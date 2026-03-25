@@ -20,7 +20,10 @@ use crate::{
 const EXT4_MAGIC: u64 = 0xEF53;
 const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT4_SB_LOG_BLOCK_SIZE_OFFSET: usize = 24;
+const EXT4_SB_BLOCKS_PER_GROUP_OFFSET: usize = 32;
+const EXT4_SB_INODES_PER_GROUP_OFFSET: usize = 40;
 const EXT4_SB_MAGIC_OFFSET: usize = 56;
+const EXT4_SB_DESC_SIZE_OFFSET: usize = 254;
 
 #[derive(Debug)]
 struct KernelBlockDeviceAdapter {
@@ -58,10 +61,29 @@ impl KernelBlockDeviceAdapter {
     fn consume_io_failure(&self) -> bool {
         self.io_failed.swap(false, Ordering::AcqRel)
     }
+
+    fn device_size_bytes(&self) -> usize {
+        self.inner.metadata().nr_sectors.saturating_mul(SECTOR_SIZE)
+    }
 }
 
 impl Ext4BlockDevice for KernelBlockDeviceAdapter {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
+        let dev_size = self.device_size_bytes();
+        let Some(read_end) = offset.checked_add(EXT4_BLOCK_SIZE) else {
+            self.mark_io_failure();
+            error!("ext4 block read overflow at offset {}", offset);
+            return vec![0u8; EXT4_BLOCK_SIZE];
+        };
+        if read_end > dev_size {
+            self.mark_io_failure();
+            error!(
+                "ext4 block read out of range: offset={} len={} device_size={}",
+                offset, EXT4_BLOCK_SIZE, dev_size
+            );
+            return vec![0u8; EXT4_BLOCK_SIZE];
+        }
+
         let aligned_start = Self::align_down(offset);
         let aligned_end = Self::align_up(offset + EXT4_BLOCK_SIZE);
         let aligned_len = aligned_end - aligned_start;
@@ -70,7 +92,7 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         let mut writer = VmWriter::from(aligned.as_mut_slice()).to_fallible();
         if let Err(err) = self.inner.read(aligned_start, &mut writer) {
             self.mark_io_failure();
-            warn!("ext4 block read failed at offset {}: {:?}", offset, err);
+            error!("ext4 block read failed at offset {}: {:?}", offset, err);
             return vec![0u8; EXT4_BLOCK_SIZE];
         }
 
@@ -80,6 +102,21 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
         if data.is_empty() {
+            return;
+        }
+
+        let dev_size = self.device_size_bytes();
+        let Some(write_end) = offset.checked_add(data.len()) else {
+            self.mark_io_failure();
+            error!("ext4 block write overflow at offset {} len={}", offset, data.len());
+            return;
+        };
+        if write_end > dev_size {
+            self.mark_io_failure();
+            error!(
+                "ext4 block write out of range: offset={} len={} device_size={}",
+                offset, data.len(), dev_size
+            );
             return;
         }
 
@@ -93,7 +130,7 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
             let mut writer = VmWriter::from(aligned.as_mut_slice()).to_fallible();
             if let Err(err) = self.inner.read(aligned_start, &mut writer) {
                 self.mark_io_failure();
-                warn!(
+                error!(
                     "ext4 block pre-read failed at offset {}: {:?}",
                     aligned_start, err
                 );
@@ -107,7 +144,7 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         let mut reader = VmReader::from(aligned.as_slice()).to_fallible();
         if let Err(err) = self.inner.write(aligned_start, &mut reader) {
             self.mark_io_failure();
-            warn!("ext4 block write failed at offset {}: {:?}", offset, err);
+            error!("ext4 block write failed at offset {}: {:?}", offset, err);
         }
     }
 }
@@ -350,6 +387,38 @@ fn verify_ext4_superblock(block_device: &dyn BlockDevice) -> Result<()> {
     };
     if block_size != EXT4_BLOCK_SIZE {
         return_errno_with_message!(Errno::EINVAL, "only 4KiB ext4 block size is supported");
+    }
+
+    let blocks_per_group = u32::from_le_bytes([
+        superblock_sector[EXT4_SB_BLOCKS_PER_GROUP_OFFSET],
+        superblock_sector[EXT4_SB_BLOCKS_PER_GROUP_OFFSET + 1],
+        superblock_sector[EXT4_SB_BLOCKS_PER_GROUP_OFFSET + 2],
+        superblock_sector[EXT4_SB_BLOCKS_PER_GROUP_OFFSET + 3],
+    ]);
+    if blocks_per_group == 0 {
+        return_errno_with_message!(Errno::EINVAL, "invalid ext4 blocks_per_group");
+    }
+
+    let inodes_per_group = u32::from_le_bytes([
+        superblock_sector[EXT4_SB_INODES_PER_GROUP_OFFSET],
+        superblock_sector[EXT4_SB_INODES_PER_GROUP_OFFSET + 1],
+        superblock_sector[EXT4_SB_INODES_PER_GROUP_OFFSET + 2],
+        superblock_sector[EXT4_SB_INODES_PER_GROUP_OFFSET + 3],
+    ]);
+    if inodes_per_group == 0 {
+        return_errno_with_message!(Errno::EINVAL, "invalid ext4 inodes_per_group");
+    }
+
+    let desc_size = u16::from_le_bytes([
+        superblock_sector[EXT4_SB_DESC_SIZE_OFFSET],
+        superblock_sector[EXT4_SB_DESC_SIZE_OFFSET + 1],
+    ]);
+    if desc_size == 0 {
+        return_errno_with_message!(Errno::EINVAL, "invalid ext4 group descriptor size");
+    }
+    let desc_size = desc_size as usize;
+    if desc_size > EXT4_BLOCK_SIZE || (EXT4_BLOCK_SIZE % desc_size) != 0 {
+        return_errno_with_message!(Errno::EINVAL, "unsupported ext4 group descriptor size");
     }
 
     Ok(())
