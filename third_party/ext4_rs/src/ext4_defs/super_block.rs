@@ -199,6 +199,10 @@ impl Ext4Superblock {
         self.free_inodes_count -= 1;
     }
 
+    pub fn increase_free_inodes_count(&mut self) {
+        self.free_inodes_count += 1;
+    }
+
     pub fn free_blocks_count(&self) -> u64 {
         self.free_blocks_count_lo as u64 | ((self.free_blocks_count_hi as u64) << 32).to_le()
     }

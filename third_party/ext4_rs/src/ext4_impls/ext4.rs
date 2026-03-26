@@ -52,9 +52,16 @@ impl Ext4 {
     }
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
+        // Superblock is always located at byte offset 1024, read with default
+        // compile-time block size first, then switch runtime block size.
+        set_runtime_block_size(BLOCK_SIZE);
+
         // Load the superblock
         let block = Block::load(&block_device, SUPERBLOCK_OFFSET);
         let super_block: Ext4Superblock = block.read_as();
+
+        // ext4 supports 1KiB/2KiB/4KiB blocks in our current scope.
+        set_runtime_block_size(super_block.block_size() as usize);
 
         // drop(block);
         
@@ -170,8 +177,31 @@ impl Ext4 {
         self.dir_remove_entry(parent, name)?;
 
         let is_dir = child.inode.is_dir();
+        let mut free_child = false;
 
-        self.ialloc_free_inode(child.inode_num, is_dir);
+        if is_dir {
+            let parent_links = parent.inode.links_count();
+            if parent_links > 0 {
+                parent.inode.set_links_count(parent_links - 1);
+            }
+            // rmdir removes both "." and ".." references.
+            child.inode.set_links_count(0);
+            free_child = true;
+            self.write_back_inode(parent);
+        } else {
+            let child_links = child.inode.links_count();
+            if child_links > 1 {
+                child.inode.set_links_count(child_links - 1);
+                self.write_back_inode(child);
+            } else {
+                child.inode.set_links_count(0);
+                free_child = true;
+            }
+        }
+
+        if free_child {
+            self.ialloc_free_inode(child.inode_num, is_dir);
+        }
 
         Ok(EOK)
     }

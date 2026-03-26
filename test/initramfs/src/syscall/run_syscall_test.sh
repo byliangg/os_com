@@ -7,6 +7,7 @@ set -e
 SYSCALL_TEST_SUITE=${SYSCALL_TEST_SUITE:-ltp}
 LTP_DIR=/opt/ltp
 GVISOR_DIR=/opt/gvisor
+XFSTESTS_DIR=/opt/xfstests
 
 if [ "${SYSCALL_TEST_SUITE}" == "ltp" ]; then
     echo "Running LTP syscall tests..."
@@ -19,6 +20,12 @@ elif [ "${SYSCALL_TEST_SUITE}" == "gvisor" ]; then
     if ! "${GVISOR_DIR}/run_gvisor_test.sh"; then
         echo "Error: gVisor syscall tests failed." >&2
         exit 2
+    fi
+elif [ "${SYSCALL_TEST_SUITE}" == "xfstests" ]; then
+    echo "Running xfstests..."
+    if ! "${XFSTESTS_DIR}/run_xfstests_test.sh"; then
+        echo "Error: xfstests failed." >&2
+        exit 4
     fi
 else
     echo "Error: Unknown test suite '${SYSCALL_TEST_SUITE}'." >&2

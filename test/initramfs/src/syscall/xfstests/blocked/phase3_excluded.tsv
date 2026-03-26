@@ -1,0 +1,27 @@
+# test\treason
+# Static exclusions for phase3 scope. Runtime NOTRUN/blocked cases will be appended to
+# /tmp/xfstests_results/phase3_base_excluded.tsv by run_xfstests_test.sh.
+#
+# Keep this file minimal. Prefer runtime evidence over broad static filtering.
+generic/001	rename/mv semantics out of stage3 scope
+generic/002	hardlink support out of stage3 scope
+generic/004	O_TMPFILE/flink support out of stage3 scope
+generic/005	symlink support out of stage3 scope
+generic/007	heavy nametest stress deferred outside stage3 baseline
+generic/011	heavy dirstress concurrency deferred outside stage3 baseline
+generic/014	sparse truncation stress deferred outside stage3 baseline
+generic/017	fallocate collapse-range support out of stage3 scope
+generic/021	fpunch/fcollapse/fiemap semantics out of stage3 scope
+generic/022	delalloc + collapse-range semantics out of stage3 scope
+generic/023	symlink support out of stage3 scope
+generic/024	renameat2 support out of stage3 scope
+generic/026	chacl/xattr tooling dependency out of stage3 scope
+generic/027	scratch size requirement exceeds current stage3 test image
+generic/029	mmap+truncate stress with xfs_io dependency out of stage3 scope
+generic/031	fcollapse stress with xfs_io dependency out of stage3 scope
+generic/032	unwritten-extent stress with xfs_io dependency out of stage3 scope
+generic/035	rename overwrite semantics out of stage3 scope
+generic/063	finsert/fpunch/fiemap semantics out of stage3 scope
+generic/069	O_APPEND stress workload deferred outside stage3 baseline
+generic/071	fallocate prealloc behavior out of stage3 scope
+generic/086	unwritten/delayed extent stress out of stage3 scope

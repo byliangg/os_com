@@ -402,9 +402,7 @@ impl FileLike for InodeHandle {
         if let Some(ref file_io) = self.file_io {
             file_io.check_seekable()?;
             if file_io.is_offset_aware() {
-                // TODO: Figure out whether we need to add support for seeking from the end of
-                // special files.
-                return do_seek_util(&self.offset, pos, None);
+                return do_seek_util(&self.offset, pos, file_io.seek_end());
             } else {
                 return Ok(0);
             }
@@ -522,6 +520,13 @@ pub trait FileIo: Pollable + InodeIo + Any + Send + Sync + 'static {
     /// the offset in the `seek()` operation will be ignored.
     /// In that case, the `seek()` operation will do nothing but succeed.
     fn is_offset_aware(&self) -> bool;
+
+    /// Returns the end position for [`SeekFrom::End`] on special files.
+    ///
+    /// Implementors should return `None` when seeking from end is unsupported.
+    fn seek_end(&self) -> Option<usize> {
+        None
+    }
 
     // See `FileLike::mappable`.
     fn mappable(&self) -> Result<Mappable> {

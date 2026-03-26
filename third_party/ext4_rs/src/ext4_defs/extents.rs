@@ -232,7 +232,7 @@ impl ExtentNode {
                 is_root,
             })
         } else {
-            if data.len() != BLOCK_SIZE {
+            if data.len() != runtime_block_size() {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
             }
             let header = Ext4ExtentHeader::load_from_u8(&data[..size_of::<Ext4ExtentHeader>()]);
@@ -264,7 +264,7 @@ impl ExtentNode {
                 is_root,
             })
         } else {
-            if data.len() != BLOCK_SIZE {
+            if data.len() != runtime_block_size() {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
             }
             let mut header = *Ext4ExtentHeader::load_from_u8_mut(&mut data[..size_of::<Ext4ExtentHeader>()]);

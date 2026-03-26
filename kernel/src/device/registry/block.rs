@@ -94,6 +94,22 @@ impl Device for BlockFile {
 // strategy to eliminate the unnecessary intermediate `Box`.
 struct OpenBlockFile(Arc<dyn BlockDevice>);
 
+impl OpenBlockFile {
+    #[inline]
+    fn align_down(offset: usize) -> usize {
+        offset / SECTOR_SIZE * SECTOR_SIZE
+    }
+
+    #[inline]
+    fn align_up(offset: usize) -> usize {
+        offset.div_ceil(SECTOR_SIZE) * SECTOR_SIZE
+    }
+
+    fn device_size_bytes(&self) -> usize {
+        self.0.metadata().nr_sectors.saturating_mul(SECTOR_SIZE)
+    }
+}
+
 impl InodeIo for OpenBlockFile {
     fn read_at(
         &self,
@@ -101,10 +117,28 @@ impl InodeIo for OpenBlockFile {
         writer: &mut VmWriter,
         _status_flags: StatusFlags,
     ) -> Result<usize> {
-        let total = writer.avail();
-        self.0.read(offset, writer)?;
-        let avail = writer.avail();
-        Ok(total - avail)
+        let requested_len = writer.avail();
+        if requested_len == 0 {
+            return Ok(0);
+        }
+
+        let device_size = self.device_size_bytes();
+        if offset >= device_size {
+            return Ok(0);
+        }
+
+        let read_len = requested_len.min(device_size - offset);
+        let aligned_start = Self::align_down(offset);
+        let aligned_end = Self::align_up(offset + read_len);
+        let aligned_len = aligned_end - aligned_start;
+
+        let mut aligned = vec![0u8; aligned_len];
+        let mut device_writer = VmWriter::from(aligned.as_mut_slice()).to_fallible();
+        self.0.read(aligned_start, &mut device_writer)?;
+
+        let start = offset - aligned_start;
+        writer.write_fallible(&mut VmReader::from(&aligned[start..start + read_len]).to_fallible())?;
+        Ok(read_len)
     }
 
     fn write_at(
@@ -113,10 +147,39 @@ impl InodeIo for OpenBlockFile {
         reader: &mut VmReader,
         _status_flags: StatusFlags,
     ) -> Result<usize> {
-        let total = reader.remain();
-        self.0.write(offset, reader)?;
-        let remain = reader.remain();
-        Ok(total - remain)
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+
+        let Some(write_end) = offset.checked_add(write_len) else {
+            return_errno_with_message!(Errno::EINVAL, "block write offset overflow");
+        };
+
+        let device_size = self.device_size_bytes();
+        if write_end > device_size {
+            return_errno_with_message!(Errno::EINVAL, "block write exceeds device size");
+        }
+
+        let aligned_start = Self::align_down(offset);
+        let aligned_end = Self::align_up(write_end);
+        let aligned_len = aligned_end - aligned_start;
+        let mut aligned = vec![0u8; aligned_len];
+
+        // Preserve neighbor bytes if the write request is not sector aligned.
+        if aligned_start != offset || aligned_end != write_end {
+            let mut device_writer = VmWriter::from(aligned.as_mut_slice()).to_fallible();
+            self.0.read(aligned_start, &mut device_writer)?;
+        }
+
+        let start = offset - aligned_start;
+        reader.read_fallible(
+            &mut VmWriter::from(&mut aligned[start..start + write_len]).to_fallible(),
+        )?;
+
+        let mut device_reader = VmReader::from(aligned.as_slice()).to_fallible();
+        self.0.write(aligned_start, &mut device_reader)?;
+        Ok(write_len)
     }
 }
 
@@ -134,6 +197,10 @@ impl FileIo for OpenBlockFile {
 
     fn is_offset_aware(&self) -> bool {
         true
+    }
+
+    fn seek_end(&self) -> Option<usize> {
+        Some(self.0.metadata().nr_sectors * SECTOR_SIZE)
     }
 
     fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {

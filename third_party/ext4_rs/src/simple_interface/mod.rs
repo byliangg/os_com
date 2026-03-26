@@ -19,6 +19,7 @@ pub struct SimpleDirEntry {
     pub inode: u32,
     pub de_type: u8,
     pub name: String,
+    pub next_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,13 +236,14 @@ impl Ext4 {
 
     /// Get simplified directory entries under a directory inode.
     pub fn ext4_readdir(&self, inode: u32) -> Vec<SimpleDirEntry> {
-        let entries = self.dir_get_entries(inode);
+        let entries = self.dir_get_entries_with_next_offset(inode);
         let mut simple_entries = Vec::new();
-        for entry in entries {
+        for (entry, next_offset) in entries {
             simple_entries.push(SimpleDirEntry {
                 inode: entry.inode,
                 de_type: entry.get_de_type(),
                 name: entry.get_name(),
+                next_offset,
             });
         }
         simple_entries

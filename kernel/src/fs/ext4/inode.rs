@@ -294,27 +294,38 @@ impl Inode for Ext4Inode {
 
         let fs = self.ext4_fs()?;
         let entries = fs.readdir(self.ino)?;
-        if offset >= entries.len() {
+        let mut iterate_offset = offset;
+        let start_idx = if offset == 0 {
+            0
+        } else {
+            entries
+                .iter()
+                .position(|entry| entry.next_offset > offset)
+                .unwrap_or(entries.len())
+        };
+
+        if start_idx >= entries.len() {
             return Ok(0);
         }
 
-        let mut visited = 0usize;
-        for (index, entry) in entries.iter().enumerate().skip(offset) {
+        let mut visited = false;
+        for entry in entries.iter().skip(start_idx) {
             let type_ = Self::type_from_dirent_type(entry.de_type);
             if let Err(err) = visitor.visit(
                 entry.name.as_str(),
                 entry.inode as u64,
                 type_,
-                index + 1,
+                entry.next_offset,
             ) {
-                if visited == 0 {
+                if !visited {
                     return Err(err);
                 }
                 break;
             }
-            visited += 1;
+            visited = true;
+            iterate_offset = entry.next_offset;
         }
-        Ok(visited)
+        Ok(iterate_offset.saturating_sub(offset))
     }
 
     fn unlink(&self, name: &str) -> Result<()> {

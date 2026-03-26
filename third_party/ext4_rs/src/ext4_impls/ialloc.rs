@@ -5,6 +5,7 @@ use crate::utils::bitmap::*;
 
 impl Ext4 {
     pub fn ialloc_alloc_inode(&self, is_dir: bool) -> Result<u32> {
+        let block_size = self.super_block.block_size() as usize;
         let mut bgid = 0;
         let bg_count = self.super_block.block_group_count();
         let mut super_block = self.super_block;
@@ -25,7 +26,7 @@ impl Ext4 {
 
                 let mut raw_data = self
                     .block_device
-                    .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
+                    .read_offset(inode_bitmap_block as usize * block_size);
 
                 let inodes_in_bg = super_block.get_inodes_in_group_cnt(bgid);
 
@@ -38,7 +39,7 @@ impl Ext4 {
 
                 // update bitmap in disk
                 self.block_device
-                    .write_offset(inode_bitmap_block as usize * BLOCK_SIZE, bitmap_data);
+                    .write_offset(inode_bitmap_block as usize * block_size, bitmap_data);
 
                 bg.set_block_group_ialloc_bitmap_csum(&super_block, bitmap_data);
 
@@ -80,6 +81,7 @@ impl Ext4 {
     }
 
     pub fn ialloc_free_inode(&self, index: u32, is_dir: bool) {
+        let block_size = self.super_block.block_size() as usize;
         // Compute index of block group
         let bgid = self.get_bgid_of_inode(index);
 
@@ -91,7 +93,7 @@ impl Ext4 {
         let inode_bitmap_block = bg.get_inode_bitmap_block(&self.super_block);
         let mut bitmap_data = self
             .block_device
-            .read_offset(inode_bitmap_block as usize * BLOCK_SIZE);
+            .read_offset(inode_bitmap_block as usize * block_size);
 
         // Find index within group and clear bit
         let index_in_group = self.inode_to_bgidx(index);
@@ -100,7 +102,7 @@ impl Ext4 {
         // Set new checksum after modification
         // update bitmap in disk
         self.block_device
-            .write_offset(inode_bitmap_block as usize * BLOCK_SIZE, &bitmap_data);
+            .write_offset(inode_bitmap_block as usize * block_size, &bitmap_data);
         bg.set_block_group_ialloc_bitmap_csum(&super_block, &bitmap_data);
 
         // Update free inodes count in block group
@@ -115,7 +117,7 @@ impl Ext4 {
 
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
-        super_block.decrease_free_inodes_count();
+        super_block.increase_free_inodes_count();
         super_block.sync_to_disk_with_csum(&self.block_device);
     }
 }

@@ -12,7 +12,8 @@ test/
 │   ├── etc/           # Configuration files
 │   └── syscall/       # Syscall test suites
 │       ├── ltp/       # LTP syscall test suite
-│       └── gvisor/    # Gvisor syscall test suite
+│       ├── gvisor/    # Gvisor syscall test suite
+│       └── xfstests/  # xfstests-based fs correctness suite
 ├── nix/
 │   ├── benchmark/     # Nix expressions for `benchmark`
 │   ├── syscall/       # Nix expressions for `syscall`

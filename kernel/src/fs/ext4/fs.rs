@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_block::{BlockDevice, SECTOR_SIZE};
@@ -24,6 +25,19 @@ const EXT4_SB_BLOCKS_PER_GROUP_OFFSET: usize = 32;
 const EXT4_SB_INODES_PER_GROUP_OFFSET: usize = 40;
 const EXT4_SB_MAGIC_OFFSET: usize = 56;
 const EXT4_SB_DESC_SIZE_OFFSET: usize = 254;
+
+#[derive(Debug, Default)]
+struct DirEntryCache {
+    loaded: bool,
+    entries: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirLookupCacheResult {
+    Hit(u32),
+    Miss,
+    Unknown,
+}
 
 #[derive(Debug)]
 struct KernelBlockDeviceAdapter {
@@ -153,6 +167,7 @@ pub(super) struct Ext4Fs {
     inner: Mutex<Ext4>,
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
+    dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
 }
@@ -166,6 +181,7 @@ impl Ext4Fs {
             inner: Mutex::new(ext4),
             block_device,
             adapter,
+            dir_entry_cache: Mutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
         })
@@ -213,8 +229,89 @@ impl Ext4Fs {
         self.run_ext4_noerr(|ext4| ext4.ext4_stat(ino))
     }
 
+    fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
+        let caches = self.dir_entry_cache.lock();
+        let Some(cache) = caches.get(&parent) else {
+            return DirLookupCacheResult::Unknown;
+        };
+        if let Some(ino) = cache.entries.get(name) {
+            return DirLookupCacheResult::Hit(*ino);
+        }
+        if cache.loaded {
+            return DirLookupCacheResult::Miss;
+        }
+        DirLookupCacheResult::Unknown
+    }
+
+    fn load_dir_cache_if_needed(&self, parent: u32) -> Result<()> {
+        {
+            let caches = self.dir_entry_cache.lock();
+            if let Some(cache) = caches.get(&parent) {
+                if cache.loaded {
+                    return Ok(());
+                }
+            }
+        }
+
+        let meta = self.stat(parent)?;
+        if meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+            return_errno_with_message!(Errno::ENOTDIR, "parent inode is not a directory");
+        }
+
+        let entries = self.readdir(parent)?;
+        let mut entry_map = BTreeMap::new();
+        for entry in entries {
+            entry_map.insert(entry.name, entry.inode);
+        }
+
+        let mut caches = self.dir_entry_cache.lock();
+        let cache = caches.entry(parent).or_default();
+        if !cache.loaded {
+            cache.entries = entry_map;
+            cache.loaded = true;
+        }
+        Ok(())
+    }
+
+    fn cache_insert_entry(&self, parent: u32, name: &str, child: u32) {
+        let mut caches = self.dir_entry_cache.lock();
+        let cache = caches.entry(parent).or_default();
+        cache.entries.insert(name.to_string(), child);
+    }
+
+    fn cache_remove_entry(&self, parent: u32, name: &str) {
+        let mut caches = self.dir_entry_cache.lock();
+        if let Some(cache) = caches.get_mut(&parent) {
+            cache.entries.remove(name);
+        }
+    }
+
+    fn cache_remove_dir(&self, ino: u32) {
+        let mut caches = self.dir_entry_cache.lock();
+        caches.remove(&ino);
+    }
+
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
-        self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))
+        match self.lookup_cache(parent, name) {
+            DirLookupCacheResult::Hit(ino) => return Ok(ino),
+            DirLookupCacheResult::Miss => {
+                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
+            }
+            DirLookupCacheResult::Unknown => {}
+        }
+
+        self.load_dir_cache_if_needed(parent)?;
+        match self.lookup_cache(parent, name) {
+            DirLookupCacheResult::Hit(ino) => return Ok(ino),
+            DirLookupCacheResult::Miss => {
+                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
+            }
+            DirLookupCacheResult::Unknown => {}
+        }
+
+        let ino = self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))?;
+        self.cache_insert_entry(parent, name, ino);
+        Ok(ino)
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
@@ -222,20 +319,30 @@ impl Ext4Fs {
     }
 
     pub(super) fn create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
-        self.run_ext4(|ext4| ext4.ext4_create_at(parent, name, mode))
+        let ino = self.run_ext4(|ext4| ext4.ext4_create_at(parent, name, mode))?;
+        self.cache_insert_entry(parent, name, ino);
+        self.cache_remove_dir(ino);
+        Ok(ino)
     }
 
     pub(super) fn mkdir_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
-        self.run_ext4(|ext4| ext4.ext4_mkdir_at(parent, name, mode))
+        let ino = self.run_ext4(|ext4| ext4.ext4_mkdir_at(parent, name, mode))?;
+        self.cache_insert_entry(parent, name, ino);
+        self.cache_remove_dir(ino);
+        Ok(ino)
     }
 
     pub(super) fn unlink_at(&self, parent: u32, name: &str) -> Result<()> {
         self.run_ext4(|ext4| ext4.ext4_unlink_at(parent, name))?;
+        self.cache_remove_entry(parent, name);
         Ok(())
     }
 
     pub(super) fn rmdir_at(&self, parent: u32, name: &str) -> Result<()> {
+        let child_ino = self.lookup_at(parent, name)?;
         self.run_ext4(|ext4| ext4.ext4_rmdir_at(parent, name))?;
+        self.cache_remove_entry(parent, name);
+        self.cache_remove_dir(child_ino);
         Ok(())
     }
 
@@ -284,7 +391,29 @@ impl FileSystem for Ext4Fs {
     }
 
     fn sb(&self) -> SuperBlock {
-        SuperBlock::new(EXT4_MAGIC, EXT4_BLOCK_SIZE, NAME_MAX)
+        let ext4_sb = self.lock_inner().super_block;
+        let block_size = ext4_sb.block_size() as usize;
+        let blocks = ext4_sb.blocks_count() as usize;
+        let bfree = ext4_sb
+            .free_blocks_count()
+            .min(usize::MAX as u64) as usize;
+        let files = ext4_sb.total_inodes() as usize;
+        let ffree = ext4_sb.free_inodes_count() as usize;
+        let fsid = u64::from_le_bytes(ext4_sb.uuid[..8].try_into().unwrap_or([0u8; 8]));
+
+        SuperBlock {
+            magic: EXT4_MAGIC,
+            bsize: block_size,
+            blocks,
+            bfree,
+            bavail: bfree,
+            files,
+            ffree,
+            fsid,
+            namelen: NAME_MAX,
+            frsize: block_size,
+            flags: 0,
+        }
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
@@ -385,8 +514,8 @@ fn verify_ext4_superblock(block_device: &dyn BlockDevice) -> Result<()> {
     let Some(block_size) = 1024usize.checked_shl(log_block_size) else {
         return_errno_with_message!(Errno::EINVAL, "invalid ext4 block size");
     };
-    if block_size != EXT4_BLOCK_SIZE {
-        return_errno_with_message!(Errno::EINVAL, "only 4KiB ext4 block size is supported");
+    if !matches!(block_size, 1024 | 2048 | 4096) {
+        return_errno_with_message!(Errno::EINVAL, "unsupported ext4 block size");
     }
 
     let blocks_per_group = u32::from_le_bytes([
@@ -417,7 +546,7 @@ fn verify_ext4_superblock(block_device: &dyn BlockDevice) -> Result<()> {
         return_errno_with_message!(Errno::EINVAL, "invalid ext4 group descriptor size");
     }
     let desc_size = desc_size as usize;
-    if desc_size > EXT4_BLOCK_SIZE || (EXT4_BLOCK_SIZE % desc_size) != 0 {
+    if desc_size > block_size || (block_size % desc_size) != 0 {
         return_errno_with_message!(Errno::EINVAL, "unsupported ext4 group descriptor size");
     }
 

@@ -19,6 +19,7 @@ impl Ext4 {
         name: &str,
         result: &mut Ext4DirSearchResult,
     ) -> Result<usize> {
+        let block_size = self.super_block.block_size() as usize;
         // load parent inode
         let parent = self.get_inode_ref(parent_inode);
         if !parent.inode.is_dir() {
@@ -32,7 +33,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let total_blocks: u64 = inode_size / BLOCK_SIZE as u64;
+        let total_blocks: u64 = inode_size / block_size as u64;
 
         // iterate all blocks
         while iblock < total_blocks {
@@ -45,7 +46,7 @@ impl Ext4 {
             fblock = path_node.pblock;
 
             // load physical block
-            let ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+            let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
 
             // find entry in block
             let r = self.dir_find_in_block(&ext4block, name, result);
@@ -75,14 +76,15 @@ impl Ext4 {
         name: &str,
         result: &mut Ext4DirSearchResult,
     ) -> Result<Ext4DirEntry> {
+        let block_size = self.super_block.block_size() as usize;
         let mut offset = 0;
         let mut prev_de_offset = 0;
 
         // start from the first entry
-        while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
+        while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
             let de: Ext4DirEntry = block.read_offset_as(offset);
             let rec_len = de.entry_len() as usize;
-            if rec_len == 0 || rec_len > BLOCK_SIZE - offset {
+            if rec_len == 0 || rec_len > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
             }
             if !de.unused() && de.compare_name(name) {
@@ -107,6 +109,7 @@ impl Ext4 {
     /// Returns:
     /// `Vec<Ext4DirEntry>` - list of directory entries
     pub fn dir_get_entries(&self, inode: u32) -> Vec<Ext4DirEntry> {
+        let block_size = self.super_block.block_size() as usize;
         let mut entries = Vec::new();
 
         // load inode
@@ -117,7 +120,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size = inode_ref.inode.size();
-        let total_blocks = inode_size / BLOCK_SIZE as u64;
+        let total_blocks = inode_size / block_size as u64;
 
         // start from the first logical block
         let mut iblock = 0;
@@ -139,14 +142,14 @@ impl Ext4 {
 
                 // load physical block
                 let ext4block =
-                    Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+                    Block::load(&self.block_device, fblock as usize * block_size);
                 let mut offset = 0;
 
                 // iterate all entries in a block
-                while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
+                while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
                     let de: Ext4DirEntry = ext4block.read_offset_as(offset);
                     let rec_len = de.entry_len() as usize;
-                    if rec_len == 0 || rec_len > BLOCK_SIZE - offset {
+                    if rec_len == 0 || rec_len > block_size - offset {
                         break;
                     }
                     if !de.unused() {
@@ -162,10 +165,65 @@ impl Ext4 {
         entries
     }
 
+    /// Get visible directory entries with cookie-like next offsets.
+    ///
+    /// The returned offset is the absolute byte offset of the next entry in
+    /// the directory stream, suitable for `readdir` continuation.
+    pub fn dir_get_entries_with_next_offset(
+        &self,
+        inode: u32,
+    ) -> Vec<(Ext4DirEntry, usize)> {
+        let block_size = self.super_block.block_size() as usize;
+        let mut entries = Vec::new();
+
+        let inode_ref = self.get_inode_ref(inode);
+        if !inode_ref.inode.is_dir() {
+            return entries;
+        }
+
+        let inode_size = inode_ref.inode.size();
+        let total_blocks = inode_size / block_size as u64;
+        let mut iblock = 0u64;
+
+        while iblock < total_blocks {
+            let search_path = self.find_extent(&inode_ref, iblock as u32);
+            if let Ok(path) = search_path {
+                let Some(path) = path.path.last() else {
+                    iblock += 1;
+                    continue;
+                };
+
+                let fblock = path.pblock;
+                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let mut offset = 0usize;
+
+                while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
+                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                    let rec_len = de.entry_len() as usize;
+                    if rec_len == 0 || rec_len > block_size - offset {
+                        break;
+                    }
+
+                    if !de.unused() {
+                        let next_offset = iblock as usize * block_size + offset + rec_len;
+                        entries.push((de, next_offset));
+                    }
+
+                    offset += rec_len;
+                }
+            }
+
+            iblock += 1;
+        }
+
+        entries
+    }
+
     pub fn dir_set_csum(&self, dst_blk: &mut Block, ino_gen: u32) {
+        let block_size = self.super_block.block_size() as usize;
         let parent_de: Ext4DirEntry = dst_blk.read_offset_as(0);
 
-        let tail_offset = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
+        let tail_offset = block_size - size_of::<Ext4DirEntryTail>();
         let mut tail: Ext4DirEntryTail = *dst_blk.read_offset_as_mut(tail_offset);
 
         tail.tail_set_csum(&self.super_block, &parent_de, &dst_blk.data[..], ino_gen);
@@ -200,10 +258,31 @@ impl Ext4 {
         child: &Ext4InodeRef,
         name: &str,
     ) -> Result<usize> {
+        let block_size = self.super_block.block_size() as usize;
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let block_size = self.super_block.block_size();
         let total_blocks: u64 = inode_size / block_size as u64;
+
+        // Fast path: most appends can be satisfied by the last directory block.
+        // This avoids repeatedly rescanning all earlier blocks for bulk creates.
+        if total_blocks > 0 {
+            let last_iblock = total_blocks - 1;
+            let pblock = self.get_pblock_idx(parent, last_iblock as u32)?;
+            let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
+            if self
+                .try_insert_to_existing_block(
+                    &mut ext4block,
+                    name,
+                    child.inode_num,
+                    Self::inode_to_dir_entry_type(&child.inode),
+                )
+                .is_ok()
+            {
+                self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                ext4block.sync_blk_to_disk(&self.block_device);
+                return Ok(EOK);
+            }
+        }
 
         // iterate all blocks
         let mut iblock = 0;
@@ -213,7 +292,7 @@ impl Ext4 {
 
             // load physical block
             let mut ext4block =
-                Block::load(&self.block_device, pblock as usize * BLOCK_SIZE);
+                Block::load(&self.block_device, pblock as usize * block_size);
 
             let result = self.try_insert_to_existing_block(
                 &mut ext4block,
@@ -239,7 +318,7 @@ impl Ext4 {
 
         // load new block
         let mut new_ext4block =
-            Block::load(&self.block_device, new_block as usize * BLOCK_SIZE);
+            Block::load(&self.block_device, new_block as usize * block_size);
 
         // write new entry to the new block
         // must succeed, as we just allocated the block
@@ -273,6 +352,7 @@ impl Ext4 {
         child_inode: u32,
         de_type: DirEntryType,
     ) -> Result<usize> {
+        let block_size = self.super_block.block_size() as usize;
         // required length aligned to 4 bytes
         let required_len = {
             let mut len = size_of::<Ext4DirEntry>() + name.len();
@@ -285,10 +365,10 @@ impl Ext4 {
         let mut offset = 0;
 
         // Start from the first entry
-        while offset < BLOCK_SIZE - size_of::<Ext4DirEntryTail>() {
+        while offset < block_size - size_of::<Ext4DirEntryTail>() {
             let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
             let rec_len = de.entry_len() as usize;
-            if rec_len == 0 || rec_len > BLOCK_SIZE - offset {
+            if rec_len == 0 || rec_len > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
             }
 
@@ -348,9 +428,10 @@ impl Ext4 {
         name: &str,
         de_type: DirEntryType,
     ) {
+        let block_size = self.super_block.block_size() as usize;
         // write new entry
         let mut new_entry = Ext4DirEntry::default();
-        let el = BLOCK_SIZE - size_of::<Ext4DirEntryTail>();
+        let el = block_size - size_of::<Ext4DirEntryTail>();
         new_entry.write_entry(el as u16, inode, name, de_type);
         new_entry.copy_to_slice(&mut block.data, 0);
 
@@ -362,12 +443,13 @@ impl Ext4 {
     }
 
     pub fn dir_remove_entry(&self, parent: &mut Ext4InodeRef, path: &str) -> Result<usize> {
+        let block_size = self.super_block.block_size() as usize;
         // get remove_entry pos in parent and its prev entry
         let mut result = Ext4DirSearchResult::new(Ext4DirEntry::default());
 
         let r = self.dir_find_entry(parent.inode_num, path, &mut result)?;
 
-        let mut ext4block = Block::load(&self.block_device, result.pblock_id * BLOCK_SIZE);
+        let mut ext4block = Block::load(&self.block_device, result.pblock_id * block_size);
 
         // Invalidate entry first
         let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
@@ -383,7 +465,7 @@ impl Ext4 {
             // Start from the first entry in block
             let mut tmp_de: Ext4DirEntry = ext4block.read_offset_as(offset);
             let mut de_len = tmp_de.entry_len();
-            if de_len == 0 || de_len as usize > BLOCK_SIZE - offset {
+            if de_len == 0 || de_len as usize > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
             }
 
@@ -392,7 +474,7 @@ impl Ext4 {
                 offset += de_len as usize;
                 tmp_de = ext4block.read_offset_as(offset);
                 de_len = tmp_de.entry_len();
-                if de_len == 0 || de_len as usize > BLOCK_SIZE - offset {
+                if de_len == 0 || de_len as usize > block_size - offset {
                     return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
                 }
             }
@@ -413,6 +495,7 @@ impl Ext4 {
     }
 
     pub fn dir_has_entry(&self, dir_inode: u32) -> Result<bool> {
+        let block_size = self.super_block.block_size() as usize;
         // load parent inode
         let parent = self.get_inode_ref(dir_inode);
         if !parent.inode.is_dir() {
@@ -426,7 +509,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let total_blocks: u64 = inode_size / BLOCK_SIZE as u64;
+        let total_blocks: u64 = inode_size / block_size as u64;
 
         // iterate all blocks
         while iblock < total_blocks {
@@ -439,14 +522,14 @@ impl Ext4 {
             fblock = path_node.pblock;
 
             // load physical block
-            let ext4block = Block::load(&self.block_device, fblock as usize * BLOCK_SIZE);
+            let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
 
             // start from the first entry
             let mut offset = 0;
-            while offset < BLOCK_SIZE - core::mem::size_of::<Ext4DirEntryTail>() {
+            while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
                 let de: Ext4DirEntry = ext4block.read_offset_as(offset);
                 let rec_len = de.entry_len as usize;
-                if rec_len == 0 || rec_len > BLOCK_SIZE - offset {
+                if rec_len == 0 || rec_len > block_size - offset {
                     return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
                 }
                 offset += rec_len;

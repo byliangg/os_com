@@ -40,13 +40,14 @@ impl Ext4BlockGroup {
         super_block: &Ext4Superblock,
         block_group_idx: usize,
     ) -> Self {
-        let dsc_cnt = BLOCK_SIZE / super_block.desc_size as usize;
+        let block_size = super_block.block_size() as usize;
+        let dsc_cnt = block_size / super_block.desc_size as usize;
         let dsc_id = block_group_idx / dsc_cnt;
         let first_data_block = super_block.first_data_block;
         let block_id = first_data_block as usize + dsc_id + 1;
         let offset = (block_group_idx % dsc_cnt) * super_block.desc_size as usize;
 
-        let ext4block = Block::load(block_device, block_id * BLOCK_SIZE);
+        let ext4block = Block::load(block_device, block_id * block_size);
         let bg: Ext4BlockGroup = ext4block.read_offset_as(offset);
 
         bg
@@ -171,7 +172,8 @@ impl Ext4BlockGroup {
         bgid: usize,
         super_block: &Ext4Superblock,
     ) {
-        let dsc_cnt = BLOCK_SIZE / super_block.desc_size as usize;
+        let block_size = super_block.block_size() as usize;
+        let dsc_cnt = block_size / super_block.desc_size as usize;
         let dsc_id = bgid / dsc_cnt;
         let first_data_block = super_block.first_data_block;
         let block_id = first_data_block as usize + dsc_id + 1;
@@ -180,7 +182,7 @@ impl Ext4BlockGroup {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4BlockGroup>())
         };
-        block_device.write_offset(block_id * BLOCK_SIZE + offset, data);
+        block_device.write_offset(block_id * block_size + offset, data);
     }
 
     /// Set the checksum of the block group descriptor.
