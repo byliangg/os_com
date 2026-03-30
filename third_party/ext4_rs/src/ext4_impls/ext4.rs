@@ -200,6 +200,8 @@ impl Ext4 {
         }
 
         if free_child {
+            // Persist zero nlink before releasing inode bitmap entry.
+            self.write_back_inode(child);
             self.ialloc_free_inode(child.inode_num, is_dir);
         }
 

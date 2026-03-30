@@ -20,8 +20,13 @@ SCRATCH_DEV=${XFSTESTS_SCRATCH_DEV:-/dev/vdb}
 TEST_DIR=${XFSTESTS_TEST_DIR:-/ext4_test}
 SCRATCH_MNT=${XFSTESTS_SCRATCH_MNT:-/ext4_scratch}
 
-BASE_LIST=${SCRIPT_DIR}/testcases/phase3_base.list
-STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase3_excluded.tsv
+PHASE3_BASE_LIST=${SCRIPT_DIR}/testcases/phase3_base.list
+PHASE3_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase3_excluded.tsv
+PHASE4_GOOD_LIST=${SCRIPT_DIR}/testcases/phase4_good.list
+PHASE4_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase4_excluded.tsv
+
+BASE_LIST=""
+STATIC_EXCLUDED=""
 
 CHECK_BIN=${XFSTESTS_DEV_DIR}/check
 RESULTS_FILE=${RESULTS_DIR}/${MODE}_results.tsv
@@ -207,9 +212,75 @@ EOF
 chmod +x "${SHIM_DIR}/mke2fs"
 
 # xfstests common/config requires a perl command in PATH.
-# Phase3 base list does not rely on perl scripts directly, so provide a stub.
+# Provide a minimal compatibility shim for common/rc _link_out_file_named().
 cat > "${SHIM_DIR}/perl" <<'EOF'
 #!/bin/bash
+set -eu
+
+if [ "${1:-}" = "-e" ] && [ $# -ge 2 ]; then
+    script="$2"
+    shift 2
+
+    # xfstests common/rc calls perl -e with FEATURES to pick *.out suffix.
+    case "${script}" in
+        *"my %feathash"*'ENV{"FEATURES"}'*)
+        features="${FEATURES:-}"
+        /usr/bin/busybox awk -v features="${features}" '
+BEGIN {
+    n = split(features, parts, ",")
+    for (i = 1; i <= n; i++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", parts[i])
+        if (parts[i] != "") {
+            have[parts[i]] = 1
+        }
+    }
+    printed = 0
+}
+{
+    line = $0
+    sub(/[[:space:]]*#.*/, "", line)
+    if (line == "") {
+        next
+    }
+
+    split(line, kv, /[[:space:]]*:[[:space:]]*/)
+    opts = kv[1]
+    suffix = kv[2]
+    gsub(/^[[:space:]]+|[[:space:]]+$/, "", suffix)
+    if (suffix == "") {
+        next
+    }
+
+    ok = 1
+    m = split(opts, req, ",")
+    for (j = 1; j <= m; j++) {
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", req[j])
+        if (req[j] == "") {
+            continue
+        }
+        if (!(req[j] in have)) {
+            ok = 0
+            break
+        }
+    }
+
+    if (ok == 1) {
+        print suffix
+        printed = 1
+        exit 0
+    }
+}
+END {
+    if (printed == 0) {
+        print "default"
+    }
+}
+'
+        exit 0
+        ;;
+    esac
+fi
+
 echo "perl shim invoked but perl is unavailable: $*" >&2
 exit 127
 EOF
@@ -568,6 +639,12 @@ case "${MODE}" in
         exit 0
         ;;
     phase3_base)
+        BASE_LIST=${PHASE3_BASE_LIST}
+        STATIC_EXCLUDED=${PHASE3_STATIC_EXCLUDED}
+        ;;
+    phase4_good)
+        BASE_LIST=${PHASE4_GOOD_LIST}
+        STATIC_EXCLUDED=${PHASE4_STATIC_EXCLUDED}
         ;;
     *)
         echo "Error: unsupported XFSTESTS_MODE=${MODE}" >&2
@@ -760,12 +837,12 @@ fi
 
 PASS_RATE_OK=$(awk -v r="${PASS_RATE}" -v t="${THRESHOLD_PERCENT}" 'BEGIN{ if ((r+0) >= (t+0)) print 1; else print 0; }')
 if [ "${PASS_RATE_OK}" -ne 1 ]; then
-    echo "xfstests phase3_base failed: pass_rate=${PASS_RATE}% < threshold=${THRESHOLD_PERCENT}%" >&2
+    echo "xfstests ${MODE} failed: pass_rate=${PASS_RATE}% < threshold=${THRESHOLD_PERCENT}%" >&2
     echo "See summary: ${SUMMARY_FILE}" >&2
     exit 6
 fi
 
-echo "xfstests phase3_base passed: pass_rate=${PASS_RATE}% >= ${THRESHOLD_PERCENT}%"
+echo "xfstests ${MODE} passed: pass_rate=${PASS_RATE}% >= ${THRESHOLD_PERCENT}%"
 echo "summary=${SUMMARY_FILE}"
 echo "results=${RESULTS_FILE}"
 echo "excluded=${EXCLUDED_FILE}"

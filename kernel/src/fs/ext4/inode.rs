@@ -344,6 +344,21 @@ impl Inode for Ext4Inode {
         fs.rmdir_at(self.ino, name)
     }
 
+    fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
+        if self.type_() != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+        let Some(target_inode) = target.downcast_ref::<Ext4Inode>() else {
+            return_errno_with_message!(Errno::EINVAL, "target is not an ext4 inode");
+        };
+        if target_inode.type_() != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let fs = self.ext4_fs()?;
+        fs.rename_at(self.ino, old_name, target_inode.ino, new_name)
+    }
+
     fn read_link(&self) -> Result<SymbolicLink> {
         return_errno_with_message!(Errno::EOPNOTSUPP, "symlink is not supported in stage1");
     }

@@ -8,6 +8,7 @@ SYSCALL_TEST_SUITE=${SYSCALL_TEST_SUITE:-ltp}
 LTP_DIR=/opt/ltp
 GVISOR_DIR=/opt/gvisor
 XFSTESTS_DIR=/opt/xfstests
+EXT4_CRASH_DIR=/opt/ext4_crash
 
 if [ "${SYSCALL_TEST_SUITE}" == "ltp" ]; then
     echo "Running LTP syscall tests..."
@@ -26,6 +27,12 @@ elif [ "${SYSCALL_TEST_SUITE}" == "xfstests" ]; then
     if ! "${XFSTESTS_DIR}/run_xfstests_test.sh"; then
         echo "Error: xfstests failed." >&2
         exit 4
+    fi
+elif [ "${SYSCALL_TEST_SUITE}" == "ext4_crash" ]; then
+    echo "Running ext4 crash-recovery tests..."
+    if ! "${EXT4_CRASH_DIR}/run_ext4_crash_test.sh"; then
+        echo "Error: ext4 crash-recovery tests failed." >&2
+        exit 5
     fi
 else
     echo "Error: Unknown test suite '${SYSCALL_TEST_SUITE}'." >&2

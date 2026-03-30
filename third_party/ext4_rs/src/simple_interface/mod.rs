@@ -194,6 +194,73 @@ impl Ext4 {
         self.dir_remove(parent, name)
     }
 
+    /// Rename an entry under ext4.
+    ///
+    /// Current scope keeps semantics needed by phase4_part2:
+    /// - same-directory rename
+    /// - overwrite regular file / empty directory
+    /// - reject cross-directory rename for now
+    pub fn ext4_rename_at(
+        &self,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> Result<usize> {
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return_errno_with_message!(Errno::EISDIR, "rename on . or .. is not allowed");
+        }
+
+        if old_parent != new_parent {
+            return_errno_with_message!(Errno::EXDEV, "cross-directory rename is not supported");
+        }
+
+        if old_name == new_name {
+            return Ok(EOK);
+        }
+
+        let old_ino = self.ext4_lookup_at(old_parent, old_name)?;
+        let old_inode_ref = self.get_inode_ref(old_ino);
+        let old_is_dir = old_inode_ref.inode.is_dir();
+
+        if let Ok(new_ino) = self.ext4_lookup_at(new_parent, new_name) {
+            if new_ino == old_ino {
+                return Ok(EOK);
+            }
+
+            let mut new_inode_ref = self.get_inode_ref(new_ino);
+            if old_is_dir {
+                if !new_inode_ref.inode.is_dir() {
+                    return_errno_with_message!(Errno::ENOTDIR, "cannot overwrite non-directory");
+                }
+                if self.dir_has_entry(new_inode_ref.inode_num)? {
+                    return_errno_with_message!(Errno::ENOTEMPTY, "directory not empty");
+                }
+
+                self.truncate_inode(&mut new_inode_ref, 0)?;
+                let mut parent_inode_ref = self.get_inode_ref(new_parent);
+                self.unlink(&mut parent_inode_ref, &mut new_inode_ref, new_name)?;
+                self.write_back_inode(&mut parent_inode_ref);
+            } else {
+                if new_inode_ref.inode.is_dir() {
+                    return_errno_with_message!(Errno::EISDIR, "cannot overwrite directory");
+                }
+
+                if new_inode_ref.inode.links_count() == 1 {
+                    self.truncate_inode(&mut new_inode_ref, 0)?;
+                }
+                let mut parent_inode_ref = self.get_inode_ref(new_parent);
+                self.unlink(&mut parent_inode_ref, &mut new_inode_ref, new_name)?;
+            }
+        }
+
+        let mut parent_inode_ref = self.get_inode_ref(old_parent);
+        self.dir_remove_entry(&mut parent_inode_ref, old_name)?;
+        self.dir_add_entry(&mut parent_inode_ref, &old_inode_ref, new_name)?;
+
+        Ok(EOK)
+    }
+
     /// Read bytes from a file inode.
     pub fn ext4_read_at(&self, inode: u32, offset: usize, read_buf: &mut [u8]) -> Result<usize> {
         self.read_at(inode, offset, read_buf)

@@ -1,4 +1,4 @@
-# xfstests Syscall Suite (Phase3)
+# xfstests Syscall Suite (Phase3/Phase4)
 
 This suite integrates `xfstests` into Asterinas `AUTO_TEST=syscall` pipeline.
 
@@ -12,9 +12,10 @@ Set `XFSTESTS_PREBUILT_DIR` before building initramfs. The directory must contai
 ## Runtime modes
 
 1. `XFSTESTS_MODE=phase3_base` (default): blocking mode, computes pass-rate with phase3 rules.
-2. `XFSTESTS_MODE=generic_quick`: observation-only mode, always exits success and records log.
+2. `XFSTESTS_MODE=phase4_good`: blocking mode, computes pass-rate with phase4-part1 candidate set.
+3. `XFSTESTS_MODE=generic_quick`: observation-only mode, always exits success and records log.
 
-## Pass-rate rules (phase3_base)
+## Pass-rate rules (phase3_base / phase4_good)
 
 1. Denominator = `PASS + FAIL`
 2. Numerator = `PASS`
