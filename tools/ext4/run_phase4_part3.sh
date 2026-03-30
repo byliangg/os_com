@@ -26,6 +26,27 @@ PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
 
+has_pattern() {
+  local pattern="$1"
+  local file="$2"
+  if command -v rg >/dev/null 2>&1; then
+    rg -q "${pattern}" "${file}" 2>/dev/null
+  else
+    grep -qE "${pattern}" "${file}" 2>/dev/null
+  fi
+}
+
+print_matches() {
+  local pattern="$1"
+  local file="$2"
+  local lines="$3"
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "${pattern}" "${file}" | tail -n "${lines}" || true
+  else
+    grep -nE "${pattern}" "${file}" | tail -n "${lines}" || true
+  fi
+}
+
 if [ ! -f "${INITRAMFS_IMG}" ]; then
   "${ROOT_DIR}/tools/ext4/prepare_phase4_part3_initramfs.sh" "${BASE_INITRAMFS}" "${INITRAMFS_IMG}"
 fi
@@ -59,7 +80,7 @@ run_crash_prepare_once() {
   local marker_seen=0
   local i=0
   while [ "${i}" -lt "${CRASH_PREPARE_WAIT_SEC}" ]; do
-    if rg -q "${marker}" "${log_file}" 2>/dev/null; then
+    if has_pattern "${marker}" "${log_file}"; then
       marker_seen=1
       break
     fi
@@ -116,7 +137,7 @@ run_crash_verify_once() {
     return ${rc}
   fi
 
-  if ! rg -q "EXT4_CRASH_VERIFY_PASS scenario=${scenario}" "${log_file}"; then
+  if ! has_pattern "EXT4_CRASH_VERIFY_PASS scenario=${scenario}" "${log_file}"; then
     echo "[FAIL] crash verify marker missing: scenario=${scenario} round=${round}" >&2
     tail -n 120 "${log_file}" >&2 || true
     return 1
@@ -183,7 +204,7 @@ run_xfstests_mode() {
   set -e
 
   echo "[DONE] mode=${mode} rc=${rc} log=${log_file}"
-  rg -n "mode\\tpass\\tfail|${mode}\\t|xfstests ${mode} passed|xfstests ${mode} failed|All syscall tests passed|Error: xfstests failed|xfstests case done" "${log_file}" | tail -n 80 || true
+  print_matches "mode\\tpass\\tfail|${mode}\\t|xfstests ${mode} passed|xfstests ${mode} failed|All syscall tests passed|Error: xfstests failed|xfstests case done" "${log_file}" 80
   if [ ${rc} -ne 0 ]; then
     return ${rc}
   fi
