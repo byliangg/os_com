@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{BlockDevice, SECTOR_SIZE};
 use aster_cmdline::{KCMDLINE, ModuleArg};
@@ -28,12 +28,16 @@ const EXT4_SB_MAGIC_OFFSET: usize = 56;
 const EXT4_SB_DESC_SIZE_OFFSET: usize = 254;
 const CRASH_JOURNAL_OFFSET: usize = 0;
 const CRASH_JOURNAL_MAGIC: u32 = 0x4A42_5232; // "JBR2"
-const CRASH_JOURNAL_VERSION: u32 = 1;
-const CRASH_JOURNAL_HEADER_SIZE: usize = 24;
+const CRASH_JOURNAL_VERSION_V1: u32 = 1;
+const CRASH_JOURNAL_VERSION: u32 = 2;
+const CRASH_JOURNAL_HEADER_SIZE_V1: usize = 24;
+const CRASH_JOURNAL_HEADER_SIZE: usize = 28;
 const CRASH_JOURNAL_MAX_PAYLOAD: usize = SECTOR_SIZE - CRASH_JOURNAL_HEADER_SIZE;
 const CRASH_JOURNAL_STATE_EMPTY: u32 = 0;
 const CRASH_JOURNAL_STATE_PREPARED: u32 = 1;
 const CRASH_JOURNAL_STATE_COMMITTED: u32 = 2;
+const CRASH_JOURNAL_STATE_CHECKPOINTED: u32 = 3;
+const CRASH_JOURNAL_SLOTS: usize = 1;
 const CRASH_JOURNAL_OP_CREATE: u32 = 1;
 const CRASH_JOURNAL_OP_MKDIR: u32 = 2;
 const CRASH_JOURNAL_OP_UNLINK: u32 = 3;
@@ -84,6 +88,7 @@ enum CrashJournalOp {
 struct CrashJournalRecord {
     state: u32,
     op: u32,
+    txid: u32,
     payload: Vec<u8>,
 }
 
@@ -399,6 +404,7 @@ pub(super) struct Ext4Fs {
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
     crash_journal_lock: Mutex<()>,
+    next_journal_txid: AtomicU32,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
@@ -414,6 +420,7 @@ impl Ext4Fs {
             block_device,
             adapter,
             crash_journal_lock: Mutex::new(()),
+            next_journal_txid: AtomicU32::new(1),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
@@ -477,8 +484,21 @@ impl Ext4Fs {
         Some(u32::from_le_bytes(bytes))
     }
 
+    fn crash_journal_slot_offset(slot: usize) -> Result<usize> {
+        if slot >= CRASH_JOURNAL_SLOTS {
+            return_errno_with_message!(Errno::EINVAL, "crash journal slot out of range");
+        }
+        let slot_offset = slot
+            .checked_mul(SECTOR_SIZE)
+            .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "crash journal slot overflow"))?;
+        CRASH_JOURNAL_OFFSET
+            .checked_add(slot_offset)
+            .ok_or_else(|| Error::with_message(Errno::EOVERFLOW, "crash journal offset overflow"))
+    }
+
     fn serialize_crash_journal_record(
         state: u32,
+        txid: u32,
         op: u32,
         payload: &[u8],
     ) -> Result<[u8; SECTOR_SIZE]> {
@@ -491,14 +511,15 @@ impl Ext4Fs {
         sector[4..8].copy_from_slice(&CRASH_JOURNAL_VERSION.to_le_bytes());
         sector[8..12].copy_from_slice(&state.to_le_bytes());
         sector[12..16].copy_from_slice(&op.to_le_bytes());
-        sector[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        sector[16..20].copy_from_slice(&txid.to_le_bytes());
+        sector[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         if !payload.is_empty() {
             sector[CRASH_JOURNAL_HEADER_SIZE..CRASH_JOURNAL_HEADER_SIZE + payload.len()]
                 .copy_from_slice(payload);
         }
         let checksum =
             Self::crash_journal_checksum(&sector[0..CRASH_JOURNAL_HEADER_SIZE - 4 + payload.len()]);
-        sector[20..24].copy_from_slice(&checksum.to_le_bytes());
+        sector[24..28].copy_from_slice(&checksum.to_le_bytes());
         Ok(sector)
     }
 
@@ -512,29 +533,68 @@ impl Ext4Fs {
 
         let version = Self::read_u32_at(sector, 4)
             .ok_or_else(|| Error::with_message(Errno::EIO, "corrupted crash journal version"))?;
-        if version != CRASH_JOURNAL_VERSION {
-            return_errno_with_message!(Errno::EIO, "unsupported crash journal version");
-        }
+        let (state, op, txid, payload_len, payload_offset, checksum_offset, checksum_window_len) =
+            match version {
+                CRASH_JOURNAL_VERSION_V1 => {
+                    let state = Self::read_u32_at(sector, 8).ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "corrupted crash journal state")
+                    })?;
+                    let op = Self::read_u32_at(sector, 12).ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "corrupted crash journal op")
+                    })?;
+                    let payload_len = Self::read_u32_at(sector, 16)
+                        .ok_or_else(|| {
+                            Error::with_message(Errno::EIO, "corrupted crash journal len")
+                        })? as usize;
+                    (
+                        state,
+                        op,
+                        0u32,
+                        payload_len,
+                        CRASH_JOURNAL_HEADER_SIZE_V1,
+                        20usize,
+                        CRASH_JOURNAL_HEADER_SIZE_V1 - 4 + payload_len,
+                    )
+                }
+                CRASH_JOURNAL_VERSION => {
+                    let state = Self::read_u32_at(sector, 8).ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "corrupted crash journal state")
+                    })?;
+                    let op = Self::read_u32_at(sector, 12).ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "corrupted crash journal op")
+                    })?;
+                    let txid = Self::read_u32_at(sector, 16).ok_or_else(|| {
+                        Error::with_message(Errno::EIO, "corrupted crash journal txid")
+                    })?;
+                    let payload_len = Self::read_u32_at(sector, 20)
+                        .ok_or_else(|| {
+                            Error::with_message(Errno::EIO, "corrupted crash journal len")
+                        })? as usize;
+                    (
+                        state,
+                        op,
+                        txid,
+                        payload_len,
+                        CRASH_JOURNAL_HEADER_SIZE,
+                        24usize,
+                        CRASH_JOURNAL_HEADER_SIZE - 4 + payload_len,
+                    )
+                }
+                _ => {
+                    return_errno_with_message!(Errno::EIO, "unsupported crash journal version");
+                }
+            };
 
-        let state = Self::read_u32_at(sector, 8)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "corrupted crash journal state"))?;
         if state == CRASH_JOURNAL_STATE_EMPTY {
             return Ok(None);
         }
-
-        let op = Self::read_u32_at(sector, 12)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "corrupted crash journal op"))?;
-        let payload_len = Self::read_u32_at(sector, 16)
-            .ok_or_else(|| Error::with_message(Errno::EIO, "corrupted crash journal len"))?
-            as usize;
         if payload_len > CRASH_JOURNAL_MAX_PAYLOAD {
             return_errno_with_message!(Errno::EIO, "crash journal payload length overflow");
         }
 
-        let stored_checksum = Self::read_u32_at(sector, 20)
+        let stored_checksum = Self::read_u32_at(sector, checksum_offset)
             .ok_or_else(|| Error::with_message(Errno::EIO, "corrupted crash journal checksum"))?;
-        let expected_checksum =
-            Self::crash_journal_checksum(&sector[0..CRASH_JOURNAL_HEADER_SIZE - 4 + payload_len]);
+        let expected_checksum = Self::crash_journal_checksum(&sector[0..checksum_window_len]);
         if stored_checksum != expected_checksum {
             return_errno_with_message!(Errno::EIO, "crash journal checksum mismatch");
         }
@@ -542,34 +602,83 @@ impl Ext4Fs {
         let payload = if payload_len == 0 {
             Vec::new()
         } else {
-            sector[CRASH_JOURNAL_HEADER_SIZE..CRASH_JOURNAL_HEADER_SIZE + payload_len].to_vec()
+            sector[payload_offset..payload_offset + payload_len].to_vec()
         };
-        Ok(Some(CrashJournalRecord { state, op, payload }))
+        Ok(Some(CrashJournalRecord {
+            state,
+            op,
+            txid,
+            payload,
+        }))
     }
 
-    fn read_crash_journal_record(&self) -> Result<Option<CrashJournalRecord>> {
+    fn read_crash_journal_record_at(&self, slot: usize) -> Result<Option<CrashJournalRecord>> {
+        let offset = Self::crash_journal_slot_offset(slot)?;
         let mut sector = [0u8; SECTOR_SIZE];
         let mut writer = VmWriter::from(sector.as_mut_slice()).to_fallible();
         self.block_device
-            .read(CRASH_JOURNAL_OFFSET, &mut writer)
+            .read(offset, &mut writer)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read crash journal"))?;
         Self::parse_crash_journal_record(&sector)
     }
 
-    fn write_crash_journal_record(&self, state: u32, op: u32, payload: &[u8]) -> Result<()> {
-        let sector = Self::serialize_crash_journal_record(state, op, payload)?;
+    fn write_crash_journal_record_at(
+        &self,
+        slot: usize,
+        state: u32,
+        txid: u32,
+        op: u32,
+        payload: &[u8],
+        do_sync: bool,
+    ) -> Result<()> {
+        let offset = Self::crash_journal_slot_offset(slot)?;
+        let sector = Self::serialize_crash_journal_record(state, txid, op, payload)?;
         let mut reader = VmReader::from(sector.as_slice()).to_fallible();
         self.block_device
-            .write(CRASH_JOURNAL_OFFSET, &mut reader)
+            .write(offset, &mut reader)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write crash journal"))?;
-        self.block_device
-            .sync()
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to sync crash journal"))?;
+        if do_sync {
+            self.block_device
+                .sync()
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to sync crash journal"))?;
+        }
         Ok(())
     }
 
-    fn clear_crash_journal(&self) -> Result<()> {
-        self.write_crash_journal_record(CRASH_JOURNAL_STATE_EMPTY, 0, &[])
+    fn clear_crash_journal_slot(&self, slot: usize) -> Result<()> {
+        self.write_crash_journal_record_at(slot, CRASH_JOURNAL_STATE_EMPTY, 0, 0, &[], false)
+    }
+
+    fn checkpoint_crash_journal_slot(&self, slot: usize, record: &CrashJournalRecord) -> Result<()> {
+        self.write_crash_journal_record_at(
+            slot,
+            CRASH_JOURNAL_STATE_CHECKPOINTED,
+            record.txid,
+            record.op,
+            &record.payload,
+            false,
+        )
+    }
+
+    fn checkpoint_all_committed_crash_journal(&self) -> Result<()> {
+        for slot in 0..CRASH_JOURNAL_SLOTS {
+            let Some(record) = self.read_crash_journal_record_at(slot)? else {
+                continue;
+            };
+            if record.state == CRASH_JOURNAL_STATE_COMMITTED {
+                self.checkpoint_crash_journal_slot(slot, &record)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn next_crash_journal_txid_and_slot(&self) -> (u32, usize) {
+        let mut txid = self.next_journal_txid.fetch_add(1, Ordering::AcqRel);
+        if txid == 0 {
+            self.next_journal_txid.store(1, Ordering::Release);
+            txid = self.next_journal_txid.fetch_add(1, Ordering::AcqRel);
+        }
+        (txid, (txid as usize) % CRASH_JOURNAL_SLOTS)
     }
 
     fn crash_journal_op_name(op: u32) -> &'static str {
@@ -638,6 +747,72 @@ impl Ext4Fs {
         }
     }
 
+    fn decode_crash_journal_record_op(record: &CrashJournalRecord) -> Option<CrashJournalOp> {
+        CrashJournalOp::decode(record.op, record.payload.as_slice())
+    }
+
+    fn recover_or_checkpoint_crash_journal_slot(
+        &self,
+        slot: usize,
+        record: &CrashJournalRecord,
+    ) -> Result<()> {
+        match record.state {
+            CRASH_JOURNAL_STATE_PREPARED => {
+                warn!(
+                    "ext4: discarding uncommitted crash journal record in slot={} txid={}",
+                    slot, record.txid
+                );
+                self.clear_crash_journal_slot(slot)?;
+            }
+            CRASH_JOURNAL_STATE_COMMITTED => {
+                let Some(op) = Self::decode_crash_journal_record_op(record) else {
+                    warn!(
+                        "ext4: invalid committed crash journal payload in slot={} txid={}",
+                        slot, record.txid
+                    );
+                    self.clear_crash_journal_slot(slot)?;
+                    return Ok(());
+                };
+                if let Err(err) = self.replay_journal_op(&op) {
+                    warn!(
+                        "ext4: drop committed crash journal tx on replay failure slot={} txid={} err={:?}",
+                        slot, record.txid, err
+                    );
+                    self.clear_crash_journal_slot(slot)?;
+                    return Ok(());
+                }
+                self.checkpoint_crash_journal_slot(slot, record)?;
+            }
+            CRASH_JOURNAL_STATE_CHECKPOINTED | CRASH_JOURNAL_STATE_EMPTY => {}
+            other => {
+                warn!(
+                    "ext4: unknown crash journal state {} in slot={} txid={}",
+                    other, slot, record.txid
+                );
+                self.clear_crash_journal_slot(slot)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn prepare_crash_journal_slot_for_next_tx(&self, slot: usize) -> Result<()> {
+        let record = match self.read_crash_journal_record_at(slot) {
+            Ok(record) => record,
+            Err(err) => {
+                warn!(
+                    "ext4: failed to read crash journal slot={} before next tx, clearing slot: {:?}",
+                    slot, err
+                );
+                self.clear_crash_journal_slot(slot)?;
+                return Ok(());
+            }
+        };
+        let Some(record) = record else {
+            return Ok(());
+        };
+        self.recover_or_checkpoint_crash_journal_slot(slot, &record)
+    }
+
     fn run_journaled<T>(&self, op: Option<CrashJournalOp>, apply: impl FnOnce() -> Result<T>) -> Result<T> {
         let Some(op) = op else {
             return apply();
@@ -647,21 +822,95 @@ impl Ext4Fs {
         };
 
         let _journal_guard = self.crash_journal_lock.lock();
-        self.write_crash_journal_record(CRASH_JOURNAL_STATE_PREPARED, op_code, &payload)?;
-        self.write_crash_journal_record(CRASH_JOURNAL_STATE_COMMITTED, op_code, &payload)?;
+        let (txid, slot) = self.next_crash_journal_txid_and_slot();
+        if let Err(err) = self.prepare_crash_journal_slot_for_next_tx(slot) {
+            error!(
+                "ext4: journal prepare slot failed: op={} txid={} slot={} err={:?}",
+                Self::crash_journal_op_name(op_code),
+                txid,
+                slot,
+                err
+            );
+            return Err(err);
+        }
+        if let Err(err) =
+            self.write_crash_journal_record_at(
+                slot,
+                CRASH_JOURNAL_STATE_PREPARED,
+                txid,
+                op_code,
+                &payload,
+                false,
+            )
+        {
+            error!(
+                "ext4: journal write prepared failed: op={} txid={} slot={} err={:?}",
+                Self::crash_journal_op_name(op_code),
+                txid,
+                slot,
+                err
+            );
+            return Err(err);
+        }
+        if let Err(err) =
+            self.write_crash_journal_record_at(
+                slot,
+                CRASH_JOURNAL_STATE_COMMITTED,
+                txid,
+                op_code,
+                &payload,
+                true,
+            )
+        {
+            error!(
+                "ext4: journal write committed failed: op={} txid={} slot={} err={:?}",
+                Self::crash_journal_op_name(op_code),
+                txid,
+                slot,
+                err
+            );
+            return Err(err);
+        }
 
         let result = apply();
+        if let Err(ref err) = result {
+            debug!(
+                "ext4: journal apply failed: op={} txid={} slot={} err={:?}",
+                Self::crash_journal_op_name(op_code),
+                txid,
+                slot,
+                err
+            );
+            if let Err(clear_err) = self.clear_crash_journal_slot(slot) {
+                warn!(
+                    "ext4: failed to clear crash journal slot={} after failed apply txid={}: {:?}",
+                    slot, txid, clear_err
+                );
+            }
+        }
         if result.is_ok() && Self::should_hold_after_commit_for_injected_crash(op_code) {
             warn!(
-                "ext4: replay hold point reached for op={} (kill VM now to simulate power loss)",
-                Self::crash_journal_op_name(op_code)
+                "ext4: replay hold point reached for op={} txid={} (kill VM now to simulate power loss)",
+                Self::crash_journal_op_name(op_code),
+                txid
             );
             loop {
                 core::hint::spin_loop();
             }
         }
-        if let Err(err) = self.clear_crash_journal() {
-            warn!("ext4: failed to clear crash journal: {:?}", err);
+        if result.is_ok() {
+            let record = CrashJournalRecord {
+                state: CRASH_JOURNAL_STATE_COMMITTED,
+                op: op_code,
+                txid,
+                payload,
+            };
+            if let Err(err) = self.checkpoint_crash_journal_slot(slot, &record) {
+                warn!(
+                    "ext4: failed to checkpoint crash journal slot={} txid={}: {:?}",
+                    slot, txid, err
+                );
+            }
         }
         result
     }
@@ -787,47 +1036,87 @@ impl Ext4Fs {
 
     fn replay_mount_crash_journal(&self) {
         let _journal_guard = self.crash_journal_lock.lock();
-        let record = match self.read_crash_journal_record() {
-            Ok(record) => record,
-            Err(err) => {
-                warn!("ext4: failed to read crash journal at mount: {:?}", err);
-                if let Err(clear_err) = self.clear_crash_journal() {
-                    warn!(
-                        "ext4: failed to reset crash journal after read error: {:?}",
-                        clear_err
-                    );
-                }
-                return;
-            }
-        };
+        let mut max_txid = 0u32;
+        let mut replay_entries: Vec<(u32, usize, CrashJournalOp, CrashJournalRecord)> = Vec::new();
 
-        let Some(record) = record else {
-            return;
-        };
-
-        match record.state {
-            CRASH_JOURNAL_STATE_PREPARED => {
-                warn!("ext4: discarding uncommitted crash journal record");
-            }
-            CRASH_JOURNAL_STATE_COMMITTED => {
-                if let Some(op) = CrashJournalOp::decode(record.op, record.payload.as_slice()) {
-                    if let Err(err) = self.replay_journal_op(&op) {
-                        warn!("ext4: crash journal replay failed: op={:?} err={:?}", op, err);
-                    } else {
-                        info!("ext4: crash journal replay succeeded: op={:?}", op);
+        for slot in 0..CRASH_JOURNAL_SLOTS {
+            let record = match self.read_crash_journal_record_at(slot) {
+                Ok(record) => record,
+                Err(err) => {
+                    warn!("ext4: failed to read crash journal slot={} at mount: {:?}", slot, err);
+                    if let Err(clear_err) = self.clear_crash_journal_slot(slot) {
+                        warn!(
+                            "ext4: failed to clear crash journal slot={} after read error: {:?}",
+                            slot, clear_err
+                        );
                     }
-                } else {
-                    warn!("ext4: invalid crash journal payload (op={})", record.op);
+                    continue;
                 }
-            }
-            other => {
-                warn!("ext4: unknown crash journal state {}", other);
+            };
+
+            let Some(record) = record else {
+                continue;
+            };
+            max_txid = max_txid.max(record.txid);
+
+            match record.state {
+                CRASH_JOURNAL_STATE_PREPARED => {
+                    warn!(
+                        "ext4: discarding uncommitted crash journal record in slot={} txid={}",
+                        slot, record.txid
+                    );
+                    if let Err(err) = self.clear_crash_journal_slot(slot) {
+                        warn!("ext4: failed to clear prepared crash record at slot={}: {:?}", slot, err);
+                    }
+                }
+                CRASH_JOURNAL_STATE_COMMITTED => {
+                    if let Some(op) = Self::decode_crash_journal_record_op(&record) {
+                        replay_entries.push((record.txid, slot, op, record));
+                    } else {
+                        warn!(
+                            "ext4: invalid committed crash journal payload in slot={} txid={} op={}",
+                            slot, record.txid, record.op
+                        );
+                        if let Err(err) = self.clear_crash_journal_slot(slot) {
+                            warn!("ext4: failed to clear invalid crash record at slot={}: {:?}", slot, err);
+                        }
+                    }
+                }
+                CRASH_JOURNAL_STATE_CHECKPOINTED => {}
+                other => {
+                    warn!("ext4: unknown crash journal state {} in slot={}", other, slot);
+                    if let Err(err) = self.clear_crash_journal_slot(slot) {
+                        warn!("ext4: failed to clear unknown crash state at slot={}: {:?}", slot, err);
+                    }
+                }
             }
         }
 
-        if let Err(err) = self.clear_crash_journal() {
-            warn!("ext4: failed to clear crash journal at mount: {:?}", err);
+        replay_entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_txid, slot, op, record) in replay_entries {
+            if let Err(err) = self.replay_journal_op(&op) {
+                warn!(
+                    "ext4: crash journal replay failed: slot={} txid={} op={:?} err={:?}",
+                    slot, record.txid, op, err
+                );
+                continue;
+            }
+            if let Err(err) = self.checkpoint_crash_journal_slot(slot, &record) {
+                warn!(
+                    "ext4: failed to checkpoint replayed crash journal: slot={} txid={} err={:?}",
+                    slot, record.txid, err
+                );
+            } else {
+                info!(
+                    "ext4: crash journal replay succeeded: slot={} txid={} op={:?}",
+                    slot, record.txid, op
+                );
+            }
         }
+
+        let next_txid = max_txid.wrapping_add(1);
+        self.next_journal_txid
+            .store(if next_txid == 0 { 1 } else { next_txid }, Ordering::Release);
     }
 
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
@@ -897,26 +1186,10 @@ impl Ext4Fs {
     }
 
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
-        match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(ino) => return Ok(ino),
-            DirLookupCacheResult::Miss => {
-                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
-            }
-            DirLookupCacheResult::Unknown => {}
-        }
-
-        self.load_dir_cache_if_needed(parent)?;
-        match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(ino) => return Ok(ino),
-            DirLookupCacheResult::Miss => {
-                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
-            }
-            DirLookupCacheResult::Unknown => {}
-        }
-
-        let ino = self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))?;
-        self.cache_insert_entry(parent, name, ino);
-        Ok(ino)
+        // The current directory entry cache is not yet concurrency-safe under
+        // heavy rename/unlink/create races (e.g. fsstress). Prefer correctness
+        // over caching in stage6 runs.
+        self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
@@ -1057,8 +1330,11 @@ impl FileSystem for Ext4Fs {
 
     fn sync(&self) -> Result<()> {
         let _journal_guard = self.crash_journal_lock.lock();
-        if let Err(err) = self.clear_crash_journal() {
-            warn!("ext4: failed to clear crash journal during sync: {:?}", err);
+        if let Err(err) = self.checkpoint_all_committed_crash_journal() {
+            warn!(
+                "ext4: failed to checkpoint committed crash journal during sync: {:?}",
+                err
+            );
         }
         self.block_device.sync()?;
         Ok(())

@@ -9,6 +9,7 @@ LTP_DIR=/opt/ltp
 GVISOR_DIR=/opt/gvisor
 XFSTESTS_DIR=/opt/xfstests
 EXT4_CRASH_DIR=/opt/ext4_crash
+EXT4_JOURNAL_DIR=/opt/ext4_journal
 
 if [ "${SYSCALL_TEST_SUITE}" == "ltp" ]; then
     echo "Running LTP syscall tests..."
@@ -33,6 +34,12 @@ elif [ "${SYSCALL_TEST_SUITE}" == "ext4_crash" ]; then
     if ! "${EXT4_CRASH_DIR}/run_ext4_crash_test.sh"; then
         echo "Error: ext4 crash-recovery tests failed." >&2
         exit 5
+    fi
+elif [ "${SYSCALL_TEST_SUITE}" == "ext4_journal" ]; then
+    echo "Running ext4 journal transaction tests..."
+    if ! "${EXT4_JOURNAL_DIR}/run_ext4_journal_test.sh"; then
+        echo "Error: ext4 journal transaction tests failed." >&2
+        exit 6
     fi
 else
     echo "Error: Unknown test suite '${SYSCALL_TEST_SUITE}'." >&2

@@ -421,13 +421,33 @@ impl Ext4 {
                 // After growing, re-insert
                 return self.insert_extent(inode_ref, new_extent);
             }
+            let entries = header.entries_count as usize;
+            let mut insert_pos = node.position.saturating_add(1);
+            if let Some(cur) = node.extent {
+                if new_extent.first_block < cur.first_block {
+                    insert_pos = node.position;
+                }
+            }
+            if insert_pos > entries {
+                insert_pos = entries;
+            }
 
-            
-            // Not empty, insert at search result pos + 1
-            log::info!("[insert_new_extent] Inserting at root at position {} (entries: {})", 
-                node.position + 1, header.entries_count);
-            *inode_ref.inode.root_extent_mut_at(node.position + 1) = *new_extent;
+            log::info!(
+                "[insert_new_extent] Inserting at root position {} (entries={})",
+                insert_pos,
+                header.entries_count
+            );
+
+            if entries > insert_pos {
+                for i in (insert_pos..entries).rev() {
+                    let moved = inode_ref.inode.root_extent_at(i);
+                    *inode_ref.inode.root_extent_mut_at(i + 1) = moved;
+                }
+            }
+
+            *inode_ref.inode.root_extent_mut_at(insert_pos) = *new_extent;
             inode_ref.inode.root_extent_header_mut().entries_count += 1;
+            self.write_back_inode(inode_ref);
             
             log::debug!("[insert_new_extent] Successfully inserted at root:");
             log::debug!("  - Root header: magic={:x}, entries={}, max={}, depth={}", 
@@ -446,14 +466,34 @@ impl Ext4 {
             let node_block = node.pblock_of_node;
             let mut ext4block =
             Block::load(&self.block_device, node_block * block_size);
-            let new_ex_offset = core::mem::size_of::<Ext4ExtentHeader>() + core::mem::size_of::<Ext4Extent>() * (node.position + 1);
+            let ext_header_size = core::mem::size_of::<Ext4ExtentHeader>();
+            let ext_size = core::mem::size_of::<Ext4Extent>();
+            let mut insert_pos = node.position.saturating_add(1);
+            if let Some(cur) = node.extent {
+                if new_extent.first_block < cur.first_block {
+                    insert_pos = node.position;
+                }
+            }
 
-            // insert new extent
+            let header_snapshot: Ext4ExtentHeader = ext4block.read_offset_as(0);
+            let entries = header_snapshot.entries_count as usize;
+            if insert_pos > entries {
+                insert_pos = entries;
+            }
+
+            if entries > insert_pos {
+                let src_start = ext_header_size + ext_size * insert_pos;
+                let src_end = ext_header_size + ext_size * entries;
+                let dst_start = ext_header_size + ext_size * (insert_pos + 1);
+                ext4block.data.copy_within(src_start..src_end, dst_start);
+            }
+
+            let new_ex_offset = ext_header_size + ext_size * insert_pos;
             let ex: &mut Ext4Extent = ext4block.read_offset_as_mut(new_ex_offset);
             *ex = *new_extent;
-            let header: &mut Ext4ExtentHeader = ext4block.read_offset_as_mut(0);
 
             // update entry count 
+            let header: &mut Ext4ExtentHeader = ext4block.read_offset_as_mut(0);
             header.entries_count += 1;
             log::info!("[insert_new_extent] Updated non-root node: entries={}, max={}", 
                 header.entries_count, header.max_entries_count);
@@ -775,7 +815,17 @@ impl Ext4 {
         let depth = search_path.depth as usize;
 
         /* If we do remove_space inside the range of an extent */
-        let mut ex = search_path.path[depth].extent.unwrap();
+        let mut ex = if let Some(extent) = search_path.path[depth].extent {
+            extent
+        } else if search_path.path[depth].header.entries_count == 0 {
+            // Empty leaf/root: nothing to remove.
+            return Ok(EOK);
+        } else {
+            return return_errno_with_message!(
+                Errno::EIO,
+                "extent_remove_space: missing extent in non-empty node"
+            );
+        };
         if ex.get_first_block() < from
             && to < (ex.get_first_block() + ex.get_actual_len() as u32 - 1)
         {

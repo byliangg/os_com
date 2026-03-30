@@ -140,12 +140,30 @@ if [ -d "${TOOLS_BIN_DIR}" ]; then
 else
     export PATH="${BASE_PATH}:${PATH}"
 fi
+export XFSTESTS_TOOLS_BIN_DIR="${TOOLS_BIN_DIR}"
 
 CHECK_SHELL=/bin/sh
 if command -v bash >/dev/null 2>&1; then
     CHECK_SHELL=$(command -v bash)
 fi
 export SHELL="${CHECK_SHELL}"
+
+# Most local helper shims below use "#!/bin/bash". In minimal initramfs,
+# /bin/bash may be absent while bash is available elsewhere in PATH
+# (for example /opt/xfstests/tools/bin/bash wrapper). Ensure /bin/bash
+# is executable so those helper scripts can run.
+if [ ! -x /bin/bash ]; then
+    if [ "${CHECK_SHELL}" != "/bin/bash" ]; then
+        ln -sf "${CHECK_SHELL}" /bin/bash >/dev/null 2>&1 || true
+    fi
+fi
+if [ ! -x /bin/bash ]; then
+    cat > /bin/bash <<EOF
+#!/bin/sh
+exec ${CHECK_SHELL} "\$@"
+EOF
+    chmod +x /bin/bash >/dev/null 2>&1 || true
+fi
 
 # Place shims under /opt so they stay executable in environments where /tmp is mounted noexec.
 SHIM_DIR="${XFSTESTS_ROOT}/shims/bin"
@@ -298,9 +316,21 @@ chmod +x "${SHIM_DIR}/xfs_io"
 cat > "${SHIM_DIR}/grep" <<'EOF'
 #!/bin/bash
 set -eu
+
 rewritten=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --extended-regexp|-E)
+            # BusyBox grep in minimal initramfs may not support -E.
+            # Most xfstests patterns here are BRE-compatible.
+            ;;
+        -*E*)
+            # Normalize clustered short options like -Eqm1 -> -qm1.
+            opt_body=$(printf '%s' "${1#-}" | tr -d 'E')
+            if [ -n "${opt_body}" ]; then
+                rewritten="${rewritten} \"-${opt_body}\""
+            fi
+            ;;
         -[0-9]*)
             n=${1#-}
             case "${n}" in
@@ -327,6 +357,13 @@ chmod +x "${SHIM_DIR}/grep"
 cat > "${SHIM_DIR}/readlink" <<'EOF'
 #!/bin/bash
 set -eu
+
+# Prefer xfstests bundled readlink when available.
+TOOLS_READLINK="${XFSTESTS_TOOLS_BIN_DIR:-/opt/xfstests/tools/bin}/readlink"
+if [ -x "${TOOLS_READLINK}" ]; then
+    exec "${TOOLS_READLINK}" "$@"
+fi
+
 mode="plain"
 path=""
 normalize_abs_path() {
@@ -568,8 +605,14 @@ fi
 
 # Some xfstests helper paths invoke "sh readlink"/"sh grep" unexpectedly.
 # Put same-name wrappers in the test working directory so those calls resolve.
+ln -sf /bin/bash "${SHIM_DIR}/bash"
 ln -sf "${SHIM_DIR}/grep" "${XFSTESTS_DEV_DIR}/grep"
 ln -sf "${SHIM_DIR}/readlink" "${XFSTESTS_DEV_DIR}/readlink"
+ln -sf "${SHIM_DIR}/bash" "${XFSTESTS_DEV_DIR}/bash"
+if [ -n "${TOOLS_BIN_DIR}" ] && [ -d "${TOOLS_BIN_DIR}" ]; then
+    ln -sf "${SHIM_DIR}/grep" "${TOOLS_BIN_DIR}/grep"
+    ln -sf "${SHIM_DIR}/readlink" "${TOOLS_BIN_DIR}/readlink"
+fi
 
 echo "xfstests probe: CHECK_SHELL=${CHECK_SHELL} SHELL=${SHELL}" >&2
 echo "xfstests probe: grep=$(command -v grep || echo missing) readlink=$(command -v readlink || echo missing)" >&2
@@ -762,6 +805,8 @@ while IFS= read -r test_name; do
             "${test_log}" || true
     )
     if [ -n "${notrun_line}" ]; then
+        echo "xfstests case notrun: ${test_name} :: ${notrun_line}" >&2
+        sed -n '1,30p' "${test_log}" >&2 || true
         reason=$(echo "${notrun_line}" | tr '\t' ' ')
         [ -z "${reason}" ] && reason="runtime notrun"
         record_notrun "${test_name}" "${reason}"
@@ -792,6 +837,9 @@ while IFS= read -r test_name; do
         else
             sed -n '1,20p' "${test_log}" >&2 || true
         fi
+        echo "----- PROCESS SNAPSHOT (fsstress) -----" >&2
+        ps -ef | grep -E '[f]sstress' >&2 || true
+        echo "----- END PROCESS SNAPSHOT -----" >&2
         if [ -f /tmp/xfstests_child_xtrace.log ]; then
             echo "----- CHILD XTRACE -----" >&2
             cat /tmp/xfstests_child_xtrace.log >&2 || true
@@ -809,6 +857,12 @@ while IFS= read -r test_name; do
         if [ -f "${bad_out}" ]; then
             echo "----- BAD OUT: ${test_name} -----" >&2
             sed -n '1,120p' "${bad_out}" >&2 || true
+        fi
+        full_log="${XFSTESTS_DEV_DIR}/results/${test_name}.full"
+        if [ -f "${full_log}" ]; then
+            echo "----- FULL LOG TAIL: ${test_name} -----" >&2
+            tail -n 200 "${full_log}" >&2 || true
+            echo "----- END FULL LOG TAIL -----" >&2
         fi
         echo "===== END FAIL LOG: ${test_name} =====" >&2
         FAIL_COUNT=$((FAIL_COUNT + 1))

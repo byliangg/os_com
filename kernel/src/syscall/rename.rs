@@ -29,11 +29,12 @@ pub fn sys_renameat2(
     let Some(flags) = Flags::from_bits(flags) else {
         return_errno_with_message!(Errno::EINVAL, "invalid flags");
     };
-    // TODO: Add support for handling the `NOREPLACE`, `EXCHANGE`, and `WHITEOUT` flags.
-    if !flags.is_empty() {
-        warn!("unsupported flags: {:?}", flags);
+    let unsupported = flags - Flags::NOREPLACE;
+    if !unsupported.is_empty() {
+        warn!("unsupported flags: {:?}", unsupported);
         return_errno_with_message!(Errno::EINVAL, "unsupported flags");
     }
+    let no_replace = flags.contains(Flags::NOREPLACE);
 
     let fs_ref = ctx.thread_local.borrow_fs();
     let path_resolver = fs_ref.resolver().read();
@@ -73,6 +74,10 @@ pub fn sys_renameat2(
                 "the new path contains a path prefix of the old path"
             );
         }
+    }
+
+    if no_replace && path_resolver.lookup_at_path(&new_dir_path, new_name).is_ok() {
+        return_errno_with_message!(Errno::EEXIST, "new path already exists");
     }
 
     old_dir_path.rename(old_name, &new_dir_path, new_name)?;

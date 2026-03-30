@@ -82,7 +82,9 @@ impl Ext4 {
 
         // start from the first entry
         while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
-            let de: Ext4DirEntry = block.read_offset_as(offset);
+            let de = Ext4DirEntry::try_from(&block.data[offset..]).map_err(|_| {
+                Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+            })?;
             let rec_len = de.entry_len() as usize;
             if rec_len == 0 || rec_len > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
@@ -147,7 +149,10 @@ impl Ext4 {
 
                 // iterate all entries in a block
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
-                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                    let de = match Ext4DirEntry::try_from(&ext4block.data[offset..]) {
+                        Ok(de) => de,
+                        Err(_) => break,
+                    };
                     let rec_len = de.entry_len() as usize;
                     if rec_len == 0 || rec_len > block_size - offset {
                         break;
@@ -198,7 +203,10 @@ impl Ext4 {
                 let mut offset = 0usize;
 
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
-                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                    let de = match Ext4DirEntry::try_from(&ext4block.data[offset..]) {
+                        Ok(de) => de,
+                        Err(_) => break,
+                    };
                     let rec_len = de.entry_len() as usize;
                     if rec_len == 0 || rec_len > block_size - offset {
                         break;
@@ -221,7 +229,9 @@ impl Ext4 {
 
     pub fn dir_set_csum(&self, dst_blk: &mut Block, ino_gen: u32) {
         let block_size = self.super_block.block_size() as usize;
-        let parent_de: Ext4DirEntry = dst_blk.read_offset_as(0);
+        let Ok(parent_de) = Ext4DirEntry::try_from(&dst_blk.data[..]) else {
+            return;
+        };
 
         let tail_offset = block_size - size_of::<Ext4DirEntryTail>();
         let mut tail: Ext4DirEntryTail = *dst_blk.read_offset_as_mut(tail_offset);
@@ -366,7 +376,9 @@ impl Ext4 {
 
         // Start from the first entry
         while offset < block_size - size_of::<Ext4DirEntryTail>() {
-            let mut de = Ext4DirEntry::try_from(&block.data[offset..]).unwrap();
+            let mut de = Ext4DirEntry::try_from(&block.data[offset..]).map_err(|_| {
+                Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+            })?;
             let rec_len = de.entry_len() as usize;
             if rec_len == 0 || rec_len > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
@@ -377,7 +389,6 @@ impl Ext4 {
                 continue;
             }
 
-            let inode = de.inode;
             let rec_len = de.entry_len;
 
             let used_len = de.name_len as usize;
@@ -435,8 +446,6 @@ impl Ext4 {
         new_entry.write_entry(el as u16, inode, name, de_type);
         new_entry.copy_to_slice(&mut block.data, 0);
 
-        copy_dir_entry_to_array(&new_entry, &mut block.data, 0);
-
         // init tail for new block
         let tail = Ext4DirEntryTail::new();
         tail.copy_to_slice(&mut block.data);
@@ -452,8 +461,11 @@ impl Ext4 {
         let mut ext4block = Block::load(&self.block_device, result.pblock_id * block_size);
 
         // Invalidate entry first
-        let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
+        let mut de_del = Ext4DirEntry::try_from(&ext4block.data[result.offset..]).map_err(|_| {
+            Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+        })?;
         de_del.inode = 0;
+        de_del.copy_to_slice(&mut ext4block.data, result.offset);
 
         // Store entry position in block
         let pos = result.offset;
@@ -463,7 +475,9 @@ impl Ext4 {
             let mut offset = 0;
 
             // Start from the first entry in block
-            let mut tmp_de: Ext4DirEntry = ext4block.read_offset_as(offset);
+            let mut tmp_de = Ext4DirEntry::try_from(&ext4block.data[offset..]).map_err(|_| {
+                Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+            })?;
             let mut de_len = tmp_de.entry_len();
             if de_len == 0 || de_len as usize > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
@@ -472,7 +486,9 @@ impl Ext4 {
             // Find direct predecessor of removed entry
             while (offset + de_len as usize) < pos {
                 offset += de_len as usize;
-                tmp_de = ext4block.read_offset_as(offset);
+                tmp_de = Ext4DirEntry::try_from(&ext4block.data[offset..]).map_err(|_| {
+                    Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+                })?;
                 de_len = tmp_de.entry_len();
                 if de_len == 0 || de_len as usize > block_size - offset {
                     return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
@@ -484,8 +500,8 @@ impl Ext4 {
 
             // Add removed entry length to predecessor's length
             let del_len = result.dentry.entry_len();
-            let mut tmp_de_mut: &mut Ext4DirEntry = ext4block.read_offset_as_mut(offset);
-            tmp_de_mut.entry_len = de_len + del_len;
+            tmp_de.entry_len = de_len + del_len;
+            tmp_de.copy_to_slice(&mut ext4block.data, offset);
         }
 
         self.dir_set_csum(&mut ext4block, parent.inode.generation());
@@ -527,7 +543,9 @@ impl Ext4 {
             // start from the first entry
             let mut offset = 0;
             while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
-                let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                let de = Ext4DirEntry::try_from(&ext4block.data[offset..]).map_err(|_| {
+                    Ext4Error::with_message(Errno::EIO, "corrupted ext4 dir entry")
+                })?;
                 let rec_len = de.entry_len as usize;
                 if rec_len == 0 || rec_len > block_size - offset {
                     return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
@@ -581,14 +599,5 @@ impl Ext4 {
         // ext4_fs_free_inode(&child)
 
         Ok(EOK)
-    }
-}
-
-pub fn copy_dir_entry_to_array(header: &Ext4DirEntry, array: &mut [u8], offset: usize) {
-    unsafe {
-        let de_ptr = header as *const Ext4DirEntry as *const u8;
-        let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
     }
 }

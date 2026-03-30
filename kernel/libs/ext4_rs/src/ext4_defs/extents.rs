@@ -278,6 +278,56 @@ impl ExtentNode {
 }
 
 impl ExtentNode {
+    fn valid_extent_entries(&self) -> usize {
+        let reported = self.header.entries_count as usize;
+        let capacity = match &self.data {
+            NodeData::Root(root_data) => {
+                let start_words = size_of::<Ext4ExtentHeader>() / size_of::<u32>();
+                let extent_words = size_of::<Ext4Extent>() / size_of::<u32>();
+                if root_data.len() <= start_words || extent_words == 0 {
+                    0
+                } else {
+                    (root_data.len() - start_words) / extent_words
+                }
+            }
+            NodeData::Internal(internal_data) => {
+                let start = size_of::<Ext4ExtentHeader>();
+                let extent_size = size_of::<Ext4Extent>();
+                if internal_data.len() <= start || extent_size == 0 {
+                    0
+                } else {
+                    (internal_data.len() - start) / extent_size
+                }
+            }
+        };
+        reported.min(capacity)
+    }
+
+    fn valid_index_entries(&self) -> usize {
+        let reported = self.header.entries_count as usize;
+        let capacity = match &self.data {
+            NodeData::Root(root_data) => {
+                let start_words = size_of::<Ext4ExtentHeader>() / size_of::<u32>();
+                let index_words = size_of::<Ext4ExtentIndex>() / size_of::<u32>();
+                if root_data.len() <= start_words || index_words == 0 {
+                    0
+                } else {
+                    (root_data.len() - start_words) / index_words
+                }
+            }
+            NodeData::Internal(internal_data) => {
+                let start = size_of::<Ext4ExtentHeader>();
+                let index_size = size_of::<Ext4ExtentIndex>();
+                if internal_data.len() <= start || index_size == 0 {
+                    0
+                } else {
+                    (internal_data.len() - start) / index_size
+                }
+            }
+        };
+        reported.min(capacity)
+    }
+
     /// Binary search for the rightmost extent whose first block is <= `lblock`.
     /// Returns `None` for empty nodes.
     pub fn binsearch_extent_pos(&self, lblock: Ext4Lblk) -> Option<usize> {
@@ -287,13 +337,21 @@ impl ExtentNode {
 
         match &self.data {
             NodeData::Root(root_data) => {
-                let entries = self.header.entries_count as usize;
+                let entries = self.valid_extent_entries();
+                if entries == 0 {
+                    return None;
+                }
+                let start_words = size_of::<Ext4ExtentHeader>() / size_of::<u32>();
+                let extent_words = size_of::<Ext4Extent>() / size_of::<u32>();
                 let mut l = 0usize;
                 let mut r = entries;
 
                 while l < r {
                     let m = l + (r - l) / 2;
-                    let idx = 3 + m * 3;
+                    let idx = start_words + m * extent_words;
+                    if idx.checked_add(extent_words).is_none() || idx + extent_words > root_data.len() {
+                        return None;
+                    }
                     let ext = Ext4Extent::load_from_u32(&root_data[idx..]);
                     if lblock < ext.first_block {
                         r = m;
@@ -305,13 +363,23 @@ impl ExtentNode {
                 Some(l.saturating_sub(1))
             }
             NodeData::Internal(internal_data) => {
-                let entries = self.header.entries_count as usize;
+                let entries = self.valid_extent_entries();
+                if entries == 0 {
+                    return None;
+                }
+                let start = size_of::<Ext4ExtentHeader>();
+                let extent_size = size_of::<Ext4Extent>();
                 let mut l = 0usize;
                 let mut r = entries;
 
                 while l < r {
                     let m = l + (r - l) / 2;
-                    let offset = size_of::<Ext4ExtentHeader>() + m * size_of::<Ext4Extent>();
+                    let offset = start + m * extent_size;
+                    if offset.checked_add(extent_size).is_none()
+                        || offset + extent_size > internal_data.len()
+                    {
+                        return None;
+                    }
                     let ext = Ext4Extent::load_from_u8(&internal_data[offset..]);
                     if lblock < ext.first_block {
                         r = m;
@@ -350,13 +418,21 @@ impl ExtentNode {
                 // Root node handling
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
+                let entries = self.valid_index_entries();
+                if entries == 0 {
+                    return None;
+                }
 
                 let mut l = 1; // Skip the first index
-                let mut r = self.header.entries_count as usize - 1;
+                let mut r = entries.saturating_sub(1);
 
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let offset = m * size_of::<Ext4ExtentIndex>() / 4; // Convert to u32 offset
+                    let index_words = size_of::<Ext4ExtentIndex>() / size_of::<u32>();
+                    if offset.checked_add(index_words).is_none() || offset + index_words > indexes.len() {
+                        return None;
+                    }
                     let extent_index = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {
@@ -379,13 +455,22 @@ impl ExtentNode {
                 // Internal node handling
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
+                let entries = self.valid_index_entries();
+                if entries == 0 {
+                    return None;
+                }
 
                 let mut l = 0;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let mut r = entries - 1;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
                     let offset = m * size_of::<Ext4ExtentIndex>();
+                    if offset.checked_add(size_of::<Ext4ExtentIndex>()).is_none()
+                        || offset + size_of::<Ext4ExtentIndex>() > indexes.len()
+                    {
+                        return None;
+                    }
                     let extent_index = Ext4ExtentIndex::load_from_u8(&indexes[offset..]);
 
                     if lblock < extent_index.first_block {
@@ -411,15 +496,32 @@ impl ExtentNode {
     pub fn get_index(&self, pos: usize) -> Result<Ext4ExtentIndex> {
         match &self.data {
             NodeData::Root(root_data) => {
+                let entries = self.valid_index_entries();
+                if pos >= entries {
+                    return_errno_with_message!(Errno::EIO, "extent index position out of range");
+                }
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
                 let offset = pos * size_of::<Ext4ExtentIndex>() / 4;
+                let index_words = size_of::<Ext4ExtentIndex>() / size_of::<u32>();
+                if offset.checked_add(index_words).is_none() || offset + index_words > indexes.len() {
+                    return_errno_with_message!(Errno::EIO, "extent index offset overflow");
+                }
                 Ok(Ext4ExtentIndex::load_from_u32(&indexes[offset..]))
             }
             NodeData::Internal(internal_data) => {
+                let entries = self.valid_index_entries();
+                if pos >= entries {
+                    return_errno_with_message!(Errno::EIO, "extent index position out of range");
+                }
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
                 let offset = pos * size_of::<Ext4ExtentIndex>();
+                if offset.checked_add(size_of::<Ext4ExtentIndex>()).is_none()
+                    || offset + size_of::<Ext4ExtentIndex>() > indexes.len()
+                {
+                    return_errno_with_message!(Errno::EIO, "extent index offset overflow");
+                }
                 Ok(Ext4ExtentIndex::load_from_u8(&indexes[offset..]))
             }
         }
@@ -429,15 +531,32 @@ impl ExtentNode {
     pub fn get_extent(&self, pos: usize) -> Option<Ext4Extent> {
         match &self.data {
             NodeData::Root(root_data) => {
+                let entries = self.valid_extent_entries();
+                if pos >= entries {
+                    return None;
+                }
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let extents = &root_data[start..];
                 let offset = pos * size_of::<Ext4Extent>() / 4;
+                let extent_words = size_of::<Ext4Extent>() / size_of::<u32>();
+                if offset.checked_add(extent_words).is_none() || offset + extent_words > extents.len() {
+                    return None;
+                }
                 Some(Ext4Extent::load_from_u32(&extents[offset..]))
             }
             NodeData::Internal(internal_data) => {
+                let entries = self.valid_extent_entries();
+                if pos >= entries {
+                    return None;
+                }
                 let start = size_of::<Ext4ExtentHeader>();
                 let extents = &internal_data[start..];
                 let offset = pos * size_of::<Ext4Extent>();
+                if offset.checked_add(size_of::<Ext4Extent>()).is_none()
+                    || offset + size_of::<Ext4Extent>() > extents.len()
+                {
+                    return None;
+                }
                 Some(Ext4Extent::load_from_u8(&extents[offset..]))
             }
         }
@@ -794,5 +913,47 @@ mod tests {
         let extent = node.get_extent(1).expect("Failed to get extent at position 1");
         assert_eq!(extent.first_block, 10);
         assert_eq!(extent.block_count, 10);
+    }
+
+    #[test]
+    fn test_binsearch_extent_pos_with_truncated_internal_node() {
+        let node = ExtentNode {
+            header: Ext4ExtentHeader {
+                entries_count: 1,
+                ..Default::default()
+            },
+            data: NodeData::Internal(vec![0; size_of::<Ext4ExtentHeader>()]),
+            is_root: false,
+        };
+
+        assert_eq!(node.binsearch_extent_pos(0), None);
+    }
+
+    #[test]
+    fn test_get_extent_out_of_range_is_none() {
+        let node = ExtentNode {
+            header: Ext4ExtentHeader {
+                entries_count: 1,
+                ..Default::default()
+            },
+            data: NodeData::Internal(vec![0; size_of::<Ext4ExtentHeader>()]),
+            is_root: false,
+        };
+
+        assert_eq!(node.get_extent(0), None);
+    }
+
+    #[test]
+    fn test_get_index_out_of_range_returns_err() {
+        let node = ExtentNode {
+            header: Ext4ExtentHeader {
+                entries_count: 1,
+                ..Default::default()
+            },
+            data: NodeData::Internal(vec![0; size_of::<Ext4ExtentHeader>()]),
+            is_root: false,
+        };
+
+        assert!(node.get_index(0).is_err());
     }
 }

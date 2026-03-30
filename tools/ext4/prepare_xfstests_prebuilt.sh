@@ -33,6 +33,15 @@ fi
 
 make -j"${JOBS}" || true
 make install prefix="${OUT_DIR}/xfstests-dev" || true
+
+if [ -x "${SRC_DIR}/tools/mkgroupfile" ] && [ -d "${SRC_DIR}/tests" ]; then
+  for test_dir in "${SRC_DIR}"/tests/*; do
+    [ -d "${test_dir}" ] || continue
+    if [ ! -s "${test_dir}/group.list" ]; then
+      (cd "${test_dir}" && ../../tools/mkgroupfile group.list >/dev/null 2>&1 || true)
+    fi
+  done
+fi
 popd >/dev/null
 
 mkdir -p "${OUT_DIR}/tools/bin"

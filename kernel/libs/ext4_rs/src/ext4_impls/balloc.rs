@@ -382,19 +382,49 @@ impl Ext4 {
         let mut start = start;
 
         let mut super_block = self.super_block;
+        let total_blocks = super_block.blocks_count() as u64;
+        if count == 0 || start >= total_blocks {
+            if count != 0 {
+                log::error!(
+                    "balloc_free_blocks out of range: start={} count={} total_blocks={}",
+                    start,
+                    count,
+                    total_blocks
+                );
+            }
+            return;
+        }
+        let max_reclaim = (total_blocks - start) as usize;
+        if count > max_reclaim {
+            count = max_reclaim;
+        }
+        if count == 0 {
+            return;
+        }
 
         let blocks_per_group = super_block.blocks_per_group();
-
-        let bgid = start / blocks_per_group as u64;
+        let block_group_count = super_block.block_group_count() as u64;
+        if blocks_per_group == 0 || block_group_count == 0 {
+            log::error!(
+                "balloc_free_blocks invalid geometry: blocks_per_group={} block_group_count={}",
+                blocks_per_group,
+                block_group_count
+            );
+            return;
+        }
 
         let mut bg_first = start / blocks_per_group as u64;
-        let mut bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
+        let end = start.saturating_add(count as u64).saturating_sub(1);
+        let mut bg_last = end / blocks_per_group as u64;
+        if bg_last >= block_group_count {
+            bg_last = block_group_count.saturating_sub(1);
+        }
 
-        while bg_first <= bg_last {
+        while bg_first <= bg_last && count > 0 {
             let idx_in_bg = start % blocks_per_group as u64;
+            let bgid = bg_first as usize;
 
-            let mut bg =
-                Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
+            let mut bg = Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid);
 
             let block_bitmap_block = bg.get_block_bitmap_block(&super_block);
             let mut raw_data = self
@@ -402,7 +432,18 @@ impl Ext4 {
                 .read_offset(block_bitmap_block as usize * block_size);
             let mut data: &mut Vec<u8> = &mut raw_data;
 
-            let mut free_cnt = block_size * 8 - idx_in_bg as usize;
+            let bits_per_group = (block_size * 8).min(blocks_per_group as usize);
+            if idx_in_bg as usize >= bits_per_group {
+                log::error!(
+                    "balloc_free_blocks invalid index in group: start={} idx_in_bg={} bits_per_group={} bgid={}",
+                    start,
+                    idx_in_bg,
+                    bits_per_group,
+                    bgid
+                );
+                break;
+            }
+            let mut free_cnt = bits_per_group - idx_in_bg as usize;
 
             if count > free_cnt {
             } else {
@@ -428,7 +469,8 @@ impl Ext4 {
             /* Update inode blocks (different block size!) count */
             let mut inode_blocks = inode_ref.inode.blocks_count();
 
-            inode_blocks -= (free_cnt  * (block_size / EXT4_INODE_BLOCK_SIZE)) as u64;
+            inode_blocks = inode_blocks
+                .saturating_sub((free_cnt * (block_size / EXT4_INODE_BLOCK_SIZE)) as u64);
             inode_ref.inode.set_blocks_count(inode_blocks);
             self.write_back_inode(inode_ref);
 
@@ -436,7 +478,7 @@ impl Ext4 {
             let mut fb_cnt = bg.get_free_blocks_count();
             fb_cnt += free_cnt as u64;
             bg.set_free_blocks_count(fb_cnt as u32);
-            bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+            bg.sync_to_disk_with_csum(&self.block_device, bgid, &super_block);
 
             bg_first += 1;
         }

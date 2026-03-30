@@ -105,11 +105,41 @@ impl Default for Ext4DirEntry {
     }
 }
 
-impl<T> TryFrom<&[T]> for Ext4DirEntry {
+impl TryFrom<&[u8]> for Ext4DirEntry {
     type Error = u64;
-    fn try_from(data: &[T]) -> core::result::Result<Self, u64> {
-        // let data = data;
-        Ok(unsafe { core::ptr::read(data.as_ptr() as *const _) })
+
+    fn try_from(data: &[u8]) -> core::result::Result<Self, u64> {
+        let header_len = size_of::<Ext4FakeDirEntry>();
+        if data.len() < header_len {
+            return Err(1);
+        }
+
+        let inode = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        let entry_len = u16::from_le_bytes([data[4], data[5]]);
+        let name_len = data[6];
+        let inode_type = data[7];
+
+        let entry_len_usize = entry_len as usize;
+        if entry_len_usize < header_len || entry_len_usize > data.len() {
+            return Err(1);
+        }
+
+        let mut de = Ext4DirEntry::default();
+        de.inode = inode;
+        de.entry_len = entry_len;
+        de.name_len = name_len;
+        de.inner = Ext4DirEnInternal { inode_type };
+
+        let payload_len = entry_len_usize - header_len;
+        let copy_len = core::cmp::min(
+            core::cmp::min(name_len as usize, payload_len),
+            de.name.len(),
+        );
+        if copy_len > 0 {
+            de.name[..copy_len].copy_from_slice(&data[header_len..header_len + copy_len]);
+        }
+
+        Ok(de)
     }
 }
 
@@ -169,11 +199,13 @@ impl Ext4DirEntry {
     }
 
     pub fn write_entry(&mut self, entry_len: u16, inode: u32, name: &str, de_type:DirEntryType) {
+        self.name.fill(0);
         self.inode = inode;
         self.entry_len = entry_len;
-        self.name_len = name.len() as u8;
+        let copy_len = core::cmp::min(name.len(), self.name.len());
+        self.name_len = copy_len as u8;
         self.inner.inode_type = de_type.bits();
-        self.name[..name.len()].copy_from_slice(name.as_bytes());
+        self.name[..copy_len].copy_from_slice(&name.as_bytes()[..copy_len]);
     }
 
 }
@@ -204,22 +236,33 @@ impl Ext4DirEntry {
 
     /// Write de to block
     pub fn write_de_to_blk(&self, dst_blk: &mut Block, offset: usize) {
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        let data = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, count) };
-        dst_blk.data.splice(
-            offset..offset + core::mem::size_of::<Ext4DirEntry>(),
-            data.iter().cloned(),
-        );
-        // assert_eq!(dst_blk.block_data[offset..offset + core::mem::size_of::<Ext4DirEntry>()], data[..]);
+        self.copy_to_slice(&mut dst_blk.data, offset);
     }
 
     /// Copy the directory entry to a slice.
     pub fn copy_to_slice(&self, array: &mut [u8], offset: usize) {
-        let de_ptr = self as *const Ext4DirEntry as *const u8;
-        let array_ptr = array as *mut [u8] as *mut u8;
-        let count = core::mem::size_of::<Ext4DirEntry>() / core::mem::size_of::<u8>();
-        unsafe {
-            core::ptr::copy_nonoverlapping(de_ptr, array_ptr.add(offset), count);
+        let header_len = size_of::<Ext4FakeDirEntry>();
+        let rec_len = self.entry_len as usize;
+        if rec_len < header_len {
+            return;
+        }
+        let Some(end) = offset.checked_add(rec_len) else {
+            return;
+        };
+        if end > array.len() {
+            return;
+        }
+
+        array[offset..end].fill(0);
+        array[offset..offset + 4].copy_from_slice(&self.inode.to_le_bytes());
+        array[offset + 4..offset + 6].copy_from_slice(&self.entry_len.to_le_bytes());
+        array[offset + 6] = self.name_len;
+        array[offset + 7] = self.get_de_type();
+
+        let max_name = core::cmp::min(self.name_len as usize, rec_len - header_len);
+        if max_name > 0 {
+            array[offset + header_len..offset + header_len + max_name]
+                .copy_from_slice(&self.name[..max_name]);
         }
     }
 }

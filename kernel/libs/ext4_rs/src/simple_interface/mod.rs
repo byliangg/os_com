@@ -194,12 +194,51 @@ impl Ext4 {
         self.dir_remove(parent, name)
     }
 
+    fn update_dotdot_for_moved_dir(
+        &self,
+        moved_dir: &Ext4InodeRef,
+        new_parent: u32,
+    ) -> Result<()> {
+        let block_size = self.super_block.block_size() as usize;
+        let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+        self.dir_find_entry(moved_dir.inode_num, "..", &mut search_result)?;
+
+        let mut block = Block::load(&self.block_device, search_result.pblock_id * block_size);
+        let dotdot: &mut Ext4DirEntry = block.read_offset_as_mut(search_result.offset);
+        dotdot.inode = new_parent;
+
+        self.dir_set_csum(&mut block, moved_dir.inode.generation());
+        block.sync_blk_to_disk(&self.block_device);
+        Ok(())
+    }
+
+    fn is_dir_descendant_of(&self, mut node: u32, ancestor: u32) -> Result<bool> {
+        if node == ancestor {
+            return Ok(true);
+        }
+
+        for _ in 0..1024 {
+            if node == ROOT_INODE {
+                return Ok(false);
+            }
+
+            let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
+            self.dir_find_entry(node, "..", &mut search_result)?;
+            let parent = search_result.dentry.inode;
+
+            if parent == ancestor {
+                return Ok(true);
+            }
+            if parent == node {
+                return Ok(false);
+            }
+            node = parent;
+        }
+
+        return_errno_with_message!(Errno::EINVAL, "directory ancestry loop detected");
+    }
+
     /// Rename an entry under ext4.
-    ///
-    /// Current scope keeps semantics needed by phase4_part2:
-    /// - same-directory rename
-    /// - overwrite regular file / empty directory
-    /// - reject cross-directory rename for now
     pub fn ext4_rename_at(
         &self,
         old_parent: u32,
@@ -211,17 +250,19 @@ impl Ext4 {
             return_errno_with_message!(Errno::EISDIR, "rename on . or .. is not allowed");
         }
 
-        if old_parent != new_parent {
-            return_errno_with_message!(Errno::EXDEV, "cross-directory rename is not supported");
-        }
-
-        if old_name == new_name {
+        if old_parent == new_parent && old_name == new_name {
             return Ok(EOK);
         }
 
         let old_ino = self.ext4_lookup_at(old_parent, old_name)?;
         let old_inode_ref = self.get_inode_ref(old_ino);
         let old_is_dir = old_inode_ref.inode.is_dir();
+        let same_parent = old_parent == new_parent;
+        let mut replaced_dir = false;
+
+        if old_is_dir && self.is_dir_descendant_of(new_parent, old_ino)? {
+            return_errno_with_message!(Errno::EINVAL, "cannot move directory into its subtree");
+        }
 
         if let Ok(new_ino) = self.ext4_lookup_at(new_parent, new_name) {
             if new_ino == old_ino {
@@ -237,6 +278,7 @@ impl Ext4 {
                     return_errno_with_message!(Errno::ENOTEMPTY, "directory not empty");
                 }
 
+                replaced_dir = true;
                 self.truncate_inode(&mut new_inode_ref, 0)?;
                 let mut parent_inode_ref = self.get_inode_ref(new_parent);
                 self.unlink(&mut parent_inode_ref, &mut new_inode_ref, new_name)?;
@@ -254,9 +296,51 @@ impl Ext4 {
             }
         }
 
-        let mut parent_inode_ref = self.get_inode_ref(old_parent);
-        self.dir_remove_entry(&mut parent_inode_ref, old_name)?;
-        self.dir_add_entry(&mut parent_inode_ref, &old_inode_ref, new_name)?;
+        if same_parent {
+            let mut parent_inode_ref = self.get_inode_ref(old_parent);
+            self.dir_remove_entry(&mut parent_inode_ref, old_name)?;
+            if let Err(err) = self.dir_add_entry(&mut parent_inode_ref, &old_inode_ref, new_name) {
+                let _ = self.dir_add_entry(&mut parent_inode_ref, &old_inode_ref, old_name);
+                self.write_back_inode(&mut parent_inode_ref);
+                return Err(err);
+            }
+
+            // unlink() on an overwritten empty dir decrements nlink;
+            // compensate when we place a directory back under the same parent.
+            if old_is_dir && replaced_dir {
+                let links = parent_inode_ref.inode.links_count();
+                parent_inode_ref.inode.set_links_count(links.saturating_add(1));
+            }
+            self.write_back_inode(&mut parent_inode_ref);
+            return Ok(EOK);
+        }
+
+        let mut old_parent_inode_ref = self.get_inode_ref(old_parent);
+        self.dir_remove_entry(&mut old_parent_inode_ref, old_name)?;
+
+        let mut new_parent_inode_ref = self.get_inode_ref(new_parent);
+        if let Err(err) = self.dir_add_entry(&mut new_parent_inode_ref, &old_inode_ref, new_name) {
+            let _ = self.dir_add_entry(&mut old_parent_inode_ref, &old_inode_ref, old_name);
+            self.write_back_inode(&mut old_parent_inode_ref);
+            self.write_back_inode(&mut new_parent_inode_ref);
+            return Err(err);
+        }
+
+        if old_is_dir {
+            let old_links = old_parent_inode_ref.inode.links_count();
+            if old_links > 0 {
+                old_parent_inode_ref.inode.set_links_count(old_links - 1);
+            }
+            let new_links = new_parent_inode_ref.inode.links_count();
+            new_parent_inode_ref
+                .inode
+                .set_links_count(new_links.saturating_add(1));
+
+            self.update_dotdot_for_moved_dir(&old_inode_ref, new_parent)?;
+        }
+
+        self.write_back_inode(&mut old_parent_inode_ref);
+        self.write_back_inode(&mut new_parent_inode_ref);
 
         Ok(EOK)
     }
