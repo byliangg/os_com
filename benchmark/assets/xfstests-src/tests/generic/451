@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. 451
+#
+# Test data integrity when mixing buffered reads and asynchronous
+# direct writes a file.
+#
+. ./common/preamble
+_begin_fstest auto quick rw aio
+
+# Import common functions.
+
+_require_test
+_require_test_program "feature"
+_require_aiodio aio-dio-cycle-write
+_require_command "$TIMEOUT_PROG" timeout
+
+TESTFILE=$TEST_DIR/tst-aio-dio-cycle-write.$seq
+FSIZE=655360	# bytes
+
+# More read processes can help to reproduce the bug easier, so run
+# 2 ~ 20 readers according to the number of CPUs
+nr_cpu=`$here/src/feature -o`
+loops=$((nr_cpu / 2))
+if [ $loops -lt 2 ]; then
+	loops=2
+elif [ $loops -gt 20 ]; then
+	loops=20
+fi
+
+keep_reading=$tmp.reading
+touch $keep_reading
+# buffered reads the file frequently
+for ((i=0; i<loops; i++)); do
+	while [ -e $keep_reading ]; do
+		$XFS_IO_PROG -f -c "pread 0 $FSIZE" $TESTFILE >/dev/null 2>&1
+	done &
+	reader_pid="$reader_pid $!"
+done
+
+# start an aio writer, which does writing loops internally and check
+# data integrality.
+# For reproduce the original bug, keep testing about 30s will be better,
+# So let the AIO_TEST run as many loops as it can, then kill it in 30s.
+$TIMEOUT_PROG -s TERM 30s $AIO_TEST -c 999999 -b $FSIZE $TESTFILE >/dev/null
+
+# Remove $keep_reading file to stop the reader cycle
+rm -f $keep_reading
+wait $reader_pid
+
+echo "Silence is golden"
+
+status=0
+exit

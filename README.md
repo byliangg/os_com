@@ -1,186 +1,161 @@
-<p align="center">
-    <img src="book/src/images/logo_en.svg" alt="asterinas-logo" width="620"><br>
-    Toward a production-grade Linux alternative—memory safe, high-performance, and more<br/>
-</p>
+# Asterinas EXT4 赛题版本（Stage4）
 
-<!-- Asterinas NixOS 0.17.0 demo. It is uploaded as a Github attachment
-so that GitHub will render that URL as a video player in Markdown.
-The original file name will be displayed up in the top bar of the video player.
-So make sure you give the video file a cool name before uploading it.
--->
-https://github.com/user-attachments/assets/26be2d18-994d-4658-a1b8-f8959bd88b75
+## 1. 项目概述
 
-<p align="center">
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml/badge.svg?event=push" alt="Test x86-64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml/badge.svg?event=push" alt="Test riscv64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml/badge.svg?event=push" alt="Test loongarch64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml/badge.svg" alt="Test Intel TDX" style="max-width: 100%;"></a>
-    <a href="https://asterinas.github.io/benchmark/x86-64/"><img src="https://github.com/asterinas/asterinas/actions/workflows/benchmark_x86.yml/badge.svg" alt="Benchmark x86-64" style="max-width: 100%;"></a>
-    <a href="https://asterinas.github.io/benchmark/tdx/"><img src="https://github.com/asterinas/asterinas/actions/workflows/benchmark_x86_tdx.yml/badge.svg" alt="Benchmark Intel TDX" style="max-width: 100%;"></a>
-    <br/>
-</p>
+本仓库是基于 Asterinas 内核进行 EXT4 适配与验证的赛题工程版本，目标是：
 
-**News:**
-* 2025-12-08: **FAST 2026** accepted a paper on a novel secure storage solution having been integrated into Asterinas: _MlsDisk: Trusted Block Storage for TEEs Based on Layered Secure Logging_.
-* 2025-10-17: **ICSE 2026** accepted yet another paper about Asterinas: _RusyFuzz: Unhandled Exception Guided Fuzzing for Rust OS Kernel_.
-* 2025-10-14: [*CortenMM: Efficient Memory Management with Strong Correctness Guarantees*](https://dl.acm.org/doi/10.1145/3731569.3764836) received the **Best Paper Award** at **SOSP 2025**.
-* 2025-07-23: **SOSP 2025** accepted another Asterinas paper: [*CortenMM: Efficient Memory Management with Strong Correctness Guarantees*](https://dl.acm.org/doi/10.1145/3731569.3764836).
-* 2025-06-18: **USENIX _;login:_ magazine** published [*Asterinas: A Rust-Based Framekernel to Reimagine Linux in the 2020s*](https://www.usenix.org/publications/loginonline/asterinas-rust-based-framekernel-reimagine-linux-2020s).
-* 2025-04-30: **USENIX ATC 2025** accepted two Asterinas papers:
-    1. [*Asterinas: A Linux ABI-Compatible, Rust-Based Framekernel OS with a Small and Sound TCB*](https://www.usenix.org/conference/atc25/presentation/peng-yuke);
-    2. [*Converos: Practical Model Checking for Verifying Rust OS Kernel Concurrency*](https://www.usenix.org/conference/atc25/presentation/tang).
+1. 在 Asterinas 上实现并验证 EXT4 的核心文件系统能力。
+2. 通过 xfstests 与 lmbench 建立可重复、可追踪的功能与性能验证流程。
+3. 将测试输入、输出、运行资产统一收敛到仓库内，降低环境漂移风险，支持跨环境直接复现。
 
-Congratulations to the Asterinas community🎉🎉🎉
+本版本重点覆盖 `stage4` 阶段工作，测试默认在 Docker 环境中执行。
 
-## Introducing Asterinas
+## 2. 当前完成情况
 
-The future of operating systems (OSes) belongs to Rust—a modern systems programming language (PL)
-that delivers safety, efficiency, and productivity at once.
-The open question is not _whether_ OS kernels should transition from C to Rust,
-but _how_ we get there.
+### 2.1 功能实现与修复
 
-Linux follows an _incremental_ path.
-While the Rust for Linux project has successfully integrated Rust as an official second PL,
-this approach faces _inherent friction_.
-As a newcomer within a massive C codebase,
-Rust must often compromise on safety, efficiency, clarity, and ergonomics
-to maintain compatibility with legacy structures.
-And while new Rust code can improve what it touches,
-it cannot retroactively eliminate _vulnerabilities_ in decades of existing C code.
+1. 已完成一组可运行的 EXT4 核心功能链路，覆盖基础文件读写与目录操作相关场景。
+2. 已修复历史关键问题：针对 legacy block map 路径的兼容处理（含 direct/single/double/triple 逻辑分支），解决了此前 `generic/013`、`generic/084` 等场景中的目录查找异常。
+3. 已形成稳定的阶段测试入口脚本与日志归档流程。
 
-Asterinas takes a _clean-slate_ approach.
-By building a Linux-compatible, general-purpose OS kernel from the ground up in Rust,
-we are liberated from the constraints of a legacy C codebase—its interfaces, designs, and assumptions—and from the need to preserve historical compatibility for outdated platforms.
-**Languages—including PLs—shape our way of thinking**.
-Through the lens of a modern PL, Asterinas rethinks and modernizes the construction of OS kernels:
+### 2.2 测试状态（最新一轮）
 
-* **Modern architecture.**
-  Asterinas pioneers the [_framekernel_](https://asterinas.github.io/book/kernel/the-framekernel-architecture.html) architecture,
-  combining monolithic-kernel performance with microkernel-inspired separation.
-  Unsafe Rust is confined to a small, auditable framework called [OSTD](https://asterinas.github.io/api-docs-nightly/ostd/),
-  while the rest of the kernel is written in safe Rust,
-  keeping the memory-safety TCB intentionally minimal.
+1. `phase4_good`（基于 `phase4_good.list` 共 40 个候选）：
+   `PASS=6`，`FAIL=0`，`NOTRUN=14`，`STATIC_BLOCKED=20`，脚本口径 `pass_rate=100%`。
+   当前通过样例：`generic/001, 006, 013, 028, 035, 084`。
+2. `phase3_base`（基于 `phase3_base.list` 共 40 个候选）：
+   `PASS=4`，`FAIL=0`，`NOTRUN=14`，`STATIC_BLOCKED=22`，脚本口径 `pass_rate=100%`。
+   当前通过样例：`generic/006, 013, 028, 084`。
+3. `lmbench`：`8/8` 通过，覆盖 VFS 延迟与小文件/拷贝吞吐测试。
 
-* **Modern design.**
-  Asterinas learns from Linux's hard-won engineering lessons,
-  but it is not afraid to deviate when the design warrants it.
-  For example, Asterinas improves the CPU scalability of its memory management subsystem
-  with a novel scheme called [CortenMM](https://dl.acm.org/doi/10.1145/3731569.3764836).
+最新日志见：
 
-* **Modern code.**
-  Asterinas's codebase prioritizes safety, clarity, and maintainability.
-  Performance is pursued aggressively, but never by compromising safety guarantees.
-  Readability is treated as a feature, not a luxury,
-  and the codebase is structured to avoid hidden, cross-module coupling.
+1. `benchmark/logs/phase4_good_20260407_112525.log`
+2. `benchmark/logs/phase3_base_guard_20260407_114626.log`
+3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_114043.tsv`
 
-* **Modern tooling.**
-  Asterinas ships a purpose-built toolkit, [OSDK](https://asterinas.github.io/book/osdk/guide/index.html),
-  to facilitate building, running, and testing Rust kernels or kernel components.
-  Powered by OSTD,
-  OSDK makes kernel development as easy and fluid as writing a standard Rust application, eliminating the traditional friction of OS engineering.
+## 3. 测试体系说明
 
-Asterinas aims to become **a production-grade, memory-safe Linux alternative**,
-with performance that matches Linux—and in some scenarios, exceeds it.
-The project has been under active development for four years,
-supports 230+ Linux system calls,
-and has launched an experimental distribution,
-[Asterinas NixOS](https://asterinas.github.io/book/distro/index.html).
+### 3.1 xfstests 模式
 
-In 2026, our priority is to advance project maturity toward production readiness,
-specifically targeting standard and confidential virtual machines on x86-64.
-Looking ahead, we will continue to expand functionality and 
-harden the system for **mission-critical deployments**
-in data centers, autonomous vehicles, and embodied AI.
+当前主要使用以下模式：
 
-## Getting Started
+1. `phase4_good`
+2. `phase3_base`
 
-### Supported CPU Architectures
+对应用例集合与静态排除列表在：
 
-Asterinas targets modern, 64-bit platforms only.
+1. `test/initramfs/src/syscall/xfstests/testcases/`
+2. `test/initramfs/src/syscall/xfstests/blocked/`
 
-A **development platform** is where you build and test Asterinas
-(i.e., the host machine running the Docker-based development environment).
+### 3.2 结果口径
 
-| Development Platform |
-| -------------------- |
-| x86-64               |
+当前脚本中 xfstests 通过率口径为：
 
-A **deployment platform** is a CPU architecture
-that Asterinas can run on as an OS kernel.
+1. 分母 = `PASS + FAIL`
+2. `NOTRUN` 与 `STATIC_BLOCKED` 不计入分母
 
-| Deployment Platform | Tier   |
-| ------------------- | ------ |
-| x86-64              | Tier 1 |
-| x86-64 (Intel TDX)  | Tier 2 |
-| RISC-V 64           | Tier 2 |
-| LoongArch 64        | Tier 3 |
+因此阅读测试结果时，需要同时结合详细结果表看覆盖边界。
 
-Tier definitions:
-- **Tier 1:** Fully supported and tested.
-  CI runs the full test suite on every PR.
-- **Tier 2:** Actively developed with basic functionality working.
-  CI runs build checks and basic tests on a regular basis
-  (per PR for RISC-V and nightly for Intel TDX),
-  but the full test suite is not yet covered.
-- **Tier 3:** Early-stage or experimental.
-  The kernel can boot and perform basic operations,
-  but CI coverage is limited and
-  may not include automated runtime tests for every pull request.
+### 3.3 当前样例覆盖范围（概览）
 
-### For End Users
+1. 已稳定通过的 xfstests 样例主要覆盖：基础文件创建/读写/截断、目录查找与路径遍历等核心链路（如 `generic/001/006/013/028/035/084`）。
+2. 当前 `NOTRUN` 样例主要受能力或工具依赖限制：例如 hardlink、`shutdown/freezing`、`attr` 工具缺失、`O_DIRECT`、scratch 设备容量限制。
+3. `STATIC_BLOCKED` 样例主要是阶段性未纳入范围的语义：如 hardlink/symlink、`O_TMPFILE/flink`、`renameat2`、`fallocate/collapse-range/fiemap`、xattr/chacl 等。
+4. lmbench 当前覆盖 8 项：`open/stat/fstat/read/write` 延迟、`create+delete(0k/10k)`、`copy_files_bw`。
 
-We provide [Asterinas NixOS ISO Installer](https://github.com/asterinas/asterinas/releases)
-to make the Asterinas kernel more accessible for early adopters and enthusiasts.
-We encourage you to try out Asterinas NixOS and share feedback.
-Instructions on how to use the ISO installer can be found [here](https://asterinas.github.io/book/distro/index.html#end-users).
+## 4. 一键测试（推荐）
 
-**Disclaimer: Asterinas is an independent, community-led project.
-Asterinas NixOS is _not_ an official NixOS project and has _no_ affiliation with the NixOS Foundation. _No_ sponsorship or endorsement is implied.**
+在仓库根目录执行：
 
-### For Kernel Developers
+```bash
+cd /home/lby/os_com/asterinas
 
-Follow the steps below to get Asterinas up and running.
+# 1) phase4
+PHASE4_DOCKER_MODE=phase4_good \
+ENABLE_KVM=1 \
+XFSTESTS_CASE_TIMEOUT_SEC=900 \
+KLOG_LEVEL=error \
+./tools/ext4/run_phase4_in_docker.sh
 
-1. Download the latest source code on an x86-64 Linux machine:
+# 2) phase3
+PHASE4_DOCKER_MODE=phase3_only \
+ENABLE_KVM=1 \
+XFSTESTS_CASE_TIMEOUT_SEC=900 \
+KLOG_LEVEL=error \
+./tools/ext4/run_phase4_in_docker.sh
 
-    ```bash
-    git clone https://github.com/asterinas/asterinas
-    ```
+# 3) lmbench
+PHASE4_DOCKER_MODE=lmbench_only \
+ENABLE_KVM=1 \
+KLOG_LEVEL=error \
+./tools/ext4/run_phase4_in_docker.sh
+```
 
-2. Run a Docker container as the development environment:
+## 5. 目录与文档索引
 
-    ```bash
-    docker run -it --privileged --network=host -v /dev:/dev -v $(pwd)/asterinas:/root/asterinas asterinas/asterinas:0.17.0-20260227
-    ```
+| 文档/目录 | 作用 |
+| --- | --- |
+| `benchmark/README.md` | benchmark 子系统总览 |
+| `benchmark/benchmark.md` | 最新测试结论与结果摘要 |
+| `benchmark/environment.md` | 复现环境、依赖与命令说明 |
+| `benchmark/assets/README.md` | 测试运行资产说明（initramfs、xfstests、vDSO） |
+| `benchmark/datasets/xfstests/README.md` | xfstests 样例数据集说明 |
+| `benchmark/logs/` | 测试脚本默认日志输出目录 |
+| `benchmark/datasets/results/` | 归档后的稳定结果快照（便于 git 追踪） |
+| `tools/ext4/run_phase4_in_docker.sh` | 主测试入口（Docker） |
+| `tools/ext4/run_phase4_part3.sh` | phase3/phase4/lmbench 组合执行逻辑 |
 
-3. Inside the container,
-go to the project folder (`/root/asterinas`) and run:
+历史阶段文档（保留）示例：
 
-    ```bash
-    make kernel
-    make run_kernel
-    ```
+1. `EXT4_PHASE2_REPRO.md`
+2. `EXT4_PHASE3_REPRO.md`
+3. `EXT4_PHASE3_PART1_SUMMARY.md`
+4. `asterinas_ext4_phase2_manual_test_commands.md`
 
-    This results in a VM running the Asterinas kernel with a small initramfs.
+## 6. 复现所需运行资产
 
-4. To install and test real-world applications on Asterinas,
-build and run Asterinas NixOS in a VM:
+为降低对宿主 `.local` 的依赖，当前脚本默认读取仓库内资产：
 
-    ```bash
-    make nixos
-    make run_nixos
-    ```
-    
-    This boots into an interactive shell in Asterinas NixOS,
-    where you can use Nix to install and try more packages.
+1. `benchmark/assets/initramfs/initramfs_phase3.cpio.gz`
+2. `benchmark/assets/xfstests-prebuilt/xfstests-dev`
+3. `benchmark/assets/linux_vdso/`
 
-## The Book
+对应默认路径已在脚本中切换完成，核心涉及：
 
-See [The Asterinas Book](https://asterinas.github.io/book/) to learn more about the project.
+1. `tools/ext4/run_phase4_in_docker.sh`
+2. `tools/ext4/run_phase4_part1.sh`
+3. `tools/ext4/run_phase4_part2.sh`
+4. `tools/ext4/run_phase4_part3.sh`
+5. `tools/ext4/prepare_phase4_part*_initramfs.sh`
+6. `tools/ext4/prepare_xfstests_prebuilt.sh`
 
-## License
+## 7. 最小复现检查
 
-Asterinas's source code and documentation primarily use the
-[Mozilla Public License (MPL), Version 2.0](https://github.com/asterinas/asterinas/blob/main/LICENSE-MPL).
-Select components are under more permissive licenses,
-detailed [here](https://github.com/asterinas/asterinas/blob/main/.licenserc.yaml). For the rationales behind the choice of MPL, see [here](https://asterinas.github.io/book/index.html#licensing).
+在跑测试前建议先检查：
+
+```bash
+cd /home/lby/os_com/asterinas
+
+test -f benchmark/assets/initramfs/initramfs_phase3.cpio.gz
+test -d benchmark/assets/xfstests-prebuilt/xfstests-dev
+test -f benchmark/assets/linux_vdso/vdso_x86_64.so
+```
+
+环境前提：
+
+1. 宿主机已安装 Docker。
+2. 宿主机可使用 `--privileged` 与 `/dev` 挂载能力。
+3. 建议支持 KVM（`ENABLE_KVM=1`），否则部分测试耗时会明显增加。
+
+## 8. 当前边界与后续方向
+
+当前结果体现的是 `stage4` 阶段可运行能力与门禁通过状态。后续可继续推进：
+
+1. 扩大 xfstests 可运行集合，减少 `NOTRUN/STATIC_BLOCKED`。
+2. 完善更高阶段的功能覆盖（例如更多 POSIX 语义、崩溃一致性、并发场景）。
+3. 进一步沉淀自动化验收规范与提交前自检流程。
+
+## 9. 致谢与来源说明
+
+本工程基于 Asterinas 社区项目进行赛题方向开发，保留原工程结构与许可证信息。

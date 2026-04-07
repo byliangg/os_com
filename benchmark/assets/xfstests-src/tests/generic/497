@@ -1,0 +1,70 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 497
+#
+# Test various swapfile activation oddities, having used fcollapse to
+# create discontiguous ranges in the file.
+#
+. ./common/preamble
+_begin_fstest auto quick swap collapse
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	swapoff $swapfile 2> /dev/null
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_swapfile
+_require_test_program mkswap
+_require_test_program swapon
+_require_xfs_io_command "fcollapse"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount >>$seqres.full 2>&1
+
+swapfile=$SCRATCH_MNT/swap
+len=$((2 * 1048576))
+page_size=$(_get_page_size)
+
+swapfile_cycle() {
+	local swapfile="$1"
+
+	# Swap files must be nocow on Btrfs.
+	$CHATTR_PROG +C $swapfile >> $seqres.full 2>&1
+	"$here/src/mkswap" $swapfile >> $seqres.full
+	"$here/src/swapon" $swapfile 2>&1 | _filter_scratch
+	swapoff $swapfile 2>> $seqres.full
+	rm -f $swapfile
+}
+
+# Create a swap file with a large discontiguous range(?)
+echo "large discontig swap" | tee -a $seqres.full
+_pwrite_byte 0x58 0 $((len * 2)) $swapfile >> $seqres.full
+old_sz="$(_get_filesize $swapfile)"
+$XFS_IO_PROG -c "fcollapse $((len / 2)) $len" $swapfile >> $seqres.full 2>&1
+new_sz="$(_get_filesize $swapfile)"
+if [ $old_sz -gt $new_sz ]; then
+	swapfile_cycle $swapfile
+fi
+rm -f $swapfile
+
+# Create a swap file with a small discontiguous range(?)
+echo "small discontig swap" | tee -a $seqres.full
+_pwrite_byte 0x58 0 $((len + 1024)) $swapfile >> $seqres.full
+old_sz="$(_get_filesize $swapfile)"
+$XFS_IO_PROG -c "fcollapse 66560 1024" $swapfile >> $seqres.full 2>&1
+new_sz="$(_get_filesize $swapfile)"
+if [ $old_sz -gt $new_sz ]; then
+	swapfile_cycle $swapfile
+fi
+rm -f $swapfile
+
+status=0
+exit

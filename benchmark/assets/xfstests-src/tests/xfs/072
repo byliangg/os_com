@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 072
+#
+# Check some unwritten extent boundary conditions
+#
+. ./common/preamble
+_begin_fstest rw auto prealloc quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_scratch_unmount 2>/dev/null
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_scratch_unmount >/dev/null 2>&1
+
+_scratch_mkfs_xfs >/dev/null
+_scratch_mount
+
+# check there's enough freespace on $SCRATCH_MNT ... (1GiB + 1MiB)
+avail=`df -P $SCRATCH_MNT | awk 'END {print $4}'`
+[ "$avail" -ge 1049600 ] || _notrun "Scratch device is too small ($avail KiB)"
+
+echo Silence is golden
+
+# reserve 1GiB, truncate at 100bytes
+$XFS_IO_PROG -f -c 'resvsp 0 1g' -c 'truncate 100' $SCRATCH_MNT/ouch
+rm -f $SCRATCH_MNT/ouch
+
+# reserve 1GiB, truncate at 1GiB
+$XFS_IO_PROG -f -c 'resvsp 0 1g' -c 'truncate 1g' $SCRATCH_MNT/ouch
+rm -f $SCRATCH_MNT/ouch
+
+# reserve 1GiB, truncate at 2GiB
+$XFS_IO_PROG -f -c 'resvsp 0 1g' -c 'truncate 2g' $SCRATCH_MNT/ouch
+rm -f $SCRATCH_MNT/ouch
+
+# reserve 1GiB, 1GiB hole, reserve 1MiB, truncate at 3GiB
+$XFS_IO_PROG -f -c 'resvsp 0 1g' -c 'resvsp 2g 1m' -c 'truncate 3g' $SCRATCH_MNT/ouch
+rm -f $SCRATCH_MNT/ouch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 005
+#
+# Test corruption issue in converting file with a hole at the beginning to
+# non-extent based format
+#
+# These two commits fixed the corruption:
+# ext4: be more strict when migrating to non-extent based file
+# ext4: correctly migrate a file with a hole at the beginning
+#
+. ./common/preamble
+_begin_fstest auto quick metadata ioctl rw
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_command "$CHATTR_PROG" chattr
+
+echo "Silence is golden"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/$seq.attrtest
+touch $testfile
+$CHATTR_PROG -e $testfile >>$seqres.full 2>&1
+if [ $? -ne 0 ]; then
+	_notrun "Clearing extent flag not supported, old chattr and/or kernel?"
+fi
+
+rm -f $testfile
+# skip the first 4k and write to the second 4k, leave the first 4k as a hole
+$XFS_IO_PROG -fc "pwrite 4k 4k" -c "fsync" $testfile >>$seqres.full 2>&1
+
+# convert to non-extent based file format, buggy ext4 moves the data blocks to
+# the beginning of the file, but extent status cache still marks that region as
+# a hole
+$CHATTR_PROG -e $testfile >>$seqres.full 2>&1
+
+# delayed allocation writes to the "hole", reclaim the same data block again,
+# results in i_blocks corruption
+$XFS_IO_PROG -c "pwrite 0 4k" $testfile >>$seqres.full 2>&1
+
+# success, all done
+status=0
+exit

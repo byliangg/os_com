@@ -1,0 +1,112 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc., All Rights Reserved.
+#
+# FS QA Test 469
+#
+# Test that mmap read doesn't see non-zero data past EOF on truncate down.
+#
+# This is inspired by an XFS bug that truncate down fails to zero page cache
+# beyond new EOF and causes stale data written to disk unexpectedly and a
+# subsequent mmap reads and sees non-zeros post EOF.
+#
+# Patch "xfs: truncate pagecache before writeback in xfs_setattr_size()" fixed
+# the bug on XFS.
+#
+. ./common/preamble
+_begin_fstest auto quick punch zero prealloc mmap
+
+file=$TEST_DIR/$seq.fsx
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $file $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_xfs_io_command "falloc" "-k"
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "fzero"
+
+run_fsx()
+{
+	$FSX_PROG $2 --replay-ops $1 $file 2>&1 | tee -a $seqres.full >$tmp.fsx
+	if [ ${PIPESTATUS[0]} -ne 0 ]; then
+		cat $tmp.fsx
+		exit 1
+	fi
+}
+
+# run fsx with and without fsync(2) after write to get more coverage
+test_fsx()
+{
+	echo "fsx --replay-ops ${1#*.}" | tee -a $seqres.full
+	run_fsx $1
+
+	echo "fsx -y --replay-ops ${1#*.}" | tee -a $seqres.full
+	run_fsx $1 -y
+}
+
+# simplified fsx operations that work on small & not blocksize-aligned offsets,
+# so filesystems with small block size could reproduce too
+cat >$tmp.fsxops.0 <<EOF
+# create file with unwritten extent, KEEP_SIZE flag is required, otherwise page
+# straddles new i_size in the writeback triggered by truncate, range [i_size,
+# page_boundary] will be zeroed there, and bug won't be reproduced
+fallocate 0x0 0x1000 0x0 keep_size
+
+# overwrite the unwritten extents with non-zeros, but extent will stay in
+# unwritten till I/O completion
+write 0x0 0x1000 0x0
+
+# truncate down the file, which should zero page cache beyong new EOF but a
+# buggy kernel won't
+truncate 0x0 0x10 0x1000
+
+# unmap the file and invalidate the pagecache of the block
+punch_hole 0x0 0x10 0x10
+
+# mmap reads the whole block from disk, and fsx will check page range beyond
+# EOF to make sure we only see zeros there
+mapread 0x0 0x10 0x10
+EOF
+
+# to get a bit more test coverage, try other operation combinations too
+# same as fsxops.0, but skip punch_hole to keep the pagecache before mapread
+cat >$tmp.fsxops.1 <<EOF
+fallocate 0x0 0x1000 0x0 keep_size
+write 0x0 0x1000 0x0
+truncate 0x0 0x10 0x1000
+mapread 0x0 0x10 0x10
+EOF
+
+# same as fsxops.0, but fallocate without KEEP_SIZE flag
+cat >$tmp.fsxops.2 <<EOF
+fallocate 0x0 0x1000 0x0
+write 0x0 0x1000 0x0
+truncate 0x0 0x10 0x1000
+punch_hole 0x0 0x10 0x10
+mapread 0x0 0x10 0x10
+EOF
+
+# this is from the original fsxops when bug was first hit
+cat >$tmp.fsxops.3 <<EOF
+fallocate 0x35870 0xa790 0x0 keep_size
+write 0x2aa50 0xc37f 0x0
+truncate 0x0 0x36dcd 0x36dcf
+zero_range 0x35849 0x1584 0x36dcd
+mapread 0x361c8 0xc05 0x36dcd
+EOF
+
+for i in 0 1 2 3; do
+	test_fsx $tmp.fsxops.$i
+done
+
+# success, all done
+status=0
+exit

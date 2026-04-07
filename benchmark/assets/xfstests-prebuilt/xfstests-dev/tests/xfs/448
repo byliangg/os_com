@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 FUJITSU LIMITED. All Rights Reserved.
+#
+# FS QA Test No. 448
+#
+# Regression test for commit:
+# 46c59736d809 ("xfs: harden directory integrity checks some more")
+#
+# If a malicious XFS contains a block+ format directory wherein
+# the directory inode's core.mode is corrupted, and there are
+# subdirectories of the corrupted directory, an attempt to traverse
+# up the directory tree by running xfs_scrub will crash the
+# kernel in __xfs_dir3_data_check.
+#
+. ./common/preamble
+_begin_fstest auto quick fuzzers
+
+# Import common functions.
+. ./common/filter
+. ./common/populate
+
+_require_scratch_nocheck
+_require_xfs_io_command "scrub"
+
+rm -f "$seqres.full"
+
+# Format and mount
+_scratch_mkfs | _filter_mkfs > $seqres.full 2> $tmp.mkfs
+_scratch_mount
+
+# Get directory block size
+. $tmp.mkfs
+
+# Create a block+(e.g. leaf) format directory
+__populate_create_dir "${SCRATCH_MNT}/dir_leaf" "$((dirbsize / 12))"
+
+# Get the block+ directory inode and a subdirectory inode of it
+subdino=$(stat -c "%i" "$(find ${SCRATCH_MNT}/dir_leaf/* -type d | head -1)")
+dino=$(stat -c "%i" "${SCRATCH_MNT}/dir_leaf")
+
+# Get the subdirectory's generation number
+_scratch_unmount
+subdgen=$(_scratch_xfs_get_metadata_field "core.gen" "inode $subdino")
+
+# Corrupt the directory inode's core.mode
+setmode="0100755"
+_scratch_xfs_set_metadata_field "core.mode" "$setmode" "inode $dino" >> $seqres.full
+getmode=$(_scratch_xfs_get_metadata_field "core.mode" "inode $dino")
+[ "$getmode" != "$setmode" ] && _fail "failed to set core.mode"
+
+# Scrub parent directory in subdirectory (online)
+_scratch_mount
+$XFS_IO_PROG -x -c "scrub parent $subdino $subdgen" ${SCRATCH_MNT} >> $seqres.full
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

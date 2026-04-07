@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. ext4/306
+#
+# Test that blocks are available to non-extent files after a resize2fs
+# Regression test for commit:
+# c5c72d8 ext4: fix online resizing for ext3-compat file systems
+#
+. ./common/preamble
+_begin_fstest auto rw resize quick
+
+PIDS=""
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _scratch_unmount
+}
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_command "$RESIZE2FS_PROG" resize2fs
+
+# Make a small ext4 fs with extents disabled & mount it
+features="^extents"
+if grep -q 64bit /etc/mke2fs.conf ; then
+    features+=",^64bit"
+fi
+if echo "${MOUNT_OPTIONS}" | grep -q 'test_dummy_encryption' ; then
+    features+=",encrypt"
+fi
+
+blksz=$(_get_page_size)
+
+$MKFS_EXT4_PROG -F -b $blksz -O "$features" $SCRATCH_DEV 512m >> $seqres.full 2>&1
+_scratch_mount
+
+# Create a small non-extent-based file
+echo "Create 1m testfile1"
+$XFS_IO_PROG -f $SCRATCH_MNT/testfile1 -c "pwrite 0 1m" | _filter_xfs_io
+
+# Create a large non-extent-based file filling the fs; this will run out & fail
+echo "Create testfile2 to fill the fs"
+$XFS_IO_PROG -f $SCRATCH_MNT/testfile2 -c "pwrite 0 512m" 2>&1 | \
+	_filter_xfs_io_error
+df -h $SCRATCH_MNT >> $seqres.full
+
+# Grow fs by 512m
+echo "Resize to 1g"
+$RESIZE2FS_PROG $SCRATCH_DEV 1g >> $seqres.full 2>&1 || _fail "Could not resize to 1g"
+df -h $SCRATCH_MNT >> $seqres.full
+
+# See if we can add more blocks to the files
+echo "append 2m to testfile1"
+$XFS_IO_PROG -f $SCRATCH_MNT/testfile1 -c "pwrite 1m 2m" | _filter_xfs_io
+echo "append 2m to testfile2"
+$XFS_IO_PROG -f $SCRATCH_MNT/testfile1 -c "pwrite 512m 2m" | _filter_xfs_io
+
+status=0
+exit

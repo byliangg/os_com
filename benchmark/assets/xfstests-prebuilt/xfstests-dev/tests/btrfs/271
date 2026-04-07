@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 Christoph Hellwig.
+#
+# FS QA Test btrfs/271
+#
+# Test btrfs write error propagation and reporting on the raid1 profile.
+#
+. ./common/preamble
+_begin_fstest auto quick raid
+
+. ./common/filter
+. ./common/fail_make_request
+
+_require_scratch
+_require_fail_make_request
+_require_scratch_dev_pool 2
+_scratch_dev_pool_get 2
+
+_check_minimal_fs_size $(( 1024 * 1024 * 1024 ))
+_scratch_pool_mkfs "-m raid1 -d raid1 -b 1G" >> $seqres.full 2>&1
+
+_scratch_mount
+
+dev2=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}'`
+
+_allow_fail_make_request
+
+echo "Step 1: writing with one failing mirror:"
+_bdev_fail_make_request $SCRATCH_DEV 1
+$XFS_IO_PROG -f -c "pwrite -W -S 0xaa 0 8K" $SCRATCH_MNT/foobar | _filter_xfs_io
+_bdev_fail_make_request $SCRATCH_DEV 0
+
+# btrfs counts errors per IO, assuming the data is merged that'll be 1 IO, then
+# the log tree block and then the log root tree block and then the super block.
+# We should see at least 4 failed IO's, but with subpage blocksize we could see
+# more if the log blocks end up on the same page, or if the data IO gets split
+# at all.
+errs=$($BTRFS_UTIL_PROG device stats $SCRATCH_DEV | \
+	$AWK_PROG '/write_io_errs/ { print $2 }')
+if [ $errs -lt 4 ]; then
+        _fail "Errors: $errs expected: 4"
+fi
+
+echo "Step 2: verify that the data reads back fine:"
+$XFS_IO_PROG -c "pread -v 0 8K" $SCRATCH_MNT/foobar | _filter_xfs_io_offset
+
+echo "Step 3: writing with two failing mirrors (should fail):"
+_bdev_fail_make_request $SCRATCH_DEV 1
+_bdev_fail_make_request $dev2 1
+$XFS_IO_PROG -f -c "pwrite -W -S 0xbb 0 8K" $SCRATCH_MNT/foobar | _filter_xfs_io
+_bdev_fail_make_request $dev2 0
+_bdev_fail_make_request $SCRATCH_DEV 0
+
+_disallow_fail_make_request
+
+_scratch_dev_pool_put
+# success, all done
+status=0
+exit

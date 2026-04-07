@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 008
+#
+# randholes test
+#
+. ./common/preamble
+_begin_fstest rw ioctl auto quick
+
+status=0	# success is the default!
+blksize=$(_get_file_block_size "$TEST_DIR")
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -f $tmp.*
+    rm -rf $TEST_DIR/randholes.$$.*
+}
+
+_filter()
+{
+    sed -e "s/-b $blksize/-b BLKSIZE/g" \
+	-e "s/-l .* -c/-l FSIZE -c/g"
+}
+
+# Import common functions.
+. ./common/filter
+
+_do_test()
+{
+    _n="$1"
+    _holes="$2"
+    _param="$3"
+
+    out=$TEST_DIR/randholes.$$.$_n
+    echo ""
+    echo "randholes.$_n : $_param" | _filter
+    echo "------------------------------------------"
+    if $here/src/randholes $_param $out >$tmp.out
+    then
+	# only check if we're not allocating in huge chunks (extsz flag)
+	if _test_inode_flag extsize $out || _test_inode_flag realtime $out
+	then
+		echo "holes is in range"
+	else
+		# quick check - how many holes did we get?
+	        count=`xfs_bmap $out | grep -E -c ': hole'`
+		# blocks can end up adjacent, therefore number of holes varies
+		_within_tolerance "holes" $count $_holes 10% -v
+	fi
+    else
+        echo "    randholes returned $? - see $seq.out.full"
+        echo "--------------------------------------"       >>$seqres.full
+        echo "$_n - output from randholes:"                 >>$seqres.full
+        echo "--------------------------------------"       >>$seqres.full
+        cat $tmp.out                                        >>$seqres.full
+        echo "--------------------------------------"       >>$seqres.full
+        echo "$_n - output from bmap:"                      >>$seqres.full
+        echo "--------------------------------------"       >>$seqres.full
+        xfs_bmap -vvv $out                                  >>$seqres.full
+        status=1
+    fi
+}
+
+_require_test
+
+# Note on special numbers here.
+#
+# We are trying to create roughly 50 or 100 holes in a file
+# using random writes. Assuming a good distribution of 50 writes
+# in a file, the file only needs to be 3-4x the size of the write
+# size muliplied by the number of writes. Hence we use 200 * blksize
+# for files we want 50 holes in and 400 * blksize for files we want
+# 100 holes in. This keeps the runtime down as low as possible.
+#
+_do_test 1 50 "-l `expr 200 \* $blksize` -c 50 -b $blksize"
+_do_test 2 100 "-l `expr 400 \* $blksize` -c 100 -b $blksize"
+_do_test 3 100 "-l `expr 400 \* $blksize` -c 100 -b 512"   # test partial blocks
+
+# rinse, lather, repeat for direct IO
+_do_test 4 50 "-d -l `expr 200 \* $blksize` -c 50 -b $blksize"
+_do_test 5 100 "-d -l `expr 400 \* $blksize` -c 100 -b $blksize"
+
+# todo: realtime.
+
+# success, all done
+exit

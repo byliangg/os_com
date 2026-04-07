@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 SUSE Linux Products GmbH.  All Rights Reserved.
+#
+# FS QA Test No. 043
+#
+# Test file timestamps are only precise to seconds with 128-byte inodes."
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+
+_require_scratch
+_require_test_program "t_get_file_time"
+
+echo "Silence is golden"
+
+echo "Start test timestamps with 128 inode size one device $SCRATCH_DEV" >$seqres.full
+_scratch_mkfs -I 128 >> $seqres.full 2>&1
+_scratch_mount
+
+touch "${SCRATCH_MNT}/tmp_file"
+
+atime=`$here/src/t_get_file_time $SCRATCH_MNT/tmp_file atime nsec`
+mtime=`$here/src/t_get_file_time $SCRATCH_MNT/tmp_file mtime nsec`
+ctime=`$here/src/t_get_file_time $SCRATCH_MNT/tmp_file ctime nsec`
+
+if [ $atime -ne 0 -o $mtime -ne 0 -o $ctime -ne 0 ]; then
+       echo "nsec should be zero when extended timestamps are disabled"
+       echo "atime: $atime, mtime: $mtime, ctime: $ctime"
+fi
+
+status=0
+exit

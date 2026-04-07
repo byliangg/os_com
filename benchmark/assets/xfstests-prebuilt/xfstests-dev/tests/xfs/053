@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 053
+#
+# Ensure that xfs_repair can properly spot SGI_ACL_FILE
+# and SGI_ACL_DEFAULT in the root attr namespace.
+#
+# Due to bugs here and there, we sometimes matched on partial
+# strings with those names, and threw off xfs_repair.
+#
+. ./common/preamble
+_begin_fstest attr acl repair quick auto
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+_require_scratch
+_require_attrs
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# Create root attr names which are substrings or superstrings
+# of the reserved ACL names, and make sure xfs_repair copes.
+
+# Due to various bugs, either the compared length was shorter
+# than the reserved name (7 chars), so substrings matched, and/or only
+# the reserved name length was compared, so superstrings matched.
+
+rm -f $SCRATCH_MNT/$seq.*
+
+# actual reserved names:
+#           SGI_ACL_FILE	SGI_ACL_DEFAULT
+for NAME in SGI_ACL \
+	    SGI_ACL_F		SGI_ACL_D \
+	    SGI_ACL_FILE_FOO	SGI_ACL_DEFAULT_FOO; do
+	touch $SCRATCH_MNT/${seq}.${NAME}
+	$ATTR_PROG -R -s $NAME -V "Wow, such $NAME" $SCRATCH_MNT/$seq.$NAME \
+		| _filter_scratch
+done
+
+# Older repair failed because it sees the above names as matching
+# SGI_ACL_FILE / SGI_ACL_DEFAULT but w/o valid acls on them
+
+# The test harness will catch this (false positive) corruption
+
+# success, all done
+status=0
+exit

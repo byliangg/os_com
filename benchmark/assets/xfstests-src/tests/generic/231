@@ -1,0 +1,93 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 231
+#
+# Run fsx with quotas enabled and verify accounted quotas in the end
+#
+# Derived from test 127
+. ./common/preamble
+_begin_fstest auto quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+FSX_FILE_SIZE=64000000
+FSX_ARGS="-q -l $FSX_FILE_SIZE -o 65536 -N 20000"
+
+_fsx()
+{
+	tasks=$1
+	echo "=== FSX Standard Mode, Memory Mapping, $tasks Tasks ==="
+	for (( i = 1; i <= $tasks; i++ )); do
+		SEED=$RANDOM
+		# The absolute path $here might not be traversable (+x) for
+		# $qa_user, so supply a relative path to fsx here.
+		echo "ltp/fsx $FSX_ARGS -S $SEED $SCRATCH_MNT/fsx_file$i" >>$seqres.full
+		_su $qa_user -c "ltp/fsx $FSX_ARGS -S $SEED \
+			$FSX_AVOID $SCRATCH_MNT/fsx_file$i" >$tmp.output$i 2>&1 &
+	done
+
+	for (( i = 1; i <= $tasks; i++ )); do
+		if ! wait %$i; then
+			cat $tmp.output$i | tee -a $seqres.full
+			wait
+			return 1
+		fi
+		$XFS_IO_PROG -c 'fsync' $SCRATCH_MNT/fsx_file$i
+		cat $tmp.output$i | tee -a $seqres.full
+	done
+	return 0
+}
+
+_require_scratch
+_require_quota
+_require_user
+
+_scratch_mkfs >> $seqres.full 2>&1
+_qmount_option "usrquota,grpquota"
+_qmount
+
+if ! _fsx 1; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+if ! _check_quota_usage; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+if ! _fsx 4; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+if ! _check_quota_usage; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+#flush cache after write
+FSX_ARGS="-f $FSX_ARGS"
+if ! _fsx 1; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+if ! _check_quota_usage; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+_scratch_unmount 2>/dev/null
+status=0
+exit

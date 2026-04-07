@@ -1,0 +1,103 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Facebook.  All Rights Reserved.
+#
+# FS QA Test 219
+#
+# Test a variety of stale device usecases.  We cache the device and generation
+# to make sure we do not allow stale devices, which can end up with some wonky
+# behavior for loop back devices.
+# And, added a few other test cases so it's clear what we expect to happen
+# currently.
+#
+
+. ./common/preamble
+_begin_fstest auto quick volume
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+
+	# The variables are set before the test case can fail.
+	$UMOUNT_PROG ${loop_mnt1} &> /dev/null
+	$UMOUNT_PROG ${loop_mnt2} &> /dev/null
+	rm -rf $loop_mnt1
+	rm -rf $loop_mnt2
+
+	[ ! -z $loop_dev1 ] && _destroy_loop_device $loop_dev1
+	[ ! -z $loop_dev1 ] && _destroy_loop_device $loop_dev2
+
+	rm -f $fs_img1
+	rm -f $fs_img2
+
+	_btrfs_rescan_devices
+}
+
+. ./common/filter
+
+
+loop_mnt1=$TEST_DIR/$seq/mnt1
+loop_mnt2=$TEST_DIR/$seq/mnt2
+fs_img1=$TEST_DIR/$seq/img1
+fs_img2=$TEST_DIR/$seq/img2
+loop_dev1=""
+loop_dev2=""
+
+_require_test
+_require_loop
+_require_btrfs_fs_sysfs
+_require_btrfs_forget_or_module_loadable
+_fixed_by_kernel_commit 5f58d783fd78 \
+	"btrfs: free device in btrfs_close_devices for a single device filesystem"
+
+mkdir -p $loop_mnt1
+mkdir -p $loop_mnt2
+
+$XFS_IO_PROG -f -c "truncate 256m" $fs_img1 >>$seqres.full 2>&1
+
+_mkfs_dev $fs_img1 >>$seqres.full 2>&1
+cp $fs_img1 $fs_img2
+
+loop_dev1=`_create_loop_device $fs_img1`
+loop_dev2=`_create_loop_device $fs_img2`
+
+# Normal single device case, should pass just fine
+_mount $loop_dev1 $loop_mnt1 > /dev/null  2>&1 || \
+	_fail "Couldn't do initial mount"
+$UMOUNT_PROG $loop_mnt1
+
+_btrfs_forget_or_module_reload
+
+# Now mount the new version again to get the higher generation cached, umount
+# and try to mount the old version.  Mount the new version again just for good
+# measure.
+_mount $loop_dev1 $loop_mnt1 > /dev/null 2>&1 || \
+	_fail "Failed to mount the second time"
+$UMOUNT_PROG $loop_mnt1
+
+_mount $loop_dev2 $loop_mnt2 > /dev/null 2>&1 || \
+	_fail "We couldn't mount the old generation"
+$UMOUNT_PROG $loop_mnt2
+
+_mount $loop_dev1 $loop_mnt1 > /dev/null 2>&1 || \
+	_fail "Failed to mount the second time"
+$UMOUNT_PROG $loop_mnt1
+
+# Now try mount them at the same time, if kernel does not support
+# temp-fsid feature then mount will fail.
+_btrfs_forget_or_module_reload
+
+_mount $loop_dev1 $loop_mnt1 > /dev/null 2>&1 || \
+	_fail "Failed to mount the third time"
+if ! _has_btrfs_sysfs_feature_attr temp_fsid; then
+	_mount $loop_dev2 $loop_mnt2 > /dev/null 2>&1 && \
+		_fail "We were allowed to mount when we should have failed"
+fi
+
+_btrfs_rescan_devices
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 240
+#
+# Test that non-block-aligned aio+dio into holes does not leave
+# zero'd out portions of the file
+#
+# QEMU IO to a file-backed device with misaligned partitions
+# can send this sort of IO
+#
+# This test need only be run in the case where the logical block size
+# of the device can be smaller than the file system block size.
+#
+. ./common/preamble
+_begin_fstest auto aio quick rw
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_sparse_files
+_require_aiodio aiodio_sparse2
+
+echo "Silence is golden."
+
+
+rm -f $TEST_DIR/aiodio_sparse
+
+logical_block_size=`$here/src/min_dio_alignment $TEST_DIR $TEST_DEV`
+fs_block_size=`_get_block_size $TEST_DIR`
+file_size=$((8 * $fs_block_size))
+
+if [ $fs_block_size -le $logical_block_size ]; then
+	_notrun "fs block size must be larger than the device block size.  fs block size: $fs_block_size, device block size: $logical_block_size"
+fi
+
+# 2 threads, fs block sized writes, filesize, stride through file by
+# fs block size, start at logical block size offset
+$AIO_TEST -i 2 -w $fs_block_size -s $file_size -n $fs_block_size -o $logical_block_size "$TEST_DIR/aiodio_sparse"
+
+status=$?
+exit

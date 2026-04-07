@@ -1,0 +1,77 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 178
+#
+# Reproduce PV#:967665
+# Test if mkfs.xfs wipes old AG headers when using -f option
+#
+. ./common/preamble
+_begin_fstest mkfs other auto
+
+filter_repair() {
+	_filter_repair | sed \
+		-e '/unable to verify superblock, continuing/d' \
+		-e '/found candidate secondary superblock/d' \
+		-e '/error reading superblock.*-- seek to offset/d'
+}
+
+# dd the 1st sector then repair
+_dd_repair_check()
+{
+	#dd first sector
+	dd if=/dev/zero of=$1 bs=$2 count=1 2>&1 | _filter_dd
+	#xfs_repair
+	_scratch_xfs_repair 2>&1 | filter_repair
+	#check repair
+	if _check_scratch_fs; then
+        	echo "repair passed"
+	else
+	        echo "repair failed!"
+	fi
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/repair
+
+
+# Modify as appropriate.
+
+# From the PV
+# o Summary of testing:
+#    1. mkfs.xfs a default filesystem, note agcount value.
+#    2. dd zero first sector and repair and verify.
+#    3. mkfs.xfs overriding agcount to a smaller value
+#             (ie. each AG is bigger)
+#    4. dd zero first sector, repair and verify.
+#          -> old mkfs.xfs will cause repair to incorrectly
+#             fix filesystem, new mkfs.xfs will be fine.
+
+_require_scratch
+_scratch_xfs_force_no_metadir
+_scratch_mkfs_xfs | _filter_mkfs 2>$tmp.mkfs
+
+# By executing the followint tmp file, will get on the mkfs options stored in
+# variables
+. $tmp.mkfs
+
+# if the default agcount is too small, bump it up and re-mkfs before testing
+if [ $agcount -lt 8 ]; then
+	agcount=8
+	_try_scratch_mkfs_xfs -dagcount=$agcount >/dev/null 2>&1 \
+	        || _notrun "Test requires at least 8 AGs."
+fi
+
+_dd_repair_check $SCRATCH_DEV $sectsz
+
+# smaller AGCOUNT
+let "agcount=$agcount-2"
+_scratch_mkfs_xfs -dagcount=$agcount >/dev/null 2>&1
+
+_dd_repair_check $SCRATCH_DEV $sectsz
+
+# success, all done
+status=0
+exit

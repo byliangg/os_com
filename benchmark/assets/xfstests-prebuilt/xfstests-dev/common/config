@@ -1,0 +1,931 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003,2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# setup and check for config parameters, and in particular
+#
+# EMAIL -           email of the script runner.
+# TEST_DIR -        scratch test directory that is in an already
+#                   mounted XFS file system, needs to be be world
+#                   writeable
+# TEST_DEV -        device for file system containing TEST_DIR
+#
+# and optionally:
+# SCRATCH_DEV -     device you can make a scratch file system on
+# SCRATCH_MNT -     mount point for scratch file system
+# SCRATCH_LOGDEV -  scratch log device for external log testing
+# SCRATCH_RTDEV -   scratch rt dev
+# TEST_LOGDEV -     test log device for external log testing
+# TEST_RTDEV -      test rt dev
+# TAPE_DEV -        the tape device for the xfsdump tests
+# RMT_TAPE_DEV -    the remote tape device for the xfsdump tests
+# RMT_IRIXTAPE_DEV- the IRIX remote tape device for the xfsdump tests
+# RMT_TAPE_USER -   remote user for tape device
+# SELINUX_MOUNT_OPTIONS - Options to use when SELinux is enabled.
+# KEEP_DMESG -      whether to keep all dmesg for each test case.
+#                   yes: keep all dmesg
+#                   no: only keep dmesg with error/warning (default)
+# CANON_DEVS -      whether or not to canonicalize device symlinks
+#                   yes: canonicalize device symlinks
+#                   no (default) do not canonicalize device if they are symlinks
+#
+# - These can be added to $HOST_CONFIG_DIR (witch default to ./config)
+#   below or a separate local configuration file can be used (using
+#   the HOST_OPTIONS variable).
+# - This script is shared by the stress test system and the auto-qa
+#   system
+# - TEST_DEV & TEST_DIR must be assigned.
+# - this script shouldn't make any assertions about filesystem
+#   validity or mountedness.
+#
+
+# all tests should use a common language setting to prevent golden
+# output mismatches.
+export LANG=C
+export LC_ALL=C
+
+PATH=".:$PATH"
+
+export HOST=`hostname -s`
+test `uname -s` = "Linux" || _fatal "fstests only supports Linux"
+
+export MODULAR=0               # using XFS as a module or not
+export BOOT="/boot"            # install target for kernels
+export EXTRA=${EXTRA:=xfs-qa}
+
+# general parameters (mainly for auto-qa)
+export SOAK_PROC=3             # -p option to fsstress
+export SOAK_STRESS=10000       # -n option to fsstress
+export SOAK_PASSES=-1          # count of repetitions of fsstress (while soaking)
+export EMAIL=root@localhost    # where auto-qa will send its status messages
+
+export HOST_OPTIONS=${HOST_OPTIONS:=local.config}
+export CHECK_OPTIONS=${CHECK_OPTIONS:="-g auto"}
+export BENCH_PASSES=${BENCH_PASSES:=5}
+export TIME_FACTOR=${TIME_FACTOR:=1}
+export LOAD_FACTOR=${LOAD_FACTOR:=1}
+export SOAK_DURATION=${SOAK_DURATION:=}
+export DEBUGFS_MNT=${DEBUGFS_MNT:="/sys/kernel/debug"}
+
+# some constants for overlayfs setup
+export OVL_UPPER="ovl-upper"
+export OVL_LOWER="ovl-lower"
+export OVL_WORK="ovl-work"
+# overlay mount point parent must be the base fs root
+export OVL_MNT="ovl-mnt"
+# By default unionmount-testsuite is expected under src
+export UNIONMOUNT_TESTSUITE=${UNIONMOUNT_TESTSUITE:=$here/src/unionmount-testsuite}
+
+# From e2fsprogs/e2fsck/e2fsck.h:
+# Exit code used by fsck-type programs
+export FSCK_OK=0
+export FSCK_NONDESTRUCT=1
+export FSCK_REBOOT=2
+export FSCK_UNCORRECTED=4
+export FSCK_ERROR=8
+export FSCK_USAGE=16
+export FSCK_CANCELED=32
+export FSCK_LIBRARY=128
+
+export PWD=`pwd`
+#export DEBUG=${DEBUG:=...} # arbitrary CFLAGS really.
+export MALLOCLIB=${MALLOCLIB:=/usr/lib/libefence.a}
+export LOCAL_CONFIGURE_OPTIONS=${LOCAL_CONFIGURE_OPTIONS:=--enable-readline=yes}
+
+export RECREATE_TEST_DEV=${RECREATE_TEST_DEV:=false}
+
+# Handle mkfs.$fstyp which does (or does not) require -f to overwrite
+set_mkfs_prog_path_with_opts()
+{
+	local fstyp=$1
+	local p=$(type -P mkfs.$fstyp)
+
+	# Note: mkfs.f2fs doesn't support the --help option yet, but it doesn't
+	# matter since it also prints the help when an invalid option is given.
+	if [ "$p" != "" ] && \
+		$p --help |& grep -q "[[:space:]]-f[[:space:]|,]"; then
+		echo "$p -f"
+	else
+		echo $p
+	fi
+}
+
+export MKFS_PROG="$(type -P mkfs)"
+[ "$MKFS_PROG" = "" ] && _fatal "mkfs not found"
+
+export MOUNT_PROG="$(type -P mount)"
+[ "$MOUNT_PROG" = "" ] && _fatal "mount not found"
+
+export UMOUNT_PROG="$(type -P umount)"
+[ "$UMOUNT_PROG" = "" ] && _fatal "umount not found"
+
+export FSSTRESS_PROG="$here/ltp/fsstress"
+[ ! -x $FSSTRESS_PROG ] && _fatal "fsstress not found or executable"
+
+export FSX_PROG="$here/ltp/fsx"
+[ ! -x $FSX_PROG ] && _fatal "fsx not found or executable"
+
+export PERL_PROG="$(type -P perl)"
+[ "$PERL_PROG" = "" ] && _fatal "perl not found"
+
+export AWK_PROG="$(type -P awk)"
+[ "$AWK_PROG" = "" ] && _fatal "awk not found"
+
+export SED_PROG="$(type -P sed)"
+[ "$SED_PROG" = "" ] && _fatal "sed not found"
+
+export BC_PROG="$(type -P bc)"
+[ "$BC_PROG" = "" ] && _fatal "bc not found"
+
+export PS_ALL_FLAGS="-ef"
+
+export DF_PROG="$(type -P df)"
+[ "$DF_PROG" = "" ] && _fatal "df not found"
+export DF_PROG="$DF_PROG -T -P"	# Linux
+
+export XFS_IO_PROG="$(type -P xfs_io)"
+[ "$XFS_IO_PROG" = "" ] && _fatal "xfs_io not found"
+
+export MKSWAP_PROG="$(type -P mkswap)"
+# mkswap from util-linux v2.17.2 or older needs "-f" option to force to erase
+# bootbits sectors
+MKSWAP_PROG="$MKSWAP_PROG -f"
+
+export XFS_LOGPRINT_PROG="$(type -P xfs_logprint)"
+export XFS_PROTOFILE_PROG="$(type -P xfs_protofile)"
+export XFS_REPAIR_PROG="$(type -P xfs_repair)"
+export XFS_DB_PROG="$(type -P xfs_db)"
+export XFS_METADUMP_PROG="$(type -P xfs_metadump)"
+export XFS_MDRESTORE_PROG="$(type -P xfs_mdrestore)"
+export XFS_ADMIN_PROG="$(type -P xfs_admin)"
+export XFS_GROWFS_PROG=$(type -P xfs_growfs)
+export XFS_SPACEMAN_PROG="$(type -P xfs_spaceman)"
+export XFS_SCRUB_PROG="$(type -P xfs_scrub)"
+export XFS_PARALLEL_REPAIR_PROG="$(type -P xfs_prepair)"
+export XFS_PARALLEL_REPAIR64_PROG="$(type -P xfs_prepair64)"
+export __XFSDUMP_PROG="$(type -P xfsdump)"
+if [ -n "$__XFSDUMP_PROG" ]; then
+	export XFSDUMP_PROG="$__XFSDUMP_PROG -e"
+else
+	export XFSDUMP_PROG=""
+fi
+export XFSRESTORE_PROG="$(type -P xfsrestore)"
+export XFSINVUTIL_PROG="$(type -P xfsinvutil)"
+export GETFATTR_PROG="$(type -P getfattr)"
+export SETFATTR_PROG="$(type -P setfattr)"
+export CHACL_PROG="$(type -P chacl)"
+export ATTR_PROG="$(type -P attr)"
+export QUOTA_PROG="$(type -P quota)"
+export XFS_QUOTA_PROG="$(type -P xfs_quota)"
+export INDENT_PROG="$(type -P indent)"
+export XFS_COPY_PROG="$(type -P xfs_copy)"
+export FSTRIM_PROG="$(type -P fstrim)"
+export DUMPE2FS_PROG="$(type -P dumpe2fs)"
+export RESIZE2FS_PROG="$(type -P resize2fs)"
+export FIO_PROG="$(type -P fio)"
+export FILEFRAG_PROG="$(type -P filefrag)"
+export E4DEFRAG_PROG="$(type -P e4defrag)"
+export LOGGER_PROG="$(type -P logger)"
+export DBENCH_PROG="$(type -P dbench)"
+export DMSETUP_PROG="$(type -P dmsetup)"
+export WIPEFS_PROG="$(type -P wipefs)"
+export BLKDISCARD_PROG="$(type -P blkdiscard)"
+export DUMP_PROG="$(type -P dump)"
+export RESTORE_PROG="$(type -P restore)"
+export LVM_PROG="$(type -P lvm)"
+export LSATTR_PROG="$(type -P lsattr)"
+export CHATTR_PROG="$(type -P chattr)"
+export DEBUGFS_PROG="$(type -P debugfs)"
+export UUIDGEN_PROG="$(type -P uuidgen)"
+export KEYCTL_PROG="$(type -P keyctl)"
+export XZ_PROG="$(type -P xz)"
+export LZ4_PROG="$(type -P lz4)"
+export FLOCK_PROG="$(type -P flock)"
+export LDD_PROG="$(type -P ldd)"
+export TIMEOUT_PROG="$(type -P timeout)"
+export MAN_PROG="$(type -P man)"
+export NFS4_SETFACL_PROG="$(type -P nfs4_setfacl)"
+export NFS4_GETFACL_PROG="$(type -P nfs4_getfacl)"
+export UBIUPDATEVOL_PROG="$(type -P ubiupdatevol)"
+export THIN_CHECK_PROG="$(type -P thin_check)"
+export PYTHON3_PROG="$(type -P python3)"
+export SQLITE3_PROG="$(type -P sqlite3)"
+export SETCAP_PROG="$(type -P setcap)"
+export GETCAP_PROG="$(type -P getcap)"
+export CAPSH_PROG="$(type -P capsh)"
+export CHECKBASHISMS_PROG="$(type -P checkbashisms)"
+export XFS_INFO_PROG="$(type -P xfs_info)"
+export DUPEREMOVE_PROG="$(type -P duperemove)"
+export CC_PROG="$(type -P cc)"
+export FSVERITY_PROG="$(type -P fsverity)"
+export OPENSSL_PROG="$(type -P openssl)"
+export ACCTON_PROG="$(type -P accton)"
+export E2IMAGE_PROG="$(type -P e2image)"
+export BLKZONE_PROG="$(type -P blkzone)"
+export GZIP_PROG="$(type -P gzip)"
+export BTRFS_IMAGE_PROG="$(type -P btrfs-image)"
+export BTRFS_MAP_LOGICAL_PROG=$(type -P btrfs-map-logical)
+export PARTED_PROG="$(type -P parted)"
+export XFS_PROPERTY_PROG="$(type -P xfs_property)"
+export FSCRYPTCTL_PROG="$(type -P fscryptctl)"
+
+# udev wait functions.
+#
+# This is how we wait for udev to create or remove device nodes after running a
+# device create/remove command for logical volumes (e.g. lvm or dm).
+#
+# We can wait for the udev queue to empty via "settling". This, however, has
+# major issues when running tests in parallel - the udev queue takes a long time
+# to reach empty state. Hence if we have udev > 2.51 installed we use device
+# waiting instead. This waits for the device node to appear/disappear rather
+# than waiting for the udev queue to empty.
+#
+# If none of these methods are available, fall back to a simple delay (sleep 1)
+# and hope this is sufficient.
+UDEVADM_PROG="$(type -P udevadm)"
+if [ -z "$UDEVADM_PROG" ]; then
+	UDEV_SETTLE_PROG="$(type -P udevsettle)"
+else
+	UDEV_SETTLE_PROG="$UDEVADM_PROG settle"
+	$UDEVADM_PROG help | grep -q "Wait for device or device symlink"
+	if [ $? -eq 0 ]; then
+		UDEV_WAIT_PROG="$UDEVADM_PROG wait"
+	fi
+fi
+
+# neither command is available, use sleep 1
+#
+# Udev events are sent via netlink to userspace through
+# kobject_uevent_net_broadcast(), and udev in userspace is in charge of
+# handling the events. The command `udevadm settle` just checks if
+# /run/udev/queue is 0, however, a kernel without CONFIG_NET will have
+# kobject_uevent_net_broadcast() be a no-op, and so /run/udev/queue may not
+# exist or always be 0. We check for /proc/net to see CONFIG_NET was enabled.
+if [[ "$UDEV_SETTLE_PROG" == "" || ! -d /proc/net ]]; then
+	UDEV_SETTLE_PROG="sleep 1"
+	unset UDEV_WAIT_PROG
+fi
+export UDEV_SETTLE_PROG
+export UDEVADM_PROG
+export UDEV_WAIT_PROG
+
+# Set MODPROBE_PATIENT_RM_TIMEOUT_SECONDS to "forever" if you want the patient
+# modprobe removal to run forever trying to remove a module.
+MODPROBE_REMOVE_PATIENT=""
+modprobe --help >& /dev/null && modprobe --help 2>&1 | grep -q -1 "remove-patiently"
+if [[ $? -ne 0 ]]; then
+	if [[ -z "$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS" ]]; then
+		# We will open code our own implementation of patient module
+		# remover in fstests. Use a 50 second default.
+		export MODPROBE_PATIENT_RM_TIMEOUT_SECONDS="50"
+	fi
+else
+	MODPROBE_RM_PATIENT_TIMEOUT_ARGS=""
+	if [[ ! -z "$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS" ]]; then
+		if [[ "$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS" != "forever" ]]; then
+			MODPROBE_PATIENT_RM_TIMEOUT_MS="$((MODPROBE_PATIENT_RM_TIMEOUT_SECONDS * 1000))"
+			MODPROBE_RM_PATIENT_TIMEOUT_ARGS="-t $MODPROBE_PATIENT_RM_TIMEOUT_MS"
+		fi
+	else
+		# We export MODPROBE_PATIENT_RM_TIMEOUT_SECONDS here for parity
+		# with environments without support for modprobe -p, but we
+		# only really need it exported right now for environments which
+		# don't have support for modprobe -p to implement our own
+		# patient module removal support within fstests.
+		export MODPROBE_PATIENT_RM_TIMEOUT_SECONDS="50"
+		MODPROBE_PATIENT_RM_TIMEOUT_MS="$((MODPROBE_PATIENT_RM_TIMEOUT_SECONDS * 1000))"
+		MODPROBE_RM_PATIENT_TIMEOUT_ARGS="-t $MODPROBE_PATIENT_RM_TIMEOUT_MS"
+	fi
+	MODPROBE_REMOVE_PATIENT="modprobe -p $MODPROBE_RM_PATIENT_TIMEOUT_ARGS"
+fi
+export MODPROBE_REMOVE_PATIENT
+
+export MKFS_XFS_PROG=$(type -P mkfs.xfs)
+export MKFS_EXT4_PROG=$(type -P mkfs.ext4)
+export MKFS_UDF_PROG=$(type -P mkudffs)
+export MKFS_BTRFS_PROG=$(set_mkfs_prog_path_with_opts btrfs)
+export MKFS_F2FS_PROG=$(set_mkfs_prog_path_with_opts f2fs)
+export DUMP_F2FS_PROG=$(type -P dump.f2fs)
+export F2FS_IO_PROG=$(type -P f2fs_io)
+export F2FS_INJECT_PROG=$(type -P inject.f2fs)
+export F2FS_FSCK_PROG=$(type -P fsck.f2fs)
+export BTRFS_UTIL_PROG=$(type -P btrfs)
+export BTRFS_SHOW_SUPER_PROG=$(type -P btrfs-show-super)
+export BTRFS_CONVERT_PROG=$(type -P btrfs-convert)
+export BTRFS_TUNE_PROG=$(type -P btrfstune)
+export BTRFS_CORRUPT_BLOCK_PROG=$(type -P btrfs-corrupt-block)
+export XFS_FSR_PROG=$(type -P xfs_fsr)
+export MKFS_NFS_PROG="false"
+export MKFS_AFS_PROG="false"
+export MKFS_CIFS_PROG="false"
+export MKFS_OVERLAY_PROG="false"
+export MKFS_REISER4_PROG=$(type -P mkfs.reiser4)
+export E2FSCK_PROG=$(type -P e2fsck)
+export TUNE2FS_PROG=$(type -P tune2fs)
+export FSCK_OVERLAY_PROG=$(type -P fsck.overlay)
+export MKFS_BCACHEFS_PROG=$(set_mkfs_prog_path_with_opts bcachefs)
+
+# SELinux adds extra xattrs which can mess up our expected output.
+# So, mount with a context, and they won't be created.
+#
+# Since the context= option only accepts contexts defined in the SELinux
+# policy, and different systems may have different policies with
+# different context names, use the context of an existing directory.
+# Assume that any valid context is fine, since xfstests should really
+# only be run from an "unconfined" process, or with SELinux in permissive
+# mode.  But if not, just specify your own SELINUX_MOUNT_OPTIONS.
+if [ -x /usr/sbin/selinuxenabled ] && /usr/sbin/selinuxenabled; then
+	: ${SELINUX_MOUNT_OPTIONS:="-o context=$(stat -c %C /)"}
+	export SELINUX_MOUNT_OPTIONS
+fi
+
+_common_mount_opts()
+{
+	case $FSTYP in
+	9p)
+		echo $PLAN9_MOUNT_OPTIONS
+		;;
+	fuse)
+		echo $FUSE_MOUNT_OPTIONS
+		;;
+	xfs)
+		echo $XFS_MOUNT_OPTIONS
+		;;
+	udf)
+		echo $UDF_MOUNT_OPTIONS
+		;;
+	nfs)
+		echo $NFS_MOUNT_OPTIONS
+		;;
+	afs)
+		echo $AFS_MOUNT_OPTIONS
+		;;
+	cifs)
+		echo $CIFS_MOUNT_OPTIONS
+		;;
+	ceph)
+		echo $CEPHFS_MOUNT_OPTIONS
+		;;
+	glusterfs)
+		echo $GLUSTERFS_MOUNT_OPTIONS
+		;;
+	overlay)
+		echo $OVERLAY_MOUNT_OPTIONS
+		;;
+	ext2|ext3|ext4)
+		# acls & xattrs aren't turned on by default on ext$FOO
+		echo "-o acl,user_xattr $EXT_MOUNT_OPTIONS"
+		;;
+	f2fs)
+		echo "-o acl,user_xattr $F2FS_MOUNT_OPTIONS"
+		;;
+       reiser4)
+		# acls & xattrs aren't supported by reiser4
+		echo $REISER4_MOUNT_OPTIONS
+		;;
+	gfs2)
+		# acls aren't turned on by default on gfs2
+		echo "-o acl $GFS2_MOUNT_OPTIONS"
+		;;
+	tmpfs)
+		# We need to specify the size at mount, use 1G by default
+		echo "-o size=1G $TMPFS_MOUNT_OPTIONS"
+		;;
+	ubifs)
+		echo $UBIFS_MOUNT_OPTIONS
+		;;
+	*)
+		;;
+	esac
+}
+
+_mount_opts()
+{
+	export MOUNT_OPTIONS=$(_common_mount_opts)
+}
+
+_test_mount_opts()
+{
+	export TEST_FS_MOUNT_OPTS=$(_common_mount_opts)
+}
+
+_mkfs_opts()
+{
+	case $FSTYP in
+	xfs)
+		export MKFS_OPTIONS=$XFS_MKFS_OPTIONS
+		;;
+	udf)
+		[ ! -z "$udf_fsize" ] && \
+			UDF_MKFS_OPTIONS="$UDF_MKFS_OPTIONS -s $udf_fsize"
+		export MKFS_OPTIONS=$UDF_MKFS_OPTIONS
+		;;
+	nfs)
+		export MKFS_OPTIONS=$NFS_MKFS_OPTIONS
+		;;
+	afs)
+		export MKFS_OPTIONS=$AFS_MKFS_OPTIONS
+		;;
+	cifs)
+		export MKFS_OPTIONS=$CIFS_MKFS_OPTIONS
+		;;
+	ceph)
+		export MKFS_OPTIONS=$CEPHFS_MKFS_OPTIONS
+		;;
+       reiser4)
+		export MKFS_OPTIONS=$REISER4_MKFS_OPTIONS
+		;;
+	gfs2)
+		export MKFS_OPTIONS="$GFS2_MKFS_OPTIONS -O -p lock_nolock"
+		;;
+	jfs)
+		export MKFS_OPTIONS="$JFS_MKFS_OPTIONS -q"
+		;;
+	f2fs)
+		export MKFS_OPTIONS="$F2FS_MKFS_OPTIONS"
+		;;
+	btrfs)
+		export MKFS_OPTIONS="$BTRFS_MKFS_OPTIONS"
+		;;
+	bcachefs)
+		export MKFS_OPTIONS=$BCACHEFS_MKFS_OPTIONS
+		;;
+	*)
+		;;
+	esac
+}
+
+_fsck_opts()
+{
+	case $FSTYP in
+	ext2|ext3|ext4)
+		export FSCK_OPTIONS="-nf"
+		;;
+	reiser*)
+		export FSCK_OPTIONS="--yes"
+		;;
+	f2fs)
+		export FSCK_OPTIONS=""
+		;;
+	*)
+		export FSCK_OPTIONS="-n"
+		;;
+	esac
+}
+
+# check necessary running dependences then source sepcific fs helpers
+_source_specific_fs()
+{
+	local fs=$1
+
+	if [ -z "$fs" ];then
+		fs=$FSTYP
+	fi
+
+	case "$fs" in
+	xfs)
+		[ "$XFS_LOGPRINT_PROG" = "" ] && _fatal "xfs_logprint not found"
+		[ "$XFS_REPAIR_PROG" = "" ] && _fatal "xfs_repair not found"
+		[ "$XFS_DB_PROG" = "" ] && _fatal "xfs_db not found"
+		[ "$MKFS_XFS_PROG" = "" ] && _fatal "mkfs_xfs not found"
+		[ "$XFS_INFO_PROG" = "" ] && _fatal "xfs_info not found"
+
+		. ./common/xfs
+		;;
+	udf)
+		[ "$MKFS_UDF_PROG" = "" ] && _fatal "mkfs_udf/mkudffs not found"
+		;;
+	btrfs)
+		[ "$MKFS_BTRFS_PROG" = "" ] && _fatal "mkfs.btrfs not found"
+
+		. ./common/btrfs
+		;;
+	ext4)
+		[ "$MKFS_EXT4_PROG" = "" ] && _fatal "mkfs.ext4 not found"
+		. ./common/ext4
+		;;
+	ext2|ext3)
+		. ./common/ext4
+		;;
+	f2fs)
+		[ "$MKFS_F2FS_PROG" = "" ] && _fatal "mkfs.f2fs not found"
+		. ./common/f2fs
+		;;
+	nfs)
+		. ./common/nfs
+		;;
+	afs)
+		;;
+	cifs)
+		;;
+	9p)
+		;;
+	fuse)
+		;;
+	ceph)
+		. ./common/ceph
+		;;
+	glusterfs)
+		;;
+	overlay)
+		. ./common/overlay
+		;;
+	reiser4)
+		[ "$MKFS_REISER4_PROG" = "" ] && _fatal "mkfs.reiser4 not found"
+		;;
+	pvfs2)
+		;;
+	ubifs)
+		[ "$UBIUPDATEVOL_PROG" = "" ] && _fatal "ubiupdatevol not found"
+		. ./common/ubifs
+		;;
+	esac
+}
+
+known_hosts()
+{
+	[ "$HOST_CONFIG_DIR" ] || HOST_CONFIG_DIR=`pwd`/configs
+
+	[ -f /etc/xfsqa.config ]             && export HOST_OPTIONS=/etc/xfsqa.config
+	[ -f $HOST_CONFIG_DIR/$HOST ]        && export HOST_OPTIONS=$HOST_CONFIG_DIR/$HOST
+	[ -f $HOST_CONFIG_DIR/$HOST.config ] && export HOST_OPTIONS=$HOST_CONFIG_DIR/$HOST.config
+}
+
+# Returns a list of sections in config file
+# Each section starts with the section name in the format
+# [section_name1]. Only alphanumeric characters and '_' is allowed
+# in the section name otherwise the section will not be resognised.
+# Section name must be contained between square brackets.
+get_config_sections() {
+	sed -n -e "s/^\[\([[:alnum:]_-]*\)\]/\1/p" < $1
+}
+
+if [ ! -f "$HOST_OPTIONS" ]; then
+	known_hosts
+fi
+
+export HOST_OPTIONS_SECTIONS="-no-sections-"
+export OPTIONS_HAVE_SECTIONS=false
+if [ -f "$HOST_OPTIONS" ]; then
+	export HOST_OPTIONS_SECTIONS=`get_config_sections $HOST_OPTIONS`
+	if [ -z "$HOST_OPTIONS_SECTIONS" ]; then
+		. $HOST_OPTIONS
+		export HOST_OPTIONS_SECTIONS="-no-sections-"
+	else
+		export OPTIONS_HAVE_SECTIONS=true
+	fi
+fi
+
+_check_device()
+{
+	local name=$1
+	local dev_needed=$2
+	local dev=$3
+
+	if [ -z "$dev" ]; then
+		if [ "$dev_needed" == "required" ]; then
+			_fatal "common/config: $name is required but not defined!"
+		fi
+		return 0
+	fi
+
+	if [ -b "$dev" ] || ( echo $dev | grep -qE ":|//" ); then
+		# block device or a network url
+		return 0
+	fi
+
+	case "$FSTYP" in
+	9p|fuse|tmpfs|virtiofs|afs)
+		# 9p, fuse, virtiofs and afs mount tags are just plain strings,
+		# so anything is allowed tmpfs doesn't use mount source, ignore
+		;;
+	ceph)
+		# ceph has two different possible syntaxes for mount devices. The
+		# network URL check above catches the legacy syntax. Check for the
+		# new-style syntax here.
+		if ( echo $dev | grep -qEv "=/" ); then
+			_fatal "common/config: $name ($dev) is not a valid ceph mount string"
+		fi
+		;;
+	overlay)
+		if [ ! -d "$dev" ]; then
+			_fatal "common/config: $name ($dev) is not a directory for overlay"
+		fi
+		;;
+	ubifs)
+		if [ ! -c "$dev" ]; then
+			_fatal "common/config: $name ($dev) is not a character device"
+		fi
+		;;
+	ceph-fuse)
+		;;
+	*)
+		_fatal "common/config: $name ($dev) is not a block device or a network filesystem"
+	esac
+}
+
+# check and return a canonical mount point path
+_canonicalize_mountpoint()
+{
+	local name=$1
+	local dir=$2
+
+	if [ -d "$dir" ]; then
+		# this follows symlinks and removes all trailing "/"s
+		readlink -e "$dir"
+		return 0
+	fi
+
+	if [ "$FSTYP" != "overlay" ] || [[ "$name" == OVL_BASE_* ]]; then
+		_fatal "common/config: $name ($dir) is not a directory"
+	fi
+
+	# base fs may not be mounted yet, so just check that parent dir
+	# exists (where base fs will be mounted) because we are going to
+	# mkdir the overlay mount point dir anyway
+	local base=`basename $dir`
+	local parent=`dirname $dir`
+	parent=`_canonicalize_mountpoint OVL_BASE_$name "$parent"`
+
+	# prepend the overlay mount point to canonical parent path
+	echo "$parent/$base"
+}
+
+# Enables usage of /dev/disk/by-id/ symlinks to persist target devices
+# over reboots
+_canonicalize_devices()
+{
+	if [ "$CANON_DEVS" != "yes" ]; then
+		return
+	fi
+	[ -L "$TEST_DEV" ]	&& TEST_DEV=$(readlink -e "$TEST_DEV")
+	[ -L "$SCRATCH_DEV" ]	&& SCRATCH_DEV=$(readlink -e "$SCRATCH_DEV")
+	[ -L "$TEST_LOGDEV" ]	&& TEST_LOGDEV=$(readlink -e "$TEST_LOGDEV")
+	[ -L "$TEST_RTDEV" ]	&& TEST_RTDEV=$(readlink -e "$TEST_RTDEV")
+	[ -L "$SCRATCH_RTDEV" ]	&& SCRATCH_RTDEV=$(readlink -e "$SCRATCH_RTDEV")
+	[ -L "$LOGWRITES_DEV" ]	&& LOGWRITES_DEV=$(readlink -e "$LOGWRITES_DEV")
+	if [ ! -z "$SCRATCH_DEV_POOL" ]; then
+		local NEW_SCRATCH_POOL=""
+		for i in $SCRATCH_DEV_POOL; do
+			if [ -L $i ]; then
+				NEW_SCRATCH_POOL="$NEW_SCRATCH_POOL $(readlink -e $i)"
+			else
+				NEW_SCRATCH_POOL="$NEW_SCRATCH_POOL $i"
+			fi
+		done
+		SCRATCH_DEV_POOL="$NEW_SCRATCH_POOL"
+	fi
+}
+
+# On check -overlay, for the non multi section config case, this
+# function is called on every test, before init_rc().
+# When SCRATCH/TEST_* vars are defined in config file, config file
+# is sourced on every test and this function overrides the vars
+# every time.
+# When SCRATCH/TEST_* vars are defined in evironment and not
+# in config file, this function is called after vars have already
+# been overriden in the previous test.
+# In that case, TEST_DEV is a directory and not a blockdev/chardev and
+# the function will return without overriding the SCRATCH/TEST_* vars.
+_overlay_config_override()
+{
+	# There are 2 options for configuring overlayfs tests:
+	#
+	# 1. (legacy) SCRATCH/TEST_DEV point to existing directories
+	#    on an already mounted fs.  In this case, the new
+	#    OVL_BASE_SCRATCH/TEST_* vars are set to use the legacy
+	#    vars values (even though they may not be mount points).
+	#
+	[ ! -d "$TEST_DEV" ] || export OVL_BASE_TEST_DIR="$TEST_DEV"
+	[ ! -d "$SCRATCH_DEV" ] || export OVL_BASE_SCRATCH_MNT="$SCRATCH_DEV"
+
+	# Config file may specify base fs type, but we obay -overlay flag
+	[ "$FSTYP" == overlay ] || export OVL_BASE_FSTYP="$FSTYP"
+	export FSTYP=overlay
+
+	# 2. SCRATCH/TEST_DEV point to the base fs partitions.  In this case,
+	#    the new OVL_BASE_SCRATCH/TEST_DEV/MNT vars are set to the values
+	#    of the configured base fs and SCRATCH/TEST_DEV vars are set to the
+	#    overlayfs base and mount dirs inside base fs mount.
+	[ -b "$TEST_DEV" ] || [ -c "$TEST_DEV" ] || [ "$OVL_BASE_FSTYP" == tmpfs ] || return 0
+
+	# Store original base fs vars
+	export OVL_BASE_TEST_DEV="$TEST_DEV"
+	export OVL_BASE_TEST_DIR="$TEST_DIR"
+	# If config does not set MOUNT_OPTIONS, its value may be
+	# leftover from previous _overlay_config_override, so
+	# don't use that value for base fs mount
+	[ "$MOUNT_OPTIONS" != "$OVERLAY_MOUNT_OPTIONS" ] || unset MOUNT_OPTIONS
+	export OVL_BASE_MOUNT_OPTIONS="$MOUNT_OPTIONS"
+
+	# Set TEST vars to overlay base and mount dirs inside base fs
+	export TEST_DEV="$OVL_BASE_TEST_DIR"
+	export TEST_DIR="$OVL_BASE_TEST_DIR/$OVL_MNT"
+	export MOUNT_OPTIONS="$OVERLAY_MOUNT_OPTIONS"
+
+	[ -b "$SCRATCH_DEV" ] || [ -c "$SCRATCH_DEV" ] || [ "$OVL_BASE_FSTYP" == tmpfs ] || return 0
+
+	# Store original base fs vars
+	export OVL_BASE_SCRATCH_DEV="$SCRATCH_DEV"
+	export OVL_BASE_SCRATCH_MNT="$SCRATCH_MNT"
+
+	# Set SCRATCH vars to overlay base and mount dirs inside base fs
+	export SCRATCH_DEV="$OVL_BASE_SCRATCH_MNT"
+	export SCRATCH_MNT="$OVL_BASE_SCRATCH_MNT/$OVL_MNT"
+
+	# Set fsck options, use default if user not set directly.
+	export FSCK_OPTIONS="$OVERLAY_FSCK_OPTIONS"
+	[ -z "$FSCK_OPTIONS" ] && _fsck_opts
+	export IDMAPPED_MOUNTS="$IDMAPPED_MOUNTS"
+}
+
+_overlay_config_restore()
+{
+	export OVERLAY=true
+	[ -z "$OVL_BASE_FSTYP" ] || export FSTYP=$OVL_BASE_FSTYP
+	[ -z "$OVL_BASE_TEST_DEV" ] || export TEST_DEV=$OVL_BASE_TEST_DEV
+	[ -z "$OVL_BASE_TEST_DIR" ] || export TEST_DIR=$OVL_BASE_TEST_DIR
+	[ -z "$OVL_BASE_SCRATCH_DEV" ] || export SCRATCH_DEV=$OVL_BASE_SCRATCH_DEV
+	[ -z "$OVL_BASE_SCRATCH_MNT" ] || export SCRATCH_MNT=$OVL_BASE_SCRATCH_MNT
+	[ -z "$OVL_BASE_MOUNT_OPTIONS" ] || export MOUNT_OPTIONS=$OVL_BASE_MOUNT_OPTIONS
+}
+
+# Parse config section options. This function will parse all the configuration
+# within a single section which name is passed as an argument. For section
+# name format see comments in get_config_sections().
+# Empty lines and everything after '#' will be ignored.
+# Configuration options should be defined in the format
+#
+# CONFIG_OPTION=value
+#
+# This 'CONFIG_OPTION' variable and will be exported as an environment variable.
+parse_config_section() {
+	SECTION=$1
+	if ! $OPTIONS_HAVE_SECTIONS; then
+		return 0
+	fi
+	eval `sed -e 's/[[:space:]]*\=[[:space:]]*/=/g' \
+		-e 's/#.*$//' \
+		-e 's/[[:space:]]*$//' \
+		-e 's/^[[:space:]]*//' \
+		-e "s/^\([^=]*\)=\"\?'\?\([^\"']*\)\"\?'\?$/export \1=\"\2\"/" \
+		< $HOST_OPTIONS \
+		| sed -n -e "/^\[$SECTION\]/,/^\s*\[/{/^[^#].*\=.*/p;}"`
+}
+
+get_next_config() {
+	if [ ! -z "$CONFIG_INCLUDED" ] && ! $OPTIONS_HAVE_SECTIONS; then
+		return 0
+	fi
+
+	# We might have overriden FSTYP and TEST/SCRATCH vars with overlay values
+	# in the previous section, so restore them to original values stored in
+	# OVL_BASE_*.
+	# We need to do this *before* old FSTYP and MOUNT_OPTIONS are recorded
+	# and *before* SCRATCH_DEV and MOUNT_OPTIONS are unset
+	if [ "$FSTYP" == "overlay" ]; then
+		_overlay_config_restore
+	fi
+
+	local OLD_FSTYP=$FSTYP
+	local OLD_MOUNT_OPTIONS=$MOUNT_OPTIONS
+	local OLD_TEST_FS_MOUNT_OPTS=$TEST_FS_MOUNT_OPTS
+	local OLD_MKFS_OPTIONS=$MKFS_OPTIONS
+	local OLD_FSCK_OPTIONS=$FSCK_OPTIONS
+	local OLD_USE_EXTERNAL=$USE_EXTERNAL
+
+	unset MOUNT_OPTIONS
+	unset TEST_FS_MOUNT_OPTS
+	unset MKFS_OPTIONS
+	unset FSCK_OPTIONS
+	unset USE_EXTERNAL
+
+	# We might have deduced SCRATCH_DEV from the SCRATCH_DEV_POOL in the previous
+	# run, so we have to unset it now.
+	if [ "$SCRATCH_DEV_NOT_SET" == "true" ]; then
+		unset SCRATCH_DEV
+	fi
+
+	parse_config_section $1
+	if [ ! -z "$OLD_FSTYP" ] && [ $OLD_FSTYP != $FSTYP ]; then
+		[ -z "$MOUNT_OPTIONS" ] && _mount_opts
+		[ -z "$TEST_FS_MOUNT_OPTS" ] && _test_mount_opts
+		[ -z "$MKFS_OPTIONS" ] && _mkfs_opts
+		[ -z "$FSCK_OPTIONS" ] && _fsck_opts
+
+		# clear the external devices if we are not using them
+		if [ -z "$USE_EXTERNAL" ]; then
+			unset TEST_RTDEV
+			unset TEST_LOGDEV
+			unset SCRATCH_RTDEV
+			unset SCRATCH_LOGDEV
+		fi
+	else
+		[ -z "$MOUNT_OPTIONS" ] && export MOUNT_OPTIONS=$OLD_MOUNT_OPTIONS
+		[ -z "$TEST_FS_MOUNT_OPTS" ] && export TEST_FS_MOUNT_OPTS=$OLD_TEST_FS_MOUNT_OPTS
+		[ -z "$MKFS_OPTIONS" ] && export MKFS_OPTIONS=$OLD_MKFS_OPTIONS
+		[ -z "$FSCK_OPTIONS" ] && export FSCK_OPTIONS=$OLD_FSCK_OPTIONS
+		[ -z "$USE_EXTERNAL" ] && export USE_EXTERNAL=$OLD_USE_EXTERNAL
+	fi
+
+	# set default RESULT_BASE
+	if [ -z "$RESULT_BASE" ]; then
+		export RESULT_BASE="$here/results/"
+	fi
+
+	if [ "$FSTYP" == "tmpfs" ]; then
+		if [ -z "$TEST_DEV" ]; then
+			export TEST_DEV=tmpfs_test
+		fi
+		if [ -z "$SCRATCH_DEV" ]; then
+			export TEST_DEV=tmpfs_scratch
+		fi
+	fi
+
+	#  Mandatory Config values.
+	MC=""
+	[ -z "$EMAIL" ]          && MC="$MC EMAIL"
+	[ -z "$TEST_DIR" ]       && MC="$MC TEST_DIR"
+	[ -z "$TEST_DEV" ]       && MC="$MC TEST_DEV"
+
+	if [ -n "$MC" ]; then
+		echo "Warning: need to define parameters for host $HOST"
+		echo "       or set variables:"
+		echo "       $MC"
+		_exit 1
+	fi
+
+	_check_device TEST_DEV required $TEST_DEV
+	export TEST_DIR=`_canonicalize_mountpoint TEST_DIR $TEST_DIR`
+
+	# a btrfs tester will set only SCRATCH_DEV_POOL, we will put first of its dev
+	# to SCRATCH_DEV and rest to SCRATCH_DEV_POOL to maintain the backward compatibility
+	if [ ! -z "$SCRATCH_DEV_POOL" ]; then
+		if [ ! -z "$SCRATCH_DEV" ]; then
+			echo "common/config: Error: \$SCRATCH_DEV ($SCRATCH_DEV) should be unset when \$SCRATCH_DEV_POOL ($SCRATCH_DEV_POOL) is set"
+			_exit 1
+		fi
+		SCRATCH_DEV=`echo $SCRATCH_DEV_POOL | awk '{print $1}'`
+		export SCRATCH_DEV
+		export SCRATCH_DEV_NOT_SET=true
+	fi
+
+	_check_device SCRATCH_DEV optional $SCRATCH_DEV
+	export SCRATCH_MNT=`_canonicalize_mountpoint SCRATCH_MNT $SCRATCH_MNT`
+
+	if [ -n "$USE_EXTERNAL" ]; then
+		_check_device TEST_RTDEV optional $TEST_RTDEV
+		_check_device TEST_LOGDEV optional $TEST_LOGDEV
+		_check_device SCRATCH_RTDEV optional $SCRATCH_RTDEV
+		_check_device SCRATCH_LOGDEV optional $SCRATCH_LOGDEV
+	fi
+
+	# Override FSTYP from config when running ./check -overlay
+	# and maybe override base fs TEST/SCRATCH_DEV with overlay base dirs.
+	# We need to do this *after* default mount options are set by base FSTYP
+	# and *after* SCRATCH_DEV is deduced from SCRATCH_DEV_POOL
+	if [ "$OVERLAY" == "true" -o "$FSTYP" == "overlay" ]; then
+		_overlay_config_override
+	fi
+}
+
+if [ -z "$CONFIG_INCLUDED" ]; then
+	get_next_config `echo $HOST_OPTIONS_SECTIONS | cut -f1 -d" "`
+	export CONFIG_INCLUDED=true
+
+	# Autodetect fs type based on what's on $TEST_DEV unless it's been set
+	# externally
+	if [ -z "$FSTYP" ] && [ ! -z "$TEST_DEV" ]; then
+		FSTYP=`blkid -c /dev/null -s TYPE -o value $TEST_DEV`
+	fi
+	FSTYP=${FSTYP:=xfs}
+	export FSTYP
+	[ -z "$MOUNT_OPTIONS" ] && _mount_opts
+	[ -z "$TEST_FS_MOUNT_OPTS" ] && _test_mount_opts
+	[ -z "$MKFS_OPTIONS" ] && _mkfs_opts
+	[ -z "$FSCK_OPTIONS" ] && _fsck_opts
+else
+	# We get here for the non multi section case, on every test that sources
+	# common/rc after re-sourcing the HOST_OPTIONS config file.
+	# Because of this re-sourcing, we need to re-canonicalize the configured
+	# mount points and re-override TEST/SCRATCH_DEV overlay vars.
+
+	# canonicalize the mount points
+	# this follows symlinks and removes all trailing "/"s
+	export TEST_DIR=`_canonicalize_mountpoint TEST_DIR $TEST_DIR`
+	export SCRATCH_MNT=`_canonicalize_mountpoint SCRATCH_MNT $SCRATCH_MNT`
+
+	# Override FSTYP from config when running ./check -overlay
+	# and maybe override base fs TEST/SCRATCH_DEV with overlay base dirs
+	if [ "$OVERLAY" == "true" -o "$FSTYP" == "overlay" ]; then
+		_overlay_config_override
+	fi
+fi
+
+_canonicalize_devices
+# mkfs.xfs checks for TEST_DEV before permitting < 300M filesystems. TEST_DIR
+# and QA_CHECK_FS are also checked by mkfs.xfs, but already exported elsewhere.
+export TEST_DEV
+
+# make sure this script returns success
+/bin/true

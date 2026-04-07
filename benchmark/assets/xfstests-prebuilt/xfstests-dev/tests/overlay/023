@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 023
+#
+# The "work" directory in an overlyfs workdir should not inherit
+# ACL attrs from workdir.
+# Kernel commits below fix it.
+#   c11b9fdd6a61 ovl: remove posix_acl_default from workdir
+#   e1ff3dd1ae52 ovl: fix workdir creation
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick attr perms
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+# Modify as appropriate.
+_require_acls
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# setting acls before mount
+wkdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+mkdir -p $wkdir
+setfacl -d -m o::rwx $wkdir
+
+_scratch_mount
+
+# getting acls, ACL set on workdir should be cleaned
+getfacl -n -p $wkdir/work 2>&1 | _filter_scratch | _filter_ovl_dirs
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,105 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Huawei.  All Rights Reserved.
+#
+# FS QA Test No. 056
+#
+# Test fsck.overlay how to deal with impure xattr in overlayfs.
+#
+. ./common/preamble
+_begin_fstest auto quick fsck
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch_nocheck
+_require_attrs trusted
+_require_command "$FSCK_OVERLAY_PROG" fsck.overlay
+
+OVL_XATTR_IMPURE_VAL=y
+
+# remove all files from previous tests
+_scratch_mkfs
+
+# Create a redirect directory
+make_redirect_dir()
+{
+	local target=$1
+	local value=$2
+
+	mkdir -p $target
+	$SETFATTR_PROG -n $OVL_XATTR_REDIRECT -v $value $target
+}
+
+# Remove impure xattr
+remove_impure()
+{
+	local target=$1
+
+	$SETFATTR_PROG -x $OVL_XATTR_IMPURE $target
+}
+
+# Check impure xattr
+check_impure()
+{
+	local target=$1
+
+	value=$(_getfattr --absolute-names --only-values -n \
+		$OVL_XATTR_IMPURE $target)
+
+	[[ "$value" == "$OVL_XATTR_IMPURE_VAL" ]] || echo "Missing impure xattr"
+}
+
+# Create test directories
+lowerdir=$OVL_BASE_SCRATCH_MNT/lower
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+
+make_test_dirs()
+{
+	rm -rf $lowerdir $lowerdir2 $upperdir $workdir
+	mkdir -p $lowerdir $lowerdir2 $upperdir $workdir
+}
+
+# Test missing impure xattr in directory which has origin targets, should fix
+echo "+ Missing impure"
+make_test_dirs
+mkdir $lowerdir/{testdir1,testdir2}
+mkdir $upperdir/{testdir1,testdir2}
+touch $lowerdir/testdir1/foo
+mkdir $lowerdir/testdir2/subdir
+_overlay_scratch_mount_dirs $lowerdir $upperdir $workdir
+touch $SCRATCH_MNT/testdir1/foo
+touch $SCRATCH_MNT/testdir2/subdir
+$UMOUNT_PROG $SCRATCH_MNT
+remove_impure $upperdir/testdir1
+remove_impure $upperdir/testdir2
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_impure $upperdir/testdir1
+check_impure $upperdir/testdir2
+
+# Test missing impure xattr in directory which has redirect directories,
+# should fix
+echo "+ Missing impure(2)"
+make_test_dirs
+mkdir $lowerdir/origin
+make_redirect_dir $upperdir/testdir/subdir "/origin"
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_impure $upperdir/testdir
+
+# Test missing impure xattr in directory which has merge directories,
+# should fix
+echo "+ Missing impure(3)"
+make_test_dirs
+mkdir $lowerdir/testdir $upperdir/testdir
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_impure $upperdir
+
+# success, all done
+status=0
+exit

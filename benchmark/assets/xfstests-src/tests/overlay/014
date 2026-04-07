@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 014
+#
+# Test copy-up of lowerdir with opaque xattr set.
+#
+# When copying up a directory with opaque xattr set, the xattr was copied up as
+# well, after a remount the opaque flag is honored so the copied-up directory
+# is treated as opaque, which causes files created in the lowerdir to be hidden
+# when using multiple lower directories.
+#
+# This is fixed by "ovl: don't copy up opaqueness".
+#
+. ./common/preamble
+_begin_fstest auto quick copyup
+
+# Import common functions.
+. ./common/filter
+
+_fixed_by_kernel_commit 0956254a2d5b "ovl: don't copy up opaqueness"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create multiple lowerdirs and upperdir, workdir, and testdir on lowerdir
+lowerdir1=$OVL_BASE_SCRATCH_MNT/lower1
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+# When overlay inode index feature is enabled, a workdir cannot be reused
+# with a different upperdir. workdir2 in this test is used as the workdir
+# when lowerdir2 is used as the upperdir.
+workdir2=$OVL_BASE_SCRATCH_MNT/workdir2
+mkdir -p $lowerdir1 $lowerdir2 $upperdir $workdir $workdir2
+mkdir -p $lowerdir1/testdir/d
+
+# mount overlay with $lowerdir2 as upperdir, and remove & recreate testdir,
+# make testdir on $lowerdir2 opaque
+_overlay_scratch_mount_dirs $lowerdir1 $lowerdir2 $workdir2
+rm -rf $SCRATCH_MNT/testdir
+mkdir -p $SCRATCH_MNT/testdir/visibledir
+# unmount overlayfs but not base fs
+$UMOUNT_PROG $SCRATCH_MNT
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir1 $lowerdir2 $workdir2
+
+# mount overlay again, with lowerdir1 and lowerdir2 as multiple lowerdirs,
+# and create a new file in testdir, triggers copyup from lowerdir,
+# copyup should not copy overlayfs private xattr
+_overlay_scratch_mount_dirs "$lowerdir2:$lowerdir1" $upperdir $workdir
+touch $SCRATCH_MNT/testdir/visiblefile
+
+# umount and mount overlay again, buggy kernel treats the copied-up dir as
+# opaque, visibledir is not seen in merged dir.
+$UMOUNT_PROG $SCRATCH_MNT
+_overlay_scratch_mount_dirs "$lowerdir2:$lowerdir1" $upperdir $workdir
+ls $SCRATCH_MNT/testdir
+
+# check overlayfs
+_overlay_check_scratch_dirs "$lowerdir2:$lowerdir1" $upperdir $workdir
+
+# success, all done
+status=0
+exit

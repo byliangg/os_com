@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2019 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 179
+#
+# Test if btrfs will lockup at subvolume deletion when qgroups are enabled.
+#
+# This bug is going to be fixed by a patch for the kernel titled
+# "btrfs: qgroup: Don't trigger backref walk at delayed ref insert time".
+#
+. ./common/preamble
+_begin_fstest auto qgroup dangerous
+
+. ./common/filter
+
+_require_scratch
+
+# default sleep interval
+sleep_time=1
+
+# stress test runtime
+runtime=120
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+mkdir -p "$SCRATCH_MNT/snapshots"
+$BTRFS_UTIL_PROG subvolume create "$SCRATCH_MNT/src" > /dev/null
+$BTRFS_UTIL_PROG quota enable "$SCRATCH_MNT" > /dev/null
+_qgroup_rescan "$SCRATCH_MNT" > /dev/null
+
+fill_workload()
+{
+	trap "wait; exit" SIGTERM
+	local i=0
+	while true; do
+		_pwrite_byte 0xcd 0 8K "$SCRATCH_MNT/src/large_$i" > /dev/null
+		_pwrite_byte 0xcd 0 2K "$SCRATCH_MNT/src/inline_$i" > /dev/null
+
+		# Randomly remove some files for every 5 loop
+		if [ $(( $i % 5 )) -eq 0 ]; then
+			victim=$(_random_file "$SCRATCH_MNT/src")
+			rm "$victim"
+		fi
+		i=$((i + 1))
+	done
+}
+
+snapshot_workload()
+{
+	trap "wait; exit" SIGTERM
+	local i=0
+	while true; do
+		sleep $sleep_time
+		$BTRFS_UTIL_PROG subvolume snapshot "$SCRATCH_MNT/src" \
+			"$SCRATCH_MNT/snapshots/$i" > /dev/null
+		i=$((i + 1))
+	done
+}
+
+delete_workload()
+{
+	trap "wait; exit" SIGTERM
+	while true; do
+		sleep $((sleep_time * 2))
+		victim=$(_random_file "$SCRATCH_MNT/snapshots")
+		if [ -z "$victim" ]; then
+			# No snapshots available, sleep and retry later.
+			continue
+		fi
+		$BTRFS_UTIL_PROG subvolume delete "$victim" > /dev/null
+	done
+}
+
+fill_workload &
+fill_pid=$!
+
+sleep $((sleep_time * 2))
+snapshot_workload &
+snapshot_pid=$!
+delete_workload &
+delete_pid=$!
+
+sleep $runtime
+kill $fill_pid
+wait $fill_pid
+kill $snapshot_pid
+wait $snapshot_pid
+kill $delete_pid
+wait $delete_pid
+
+# By the async nature of qgroup tree scan and subvolume delete, the latest
+# qgroup counts at the time of umount might not be upto date, if it isn't
+# then the check will report the difference in count. The difference in
+# qgroup counts are anyway updated in the following mount, so it is not a
+# real issue that this test case is trying to verify. So make sure the
+# qgroup counts are in sync before unmount happens.
+
+$BTRFS_UTIL_PROG subvolume sync $SCRATCH_MNT >> $seqres.full
+
+# success, all done
+echo "Silence is golden"
+
+status=0
+exit

@@ -1,0 +1,68 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# common functions for setting up and tearing down a dmdelay device
+
+DELAY_NONE=0
+DELAY_READ=1
+
+export DELAY_NAME="delay-test.$seq"
+
+_init_delay()
+{
+	local BLK_DEV_SIZE=`blockdev --getsz $SCRATCH_DEV`
+	DELAY_DEV=/dev/mapper/$DELAY_NAME
+	DELAY_TABLE="0 $BLK_DEV_SIZE delay $SCRATCH_DEV 0 0"
+	DELAY_TABLE_RDELAY="0 $BLK_DEV_SIZE delay $SCRATCH_DEV 0 10000 $SCRATCH_DEV 0 0"
+	_dmsetup_create $DELAY_NAME --table "$DELAY_TABLE" || \
+		_fatal "failed to create delay device"
+}
+
+_mount_delay()
+{
+	_scratch_options mount
+	$MOUNT_PROG -t $FSTYP `_common_dev_mount_options` $SCRATCH_OPTIONS \
+		$DELAY_DEV $SCRATCH_MNT
+}
+
+_unmount_delay()
+{
+	_unmount $SCRATCH_MNT
+}
+
+_cleanup_delay()
+{
+	# If dmsetup load fails then we need to make sure to do resume here
+	# otherwise the umount will hang
+	$DMSETUP_PROG resume $DELAY_NAME > /dev/null 2>&1
+	_unmount $SCRATCH_MNT > /dev/null 2>&1
+	_dmsetup_remove $DELAY_NAME
+}
+
+# _load_delay_table <table> [lockfs]
+#
+# This defaults to --nolockfs, which doesn't freeze_fs() before loading the new
+# table
+_load_delay_table()
+{
+	table="$DELAY_TABLE"
+	[ $1 -eq $DELAY_READ ] && table="$DELAY_TABLE_RDELAY"
+
+	suspend_opt="--nolockfs"
+	[ $# -gt 1 ] && [ $2 -eq 1 ] && suspend_opt=""
+
+	# run a suspend/resume cycle to avoid excessive resume delays once a
+	# delay is introduced below
+	$DMSETUP_PROG suspend $suspend_opt $DELAY_NAME
+	$DMSETUP_PROG resume $suspend_opt $DELAY_NAME
+
+	$DMSETUP_PROG suspend $suspend_opt $DELAY_NAME
+	[ $? -ne 0 ] && _fatal "failed to suspend delay-test"
+
+	$DMSETUP_PROG load $DELAY_NAME --table "$table"
+	[ $? -ne 0 ] && _fatal "failed to load table into delay-test"
+
+	$DMSETUP_PROG resume $DELAY_NAME
+	[ $? -ne 0 ] && _fatal  "failed to resume delay-test"
+}

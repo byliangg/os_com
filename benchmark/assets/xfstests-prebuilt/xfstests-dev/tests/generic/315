@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 315
+#
+# fallocate/truncate tests with FALLOC_FL_KEEP_SIZE option.
+# Verify if the disk space is released after truncating a file back
+# to the old smaller size.  Before Linux 3.10, Btrfs/OCFS2 are test
+# failed in this case.
+#
+. ./common/preamble
+_begin_fstest auto quick rw prealloc
+
+status=0	# success is the default!
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_xfs_io_command "falloc" "-k"
+
+echo "Slience is golden"
+
+# Check the current avaliable disk space on $TEST_DIR.
+# 1024KiB at least
+avail_begin=`df -P $TEST_DIR | awk 'END {print $4}'`
+[ "$avail_begin" -ge 1024 ] || _notrun "Test device is too small ($avail_begin KiB)"
+
+# Preallocate half size of the available disk space to a file
+# starts from offset 0 with FALLOC_FL_KEEP_SIZE option on the
+# test file system.
+$XFS_IO_PROG -f -c 'falloc -k 0 $(($avail_begin/2))' \
+	$TEST_DIR/testfile.$seq >>$seqres.full 2>&1
+
+# Verify the file size, it should keep unchanged as 0 in this case
+fsize=`_get_filesize $TEST_DIR/testfile.$seq`
+[ "$fsize" -eq 0 ] || _fail "File size is changed to ($fsize Bytes)"
+
+# Truncate the file size back to 0
+truncate -s 0 $TEST_DIR/testfile.$seq
+_test_sync
+
+# Preallocated disk space should be released
+avail_done=`df -P $TEST_DIR | awk 'END {print $4}'`
+_within_tolerance "df" $avail_done $avail_begin 1%
+[ $? -eq 0 ] || _fail "Available disk space ($avail_done KiB) wanted ($avail_begin KiB)"
+
+# success, all done
+exit

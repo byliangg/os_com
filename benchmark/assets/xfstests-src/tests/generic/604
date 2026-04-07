@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Facebook  All Rights Reserved.
+#
+# FS QA Test 604
+#
+# Evicting dirty inodes can take a long time during umount.
+# Check that a new mount racing with such a delayed umount succeeds.
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Import common functions.
+. ./common/filter
+
+# Overlayfs does not allow mounting over again with the same layers
+# until umount is fully completed, so is not appropriate for this test.
+_exclude_fs overlay
+
+# Modify as appropriate.
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+for i in $(seq 0 500); do
+	$XFS_IO_PROG -f -c "pwrite 0 4K" $SCRATCH_MNT/$i >/dev/null
+done
+# Delay the mount attempt by a small amount in the hope that the mount() call
+# will try to lock s_umount /after/ umount has already taken it.
+_scratch_unmount &
+sleep 0.01s ; _scratch_mount
+wait
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

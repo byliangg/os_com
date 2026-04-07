@@ -1,0 +1,97 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 156
+#
+# Ensure that fallocate on reflinked files actually CoWs the shared blocks.
+#   - Record fs block usage (0)
+#   - Create a file and some reflink copies
+#   - Record fs block usage (1)
+#   - funshare half of one of the copies
+#   - Record fs block usage (2)
+#   - funshare all of the copies
+#   - Record fs block usage (3)
+#   - rewrite the original file
+#   - Record fs block usage (4)
+#   - Compare fs block usage of 0-4 to ensure that block usage behaves as
+#     we expect.
+#
+# "funshare" refers to fallocate copy-on-writing the shared blocks
+#
+. ./common/preamble
+_begin_fstest auto quick clone unshare
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+_require_xfs_io_command "funshare"
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_block_size $testdir)"
+blks=2000
+margin='15%'
+sz=$((blksz * blks))
+free_blocks0=$(stat -f $testdir -c '%f')
+nr=4
+filesize=$((blksz * nr))
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+_test_cycle_mount
+
+echo "Create the reflink copies"
+for i in `seq 2 $nr`; do
+	_cp_reflink $testdir/file1 $testdir/file$i
+done
+_test_cycle_mount
+free_blocks1=$(stat -f $testdir -c '%f')
+
+echo "funshare part of a file"
+$XFS_IO_PROG -f -c "funshare 0 $((sz / 2))" $testdir/file2
+_test_cycle_mount
+
+echo "funshare some of the copies"
+$XFS_IO_PROG -f -c "funshare 0 $sz" $testdir/file2
+$XFS_IO_PROG -f -c "funshare 0 $sz" $testdir/file3
+_test_cycle_mount
+free_blocks2=$(stat -f $testdir -c '%f')
+
+echo "funshare the rest of the files"
+$XFS_IO_PROG -f -c "funshare 0 $sz" $testdir/file4
+$XFS_IO_PROG -f -c "funshare 0 $sz" $testdir/file1
+_test_cycle_mount
+free_blocks3=$(stat -f $testdir -c '%f')
+
+echo "Rewrite the original file"
+_pwrite_byte 0x65 0 $sz $testdir/file1 >> $seqres.full
+_test_cycle_mount
+free_blocks4=$(stat -f $testdir -c '%f')
+#echo $free_blocks0 $free_blocks1 $free_blocks2 $free_blocks3 $free_blocks4
+
+_within_tolerance "free blocks after reflinking" $free_blocks1 $((free_blocks0 - blks)) $margin -v
+
+_within_tolerance "free blocks after nocow'ing some copies" $free_blocks2 $((free_blocks1 - (2 * blks))) $margin -v
+
+_within_tolerance "free blocks after nocow'ing all copies" $free_blocks3 $((free_blocks2 - blks)) $margin -v
+
+_within_tolerance "free blocks after overwriting original" $free_blocks4 $free_blocks3 $margin -v
+
+_within_tolerance "free blocks after all tests" $free_blocks4 $((free_blocks0 - (4 * blks))) $margin -v
+
+# success, all done
+status=0
+exit

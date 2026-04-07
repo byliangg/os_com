@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 394
+#
+# Make sure fs honors file size resource limit.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	ulimit -f unlimited
+	rm -f $tmp.* $TEST_DIR/$seq.*
+}
+
+# Import common functions.
+. ./common/filter
+
+# need a wrapper function so "File size limit exceeded" message can be filtered
+do_truncate()
+{
+	$XFS_IO_PROG -fc "truncate $1" $2
+}
+
+_require_test
+
+# set max file size to 1G (in block number of 1k blocks), so it should be big
+# enough to let test run without bringing any trouble to test harness
+ulimit -f $((1024 * 1024))
+# default action to SIGXFSZ is coredump, limit core file size to 0 to avoid
+# such core files after each test run
+ulimit -c 0
+
+# exercise file size limit boundaries
+do_truncate $((1024 * 1024 * 1024 - 1))	$TEST_DIR/$seq.$$-1
+do_truncate $((1024 * 1024 * 1024))	$TEST_DIR/$seq.$$
+do_truncate $((1024 * 1024 * 1024 + 1))	$TEST_DIR/$seq.$$+1 2>&1 | \
+	grep -o "File size limit exceeded"
+
+# success, all done
+status=0
+exit

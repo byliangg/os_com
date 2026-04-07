@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 382
+#
+# When default quota is set, all different quota types inherits the
+# same default value, include group quota. So if a user quota limit
+# larger than the default user quota value, it will still be limited
+# by the group default quota value.
+#
+# There's a patch from Upstream can fix this bug:
+#
+#    [PATCH] xfs: Split default quota limits by quota type V4
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_xfs_quota_foreign
+_require_user
+_require_group
+
+do_test()
+{
+	local qname=$1
+	local type
+
+	if [ "$qname" = "user" ];then
+		type="-u"
+		echo "=== user quota test ==="
+	elif [ "$qname" = "group" ];then
+		type="-g"
+		echo "=== group quota test ==="
+	else
+		echo "wrong quota type name - $qname"
+		return 1
+	fi
+
+	$XFS_QUOTA_PROG -x -c "limit bsoft=20M bhard=20M isoft=20 ihard=20 $type -d" $SCRATCH_MNT
+	$XFS_QUOTA_PROG -x -c "limit bsoft=40M bhard=40M isoft=40 ihard=40 $type fsgqa" $SCRATCH_MNT
+	echo "$qname blocks and inode limit"
+	$XFS_QUOTA_PROG -x -c "report $type -N -bi" $SCRATCH_MNT | grep -v ^root | _filter_spaces
+
+	## blocks default quota test ##
+	_user_do "$XFS_IO_PROG -f -c \"pwrite 0 30M\" -c \"fsync\" $SCRATCH_MNT/data" | _filter_xfs_io
+
+	rm -f ${SCRATCH_MNT}/* >/dev/null 2>&1
+
+	## inode default quota test ##
+	for ((i=0; i<30; i++));do
+		_user_do "echo -n > ${SCRATCH_MNT}/file${i}"
+	done
+	_scratch_sync
+
+	rm -f ${SCRATCH_MNT}/* >/dev/null 2>&1
+}
+
+### user default quota test ###
+_scratch_mkfs >/dev/null 2>&1
+_qmount_option "usrquota,grpquota"
+_qmount
+
+do_test user
+
+### group default quota test ###
+_scratch_unmount
+_scratch_mkfs >/dev/null 2>&1
+_qmount_option "grpquota,usrquota"
+_qmount
+
+do_test group
+
+# success, all done
+status=0
+exit

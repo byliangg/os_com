@@ -1,0 +1,25 @@
+# test\treason
+# Static exclusions for phase4-good scope.
+# Keep this conservative: only exclude cases that are clearly out of current
+# stage4-part1 target or require unavailable dependencies/tooling.
+
+generic/002	hardlink semantics out of phase4_part1 scope
+generic/004	O_TMPFILE/flink support out of phase4_part1 scope
+generic/005	symlink support out of phase4_part1 scope
+generic/007	heavy nametest stress deferred to later stability rounds
+generic/011	heavy dirstress concurrency deferred to later rounds
+generic/014	sparse truncation stress deferred to later rounds
+generic/017	fallocate collapse-range support out of phase4_part1 scope
+generic/021	fpunch/fcollapse/fiemap semantics out of phase4_part1 scope
+generic/022	delalloc + collapse-range semantics out of phase4_part1 scope
+generic/023	symlink support out of phase4_part1 scope
+generic/024	renameat2 semantics out of phase4_part1 scope
+generic/026	chacl/xattr tooling dependency out of phase4_part1 scope
+generic/027	scratch size requirement exceeds current part1 test image
+generic/029	mmap+truncate stress with xfs_io dependency out of phase4_part1 scope
+generic/031	fcollapse stress with xfs_io dependency out of phase4_part1 scope
+generic/032	unwritten-extent stress with xfs_io dependency out of phase4_part1 scope
+generic/063	finsert/fpunch/fiemap semantics out of phase4_part1 scope
+generic/069	O_APPEND heavy stress deferred to later rounds
+generic/071	fallocate prealloc behavior out of phase4_part1 scope
+generic/086	unwritten/delayed extent stress out of phase4_part1 scope

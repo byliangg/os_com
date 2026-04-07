@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 312
+#
+# ENOSPC in fallocate(2) could corrupt ext4 when file size > 4G
+#
+# Regression test for commit
+# 29ae07b ext4: Fix overflow caused by missing cast in ext4_fallocate()
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc enospc
+
+# Import common functions.
+. ./common/filter
+
+_require_xfs_io_command "falloc"
+_require_scratch
+
+# 5G in byte
+fssize=$((2**30 * 5))
+
+_scratch_mkfs_sized $fssize >>$seqres.full 2>&1
+_scratch_mount >>$seqres.full 2>&1
+
+echo "Silence is golden"
+
+# fallocate(2) a 6G(> 4G) file on a 5G fs
+$XFS_IO_PROG -f -c "falloc 0 6g" $SCRATCH_MNT/testfile.$seq >>$seqres.full 2>&1
+
+_scratch_unmount
+status=0
+exit

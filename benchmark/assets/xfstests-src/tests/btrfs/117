@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/117
+#
+# Test that an incremental send operation which issues clone operations works
+# for files that have a full path containing more than one parent directory
+# component.
+#
+. ./common/preamble
+_begin_fstest auto quick send clone
+
+tmp=`mktemp -d`
+
+. ./common/filter
+. ./common/reflink
+
+_require_scratch
+_require_cp_reflink
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir -p $SCRATCH_MNT/a/b/c
+$XFS_IO_PROG -f -c "pwrite -S 0xfd 0 128K" $SCRATCH_MNT/a/b/c/x | _filter_xfs_io
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/snap1
+
+# Create a bunch of small and empty files, this is just to make sure our
+# subvolume's btree gets more than 1 leaf, a condition necessary to trigger a
+# past bug (1000 files is enough even for a leaf/node size of 64K, the largest
+# possible size).
+for ((i = 1; i <= 1000; i++)); do
+	echo -n > $SCRATCH_MNT/a/b/c/z_$i
+done
+
+# Create a clone of file x's extent and write some data to the middle of this
+# new file, this is to guarantee the incremental send operation below issues
+# a clone operation.
+cp --reflink=always $SCRATCH_MNT/a/b/c/x $SCRATCH_MNT/a/b/c/y
+$XFS_IO_PROG -c "pwrite -S 0xab 32K 16K" $SCRATCH_MNT/a/b/c/y | _filter_xfs_io
+
+# Will be used as an extra source root for clone operations for the incremental
+# send operation below.
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/clones_snap
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/snap2
+
+_btrfs send -f $tmp/1.snap $SCRATCH_MNT/snap1
+_btrfs send -f $tmp/clones.snap $SCRATCH_MNT/clones_snap
+_btrfs send -p $SCRATCH_MNT/snap1 \
+	-c $SCRATCH_MNT/clones_snap -f $tmp/2.snap $SCRATCH_MNT/snap2
+
+echo "File digests in the original filesystem:"
+md5sum $SCRATCH_MNT/snap1/a/b/c/x | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/a/b/c/x | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/a/b/c/y | _filter_scratch
+
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $tmp/1.snap $SCRATCH_MNT
+_btrfs receive -f $tmp/clones.snap $SCRATCH_MNT
+_btrfs receive -f $tmp/2.snap $SCRATCH_MNT
+
+echo "File digests in the new filesystem:"
+# Should match the digests we had in the original filesystem.
+md5sum $SCRATCH_MNT/snap1/a/b/c/x | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/a/b/c/x | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/a/b/c/y | _filter_scratch
+
+status=0
+exit

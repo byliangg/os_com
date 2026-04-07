@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 349
+#
+# Test fallocate(ZERO_RANGE) on a block device, which should be able to
+# WRITE SAME (or equivalent) the range.
+#
+. ./common/preamble
+_begin_fstest blockdev rw zero
+
+_register_cleanup "_cleanup" BUS
+
+# Import common functions.
+. ./common/filter
+. ./common/scsi_debug
+
+_require_scsi_debug
+_require_xfs_io_command "fzero"
+
+echo "Create and format"
+dev=$(_get_scsi_debug_dev 512 512 0 4 "lbpws=1 lbpws10=1")
+_pwrite_byte 0x62 0 4m $dev >> $seqres.full
+
+echo "Zero range"
+$XFS_IO_PROG -c "fzero -k 512k 1m" $dev
+
+echo "Zero range without keep_size"
+$XFS_IO_PROG -c "fzero 384k 64k" $dev
+
+echo "Zero range past EOD"
+$XFS_IO_PROG -c "fzero -k 3m 4m" $dev
+
+echo "Check contents"
+md5sum $dev | sed -e "s|$dev|SCSI_DEBUG_DEV|g"
+
+echo "Zero range to MAX_LFS_FILESIZE"
+# zod = MAX_LFS_FILESIZE
+zod=$(_get_max_lfs_filesize)
+$XFS_IO_PROG -c "fzero -k 0 $zod" $dev
+
+echo "Check contents"
+md5sum $dev | sed -e "s|$dev|SCSI_DEBUG_DEV|g"
+
+echo "Destroy device"
+_put_scsi_debug_dev
+
+# success, all done
+status=0
+exit

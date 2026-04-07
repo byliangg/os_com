@@ -1,0 +1,26 @@
+# QA groups control file, automatically generated.
+# See _begin_fstest in each test for details.
+
+001 auto quick rw prealloc
+002 auto quick rw encrypt compress fiemap
+003 auto quick
+004 auto quick punch
+005 auto quick
+006 auto quick
+007 auto quick rw compress
+008 auto quick rw
+009 auto quick
+010 auto quick
+011 auto quick
+012 auto quick casefold
+013 auto quick
+014 auto quick trim
+015 auto quick mount
+016 auto quick mount
+017 auto quick mount
+018 auto quick rw compress
+019 auto quick rw
+020 auto quick rw
+021 auto quick mount quota remount
+022 auto quick rw
+023 auto quick rw attr

@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 300
+#
+# Test xfs_fsr / exchangerange management of di_forkoff w/ selinux
+
+# unreliable_in_parallel: file layout appears to be perturbed by load related
+# timing issues. Not 100% sure, but the backwards write does not reliably
+# fragment the source file under heavy external load
+
+. ./common/preamble
+_begin_fstest auto fsr unreliable_in_parallel
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_nocrc
+
+
+
+getenforce | grep -q "Enforcing\|Permissive" || _notrun "SELinux not enabled"
+[ "$XFS_FSR_PROG" = "" ] && _notrun "xfs_fsr not found"
+
+_scratch_mkfs_xfs -m crc=0 -i size=256 >> $seqres.full 2>&1
+
+# Manually mount to avoid fs-wide context set by default in xfstests
+mount $SCRATCH_DEV $SCRATCH_MNT
+
+touch $SCRATCH_MNT/$seq.test
+
+# Create an extents-format attribute on a file
+$XFS_IO_PROG -f -c "pwrite -S 0x63 0 4096" $SCRATCH_MNT/attrvals >> $seqres.full 2>&1
+cat $SCRATCH_MNT/attrvals | attr -s name $SCRATCH_MNT/$seq.test >> $seqres.full 2>&1
+
+# Fragment the file by writing backwards
+bs=$(_get_file_block_size $SCRATCH_MNT)
+for I in `seq 6 -1 0`; do
+	dd if=/dev/zero of=$SCRATCH_MNT/$seq.test seek=$I bs=${bs} \
+	   oflag=direct count=1 conv=notrunc >> $seqres.full 2>&1
+done
+
+# See if xfs_fsr works.
+
+# The target file now has a non-local attribute, but the
+# fsr temp file gets assigned a local attribute on creation,
+# due to selinux.
+    
+# In this case, the large-ish selinux attr will create a forkoff
+# in the temp file smaller than the forkoff in the target file,
+# because the FMT_EXTENTS attr takes up less space.  If there is
+# no mechanism to grow the temp forkoff to match, we can end up
+# failing to swap these 2 inodes if the result is not enough
+# data space in the temp inode as a result.
+
+$XFS_FSR_PROG -v $SCRATCH_MNT/$seq.test | _filter_scratch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2024 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 605
+#
+# Test metadump/mdrestore's ability to dump a dirty log and restore it
+# correctly.
+#
+. ./common/preamble
+_begin_fstest auto quick metadump log logprint punch
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -r -f $tmp.*
+	_xfs_cleanup_verify_metadump
+}
+
+# Import common functions.
+. ./common/dmflakey
+. ./common/inject
+. ./common/metadump
+
+_require_scratch
+_require_test
+_require_loop
+_require_xfs_debug
+_require_xfs_io_error_injection log_item_pin
+_require_dm_target flakey
+_require_xfs_io_command "pwrite"
+_require_test_program "punch-alternating"
+_xfs_setup_verify_metadump
+
+testfile=${SCRATCH_MNT}/testfile
+
+echo "Format filesystem on scratch device"
+_scratch_mkfs >> $seqres.full 2>&1
+
+echo "Initialize and mount filesystem on flakey device"
+_init_flakey
+_load_flakey_table $FLAKEY_ALLOW_WRITES
+_scratch_mount
+
+echo "Create test file"
+$XFS_IO_PROG -s -f -c "pwrite 0 5M" $testfile >> $seqres.full
+
+echo "Punch alternative blocks of test file"
+$here/src/punch-alternating $testfile
+
+echo "Mount cycle the filesystem on flakey device"
+_scratch_unmount
+_scratch_mount
+
+device=$(readlink -f $SCRATCH_DEV)
+device=$(_short_dev $device)
+
+echo "Pin log items in the AIL"
+echo 1 > /sys/fs/xfs/${device}/errortag/log_item_pin
+
+echo "Create two checkpoint transactions on ondisk log"
+for ct in $(seq 1 2); do
+	offset=$($XFS_IO_PROG -c 'fiemap' $testfile | tac |  grep -v hole | \
+			 head -n 1 | awk -F '[\\[.]' '{ print $2 * 512; }')
+	$XFS_IO_PROG -c "truncate $offset" -c fsync $testfile
+done
+
+echo "Drop writes to filesystem from here onwards"
+_load_flakey_table $FLAKEY_DROP_WRITES
+
+echo "Unpin log items in AIL"
+echo 0 > /sys/fs/xfs/${device}/errortag/log_item_pin
+
+echo "Unmount filesystem on flakey device"
+_scratch_unmount
+
+echo "Clean up flakey device"
+_cleanup_flakey
+
+echo -n "Filesystem has a "
+_print_logstate
+
+echo "Create metadump file, restore it and check restored fs"
+_xfs_verify_metadumps '-a -o'
+
+# Mount the fs to replay the contents from the dirty log.
+_scratch_mount
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,117 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. 067
+#
+# Some random mount/umount corner case tests
+#
+# - mount at a nonexistent mount point
+# - mount a free loop device
+# - mount with a wrong fs type specified
+# - umount an symlink to device which is not mounted
+# - umount a path with too long name
+# - lazy umount a symlink
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_symlinks
+_require_test
+_require_scratch
+_require_loop
+_require_block_device $SCRATCH_DEV
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# kernel should not hang nor oops when mounting fs to nonexistent mount point
+mount_nonexistent_mnt()
+{
+	echo "# mount to nonexistent mount point" >>$seqres.full
+	rm -rf $TEST_DIR/nosuchdir
+	$MOUNT_PROG $SCRATCH_DEV $TEST_DIR/nosuchdir >>$seqres.full 2>&1
+}
+
+# fs driver should be able to handle mounting a free loop device gracefully xfs
+# ever hung, "ec53d1d xfs: don't block on buffer read errors" fixed it
+#
+# Using 'losetup -f' like this is racy. We might end up mounting a real loop dev
+# here, so unmount $SCRATCH_MNT (not the loop dev we might not own!) and ignore
+# any error it might return.
+mount_free_loopdev()
+{
+	echo "# mount a free loop device" >>$seqres.full
+	loopdev=`losetup -f`
+	_mount $loopdev $SCRATCH_MNT >>$seqres.full 2>&1
+	_unmount $SCRATCH_MNT >> /dev/null 2>&1
+}
+
+# mount with wrong fs type specified.
+# This should fail gracefully, no hang no oops are expected
+mount_wrong_fstype()
+{
+	local fs=ext4
+	if [ "$FSTYP" == "ext4" ]; then
+		fs=xfs
+	fi
+	echo "# mount with wrong fs type" >>$seqres.full
+	$MOUNT_PROG -t $fs $SCRATCH_DEV $SCRATCH_MNT >>$seqres.full 2>&1
+}
+
+# umount a symlink to device, which is not mounted.
+# This should fail gracefully, no hang no oops are expected
+umount_symlink_device()
+{
+	local symlink=$TEST_DIR/$seq.scratch_dev_symlink
+	rm -f $symlink
+	echo "# umount symlink to device, which is not mounted" >>$seqres.full
+	ln -s $SCRATCH_DEV $symlink
+	_unmount $symlink >>$seqres.full 2>&1
+}
+
+# umount a path name that is 256 bytes long, this should fail gracefully,
+# and the following umount should not hang nor oops
+umount_toolong_name()
+{
+	local longname=$SCRATCH_MNT/`$PERL_PROG -e 'print "a"x256;'`
+
+	_scratch_mount 2>&1 | tee -a $seqres.full
+
+	echo "# umount a too-long name" >>$seqres.full
+	_unmount $longname >>$seqres.full 2>&1
+	_scratch_unmount 2>&1 | tee -a $seqres.full
+}
+
+# lazy umount a symlink should not block following umount.
+# This is the test case described in https://lkml.org/lkml/2014/7/21/98
+lazy_umount_symlink()
+{
+	local symlink=$SCRATCH_MNT/$seq.testdir_symlink
+	echo "# lazy umount a symlink" >>$seqres.full
+	_scratch_mount 2>&1 | tee -a $seqres.full
+	mkdir -p $SCRATCH_MNT/testdir
+	rm -f $symlink
+	ln -s $SCRATCH_MNT/testdir $symlink
+
+	_unmount -l $symlink >>$seqres.full 2>&1
+	# _scratch_unmount should not be blocked
+	_scratch_unmount 2>&1 | tee -a $seqres.full
+}
+
+echo "Silence is golden"
+
+mount_nonexistent_mnt
+mount_free_loopdev
+mount_wrong_fstype
+
+umount_symlink_device
+umount_toolong_name
+lazy_umount_symlink
+
+status=0
+exit

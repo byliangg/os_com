@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/059
+#
+# Regression test for btrfs where removing the flag FS_COMPR_FL (chattr -c)
+# from an inode wouldn't clear its compression property.
+# This was fixed in the following linux kernel patch:
+#
+#     Btrfs: add missing compression property remove in btrfs_ioctl_setflags
+#
+. ./common/preamble
+_begin_fstest auto quick compress
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -fr $tmp
+}
+
+. ./common/filter
+. ./common/filter.btrfs
+
+_require_test
+_require_scratch
+_require_btrfs_command "property"
+_require_btrfs_no_nodatacow
+# We exercise setting compression through properties, and that fails on inodes
+# with nodatasum, so skip when mounting with nodatasum.
+_require_btrfs_no_nodatasum
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/testdir
+echo "Setting compression flag in the directory..."
+$CHATTR_PROG +c $SCRATCH_MNT/testdir
+echo "Directory compression property value:"
+$BTRFS_UTIL_PROG property get $SCRATCH_MNT/testdir compression | \
+	_filter_btrfs_compress_property
+
+touch $SCRATCH_MNT/testdir/file1
+echo "file1 compression property value:"
+$BTRFS_UTIL_PROG property get $SCRATCH_MNT/testdir/file1 compression | \
+	_filter_btrfs_compress_property
+
+echo "Clearing compression flag from directory..."
+$CHATTR_PROG -c $SCRATCH_MNT/testdir
+echo "Directory compression property value:"
+$BTRFS_UTIL_PROG property get $SCRATCH_MNT/testdir compression | \
+	_filter_btrfs_compress_property
+
+touch $SCRATCH_MNT/testdir/file2
+echo "file2 compression property value:"
+$BTRFS_UTIL_PROG property get $SCRATCH_MNT/testdir/file2 compression | \
+	_filter_btrfs_compress_property
+
+touch $SCRATCH_MNT/testdir/file1
+echo "file1 compression property value:"
+$BTRFS_UTIL_PROG property get $SCRATCH_MNT/testdir/file1 compression | \
+	_filter_btrfs_compress_property
+
+status=0
+exit

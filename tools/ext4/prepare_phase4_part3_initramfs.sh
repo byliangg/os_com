@@ -5,8 +5,9 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "${ROOT_DIR}"
 
-SRC_IMG=${1:-"${ROOT_DIR}/.local/initramfs_phase3.cpio.gz"}
-OUT_IMG=${2:-"${ROOT_DIR}/.local/initramfs_phase4_part3.cpio.gz"}
+SRC_IMG=${1:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase3.cpio.gz"}
+OUT_IMG=${2:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz"}
+XFSTESTS_PREBUILT_DIR=${XFSTESTS_PREBUILT_DIR:-"${ROOT_DIR}/benchmark/assets/xfstests-prebuilt"}
 
 case "${SRC_IMG}" in
   /*) ;;
@@ -23,7 +24,7 @@ if [ ! -f "${SRC_IMG}" ]; then
 fi
 
 WORK_DIR=$(mktemp -d)
-trap 'rm -rf "${WORK_DIR}"' EXIT
+trap 'chmod -R u+w "${WORK_DIR}" 2>/dev/null || true; rm -rf "${WORK_DIR}" 2>/dev/null || true' EXIT
 ROOTFS_DIR="${WORK_DIR}/rootfs"
 mkdir -p "${ROOTFS_DIR}"
 
@@ -48,6 +49,18 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase4_excluded.t
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase4_excluded.tsv"
 install -D -m 0755 test/initramfs/src/syscall/ext4_crash/run_ext4_crash_test.sh \
   "${ROOTFS_DIR}/opt/ext4_crash/run_ext4_crash_test.sh"
+
+if [ -d "${XFSTESTS_PREBUILT_DIR}/xfstests-dev" ]; then
+  echo "[INFO] Injecting xfstests prebuilt from ${XFSTESTS_PREBUILT_DIR} ..."
+  mkdir -p "${ROOTFS_DIR}/opt/xfstests"
+  rm -rf "${ROOTFS_DIR}/opt/xfstests/xfstests-dev" "${ROOTFS_DIR}/opt/xfstests/tools"
+  cp -a "${XFSTESTS_PREBUILT_DIR}/xfstests-dev" "${ROOTFS_DIR}/opt/xfstests/"
+  if [ -d "${XFSTESTS_PREBUILT_DIR}/tools" ]; then
+    cp -a "${XFSTESTS_PREBUILT_DIR}/tools" "${ROOTFS_DIR}/opt/xfstests/"
+  fi
+else
+  echo "[WARN] xfstests prebuilt missing: ${XFSTESTS_PREBUILT_DIR}/xfstests-dev" >&2
+fi
 
 mkdir -p "$(dirname "${OUT_IMG}")"
 echo "[INFO] Repacking to ${OUT_IMG} ..."

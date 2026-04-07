@@ -1,0 +1,244 @@
+#
+# ext4 specific common functions
+#
+
+__generate_ext4_report_vars() {
+	__generate_blockdev_report_vars TEST_LOGDEV
+	__generate_blockdev_report_vars SCRATCH_LOGDEV
+}
+
+_setup_large_ext4_fs()
+{
+	local fs_size=$1
+	local tmp_dir=/tmp/
+
+	[ "$LARGE_SCRATCH_DEV" != yes ] && return 0
+	[ -z "$SCRATCH_DEV_EMPTY_SPACE" ] && SCRATCH_DEV_EMPTY_SPACE=0
+	[ $SCRATCH_DEV_EMPTY_SPACE -ge $fs_size ] && return 0
+
+	# Default free space in the FS is 50GB, but you can specify more via
+	# SCRATCH_DEV_EMPTY_SPACE
+	local space_to_consume=$(($fs_size - 50*1024*1024*1024 - $SCRATCH_DEV_EMPTY_SPACE))
+
+	# mount the filesystem and create 16TB - 4KB files until we consume
+	# all the necessary space.
+	_try_scratch_mount 2>&1 >$tmp_dir/mnt.err
+	local status=$?
+	if [ $status -ne 0 ]; then
+		echo "mount failed"
+		cat $tmp_dir/mnt.err >&2
+		rm -f $tmp_dir/mnt.err
+		return $status
+	fi
+	rm -f $tmp_dir/mnt.err
+
+	local file_size=$((16*1024*1024*1024*1024 - 4096))
+	local nfiles=0
+	while [ $space_to_consume -gt $file_size ]; do
+
+		xfs_io -F -f \
+			-c "truncate $file_size" \
+			-c "falloc -k 0 $file_size" \
+			$SCRATCH_MNT/.use_space.$nfiles 2>&1
+		status=$?
+		if [ $status -ne 0 ]; then
+			break;
+		fi
+
+		space_to_consume=$(( $space_to_consume - $file_size ))
+		nfiles=$(($nfiles + 1))
+	done
+
+	# consume the remaining space.
+	if [ $space_to_consume -gt 0 ]; then
+		xfs_io -F -f \
+			-c "truncate $space_to_consume" \
+			-c "falloc -k 0 $space_to_consume" \
+			$SCRATCH_MNT/.use_space.$nfiles 2>&1
+		status=$?
+	fi
+	export NUM_SPACE_FILES=$nfiles
+
+	_scratch_unmount
+	if [ $status -ne 0 ]; then
+		echo "large file prealloc failed"
+		cat $tmp_dir/mnt.err >&2
+		return $status
+	fi
+	return 0
+}
+
+_scratch_mkfs_ext4_opts()
+{
+	mkfs_opts=$*
+
+	_scratch_options mkfs
+
+	echo "$MKFS_EXT4_PROG $SCRATCH_OPTIONS $mkfs_opts"
+}
+
+_scratch_mkfs_ext4()
+{
+	local mkfs_cmd="`_scratch_mkfs_ext4_opts`"
+	local mkfs_filter="grep -v -e ^Warning: -e \"^mke2fs \" | grep -v \"^$\""
+	local tmp=`mktemp -u`
+	local mkfs_status
+
+	if [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ]; then
+		$MKFS_EXT4_PROG -F -O journal_dev $MKFS_OPTIONS $* $SCRATCH_LOGDEV 2>$tmp.mkfserr 1>$tmp.mkfsstd
+		mkjournal_status=$?
+
+		if [ $mkjournal_status -ne 0 ]; then
+			cat $tmp.mkfsstd
+			cat $tmp.mkfserr >&2
+			return $mkjournal_status
+		fi
+	fi
+
+	_scratch_do_mkfs "$mkfs_cmd" "$mkfs_filter" $* 2>$tmp.mkfserr 1>$tmp.mkfsstd
+	mkfs_status=$?
+
+	if [ $mkfs_status -eq 0 -a "$LARGE_SCRATCH_DEV" = yes ]; then
+		# manually parse the mkfs output to get the fs size in bytes
+		local fs_size=`cat $tmp.mkfsstd | awk ' \
+			/^Block size/ { split($2, a, "="); bs = a[2] ; } \
+			/ inodes, / { blks = $3 } \
+			/reserved for the super user/ { resv = $1 } \
+			END { fssize = bs * blks - resv; print fssize }'`
+
+		_setup_large_ext4_fs $fs_size
+		mkfs_status=$?
+	fi
+
+	# output mkfs stdout and stderr
+	cat $tmp.mkfsstd
+	cat $tmp.mkfserr >&2
+	rm -f $tmp.mkfserr $tmp.mkfsstd
+
+	return $mkfs_status
+}
+
+_ext4_metadump()
+{
+	local device="$1"
+	local dumpfile="$2"
+	local compressopt="$3"
+
+	test -n "$E2IMAGE_PROG" || _fail "e2image not installed"
+	$E2IMAGE_PROG -Q "$device" "$dumpfile"
+	[ "$compressopt" = "compress" ] && [ -n "$DUMP_COMPRESSOR" ] &&
+		$DUMP_COMPRESSOR -f "$dumpfile" &>> "$seqres.full"
+}
+
+_ext4_mdrestore()
+{
+	local metadump="$1"
+	local device="$2"
+	local logdev="$3"
+	shift; shift; shift
+	local options="$@"
+
+	# If we're configured for compressed dumps and there isn't already an
+	# uncompressed dump, see if we can use DUMP_COMPRESSOR to decompress
+	# something.
+	if [ ! -e "$metadump" ] && [ -n "$DUMP_COMPRESSOR" ]; then
+		for compr in "$metadump".*; do
+			[ -e "$compr" ] && $DUMP_COMPRESSOR -d -f -k "$compr" && break
+		done
+	fi
+	test -r "$metadump" || return 1
+
+	$E2IMAGE_PROG $options -r "${metadump}" "${SCRATCH_DEV}"
+	res=$?
+	test $res -ne 0 && return $res
+
+	# ext4 cannot e2image external logs, so we have to reformat the log
+	# device to match the restored fs
+	if [ "${logdev}" != "none" ]; then
+		local fsuuid="$($DUMPE2FS_PROG -h "${SCRATCH_DEV}" 2>/dev/null | \
+				grep 'Journal UUID:' | \
+				sed -e 's/Journal UUID:[[:space:]]*//g')"
+		$MKFS_EXT4_PROG -O journal_dev "${logdev}" \
+				-F -U "${fsuuid}"
+		res=$?
+	fi
+	return $res
+}
+
+# this test requires the ext4 kernel supports a particular feature
+# on the scratch device
+#
+_require_scratch_ext4_feature_enabled()
+{
+    if [ -z "$1" ]; then
+        echo "Usage: _require_scratch_ext4_feature feature"
+        _exit 1
+    fi
+    _scratch_mkfs_ext4 >/dev/null 2>&1
+    $DUMPE2FS_PROG -h $SCRATCH_DEV 2> /dev/null | grep -q "$1" || \
+	_notrun "$1 not enabled by this filesystem"
+    _try_scratch_mount >/dev/null 2>&1 \
+	|| _notrun "Kernel doesn't support $1 feature"
+    _scratch_unmount
+}
+
+_require_scratch_ext4_crc()
+{
+    _require_scratch_ext4_feature_enabled "metadata_csum"
+}
+
+# Check whether the specified feature whether it is supported by
+# mkfs.ext4 and the kernel.
+_require_scratch_ext4_feature()
+{
+    if [ -z "$1" ]; then
+        echo "Usage: _require_scratch_ext4_feature feature"
+        _exit 1
+    fi
+    $MKFS_EXT4_PROG -F $MKFS_OPTIONS -O "$1" \
+		    $SCRATCH_DEV 512m >/dev/null 2>&1 \
+	|| _notrun "mkfs.ext4 doesn't support $1 feature"
+    _try_scratch_mount >/dev/null 2>&1 \
+	|| _notrun "Kernel doesn't support the ext4 feature(s): $1"
+    _scratch_unmount
+}
+
+# Disable extent zeroing for ext4 on the given device
+_ext4_disable_extent_zeroout()
+{
+	local dev=${1:-$TEST_DEV}
+	local sdev=`_short_dev $dev`
+
+	[ -f /sys/fs/ext4/$sdev/extent_max_zeroout_kb ] && \
+		echo 0 >/sys/fs/ext4/$sdev/extent_max_zeroout_kb
+}
+
+_scratch_ext4_options()
+{
+	local type=$1
+	local log_opt=""
+
+	case $type in
+	mkfs)
+		SCRATCH_OPTIONS="$SCRATCH_OPTIONS -F"
+		log_opt="-J device=$SCRATCH_LOGDEV"
+		;;
+	mount)
+		# As of kernel 5.19, the kernel mount option path parser only
+		# accepts direct paths to block devices--the final path
+		# component cannot be a symlink.
+		log_opt="-o journal_path=$(realpath -q "$SCRATCH_LOGDEV")"
+		;;
+	esac
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		SCRATCH_OPTIONS="$SCRATCH_OPTIONS ${log_opt}"
+}
+
+# Get the inode flags for a particular inode number
+_ext4_get_inum_iflags() {
+	local dev="$1"
+	local inumber="$2"
+
+	debugfs -R "stat <${inumber}>" "${dev}" 2> /dev/null | \
+			sed -n 's/^.*Flags: \([0-9a-fx]*\).*$/\1/p'
+}

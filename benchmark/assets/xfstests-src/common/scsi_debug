@@ -1,0 +1,76 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc. All Rights Reserved.
+#
+# Functions useful for tests on unique block devices
+
+. common/module
+
+# _require_scsi_debug [mod_param]
+_require_scsi_debug()
+{
+	local mod_present=0
+
+	# make sure we have the module
+	modinfo scsi_debug 2>&1 > /dev/null || _notrun "scsi_debug module not found"
+
+	lsmod | grep -wq scsi_debug
+	if [[ $? -eq 0 ]]; then
+		mod_present=1
+	fi
+
+	if [[ $mod_present -eq 1 ]]; then
+		# We try to remove the module only once if MODPROBE_PATIENT_RM_TIMEOUT_SECONDS
+		# is set to forever because fstests does not leave modules
+		# lingering around. If you do have a module lingering around
+		# and its being used, it wasn't us who started it, so you
+		# likely would not want to wait forever for it really.
+		if [[ "$MODPROBE_PATIENT_RM_TIMEOUT_SECONDS" == "forever" ]]; then
+			rmmod scsi_debug || _notrun "scsi_debug module in use and MODPROBE_PATIENT_RM_TIMEOUT_SECONDS set to forever, removing once failed"
+		else
+			_patient_rmmod scsi_debug || _notrun "scsi_debug module in use"
+		fi
+	fi
+
+	# make sure it has the features we need
+	# logical/physical sectors plus unmap support all went in together
+	grep -wq sector_size <(modinfo scsi_debug) || _notrun "scsi_debug too old"
+	# make sure it supports this module parameter
+	if [ -n "$1" ];then
+		grep -Ewq "$1" <(modinfo scsi_debug) || _notrun "scsi_debug not support $1"
+	fi
+}
+
+# Args: [physical sector size, [logical sector size, [unaligned(0|1), [size in megs]]]]
+_get_scsi_debug_dev()
+{
+	# Defaults to phys 512, logical 512, aligned
+	physical=${1-512}
+	logical=${2-512}
+	unaligned=${3-0}
+	size=${4-128}
+	test -n "$4" && shift
+	test -n "$3" && shift
+	test -n "$2" && shift
+	test -n "$1" && shift
+
+	phys_exp=0
+	while [ $logical -lt $physical ]; do
+		let physical=physical/2
+		let phys_exp=phys_exp+1
+	done
+	opts="sector_size=$logical physblk_exp=$phys_exp lowest_aligned=$unaligned dev_size_mb=$size $@"
+	echo "scsi_debug options $opts" >> $seqres.full
+	modprobe scsi_debug $opts
+	[ $? -eq 0 ] || _fail "scsi_debug modprobe failed"
+	$UDEV_SETTLE_PROG
+	device=`grep -wl scsi_debug /sys/block/sd*/device/model | awk -F / '{print $4}'`
+	echo "/dev/$device"
+}
+
+_put_scsi_debug_dev()
+{
+	lsmod | grep -wq scsi_debug || return
+	$UDEV_SETTLE_PROG
+	_patient_rmmod scsi_debug || _fail "Could not remove scsi_debug module"
+}

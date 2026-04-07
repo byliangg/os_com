@@ -1,0 +1,96 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 740
+#
+# cross check mkfs detection of foreign filesystems
+#
+. ./common/preamble
+_begin_fstest mkfs auto quick
+
+# Import common functions.
+. ./common/filter
+
+# a bunch of file systems don't support foreign fs detection
+# ext* do support it, but disable the feature when called non-interactively
+_exclude_fs ext2
+_exclude_fs ext3
+_exclude_fs ext4
+_exclude_fs jfs
+_exclude_fs ocfs2
+_exclude_fs udf
+
+_require_scratch_nocheck
+_require_no_large_scratch_dev
+
+_require_block_device "${SCRATCH_DEV}"
+# not all the FS support zoned block device
+_require_non_zoned_device "${SCRATCH_DEV}"
+
+echo "Silence is golden."
+for fs in `echo ${MKFS_PROG}.* | sed -e "s:${MKFS_PROG}.::g"`
+do
+	preop=""	# for special input needs (usually a prompt)
+	preargs=""	# for any special pre-device options
+	postargs=""	# for any special post-device options
+
+	case "$fs"  in
+	ext2|ext3|ext4)
+		preargs="-F"
+		;;
+	cramfs)
+		# cramfs mkfs requires a directory argument
+		preargs=/proc/fs
+		;;
+	gfs|gfs2)
+		preop="echo y |"
+		preargs="-p lock_nolock -j 1"
+		;;
+	jffs2)
+		# mkfs.jffs2 doesn't work like a normal mkfs and just fails
+		continue;
+		;;
+	jfs)
+		preop="echo Y |"
+		;;
+	minix|msdos|vfat)
+		# minix, msdos and vfat mkfs fails for large devices,
+		# restrict to 2000 blocks
+		postargs=2000
+		;;
+	ntfs)
+		# "quick" format that doesn't zero the entire device
+		postargs="--quick"
+		;;
+	reiser4)
+		preop="echo y |"
+		preargs="-f"
+		;;
+	*)
+		;;
+	esac
+
+	# overwite the first few Kb - should blow away superblocks
+	$here/src/devzero -n 20 $SCRATCH_DEV >/dev/null
+
+	# create a filesystem of this type
+	echo "=== Creating $fs filesystem..." >>$seqres.full
+	echo "    ( $preop mkfs -t $fs $preargs $SCRATCH_DEV $postargs )" >>$seqres.full
+	eval $preop mkfs -t $fs $preargs $SCRATCH_DEV $postargs >>$seqres.full 2>&1
+
+	if [ $? -eq 0 ] ; then
+		# next, ensure we don't overwrite it
+
+		echo "=== Attempting $FSTYP overwrite of $fs..." >>$seqres.full
+		${MKFS_PROG} -t $FSTYP $SCRATCH_DEV >>$seqres.full 2>&1
+
+		[ $? -eq 0 ] && echo "Failed - overwrote fs type ${fs}!"
+	else
+		echo "mkfs of type ${fs} failed" >>$seqres.full
+	fi
+done
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,89 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 124
+#
+# Create and populate an XFS filesystem, corrupt a block xattr, then see
+# how the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/populate
+
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_xfs_crc
+_require_attrs
+_require_populate_commands
+_require_xfs_db_blocktrash_z_command
+test -z "${FUZZ_ARGS}" && FUZZ_ARGS="-n 8 -3"
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+nr="$((blksz / 40))"
+leaf_lblk="$((32 * 1073741824 / blksz))"
+node_lblk="$((64 * 1073741824 / blksz))"
+
+echo "+ make some files"
+touch "${SCRATCH_MNT}/attrfile"
+seq 0 "${nr}" | while read d; do
+	setfattr -n "user.x$(printf "%.08d" "$d")" -v "0000000000000000" "${SCRATCH_MNT}/attrfile"
+done
+inode="$(stat -c '%i' "${SCRATCH_MNT}/attrfile")"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+echo "+ check xattr"
+_scratch_xfs_db -x -c "inode ${inode}" -c "bmap" >> $seqres.full
+_scratch_xfs_db -x -c "inode ${inode}" -c "ablock 0" -c "stack" | grep -q 'file attr block is unmapped' && _fail "failed to create a block xattr (data)"
+_scratch_xfs_db -x -c "inode ${inode}" -c "ablock ${leaf_lblk}" -c "stack" | grep -q 'file attr block is unmapped' || _fail "failed to create a block xattr (leaf)"
+_scratch_xfs_db -x -c "inode ${inode}" -c "ablock ${node_lblk}" -c "stack" | grep -q 'file attr block is unmapped' || _fail "failed to create a block xattr (free)"
+
+echo "+ corrupt xattr"
+_scratch_xfs_db -x -c "inode ${inode}" -c 'ablock 0' -c "stack" -c "blocktrash -x 32 -y $((blksz * 8)) -z ${FUZZ_ARGS}" >> $seqres.full
+
+echo "+ mount image && modify xattr"
+if _try_scratch_mount >> $seqres.full 2>&1; then
+
+	setfattr -x "user.x00000000" "${SCRATCH_MNT}/attrfile" 2> /dev/null && _fail "modified corrupt xattr"
+	umount "${SCRATCH_MNT}"
+fi
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ modify xattr (2)"
+getfattr "${SCRATCH_MNT}/attrfile" -n "user.x00000000" > /dev/null 2>&1 && (setfattr -x "user.x00000000" "${SCRATCH_MNT}/attrfile" || _fail "remove corrupt xattr")
+setfattr -n "user.x00000000" -v 'x0x0x0x0' "${SCRATCH_MNT}/attrfile" || _fail "add corrupt xattr"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+status=0
+exit

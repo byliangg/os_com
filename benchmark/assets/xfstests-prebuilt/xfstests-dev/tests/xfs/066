@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 066
+#
+# Test dumping of large files
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/dump
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _cleanup_dump
+    cd /
+    rm -f $tmp.*
+}
+
+_require_test
+_require_scratch
+
+_my_stat_filter()
+{
+    grep "[sS]ize" | sed "s/.*[sS]ize[: ]*\([[:digit:]]*\).*/\1 largefile/g"
+}
+
+rm -f $TEST_DIR/testfile
+if $here/src/feature -t $TEST_DIR/testfile; then
+	:
+else
+	_notrun "Installed libc doesn't correctly handle setrlimit/ftruncate64"
+fi
+
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_largefile
+echo "ls dumpdir/largefile"
+stat $dump_dir/largefile | _my_stat_filter
+md5sum $dump_dir/largefile |_filter_scratch
+_do_dump_file
+_do_restore_file
+echo "ls restoredir/largefile"
+stat $restore_dir/$dump_sdir/largefile | _my_stat_filter
+md5sum $restore_dir/$dump_sdir/largefile |_filter_scratch
+
+# success, all done
+status=0
+exit

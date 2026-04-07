@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 196
+#
+# This test stresses indirect block reservation for delayed allocation extents.
+# XFS reserves extra blocks for deferred allocation of delalloc extents. These
+# reserved blocks can be divided among more extents than anticipated if the
+# original extent for which the blocks were reserved is split into multiple
+# delalloc extents. If this scenario repeats, eventually some extents are left
+# without any indirect block reservation whatsoever. This leads to assert
+# failures and possibly other problems in XFS.
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Import common functions.
+. ./common/punch
+. ./common/inject
+
+
+# Modify as appropriate.
+_require_scratch
+_require_xfs_io_error_injection "drop_writes"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+sdev=$(_short_dev $SCRATCH_DEV)
+file=$SCRATCH_MNT/file.$seq
+bytes=$((64 * 1024))
+
+# create sequential delayed allocation
+$XFS_IO_PROG -f -c "pwrite 0 $bytes" $file >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -elpv" $file | grep -q delalloc || \
+	_notrun "Unable to create delayed allocations"
+
+# Enable write drops. All buffered writes are dropped from this point on.
+_scratch_inject_error "drop_writes" 1
+
+# Write every other 4k range to split the larger delalloc extent into many more
+# smaller extents. Use pwrite because with write failures enabled, all
+# preexisting delalloc blocks in the range of the I/O are tossed without
+# discretion. This allows manipulation of the delalloc extent without conversion
+# to real blocks (and thus releasing the indirect reservation).
+endoff=$((bytes - 4096))
+for i in $(seq 0 8192 $endoff); do
+	$XFS_IO_PROG -c "pwrite $i 4k" $file >> $seqres.full 2>&1
+done
+
+# now pwrite the opposite set to remove remaining delalloc extents
+for i in $(seq 4096 8192 $endoff); do
+	$XFS_IO_PROG -c "pwrite $i 4k" $file >> $seqres.full 2>&1
+done
+
+_scratch_inject_error "drop_writes" 0
+
+_scratch_cycle_mount
+$XFS_IO_PROG -c 'bmap -vp' $file | _filter_bmap
+
+# Now test a buffered write workload with larger extents. Write a 100m extent,
+# split it at the 3/4 mark, then write another 100m extent that is contiguous
+# with the 1/4 portion of the split extent. Repeat several times. This pattern
+# is known to prematurely exhaust indirect reservations and cause warnings and
+# assert failures.
+rm -f $file
+for offset in $(seq 0 100 500); do
+	$XFS_IO_PROG -fc "pwrite ${offset}m 100m" $file >> $seqres.full 2>&1
+
+	punchoffset=$((offset + 75))
+	_scratch_inject_error "drop_writes"
+	$XFS_IO_PROG -c "pwrite ${punchoffset}m 4k" $file >> $seqres.full 2>&1
+	_scratch_inject_error "drop_writes" 0
+done
+
+echo "Silence is golden."
+
+status=0
+exit

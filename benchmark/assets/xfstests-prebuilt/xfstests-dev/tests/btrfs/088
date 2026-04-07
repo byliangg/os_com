@@ -1,0 +1,95 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/088
+#
+# Test that btrfs' transaction abortion does not corrupt a filesystem mounted
+# with -o discard nor allows a subsequent fstrim to corrupt the filesystem
+# (regardless of being mounted with or without -o discard).
+#
+# This issue was fixed by the following linux kernel patch:
+#
+#    Btrfs: fix fs corruption on transaction abort if device supports discard
+#    (commit 678886bdc6378c1cbd5072da2c5a3035000214e3)
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+. ./common/filter
+. ./common/fail_make_request
+
+_require_scratch
+_require_fail_make_request
+
+enable_io_failure()
+{
+	_allow_fail_make_request 100 1000 > /dev/null
+	_start_fail_scratch_dev > /dev/null
+}
+
+disable_io_failure()
+{
+	_stop_fail_scratch_dev > /dev/null
+	_disallow_fail_make_request > /dev/null
+}
+
+# We will abort a btrfs transaction later, which always produces a warning in
+# dmesg. We do not want the test to fail because of this.
+_disable_dmesg_check
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount "-o discard"
+_require_batched_discard $SCRATCH_MNT
+
+# Create a file and call sync to commit our first transaction.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 1M" $SCRATCH_MNT/foo | _filter_xfs_io
+sync
+
+# Create some other file, which forces a COW operation of the fs root, adding
+# the old root location to the pinned extents list, and opens a new btrfs
+# transaction.
+touch $SCRATCH_MNT/bar
+
+# Write to the first file to verify later that the original data extent was not
+# a victim of a discard operation.
+$XFS_IO_PROG -c "pwrite -S 0xbb 512K 1M" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Now make sure the next transaction commit will abort and turn the fs readonly,
+# unmount the fs, mount it again and verify we can open file foo and read its
+# content, which should be what it had when the first transaction was committed
+# (first call to sync), since btrfs is a COW filesystem and foo was not fsynced.
+# Btrfs used to issue a discard operation on the extents in the pinned extents
+# list, resulting in corruption of metadata and data, and used too to return the
+# pinned extents to the free space caches, allowing future fstrim operations to
+# perform a discard operation against the pinned exents. This made the fs
+# unmountable because the btree roots that the superblock points at were written
+# in place (by the discard operations).
+enable_io_failure
+
+# This sync will trigger a commit of the current transaction, which will be
+# aborted because IO will fail for metadata extents (btree nodes/leafs).
+sync
+disable_io_failure
+
+touch $SCRATCH_MNT/abc >>$seqres.full 2>&1 && \
+	echo "Transaction was not aborted, filesystem is not in readonly mode"
+
+# This fstrim operation should not cause discard operations to be performed
+# against extents that were COWed, otherwise the next mount will fail since
+# the btree roots that the superblock points at have their physical areas
+# on disk full of zeroes.
+$FSTRIM_PROG $SCRATCH_MNT
+
+# We expect to be able to mount the fs again and have available all metadata and
+# data that got persisted in the first transaction.
+_scratch_cycle_mount
+
+# We now expect file's foo content to match what it had when the first
+# transaction was committed because the second transaction was aborted and we
+# did not fsync foo.
+echo "File foo content after transaction abort + remount:"
+od -t x1 $SCRATCH_MNT/foo
+
+status=0
+exit

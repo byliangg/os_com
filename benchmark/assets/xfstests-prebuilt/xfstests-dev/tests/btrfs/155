@@ -1,0 +1,120 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/155
+#
+# Test that an incremental send operation works if a file that has multiple
+# hard links has some of its hard links renamed in the send snapshot, with one
+# of them getting the same path that some other inode had in the send snapshot.
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/a
+touch $SCRATCH_MNT/a/f1
+mkdir -p $SCRATCH_MNT/a/b/c
+ln $SCRATCH_MNT/a/f1 $SCRATCH_MNT/a/b/c/f1l1
+touch $SCRATCH_MNT/a/b/f2
+mkdir $SCRATCH_MNT/d
+mv $SCRATCH_MNT/a/b/c/f1l1 $SCRATCH_MNT/d/f1l1_2
+ln $SCRATCH_MNT/a/b/f2 $SCRATCH_MNT/a/f2l1
+ln $SCRATCH_MNT/a/b/f2 $SCRATCH_MNT/d/f2l2
+mv $SCRATCH_MNT/a/f1 $SCRATCH_MNT/d/f1_2
+
+# Filesystem looks like:
+#
+# .                                                      (ino 256)
+# |---- a/                                               (ino 257)
+# |     |---- b/                                         (ino 259)
+# |     |     |---- c/                                   (ino 260)
+# |     |     |---- f2                                   (ino 261)
+# |     |
+# |     |---- f2l1                                       (ino 261)
+# |
+# |---- d/                                               (ino 262)
+#       |---- f1l1_2                                     (ino 258)
+#       |---- f2l2                                       (ino 261)
+#       |---- f1_2                                       (ino 258)
+#
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+	$SCRATCH_MNT/mysnap1 > /dev/null
+
+$BTRFS_UTIL_PROG send -f $send_files_dir/1.snap \
+	$SCRATCH_MNT/mysnap1 2>&1 1>/dev/null | _filter_scratch
+
+mv $SCRATCH_MNT/d $SCRATCH_MNT/a/b/d2
+mv $SCRATCH_MNT/a/f2l1 $SCRATCH_MNT/d
+mkdir $SCRATCH_MNT/a/f2l1
+ln $SCRATCH_MNT/a/b/d2/f1_2 $SCRATCH_MNT/a/b/f1l2
+mv $SCRATCH_MNT/a/b $SCRATCH_MNT/a/f2l1/b2
+mv $SCRATCH_MNT/a/f2l1/b2/d2 $SCRATCH_MNT/a/f2l1/b2/c/d3
+mv $SCRATCH_MNT/a/f2l1/b2/c/d3/f2l2 $SCRATCH_MNT/a/f2l1/b2/c/d3/f2l2_2
+
+# Filesystem now looks like:
+#
+# .                                                      (ino 256)
+# |---- a/                                               (ino 257)
+# |     |---- f2l1/                                      (ino 263)
+# |             |---- b2/                                (ino 259)
+# |                   |---- c/                           (ino 260)
+# |                   |     |---- d3                     (ino 262)
+# |                   |           |---- f1l1_2           (ino 258)
+# |                   |           |---- f2l2_2           (ino 261)
+# |                   |           |---- f1_2             (ino 258)
+# |                   |
+# |                   |---- f2                           (ino 261)
+# |                   |---- f1l2                         (ino 258)
+# |
+# |---- d                                                (ino 261)
+#
+
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+		 $SCRATCH_MNT/mysnap2 > /dev/null
+$BTRFS_UTIL_PROG send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+		 $SCRATCH_MNT/mysnap2 2>&1 1>/dev/null | _filter_scratch
+
+$FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+$FSSUM_PROG -A -f -w $send_files_dir/2.fssum \
+	-x $SCRATCH_MNT/mysnap2/mysnap1 $SCRATCH_MNT/mysnap2
+
+# Now recreate the filesystem by receiving both send streams and verify we get
+# the same content that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+$BTRFS_UTIL_PROG receive -f $send_files_dir/1.snap $SCRATCH_MNT > /dev/null
+# The incremental send operation below used to issue an unlink operation for the
+# path "d/f2l1" after it orphanized inode 262 (renamed it to o262-7-0) and after
+# it created the link named "d" for inode 261, which made the receiver fail on
+# the unlink operation with error code ENOTDIR. That unlink operation should
+# have had the path "o262-7-0/f2l2" instead.
+$BTRFS_UTIL_PROG receive -f $send_files_dir/2.snap $SCRATCH_MNT > /dev/null
+$FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+$FSSUM_PROG -r $send_files_dir/2.fssum $SCRATCH_MNT/mysnap2
+
+status=0
+exit

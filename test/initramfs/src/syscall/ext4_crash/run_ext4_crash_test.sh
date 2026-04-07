@@ -30,9 +30,26 @@ ensure_mountpoint_unmounted() {
     fi
 }
 
+ensure_device_unmounted() {
+    dev="$1"
+    # Unmount every mountpoint using this block device.
+    while :; do
+        mp=$(awk -v d="${dev}" '$1==d { print $2; exit 0 }' /proc/mounts)
+        if [ -z "${mp}" ]; then
+            break
+        fi
+        umount "${mp}" >/dev/null 2>&1 || true
+        # If unmount failed, avoid infinite loop.
+        if awk -v d="${dev}" '$1==d { found=1; exit 0 } END { exit(found ? 0 : 1) }' /proc/mounts; then
+            break
+        fi
+    done
+}
+
 mount_test_dev() {
     [ -b "${TEST_DEV}" ] || fail "device not found: ${TEST_DEV}"
     mkdir -p "${MNT_DIR}"
+    ensure_device_unmounted "${TEST_DEV}"
     ensure_mountpoint_unmounted
     mount -t ext4 "${TEST_DEV}" "${MNT_DIR}" || fail "mount failed"
 }
@@ -51,18 +68,32 @@ mkfs_ext4_if_needed() {
     if command -v mkfs.ext4 >/dev/null 2>&1 && mkfs.ext4 -F "${dev}" >"${mkfs_log}" 2>&1; then
         return 0
     fi
-    if [ -x /usr/sbin/mke2fs ] && /usr/sbin/mke2fs -F "${dev}" >"${mkfs_log}" 2>&1; then
+    if [ -x /usr/sbin/mke2fs ] && mke2fs_try_ext4 /usr/sbin/mke2fs "${dev}" "${mkfs_log}"; then
         return 0
     fi
-    if [ -x /usr/bin/mke2fs ] && /usr/bin/mke2fs -F "${dev}" >"${mkfs_log}" 2>&1; then
+    if [ -x /usr/bin/mke2fs ] && mke2fs_try_ext4 /usr/bin/mke2fs "${dev}" "${mkfs_log}"; then
         return 0
     fi
-    if command -v mke2fs >/dev/null 2>&1 && mke2fs -F "${dev}" >"${mkfs_log}" 2>&1; then
+    if command -v mke2fs >/dev/null 2>&1 && mke2fs_try_ext4 mke2fs "${dev}" "${mkfs_log}"; then
         return 0
     fi
 
     if [ -s "${mkfs_log}" ]; then
         sed -n '1,80p' "${mkfs_log}" >&2 || true
+    fi
+    return 1
+}
+
+mke2fs_try_ext4() {
+    cmd="$1"
+    dev="$2"
+    log="$3"
+
+    if "${cmd}" -t ext4 -F "${dev}" >"${log}" 2>&1; then
+        return 0
+    fi
+    if "${cmd}" -F "${dev}" >"${log}" 2>&1; then
+        return 0
     fi
     return 1
 }
@@ -100,7 +131,10 @@ verify_truncate_append() {
 
 case "${PHASE}" in
     prepare)
-        mkfs_ext4_if_needed "${TEST_DEV}" || fail "mkfs.ext4 failed"
+        ensure_device_unmounted "${TEST_DEV}"
+        if [ "${EXT4_CRASH_SKIP_MKFS:-0}" != "1" ]; then
+            mkfs_ext4_if_needed "${TEST_DEV}" || fail "mkfs.ext4 failed"
+        fi
         mount_test_dev
 
         case "${SCENARIO}" in

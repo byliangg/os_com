@@ -1,0 +1,95 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 066
+#
+# This test is motivated by an fsync issue discovered in btrfs.
+# The issue was that the fsync log replay code did not remove xattrs that were
+# deleted before the inode was fsynced. So verify that if we delete a xattr from
+# a file and then fsync the file, after log replay the file does not have that
+# xattr anymore. Also test the case where a file is fsynced, one of its xattrs
+# is removed, a hard link to that file is created and the fsync log is committed
+# by issuing an fsync on another file. This indirect case should also result in
+# not having the xattr anymore after the fsync log is replayed.
+#
+# The btrfs issue was fixed by the following linux kernel patch:
+#
+#  Btrfs: remove deleted xattrs on fsync log replay
+#
+. ./common/preamble
+_begin_fstest auto quick attr metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+. ./common/attr
+
+_require_scratch
+_require_dm_target flakey
+_require_attrs
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create out test file and add 3 xattrs to it.
+touch $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.attr1 -v val1 $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.attr2 -v val2 $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.attr3 -v val3 $SCRATCH_MNT/foobar
+
+# Make sure everything is durably persisted.
+_scratch_sync
+
+# Now delete the second xattr and fsync the inode.
+$SETFATTR_PROG -x user.attr2 $SCRATCH_MNT/foobar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+
+# f2fs doesn't support fs-op level transaction functionality. so it have no way
+# to persist all metadata updates in one transaction.  We can use "fastboot"
+# mountoption for this case, so during last fsync on qwerty, f2fs can trigger a
+# checkpoint which will persist all metadata updates before fsync().
+if [ $FSTYP = "f2fs" ]; then
+	export MOUNT_OPTIONS="-o fastboot $MOUNT_OPTIONS"
+fi
+
+_flakey_drop_and_remount
+
+# After the fsync log is replayed, the file should have only 2 xattrs, the ones
+# named user.attr1 and user.attr3. The btrfs fsync log replay bug left the file
+# with the 3 xattrs that we had before deleting the second one and fsyncing the
+# file.
+echo "xattr names and values after first fsync log replay:"
+_getfattr --absolute-names --dump $SCRATCH_MNT/foobar | _filter_scratch
+
+# Now write some data to our file, fsync it, remove the first xattr, add a new
+# hard link to our file and commit the fsync log by fsyncing some other new
+# file. This is to verify that after log replay our first xattr does not exist
+# anymore.
+echo "hello world!" >> $SCRATCH_MNT/foobar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+$SETFATTR_PROG -x user.attr1 $SCRATCH_MNT/foobar
+ln $SCRATCH_MNT/foobar $SCRATCH_MNT/foobar_link
+touch $SCRATCH_MNT/qwerty
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/qwerty
+
+_flakey_drop_and_remount
+
+# Now only the xattr with name user.attr3 should be set in our file.
+echo "xattr names and values after second fsync log replay:"
+_getfattr --absolute-names --dump $SCRATCH_MNT/foobar | _filter_scratch
+
+_scratch_unmount
+
+status=0
+exit

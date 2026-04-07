@@ -1,0 +1,11 @@
+QA output created by 152
+Create subvolume 'SCRATCH_MNT/subvol1'
+Create subvolume 'SCRATCH_MNT/subvol2'
+Create subvolume 'SCRATCH_MNT/recv1_1'
+Create subvolume 'SCRATCH_MNT/recv1_2'
+Create subvolume 'SCRATCH_MNT/recv2_1'
+Create subvolume 'SCRATCH_MNT/recv2_2'
+At subvol 1
+At subvol 1
+At subvol 1
+At subvol 1

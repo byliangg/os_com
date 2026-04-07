@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc., Lukas Czerner <lczerner@redhat.com>
+#
+# FS QA Test 086
+#
+# This test excercises the problem with unwritten and delayed extents
+# in ext4 extent status tree where we might in some cases lose a block
+# worth of data. Even though this was a ext4 specific problem the
+# reproducer can be easily tun on any file system so let's do that just
+# in case.
+#
+# This tests excercises the problem fixed in kernel with commit
+# "ext4: Fix data corruption caused by unwritten and delayed extents"
+#
+. ./common/preamble
+_begin_fstest auto prealloc preallocrw quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_xfs_io_command "falloc"
+
+test_file=${TEST_DIR}/testfile-$seq
+
+rm -f $test_file
+
+# The first write creates a delayed extent, fallocate creates
+# unwritten extent which will be marked as delayed in ext4
+# extent status tree. Second write will convert unwritten/delayed
+# block into written/delayed.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 4096 2048" \
+		-c "falloc 0 131072" \
+		-c "pwrite -S 0xbb 65536 2048" \
+		-c "fsync"  $test_file > $seqres.full 2>&1
+
+# Drop the caches to evict dirty buffers from memory
+echo 3 > /proc/sys/vm/drop_caches
+
+# Write into the second part of the block with 0xbb write from before
+# will create new empty! buffer because the block is still marked as
+# delayed even though it's already written - resulting in
+# overwriting previous data.
+$XFS_IO_PROG -c "pwrite -S 0xdd 67584 2048" $test_file >> $seqres.full 2>&1
+
+# On a faulty ext4 oxbb data will be missing, overwritten by zeroes.
+_hexdump $test_file
+
+# success, all done
+status=0
+exit

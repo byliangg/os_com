@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright 2021 Red Hat, Inc.
+#
+# FS QA Test No. 623
+#
+# Test a write fault scenario on a shutdown fs.
+#
+. ./common/preamble
+_begin_fstest auto quick shutdown mmap
+
+. ./common/filter
+
+[ "$FSTYP" = "xfs" ] && _fixed_by_kernel_commit e4826691cc7e \
+	"xfs: restore shutdown check in mapped write fault path"
+
+_require_scratch_nocheck
+_require_xfs_io_shutdown
+
+_scratch_mkfs &>> $seqres.full
+_scratch_mount
+
+# XFS had a regression where it failed to check shutdown status in the fault
+# path. This produced an iomap warning because writeback failure clears Uptodate
+# status on the page.
+file=$SCRATCH_MNT/file
+$XFS_IO_PROG -fc "pwrite 0 4k" -c fsync $file | _filter_xfs_io
+ulimit -c 0
+$XFS_IO_PROG -x -c "mmap 0 4k" -c "mwrite 0 4k" -c shutdown -c fsync \
+	-c "mwrite 0 4k" $file | _filter_xfs_io
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,77 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 032
+#
+# Test concurrent copy up of lower hardlinks.
+#
+# Two tasks make a metadata change concurrently on two hardlinks of a large
+# lower inode.  The copy up should be triggers by one of the tasks and the
+# other should be waiting for copy up to complete.  Both copy up targets
+# should end up being upper hardlinks and both metadata changes should be
+# applied.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup hardlink
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_scratch_feature index
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# overlay copy_up doesn't deal with sparse file well, holes will be filled by
+# zeros, so if both hardlinks are broken on copy up, we need (2*1G) free space
+# on $OVL_BASE_SCRATCH_MNT.
+_require_fs_space $OVL_BASE_SCRATCH_MNT $((1024*1024*2))
+
+# Create a large file in lower with 2 hardlinks.
+# Make the file have non zero blocks, so copy up won't be able to do
+# a naive sparse file copy up optimization.
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+$XFS_IO_PROG -fc "pwrite 1g 4k" $lowerdir/zero >> $seqres.full
+ln $lowerdir/zero $lowerdir/one
+ln $lowerdir/zero $lowerdir/two
+
+# Enable overlay index feature to prevent breaking hardlinks on copy up
+_scratch_mount -o index=on
+
+do_cmd()
+{
+	echo "`date +%T` $1..." >> $seqres.full
+	eval "$1"
+	echo "`date +%T` ...$1" >> $seqres.full
+}
+
+# Perform one modification on each hardlink (size and owner)
+do_cmd "echo >> $SCRATCH_MNT/one" &
+#
+# When hardlinks are broken and overlayfs supports concurrent copy up,
+# $seqres.full will show that file two copy up started ~2s after file one
+# copy up started and ended ~2s after file one copy up ended.
+# With synchronized copy up of lower inodes, $seqres.full will show that
+# file two copy up ended at the same time as file one copy up.
+# Without sparse file copy up optimizations, copy of 1g on a standard disk
+# is expected to take more than 2s.
+# If underlying filesystem supports clone, overlay clone up with take less
+# than 1s and this test will not be doing concurrent copy up of hardlinks,
+# but rather consequent copy up of hardlinks.
+#
+sleep 2
+do_cmd "chown 100 $SCRATCH_MNT/two" &
+
+wait
+
+# Expect all hardlinks to show both metadata modifications (owner and size).
+# List <nlink> <owner> <size> <name>:
+for f in zero one two; do
+	_ls_l -n $SCRATCH_MNT/$f | awk '{ print $2, $3, $5, $9 }' | _filter_scratch
+done
+
+status=0
+exit

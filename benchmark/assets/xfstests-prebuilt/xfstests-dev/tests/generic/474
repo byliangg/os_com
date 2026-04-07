@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Chengguang Xu <cgxu519@icloud.com>
+#
+# FS QA Test 474
+#
+# Inspired by syncfs bug of overlayfs which does not sync dirty inodes in
+# underlying filesystem.
+#
+# Create a small file then run syncfs and shutdown filesystem(or underlying
+# filesystem of overlayfs) to check syncfs result.
+#
+# Test will be skipped if filesystem(or underlying filesystem of overlayfs)
+# does not support shutdown.
+#
+. ./common/preamble
+_begin_fstest auto quick shutdown metadata
+
+status=0
+
+# Import common functions.
+. ./common/filter
+
+
+_require_fssum
+_require_scratch
+_require_scratch_shutdown
+_require_xfs_io_command "syncfs"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# Background writeback will flush dirty inode by dirty ratio and dirty time
+# period(default 30 seconds), in order to avoid interference from it,
+# run sync before test to make all dirty inodes clean, and it also
+# accelerates syncfs on testing filesystem so that test case can finish
+# in 30 seconds.
+
+_scratch_sync
+
+# Large fs has a huge size .use_space file, will take long time on running
+# fssum $SCRATCH_MNT. So change the target path to a sub-dir of $SCRATCH_MNT.
+localdir=$SCRATCH_MNT/dir
+mkdir $localdir
+$XFS_IO_PROG -f -c "pwrite 0 4K" $localdir/testfile >/dev/null 2>&1
+
+# fssum used for comparing checksum of test file(data & metedata),
+# exclude checking about atime, block structure, open error.
+$FSSUM_PROG -ugomAcdES -f -w $tmp.fssum $localdir
+_sync_fs $localdir/testfile
+_scratch_shutdown
+_scratch_cycle_mount
+$FSSUM_PROG -r $tmp.fssum $localdir
+
+exit

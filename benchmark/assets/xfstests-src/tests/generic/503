@@ -1,0 +1,49 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Intel Corporation.  All Rights Reserved.
+#
+# FS QA Test No. 503
+#
+# This is a regression test for kernel patch:
+#   ext4: handle layout changes to pinned DAX mapping
+#
+# This test exercises each of the DAX paths in ext4 which remove blocks from
+# an inode's block map.  This includes things like hole punch, truncate down,
+# etc.  This test was written to regression test errors seen with an ext4 +
+# DAX setup, but the test runs fine with or without DAX and with XFS so we
+# don't require the DAX mount option or a specific filesystem for the test.
+
+. ./common/preamble
+_begin_fstest auto quick dax punch collapse zero prealloc mmap
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_test
+_require_scratch
+_require_test_program "t_mmap_collision"
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "fcollapse"
+_require_xfs_io_command "fzero"
+
+_scratch_mkfs >> $seqres.full 2>&1
+# To get the failure we turn off DAX on our SCRATCH_MNT so we can get O_DIRECT
+# behavior.  We will continue to use unmodified mount options for the test
+# TEST_DIR.  The failures fixed by the above mentioned kernel patch trigger
+# when those mount options include "-o dax", but the test runs fine without
+# that option so we don't require it.
+export MOUNT_OPTIONS=""
+_scratch_mount >> $seqres.full 2>&1
+
+blksize=$(_get_file_block_size $SCRATCH_MNT)
+test $blksize -eq $(getconf PAGE_SIZE) || \
+	_notrun "file block size must match page size"
+
+$here/src/t_mmap_collision $TEST_DIR/testfile $SCRATCH_MNT/testfile
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Facebook.  All Rights Reserved.
+#
+# FS QA Test No. 094
+#
+# Run the fiemap (file extent mapping) tester with preallocation enabled
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc fiemap
+
+_cleanup()
+{
+	cd /
+	rm -fr $tmp.*
+	rm -f $fiemapfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_odirect
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "falloc"
+
+fiemapfile=$TEST_DIR/$seq.fiemap
+
+_require_test_program "fiemap-tester"
+
+seed=`date +%s`
+
+echo "using seed $seed" >> $seqres.full
+
+echo "fiemap run with sync"
+$here/src/fiemap-tester -q -S -s $seed -r 200 $fiemapfile
+
+echo "fiemap run without sync"
+$here/src/fiemap-tester -q -s $seed -r 200 $fiemapfile
+
+status=0
+exit

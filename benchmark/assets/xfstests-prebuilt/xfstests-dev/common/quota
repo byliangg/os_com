@@ -1,0 +1,473 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001,2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# Functions useful for quota tests
+
+# checks that the generic quota support in the kernel is enabled
+# and that we have valid quota user tools installed.
+#
+_require_quota()
+{
+    [ -n "$QUOTA_PROG" ] || _notrun "Quota user tools not installed"
+
+    case $FSTYP in
+    ext2|ext3|ext4|f2fs)
+	if [ ! -d /proc/sys/fs/quota ]; then
+	    _notrun "Installed kernel does not support quotas"
+	fi
+	_require_kernel_config CONFIG_QFMT_V2
+	;;
+    gfs2|ocfs2|bcachefs)
+	;;
+    xfs)
+	if [ ! -f /proc/fs/xfs/xqmstat ]; then
+	    _notrun "Installed kernel does not support XFS quotas"
+        fi
+	_require_xfs_rtquota_if_rtdev
+	;;
+    *)
+	_notrun "disk quotas not supported by this filesystem type: $FSTYP"
+	;;
+    esac
+}
+
+#
+# checks that the XFS quota support in the kernel is enabled
+# and that we have valid quota user tools installed.
+#
+_require_xfs_quota()
+{
+    $here/src/feature -q $TEST_DEV
+    [ $? -ne 0 ] && _notrun "Installed kernel does not support XFS quota"
+    _require_xfs_rtquota_if_rtdev
+    [ -n "$XFS_QUOTA_PROG" ] || _notrun "XFS quota user tools not installed"
+}
+
+# Check that a mounted fs has a particular type of quota accounting turned on.
+#
+# The first argument must be the data device of a mounted fs.  It must not be
+# the actual mountpath.
+#
+# The second argument is the quota type ('usrquota', 'grpquota', 'prjquota',
+# 'any', or 'all').
+_xfs_quota_acct_enabled()
+{
+	local dev="$1"
+	local qtype="$2"
+	local f_args=()
+	local any=
+
+	case "$qtype" in
+	"usrquota"|"uquota")	f_args=("-U");;
+	"grpquota"|"gquota")	f_args=("-G");;
+	"prjquota"|"pquota")	f_args=("-P");;
+	"all")			f_args=("-U" "-G" "-P");;
+	"any")			f_args=("-U" "-G" "-P"); any=1;;
+	*)			echo "$qtype: Unknown quota type."; return 1;;
+	esac
+
+	if [ "$any" = "1" ]; then
+		for arg in "$f_args"; do
+			$here/src/feature "$arg" "$dev" && return 0
+		done
+		return 1
+	fi
+
+	$here/src/feature "${f_args[@]}" "$dev"
+}
+
+# Require that a mounted fs has a particular type of quota turned on.  This
+# takes the same arguments as _xfs_quota_acct_enabled.  If the third argument is
+# '-u' (or is empty and dev is $SCRATCH_DEV) the fs will be unmounted on
+# failure.
+_require_xfs_quota_acct_enabled()
+{
+	local dev="$1"
+	local qtype="$2"
+	local umount="$3"
+	local fsname="$dev"
+
+	_xfs_quota_acct_enabled "$dev" "$qtype" "$qmode" && return 0
+
+	if [ -z "$umount" ] && [ "$dev" = "$SCRATCH_DEV" ]; then
+		umount="-u"
+	fi
+	test "$umount" = "-u" && umount "$dev" &>/dev/null
+
+	case "$dev" in
+	"$TEST_DEV")	fsname="test";;
+	"$SCRATCH_DEV")	fsname="scratch";;
+	esac
+
+	case "$qtype" in
+	"any")		qtype="any quotas";;
+	"all")		qtype="all quotas";;
+	esac
+
+	_notrun "$qtype: accounting not enabled on $fsname filesystem."
+}
+
+#
+# checks that xfs_quota can operate on foreign (non-xfs) filesystems
+# Skips check on xfs filesystems, old xfs_quota is fine there.
+# Appends "-f" to enable foreign behavior on non-xfs filesystems if available.
+#
+_require_xfs_quota_foreign()
+{
+	if [ "$FSTYP" != "xfs" ]; then
+		$XFS_QUOTA_PROG -f -V &>/dev/null || \
+		 _notrun "xfs_quota binary does not support foreign filesystems"
+		XFS_QUOTA_PROG="$XFS_QUOTA_PROG -f"
+	fi
+}
+
+#
+# Checks that the project quota support in the kernel is enabled.
+# The device must be mounted for detection to work properly.
+#
+_require_prjquota()
+{
+    [ -n "$1" ] && _dev="$1" || _dev="$TEST_DEV"
+    if [[ "$FSTYP" == ext[234] ]]; then
+	dumpe2fs -h $_dev 2>&1 | grep -qw project || \
+		_notrun "Project quota not available on this $FSTYP"
+    fi
+    if [ "$FSTYP" == "f2fs" ]; then
+	dump.f2fs $_dev 2>&1 | grep -qw project_quota
+	[ $? -ne 0 ] && _notrun "Project quota not enabled in this device $_dev"
+	dump.f2fs $_dev 2>&1 | grep -Eqw "quota|quota_ino"
+	[ $? -ne 0 ] && _notrun "quota sysfile not enabled in this device $_dev"
+	cat /sys/fs/f2fs/features/project_quota | grep -qw supported
+	[ $? -ne 0 ] && _notrun "Installed kernel does not support project quotas"
+	return
+    fi
+    $here/src/feature -P $_dev
+    [ $? -ne 0 ] && _notrun "Installed kernel does not support project quotas"
+    test "$FSTYP" = "xfs" && _require_xfs_rtquota_if_rtdev
+}
+
+#
+# Do we have GETNEXTQUOTA?  Querying ID 0 should work.
+#
+_require_getnextquota()
+{
+	_require_test_program "test-nextquota"
+	$here/src/test-nextquota -i 0 -u -d $SCRATCH_DEV &> $seqres.full || \
+		_notrun "No GETNEXTQUOTA support"
+}
+
+#
+# ext4 (for now) is unique in that we must enable the project quota feature
+# prior to mount.  This is a relatively new feature ...
+_scratch_enable_pquota()
+{
+	case $FSTYP in
+	ext2|ext3|ext4)
+		tune2fs -O quota,project $SCRATCH_DEV >>$seqres.full 2>&1
+		_try_scratch_mount >/dev/null 2>&1 \
+			|| _notrun "kernel doesn't support project feature on $FSTYP"
+		_scratch_unmount
+		;;
+	f2fs)
+		_scratch_mkfs "-O extra_attr -O quota -O project_quota" >> $seqres.full 2>&1
+		;;
+	esac
+}
+
+_require_setquota_project()
+{
+	setquota --help 2>&1 | \
+		grep -q -- "-P, --project[[:space:]]*set limits for project"
+	if [ "$?" -ne 0 ];then
+		_notrun "setquota doesn't support project quota (-P)"
+	fi
+}
+
+#
+# checks for user nobody in /etc/passwd and /etc/group.
+#
+_require_nobody()
+{
+    _cat_passwd | grep -q '^nobody'
+    [ $? -ne 0 ] && _notrun "password file does not contain user nobody."
+
+    _cat_group | grep -Eq '^no(body|group)'
+    [ $? -ne 0 ] && _notrun "group file does not contain nobody/nogroup."
+}
+
+# create a file as a specific user (uid)
+# takes filename, id, type (u/g/p), blocksize, blockcount
+#
+_file_as_id()
+{
+    [ $# != 5 ] && _fail "broken call to _file_as_id in test $seq"
+
+    parent=`dirname $1`
+    if [ $3 = p ]; then
+	echo PARENT: $XFS_IO_PROG -r -c "chproj $2" -c "chattr +P" $parent >>$seqres.full
+	$XFS_IO_PROG -r -c "chproj $2" -c "chattr +P" $parent >>$seqres.full 2>&1
+	magik='$>'	# (irrelevent, above set projid-inherit-on-parent)
+    elif [ $3 = u ]; then
+	magik='$>'	# perlspeak for effective uid
+    elif [ $3 = g ]; then
+	magik='$)'	# perlspeak for effective gid
+    else
+	_notrun "broken type in call to _file_as_id in test $seq"
+    fi
+
+    perl <<EOF >>$seqres.full 2>&1
+	\$| = 1;
+	$magik = $2;
+	if ($5 == 0) {
+	    print "touch $1";
+	    exec "touch $1";
+	} else {
+	    print "dd if=/dev/zero of=$1 bs=$4 count=$5";
+	    exec "dd if=/dev/zero of=$1 bs=$4 count=$5";
+	}
+EOF
+# for debugging the above euid change, try... [need write in cwd]
+#	exec "dd if=/dev/zero of=$1 bs=$4 count=$5 >>$seqres.full 2>&1";
+
+    if [ $3 = p ]; then
+	echo PARENT: $XFS_IO_PROG -r -c "chproj 0" -c "chattr -P" $parent >>$seqres.full
+	$XFS_IO_PROG -r -c "chproj 0" -c "chattr -P" $parent >>$seqres.full 2>&1
+    fi
+}
+
+_choose_uid()
+{
+    _cat_passwd | grep '^nobody' | perl -ne '@a = split(/:/); END { printf "id=%d name=%s\n", $a[2],$a[0] }'
+}
+
+_choose_gid()
+{
+    _cat_group | grep -E '^no(body|group)' | perl -ne '@a = split(/:/); END { printf "id=%d name=%s\n", $a[2],$a[0] }'
+}
+
+_choose_prid()
+{
+    if [ "X$projid_file" == "X" ]; then
+	projid_file=/etc/projid
+    fi
+    if [ ! -f $projid_file ]; then
+	echo 0
+	return
+    fi
+    perl -ne '@a = split(/:/); END { printf "id=%d name=%s\n", $a[1],$a[0] }' \
+	$projid_file
+}
+
+_qmount()
+{
+    _scratch_unmount >/dev/null 2>&1
+    _try_scratch_mount || _fail "qmount failed"
+    # xfs doesn't need these setups and quotacheck even fails on xfs
+    # redirect the output to $seqres.full for debug purpose and ignore results
+    if [ "$FSTYP" != "xfs" ]; then
+        quotacheck -ug $SCRATCH_MNT >>$seqres.full 2>&1
+        quotaon -ug $SCRATCH_MNT >>$seqres.full 2>&1
+        # try to turn on project quota if it's supported
+        if quotaon --help 2>&1 | grep -q -- '--project'; then
+            quotaon --project $SCRATCH_MNT >>$seqres.full 2>&1
+        fi
+    fi
+    chmod ugo+rwx $SCRATCH_MNT
+}
+
+#
+# Ensures only the given quota mount option is used
+#
+_qmount_option()
+{
+	OPTS=$1
+
+	# Replace any user defined quota options
+	# with the quota option that we want.
+	# Simplest to do this rather than delete existing ones first because
+	# of the variety of commas and spaces and multiple -o's
+	# that we'd have to cater for. Doesn't matter if we have duplicates.
+	# Use "QUOTA" string so that we don't have any substring confusion
+	# thanks to "quota" which will match with "uquota" and "gquota" etc.
+	export MOUNT_OPTIONS=`echo $MOUNT_OPTIONS \
+	| sed   -e 's/uquota/QUOTA/g'      \
+		-e 's/usrquota/QUOTA/g'    \
+		-e 's/usrjquota=[^, ]*/QUOTA/g' \
+		-e 's/gquota/QUOTA/g'      \
+		-e 's/grpquota/QUOTA/g'    \
+		-e 's/grpjquota=[^, ]*/QUOTA/g' \
+		-e 's/\bpquota/QUOTA/g'    \
+		-e 's/prjquota/QUOTA/g'    \
+		-e 's/noquota/QUOTA/g'     \
+		-e 's/quota/QUOTA/g'       \
+		-e 's/uqnoenforce/QUOTA/g' \
+		-e 's/gqnoenforce/QUOTA/g' \
+		-e 's/pqnoenforce/QUOTA/g' \
+		-e 's/qnoenforce/QUOTA/g'  \
+		-e "s/QUOTA/$OPTS/g"`
+
+	# ext4 doesn't _do_ "-o pquota/prjquota" because reasons
+	# Switch it to "quota" to enable mkfs-time pquota
+	if [[ "$FSTYP" == ext[234] ]]; then
+		OPTS=`echo $OPTS \
+		| sed	-e 's/\bpquota/quota/g'	\
+			-e 's/prjquota/quota/g'`
+	# ocfs2 doesn't support "-o projquota"
+	elif [[ "$FSTYP" == ocfs2 ]]; then
+		OPTS=`echo $OPTS | sed -e 's/prjquota//g'`
+	fi
+	# Ensure we have the given quota option - duplicates are fine
+	if [ -n "$OPTS" ]; then
+		export MOUNT_OPTIONS="$MOUNT_OPTIONS -o $OPTS"
+	fi
+	echo "MOUNT_OPTIONS = $MOUNT_OPTIONS" >>$seqres.full
+}
+
+_check_quota_usage()
+{
+	# Sync to get delalloc to disk
+	_scratch_sync
+
+	# kill caches to guarantee removal speculative delalloc
+	# XXX: really need an ioctl instead of this big hammer
+	echo 3 > /proc/sys/vm/drop_caches
+
+	VFS_QUOTA=0
+	case $FSTYP in
+	ext2|ext3|ext4|gfs2|bcachefs)
+		VFS_QUOTA=1
+		quotaon -f -u -g $SCRATCH_MNT 2>/dev/null
+		;;
+	f2fs)
+		# wait for inode_switch_wbs_wor_fn() to release inodes
+		sleep 3
+
+		VFS_QUOTA=1
+		quotaon -f -u -g $SCRATCH_MNT 2>/dev/null
+		;;
+	xfs)
+		# Only way to make this reliable with cow/delalloc/speculative
+		# preallocations is to unmount and remount the whole mess...
+		_scratch_unmount
+		_scratch_mount "-o usrquota,grpquota"
+		;;
+	*)
+		;;
+	esac
+	repquota -u -n $SCRATCH_MNT  | grep -v "^#0" | _filter_scratch |
+		sort >$tmp.user.orig
+	repquota -g -n $SCRATCH_MNT  | grep -v "^#0" | _filter_scratch |
+		sort >$tmp.group.orig
+	if [ $VFS_QUOTA -eq 1 ]; then
+		quotacheck -u -g $SCRATCH_MNT 2>/dev/null
+	else
+		# use XFS method to force quotacheck
+		xfs_quota -x -c "off -ug" $SCRATCH_MNT
+		_scratch_unmount
+		_scratch_mount "-o usrquota,grpquota"
+	fi
+	repquota -u -n $SCRATCH_MNT  | grep -v "^#0" | _filter_scratch |
+		sort >$tmp.user.checked
+	repquota -g -n $SCRATCH_MNT  | grep -v "^#0" | _filter_scratch |
+		sort >$tmp.group.checked
+	if [ $VFS_QUOTA -eq 1 ]; then
+		quotaon -u -g $SCRATCH_MNT 2>/dev/null
+	fi
+	{
+		echo "Comparing user usage"
+		diff $tmp.user.orig $tmp.user.checked
+	} && {
+		echo "Comparing group usage"
+		diff $tmp.group.orig $tmp.group.checked
+	}
+}
+
+# Report the block usage of root, $qa_user, and nobody
+_report_quota_blocks() {
+	repquota $1 | grep -E "^($qa_user|root|nobody)" | awk '{print $1, $3, $4, $5}' | sort -r
+}
+
+# Report the inode usage of root, $qa_user, and nobody
+_report_quota_inodes() {
+	repquota $1 | grep -E "^($qa_user|root|nobody)" | awk '{print $1, $6, $7, $8}' | sort -r
+}
+
+# Determine which type of quota we're using
+_qsetup()
+{
+	opt=$1
+	enforce=0
+	if [ $opt = "u" -o $opt = "uno" ]; then
+		type=u
+		eval `_choose_uid`
+	elif [ $opt = "g" -o $opt = "gno" ]; then
+		type=g
+		eval `_choose_gid`
+	elif [ $opt = "p" -o $opt = "pno" ]; then
+		type=p
+		eval `_choose_prid`
+	fi
+	[ $opt = "u" -o $opt = "g" -o $opt = "p" ] && enforce=1
+
+	echo "Using type=$type id=$id" >> $seqres.full
+}
+
+# Help to create project quota on directory, works for xfs and other fs.
+# Usage: _create_project_quota <dirname> <projid> [name]
+# Although the [name] is optional, better to specify it if need a fixed name.
+_create_project_quota()
+{
+	local prjdir=$1
+	local id=$2
+	local name=$3
+
+	if [ -z "$name" ];then
+		name=`echo $projdir | tr \/ \_`
+	fi
+
+	rm -rf $prjdir
+	mkdir $prjdir
+	chmod ugo+rwx $prjdir
+
+	echo "$id:$prjdir" >> /etc/project
+	echo "$name:$id" >> /etc/projid
+	$XFS_IO_PROG -r -c "chproj $id" -c "chattr +P" $prjdir
+}
+
+# If you've called _create_project_quota, then use this function in _cleanup
+_restore_project_quota()
+{
+	local id=$1
+
+	sed -i "/^$id:/d" /etc/project
+	sed -i "/:$id$/d" /etc/projid
+}
+
+# Reconfigure the mounted fs as needed so that we can test the VFS quota
+# utilities.  They do not support realtime block limits or reporting, so
+# we forcibly inhibit rtinherit on XFS filesystems.
+_force_vfs_quota_testing()
+{
+	local mount="${1:-$TEST_DIR}"
+
+	test "$FSTYP" = "xfs" && _xfs_force_bdev data "$mount"
+}
+
+# Does the mounted scratch filesystem have a realtime volume where quota works?
+# Returns nonzero if any of the above are false.
+_scratch_supports_rtquota()
+{
+	case "$FSTYP" in
+	"xfs")
+		if [ "$USE_EXTERNAL" = yes ] && [ -n "$SCRATCH_RTDEV" ]; then
+			_xfs_scratch_supports_rtquota
+			return
+		fi
+	esac
+
+	return 1
+}
+
+# make sure this script returns success
+/bin/true

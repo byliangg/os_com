@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 103
+#
+# Test attribute fork teardown. This test is inspired by a regression in XFS
+# that resulted in problematic removal of inodes with remote attribute forks
+# without attribute extents. The attribute fork condition is created by
+# attempting to set larger attribute values on a filesystem that is at or near
+# ENOSPC.
+#
+. ./common/preamble
+_begin_fstest auto quick attr enospc prealloc
+
+_register_cleanup "_cleanup" 25
+
+# Import common functions.
+. ./common/attr
+
+_require_scratch
+_require_attrs
+_require_xfs_io_command "falloc"
+
+_consume_freesp()
+{
+	file=$1
+	left=512
+
+	# consume nearly all available space (leave ~512kB)
+	avail=`_get_available_space $SCRATCH_MNT`
+
+	# f2fs uses index(radix) tree as mapping metadata, its space overhead
+	# is about one thousandth of the data
+	if [ $FSTYP == "f2fs" ]; then
+		left=$((left + avail / 1024000))
+	fi
+
+	filesizekb=$((avail / 1024 - $left))
+	$XFS_IO_PROG -fc "falloc 0 ${filesizekb}k" $file
+}
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+for i in $(seq 0 63); do
+	touch $SCRATCH_MNT/$seq.$i
+done
+
+# Generate a large attribute value and consume the rest of the space in the
+# filesystem.
+$XFS_IO_PROG -fc "pwrite 0 64k" $SCRATCH_MNT/attrval > /dev/null 2>&1
+_consume_freesp $SCRATCH_MNT/spc
+
+# Set attributes on the test files. These should start to hit ENOSPC.
+for i in $(seq 0 63); do
+	$SETFATTR_PROG -n user.test -v "`cat $SCRATCH_MNT/attrval`" \
+		$SCRATCH_MNT/$seq.$i >> $seqres.full 2>&1
+done
+
+# Remove the files with attributes to test attribute fork teardown. Problems
+# result in dmesg output.
+rm -f $SCRATCH_MNT/$seq.*
+
+echo Silence is golden.
+
+status=0
+exit

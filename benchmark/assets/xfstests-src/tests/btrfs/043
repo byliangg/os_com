@@ -1,0 +1,122 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/043
+#
+# Regression test for btrfs incremental send issue where a rmdir instruction
+# is sent against an orphan directory inode which is not empty yet, causing
+# btrfs receive to fail when it attempts to remove the directory.
+#
+# This issue is fixed by the following linux kernel btrfs patch:
+#
+#   Btrfs: fix send attempting to rmdir non-empty directories
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+tmp=`mktemp -d`
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $tmp
+}
+
+. ./common/filter
+
+_require_scratch
+_require_fssum
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+mkdir -p $SCRATCH_MNT/a/b
+mkdir $SCRATCH_MNT/0
+mkdir $SCRATCH_MNT/1
+mkdir $SCRATCH_MNT/a/b/c
+mv $SCRATCH_MNT/0 $SCRATCH_MNT/a/b/c
+mv $SCRATCH_MNT/1 $SCRATCH_MNT/a/b/c
+echo 'ola mundo' > $SCRATCH_MNT/a/b/c/foo.txt
+mkdir $SCRATCH_MNT/a/b/c/x
+mkdir $SCRATCH_MNT/a/b/c/x2
+mkdir $SCRATCH_MNT/a/b/y
+mkdir $SCRATCH_MNT/a/b/z
+mkdir -p $SCRATCH_MNT/a/b/d1/d2/d3
+mkdir $SCRATCH_MNT/a/b/d4
+
+# Filesystem looks like:
+#
+# .                        (ino 256)
+# |-- a/                   (ino 257)
+#     |-- b/               (ino 258)
+#         |-- c/           (ino 261)
+#         |   |-- foo.txt  (ino 262)
+#         |   |-- 0/       (ino 259)
+#         |   |-- 1/       (ino 260)
+#         |   |-- x/       (ino 263)
+#         |   |-- x2/      (ino 264)
+#         |
+#         |-- y/           (ino 265)
+#         |-- z/           (ino 266)
+#         |-- d1/          (ino 267)
+#         |   |-- d2/      (ino 268)
+#         |       |-- d3/  (ino 269)
+#         |
+#         |-- d4/          (ino 270)
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+rm -f $SCRATCH_MNT/a/b/c/foo.txt
+mv $SCRATCH_MNT/a/b/y $SCRATCH_MNT/a/b/YY
+mv $SCRATCH_MNT/a/b/z $SCRATCH_MNT/a
+mv $SCRATCH_MNT/a/b/c/x $SCRATCH_MNT/a/b/YY
+mv $SCRATCH_MNT/a/b/c/0 $SCRATCH_MNT/a/b/YY/00
+mv $SCRATCH_MNT/a/b/c/x2 $SCRATCH_MNT/a/z/X_2
+mv $SCRATCH_MNT/a/b/c/1 $SCRATCH_MNT/a/z/X_2
+rmdir $SCRATCH_MNT/a/b/c
+mv $SCRATCH_MNT/a/b/d4 $SCRATCH_MNT/a/d44
+mv $SCRATCH_MNT/a/b/d1/d2 $SCRATCH_MNT/a/d44
+rmdir $SCRATCH_MNT/a/b/d1
+
+# Filesystem now looks like:
+#
+# .                        (ino 256)
+# |-- a/                   (ino 257)
+#     |-- b/               (ino 258)
+#     |   |-- YY/          (ino 265)
+#     |        |-- x/      (ino 263)
+#     |        |-- 00/     (ino 259)
+#     |
+#     |-- z/               (ino 266)
+#     |   |-- X_2/         (ino 264)
+#     |        |-- 1/      (ino 260)
+#     |
+#     |-- d44/             (ino 270)
+#          |-- d2/         (ino 268)
+#              |-- d3/     (ino 269)
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+run_check $FSSUM_PROG -A -f -w $tmp/1.fssum $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $tmp/2.fssum -x $SCRATCH_MNT/mysnap2/mysnap1 \
+	$SCRATCH_MNT/mysnap2
+
+_btrfs send -f $tmp/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $tmp/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+_check_scratch_fs
+
+_scratch_unmount
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+_btrfs receive -f $tmp/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $tmp/1.fssum $SCRATCH_MNT/mysnap1
+
+_btrfs receive -f $tmp/2.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $tmp/2.fssum $SCRATCH_MNT/mysnap2
+
+status=0
+exit

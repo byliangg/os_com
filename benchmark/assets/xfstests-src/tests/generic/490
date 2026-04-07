@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 SUSE.  All Rights Reserved.
+#
+# FS QA Test No. 490
+#
+# Check that SEEK_DATA works properly for offsets in the middle of large holes.
+# This was broken for ext4 with indirect-block based files and this test checks
+# for that. The problem has been fixed by commit 2ee3ee06a8fd79 "ext4: fix hole
+# length detection in ext4_ind_map_blocks()"
+#
+. ./common/preamble
+_begin_fstest auto quick rw seek
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_seek_data_hole
+
+base_test_file=$TEST_DIR/seek_sanity_testfile.$seq
+
+_require_test_program "seek_sanity_test"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $base_test_file*
+}
+
+_run_seek_sanity_test -s 19 -e 20 $base_test_file > $seqres.full 2>&1 ||
+	_fail "seek sanity check failed!"
+
+# success, all done
+status=0
+exit

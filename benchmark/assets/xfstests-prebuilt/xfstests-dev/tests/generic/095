@@ -1,0 +1,108 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test generic/095
+#
+# Concurrent mixed I/O (buffer I/O, aiodio, mmap, splice) on the same files
+#
+. ./common/preamble
+_begin_fstest auto quick rw stress mmap
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_odirect
+_require_aio
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+iodepth=$((16 * LOAD_FACTOR))
+iodepth_batch=$((8 * LOAD_FACTOR))
+numjobs=$((5 * LOAD_FACTOR))
+fio_config=$tmp.fio
+fio_out=$tmp.fio.out
+blksz=`$here/src/min_dio_alignment $SCRATCH_MNT $SCRATCH_DEV`
+cat >$fio_config <<EOF
+[global]
+bs=8k
+iodepth=$iodepth
+iodepth_batch=$iodepth_batch
+randrepeat=1
+size=1m
+directory=$SCRATCH_MNT
+numjobs=$numjobs
+[job1]
+ioengine=sync
+bs=$blksz
+direct=1
+rw=randread
+filename=file1:file2
+[job2]
+ioengine=libaio
+rw=randwrite
+direct=1
+filename=file1:file2
+[job3]
+bs=$blksz
+ioengine=posixaio
+rw=randwrite
+direct=1
+filename=file1:file2
+[job4]
+ioengine=splice
+direct=1
+rw=randwrite
+filename=file1:file2
+[job5]
+bs=1k
+ioengine=sync
+rw=randread
+filename=file1:file2
+[job6]
+ioengine=posixaio
+rw=randwrite
+filename=file1:file2
+[job7]
+ioengine=splice
+rw=randwrite
+filename=file1:file2
+[job8]
+ioengine=mmap
+rw=randwrite
+bs=1k
+filename=file1:file2
+[job9]
+ioengine=mmap
+rw=randwrite
+direct=1
+filename=file1:file2
+EOF
+# with ioengine=mmap and direct=1, fio requires bs to be at least pagesize,
+# which is a fio built-in var.
+echo 'bs=$pagesize' >> $fio_config
+
+_require_fio $fio_config
+
+# There's a known EIO failure to report collisions between directio and buffered
+# writes to userspace, refer to upstream linux 5a9d929d6e13. So ignore EIO error
+# at here.
+$FIO_PROG $fio_config --ignore_error=,EIO --output=$fio_out
+cat $fio_out >> $seqres.full
+echo "Silence is golden"
+
+# xfs generates WARNINGs on purpose when applications mix buffered/mmap IO with
+# direct IO on the same file. On the other hand, this fio job has been proven
+# to be potent, we don't want to simply _disable_dmesg_check which could miss
+# other potential bugs. So filter out the intentional WARNINGs, make sure test
+# doesn't fail because of this warning and fails on other WARNINGs.
+
+# umount before checking dmesg in case umount triggers any WARNING or Oops
+_scratch_unmount
+
+_check_dmesg _filter_aiodio_dmesg
+
+status=$?
+exit

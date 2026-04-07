@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 432
+#
+# Ensure that metadump copies large directory extents
+#
+# Metadump helpfully discards directory (and xattr) extents that are
+# longer than 1000 blocks.  This is a little silly since a hardlink farm
+# can easily create such a monster.
+#
+# Now that we've upped metadump's default too-long-extent discard
+# threshold to 2^21 blocks, make sure we never do that again.
+#
+. ./common/preamble
+_begin_fstest auto quick dir metadata metadump
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f "$tmp".*
+	_xfs_cleanup_verify_metadump
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/metadump
+
+_require_command "$XFS_MDRESTORE_PROG" "xfs_mdrestore"
+_require_scratch
+_xfs_setup_verify_metadump
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+# We need to create a directory with a huuuge extent record.  Normally
+# a rapidly expanding directory gets its blocks allocated in lockstep --
+# physically we end up writing (a couple of dir data blocks) followed by
+# (a da btree block) over and over.
+#
+# Therefore, we crank the directory block size up to maximum and the
+# filesystem down to minimum so that we have to allocate 64 blocks at
+# a time, trying to end up with the result that we have > 1000 blocks
+# allocated in a single extent.
+#
+# In theory the math works out here -- ~65500 bytes for a da leaf block /
+# 8 bytes per da leaf entry == ~8187 hash entries for a da node.  65500
+# bytes for a dir data block / 264 bytes per dirent == ~248 dirents per
+# block.  8187 hashes/dablk / 248 dirents/dirblock = ~33 dirblocks per
+# dablock.  33 dirblocks * 64k mean that we can expand a directory by
+# 2112k before we have to allocate another da btree block.
+
+_scratch_mkfs_xfs -b size=1k -n size=64k > "$seqres.full" 2>&1
+_scratch_mount >> "$seqres.full" 2>&1
+
+testdir="$SCRATCH_MNT/test-$seq"
+max_fname_len=255
+blksz=$(_get_block_size $SCRATCH_MNT)
+
+# Try to create a directory w/ extents
+blocks=1050
+names=$((blocks * (blksz / max_fname_len)))
+echo "Create huge dir"
+mkdir -p $testdir
+touch $SCRATCH_MNT/a
+seq 0 $names | while read f; do
+	name="$testdir/$(printf "%0${max_fname_len}d" $f)"
+	ln $SCRATCH_MNT/a $name
+done
+dir_inum=$(stat -c %i $testdir)
+
+echo "Check for > 1000 block extent?"
+_scratch_unmount
+check_for_long_extent() {
+	inum=$1
+
+	_scratch_xfs_db -x -c "inode $dir_inum" -c bmap | \
+		sed -e 's/^.*count \([0-9]*\) flag.*$/\1/g' | \
+		awk '{if ($1 > 1000) { printf("yes, %d\n", $1); } }'
+}
+extlen="$(check_for_long_extent $dir_inum)"
+echo "qualifying extent: $extlen blocks" >> $seqres.full
+test -n "$extlen" || _notrun "could not create dir extent > 1000 blocks"
+
+echo "Try to metadump, restore and check restored metadump image"
+_xfs_verify_metadumps '-a -o -w'
+
+# success, all done
+status=0
+exit

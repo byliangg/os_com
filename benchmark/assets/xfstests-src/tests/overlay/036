@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 036
+#
+# Test mount error cases with exclusive directories
+#
+# Overlayfs is often used to mount several mounts that share a single
+# lower dir, but every overlayfs mount should have its own private
+# upperdir and private workdir.
+#
+# Overlayfs mount on kernel <= v4.12 does not check if upper/work dirs
+# are currently in-use by another overlayfs mount on the system and bad
+# things can happen with such configuration.
+#
+# Commit 2cac0c00a6cd ("ovl: get exclusive ownership on upper/work dirs")
+# in kernel v4.13 enforces upper/work dir in-use for any overlayfs mount.
+# Later stable fix commit 85fdee1eef1a ("ovl: fix regression caused by
+# exclusive upper/work dir protection") relaxes mount failure to a warning
+# for index=off mount and fails mount with EBUSY for index=on mount.
+#
+# This test expects success with index=off and EBUSY with index=on
+# when trying to mount overlay with:
+# - Upper dir is in-use by another overlay mount
+# - Work dir is in-use by another overlay mount
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	# unmount the two extra mounts in case they did not fail
+	$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+	$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+}
+
+# Import common functions.
+. ./common/filter
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_scratch_feature index
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create multiple lowerdirs, upperdirs and workdirs
+lowerdir=$OVL_BASE_SCRATCH_MNT/lower
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+upperdir2=$OVL_BASE_SCRATCH_MNT/upper2
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+workdir2=$OVL_BASE_SCRATCH_MNT/workdir2
+mkdir -p $lowerdir $lowerdir2 $upperdir $upperdir2 $workdir $workdir2
+
+# Mount overlay with lowerdir, upperdir, workdir
+_overlay_mount_dirs $lowerdir $upperdir $workdir \
+		    overlay $SCRATCH_MNT
+
+# Try to mount another overlay with the same upperdir
+# with index=off - expect success
+_overlay_mount_dirs $lowerdir $upperdir $workdir2 \
+		    overlay0 $SCRATCH_MNT -oindex=off && \
+		    $UMOUNT_PROG $SCRATCH_MNT
+
+# Try to mount another overlay with the same workdir
+# with index=off - expect success
+_overlay_mount_dirs $lowerdir2 $upperdir2 $workdir \
+		    overlay1 $SCRATCH_MNT -oindex=off && \
+		    $UMOUNT_PROG $SCRATCH_MNT
+
+# Try to mount another overlay with the same upperdir
+# with index=on - expect EBUSY
+_overlay_mount_dirs $lowerdir $upperdir $workdir2 \
+	    overlay2 $SCRATCH_MNT -oindex=on 2>&1 | _filter_busy_mount
+
+# Try to mount another overlay with the same workdir
+# with index=on - expect EBUSY
+_overlay_mount_dirs $lowerdir2 $upperdir2 $workdir \
+	    overlay3 $SCRATCH_MNT -oindex=on 2>&1 | _filter_busy_mount
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir $upperdir $workdir
+
+# success, all done
+status=0
+exit

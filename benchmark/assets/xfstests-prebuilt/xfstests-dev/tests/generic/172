@@ -1,0 +1,74 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 172
+#
+# Reflink a file that uses more than half of the space, then try to observe
+# ENOSPC while copy-on-writing the file via the page cache.
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir1
+}
+
+# Import common functions.
+. ./common/populate
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Reformat with appropriate size"
+blksz="$(_get_block_size $testdir)"
+_scratch_unmount
+
+file_size=$((768 * 1024 * 1024))
+fs_size=$((1024 * 1024 * 1024))
+_scratch_mkfs_sized $fs_size >> $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create a big file and reflink it"
+_pwrite_byte 0x61 0 $file_size $testdir/bigfile >> $seqres.full 2>&1
+_cp_reflink $testdir/bigfile $testdir/clonefile
+_scratch_sync
+
+echo "Allocate the rest of the space"
+_fill_fs $fs_size  $testdir/space $blksz 0 >> $seqres.full 2>&1
+_scratch_sync
+
+echo "CoW the big file"
+out="$(_pwrite_byte 0x62 0 $file_size $testdir/bigfile 2>&1 | \
+	_filter_xfs_io_error)"
+echo ${out} | grep -q "No space left on device" || echo "CoW should have failed with ENOSPC"
+echo ${out} >> $seqres.full 2>&1
+echo ${out}
+
+echo "Remount and try CoW again"
+_scratch_cycle_mount
+
+out="$(_pwrite_byte 0x62 0 $file_size $testdir/bigfile 2>&1 | \
+	_filter_xfs_io_error)"
+echo ${out} | grep -q "No space left on device" || echo "CoW should have failed with ENOSPC"
+echo ${out} >> $seqres.full 2>&1
+echo ${out}
+
+# success, all done
+status=0
+exit

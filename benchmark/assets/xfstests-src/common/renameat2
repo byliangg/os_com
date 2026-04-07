@@ -1,0 +1,141 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Miklos Szeredi.  All Rights Reserved.
+#
+# renameat2 helpers
+
+# Setup source or dest
+#
+_setup_one()
+{
+	local path=$1
+	local type=$2
+
+	case $type in
+		none)	;;
+		regu)	echo foo > $path;;
+		symb)	ln -s foo $path;;
+		dire)	mkdir $path;;
+		tree)	mkdir $path; echo foo > $path/bar;;
+	esac
+}
+
+#
+# Cleanup source or dest
+#
+_cleanup_one()
+{
+	local path=$1
+
+	if test -d $path; then
+		rm -f $path/bar
+		rmdir $path
+	else
+		rm -f $path
+	fi
+}
+
+#
+# Check type of source or destination
+#
+_showtype_one()
+{
+	local path=$1
+
+	if test -e $path -o -h $path; then
+		if test -d $path -a -e $path/bar; then
+			echo -n "tree"
+		else
+			echo -n `stat -c %F $path | cut -b-4`
+		fi
+	else
+		echo -n "none"
+	fi
+}
+
+#
+# This runs renameat2 on all combinations of source and dest
+#
+_rename_tests_source_dest()
+{
+	local source=$1
+	local dest=$2
+	local options=$3
+	local flags=$4
+
+	for stype in none regu symb dire tree; do
+		for dtype in none regu symb dire tree; do
+			echo -n "$options $stype/$dtype -> "
+			_setup_one $source $stype
+			_setup_one $dest $dtype
+			$here/src/renameat2 $source $dest $flags
+			if test $? == 0; then
+				_showtype_one $source
+				echo -n "/"
+				_showtype_one $dest
+				echo "."
+			fi
+			_cleanup_one $source
+			_cleanup_one $dest
+		done
+	done
+}
+
+#
+# This runs _rename_tests_source_dest() for both same-directory and
+# cross-directory renames
+#
+_rename_tests()
+{
+	local testdir=$1
+	local flags=$2
+
+	#same directory renames
+	_rename_tests_source_dest $testdir/src $testdir/dst     "samedir " $flags
+
+	#cross directory renames
+	mkdir $testdir/x $testdir/y
+	_rename_tests_source_dest $testdir/x/src $testdir/y/dst "crossdir" $flags
+	rmdir $testdir/x $testdir/y
+}
+
+#
+# This checks whether the renameat2 syscall is supported
+#
+_require_renameat2()
+{
+	local flags=$1
+	local rename_dir=`mktemp -d -p $TEST_DIR`
+	local cmd=""
+
+	if test ! -x $here/src/renameat2; then
+		_notrun "renameat2 binary not found"
+	fi
+
+	touch $rename_dir/foo
+	case $flags in
+	"noreplace")
+		cmd="-n $rename_dir/foo $rename_dir/bar"
+		;;
+	"exchange")
+		touch $rename_dir/bar
+		cmd="-x $rename_dir/foo $rename_dir/bar"
+		;;
+	"whiteout")
+		touch $rename_dir/bar
+		cmd="-w $rename_dir/foo $rename_dir/bar"
+		;;
+	"")
+		cmd=""
+		;;
+	*)
+		rm -rf $rename_dir
+		_fail "_require_renameat2: only support noreplace,exchange,whiteout rename flags"
+		;;
+	esac
+	if ! $here/src/renameat2 -t $cmd; then
+		rm -rf $rename_dir
+		_notrun "kernel doesn't support renameat2 syscall"
+	fi
+	rm -rf $rename_dir
+}

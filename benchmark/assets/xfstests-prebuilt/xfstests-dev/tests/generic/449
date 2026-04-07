@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Ernesto A. Fernandez.  All Rights Reserved.
+#
+# FS QA Test 449
+#
+# Fill the device and set as many extended attributes to a file as
+# possible. Then call setfacl on it and, if this fails for lack of
+# space, test that the permissions remain the same.
+#
+. ./common/preamble
+_begin_fstest auto quick acl attr enospc
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+# Modify as appropriate.
+_require_scratch
+_require_test
+_require_acls
+_require_attrs trusted
+
+_scratch_mkfs_sized $((256 * 1024 * 1024)) >> $seqres.full 2>&1
+_scratch_mount || _fail "mount failed"
+
+# This is a test of xattr behavior when we run out of disk space for xattrs,
+# so make sure the pwrite goes to the data device and not the rt volume.
+test "$FSTYP" = "xfs" && \
+	_xfs_force_bdev data $SCRATCH_MNT
+
+TFILE=$SCRATCH_MNT/testfile.$seq
+
+# Create the test file and choose its permissions
+touch $TFILE
+chmod u+rwx $TFILE
+chmod go-rwx $TFILE
+
+# Try to run out of space so setfacl will fail
+$XFS_IO_PROG -c "pwrite 0 256m" $TFILE >>$seqres.full 2>&1
+i=1
+
+# Setting acls on an xfs filesystem will succeed even after running out of
+# space for user attributes. Use trusted attributes
+while $SETFATTR_PROG -n trusted.$i -v $(perl -e 'print "a"x1024') $TFILE &>/dev/null; do
+	((++i))
+done
+j=1
+ret=0
+while [ $ret -eq 0 ]; do
+	ret=1
+	while [ $j -le 1000 ]; do
+		# On btrfs, setfattr will sometimes fail when free space is
+		# low, long before it's actually exhausted. Insist until it
+		# fails consistently.
+		$SETFATTR_PROG -n trusted.$i"x"$j $TFILE &>/dev/null
+		ret=$(( $ret && $? ))
+		((++j))
+	done
+	j=1
+	((++i))
+done
+
+if setfacl -m m:r $TFILE &>/dev/null; then
+	# setfacl succeeded, so the test was meaningless
+	# The filesystem might still have an issue
+	_notrun "$FSTYP succeeds in setting acls despite running out of space for user attrs"
+fi
+
+# Since setfacl failed, the permissions should not have changed
+stat -c %A $TFILE
+
+status=0
+exit

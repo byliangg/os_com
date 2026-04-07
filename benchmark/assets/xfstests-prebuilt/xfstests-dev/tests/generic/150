@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 150
+#
+# Ensure that reflinking a file N times doesn't eat a lot of blocks
+#   - Create a file and record fs block usage
+#   - Create some reflink copies
+#   - Compare fs block usage to before
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_block_size $testdir)"
+blks=2000
+margin='15%'
+sz=$((blksz * blks))
+nr=7
+filesize=$((blksz * nr))
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+_test_sync
+free_blocks0=$(stat -f $testdir -c '%f')
+
+echo "Create the reflink copies"
+for i in `seq 2 $nr`; do
+	_cp_reflink $testdir/file1 $testdir/file.$i
+done
+_test_cycle_mount
+free_blocks1=$(stat -f $testdir -c '%f')
+
+_within_tolerance "free blocks after reflink" $free_blocks1 $free_blocks0 $margin -v
+
+# success, all done
+status=0
+exit

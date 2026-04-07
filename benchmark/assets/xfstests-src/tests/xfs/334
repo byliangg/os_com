@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 334
+#
+# Ensure that we can create a few realtime files on a rmapbt filesystem.
+#
+. ./common/preamble
+_begin_fstest auto quick rmap realtime
+
+# Import common functions.
+. ./common/filter
+
+_require_realtime
+_require_xfs_scratch_rmapbt
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+
+echo "Create a few files"
+$XFS_IO_PROG -f -R -c 'pwrite -S 0x67 0 50000' -c fsync $SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG -f -R -c 'pwrite -S 0x67 0 50000' -c fsync $SCRATCH_MNT/f2 >> $seqres.full
+_scratch_cycle_mount
+
+echo "Grab contents"
+md5sum $SCRATCH_MNT/f1 $SCRATCH_MNT/f2 | _filter_scratch
+
+echo "Remove one file"
+rm -rf $SCRATCH_MNT/f2
+
+# success, all done
+status=0
+exit

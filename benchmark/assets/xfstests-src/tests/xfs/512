@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Christoph Hellwig
+#
+# FS QA Test 512
+#
+# Ensure that removing the access ACL through the XFS-specific attr name removes
+# the cached ACL as well
+#
+. ./common/preamble
+_begin_fstest auto quick acl attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $FILE
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+_require_test
+_require_runas
+_require_acls
+_require_attrs
+_require_user
+
+FILE=$TEST_DIR/foo
+
+echo "This is a test" > ${FILE}
+chmod g-r $FILE
+chmod o-r $FILE
+chmod u-r $FILE
+
+echo "No ACL: "
+_user_do "cat $FILE"
+
+echo "With ACL: "
+setfacl -m u:$qa_user:r $FILE
+_user_do "cat $FILE"
+
+echo "ACL Removed through attr:"
+$SETFATTR_PROG -x trusted.SGI_ACL_FILE ${FILE}
+_user_do "cat $FILE"
+
+status=0
+exit

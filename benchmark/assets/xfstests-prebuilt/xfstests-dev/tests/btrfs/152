@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 NETGEAR, Inc.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/152
+#
+# Test that incremental send/receive operations don't corrupt metadata when
+# qgroups are enabled.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata qgroup send
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Enable quotas
+$BTRFS_UTIL_PROG quota enable $SCRATCH_MNT
+
+# Create 2 source and 4 destination subvolumes
+for subvol in subvol1 subvol2 recv1_1 recv1_2 recv2_1 recv2_2; do
+	$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/$subvol | _filter_scratch
+done
+mkdir $SCRATCH_MNT/subvol{1,2}/.snapshots
+touch $SCRATCH_MNT/subvol{1,2}/foo
+
+# Create base snapshots and send them
+_btrfs subvolume snapshot -r $SCRATCH_MNT/subvol1 $SCRATCH_MNT/subvol1/.snapshots/1
+_btrfs subvolume snapshot -r $SCRATCH_MNT/subvol2 $SCRATCH_MNT/subvol2/.snapshots/1
+for recv in recv1_1 recv1_2 recv2_1 recv2_2; do
+	$BTRFS_UTIL_PROG send $SCRATCH_MNT/subvol1/.snapshots/1 2> /dev/null | \
+		$BTRFS_UTIL_PROG receive $SCRATCH_MNT/${recv} | _filter_scratch
+done
+
+# Now do 10 loops of concurrent incremental send/receives
+for i in `seq 1 10`; do
+	prev=$i
+	curr=$((i+1))
+
+	_btrfs subvolume snapshot -r $SCRATCH_MNT/subvol1 \
+		$SCRATCH_MNT/subvol1/.snapshots/${curr}
+	($BTRFS_UTIL_PROG send -p $SCRATCH_MNT/subvol1/.snapshots/${prev} \
+		$SCRATCH_MNT/subvol1/.snapshots/${curr} 2> /dev/null | \
+		$BTRFS_UTIL_PROG receive $SCRATCH_MNT/recv1_1) > /dev/null &
+	($BTRFS_UTIL_PROG send -p $SCRATCH_MNT/subvol1/.snapshots/${prev} \
+		$SCRATCH_MNT/subvol1/.snapshots/${curr} 2> /dev/null | \
+		$BTRFS_UTIL_PROG receive $SCRATCH_MNT/recv1_2) > /dev/null &
+
+	_btrfs subvolume snapshot -r $SCRATCH_MNT/subvol2 \
+		$SCRATCH_MNT/subvol2/.snapshots/${curr}
+	($BTRFS_UTIL_PROG send -p $SCRATCH_MNT/subvol2/.snapshots/${prev} \
+		$SCRATCH_MNT/subvol2/.snapshots/${curr} 2> /dev/null | \
+		$BTRFS_UTIL_PROG receive $SCRATCH_MNT/recv2_1) > /dev/null &
+	($BTRFS_UTIL_PROG send -p $SCRATCH_MNT/subvol2/.snapshots/${prev} \
+		$SCRATCH_MNT/subvol2/.snapshots/${curr} 2> /dev/null | \
+		$BTRFS_UTIL_PROG receive $SCRATCH_MNT/recv2_2) > /dev/null &
+	wait
+done
+
+_scratch_unmount
+
+status=0
+exit

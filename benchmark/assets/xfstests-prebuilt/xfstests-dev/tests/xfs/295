@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 295
+#
+# Test xfs_logprint w/ multiply-logged inodes & continued transactions
+#
+. ./common/preamble
+_begin_fstest auto logprint quick
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+# Modify as appropriate.
+_require_scratch
+_require_attrs
+
+logblks=$(_scratch_find_xfs_min_logblocks)
+_scratch_mkfs -l size=${logblks}b >/dev/null 2>&1
+
+# Should yield a multiply-logged inode, thanks to xattr
+# Old logprint says this, then coredumps:
+#	xlog_print_trans_inode: illegal inode type
+_scratch_mount
+echo hello > $SCRATCH_MNT/hello; setfattr -n user.name -v value $SCRATCH_MNT/hello
+_scratch_unmount
+_scratch_xfs_logprint 2>&1 >> $seqres.full
+
+# Now go for a continued transaction
+# The trick here is to get a transaction which is exactly the size of a
+# xfs_inode_log_format_32_t or xfs_inode_log_format_64_t
+# Prior to the bugfix, this was parsed like an inode due to the size
+# match, not as a continued transaction.  If that happens we'll see:
+#	xfs_logprint: unknown log operation type (494e)
+
+_scratch_mkfs -l size=${logblks}b >/dev/null 2>&1
+_scratch_mount
+for I in `seq 0 8192`; do
+        echo a >> $SCRATCH_MNT/cat
+        touch $SCRATCH_MNT/tmp$I
+done
+_scratch_unmount
+_scratch_xfs_logprint 2>&1 >> $seqres.full
+
+# success, all done
+status=0
+exit

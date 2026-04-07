@@ -1,0 +1,180 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 613
+#
+# XFS v4 mount options sanity check, refer to 'man 5 xfs'.
+#
+. ./common/preamble
+_begin_fstest auto mount prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_unmount $LOOP_MNT 2>/dev/null
+	[ -n "$loop_dev" ] &&_destroy_loop_device $loop_dev
+	rm -f $LOOP_IMG
+	rmdir $LOOP_MNT
+}
+
+# Import common functions.
+. ./common/filter
+
+_fixed_by_kernel_commit 237d7887ae72 \
+	"xfs: show the proper user quota options"
+
+_require_xfs_nocrc
+_require_test
+_require_loop
+_require_xfs_io_command "falloc"
+
+LOOP_IMG=$TEST_DIR/$seq.dev
+LOOP_MNT=$TEST_DIR/$seq.mnt
+
+echo "** create loop device"
+$XFS_IO_PROG -f -c "truncate 32g" $LOOP_IMG
+# 512b sector size needed for v1 log
+loop_dev=`_create_loop_device $LOOP_IMG 512`
+
+echo "** create loop mount point"
+rmdir $LOOP_MNT 2>/dev/null
+mkdir -p $LOOP_MNT || _fail "cannot create loopback mount point"
+
+filter_loop()
+{
+	sed -e "s,\B$LOOP_MNT,LOOP_MNT,g" \
+	    -e "s,\B$loop_dev,LOOP_DEV,g"
+}
+
+filter_xfs_opt()
+{
+	sed -e "s,allocsize=$pagesz,allocsize=PAGESIZE,g"
+}
+
+# avoid the effection from MKFS_OPTIONS
+MKFS_OPTIONS=""
+do_mkfs()
+{
+	echo "FORMAT: $@" | filter_loop | tee -a $seqres.full
+	$MKFS_XFS_PROG -f $* $loop_dev | _filter_mkfs >>$seqres.full 2>$tmp.mkfs
+	if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+		_fail "Fails on _mkfs_dev $* $loop_dev"
+	fi
+	. $tmp.mkfs
+}
+
+is_dev_mounted()
+{
+	findmnt --source $loop_dev >/dev/null
+	return $?
+}
+
+get_mount_info()
+{
+	findmnt --source $loop_dev -o OPTIONS -n
+}
+
+force_unmount()
+{
+	_unmount $LOOP_MNT >/dev/null 2>&1
+}
+
+# _do_test <mount options> <should be mounted?> [<key string> <key should be found?>]
+_do_test()
+{
+	local opts="$1"
+	local mounted="$2"	# pass or fail
+	local key="$3"
+	local found="$4"	# true or false
+	local rc
+	local info
+
+	# mount test
+	_mount $loop_dev $LOOP_MNT $opts 2>>$seqres.full
+	rc=$?
+	if [ $rc -eq 0 ];then
+		if [ "${mounted}" = "fail" ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: expect mount to fail, but it succeeded"
+			return 1
+		fi
+		is_dev_mounted
+		if [ $? -ne 0 ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: fs not mounted even mount return 0"
+			return 1
+		fi
+	else
+		if [ "${mounted}" = "pass" ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: expect mount to succeed, but it failed"
+			return 1
+		fi
+		is_dev_mounted
+		if [ $? -eq 0 ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: fs is mounted even mount return non-zero"
+			return 1
+		fi
+	fi
+
+	# Skip below checking if "$key" argument isn't specified
+	if [ -z "$key" ];then
+		return 0
+	fi
+	# Check the mount options after fs mounted.
+	info=`get_mount_info`
+	echo ${info} | grep -q "${key}"
+	rc=$?
+	if [ $rc -eq 0 ];then
+		if [ "$found" != "true" ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: expected to find \"$key\" in mount info \"$info\""
+			return 1
+		fi
+	else
+		if [ "$found" != "false" ];then
+			echo "[FAILED]: mount $loop_dev $LOOP_MNT $opts"
+			echo "ERROR: did not expect to find \"$key\" in \"$info\""
+			return 1
+		fi
+	fi
+
+	return 0
+}
+
+do_test()
+{
+	# Print each argument, include nil ones
+	echo -n "TEST:" | tee -a $seqres.full
+	for i in "$@";do
+		echo -n " \"$i\"" | filter_loop | filter_xfs_opt | tee -a $seqres.full
+	done
+	echo | tee -a $seqres.full
+
+	# force unmount before testing
+	force_unmount
+	_do_test "$@"
+	# force unmount after testing
+	force_unmount
+}
+
+echo "** start xfs mount testing ..."
+# Test logbsize=value.
+do_mkfs -m crc=0 -l version=1
+# New kernel (refer to 4f62282a3696 xfs: cleanup xlog_get_iclog_buffer_size)
+# prints "logbsize=N" in /proc/mounts, but old kernel not. So the default
+# 'display' about logbsize can't be expected, disable this test.
+#do_test "" pass "logbsize" "false"
+do_test "-o logbsize=16384" pass "logbsize=16k" "true"
+do_test "-o logbsize=16k" pass "logbsize=16k" "true"
+do_test "-o logbsize=32k" pass "logbsize=32k" "true"
+do_test "-o logbsize=64k" fail
+
+echo "** end of testing"
+# success, all done
+status=0
+exit

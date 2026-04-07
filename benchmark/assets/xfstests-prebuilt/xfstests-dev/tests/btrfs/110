@@ -1,0 +1,93 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/110
+#
+# Test that sending and receiving snapshots across different filesystems works
+# for full and incremental send operations.
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_scratch
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create a test file
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0K 32K" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Create the first snapshot.
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/snap1
+
+echo "File digest in the first filesystem, first snapshot:"
+md5sum $SCRATCH_MNT/snap1/foo | _filter_scratch
+
+# Save send stream for this snapshot.
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/snap1
+
+# Create a new filesystem and receive the snapshot.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+
+echo "File digest in the second filesystem, first snapshot:"
+# Must match the digest we got in the first filesystem.
+md5sum $SCRATCH_MNT/snap1/foo | _filter_scratch
+
+# Snapshot the first snapshot as rw, modify this new snapshot and then snapshot
+# it as RO to use in a send operation (send requires RO snapshots).
+_btrfs subvolume snapshot $SCRATCH_MNT/snap1 $SCRATCH_MNT/snap2_rw
+
+$XFS_IO_PROG -c "pwrite -S 0xbb 4K 4K" \
+	$SCRATCH_MNT/snap2_rw/foo | _filter_xfs_io
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT/snap2_rw \
+	$SCRATCH_MNT/snap2
+
+echo "File digest in the second filesystem, second snapshot:"
+md5sum $SCRATCH_MNT/snap2/foo | _filter_scratch
+
+_btrfs send -p $SCRATCH_MNT/snap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/snap2
+
+# Create a new filesystem and receive both the first snapshot, through the first
+# send stream we created, and the second snapshot through the incremental send
+# stream we just created. Verify this works and the file data is correct in both
+# snapshots.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+# Receiving the second snapshot used to fail because the send stream used an
+# incorrect value for the clone sources uuid field - it used the uuid of
+# snapshot 1, which is different on each filesystem, instead of the received
+# uuid value, which is preserved across different filesystems.
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+
+echo "File digests in the third filesystem:"
+# Must match the digests we got in the previous filesystems.
+md5sum $SCRATCH_MNT/snap1/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/foo | _filter_scratch
+
+status=0
+exit

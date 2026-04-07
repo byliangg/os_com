@@ -5,7 +5,119 @@ use crate::prelude::*;
 use crate::return_errno_with_message;
 use crate::utils::bitmap::*;
 
+const EXT4_NDIR_BLOCKS: u32 = 12;
+const EXT4_IND_BLOCK: usize = 12;
+const EXT4_DIND_BLOCK: usize = 13;
+const EXT4_TIND_BLOCK: usize = 14;
+
 impl Ext4 {
+    fn inode_uses_extents(inode_ref: &Ext4InodeRef) -> bool {
+        (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0
+    }
+
+    fn legacy_read_indirect_ptr(&self, ind_block: u32, idx: u32) -> Result<u32> {
+        let block_size = self.super_block.block_size() as usize;
+        let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+        if idx >= ptrs_per_block {
+            return_errno_with_message!(Errno::EFBIG, "legacy indirect index out of range");
+        }
+        let blk = Block::load(&self.block_device, ind_block as usize * block_size);
+        let ptr: u32 = blk.read_offset_as((idx as usize) * core::mem::size_of::<u32>());
+        Ok(ptr)
+    }
+
+    fn legacy_write_indirect_ptr(&self, ind_block: u32, idx: u32, val: u32) -> Result<()> {
+        let block_size = self.super_block.block_size() as usize;
+        let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+        if idx >= ptrs_per_block {
+            return_errno_with_message!(Errno::EFBIG, "legacy indirect index out of range");
+        }
+        let mut blk = Block::load(&self.block_device, ind_block as usize * block_size);
+        let ptr: &mut u32 = blk.read_offset_as_mut((idx as usize) * core::mem::size_of::<u32>());
+        *ptr = val;
+        blk.sync_blk_to_disk(&self.block_device);
+        Ok(())
+    }
+
+    fn get_pblock_idx_legacy(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        lblock: Ext4Lblk,
+    ) -> Result<Ext4Fsblk> {
+        let block_size = self.super_block.block_size() as usize;
+        let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+
+        if lblock < EXT4_NDIR_BLOCKS {
+            let p = inode_ref.inode.block[lblock as usize];
+            if p != 0 {
+                return Ok(p as u64);
+            }
+            return_errno_with_message!(Errno::ENOENT, "legacy direct block not mapped");
+        }
+
+        let mut rel = lblock - EXT4_NDIR_BLOCKS;
+        if rel < ptrs_per_block {
+            let ind_block = inode_ref.inode.block[EXT4_IND_BLOCK];
+            if ind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy indirect block absent");
+            }
+            let p = self.legacy_read_indirect_ptr(ind_block, rel)?;
+            if p != 0 {
+                return Ok(p as u64);
+            }
+            return_errno_with_message!(Errno::ENOENT, "legacy indirect block not mapped");
+        }
+
+        rel -= ptrs_per_block;
+        if rel < ptrs_per_block.saturating_mul(ptrs_per_block) {
+            let dind_block = inode_ref.inode.block[EXT4_DIND_BLOCK];
+            if dind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy dind block absent");
+            }
+            let lvl1 = rel / ptrs_per_block;
+            let lvl2 = rel % ptrs_per_block;
+            let ind_block = self.legacy_read_indirect_ptr(dind_block, lvl1)?;
+            if ind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy dind level1 not mapped");
+            }
+            let p = self.legacy_read_indirect_ptr(ind_block, lvl2)?;
+            if p != 0 {
+                return Ok(p as u64);
+            }
+            return_errno_with_message!(Errno::ENOENT, "legacy dind level2 not mapped");
+        }
+
+        rel -= ptrs_per_block.saturating_mul(ptrs_per_block);
+        let tind_cap = ptrs_per_block
+            .saturating_mul(ptrs_per_block)
+            .saturating_mul(ptrs_per_block);
+        if rel < tind_cap {
+            let tind_block = inode_ref.inode.block[EXT4_TIND_BLOCK];
+            if tind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy tind block absent");
+            }
+            let lvl1 = rel / ptrs_per_block.saturating_mul(ptrs_per_block);
+            let rem = rel % ptrs_per_block.saturating_mul(ptrs_per_block);
+            let lvl2 = rem / ptrs_per_block;
+            let lvl3 = rem % ptrs_per_block;
+            let dind_block = self.legacy_read_indirect_ptr(tind_block, lvl1)?;
+            if dind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy tind level1 not mapped");
+            }
+            let ind_block = self.legacy_read_indirect_ptr(dind_block, lvl2)?;
+            if ind_block == 0 {
+                return_errno_with_message!(Errno::ENOENT, "legacy tind level2 not mapped");
+            }
+            let p = self.legacy_read_indirect_ptr(ind_block, lvl3)?;
+            if p != 0 {
+                return Ok(p as u64);
+            }
+            return_errno_with_message!(Errno::ENOENT, "legacy tind level3 not mapped");
+        }
+
+        return_errno_with_message!(Errno::EFBIG, "legacy logical block out of range");
+    }
+
     pub fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
         inode_num.saturating_sub(1) / self.super_block.inodes_per_group()
     }
@@ -74,6 +186,10 @@ impl Ext4 {
     /// Returns:
     /// `Result<Ext4Fsblk>` - physical block id
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
+        if !Self::inode_uses_extents(inode_ref) {
+            return self.get_pblock_idx_legacy(inode_ref, lblock);
+        }
+
         let search_path = self.find_extent(inode_ref, lblock);
         if let Ok(path) = search_path {
             // get the last path
@@ -166,6 +282,48 @@ impl Ext4 {
     /// Returns:
     /// `Result<Ext4Fsblk>` - physical block id of the new block
     pub fn append_inode_pblk(&self, inode_ref: &mut Ext4InodeRef) -> Result<Ext4Fsblk> {
+        if !Self::inode_uses_extents(inode_ref) {
+            let block_size = self.super_block.block_size() as usize;
+            let inode_size = inode_ref.inode.size();
+            let iblock = ((inode_size as usize + block_size - 1) / block_size) as u32;
+            let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+
+            let new_block = self.balloc_alloc_block(inode_ref, None)?;
+            let new_block_u32 = u32::try_from(new_block)
+                .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+
+            if iblock < EXT4_NDIR_BLOCKS {
+                inode_ref.inode.block[iblock as usize] = new_block_u32;
+            } else {
+                let rel = iblock - EXT4_NDIR_BLOCKS;
+                if rel >= ptrs_per_block {
+                    return_errno_with_message!(
+                        Errno::ENOSPC,
+                        "legacy append beyond single indirect is not supported"
+                    );
+                }
+
+                let mut ind_block = inode_ref.inode.block[EXT4_IND_BLOCK];
+                if ind_block == 0 {
+                    let fresh = self.balloc_alloc_block(inode_ref, None)?;
+                    ind_block = u32::try_from(fresh).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+                    inode_ref.inode.block[EXT4_IND_BLOCK] = ind_block;
+
+                    let mut ind = Block::load(&self.block_device, ind_block as usize * block_size);
+                    ind.data.fill(0);
+                    ind.sync_blk_to_disk(&self.block_device);
+                }
+                self.legacy_write_indirect_ptr(ind_block, rel, new_block_u32)?;
+            }
+
+            let mut inode_size = inode_ref.inode.size();
+            inode_size += block_size as u64;
+            inode_ref.inode.set_size(inode_size);
+            self.write_back_inode(inode_ref);
+
+            return Ok(new_block);
+        }
+
         let block_size = self.super_block.block_size() as usize;
         let inode_size = inode_ref.inode.size();
         let iblock = ((inode_size as usize + block_size - 1) / block_size) as u32;
@@ -202,6 +360,10 @@ impl Ext4 {
         inode_ref: &mut Ext4InodeRef,
         start_bgid: &mut u32,
     ) -> Result<Ext4Fsblk> {
+        if !Self::inode_uses_extents(inode_ref) {
+            return self.append_inode_pblk(inode_ref);
+        }
+
         let block_size = self.super_block.block_size() as usize;
         let inode_size = inode_ref.inode.size();
         let iblock = ((inode_size as usize + block_size - 1) / block_size) as u32;

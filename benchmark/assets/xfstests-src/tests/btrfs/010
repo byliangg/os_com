@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Facebook.  All Rights Reserved.
+#
+# FS QA Test 10
+#
+# Test delayed allocation with a large number of extents that are merged.
+# Regression test for patch "Btrfs: fix delalloc accounting leak caused
+# by u32 overflow".
+#
+. ./common/preamble
+_begin_fstest auto
+
+test_file="$TEST_DIR/$seq"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* "$test_file"
+}
+
+. ./common/filter
+
+_require_test
+_require_btrfs_fs_sysfs
+
+# Create 32k extents. All of these extents will be accounted as outstanding and
+# reserved.
+for ((i = 0; i < 32 * 1024; i++)); do
+	$XFS_IO_PROG -f -c "pwrite $((2 * 4096 * i)) 4096" "$test_file" >>"$seqres.full"
+done
+
+# Fill in the gaps between the created extents. The outstanding extents will
+# all be merged into 1, but there will still be 32k reserved.
+for ((i = 0; i < 32 * 1024; i++)); do
+	$XFS_IO_PROG -f -c "pwrite $((2 * 4096 * i + 4096)) 4096" "$test_file" >>"$seqres.full"
+done
+
+# Flush the delayed allocations.
+sync
+
+# Make sure that we didn't leak any metadata space.
+uuid="$(findmnt -n -o UUID "$TEST_DIR")"
+cd "/sys/fs/btrfs/$uuid/allocation"
+echo "$(($(cat metadata/bytes_may_use) - $(cat global_rsv_reserved))) bytes leaked" | grep -v '^0 '
+
+echo "Silence is golden"
+
+status=0
+exit

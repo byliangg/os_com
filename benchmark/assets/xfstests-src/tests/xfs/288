@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 288
+#
+# When an attribute leaf block count is 0, xfs_repair should junk
+# that leaf directly (as xfsprogs commit f714016).
+#
+. ./common/preamble
+_begin_fstest auto quick repair fuzzers attr
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+# Modify as appropriate.
+_require_scratch
+_require_attrs
+
+# Parent pointers change the xattr formats sufficiently to break this test.
+# Disable parent pointers if mkfs supports it.
+_xfs_force_no_pptrs
+
+# get block size ($dbsize) from the mkfs output
+_scratch_mkfs_xfs 2>/dev/null | _filter_mkfs 2>$tmp.mkfs >/dev/null
+. $tmp.mkfs
+
+_scratch_mount
+
+touch $SCRATCH_MNT/$seq.attrfile
+inum=$(stat -c '%i' $SCRATCH_MNT/$seq.attrfile)
+
+# To get an attr block leaf, we need to extend attr format to extent
+# or btree format at least, and the max inode size is half of filesystem
+# block size, so write half of block size attr to make sure attr
+# out of local format.
+maxisize=$((dbsize/2))
+$SETFATTR_PROG -n "user.testattr${seq}" \
+	       -v "$(perl -e "print 'v' x ${maxisize};")" \
+	       $SCRATCH_MNT/$seq.attrfile
+
+_scratch_unmount
+# manually corrupt the XFS, by set the header count of attr to 0
+_scratch_xfs_set_metadata_field "hdr.count" "0" \
+				"inode $inum" "ablock 0" >> $seqres.full
+
+# verify current xfs_db write command can set hdr.count to 0. Old xfsprogs
+# can't do that on v5 filesystems.
+count=$(_scratch_xfs_get_metadata_field "hdr.count" \
+					"inode $inum" "ablock 0" 2> /dev/null)
+if [ "$count" != "0" ]; then
+	_notrun "xfs_db can't set attr hdr.count to 0"
+fi
+
+# Check that xfs_repair discards the attr fork if block 0 is an empty leaf
+# block.  Empty leaf blocks at the start of the xattr data can be a byproduct
+# of a shutdown race, and hence are not a corruption.
+_scratch_xfs_repair >> $seqres.full 2>&1
+
+# Old xfs_repair maybe find and fix this corruption by
+# reset the first used heap value and the usedbytes cnt
+# in ablock 0. That's not what we want. So check if
+# xfs_repair has junked the whole ablock 0 by xfs_db.
+_scratch_xfs_db -x -c "inode $inum" -c "ablock 0" | \
+	grep -q "no attribute data"
+if [ $? -ne 0 ]; then
+	_fail "xfs_repair didn't junk the empty attr leaf"
+fi
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

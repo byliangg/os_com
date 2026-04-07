@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -16,7 +16,7 @@ use crate::{
         bin::{AsterBin, AsterBinType, AsterBzImageMeta, AsterElfMeta},
         file::BundleFile,
     },
-    util::{get_current_crates, hard_link_or_copy, new_command_checked_exists},
+    util::{get_current_crates, new_command_checked_exists},
 };
 
 pub fn make_install_bzimage(
@@ -91,6 +91,9 @@ pub fn make_elf_for_qemu(install_dir: impl AsRef<Path>, elf: &AsterBin, strip: b
             .to_string();
         install_dir.as_ref().join(elf_name + ".qemu_elf")
     };
+    if result_elf_path.exists() {
+        fs::remove_file(&result_elf_path).unwrap();
+    }
 
     if strip {
         // We use rust-strip to reduce the kernel image size.
@@ -115,8 +118,12 @@ pub fn make_elf_for_qemu(install_dir: impl AsRef<Path>, elf: &AsterBin, strip: b
             },
         }
     } else {
-        // Copy the ELF file.
-        hard_link_or_copy(elf.path(), &result_elf_path).unwrap();
+        // Copy the ELF file to avoid sharing inode with the source binary.
+        //
+        // This function mutates the output ELF header below. If we use a hard
+        // link, the source ELF can be modified or even corrupted on repeated
+        // builds.
+        fs::copy(elf.path(), &result_elf_path).unwrap();
     }
 
     if elf.arch() == Arch::X86_64 {

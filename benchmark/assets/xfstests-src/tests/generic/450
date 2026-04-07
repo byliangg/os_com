@@ -1,0 +1,136 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 450
+#
+# Test read around EOF. If the file offset is at or past the end of file,
+# no bytes are read, and read() returns zero. There was a bug, when DIO
+# read offset is just past the EOF a little, but in the same block with
+# EOF, read returns different negative values.
+#
+# The following two kernel commits fixed this bug:
+# 74cedf9b6c60 direct-io: Fix negative return from dio read beyond eof
+# 2d4594acbf6d fix the regression from "direct-io: Fix negative return
+# from dio read beyond eof"
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $tfile
+}
+
+# Import common functions.
+
+_require_test
+_require_odirect
+
+tfile=$TEST_DIR/testfile_${seq}
+ssize=`$here/src/min_dio_alignment $TEST_DIR $TEST_DEV`
+bsize=`_get_block_size $TEST_DIR`
+
+# let's focus on the specific bug that only happens when $ssize <= $bsize
+if [ $ssize -gt $((bsize/4)) ]; then
+	_notrun "Only test on sector size < half of block size"
+fi
+
+rm -f $tfile 2>/dev/null
+
+# check xfs_io pread result, especially for
+# Param1: expected pread offset
+# Param2: expected pread count
+# Param3: expected pread return
+#
+# If any of above values are not as expected, the output keeps
+# using the real value
+check_xfs_io_read()
+{
+	OFFSET=$1
+	COUNT=$2
+	RETURN=$3
+
+	$AWK_PROG -v ret="$RETURN" -v cnt="$COUNT" -v off="$OFFSET" '
+		/read/{
+			split($2, bytes, "/")
+
+			retval=bytes[1]
+			count=bytes[2]
+			offset=$NF
+
+			if(retval != ret || count != cnt || offset != off)
+				printf("expect [%s,%s,%s], got [%s,%s,%s]\n", \
+					off, cnt, ret, offset, count, retval)
+
+			next
+		}
+	'
+}
+
+# +-------------------------------------------------------+
+# |           block           |           block           |
+# +-------------------------------------------------------+
+# | sect | sect | sect | sect | sect | sect | sect | sect |
+#                                           |
+#                                          EOF
+# |<--------------- move EOF -------------->| xxxxxxxxxxx |
+# [pread1]
+#                             [           pread2          ]
+#                                           [pread3]
+#                                                  [pread4]  ...  [pread5]
+#
+# Run below steps with different $operation and $openflag
+#
+# 1) write 2 blocks (6 sectors) data to move EOF to the penultimate sector
+# 2) read (pread1) the first sector within EOF
+# 3) read (pread2) the second block contain EOF
+# 4) read (pread3) a sector at (after) EOF
+# 5) read (pread4) the last sector past EOF
+# 6) read (pread5) at far away from EOF
+#
+asize=$((bsize * 2))
+tsize=$((asize - ssize * 2))
+
+read_test()
+{
+	local of="$1"
+	local op="buffer read"
+
+	if [ "$of" != "" ]; then
+		op="direct read"
+	fi
+
+	echo "$op the first sector within EOF"
+	$XFS_IO_PROG $of -c "pread 0 $ssize" $tfile | \
+		check_xfs_io_read 0 "$ssize" "$ssize"
+
+	echo "$op the second block contains EOF"
+	$XFS_IO_PROG $of -c "pread $bsize $bsize" $tfile | \
+		check_xfs_io_read "$bsize" "$bsize" "$((tsize - bsize))"
+
+	echo "$op a sector at (after) EOF"
+	$XFS_IO_PROG $of -c "pread $tsize $ssize" $tfile | \
+		check_xfs_io_read "$tsize" "$ssize" "0"
+
+	echo "$op the last sector past EOF"
+	$XFS_IO_PROG $of -c "pread $((tsize + ssize)) $ssize" $tfile | \
+		check_xfs_io_read "$((tsize + ssize))" "$ssize" "0"
+
+	echo "$op at far away from EOF"
+	$XFS_IO_PROG $of -c "pread $((bsize * 100)) $ssize" $tfile | \
+		check_xfs_io_read "$((bsize * 100))" "$ssize" "0"
+}
+
+# Test buffer/direct I/O read
+$XFS_IO_PROG -ft -c "pwrite 0 ${tsize}" -c "fsync" $tfile >>$seqres.full
+for oflag in "" "-d"; do
+	read_test "$oflag"
+done
+
+# success, all done
+status=0
+exit

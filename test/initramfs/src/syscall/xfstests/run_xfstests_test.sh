@@ -129,9 +129,11 @@ mkfs_ext4_if_needed() {
     return 1
 }
 
-# Ensure deterministic ext4 media for xfstests.
-mkfs_ext4_if_needed "${TEST_DEV}"
-mkfs_ext4_if_needed "${SCRATCH_DEV}"
+# Ensure deterministic ext4 media for xfstests unless host side already did it.
+if [ "${XFSTESTS_SKIP_MKFS:-0}" != "1" ]; then
+    mkfs_ext4_if_needed "${TEST_DEV}"
+    mkfs_ext4_if_needed "${SCRATCH_DEV}"
+fi
 
 BASE_PATH="/bin:/usr/bin:/sbin:/usr/sbin"
 if [ -d "${TOOLS_BIN_DIR}" ]; then
@@ -141,11 +143,40 @@ else
     export PATH="${BASE_PATH}:${PATH}"
 fi
 
+# Prebuilt xfstests helper binaries are ELF executables that may expect
+# glibc loader paths such as /lib64/ld-linux-x86-64.so.2.
+if [ -d /nix/store ]; then
+    glibc_lib_dir=$(ls -d /nix/store/*-glibc-*/lib 2>/dev/null | head -n 1 || true)
+    if [ -n "${glibc_lib_dir}" ] && [ -d "${glibc_lib_dir}" ]; then
+        if [ -e "${glibc_lib_dir}/ld-linux-x86-64.so.2" ]; then
+            ln -sf "${glibc_lib_dir}/ld-linux-x86-64.so.2" /lib64/ld-linux-x86-64.so.2 || true
+        fi
+        for lib in libc.so.6 libm.so.6 libpthread.so.0 librt.so.1 libdl.so.2 libresolv.so.2; do
+            if [ -e "${glibc_lib_dir}/${lib}" ]; then
+                ln -sf "${glibc_lib_dir}/${lib}" "/usr/lib/${lib}" || true
+                ln -sf "${glibc_lib_dir}/${lib}" "/usr/lib64/${lib}" || true
+            fi
+        done
+    fi
+fi
+
 CHECK_SHELL=/bin/sh
 if command -v bash >/dev/null 2>&1; then
     CHECK_SHELL=$(command -v bash)
+else
+    for candidate in /nix/store/*-bash-*/bin/bash /opt/xfstests/tools/bin/bash /usr/bin/bash /bin/bash; do
+        if [ -x "${candidate}" ]; then
+            CHECK_SHELL="${candidate}"
+            break
+        fi
+    done
 fi
 export SHELL="${CHECK_SHELL}"
+
+# Some helper scripts use `#!/bin/bash`; keep that path usable in minimal initramfs.
+if [ "${CHECK_SHELL}" != "/bin/sh" ] && [ ! -x /bin/bash ] && [ -x "${CHECK_SHELL}" ]; then
+    ln -sf "${CHECK_SHELL}" /bin/bash || true
+fi
 
 # Place shims under /opt so they stay executable in environments where /tmp is mounted noexec.
 SHIM_DIR="${XFSTESTS_ROOT}/shims/bin"
@@ -505,6 +536,17 @@ export SCRATCH_DEV
 export TEST_DIR
 export SCRATCH_MNT
 
+# Some prebuilt xfstests trees may ship `tests/*/group` without `group.list`.
+# `check` requires group.list for test resolution.
+if [ -d "${XFSTESTS_DEV_DIR}/tests" ]; then
+    for test_dir in "${XFSTESTS_DEV_DIR}"/tests/*; do
+        [ -d "${test_dir}" ] || continue
+        if [ -f "${test_dir}/group" ] && [ ! -f "${test_dir}/group.list" ]; then
+            cp "${test_dir}/group" "${test_dir}/group.list"
+        fi
+    done
+fi
+
 # Keep xfstests config deterministic. Relying only on inherited env vars can
 # leave TEST_DIR/SCRATCH_MNT unset after config re-sourcing.
 HOST_CONFIG_FILE="${XFSTESTS_DEV_DIR}/local.config"
@@ -517,6 +559,48 @@ SCRATCH_DEV=${SCRATCH_DEV}
 SCRATCH_MNT=${SCRATCH_MNT}
 EOF
 export HOST_OPTIONS="${HOST_CONFIG_FILE}"
+
+# Some prebuilt trees may ship src/lstat64 as a binary that is not runnable
+# in our minimal initramfs. Install a deterministic script implementation.
+mkdir -p "${XFSTESTS_DEV_DIR}/src"
+cat > "${XFSTESTS_DEV_DIR}/src/lstat64" <<'EOF'
+#!/bin/bash
+set -eu
+target="${1:-}"
+[ -n "${target}" ] || exit 1
+[ -e "${target}" ] || exit 1
+dev_id=""
+if [ -b "${target}" ]; then
+    dev_node=$(basename "${target}")
+    dev_id=$(cat "/sys/class/block/${dev_node}/dev" 2>/dev/null || true)
+fi
+if [ -z "${dev_id}" ]; then
+    # Fallback for environments without /sys/class/block entries.
+    dev_id=$(stat -c '%t:%T' "${target}" 2>/dev/null || true)
+fi
+[ -n "${dev_id}" ] || exit 1
+# Match common/rc expectation: awk '/Device type:/ { print $9 }'
+echo "Device type: shim shim shim shim shim shim ${dev_id}"
+EOF
+chmod +x "${XFSTESTS_DEV_DIR}/src/lstat64"
+
+if [ -x "${XFSTESTS_DEV_DIR}/src/lstat64" ]; then
+    test_dev_is_block=0
+    scratch_dev_is_block=0
+    [ -b "${TEST_DEV}" ] && test_dev_is_block=1
+    [ -b "${SCRATCH_DEV}" ] && scratch_dev_is_block=1
+    echo "xfstests probe: is_block TEST_DEV=${test_dev_is_block} SCRATCH_DEV=${scratch_dev_is_block}" >&2
+    ls -l "${TEST_DEV}" "${SCRATCH_DEV}" >&2 || true
+
+    test_dev_raw=$("${XFSTESTS_DEV_DIR}/src/lstat64" "${TEST_DEV}" 2>&1 || true)
+    scratch_dev_raw=$("${XFSTESTS_DEV_DIR}/src/lstat64" "${SCRATCH_DEV}" 2>&1 || true)
+    echo "xfstests probe: lstat64 raw TEST_DEV=${test_dev_raw:-<empty>}" >&2
+    echo "xfstests probe: lstat64 raw SCRATCH_DEV=${scratch_dev_raw:-<empty>}" >&2
+
+    test_dev_type=$("${XFSTESTS_DEV_DIR}/src/lstat64" "${TEST_DEV}" 2>/dev/null | awk '/Device type:/ { print $9 }' || true)
+    scratch_dev_type=$("${XFSTESTS_DEV_DIR}/src/lstat64" "${SCRATCH_DEV}" 2>/dev/null | awk '/Device type:/ { print $9 }' || true)
+    echo "xfstests probe: lstat64 TEST_DEV_TYPE=${test_dev_type:-<empty>} SCRATCH_DEV_TYPE=${scratch_dev_type:-<empty>}" >&2
+fi
 
 # check uses "bash -c ... exec ./tests/..." to run each testcase. Ensure
 # every non-interactive bash sees stable xfstests vars instead of inheriting
@@ -578,6 +662,16 @@ echo "xfstests probe: single_test=${SINGLE_TEST:-none} trace_run=${TRACE_RUN}" >
 echo "xfstests probe: TEST_DEV=${TEST_DEV} TEST_DIR=${TEST_DIR} SCRATCH_DEV=${SCRATCH_DEV} SCRATCH_MNT=${SCRATCH_MNT}" >&2
 echo "xfstests probe: local.config" >&2
 sed -n '1,80p' "${HOST_CONFIG_FILE}" >&2 || true
+
+set +e
+if [ -x "${XFSTESTS_DEV_DIR}/src/fill" ]; then
+    "${XFSTESTS_DEV_DIR}/src/fill" >/tmp/xfstests_fill_probe.log 2>&1
+    fill_probe_rc=$?
+    echo "xfstests probe: fill rc=${fill_probe_rc}" >&2
+    sed -n '1,3p' /tmp/xfstests_fill_probe.log >&2 || true
+fi
+set -e
+
 set +e
 "${SHIM_DIR}/grep" -q "never-match" /dev/null >/dev/null 2>&1
 grep_probe_rc=$?
@@ -729,6 +823,21 @@ record_notrun() {
     NOTRUN_COUNT=$((NOTRUN_COUNT + 1))
 }
 
+log_case_fs_state() {
+    label="$1"
+    test_dir_info=$(ls -ld "${TEST_DIR}" 2>&1 | tr '\t' ' ' | tr '\n' ' ')
+    scratch_mnt_info=$(ls -ld "${SCRATCH_MNT}" 2>&1 | tr '\t' ' ' | tr '\n' ' ')
+    test_dev_mounts=$(awk -v d="${TEST_DEV}" -v t="${TEST_DIR}" '
+        $1==d || $2==t { printf "%s %s %s %s | ", $1, $2, $3, $4 }
+    ' /proc/mounts)
+    scratch_dev_mounts=$(awk -v d="${SCRATCH_DEV}" -v t="${SCRATCH_MNT}" '
+        $1==d || $2==t { printf "%s %s %s %s | ", $1, $2, $3, $4 }
+    ' /proc/mounts)
+    [ -n "${test_dev_mounts}" ] || test_dev_mounts="<none>"
+    [ -n "${scratch_dev_mounts}" ] || scratch_dev_mounts="<none>"
+    echo "xfstests fsstate: ${label} TEST_DIR='${test_dir_info}' SCRATCH_MNT='${scratch_mnt_info}' TEST_DEV_MOUNTS='${test_dev_mounts}' SCRATCH_MOUNTS='${scratch_dev_mounts}'" >&2
+}
+
 while IFS= read -r test_name; do
     case "${test_name}" in
         "" | "#"*)
@@ -749,12 +858,14 @@ while IFS= read -r test_name; do
     fi
 
     test_log="${RESULTS_DIR}/$(echo "${test_name}" | tr '/' '_').log"
+    log_case_fs_state "pre:${test_name}"
     echo "xfstests case start: ${test_name} timeout=${CASE_TIMEOUT_SEC}s trace=${TRACE_RUN}" >&2
     set +e
     run_check_with_optional_timeout "${CASE_TIMEOUT_SEC}" "${TRACE_RUN}" "${test_name}" "${test_log}"
     rc=$?
     set -e
     echo "xfstests case done: ${test_name} rc=${rc}" >&2
+    log_case_fs_state "post:${test_name}"
 
     notrun_line=$(
         grep -Eim1 \

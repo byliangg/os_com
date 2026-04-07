@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 Fujitsu Limited. All Rights Reserved.
+#
+# FS QA Test No. 557
+#
+# This is a test for:
+#   bf3cb3944792 (xfs: allow single bulkstat of special inodes)
+# Create a filesystem which contains an inode with a lower number
+# than the root inode. Then verify that XFS_BULK_IREQ_SPECIAL_ROOT gets
+# the correct root inode number.
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc
+
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "bulkstat_single"
+_require_scratch
+
+_fixed_by_kernel_commit 817644fa4525 \
+	"xfs: get root inode correctly at bulkstat"
+
+# Create a filesystem which contains a fake root inode
+inums=($(_scratch_xfs_create_fake_root))
+root_inum=${inums[0]}
+fake_inum=${inums[1]}
+
+# Get root ino with XFS_BULK_IREQ_SPECIAL_ROOT
+bulkstat_root_inum=$($XFS_IO_PROG -c 'bulkstat_single root' $SCRATCH_MNT | grep bs_ino | awk '{print $3;}')
+echo "bulkstat_root_inum: $bulkstat_root_inum" >> $seqres.full
+if [ $root_inum -ne $bulkstat_root_inum ]; then
+	echo "root ino mismatch: expected:${root_inum}, actual:${bulkstat_root_inum}"
+fi
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

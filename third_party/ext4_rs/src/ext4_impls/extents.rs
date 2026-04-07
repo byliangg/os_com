@@ -166,7 +166,7 @@ impl Ext4 {
             if pos < last_extent_pos
                 && ((ex.first_block + ex.block_count as u32) < newex.first_block)
             {
-                if let Ok(next_extent) = self.get_extent_from_node(node, pos + 1) {
+                if let Ok(next_extent) = self.get_extent_from_node(inode_ref, node, pos + 1) {
                     if self.can_merge(&next_extent, newex) {
                         self.merge_extent(&search_path, newex, &next_extent)?;
                         return Ok(());
@@ -182,7 +182,7 @@ impl Ext4 {
             // merge:    |<---newex--->|<---found_ext--->|....|<---ext2--->|
             //           0            20                30    40          50
             if pos > 0 && (newex.first_block + newex.block_count as u32) < ex.first_block {
-                if let Ok(mut prev_extent) = self.get_extent_from_node(node, pos - 1) {
+                if let Ok(mut prev_extent) = self.get_extent_from_node(inode_ref, node, pos - 1) {
                     if self.can_merge(&prev_extent, newex) {
                         self.merge_extent(&search_path, &mut prev_extent, newex)?;
                         return Ok(());
@@ -218,11 +218,24 @@ impl Ext4 {
     }
 
     /// Get extent from the node at the given position.
-    fn get_extent_from_node(&self, node: &ExtentPathNode, pos: usize) -> Result<Ext4Extent> {
+    fn get_extent_from_node(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        node: &ExtentPathNode,
+        pos: usize,
+    ) -> Result<Ext4Extent> {
+        if node.pblock_of_node == 0 {
+            let entries = node.header.entries_count as usize;
+            if pos >= entries {
+                return_errno_with_message!(Errno::EINVAL, "extent position out of range in root");
+            }
+            return Ok(inode_ref.inode.root_extent_at(pos));
+        }
+
         let block_size = self.super_block.block_size() as usize;
         let data = self
             .block_device
-            .read_offset(node.pblock as usize * block_size);
+            .read_offset(node.pblock_of_node * block_size);
         let mut data = data;
         if data.len() < block_size {
             data.resize(block_size, 0);
@@ -238,11 +251,28 @@ impl Ext4 {
     }
 
     /// Get index from the node at the given position.
-    fn get_index_from_node(&self, node: &ExtentPathNode, pos: usize) -> Result<Ext4ExtentIndex> {
+    fn get_index_from_node(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        node: &ExtentPathNode,
+        pos: usize,
+    ) -> Result<Ext4ExtentIndex> {
+        if node.pblock_of_node == 0 {
+            let entries = node.header.entries_count as usize;
+            if pos >= entries {
+                return_errno_with_message!(Errno::EINVAL, "index position out of range in root");
+            }
+            let idx = unsafe {
+                let header_ptr = inode_ref.inode.block.as_ptr() as *const Ext4ExtentHeader;
+                *((header_ptr.add(1) as *const Ext4ExtentIndex).add(pos))
+            };
+            return Ok(idx);
+        }
+
         let block_size = self.super_block.block_size() as usize;
         let data = self
             .block_device
-            .read_offset(node.pblock as usize * block_size);
+            .read_offset(node.pblock_of_node * block_size);
         let mut data = data;
         if data.len() < block_size {
             data.resize(block_size, 0);
@@ -426,7 +456,15 @@ impl Ext4 {
             // Not empty, insert at search result pos + 1
             log::info!("[insert_new_extent] Inserting at root at position {} (entries: {})", 
                 node.position + 1, header.entries_count);
-            *inode_ref.inode.root_extent_mut_at(node.position + 1) = *new_extent;
+            let insert_pos = node.position + 1;
+            let entries = header.entries_count as usize;
+            if insert_pos < entries {
+                for i in (insert_pos..entries).rev() {
+                    let moved = inode_ref.inode.root_extent_at(i);
+                    *inode_ref.inode.root_extent_mut_at(i + 1) = moved;
+                }
+            }
+            *inode_ref.inode.root_extent_mut_at(insert_pos) = *new_extent;
             inode_ref.inode.root_extent_header_mut().entries_count += 1;
             
             log::debug!("[insert_new_extent] Successfully inserted at root:");
@@ -446,9 +484,26 @@ impl Ext4 {
             let node_block = node.pblock_of_node;
             let mut ext4block =
             Block::load(&self.block_device, node_block * block_size);
-            let new_ex_offset = core::mem::size_of::<Ext4ExtentHeader>() + core::mem::size_of::<Ext4Extent>() * (node.position + 1);
+            let insert_pos = node.position + 1;
+            let extent_size = core::mem::size_of::<Ext4Extent>();
+            let ext_header_size = core::mem::size_of::<Ext4ExtentHeader>();
+            let entries_count = {
+                // read_offset_as returns a value, not a reference
+                let header: Ext4ExtentHeader = ext4block.read_offset_as(0);
+                header.entries_count as usize
+            };
+
+            if insert_pos < entries_count {
+                let src = ext_header_size + insert_pos * extent_size;
+                let dst = ext_header_size + (insert_pos + 1) * extent_size;
+                let bytes_to_move = (entries_count - insert_pos) * extent_size;
+                ext4block
+                    .data
+                    .copy_within(src..src + bytes_to_move, dst);
+            }
 
             // insert new extent
+            let new_ex_offset = ext_header_size + extent_size * insert_pos;
             let ex: &mut Ext4Extent = ext4block.read_offset_as_mut(new_ex_offset);
             *ex = *new_extent;
             let header: &mut Ext4ExtentHeader = ext4block.read_offset_as_mut(0);
@@ -775,28 +830,29 @@ impl Ext4 {
         let depth = search_path.depth as usize;
 
         /* If we do remove_space inside the range of an extent */
-        let mut ex = search_path.path[depth].extent.unwrap();
-        if ex.get_first_block() < from
-            && to < (ex.get_first_block() + ex.get_actual_len() as u32 - 1)
-        {
-            let mut newex = Ext4Extent::default();
-            let unwritten = ex.is_unwritten();
-            let ee_block = ex.first_block;
-            let block_count = ex.block_count;
-            let newblock = to + 1 - ee_block + ex.get_pblock() as u32;
-            ex.block_count = from as u16 - ee_block as u16;
+        if let Some(mut ex) = search_path.path[depth].extent {
+            if ex.get_first_block() < from
+                && to < (ex.get_first_block() + ex.get_actual_len() as u32 - 1)
+            {
+                let mut newex = Ext4Extent::default();
+                let unwritten = ex.is_unwritten();
+                let ee_block = ex.first_block;
+                let block_count = ex.block_count;
+                let newblock = to + 1 - ee_block + ex.get_pblock() as u32;
+                ex.block_count = from as u16 - ee_block as u16;
 
-            if unwritten {
-                ex.mark_unwritten();
+                if unwritten {
+                    ex.mark_unwritten();
+                }
+                newex.first_block = to + 1;
+                newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
+                newex.start_lo = newblock;
+                newex.start_hi = ((newblock as u64) >> 32) as u16;
+
+                self.insert_extent(inode_ref, &mut newex)?;
+
+                return Ok(EOK);
             }
-            newex.first_block = to + 1;
-            newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
-            newex.start_lo = newblock;
-            newex.start_hi = ((newblock as u64) >> 32) as u16;
-
-            self.insert_extent(inode_ref, &mut newex)?;
-
-            return Ok(EOK);
         }
 
         // log::warn!("Remove space in depth: {:x?}", depth);

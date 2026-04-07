@@ -1,0 +1,9 @@
+# QA groups control file, automatically generated.
+# See _begin_fstest in each test for details.
+
+001 auto quick copy_range
+002 auto quick copy_range
+003 auto quick copy_range
+004 auto quick quota
+005 auto quick quota
+006 auto quick snapshot

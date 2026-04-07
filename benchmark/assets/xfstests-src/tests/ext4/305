@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 305
+#
+# Regression test for commit:
+# 9559996 ext4: remove mb_groups before tearing down the buddy_cache
+#
+. ./common/preamble
+_begin_fstest auto
+
+PIDS=""
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    kill $PIDS >/dev/null 2>&1
+}
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+
+echo "Silence is golden"
+
+DEV_BASENAME=$(_short_dev $SCRATCH_DEV)
+echo "Start test on device $SCRATCH_DEV, basename $DEV_BASENAME" >$seqres.full
+_scratch_mkfs >>$seqres.full 2>&1
+
+while true; do
+	cat /proc/fs/ext4/$DEV_BASENAME/mb_groups > /dev/null 2>&1
+done &
+PIDS=$!
+
+# 30 loops is enough to crash a buggy kernel
+i=0
+while [ $i -lt 30 ]; do
+	_try_scratch_mount
+	_scratch_unmount
+	let i=i+1
+done
+
+# no BUG_ON, all done
+kill $PIDS >/dev/null 2>&1
+wait
+status=0
+exit

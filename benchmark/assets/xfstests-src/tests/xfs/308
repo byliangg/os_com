@@ -1,0 +1,136 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 308
+#
+# Test recovery of "lost" CoW blocks:
+# - Use the debugger to fake a leftover CoW extent
+# - See if mount/umount fixes it
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+
+echo "Format"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full
+is_rmap=$(_xfs_has_feature $SCRATCH_MNT rmapbt -v)
+_scratch_xfs_unmount_dirty
+
+_get_agf_data() {
+	field="$1"
+	shift
+
+	_scratch_xfs_db -c 'agf 1' "$@" -c "p $field"  | awk '{print $3}'
+}
+
+_set_agf_data() {
+	field="$1"
+	value="$2"
+	shift; shift
+
+	_scratch_xfs_db -x -c 'agf 1' "$@" -c "write $field -- $value"  >> $seqres.full
+}
+
+_get_sb_data() {
+	_scratch_xfs_get_sb_field "$@"
+}
+
+_set_sb_data() {
+	_scratch_xfs_set_sb_field "$@" >> $seqres.full
+}
+
+_filter_leftover() {
+	grep "^leftover" | sed -e "s/[0-9]\+/NR/g"
+}
+
+_dump_status() {
+	echo "** " "$@"
+	_scratch_xfs_db -c 'sb 0' -c p
+	echo "** agf header"
+	_scratch_xfs_db -c 'agf 1' -c p
+	echo "** refcntbt"
+	_scratch_xfs_db -c 'agf 1' -c 'addr refcntroot' -c p
+	echo "** rmapbt"
+	test $is_rmap -gt 0 && _scratch_xfs_db -c 'agf 1' -c 'addr rmaproot' -c p
+	echo "** bnobt"
+	_scratch_xfs_db -c 'agf 1' -c 'addr bnoroot' -c p
+	echo "** cntbt"
+	_scratch_xfs_db -c 'agf 1' -c 'addr cntroot' -c p
+}
+
+echo "We need AG1 to have a single free extent"
+bno_lvl=$(_get_agf_data level -c 'addr bnoroot')
+bno_nr=$(_get_agf_data numrecs -c 'addr bnoroot')
+refc_lvl=$(_get_agf_data level -c 'addr refcntroot')
+refc_nr=$(_get_agf_data numrecs -c 'addr refcntroot')
+
+test $bno_lvl -eq 0 || echo "  AG 1 bnobt must only have one level"
+test $bno_nr -eq 1 || echo "  AG 1 bnobt must only have one record"
+test $refc_lvl -eq 0 || echo "  AG 1 refcountbt must only have one level"
+test $refc_nr -eq 0 || echo "  AG 1 refcountbt must only have one record"
+
+if [ $is_rmap -gt 0 ]; then
+	rmap_lvl=$(_get_agf_data level -c 'addr rmaproot')
+	rmap_nr=$(_get_agf_data numrecs -c 'addr rmaproot')
+	test $rmap_lvl -eq 0 || echo "  AG 1 rmapbt must only have one level"
+fi
+
+echo "Find our extent and old counter values"
+bno=$(_get_agf_data "recs[1].startblock" -c 'addr bnoroot')
+len=$(_get_agf_data "recs[1].blockcount" -c 'addr bnoroot')
+agf_freeblks=$(_get_agf_data freeblks)
+sb_fdblocks=$(_get_sb_data fdblocks)
+
+test $len -ge 200 || echo "  AG 1 doesn't have enough free blocks"
+
+# Take the last 100 blocks of the free extent
+debris_len=100
+debris_bno=$((bno + len - debris_len))
+
+echo "Remove the extent from the freesp btrees"
+_set_agf_data "recs[1].blockcount" $((len - debris_len)) -c 'addr bnoroot'
+_set_agf_data "recs[1].blockcount" $((len - debris_len)) -c 'addr cntroot'
+_set_agf_data longest $((len - debris_len))
+_set_agf_data freeblks $((agf_freeblks - debris_len))
+_set_sb_data fdblocks $((sb_fdblocks - debris_len))
+
+echo "Add the extent to the refcount btree"
+_set_agf_data numrecs 1 -c 'addr refcntroot'
+_set_agf_data "recs[1].startblock" $debris_bno -c 'addr refcntroot'
+_set_agf_data "recs[1].blockcount" $debris_len -c 'addr refcntroot'
+_set_agf_data "recs[1].refcount" 1 -c 'addr refcntroot'
+_set_agf_data "recs[1].cowflag" 1 -c 'addr refcntroot'
+
+if [ $is_rmap -gt 0 ]; then
+	rmap_nr=$((rmap_nr + 1))
+	_set_agf_data numrecs $rmap_nr -c 'addr rmaproot'
+	_set_agf_data "recs[$rmap_nr].startblock" $debris_bno -c 'addr rmaproot'
+	_set_agf_data "recs[$rmap_nr].blockcount" $debris_len -c 'addr rmaproot'
+	_set_agf_data "recs[$rmap_nr].owner" -9 -c 'addr rmaproot'
+	_set_agf_data "recs[$rmap_nr].offset" 0 -c 'addr rmaproot'
+fi
+
+_dump_status "broken fs config" >> $seqres.full
+
+echo "Look for leftover warning in xfs_repair"
+_scratch_xfs_repair -n 2>&1 | _filter_leftover
+
+echo "Mount filesystem"
+_scratch_mount
+_scratch_unmount
+
+_dump_status "supposedly fixed fs config" >> $seqres.full
+
+echo "Look for no more leftover warning in xfs_repair"
+_scratch_xfs_repair -n 2>&1 | _filter_leftover
+
+# success, all done
+status=0
+exit

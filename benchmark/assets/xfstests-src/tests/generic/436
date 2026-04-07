@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 SUSE.  All Rights Reserved.
+#
+# FS QA Test No. 436
+#
+# More SEEK_DATA/SEEK_HOLE sanity tests.
+#
+. ./common/preamble
+_begin_fstest auto quick rw seek prealloc
+
+tmp=$$
+
+BASE_TEST_FILE=$TEST_DIR/seek_sanity_testfile
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $tmp.* $BASE_TEST_FILE*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_seek_data_hole
+# All the seek sanity test cases here do falloc
+_require_xfs_io_command "falloc"
+
+_require_test_program "seek_sanity_test"
+
+_run_seek_sanity_test -s 13 -e 16 $BASE_TEST_FILE > $seqres.full 2>&1 ||
+	_fail "seek sanity check failed!"
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

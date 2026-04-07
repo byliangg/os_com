@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 232
+#
+# Test that performing io and exhausting qgroup limit won't deadlock. This
+# exercises issues fixed by the following kernel commits:
+#
+# 4f6a49de64fd ("btrfs: unlock extents in btrfs_zero_range in case of quota
+# reservation errors")
+# 4d14c5cde5c2 ("btrfs: don't flush from btrfs_delayed_inode_reserve_metadata")
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup limit
+
+. ./common/filter
+
+writer()
+{
+	# Wait for running fsstress subcommand before exitting so that
+	# mountpoint is not busy when we try to unmount it.
+	trap "wait; exit" SIGTERM
+
+	while true; do
+		args=`_scale_fsstress_args -p 20 -n 1000 -d $SCRATCH_MNT/stressdir`
+		_run_fsstress $args
+	done
+}
+
+
+# This test requires specific data space usage, skip if we have compression
+# enabled.
+_require_no_compress
+
+_require_scratch_size $((2 * 1024 * 1024))
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+_pwrite_byte 0xcd 0 900m $SCRATCH_MNT/file >> $seqres.full
+# Make sure the data reach disk so later qgroup scan can see it
+sync
+
+$BTRFS_UTIL_PROG quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT >> $seqres.full
+# set the limit to 1 g, leaving us just 100mb of slack space
+$BTRFS_UTIL_PROG qgroup limit 1G 0/5 $SCRATCH_MNT
+
+writer &
+writer_pid=$!
+
+# Give time for the background thread to generate some load
+sleep 30
+
+kill $writer_pid
+wait
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

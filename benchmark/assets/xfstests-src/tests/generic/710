@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2022 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 710
+#
+# Can we use exchangerange to exceed the quota enforcement?
+
+. ./common/preamble
+_begin_fstest auto quick fiexchange quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_xfs_io_command exchangerange
+_require_user
+_require_nobody
+_require_quota
+_require_xfs_quota
+_require_scratch
+
+# Format filesystem and set up quota limits
+_scratch_mkfs > $seqres.full
+_qmount_option "usrquota,grpquota"
+_qmount >> $seqres.full
+
+# Set up initial files
+$XFS_IO_PROG -f -c 'pwrite -S 0x58 0 256k -b 1m' $SCRATCH_MNT/a >> $seqres.full
+chown $qa_user $SCRATCH_MNT/a
+$XFS_IO_PROG -f -c 'pwrite -S 0x59 0 64k -b 64k' -c 'truncate 256k' $SCRATCH_MNT/b >> $seqres.full
+chown nobody $SCRATCH_MNT/b
+
+# Set up a quota limit
+_scratch_supports_rtquota && \
+	extra_limits="rtbhard=70k"
+$XFS_QUOTA_PROG -x -c "limit -u bhard=70k $extra_limits nobody" $SCRATCH_MNT
+
+echo before exchangerange >> $seqres.full
+$XFS_QUOTA_PROG -x -c 'report -a' $SCRATCH_MNT >> $seqres.full
+stat $SCRATCH_MNT/* >> $seqres.full
+
+# Now try to exchangerange
+$XFS_IO_PROG -c "exchangerange $SCRATCH_MNT/b" $SCRATCH_MNT/a
+
+echo after exchangerange >> $seqres.full
+$XFS_QUOTA_PROG -x -c 'report -a' $SCRATCH_MNT >> $seqres.full
+stat $SCRATCH_MNT/* >> $seqres.full
+
+_check_quota_usage
+
+# success, all done
+status=0
+exit

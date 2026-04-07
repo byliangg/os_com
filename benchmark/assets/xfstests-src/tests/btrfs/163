@@ -1,0 +1,96 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle.  All Rights Reserved.
+#
+# FS QA Test 163
+#
+# Test case to verify that a sprouted device can be replaced
+#  Create a seed device
+#  Create a sprout device
+#  Remount RW
+#  Run device replace on the sprout device
+#
+# Depends on the kernel patch
+#   c6a5d954950c btrfs: fail replace of seed device
+
+. ./common/preamble
+_begin_fstest auto quick volume seed remount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_btrfs_rescan_devices
+}
+
+. ./common/filter
+. ./common/filter.btrfs
+
+_require_command "$BTRFS_TUNE_PROG" btrfstune
+_require_scratch_dev_pool 3
+_require_btrfs_forget_or_module_loadable
+
+_scratch_dev_pool_get 3
+
+dev_seed=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}')
+dev_sprout=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}')
+dev_replace_tgt=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $3}')
+
+create_seed()
+{
+	_mkfs_dev $dev_seed
+	run_check _mount $dev_seed $SCRATCH_MNT
+	$XFS_IO_PROG -f -d -c "pwrite -S 0xab 0 4M" $SCRATCH_MNT/foobar >\
+		/dev/null
+	echo -- golden --
+	od -x $SCRATCH_MNT/foobar
+	_btrfs filesystem show -m $SCRATCH_MNT
+	_scratch_unmount
+	$BTRFS_TUNE_PROG -S 1 $dev_seed
+	run_check _mount $dev_seed $SCRATCH_MNT
+}
+
+add_sprout()
+{
+	_btrfs device add -f $dev_sprout $SCRATCH_MNT >>\
+		$seqres.full
+	_btrfs filesystem show -m $SCRATCH_MNT
+	_mount -o remount,rw $dev_sprout $SCRATCH_MNT
+	$XFS_IO_PROG -f -c "pwrite -S 0xcd 0 4M" $SCRATCH_MNT/foobar2 >\
+		/dev/null
+}
+
+replace_sprout()
+{
+	_btrfs replace start -fB $dev_sprout $dev_replace_tgt $SCRATCH_MNT
+	_btrfs filesystem show -m $SCRATCH_MNT
+	_scratch_unmount
+	_btrfs_forget_or_module_reload
+	run_check _mount -o device=$dev_seed $dev_replace_tgt $SCRATCH_MNT
+	echo -- sprout --
+	od -x $SCRATCH_MNT/foobar
+	od -x $SCRATCH_MNT/foobar2
+	_scratch_unmount
+
+}
+
+seed_is_mountable()
+{
+	_btrfs_forget_or_module_reload
+	run_check _mount $dev_seed $SCRATCH_MNT
+	_btrfs filesystem show -m $SCRATCH_MNT
+	_scratch_unmount
+}
+
+create_seed
+add_sprout
+replace_sprout
+
+seed_is_mountable
+
+_scratch_dev_pool_put
+_btrfs_rescan_devices
+
+status=0
+exit

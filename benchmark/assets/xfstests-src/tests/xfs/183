@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 183
+#
+# Test to check bulkstat returns unlinked-but-referenced inodes
+# (PVs: 972128, 972004)
+#
+. ./common/preamble
+_begin_fstest rw other auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+
+# Setup Filesystem
+_require_scratch
+_scratch_mkfs_xfs >/dev/null 2>&1
+
+_scratch_mount
+
+# run Mark Goodwin test here
+# Usage: ./bulkstat_unlink_test iterations nfiles stride dir
+#        Create dir with nfiles, unlink each stride'th file, sync, bulkstat
+echo "Start original bulkstat_unlink_test with -r switch"
+$here/src/bulkstat_unlink_test -r 1 100 1 $SCRATCH_MNT/bulkstat
+
+# success, all done
+status=0
+exit

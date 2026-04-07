@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 059
+#
+# Test multiple origin references to the same lower file.
+#
+# Multiple origin references to the same lower file from upper files that
+# are not hardlinks will falsely return the same st_ino/st_dev for two
+# different overlay files and will cause 'diff' to falsely report that
+# content of files is the same when it is not.
+#
+# This test checks that overlayfs detects and fails lookup of a multiply
+# referenced origin.
+#
+# The check for multiply referenced origin was a by-product of kernel
+# commit 31747eda41ef ("ovl: hash directory inodes for fsnotify")
+#
+. ./common/preamble
+_begin_fstest auto quick copyup
+
+# Rename lower file to create copy up with origin xattr
+create_origin_ref()
+{
+	local ref=$1
+
+	touch $lowerdir/origin
+
+	# Enabling redirect_dir may seem irrelevant to rename of non-dir,
+	# but with upcoming 'metacopy' feature, redirects will be set also
+	# on non-dir and may also create multiple redirects.
+	_scratch_mount -o redirect_dir=on
+	mv $SCRATCH_MNT/origin $SCRATCH_MNT/$ref
+
+	$UMOUNT_PROG $SCRATCH_MNT
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+_require_scratch_feature redirect_dir
+
+# remove all files from previous runs
+_scratch_mkfs
+
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+
+# Create copied up file with origin xattr
+create_origin_ref ref1
+# Duplicate the copied up file
+cp -a $upperdir/ref1 $upperdir/ref2
+
+# Diverge the content of the two copies of file
+# and the content of two copies of redirected dir
+echo right >> $upperdir/ref1
+echo wrong >> $upperdir/ref2
+
+_scratch_mount -o redirect_dir=on
+
+# If both copies of file use the same st_dev/st_ino in overlay
+# diff won't detect that their content differs
+diff -q $SCRATCH_MNT/ref1 $SCRATCH_MNT/ref2 &>/dev/null && \
+	echo "diff on duplicated upper files doesn't know right from wrong!"
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

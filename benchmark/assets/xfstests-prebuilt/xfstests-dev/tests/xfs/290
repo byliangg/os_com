@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 290
+#
+# Makes calls to XFS_IOC_ZERO_RANGE and checks tossed ranges
+#
+# Nothing should be tossed unless the range includes a page boundry
+#
+# Primarily tests page boundries and boundries that are
+#  off-by-one to ensure we're only tossing what's expected
+#
+. ./common/preamble
+_begin_fstest auto rw prealloc quick ioctl zero
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+
+# Modify as appropriate.
+
+_require_test
+_require_xfs_io_command "zero"
+
+testfile=$TEST_DIR/290.$$
+
+_test_block_boundaries 4096 zero _filter_xfs_io_unique $testfile
+
+# success, all done
+status=0
+exit

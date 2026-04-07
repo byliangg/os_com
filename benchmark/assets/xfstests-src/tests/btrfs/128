@@ -1,0 +1,103 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/128
+#
+# Test that, under a particular scenario, an incremental send operation does
+# not leak memory (which used to emit a warning in dmesg/syslog).
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/a
+mkdir $SCRATCH_MNT/tmp
+mkdir $SCRATCH_MNT/del
+mv $SCRATCH_MNT/tmp $SCRATCH_MNT/del
+mkdir $SCRATCH_MNT/a/c
+mkdir $SCRATCH_MNT/del/x
+mkdir $SCRATCH_MNT/del/y
+
+# Filesystem looks like:
+#
+# .                                                             (ino 256)
+# |--- a/                                                       (ino 257)
+# |    |--- c/                                                  (ino 260)
+# |
+# |--- del/                                                     (ino 259)
+#       |--- tmp/                                               (ino 258)
+#       |--- x/                                                 (ino 261)
+#       |--- y/                                                 (ino 262)
+#
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+# It used to be that when attempting to issue an rmdir operation for inode 259,
+# the kernel allocated an orphan_dir_info structure so that later after doing
+# the delayed rename operation for inode 258 (which happened once inode 260 was
+# renamed) it would check if it could finally issue a rmdir instruction for
+# inode 259. If it couldn't, it would not release the previously allocated
+# orphan_dir_info structure immediately. Instead it would only release it once
+# it finished the send stream and it would emit a warning in dmesg/syslog.
+#
+mv $SCRATCH_MNT/a/c $SCRATCH_MNT
+mv $SCRATCH_MNT/del/x $SCRATCH_MNT/a
+mv $SCRATCH_MNT/del/y $SCRATCH_MNT/a
+mv $SCRATCH_MNT/del/tmp $SCRATCH_MNT/c
+rmdir $SCRATCH_MNT/del
+
+# Filesystem now looks like:
+#
+# .                                                             (ino 256)
+# |--- a/                                                       (ino 257)
+# |    |--- x/                                                  (ino 261)
+# |    |--- y/                                                  (ino 262)
+# |
+# |--- c/                                                       (ino 260)
+#      |--- tmp/                                                (ino 258)
+#
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+run_check $FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $send_files_dir/2.fssum \
+	-x $SCRATCH_MNT/mysnap2/mysnap1 $SCRATCH_MNT/mysnap2
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+# Now recreate the filesystem by receiving both send streams and verify we get
+# the same content that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/2.fssum $SCRATCH_MNT/mysnap2
+
+echo "Silence is golden"
+status=0
+exit

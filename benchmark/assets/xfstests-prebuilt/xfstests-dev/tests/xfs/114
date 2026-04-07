@@ -1,0 +1,107 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 114
+#
+# Make sure that we can handle insert-range followed by collapse-range.
+# In particular, make sure that fcollapse works for rmap when the
+# extents on either side of the collapse area are mergeable.
+#
+. ./common/preamble
+_begin_fstest auto quick clone rmap collapse insert prealloc
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_program "punch-alternating"
+_require_cp_reflink
+_require_scratch_reflink
+_require_xfs_scratch_rmapbt
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fcollapse"
+_require_xfs_io_command "finsert"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+blksz=65536
+blocks1=150	# enough extents to force btree format
+blocks2=16	# local format
+len1=$((blocks1 * blksz))
+len2=$((blocks2 * blksz))
+file_blksz=$(_get_file_block_size $SCRATCH_MNT)
+
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+
+echo "Create some files"
+$XFS_IO_PROG -f \
+	-c "falloc 0 $len1" \
+	-c "pwrite -S 0x68 -b 1048576 0 $len1" \
+	$SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG -f \
+	-c "falloc 0 $len2" \
+	-c "pwrite -S 0x68 -b 1048576 0 $len2" \
+	$SCRATCH_MNT/f2 >> $seqres.full
+
+# The arguments to punch-alternating must be specified in units of file
+# allocation units, so we divide the argument by $file_blksz.  We already
+# verified that $blksz is congruent with $file_blksz, so the fpunch parameters
+# will always align with the file allocation unit.
+$here/src/punch-alternating -o $((16 * blksz / file_blksz)) \
+	-s $((blksz / file_blksz)) \
+	-i $((blksz * 2 / file_blksz)) \
+	$SCRATCH_MNT/f1 >> "$seqres.full"
+
+echo "Insert and write file range"
+$XFS_IO_PROG \
+	-c "finsert $((8 * blksz)) $blksz" \
+	-c "pwrite -S 0x69 $((8 * blksz)) $blksz" \
+	-c "fsync" \
+	$SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG \
+	-c "finsert $((8 * blksz)) $blksz" \
+	-c "pwrite -S 0x69 $((8 * blksz)) $blksz" \
+	-c "fsync" \
+	$SCRATCH_MNT/f2 >> $seqres.full
+
+# Make reflink copies to force it to use the fancy rmap operations.
+# The test's functionality doesn't depend on the fs supporting reflink.
+_cp_reflink $SCRATCH_MNT/f1 $SCRATCH_MNT/e1 >> $seqres.full 2>&1
+_cp_reflink $SCRATCH_MNT/f2 $SCRATCH_MNT/e2 >> $seqres.full 2>&1
+
+echo "f1 bmap" >> $seqres.full
+$XFS_IO_PROG -c 'bmap -elpv' $SCRATCH_MNT/f1 >> $seqres.full
+echo "f2 bmap" >> $seqres.full
+$XFS_IO_PROG -c 'bmap -elpv' $SCRATCH_MNT/f2 >> $seqres.full
+echo "fsmap" >> $seqres.full
+$XFS_IO_PROG -c 'fsmap -v' $SCRATCH_MNT >> $seqres.full
+
+echo "Remount"
+_scratch_unmount
+_check_xfs_scratch_fs
+_scratch_mount
+
+echo "Collapse file"
+$XFS_IO_PROG -c "fcollapse $((8 * blksz)) $blksz" $SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG -c "fcollapse $((8 * blksz)) $blksz" $SCRATCH_MNT/f2 >> $seqres.full
+
+echo "f1 bmap" >> $seqres.full
+$XFS_IO_PROG -c 'bmap -elpv' $SCRATCH_MNT/f1 >> $seqres.full
+echo "f2 bmap" >> $seqres.full
+$XFS_IO_PROG -c 'bmap -elpv' $SCRATCH_MNT/f2 >> $seqres.full
+echo "fsmap" >> $seqres.full
+$XFS_IO_PROG -c 'fsmap -v' $SCRATCH_MNT >> $seqres.full
+
+echo "Check file"
+md5sum $SCRATCH_MNT/f1 | _filter_scratch
+md5sum $SCRATCH_MNT/f2 | _filter_scratch
+od -tx1 -Ad -c $SCRATCH_MNT/f1 >> $seqres.full
+od -tx1 -Ad -c $SCRATCH_MNT/f2 >> $seqres.full
+
+# success, all done
+status=0
+exit

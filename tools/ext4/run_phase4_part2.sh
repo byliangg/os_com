@@ -17,11 +17,11 @@ export NETDEV=${NETDEV:-user}
 export VHOST=${VHOST:-off}
 export CONSOLE=${CONSOLE:-ttyS0}
 
-LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/stage4_ext4_logs_part2"}
+LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/benchmark/logs/part2"}
 mkdir -p "${LOG_DIR}" "${LOG_DIR}/lmbench"
 
-INITRAMFS_IMG=${INITRAMFS_IMG:-"${ROOT_DIR}/.local/initramfs_phase4_part2.cpio.gz"}
-BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/.local/initramfs_phase3.cpio.gz"}
+INITRAMFS_IMG=${INITRAMFS_IMG:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase4_part2.cpio.gz"}
+BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase3.cpio.gz"}
 PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
 
 if [ ! -f "${INITRAMFS_IMG}" ]; then

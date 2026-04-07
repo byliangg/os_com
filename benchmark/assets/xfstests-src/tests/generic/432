@@ -1,0 +1,68 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Netapp, Inc. All rights reserved.
+#
+# FS QA Test No. 432
+#
+# Tests vfs_copy_file_range():
+#   - Copy a file
+#   - Use copy to swap data at beginning and end
+#   - Use copy to swap data in the middle
+#   - Use copy to simultaneously overwrite and append to destination file
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+# get standard environment
+. common/filter
+
+
+_require_xfs_io_command "copy_range"
+_require_test
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file and then copy"
+$XFS_IO_PROG -f -c 'pwrite -S 0x61 0    1000' $testdir/file >> $seqres.full 2>&1
+$XFS_IO_PROG -f -c 'pwrite -S 0x62 1000 1000' $testdir/file >> $seqres.full 2>&1
+$XFS_IO_PROG -f -c 'pwrite -S 0x63 2000 1000' $testdir/file >> $seqres.full 2>&1
+$XFS_IO_PROG -f -c 'pwrite -S 0x64 3000 1000' $testdir/file >> $seqres.full 2>&1
+$XFS_IO_PROG -f -c 'pwrite -S 0x65 4000 1000' $testdir/file >> $seqres.full 2>&1
+$XFS_IO_PROG -f -c "copy_range $testdir/file" "$testdir/copy"
+cmp $testdir/file  $testdir/copy
+echo "Original md5sums:"
+md5sum $testdir/{file,copy} | _filter_test_dir
+
+echo "Swap beginning and end of original file"
+$XFS_IO_PROG -f -c "copy_range -s 4000 -l 1000 $testdir/file" "$testdir/copy"
+$XFS_IO_PROG -f -c "copy_range -d 4000 -l 1000 $testdir/file" "$testdir/copy"
+cmp -n 1000 $testdir/file $testdir/copy 4000
+cmp -n 3000 $testdir/file $testdir/copy 1000 1000
+cmp -n 1000 $testdir/file $testdir/copy 0 4000
+echo "md5sums after swapping beginning and end:"
+md5sum $testdir/{file,copy} | _filter_test_dir
+
+echo "Swap middle parts of original file"
+$XFS_IO_PROG -f -c "copy_range -s 1000 -d 3000 -l 1000 $testdir/file" "$testdir/copy"
+$XFS_IO_PROG -f -c "copy_range -s 3000 -d 1000 -l 1000 $testdir/file" "$testdir/copy"
+cmp -n 1000 $testdir/file $testdir/copy 4000
+cmp -n 1000 $testdir/file $testdir/copy 3000 1000
+cmp -n 1000 $testdir/file $testdir/copy 2000 2000
+cmp -n 1000 $testdir/file $testdir/copy 1000 3000
+cmp -n 1000 $testdir/file $testdir/copy 0 4000
+echo "md5sums after swapping middle:"
+md5sum $testdir/{file,copy} | _filter_test_dir
+
+echo "Copy tail of original file onto copy"
+$XFS_IO_PROG -f -c "copy_range -s 1000 -d 3000 -l 4000 $testdir/file" "$testdir/copy"
+cmp -n 1000 $testdir/file $testdir/copy 4000
+cmp -n 1000 $testdir/file $testdir/copy 3000 1000
+cmp -n 1000 $testdir/file $testdir/copy 2000 2000
+cmp -n 4000 $testdir/file $testdir/copy 1000 3000
+echo "md5sums after copying tail:"
+md5sum $testdir/{file,copy} | _filter_test_dir
+
+#success, all done
+status=0
+exit

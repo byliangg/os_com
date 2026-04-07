@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/016
+#
+# btrfs send hole punch test
+#
+. ./common/preamble
+_begin_fstest auto quick send prealloc
+
+tmp=`mktemp -d`
+tmp_dir=send_temp_$seq
+
+. ./common/filter
+
+_require_scratch
+_require_fssum
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/$tmp_dir
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/$tmp_dir/send \
+	> $seqres.full 2>&1 || _fail "failed subvolume create"
+
+_ddt of=$SCRATCH_MNT/$tmp_dir/send/foo bs=1M count=10 >> $seqres.full \
+	2>&1 || _fail "dd failed"
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT/$tmp_dir/send \
+	$SCRATCH_MNT/$tmp_dir/snap >> $seqres.full 2>&1 || _fail "failed snap"
+$XFS_IO_PROG -c "fpunch 1m 1m" $SCRATCH_MNT/$tmp_dir/send/foo
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT/$tmp_dir/send \
+	$SCRATCH_MNT/$tmp_dir/snap1 >> $seqres.full 2>&1 || _fail "failed snap"
+
+# -A disable access time check.
+# And -T disable xattrs to prevent SELinux changes causing false alerts, and the
+# test case only cares about hole punching.
+$FSSUM_PROG -AT -f -w $tmp/fssum.snap $SCRATCH_MNT/$tmp_dir/snap >> $seqres.full \
+	2>&1 || _fail "fssum gen failed"
+$FSSUM_PROG -AT -f -w $tmp/fssum.snap1 $SCRATCH_MNT/$tmp_dir/snap1 >> $seqres.full \
+	2>&1 || _fail "fssum gen failed"
+
+$BTRFS_UTIL_PROG send -f $tmp/send.snap $SCRATCH_MNT/$tmp_dir/snap >> \
+	$seqres.full 2>&1 || _fail "failed send"
+$BTRFS_UTIL_PROG send -p $SCRATCH_MNT/$tmp_dir/snap \
+	-f $tmp/send.snap1 $SCRATCH_MNT/$tmp_dir/snap1 \
+	>> $seqres.full 2>&1 || _fail "failed send"
+
+_scratch_unmount
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+$BTRFS_UTIL_PROG receive -f $tmp/send.snap $SCRATCH_MNT >> $seqres.full 2>&1 \
+	|| _fail "failed recv"
+$BTRFS_UTIL_PROG receive -f $tmp/send.snap1 $SCRATCH_MNT >> $seqres.full 2>&1 \
+	|| _fail "failed recv"
+
+$FSSUM_PROG -r $tmp/fssum.snap $SCRATCH_MNT/snap >> $seqres.full 2>&1 \
+	|| _fail "fssum failed"
+$FSSUM_PROG -r $tmp/fssum.snap1 $SCRATCH_MNT/snap1 >> $seqres.full 2>&1 \
+	|| _fail "fssum failed"
+
+echo "Silence is golden"
+status=0
+exit

@@ -195,7 +195,12 @@ impl Ext4 {
                 self.write_back_inode(child);
             } else {
                 child.inode.set_links_count(0);
-                free_child = true;
+                // Keep regular-file inode allocated when nlink drops to zero.
+                // POSIX requires unlink to keep an opened-but-unlinked inode alive
+                // until the last file reference is closed. We currently do not have
+                // close-time orphan cleanup, so avoid immediate inode bitmap recycle
+                // to prevent inode reuse corruption in open-unlink races.
+                self.write_back_inode(child);
             }
         }
 

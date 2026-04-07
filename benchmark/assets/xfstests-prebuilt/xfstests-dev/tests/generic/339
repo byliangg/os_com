@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Hannes Frederic Sowa.  All Rights Reserved.
+#
+# FS QA Test No. 339
+#
+# Test that directory hash entries are place in the correct order.
+# commit f5ea110 ("xfs: add CRCs to dir2/da node blocks") left the
+# directory with incorrect hash ordering.
+#
+. ./common/preamble
+_begin_fstest auto dir
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_test_program "dirhash_collide"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+echo "Silence is golden"
+
+testdir=$SCRATCH_MNT/$seq.$$
+mkdir -p $testdir
+$here/src/dirhash_collide -d -n 10000 $testdir >>$seqres.full 2>&1
+
+# check the scratch device
+_scratch_unmount
+_check_scratch_fs
+
+# remove all test dirs and let test harness check scratch fs again
+_scratch_mount
+rm -rf $testdir
+
+# success, all done
+status=0
+exit

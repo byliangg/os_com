@@ -1,0 +1,113 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 012
+#
+# Test btrfs-convert
+#
+# 1) create ext4 filesystem & populate it
+# 2) convert it to btrfs, mount it, verify contents
+# 3) verify archived ext4 image integriy & contents
+# 4) populate btrfs fs with new data
+# 5) roll back conversion to original ext4
+# 6) verify rolled-back fs integrity & contents
+#
+. ./common/preamble
+_begin_fstest auto convert
+
+. ./common/filter.btrfs
+
+_require_scratch_nocheck
+
+_require_command "$BTRFS_CONVERT_PROG" btrfs-convert
+_require_command "$MKFS_EXT4_PROG" mkfs.ext4
+_require_command "$E2FSCK_PROG" e2fsck
+_require_fssum
+# ext4 does not support zoned block device
+_require_non_zoned_device "${SCRATCH_DEV}"
+_require_loop
+_require_extra_fs ext4
+
+BASENAME="stressdir"
+BLOCK_SIZE=`_get_block_size $TEST_DIR`
+
+# Override the SELinux mount options, or it will lead to unexpected
+# different security.selinux between the original and converted fs,
+# causing false metadata mismatch during fssum.
+export SELINUX_MOUNT_OPTIONS=""
+
+# Create & populate an ext4 filesystem
+$MKFS_EXT4_PROG -F -b $BLOCK_SIZE $SCRATCH_DEV > $seqres.full 2>&1 || \
+	_notrun "Could not create ext4 filesystem"
+# Manual mount so we don't use -t btrfs or selinux context
+mount -t ext4 $SCRATCH_DEV $SCRATCH_MNT
+if [ $? -ne 0 -a $BLOCK_SIZE -gt $(_get_page_size) ]; then
+	_notrun "block size $BLOCK_SIZE is not supported by ext4"
+fi
+
+echo "populating the initial ext fs:" >> $seqres.full
+mkdir "$SCRATCH_MNT/$BASENAME"
+_run_fsstress -w -d "$SCRATCH_MNT/$BASENAME" -n 20 -p 500
+
+# Create the checksum to verify later.
+$FSSUM_PROG -A -f -w $tmp.original "$SCRATCH_MNT/$BASENAME"
+_scratch_unmount
+
+# Convert it to btrfs, mount it, verify the data
+$BTRFS_CONVERT_PROG $SCRATCH_DEV >> $seqres.full 2>&1 || \
+	_fail "btrfs-convert failed"
+_try_scratch_mount || _fail "Could not mount new btrfs fs"
+
+echo "Checking converted btrfs against the original one:"
+$FSSUM_PROG -r $tmp.original $SCRATCH_MNT/$BASENAME
+
+# Old ext4 image file should exist & be consistent
+$E2FSCK_PROG -fn $SCRATCH_MNT/ext2_saved/image >> $seqres.full 2>&1 || \
+	_fail "archived ext4 image is corrupt"
+
+# And the files in that image should match
+mkdir -p $SCRATCH_MNT/mnt
+mount -o loop $SCRATCH_MNT/ext2_saved/image $SCRATCH_MNT/mnt || \
+	_fail "could not loop mount saved ext4 image"
+
+echo "Checking saved ext2 image against the original one:"
+$FSSUM_PROG -r $tmp.original $SCRATCH_MNT/mnt/$BASENAME
+umount $SCRATCH_MNT/mnt
+
+echo "Generating new data on the converted btrfs" >> $seqres.full
+mkdir -p $SCRATCH_MNT/new 
+_run_fsstress -w -d "$SCRATCH_MNT/new" -n 20 -p 500
+
+_scratch_unmount
+
+# Now restore the ext4 device
+$BTRFS_CONVERT_PROG -r $SCRATCH_DEV >> $seqres.full 2>&1 || \
+	_fail "btrfs-convert rollback failed"
+
+# Check it again
+$E2FSCK_PROG -fn $SCRATCH_DEV >> $seqres.full 2>&1 || \
+        _fail "restored ext4 image is corrupt"
+
+# Mount the un-converted ext4 device & check the contents
+mount -t ext4 $SCRATCH_DEV $SCRATCH_MNT
+echo "Checking rolled back ext2 against the original one:"
+$FSSUM_PROG -r $tmp.original $SCRATCH_MNT/$BASENAME
+
+_scratch_unmount
+
+# Convert it to btrfs, mount it and delete "ext2_saved"
+$BTRFS_CONVERT_PROG $SCRATCH_DEV >> $seqres.full 2>&1 || \
+	_fail "btrfs-convert failed"
+_try_scratch_mount || _fail "Could not mount new btrfs fs"
+$BTRFS_UTIL_PROG subvolume delete $SCRATCH_MNT/ext2_saved >> $seqres.full 2>&1 ||
+	_fail "failed to delete ext2_saved subvolume"
+_scratch_unmount
+
+# Now restore the ext4 device, expecting a failure
+$BTRFS_CONVERT_PROG -r $SCRATCH_DEV >> $seqres.full 2>&1
+[ $? -eq 1 ] || _fail "Failure is expected, but btrfs-convert returns with rollback complete"
+
+# success, all done
+status=0
+exit

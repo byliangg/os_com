@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Red Hat.  All Rights Reserved.
+#
+# FS QA Test No. 255
+#
+# Test Generic fallocate hole punching
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc punch fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+_require_test
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fiemap"
+
+testfile=$TEST_DIR/255.$$
+
+# Standard punch hole tests
+_test_generic_punch falloc fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Delayed allocation punch hole tests
+_test_generic_punch -d falloc fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Multi hole punch tests
+_test_generic_punch -k falloc fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Delayed allocation multi punch hole tests
+_test_generic_punch -d -k falloc fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+status=0 ; exit

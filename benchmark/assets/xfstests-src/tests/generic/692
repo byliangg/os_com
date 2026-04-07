@@ -1,0 +1,83 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 Meta, Inc.  All Rights Reserved.
+#
+# FS QA Test 692
+#
+# fs-verity requires the filesystem to decide how it stores the Merkle tree,
+# which can be quite large.
+# It is convenient to treat the Merkle tree as past EOF, and ext4, f2fs, and
+# btrfs do so in at least some fashion. This leads to an edge case where a
+# large file can be under the file system file size limit, but trigger EFBIG
+# on enabling fs-verity. Test enabling verity on some large files to exercise
+# EFBIG logic for filesystems with fs-verity specific limits.
+#
+. ./common/preamble
+_begin_fstest auto quick verity
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_restore_fsverity_signatures
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/verity
+
+_require_test
+_require_math
+_require_scratch_verity
+_require_fsverity_max_file_size_limit
+_disable_fsverity_signatures
+
+_scratch_mkfs_verity &>> $seqres.full
+_scratch_mount
+
+fsv_file=$SCRATCH_MNT/file.fsv
+
+max_sz=$(_get_max_file_size $SCRATCH_MNT)
+_fsv_scratch_begin_subtest "way too big: fail on first merkle block"
+truncate -s $max_sz $fsv_file
+_fsv_enable $fsv_file |& _filter_scratch
+
+# The goal of this second test is to make a big enough file that we trip the
+# EFBIG codepath, but not so big that we hit it immediately when writing the
+# first Merkle leaf.
+#
+# The Merkle tree is stored with the leaf node level (L0) last, but it is
+# written first.  To get an interesting overflow, we need the maximum file size
+# ($max_sz) to be in the middle of L0 -- ideally near the beginning of L0 so
+# that we don't have to write many blocks before getting an error.
+
+bs=$FSV_BLOCK_SIZE
+hash_size=32   # SHA-256
+hashes_per_block=$(echo "scale=30; $bs/$hash_size" | $BC -q)
+
+# Compute the proportion of the original file size that the non-leaf levels of
+# the Merkle tree take up.  Ignoring padding, this is 1/($hashes_per_block^2) +
+# 1/($hashes_per_block^3) + 1/($hashes_per_block^4) + ...  Compute it using the
+# formula for the sum of a geometric series: \sum_{k=0}^{\infty} ar^k = a/(1-r).
+a=$(echo "scale=30; 1/($hashes_per_block^2)" | $BC -q)
+r=$(echo "scale=30; 1/$hashes_per_block" | $BC -q)
+nonleaves_relative_size=$(echo "scale=30; $a/(1-$r)" | $BC -q)
+
+# Compute the original file size where the leaf level L0 starts at $max_sz.
+# Padding is still ignored, so the real value is slightly smaller than this.
+sz=$(echo "$max_sz/(1+$nonleaves_relative_size)" | $BC -q)
+
+# Finally, to get a file size where $max_sz occurs just after the start of L0
+# rather than *at* the start of L0, subtract an overestimate of the padding: 64K
+# after the file contents, then $bs per level for 11 levels.  11 levels is the
+# most levels that can ever be needed, assuming the block size is at least 1K.
+sz=$(echo "$sz - 65536 - $bs*11" | $BC -q)
+
+_fsv_scratch_begin_subtest "still too big: fail on first invalid merkle block"
+truncate -s $sz $fsv_file
+_fsv_enable $fsv_file |& _filter_scratch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Samsung Electronics.  All Rights Reserved.
+#
+# FS QA Test No. generic/064
+#
+# Test multiple fallocate insert/collapse range calls on same file.
+# Call insert range on alternate blocks multiple times until the file
+# is left with 50 extents and as many holes. Then call collapse range
+# on the previously inserted ranges to test merge code of collapse
+# range. Also check for data integrity and file system consistency.
+. ./common/preamble
+_begin_fstest auto quick prealloc collapse insert fiemap
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "finsert"
+_require_xfs_io_command "fcollapse"
+
+_scratch_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+_scratch_mount
+
+src=$SCRATCH_MNT/testfile
+dest=$SCRATCH_MNT/testfile.dest
+BLOCKS=100
+BSIZE=`_get_file_block_size $SCRATCH_MNT`
+length=$(($BLOCKS * $BSIZE))
+
+# Write file
+_do "$XFS_IO_PROG -f -c \"pwrite 0 $length\" -c fsync $src"
+cp $src $dest
+extent_before=`_count_extents $dest`
+
+# Insert alternate blocks
+for (( j=0; j < $(($BLOCKS/2)); j++ )); do
+	offset=$((($j*$BSIZE)*2))
+	_do "$XFS_IO_PROG -c \"finsert $offset $BSIZE\" $dest"
+done
+
+# Check if 50 extents are present, allowing some slop for file systems
+# that don't have ideal allocation behavior
+num_extents=`_count_extents $dest`
+_within_tolerance "Extent count after inserts" $num_extents 50 0 6% -v
+
+_check_scratch_fs
+if [ $? -ne 0 ]; then
+	status=1
+	exit
+fi
+
+# Collapse alternate blocks
+for (( j=0; j < $(($BLOCKS/2)); j++ )); do
+	offset=$((($j*$BSIZE)))
+	_do "$XFS_IO_PROG -c \"fcollapse $offset $BSIZE\" $dest"
+done
+
+extent_after=`_count_extents $dest`
+if [ $extent_before -ne $extent_after ]; then
+	echo "extents mismatched before = $extent_before after = $extent_after"
+fi
+
+# compare original file and test file.
+cmp $src $dest || _fail "file bytes check failed"
+
+# success, all done
+status=0
+exit

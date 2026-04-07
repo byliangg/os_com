@@ -384,17 +384,26 @@ impl Ext4 {
         let mut super_block = self.super_block;
 
         let blocks_per_group = super_block.blocks_per_group();
-
-        let bgid = start / blocks_per_group as u64;
+        let max_bits_per_bitmap = block_size * 8;
+        let max_bits_per_group = core::cmp::min(blocks_per_group as usize, max_bits_per_bitmap);
 
         let mut bg_first = start / blocks_per_group as u64;
         let mut bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
 
         while bg_first <= bg_last {
             let idx_in_bg = start % blocks_per_group as u64;
+            let idx_in_bg = idx_in_bg as usize;
+            if idx_in_bg >= max_bits_per_group {
+                // Guard against malformed metadata leading to invalid bitmap offsets.
+                // Skip to the next group to avoid out-of-bounds bitmap access.
+                bg_first += 1;
+                continue;
+            }
+
+            let current_bgid = bg_first as usize;
 
             let mut bg =
-                Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
+                Ext4BlockGroup::load_new(&self.block_device, &super_block, current_bgid);
 
             let block_bitmap_block = bg.get_block_bitmap_block(&super_block);
             let mut raw_data = self
@@ -402,11 +411,13 @@ impl Ext4 {
                 .read_offset(block_bitmap_block as usize * block_size);
             let mut data: &mut Vec<u8> = &mut raw_data;
 
-            let mut free_cnt = block_size * 8 - idx_in_bg as usize;
-
-            if count > free_cnt {
-            } else {
+            let mut free_cnt = max_bits_per_group - idx_in_bg;
+            if count <= free_cnt {
                 free_cnt = count;
+            }
+            if free_cnt == 0 {
+                bg_first += 1;
+                continue;
             }
 
             ext4_bmap_bits_free(data, idx_in_bg as u32, idx_in_bg as u32 + free_cnt as u32 - 1);
@@ -436,7 +447,7 @@ impl Ext4 {
             let mut fb_cnt = bg.get_free_blocks_count();
             fb_cnt += free_cnt as u64;
             bg.set_free_blocks_count(fb_cnt as u32);
-            bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+            bg.sync_to_disk_with_csum(&self.block_device, current_bgid, &super_block);
 
             bg_first += 1;
         }

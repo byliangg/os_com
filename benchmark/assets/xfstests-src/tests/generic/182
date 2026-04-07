@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 182
+#
+# Test the convention that dedupe with length == 0 always returns success.
+#   - Create a file.
+#   - Try to dedupe "zero" bytes.
+#   - Check that the dedupe happened and nothing changed.
+#
+. ./common/preamble
+_begin_fstest auto quick clone dedupe
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_dedupe
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original files"
+blksz=65536
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz * 257)) $testdir/file2 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz * 257)) $testdir/file2.chk >> $seqres.full
+_dedupe_range $testdir/file1 $blksz $testdir/file2 $((blksz * 2)) 0 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file2.chk | _filter_test_dir
+
+c1=$(_md5_checksum $testdir/file1)
+c2=$(_md5_checksum $testdir/file2)
+
+test ${c1} != ${c2} || echo "file1 and file2 should not match"
+
+echo "Compare against check files"
+cmp -s $testdir/file2 $testdir/file2.chk || echo "file2 and file2.chk do not match"
+
+echo "Make the original file almost dedup-able"
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file2 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file2.chk >> $seqres.full
+_dedupe_range $testdir/file1 $blksz $testdir/file2 $((blksz * 2)) 0 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file2.chk | _filter_test_dir
+
+c1=$(_md5_checksum $testdir/file1)
+c2=$(_md5_checksum $testdir/file2)
+
+test ${c1} != ${c2} || echo "file1 and file2 should not match"
+
+echo "Compare against check files"
+cmp -s $testdir/file2 $testdir/file2.chk || echo "file2 and file2.chk do not match"
+
+echo "Make the original file dedup-able"
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz * 257)) $testdir/file2 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz * 257)) $testdir/file2.chk >> $seqres.full
+_dedupe_range $testdir/file1 $blksz $testdir/file2 $((blksz * 2)) 0 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file2.chk | _filter_test_dir
+
+c1=$(_md5_checksum $testdir/file1)
+c2=$(_md5_checksum $testdir/file2)
+
+test ${c1} = ${c2} || echo "file1 and file2 should match"
+
+echo "Compare against check files"
+cmp -s $testdir/file2 $testdir/file2.chk || echo "file2 and file2.chk do not match"
+
+# success, all done
+status=0
+exit

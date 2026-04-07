@@ -1,0 +1,377 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 453
+#
+# Create a directory with multiple filenames that all appear the same
+# (in unicode, anyway) but point to different inodes.  In theory all
+# Linux filesystems should allow this (filenames are a sequence of
+# arbitrary bytes) even if the user implications are horrifying.
+#
+. ./common/preamble
+_begin_fstest auto quick dir
+
+# Import common functions.
+
+_require_scratch
+_require_names_are_bytes
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir="${SCRATCH_MNT}/test-${seq}"
+mkdir $testdir
+
+hexbytes() {
+	echo -n "$1" | od -tx1 -w99999 | head -n1 | sed -e 's/^0* //g'
+}
+
+setf() {
+	key="$(echo -e "$1")"
+	value="$2"
+
+	echo "${value}" > "${testdir}/${key}"
+	echo "Storing ${key} ($(hexbytes "${key}")) -> ${value}" >> $seqres.full
+}
+
+setchild() {
+	subdir="$1"
+	key="$(echo -e "$2")"
+
+	mkdir -p "${testdir}/${subdir}"
+	echo "$subdir" > "${testdir}/${subdir}/${key}"
+	echo "Storing ${subdir}/${key} ($(hexbytes "${key}")) -> ${subdir}" >> $seqres.full
+}
+
+setd() {
+	key="$(echo -e "$1")"
+	value="$2"
+
+	mkdir -p "${testdir}/${key}"
+	echo "${value}" > "${testdir}/${key}/value"
+	echo "Storing ${key} ($(hexbytes "${key}")) -> ${value}" >> $seqres.full
+}
+
+testf() {
+	key="$(echo -e "$1")"
+	value="$2"
+	fname="${testdir}/${key}"
+
+	echo "Testing ${key} ($(hexbytes "${key}")) -> ${value}" >> $seqres.full
+
+	if [ ! -e "${fname}" ]; then
+		echo "Key ${key} does not exist for ${value} test??"
+		return
+	fi
+
+	actual_value="$(cat "${fname}")"
+	if [ "${actual_value}" != "${value}" ]; then
+		echo "Key ${key} has value ${value}, expected ${actual_value}."
+	fi
+}
+
+testchild() {
+	subdir="$1"
+	key="$(echo -e "$2")"
+	fname="${testdir}/${subdir}/${key}"
+
+	echo "Testing ${subdir}/${key} ($(hexbytes "${key}")) -> ${subdir}" >> $seqres.full
+
+	if [ ! -e "${fname}" ]; then
+		echo "Key ${key} does not exist for ${subdir} test??"
+		return
+	fi
+
+	actual_value="$(cat "${fname}")"
+	if [ "${actual_value}" != "${subdir}" ]; then
+		echo "Key ${key} has value ${subdir}, expected ${actual_value}."
+	fi
+}
+
+testd() {
+	key="$(echo -e "$1")"
+	value="$2"
+	fname="${testdir}/${key}/value"
+
+	echo "Testing ${key} ($(hexbytes "${key}")) -> ${value}" >> $seqres.full
+
+	if [ ! -e "${fname}" ]; then
+		echo "Key ${key} does not exist for ${value} test??"
+		return
+	fi
+
+	actual_value="$(cat "${fname}")"
+	if [ "${actual_value}" != "${value}" ]; then
+		echo "Key ${key} has value ${value}, expected ${actual_value}."
+	fi
+}
+
+filter_scrub() {
+	grep 'Unicode' | sed -e 's/^.*Duplicate/Duplicate/g'
+}
+
+echo "Create files"
+# These two render the same
+setf "french_caf\xc3\xa9.txt" "NFC"
+setf "french_cafe\xcc\x81.txt" "NFD"
+
+# These two may have different widths
+setf "chinese_\xef\xbd\xb6.txt" "NFKC1"
+setf "chinese_\xe3\x82\xab.txt" "NFKC2"
+
+# Same point, different byte representations in NFC/NFD/NFKC/NFKD
+setf "greek_\xcf\x93.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFC"
+setf "greek_\xcf\x92\xcc\x81.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFD"
+setf "greek_\xce\x8e.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFKC"
+setf "greek_\xce\xa5\xcc\x81.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFKD"
+
+# Arabic code point can expand into a muuuch longer series
+setf "arabic_\xef\xb7\xba.txt" "ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM, NFC"
+setf "arabic_\xd8\xb5\xd9\x84\xd9\x89\x20\xd8\xa7\xd9\x84\xd9\x84\xd9\x87\x20\xd8\xb9\xd9\x84\xd9\x8a\xd9\x87\x20\xd9\x88\xd8\xb3\xd9\x84\xd9\x85.txt" "ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM, NFKC"
+
+# Fake slash?
+setf "urk\xc0\xafmoo" "FAKESLASH"
+
+# Emoji: octopus butterfly owl giraffe
+setf "emoji_\xf0\x9f\xa6\x91\xf0\x9f\xa6\x8b\xf0\x9f\xa6\x89\xf0\x9f\xa6\x92.txt" "octopus butterfly owl giraffe emoji"
+
+# Line draw characters, because why not?
+setf "\x6c\x69\x6e\x65\x64\x72\x61\x77\x5f\x0a\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\x0a\xe2\x95\x91\x20\x6d\x65\x74\x61\x74\x61\x62\x6c\x65\x20\xe2\x95\x91\x0a\xe2\x95\x9f\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xa2\x0a\xe2\x95\x91\x20\x5f\x5f\x69\x6e\x64\x65\x78\x20\x20\x20\xe2\x95\x91\x0a\xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\x0a.txt" "ugly box because we can"
+
+# unicode rtl widgets too...
+setf "moo\xe2\x80\xaegnp.txt" "Well say hello,"
+setf "mootxt.png" "Harvey"
+
+# mixed-script confusables
+setf "mixed_t\xce\xbfp.txt" "greek omicron instead of o"
+setf "mixed_top.txt" "greek omicron instead of o"
+
+# single-script spoofing
+setf "hyphens_a\xe2\x80\x90b.txt" "hyphens"
+setf "hyphens_a-b.txt" "hyphens"
+
+setf "dz_digraph_dze.txt" "d-z digraph"
+setf "dz_digraph_\xca\xa3e.txt" "d-z digraph"
+
+# inadequate rendering
+setf "inadequate_al.txt" "is it l or is it 1"
+setf "inadequate_a1.txt" "is it l or is it 1"
+
+# symbols
+setf "prohibition_Rs.txt" "rupee symbol"
+setf "prohibition_\xe2\x82\xa8.txt" "rupee symbol"
+
+# zero width joiners
+setf "zerojoin_moocow.txt" "zero width joiners"
+setf "zerojoin_moo\xe2\x80\x8dcow.txt" "zero width joiners"
+
+# combining marks
+setf "combmark_\xe1\x80\x9c\xe1\x80\xad\xe1\x80\xaf.txt" "combining marks"
+setf "combmark_\xe1\x80\x9c\xe1\x80\xaf\xe1\x80\xad.txt" "combining marks"
+
+# fake dotdot entry
+setd ".\xe2\x80\x8d" "zero width joiners in dot entry"
+setd "..\xe2\x80\x8d" "zero width joiners in dotdot entry"
+
+# utf8 sequence mapping to a u32 unicode codepoint that can be confused
+setf "toilet_bowl.\xf0\x9f\x9a\xbd" "toilet emoji"
+setf "toilet_bow\xe2\x80\x8dl.\xf0\x9f\x9a\xbd" "toilet emoji with zero width joiner"
+
+# decoy file extensions used in 3cx malware attack, and similar ones
+setchild "one_dot_leader" "job offer\xe2\x80\xa4pdf"
+setchild "small_full_stop" "job offer\xef\xb9\x92pdf"
+setchild "fullwidth_full_stop" "job offer\xef\xbc\x8epdf"
+setchild "syriac_supralinear" "job offer\xdc\x81pdf"
+setchild "syriac_sublinear" "job offer\xdc\x82pdf"
+setchild "lisu_letter_tone" "job offer\xea\x93\xb8pdf"
+setchild "actual_period" "job offer.pdf"
+setchild "one_dot_leader_zero_width_space" "job offer\xe2\x80\xa4\xe2\x80\x8dpdf"
+
+# again, but this time all in the same directory to trip the confusable
+# detector
+setf "job offer\xe2\x80\xa4pdf" "one dot leader"
+setf "job offer\xef\xb9\x92pdf" "small full stop"
+setf "job offer\xef\xbc\x8epdf" "fullwidth full stop"
+setf "job offer\xdc\x81pdf" "syriac supralinear full stop"
+setf "job offer\xdc\x82pdf" "syriac sublinear full stop"
+setf "job offer\xea\x93\xb8pdf" "li_su letter tone mya ti"
+setf "job offer.pdf" "actual period"
+
+# encoding hidden tag characters in filenames to create confusing names
+setf "llamapirate\xf3\xa0\x80\x81\xf3\xa0\x81\x94\xf3\xa0\x81\xa8\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\xb3\xf3\xa0\x81\xa1\xf3\xa0\x81\xac\xf3\xa0\x81\xa5\xf3\xa0\x81\xb3\xf3\xa0\x80\xa0\xf3\xa0\x81\xa6\xf3\xa0\x81\xaf\xf3\xa0\x81\xb2\xf3\xa0\x80\xa0\xf3\xa0\x81\x93\xf3\xa0\x81\xa5\xf3\xa0\x81\xa1\xf3\xa0\x81\xb4\xf3\xa0\x81\xb4\xf3\xa0\x81\xac\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\xb7\xf3\xa0\x81\xa5\xf3\xa0\x81\xb2\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\x95\xf3\xa0\x81\x93\xf3\xa0\x81\x84\xf3\xa0\x80\xa0\xf3\xa0\x80\xb1\xf3\xa0\x80\xb2\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x81\xbf"
+setf "llamapirate"
+
+# colored heart emoji to check if casefolding whacks emoji
+setf "\xf0\x9f\x92\x9c" "purple"
+setf "\xf0\x9f\x92\x99" "blue"
+setf "\xf0\x9f\x92\x9a" "green"
+setf "\xf0\x9f\x92\x9b" "yellow"
+setf "\xf0\x9f\xab\x80" "heart"
+setf "\xe2\x9d\xa4\xef\xb8\x8f" "red"
+setf "\xf0\x9f\xa4\x8e" "brown"
+setf "\xf0\x9f\xa4\x8d" "white"
+setf "\xf0\x9f\x96\xa4" "black"
+setf "\xf0\x9f\xa7\xa1" "orange"
+setf "\xe2\x99\xa5\xef\xb8\x8f" "red suit"
+
+# zero width joiners exist in the middle of emoji sequences aren't supposed
+# to be normalized to nothing, but apparently this caused issues with
+# casefolding on ext4; also the mending heart caused a crash in xfs_scrub
+setf "\xf0\x9f\x92\x94" "broken heart"
+setf "\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\xa9\xb9" "mending heart"
+setf "\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbb\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8
+\x8f\xe2\x80\x8d\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbc" "couple with heart"
+setf "\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbb\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbf" "couple with heart, light and dark skin tone"
+
+# emoji heart hands with skin tone variations
+setf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbf" "dark"
+setf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbe" "medium dark"
+setf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbd" "medium"
+setf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbc" "medium light"
+setf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbb" "light"
+setf "\xf0\x9f\xab\xb6" "neutral"
+
+ls -laR $testdir >> $seqres.full
+
+echo "Test files"
+testf "french_caf\xc3\xa9.txt" "NFC"
+testf "french_cafe\xcc\x81.txt" "NFD"
+
+testf "chinese_\xef\xbd\xb6.txt" "NFKC1"
+testf "chinese_\xe3\x82\xab.txt" "NFKC2"
+
+testf "greek_\xcf\x93.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFC"
+testf "greek_\xcf\x92\xcc\x81.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFD"
+testf "greek_\xce\x8e.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFKC"
+testf "greek_\xce\xa5\xcc\x81.txt" "GREEK UPSILON WITH ACUTE AND HOOK SYMBOL, NFKD"
+
+testf "arabic_\xef\xb7\xba.txt" "ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM, NFC"
+testf "arabic_\xd8\xb5\xd9\x84\xd9\x89\x20\xd8\xa7\xd9\x84\xd9\x84\xd9\x87\x20\xd8\xb9\xd9\x84\xd9\x8a\xd9\x87\x20\xd9\x88\xd8\xb3\xd9\x84\xd9\x85.txt" "ARABIC LIGATURE SALLALLAHOU ALAYHE WASALLAM, NFKC"
+
+testf "urk\xc0\xafmoo" "FAKESLASH"
+
+testf "emoji_\xf0\x9f\xa6\x91\xf0\x9f\xa6\x8b\xf0\x9f\xa6\x89\xf0\x9f\xa6\x92.txt" "octopus butterfly owl giraffe emoji"
+
+testf "\x6c\x69\x6e\x65\x64\x72\x61\x77\x5f\x0a\xe2\x95\x94\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x97\x0a\xe2\x95\x91\x20\x6d\x65\x74\x61\x74\x61\x62\x6c\x65\x20\xe2\x95\x91\x0a\xe2\x95\x9f\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x95\xa2\x0a\xe2\x95\x91\x20\x5f\x5f\x69\x6e\x64\x65\x78\x20\x20\x20\xe2\x95\x91\x0a\xe2\x95\x9a\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x90\xe2\x95\x9d\x0a.txt" "ugly box because we can"
+
+testf "moo\xe2\x80\xaegnp.txt" "Well say hello,"
+testf "mootxt.png" "Harvey"
+
+testf "mixed_t\xce\xbfp.txt" "greek omicron instead of o"
+testf "mixed_top.txt" "greek omicron instead of o"
+
+testf "hyphens_a\xe2\x80\x90b.txt" "hyphens"
+testf "hyphens_a-b.txt" "hyphens"
+
+testf "dz_digraph_dze.txt" "d-z digraph"
+testf "dz_digraph_\xca\xa3e.txt" "d-z digraph"
+
+testf "inadequate_al.txt" "is it l or is it 1"
+testf "inadequate_a1.txt" "is it l or is it 1"
+
+testf "prohibition_Rs.txt" "rupee symbol"
+testf "prohibition_\xe2\x82\xa8.txt" "rupee symbol"
+
+testf "zerojoin_moocow.txt" "zero width joiners"
+testf "zerojoin_moo\xe2\x80\x8dcow.txt" "zero width joiners"
+
+testf "combmark_\xe1\x80\x9c\xe1\x80\xad\xe1\x80\xaf.txt" "combining marks"
+testf "combmark_\xe1\x80\x9c\xe1\x80\xaf\xe1\x80\xad.txt" "combining marks"
+
+testd ".\xe2\x80\x8d" "zero width joiners in dot entry"
+testd "..\xe2\x80\x8d" "zero width joiners in dotdot entry"
+
+testf "toilet_bowl.\xf0\x9f\x9a\xbd" "toilet emoji"
+testf "toilet_bow\xe2\x80\x8dl.\xf0\x9f\x9a\xbd" "toilet emoji with zero width joiner"
+
+testchild "one_dot_leader" "job offer\xe2\x80\xa4pdf"
+testchild "small_full_stop" "job offer\xef\xb9\x92pdf"
+testchild "fullwidth_full_stop" "job offer\xef\xbc\x8epdf"
+testchild "syriac_supralinear" "job offer\xdc\x81pdf"
+testchild "syriac_sublinear" "job offer\xdc\x82pdf"
+testchild "lisu_letter_tone" "job offer\xea\x93\xb8pdf"
+testchild "actual_period" "job offer.pdf"
+testchild "one_dot_leader_zero_width_space" "job offer\xe2\x80\xa4\xe2\x80\x8dpdf"
+
+testf "job offer\xe2\x80\xa4pdf" "one dot leader"
+testf "job offer\xef\xb9\x92pdf" "small full stop"
+testf "job offer\xef\xbc\x8epdf" "fullwidth full stop"
+testf "job offer\xdc\x81pdf" "syriac supralinear full stop"
+testf "job offer\xdc\x82pdf" "syriac sublinear full stop"
+testf "job offer\xea\x93\xb8pdf" "li_su letter tone mya ti"
+testf "job offer.pdf" "actual period"
+
+testf "llamapirate\xf3\xa0\x80\x81\xf3\xa0\x81\x94\xf3\xa0\x81\xa8\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\xb3\xf3\xa0\x81\xa1\xf3\xa0\x81\xac\xf3\xa0\x81\xa5\xf3\xa0\x81\xb3\xf3\xa0\x80\xa0\xf3\xa0\x81\xa6\xf3\xa0\x81\xaf\xf3\xa0\x81\xb2\xf3\xa0\x80\xa0\xf3\xa0\x81\x93\xf3\xa0\x81\xa5\xf3\xa0\x81\xa1\xf3\xa0\x81\xb4\xf3\xa0\x81\xb4\xf3\xa0\x81\xac\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\xb7\xf3\xa0\x81\xa5\xf3\xa0\x81\xb2\xf3\xa0\x81\xa5\xf3\xa0\x80\xa0\xf3\xa0\x81\x95\xf3\xa0\x81\x93\xf3\xa0\x81\x84\xf3\xa0\x80\xa0\xf3\xa0\x80\xb1\xf3\xa0\x80\xb2\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x80\xb0\xf3\xa0\x81\xbf"
+testf "llamapirate"
+
+testf "\xf0\x9f\x92\x9c" "purple"
+testf "\xf0\x9f\x92\x99" "blue"
+testf "\xf0\x9f\x92\x9a" "green"
+testf "\xf0\x9f\x92\x9b" "yellow"
+testf "\xf0\x9f\xab\x80" "heart"
+testf "\xe2\x9d\xa4\xef\xb8\x8f" "red"
+testf "\xf0\x9f\xa4\x8e" "brown"
+testf "\xf0\x9f\xa4\x8d" "white"
+testf "\xf0\x9f\x96\xa4" "black"
+testf "\xf0\x9f\xa7\xa1" "orange"
+testf "\xe2\x99\xa5\xef\xb8\x8f" "red suit"
+
+testf "\xf0\x9f\x92\x94" "broken heart"
+testf "\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\xa9\xb9" "mending heart"
+testf "\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbb\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8
+\x8f\xe2\x80\x8d\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbc" "couple with heart"
+testf "\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbb\xe2\x80\x8d\xe2\x9d\xa4\xef\xb8\x8f\xe2\x80\x8d\xf0\x9f\xa7\x91\xf0\x9f\x8f\xbf" "couple with heart, light and dark skin tone"
+
+testf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbf" "dark"
+testf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbe" "medium dark"
+testf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbd" "medium"
+testf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbc" "medium light"
+testf "\xf0\x9f\xab\xb6\xf0\x9f\x8f\xbb" "light"
+testf "\xf0\x9f\xab\xb6" "neutral"
+
+echo "Uniqueness of inodes?"
+stat -c '%i' "${testdir}/"* | sort | uniq -c | while read nr inum; do
+	if [ "${nr}" -gt 1 ]; then
+		echo "${nr} ${inum}"
+	fi
+done
+
+echo "Test XFS online scrub, if applicable"
+
+if _check_xfs_scrub_does_unicode "$SCRATCH_MNT" "$SCRATCH_DEV"; then
+	LC_ALL="C.UTF-8" ${XFS_SCRUB_PROG} -v -n "${SCRATCH_MNT}" 2>&1 | filter_scrub > $tmp.scrub
+
+	grep -q "french_" $tmp.scrub || echo "No complaints about french e accent?"
+	grep -q "greek_" $tmp.scrub || echo "No complaints about greek letter mess?"
+	grep -q "arabic_" $tmp.scrub || echo "No complaints about arabic expanded string?"
+	grep -q "mixed_" $tmp.scrub || echo "No complaints about mixed script confusables?"
+	grep -q "hyphens_" $tmp.scrub || echo "No complaints about hyphenation confusables?"
+	grep -q "dz_digraph_" $tmp.scrub || echo "No complaints about single script confusables?"
+	grep -q "inadequate_" $tmp.scrub || echo "No complaints about inadequate rendering confusables?"
+	grep -q "prohibition_" $tmp.scrub || echo "No complaints about prohibited sequence confusables?"
+	grep -q "zerojoin_" $tmp.scrub || echo "No complaints about zero-width join confusables?"
+	grep -q "toilet_" $tmp.scrub || echo "No complaints about zero-width join confusables with emoji?"
+
+	# Does xfs_scrub complain at all about the job offer files?  Pre-2023
+	# versions did not know to screen for that.
+	if grep -q "job offer" $tmp.scrub; then
+		grep -q 'job offer.xe2.x80.xa4pdf' $tmp.scrub || echo "No complaints about one dot leader?"
+		grep -q "job offer.xef.xb9.x92pdf" $tmp.scrub || echo "No complaints about small full stop?"
+		grep -q "job offer.xef.xbc.x8epdf" $tmp.scrub || echo "No complaints about fullwidth full stop?"
+		grep -q "job offer.xdc.x81pdf" $tmp.scrub || echo "No complaints about syriac supralinear full stop?"
+		grep -q "job offer.xdc.x82pdf" $tmp.scrub || echo "No complaints about syriac sublinear full stop?"
+		grep -q "job offer.xea.x93.xb8pdf" $tmp.scrub || echo "No complaints about li_su letter tone mya ti?"
+		grep -q "job offer.*could be confused with" $tmp.scrub || echo "No complaints about confusing job offers?"
+		grep -q "job offer.xe2.x80.xa4.xe2.x80.x8dpdf" $tmp.scrub || echo "No complaints about one dot leader with invisible space?"
+		grep -q "llamapirate" $tmp.scrub || echo "No complaints about hidden llm instructions in filenames?"
+	fi
+
+	echo "Actual xfs_scrub output:" >> $seqres.full
+	cat $tmp.scrub >> $seqres.full
+fi
+
+# success, all done
+status=0
+exit

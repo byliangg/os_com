@@ -1,0 +1,79 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test 019
+#
+# Run fsstress on lower dir and top dir at the same time
+#
+. ./common/preamble
+_begin_fstest auto stress
+
+# This nests multiple background fsstress instances, so we have to
+# do some magic with _FSSTRESS_PID here.
+_cleanup()
+{
+	if [ -n "$fsstress_pid_1" ]; then
+		 FSTRESS_PID=$fsstress_pid_1
+		_kill_fsstress
+	fi
+	if [ -n "$fsstress_pid_2" ]; then
+		 FSTRESS_PID=$fsstress_pid_2
+		_kill_fsstress
+	fi
+	cd /
+	rm -f tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+
+_scratch_mount
+
+echo "Silence is golden"
+
+d_low=$lowerdir/fsstress
+d_top=$SCRATCH_MNT/fsstress
+mkdir -p $d_low $d_top
+
+echo fsstress -s 42 -d $d_low -p 4 -n 1000 -l100 -v >> $seqres.full
+_run_fsstress_bg -s 42 -d $d_low -p 4 -n 1000 -l100 -v
+fsstress_pid_1=$_FSSTRESS_PID
+
+echo fsstress -s 42 -d $d_top -p 4 -n 1000 -l100 -v >> $seqres.full
+_run_fsstress_bg -s 42 -d $d_top -p 4 -n 1000 -l100 -v
+fsstress_pid_2=$_FSTRESS_PID
+unset _FSSTRESS_PID
+
+ret=0
+if ! wait $fsstress_pid_1; then
+	echo "--------------------------------------"       >>$seqres.full
+	echo "fsstress on lower directory returned $? - see $seqres.full"
+	echo "--------------------------------------"       >>$seqres.full
+	ret=1
+fi
+unset fsstress_pid_1
+
+if ! wait $fsstress_pid_2; then
+	echo "--------------------------------------"       >>$seqres.full
+	echo "fsstress on overlay directory returned $? - see $seqres.full"
+	echo "--------------------------------------"       >>$seqres.full
+	ret=1
+fi
+unset fsstress_pid_2
+
+if [ "$ret" -eq 1 ]; then
+	status=1
+else
+	status=0
+fi
+
+exit $status

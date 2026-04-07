@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 005
+#
+# Test that a bad crc on a primary V5 superblock will fail the mount
+#
+# 10e6e65 xfs: be more forgiving of a v4 secondary sb w/ junk in v5 fields
+# inadvertently caused primary SB CRC failures to not error out, this
+# is a regression test for that fix.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+
+_require_scratch_nocheck
+
+_scratch_mkfs_xfs -m crc=1 >> $seqres.full 2>&1
+
+# Zap the crc.  xfs_db updates the CRC post-write, so poke it directly
+$XFS_IO_PROG -c "pwrite 224 4" -c fsync $SCRATCH_DEV | _filter_xfs_io
+
+# should FAIL, the crc is bad; golden output contains mount failure
+_try_scratch_mount 2>&1 | _filter_error_mount
+
+# success, all done
+status=0
+exit

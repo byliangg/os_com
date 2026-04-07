@@ -1,0 +1,123 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/077
+#
+# Regression test for a btrfs incremental send issue.
+# If between two snapshots we rename an existing directory named X to Y and
+# make it a child (direct or not) of a new inode named X, we were delaying
+# the move/rename of the former directory unnecessarily, which would result
+# in attempting to rename the new directory from its orphan name to name X
+# prematurely. This made btrfs receive fail with an error message like the
+# following:
+#
+#   rename o261-7-0 -> merlin/RC/OSD failed
+#
+# This issue was a regression in the 3.16 kernel and got fixed by the following
+# linux kernel btrfs patch:
+#
+#   Btrfs: send, don't delay dir move if there's a new parent inode
+#
+. ./common/preamble
+_begin_fstest auto quick send snapshot
+
+tmp=`mktemp -d`
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $send_files_dir
+    rm -fr $tmp
+}
+
+. ./common/filter
+
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir -p $SCRATCH_MNT/merlin/RC/OSD/Source
+mkdir -p $SCRATCH_MNT/fdm/RCz/OSDz/Sourcez
+mkdir -p $SCRATCH_MNT/Z/Z2
+
+# Filesystem looks like:
+#
+# .                                                 (ino 256)
+# |---- merlin/                                     (ino 257)
+# |        |---- RC/                                (ino 258)
+# |              |----- OSD/                        (ino 259)
+# |                      |---- Source/              (ino 260)
+# |
+# |---- fdm/                                        (ino 261)
+# |       |---- RCz/                                (ino 262)
+# |             |----- OSDz/                        (ino 263)
+# |                     |---- Sourcez/              (ino 264)
+# |
+# |---- Z/                                          (ino 265)
+#       |---- Z2/                                   (ino 266)
+#
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+mkdir $SCRATCH_MNT/OSD
+mv $SCRATCH_MNT/merlin/RC/OSD $SCRATCH_MNT/OSD/OSD-Plane_788
+mv $SCRATCH_MNT/OSD $SCRATCH_MNT/merlin/RC
+
+mkdir $SCRATCH_MNT/OSDz
+mv $SCRATCH_MNT/Z/Z2 $SCRATCH_MNT/OSDz/xz2
+mv $SCRATCH_MNT/Z $SCRATCH_MNT/OSDz/xz2/xz
+mv $SCRATCH_MNT/fdm/RCz/OSDz $SCRATCH_MNT/OSDz/xz2/xz/OSD-Plane_788z
+mv $SCRATCH_MNT/OSDz $SCRATCH_MNT/fdm/RCz
+
+# Filesystem now looks like:
+#
+#
+# .                                                                  (ino 256)
+# |---- merlin/                                                      (ino 257)
+# |       |---- RC/                                                  (ino 258)
+# |             |----- OSD/                                     (ino 267) (new)
+# |                     |---- OSD-Plane_788/                         (ino 259)
+# |                                    |---- Source/                 (ino 260)
+# |
+# |---- fdm/                                                         (ino 261)
+#         |---- RCz/                                                 (ino 262)
+#                |----- OSDz/                                   (ino 268) (new)
+#                        |--- xz2/                                   (ino 266)
+#                              |---- xz/                             (ino 265)
+#                                    |---- OSD-Plane_788z/           (ino 263)
+#                                                    |---- Sourcez/  (ino 264)
+#
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+run_check $FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $send_files_dir/2.fssum \
+	-x $SCRATCH_MNT/mysnap2/mysnap1 $SCRATCH_MNT/mysnap2
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+_check_scratch_fs
+
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/2.fssum $SCRATCH_MNT/mysnap2
+
+echo "Silence is golden"
+
+status=0
+exit

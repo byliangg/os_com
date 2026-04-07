@@ -1,0 +1,32 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/082
+#
+# Regression test for a btrfs issue of resizing 'thread_pool' when
+# remount the fs.
+#
+# This regression was introduced by the following linux kernel commit:
+#     btrfs: Added btrfs_workqueue_struct implemented ordered
+#     execution based on kernel workqueue
+#     08a9ff3264181986d1d692a4e6fce3669700c9f8
+# And it was fixed by the following linux kernel commit:
+#     btrfs: fix crash in remount(thread_pool=) case
+#     800ee2247f483b6d05ed47ef3bbc90b56451746c
+#
+. ./common/preamble
+_begin_fstest auto quick remount
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs >$seqres.full 2>&1
+
+_scratch_mount "-o thread_pool=6"
+_scratch_mount "-o remount,thread_pool=10"
+
+echo "Silence is golden"
+status=0
+exit

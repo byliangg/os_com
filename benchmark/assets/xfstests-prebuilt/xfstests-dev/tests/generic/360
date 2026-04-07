@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 360
+#
+# Test symlink to very long path, check symlink file contains correct path.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_symlinks
+
+linkfile=$TEST_DIR/$seq.symlink
+rm -f $linkfile
+
+FNAME=$(perl -e 'print "a"x254')
+
+# Create a symlink points to a very long path, so that the path could not be
+# hold in inode
+ln -s $FNAME/$FNAME/$FNAME/$FNAME $linkfile
+
+# Check symlink contains the correct path.
+# 1023 chars are a bit long for golden image output, compute the md5 checksum
+readlink $linkfile | md5sum
+
+# success, all done
+status=0
+exit

@@ -1216,15 +1216,17 @@ fn verify_ext4_superblock(block_device: &dyn BlockDevice) -> Result<()> {
         return_errno_with_message!(Errno::EINVAL, "invalid ext4 inodes_per_group");
     }
 
-    let desc_size = u16::from_le_bytes([
+    let desc_size_on_disk = u16::from_le_bytes([
         superblock_sector[EXT4_SB_DESC_SIZE_OFFSET],
         superblock_sector[EXT4_SB_DESC_SIZE_OFFSET + 1],
     ]);
-    if desc_size == 0 {
-        return_errno_with_message!(Errno::EINVAL, "invalid ext4 group descriptor size");
-    }
-    let desc_size = desc_size as usize;
-    if desc_size > block_size || (block_size % desc_size) != 0 {
+    // Legacy ext4 may store s_desc_size as 0, which means 32-byte descriptors.
+    let desc_size = if desc_size_on_disk == 0 {
+        32usize
+    } else {
+        desc_size_on_disk as usize
+    };
+    if desc_size < 32 || desc_size > block_size || (block_size % desc_size) != 0 {
         return_errno_with_message!(Errno::EINVAL, "unsupported ext4 group descriptor size");
     }
 

@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 090
+#
+# Test that after syncing the filesystem, adding a hard link to a file,
+# syncing the filesystem again, doing a write to the file that increases
+# its size and then doing a fsync against that file, durably persists the
+# data written to the file. That is, after log/journal replay, the data
+# is available.
+#
+# This test is motivated by a bug found in btrfs.
+#
+. ./common/preamble
+_begin_fstest metadata auto quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create the test file with some initial data and then fsync it.
+# The fsync here is only needed to trigger the issue in btrfs, as it causes the
+# the flag BTRFS_INODE_NEEDS_FULL_SYNC to be removed from the btrfs inode.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 32k" \
+		-c "fsync" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+_scratch_sync
+
+# Add a hard link to our file.
+# On btrfs this sets the flag BTRFS_INODE_COPY_EVERYTHING on the btrfs inode,
+# which is a necessary condition to trigger the issue.
+ln $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+
+# Sync the filesystem to force a commit of the current btrfs transaction, this
+# is a necessary condition to trigger the bug on btrfs.
+_scratch_sync
+
+# Now append more data to our file, increasing its size, and fsync the file.
+# In btrfs because the inode flag BTRFS_INODE_COPY_EVERYTHING was set and the
+# write path did not update the inode item in the btree nor the delayed inode
+# item (in memory structure) in the current transaction (created by the fsync
+# handler), the fsync did not record the inode's new i_size in the fsync
+# log/journal. This made the data unavailable after the fsync log/journal is
+# replayed.
+$XFS_IO_PROG -c "pwrite -S 0xbb 32K 32K" \
+		-c "fsync" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+
+echo "File content after fsync and before crash:"
+od -t x1 $SCRATCH_MNT/foo
+
+_flakey_drop_and_remount
+
+echo "File content after crash and log replay:"
+od -t x1 $SCRATCH_MNT/foo
+
+status=0
+exit

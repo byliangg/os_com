@@ -1,0 +1,288 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. ceph/001
+#
+# Test remote copy operation (CEPH_OSD_OP_COPY_FROM) with several combinations
+# of both object sizes and copy sizes.  It also uses several combinations of
+# copy ranges.  For example, copying the 1st object in the src file into
+# 1) the beginning (1st object) of dst file, 2) the end (last object) of dst
+# file and 3) the middle of the dst file.
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+# get standard environment
+. common/filter
+. common/attr
+. common/reflink
+
+_require_debugfs
+_require_xfs_io_command "copy_range"
+_exclude_test_mount_option "test_dummy_encryption"
+_require_attrs
+_require_test
+
+workdir=$TEST_DIR/test-$seq
+rm -rf $workdir
+mkdir $workdir
+
+cluster_fsid=$(_ceph_get_cluster_fsid)
+client_id=$(_ceph_get_client_id)
+metrics_dir="$DEBUGFS_MNT/ceph/$cluster_fsid.$client_id/metrics"
+
+check_range()
+{
+	local file=$1
+	local off0=$2
+	local off1=$3
+	local val=$4
+	_read_range $file $off0 $off1 | grep -v -q $val
+	[ $? -eq 0 ] && echo "file $file is not '$val' in [ $off0 $off1 ]"
+}
+
+#
+# The metrics file has the following fields:
+#   1. item
+#   2. total
+#   3. avg_sz(bytes)
+#   4. min_sz(bytes)
+#   5. max_sz(bytes)
+#   6. total_sz(bytes)
+get_copyfrom_total_copies()
+{
+	local total=0
+
+	if [ -d $metrics_dir ]; then
+		total=$(grep copyfrom $metrics_dir/size | tr -s '[:space:]' | cut -d ' ' -f 2)
+	fi
+	echo $total
+}
+get_copyfrom_total_size()
+{
+	local total=0
+
+	if [ -d $metrics_dir ]; then
+		total=$(grep copyfrom $metrics_dir/size | tr -s '[:space:]' | cut -d ' ' -f 6)
+	fi
+	echo $total
+}
+
+# This function checks that the metrics file has the expected values for number
+# of remote object copies and the total size of the copies.  For this, it
+# expects a input:
+#   $1 - initial number copies in metrics file (field 'total')
+#   $2 - initial total size in bytes in metrics file (field 'total_sz')
+#   $3 - object size used for copies
+#   $4 - number of remote objects copied
+check_copyfrom_metrics()
+{
+	local c0=$1
+	local s0=$2
+	local objsz=$3
+	local copies=$4
+	local c1=$(get_copyfrom_total_copies)
+	local s1=$(get_copyfrom_total_size)
+	local hascopyfrom=$(_fs_options $TEST_DEV | grep "copyfrom")
+	local sum
+
+	if [ ! -d "$metrics_dir" ]; then
+		return # skip metrics check if debugfs isn't mounted
+	fi
+	if [ -z "$hascopyfrom" ]; then
+		return # ... or if we don't have copyfrom mount option
+	fi
+
+	sum=$(($c0+$copies))
+	if [ $sum -ne $c1 ]; then
+		echo "Wrong number of remote copies.  Expected $sum, got $c1"
+	fi
+	sum=$(($s0+$copies*$objsz))
+	if [ $sum -ne $s1 ]; then
+		echo "Wrong size of remote copies.  Expected $sum, got $s1"
+	fi
+}
+
+run_copy_range_tests()
+{
+	total_copies=$(get_copyfrom_total_copies)
+	total_size=$(get_copyfrom_total_size)
+	objsz=$1
+	halfobj=$(($objsz / 2))
+	file="$workdir/file-$objsz"
+	copy="$workdir/copy-$objsz"
+	dest="$workdir/dest-$objsz"
+
+	# create files and set file layout, which needs to be done before
+	# writing any data
+	_ceph_create_file_layout $file $objsz 1 $objsz
+	_ceph_create_file_layout $copy $objsz 1 $objsz
+	_ceph_create_file_layout $dest $objsz 1 $objsz
+
+	# file containing 3 objects with 'aaaa|bbbb|cccc'
+	$XFS_IO_PROG -c "pwrite -S 0x61 0 $objsz" $file >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "pwrite -S 0x62 $objsz $objsz" $file >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "pwrite -S 0x63 $(($objsz * 2)) $objsz" $file >> $seqres.full 2>&1
+
+	echo "  Copy whole file (3 objects):"
+	echo "    aaaa|bbbb|cccc => aaaa|bbbb|cccc"
+	$XFS_IO_PROG -c "copy_range -s 0 -d 0 -l $(($objsz * 3)) $file" "$copy"
+	cmp $file $copy
+
+	echo "  Copy single object to beginning:"
+	# dest file with 3 objects with 'dddd|dddd|dddd'
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 3))" $dest >> $seqres.full 2>&1
+
+	echo "    dddd|dddd|dddd => aaaa|dddd|dddd"
+	$XFS_IO_PROG -c "copy_range -s 0 -d 0 -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 61
+	check_range $dest $objsz $(($objsz * 2)) 64
+
+	echo "    aaaa|dddd|dddd => bbbb|dddd|dddd"
+	$XFS_IO_PROG -c "copy_range -s $objsz -d 0 -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 62
+	check_range $dest $objsz $(($objsz * 2)) 64
+
+	echo "    bbbb|dddd|dddd => cccc|dddd|dddd"
+	$XFS_IO_PROG -c "copy_range -s $(($objsz * 2)) -d 0 -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 63
+	check_range $dest $objsz $(($objsz * 2)) 64
+
+	echo "  Copy single object to middle:"
+
+	echo "    cccc|dddd|dddd => cccc|aaaa|dddd"
+	$XFS_IO_PROG -c "copy_range -s 0 -d $objsz -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 63
+	check_range $dest $objsz $objsz 61
+	check_range $dest $(($objsz * 2)) $objsz 64
+
+	echo "    cccc|aaaa|dddd => cccc|bbbb|dddd"
+	$XFS_IO_PROG -c "copy_range -s $objsz -d $objsz -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 63
+	check_range $dest $objsz $objsz 62
+	check_range $dest $(($objsz * 2)) $objsz 64
+
+	echo "    cccc|bbbb|dddd => cccc|cccc|dddd"
+	$XFS_IO_PROG -c "copy_range -s $((objsz * 2)) -d $objsz -l $objsz $file" "$dest"
+	check_range $dest 0 $objsz 63
+	check_range $dest $objsz $objsz 63
+	check_range $dest $(($objsz * 2)) $objsz 64
+
+	echo "  Copy single object to end:"
+
+	echo "    cccc|cccc|dddd => cccc|cccc|aaaa"
+	$XFS_IO_PROG -c "copy_range -s 0 -d $(($objsz * 2)) -l $objsz $file" "$dest"
+	check_range $dest 0 $(($objsz * 2)) 63
+	check_range $dest $(($objsz * 2)) $objsz 61
+
+	echo "    cccc|cccc|aaaa => cccc|cccc|bbbb"
+	$XFS_IO_PROG -c "copy_range -s $objsz -d $(($objsz * 2)) -l $objsz $file" "$dest"
+	check_range $dest 0 $(($objsz * 2)) 63
+	check_range $dest $(($objsz * 2)) $objsz 62
+
+	echo "    cccc|cccc|aaaa => cccc|cccc|cccc"
+	$XFS_IO_PROG -c "copy_range -s $(($objsz * 2)) -d $(($objsz * 2)) -l $objsz $file" "$dest"
+	check_range $dest 0 $(($objsz * 3)) 63
+
+	echo "  Copy 2 objects to beginning:"
+
+	echo "    cccc|cccc|cccc => aaaa|bbbb|cccc"
+	$XFS_IO_PROG -c "copy_range -s 0 -d 0 -l $(($objsz * 2)) $file" "$dest"
+	cmp $file $dest
+
+	echo "    aaaa|bbbb|cccc => bbbb|cccc|cccc"
+	$XFS_IO_PROG -c "copy_range -s $objsz -d 0 -l $(($objsz * 2)) $file" "$dest"
+	check_range $dest 0 $objsz 62
+	check_range $dest $objsz $(($objsz * 2)) 63
+
+	echo "  Copy 2 objects to end:"
+
+	echo "    bbbb|cccc|cccc => bbbb|aaaa|bbbb"
+	$XFS_IO_PROG -c "copy_range -s 0 -d $objsz -l $(($objsz * 2)) $file" "$dest"
+	check_range $dest 0 $objsz 62
+	check_range $dest $objsz $objsz 61
+	check_range $dest $(($objsz * 2)) $objsz 62
+
+	echo "    bbbb|aaaa|bbbb => bbbb|bbbb|cccc"
+	$XFS_IO_PROG -c "copy_range -s $objsz -d $objsz -l $(($objsz * 2)) $file" "$dest"
+	check_range $dest 0 $(($objsz * 2)) 62
+	check_range $dest $(($objsz * 2)) $objsz 63
+
+	echo "  Append 1 object:"
+
+	echo "    bbbb|bbbb|cccc => bbbb|bbbb|cccc|aaaa"
+	$XFS_IO_PROG -c "copy_range -s 0 -d $(($objsz * 3)) -l $objsz $file" "$dest"
+	check_range $dest 0 $(($objsz * 2)) 62
+	check_range $dest $(($objsz * 2)) $objsz 63
+	check_range $dest $(($objsz * 3)) $objsz 61
+
+	echo "  Cross object boundary (no full object copy)"
+	echo "    dddd|dddd|dddd|dddd => ddaa|aadd|dddd|dddd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s 0 -d $halfobj -l $objsz $file" "$dest"
+	check_range $dest 0 $halfobj 64
+	check_range $dest $halfobj $objsz 61
+	check_range $dest $(($objsz + $halfobj)) $(($objsz * 2 + $halfobj)) 64
+
+	echo "    dddd|dddd|dddd|dddd => ddaa|bbdd|dddd|dddd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s $halfobj -d $halfobj -l $objsz $file" "$dest"
+	check_range $dest 0 $halfobj 64
+	check_range $dest $halfobj $halfobj 61
+	check_range $dest $objsz $halfobj 62
+	check_range $dest $(($objsz + $halfobj)) $(($objsz * 2 + $halfobj)) 64
+
+	echo "  Cross object boundaries (with full object copy)"
+	echo "    dddd|dddd|dddd|dddd => ddaa|bbbb|dddd|dddd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s $halfobj -d $halfobj -l $(($objsz + $halfobj)) $file" "$dest"
+	check_range $dest 0 $halfobj 64
+	check_range $dest $halfobj $halfobj 61
+	check_range $dest $objsz $objsz 62
+	check_range $dest $(($objsz * 2)) $(($objsz * 2)) 64
+
+	echo "    dddd|dddd|dddd|dddd => ddaa|bbbb|ccdd|dddd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s $halfobj -d $halfobj -l $(($objsz * 2)) $file" "$dest"
+	check_range $dest 0 $halfobj 64
+	check_range $dest $halfobj $halfobj 61
+	check_range $dest $objsz $objsz 62
+	check_range $dest $(($objsz * 2)) $halfobj 63
+	check_range $dest $(($objsz * 2 + $halfobj)) $(($objsz + $halfobj)) 64
+
+	echo "    dddd|dddd|dddd|dddd => dddd|aaaa|bbdd|dddd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s 0 -d $objsz -l $(($objsz + $halfobj)) $file" "$dest"
+	check_range $dest 0 $objsz 64
+	check_range $dest $objsz $objsz 61
+	check_range $dest $(($objsz * 2)) $halfobj 62
+	check_range $dest $(($objsz * 2 + $halfobj)) $(($objsz + $halfobj)) 64
+
+	echo "  Cross object boundaries (with 2 full object copies)"
+	echo "    dddd|dddd|dddd|dddd => ddaa|aabb|bbcc|ccdd"
+	$XFS_IO_PROG -c "pwrite -S 0x64 0 $(($objsz * 4))" $dest >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "copy_range -s 0 -d $halfobj -l $(($objsz * 3)) $file" "$dest"
+	check_range $dest 0 $halfobj 64
+	check_range $dest $halfobj $objsz 61
+	check_range $dest $(($objsz + $halfobj)) $objsz 62
+	check_range $dest $(($objsz * 2 + $halfobj)) $objsz 63
+	check_range $dest $(($objsz * 3 + $halfobj)) $halfobj 64
+
+	# Confirm that we've done a total of 24 object copies
+	check_copyfrom_metrics $total_copies $total_size $objsz 24
+}
+
+echo "Object size: 65536" # CEPH_MIN_STRIPE_UNIT
+run_copy_range_tests 65536
+echo "Object size: 1M"
+run_copy_range_tests 1048576
+echo "Object size: 4M"
+run_copy_range_tests 4194304
+# the max object size is 1TB, but by default OSDs only accept a max of 128M objects
+echo "Object size: 128M"
+run_copy_range_tests 134217728
+
+# success, all done
+status=0
+exit

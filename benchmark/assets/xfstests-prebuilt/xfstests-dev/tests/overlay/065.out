@@ -1,0 +1,21 @@
+QA output created by 065
+Conflicting upperdir/lowerdir
+mount: Too many levels of symbolic links
+Conflicting workdir/lowerdir
+mount: Too many levels of symbolic links
+Overlapping upperdir/lowerdir
+mount: Too many levels of symbolic links
+Conflicting lower layers
+mount: Too many levels of symbolic links
+Overlapping lower layers below
+mount: Too many levels of symbolic links
+Overlapping lower layers above
+mount: Too many levels of symbolic links
+Overlapping with upperdir of another instance (index=on)
+mount: device already mounted or mount point busy
+Overlapping with upperdir of another instance (index=off)
+Overlapping with workdir of another instance (index=on)
+mount: device already mounted or mount point busy
+Overlapping with workdir of another instance (index=off)
+Overlapping upperdir/lowerdir after mount
+find: 'SCRATCH_DEV/mnt.2/upper': Too many levels of symbolic links

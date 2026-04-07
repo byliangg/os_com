@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 003
+#
+# exercise xfs_db bug #784078
+#
+. ./common/preamble
+_begin_fstest db auto quick
+
+# Import common functions.
+. ./common/filter
+
+status=0	# success is the default!
+
+_require_test
+
+[ -f core ] && rm -f core
+[ -f core ] && echo "Warning: can't nuke existing core file!"
+
+test_done()
+{
+        sts=$?
+        [ -f core ] && echo "FAILED - core file"
+        [ ! -f core -a $sts != 0 ] && echo "FAILED - non-zero exit status"
+        rm -f core
+}
+
+
+echo "=== TEST 1 ==="
+_test_xfs_db -r -c 'pop' -c 'type sb'
+test_done
+
+echo "=== TEST 2 ==="
+_test_xfs_db -r -c 'push sb'
+test_done
+
+echo "=== TEST 3 ==="
+_test_xfs_db -r -c 'pop' -c 'push sb'
+test_done
+
+echo "=== TEST 4 ==="
+_test_xfs_db -r -c 'type sb' -c 'print'
+test_done
+
+echo "=== TEST 5 ==="
+_test_xfs_db -r -c 'inode 128' -c 'push' -c 'type' >$tmp.out 2>&1
+test_done
+if ! grep -q "current type is \"inode\"" $tmp.out; then
+    cat $tmp.out
+fi
+
+echo "=== TEST 6 ==="
+_test_xfs_db -r -c 'sb' -c 'a' >$tmp.out 2>&1 # don't care about output
+test_done
+
+echo "=== TEST 7 ==="
+_test_xfs_db -r -c 'ring'
+test_done

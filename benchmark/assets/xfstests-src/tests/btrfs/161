@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle.  All Rights Reserved.
+#
+# FS QA Test 161
+#
+# seed sprout functionality test
+#  Create a seed device, mount it and, add a new device to create a
+#  sprout filesystem.
+#
+. ./common/preamble
+_begin_fstest auto quick volume seed
+
+. ./common/filter
+
+_require_command "$BTRFS_TUNE_PROG" btrfstune
+_require_scratch_dev_pool 2
+
+_scratch_dev_pool_get 2
+
+dev_seed=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}')
+dev_sprout=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}')
+
+create_seed()
+{
+	_mkfs_dev $dev_seed
+	run_check _mount $dev_seed $SCRATCH_MNT
+	$XFS_IO_PROG -f -d -c "pwrite -S 0xab 0 256K" $SCRATCH_MNT/foobar >\
+		/dev/null
+	echo -- golden --
+	od -x $SCRATCH_MNT/foobar
+	_btrfs filesystem show -m $SCRATCH_MNT
+	_scratch_unmount
+	$BTRFS_TUNE_PROG -S 1 $dev_seed
+	run_check _mount $dev_seed $SCRATCH_MNT
+}
+
+create_sprout()
+{
+	_btrfs device add -f $dev_sprout $SCRATCH_MNT >> \
+		$seqres.full
+	_scratch_unmount
+	run_check _mount $dev_sprout $SCRATCH_MNT
+	echo -- sprout --
+	od -x $SCRATCH_MNT/foobar
+	_scratch_unmount
+}
+
+create_seed
+create_sprout
+
+_scratch_dev_pool_put
+
+status=0
+exit

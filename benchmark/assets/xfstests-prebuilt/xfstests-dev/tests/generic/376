@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 376
+#
+# Test that if we rename a file, without changing its parent directory, create
+# a new file that has the old name of the file we renamed, doing an fsync
+# against the file we renamed works correctly and after a power failure both
+# files exists.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test directories and files.
+mkdir $SCRATCH_MNT/dir
+touch $SCRATCH_MNT/dir/foo
+# Make sure everything is durably persisted.
+_scratch_sync
+mv $SCRATCH_MNT/dir/foo $SCRATCH_MNT/dir/bar
+touch $SCRATCH_MNT/dir/foo
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/dir/bar
+
+_flakey_drop_and_remount
+
+echo "Filesystem contents after log replay:"
+ls -R $SCRATCH_MNT/dir | _filter_scratch
+
+_scratch_unmount
+status=0
+exit

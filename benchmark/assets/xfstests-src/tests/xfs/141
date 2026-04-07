@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 141
+#
+# Use the XFS log record CRC error injection mechanism to test torn writes to
+# the log. The error injection mechanism writes an invalid CRC and shuts down
+# the filesystem. The test verifies that a subsequent remount recovers the log
+# and that the filesystem is consistent.
+#
+# Note that this test requires a DEBUG mode kernel.
+#
+. ./common/preamble
+_begin_fstest auto log metadata
+
+# Import common functions.
+. ./common/inject
+
+# Modify as appropriate.
+_require_xfs_io_error_injection "log_bad_crc"
+_require_scratch
+
+echo "Silence is golden."
+
+_scratch_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+_scratch_mount
+
+sdev=$(_short_dev $SCRATCH_DEV)
+
+nr_times=$((TIME_FACTOR * 5))
+while [ $nr_times -gt 0 ]; do
+	# Enable error injection. Use a random bad crc factor up to 100
+	# (increase this value to run fsstress longer).
+	factor=$((RANDOM % 100 + 1))
+	echo iteration $i log_badcrc_factor: $factor >> $seqres.full 2>&1
+	_scratch_inject_error "log_bad_crc" "$factor"
+
+	# Run fsstress until the filesystem shuts down. It will shut down
+	# automatically when error injection triggers.
+	_run_fsstress -d $SCRATCH_MNT -p 4 -n 999999
+
+	# Verify that we can remount the fs. Log recovery should handle the torn
+	# write.
+	_scratch_unmount
+	_scratch_mount
+	nr_times=$((nr_times - 1))
+done
+
+# success, all done
+status=0
+exit

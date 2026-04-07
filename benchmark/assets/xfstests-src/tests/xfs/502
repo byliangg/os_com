@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 502
+#
+# Stress test creating a lot of unlinked O_TMPFILE files and closing them
+# all at once, checking that we don't blow up the filesystem.  This is sort
+# of a performance test for the xfs unlinked inode backref patchset.
+#
+# Here we force the use of the slow iunlink bucket walk code, using every
+# CPU possible.
+#
+. ./common/preamble
+_begin_fstest auto quick unlink
+testfile=$TEST_DIR/$seq.txt
+
+# Import common functions.
+. ./common/inject
+. ./common/filter
+
+_require_xfs_io_error_injection "iunlink_fallback"
+_require_scratch
+_require_test_program "t_open_tmpfiles"
+
+_scratch_mkfs $(_scratch_mkfs_concurrency_options) | _filter_mkfs 2> $tmp.mkfs > /dev/null
+cat $tmp.mkfs >> $seqres.full
+. $tmp.mkfs
+
+_scratch_mount
+
+# Load up all the CPUs, two threads per CPU.
+nr_cpus=$(( $(getconf _NPROCESSORS_ONLN) * 2 ))
+
+# Set ULIMIT_NOFILE to min(file-max / $nr_cpus / 2, 50000 files per AG per LOAD_FACTOR)
+# so that this test doesn't take forever or OOM the box
+max_files=$((50000 * agcount * LOAD_FACTOR))
+max_files=$((max_files / $nr_cpus))
+
+max_allowable_files=$(( $(cat /proc/sys/fs/file-max) / $nr_cpus / 2 ))
+test $max_allowable_files -gt 0 && test $max_files -gt $max_allowable_files && \
+	max_files=$max_allowable_files
+ulimit -n $max_files
+
+# Force xfs to use the iunlinked fallback 50% of the time
+_scratch_inject_error "iunlink_fallback" "2"
+
+# Open a lot of unlinked files
+echo create >> $seqres.full
+for i in $(seq 1 $nr_cpus); do
+	mkdir $SCRATCH_MNT/$i
+	$here/src/t_open_tmpfiles $SCRATCH_MNT/$i >> $seqres.full &
+done
+wait
+
+# Unmount to prove that we can clean it all
+echo umount >> $seqres.full
+before=$(date +%s)
+_scratch_unmount
+after=$(date +%s)
+echo "Unmount took $((after - before))s." >> $seqres.full
+
+# Mount so that we can run the usual checks
+echo silence is golden
+_scratch_mount
+status=0
+exit

@@ -1,0 +1,423 @@
+[Info] [normal] Forwarded QEMU guest port: 46639->22; 33128->8080 54182->6379 55569->5201 31219->31234 12109->31236 31410->11211
+[Info] [test] Forwarded QEMU guest port: 57181->22; 38601->8080 13683->6379 21530->5201 7830->31234 24390->31236 45291->11211
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+ Downloading crates ...
+  Downloaded cobs v0.3.0
+  Downloaded bit_field v0.10.3
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded bittle v0.5.7
+  Downloaded bitflags v1.3.2
+  Downloaded adler32 v1.2.0
+  Downloaded aead v0.4.3
+  Downloaded core2 v0.4.0
+  Downloaded bitflags v2.11.0
+  Downloaded universal-hash v0.4.1
+  Downloaded time-core v0.1.8
+  Downloaded acpi v5.2.0
+  Downloaded memoffset v0.9.1
+  Downloaded intrusive-collections v0.9.7
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded wyz v0.5.1
+  Downloaded lending-iterator v0.1.7
+  Downloaded multiboot2 v0.24.1
+  Downloaded allocator-api2 v0.2.21
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ghost v0.1.20
+  Downloaded libflate_lz77 v2.2.0
+  Downloaded semver v1.0.28
+  Downloaded thiserror-impl v2.0.18
+  Downloaded lru v0.16.3
+  Downloaded toml_datetime v0.6.11
+  Downloaded defmt-parser v1.0.0
+  Downloaded subtle v2.4.1
+  Downloaded autocfg v1.5.0
+  Downloaded polyval v0.5.3
+  Downloaded libflate v2.2.1
+  Downloaded postcard v1.1.3
+  Downloaded tap v1.0.1
+  Downloaded rustversion v1.0.22
+  Downloaded byteorder v1.5.0
+  Downloaded hash32 v0.2.1
+  Downloaded managed v0.8.0
+  Downloaded cipher v0.3.0
+  Downloaded deranged v0.5.8
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded funty v2.0.0
+  Downloaded tdx-guest v0.2.4
+  Downloaded spin v0.9.8
+  Downloaded ext-trait v1.0.1
+  Downloaded num-conv v0.2.1
+  Downloaded thiserror v2.0.18
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded hash32 v0.3.1
+  Downloaded extension-traits v1.0.1
+  Downloaded ptr_meta v0.3.1
+  Downloaded serde_spanned v0.6.9
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded rand_core v0.9.5
+  Downloaded quote v1.0.45
+  Downloaded getset v0.1.6
+  Downloaded radium v0.7.0
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded defmt v0.3.100
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded owo-colors v4.3.0
+  Downloaded opaque-debug v0.3.1
+  Downloaded ghash v0.4.4
+  Downloaded darling_macro v0.13.4
+  Downloaded never-say-never v6.6.666
+  Downloaded rle-decode-fast v1.0.3
+  Downloaded darling v0.13.4
+  Downloaded takeable v0.2.2
+  Downloaded nougat v0.2.4
+  Downloaded powerfmt v0.2.0
+  Downloaded num-traits v0.2.19
+  Downloaded foldhash v0.2.0
+  Downloaded dary_heap v0.3.8
+  Downloaded volatile v0.4.6
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded generic-array v0.14.9
+  Downloaded defmt-macros v1.0.1
+  Downloaded defmt v1.0.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded paste v1.0.15
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded once_cell v1.21.4
+  Downloaded const_format v0.2.35
+  Downloaded darling_core v0.13.4
+  Downloaded zero v0.1.3
+  Downloaded log v0.4.29
+  Downloaded font8x8 v0.2.7
+  Downloaded crc32fast v1.5.0
+  Downloaded ctr v0.8.0
+  Downloaded bitvec v1.0.1
+  Downloaded xmas-elf v0.10.0
+  Downloaded gimli v0.28.1
+  Downloaded json v0.12.4
+  Downloaded itertools v0.10.5
+  Downloaded unwinding v0.2.8
+  Downloaded volatile v0.6.1
+  Downloaded libc v0.2.184
+  Downloaded memchr v2.8.0
+  Downloaded raw-cpuid v10.7.0
+  Downloaded aes-gcm v0.9.4
+  Downloaded uguid v2.2.1
+  Downloaded multiboot2-common v0.3.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded toml v0.7.8
+  Downloaded iced-x86 v1.21.0
+  Downloaded heapless v0.8.0
+  Downloaded indexmap v2.13.1
+  Downloaded hashbrown v0.14.5
+  Downloaded aes v0.7.5
+  Downloaded syn v2.0.117
+  Downloaded heapless v0.7.17
+  Downloaded gimli v0.32.3
+  Downloaded winnow v0.5.40
+  Downloaded time v0.3.47
+  Downloaded zerocopy v0.8.48
+  Downloaded uefi-raw v0.12.0
+  Downloaded x86_64 v0.14.13
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded toml_edit v0.19.15
+  Downloaded x86 v0.52.0
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded getopts v0.2.24
+  Downloaded rustc-literal-escaper v0.0.5
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `ostd-test` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 17.23s
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19D0+7EF319D0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..[kernel] OSTD initialized. Preparing components.
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running xfstests...
+xfstests probe: is_block TEST_DEV=1 SCRATCH_DEV=1
+brw-rw-rw-    1 root     root      254,   0 Apr  7 11:46 [1;35m/dev/vda[m
+brw-rw-rw-    1 root     root      254,  16 Apr  7 11:46 [1;35m/dev/vdb[m
+xfstests probe: lstat64 raw TEST_DEV=Device type: shim shim shim shim shim shim fe:0
+xfstests probe: lstat64 raw SCRATCH_DEV=Device type: shim shim shim shim shim shim fe:10
+xfstests probe: lstat64 TEST_DEV_TYPE=fe:0 SCRATCH_DEV_TYPE=fe:10
+xfstests probe: CHECK_SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash
+xfstests probe: grep=/opt/xfstests/shims/bin/grep readlink=/opt/xfstests/shims/bin/readlink
+xfstests probe: HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+xfstests probe: single_test=none trace_run=0
+xfstests probe: TEST_DEV=/dev/vda TEST_DIR=/ext4_test SCRATCH_DEV=/dev/vdb SCRATCH_MNT=/ext4_scratch
+xfstests probe: local.config
+EMAIL=root@localhost
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+xfstests probe: fill rc=1
+fill: cannot create "(null)": Bad address
+xfstests probe: shim grep rc=1 shim readlink rc=0 shim findmnt rc=1
+xfstests env: MKFS_PROG=/usr/bin/mke2fs FSCK_PROG=unset
+xfstests fsstate: pre:generic/006 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/006 timeout=900s trace=0
+xfstests case done: generic/006 rc=0
+xfstests fsstate: post:generic/006 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/013 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/013 timeout=900s trace=0
+[32m[    47.589][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8213 name='f8XXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    47.711][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8226 name='f7XXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    47.852][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8245 name='f7XXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.188][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8249 name='f4X' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.206][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8270 name='f2XXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.224][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8226 name='ffXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.242][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8270 name='f3XXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.410][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8264 name='f5XXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.665][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8284 name='f2X' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    48.883][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8264 name='f9' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    60.687][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8249 name='f8XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    64.905][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8283 name='fdXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    66.517][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8226 name='f1bXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    66.542][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8226 name='f1c' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    72.285][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8245 name='fbXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    75.204][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8216 name='f1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    75.236][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8216 name='f2XXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    89.034][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8245 name='ffX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    90.881][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8354 name='f20' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[    92.413][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8268 name='fa' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   124.256][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8341 name='d1cXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   146.440][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8268 name='f12' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   146.616][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8268 name='f14XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   147.234][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8268 name='f1cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   147.319][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8268 name='f1eXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   158.188][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8241 name='f14' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   158.609][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8241 name='f19XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   158.829][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8241 name='f1aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   165.887][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8395 name='d30XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   215.766][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8351 name='f11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   227.856][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8345 name='d39XXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   244.186][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8341 name='d36X' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   252.581][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8345 name='f44X' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   254.601][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8545 name='d64XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   261.815][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8228 name='f1aXX' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   262.335][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8297 name='f48' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   312.360][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8603 name='f5' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   312.404][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8604 name='f9' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   312.416][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8611 name='f7' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   312.476][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8611 name='df' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[   312.506][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=8611 name='d13' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+xfstests case done: generic/013 rc=0
+xfstests fsstate: post:generic/013 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/028 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/028 timeout=900s trace=0
+xfstests case done: generic/028 rc=0
+xfstests fsstate: post:generic/028 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/036 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/036 timeout=900s trace=0
+xfstests case done: generic/036 rc=0
+xfstests fsstate: post:generic/036 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/041 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/041 timeout=900s trace=0
+xfstests case done: generic/041 rc=0
+xfstests fsstate: post:generic/041 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/047 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/047 timeout=900s trace=0
+xfstests case done: generic/047 rc=0
+xfstests fsstate: post:generic/047 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/051 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/051 timeout=900s trace=0
+xfstests case done: generic/051 rc=0
+xfstests fsstate: post:generic/051 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/052 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/052 timeout=900s trace=0
+xfstests case done: generic/052 rc=0
+xfstests fsstate: post:generic/052 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/054 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/054 timeout=900s trace=0
+xfstests case done: generic/054 rc=0
+xfstests fsstate: post:generic/054 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/062 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/062 timeout=900s trace=0
+xfstests case done: generic/062 rc=0
+xfstests fsstate: post:generic/062 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/068 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/068 timeout=900s trace=0
+xfstests case done: generic/068 rc=0
+xfstests fsstate: post:generic/068 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/070 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/070 timeout=900s trace=0
+xfstests case done: generic/070 rc=0
+xfstests fsstate: post:generic/070 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/083 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/083 timeout=900s trace=0
+xfstests case done: generic/083 rc=0
+xfstests fsstate: post:generic/083 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/084 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/084 timeout=900s trace=0
+xfstests case done: generic/084 rc=0
+xfstests fsstate: post:generic/084 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/088 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/088 timeout=900s trace=0
+xfstests case done: generic/088 rc=0
+xfstests fsstate: post:generic/088 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/090 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/090 timeout=900s trace=0
+xfstests case done: generic/090 rc=0
+xfstests fsstate: post:generic/090 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/091 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/091 timeout=900s trace=0
+xfstests case done: generic/091 rc=0
+xfstests fsstate: post:generic/091 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/093 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/093 timeout=900s trace=0
+xfstests case done: generic/093 rc=0
+xfstests fsstate: post:generic/093 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 11:46 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+phase3_base\t4\t0\t14\t22\t4\t100.00\t90
+===== phase3_base detailed results =====
+test	status	rc	reason
+generic/001	STATIC_BLOCKED	NA	rename/mv semantics out of stage3 scope
+generic/002	STATIC_BLOCKED	NA	hardlink support out of stage3 scope
+generic/004	STATIC_BLOCKED	NA	O_TMPFILE/flink support out of stage3 scope
+generic/005	STATIC_BLOCKED	NA	symlink support out of stage3 scope
+generic/006	PASS	0	
+generic/007	STATIC_BLOCKED	NA	heavy nametest stress deferred outside stage3 baseline
+generic/011	STATIC_BLOCKED	NA	heavy dirstress concurrency deferred outside stage3 baseline
+generic/013	PASS	0	
+generic/014	STATIC_BLOCKED	NA	sparse truncation stress deferred outside stage3 baseline
+generic/017	STATIC_BLOCKED	NA	fallocate collapse-range support out of stage3 scope
+generic/021	STATIC_BLOCKED	NA	fpunch/fcollapse/fiemap semantics out of stage3 scope
+generic/022	STATIC_BLOCKED	NA	delalloc + collapse-range semantics out of stage3 scope
+generic/023	STATIC_BLOCKED	NA	symlink support out of stage3 scope
+generic/024	STATIC_BLOCKED	NA	renameat2 support out of stage3 scope
+generic/026	STATIC_BLOCKED	NA	chacl/xattr tooling dependency out of stage3 scope
+generic/027	STATIC_BLOCKED	NA	scratch size requirement exceeds current stage3 test image
+generic/028	PASS	0	
+generic/029	STATIC_BLOCKED	NA	mmap+truncate stress with xfs_io dependency out of stage3 scope
+generic/031	STATIC_BLOCKED	NA	fcollapse stress with xfs_io dependency out of stage3 scope
+generic/032	STATIC_BLOCKED	NA	unwritten-extent stress with xfs_io dependency out of stage3 scope
+generic/035	STATIC_BLOCKED	NA	rename overwrite semantics out of stage3 scope
+generic/036	NOTRUN	NA	generic/036        [not run] /opt/xfstests/xfstests-dev/src/aio-dio-regress/aio-dio-fcntl-race not built
+generic/041	NOTRUN	NA	generic/041        [not run] No hardlink support
+generic/047	NOTRUN	NA	generic/047        [not run] ext4 does not support shutdown
+generic/051	NOTRUN	NA	generic/051        [not run] ext4 does not support shutdown
+generic/052	NOTRUN	NA	generic/052        [not run] ext4 does not support shutdown
+generic/054	NOTRUN	NA	generic/054        [not run] ext4 does not support shutdown
+generic/062	NOTRUN	NA	generic/062        [not run] attr command not found
+generic/063	STATIC_BLOCKED	NA	finsert/fpunch/fiemap semantics out of stage3 scope
+generic/068	NOTRUN	NA	generic/068        [not run] ext4 does not support freezing
+generic/069	STATIC_BLOCKED	NA	O_APPEND stress workload deferred outside stage3 baseline
+generic/070	NOTRUN	NA	generic/070        [not run] attr command not found
+generic/071	STATIC_BLOCKED	NA	fallocate prealloc behavior out of stage3 scope
+generic/083	NOTRUN	NA	generic/083        [not run] Scratch device too small
+generic/084	PASS	0	
+generic/086	STATIC_BLOCKED	NA	unwritten/delayed extent stress out of stage3 scope
+generic/088	NOTRUN	NA	generic/088        [not run] chown is not supported ext4
+generic/090	NOTRUN	NA	generic/090        [not run] No hardlink support
+generic/091	NOTRUN	NA	generic/091        [not run] O_DIRECT is not supported
+generic/093	NOTRUN	NA	generic/093        [not run] attr command not found
+xfstests phase3_base passed: pass_rate=100.00% >= 90%
+summary=/tmp/xfstests_results/phase3_base_summary.tsv
+results=/tmp/xfstests_results/phase3_base_results.tsv
+excluded=/tmp/xfstests_results/phase3_base_excluded.tsv
+All syscall tests passed.
+

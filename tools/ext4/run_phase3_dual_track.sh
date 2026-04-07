@@ -15,7 +15,7 @@ export NETDEV=${NETDEV:-user}
 export VHOST=${VHOST:-off}
 export CONSOLE=${CONSOLE:-ttyS0}
 
-LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/stage3_ext4_logs"}
+LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/benchmark/logs/stage3_dual_track"}
 mkdir -p "${LOG_DIR}"
 
 run_phase3_base_round() {

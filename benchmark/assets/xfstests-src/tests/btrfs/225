@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Oracle. All Rights Reserved.
+#
+# FS QA Test 225
+#
+# Test for seed device-delete on a sprouted FS.
+#
+# Steps:
+#  Create a seed FS. Add a RW device to make it sprout FS and then delete
+#  the seed device.
+
+. ./common/preamble
+_begin_fstest auto quick volume seed
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_btrfs_rescan_devices
+}
+
+. ./common/filter
+
+_fixed_by_kernel_commit b5ddcffa3777 \
+	"btrfs: fix put of uninitialized kobject after seed device delete"
+_require_test
+_require_scratch_dev_pool 2
+_require_btrfs_forget_or_module_loadable
+
+_scratch_dev_pool_get 2
+
+seed=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}')
+sprout=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}')
+
+_mkfs_dev $seed
+_mount $seed $SCRATCH_MNT
+
+$XFS_IO_PROG -f -c "pwrite -S 0xab 0 1M" $SCRATCH_MNT/foo > /dev/null
+_scratch_unmount
+$BTRFS_TUNE_PROG -S 1 $seed
+
+# Mount the seed device and add the rw device
+_mount -o ro $seed $SCRATCH_MNT
+$BTRFS_UTIL_PROG device add -f $sprout $SCRATCH_MNT >> $seqres.full
+_scratch_unmount
+
+# Now remount
+_mount $sprout $SCRATCH_MNT
+$XFS_IO_PROG -f -c "pwrite -S 0xcd 0 1M" $SCRATCH_MNT/bar > /dev/null
+
+echo --- before delete ----
+od -x $SCRATCH_MNT/foo
+od -x $SCRATCH_MNT/bar
+
+$BTRFS_UTIL_PROG device delete $seed $SCRATCH_MNT
+_scratch_unmount
+_btrfs_forget_or_module_reload
+_mount $sprout $SCRATCH_MNT
+
+echo --- after delete ----
+od -x $SCRATCH_MNT/foo
+od -x $SCRATCH_MNT/bar
+
+_scratch_dev_pool_put
+_btrfs_rescan_devices
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,123 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 411
+#
+# This test cover linux commit 7ae8fd0, kernel two mnt_group_id == 0
+# (no peer)vfsmount as peers. It case kernel dereference a NULL
+# address.
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_kill_fsstress
+	_clear_mount_stack
+	# make sure there's no bug cause dentry isn't be freed
+	rm -rf $MNTHEAD
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_local_device $SCRATCH_DEV
+
+fs_stress()
+{
+	local target=$1
+
+	_run_fsstress -z -n 500 -p 5 \
+		       -f creat=5 \
+		       -f mkdir=5 \
+		       -f dwrite=1 \
+		       -f dread=1 \
+		       -f link=2 \
+		       -f rename=1 \
+		       -f rmdir=2 \
+		       -f unlink=1 \
+		       -f symlink=1 \
+		       -f write=1 \
+		       -f read=1 \
+		       -f chown=1 \
+		       -f getdents=1 \
+		       -f fiemap=1 \
+		       -d $target
+	_sync_fs $target
+}
+
+# prepare some mountpoint dir
+MNTHEAD=$TEST_DIR/$seq
+rm -rf $MNTHEAD
+mkdir $MNTHEAD 2>>$seqres.full
+mpA=$MNTHEAD/"$$"_mpA
+mpB=$MNTHEAD/"$$"_mpB
+mpC=$MNTHEAD/"$$"_mpC
+
+find_mnt()
+{
+	echo "------"
+	findmnt -n -o TARGET,SOURCE $SCRATCH_DEV | \
+		sed -e "s;$mpA;mpA;g" \
+		    -e "s;$mpB;mpB;g" \
+		    -e "s;$mpC;mpC;g" | \
+		_filter_spaces | _filter_testdir_and_scratch | sort
+	echo "======"
+}
+
+start_test()
+{
+	local type=$1
+
+	_scratch_mkfs >$seqres.full 2>&1
+	_get_mount -t $FSTYP $SCRATCH_DEV $MNTHEAD
+	$MOUNT_PROG --make-"${type}" $MNTHEAD
+	mkdir $mpA $mpB $mpC
+}
+
+end_test()
+{
+	_clear_mount_stack
+	rm -rf $mpA $mpB $mpC
+}
+
+#
+#            shared            New FS           shared
+#      -----------------------[A/mnt1]----------------------
+#     |                           |                         |
+#     |                bind       |    bind                 |       New FS
+# [C/mnt1]--[slave C]<------[shared A]------>[slave B]--[B/mnt1]--[B/mnt1/mnt2]
+#
+crash_test()
+{
+	start_test shared
+
+	_get_mount -t $FSTYP $SCRATCH_DEV $mpA
+	mkdir $mpA/mnt1
+	$MOUNT_PROG --make-shared $mpA
+	_get_mount --bind $mpA $mpB
+	_get_mount --bind $mpA $mpC
+	$MOUNT_PROG --make-slave $mpB
+	$MOUNT_PROG --make-slave $mpC
+	_get_mount -t $FSTYP $SCRATCH_DEV $mpA/mnt1
+	mkdir $mpA/mnt1/mnt2
+
+	_get_mount -t $FSTYP $SCRATCH_DEV $mpB/mnt1/mnt2
+	find_mnt
+	fs_stress $mpB/mnt1/mnt2
+
+	end_test
+	echo "crash test passed"
+}
+
+crash_test
+
+# success, all done
+status=0
+exit

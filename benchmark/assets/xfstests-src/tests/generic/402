@@ -1,0 +1,138 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Deepa Dinamani.  All Rights Reserved.
+#
+# FS QA Test 402
+#
+# Test to verify filesystem timestamps for supported ranges.
+#
+# Exit status 1: test failed.
+# Exit status 0: test passed.
+#
+. ./common/preamble
+_begin_fstest auto quick rw bigtime
+
+# Get standard environment, filters and checks.
+. ./common/filter
+. ./common/attr
+
+# Prerequisites for the test run.
+_require_scratch
+_require_check_dmesg
+_require_xfs_io_command utimes
+
+# Compare file timestamps obtained from stat
+# with a given timestamp.
+check_stat()
+{
+	file=$1
+	timestamp=$2
+
+	stat_timestamp=`stat -c"%X;%Y" $file`
+
+	prev_timestamp="$timestamp;$timestamp"
+	if [ $prev_timestamp != $stat_timestamp ]; then
+		echo "$prev_timestamp != $stat_timestamp" | tee -a $seqres.full
+	fi
+}
+
+run_test_individual()
+{
+	file=$1
+	timestamp=$2
+	update_time=$3
+
+	# check if the time needs update
+	if [ $update_time -eq 1 ]; then
+		echo "Updating file: $file to timestamp $timestamp"  >> $seqres.full
+		rm -f $tmp.utimes
+		$XFS_IO_PROG -f -c "utimes $timestamp 0 $timestamp 0" $file > $tmp.utimes 2>&1
+		local res=$?
+
+		cat $tmp.utimes >> $seqres.full
+		if [ "$timestamp" -ne 0 ] && grep -q "Bad value" "$tmp.utimes"; then
+			echo "xfs_io could not interpret time value \"$timestamp\", skipping \"$file\" test." >> $seqres.full
+			rm -f $file $tmp.utimes
+			return
+		fi
+		cat $tmp.utimes
+		rm -f $tmp.utimes
+		if [ $res -ne 0 ]; then
+			echo "Failed to update times on $file" | tee -a $seqres.full
+		fi
+	else
+		if [ ! -f "$file" ]; then
+			echo "xfs_io did not create file for time value \"$timestamp\", skipping test." >> $seqres.full
+			return
+		fi
+	fi
+
+	tsclamp=$((timestamp<tsmin?tsmin:timestamp>tsmax?tsmax:timestamp))
+	echo "Checking file: $file Updated timestamp is $tsclamp"  >> $seqres.full
+	check_stat $file $tsclamp
+}
+
+run_test()
+{
+	update_time=$1
+
+	n=1
+
+	for TIME in "${TIMESTAMPS[@]}"; do
+		run_test_individual ${SCRATCH_MNT}/test_$n $TIME $update_time
+		((n++))
+	done
+}
+
+_scratch_mkfs &>> $seqres.full 2>&1 || _fail "mkfs failed"
+_scratch_mount
+
+_require_timestamp_range $SCRATCH_DEV
+
+read tsmin tsmax <<<$(_filesystem_timestamp_range $SCRATCH_DEV)
+echo min supported timestamp $tsmin >> $seqres.full
+echo max supported timestamp $tsmax >> $seqres.full
+
+# Test timestamps array
+
+declare -a TIMESTAMPS=(
+	$tsmin
+	0
+	$tsmax
+	$((tsmax/2))
+	$((tsmax+1))
+)
+
+status=0
+
+# Begin test case 1
+echo "In memory timestamps update test start" >> $seqres.full
+
+# update time on the file
+update_time=1
+
+run_test $update_time
+
+echo "In memory timestamps update complete" >> $seqres.full
+
+echo "Unmounting and mounting scratch $SCRATCH_MNT" >> $seqres.full
+
+# unmount and remount $SCRATCH_DEV
+_scratch_cycle_mount
+
+# Begin test case 2
+
+n=1
+
+# Do not update time on the file this time, just read from disk
+update_time=0
+
+echo "On disk timestamps update test start" >> $seqres.full
+
+# Re-run test
+run_test $update_time
+
+echo "On disk timestamps update test complete" >> $seqres.full
+
+echo Silence is golden
+exit

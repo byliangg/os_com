@@ -1,0 +1,58 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 480
+#
+# Test that if we have a file with two hard links in the same parent directory,
+# then remove of the links, create a new file in the same parent directory and
+# with the name of the link removed, fsync the new file and have a power loss,
+# mounting the filesystem succeeds.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+mkdir $SCRATCH_MNT/testdir
+touch $SCRATCH_MNT/testdir/foo
+ln $SCRATCH_MNT/testdir/foo $SCRATCH_MNT/testdir/bar
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Now remove of the links of our file and create a new file with the same name
+# and in the same parent directory, and finally fsync this new file.
+unlink $SCRATCH_MNT/testdir/bar
+touch $SCRATCH_MNT/testdir/bar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir/bar
+
+# Simulate a power failure and mount the filesystem to check that replaying the
+# the fsync log/journal succeeds, that is the mount operation does not fail.
+_flakey_drop_and_remount
+
+_scratch_unmount
+_cleanup_flakey
+
+echo "Silence is golden"
+status=0
+exit

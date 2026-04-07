@@ -1,0 +1,94 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 745
+#
+# Test that after syncing the filesystem, adding many xattrs to a file, syncing
+# the filesystem again, writing to the file and then doing a fsync against that
+# file, all the xattrs still exists after a power failure. That is, after the
+# fsync log/journal is replayed, the xattrs still exist and with the correct
+# values.
+#
+# This test is motivated by a bug found in btrfs.
+#
+. ./common/preamble
+_begin_fstest auto metadata quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+. ./common/attr
+
+_require_scratch
+_require_dm_target flakey
+_require_attrs
+
+# We create a lot of xattrs for a single file. Only btrfs and xfs are currently
+# able to store such a large mount of xattrs per file, other filesystems such
+# as ext3/4 and f2fs for example, fail with ENOSPC even if we attempt to add
+# less than 1000 xattrs with very small values.
+case "$FSTYP" in
+btrfs|xfs)
+	;;
+*)
+	_notrun "Requires support for > 1000 xattrs"
+	;;
+esac
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create the test file with some initial data and make sure everything is
+# durably persisted.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 32k" $SCRATCH_MNT/foo | _filter_xfs_io
+_scratch_sync
+
+# Add many small xattrs to our file.
+# We create such a large amount because it's needed to trigger the issue found
+# in btrfs - we need to have an amount that causes the fs to have at least 3
+# btree leafs with xattrs stored in them, and it must work on any leaf size
+# (maximum leaf/node size is 64Kb).
+num_xattrs=2000
+for ((i = 1; i <= $num_xattrs; i++)); do
+	name="user.attr_$(printf "%04d" $i)"
+	$SETFATTR_PROG -n $name -v "val_$(printf "%04d" $i)" $SCRATCH_MNT/foo
+done
+
+# Sync the filesystem to force a commit of the current btrfs transaction, this
+# is a necessary condition to trigger the bug on btrfs.
+_scratch_sync
+
+# Now update our file's data and fsync the file.
+# After a successful fsync, if the fsync log/journal is replayed we expect to
+# see all the xattrs we added before with the same values (and the updated file
+# data of course). Btrfs used to delete some of these xattrs when it replayed
+# its fsync log/journal.
+$XFS_IO_PROG -c "pwrite -S 0xbb 8K 16K" \
+		-c "fsync" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+
+_flakey_drop_and_remount
+
+echo "File content after crash and log replay:"
+od -t x1 $SCRATCH_MNT/foo
+
+echo "File xattrs after crash and log replay:"
+for ((i = 1; i <= $num_xattrs; i++)); do
+	name="user.attr_$(printf "%04d" $i)"
+	echo -n "$name="
+	_getfattr --absolute-names -n $name --only-values $SCRATCH_MNT/foo
+	echo
+done
+
+status=0
+exit

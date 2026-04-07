@@ -1,0 +1,156 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 423
+#
+# Test the statx system call
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -rf $TEST_DIR/$seq-*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_test_program "stat_test"
+_require_test_program "af_unix"
+_require_statx
+_require_symlinks
+_require_mknod
+
+function check_stat () {
+	$here/src/stat_test $* || echo stat_test failed
+}
+
+function create_af_unix () {
+	$here/src/af_unix $* || echo af_unix failed
+}
+
+###############################################################################
+#
+# Check statx'ing of various types of object
+#
+# After each object is created, barring the first, we check that the creation
+# time and the change time of the new object as same as or later than the
+# corresponding timestamps on the previous object created.
+#
+###############################################################################
+echo "Test statx on a fifo"
+mkfifo -m 0600 $TEST_DIR/$seq-fifo
+check_stat $TEST_DIR/$seq-fifo \
+	   ts_order \
+	   stx_type=fifo \
+	   stx_mode=0600 \
+	   stx_rdev_major=0 \
+	   stx_rdev_minor=0 \
+	   stx_nlink=1
+
+echo "Test statx on a chardev"
+mknod -m 0600 $TEST_DIR/$seq-null c 1 3
+check_stat $TEST_DIR/$seq-null \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-fifo \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=char \
+	   stx_mode=0600 \
+	   stx_rdev_major=1 \
+	   stx_rdev_minor=3 \
+	   stx_nlink=1
+
+echo "Test statx on a directory"
+mkdir $TEST_DIR/$seq-dir
+check_stat $TEST_DIR/$seq-dir \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-null \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=dir \
+	   stx_mode=0755 \
+	   stx_rdev_major=0 \
+	   stx_rdev_minor=0
+
+echo "Test statx on a blockdev"
+mknod -m 0600 $TEST_DIR/$seq-loopy b 7 123
+check_stat $TEST_DIR/$seq-loopy \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-dir \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=block \
+	   stx_mode=0600 \
+	   stx_rdev_major=7 \
+	   stx_rdev_minor=123 \
+	   stx_nlink=1
+
+echo "Test statx on a file"
+dd if=/dev/zero of=$TEST_DIR/$seq-file bs=1024 count=20
+check_stat $TEST_DIR/$seq-file \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-loopy \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=file \
+	   stx_size=20480 \
+	   stx_rdev_major=0 \
+	   stx_rdev_minor=0 \
+	   stx_nlink=1
+
+echo "Test statx on a symlink"
+target=$TEST_DIR/$seq-nowhere
+ln -s $target $TEST_DIR/$seq-symlink
+check_stat $TEST_DIR/$seq-symlink \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-file \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=sym \
+	   stx_size=${#target} \
+	   stx_rdev_major=0 \
+	   stx_rdev_minor=0 \
+	   stx_nlink=1
+
+echo "Test statx on an AF_UNIX socket"
+create_af_unix $TEST_DIR/$seq-sock
+check_stat $TEST_DIR/$seq-sock \
+	   ts_order \
+	   ref=$TEST_DIR/$seq-symlink \
+	   ts=B,b \
+	   ts=M,m \
+	   stx_type=sock \
+	   stx_rdev_major=0 \
+	   stx_rdev_minor=0 \
+	   stx_nlink=1
+
+#
+# Test hard link creation.  Make sure that the file's ctime is now same as or
+# later than the creation time of the socket, but that the file's creation time
+# still lies somewhere between those of the directory and the socket.
+#
+echo "Test a hard link to a file"
+ln $TEST_DIR/$seq-file $TEST_DIR/$seq-link
+check_stat $TEST_DIR/$seq-link \
+	   ref=$TEST_DIR/$seq-dir \
+	   ts=B,b \
+	   ref=$TEST_DIR/$seq-sock \
+	   ts=b,B \
+	   ts=B,c \
+	   ts=C,c \
+	   ref=$TEST_DIR/$seq-file \
+	   cmp_ref \
+	   stx_nlink=2
+
+# Done.  We leave the success determination to the output comparator.
+status=0
+exit

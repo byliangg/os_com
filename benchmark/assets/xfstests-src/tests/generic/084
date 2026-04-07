@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. 084
+#
+# Test hardlink to unlinked file.
+#
+# Regression test for commit:
+# aae8a97 fs: Don't allow to create hardlink for deleted file
+#
+. ./common/preamble
+_begin_fstest auto metadata quick
+
+_cleanup()
+{
+	[ -n "$link_pids" ] && kill $link_pids
+	[ -n "$open_pid" ] && kill $open_pid
+	wait
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+link_unlink_storm()
+{
+	local src=$1
+	local target=$2
+	local i=0
+
+	while true; do
+		ln -f $src $target.$i >/dev/null 2>&1
+		rm -f $target.$i >/dev/null 2>&1
+		let i=i+1
+	done
+}
+
+nr_cpu=`$here/src/feature -o`
+echo "Silence is golden"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# create, open & unlinked files so unlinked inode list is not empty
+$here/src/multi_open_unlink -f $SCRATCH_MNT/$seq.unlinked -n $nr_cpu &
+open_pid=$!
+
+# start link/unlink storm
+src=$SCRATCH_MNT/$seq.target
+touch $src
+for i in `seq 1 $nr_cpu`; do
+	target=$SCRATCH_MNT/$seq.target.link.$i
+	link_unlink_storm $src $target &
+	link_pids="$link_pids $!"
+done
+
+# remove & re-create target to race with link/unlink
+while true; do
+	rm -f $src
+	touch $src
+done &
+sleep 5
+kill $! >/dev/null 2>&1
+
+# all done, no oops/hang expected, _check_filesystems checks SCRATCH_DEV after test
+status=0
+exit

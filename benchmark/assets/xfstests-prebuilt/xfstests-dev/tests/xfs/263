@@ -1,0 +1,72 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 263
+#
+# test xfs_quota state command
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+# Modify as appropriate.
+
+_require_scratch
+_require_xfs_quota
+
+function option_string()
+{
+	VAL=$1
+	# Treat 3 options as a bit field, prjquota|grpquota|usrquota
+	OPT="rw"
+	if [ "$((VAL & 4))" -ne "0" ]; then OPT=prjquota,${OPT}; fi;
+	if [ "$((VAL & 2))" -ne "0" ]; then OPT=grpquota,${OPT}; fi;
+	if [ "$((VAL & 1))" -ne "0" ]; then OPT=usrquota,${OPT}; fi;
+	if [ "$VAL" = "0" ]; then OPT=noquota; fi;
+	echo $OPT
+}
+
+filter_quota_state() {
+	sed -e 's/Inode: #[0-9]\+/Inode #XXX/g' \
+	    -e '/max warnings:/d' \
+	    -e '/Blocks grace time:/d' \
+	    -e '/Inodes grace time:/d' \
+		| _filter_scratch
+}
+
+filter_quota_state2() {
+	sed -e '/User quota state on/d' \
+	    -e '/ Accounting: /d' \
+	    -e '/ Enforcement: /d' \
+	    -e '/ Inode: /d' \
+	    -e '/Blocks max warnings: /d' \
+	    -e '/Inodes max warnings: /d' \
+		| _filter_scratch
+}
+
+function test_all_state()
+{
+	for I in `seq 0 7`; do
+		OPTIONS=`option_string $I`
+		echo "== Options: $OPTIONS =="
+		# Some combinations won't mount on V4 supers (grp + prj)
+		_qmount_option "$OPTIONS"
+		_try_scratch_mount &>> $seqres.full || continue
+		$XFS_QUOTA_PROG -x -c "state -u" $SCRATCH_MNT | filter_quota_state
+		$XFS_QUOTA_PROG -x -c "state -g" $SCRATCH_MNT | filter_quota_state
+		$XFS_QUOTA_PROG -x -c "state -p" $SCRATCH_MNT | filter_quota_state
+		$XFS_QUOTA_PROG -x -c "state -u" $SCRATCH_MNT | filter_quota_state2
+		_scratch_unmount
+	done
+}
+
+_scratch_mkfs_xfs "-m crc=1" >>$seqres.full
+test_all_state
+
+status=0
+exit

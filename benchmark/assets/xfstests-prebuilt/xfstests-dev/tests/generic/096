@@ -1,0 +1,32 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc., Lukas Czerner <lczerner@redhat.com>
+#
+# FS QA Test 096
+#
+# Exercise the situation that cause ext4 to BUG_ON() when we use
+# zero range to zero a range which starts within the isize but ends
+# past the isize but still in the same block. This particular problem
+# has only been seen on systems with page_size > block_size.
+#
+. ./common/preamble
+_begin_fstest auto prealloc quick zero
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "fzero"
+
+echo "Silence is golden"
+
+# Use smaller scratch fs to shorten the test time
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/$seq.$$
+$XFS_IO_PROG -f -c "pwrite 4096 512" -c "fzero 4351 512" $testfile >> $seqres.full 2>&1
+
+# success, all done
+status=0
+exit

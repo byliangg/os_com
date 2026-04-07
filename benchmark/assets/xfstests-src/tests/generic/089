@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 089
+#
+# Emulate the way Linux mount manipulates /etc/mtab to attempt to
+# reproduce a possible bug in rename (see src/t_mtab.c).
+#
+. ./common/preamble
+_begin_fstest metadata auto
+
+mtab_output=$TEST_DIR/mtab_output
+
+# Import common functions.
+. ./common/filter
+
+addentries()
+{
+	count=$1
+	pattern="%0$2d"
+
+	while [ $count -gt 0 ]; do
+		touch `printf $pattern $count`
+		let count=$count-1
+	done
+}
+
+_require_test
+_require_hardlinks
+
+[ "X$TEST_DIR" = "X" ] && exit 1
+cd $TEST_DIR
+rm -fr test
+mkdir test || exit 1
+cd $TEST_DIR/test
+mount > t_mtab
+
+mtab()
+{
+	rm -f $mtab_output
+	$here/src/t_mtab 50 $mtab_output &
+	$here/src/t_mtab 50 $mtab_output &
+	$here/src/t_mtab 50 $mtab_output &
+	wait
+	cat $mtab_output
+
+	$here/src/t_mtab 10000
+
+	echo directory entries:
+	ls | grep mtab
+	echo directory entries >> $seqres.full
+	ls -li >> $seqres.full
+}
+
+# directory with only a few entries
+mtab
+
+# directory with a hundred more entries, each 4chars wide
+addentries 100 4
+mtab
+
+# directory with a thousand more entries, each 8chars wide
+addentries 1000 8
+mtab
+
+status=0
+exit

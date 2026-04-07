@@ -1,0 +1,58 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 110
+#
+# Incorrect dir2 freetab warning case from Masanori Tsuda.
+#
+. ./common/preamble
+_begin_fstest repair auto
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+_scratch_unmount 2>/dev/null
+_scratch_mkfs_xfs | _filter_mkfs 2>$tmp.mkfs
+
+STR1=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+STR2=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+STR3=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC
+
+#------------------------------------------------
+# Free Block No. | Data Entry No. (Start - End) |
+#       1        |     10000001 - 10030599      |
+#       2        |     10030600 - 10061199      |
+#       3        |     10061200 - 10091799      |
+#------------------------------------------------
+# 15 Data Entries / 1 Data Block                |
+#------------------------------------------------
+
+_scratch_mount
+mkdir -p $SCRATCH_MNT/test
+
+I=10000001
+E=10030600
+while [ $I -le $E ]
+do
+    echo > $SCRATCH_MNT/test/${STR1}${STR2}${STR3}${I}
+    let I=$I+1
+    [ $[$I % 1000] -eq 0 ] && echo "Created $I/$E"
+done
+wait
+
+_scratch_sync
+
+I=10030585
+E=10030599
+while [ $I -le $E ]
+do
+    rm $SCRATCH_MNT/test/${STR1}${STR2}${STR3}${I} &
+    let I=$I+1
+done
+wait
+
+status=0
+exit

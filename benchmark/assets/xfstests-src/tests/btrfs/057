@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 Fujitsu.  All rights reserved.
+#
+# FSQA Test No. btrfs/057
+#
+# Quota rescan stress test, we run fsstress and quota rescan concurrently
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+. ./common/filter
+
+_require_scratch
+_require_qgroup_rescan
+
+_scratch_mkfs_sized $((1024 * 1024 * 1024)) >> $seqres.full 2>&1
+
+_scratch_mount
+
+# -w ensures that the only ops are ones which cause write I/O
+_run_fsstress -d $SCRATCH_MNT -w -p 5 -n 1000
+
+_btrfs subvolume snapshot $SCRATCH_MNT \
+	$SCRATCH_MNT/snap1
+
+_run_fsstress -d $SCRATCH_MNT/snap1 -w -p 5 -n 1000
+
+_btrfs quota enable $SCRATCH_MNT
+_btrfs quota rescan -w $SCRATCH_MNT
+
+echo "Silence is golden"
+# btrfs check will detect any qgroup number mismatch.
+
+status=0
+exit

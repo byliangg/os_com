@@ -1,0 +1,89 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 108
+#
+# Test partial block device failure. Calls like fsync() should report failure
+# on partial I/O failure, e.g. a single failed disk in a raid 0 stripe.
+#
+# Test motivated by an XFS bug, and this commit fixed the issue
+# xfs: return errors from partial I/O failures to files
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	echo running > /sys/block/`_short_dev $SCSI_DEBUG_DEV`/device/state
+	_unmount $SCRATCH_MNT >>$seqres.full 2>&1
+	$LVM_PROG vgremove -f $vgname >>$seqres.full 2>&1
+	 pvremove -f $SCRATCH_DEV $SCSI_DEBUG_DEV >>$seqres.full 2>&1
+	_udev_wait --removed /dev/mapper/$vgname-$lvname
+	_put_scsi_debug_dev
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/scsi_debug
+
+_require_scratch_nolvm
+_require_block_device $SCRATCH_DEV
+_require_scsi_debug
+_require_command "$LVM_PROG" lvm
+# We cannot ensure the Logical Volume is aligned to the zone boundary
+_require_non_zoned_device $SCRATCH_DEV
+
+lvname=lv_$seq
+vgname=vg_$seq
+
+physical=`blockdev --getpbsz $SCRATCH_DEV`
+logical=`blockdev --getss $SCRATCH_DEV`
+size=$(_small_fs_size_mb 300)
+lvsize=$((size * 91 / 100))
+
+# _get_scsi_debug_dev returns a scsi debug device with 128M in size by default
+SCSI_DEBUG_DEV=`_get_scsi_debug_dev ${physical:-512} ${logical:-512} 0 $size`
+test -b "$SCSI_DEBUG_DEV" || _notrun "Failed to initialize scsi debug device"
+echo "SCSI debug device $SCSI_DEBUG_DEV" >>$seqres.full
+
+got_size_kb=$(_get_device_size $SCSI_DEBUG_DEV)
+
+[[ $got_size_kb -lt $((size * 1024)) ]] &&
+	_notrun "Need SCSI debug device of size $(( size * 1024 )) KB. Got $got_size_kb KB"
+
+# create striped volume with 4MB stripe size
+#
+# lvm has a hardcoded list of valid devices and fails with
+# "device type is unknown" for those not in the list like null_blk
+$LVM_PROG pvcreate -f $SCSI_DEBUG_DEV $SCRATCH_DEV >>$seqres.full 2>&1 || \
+	_notrun "LVM is too stupid for this device"
+$LVM_PROG vgcreate -f $vgname $SCSI_DEBUG_DEV $SCRATCH_DEV >>$seqres.full 2>&1
+# We use yes pipe instead of 'lvcreate --yes' because old version of lvm
+# (like 2.02.95 in RHEL6) don't support --yes option
+yes | $LVM_PROG lvcreate -i 2 -I 4m -L ${lvsize}m -n $lvname $vgname \
+	>>$seqres.full 2>&1 || _fail "Failed to create LVM lv"
+_udev_wait /dev/mapper/$vgname-$lvname
+
+# _mkfs_dev exits the test on failure, this makes sure test lv is created by
+# above vgcreate/lvcreate operations
+_mkfs_dev /dev/mapper/$vgname-$lvname
+
+_mount /dev/mapper/$vgname-$lvname $SCRATCH_MNT
+
+# create a test file with contiguous blocks which will span across the 2 disks
+$XFS_IO_PROG -f -c "pwrite 0 16M" -c fsync $SCRATCH_MNT/testfile >>$seqres.full
+
+# offline the scsi debug device
+echo offline > /sys/block/`_short_dev $SCSI_DEBUG_DEV`/device/state
+
+# write to an allocated area of the test file with writes which spans both disks
+# and call fsync, the fsync should report failure
+$XFS_IO_PROG -c "pwrite -b 1M 0 6M" -c fsync $SCRATCH_MNT/testfile \
+	>>$seqres.full
+
+status=0
+exit

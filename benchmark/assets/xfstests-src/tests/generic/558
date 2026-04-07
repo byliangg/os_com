@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/558
+#
+# Stress test fs by using up all inodes and check fs.
+#
+# Also a regression test for xfsprogs commit
+# d586858 xfs_repair: fix sibling pointer tests in verify_dir2_path()
+#
+. ./common/preamble
+_begin_fstest auto enospc
+
+create_file()
+{
+	local dir=$1
+	local nr_file=$2
+	local prefix=$3
+	local i=0
+
+	for ((i = 0; i < nr_file; i++)); do
+		echo -n > $dir/${prefix}_${i}
+	done
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_inode_limits
+_require_scratch
+
+echo "Silence is golden"
+
+_scratch_mkfs_sized $((1024 * 1024 * 1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+i=0
+free_inodes=$(_get_free_inode $SCRATCH_MNT)
+# Round the number of inodes to create up to the nearest 1000, like the old
+# code did to make sure that we *cannot* allocate any more inodes at all.
+free_inodes=$(( ( (free_inodes + 999) / 1000) * 1000 ))
+nr_cpus=$(( $($here/src/feature -o) * 4 * LOAD_FACTOR ))
+echo "free inodes: $free_inodes nr_cpus: $nr_cpus" >> $seqres.full
+
+if ((free_inodes <= nr_cpus)); then
+	nr_cpus=1
+	files_per_dir=$free_inodes
+else
+	files_per_dir=$(( (free_inodes + nr_cpus - 1) / nr_cpus ))
+fi
+mkdir -p $SCRATCH_MNT/testdir
+echo "nr_cpus: $nr_cpus files_per_dir: $files_per_dir" >> $seqres.full
+
+echo "Create $((nr_cpus * files_per_dir)) files in $SCRATCH_MNT/testdir" >>$seqres.full
+for ((i = 0; i < nr_cpus; i++)); do
+	create_file $SCRATCH_MNT/testdir $files_per_dir $i >>$seqres.full 2>&1 &
+done
+wait
+
+# log inode status in $seqres.full for debug purpose
+echo "Inode status after taking all inodes" >>$seqres.full
+$DF_PROG -i $SCRATCH_MNT >>$seqres.full
+
+_check_scratch_fs
+
+# Check again after removing all the files
+rm -rf $SCRATCH_MNT/testdir
+echo "Inode status after deleting all test files" >>$seqres.full
+$DF_PROG -i $SCRATCH_MNT >>$seqres.full
+
+status=0
+exit

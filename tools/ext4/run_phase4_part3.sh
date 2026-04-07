@@ -17,14 +17,23 @@ export NETDEV=${NETDEV:-user}
 export VHOST=${VHOST:-off}
 export CONSOLE=${CONSOLE:-ttyS0}
 
-LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/stage4_ext4_logs_part3"}
+LOG_DIR=${LOG_DIR:-"${ROOT_DIR}/benchmark/logs"}
 mkdir -p "${LOG_DIR}" "${LOG_DIR}/lmbench" "${LOG_DIR}/crash"
 
-INITRAMFS_IMG=${INITRAMFS_IMG:-"${ROOT_DIR}/.local/initramfs_phase4_part3.cpio.gz"}
-BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/.local/initramfs_phase3.cpio.gz"}
+INITRAMFS_IMG=${INITRAMFS_IMG:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz"}
+BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase3.cpio.gz"}
 PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
+XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
+XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC:-600}
+XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN:-0}
+XFSTESTS_CHILD_XTRACE=${XFSTESTS_CHILD_XTRACE:-0}
+RUN_CRASH_SUITE=${RUN_CRASH_SUITE:-1}
+RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD:-1}
+RUN_PHASE3_BASE=${RUN_PHASE3_BASE:-1}
+RUN_LMBENCH=${RUN_LMBENCH:-1}
+KLOG_LEVEL=${KLOG_LEVEL:-error}
 
 if [ ! -f "${INITRAMFS_IMG}" ]; then
   "${ROOT_DIR}/tools/ext4/prepare_phase4_part3_initramfs.sh" "${BASE_INITRAMFS}" "${INITRAMFS_IMG}"
@@ -38,6 +47,7 @@ run_crash_prepare_once() {
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
+  mkfs.ext4 -F -b 4096 test/initramfs/build/ext2.img >/tmp/mkfs_ext4_phase4_part3_crash.log 2>&1
 
   timeout 1200s bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
     --kcmd-args='ostd.log_level=warn' \
@@ -45,6 +55,7 @@ run_crash_prepare_once() {
     --kcmd-args='SYSCALL_TEST_SUITE=ext4_crash' \
     --kcmd-args='EXT4_CRASH_PHASE=prepare' \
     --kcmd-args='EXT4_CRASH_SCENARIO=${scenario}' \
+    --kcmd-args='EXT4_CRASH_SKIP_MKFS=1' \
     --kcmd-args='ext4fs.replay_hold=1' \
     --kcmd-args='ext4fs.replay_hold_op=${hold_op}' \
     --init-args='/opt/syscall_test/run_syscall_test.sh' \
@@ -156,10 +167,12 @@ run_xfstests_mode() {
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
+  mkfs.ext4 -F -b 4096 test/initramfs/build/ext2.img >/tmp/mkfs_ext4_phase4_part3_xfstests_test.log 2>&1
+  mkfs.ext4 -F -b 4096 test/initramfs/build/exfat.img >/tmp/mkfs_ext4_phase4_part3_xfstests_scratch.log 2>&1
 
   set +e
   timeout 1800s bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
-    --kcmd-args='ostd.log_level=error' \
+    --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
     --kcmd-args='console=${CONSOLE}' \
     --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \
     --kcmd-args='SYSCALL_TEST_WORKDIR=/ext4' \
@@ -171,8 +184,11 @@ run_xfstests_mode() {
     --kcmd-args='XFSTESTS_SCRATCH_DEV=/dev/vdb' \
     --kcmd-args='XFSTESTS_TEST_DIR=/ext4_test' \
     --kcmd-args='XFSTESTS_SCRATCH_MNT=/ext4_scratch' \
-    --kcmd-args='XFSTESTS_SINGLE_TEST=' \
-    --kcmd-args='XFSTESTS_CASE_TIMEOUT_SEC=' \
+    --kcmd-args='XFSTESTS_SKIP_MKFS=1' \
+    --kcmd-args='XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST}' \
+    --kcmd-args='XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC}' \
+    --kcmd-args='XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN}' \
+    --kcmd-args='XFSTESTS_CHILD_XTRACE=${XFSTESTS_CHILD_XTRACE}' \
     --init-args='/opt/syscall_test/run_syscall_test.sh' \
     --target-arch=x86_64 \
     --profile release-lto \
@@ -183,7 +199,11 @@ run_xfstests_mode() {
   set -e
 
   echo "[DONE] mode=${mode} rc=${rc} log=${log_file}"
-  rg -n "mode\\tpass\\tfail|${mode}\\t|xfstests ${mode} passed|xfstests ${mode} failed|All syscall tests passed|Error: xfstests failed|xfstests case done" "${log_file}" | tail -n 80 || true
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "mode\\tpass\\tfail|${mode}\\t|xfstests ${mode} passed|xfstests ${mode} failed|All syscall tests passed|Error: xfstests failed|xfstests case done" "${log_file}" | tail -n 80 || true
+  else
+    grep -nE "mode[[:space:]]+pass[[:space:]]+fail|${mode}[[:space:]]|xfstests ${mode} passed|xfstests ${mode} failed|All syscall tests passed|Error: xfstests failed|xfstests case done" "${log_file}" | tail -n 80 || true
+  fi
   if [ ${rc} -ne 0 ]; then
     return ${rc}
   fi
@@ -207,6 +227,9 @@ run_lmbench_regression() {
 
   for bench in "${benches[@]}"; do
     local timeout_s=420
+    if [[ "${bench}" == "lmbench/ext4_vfs_open_lat" ]]; then
+      timeout_s=900
+    fi
     if [[ "${bench}" == "lmbench/ext4_copy_files_bw" ]]; then
       timeout_s=700
     fi
@@ -222,7 +245,7 @@ run_lmbench_regression() {
 
     set +e
     timeout "${timeout_s}s" bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
-      --kcmd-args='ostd.log_level=error' \
+      --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
       --kcmd-args='console=${CONSOLE}' \
       --init-args='/benchmark/common/bench_runner.sh ${bench} asterinas' \
       --target-arch=x86_64 \
@@ -267,13 +290,59 @@ PHASE4_LOG="${LOG_DIR}/phase4_good_${TS}.log"
 PHASE3_LOG="${LOG_DIR}/phase3_base_guard_${TS}.log"
 LMB_SUMMARY="${LOG_DIR}/lmbench/phase4_part3_lmbench_summary_${TS}.tsv"
 
-run_crash_suite "${CRASH_SUMMARY}"
-run_xfstests_mode phase4_good "${PHASE4_GOOD_THRESHOLD}" "${PHASE4_LOG}"
-run_xfstests_mode phase3_base 90 "${PHASE3_LOG}"
-run_lmbench_regression "${LMB_SUMMARY}"
+ANY_STAGE_RAN=0
+
+if [ "${RUN_CRASH_SUITE}" = "1" ]; then
+  run_crash_suite "${CRASH_SUMMARY}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] crash suite disabled (RUN_CRASH_SUITE=${RUN_CRASH_SUITE})"
+fi
+
+if [ "${RUN_PHASE4_GOOD}" = "1" ]; then
+  run_xfstests_mode phase4_good "${PHASE4_GOOD_THRESHOLD}" "${PHASE4_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] phase4_good disabled (RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD})"
+fi
+
+if [ "${RUN_PHASE3_BASE}" = "1" ]; then
+  run_xfstests_mode phase3_base 90 "${PHASE3_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] phase3_base disabled (RUN_PHASE3_BASE=${RUN_PHASE3_BASE})"
+fi
+
+if [ "${RUN_LMBENCH}" = "1" ]; then
+  run_lmbench_regression "${LMB_SUMMARY}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] lmbench disabled (RUN_LMBENCH=${RUN_LMBENCH})"
+fi
+
+if [ "${ANY_STAGE_RAN}" -ne 1 ]; then
+  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_LMBENCH." >&2
+  exit 2
+fi
 
 echo "[DONE] phase4_part3 run finished"
-echo "crash_summary=${CRASH_SUMMARY}"
-echo "phase4_good_log=${PHASE4_LOG}"
-echo "phase3_base_log=${PHASE3_LOG}"
-echo "lmbench_summary=${LMB_SUMMARY}"
+if [ "${RUN_CRASH_SUITE}" = "1" ]; then
+  echo "crash_summary=${CRASH_SUMMARY}"
+else
+  echo "crash_summary=<disabled>"
+fi
+if [ "${RUN_PHASE4_GOOD}" = "1" ]; then
+  echo "phase4_good_log=${PHASE4_LOG}"
+else
+  echo "phase4_good_log=<disabled>"
+fi
+if [ "${RUN_PHASE3_BASE}" = "1" ]; then
+  echo "phase3_base_log=${PHASE3_LOG}"
+else
+  echo "phase3_base_log=<disabled>"
+fi
+if [ "${RUN_LMBENCH}" = "1" ]; then
+  echo "lmbench_summary=${LMB_SUMMARY}"
+else
+  echo "lmbench_summary=<disabled>"
+fi

@@ -1,0 +1,96 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test No. 081
+#
+# Test I/O error path by fully filling an dm snapshot.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	local pv_ret
+	cd /
+	rm -f $tmp.*
+
+	# Tear down the lvm vg and snapshot.
+	#
+	# NOTE: We do the unmount and {vg,pv}remove in a loop here because
+	# dmeventd could be configured to unmount the filesystem automatically
+	# after the IO errors.  That is racy with the umount we're trying to do
+	# here because there's a window in which the directory tree has been
+	# removed from the mount namespaces (so the umount call here sees no
+	# mount and exits) but the filesystem hasn't yet released the block
+	# device, which causes the vgremove here to fail.
+	#
+	# We "solve" the race by repeating the umount/lvm teardown until the
+	# block device goes away, because we cannot exit this test without
+	# removing the lvm devices from the scratch device -- this will cause
+	# other tests to fail.
+	while test -e /dev/mapper/$vgname-$snapname || \
+	      test -e /dev/mapper/$vgname-$lvname; do
+		_unmount $mnt >> $seqres.full 2>&1
+		$LVM_PROG lvremove -f $vgname/$snapname >>$seqres.full 2>&1
+		$LVM_PROG lvremove -f $vgname/$lvname >>$seqres.full 2>&1
+		$LVM_PROG vgremove -f $vgname >>$seqres.full 2>&1
+		$LVM_PROG pvremove -f $SCRATCH_DEV >>$seqres.full 2>&1
+		pv_ret=$?
+		_udev_wait --removed /dev/mapper/$vgname-$lvname
+		test $pv_ret -eq 0 && break
+		sleep 2
+	done
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_scratch_nolvm
+_require_dm_target snapshot
+_require_command $LVM_PROG lvm
+
+echo "Silence is golden"
+
+vgname=vg_$seq
+lvname=base_$seq
+snapname=snap_$seq
+mnt=$TEST_DIR/mnt_$seq
+mkdir -p $mnt
+
+size=$(_small_fs_size_mb 300)
+lvsize=$((size * 85 / 100))	 # ~256M
+
+# make sure there's enough disk space for 256M lv, test for 300M here in case
+# lvm uses some space for metadata
+_scratch_mkfs_sized $((size * 1024 * 1024)) >>$seqres.full 2>&1
+
+# lvm has a hardcoded list of valid devices and fails with
+# "device type is unknown" for those not in the list like null_blk
+$LVM_PROG vgcreate -f $vgname $SCRATCH_DEV >>$seqres.full 2>&1 || \
+	_notrun "LVM is too stupid for this device"
+# We use yes pipe instead of 'lvcreate --yes' because old version of lvm
+# (like 2.02.95 in RHEL6) don't support --yes option
+yes | $LVM_PROG lvcreate -L ${lvsize}M -n $lvname $vgname >>$seqres.full 2>&1 \
+	|| _notrun "Can't set up LVM"
+_udev_wait /dev/mapper/$vgname-$lvname
+
+
+# _mkfs_dev exits the test on failure, this can make sure lv is created in
+# above vgcreate/lvcreate steps
+_mkfs_dev /dev/mapper/$vgname-$lvname
+
+# create a 4M snapshot
+$LVM_PROG lvcreate -s -L 4M -n $snapname $vgname/$lvname >>$seqres.full 2>&1 || \
+	_fail "Failed to create snapshot"
+
+_mount /dev/mapper/$vgname-$snapname $mnt
+
+# write 5M data to the snapshot
+$XFS_IO_PROG -fc "pwrite 0 5m" -c fsync $mnt/testfile >>$seqres.full 2>&1
+
+# _check_dmesg will check for WARNINGs/BUGs in dmesg
+status=0
+exit

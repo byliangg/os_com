@@ -1,0 +1,94 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 064
+#
+# test multilevel dump and restores with hardlinks
+#
+. ./common/preamble
+_begin_fstest dump auto
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dump
+
+_ls_size_filter()
+{
+    #
+    # Print size ($5) and fname ($9).
+    # The size is significant since we add to the file as part
+    # of a file change for the incremental.
+    #
+    # Filter out the housekeeping files of xfsrestore
+    #
+    $AWK_PROG 'NF == 9 { print $5, $9 }' |\
+    grep -E -v 'dumpdir|housekeeping|dirattr|dirextattr|namreg|state|tree'
+}
+
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_hardlinks 9
+
+echo "Do the incremental dumps"
+i=0
+while [ $i -le 9 ]; do
+    if [ $i -gt 0 ]; then
+	sleep 2
+	_modify_level $i
+    fi
+
+    _stable_fs
+    sleep 2
+
+    echo "********* level $i ***********" >>$seqres.full
+    date >>$seqres.full
+    find $SCRATCH_MNT -exec $here/src/lstat64 {} \; | sed 's/(00.*)//' >$tmp.dates.$i
+    if [ $i -gt 0 ]; then
+       let level_1=$i-1
+       diff -c $tmp.dates.$level_1 $tmp.dates.$i >>$seqres.full
+    else
+       cat $tmp.dates.$i >>$seqres.full
+    fi
+
+    _do_dump_file -f $tmp.df.level$i -l $i
+    let i=$i+1
+done
+
+echo "Listing of what files we start with:"
+ls -l $dump_dir | _ls_size_filter
+
+echo "Look at what files are contained in the inc. dump"
+i=0
+while [ $i -le 9 ]; do
+    echo ""
+    echo "restoring from df.level$i"
+    _do_restore_toc -f $tmp.df.level$i
+    let i=$i+1
+done
+
+echo "Do the cumulative restores"
+_prepare_restore_dir
+i=0
+while [ $i -le 9 ]; do
+    echo ""
+    echo "restoring from df.level$i"
+    _do_restore_file_cum -f $tmp.df.level$i
+    echo "ls -l restore_dir"
+    ls -lR $restore_dir | _ls_size_filter | _check_quota_file
+    let i=$i+1
+done
+
+# success, all done
+status=0
+exit

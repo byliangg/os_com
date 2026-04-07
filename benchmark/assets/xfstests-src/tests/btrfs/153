@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 NETGEAR, Inc.  All Rights Reserved.
+#
+# FS QA Test 153
+#
+# Test for leaking quota reservations on preallocated files.
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup limit preallocrw
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs >/dev/null
+_scratch_mount
+
+_btrfs quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT
+_btrfs qgroup limit 100M 0/5 $SCRATCH_MNT
+
+testfile1=$SCRATCH_MNT/testfile1
+testfile2=$SCRATCH_MNT/testfile2
+$XFS_IO_PROG -fc "falloc 0 80M" $testfile1
+$XFS_IO_PROG -fc "pwrite 0 80M" $testfile1 > /dev/null
+$XFS_IO_PROG -fc "falloc 0 19M" $testfile2
+$XFS_IO_PROG -fc "pwrite 0 19M" $testfile2 > /dev/null
+
+echo "Silence is golden"
+status=0
+exit

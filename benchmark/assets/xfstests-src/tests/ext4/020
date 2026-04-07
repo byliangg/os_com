@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 020
+#
+# Test partial blocksize defrag integrity issue.
+#
+# Calling EXT4_IOC_MOVE_EXTENT on file not aligned with block size and block
+# size is smaller than page size would cause integrity issue on the
+# partial-blocksize part when copying data between orign file and donor file.
+#
+. ./common/preamble
+_begin_fstest auto quick ioctl rw defrag
+
+# Import common functions.
+. ./common/filter
+. ./common/defrag
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_defrag
+
+e4compact=$here/src/e4compact
+_require_test_program "e4compact"
+
+testfile=$SCRATCH_MNT/$seq.orig
+donorfile=$SCRATCH_MNT/$seq.donor
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# reserve space for donor file, written by 0xaa and sync to disk to avoid
+# EBUSY on EXT4_IOC_MOVE_EXT
+$XFS_IO_PROG -fc "pwrite -S 0xaa 0 1m" -c "fsync" $donorfile | _filter_xfs_io
+
+# create test file with 1023 in size, written by 0xbb
+# 1023 is smaller than 1k and works for any block size filesystems
+$XFS_IO_PROG -fc "pwrite -S 0xbb 0 1023" -c "fsync" $testfile | _filter_xfs_io
+
+# compute initial md5sum
+md5sum $testfile > $tmp.md5sum
+
+# drop cache, force e4compact to read data from disk
+echo 3 > /proc/sys/vm/drop_caches
+
+# test defrag
+echo "$testfile" | $e4compact -i -v -f $donorfile >>$seqres.full
+
+# check md5sum
+md5sum -c $tmp.md5sum | _filter_scratch
+
+# success, all done
+status=0
+exit

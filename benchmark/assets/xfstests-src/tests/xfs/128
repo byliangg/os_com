@@ -1,0 +1,140 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 128
+#
+# Ensure that xfs_fsr un-reflinks files while defragmenting
+#
+. ./common/preamble
+_begin_fstest auto quick clone fsr prealloc
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_lsattr
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "falloc"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+free_blocks0=$(stat -f $testdir -c '%f')
+
+echo "Create the original file and reflink to file2, file3"
+blks=2000
+margin=160
+blksz=65536
+real_blksz="$(_get_block_size $testdir)"
+blksz_factor=$((blksz / real_blksz))
+
+# The expected free space numbers in this test require file1 and file4 to share
+# the same blocks at the end of the test.  Therefore, we need the allocator to
+# give file1 a single extent at the start of the test so that fsr will not be
+# tempted to "defragment" a multi-extent file1 or file4.  Defragmenting really
+# means rewriting the file, and if that succeeds on either file, we'll have
+# unshared the space and there will be too little free space.  Therefore,
+# preallocate space to try to produce a single extent.
+$XFS_IO_PROG -f -c "falloc 0 $((blks * blksz))" $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $((blks * blksz)) $testdir/file1 >> $seqres.full
+_scratch_sync
+
+nextents=$($XFS_IO_PROG -c 'stat' $testdir/file1 | grep 'fsxattr.nextents' | awk '{print $3}')
+
+_cp_reflink $testdir/file1 $testdir/file2
+_cp_reflink $testdir/file2 $testdir/file3
+_cp_reflink $testdir/file3 $testdir/file4
+_scratch_cycle_mount
+free_blocks1=$(stat -f $testdir -c '%f')
+
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+md5sum $testdir/file4 | _filter_scratch
+
+c01=$(_md5_checksum $testdir/file1)
+c02=$(_md5_checksum $testdir/file2)
+c03=$(_md5_checksum $testdir/file3)
+c04=$(_md5_checksum $testdir/file4)
+
+echo "CoW the reflink copies"
+_pwrite_byte 0x62 $blksz $blksz $testdir/file2 >> $seqres.full
+_pwrite_byte 0x63 $(( blksz * (blks - 1) )) $blksz $testdir/file3 >> $seqres.full
+_scratch_cycle_mount
+free_blocks2=$(stat -f $testdir -c '%f')
+
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+md5sum $testdir/file4 | _filter_scratch
+
+c11=$(_md5_checksum $testdir/file1)
+c12=$(_md5_checksum $testdir/file2)
+c13=$(_md5_checksum $testdir/file3)
+c14=$(_md5_checksum $testdir/file4)
+
+echo "Defragment"
+lsattr -l $testdir/ | _filter_scratch | _filter_spaces | sed -e 's/DAX/---/g'
+$XFS_FSR_PROG -v -d $testdir/file1 >> $seqres.full
+$XFS_FSR_PROG -v -d $testdir/file2 >> $seqres.full # fsr probably breaks the link
+$XFS_FSR_PROG -v -d $testdir/file3 >> $seqres.full # fsr probably breaks the link
+$XFS_FSR_PROG -v -d $testdir/file4 >> $seqres.full # fsr probably ignores this file
+_scratch_cycle_mount
+free_blocks3=$(stat -f $testdir -c '%f')
+
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+md5sum $testdir/file4 | _filter_scratch
+
+c21=$(_md5_checksum $testdir/file1)
+c22=$(_md5_checksum $testdir/file2)
+c23=$(_md5_checksum $testdir/file3)
+c24=$(_md5_checksum $testdir/file4)
+
+echo "Check files"
+test $c01 = $c02 || echo "Files 1-2 do not match"
+test $c01 = $c03 || echo "Files 1-3 do not match"
+test $c01 = $c04 || echo "Files 1-4 do not match"
+test $c02 = $c03 || echo "Files 2-3 do not match"
+test $c02 = $c04 || echo "Files 2-4 do not match"
+test $c03 = $c04 || echo "Files 3-4 do not match"
+
+test $c01 = $c11 || echo "File1 should not be different after CoW"
+test $c02 != $c12 || echo "File2 should be different after CoW"
+test $c03 != $c13 || echo "File3 should be different after CoW"
+test $c04 = $c14 || echo "File4 should not be different after CoW"
+
+test $c11 = $c21 || echo "File1 changed by defrag"
+test $c12 = $c22 || echo "File2 changed by defrag"
+test $c13 = $c23 || echo "File3 changed by defrag"
+test $c14 = $c24 || echo "File4 changed by defrag"
+
+#echo $free_blocks0 $free_blocks1 $free_blocks2 $free_blocks3
+
+freesp_bad=0
+
+_within_tolerance "free blocks after creating some reflink copies" \
+	$free_blocks1 $((free_blocks0 - (blks * blksz_factor) )) $margin -v || freesp_bad=1
+
+_within_tolerance "free blocks after CoW some reflink copies" \
+	$free_blocks2 $((free_blocks1 - 2)) $margin -v || freesp_bad=1
+
+_within_tolerance "free blocks after defragging all reflink copies" \
+	$free_blocks3 $((free_blocks2 - (blks * 2 * blksz_factor))) $margin -v || freesp_bad=1
+
+_within_tolerance "free blocks after all tests" \
+	$free_blocks3 $((free_blocks0 - (blks * 3 * blksz_factor))) $margin -v || freesp_bad=1
+
+if [ $freesp_bad -ne 0 ] && [ $nextents -gt 1 ]; then
+	echo "free space checks probably failed because file1 nextents was $nextents"
+fi
+
+# success, all done
+status=0
+exit

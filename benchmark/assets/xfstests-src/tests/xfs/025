@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 025
+#
+# Test dump/restore using -m option (min strategy) 
+#
+. ./common/preamble
+_begin_fstest dump ioctl tape
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+
+_require_tape $TAPE_DEV
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_fill
+_erase_hard
+_do_dump_min
+_do_restore_min
+_diff_compare
+
+# success, all done
+exit

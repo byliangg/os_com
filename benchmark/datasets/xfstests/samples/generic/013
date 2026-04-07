@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 013
+#
+# fsstress
+#
+. ./common/preamble
+_begin_fstest other ioctl udf auto quick
+
+# Import common functions.
+. ./common/filter
+
+_do_test()
+{
+    _n="$1"
+    _param="$2"
+    _count="$3"
+
+    out=$TEST_DIR/fsstress.$seq.$_n
+    rm -rf $out
+    if ! mkdir $out
+    then
+        echo "    failed to mkdir $out"
+        status=1
+        exit
+    fi
+
+    echo ""
+    echo "-----------------------------------------------"
+    echo "fsstress.$_n : $_param"
+    echo "-----------------------------------------------"
+    # -m limits number of users/groups so check doesn't fail (malloc) later
+    _run_fsstress $_param -v -m 8 -n $_count -d $out
+    if [ $? -ne 0 ]; then
+        echo "    fsstress (count=$_count) returned $? - see $seqres.full"
+        echo "--------------------------------------"       >>$seqres.full
+        echo "$_n - output from fsstress:"                  >>$seqres.full
+        echo "--------------------------------------"       >>$seqres.full
+        echo "<NOT LOGGED>"                                 >>$seqres.full
+        #cat $tmp.out                                       >>$seqres.full
+        status=1
+    fi
+
+    _check_test_fs
+}
+
+_require_test
+
+echo "brevity is wit..."
+status=0
+
+count=1000
+procs=20
+
+_check_test_fs
+
+# the default
+
+_do_test 1 "-r" $count
+
+# and the default with multiprocess
+
+_do_test 2 "-p $procs -r" $count
+
+# from Glen's notes
+
+_do_test 3 "-p 4 -z -f rmdir=10 -f link=10 -f creat=10 -f mkdir=10 -f rename=30 -f stat=30 -f unlink=30 -f truncate=20" $count
+
+rm -rf $TEST_DIR/fsstress.$seq.*
+
+exit
+
+# Test with error injection:
+#
+# (error injection)
+# fsstress -n 1000 -d $scratch -p 4 -z -f rmdir=10 -f link=10 -f creat=10 \
+#          -f mkdir=10 -f rename=30 -f stat=30 -f unlink=30 -f truncate=20 \
+#          -e 1
+#
+# Error values 1 - 6 test IFLUSH
+#         1 - corrupt buffer being flushed to di_core.di_magic
+#         2 - corrupt inode being flushed i_d.di_magic
+#         3 - corrupt S_IFREG format check
+#         4 - corrupt S_IFDIR format check
+#         5 - corrupt i_d.di_nextents
+#         6 - corrupt i_d.di_forkoff > sb_inodesize

@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 SUSE.  All Rights Reserved.
+#
+# FS QA Test 438
+#
+# This is a regression test for kernel patch
+#   "ext4: Fix data corruption for mmap writes"
+#
+# The problem this test checks for is when too much is zeroed in the tail
+# page that gets written out just while the file gets extended and written
+# to through mmap.
+#
+# Based on test program by Michael Zimmer <michael@swarm64.com>
+#
+. ./common/preamble
+_begin_fstest auto mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $FILE
+}
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_test
+_require_test_program "t_mmap_fallocate"
+
+FILE=$TEST_DIR/testfile_fallocate
+# Make sure file exists
+echo >$FILE
+# Force frequent writeback of the file
+(
+	trap "STOP=1" SIGTERM
+	STOP=0
+	while [ $STOP -eq 0 ]; do
+		$XFS_IO_PROG -c fsync $FILE
+	done
+)&
+SYNCPID=$!
+
+# Run the test
+$here/src/t_mmap_fallocate $FILE 256 && echo "Silence is golden"
+
+kill -TERM $SYNCPID
+wait $SYNCPID
+
+# success, all done
+status=0
+exit

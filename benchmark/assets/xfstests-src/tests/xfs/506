@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 506
+#
+# Basic tests of the xfs_spaceman health command.
+
+. ./common/preamble
+_begin_fstest auto quick health
+
+# Import common functions.
+. ./common/fuzzy
+. ./common/filter
+
+_require_scratch_nocheck
+_require_scrub
+_require_xfs_spaceman_command "health"
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+_require_scratch_xfs_scrub
+
+_scratch_cycle_mount	# make sure we haven't run quotacheck on this mount
+
+# Haven't checked anything, it should tell us to run scrub
+$XFS_SPACEMAN_PROG -c "health" $SCRATCH_MNT
+
+# Run scrub to collect health info.
+_scratch_scrub -n >> $seqres.full
+
+query() {
+	$XFS_SPACEMAN_PROG -c "$@" $SCRATCH_MNT | tee -a $seqres.full
+}
+
+query_health() {
+	query "$@" | grep -q ": ok$"
+}
+
+query_sick() {
+	query "$@" | grep -q ": unhealthy$"
+}
+
+# Let's see if we get at least one healthy rating for each health reporting
+# group.
+query_health "health -f" || \
+	echo "Didn't see a single healthy fs metadata?"
+
+query_health "health -a 0" || \
+	echo "Didn't see a single healthy ag metadata?"
+
+query_health "health $SCRATCH_MNT" || \
+	echo "Didn't see a single healthy file metadata?"
+
+# Unmount, corrupt filesystem
+_scratch_unmount
+_scratch_xfs_db -x -c 'sb 1' -c 'fuzz -d magicnum random' >> $seqres.full
+
+# Now let's see what the AG report says
+_scratch_mount
+_scratch_scrub -n >> $seqres.full 2>&1
+query_sick "health -a 1" || \
+	echo "Didn't see the expected unhealthy metadata?"
+
+# success, all done
+status=0
+exit

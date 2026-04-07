@@ -1,0 +1,97 @@
+			==============================
+			AUXILIARY PROGRAMS FOR TESTING
+			==============================
+
+Not everything a test script can do is easily done within a test script;
+sometimes it makes a lot more sense to write auxiliary program in C and have
+the test script call them.  Auxiliary commands can be found in the src/
+directory and in other packages.
+
+Tests wanting to use an auxiliary program found in the src/ directory should
+note the dependency with:
+
+	_require_test_program "<program-name>"
+
+
+Contents:
+
+ - af_unix		-- Create an AF_UNIX socket
+ - dmerror		-- fault injection block device control
+ - fsync-err		-- tests fsync error reporting after failed writeback
+ - log-writes/replay-log -- Replay log from device mapper log-writes target
+ - open_by_handle	-- open_by_handle_at syscall exercise
+ - stat_test		-- statx syscall exercise
+ - t_dir_type		-- print directory entries and their file type
+ - xfs_io		-- General I/O operation exercise
+
+
+==================
+QUICK DESCRIPTIONS
+==================
+
+af_unix
+
+	The af_unix program creates an AF_UNIX socket at the given location.
+
+dmerror
+
+	dmerror is a program for creating, destroying and controlling a
+	fault injection device. The device can be set up as initially
+	working and then flip to throwing errors for testing purposes.
+
+fsync-err
+
+	Specialized program for testing how the kernel reports errors that
+	occur during writeback. Works in conjunction with the dmerror script
+	in tools/ to write data to a device, and then force it to fail
+	writeback and test that errors are reported during fsync and cleared
+	afterward.
+
+log-writes/replay-log
+
+	Specialized program for replaying a write log that was recorded by
+	device mapper log-writes target.  The tools is used to perform crash
+	consistency tests, allowing to run an arbitrary check tool (fsck) at
+	specified checkpoints in the write log.
+
+open_by_handle
+
+	The open_by_handle program exercises the open_by_handle_at() system
+	call.  It can check if file handles are valid or stale after certain
+	filesystem operations.
+
+	See also:
+		_require_exportfs
+
+stat_test
+
+	The stat_test program is primarily designed to exercise the statx()
+	system call.  It can check statx() against fstatat() and it can
+	compare and check various file attributes.
+
+	See also:
+		_require_statx
+
+
+t_dir_type
+
+	The t_dir_type program exercises the getdents64() system call.
+	It prints directory entry names returned from getdents64() and
+	thier d_type, optionally filtered by type or by inode number.
+
+xfs_io
+
+	The xfs_io program can be found in the xfsprogs package and can be used
+	to perform sequences of I/O commands, though it is limited to what it
+	can do on open files.
+
+	xfs_io is a debugging tool that is aimed at examining regular file I/O
+	paths rather than a raw XFS volume itself.  These code paths include
+	not only the obvious read/write/mmap interfaces for manipulating files,
+	but also cover all of the XFS extensions (such as space preallocation,
+	additional inode flags, etc).
+
+	Most of its commands can also be used with other filesystems.
+
+	See also:
+		_require_xfs_io_command

@@ -1,0 +1,104 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 Fujitsu All Rights Reserved.
+#
+# FS QA Test No. btrfs/079
+#
+# Do write along with fiemap ioctl.
+# Regression test for the kernel comit:
+# 51f395ad btrfs: Use right extent length when inserting overlap extent map.
+#
+# When calling fiemap(without SYNC flag) and btrfs fs is commiting,
+# it will cause race condition and cause btrfs to generate a wrong extent
+# whose len is overflow and fail to insert into the extent map tree,
+# returning -EEXIST.
+#
+# Fixed by the following patches (not merged in mainline yet):
+# btrfs: Fix and enhance merge_extent_mapping() to insert best fitted extent map
+# btrfs: Fix the wrong condition judgment about subset extent map
+#
+. ./common/preamble
+_begin_fstest auto rw metadata fiemap prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	kill $dd_pid &> /dev/null
+	kill $fiemap_pid &> /dev/null
+	wait
+	rm -fr $testfile
+	rm -fr $tmp.* $tmp
+}
+
+. ./common/filter
+
+_require_scratch
+# Since xfs_io's fiemap always use SYNC flag and can't be unset,
+# we must use filefrag to call fiemap without SYNC flag.
+_require_command "$FILEFRAG_PROG" filefrag
+_require_xfs_io_command "falloc"
+
+filesize=$((10 * 1024 * 1024 * 1024)) #10G size
+buffersize=$((1024 * 1024)) # 1M bs for dd
+count=$(($filesize / $buffersize))
+testfile=$SCRATCH_MNT/testfile
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+_require_fs_space $SCRATCH_MNT $(($filesize / 1024))
+$XFS_IO_PROG -f -c "falloc 0 $filesize" $testfile
+
+dd_work() {
+	out=$1
+	dd if=/dev/zero of=$out bs=$buffersize count=$count \
+	   conv=notrunc &> /dev/null
+}
+
+# There is a bug for e2fsprogs, at least in version 1.42.9, filefrag will
+# leak the return value, so we can't judge return value only,
+# but also to filter the output
+_filter_error() {
+	# when filefrag fails FIEMAP ioctl, it will fall back to FIBMAP,
+	# which is not supported by btrfs and will report "FIBMAP: strerr()"
+	# However old e2fsprogs will use wrong errno EINVAL other than ENOTTY
+	# so only grep for "FIBMAP" for max compatibility.
+	grep "FIBMAP"
+}
+
+fiemap_work() {
+	# Wait for any running 'filefrag' subcommand before exitting so that
+	# after the test kills the subshell running this function, it does not
+	# fail with EBUSY when unmounting the scratch device because the filefrag
+	# subcommand is still running with an open file on the scratch fs.
+	trap "wait; exit" SIGTERM
+
+	filename=$1
+	while true; do
+		$FILEFRAG_PROG $filename 2> $tmp.output 1> /dev/null
+		ret=$?
+		err=`cat $tmp.output | _filter_error`
+		if [ $ret -ne 0 -o -n "$err" ]; then
+			kill $dd_pid
+			return 1
+		fi
+	done
+}
+
+dd_work $testfile &
+dd_pid=$!
+fiemap_work $testfile &
+fiemap_pid=$!
+wait $dd_pid
+ddret=$?
+kill $fiemap_pid &> /dev/null
+wait $fiemap_pid
+
+if [ $ddret -ne 0 ]; then
+	echo "Extent merge bug detected"
+	status=1
+	exit
+else
+	echo "Silence is golden"
+	status=0
+	exit
+fi

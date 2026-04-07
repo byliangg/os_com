@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 075
+#
+# Commit bbe051c8 disallows ro->rw remount on norecovery mount
+# This test makes sure the behavior is correct.
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+
+# norecovery mounts do not succeed with quotas eanbled, so shut them off
+_qmount_option "defaults"
+
+echo "Silence is golden"
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >$seqres.full
+
+# first ro mount with norecovery
+_try_scratch_mount "-o ro,norecovery" >>$seqres.full 2>&1 \
+	|| _fail "First ro mount failed"
+# make sure a following remount,rw fails
+_try_scratch_mount "-o remount,rw" >>$seqres.full 2>&1 \
+	&& _fail "Second rw remount succeeded"
+
+# success, all done
+status=0
+exit

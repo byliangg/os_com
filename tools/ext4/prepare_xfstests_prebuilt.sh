@@ -13,8 +13,8 @@ if ! command -v make >/dev/null 2>&1; then
 fi
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-OUT_DIR=${1:-"${ROOT_DIR}/.local/xfstests-prebuilt"}
-SRC_DIR=${2:-"${ROOT_DIR}/.local/xfstests-src"}
+OUT_DIR=${1:-"${ROOT_DIR}/benchmark/assets/xfstests-prebuilt"}
+SRC_DIR=${2:-"${ROOT_DIR}/benchmark/assets/xfstests-src"}
 JOBS=${JOBS:-$(nproc)}
 
 mkdir -p "${OUT_DIR}" "${SRC_DIR}"

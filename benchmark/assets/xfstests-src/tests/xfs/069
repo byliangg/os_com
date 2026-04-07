@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Google Inc.  All Rights Reserved.
+#
+# FS QA Test No. 069
+#
+# Determine whether the extent size hint can be set on directories
+# with allocated extents correctly.
+#
+. ./common/preamble
+_begin_fstest ioctl auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+
+# Modify as appropriate.
+_require_scratch
+
+_scratch_mkfs_xfs >/dev/null 2>&1
+_scratch_mount
+_require_congruent_file_oplen $SCRATCH_MNT 8388608
+
+small=$SCRATCH_MNT/small
+big=$SCRATCH_MNT/big
+
+# sanity check on a small directory
+mkdir $small
+# expect that an empty directory has no extents
+$XFS_IO_PROG -c "bmap" $small | _filter_scratch
+# and that we can set an extent size on it
+$XFS_IO_PROG -c 'extsize 8m' $small
+# and finally check that the extent size update has taken place
+$XFS_IO_PROG -c "extsize" $small | _filter_scratch
+
+# now create a 'big' (with extents) directory
+mkdir $big
+for idx in {0..1000}; do
+    touch $big/$idx
+done
+$XFS_IO_PROG -c 'bmap -vp' $big | _filter_bmap | \
+    grep -q '^0: .*data'
+[ $? -eq 0 ] || echo "Can't force allocating extents!" 1>&2
+
+# expect that we can set the extent size on $big as well
+$XFS_IO_PROG -c 'extsize 8m' $big | _filter_scratch
+# and that it took effect
+$XFS_IO_PROG -c 'extsize' $big | _filter_scratch
+
+# success, all done
+status=0
+exit

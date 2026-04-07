@@ -1,0 +1,41 @@
+QA output created by 577
+
+# Generating certificates and private keys
+
+# Clearing fs-verity keyring
+
+# Loading first certificate into fs-verity keyring
+
+# Enabling fs.verity.require_signatures
+
+# Generating file and signing it for fs-verity
+Signed file 'SCRATCH_MNT/file' (sha256:<digest>)
+Signed file 'SCRATCH_MNT/file' (sha256:<digest>)
+
+# Signing a different file for fs-verity
+Signed file 'SCRATCH_MNT/otherfile' (sha256:<digest>)
+
+# Enabling verity with valid signature (should succeed)
+
+# Enabling verity without signature (should fail)
+ERROR: FS_IOC_ENABLE_VERITY failed on 'SCRATCH_MNT/file.fsv': Operation not permitted
+
+# Opening verity file without signature (should fail)
+md5sum: SCRATCH_MNT/file.fsv: Operation not permitted
+
+# Enabling verity with untrusted signature (should fail)
+ERROR: FS_IOC_ENABLE_VERITY failed on 'SCRATCH_MNT/file.fsv': Required key not available
+
+# Enabling verity with wrong file's signature (should fail)
+ERROR: FS_IOC_ENABLE_VERITY failed on 'SCRATCH_MNT/file.fsv': Key was rejected by service
+
+# Enabling verity with malformed signature (should fail)
+ERROR: FS_IOC_ENABLE_VERITY failed on 'SCRATCH_MNT/file.fsv': Bad message
+
+# Testing salt
+Signed file 'SCRATCH_MNT/file' (sha256:<digest>)
+
+# Testing non-default hash algorithm
+
+# Testing empty file
+Signed file 'SCRATCH_MNT/file.fsv' (sha256:<digest>)

@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test 352
+#
+# Test fiemap ioctl on heavily deduped file
+#
+# This test case will check if reserved extent map searching go
+# without problem and return correct SHARED flag.
+# Which btrfs will soft lock up and return wrong shared flag.
+#
+. ./common/preamble
+_begin_fstest auto clone fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/punch
+
+
+# Modify as appropriate.
+_require_scratch_reflink
+_require_xfs_io_command "fiemap"
+
+# The size is too small, this will result in an inline extent and then reflink
+# will simply be a copy on btrfs, so exclude compression.
+ _require_no_compress
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+blocksize=$(_get_file_block_size $SCRATCH_MNT)
+_require_congruent_file_oplen $SCRATCH_MNT $blocksize
+file="$SCRATCH_MNT/tmp"
+
+# Golden output is for $LOAD_FACTOR == 1 case
+# and assumes a normal blocksize of 4K
+orig_nr=8192
+orig_blocksize=4096
+orig_last_extent=$(($orig_nr * $orig_blocksize / 512))
+orig_end=$(($orig_last_extent + $orig_blocksize / 512 - 1))
+
+# Real output
+nr=$(($orig_nr * $LOAD_FACTOR))
+last_extent=$(($nr * $blocksize / 512))
+end=$(($last_extent + $blocksize / 512 - 1))
+
+# write the initial block for later reflink
+_pwrite_byte 0xcdcdcdcd 0 $blocksize $file > /dev/null
+
+# use reflink to create the rest of the file, whose all extents are all
+# pointing to the first extent
+for i in $(seq 1 $nr); do
+	_reflink_range $file 0 $file $(($i * $blocksize)) $blocksize > /dev/null
+done
+
+# then call fiemap on that file to test both the shared flag and if
+# reserved extent mapping search will cause soft lockup
+$XFS_IO_PROG -c "fiemap -v" $file | _filter_fiemap_flags > $tmp.out
+cat $tmp.out >> $seqres.full
+
+# refact the $LOAD_FACTOR to 1 to match the golden output
+sed -i -e "s/$(($last_extent - 1))/$(($orig_last_extent - 1))/" \
+	-e "s/$last_extent/$orig_last_extent/" \
+	-e "s/$end/$orig_end/" $tmp.out
+cat $tmp.out
+
+# success, all done
+status=0
+exit

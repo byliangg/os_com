@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 151
+#
+# Ensure that deleting all copies of a file reflinked N times releases the blocks
+#   - Record fs block usage (0)
+#   - Create a file and some reflink copies
+#   - Record fs block usage (1)
+#   - Delete some copies of the file
+#   - Record fs block usage (2)
+#   - Delete all copies of the file
+#   - Compare fs block usage to (2), (1), and (0)
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_block_size $testdir)"
+blks=2000
+margin='15%'
+sz=$((blksz * blks))
+free_blocks0=$(stat -f $testdir -c '%f')
+nr=7
+filesize=$((blksz * nr))
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+_test_sync
+
+echo "Create the reflink copies"
+for i in `seq 2 $nr`; do
+	_cp_reflink $testdir/file1 $testdir/file.$i
+done
+_cp_reflink $testdir/file1 $testdir/survivor
+_test_cycle_mount
+free_blocks1=$(stat -f $testdir -c '%f')
+
+echo "Delete most of the files"
+rm -rf $testdir/file*
+_test_cycle_mount
+free_blocks2=$(stat -f $testdir -c '%f')
+
+echo "Delete all the files"
+rm -rf $testdir/*
+_test_cycle_mount
+free_blocks3=$(stat -f $testdir -c '%f')
+#echo $free_blocks0 $free_blocks1 $free_blocks2 $free_blocks3
+
+_within_tolerance "free blocks after reflink" $free_blocks1 $((free_blocks0 - blks)) $margin -v
+
+_within_tolerance "free blocks after deleting some reflink copies" $free_blocks2 $free_blocks1 $margin -v
+
+_within_tolerance "free blocks after deleting all copies" $free_blocks3 $free_blocks0 $margin -v
+
+# success, all done
+status=0
+exit

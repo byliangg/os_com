@@ -1,0 +1,144 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 504
+#
+# Create a filesystem label with emoji and confusing unicode characters
+# to make sure that these special things actually work on xfs.  In
+# theory it should allow this (labels are a sequence of arbitrary bytes)
+# even if the user implications are horrifying.
+#
+. ./common/preamble
+_begin_fstest auto quick mkfs label
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+_require_xfs_io_command 'label'
+
+echo "Silence is golden."
+
+_scratch_mkfs > /dev/null
+_scratch_mount
+want_scrub=
+_check_xfs_scrub_does_unicode "$SCRATCH_MNT" "$SCRATCH_DEV" && want_scrub=yes
+_scratch_unmount
+
+filter_scrub() {
+	grep 'Unicode' | sed -e 's/^.*Duplicate/Duplicate/g'
+}
+
+maybe_scrub() {
+	test "$want_scrub" = "yes" || return
+
+	output="$(LC_ALL="C.UTF-8" ${XFS_SCRUB_PROG} -v -n "${SCRATCH_MNT}" 2>&1)"
+	echo "xfs_scrub output:" >> $seqres.full
+	echo "$output" >> $seqres.full
+	echo "$output" >> $tmp.scrub
+}
+
+testlabel() {
+	local label="$(echo -e "$1")"
+	local expected_label="label = \"$label\""
+
+	echo "Formatting label '$1'." >> $seqres.full
+	# First, let's see if we can recover the label when we set it
+	# with mkfs.
+	_scratch_mkfs -L "$label" >> $seqres.full 2>&1
+	_scratch_mount >> $seqres.full 2>&1
+	blkid -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g" >> $seqres.full
+	blkid -d -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g" >> $seqres.full
+
+	# Did it actually stick?
+	local actual_label="$($XFS_IO_PROG -c label $SCRATCH_MNT)"
+	echo "$actual_label" >> $seqres.full
+
+	if [ "${actual_label}" != "${expected_label}" ]; then
+		echo "Saw '${expected_label}', expected '${actual_label}'."
+	fi
+	maybe_scrub
+	_scratch_unmount
+
+	# Now let's try setting the label online to see what happens.
+	echo "Setting label '$1'." >> $seqres.full
+	_scratch_mkfs >> $seqres.full 2>&1
+	_scratch_mount >> $seqres.full 2>&1
+	$XFS_IO_PROG -c "label -s $label" $SCRATCH_MNT >> $seqres.full
+	blkid -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g" >> $seqres.full
+	blkid -d -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g" >> $seqres.full
+	_scratch_cycle_mount
+
+	# Did it actually stick?
+	local actual_label="$($XFS_IO_PROG -c label $SCRATCH_MNT)"
+	echo "$actual_label" >> $seqres.full
+
+	if [ "${actual_label}" != "${expected_label}" ]; then
+		echo "Saw '${expected_label}'; expected '${actual_label}'."
+	fi
+	maybe_scrub
+	_scratch_unmount
+}
+
+# Simple test
+testlabel "simple"
+
+# Two different renderings of the same label
+testlabel "caf\xc3\xa9.fs"
+testlabel "cafe\xcc\x81.fs"
+
+# Arabic code point can expand into a muuuch longer series
+testlabel "xfs_\xef\xb7\xba.fs"
+
+# Fake slash?
+testlabel "urk\xc0\xafmoo"
+
+# Emoji: octopus butterfly owl giraffe
+testlabel "\xf0\x9f\xa6\x91\xf0\x9f\xa6\x8b\xf0\x9f\xa6\x89"
+
+# unicode rtl widgets too...
+testlabel "mo\xe2\x80\xaegnp.txt"
+testlabel "motxt.png"
+
+# mixed-script confusables
+testlabel "mixed_t\xce\xbfp"
+testlabel "mixed_top"
+
+# single-script spoofing
+testlabel "a\xe2\x80\x90b.fs"
+testlabel "a-b.fs"
+
+testlabel "dz_dze.fs"
+testlabel "dz_\xca\xa3e.fs"
+
+# symbols
+testlabel "_Rs.fs"
+testlabel "_\xe2\x82\xa8.fs"
+
+# zero width joiners
+testlabel "moocow.fs"
+testlabel "moo\xe2\x80\x8dcow.fs"
+
+# combining marks
+testlabel "\xe1\x80\x9c\xe1\x80\xad\xe1\x80\xaf.fs"
+testlabel "\xe1\x80\x9c\xe1\x80\xaf\xe1\x80\xad.fs"
+
+# fake dotdot entry
+testlabel ".\xe2\x80\x8d"
+testlabel "..\xe2\x80\x8d"
+
+# encoding hidden tag characters in fslabels to create confusing names
+testlabel "llmpir8\xf3\xa0\x81\x94"
+
+# Did scrub choke on anything?
+if [ "$want_scrub" = "yes" ]; then
+	grep -q "^Warning.*gnp.txt.*suspicious text direction" $tmp.scrub || \
+		echo "No complaints about direction overrides?"
+	grep -q "^Warning.*control characters" $tmp.scrub || \
+		echo "No complaints about control characters?"
+fi
+
+# success, all done
+status=0
+exit

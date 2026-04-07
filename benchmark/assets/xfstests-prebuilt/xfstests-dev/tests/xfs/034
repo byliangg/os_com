@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 034
+#
+# pv 801241 - check for reference leaks from the *handle xfsctls
+#
+. ./common/preamble
+_begin_fstest other auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    echo "*** unmount"
+    _scratch_unmount 2>/dev/null
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+
+echo "*** init FS"
+
+_scratch_unmount >/dev/null 2>&1
+echo "*** MKFS ***"                         >>$seqres.full
+echo ""                                     >>$seqres.full
+_scratch_mkfs_xfs                           >>$seqres.full
+_scratch_mount
+
+echo "*** test"
+
+_check_scratch_fs
+
+if ! touch $SCRATCH_MNT/fish
+then
+    echo "!!! failed to touch fish"
+    exit
+fi
+
+if ! $here/src/xfsctl $SCRATCH_MNT $SCRATCH_MNT/fish >>$seqres.full 2>&1
+then
+    echo "!!! failed to run xfsctl test program"
+    exit
+fi
+
+if ! rm $SCRATCH_MNT/fish
+then
+    echo "!!! failed to remove fish"
+    exit
+fi
+
+# pv 801241 causes corruption here (inode left in agi_unlinked list)
+echo "*** done"
+# happy exit
+status=0
+exit 0

@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 FUJITSU LIMITED. All Rights Reserved.
+#
+# FS QA Test No. 236
+#
+# Check ctime updated or not if file linked
+# See also http://marc.info/?l=linux-btrfs&m=127434439020230&w=2
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $TEST_DIR/ouch*
+}
+
+# Import common functions.
+
+_require_hardlinks
+_require_test
+
+rm -f $TEST_DIR/ouch*
+
+# create a file and get its ctime
+touch $TEST_DIR/ouch
+ctime=`stat -c %Z $TEST_DIR/ouch`
+sleep 1
+
+# create a link to a file and get existing file's ctime
+link $TEST_DIR/ouch $TEST_DIR/ouch2
+ctime2=`stat -c %Z $TEST_DIR/ouch`
+
+# check ctime updated
+if [ $ctime2 -le $ctime ]; then
+	echo "ctime: $ctime -> $ctime2 "
+	echo "Fatal error: ctime not updated after link"
+	_cleanup
+	exit 1
+fi
+
+echo "Test over."
+# success, all done
+status=0
+exit

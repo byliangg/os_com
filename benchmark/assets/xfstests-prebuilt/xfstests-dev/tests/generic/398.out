@@ -1,0 +1,41 @@
+QA output created by 398
+
+*** Link encrypted <= encrypted ***
+ln: failed to create hard link 'SCRATCH_MNT/edir2/efile1' => 'SCRATCH_MNT/edir1/efile1': Invalid cross-device link
+
+*** Rename encrypted => encrypted ***
+Invalid cross-device link
+
+
+*** Link unencrypted <= encrypted ***
+ln: failed to create hard link 'SCRATCH_MNT/edir1/ufile' => 'SCRATCH_MNT/udir/ufile': Invalid cross-device link
+
+*** Rename unencrypted => encrypted ***
+Invalid cross-device link
+
+
+*** Link encrypted <= unencrypted ***
+'SCRATCH_MNT/udir/efile1' => 'SCRATCH_MNT/edir1/efile1'
+
+*** Rename encrypted => unencrypted ***
+
+
+*** Exchange encrypted <=> encrypted ***
+Invalid cross-device link
+
+*** Exchange unencrypted <=> encrypted ***
+Invalid cross-device link
+
+*** Exchange encrypted <=> unencrypted ***
+Invalid cross-device link
+
+
+*** Special file tests ***
+'SCRATCH_MNT/edir2/fifo' => 'SCRATCH_MNT/edir1/fifo'
+
+
+*** Exchange encrypted <=> encrypted without key ***
+Required key not available
+
+*** Exchange encrypted <=> unencrypted without key ***
+Required key not available

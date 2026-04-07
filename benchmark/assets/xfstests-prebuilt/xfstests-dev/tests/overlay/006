@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.,  All Rights Reserved.
+#
+# FS QA Test 006
+#
+# Test visible whiteout issue after renaming file from lowerdir to a dir in
+# upperdir.
+#
+# Upstream commit 45d117389696 ("ovl: ignore lower entries when checking purity
+# of non-directory entries") fixed the issue
+#
+. ./common/preamble
+_begin_fstest auto quick copyup whiteout
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+echo "Silence is golden"
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create test file/dir before mount
+mkdir -p $OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+touch $OVL_BASE_SCRATCH_MNT/$OVL_LOWER/lowertestfile
+mkdir $OVL_BASE_SCRATCH_MNT/$OVL_UPPER/uppertestdir
+
+_scratch_mount
+
+# rename lowertestfile to uppertestdir, this triggers copyup and creates
+# whiteout in $OVL_UPPER
+mv $SCRATCH_MNT/lowertestfile $SCRATCH_MNT/uppertestdir
+# the lowertestfile can be removed
+rm $SCRATCH_MNT/uppertestdir/lowertestfile
+# no file no whiteout file in upptestdir
+ls $SCRATCH_MNT/uppertestdir
+
+# success, all done
+status=0
+exit

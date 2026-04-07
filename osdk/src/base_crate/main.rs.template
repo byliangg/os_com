@@ -5,6 +5,18 @@
 
 extern crate #TARGET_NAME#;
 
+// Keep a hard reference to the x86_64 multiboot entry symbol.
+// Newer linker behaviors may otherwise garbage-collect the kernel body,
+// which can produce an invalid tiny output image.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    fn __multiboot_boot();
+}
+
+#[cfg(target_arch = "x86_64")]
+#[used]
+static __FORCE_BOOT_ENTRY_REF: unsafe extern "C" fn() = __multiboot_boot;
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe extern "Rust" {

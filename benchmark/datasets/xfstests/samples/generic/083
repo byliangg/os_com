@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 083
+#
+# Exercise filesystem full behaviour - run numerous fsstress
+# processes in write mode on a small filesystem.  NB: delayed
+# allocate flushing is quite deadlock prone at the filesystem
+# full boundary due to the fact that we will retry allocation
+# several times after flushing, before giving back ENOSPC.
+#
+# Note that this test will intentionally cause console msgs of form:
+#     dksc0d1s4: Process [fsstress] ran out of disk space
+#     dksc0d1s4: Process [fsstress] ran out of disk space
+#     dksc0d1s4: Process [fsstress] ran out of disk space
+#
+. ./common/preamble
+_begin_fstest rw auto enospc stress
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_no_large_scratch_dev
+
+workout()
+{
+	fsz=$1
+	ags=$2
+	procs=$3
+	nops=$4
+
+	_scratch_unmount >/dev/null 2>&1
+	echo "*** mkfs -dsize=$fsz,agcount=$ags"    >>$seqres.full
+	echo ""                                     >>$seqres.full
+	if [ $FSTYP = xfs ]
+	then
+		_scratch_mkfs_xfs -dsize=$fsz,agcount=$ags  >>$seqres.full 2>&1
+	else
+		_scratch_mkfs_sized $fsz >>$seqres.full 2>&1
+	fi
+	_scratch_mount
+
+	# -w ensures that the only ops are ones which cause write I/O
+	FSSTRESS_ARGS=`_scale_fsstress_args -d $SCRATCH_MNT -w -p $procs -n $nops`
+	_run_fsstress $FSSTRESS_ARGS >>$seqres.full
+}
+
+echo "*** test out-of-space handling for random write operations"
+
+filesize=`expr 256 \* 1024 \* 1024`
+agcount=6
+numprocs=15
+numops=1500
+
+workout $filesize $agcount $numprocs $numops
+
+echo "*** done"
+status=0
+exit

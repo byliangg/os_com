@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Jeff Layton <jlayton@redhat.com>
+#
+# FS QA Test No. 441
+#
+# Open a file several times, write to it, fsync on all fds and make sure that
+# they all return 0. Change the device to start throwing errors. Write again
+# on all fds and fsync on all fds. Ensure that we get errors on all of them.
+# Then fsync on all one last time and verify that all return 0.
+#
+. ./common/preamble
+_begin_fstest auto quick eio
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.* $testdir
+	_dmerror_cleanup
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmerror
+
+_require_scratch
+
+# Generally, we want to avoid journal errors on the extended testcase. Only
+# unset the -s flag if we have a logdev
+sflag='-s'
+case $FSTYP in
+	btrfs)
+		_notrun "btrfs has a specialized test for this"
+		;;
+	ext3|ext4|xfs|bcachefs)
+		# Do the more thorough test if we have a logdev
+		_has_logdev && sflag=''
+		;;
+	*)
+		;;
+esac
+
+_require_dm_target error
+_require_test_program fsync-err
+_require_test_program dmerror
+
+# Disable the scratch rt device to avoid test failures relating to the rt
+# bitmap consuming all the free space in our small data device.
+unset SCRATCH_RTDEV
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_dmerror_init no_log
+_dmerror_mount
+
+_require_fs_space $SCRATCH_MNT 65536
+
+testfile=$SCRATCH_MNT/fsync-err-test
+
+echo "$here/src/fsync-err $sflag -d $here/src/dmerror $testfile" >> $seqres.full
+$here/src/fsync-err $sflag -d "$here/src/dmerror $seq" $testfile
+
+# success, all done
+_dmerror_load_working_table
+_dmerror_unmount
+_dmerror_cleanup
+
+# fs may be corrupt after this -- attempt to repair it
+_repair_scratch_fs >> $seqres.full
+
+status=0
+exit

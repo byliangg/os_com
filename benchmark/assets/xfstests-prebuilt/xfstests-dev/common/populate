@@ -1,0 +1,1182 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2015 Oracle.  All Rights Reserved.
+#
+# Routines for populating a scratch fs, and helpers to exercise an FS
+# once it's been fuzzed.
+
+. ./common/quota
+
+_require_populate_commands() {
+	_require_xfs_io_command "fpunch"
+	_require_test_program "punch-alternating"
+	_require_test_program "popdir.pl"
+	if [ -n "${PYTHON3_PROG}" ]; then
+		_require_command $PYTHON3_PROG python3
+		_require_test_program "popattr.py"
+	fi
+	case "${FSTYP}" in
+	"xfs")
+		_require_command "$XFS_DB_PROG" "xfs_db"
+		_require_command "$WIPEFS_PROG" "wipefs"
+		_require_scratch_xfs_mdrestore
+		;;
+	ext*)
+		_require_command "$DUMPE2FS_PROG" "dumpe2fs"
+		_require_command "$E2IMAGE_PROG" "e2image"
+		;;
+	esac
+}
+
+_require_xfs_db_blocktrash_z_command() {
+	test "${FSTYP}" = "xfs" || _notrun "cannot run xfs_db on ${FSTYP}"
+	$XFS_DB_PROG -x -f -c 'blocktrash -z' "${TEST_DEV}" | grep -q 'nothing on stack' || _notrun "blocktrash -z not supported"
+}
+
+# Attempt to make files of "every" format for data, dirs, attrs etc.
+# (with apologies to Eric Sandeen for mutating xfser.sh)
+
+# Create a file of a given size.
+__populate_create_file() {
+	local sz="$1"
+	local fname="$2"
+
+	$XFS_IO_PROG -f -c "pwrite -S 0x62 -W -b 1m 0 $sz" "${fname}"
+}
+
+# Fail the test if we failed to create some kind of filesystem metadata.
+# Create a metadata dump of the failed filesystem so that we can analyze
+# how things went rong.
+__populate_fail() {
+	local flatdev="$(basename "$SCRATCH_DEV")"
+	local metadump="$seqres.$flatdev.populate.md"
+
+	case "$FSTYP" in
+	xfs)
+		_scratch_unmount
+
+		mdargs=('-a' '-o')
+		test "$(_xfs_metadump_max_version)" -gt 1 && \
+			mdargs+=('-v' '2')
+
+		_scratch_xfs_metadump "$metadump" "${mdargs[@]}"
+		;;
+	ext4)
+		_scratch_unmount
+		_ext4_metadump "${SCRATCH_DEV}" "$metadump"
+		;;
+	esac
+
+	_fail "$@"
+}
+
+# Punch out every other hole in this file, if it exists.
+#
+# The goal here is to force the creation of a large number of metadata records
+# by creating a lot of tiny extent mappings in a file.  Callers should ensure
+# that fragmenting the file actually causes record creation.  Call this
+# function /after/ creating all other metadata structures.
+__populate_fragment_file() {
+	local fname="$1"
+
+	test -f "${fname}" && $here/src/punch-alternating "${fname}"
+}
+
+# Create a large directory
+__populate_create_dir() {
+	local name="$1"
+	local nr="$2"
+	local missing="$3"
+	shift; shift; shift
+
+	mkdir -p "${name}"
+	$here/src/popdir.pl --dir "${name}" --end "${nr}" "$@"
+
+	test -z "${missing}" && return
+	$here/src/popdir.pl --dir "${name}" --start 1 --incr 19 --end "${nr}" --remove "$@"
+}
+
+# Create a large directory and ensure that it's a btree format
+__populate_xfs_create_btree_dir() {
+	local name="$1"
+	local isize="$2"
+	local dblksz="$3"
+	local missing="$4"
+	local icore_size="$(_xfs_get_inode_core_bytes $SCRATCH_MNT)"
+	# We need enough extents to guarantee that the data fork is in
+	# btree format.  Cycling the mount to use xfs_db is too slow, so
+	# watch for when the extent count exceeds the space after the
+	# inode core.
+	local max_nextents="$(((isize - icore_size) / 16))"
+	local nr
+	local incr
+
+	# Add about one block's worth of dirents before we check the data fork
+	# format.
+	incr=$(( (dblksz / 8) / 100 * 100 ))
+
+	mkdir -p "${name}"
+	for ((nr = 0; ; nr += incr)); do
+		$here/src/popdir.pl --dir "${name}" --start "${nr}" --end "$((nr + incr - 1))"
+
+		# Extent count checks use data blocks only to avoid the removal
+		# step from removing dabtree index blocks and reducing the
+		# number of extents below the required threshold.
+		local nextents="$(xfs_bmap ${name} | grep -v hole | wc -l)"
+		[ "$((nextents - 1))" -gt $max_nextents ] && break
+	done
+
+	test -z "${missing}" && return
+	$here/src/popdir.pl --dir "${name}" --start 1 --incr 19 --end "${nr}" --remove
+}
+
+# Add a bunch of attrs to a file
+__populate_create_attr() {
+	name="$1"
+	nr="$2"
+	missing="$3"
+
+	touch "${name}"
+
+	if [ -n "${PYTHON3_PROG}" ]; then
+		${PYTHON3_PROG} $here/src/popattr.py --file "${name}" --end "${nr}"
+
+		test -z "${missing}" && return
+		${PYTHON3_PROG} $here/src/popattr.py --file "${name}" --start 1 --incr 19 --end "${nr}" --remove
+		return
+	fi
+
+	# Simulate a getfattr dump file so we can bulk-add attrs.
+	(
+		echo "# file: ${name}";
+		seq --format "user.%08g=\"abcdefgh\"" 0 "${nr}"
+		echo
+	) | setfattr --restore -
+
+	test -z "${missing}" && return
+	seq 1 2 "${nr}" | while read d; do
+		setfattr -x "user.$(printf "%.08d" "$d")" "${name}"
+	done
+}
+
+# Create an extended attr structure and ensure that the fork is btree format
+__populate_xfs_create_btree_attr() {
+	local name="$1"
+	local isize="$2"
+	local dblksz="$3"
+	local icore_size="$(_xfs_get_inode_core_bytes $SCRATCH_MNT)"
+	# We need enough extents to guarantee that the attr fork is in btree
+	# format.  Cycling the mount to use xfs_db is too slow, so watch for
+	# when the number of holes that we can punch in the attr fork by
+	# deleting remote xattrs exceeds the number of extent mappings that can
+	# fit in the inode core.
+	local max_nextents="$(((isize - icore_size) / 16))"
+	local nr
+	local i
+	local incr
+	local bigval
+
+	# Add about one block's worth of attrs in betweeen creating punchable
+	# remote value blocks.
+	incr=$(( (dblksz / 16) / 100 * 100 ))
+	bigval="$(perl -e "print \"@\" x $dblksz;")"
+
+	touch "${name}"
+
+	# We cannot control the mapping behaviors of the attr fork leaf and
+	# dabtree blocks, but we do know that remote values are stored in a
+	# single extent, and that those mappings are removed if the xattr is
+	# deleted.
+	#
+	# The extended attribute structure tends to grow from offset zero
+	# upwards, so we try to set up a sparse attr fork mapping by
+	# iteratively creating at least one leaf block's worth of local attrs,
+	# and then one remote attr, until the number of remote xattrs exceeds
+	# the number of mappings that fit in the inode core...
+	for ((nr = 0; nr < (incr * max_nextents); nr += incr)); do
+		# Simulate a getfattr dump file so we can bulk-add attrs.
+		(
+			echo "# file: ${name}";
+			seq --format "user.%08g=\"abcdefgh\"" "${nr}" "$((nr + incr + 1))"
+			echo "user.v$(printf "%.08d" "$nr")=\"${bigval}\""
+			echo
+		) | setfattr --restore -
+	done
+
+	# ... and in the second loop we delete all the remote attrs to
+	# fragment the attr fork mappings.
+	for ((i = 0; i < nr; i += incr)); do
+		setfattr -x "user.v$(printf "%.08d" "$i")" "${name}"
+	done
+}
+
+# Fill up some percentage of the remaining free space
+__populate_fill_fs() {
+	dir="$1"
+	pct="$2"
+	test -z "${pct}" && pct=60
+
+	mkdir -p "${dir}/test/1"
+	cp -pRdu "${dir}"/S_IFREG* "${dir}/test/1/"
+
+	SRC_SZ="$(du -ks "${dir}/test/1" | cut -f 1)"
+	FS_SZ="$(( $(stat -f "${dir}" -c '%a * %S') / 1024 ))"
+
+	NR="$(( (FS_SZ * ${pct} / 100) / SRC_SZ ))"
+
+	echo "FILL FS"
+	echo "src_sz $SRC_SZ fs_sz $FS_SZ nr $NR"
+	seq 2 "${NR}" | while read nr; do
+		cp -pRdu "${dir}/test/1" "${dir}/test/${nr}"
+	done
+}
+
+# For XFS, force on all the quota options if quota is enabled
+# and the user didn't feed us noquota.
+_populate_xfs_qmount_option()
+{
+	# User explicitly told us not to quota
+	if echo "${MOUNT_OPTIONS}" | grep -q 'noquota'; then
+		return
+	fi
+
+	# Don't bother if we can't turn on quotas
+	if [ ! -f /proc/fs/xfs/xqmstat ]; then
+		# No quota support
+		return
+	elif [ "${USE_EXTERNAL}" = "yes" ] && [ -n "${SCRATCH_RTDEV}" ]; then
+		# We have not mounted the scratch fs, so we can only check
+		# rtquota support from the test fs.  Skip the quota options if
+		# the test fs does not have an rt section.
+		test -n "${TEST_RTDEV}" || return
+		_xfs_kmod_supports_rtquota || return
+		_xfs_test_supports_rtquota || return
+	elif [ -z "${XFS_QUOTA_PROG}" ]; then
+		# xfs quota tools not installed
+		return
+	fi
+
+	# Turn on all the quotas
+	if _xfs_has_feature "$TEST_DIR" crc; then
+		# v5 filesystems can have group & project quotas
+		quota="usrquota,grpquota,prjquota"
+	else
+		# v4 filesystems cannot mix group & project quotas
+		quota="usrquota,grpquota"
+	fi
+
+	# Inject our quota mount options
+	if echo "${MOUNT_OPTIONS}" | grep -q "${quota}"; then
+		return
+	elif echo "${MOUNT_OPTIONS}" | grep -Eq '(quota|noenforce)'; then
+		_qmount_option "${quota}"
+	else
+		export MOUNT_OPTIONS="$MOUNT_OPTIONS -o ${quota}"
+		echo "MOUNT_OPTIONS = $MOUNT_OPTIONS" >>$seqres.full
+	fi
+}
+
+# Populate an XFS on the scratch device with (we hope) all known
+# types of metadata block
+_scratch_xfs_populate() {
+	fill=1
+
+	for arg in $@; do
+		case "${arg}" in
+		"nofill")
+			fill=0;;
+		esac
+	done
+
+	# fill the fs label with obvious emoji because nobody uses them in prod
+	# and blkid throws a fit
+	_scratch_xfs_admin -L 'I❤🐸s'
+
+	_populate_xfs_qmount_option
+	_scratch_mount
+
+	# We cannot directly force the filesystem to create the metadata
+	# structures we want; we can only achieve this indirectly by carefully
+	# crafting files and a directory tree.  Therefore, we must have exact
+	# control over the layout and device selection of all files created.
+	# Clear the rtinherit flag on the root directory so that files are
+	# always created on the data volume regardless of MKFS_OPTIONS.  We can
+	# set the realtime flag when needed.
+	_xfs_force_bdev data $SCRATCH_MNT
+
+	blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+	dblksz="$(_xfs_get_dir_blocksize "$SCRATCH_MNT")"
+	isize="$(_xfs_get_inode_size "$SCRATCH_MNT")"
+	crc="$(_xfs_has_feature "$SCRATCH_MNT" crc -v)"
+	if [ $crc -eq 1 ]; then
+		leaf_hdr_size=64
+	else
+		leaf_hdr_size=16
+	fi
+	leaf_lblk="$((32 * 1073741824 / blksz))"
+	node_lblk="$((64 * 1073741824 / blksz))"
+
+	# Data:
+
+	# Fill up the root inode chunk
+	echo "+ fill root ino chunk"
+	$here/src/popdir.pl --dir "${SCRATCH_MNT}" --start 1 --end 64 --format "dummy%u" --file-pct 100
+
+	# Regular files
+	# - FMT_EXTENTS
+	echo "+ extents file"
+	__populate_create_file $blksz "${SCRATCH_MNT}/S_IFREG.FMT_EXTENTS"
+
+	# - FMT_BTREE
+	echo "+ btree extents file"
+	nr="$((blksz * 2 / 16))"
+	__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/S_IFREG.FMT_BTREE"
+
+	# Directories
+	# - INLINE
+	echo "+ inline dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_INLINE" 1
+
+	# - BLOCK
+	echo "+ block dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_BLOCK" "$((dblksz / 40))"
+
+	# - LEAF
+	echo "+ leaf dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_LEAF" "$((dblksz / 12))"
+
+	# - LEAFN
+	echo "+ leafn dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_LEAFN" "$(( ((dblksz - leaf_hdr_size) / 8) - 3 ))"
+
+	# - NODE
+	echo "+ node dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_NODE" "$((16 * dblksz / 40))" true
+
+	# - BTREE
+	echo "+ btree dir"
+	__populate_xfs_create_btree_dir "${SCRATCH_MNT}/S_IFDIR.FMT_BTREE" "$isize" "$dblksz" true
+
+	# Symlinks
+	# - FMT_LOCAL
+	echo "+ inline symlink"
+	ln -s target "${SCRATCH_MNT}/S_IFLNK.FMT_LOCAL"
+
+	# - FMT_EXTENTS
+	echo "+ extents symlink"
+	ln -s "$(perl -e 'print "x" x 1023;')" "${SCRATCH_MNT}/S_IFLNK.FMT_EXTENTS"
+
+	# Char & block
+	echo "+ special"
+	mknod "${SCRATCH_MNT}/S_IFCHR" c 1 1
+	mknod "${SCRATCH_MNT}/S_IFBLK" b 1 1
+	mknod "${SCRATCH_MNT}/S_IFIFO" p
+
+	# non-root dquot
+	local nonroot_id=4242
+	echo "${nonroot_id}" > "${SCRATCH_MNT}/non_root_dquot"
+	chown "${nonroot_id}:${nonroot_id}" "${SCRATCH_MNT}/non_root_dquot"
+	$XFS_IO_PROG -c "chproj ${nonroot_id}" "${SCRATCH_MNT}/non_root_dquot"
+
+	# empty dquot
+	local empty_id=8484
+	echo "${empty_id}" > "${SCRATCH_MNT}/empty_dquot"
+	chown "${empty_id}:${empty_id}" "${SCRATCH_MNT}/empty_dquot"
+	$XFS_IO_PROG -c "chproj ${empty_id}" "${SCRATCH_MNT}/empty_dquot"
+	chown "0:0" "${SCRATCH_MNT}/empty_dquot"
+	$XFS_IO_PROG -c "chproj 0" "${SCRATCH_MNT}/empty_dquot"
+
+	# special file with an xattr
+	setfacl -P -m u:nobody:r ${SCRATCH_MNT}/S_IFCHR
+
+	# Attribute formats
+	# LOCAL
+	echo "+ local attr"
+	__populate_create_attr "${SCRATCH_MNT}/ATTR.FMT_LOCAL" 1
+
+	# LEAF
+	echo "+ leaf attr"
+	__populate_create_attr "${SCRATCH_MNT}/ATTR.FMT_LEAF" "$((blksz / 40))"
+
+	# NODE
+	echo "+ node attr"
+	__populate_create_attr "${SCRATCH_MNT}/ATTR.FMT_NODE" "$((8 * blksz / 40))"
+
+	# BTREE
+	echo "+ btree attr"
+	__populate_xfs_create_btree_attr "${SCRATCH_MNT}/ATTR.FMT_BTREE" "$isize" "$dblksz"
+
+	# trusted namespace
+	touch ${SCRATCH_MNT}/ATTR.TRUSTED
+	setfattr -n trusted.moo -v urk ${SCRATCH_MNT}/ATTR.TRUSTED
+
+	# security namespace
+	touch ${SCRATCH_MNT}/ATTR.SECURITY
+	setfattr -n security.foo -v bar ${SCRATCH_MNT}/ATTR.SECURITY
+
+	# system namespace
+	touch ${SCRATCH_MNT}/ATTR.SYSTEM
+	setfacl -m u:root:r ${SCRATCH_MNT}/ATTR.SYSTEM
+
+	# FMT_EXTENTS with a remote less-than-a-block value
+	echo "+ attr extents with a remote less-than-a-block value"
+	touch "${SCRATCH_MNT}/ATTR.FMT_EXTENTS_REMOTE3K"
+	$XFS_IO_PROG -f -c "pwrite -S 0x43 0 $((blksz - 300))" "${SCRATCH_MNT}/attrvalfile" > /dev/null
+	attr -q -s user.remotebtreeattrname "${SCRATCH_MNT}/ATTR.FMT_EXTENTS_REMOTE3K" < "${SCRATCH_MNT}/attrvalfile"
+
+	# FMT_EXTENTS with a remote block-size value
+	echo "+ attr extents with a remote one-block value"
+	touch "${SCRATCH_MNT}/ATTR.FMT_EXTENTS_REMOTE4K"
+	$XFS_IO_PROG -f -c "pwrite -S 0x44 0 ${blksz}" "${SCRATCH_MNT}/attrvalfile" > /dev/null
+	attr -q -s user.remotebtreeattrname "${SCRATCH_MNT}/ATTR.FMT_EXTENTS_REMOTE4K" < "${SCRATCH_MNT}/attrvalfile"
+	rm -rf "${SCRATCH_MNT}/attrvalfile"
+
+	# Make an unused inode
+	echo "+ empty file"
+	touch "${SCRATCH_MNT}/unused"
+	$XFS_IO_PROG -f -c 'fsync' "${SCRATCH_MNT}/unused"
+	rm -rf "${SCRATCH_MNT}/unused"
+
+	# Free space btree
+	echo "+ freesp btree"
+	nr="$((blksz * 2 / 8))"
+	__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/BNOBT"
+
+	# Inode btree
+	echo "+ inobt btree"
+	local ino_per_rec=64
+	local rec_per_btblock=16
+	local nr="$(( 2 * (blksz / rec_per_btblock) * ino_per_rec ))"
+	local dir="${SCRATCH_MNT}/INOBT"
+	__populate_create_dir "${dir}" "${nr}" true --file-pct 100
+
+	is_rt="$(_xfs_get_rtextents "$SCRATCH_MNT")"
+	is_rmapbt="$(_xfs_has_feature "$SCRATCH_MNT" rmapbt -v)"
+	is_reflink="$(_xfs_has_feature "$SCRATCH_MNT" reflink -v)"
+
+	# Reverse-mapping btree
+	if [ $is_rmapbt -gt 0 ]; then
+		echo "+ rmapbt btree"
+		nr="$((blksz * 2 / 24))"
+		__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/RMAPBT"
+	fi
+
+	# Realtime Reference-count btree comes before the rtrmapbt so that
+	# the refcount entries are created in rtgroup 0.
+	if [ $is_reflink -gt 0 ] && [ $is_rt -gt 0 ]; then
+		echo "+ rtreflink btree"
+		rt_blksz=$(_xfs_get_rtextsize "$SCRATCH_MNT")
+		nr="$((rt_blksz * 2 / 12))"
+		$XFS_IO_PROG -R -f -c 'truncate 0' "${SCRATCH_MNT}/RTREFCOUNTBT"
+		__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/RTREFCOUNTBT"
+		$XFS_IO_PROG -R -f -c 'truncate 0' "${SCRATCH_MNT}/RTREFCOUNTBT2"
+		cp --reflink=always "${SCRATCH_MNT}/RTREFCOUNTBT" "${SCRATCH_MNT}/RTREFCOUNTBT2"
+	fi
+
+	# Realtime Reverse-mapping btree
+	if [ $is_rmapbt -gt 0 ] && [ $is_rt -gt 0 ]; then
+		echo "+ rtrmapbt btree"
+		nr="$((blksz * 2 / 24))"
+		$XFS_IO_PROG -R -f -c 'truncate 0' "${SCRATCH_MNT}/RTRMAPBT"
+		__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/RTRMAPBT"
+	fi
+
+	# Reference-count btree
+	if [ $is_reflink -gt 0 ]; then
+		echo "+ reflink btree"
+		nr="$((blksz * 2 / 12))"
+		__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/REFCOUNTBT"
+		cp --reflink=always "${SCRATCH_MNT}/REFCOUNTBT" "${SCRATCH_MNT}/REFCOUNTBT2"
+	fi
+
+	# Parent pointers
+	is_pptr="$(_xfs_has_feature "$SCRATCH_MNT" parent -v)"
+	if [ $is_pptr -gt 0 ]; then
+		echo "+ parent pointers"
+
+		# Create a couple of parent pointers
+		__populate_create_dir "${SCRATCH_MNT}/PPTRS" 1 '' \
+			--hardlink --format "two_%d"
+
+		# Create one xattr leaf block of parent pointers.  The name is
+		# 8 bytes and, the handle is 12 bytes, which rounds up to 24
+		# bytes per record, plus xattr structure overhead.
+		nr="$((blksz / 24))"
+		__populate_create_dir "${SCRATCH_MNT}/PPTRS" ${nr} '' \
+			--hardlink --format "many%04d"
+
+		# Create multiple xattr leaf blocks of large parent pointers.
+		# The name is 256 bytes and the handle is 12 bytes, which
+		# rounds up to 272 bytes per record, plus xattr structure
+		# overhead.
+		nr="$((blksz * 2 / 272))"
+		__populate_create_dir "${SCRATCH_MNT}/PPTRS" ${nr} '' \
+			--hardlink --format "y%0254d"
+
+		# Create multiple paths to a file
+		local moof="${SCRATCH_MNT}/PPTRS/moofile"
+		touch "${moof}"
+		for ((i = 0; i < 4; i++)); do
+			mkdir -p "${SCRATCH_MNT}/PPTRS/SUB${i}"
+			ln "${moof}" "${SCRATCH_MNT}/PPTRS/SUB${i}/moofile"
+		done
+
+		# Create parent pointers of various lengths
+		touch "${SCRATCH_MNT}/PPTRS/vlength"
+		local len_len
+		local tst
+		local fname
+		ln "${SCRATCH_MNT}/PPTRS/vlength" "${SCRATCH_MNT}/PPTRS/b"
+		for len in 32 64 96 128 160 192 224 250 255; do
+			len_len="${#len}"
+			tst="$(perl -e "print \"b\" x (${len} - (${len_len} + 1))")"
+			fname="v${tst}${len}"
+			ln "${SCRATCH_MNT}/PPTRS/vlength" \
+				"${SCRATCH_MNT}/PPTRS/${fname}"
+		done
+	fi
+
+	# Copy some real files (xfs tests, I guess...)
+	echo "+ real files"
+	test $fill -ne 0 && __populate_fill_fs "${SCRATCH_MNT}" 5
+
+	# Make sure we get all the fragmentation we asked for
+	__populate_fragment_file "${SCRATCH_MNT}/S_IFREG.FMT_BTREE"
+	__populate_fragment_file "${SCRATCH_MNT}/BNOBT"
+	__populate_fragment_file "${SCRATCH_MNT}/RMAPBT"
+	__populate_fragment_file "${SCRATCH_MNT}/RTRMAPBT"
+	__populate_fragment_file "${SCRATCH_MNT}/REFCOUNTBT"
+	__populate_fragment_file "${SCRATCH_MNT}/RTREFCOUNTBT"
+
+	_scratch_unmount
+}
+
+# Populate an ext4 on the scratch device with (we hope) all known
+# types of metadata block
+_scratch_ext4_populate() {
+	fill=1
+
+	for arg in $@; do
+		case "${arg}" in
+		"nofill")
+			fill=0;;
+		esac
+	done
+
+	# fill the fs label with obvious emoji because nobody uses them in prod
+	# and blkid throws a fit
+	$TUNE2FS_PROG -L 'I❤🐸s' $SCRATCH_DEV
+
+	_scratch_mount
+	blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+	dblksz="${blksz}"
+	leaf_lblk="$((32 * 1073741824 / blksz))"
+	node_lblk="$((64 * 1073741824 / blksz))"
+
+	# Data:
+
+	# Regular files
+	# - FMT_INLINE
+	echo "+ inline file"
+	__populate_create_file 1 "${SCRATCH_MNT}/S_IFREG.FMT_INLINE"
+
+	# - FMT_EXTENTS
+	echo "+ extents file"
+	__populate_create_file $blksz "${SCRATCH_MNT}/S_IFREG.FMT_EXTENTS"
+
+	# - FMT_ETREE
+	echo "+ extent tree file"
+	nr="$((blksz * 2 / 12))"
+	__populate_create_file $((blksz * nr)) "${SCRATCH_MNT}/S_IFREG.FMT_ETREE"
+
+	# Directories
+	# - INLINE
+	echo "+ inline dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_INLINE" 1
+
+	# - BLOCK
+	echo "+ block dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_BLOCK" "$((dblksz / 32))"
+
+	# - HTREE
+	echo "+ htree dir"
+	__populate_create_dir "${SCRATCH_MNT}/S_IFDIR.FMT_HTREE" "$((4 * dblksz / 24))"
+
+	# Symlinks
+	# - FMT_LOCAL
+	echo "+ inline symlink"
+	ln -s target "${SCRATCH_MNT}/S_IFLNK.FMT_LOCAL"
+
+	# - FMT_EXTENTS
+	echo "+ extents symlink"
+	ln -s "$(perl -e 'print "x" x 1023;')" "${SCRATCH_MNT}/S_IFLNK.FMT_EXTENTS"
+
+	# Char & block
+	echo "+ special"
+	mknod "${SCRATCH_MNT}/S_IFCHR" c 1 1
+	mknod "${SCRATCH_MNT}/S_IFBLK" b 1 1
+	mknod "${SCRATCH_MNT}/S_IFIFO" p
+
+	# special file with an xattr
+	setfacl -P -m u:nobody:r ${SCRATCH_MNT}/S_IFCHR
+
+	# Attribute formats
+	# LOCAL
+	echo "+ local attr"
+	__populate_create_attr "${SCRATCH_MNT}/ATTR.FMT_LOCAL" 0
+
+	# BLOCK
+	echo "+ block attr"
+	__populate_create_attr "${SCRATCH_MNT}/ATTR.FMT_BLOCK" "$((blksz / 40))"
+
+	# trusted namespace
+	touch ${SCRATCH_MNT}/ATTR.TRUSTED
+	setfattr -n trusted.moo -v urk ${SCRATCH_MNT}/ATTR.TRUSTED
+
+	# security namespace
+	touch ${SCRATCH_MNT}/ATTR.SECURITY
+	setfattr -n security.foo -v bar ${SCRATCH_MNT}/ATTR.SECURITY
+
+	# system namespace
+	touch ${SCRATCH_MNT}/ATTR.SYSTEM
+	setfacl -m u:root:r ${SCRATCH_MNT}/ATTR.SYSTEM
+
+	# Make an unused inode
+	echo "+ empty file"
+	touch "${SCRATCH_MNT}/unused"
+	$XFS_IO_PROG -f -c 'fsync' "${SCRATCH_MNT}/unused"
+	rm -rf "${SCRATCH_MNT}/unused"
+
+	# Copy some real files (xfs tests, I guess...)
+	echo "+ real files"
+	test $fill -ne 0 && __populate_fill_fs "${SCRATCH_MNT}" 5
+
+	# Make sure we get all the fragmentation we asked for
+	__populate_fragment_file "${SCRATCH_MNT}/S_IFREG.FMT_ETREE"
+
+	_scratch_unmount
+}
+
+# Find the inode number of a file
+__populate_find_inode() {
+	name="$1"
+	inode="$(stat -c '%i' "${name}")"
+	echo "${inode}"
+}
+
+# Check data fork format of XFS file
+__populate_check_xfs_dformat() {
+	inode="$1"
+	format="$2"
+
+	fmt="$(_scratch_xfs_db -c "inode ${inode}" -c 'p core.format' | sed -e 's/^.*(\([a-z]*\)).*$/\1/g')"
+	test "${format}" = "${fmt}" || __populate_fail "failed to create ino ${inode} dformat expected ${format} saw ${fmt}"
+}
+
+# Check attr fork format of XFS file
+__populate_check_xfs_aformat() {
+	inode="$1"
+	format="$2"
+
+	fmt="$(_scratch_xfs_db -c "inode ${inode}" -c 'p core.aformat' | sed -e 's/^.*(\([a-z]*\)).*$/\1/g')"
+	test "${format}" = "${fmt}" || __populate_fail "failed to create ino ${inode} aformat expected ${format} saw ${fmt}"
+}
+
+# Check structure of XFS directory
+__populate_check_xfs_dir() {
+	inode="$1"
+	dtype="$2"
+
+	(test -n "${leaf_lblk}" && test -n "${node_lblk}") || _fail "must define leaf_lblk and node_lblk before calling __populate_check_xfs_dir"
+	datab=0
+	leafb=0
+	freeb=0
+	#echo "== check dir ${inode} type ${dtype}" ; _scratch_xfs_db -x -c "inode ${inode}" -c "bmap"
+	_scratch_xfs_db -x -c "inode ${inode}" -c "dblock 0" -c "stack" | grep -q 'file data block is unmapped' || datab=1
+	_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${leaf_lblk}" -c "stack" | grep -q 'file data block is unmapped' || leafb=1
+	_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${node_lblk}" -c "stack" | grep -q 'file data block is unmapped' || freeb=1
+
+	case "${dtype}" in
+	"shortform"|"inline"|"local")
+		(test "${datab}" -eq 0 && test "${leafb}" -eq 0 && test "${freeb}" -eq 0) || __populate_fail "failed to create ${dtype} dir ino ${inode} datab ${datab} leafb ${leafb} freeb ${freeb}"
+		;;
+	"block")
+		(test "${datab}" -eq 1 && test "${leafb}" -eq 0 && test "${freeb}" -eq 0) || __populate_fail "failed to create ${dtype} dir ino ${inode} datab ${datab} leafb ${leafb} freeb ${freeb}"
+		;;
+	"leaf")
+		(test "${datab}" -eq 1 && test "${leafb}" -eq 1 && test "${freeb}" -eq 0) || __populate_fail "failed to create ${dtype} dir ino ${inode} datab ${datab} leafb ${leafb} freeb ${freeb}"
+		;;
+	"leafn")
+		_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${leaf_lblk}" -c "p lhdr.info.hdr.magic" | grep -q '0x3dff' && return
+		_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${leaf_lblk}" -c "p lhdr.info.magic" | grep -q '0xd2ff' && return
+		__populate_fail "failed to create ${dtype} dir ino ${inode} datab ${datab} leafb ${leafb} freeb ${freeb}"
+		;;
+	"node"|"btree")
+		(test "${datab}" -eq 1 && test "${leafb}" -eq 1 && test "${freeb}" -eq 1) || __populate_fail "failed to create ${dtype} dir ino ${inode} datab ${datab} leafb ${leafb} freeb ${freeb}"
+		;;
+	*)
+		_fail "Unknown directory type ${dtype}"
+	esac
+}
+
+# Check structure of XFS attr
+__populate_check_xfs_attr() {
+	inode="$1"
+	atype="$2"
+
+	datab=0
+	leafb=0
+	#echo "== check attr ${inode} type ${dtype}" ; _scratch_xfs_db -x -c "inode ${inode}" -c "bmap -a"
+	_scratch_xfs_db -x -c "inode ${inode}" -c "ablock 0" -c "stack" | grep -q 'file attr block is unmapped' || datab=1
+	_scratch_xfs_db -x -c "inode ${inode}" -c "ablock 1" -c "stack" | grep -q 'file attr block is unmapped' || leafb=1
+
+	case "${atype}" in
+	"shortform"|"inline"|"local")
+		(test "${datab}" -eq 0 && test "${leafb}" -eq 0) || __populate_fail "failed to create ${atype} attr ino ${inode} datab ${datab} leafb ${leafb}"
+		;;
+	"leaf")
+		(test "${datab}" -eq 1 && test "${leafb}" -eq 0) || __populate_fail "failed to create ${atype} attr ino ${inode} datab ${datab} leafb ${leafb}"
+		;;
+	"node"|"btree")
+		(test "${datab}" -eq 1 && test "${leafb}" -eq 1) || __populate_fail "failed to create ${atype} attr ino ${inode} datab ${datab} leafb ${leafb}"
+		;;
+	*)
+		_fail "Unknown attribute type ${atype}"
+	esac
+}
+
+# Check that there's at least one per-AG btree with multiple levels
+__populate_check_xfs_agbtree_height() {
+	local bt_type="$1"
+	local agcount=$(_scratch_xfs_db -c 'sb 0' -c 'p agcount' | awk '{print $3}')
+
+	case "${bt_type}" in
+	"bno"|"cnt"|"rmap"|"refcnt")
+		hdr="agf"
+		bt_prefix="${bt_type}"
+		;;
+	"ino")
+		hdr="agi"
+		bt_prefix=""
+		;;
+	"fino")
+		hdr="agi"
+		bt_prefix="free_"
+		;;
+	*)
+		_fail "Don't know about AG btree ${bt_type}"
+		;;
+	esac
+
+	for ((agno = 0; agno < agcount; agno++)); do
+		bt_level=$(_scratch_xfs_db -c "${hdr} ${agno}" -c "p ${bt_prefix}level" | awk '{print $3}')
+		# "level" is really the btree height
+		if [ "${bt_level}" -gt 1 ]; then
+			return 0
+		fi
+	done
+	__populate_fail "Failed to create ${bt_type} of sufficient height!"
+	return 1
+}
+
+# Check that there's at least one rt btree with multiple levels
+__populate_check_xfs_rgbtree_height() {
+	local bt_type="$1"
+	local rgcount=$(_scratch_xfs_db -c 'sb 0' -c 'p rgcount' | awk '{print $3}')
+	local path
+	local path_format
+	local bt_prefix
+
+	case "${bt_type}" in
+	"rmap")
+		path_format="/rtgroups/%u.rmap"
+		bt_prefix="u3.rtrmapbt"
+		;;
+	"refcnt")
+		path_format="/rtgroups/%u.refcount"
+		bt_prefix="u3.rtrefcbt"
+		;;
+	*)
+		_fail "Don't know about rt btree ${bt_type}"
+		;;
+	esac
+
+	for ((rgno = 0; rgno < rgcount; rgno++)); do
+		path="$(printf "${path_format}" "${rgno}")"
+		bt_level=$(_scratch_xfs_db -c "path -m ${path}" -c "p ${bt_prefix}.level" | awk '{print $3}')
+		# "level" is the actual level within the btree
+		if [ "${bt_level}" -gt 0 ]; then
+			return 0
+		fi
+	done
+
+	__populate_fail "Failed to create rt ${bt_type} of sufficient height!"
+	return 1
+}
+
+# Check that populate created all the types of files we wanted
+_scratch_xfs_populate_check() {
+	_scratch_mount
+	extents_file="$(__populate_find_inode "${SCRATCH_MNT}/S_IFREG.FMT_EXTENTS")"
+	btree_file="$(__populate_find_inode "${SCRATCH_MNT}/S_IFREG.FMT_BTREE")"
+	inline_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_INLINE")"
+	block_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_BLOCK")"
+	leaf_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_LEAF")"
+	leafn_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_LEAFN")"
+	node_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_NODE")"
+	btree_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_BTREE")"
+	local_slink="$(__populate_find_inode "${SCRATCH_MNT}/S_IFLNK.FMT_LOCAL")"
+	extents_slink="$(__populate_find_inode "${SCRATCH_MNT}/S_IFLNK.FMT_EXTENTS")"
+	bdev="$(__populate_find_inode "${SCRATCH_MNT}/S_IFBLK")"
+	cdev="$(__populate_find_inode "${SCRATCH_MNT}/S_IFCHR")"
+	fifo="$(__populate_find_inode "${SCRATCH_MNT}/S_IFIFO")"
+	local_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_LOCAL")"
+	leaf_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_LEAF")"
+	node_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_NODE")"
+	btree_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_BTREE")"
+	is_finobt=$(_xfs_has_feature "$SCRATCH_MNT" finobt -v)
+	is_rmapbt=$(_xfs_has_feature "$SCRATCH_MNT" rmapbt -v)
+	is_reflink=$(_xfs_has_feature "$SCRATCH_MNT" reflink -v)
+	is_rt="$(_xfs_get_rtextents "$SCRATCH_MNT")"
+
+	blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+	dblksz="$(_xfs_get_dir_blocksize "$SCRATCH_MNT")"
+	leaf_lblk="$((32 * 1073741824 / blksz))"
+	node_lblk="$((64 * 1073741824 / blksz))"
+	_scratch_unmount
+
+	__populate_check_xfs_dformat "${extents_file}" "extents"
+	__populate_check_xfs_dformat "${btree_file}" "btree"
+	__populate_check_xfs_dir "${inline_dir}" "inline"
+	__populate_check_xfs_dir "${block_dir}" "block"
+	__populate_check_xfs_dir "${leaf_dir}" "leaf"
+	__populate_check_xfs_dir "${leafn_dir}" "leafn"
+	__populate_check_xfs_dir "${node_dir}" "node"
+	__populate_check_xfs_dir "${btree_dir}" "btree"
+	__populate_check_xfs_dformat "${btree_dir}" "btree"
+	__populate_check_xfs_dformat "${bdev}" "dev"
+	__populate_check_xfs_dformat "${cdev}" "dev"
+	__populate_check_xfs_dformat "${fifo}" "dev"
+	__populate_check_xfs_attr "${local_attr}" "local"
+	__populate_check_xfs_attr "${leaf_attr}" "leaf"
+	__populate_check_xfs_attr "${node_attr}" "node"
+	__populate_check_xfs_attr "${btree_attr}" "btree"
+	__populate_check_xfs_aformat "${btree_attr}" "btree"
+	__populate_check_xfs_agbtree_height "bno"
+	__populate_check_xfs_agbtree_height "cnt"
+	__populate_check_xfs_agbtree_height "ino"
+	test $is_finobt -ne 0 && __populate_check_xfs_agbtree_height "fino"
+	test $is_rmapbt -ne 0 && __populate_check_xfs_agbtree_height "rmap"
+	test $is_reflink -ne 0 && __populate_check_xfs_agbtree_height "refcnt"
+	test $is_rmapbt -ne 0 && test $is_rt -gt 0 && \
+		__populate_check_xfs_rgbtree_height "rmap"
+	test $is_reflink -ne 0 && test $is_rt -gt 0 && \
+		__populate_check_xfs_rgbtree_height "refcnt"
+}
+
+# Check data fork format of ext4 file
+__populate_check_ext4_dformat() {
+	dev="${SCRATCH_DEV}"
+	inode="$1"
+	format="$2"
+
+	extents=0
+	etree=0
+	debugfs -R "stat <${inode}>" "${dev}" 2> /dev/null | grep 'ETB[0-9]' -q && etree=1
+	iflags="$(_ext4_get_inum_iflags "${dev}" "${inode}")"
+	test "$(echo "${iflags}" | awk '{print and(strtonum($1), 0x80000);}')" -gt 0 && extents=1
+
+	case "${format}" in
+	"blockmap")
+		test "${extents}" -eq 0 || __populate_fail "failed to create ino ${inode} with blockmap"
+		;;
+	"extent"|"extents")
+		test "${extents}" -eq 1 || __populate_fail "failed to create ino ${inode} with extents"
+		;;
+	"etree")
+		(test "${extents}" -eq 1 && test "${etree}" -eq 1) || __populate_fail "failed to create ino ${inode} with extent tree"
+		;;
+	*)
+		_fail "Unknown dformat ${format}"
+	esac
+}
+
+# Check attr fork format of ext4 file
+__populate_check_ext4_aformat() {
+	dev="${SCRATCH_DEV}"
+	inode="$1"
+	format="$2"
+
+	ablock=1
+	debugfs -R "stat <${inode}>" "${dev}" 2> /dev/null | grep 'File ACL: 0' -q && ablock=0
+
+	case "${format}" in
+	"local"|"inline")
+		test "${ablock}" -eq 0 || __populate_fail "failed to create inode ${inode} with ${format} xattr"
+		;;
+	"block")
+		test "${extents}" -eq 1 || __populate_fail "failed to create inode ${inode} with ${format} xattr"
+		;;
+	*)
+		_fail "Unknown aformat ${format}"
+	esac
+}
+
+# Check structure of ext4 dir
+__populate_check_ext4_dir() {
+	dev="${SCRATCH_DEV}"
+	inode="$1"
+	dtype="$2"
+
+	htree=0
+	inline=0
+	iflags="$(_ext4_get_inum_iflags "${dev}" "${inode}")"
+	test "$(echo "${iflags}" | awk '{print and(strtonum($1), 0x1000);}')" -gt 0 && htree=1
+	test "$(echo "${iflags}" | awk '{print and(strtonum($1), 0x10000000);}')" -gt 0 && inline=1
+
+	case "${dtype}" in
+	"inline")
+		(test "${inline}" -eq 1 && test "${htree}" -eq 0) || __populate_fail "failed to create ${dtype} dir ino ${inode} htree ${htree} inline ${inline}"
+		;;
+	"block")
+		(test "${inline}" -eq 0 && test "${htree}" -eq 0) || __populate_fail "failed to create ${dtype} dir ino ${inode} htree ${htree} inline ${inline}"
+		;;
+	"htree")
+		(test "${inline}" -eq 0 && test "${htree}" -eq 1) || __populate_fail "failed to create ${dtype} dir ino ${inode} htree ${htree} inline ${inline}"
+		;;
+	*)
+		_fail "Unknown directory type ${dtype}"
+		;;
+	esac
+}
+
+# Check that populate created all the types of files we wanted
+_scratch_ext4_populate_check() {
+	_scratch_mount
+	extents_file="$(__populate_find_inode "${SCRATCH_MNT}/S_IFREG.FMT_EXTENTS")"
+	etree_file="$(__populate_find_inode "${SCRATCH_MNT}/S_IFREG.FMT_ETREE")"
+	block_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_BLOCK")"
+	htree_dir="$(__populate_find_inode "${SCRATCH_MNT}/S_IFDIR.FMT_HTREE")"
+	extents_slink="$(__populate_find_inode "${SCRATCH_MNT}/S_IFLNK.FMT_EXTENTS")"
+	local_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_LOCAL")"
+	block_attr="$(__populate_find_inode "${SCRATCH_MNT}/ATTR.FMT_BLOCK")"
+	_scratch_unmount
+
+	__populate_check_ext4_dformat "${extents_file}" "extents"
+	__populate_check_ext4_dformat "${etree_file}" "etree"
+	__populate_check_ext4_dir "${block_dir}" "block"
+	__populate_check_ext4_dir "${htree_dir}" "htree"
+	__populate_check_ext4_dformat "${extents_slink}" "extents"
+	__populate_check_ext4_aformat "${local_attr}" "local"
+	__populate_check_ext4_aformat "${block_attr}" "block"
+}
+
+# Populate a scratch FS and check the contents to make sure we got that
+_scratch_populate() {
+	case "${FSTYP}" in
+	"xfs")
+		_scratch_xfs_populate
+		_scratch_xfs_populate_check
+		;;
+	"ext2"|"ext3"|"ext4")
+		_scratch_ext4_populate
+		_scratch_ext4_populate_check
+		;;
+	*)
+		_fail "Don't know how to populate a ${FSTYP} filesystem."
+		;;
+	esac
+}
+
+# Fill a file system by repeatedly creating files in the given folder
+# starting with the given file size.  Files are reduced in size when
+# they can no longer fit until no more files can be created.
+_fill_fs()
+{
+	local file_size=$1
+	local dir=$2
+	local block_size=$3
+	local switch_user=$4
+	local file_count=1
+	local bytes_written=0
+	local use_falloc=1;
+
+	if [ $# -ne 4 ]; then
+		echo "Usage: _fill_fs filesize dir blocksize switch_user"
+		_exit 1
+	fi
+
+	if [ $switch_user -eq 0 ]; then
+		mkdir -p $dir
+	else
+		_user_do "mkdir -p $dir"
+	fi
+	if [ ! -d $dir ]; then
+		return 0;
+	fi
+
+	testio=`$XFS_IO_PROG -F -fc "falloc 0 $block_size" $dir/$$.xfs_io 2>&1`
+	echo $testio | grep -q "not found" && use_falloc=0
+	echo $testio | grep -q "Operation not supported" && use_falloc=0
+
+	if [ $file_size -lt $block_size ]; then
+		file_size=$block_size
+	fi
+
+	while [ $file_size -ge $block_size ]; do
+		bytes_written=0
+		if [ $switch_user -eq 0 ]; then
+			if [ $use_falloc -eq 0 ]; then
+				$XFS_IO_PROG -fc "pwrite -b 8388608 0 $file_size" \
+					$dir/$file_count
+			else
+				$XFS_IO_PROG -fc "falloc 0 $file_size" \
+					$dir/$file_count
+			fi
+		else
+			if [ $use_falloc -eq 0 ]; then
+				_user_do "$XFS_IO_PROG -f -c \"pwrite -b 8388608 0 \
+					$file_size\" $dir/$file_count"
+			else
+				_user_do "$XFS_IO_PROG -f -c \"falloc 0 \
+					$file_size\" $dir/$file_count"
+			fi
+		fi
+
+		if [ -f $dir/$file_count ]; then
+			bytes_written=$(_get_filesize $dir/$file_count)
+		fi
+
+		# If there was no room to make the file, then divide it in
+		# half, and keep going
+		if [ $bytes_written -lt $file_size ]; then
+			file_size=$((file_size / 2))
+		fi
+		file_count=$((file_count + 1))
+	done
+}
+
+# Compute the fs geometry description of a populated filesystem
+_scratch_populate_cache_tag() {
+	local extra_descr=""
+	local size="$(blockdev --getsz "${SCRATCH_DEV}")"
+	local logdev_sz="none"
+	local rtdev_sz="none"
+
+	if [ "${USE_EXTERNAL}" = "yes" ] && [ -n "${SCRATCH_LOGDEV}" ]; then
+		logdev_sz="$(blockdev --getsz "${SCRATCH_LOGDEV}")"
+	fi
+
+	if [ "${USE_EXTERNAL}" = "yes" ] && [ -n "${SCRATCH_RTDEV}" ]; then
+		rtdev_sz="$(blockdev --getsz "${SCRATCH_RTDEV}")"
+	fi
+
+	case "${FSTYP}" in
+	"ext4")
+		extra_descr="LOGDEV_SIZE ${logdev_sz}"
+		;;
+	"xfs")
+		extra_descr="LOGDEV_SIZE ${logdev_sz} RTDEV_SIZE ${rtdev_sz}"
+		_populate_xfs_qmount_option
+		if echo "${MOUNT_OPTIONS}" | grep -q 'usrquota'; then
+			extra_descr="${extra_descr} QUOTAS"
+		fi
+		;;
+	esac
+	echo "FSTYP ${FSTYP} MKFS_OPTIONS ${MKFS_OPTIONS} SIZE ${size} ${extra_descr} ARGS $@"
+}
+
+# Restore a cached populated fs from a metadata dump
+_scratch_populate_restore_cached() {
+	local metadump="$1"
+
+	case "${FSTYP}" in
+	"xfs")
+		_scratch_xfs_mdrestore "${metadump}"
+		return $?
+		;;
+	"ext2"|"ext3"|"ext4")
+		local logdev=none
+		[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+			logdev=$SCRATCH_LOGDEV
+
+		_ext4_mdrestore "${metadump}" "${SCRATCH_DEV}" "${logdev}"
+		return $?
+		;;
+	esac
+	return 1
+}
+
+# Take a metadump of the scratch filesystem and cache it for later.
+_scratch_populate_save_metadump()
+{
+	local metadump_file="$1"
+
+	case "${FSTYP}" in
+	"xfs")
+		local logdev=none
+		[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+			logdev=$SCRATCH_LOGDEV
+
+		local rtdev=none
+		[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+			rtdev=$SCRATCH_RTDEV
+
+		mdargs=('-a' '-o')
+		test "$(_xfs_metadump_max_version)" -gt 1 && \
+			mdargs+=('-v' '2')
+
+		_xfs_metadump "$metadump_file" "$SCRATCH_DEV" "$logdev" \
+				"$rtdev" compress "${mdargs[@]}"
+		res=$?
+		;;
+	"ext2"|"ext3"|"ext4")
+		_ext4_metadump "${SCRATCH_DEV}" "${metadump_file}" compress
+		res=$?
+		;;
+	*)
+		_fail "Don't know how to save a ${FSTYP} filesystem."
+	esac
+	return $res
+}
+
+# Populate a scratch FS from scratch or from a cached image.
+_scratch_populate_cached() {
+	local meta_descr="$(_scratch_populate_cache_tag "$@")"
+	local meta_tag="$(echo "${meta_descr}" | md5sum - | cut -d ' ' -f 1)"
+	local metadump_stem="${TEST_DIR}/__populate.${FSTYP}.${meta_tag}"
+
+	# This variable is shared outside this function
+	POPULATE_METADUMP="${metadump_stem}.metadump"
+	local populate_metadump_descr="${metadump_stem}.txt"
+
+	# Don't keep metadata images cached for more 48 hours...
+	rm -rf "$(find "${POPULATE_METADUMP}" -mtime +2 2>/dev/null)"
+
+	# Throw away cached image if it doesn't match our spec.
+	cmp -s "${populate_metadump_descr}" <(echo "${meta_descr}") || \
+		rm -rf "${POPULATE_METADUMP}"
+
+	# Try to restore from the metadump
+	_scratch_populate_restore_cached "${POPULATE_METADUMP}" && \
+		return
+
+	# Oh well, just create one from scratch
+	_scratch_mkfs
+	case "${FSTYP}" in
+	"xfs")
+		_scratch_xfs_populate $@
+		_scratch_xfs_populate_check
+		;;
+	"ext2"|"ext3"|"ext4")
+		_scratch_ext4_populate $@
+		_scratch_ext4_populate_check
+		;;
+	*)
+		_fail "Don't know how to populate a ${FSTYP} filesystem."
+		;;
+	esac
+
+	_scratch_populate_save_metadump "${POPULATE_METADUMP}" && \
+			echo "${meta_descr}" > "${populate_metadump_descr}"
+}

@@ -1,0 +1,117 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/030
+#
+# Test mapped writes against remap+truncate down/up to ensure we get the data
+# correctly written. This can expose data corruption bugs on filesystems where
+# the block size is smaller than the page size.
+#
+. ./common/preamble
+_begin_fstest auto quick rw mmap
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_xfs_io_command "mremap"
+
+testfile=$SCRATCH_MNT/testfile
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+# first case is just truncate down/truncate up to check that the mapped
+# write after the truncate up is correctly handled.
+$XFS_IO_PROG -t -f \
+-c "truncate 5017k"             `# truncate     |       |` \
+-c "pwrite -S 0x58 0 5017k"     `# write        |X...XXX|` \
+-c "mmap -rw 0 5017k"           `# mmap         |       |` \
+-c "truncate 5020k"             `# truncate up  |                        |` \
+-c "mremap -m 5020k"            `# mremap up    |                        |` \
+-c "mwrite -S 0x57 5017k 3k"    `# mwrite       |        WWWWWWWWWWWWWWWW|` \
+-c "mremap 5017k "              `# mremap dn    |       |` \
+-c "truncate 5017k"             `# mremap dn    |       |` \
+-c "truncate 5020k"             `# truncate up  |                        |` \
+-c "mremap -m 5020k"            `# mremap up    |                        |` \
+-c "mwrite -S 0x59 5017k 3k"    `# mwrite       |        YYYYYYYYYYYYYYYY|` \
+-c "close"      \
+$testfile | _filter_xfs_io
+
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+rm -f $testfile
+_scratch_sync
+
+# second case is to do a mwrite between the truncate to a block on the
+# same page we are truncating within the EOF. This checks that a mapped
+# write between truncate down and truncate up a further mapped
+# write to the same page into the new space doesn't result in data being lost.
+$XFS_IO_PROG -t -f \
+-c "truncate 5017k"             `# truncate     |       |` \
+-c "pwrite -S 0x58 0 5017k"     `# write        |X...XXX|` \
+-c "mmap -rw 0 5017k"           `# mmap         |       |` \
+-c "truncate 5020k"             `# truncate up  |                        |` \
+-c "mremap -m 5020k"            `# mremap up    |                        |` \
+-c "mwrite -S 0x57 5017k 3k"    `# mwrite       |        WWWWWWWWWWWWWWWW|` \
+-c "mremap 5017k "              `# mremap dn    |       |` \
+-c "truncate 5017k"             `# mremap dn    |       |` \
+-c "mwrite -S 0x5a 5016k 1k"    `# mwrite       |    ZZZ                 |` \
+-c "truncate 5020k"             `# truncate up  |                        |` \
+-c "mremap -m 5020k"            `# mremap up    |                        |` \
+-c "mwrite -S 0x59 5017k 3k"    `# mwrite       |        YYYYYYYYYYYYYYYY|` \
+-c "close"      \
+$testfile | _filter_xfs_io
+
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+# third case is the same as the first, but this time on unaligned byte
+# boundaries rather than block boundaries. This mimics the exact mmap write
+# patterns of the application that exposed the bug in the first place, and
+# so is somewhat more complex and has repeated operations in it. 
+$XFS_IO_PROG -t -f \
+-c "truncate 5136912" \
+-c "pwrite -S 0x58 0 5136912" \
+-c "mmap -rw 0 5136912" \
+-c "mremap 5136912" \
+-c "truncate 5136912" \
+-c "truncate 5139720" \
+-c "mremap -m 5139720" \
+-c "mwrite -S 0 5136912 2808" \
+-c "mwrite -S 0 5136912 2808" \
+-c "mwrite -S 0 5136912 2808" \
+-c "mremap 5136912 " \
+-c "truncate 5136912" \
+-c "truncate 5139720" \
+-c "mremap -m 5139720" \
+-c "mwrite -S 0 5136912 2808" \
+-c "mwrite -S 0 5136912 2808" \
+-c "mwrite -S 0x59 5136912 2808" \
+-c "truncate 5140480" \
+-c "mremap 5140480" \
+-c "msync -s 0 5140480" \
+-c "mremap 5139720" \
+-c "munmap" \
+-c "close" \
+$testfile | _filter_xfs_io
+
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+status=0
+exit
+

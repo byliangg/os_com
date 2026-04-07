@@ -1,0 +1,30 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Omar Sandoval.  All Rights Reserved.
+#
+# FS QA Test 488
+#
+# Test having many file descriptors referring to deleted files open. Regression
+# test for patch "Btrfs: fix ENOSPC caused by orphan items reservations".
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+. ./common/filter
+
+_require_scratch
+_require_test_program "multi_open_unlink"
+
+_scratch_mkfs_sized $((1024 * 1024 * 1024)) >> $seqres.full 2>&1
+_scratch_mount
+
+test_file="$SCRATCH_MNT/$seq"
+
+ulimit -n $((16 * 1024))
+# ~10000 files on a 1 GB filesystem should be no problem.
+$here/src/multi_open_unlink -f $SCRATCH_MNT/$seq -n 10000 -s 0
+
+echo "Silence is golden"
+
+status=0
+exit

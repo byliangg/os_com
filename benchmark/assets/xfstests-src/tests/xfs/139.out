@@ -1,0 +1,11 @@
+QA output created by 139
+Format and mount
+Create the original files
+CoW every other block
+Compare files
+0 62 62 62 62 62 62 62 62 62 62 62 62 62 62 62 62
+*
+50000
+0 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61 61
+*
+50000

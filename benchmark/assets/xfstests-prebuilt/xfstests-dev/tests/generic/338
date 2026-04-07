@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.,  All Rights Reserved.
+#
+# FS QA Test 338
+#
+# Test I/O on dm error device.
+#
+# Motivated by an ext4 bug that crashes kernel on error path when trying to
+# update atime.
+#
+. ./common/preamble
+_begin_fstest auto quick rw eio
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_dmerror_cleanup
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmerror
+
+_require_scratch_nocheck # fs went down with a dirty log, don't check it
+_require_dm_target error
+# If SCRATCH_DEV is not a valid block device, FSTYP cannot be mkfs'ed either
+_require_block_device $SCRATCH_DEV
+
+echo "Silence is golden"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_dmerror_init
+
+# Use strictatime mount option here to force atime updates, which could help
+# trigger the NULL pointer dereference on ext4 more easily
+_dmerror_mount "-o strictatime"
+_dmerror_load_error_table
+
+# flush dmerror block device buffers and drop all caches, force reading from
+# error device
+blockdev --flushbufs $DMERROR_DEV
+echo 3 > /proc/sys/vm/drop_caches
+
+# do some test I/O
+ls -l $SCRATCH_MNT >>$seqres.full 2>&1
+$XFS_IO_PROG -fc "pwrite 0 1M" $SCRATCH_MNT/testfile >>$seqres.full 2>&1
+
+# no panic no hang, success, all done
+status=0
+exit

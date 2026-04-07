@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test generic/560
+#
+# Iterate dedupe integrity test. Copy an original data0 several
+# times (d0 -> d1, d1 -> d2, ... dn-1 -> dn), dedupe dataN everytime
+# before copy. At last, verify dataN same with data0.
+#
+. ./common/preamble
+_begin_fstest auto stress dedupe
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_duperemove
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+function iterate_dedup_verify()
+{
+	local src=$srcdir
+	local dest=$dupdir/1
+
+	for ((index = 1; index <= times; index++)); do
+		cp -a $src $dest
+		find $dest -type f -exec md5sum {} \; \
+			> $md5file$index
+		# Make some noise
+		_run_fsstress $fsstress_opts -d $noisedir \
+			       -n 200 -p $((5 * LOAD_FACTOR))
+		# Too many output, so only save error output
+		$DUPEREMOVE_PROG -dr --dedupe-options=same $dupdir \
+			>/dev/null 2>$seqres.full
+		md5sum -c --quiet $md5file$index
+		src=$dest
+		dest=$dupdir/$((index + 1))
+	done
+}
+
+srcdir=$SCRATCH_MNT/src
+dupdir=$SCRATCH_MNT/dup
+noisedir=$dupdir/noise
+mkdir $srcdir $dupdir
+mkdir $dupdir/noise
+
+md5file=${tmp}.md5sum
+
+fsstress_opts="-w -r"
+# Create some files to be original data
+_run_fsstress $fsstress_opts -d $srcdir -n 500 -p $((5 * LOAD_FACTOR))
+
+# Calculate how many test cycles will be run
+src_size=`du -ks $srcdir | awk '{print $1}'`
+free_size=`df -kP $SCRATCH_MNT | grep -v Filesystem | awk '{print $4}'`
+times=$((free_size / src_size))
+if [ $times -gt $((4 * TIME_FACTOR)) ]; then
+	times=$((4 * TIME_FACTOR))
+fi
+
+echo "= Do dedup and verify ="
+iterate_dedup_verify
+
+# Use the last checksum file to verify the original data
+sed -e s#dup/$times#src#g $md5file$times > $md5file
+echo "= Backwords verify ="
+md5sum -c --quiet $md5file
+
+# read from the disk also doesn't show mutations.
+_scratch_cycle_mount
+echo "= Verify after cycle mount ="
+for ((index = 1; index <= times; index++)); do
+	md5sum -c --quiet $md5file$index
+done
+
+status=0
+exit

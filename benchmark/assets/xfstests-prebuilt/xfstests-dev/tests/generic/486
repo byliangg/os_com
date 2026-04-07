@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 486
+#
+# Ensure that we can XATTR_REPLACE a tiny attr into a large attr.
+# Kanda Motohiro <kanda.motohiro@gmail.com> reports that XATTR_REPLACE'ing
+# a single-byte attr with a 2048-byte attr causes a fs shutdown because we
+# remove the shortform attr, convert the attr fork to long format, and then
+# try to re-add the attr having not cleared ATTR_REPLACE.
+#
+# Commit 7b38460dc8e4 ("xfs: don't fail when converting shortform attr to long
+# form during ATTR_REPLACE") fixed the xfs bug.
+#
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test_program "attr_replace_test"
+_require_attrs
+_require_scratch
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount >>$seqres.full 2>&1
+
+filter_attr_output() {
+	_filter_scratch | grep world | \
+		sed -e 's/has a [0-9]* byte value/has a NNNN byte value/g'
+}
+
+max_attr_size=65536
+
+# attr_replace_test can't easily auto-probe the attr size for ceph because:
+# - ceph imposes a maximum value for the total xattr names+values, and
+# - ceph reports the 'object size' in the block size, which is, by default, much
+#   larger than XATTR_SIZE_MAX (4M > 64k)
+# Hence, we need to provide it with a maximum size.
+[ "$FSTYP" = "ceph" ] && max_attr_size=65000
+
+$here/src/attr_replace_test -m $max_attr_size $SCRATCH_MNT/hello
+$ATTR_PROG -l $SCRATCH_MNT/hello >>$seqres.full 2>&1
+$ATTR_PROG -l $SCRATCH_MNT/hello | filter_attr_output
+
+status=0
+exit

@@ -1,0 +1,22 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Eric Sandeen.  All Rights Reserved.
+#
+# FS QA Test No. 208
+#
+# Run aio-dio-invalidate-failure - test race in read cache invalidation
+#
+. ./common/preamble
+_begin_fstest auto aio
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+
+_run_aiodio aio-dio-invalidate-failure
+
+_check_dmesg _filter_aiodio_dmesg
+
+exit $status

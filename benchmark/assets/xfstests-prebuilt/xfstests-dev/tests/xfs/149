@@ -1,0 +1,93 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 149
+#
+# Test to ensure xfs_growfs command accepts device nodes if & only
+# if they are mounted.
+# This functionality, though undocumented, worked until xfsprogs v4.12
+# It was added back and documented after xfsprogs v5.2 via
+#   7e8275f8 xfs_growfs: allow mounted device node as argument
+#
+# Based on xfs/289
+#
+. ./common/preamble
+_begin_fstest auto quick growfs
+
+loopfile=$TEST_DIR/fsfile
+mntdir=$TEST_DIR/mntdir
+loop_symlink=$TEST_DIR/loop_symlink.$$
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _unmount $mntdir &>/dev/null
+    [ -n "$loop_dev" ] && _destroy_loop_device $loop_dev
+    rmdir $mntdir
+    rm -f $loop_symlink
+    rm -f $loopfile
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_loop
+
+mkdir -p $mntdir || _fail "!!! failed to create temp mount dir"
+
+echo "=== mkfs.xfs ==="
+$MKFS_XFS_PROG -d file,name=$loopfile,size=16m -f >/dev/null 2>&1
+
+echo "=== truncate ==="
+$XFS_IO_PROG -fc "truncate 256m" $loopfile
+
+echo "=== create loop device ==="
+loop_dev=$(_create_loop_device $loopfile)
+
+echo "=== create loop device symlink ==="
+ln -s $loop_dev $loop_symlink
+
+echo "loop device is $loop_dev" >> $seqres.full
+
+# These unmounted operations should fail
+
+echo "=== xfs_growfs - unmounted device, command should be rejected ==="
+$XFS_GROWFS_PROG $loop_dev 2>&1 | sed -e s:$loop_dev:LOOPDEV:
+
+echo "=== xfs_growfs - check symlinked dev, unmounted ==="
+$XFS_GROWFS_PROG $loop_symlink 2>&1 | sed -e s:$loop_symlink:LOOPSYMLINK:
+
+# These mounted operations should pass
+
+echo "=== mount ==="
+$MOUNT_PROG $loop_dev $mntdir || _fail "!!! failed to loopback mount"
+
+echo "=== xfs_growfs - check device node ==="
+$XFS_GROWFS_PROG -D 8192 $loop_dev > /dev/null
+
+echo "=== xfs_growfs - check device symlink ==="
+$XFS_GROWFS_PROG -D 12288 $loop_symlink > /dev/null
+
+echo "=== unmount ==="
+_unmount $mntdir || _fail "!!! failed to unmount"
+
+echo "=== mount device symlink ==="
+$MOUNT_PROG $loop_symlink $mntdir || _fail "!!! failed to loopback mount"
+
+echo "=== xfs_growfs - check device symlink ==="
+$XFS_GROWFS_PROG -D 16384 $loop_symlink > /dev/null
+
+echo "=== xfs_growfs - check device node ==="
+$XFS_GROWFS_PROG -D 20480 $loop_dev > /dev/null
+
+_unmount $mntdir
+_destroy_loop_device $loop_dev
+unset loop_dev
+
+# success, all done
+status=0
+exit

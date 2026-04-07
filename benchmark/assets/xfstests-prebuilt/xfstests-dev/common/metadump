@@ -1,0 +1,166 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2024 Oracle.  All Rights Reserved.
+#
+# Filesystem metadata dump testing functions.
+#
+
+# Set up environment variables for a metadump test.  Requires the test and
+# scratch devices.  Sets XFS_METADUMP_{FILE,IMG} and MAX_XFS_METADUMP_VERSION.
+_xfs_setup_verify_metadump()
+{
+	XFS_METADUMP_FILE="$TEST_DIR/${seq}_metadump"
+	XFS_METADUMP_IMG="$TEST_DIR/${seq}_image"
+	MAX_XFS_METADUMP_VERSION="$(_xfs_metadump_max_version)"
+
+	rm -f "$XFS_METADUMP_FILE" "$XFS_METADUMP_IMG"*
+}
+
+_xfs_cleanup_verify_metadump()
+{
+	local img
+
+	_scratch_unmount &>> $seqres.full
+
+	test -n "$XFS_METADUMP_FILE" && rm -f "$XFS_METADUMP_FILE"
+
+	if [ -n "$XFS_METADUMP_IMG" ]; then
+		[ -b "$METADUMP_DATA_LOOP_DEV" ] && _destroy_loop_device $METADUMP_DATA_LOOP_DEV
+		[ -b "$METADUMP_LOG_LOOP_DEV" ] && _destroy_loop_device $METADUMP_LOG_LOOP_DEV
+		[ -b "$METADUMP_RT_LOOP_DEV" ] && _destroy_loop_device $METADUMP_RT_LOOP_DEV
+		for img in "$XFS_METADUMP_IMG"*; do
+			test -e "$img" && rm -f "$img"
+		done
+	fi
+}
+
+# Can xfs_metadump snapshot the fs metadata to a v1 metadump file?
+_scratch_xfs_can_metadump_v1()
+{
+	# metadump v1 does not support log devices
+	[ "$USE_EXTERNAL" = yes ] && [ -n "$SCRATCH_LOGDEV" ] && return 1
+
+	# metadump v1 does not support realtime devices
+	[ "$USE_EXTERNAL" = yes ] && [ -n "$SCRATCH_RTDEV" ] && return 1
+
+	return 0
+}
+
+# Can xfs_metadump snapshot the fs metadata to a v2 metadump file?
+_scratch_xfs_can_metadump_v2()
+{
+	test "$MAX_XFS_METADUMP_VERSION" -ge 2
+}
+
+# Create a metadump in v1 format, restore it to fs image files, then mount the
+# images and fsck them.
+_xfs_verify_metadump_v1()
+{
+	local metadump_args="$1"
+	local extra_test="$2"
+
+	local metadump_file="$XFS_METADUMP_FILE"
+	local version=""
+	local data_img="$XFS_METADUMP_IMG.data"
+
+	# Force v1 if we detect v2 support
+	if [[ $MAX_XFS_METADUMP_FORMAT > 1 ]]; then
+		version="-v 1"
+	fi
+
+	# Capture metadump, which creates metadump_file
+	_scratch_xfs_metadump $metadump_file $metadump_args $version
+
+	# Restore metadump, which creates data_img
+	SCRATCH_DEV=$data_img _scratch_xfs_mdrestore $metadump_file
+
+	# Create loopdev for data device so we can mount the fs
+	METADUMP_DATA_LOOP_DEV=$(_create_loop_device_like_bdev $data_img $SCRATCH_DEV)
+
+	# Mount fs, run an extra test, fsck, and unmount
+	SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV _scratch_mount
+	if [ -n "$extra_test" ]; then
+		SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV $extra_test
+	fi
+	SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV _check_xfs_scratch_fs
+	_unmount $METADUMP_DATA_LOOP_DEV
+
+	# Tear down what we created
+	_destroy_loop_device $METADUMP_DATA_LOOP_DEV
+	unset METADUMP_DATA_LOOP_DEV
+	rm -f $data_img
+}
+
+# Create a metadump in v2 format, restore it to fs image files, then mount the
+# images and fsck them.
+_xfs_verify_metadump_v2()
+{
+	local metadump_args="$1"
+	local extra_test="$2"
+
+	local metadump_file="$XFS_METADUMP_FILE"
+	local version="-v 2"
+	local data_img="$XFS_METADUMP_IMG.data"
+	local log_img=""
+	local rt_img=""
+
+	# Capture metadump, which creates metadump_file
+	_scratch_xfs_metadump $metadump_file $metadump_args $version
+
+	#
+	# Metadump v2 files can contain contents dumped from an external log
+	# device. Use a temporary file to hold the log device contents restored
+	# from such a metadump file.
+	test -n "$SCRATCH_LOGDEV" && log_img="$XFS_METADUMP_IMG.log"
+
+	# Use a temporary file to hold restored rt device contents
+	test -n "$SCRATCH_RTDEV" && _xfs_metadump_supports_rt && \
+		rt_img="$XFS_METADUMP_IMG.rt"
+
+	# Restore metadump, which creates data_img and log_img
+	SCRATCH_DEV=$data_img SCRATCH_LOGDEV=$log_img SCRATCH_RTDEV=$rt_img \
+		_scratch_xfs_mdrestore $metadump_file
+
+	# Create loopdev for data device so we can mount the fs
+	METADUMP_DATA_LOOP_DEV=$(_create_loop_device_like_bdev $data_img $SCRATCH_DEV)
+
+	# Create loopdev for log device if we recovered anything
+	if [ -s "$log_img" ]; then
+		METADUMP_LOG_LOOP_DEV=$(_create_loop_device_like_bdev $log_img $SCRATCH_LOGDEV)
+	fi
+
+	# Create loopdev for rt device if we recovered anything
+	if [ -s "$rt_img" ]; then
+		METADUMP_RT_LOOP_DEV=$(_create_loop_device_like_bdev $rt_img $SCRATCH_RTDEV)
+	fi
+
+	# Mount fs, run an extra test, fsck, and unmount
+	SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV SCRATCH_LOGDEV=$METADUMP_LOG_LOOP_DEV SCRATCH_RTDEV=$METADUMP_RT_LOOP_DEV _scratch_mount
+	if [ -n "$extra_test" ]; then
+		SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV SCRATCH_LOGDEV=$METADUMP_LOG_LOOP_DEV SCRATCH_RTDEV=$METADUMP_RT_LOOP_DEV $extra_test
+	fi
+	SCRATCH_DEV=$METADUMP_DATA_LOOP_DEV SCRATCH_LOGDEV=$METADUMP_LOG_LOOP_DEV SCRATCH_RTDEV=$METADUMP_RT_LOOP_DEV _check_xfs_scratch_fs
+	_unmount $METADUMP_DATA_LOOP_DEV
+
+	# Tear down what we created
+	if [ -b "$METADUMP_LOG_LOOP_DEV" ]; then
+		_destroy_loop_device $METADUMP_LOG_LOOP_DEV
+		unset METADUMP_LOG_LOOP_DEV
+		rm -f $log_img
+	fi
+	if [ -b "$METADUMP_RT_LOOP_DEV" ]; then
+		_destroy_loop_device $METADUMP_RT_LOOP_DEV
+		unset METADUMP_RT_LOOP_DEV
+		rm -f $rt_img
+	fi
+	_destroy_loop_device $METADUMP_DATA_LOOP_DEV
+	unset METADUMP_DATA_LOOP_DEV
+	rm -f $data_img
+}
+
+# Verify both metadump formats if possible
+_xfs_verify_metadumps()
+{
+	_scratch_xfs_can_metadump_v1 && _xfs_verify_metadump_v1 "$@"
+	_scratch_xfs_can_metadump_v2 && _xfs_verify_metadump_v2 "$@"
+}

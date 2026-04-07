@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 035
+#
+# Test cases that force read-only mount
+#
+# - No upper dir
+# - Failure to create work dir
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$CHATTR_PROG -i $workdir
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_chattr i
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create multiple lowerdirs and upperdir, workdir
+lowerdir1=$OVL_BASE_SCRATCH_MNT/lower1
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+mkdir -p $lowerdir1 $lowerdir2 $upperdir $workdir
+
+# Mount overlay with lower layers only.
+# Verify that overlay is mounted read-only and that it cannot be remounted rw.
+_overlay_scratch_mount_opts -o"lowerdir=$lowerdir2:$lowerdir1"
+touch $SCRATCH_MNT/foo 2>&1 | _filter_scratch
+_scratch_remount rw 2>&1 | _filter_ro_mount
+$UMOUNT_PROG $SCRATCH_MNT
+
+# Make workdir immutable to prevent workdir re-create on mount
+$CHATTR_PROG +i $workdir
+
+# Mount overlay with upper and workdir and expect failure to re-create workdir.
+# Verify that overlay is mounted read-only and that it cannot be remounted rw.
+_overlay_scratch_mount_dirs $lowerdir2 $upperdir $workdir
+touch $SCRATCH_MNT/bar 2>&1 | _filter_scratch
+_scratch_remount rw 2>&1 | _filter_ro_mount
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir2 $upperdir $workdir
+
+# success, all done
+status=0
+exit

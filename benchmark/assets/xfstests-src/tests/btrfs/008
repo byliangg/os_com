@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/008
+#
+# btrfs send ENOENT regression test, from a user report on linux-btrfs
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+tmp_dir=send_temp_$seq
+
+# Override the default cleanup function.
+_cleanup()
+{
+	$BTRFS_UTIL_PROG subvolume delete $TEST_DIR/$tmp_dir/send/snapshots/backup2 > /dev/null 2>&1
+	$BTRFS_UTIL_PROG subvolume delete $TEST_DIR/$tmp_dir/send/snapshots/backup3 > /dev/null 2>&1
+	$BTRFS_UTIL_PROG subvolume delete $TEST_DIR/$tmp_dir/send > /dev/null 2>&1
+	rm -rf $TEST_DIR/$tmp_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+
+#receive needs to be able to setxattrs, including the selinux context, if we use
+#the normal nfs context thing it screws up our ability to set the
+#security.selinux xattrs so we need to disable this for this test
+export SELINUX_MOUNT_OPTIONS=""
+
+_scratch_mount
+
+mkdir $TEST_DIR/$tmp_dir
+$BTRFS_UTIL_PROG subvolume create $TEST_DIR/$tmp_dir/send \
+	> $seqres.full 2>&1 || _fail "failed subvol create"
+work_dir="$TEST_DIR/$tmp_dir/send"
+mkdir $work_dir/testdir
+mkdir $work_dir/testdir/1/
+mkdir $work_dir/testdir/2/
+_ddt of=$work_dir/testdir/aa count=16 > /dev/null 2>&1
+_ddt of=$work_dir/testdir/bb count=16 > /dev/null 2>&1
+
+mkdir $work_dir/snapshots
+$BTRFS_UTIL_PROG subvolume snapshot -r $work_dir $work_dir/snapshots/backup2 \
+	>> $seqres.full 2>&1 || _fail "failed backup2"
+$BTRFS_UTIL_PROG subvolume snapshot -r $work_dir $work_dir/snapshots/backup3 \
+	>> $seqres.full 2>&1 || _fail "failed backup3"
+$BTRFS_UTIL_PROG send -f $TEST_DIR/$tmp_dir/blah $work_dir/snapshots/backup3 \
+	>> $seqres.full 2>&1 || _fail "send failed"
+$BTRFS_UTIL_PROG receive -vvvv -f $TEST_DIR/$tmp_dir/blah $SCRATCH_MNT \
+	>> $seqres.full 2>&1 || _fail "receive failed"
+
+echo "Silence is golden"
+status=0 ; exit

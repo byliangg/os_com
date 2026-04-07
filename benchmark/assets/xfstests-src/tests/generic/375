@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat.  All Rights Reserved.
+#
+# FS QA Test 375
+#
+# Check if SGID is cleared upon chmod / setfacl when the owner is not in the
+# owning group.
+#
+. ./common/preamble
+_begin_fstest auto quick acl perms
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_runas
+_require_acls
+
+cd $TEST_DIR
+
+# try with both regular file and directory
+for filetype in regular dir; do
+
+	case $filetype in
+	regular)
+		testfile=testfile.$seq
+		rm -f $testfile
+		touch $testfile
+		;;
+	*)
+		testfile=testdir.$seq
+		rm -rf $testfile
+		mkdir $testfile
+		;;
+	esac
+
+	chown 100:100 $testfile
+
+	echo '*** SGID should remain set (twice)'
+	chmod 2755 $testfile
+	_runas -u 100 -g 100 -- chmod 2777 $testfile
+	stat -c %A $testfile
+	chmod 2755 $testfile
+	_runas -u 100 -g 100 -- setfacl -m u::rwx,g::rwx,o::rwx $testfile
+	stat -c %A $testfile
+
+	echo '*** SGID should be cleared (twice)'
+	chmod 2755 $testfile
+	_runas -u 100 -g 101 -- chmod 2777 $testfile
+	stat -c %A $testfile
+	chmod 2755 $testfile
+	_runas -u 100 -g 101 -- setfacl -m u::rwx,g::rwx,o::rwx $testfile
+	stat -c %A $testfile
+
+	echo '*** Expected failure'
+	_runas -u 101 -g 101 -- chmod 2777 $testfile
+done
+
+status=0
+exit

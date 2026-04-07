@@ -1,0 +1,205 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Facebook, Inc.  All Rights Reserved.
+#
+# common functions for setting up and tearing down a dm log-writes device
+
+_require_log_writes()
+{
+	[ -z "$LOGWRITES_DEV" -o ! -b "$LOGWRITES_DEV" ] && \
+		_notrun "This test requires a valid \$LOGWRITES_DEV"
+
+	_exclude_scratch_mount_option dax
+	_require_dm_target log-writes
+	_require_test_program "log-writes/replay-log"
+}
+
+# Starting from v4.15-rc1, DAX support was added to dm-log-writes, but note
+# that it doesn't track the data that we write via the mmap(), so we can't do
+# any data integrity checking. We can only verify that the metadata writes for
+# the page faults happened, e.g. when mmap(2) with MAP_SYNC flag.
+#
+# Introduce a new helper to check if dm-log-writes target supports DAX
+# explicitly. But this is considered as a temporary workaround, we want to move
+# all the DAX check back to _require_log_writes when dm-log-writes gains full
+# DAX support and remove this helper.
+#
+# Check if dax mount options are supported
+# $1 can be either 'dax=always' or 'dax'
+# dax=always
+#      Check for the new dax options (dax=inode, dax=always or dax=never)
+#      by passing "dax=always".
+# dax
+#      Check for the old dax or new dax=always by passing "dax".
+# This only accepts 'dax=always' because dax=always, dax=inode and
+# dax=never are always supported together.  So if the other options are
+# required checking for 'dax=always' indicates support for the other 2.
+_require_log_writes_dax_mountopt()
+{
+	[ -z "$LOGWRITES_DEV" -o ! -b "$LOGWRITES_DEV" ] && \
+		_notrun "This test requires a valid \$LOGWRITES_DEV"
+
+	_require_dm_target log-writes
+	_require_test_program "log-writes/replay-log"
+
+	local ret=0
+	local mountopt=$1
+
+	_log_writes_init $SCRATCH_DEV
+	_log_writes_mkfs > /dev/null 2>&1
+	_log_writes_mount "-o $mountopt" > /dev/null 2>&1
+	# Check options to be sure.
+	# XFS ignores dax option(or changes it to dax=never)
+	# and goes on if dev underneath does not support dax.
+	_fs_options $LOGWRITES_DMDEV | grep -Eq "dax(=always|,|$)"
+	ret=$?
+	_log_writes_cleanup
+	if [ $ret -ne 0 ]; then
+		_notrun "$LOGWRITES_DMDEV $FSTYP does not support -o $mountopt"
+	fi
+}
+
+# Set up a dm-log-writes device
+#
+# blkdev: the specified target device
+# length(optional): the mapped length in bytes
+# Note that the entire size of the target device will be used
+# if length is not specified.
+_log_writes_init()
+{
+	local blkdev=$1
+	local length=$2
+	local BLK_DEV_SIZE
+
+	[ -z "$blkdev" ] && _fail \
+	"block dev must be specified for _log_writes_init"
+
+	if [ -z "$length" ]; then
+		BLK_DEV_SIZE=`blockdev --getsz $blkdev`
+	else
+		local blksz=`blockdev --getss $blkdev`
+		BLK_DEV_SIZE=$((length / blksz))
+	fi
+
+	LOGWRITES_NAME=logwrites-test
+	LOGWRITES_DMDEV=/dev/mapper/$LOGWRITES_NAME
+	LOGWRITES_TABLE="0 $BLK_DEV_SIZE log-writes $blkdev $LOGWRITES_DEV"
+	_dmsetup_create $LOGWRITES_NAME --table "$LOGWRITES_TABLE" || \
+		_fail "failed to create log-writes device"
+}
+
+_log_writes_mark()
+{
+	[ $# -ne 1 ] && _fail "_log_writes_mark takes one argument"
+	$DMSETUP_PROG message $LOGWRITES_NAME 0 mark $1
+}
+
+_log_writes_mkfs()
+{
+	_scratch_options mkfs
+	_mkfs_dev $SCRATCH_OPTIONS $@ $LOGWRITES_DMDEV
+	_log_writes_mark mkfs
+}
+
+_log_writes_mount()
+{
+	_scratch_options mount
+	$MOUNT_PROG -t $FSTYP `_common_dev_mount_options $*` $SCRATCH_OPTIONS \
+		$LOGWRITES_DMDEV $SCRATCH_MNT
+}
+
+_log_writes_unmount()
+{
+	_unmount $SCRATCH_MNT
+}
+
+# _log_writes_replay_log <mark>
+#
+# This replays the log contained on $LOGWRITES_DEV onto blkdev upto the
+# mark passed in.
+_log_writes_replay_log()
+{
+	_mark=$1
+	_blkdev=$2
+
+	[ -z "$_blkdev" ] && _fail \
+	"block dev must be specified for _log_writes_replay_log"
+
+	$here/src/log-writes/replay-log --log $LOGWRITES_DEV --find \
+		--end-mark $_mark >> $seqres.full 2>&1
+	[ $? -ne 0 ] && _fail "mark '$_mark' does not exist"
+
+	$here/src/log-writes/replay-log --log $LOGWRITES_DEV --replay $_blkdev \
+		--end-mark $_mark >> $seqres.full 2>&1
+	[ $? -ne 0 ] && _fail "replay failed"
+}
+
+_log_writes_remove()
+{
+	_dmsetup_remove $LOGWRITES_NAME
+}
+
+_log_writes_cleanup()
+{
+	_unmount $SCRATCH_MNT > /dev/null 2>&1
+	_log_writes_remove
+}
+
+# Convert log writes mark to entry number
+# Result entry number is output to stdout, could be empty if not found
+_log_writes_mark_to_entry_number()
+{
+	local mark=$1
+	local ret
+
+	[ -z "$mark" ] && _fatal \
+		"mark must be given for _log_writes_mark_to_entry_number"
+
+	ret=$($here/src/log-writes/replay-log --find --log $LOGWRITES_DEV \
+		--end-mark $mark 2> /dev/null)
+	[ -z "$ret" ] && return
+	ret=$(echo "$ret" | cut -f1 -d\@)
+	echo "mark $mark has entry number $ret" >> $seqres.full
+	echo "$ret"
+}
+
+# Find next fua write entry number
+# Result entry number is output to stdout, could be empty if not found
+_log_writes_find_next_fua()
+{
+	local start_entry=$1
+	local ret
+
+	[ -z "$start_entry" ] && start_entry=0
+	ret=$($here/src/log-writes/replay-log --find --log $LOGWRITES_DEV \
+	      --next-fua --start-entry $start_entry 2> /dev/null)
+	[ -z "$ret" ] && return
+
+	# Result should be something like "1024@offset" where 1024 is the
+	# entry number we need
+	ret=$(echo "$ret" | cut -f1 -d\@)
+	echo "next fua is entry number $ret" >> $seqres.full
+	echo "$ret"
+}
+
+# Replay log range to specified entry
+# $1:	End entry. The entry with this number *WILL* be replayed
+_log_writes_replay_log_range()
+{
+	local end=$1
+	local blkdev=$2
+
+	[ -z "$end" ] && _fail \
+	"end entry must be specified for _log_writes_replay_log_range"
+	[ -z "$blkdev" ] && _fail \
+	"block dev must be specified for _log_writes_replay_log_range"
+
+	# To ensure we replay the last entry, we need to manually increase the
+	# end entry number to ensure it's played. We also dump all the
+	# operations performed as this helps post-mortem analysis of failures.
+	echo "=== replay to $end ===" >> $seqres.full
+	$here/src/log-writes/replay-log -vv --log $LOGWRITES_DEV \
+		--replay $blkdev --limit $(($end + 1)) \
+		>> $seqres.full 2>&1
+	[ $? -ne 0 ] && _fail "replay failed"
+}

@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Fujitsu. All Rights Reserved.
+#
+# FS QA Test 099
+#
+# Check for qgroup reserved space leaks caused by re-writing dirty ranges
+# This bug has been present in btrfs qgroup for a long time
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup limit
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+
+# Use big blocksize to ensure there is still enough space left for metadata
+# space reserve.
+BLOCKSIZE=$(( 2 * 1024 * 1024 )) # 2M block size
+FILESIZE=$(( 128 * 1024 * 1024 )) # 128M file size
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+_require_fs_space $SCRATCH_MNT $(($FILESIZE * 2 / 1024))
+
+_btrfs quota enable $SCRATCH_MNT
+_btrfs qgroup limit $FILESIZE 0/5 $SCRATCH_MNT
+
+# loop 5 times without sync to ensure reserved space leak will happen
+for i in `seq 1 5`; do
+	# Use 1/4 of the file size, to ensure even commit is trigger by
+	# dirty page threshold or commit interval, we should still be
+	# able to continue write
+	$XFS_IO_PROG -f -c "pwrite -b $BLOCKSIZE 0 $(($FILESIZE / 4))" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+done
+
+# Sync to make sure all the dirty pages are written to disk, which should
+# free all the reserved space
+sync
+
+# remove the file and sync, to ensure all quota space freed
+rm $SCRATCH_MNT/foo
+sync
+
+# We should be able to write $FILESIZE - $BLOCKSIZE data now
+$XFS_IO_PROG -f -c "pwrite -b $BLOCKSIZE 0 $(($FILESIZE - $BLOCKSIZE))" \
+	$SCRATCH_MNT/foo | _filter_xfs_io
+
+# success, all done
+status=0
+exit

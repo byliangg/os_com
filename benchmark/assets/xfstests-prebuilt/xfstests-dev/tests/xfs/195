@@ -1,0 +1,64 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Christoph Hellwig.
+#
+# FS QA Test No. 195
+#
+# Make sure the chattr dump flag gets picked up by xfsdump without a sync
+#
+# http://oss.sgi.com/bugzilla/show_bug.cgi?id=340
+#
+. ./common/preamble
+_begin_fstest ioctl dump auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -rf $TEST_DIR/d
+	rm -f $TEST_DIR/dumpfile
+}
+
+#
+# Perform a level 0 dump that respects the chattr dump exclude flag,
+# and grep the output for the inode number we expect / do not expect
+# to be skipped
+#
+# Only dump a subtree so we get away with a single partition for
+# the subtree to be dumped and the dump file.
+#
+_do_dump()
+{
+	$XFSDUMP_PROG -l 0 -s d -F  \
+		-L prova -M prova \
+		-f $TEST_DIR/dumpfile -v excluded_files=debug $TEST_DIR \
+		| grep "ino $inum" \
+		| sed -e 's/.*xfsdump: pruned ino [0-9]*, owner 0, estimated size 0: skip flag set/xfsdump: pruned ino NNN, owner 0, estimated size 0: skip flag set/'
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_user
+_require_command "$XFSDUMP_PROG" xfsdump
+
+echo "Preparing subtree"
+mkdir $TEST_DIR/d
+touch $TEST_DIR/d/t
+inum=`stat -c "%i" $TEST_DIR/d/t`
+
+echo "No dump exclude flag set (should not be skipped)"
+_do_dump
+
+echo "Dump exclude flag set, but no sync yet (should be skipped)"
+$CHATTR_PROG +d $TEST_DIR/d/t
+_do_dump
+
+echo "Dump exclude flag set, after sync (should be skipped)"
+_test_sync
+_do_dump
+
+# success, all done
+echo "*** done"
+status=0

@@ -1,0 +1,50 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Netapp, Inc. All rights reserved.
+#
+# FS QA Test No. 434
+#
+# Tests vfs_copy_file_range() error checking
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+# get standard environment
+. common/filter
+
+
+_require_xfs_io_command "copy_range"
+_require_test
+_require_mknod
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original files"
+$XFS_IO_PROG -f -c 'pwrite -S 0x61 0 1000' $testdir/file >> $seqres.full 2>&1
+mknod $testdir/dev1 c 1 3
+mkfifo $testdir/fifo
+
+echo "Try to copy when source pos > source size"
+$XFS_IO_PROG -f -c "copy_range -s 1000 -l 100 $testdir/file" "$testdir/copy"
+md5sum $testdir/copy | _filter_test_dir
+
+echo "Try to copy to a read-only file"
+rm -f $testdir/copy
+$XFS_IO_PROG -r -f -c "copy_range -s 0 -l 100 $testdir/file" "$testdir/copy"
+md5sum $testdir/copy | _filter_test_dir
+
+echo "Try to copy to an append-only file"
+rm -f $testdir/copy
+$XFS_IO_PROG -a -f -c "copy_range -s 0 -l 100 $testdir/file" "$testdir/copy"
+md5sum $testdir/copy | _filter_test_dir
+
+echo "Try to copy to a device"
+$XFS_IO_PROG -a -f -c "copy_range -s 0 -l 100 $testdir/file" "$testdir/dev1"
+
+echo "Try to copy to a fifo"
+$XFS_IO_PROG -a -f -c "copy_range -s 0 -l 100 $testdir/file" "$testdir/fifo"
+
+#success, all done
+status=0
+exit

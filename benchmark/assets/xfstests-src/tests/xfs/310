@@ -1,0 +1,90 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 310
+#
+# Create a file with more than 2^21 blocks (the max length of a bmbt record).
+#
+. ./common/preamble
+_begin_fstest auto clone rmap prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	umount $SCRATCH_MNT > /dev/null 2>&1
+	_dmhugedisk_cleanup
+	rm -rf $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmhugedisk
+
+_require_xfs_scratch_rmapbt
+_require_scratch_nocheck
+_require_xfs_io_command "falloc"
+
+# Figure out block size
+echo "Figure out block size"
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount >> $seqres.full
+
+testdir=$SCRATCH_MNT/test-$seq
+blksz="$(_get_block_size $SCRATCH_MNT)"
+
+_scratch_unmount
+
+echo "Format huge device"
+nr_blks=2100000	# 2^21 plus a little more
+sectors=$(( (nr_blks * 3) * blksz / 512 )) # each AG must have > 2^21 blocks
+_dmhugedisk_init $sectors
+_mkfs_dev -d agcount=2 $DMHUGEDISK_DEV
+_mount $DMHUGEDISK_DEV $SCRATCH_MNT
+$XFS_INFO_PROG $SCRATCH_MNT >> $seqres.full
+
+echo "Create the original file blocks"
+mkdir $testdir
+blksz="$(_get_block_size $testdir)"
+$XFS_IO_PROG -f -c "falloc 0 $((nr_blks * blksz))" $testdir/file1 >> $seqres.full
+
+# make sure the allocator didn't allocate more than the needed two extents
+echo "Check extent count"
+xfs_bmap -l -p -v $testdir/file1 | grep '^[[:space:]]*2:' -q && xfs_bmap -l -p -v $testdir/file1
+inum=$(stat -c '%i' $testdir/file1)
+umount $SCRATCH_MNT
+
+echo "Check bmap count"
+nr_bmaps=$(xfs_db -c "inode $inum" -c "bmap" $DMHUGEDISK_DEV | grep 'data offset' | wc -l)
+test $nr_bmaps -gt 1 || xfs_db -c "inode $inum" -c "bmap" $DMHUGEDISK_DEV
+#xfs_db -c "agf 0" -c p -c "inode $inum" -c "bmap" $DMHUGEDISK_DEV
+
+echo "Check rmap count"
+nr_rmaps=$(xfs_db -c 'agf 0' -c 'addr rmaproot' -c 'p' $DMHUGEDISK_DEV | grep ",$inum,[0-9]*,1,0,0" | wc -l)
+test $nr_rmaps -eq 1 || xfs_db -c 'agf 0' -c 'addr rmaproot' -c 'p' $DMHUGEDISK_DEV | grep ",$inum,[0-9]*,1,0,0"
+
+echo "Check and fake-repair huge filesystem" | tee -a $seqres.full
+$XFS_REPAIR_PROG -n $DMHUGEDISK_DEV >> $seqres.full 2>&1
+test $? -eq 0 || echo "xfs_repair -n failed, see $seqres.full"
+
+echo "Real repair huge filesystem" | tee -a $seqres.full
+$XFS_REPAIR_PROG $DMHUGEDISK_DEV >> $seqres.full 2>&1
+test $? -eq 0 || echo "xfs_repair failed, see $seqres.full"
+
+echo "Check bmap count again"
+nr_bmaps=$(xfs_db -c "inode $inum" -c "bmap" $DMHUGEDISK_DEV | grep 'data offset' | wc -l)
+test $nr_bmaps -gt 1 || xfs_db -c "inode $inum" -c "bmap" $DMHUGEDISK_DEV
+
+echo "Check rmap count again"
+nr_rmaps=$(xfs_db -c 'agf 0' -c 'addr rmaproot' -c 'p' $DMHUGEDISK_DEV | grep ",$inum,[0-9]*,1,0,0" | wc -l)
+test $nr_rmaps -eq 1 || xfs_db -c 'agf 0' -c 'addr rmaproot' -c 'p' $DMHUGEDISK_DEV | grep ",$inum,[0-9]*,1,0,0"
+
+echo "Check and fake-repair huge filesystem again" | tee -a $seqres.full
+$XFS_REPAIR_PROG -n $DMHUGEDISK_DEV >> $seqres.full 2>&1
+
+echo "Done"
+
+# success, all done
+status=0
+exit

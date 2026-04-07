@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 311
+#
+# Test to reproduce an XFS unmount crash due to races with directory readahead.
+# XFS had a bug in which unmount would proceed with a readahead I/O in flight.
+# If the unmount deconstructed the log by the time I/O completion occurs,
+# certain metadata read verifier checks could access invalid memory and cause a
+# panic.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_scratch_unmount > /dev/null 2>&1
+	_cleanup_delay > /dev/null 2>&1
+}
+
+# Import common functions.
+. ./common/dmdelay
+
+# Modify as appropriate.
+
+_require_scratch
+_require_dm_target delay
+
+echo "Silence is golden."
+
+_scratch_mkfs_xfs >> $seqres.full 2>&1
+
+_init_delay
+_mount_delay
+
+# insert entries to grow the directory to at least one extent, which is what
+# triggers readahead on dir open
+mkdir $SCRATCH_MNT/dir
+for i in $(seq 0 999); do
+	echo > $SCRATCH_MNT/dir/$i
+done
+
+# remount to clear the buffer cache
+_unmount_delay
+_mount_delay
+
+# introduce a read I/O delay
+_load_delay_table $DELAY_READ
+
+# Map the directory and immediately unmount. This should invoke an asynchronous
+# readahead on the first block of the directory. The readahead is delayed by
+# dm-delay. If the unmount doesn't properly wait for the readahead completion,
+# the read verifier can run after core data structures have been freed and lead
+# to a crash/panic.
+$XFS_IO_PROG -c "bmap -v" $SCRATCH_MNT/dir >> $seqres.full 2>&1
+_unmount_delay
+
+_cleanup_delay
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 489
+#
+# Test that xattrs are not lost after calling fsync multiple times with a
+# filesystem commit in between the fsync calls.
+#
+. ./common/preamble
+_begin_fstest auto quick attr log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+. ./common/attr
+
+_require_scratch
+_require_dm_target flakey
+_require_attrs
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+touch $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.xa1 -v qwerty $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.xa2 -v 'hello world' $SCRATCH_MNT/foobar
+$SETFATTR_PROG -n user.xa3 -v test $SCRATCH_MNT/foobar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foobar
+
+# Call sync to commit all fileystem metadata.
+_scratch_sync
+
+$XFS_IO_PROG -c "pwrite -S 0xea 0 64K" \
+	     -c "fsync" \
+	     $SCRATCH_MNT/foobar >>$seqres.full
+
+# Simulate a power failure and mount the filesystem to check that the xattrs
+# were not lost and neither was the data we wrote.
+_flakey_drop_and_remount
+echo "File xattrs after power failure:"
+_getfattr --absolute-names --dump $SCRATCH_MNT/foobar | _filter_scratch
+echo "File data after power failure:"
+od -t x1 $SCRATCH_MNT/foobar
+
+_scratch_unmount
+_cleanup_flakey
+
+status=0
+exit

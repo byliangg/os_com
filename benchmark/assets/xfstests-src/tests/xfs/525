@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2020 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 525
+#
+# Test formatting with a config file that contains conflicting options.
+#
+. ./common/preamble
+_begin_fstest auto quick mkfs
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $def_cfgfile
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_scratch_nocheck
+_require_xfs_mkfs_cfgfile
+
+echo "Silence is golden"
+
+def_cfgfile=$TEST_DIR/a
+rm -rf $def_cfgfile
+
+cat > $def_cfgfile << ENDL
+[metadata]
+crc = 0
+rmapbt = 1
+reflink = 1
+
+[inode]
+sparse = 1
+ENDL
+
+$MKFS_XFS_PROG -c options=$def_cfgfile -f $SCRATCH_DEV > $tmp.mkfs 2>&1
+if [ $? -eq 0 ]; then
+	echo "mkfs.xfs did not fail!"
+	cat $tmp.mkfs
+fi
+
+# success, all done
+status=0
+exit

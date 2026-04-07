@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 134
+#
+# Since loff_t is a signed type, it is invalid for a filesystem to load
+# an inode with i_size = -1ULL.  Unfortunately, nobody checks this,
+# which means that we can trivially DoS the VFS by creating such a file
+# and appending to it.  This causes an integer overflow in the routines
+# underlying writeback, which results in the kernel locking up.
+#
+# So, create this malformed inode and try a dio append to make sure we
+# catch this situation.
+#
+. ./common/preamble
+_begin_fstest dangerous_fuzzers
+
+PIDS=""
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+_disable_dmesg_check
+
+echo "Format and mount"
+_scratch_mkfs  >> $seqres.full 2>&1
+_scratch_mount
+
+testdir=$SCRATCH_MNT
+# make sure the write offset is 512-aligned
+touch $testdir/a
+inum=$(stat -c "%i" $testdir/a)
+
+echo "Corrupt filesystem"
+_scratch_unmount
+
+# 1) Set the file size to the highest multiple of 512 below -1 so
+#    that we can perform a dio write.
+# 2) run two xfs_db commands to set core.size regardless of the special
+#    argument "--" is needed or not.
+_scratch_xfs_db -x -c "inode ${inum}" -c 'write core.size -- -512' >> $seqres.full 2>&1
+_scratch_xfs_db -x -c "inode ${inum}" -c 'write core.size -512' >> $seqres.full 2>&1
+
+# check core.size and _notrun if it's not set correctly
+i_size=`_scratch_xfs_db -c "inode ${inum}" -c "print core.size" | $AWK_PROG '{print $3}'`
+if [ $i_size -ne -512 ]; then
+	_notrun "Could not set i_size to -512 successfully, skip test."
+fi
+
+echo "Remount, try to append"
+_scratch_mount
+dd if=/dev/zero of=$testdir/a bs=512 count=1 oflag=direct,append conv=notrunc >> $seqres.full 2>&1 || echo "Write did not succeed (ok)."
+_scratch_sync
+
+# success, all done
+status=0
+exit

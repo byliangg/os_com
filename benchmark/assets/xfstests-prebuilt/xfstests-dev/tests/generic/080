@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+
+#
+# FS QA Test No. 080
+#
+# Verify that mtime is updated when writing to mmap-ed pages
+#
+. ./common/preamble
+_begin_fstest auto quick mmap
+
+status=0
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+echo "Silence is golden."
+
+# pattern the file.
+testfile=$TEST_DIR/mmap_mtime_testfile
+$XFS_IO_PROG -f -c "pwrite 0 4k" -c fsync $testfile >> $seqres.full
+
+# sample timestamps.
+mtime1=`stat -c %Y $testfile`
+ctime1=`stat -c %Z $testfile`
+echo "before mwrite: $mtime1 $ctime1" >> $seqres.full
+
+# map read followed by map write to trigger timestamp change
+sleep 2
+$XFS_IO_PROG -c "mmap 0 4k" -c "mread 0 4k" -c "mwrite 0 4k" $testfile \
+	>> $seqres.full
+
+# sample and verify that timestamps have changed.
+mtime2=`stat -c %Y $testfile`
+ctime2=`stat -c %Z $testfile`
+echo "after mwrite : $mtime2 $ctime2" >> $seqres.full
+
+if [ "$mtime1" == "$mtime2" ]; then
+	echo "mtime not updated"
+	let status=$status+1
+fi
+if [ "$ctime1" == "$ctime2" ]; then
+	echo "ctime not updated"
+	let status=$status+1
+fi
+
+exit

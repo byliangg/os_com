@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 057
+#
+# This test is motivated by an fsync issue discovered in btrfs.
+# The issue was that we could lose file data, that was previously fsync'ed
+# successfully, if we end up adding a hard link to our inode and then persist
+# the fsync log later via an fsync of other inode for example.
+#
+# The btrfs issue was fixed by the following linux kernel patch:
+#
+#  Btrfs: fix fsync data loss after adding hard link to inode
+#
+. ./common/preamble
+_begin_fstest metadata auto quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test file with some data.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa -b 8K 0 8K" \
+	$SCRATCH_MNT/foo | _filter_xfs_io
+
+# Make sure the file is durably persisted.
+_scratch_sync
+
+# Append some data to our file, to increase its size.
+$XFS_IO_PROG -f -c "pwrite -S 0xcc -b 4K 8K 4K" \
+	$SCRATCH_MNT/foo | _filter_xfs_io
+
+# Fsync the file, so from this point on if a crash/power failure happens, our
+# new data is guaranteed to be there next time the fs is mounted.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+# Add one hard link to our file. This made btrfs write into the in memory fsync
+# log a special inode with generation 0 and an i_size of 0 too. Note that this
+# didn't update the inode in the fsync log on disk.
+ln $SCRATCH_MNT/foo $SCRATCH_MNT/foo_link
+
+# Now make sure the in memory fsync log is durably persisted.
+# Creating and fsync'ing another file will do it.
+touch $SCRATCH_MNT/bar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+
+# As expected, before the crash/power failure, we should be able to read the
+# 12Kb of file data.
+echo "File content before:"
+od -t x1 $SCRATCH_MNT/foo
+
+_flakey_drop_and_remount
+
+# After mounting the fs again, the fsync log was replayed.
+# The btrfs fsync log replay code didn't update the i_size of the persisted
+# inode because the inode item in the log had a special generation with a
+# value of 0 (and it couldn't know the correct i_size, since that inode item
+# had a 0 i_size too). This made the last 4Kb of file data inaccessible and
+# effectively lost.
+echo "File content after:"
+od -t x1 $SCRATCH_MNT/foo
+
+status=0
+exit

@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 107
+#
+# Test that when we have a file with multiple hard links belonging to different
+# parent directories, if we remove one of those links, fsync the file using one
+# of its other links (that has a parent directory different from the one we
+# removed a link from), power fail and then replay the fsync log/journal, the
+# hard link we removed is not available anymore and all the filesystem metadata
+# is in a consistent state.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test directory and file.
+mkdir $SCRATCH_MNT/testdir
+touch $SCRATCH_MNT/foo
+ln $SCRATCH_MNT/foo $SCRATCH_MNT/testdir/foo2
+ln $SCRATCH_MNT/foo $SCRATCH_MNT/testdir/foo3
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Now we remove one of our file's hardlinks in the directory testdir.
+unlink $SCRATCH_MNT/testdir/foo3
+
+# We now fsync our file using the "foo" link, which has a parent that
+# is not the directory "testdir".
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+_flakey_drop_and_remount
+
+# After the journal/log is replayed we expect to not see the "foo3" link anymore
+# and we should be able to remove all names in the directory "testdir" and then
+# remove it (no stale directory entries left after the journal/log replay).
+echo "Entries in testdir:"
+ls -1 $SCRATCH_MNT/testdir
+
+rm -f $SCRATCH_MNT/testdir/*
+rmdir $SCRATCH_MNT/testdir
+
+_scratch_unmount
+
+status=0
+exit

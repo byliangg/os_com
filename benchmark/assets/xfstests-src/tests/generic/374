@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 374
+#
+# Check that cross-mountpoint dedupe works
+#
+. ./common/preamble
+_begin_fstest auto quick clone dedupe
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_dedupe
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+otherdir=$tmp.m.$seq
+othertestdir=$otherdir/test-$seq
+rm -rf $otherdir
+mkdir $otherdir
+
+blocks=1
+blksz=65536
+sz=$((blocks * blksz))
+
+echo "Mount otherdir"
+$MOUNT_PROG --bind $SCRATCH_MNT $otherdir
+
+echo "Create file"
+_pwrite_byte 0x61 0 $sz $testdir/file >> $seqres.full
+_pwrite_byte 0x61 0 $sz $testdir/otherfile >> $seqres.full
+
+echo "Dedupe one file to another"
+_dedupe_range $testdir/file 0 $othertestdir/otherfile 0 $sz 2>&1 \
+	| _filter_xfs_io
+
+filter_md5()
+{
+	_filter_scratch | sed -e "s,$otherdir,OTHER_DIR,g"
+}
+echo "Check output"
+md5sum $testdir/file $othertestdir/otherfile | filter_md5
+
+echo "Unmount otherdir"
+_unmount $otherdir
+rm -rf $otherdir
+
+# success, all done
+status=0
+exit

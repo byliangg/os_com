@@ -1,0 +1,21 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Eric Sandeen.  All Rights Reserved.
+#
+# FS QA Test No. 212
+#
+# Run aio-io-setup-with-nonwritable-context-pointer -
+# Test what happens when a non-writable context pointer is passed to io_setup
+#
+. ./common/preamble
+_begin_fstest auto aio quick
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+
+_run_aiodio aio-io-setup-with-nonwritable-context-pointer
+
+exit $status

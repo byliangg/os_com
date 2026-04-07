@@ -1,0 +1,86 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/093
+#
+# Test btrfs file range cloning with the same file as a source and destination.
+#
+# This tests a specific scenario where the extent layout of the file confused
+# the clone ioctl implementation making it return -EEXIST to userspace.
+# This issue was fixed by the following linux kernel patch:
+#
+#    Btrfs: fix range cloning when same inode used as source and destination
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+. ./common/filter
+
+_require_scratch
+_require_cloner
+
+# Create a file with an extent layout that confused the btrfs clone ioctl
+# implementation. The first extent item that is cloned by the second call
+# to the cloner program will have only a trailing part of it referenced by
+# a new extent item, since the source offset starts in the middle of that
+# extent. This confused the clone ioctl because after inserting this new
+# extent item it would immediately after process it again thinking it
+# corresponded to an extent that existed before - this made it attempt to
+# insert a duplicated extent item pointing to the same extent again, which
+# made it return an -EEXIST error to userspace and turn the filesystem to
+# readonly mode (since the current transaction got aborted).
+test_clone()
+{
+	local bs=$1
+
+	$XFS_IO_PROG -f -c "pwrite -S 0xaa $((2 * $bs)) $((2 * $bs))" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+
+	$CLONER_PROG -s $((3 * $bs)) -d $((267 * $bs)) -l 0 $SCRATCH_MNT/foo \
+		$SCRATCH_MNT/foo
+	$CLONER_PROG -s $((217 * $bs)) -d $((95 * $bs)) -l 0 $SCRATCH_MNT/foo \
+		$SCRATCH_MNT/foo
+
+	echo "File digest after clone operations using same file as source and destination"
+	md5sum $SCRATCH_MNT/foo | _filter_scratch
+
+	# Test cloning using different source and destination files for the
+	# same exact data - it must produce the exact same result as the case
+	# before.
+	$XFS_IO_PROG -f -c "pwrite -S 0xaa $((2 * $bs)) $((2 * $bs))" \
+		$SCRATCH_MNT/a | _filter_xfs_io
+	cp $SCRATCH_MNT/a $SCRATCH_MNT/b
+
+	$CLONER_PROG -s $((3 * $bs)) -d $((267 * $bs)) -l 0 $SCRATCH_MNT/a \
+		$SCRATCH_MNT/b
+
+	cp $SCRATCH_MNT/b $SCRATCH_MNT/foo2
+	$CLONER_PROG -s $((217 * $bs)) -d $((95 * $bs)) -l 0 $SCRATCH_MNT/b \
+		$SCRATCH_MNT/foo2
+
+	echo "File digest after clone operations using different files as source and destination"
+	md5sum $SCRATCH_MNT/foo2 | _filter_scratch
+
+}
+
+# Make sure the test passes offsets and lengths to the btrfs clone ioctl that
+# are multiples of the fs block size. Currently the block size on btrfs must
+# be a multiple of the page size, so use a 64Kb fs block size in order to be
+# able to test on every platform supported by linux.
+bs=$((64 * 1024))
+
+echo "Testing without the no-holes feature"
+_scratch_mkfs "-O ^no-holes -n $bs" >>$seqres.full 2>&1
+_scratch_mount
+test_clone $bs
+_check_scratch_fs
+
+echo -e "\nTesting with the no-holes feature"
+_scratch_unmount
+_scratch_mkfs "-O no-holes -n $bs" >>$seqres.full 2>&1
+_scratch_mount
+test_clone $bs
+
+status=0
+exit

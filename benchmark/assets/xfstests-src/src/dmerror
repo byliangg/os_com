@@ -1,0 +1,31 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Jeff Layton <jlayton@redhat.com>
+
+# hackity hack hack - first arg is the test number, second arg is op.
+# This is needed so that dmerror names the dm dev correctly.
+seq=$1
+
+. ./common/config
+. ./common/dmerror
+
+if [ -z "$DMERROR_DEV" ]; then
+	echo "Caller should have run _dmerror_init."
+	exit 1
+fi
+
+case $2 in
+load_error_table)
+	_dmerror_load_error_table
+	;;
+load_working_table)
+	_dmerror_load_working_table
+	;;
+*)
+	echo "Usage: $0 {load_error_table|load_working_table}"
+	exit 1
+	;;
+esac
+
+status=0
+exit

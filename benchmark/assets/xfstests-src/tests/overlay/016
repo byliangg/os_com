@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 CTERA Networks. All Rights Reserved.
+#
+# FSQA Test No. 016
+#
+# Test ro/rw fd data inconsistecies
+#
+# This simple test demonstrates an issue with overlayfs on kernel < v4.19:
+# - process A opens file F for read
+# - process B writes new data to file F
+# - process A reads old data from file F
+#
+. ./common/preamble
+_begin_fstest auto quick copyup
+
+# Import common functions.
+. ./common/filter
+
+_fixed_in_kernel_version "v4.19"
+
+_require_scratch
+_require_xfs_io_command "open"
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# Create our test files.
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+echo "This is old news" > $lowerdir/foo
+
+_scratch_mount
+
+#
+# open file for read (rofd)
+# open file for write (rwfd)
+# write to rwfd
+# read from rofd
+#
+$XFS_IO_PROG -r $SCRATCH_MNT/foo \
+	-C "open $SCRATCH_MNT/foo" \
+	-C "pwrite -S 0x61 0 16" \
+	-C "file 0" \
+	-C "pread -v 0 16" \
+| _filter_xfs_io | _filter_scratch
+
+status=0
+exit

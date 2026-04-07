@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2019 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 547
+#
+# Run fsstress, fsync every file and directory, simulate a power failure and
+# then verify that all files and directories exist, with the same data and
+# metadata they had before the power failure.
+#
+. ./common/preamble
+_begin_fstest auto quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_kill_fsstress
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_test
+_require_scratch
+_require_fssum
+_require_dm_target flakey
+
+fssum_files_dir=$TEST_DIR/generic-test-$seq
+rm -fr $fssum_files_dir
+mkdir $fssum_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+mkdir $SCRATCH_MNT/test
+args=`_scale_fsstress_args -p 4 -n 100 -d $SCRATCH_MNT/test`
+args="$args -f mknod=0 -f symlink=0"
+echo "Running fsstress with arguments: $args" >>$seqres.full
+_run_fsstress $args
+
+# Fsync every file and directory.
+find $SCRATCH_MNT/test \( -type f -o -type d \) -exec $XFS_IO_PROG -c fsync {} \;
+
+# Compute a digest of the filesystem (using the test directory only, to skip
+# fs specific directories such as "lost+found" on ext4 for example).
+$FSSUM_PROG -A -f -w $fssum_files_dir/fs_digest $SCRATCH_MNT/test
+
+# Simulate a power failure and mount the filesystem to check that all files and
+# directories exist and have all data and metadata preserved.
+_flakey_drop_and_remount
+
+# Compute a new digest and compare it to the one we created previously, they
+# must match.
+$FSSUM_PROG -r $fssum_files_dir/fs_digest $SCRATCH_MNT/test
+
+_scratch_unmount
+
+status=0
+exit

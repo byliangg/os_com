@@ -1,0 +1,98 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 181
+#
+# Like 121 only creating large EAs
+# As part of the iunlink processing in recovery it will call VN_RELE
+# which will inactivate the inodes and if they have EAs (which they
+# will here) also call xfs_inactive_attrs.
+# We want to test out this xfs_inactive_attrs code being called in recovery.
+#
+. ./common/preamble
+_begin_fstest shutdown log auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -f $tmp.*
+    [ -n "$pid" ] && kill $pid
+}
+
+pid=""
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+
+
+rm -f $tmp.log
+
+_require_scratch
+
+echo "mkfs"
+_scratch_mkfs_xfs >>$seqres.full 2>&1
+
+echo "mount"
+_scratch_mount
+
+# num_files must be greater than 64 (XFS_AGI_UNLINKED_BUCKETS)
+# so that there will be at least one linked list from one of
+# the 64 buckets, so that we can decode a di_next_unlinked field
+num_files=200
+num_eas=1
+ea_val_size=`expr 32 \* 1024`
+
+# sleep for ages and we will kill this pid when we are ready
+delay=100
+
+echo "open and unlink $num_files files with EAs"
+$here/src/multi_open_unlink -f $SCRATCH_MNT/test_file -n $num_files -s $delay -e $num_eas -v $ea_val_size &
+pid=$!
+
+# time to create and unlink all the files
+sleep 10
+
+echo "godown"
+_scratch_shutdown -v -f >> $seqres.full
+
+# kill the multi_open_unlink
+kill $pid 2>/dev/null
+wait $pid 2>/dev/null
+pid=""
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after going down..."
+_print_logstate
+
+echo "mount with replay"
+_scratch_mount $mnt >>$seqres.full 2>&1 \
+    || _fail "mount failed: $mnt $MOUNT_OPTIONS"
+
+echo "godown"
+_scratch_shutdown -v -f >> $seqres.full
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after going down..."
+_print_logstate
+
+echo "logprint to check for CLEAR_AGI_BUCKET..."
+if _scratch_xfs_logprint -t | tee -a $seqres.full | grep CLEAR; then
+	echo 'CLEAR_AGI_BUCKET transactions found!!'
+	echo 'Are you running with an old xfs kernel - where the bug still exists?'
+else
+	echo 'No CLEAR_AGI_BUCKET found in transactions - great - test passed :)'
+fi
+
+# clean up dirty log with log recovery on mount
+_scratch_mount >> $seqres.full 2>&1 \
+    || _fail "mount failed"
+
+# success, all done
+status=0
+exit

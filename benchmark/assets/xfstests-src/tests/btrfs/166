@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 166
+#
+# Test that if a power failure happens on a filesystem with quotas (qgroups)
+# enabled while the quota rescan kernel thread is running, we will be able
+# to mount the filesystem after the power failure.
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+
+_scratch_mkfs  >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Enable qgroups on the filesystem. This will start the qgroup rescan kernel
+# thread.
+_btrfs quota enable $SCRATCH_MNT
+
+# Simulate a power failure, while the qgroup rescan kernel thread is running,
+# and then mount the filesystem to check that mounting the filesystem does not
+# fail.
+_flakey_drop_and_remount
+
+_scratch_unmount
+_cleanup_flakey
+
+echo "Silence is golden"
+status=0
+exit

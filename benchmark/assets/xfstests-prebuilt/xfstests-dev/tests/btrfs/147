@@ -1,0 +1,103 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/147
+#
+# Test that an incremental send/receive operation works correctly after moving
+# some directory inode A, renaming a regular file inode B into the old name of
+# inode A and finally creating a new hard link for inode B at directory inode A.
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/dir1
+mkdir $SCRATCH_MNT/dir1/dir2
+mkdir $SCRATCH_MNT/dir1/dir2/dir3
+mkdir $SCRATCH_MNT/dir5
+touch $SCRATCH_MNT/dir1/dir2/dir3/file1
+mkdir $SCRATCH_MNT/dir1/dir2/dir3/dir4
+
+# Filesystem looks like:
+#
+# .                                                      (ino 256)
+# |
+# |--- dir1/                                             (ino 257)
+# |      |--- dir2/                                      (ino 258)
+# |             |--- dir3/                               (ino 259)
+# |                   |--- file1                         (ino 261)
+# |                   |--- dir4/                         (ino 262)
+# |
+# |--- dir5/                                             (ino 260)
+#
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+	$SCRATCH_MNT/mysnap1 > /dev/null
+
+$BTRFS_UTIL_PROG send -f $send_files_dir/1.snap \
+	$SCRATCH_MNT/mysnap1 2>&1 1>/dev/null | _filter_scratch
+
+mkdir $SCRATCH_MNT/dir1/dir6
+mv $SCRATCH_MNT/dir5 $SCRATCH_MNT/dir1/dir2/dir3/dir4/dir55
+ln $SCRATCH_MNT/dir1/dir2/dir3/file1 $SCRATCH_MNT/dir1/dir2/dir3/dir4/file11
+mv $SCRATCH_MNT/dir1/dir2/dir3/dir4 $SCRATCH_MNT/dir1/dir6/dir44
+mv $SCRATCH_MNT/dir1/dir2/dir3/file1 $SCRATCH_MNT/dir1/dir2/dir3/dir4
+
+# Filesystem now looks like:
+#
+# .                                                      (ino 256)
+# |
+# |--- dir1/                                             (ino 257)
+#        |--- dir2/                                      (ino 258)
+#        |      |--- dir3/                               (ino 259)
+#        |            |--- dir4                          (ino 261)
+#        |
+#        |--- dir6/                                      (ino 263)
+#               |--- dir44/                              (ino 262)
+#                      |--- file11                       (ino 261)
+#                      |--- dir55/                       (ino 260)
+#
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+		 $SCRATCH_MNT/mysnap2 > /dev/null
+
+$BTRFS_UTIL_PROG send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+		 $SCRATCH_MNT/mysnap2 2>&1 1>/dev/null | _filter_scratch
+
+$FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+$FSSUM_PROG -A -f -w $send_files_dir/2.fssum \
+	-x $SCRATCH_MNT/mysnap2/mysnap1 $SCRATCH_MNT/mysnap2
+
+# Now recreate the filesystem by receiving both send streams and verify we get
+# the same content that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+$BTRFS_UTIL_PROG receive -f $send_files_dir/1.snap $SCRATCH_MNT > /dev/null
+$BTRFS_UTIL_PROG receive -f $send_files_dir/2.snap $SCRATCH_MNT > /dev/null
+$FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+$FSSUM_PROG -r $send_files_dir/2.fssum $SCRATCH_MNT/mysnap2
+
+status=0
+exit

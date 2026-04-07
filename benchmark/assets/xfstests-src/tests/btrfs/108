@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/108
+#
+# Test that a send operation works correctly with reflinked files (cloned
+# extents which multiple files point to).
+#
+. ./common/preamble
+_begin_fstest auto quick send clone punch
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+. ./common/reflink
+
+_require_scratch
+_require_cp_reflink
+_require_xfs_io_command "fpunch"
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create our test file with a single 100K extent.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0K 100K" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Clone our file into a new file named bar.
+cp --reflink=always $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+
+# Now overwrite parts of our foo file.
+$XFS_IO_PROG -c "pwrite -S 0xbb 50K 10K" \
+	-c "pwrite -S 0xcc 90K 10K" \
+	-c "fpunch 70K 10k" \
+	$SCRATCH_MNT/foo | _filter_xfs_io
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/snap
+
+echo "File digests in the original filesystem:"
+md5sum $SCRATCH_MNT/snap/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap/bar | _filter_scratch
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/snap
+
+# Now recreate the filesystem by receiving the send stream and verify we get
+# the same file contents that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+
+# We expect the destination filesystem to have exactly the same file data as
+# the original filesystem.
+# The btrfs send implementation had a bug where it sent a clone operation from
+# file foo into file bar covering the whole [0, 100K[ range after creating
+# and writing the file foo. This was incorrect because the file bar now included
+# the updates done to file foo after we cloned foo to bar, breaking the COW
+# nature of reflink copies (cloned extents).
+echo "File digests in the new filesystem:"
+md5sum $SCRATCH_MNT/snap/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap/bar | _filter_scratch
+
+status=0
+exit

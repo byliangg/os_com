@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 143
+#
+# Ensure that reflinking a file N times and DIO CoWing the copies leaves the
+# original intact.
+#   - Create a file and record its hash
+#   - Create some reflink copies
+#   - Rewrite all the reflink copies w/ directio
+#   - Compare the contents of the original file
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+_require_odirect
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz=65536
+nr=9
+filesize=$((blksz * nr))
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file1 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+csum=$(_md5_checksum $testdir/file1)
+
+echo "Create the reflink copies"
+seq 2 $nr | while read i; do
+	_cp_reflink $testdir/file1 $testdir/file$i
+done
+_test_cycle_mount
+
+echo "Rewrite the copies"
+seq 2 $nr | while read i; do
+	_pwrite_byte 0x62 0 $((blksz * 256)) $testdir/file$i -d >> $seqres.full
+done
+_test_cycle_mount
+
+echo "Examine original file"
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+
+mod_csum=$(_md5_checksum $testdir/file2)
+new_csum=$(_md5_checksum $testdir/file1)
+test ${csum} != ${mod_csum} || echo "checksums do not match"
+test ${csum} = ${new_csum} || echo "checksums do not match"
+
+# success, all done
+status=0
+exit

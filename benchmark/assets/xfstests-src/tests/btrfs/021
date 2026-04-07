@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 021
+#
+# A regression test of running btrfs balance and defrag concurrently.
+#
+# The test aims to trigger snapshot-aware defrag path in endio by
+# running balance, which is not expected and leads to a crash.
+#
+. ./common/preamble
+_begin_fstest auto quick balance defrag
+
+. ./common/filter
+
+run_test()
+{
+	_run_btrfs_balance_start $SCRATCH_MNT >> $seqres.full &
+
+	sleep 0.5
+
+	# In new versions of btrfs-progs (6.0+), the defrag command outputs to
+	# stdout the path of the files it operates on. So ignore that.
+	find $SCRATCH_MNT -type f -print0 | xargs -0 \
+		$BTRFS_UTIL_PROG filesystem defrag -f > /dev/null
+
+	sync
+	wait
+}
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+# This is going to reproduce a race senario between balance and the writeback
+# of snapshot-aware defragment.
+
+# we first create a few files to get higher btree height.
+for j in `seq 0 100`; do
+	touch $SCRATCH_MNT/padding-$j
+done
+
+# Get 50 files with fragments by using backwards writes.
+for j in `seq 0 50`; do
+	for i in `seq 20 -1 1`; do
+		$XFS_IO_PROG -f -d -c "pwrite $(($i * 4096)) 4096" \
+		$SCRATCH_MNT/foo-$j >> $seqres.full | _filter_xfs_io
+	done
+done
+
+# Make sure that our metadata makes it self on disk.
+sync
+
+run_test
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

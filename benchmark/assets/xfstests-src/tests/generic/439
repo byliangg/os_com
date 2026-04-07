@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. generic/439
+#
+# Test that if we punch a hole in a file, with either a range that goes beyond
+# the file's size or covers a file range that is already a hole, and that if
+# after we do some buffered write operations that cover different parts of the
+# hole, no warnings are emmitted in syslog/dmesg and the file's content is
+# correct after remounting the filesystem.
+#
+. ./common/preamble
+_begin_fstest auto quick punch
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_xfs_io_command "fpunch"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 100K" $SCRATCH_MNT/f | _filter_xfs_io
+$XFS_IO_PROG -c "fpunch 60K 90K" $SCRATCH_MNT/f
+$XFS_IO_PROG -c "pwrite -S 0xbb -b 100K 50K 100K" $SCRATCH_MNT/f | _filter_xfs_io
+$XFS_IO_PROG -c "pwrite -S 0xcc -b 50K 100K 50K" $SCRATCH_MNT/f | _filter_xfs_io
+
+$XFS_IO_PROG -f -c "fpunch 695K 820K" $SCRATCH_MNT/f2
+$XFS_IO_PROG -c "pwrite -S 0xaa 1008K 307K" $SCRATCH_MNT/f2 |  _filter_xfs_io
+$XFS_IO_PROG -c "pwrite -S 0xbb -b 630K 1073K 630K" $SCRATCH_MNT/f2 \
+	| _filter_xfs_io
+$XFS_IO_PROG -c "pwrite -S 0xcc -b 459K 1068K 459K" $SCRATCH_MNT/f2 \
+	| _filter_xfs_io
+
+_scratch_cycle_mount
+
+echo "File f contents after remounting filesystem:"
+od -t x1 $SCRATCH_MNT/f
+echo "File f2 contents after remounting filesystem:"
+od -t x1 $SCRATCH_MNT/f2
+
+status=0
+exit

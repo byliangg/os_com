@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 551
+#
+# Randomly direct AIO write&verify stress test
+#
+. ./common/preamble
+_begin_fstest auto stress aio
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_aiodio aio-dio-write-verify
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+localfile=$SCRATCH_MNT/testfile
+diosize=`$here/src/min_dio_alignment $SCRATCH_MNT $SCRATCH_DEV`
+
+# The maximum write size and offset are both 32k diosize. So the maximum
+# file size will be (32 * 2)k
+free_size_k=`df -kP $SCRATCH_MNT | grep -v Filesystem | awk '{print $4}'`
+max_io_size_b=$((32 * 1024))
+if [ $max_io_size_b -gt $((free_size_k * 1024 / 2 / diosize)) ]; then
+	max_io_size_b=$((free_size_k * 1024 / 2 / diosize))
+fi
+
+do_test()
+{
+	local num_oper
+	local oper_list=""
+	local size
+	local off
+	local truncsize
+	local total_size=0
+	local avail_mem=`_available_memory_bytes`
+
+	# To avoid OOM on tmpfs, subtract the amount of available memory
+	# allocated for the tmpfs
+	[ "$FSTYP" = "tmpfs" ] && avail_mem=$((avail_mem - free_size_k * 1024))
+
+	# the number of AIO write operation
+	num_oper=$((RANDOM % 64 + 1))
+
+	for ((i=0; i<num_oper; i++)); do
+		size=$(((RANDOM % max_io_size_b + 1) * diosize))
+		total_size=$((total_size + size*2))
+		if [[ $total_size -ge $avail_mem ]]; then
+			break
+		fi
+		off=$((RANDOM % max_io_size_b * diosize))
+		oper_list="$oper_list -a size=$size,off=$off"
+	done
+	truncsize=$(((RANDOM * diosize + RANDOM % diosize) % max_io_size_b))
+
+	$AIO_TEST -t $truncsize $oper_list $localfile
+	ret=$?
+	if [ $ret -ne 0 ];then
+		echo "$AIO_TEST -t $truncsize $oper_list $localfile"
+		echo "==========^^ Fail ^^=========="
+	fi
+	return $ret
+}
+
+testimes=$((LOAD_FACTOR * 100))
+while [ $testimes -gt 0 ]; do
+	echo > $localfile
+	do_test || break
+	((testimes--))
+done
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,77 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 337
+#
+# Corrupt the realtime rmapbt and see how the kernel and xfs_repair deal.
+#
+. ./common/preamble
+_begin_fstest fuzzers rmap realtime prealloc repair
+
+# Import common functions.
+. ./common/filter
+
+_require_realtime
+_require_xfs_scratch_rmapbt
+_require_test_program "punch-alternating"
+_require_xfs_io_command "falloc"
+_disable_dmesg_check
+
+rm -f "$seqres.full"
+
+echo "+ create scratch fs"
+_scratch_mkfs | _filter_mkfs 2>$tmp.mkfs >/dev/null
+. $tmp.mkfs
+cat $tmp.mkfs > "$seqres.full" 2>&1
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(_get_block_size $SCRATCH_MNT)"
+
+# inode core size is at least 176 bytes; btree header is 56 bytes;
+# rtrmap record is 32 bytes; and rtrmap key/pointer are 56 bytes.
+i_core_size="$(_xfs_get_inode_core_bytes $SCRATCH_MNT)"
+i_ptrs=$(( (isize - i_core_size) / 56 ))
+bt_ptrs=$(( (blksz - 56) / 56 ))
+bt_recs=$(( (blksz - 56) / 32 ))
+
+blocks=$((i_ptrs * bt_ptrs * bt_recs + 1))
+_require_fs_space $SCRATCH_MNT $(( (2 * blocks * blksz) * 5 / 4096 ))
+len=$((blocks * blksz))
+
+echo "+ make some files"
+$XFS_IO_PROG -f -R -c "falloc 0 $len" -c "pwrite -S 0x68 -b 1048576 0 $len" $SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG -f -R -c "falloc 0 $len" -c "pwrite -S 0x68 -b 1048576 0 $len" $SCRATCH_MNT/f2 >> $seqres.full
+$here/src/punch-alternating $SCRATCH_MNT/f1 >> "$seqres.full"
+$here/src/punch-alternating $SCRATCH_MNT/f2 >> "$seqres.full"
+_scratch_unmount
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || echo "xfs_repair should not fail"
+
+echo "+ corrupt image"
+_scratch_xfs_db -x -c "path -m /rtgroups/0.rmap" -c "addr u3.rtrmapbt.ptrs[1]" \
+	-c "stack" -c "blocktrash -x 4096 -y 4096 -n 8 -3 -z" \
+	>> $seqres.full 2>&1
+
+echo "+ mount image && copy more"
+if _try_scratch_mount >> $seqres.full 2>&1; then
+
+	$XFS_IO_PROG -f -R -c "pwrite -S 0x68 0 1" $SCRATCH_MNT/e3 >> $seqres.full 2>&1
+	test -s ${SCRATCH_MNT}/f3 && echo "should not be able to copy with busted rtrmap btree"
+	_scratch_unmount
+fi
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ copy more (2)"
+$XFS_IO_PROG -f -R -c "pwrite -S 0x68 0 1" $SCRATCH_MNT/e4 >> $seqres.full
+
+# success, all done
+status=0
+exit

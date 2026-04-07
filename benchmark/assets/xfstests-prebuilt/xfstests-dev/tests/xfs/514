@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-newer
+# Copyright (c) 2020, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 514
+#
+# Ensure all xfs_db commands are documented.
+
+. ./common/preamble
+_begin_fstest auto quick db
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $file
+}
+
+# Import common functions.
+
+_require_command "$XFS_DB_PROG" "xfs_db"
+_require_command "$MAN_PROG" man
+_require_test
+
+echo "Silence is golden"
+
+MANPAGE=$($MAN_PROG --path xfs_db)
+
+case "$MANPAGE" in
+*.gz|*.z\|*.Z)	CAT=zcat;;
+*.bz2)		CAT=bzcat;;
+*.xz)		CAT=xzcat;;
+*)		CAT=cat;;
+esac
+_require_command "$(type -P $CAT)" $CAT
+
+file=$TEST_DIR/xx.$seq
+truncate -s 128m $file
+$MKFS_XFS_PROG $file >> /dev/null
+
+for COMMAND in `$XFS_DB_PROG -x -c help $file | awk '{print $1}' | grep -v "^Use"`; do
+  $CAT "$MANPAGE" | grep -E -q "^\.B.*$COMMAND" || \
+	echo "$COMMAND not documented in the xfs_db manpage"
+done
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 116
+#
+# Verify that when a fitrim operation is made against a btrfs filesystem, the
+# ranges [0, 64Kb[ and [68Kb, 1Mb[ of the device are not discarded, they remain
+# with the content they had before the fitrim operation. These regions of the
+# device are reserved for a boot loader to use at its will.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+. ./common/filter
+
+_require_scratch
+# Writing non-contiguous data directly to the device
+_require_non_zoned_device $SCRATCH_DEV
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# Write to the [0, 64Kb[ and [68Kb, 1Mb[ ranges of the device. These ranges are
+# reserved for a boot loader to use (GRUB for example) and btrfs should never
+# use them - neither for allocating metadata/data nor should trim/discard them.
+# The range [64Kb, 68Kb[ is used for the primary superblock of the filesystem.
+$XFS_IO_PROG -c "pwrite -S 0xfd 0 64K" $SCRATCH_DEV | _filter_xfs_io
+$XFS_IO_PROG -c "pwrite -S 0xfd 68K 956K" $SCRATCH_DEV | _filter_xfs_io
+
+# Now mount the filesystem and perform a fitrim against it.
+_scratch_mount
+_require_batched_discard $SCRATCH_MNT
+$FSTRIM_PROG $SCRATCH_MNT
+
+# Now unmount the filesystem and verify the content of the ranges was not
+# modified (no trim/discard happened on them).
+_scratch_unmount
+echo "Content of the ranges [0, 64Kb] and [68Kb, 1Mb[ after fitrim:"
+od -t x1 -N $((64 * 1024)) $SCRATCH_DEV
+od -t x1 -j $((68 * 1024)) -N $((956 * 1024)) $SCRATCH_DEV
+
+status=0
+exit

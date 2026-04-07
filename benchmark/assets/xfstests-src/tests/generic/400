@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 400
+#
+# test out high quota ids retrieved by Q_GETNEXTQUOTA
+# Request for next ID near 2^32 should not wrap to 0
+#
+# Designed to use the new Q_GETNEXTQUOTA quotactl
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+_require_quota
+_require_scratch
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+MOUNT_OPTIONS="-o usrquota,grpquota"
+_qmount
+_require_getnextquota
+
+echo "Launch all quotas"
+
+# We want to create a block of quotas for an id very near
+# 2^32, then ask for the next quota after it.  The returned
+# ID should not overflow to 0.
+
+# Populate  with 2^32-4
+ID=4294967292
+setquota -u $ID $ID $ID $ID $ID $SCRATCH_MNT
+touch ${SCRATCH_MNT}/${ID}
+chown ${ID} ${SCRATCH_MNT}/${ID}
+
+# remount just for kicks, make sure we get it off disk
+_scratch_unmount
+_qmount
+
+# Ask for the next quota after $ID; should get nothing back
+# If kernelspace wraps, we'll get 0 back.
+for TYPE in u g; do
+	let NEXT=ID+1
+	echo "Ask for ID after $NEXT expecting nothing"
+	$here/src/test-nextquota -i $NEXT -${TYPE} -d $SCRATCH_DEV
+done
+
+# success, all done
+status=0
+exit

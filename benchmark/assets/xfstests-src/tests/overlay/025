@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 025
+#
+# Overlayfs failed to get posix acls if lower or upper
+# fs is tmpfs.
+# Kernel commit below fixed it.
+# 5201dc449e4b ovl: use cached acl on underlying layer
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $tmpfsdir/mnt
+	$UMOUNT_PROG $tmpfsdir
+	rm -rf $tmpfsdir
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_user
+_require_extra_fs tmpfs
+
+# create a tmpfs in $TEST_DIR
+tmpfsdir=$TEST_DIR/tmpfs
+mkdir -p $tmpfsdir
+$MOUNT_PROG -t tmpfs tmpfs $tmpfsdir
+
+mkdir -p $tmpfsdir/{lower,upper,work,mnt}
+mkdir -p -m 0 $tmpfsdir/upper/testd
+# grant permission for $qa_user
+setfacl -m u:$qa_user:rx $tmpfsdir/upper/testd
+
+# mount overlay using dirs in tmpfs
+_overlay_mount_dirs $tmpfsdir/{lower,upper,work,overlay,mnt}
+
+# user accessing test dir, should be OKay
+_user_do "ls $tmpfsdir/mnt/testd"
+
+echo "Silence is golden"
+# success, all done
+status=0
+exit

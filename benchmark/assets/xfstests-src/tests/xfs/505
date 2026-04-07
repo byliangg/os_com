@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 505
+#
+# Ensure all xfs_spaceman commands are documented.
+
+. ./common/preamble
+_begin_fstest auto quick spaceman
+
+# Import common functions.
+
+_require_command "$XFS_SPACEMAN_PROG" "xfs_spaceman"
+_require_command "$MAN_PROG" man
+
+echo "Silence is golden"
+
+MANPAGE=$($MAN_PROG --path xfs_spaceman)
+
+case "$MANPAGE" in
+*.gz|*.z\|*.Z)	CAT=zcat;;
+*.bz2)		CAT=bzcat;;
+*.xz)		CAT=xzcat;;
+*)		CAT=cat;;
+esac
+_require_command "$(type -P $CAT)" $CAT
+
+for COMMAND in `$XFS_SPACEMAN_PROG -c help $TEST_DIR | awk '{print $1}' | grep -v "^Use"`; do
+  $CAT "$MANPAGE" | grep -E -q "^\.B.*$COMMAND" || \
+	echo "$COMMAND not documented in the xfs_spaceman manpage"
+done
+
+# success, all done
+status=0
+exit

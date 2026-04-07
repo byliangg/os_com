@@ -37,13 +37,7 @@ impl Ext4 {
 
         // iterate all blocks
         while iblock < total_blocks {
-            let extent_path = self.find_extent(&parent, iblock as u32)?;
-            let Some(path_node) = extent_path.path.last() else {
-                return_errno_with_message!(Errno::EIO, "empty extent search path");
-            };
-
-            // get physical block id
-            fblock = path_node.pblock;
+            fblock = self.get_pblock_idx(&parent, iblock as u32)?;
 
             // load physical block
             let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
@@ -127,25 +121,10 @@ impl Ext4 {
 
         // iterate all blocks
         while iblock < total_blocks {
-            // get physical block id of a logical block id
-            let search_path = self.find_extent(&inode_ref, iblock as u32);
-
-            if let Ok(path) = search_path {
-                // get the last path
-                let Some(path) = path.path.last() else {
-                    iblock += 1;
-                    continue;
-                };
-
-                // get physical block id
-                let fblock = path.pblock;
-
-                // load physical block
-                let ext4block =
-                    Block::load(&self.block_device, fblock as usize * block_size);
+            if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
+                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
                 let mut offset = 0;
 
-                // iterate all entries in a block
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
                     let de: Ext4DirEntry = ext4block.read_offset_as(offset);
                     let rec_len = de.entry_len() as usize;
@@ -186,14 +165,7 @@ impl Ext4 {
         let mut iblock = 0u64;
 
         while iblock < total_blocks {
-            let search_path = self.find_extent(&inode_ref, iblock as u32);
-            if let Ok(path) = search_path {
-                let Some(path) = path.path.last() else {
-                    iblock += 1;
-                    continue;
-                };
-
-                let fblock = path.pblock;
+            if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
                 let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
                 let mut offset = 0usize;
 
@@ -513,13 +485,7 @@ impl Ext4 {
 
         // iterate all blocks
         while iblock < total_blocks {
-            let extent_path = self.find_extent(&parent, iblock as u32)?;
-            let Some(path_node) = extent_path.path.last() else {
-                return_errno_with_message!(Errno::EIO, "empty extent search path");
-            };
-
-            // get physical block id
-            fblock = path_node.pblock;
+            fblock = self.get_pblock_idx(&parent, iblock as u32)?;
 
             // load physical block
             let ext4block = Block::load(&self.block_device, fblock as usize * block_size);

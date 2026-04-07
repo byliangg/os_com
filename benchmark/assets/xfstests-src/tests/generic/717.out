@@ -1,0 +1,31 @@
+QA output created by 717
+Immutable files
+exchangerange: Operation not permitted
+Readonly files
+exchangerange: Bad file descriptor
+Directories
+exchangerange: Is a directory
+Unaligned ranges
+exchangerange: Invalid argument
+file1 range entirely beyond EOF
+exchangerange: Invalid argument
+file2 range entirely beyond EOF
+exchangerange: Invalid argument
+Both ranges entirely beyond EOF
+exchangerange: Invalid argument
+file1 range crossing EOF
+exchangerange: Invalid argument
+file2 range crossing EOF
+exchangerange: Invalid argument
+Both ranges crossing EOF
+exchangerange: Invalid argument
+file1 unaligned EOF to file2 nowhere near EOF
+exchangerange: Invalid argument
+file2 unaligned EOF to file1 nowhere near EOF
+exchangerange: Invalid argument
+Files on different filesystems
+exchangerange: Invalid cross-device link
+Files on different mounts
+exchangerange: Invalid cross-device link
+Swapping a file with itself
+exchangerange: Invalid argument

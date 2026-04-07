@@ -1,0 +1,107 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 SUSE Linux Products GmbH.  All Rights Reserved.
+#
+# FS QA Test 482
+#
+# Test filesystem consistency after each FUA operation
+#
+# Will do log replay and check the filesystem.
+#
+. ./common/preamble
+_begin_fstest auto metadata replay thin recoveryloop
+
+# Override the default cleanup function.
+#
+# If debugging logwrites failures using the tools/dm-logwrite-replay script,
+# switch the cleanup function to the version that is commented out below so that
+# failure leaves the corpse intact for post-mortem failure analysis.
+_cleanup()
+{
+	_kill_fsstress
+	_log_writes_cleanup &> /dev/null
+	_dmthin_cleanup
+	cd /
+	rm -f $tmp.*
+}
+
+# tools/dm-logwrite-replay _cleanup version
+#_cleanup()
+#{
+#	cd /
+#	[ -n "$fsstress_pid" ] && kill $fsstress_pid
+#	if [ $status -eq 0 ]; then
+#		_log_writes_cleanup &> /dev/null
+#		_dmthin_cleanup
+#	else
+#		echo dm-thinvol-dev: $DMTHIN_VOL_DEV >> $seqres.full
+#	fi
+#	rm -f $tmp.*
+#}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmthin
+. ./common/dmlogwrites
+
+
+# Modify as appropriate.
+
+_require_no_logdev
+# Use thin device as replay device, which requires $SCRATCH_DEV
+_require_scratch_nocheck
+# and we need extra device as log device
+_require_log_writes
+_require_dm_target thin-pool
+
+nr_cpus=$("$here/src/feature" -o)
+# cap nr_cpus to 8 to avoid spending too much time on hosts with many cpus
+if [ $nr_cpus -gt 8 ]; then
+	nr_cpus=8
+fi
+fsstress_args=$(_scale_fsstress_args -w -d $SCRATCH_MNT -n 512 -p $nr_cpus)
+
+size=$(_small_fs_size_mb 200)           # 200m phys/virt size
+devsize=$((1024*1024*size / 512))
+csize=$((1024*64 / 512))		# 64k cluster size
+lowspace=$((1024*1024 / 512))		# 1m low space threshold
+
+# Use a thin device to provide deterministic discard behavior. Discards are used
+# by the log replay tool for fast zeroing to prevent out-of-order replay issues.
+_test_unmount
+_dmthin_init $devsize $devsize $csize $lowspace
+_log_writes_init $DMTHIN_VOL_DEV
+_log_writes_mkfs >> $seqres.full 2>&1
+_log_writes_mark mkfs
+
+_log_writes_mount
+_run_fsstress $fsstress_args
+_log_writes_unmount
+
+_log_writes_remove
+prev=$(_log_writes_mark_to_entry_number mkfs)
+[ -z "$prev" ] && _fail "failed to locate entry mark 'mkfs'"
+cur=$(_log_writes_find_next_fua $prev)
+[ -z "$cur" ] && _notrun "could not locate any FUA write"
+
+while [ ! -z "$cur" ]; do
+	_log_writes_replay_log_range $cur $DMTHIN_VOL_DEV >> $seqres.full
+
+	# Here we need extra mount to replay the log, mainly for journal based
+	# fs, as their fsck will report dirty log as error.
+	# We don't care to preserve any data on the replay dev, as we can replay
+	# back to the point we need, and in fact sometimes creating/deleting
+	# snapshots repeatedly can be slower than replaying the log.
+	_dmthin_mount
+	_dmthin_check_fs
+
+	prev=$cur
+	cur=$(_log_writes_find_next_fua $(($cur + 1)))
+	[ -z "$cur" ] && break
+done
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

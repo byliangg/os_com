@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#    Copyright (c) 2010 Intel Corporation
+#
+# FS QA Test No. 248
+#
+# Test for pwrite hang problem when writing from mmaped buffer of the same page 
+#
+. ./common/preamble
+_begin_fstest auto quick rw mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.* $TESTFILE
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+
+TESTFILE=$TEST_DIR/test_file
+TEST_PROG=$here/src/pwrite_mmap_blocked
+
+$TEST_PROG $TESTFILE
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Eric Sandeen.  All Rights Reserved.
+#
+# FS QA Test No. 068
+#
+# Test out a level 0 dump/restore of a subdir to a file
+#
+# Use fsstress to create a larger directory structure with a mix of files
+# Test for regression caused by
+# c7cb51d xfs: fix error handling at xfs_inumbers
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest auto stress dump
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+. ./common/dump
+
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_stress_num 4096
+
+echo -n "Before: " >> $seqres.full
+_count_dumpdir_files | tee $tmp.before >> $seqres.full
+
+# filter out the file count, it changes as fsstress adds new operations
+_do_dump_restore | sed -e "/entries processed$/s/[0-9][0-9]*/NUM/g"
+
+echo -n "After: " >> $seqres.full
+_count_restoredir_files | tee $tmp.after >> $seqres.full
+diff -u $tmp.before $tmp.after
+
+# success, all done
+exit

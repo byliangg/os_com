@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, inc.  All Rights Reserved.
+#
+# FS QA Test 118
+#
+# Test xfs_fsr's handling of 2-extent files with preallocation
+#
+# An error in xfs_swap_extent_forks() incorrectly set up the
+# temporary inode's if_extents pointer to inline, leading to
+# in-memory corruption when the temporary inode was released
+# and torn down; i_itemp and d_ops got overwritten with zeros,
+# which led to an oops in xfs_trans_log_inode down the fput path.
+#
+# Fixed upstream by proper nextents counting using
+# ip->i_df.if_bytes not ip->i_d.di_nextents in xfs_swap_extent_forks
+#
+. ./common/preamble
+_begin_fstest auto quick fsr prealloc
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_command "$XFS_FSR_PROG" "xfs_fsr"
+_require_xfs_io_command "falloc"
+
+# 50M
+_scratch_mkfs_sized $((50 * 1024 * 1024)) >> $seqres.full 2>&1
+_scratch_mount
+
+echo "Silence is golden"
+
+# Fragment freespace
+# The aim is to create a fragmented two-extent file *with* prealloc
+# so make the free holes big enough that a 2-extent file will have
+# preallocation added.  Let's say... 64k free chunks.
+
+$XFS_IO_PROG -fs -c "falloc 0 40000k" $SCRATCH_MNT/fill >> $seqres.full 2>&1
+_scratch_sync
+
+dd if=/dev/zero of=$SCRATCH_MNT/remainder oflag=direct > /dev/null 2>&1
+
+# Free up a bunch of 64k chunks
+for i in `seq 0 68 40000`; do
+	$XFS_IO_PROG -fs -c "unresvsp ${i}k 64k" $SCRATCH_MNT/fill
+done
+
+# Create 2-extent files w/ preallocation (via extending writes)
+for I in `seq 1 64`; do
+	$XFS_IO_PROG -f -c "pwrite 0 64k" $SCRATCH_MNT/newfile-$I \
+						 >> $seqres.full 2>&1
+	$XFS_IO_PROG -f -c "pwrite 64k 64k" $SCRATCH_MNT/newfile-$I \
+						>> $seqres.full 2>&1
+done
+# sync to get extents on disk so fsr sees them
+_scratch_sync
+
+# Free up some space for defragmentation temp file
+rm -f $SCRATCH_MNT/fill
+
+$XFS_FSR_PROG -vd $SCRATCH_MNT/newfile* >> $seqres.full 2>&1
+
+# success, all done
+status=0
+exit

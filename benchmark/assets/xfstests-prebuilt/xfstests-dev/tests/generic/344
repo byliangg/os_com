@@ -1,0 +1,27 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 344
+#
+# Test races between mmap from racing threads when pages are prefaulted,
+# Test races between mmap and buffered writes when pages are prefaulted.
+#
+. ./common/preamble
+_begin_fstest auto mmap
+
+# get standard environment and checks
+
+_require_scratch
+_require_test_program "holetest"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+$here/src/holetest -f -r $SCRATCH_MNT/testfile 16
+$here/src/holetest -f -r $SCRATCH_MNT/testfile 256
+$here/src/holetest -f -r -w $SCRATCH_MNT/testfile 16
+$here/src/holetest -f -r -w $SCRATCH_MNT/testfile 256
+
+status=0
+exit

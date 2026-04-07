@@ -1,0 +1,91 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 005
+#
+# Memleak in overlayfs copy-up error handling path leads to panic
+# when unmount the underlying fs.
+# Kernel commit ab79efab0 fixed this issue.
+#
+. ./common/preamble
+_begin_fstest auto copyup quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_destroy_loop_device $fs_loop_dev
+	_destroy_loop_device $upper_loop_dev
+	rm -f $lower_img
+	rm -f $upper_img
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_loop
+[ "$OVL_BASE_FSTYP" = "xfs" ] || _notrun "The underlying fs should be xfs"
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# setup loop images fs for overlayfs
+lower_img=${OVL_BASE_SCRATCH_MNT}/${seq}.$$.img
+$XFS_IO_PROG -f -c "truncate 120m" $lower_img >>$seqres.full 2>&1
+fs_loop_dev=`_create_loop_device $lower_img`
+$MKFS_XFS_PROG -f -n ftype=1 $fs_loop_dev >>$seqres.full 2>&1
+
+# only 20m for upper dir
+upper_img=${OVL_BASE_SCRATCH_MNT}/$$.${seq}.img
+$XFS_IO_PROG -f -c "truncate 20m" $upper_img >>$seqres.full 2>&1
+upper_loop_dev=`_create_loop_device $upper_img`
+$MKFS_XFS_PROG -f -n ftype=1 $upper_loop_dev >>$seqres.full 2>&1
+
+# mount underlying xfs
+mkdir -p ${OVL_BASE_SCRATCH_MNT}/lowermnt
+mkdir -p ${OVL_BASE_SCRATCH_MNT}/uppermnt
+$MOUNT_PROG $fs_loop_dev ${OVL_BASE_SCRATCH_MNT}/lowermnt
+$MOUNT_PROG $upper_loop_dev ${OVL_BASE_SCRATCH_MNT}/uppermnt
+
+# prepare dirs
+mkdir -p ${OVL_BASE_SCRATCH_MNT}/lowermnt/lower
+mkdir -p ${OVL_BASE_SCRATCH_MNT}/uppermnt/upper
+mkdir -p ${OVL_BASE_SCRATCH_MNT}/uppermnt/work
+
+lowerd=${OVL_BASE_SCRATCH_MNT}/lowermnt/lower
+upperd=${OVL_BASE_SCRATCH_MNT}/uppermnt/upper
+workd=${OVL_BASE_SCRATCH_MNT}/uppermnt/work
+
+# Create test file in lower dir, with too big a size for
+# upper dir to copy up.
+$XFS_IO_PROG -f -c "truncate 48m" ${lowerd}/test_file \
+	>>$seqres.full 2>&1
+
+# mount new overlayfs
+_overlay_scratch_mount_dirs $lowerd $upperd $workd
+
+# the open call triggers copy-up and it will fail ENOSPC
+$XFS_IO_PROG -f -c "o" ${SCRATCH_MNT}/test_file \
+	>>$seqres.full 2>&1
+
+# unmount overlayfs
+$UMOUNT_PROG $SCRATCH_MNT
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerd $upperd $workd
+
+# unmount undelying xfs, this tiggers panic if memleak happens
+$UMOUNT_PROG ${OVL_BASE_SCRATCH_MNT}/uppermnt
+$UMOUNT_PROG ${OVL_BASE_SCRATCH_MNT}/lowermnt
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 045
+#
+# test mount of two FSes with identical UUID and mount with unknown option
+#
+. ./common/preamble
+_begin_fstest other auto quick
+
+# Import common functions.
+. ./common/filter
+
+_get_existing_uuid()
+{
+	_test_xfs_db -r -c "uuid" | $AWK_PROG '/^UUID/ { print $3 }'
+}
+
+
+_require_test
+_require_scratch_nocheck
+
+echo "*** get uuid"
+uuid=`_get_existing_uuid`
+
+echo "*** mkfs"
+if ! _try_scratch_mkfs_xfs >$tmp.out 2>&1
+then
+    cat $tmp.out
+    echo "!!! failed to mkfs on $SCRATCH_DEV"
+    exit
+fi
+
+echo "*** mount fs with bad mount option (expect failure)"
+if _try_scratch_mount -o foobar >$tmp.out 2>&1
+then
+    cat $tmp.out
+    echo "!!! mount succeeded (expecting failure)"
+    exit
+fi
+
+echo "*** duplicate uuid"
+xfs_db -x -c "uuid $uuid" `_scratch_xfs_db_options` >/dev/null
+
+echo "*** mount fs with duplicate uuid (expect failure)"
+if _try_scratch_mount >$tmp.out 2>&1
+then
+    cat $tmp.out
+    echo "!!! mount succeeded (expecting failure)"
+    exit
+fi
+
+echo "*** ok!"
+# success, all done
+status=0
+exit

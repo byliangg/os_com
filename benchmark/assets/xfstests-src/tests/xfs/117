@@ -1,0 +1,119 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 117
+#
+# Create and populate an XFS filesystem, corrupt an inode, then see how
+# the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/populate
+
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_xfs_crc
+_require_attrs
+_require_populate_commands
+_require_xfs_db_blocktrash_z_command
+test -z "${FUZZ_ARGS}" && FUZZ_ARGS="-n 8 -3"
+
+victimdir="${SCRATCH_MNT}/scratchdir"
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+
+echo "+ make some files"
+mkdir -p "$victimdir"
+
+rootdir="$(stat -c '%i' "$SCRATCH_MNT")"
+rootchunk=$(( rootdir / 64 ))
+
+# First we create some dummy file so that the victim files don't get created
+# in the same inode chunk as the root directory, because a corrupt inode in
+# the root chunk causes mount to fail.
+for ((i = 0; i < 256; i++)); do
+	fname="$SCRATCH_MNT/dummy.$i"
+	touch "$fname"
+	ino="$(stat -c '%i' "$fname")"
+	ichunk=$(( ino / 64 ))
+	test "$ichunk" -gt "$rootchunk" && break
+done
+
+# Now create some victim files
+inos=()
+for ((i = 0; i < 64; i++)); do
+	fname="$victimdir/test.$i"
+	touch "$fname"
+	inos+=("$(stat -c '%i' "$fname")")
+done
+echo "First victim inode is: " >> $seqres.full
+stat -c '%i' "$fname" >> $seqres.full
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+echo "+ corrupt image"
+for ino in "${inos[@]}"; do
+	_scratch_xfs_db -x -c "inode ${ino}" -c "stack" -c "blocktrash -x 32 -y $((blksz * 8)) -z ${FUZZ_ARGS}" >> $seqres.full 2>&1
+done
+
+echo "+ mount image && modify files"
+broken=1
+if _try_scratch_mount >> $seqres.full 2>&1; then
+	for ((i = 0; i < 64; i++)); do
+		fname="$victimdir/test.$i"
+		stat "$fname" &>> $seqres.full
+		test $? -eq 0 && broken=0
+		touch "$fname" &>> $seqres.full
+		test $? -eq 0 && broken=0
+	done
+	umount "${SCRATCH_MNT}"
+fi
+echo "broken: ${broken}"
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ modify files (2)"
+broken=0
+for x in `seq 1 64`; do
+	test -e "${TESTFILE}.${x}" || continue
+	echo "test ${x}" >> $seqres.full
+	stat "${TESTFILE}.${x}" >> $seqres.full 2>&1
+	test $? -ne 0 && broken=1
+	touch "${TESTFILE}.${x}" >> $seqres.full 2>&1
+	test $? -ne 0 && broken=1
+	echo "${x}: broken=${broken}" >> $seqres.full
+done
+echo "broken: ${broken}"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+status=0
+exit

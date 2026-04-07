@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 485
+#
+# Regression test for:
+#    349fa7d6e193 ("ext4: prevent right-shifting extents beyond EXT_MAX_BLOCKS")
+#    7d83fb14258b ("xfs: prevent creating negative-sized file via INSERT_RANGE")
+#
+. ./common/preamble
+_begin_fstest auto quick insert prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_math
+_require_xfs_io_command "falloc" "-k"
+_require_xfs_io_command "finsert"
+_require_xfs_io_command "truncate"
+
+block_size=$(_get_file_block_size $TEST_DIR)
+max_file_size=$(_get_max_file_size $TEST_DIR)
+max_blocks=$((max_file_size / block_size))
+testfile=$TEST_DIR/testfile.$seq
+
+echo "# With KEEP_SIZE"
+rm -f "$testfile"
+
+# Add an extent at the beginning of the file.  With ext4, this is needed to
+# reproduce the bug where the extents appear out of order later.
+$XFS_IO_PROG -f -c "falloc 0 $((2 * block_size))" "$testfile"
+
+# Add an extent just below s_maxbytes, without changing i_size (i.e. with -k).
+# The out-of-order extents bug can't be reproduced if i_size is changed, because
+# then the range insertion fails due to the new i_size being > s_maxbytes.
+$XFS_IO_PROG -c "falloc -k $(( (max_blocks - 1) * $block_size )) $block_size" \
+	"$testfile"
+
+# Insert an extent at the beginning of the file.  With the ext4 bug, this caused
+# the logical block number of the extent just below s_maxbytes to wrap around,
+# causing the extents to get out of order, causing corruption detected by
+# e2fsck.  With the fix, the range insertion fails with EINVAL.  Though, with
+# xfs and f2fs the insertion succeeds, resulting in extents beyond s_maxbytes,
+# but there is no wraparound -- which is arguably okay.  So we allow either
+# behavior and just rely on fsck detecting if something went wrong.
+$XFS_IO_PROG -c "finsert 0 $((2 * block_size))" "$testfile" &>>$seqres.full
+
+# Also do the same test, but with changing i_size (i.e. without -k).  The
+# insertion should fail with EFBIG.  This exposed an XFS bug where i_size + len
+# underwent signed overflow, resulting in a negative-sized file.
+echo "# Without KEEP_SIZE"
+rm -f "$testfile"
+$XFS_IO_PROG -f -c "falloc 0 $((2 * block_size))" "$testfile"
+$XFS_IO_PROG -c "falloc $(( (max_blocks - 1) * $block_size )) $block_size" \
+	"$testfile"
+$XFS_IO_PROG -c "finsert 0 $((2 * block_size))" "$testfile"
+
+status=0
+exit

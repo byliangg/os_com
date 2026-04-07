@@ -1,0 +1,45 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 461
+#
+# Shutdown stress test - exercise shutdown codepath with fsstress,
+# make sure we don't BUG/WARN. Coverage for all fs with shutdown.
+#
+. ./common/preamble
+_begin_fstest auto shutdown stress
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+_require_scratch_shutdown
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+SLEEP_TIME=$((10 * $TIME_FACTOR))
+PROCS=$((4 * LOAD_FACTOR))
+
+load_dir=$SCRATCH_MNT/test
+
+_run_fsstress_bg -n10000000 -p $PROCS -d $load_dir
+sleep $SLEEP_TIME
+_scratch_sync
+
+# now shutdown and unmount
+sleep 5
+_scratch_shutdown
+_kill_fsstress
+
+# for some reason fsstress processes manage to live on beyond the wait?
+sleep 5
+
+_scratch_unmount
+
+echo "Silence is golden"
+
+status=0
+exit

@@ -1,0 +1,111 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 068
+#
+# Test case to reproduce xfs_freeze hang under filsystem load.
+# The fail case for this test is a hang on an xfs_freeze.
+#
+. ./common/preamble
+_begin_fstest other auto freeze stress mmap
+
+status=0	# success is the default!
+
+ITERATIONS=10
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	_kill_fsstress
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_freeze
+
+echo "*** init FS"
+
+_scratch_unmount >/dev/null 2>&1
+echo "*** MKFS ***"                         >>$seqres.full
+echo ""                                     >>$seqres.full
+_scratch_mkfs                               >>$seqres.full 2>&1 \
+    || _fail "mkfs failed"
+_scratch_mount
+
+touch $tmp.running
+
+# start fsstress loop in a background block
+{
+    STRESS_DIR="$SCRATCH_MNT/fsstress_test_dir"
+    mkdir "$STRESS_DIR"
+
+    procs=2
+    nops=200
+    while [ -f "$tmp.running" ]
+      do
+      # We do both read & write IO - not only is this more realistic,
+      # but it also potentially tests atime updates
+      FSSTRESS_ARGS=`_scale_fsstress_args -d $STRESS_DIR -p $procs -n $nops`
+      _run_fsstress $FSSTRESS_ARGS >>$seqres.full
+    done
+
+    rm -r $STRESS_DIR/*
+    rmdir $STRESS_DIR
+} &
+pid=$!
+
+# start fstest -m loop in a background block; this gets us mmap coverage
+{
+    FSTEST_DIR="$SCRATCH_MNT/fstest_test_dir"
+    mkdir "$FSTEST_DIR"
+
+    procs=2
+    while [ -f "$tmp.running" ]
+      do
+      $here/src/fstest -m -p $FSTEST_DIR  -n $procs -f 4 > /dev/null 2>&1
+    done
+
+    rm -rf $FSTEST_DIR/*
+    rmdir $FSTEST_DIR
+} &
+pid="$pid $!"
+
+i=0
+let ITERATIONS=$ITERATIONS-1
+
+echo | tee -a $seqres.full
+while [ $i -le $ITERATIONS ]
+do
+        echo "*** iteration: $i" | tee -a $seqres.full
+	echo "*** freezing \$SCRATCH_MNT" | tee -a $seqres.full
+	xfs_freeze -f "$SCRATCH_MNT" | tee -a $seqres.full
+	[ $? != 0 ] && echo xfs_freeze -f "$SCRATCH_MNT" failed | \
+	    tee -a $seqres.full
+	sleep 2
+
+	echo "*** thawing  \$SCRATCH_MNT" | tee -a $seqres.full
+	xfs_freeze -u "$SCRATCH_MNT" | tee -a $seqres.full
+	[ $? != 0 ] && echo xfs_freeze -u "$SCRATCH_MNT" failed | \
+	    tee -a $seqres.full
+	sleep 2
+
+	echo  | tee -a $seqres.full
+	let i=$i+1
+done
+
+# stop fsstress iterations
+rm $tmp.running
+
+# wait for fsstresses to finish
+wait $pid
+unset pid
+
+exit 1

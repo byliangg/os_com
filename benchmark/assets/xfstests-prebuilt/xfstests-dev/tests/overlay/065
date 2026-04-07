@@ -1,0 +1,167 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2019 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 065
+#
+# Test mount error cases with overlapping layers
+#
+# - Same upperdir/lowerdir
+# - Overlapping upperdir/lowerdir
+# - Overlapping lowerdir layers
+# - Overlapping lowerdir with other mount upperdir/workdir
+#
+# Overlapping layers on mount or lookup results in ELOOP.
+# Overlapping lowerdir with other mount upperdir/workdir
+# result in EBUSY (only if index=on is used).
+#
+# This is a regression test for kernel commit:
+#
+#    146d62e5a586 "ovl: detect overlapping layers"
+#
+# and its followup fix commit:
+#    0be0bfd2de9d "ovl: fix regression caused by overlapping layers detection"
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	$UMOUNT_PROG $mnt2 2>/dev/null
+}
+
+# Import common functions.
+. ./common/filter
+
+_fixed_in_kernel_version "v5.2"
+_fixed_by_kernel_commit 0be0bfd2de9d \
+	"ovl: fix regression caused by overlapping layers detection"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_scratch_feature index
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create multiple lowerdirs, upperdirs and workdirs
+basedir=$OVL_BASE_SCRATCH_MNT
+lowerdir=$basedir/lower
+upperdir=$basedir/upper
+workdir=$basedir/workdir
+upperdir2=$basedir/upper.2
+workdir2=$basedir/workdir.2
+mnt2=$basedir/mnt.2
+
+mkdir -p $lowerdir/lower $upperdir $workdir
+
+# Try to mount an overlay with the same upperdir/lowerdir - expect ELOOP
+echo Conflicting upperdir/lowerdir
+_overlay_scratch_mount_dirs $upperdir $upperdir $workdir \
+	2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+# Use new upper/work dirs for each test to avoid ESTALE errors
+# on mismatch lowerdir/upperdir (see test overlay/037)
+rm -rf $upperdir $workdir
+mkdir $upperdir $workdir
+
+# Try to mount an overlay with the same workdir/lowerdir - expect ELOOP
+# because $workdir/work overlaps with lowerdir
+echo Conflicting workdir/lowerdir
+_overlay_scratch_mount_dirs $workdir $upperdir $workdir \
+	-oindex=off 2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir $workdir
+mkdir -p $upperdir/lower $workdir
+
+# Try to mount an overlay with overlapping upperdir/lowerdir - expect ELOOP
+# upperdir inside lowerdir is allowed, lowerdir inside upperdir is not allowed
+echo Overlapping upperdir/lowerdir
+_overlay_scratch_mount_dirs $upperdir/lower $upperdir $workdir \
+	2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir $workdir
+mkdir $upperdir $workdir
+
+# Try to mount an overlay with the same lower layers - expect ELOOP
+echo Conflicting lower layers
+_overlay_scratch_mount_dirs $lowerdir:$lowerdir $upperdir $workdir \
+	2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir $workdir
+mkdir $upperdir $workdir
+
+# Try to mount an overlay with overlapping lower layers - expect ELOOP
+echo Overlapping lower layers below
+_overlay_scratch_mount_dirs $lowerdir:$lowerdir/lower $upperdir $workdir \
+	2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir $workdir
+mkdir $upperdir $workdir
+
+# Try to mount an overlay with overlapping lower layers - expect ELOOP
+echo Overlapping lower layers above
+_overlay_scratch_mount_dirs $lowerdir/lower:$lowerdir $upperdir $workdir \
+	2>&1 | _filter_error_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir $workdir
+mkdir -p $upperdir/upper $workdir $mnt2
+
+# Mount overlay with non overlapping lowerdir, upperdir, workdir -
+# expect success
+_overlay_mount_dirs $lowerdir $upperdir $workdir overlay $mnt2
+
+rm -rf $upperdir2 $workdir2
+mkdir -p $upperdir2 $workdir2 $mnt2
+
+# Try to mount an overlay with layers overlapping with another overlayfs
+# upperdir - expect EBUSY with index=on and success with index=off
+echo "Overlapping with upperdir of another instance (index=on)"
+_overlay_scratch_mount_dirs $upperdir/upper $upperdir2 $workdir2 \
+	-oindex=on 2>&1 | _filter_busy_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir2 $workdir2
+mkdir -p $upperdir2 $workdir2
+
+echo "Overlapping with upperdir of another instance (index=off)"
+_overlay_scratch_mount_dirs $upperdir/upper $upperdir2 $workdir2 \
+	-oindex=off && $UMOUNT_PROG $SCRATCH_MNT
+
+rm -rf $upperdir2 $workdir2
+mkdir -p $upperdir2 $workdir2
+
+# Try to mount an overlay with layers overlapping with another overlayfs
+# workdir - expect EBUSY with index=on and success with index=off
+echo "Overlapping with workdir of another instance (index=on)"
+_overlay_scratch_mount_dirs $workdir/work $upperdir2 $workdir2 \
+	-oindex=on 2>&1 | _filter_busy_mount
+$UMOUNT_PROG $SCRATCH_MNT 2>/dev/null
+
+rm -rf $upperdir2 $workdir2
+mkdir -p $upperdir2 $workdir2
+
+echo "Overlapping with workdir of another instance (index=off)"
+_overlay_scratch_mount_dirs $workdir/work $upperdir2 $workdir2 \
+	-oindex=off && $UMOUNT_PROG $SCRATCH_MNT
+
+# Move upper layer root into lower layer after mount
+echo Overlapping upperdir/lowerdir after mount
+mv $upperdir $lowerdir/
+# Lookup files in overlay mount with overlapping layers -
+# expect ELOOP when upper layer root is found in lower layer
+find $mnt2/upper 2>&1 | _filter_scratch
+
+# success, all done
+status=0
+exit

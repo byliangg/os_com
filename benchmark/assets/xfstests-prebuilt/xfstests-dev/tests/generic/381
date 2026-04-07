@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 381
+#
+# Test xfs_quota when user or names beginning with digits.
+# For example, create a 'limit' for a user or group named
+# '12345678-abcd', then query this user and group.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_xfs_quota_foreign
+
+# need user and group named 123456-fsgqa
+_require_user 123456-fsgqa
+_require_group 123456-fsgqa
+
+_scratch_mkfs >/dev/null 2>&1
+_qmount_option "usrquota,grpquota"
+_qmount
+
+# user test
+echo "== user test =="
+$XFS_QUOTA_PROG -x -c "limit -u bsoft=100m bhard=200m 123456-fsgqa" $SCRATCH_MNT
+echo "=== quota command output ==="
+$XFS_QUOTA_PROG -c "quota -u -b -N -v 123456-fsgqa" $SCRATCH_MNT | _filter_quota
+echo "=== report command output ==="
+$XFS_QUOTA_PROG -x -c "report -u -b -N" $SCRATCH_MNT | grep -v "^root " | _filter_quota
+
+# group test
+echo "== group test =="
+$XFS_QUOTA_PROG -x -c "limit -g bsoft=100m bhard=200m 123456-fsgqa" $SCRATCH_MNT
+echo "=== quota command output ==="
+$XFS_QUOTA_PROG -c "quota -g -b -N -v 123456-fsgqa" $SCRATCH_MNT | _filter_quota
+echo "=== report command output ==="
+$XFS_QUOTA_PROG -x -c "report -u -b -N" $SCRATCH_MNT | grep -v "^root " | _filter_quota
+
+# success, all done
+status=0
+exit

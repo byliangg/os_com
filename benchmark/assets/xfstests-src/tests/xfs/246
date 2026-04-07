@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 246
+#
+# Create an empty file and try to query the (nonexistant) CoW fork.
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Import common functions.
+. ./common/filter
+
+_require_xfs_debug
+_require_xfs_io_command "bmap" "-c"
+_require_scratch
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original files"
+touch $testdir/file1
+_scratch_sync
+
+echo "Dump extents after sync"
+echo "Hole CoW extents:"
+$XFS_IO_PROG -c "bmap -clpv" $testdir/file1 | _filter_scratch
+
+# success, all done
+status=0
+exit

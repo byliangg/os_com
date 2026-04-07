@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/031
+#
+# Test non-aligned writes against fcollapse to ensure that partial pages are
+# correctly written and aren't left behind causing invalidation or data
+# corruption issues.
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc rw collapse
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_xfs_io_command "fcollapse"
+
+testfile=$SCRATCH_MNT/testfile
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+_require_congruent_file_oplen $SCRATCH_MNT 4096
+
+$XFS_IO_PROG -f \
+	-c "pwrite 185332 55756" \
+	-c "fcollapse 28672 40960" \
+	-c "pwrite 133228 63394" \
+	-c "fcollapse 0 4096" \
+$testfile | _filter_xfs_io
+
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+status=0
+exit
+

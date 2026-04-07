@@ -1,0 +1,74 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 325
+#
+# Reflink a file with a few dozen extents, CoW a few blocks, and rm.
+# Inject an error during extent freeing to test log recovery.
+#
+. ./common/preamble
+_begin_fstest auto quick clone freeze
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	cd /
+	rm -rf $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/inject
+
+_require_cp_reflink
+_require_scratch_reflink
+_require_error_injection
+_require_xfs_io_error_injection "free_extent"
+_require_freeze
+
+blksz=65536
+blks=30
+echo "Format filesystem"
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount >> $seqres.full
+
+echo "Create files"
+_pwrite_byte 0x66 0 $((blksz * blks)) $SCRATCH_MNT/file1 >> $seqres.full
+_cp_reflink $SCRATCH_MNT/file1 $SCRATCH_MNT/file2
+_scratch_sync
+
+echo "Check files"
+md5sum $SCRATCH_MNT/file1 | _filter_scratch
+md5sum $SCRATCH_MNT/file2 | _filter_scratch
+
+echo "CoW a few blocks"
+$XFS_IO_PROG -c "pwrite -W -S 0x67 $((10 * blksz)) $((10 * blksz))" $SCRATCH_MNT/file2 >> $seqres.full
+
+echo "Inject error"
+_scratch_inject_error "free_extent"
+
+rm $SCRATCH_MNT/file1
+_scratch_sync
+$XFS_IO_PROG -x -c 'freeze' -c 'thaw' $SCRATCH_MNT >> $seqres.full 2>&1
+
+echo "FS should be shut down, touch will fail"
+touch $SCRATCH_MNT/badfs 2>&1 | _filter_scratch
+
+echo "Remount to replay log"
+_scratch_remount_dump_log >> $seqres.full
+
+echo "FS should be online, touch should succeed"
+touch $SCRATCH_MNT/goodfs
+
+echo "Check files again"
+md5sum $SCRATCH_MNT/file2 | _filter_scratch
+
+echo "Done"
+
+# success, all done
+status=0
+exit

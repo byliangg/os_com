@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test 074-extsz-hints-vs-maxextlen
+#
+# Check some extent size hint boundary conditions that can result in
+# MAXEXTLEN overflows.
+#
+# In xfs_bmap_extsize_align(), we had,
+# 	if ((temp = (align_alen % extsz))) {
+# 		align_alen += extsz - temp;
+# 	}
+# align_alen had the value of 2097151 (i.e. MAXEXTLEN) blocks. extsz had
+# the value of 4096 blocks.
+#
+# align_alen % extsz will be 4095. so align_alen will end up having
+# 2097151 + (4096 - 4095) = 2097152 i.e. (MAXEXTLEN + 1). Thus the length
+# of the new extent will be larger than MAXEXTLEN. This will later cause
+# the bmbt leaf to have an entry whose length is set to zero block count.
+#
+. ./common/preamble
+_begin_fstest quick auto prealloc rw
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	[ -n "$loop_dev" ] &&_destroy_loop_device $loop_dev
+	rm -f $tmp.* $LOOP_FILE
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_xfs_io_command "falloc"
+
+# we use loop devices for this so that we can create large files for prealloc
+# without having to care about the underlying device size.
+_require_loop
+
+LOOP_FILE=$TEST_DIR/$seq.img
+LOOP_MNT=$TEST_DIR/$seq.mnt
+mkdir -p $LOOP_MNT
+$XFS_IO_PROG -ft -c "truncate 1t" $LOOP_FILE >> $seqres.full
+loop_dev=`_create_loop_device $LOOP_FILE`
+
+_mkfs_dev -d size=260g,agcount=2 $loop_dev
+_mount $loop_dev $LOOP_MNT
+
+BLOCK_SIZE=$(_get_file_block_size $LOOP_MNT)
+
+# Corrupt the BMBT by creating extents larger than MAXEXTLEN
+# For 4k blocksize, MAXEXTLEN * 4k = 2097151 * 4k = 8589930496 = ~8GiB
+$XFS_IO_PROG -ft \
+	-c "extsize $(($BLOCK_SIZE * 4096))" \
+	-c "falloc 0 $(($BLOCK_SIZE * 2097152))" \
+	$LOOP_MNT/foo >> $seqres.full
+
+_unmount $LOOP_MNT
+_check_xfs_filesystem $loop_dev none none
+
+_mkfs_dev -f $loop_dev
+_mount $loop_dev $LOOP_MNT
+
+# check we trim both ends of the extent approproiately; this will fail
+# on 1k block size filesystems without the correct fixes in place.
+$XFS_IO_PROG -ft \
+	-c "extsize 1g" \
+	-c "falloc 1023m 2g" \
+	$LOOP_MNT/foo >> $seqres.full
+
+_unmount $LOOP_MNT
+_check_xfs_filesystem $loop_dev none none
+
+_destroy_loop_device $loop_dev
+unset loop_dev
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Oracle.  All Rights Reserved.
+#
+# FS QA Test 198
+#
+# Test outdated and foreign non-btrfs devices in the device listing.
+#
+. ./common/preamble
+_begin_fstest auto quick volume raid
+
+. ./common/filter
+. ./common/filter.btrfs
+
+_require_command "$WIPEFS_PROG" wipefs
+_require_scratch
+_require_scratch_dev_pool 4
+# We require at least one raid setup, raid1 is the easiest, use this to gate on
+# wether or not we run this test
+_require_btrfs_raid_type raid1
+_fixed_by_kernel_commit 96c2e067ed3e3e \
+	"btrfs: skip devices without magic signature when mounting"
+
+workout()
+{
+	raid=$1
+	device_nr=$2
+
+	if ! _check_btrfs_raid_type $raid; then
+		echo "$raid isn't supported, skipping" >> $seqres.full
+		return
+	fi
+
+	echo $raid >> $seqres.full
+	_scratch_dev_pool_get $device_nr
+
+	_scratch_pool_mkfs "-d$raid -m$raid" >> $seqres.full 2>&1 || \
+							_fail "mkfs failed"
+
+	# Make ${SCRATCH_DEV_NAME[1]} a free btrfs device for the raid created
+	# above by clearing its superblock
+
+	# don't test with the first device as auto fs check (_check_scratch_fs)
+	# picks the first device
+	$WIPEFS_PROG -a ${SCRATCH_DEV_NAME[1]} >> $seqres.full 2>&1
+
+	_mount -o degraded ${SCRATCH_DEV_NAME[0]} $SCRATCH_MNT
+	# Check if missing device is reported as in the 196.out
+	$BTRFS_UTIL_PROG filesystem show -m $SCRATCH_MNT | \
+		_filter_btrfs_filesystem_show > $tmp.output 2>&1
+	cat $tmp.output >> $seqres.full
+	grep -q "${SCRATCH_DEV_NAME[1]}" $tmp.output && _fail "found stale device"
+
+	_scratch_unmount
+	_scratch_dev_pool_put
+}
+
+workout "raid1" "2"
+workout "raid5" "3"
+workout "raid6" "4"
+workout "raid10" "4"
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

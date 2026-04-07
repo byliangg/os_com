@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2022 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 724
+#
+# Test scatter-gather atomic file writes.  We create a temporary file, write
+# sparsely to it, then use XFS_EXCHANGE_RANGE_FILE1_WRITTEN flag to swap
+# atomicallly only the ranges that we wrote.
+
+. ./common/preamble
+_begin_fstest auto quick fiexchange
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -r -f $tmp.* $dir
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_xfs_io_command exchangerange
+_require_scratch
+
+_scratch_mkfs >> $seqres.full
+_scratch_mount
+_require_congruent_file_oplen $SCRATCH_MNT 65536
+
+# Create original file
+_pwrite_byte 0x58 0 1m $SCRATCH_MNT/a >> $seqres.full
+
+# Create the donor file
+$XFS_IO_PROG -f -c 'truncate 1m' $SCRATCH_MNT/b
+_pwrite_byte 0x59 64k 64k $SCRATCH_MNT/b >> $seqres.full
+_pwrite_byte 0x57 768k 64k $SCRATCH_MNT/b >> $seqres.full
+
+md5sum $SCRATCH_MNT/a | _filter_scratch
+md5sum $SCRATCH_MNT/b | _filter_scratch
+
+# Test exchangerange.  -w means skip holes in /b
+echo swap | tee -a $seqres.full
+$XFS_IO_PROG -c "exchangerange -f -w $SCRATCH_MNT/b" $SCRATCH_MNT/a
+_scratch_cycle_mount
+
+md5sum $SCRATCH_MNT/a | _filter_scratch
+md5sum $SCRATCH_MNT/b | _filter_scratch
+
+# success, all done
+status=0
+exit

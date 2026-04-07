@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 047
+#
+# invutil with interactive responses
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+#
+# Create 5 dumps
+# and on the 3rd dump note the date
+# which we'll use to prune against using xfsinvutil
+#
+i=0
+while [ $i -lt 5 ]; do
+    _do_dump_file -L "session.$i"
+    if [ $i -eq 2 ]; then
+       sleep 1
+       middate=`date '+%m/%d/%Y %T'`
+    fi
+    rm $dump_file
+    sleep 2
+    let i=$i+1
+done
+
+echo "middate = $middate" >>$seqres.full
+
+# Only say No to 1st question to prune
+cat >$tmp.input <<EOF
+N
+Y
+Y
+Y
+Y
+EOF
+
+#
+# Now do the xfsinvutil and
+# look and the inventory before and after
+# to see if it did the job
+#
+_dump_inventory
+_do_invutil <$tmp.input
+_dump_inventory
+
+status=0
+exit

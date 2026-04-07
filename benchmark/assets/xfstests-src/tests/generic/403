@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 403
+#
+# Test racing getxattr requests against large xattr add and remove loop. This
+# reproduces a bug on XFS where a getxattr of an existing attribute spuriously
+# returned failure due to races with attribute fork conversion.
+#
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Import common functions.
+. ./common/attr
+
+
+# Modify as appropriate.
+_require_scratch
+_require_attrs trusted
+
+_scratch_mkfs > $seqres.full 2>&1 || _fail "mkfs"
+_scratch_mount
+
+# create xattr small enough for local format on XFS
+touch $SCRATCH_MNT/file
+$SETFATTR_PROG -n trusted.small -v a $SCRATCH_MNT/file
+
+# start a background getxattr loop for the existing xattr
+runfile="$tmp.getfattr"
+touch $runfile
+while [ -e $runfile ]; do
+	_getfattr --absolute-names -n trusted.small $SCRATCH_MNT/file \
+		> /dev/null || break
+done &
+getfattr_pid=$!
+
+# while the above is spinning, add and remove a large attribute to cause back
+# and forth inode attribute fork conversion
+largeval=`for i in $(seq 0 511); do echo -n a; done`
+for i in $(seq 0 99); do
+	$SETFATTR_PROG -n trusted.big -v $largeval $SCRATCH_MNT/file
+	$SETFATTR_PROG -x trusted.big $SCRATCH_MNT/file
+done
+
+rm -f $runfile
+wait > /dev/null 2>&1
+
+echo Silence is golden
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,32 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 070
+#
+# fsstress incarnation testing extended attributes writes
+#
+. ./common/preamble
+_begin_fstest attr udf auto quick stress
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_attrs
+
+FSSTRESS_ARGS=`_scale_fsstress_args \
+	-d $TEST_DIR/fsstress \
+	-f bulkstat=0 \
+	-f bulkstat1=0 \
+	-f resvsp=0 \
+	-f unresvsp=0 \
+	-f attr_set=100 \
+	-f attr_remove=100 \
+        -p 1 -n 10000 -S c`
+_run_fsstress $FSSTRESS_ARGS
+rm -rf $TEST_DIR/fsstress
+
+status=$?
+exit

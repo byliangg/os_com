@@ -41,11 +41,12 @@ impl Ext4BlockGroup {
         block_group_idx: usize,
     ) -> Self {
         let block_size = super_block.block_size() as usize;
-        let dsc_cnt = block_size / super_block.desc_size as usize;
+        let desc_size = super_block.desc_size() as usize;
+        let dsc_cnt = block_size / desc_size;
         let dsc_id = block_group_idx / dsc_cnt;
         let first_data_block = super_block.first_data_block;
         let block_id = first_data_block as usize + dsc_id + 1;
-        let offset = (block_group_idx % dsc_cnt) * super_block.desc_size as usize;
+        let offset = (block_group_idx % dsc_cnt) * desc_size;
 
         let ext4block = Block::load(block_device, block_id * block_size);
         let bg: Ext4BlockGroup = ext4block.read_offset_as(offset);
@@ -58,7 +59,7 @@ impl Ext4BlockGroup {
     /// Get the block number of the block bitmap for this block group.
     pub fn get_block_bitmap_block(&self, s: &Ext4Superblock) -> u64 {
         let mut v = self.block_bitmap_lo as u64;
-        let desc_size = s.desc_size;
+        let desc_size = s.desc_size();
         if desc_size > EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE {
             v |= (self.block_bitmap_hi as u64) << 32;
         }
@@ -68,7 +69,7 @@ impl Ext4BlockGroup {
     /// Get the block number of the inode bitmap for this block group.
     pub fn get_inode_bitmap_block(&self, s: &Ext4Superblock) -> u64 {
         let mut v = self.inode_bitmap_lo as u64;
-        let desc_size = s.desc_size;
+        let desc_size = s.desc_size();
         if desc_size > EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE {
             v |= (self.inode_bitmap_hi as u64) << 32;
         }
@@ -173,11 +174,12 @@ impl Ext4BlockGroup {
         super_block: &Ext4Superblock,
     ) {
         let block_size = super_block.block_size() as usize;
-        let dsc_cnt = block_size / super_block.desc_size as usize;
+        let desc_size = super_block.desc_size() as usize;
+        let dsc_cnt = block_size / desc_size;
         let dsc_id = bgid / dsc_cnt;
         let first_data_block = super_block.first_data_block;
         let block_id = first_data_block as usize + dsc_id + 1;
-        let offset = (bgid % dsc_cnt) * super_block.desc_size as usize;
+        let offset = (bgid % dsc_cnt) * desc_size;
 
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4BlockGroup>())

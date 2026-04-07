@@ -1,0 +1,29 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 112
+#
+# Run unionmount testsuite on a nested overlay filesystem
+# with single lower overlay layer, whose layers are
+# not on same fs
+#
+. ./common/preamble
+_begin_fstest auto quick union nested nonsamefs
+
+_register_cleanup "_unionmount_testsuite_cleanup"
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_scratch
+_require_unionmount_testsuite
+
+_unionmount_testsuite_run --ovov --verify
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

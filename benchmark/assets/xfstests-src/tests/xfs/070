@@ -1,0 +1,91 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 070
+#
+# As part of superblock verification, xfs_repair checks the primary sb and
+# verifies all secondary sb's against the primary. In the event of geometry
+# inconsistency, repair uses a heuristic that tracks the most frequently
+# occurring settings across the set of N (agcount) superblocks.
+#
+# xfs_repair was subject to a bug that disregards this heuristic in the event
+# that the last secondary superblock in the fs is corrupt. The side effect is an
+# unnecessary and potentially time consuming brute force superblock scan.
+#
+# This is a regression test for the aforementioned xfs_repair bug. We
+# intentionally corrupt the last superblock in the fs, run xfs_repair and
+# verify it repairs the fs correctly. We explicitly detect a brute force scan
+# and abort the repair to save time in the failure case.
+#
+. ./common/preamble
+_begin_fstest auto quick repair
+
+# Override the default cleanup function.
+_cleanup()
+{
+	[ -n "$repair_pid" ] && kill -9 $repair_pid > /dev/null 2>&1
+	wait > /dev/null 2>&1
+	cd /
+	rm -f $tmp.*
+}
+
+# Start and monitor an xfs_repair of the scratch device. This test can induce a
+# time consuming brute force superblock scan. Since a brute force scan means
+# test failure, detect it and end the repair.
+_xfs_repair_noscan()
+{
+	# invoke repair directly so we can kill the process if need be
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		log_repair_opts="-l $SCRATCH_LOGDEV"
+	[ "$USE_EXTERNAL" = yes ] && [ -n "$SCRATCH_RTDEV" ] && \
+		rt_repair_opts="-r $SCRATCH_RTDEV"
+	$XFS_REPAIR_PROG $log_repair_opts $rt_repair_opts $SCRATCH_DEV 2>&1 |
+		tee -a $seqres.full > $tmp.repair &
+	repair_pid=$!
+
+	# monitor progress for as long as it is running
+	running=`pgrep xfs_repair`
+	while [ -n "$running" ]; do
+		grep "couldn't verify primary superblock" $tmp.repair \
+			> /dev/null 2>&1
+		if [ $? == 0 ]; then
+			# we've started a brute force scan. kill repair and
+			# fail the test
+			kill -9 $repair_pid >> $seqres.full 2>&1
+			wait >> $seqres.full 2>&1
+
+			_fail "xfs_repair resorted to brute force scan"
+		fi
+
+		sleep 1
+		running=`pgrep xfs_repair`
+	done
+
+	wait
+
+	cat $tmp.repair | _filter_repair
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/repair
+
+
+# Modify as appropriate.
+_require_scratch_nocheck
+
+_scratch_mkfs | _filter_mkfs > /dev/null 2> $tmp.mkfs
+
+. $tmp.mkfs # import agcount
+
+# corrupt the last secondary sb in the fs
+_scratch_xfs_db -x -c "sb $((agcount - 1))" -c "type data" \
+	-c "write fill 0xff 0 512"
+
+# attempt to repair
+_xfs_repair_noscan
+
+# success, all done
+status=0
+exit

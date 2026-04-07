@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Jaegeuk Kim.  All Rights Reserved.
+#
+# FS QA Test 392
+#
+# Test inode's metadata after fsync or fdatasync calls.
+# In the case of fsync, filesystem should recover all the inode metadata, while
+# recovering for fdatasync it should at least recovery i_size.
+#
+. ./common/preamble
+_begin_fstest shutdown auto quick metadata punch
+
+status=0	# failure will be detected in runtime!
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+
+_require_scratch
+_require_scratch_shutdown
+_require_xfs_io_command "fpunch"
+
+_scratch_mkfs >/dev/null 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_scratch_mount
+
+testfile=$SCRATCH_MNT/testfile
+
+# check inode metadata after shutdown
+check_inode_metadata()
+{
+	sync_mode=$1
+
+	# fsync or fdatasync
+	if [ $sync_mode = "fsync" ]; then
+		stat_opt='-c "s: %s a: %x m: %y c: %z"'
+	else
+		stat_opt='-c "s: %s"'
+	fi
+
+	before=`stat "$stat_opt" $testfile`
+
+	$XFS_IO_PROG -c "$sync_mode" $testfile | _filter_xfs_io
+	_scratch_shutdown | tee -a $seqres.full
+	_scratch_cycle_mount
+
+	after=`stat "$stat_opt" $testfile`
+
+	if [ "$before" != "$after" ]; then
+		echo "Before: $before"
+		echo "After : $after"
+		status=1;	# this is a failure!
+	fi
+	echo "Before: $before" >> $seqres.full
+	echo "After : $after" >> $seqres.full
+	rm $testfile
+}
+
+# append XX KB with f{data}sync, followed by power-cut
+test_i_size()
+{
+	echo "==== i_size $2 test with $1 ====" | tee -a $seqres.full
+	$XFS_IO_PROG -f -c "truncate 4M"	\
+			-c "pwrite 0 4M"	\
+			-c "fsync"		\
+			-c "pwrite 4M $2"	\
+			$testfile >/dev/null
+	check_inode_metadata $1
+}
+
+# update times with f{data}sync, followed by power-cut
+test_i_time()
+{
+	echo "==== i_time test with $1 ====" | tee -a $seqres.full
+	$XFS_IO_PROG -f -c "truncate 4M"	\
+			-c "pwrite 0 4M"	\
+			-c "fsync"		\
+			$testfile >/dev/null
+	sleep 1
+	touch $testfile
+	check_inode_metadata $1
+}
+
+# punch XX KB with f{data}sync, followed by power-cut
+test_punch()
+{
+	echo "==== fpunch $2 test with $1 ====" | tee -a $seqres.full
+	$XFS_IO_PROG -f -c "truncate 4202496"	\
+			-c "pwrite 0 4202496"	\
+			-c "fsync"		\
+			-c "fpunch 4194304 $2"\
+			$testfile >/dev/null
+	check_inode_metadata $1
+}
+
+for i in fsync fdatasync; do
+	test_i_size $i 1024
+	test_i_size $i 4096
+	test_i_time $i
+	test_punch $i 1024
+	test_punch $i 4096
+done
+
+exit

@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 328
+#
+# Ensure that we can't go over the hard block limit when CoWing a file.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/quota
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "fiemap"
+_require_quota
+_require_nobody
+_require_odirect
+_require_user
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+export MOUNT_OPTIONS="-o usrquota,grpquota $MOUNT_OPTIONS"
+_scratch_mount >> $seqres.full 2>&1
+_force_vfs_quota_testing $SCRATCH_MNT
+quotacheck -u -g $SCRATCH_MNT 2> /dev/null
+quotaon $SCRATCH_MNT 2> /dev/null
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+sz=4194304
+echo "Create the original files"
+$XFS_IO_PROG -f -c "pwrite -S 0x61 -b $sz 0 $sz" $testdir/file1 >> $seqres.full
+chown $qa_user $testdir/file1
+_cp_reflink $testdir/file1 $testdir/file2 >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file3 >> $seqres.full
+_report_quota_blocks $SCRATCH_MNT
+_scratch_cycle_mount
+quotaon $SCRATCH_MNT 2> /dev/null
+
+echo "Set hard quota to prevent rewrite"
+setquota -u $qa_user 0 1024 0 0 $SCRATCH_MNT
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Try to dio write the whole file"
+_su $qa_user -c '$XFS_IO_PROG -d -c "pwrite 0 '$((sz+65536))'" '$testdir'/file1' 2>&1 >> $seqres.full | \
+	_filter_xfs_io_error
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Try to write the whole file"
+_su $qa_user -c '$XFS_IO_PROG -c "pwrite 0 '$((sz+65536))'" '$testdir'/file1' 2>&1 >> $seqres.full | \
+	_filter_xfs_io_error
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Set hard quota to allow rewrite"
+setquota -u $qa_user 0 8192 0 0 $SCRATCH_MNT
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Try to dio write the whole file"
+_pwrite_byte 0x62 0 $sz $testdir/file1 -d >> $seqres.full
+_scratch_sync
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Try to write the whole file"
+_pwrite_byte 0x62 0 $sz $testdir/file3 >> $seqres.full
+_scratch_sync
+_report_quota_blocks $SCRATCH_MNT
+
+# success, all done
+status=0
+exit

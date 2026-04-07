@@ -1,0 +1,20 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Eric Sandeen.  All Rights Reserved.
+#
+# FS QA Test No. 210
+#
+# Run aio-dio-subblock-eof-read - test AIO read of last block of DIO file
+#
+. ./common/preamble
+_begin_fstest auto aio quick
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+
+_run_aiodio aio-dio-subblock-eof-read
+
+exit $status

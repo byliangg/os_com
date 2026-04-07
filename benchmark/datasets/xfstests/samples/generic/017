@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Samsung Electronics.  All Rights Reserved.
+#
+# FS QA Test No. generci/017
+#
+# Test multiple fallocate collapse range calls on same file.
+# For different blocksizes, collapse a single alternate block multiple times
+# until the file is left with 80 blocks and as much number of extents.
+# Also check for file system consistency after completing this operation
+# for each blocksize.
+. ./common/preamble
+_begin_fstest auto prealloc collapse fiemap
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "fcollapse"
+_do_die_on_error=y
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+testfile=$SCRATCH_MNT/$seq.$$
+BLOCKS=10240
+
+BSIZE=`_get_file_block_size $SCRATCH_MNT`
+
+length=$(($BLOCKS * $BSIZE))
+
+# Write file
+$XFS_IO_PROG -f -c "pwrite 0 $length" -c fsync $testfile > /dev/null
+
+# Collapse alternate blocks 
+for (( i = 1; i <= 7; i++ )); do
+	for (( j=0; j < $(($BLOCKS/(2**$i))); j++ )); do
+		offset=$(($j*$BSIZE))
+		$XFS_IO_PROG -c "fcollapse $offset $BSIZE" $testfile > /dev/null
+	done
+done
+
+# Check if 80 extents are present
+$XFS_IO_PROG -c "fiemap -v" $testfile | grep "^ *[0-9]*:" |wc -l
+
+# success, all done
+status=0
+exit

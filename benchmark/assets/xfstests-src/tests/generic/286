@@ -1,0 +1,177 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Oracle Inc.  All Rights Reserved.
+#
+# FS QA Test No. 286
+#
+# SEEK_DATA/SEEK_HOLE copy tests.
+#
+. ./common/preamble
+_begin_fstest auto quick other seek prealloc
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_xfs_io_command "falloc"
+_require_seek_data_hole
+
+src=$TEST_DIR/seek_copy_testfile
+dest=$TEST_DIR/seek_copy_testfile.dest
+
+_require_test_program "seek_copy_test"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $src $dest
+}
+
+# seek_copy_test_01: tests file with holes and written data extents.
+# verify results:
+# 1. file size is identical.
+# 2. perform cmp(1) to compare SRC and DEST file byte by byte.
+test01()
+{
+	rm -f $src $dest
+
+	write_cmd="-c \"truncate 100m\""
+	for i in $(seq 0 5 100); do
+		offset=$(($i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"pwrite $offset 1m\""
+	done
+
+	echo "*** test01() create sparse file ***" >>$seqres.full
+	eval ${XFS_IO_PROG} -f "${write_cmd}" $src >>$seqres.full 2>&1 ||
+		_fail "create sparse file failed!"
+	echo "*** test01() create sparse file done ***" >>$seqres.full
+	echo >>$seqres.full
+
+	$here/src/seek_copy_test $src $dest
+	
+	test $(_get_filesize $src) = $(_get_filesize $dest) ||
+		_fail "TEST01: file size check failed"
+
+	cmp $src $dest || _fail "TEST01: file bytes check failed"
+}
+
+# seek_copy_test_02 - tests file with holes, written and unwritten extents.
+# verify results:
+# 1. file size is identical.
+# 2. perform cmp(1) to compare SRC and DEST file byte by byte.
+test02()
+{
+	rm -rf $src $dest
+
+	write_cmd="-c \"truncate 200m\""
+	for i in $(seq 0 10 100); do
+		offset=$(($((6 << 20)) + $i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"falloc $offset 3m\" -c \"pwrite $offset 1m\""
+	done
+
+	echo "*** test02() create sparse file ***" >>$seqres.full
+	eval ${XFS_IO_PROG} -f "${write_cmd}" $src >>$seqres.full 2>&1 ||
+		_fail "create sparse file failed!"
+	echo "*** test02() create sparse file done ***" >>$seqres.full
+	echo >>$seqres.full
+
+	$here/src/seek_copy_test $src $dest
+
+	test $(_get_filesize $src) = $(_get_filesize $dest) ||
+		_fail "TEST02: file size check failed"
+
+	cmp $src $dest || _fail "TEST02: file bytes check failed"
+}
+
+# seek_copy_test_03 - tests file with unwritten with data, repeated unwritten
+# without data, as well as data extents mapping.
+# verify results:
+# 1. file size is identical.
+# 2. perform cmp(1) to compare SRC and DEST file byte by byte.
+test03()
+{
+	rm -rf $src $dest
+
+	write_cmd="-c \"truncate 200m\""
+
+	#
+	# Firstly, make the file with allocated && reserved extents
+	# mapping without real data wrote.
+	#
+	for i in $(seq 0 10 180); do
+		offset=$(($((10 << 20)) + $i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"falloc $offset 10m\""
+	done
+
+	#
+	# Secondly, write data to some unwritten extents, hence we
+	# have a test file will extents mapping as:
+	# |data|multiple unwritten_without_data|data| repeat...
+	for i in $(seq 0 60 180); do
+		offset=$(($((20 << 20)) + $i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"pwrite $offset 10m\""
+	done
+
+	echo "*** test03() create sparse file ***" >>$seqres.full
+	eval ${XFS_IO_PROG} -f "${write_cmd}" $src >>$seqres.full 2>&1 ||
+		_fail "create sparse file failed!"
+	echo "*** test03() create sparse file done ***" >>$seqres.full
+	echo >>$seqres.full
+	$here/src/seek_copy_test $src $dest
+
+	test $(_get_filesize $src) = $(_get_filesize $dest) ||
+		_fail "TEST03: file size check failed"
+
+	cmp $src $dest || _fail "TEST03: file bytes check failed"
+}
+
+# seek_copy_test_04 - tests file with hole, repeated unwritten
+# without data, as well as data extents mapping.
+# verify results:
+# 1. file size is identical.
+# 2. perform cmp(1) to compare SRC and DEST file byte by byte.
+test04()
+{
+	rm -rf $src $dest
+
+	write_cmd="-c \"truncate 200m\""
+
+	#
+	# Firstly, make the file with allocated && reserved extents
+	# mapping without real data wrote.
+	#
+	for i in $(seq 30 30 180); do
+		offset=$(($((30 << 20)) + $i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"falloc $offset 5m\""
+	done
+
+	#
+	# Secondly, write data to some unwritten extents, hence we
+	# have a test file will extents mapping as:
+	# |hole|multiple unwritten_without_data|hole|data| repeat...
+	for i in $(seq 30 90 180); do
+		offset=$(($((30 << 20)) + $i * $((1 << 20))))
+		write_cmd="$write_cmd -c \"pwrite $offset 2m\""
+	done
+
+	echo "*** test04() create sparse file ***" >>$seqres.full
+	eval ${XFS_IO_PROG} -f "${write_cmd}" $src >>$seqres.full 2>&1 ||
+		_fail "create sparse file failed!"
+	echo "*** test04() create sparse file done ***" >>$seqres.full
+	echo >>$seqres.full
+	$here/src/seek_copy_test $src $dest
+
+	test $(_get_filesize $src) = $(_get_filesize $dest) ||
+		_fail "TEST04: file size check failed"
+
+	cmp $src $dest || _fail "TEST04: file bytes check failed"
+}
+
+test01
+test02
+test03
+test04
+
+status=0
+exit

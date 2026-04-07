@@ -1,0 +1,72 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 019
+#
+# Create and populate an ext4 filesystem, corrupt a big symlink, then
+# see how the kernel and e2fsck deal with it.  (They won't)
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_ext4_crc
+_require_attrs
+
+TESTDIR="${SCRATCH_MNT}/scratchdir"
+TESTFILE="${TESTDIR}/testfile"
+
+echo "+ create scratch fs"
+_scratch_mkfs -O has_journal >> $seqres.full 2>&1
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+test "${blksz}" -gt 4096 && blksz=4096
+
+echo "+ make some files"
+echo "file contents: moo" > "${SCRATCH_MNT}/x"
+str="$(perl -e "print './' x $(( (blksz / 2) - 16));")x"
+(cd $SCRATCH_MNT; ln -s "${str}" "long_symlink")
+cat "${SCRATCH_MNT}/long_symlink"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+e2fsck -fn "${SCRATCH_DEV}" >> $seqres.full 2>&1 || _fail "fsck should not fail"
+
+echo "+ corrupt image"
+debugfs -w -R 'zap -f /long_symlink -p 0x62 0' "${SCRATCH_DEV}" 2> /dev/null
+
+echo "+ mount image"
+_scratch_mount 2> /dev/null
+cat "${SCRATCH_MNT}/long_symlink" 2>/dev/null && _fail "symlink should be broken"
+umount "${SCRATCH_MNT}"
+
+echo "+ repair fs"
+e2fsck -fy "${SCRATCH_DEV}" >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+cat "${SCRATCH_MNT}/long_symlink" 2>/dev/null && _fail "symlink should be broken"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+e2fsck -fn "${SCRATCH_DEV}" >> $seqres.full 2>&1 || _fail "fsck should not fail"
+
+status=0
+exit

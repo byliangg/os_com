@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 269
+#
+# Check that attr_list_by_handle copies the cursor back to userspace.
+#
+. ./common/preamble
+_begin_fstest auto quick ioctl
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf "$tmp".* $TEST_DIR/fsmap $TEST_DIR/testout
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/populate
+
+_require_scratch
+_require_populate_commands
+_require_test_program "attr-list-by-handle-cursor-test"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+
+echo "Stuff file with xattrs"
+mkdir $SCRATCH_MNT/foo
+__populate_create_attr $SCRATCH_MNT/foo 100
+
+echo "Run test program"
+$here/src/attr-list-by-handle-cursor-test $SCRATCH_MNT/foo
+
+# success, all done
+status=0
+exit

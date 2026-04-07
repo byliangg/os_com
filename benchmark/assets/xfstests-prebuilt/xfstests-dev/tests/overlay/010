@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 010
+#
+# Remove dir which contains whiteout from lower dir.
+#
+# The following kernel commit fixed the kernel crash on the removal
+# 84889d4 ovl: check dentry positiveness in ovl_cleanup_whiteouts()
+#
+. ./common/preamble
+_begin_fstest auto quick whiteout
+
+# Import common functions.
+. ./common/filter
+
+_fixed_by_kernel_commit 84889d493356 \
+	"ovl: check dentry positiveness in ovl_cleanup_whiteouts()"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Need two lower dirs in this test, and we mount overlay ourselves,
+# create upper and workdir as well
+lowerdir1=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER.1
+lowerdir2=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER.2
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+mkdir -p $lowerdir1 $lowerdir2 $upperdir $workdir
+
+# One lowerdir contains test dir and test files, the other contains whiteout
+mkdir -p $lowerdir1/testdir $lowerdir2/testdir
+touch $lowerdir1/testdir/a $lowerdir1/testdir/b
+mknod $lowerdir2/testdir/a c 0 0
+
+# Mount overlayfs and remove testdir, which led to kernel crash
+_overlay_scratch_mount_dirs "$lowerdir2:$lowerdir1" $upperdir $workdir
+rm -rf $SCRATCH_MNT/testdir
+
+# check overlayfs
+_overlay_check_scratch_dirs "$lowerdir2:$lowerdir1" $upperdir $workdir
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. 519
+#
+# Verify if there's physical address overlap returned by FIBMAP, cover:
+# 79b3dbe4adb3 fs: fix iomap_bmap position calculation
+#
+. ./common/preamble
+_begin_fstest auto quick fiemap
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_fibmap
+_require_filefrag_options "es"
+
+testfile="$SCRATCH_MNT/$seq-testfile"
+
+# Use filefrag -B option to force the use of the older FIBMAP ioctl instead of
+# the FIEMAP ioctl. Then verify if there's map overlap.
+verify_filefrag()
+{
+	# record details in .full file
+	${FILEFRAG_PROG} -Bes -v $testfile >> $seqres.full
+
+	# Due to physical things can't be golden image, so only output logical
+	# information at here
+	${FILEFRAG_PROG} -Be $testfile | _filter_filefrag | \
+		cut -d# -f1-2 > $tmp.filefrag
+
+	# Verify there's no physical address overlay
+	awk '
+		BEGIN {i=0}
+		{
+			# create a lines array of the form begin#end offsets
+			split($0,res,"#")
+			begin=res[1]
+			end=begin+res[2]
+			lines[i++]=begin"#"end
+		}
+		END {
+			for (i in lines) {
+				for (j in lines) {
+					# Dont check i-th line against itself
+					if (i == j)
+						continue
+
+					split(lines[i],i_line,"#")
+					split(lines[j],j_line,"#")
+					v1=i_line[1]
+					v2=i_line[2]
+					e1=j_line[1]
+					e2=j_line[2]
+					# Verify there is not:
+					#       [ e1 ... e2 ]
+					#             [ v1 ... v2 ]
+					# Or:
+					#       [ e1 ... e2 ]
+					# [ v1 ... v2 ]
+					if (! (v1 >= e2 || v2 <= e1))
+						print "find physical addr overlap " lines[i] " vs " lines[j]
+				}
+			}
+		}
+	' $tmp.filefrag
+}
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+# Test
+echo "== FIBMAP on empty file =="
+$XFS_IO_PROG -f -c "truncate 0" $testfile > /dev/null
+verify_filefrag
+
+echo "== FIBMAP on sparse file =="
+$XFS_IO_PROG -f -t -c "pwrite -S 0xaa 0 1m" \
+	     -c "pwrite -S 0xaa 2m 1m" \
+	     -c "pwrite -S 0xaa 4m 1m" \
+	     $testfile > /dev/null
+verify_filefrag
+
+# success, all done
+status=0
+exit

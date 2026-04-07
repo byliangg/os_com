@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 308
+#
+# Regression test for commit:
+# f17722f ext4: Fix max file size and logical block counting of extent format file
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+testfile=$TEST_DIR/testfile.$seq
+
+_require_test
+
+echo "Silence is golden"
+
+block_size=`_get_block_size $TEST_DIR`
+
+# On unpatched ext4, if an extent exists which includes the block right
+# before the maximum file offset, and the block for the maximum file offset
+# is written, the kernel panics
+# On patched ext4, the write would get EFBIG since we lower s_maxbytes by
+# one fs block
+
+# Create a sparse file with an extent lays at one block before old s_maxbytes
+offset=$(((2**32 - 2) * $block_size))
+$XFS_IO_PROG -f -c "pwrite $offset $block_size" -c fsync $testfile >$seqres.full 2>&1
+
+# Write to the block after the extent just created
+offset=$(((2**32 - 1) * $block_size))
+$XFS_IO_PROG -f -c "pwrite $offset $block_size" -c fsync $testfile >>$seqres.full 2>&1
+
+# Got here without hitting BUG_ON(), test passed
+status=0
+exit

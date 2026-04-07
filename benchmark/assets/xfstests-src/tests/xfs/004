@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 004
+#
+# exercise xfs_db bug #789674 and other freesp functionality
+#
+. ./common/preamble
+_begin_fstest db auto quick
+
+status=0
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_scratch_unmount
+	rm -f $tmp.*
+}
+
+_populate_scratch()
+{
+	echo "=== mkfs output ===" >>$seqres.full
+	_try_scratch_mkfs_xfs | tee -a $seqres.full | _filter_mkfs 2>$tmp.mkfs
+	. $tmp.mkfs
+	_scratch_mount
+	# This test looks at specific behaviors of the xfs_db freesp command,
+	# which reports on the contents of the free space btrees for the data
+	# device.  Don't let anything get created on the realtime volume.
+	_xfs_force_bdev data $SCRATCH_MNT
+	dd if=/dev/zero of=$SCRATCH_MNT/foo count=200 bs=4096 >/dev/null 2>&1 &
+	dd if=/dev/zero of=$SCRATCH_MNT/goo count=400 bs=4096 >/dev/null 2>&1 &
+	dd if=/dev/zero of=$SCRATCH_MNT/moo count=800 bs=4096 >/dev/null 2>&1 &
+	wait
+	_scratch_unmount			# flush everything
+	_scratch_mount				# and then remount
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_no_large_scratch_dev
+
+_populate_scratch
+
+eval `$DF_PROG -P --block-size=512 $SCRATCH_MNT 2>&1 \
+	| tail -1 | $AWK_PROG '{ printf "blocks=%u used=%u avail=%u\n", $3, $4, $5 }'`
+echo "df gave: blocks=$blocks used=$used avail=$avail" >>$seqres.full
+echo "blocksize from mkfs is '$dbsize'" >>$seqres.full
+
+_scratch_xfs_db -r -c "freesp -s"  >$tmp.xfs_db
+echo "xfs_db for $SCRATCH_DEV" >>$seqres.full
+cat $tmp.xfs_db >>$seqres.full
+
+eval `$XFS_IO_PROG -x -c resblks $SCRATCH_MNT 2>&1 \
+	| $AWK_PROG '/available/ { printf "resblks=%u\n", $5 }'`
+echo "resblks gave: resblks=$resblks" >>$seqres.full
+
+# check the 'blocks' field from freesp command is OK
+perl -ne '
+	BEGIN	{ $avail ='$avail' * 512 + ('$resblks' * '$dbsize');
+		  $answer="(no xfs_db free blocks line?)" }
+	/free blocks (\d+)$/	|| next;
+	$freesp = $1 * '$dbsize';
+	if ($freesp >= $avail) {
+		$answer = "yes";
+	} else {
+		$answer = "no ($freesp < $avail)";
+	}
+	END	{ print "$answer\n" }
+	' <$tmp.xfs_db >$tmp.ans
+ans="`cat $tmp.ans`"
+echo "Checking blocks column same as df: $ans"
+if [ "$ans" != yes ]
+then
+	echo "Error: $SCRATCH_DEV: freesp mismatch: $ans"
+	echo "xfs_db output ..."
+	cat $tmp.xfs_db
+	status=1
+fi
+
+# check the 'pct' field from freesp command is good
+awk '
+{
+	if ($0 ~ /free/) {
+		next;
+	}
+
+	percent += $5;
+}
+END {
+	printf("%d\n", int(percent + 0.5));
+}' < $tmp.xfs_db > $tmp.ans
+ans="`cat $tmp.ans`"
+echo "Checking percent column yields 100: $ans"
+if [ "$ans" != 100 ]
+then
+	echo "Error: $SCRATCH_DEV: pct mismatch: $ans (expected 100)"
+	echo "xfs_db output ..."
+	cat $tmp.xfs_db
+	status=1
+fi
+
+exit

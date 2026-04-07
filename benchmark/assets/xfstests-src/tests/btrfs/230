@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 230
+#
+# Test if btrfs qgroup would crash if we're modifying the fs
+# after exceeding the limit
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup limit
+
+. ./common/filter
+
+
+# This test requires specific data space usage, skip if we have compression
+# enabled.
+_require_no_compress
+
+# Need at least 2GiB
+_require_scratch_size $((2 * 1024 * 1024))
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+_pwrite_byte 0xcd 0 1G $SCRATCH_MNT/file >> $seqres.full
+# Make sure the data reach disk so later qgroup scan can see it
+sync
+
+$BTRFS_UTIL_PROG quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT >> $seqres.full
+
+# Set the limit to just 512MiB, which is way below the existing usage
+$BTRFS_UTIL_PROG qgroup limit  512M 0/5 $SCRATCH_MNT
+
+# Touch above file, if kernel not patched, it will trigger an ASSERT()
+#
+# Even for patched kernel, we will still get EDQUOT error, but that
+# is expected behavior.
+touch $SCRATCH_MNT/file 2>&1 | _filter_scratch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,30 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 174
+#
+# Check the filestreams allocator is doing its job.
+# Multi-file data streams should always write into seperate AGs.
+#
+. ./common/preamble
+_begin_fstest rw filestreams auto
+
+# Import common functions.
+. ./common/filter
+. ./common/filestreams
+
+
+_require_scratch
+
+_check_filestreams_support || _notrun "filestreams not available"
+
+# test number of streams greater than AGs. Expected to fail.
+_set_stream_timeout_centisecs 6000
+
+_test_streams 8 32 65 3 1 1 0 fail
+_test_streams 8 32 65 3 1 0 1 fail
+
+status=0
+exit
+

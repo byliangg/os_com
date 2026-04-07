@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test ext4/025
+#
+# Regression test for commit:
+# 3a4b77c ("ext4: validate s_first_meta_bg at mount time").
+#
+. ./common/preamble
+_begin_fstest auto quick fuzzers dangerous
+
+# get standard environment and checks
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch_nocheck
+_require_command "$DEBUGFS_PROG" debugfs
+_require_scratch_ext4_feature "bigalloc,meta_bg,^resize_inode"
+
+echo "Create ext4 fs and modify first_meta_bg's value"
+_scratch_mkfs "-O bigalloc,meta_bg,^resize_inode" >> $seqres.full 2>&1
+
+# set a big enough first_meta_bg to trigger buffer overrun
+# 842150400 is from original fuzzed ext4 image in bug report
+$DEBUGFS_PROG -w -R "ssv first_meta_bg 842150400" $SCRATCH_DEV >> $seqres.full 2>&1
+
+echo "Try to mount a modified ext4 fs"
+_try_scratch_mount >> $seqres.full 2>&1 || echo "Fail to mount ext4 fs expectedly"
+
+# success, all done
+status=0
+exit

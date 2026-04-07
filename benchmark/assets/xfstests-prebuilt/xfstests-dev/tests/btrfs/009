@@ -1,0 +1,29 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/009
+#
+# Regression test to make sure we can't delete the default subvol
+#
+. ./common/preamble
+_begin_fstest auto quick subvol
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/newvol >> $seqres.full 2>&1 \
+	|| _fail "couldn't create subvol"
+subvolid=$(_btrfs_get_subvolid $SCRATCH_MNT newvol)
+$BTRFS_UTIL_PROG subvolume set-default $subvolid $SCRATCH_MNT >> $seqres.full 2>&1 \
+	|| _fail "couldn't set default"
+$BTRFS_UTIL_PROG subvolume delete $SCRATCH_MNT/newvol >> $seqres.full 2>&1
+_scratch_unmount
+_try_scratch_mount || _fail "mount should have succeeded"
+
+echo "Silence is golden"
+status=0 ; exit

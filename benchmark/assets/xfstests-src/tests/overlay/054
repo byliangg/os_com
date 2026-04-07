@@ -1,0 +1,134 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test No. 054
+#
+# Test encode/decode overlay file handle of dir with non-indexed ancestor
+#
+# Overlayfs with nfs_export enabled, indexes all directories on copy up.
+# Directory index is requires for decoding lower directory file handles
+# in case ancestors have been renamed.
+#
+# When enabling nfs_export on an overlay that already has non-indexed
+# merge dirs, the possibility of non-indexed ancestor rename requires
+# special handling when encoding lower directory file handles.
+#
+# - Check encode/decode/read file handles of non-indexed merge dir
+# - Check encode/decode/read file handles of dir with non-indexed parent
+# - Check encode/decode/read file handles of dir with non-indexed grandparent
+# - Check decode/read of file handles after rename of non-indexed merge dir
+# - Check decode/read of file handles after rename of non-indexed parent
+# - Check decode/read of file handles after rename of non-indexed grandparent
+#
+# This test requires and enables overlayfs NFS export support and merge
+# dir rename support (redirect_dir).
+# NFS export support depends on and requires overlayfs index feature.
+#
+# Regression test for kernel commit 2ca3c148a062 ("ovl: check lower ancestry
+# on encode of lower dir file handle")
+#
+. ./common/preamble
+_begin_fstest auto quick copyup redirect exportfs
+
+# Import common functions.
+. ./common/filter
+
+
+_fixed_by_kernel_commit 2ca3c148a062 \
+	"ovl: check lower ancestry on encode of lower dir file handle"
+
+_require_scratch
+_require_test_program "open_by_handle"
+# We need to require all features together, because nfs_export cannot
+# be enabled when index is disabled
+_require_scratch_overlay_features index nfs_export redirect_dir
+
+# All overlay dirs are on scratch partition
+lower=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upper=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+work=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+
+NUMFILES=1
+
+# Create test dir and empty test files
+create_test_files()
+{
+	local dir=$1
+	local opt=$2
+
+	mkdir -p $dir
+	$here/src/open_by_handle -cp $opt $dir $NUMFILES
+}
+
+# Test encode/decode file handles on overlay mount
+test_file_handles()
+{
+	local dir=$1
+	shift
+
+	echo test_file_handles $dir $* | _filter_scratch | \
+				sed -e "s,$tmp\.,,g"
+	$here/src/open_by_handle $* $dir $NUMFILES
+}
+
+# Re-create lower/upper/work dirs
+create_dirs()
+{
+	_scratch_mkfs
+}
+
+# Mount an overlay on $SCRATCH_MNT with all layers on scratch partition
+mount_dirs()
+{
+	_scratch_mount -o "index=on,nfs_export=on,redirect_dir=on"
+}
+
+# Unmount the overlay without unmounting base fs
+unmount_dirs()
+{
+	$UMOUNT_PROG $SCRATCH_MNT
+}
+
+# Check encode/decode/read file handles of dir with non-indexed ancestor
+create_dirs
+create_test_files $lower/merged -w
+create_test_files $lower/merged/dir -w
+create_test_files $lower/merged/dir/subdir -w
+create_test_files $lower/merged/parent/child -w
+# Create non-indexed merge dir
+mkdir $upper/merged
+mount_dirs
+# Check encode/decode/read file handles of non-indexed merge dir
+# This is expected to encode an upper file handle
+test_file_handles $SCRATCH_MNT/merged -p -o $tmp.merged_file_handles
+# Check encode/decode/read file handles of dir with non-indexed parent
+# This is expected to copy up merged/dir and encode an upper file handle
+test_file_handles $SCRATCH_MNT/merged/dir -p -o $tmp.dir_file_handles
+test -d $upper/merged/dir || echo "merged/dir not copied up"
+# Check encode/decode/read file handles of dir with non-indexed grandparent
+# This is expected to encode a lower file handle
+test_file_handles $SCRATCH_MNT/merged/dir/subdir -p -o $tmp.subdir_file_handles
+test -d $upper/merged/dir/subdir && echo "merged/dir/subdir unexpected copy up"
+# This is expected to copy up parent and encode a lower file handle
+test_file_handles $SCRATCH_MNT/merged/parent/child -p -o $tmp.child_file_handles
+test -d $upper/merged/parent || echo "merged/parent not copied up"
+test -d $upper/merged/parent/child && echo "merged/parent/child unexpected copy up"
+
+# Rename non-indexed merge dir
+mv $SCRATCH_MNT/merged $SCRATCH_MNT/merged.new/
+# Check open, read and readdir from stored file handles
+# (testdir argument is the mount point and NOT the dir
+#  we are trying to open by stored file handle)
+test_file_handles $SCRATCH_MNT -rp -i $tmp.merged_file_handles
+test_file_handles $SCRATCH_MNT -rp -i $tmp.dir_file_handles
+test_file_handles $SCRATCH_MNT -rp -i $tmp.subdir_file_handles
+test_file_handles $SCRATCH_MNT -rp -i $tmp.child_file_handles
+# Retry decoding lower subdir file handles when indexed ancestor is in dcache
+# (providing the ancestor dir argument pins the ancestor to dcache)
+test_file_handles $SCRATCH_MNT/merged.new/dir -rp -i $tmp.subdir_file_handles
+test_file_handles $SCRATCH_MNT/merged.new/parent -rp -i $tmp.child_file_handles
+unmount_dirs
+
+status=0
+exit

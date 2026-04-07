@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 343
+#
+# Test that if we create a hard link for a file F in some directory A, then move
+# some directory or file B from its parent directory C into directory A, fsync
+# file F, power fail and mount the filesystem, the directory/file B is located
+# only at directory A and both links for file F exist.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test directories and files.
+mkdir $SCRATCH_MNT/x
+mkdir $SCRATCH_MNT/y
+touch $SCRATCH_MNT/x/foo
+mkdir $SCRATCH_MNT/y/z
+touch $SCRATCH_MNT/y/foo2
+
+# Make sure everything is durably persisted.
+_scratch_sync
+
+# Now add a link to foo at directory x, move directory z and file foo2 from
+# directory y to directory x and fsync foo's inode. We expect that after a
+# log replay we see the new link for foo's inode and that z and foo2 are only
+# located at directory x.
+ln $SCRATCH_MNT/x/foo $SCRATCH_MNT/x/bar
+mv $SCRATCH_MNT/y/z $SCRATCH_MNT/x/z
+mv $SCRATCH_MNT/y/foo2 $SCRATCH_MNT/x/foo2
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/x/bar
+_flakey_drop_and_remount
+
+echo "Filesystem contents after log replay:"
+ls -R $SCRATCH_MNT/x $SCRATCH_MNT/y | _filter_scratch
+
+_scratch_unmount
+status=0
+exit

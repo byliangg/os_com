@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018, Jeff Layton <jlayton@redhat.com>
+#
+# FS QA Test No. 487
+#
+# Open a file several times, write to it, fsync on all fds and make sure that
+# they all return 0. Change the device to start throwing errors. Write again
+# on all fds and fsync on all fds. Ensure that we get errors on all of them.
+# Then fsync on all one last time and verify that all return 0.
+#
+. ./common/preamble
+_begin_fstest auto quick eio
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_dmerror_cleanup
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmerror
+
+_require_scratch_nocheck
+
+sflag='-s'
+case $FSTYP in
+        btrfs)
+                _notrun "btrfs has a specialized test for this"
+                ;;
+        *)
+                ;;
+esac
+
+_require_logdev
+_require_dm_target error
+
+# Disable the scratch rt device to avoid test failures relating to the rt
+# bitmap consuming all the free space in our small data device.
+unset SCRATCH_RTDEV
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_dmerror_init no_log
+_dmerror_mount
+
+datalen=65536
+_require_fs_space $SCRATCH_MNT $datalen
+
+# use fd 5 to hold file open
+testfile=$SCRATCH_MNT/fsync-open-after-err
+exec 5>$testfile
+
+# write some data to file and fsync it out
+$XFS_IO_PROG -c "pwrite -q 0 $datalen" -c fsync $testfile
+
+# flip device to non-working mode
+_dmerror_load_error_table
+
+# rewrite the data, call sync to ensure it's written back w/o scraping error
+$XFS_IO_PROG -c "pwrite -q 0 $datalen" -c sync $testfile
+
+# heal the device error
+_dmerror_load_working_table
+
+# open again and call fsync
+echo "The following fsync should fail with EIO:"
+$XFS_IO_PROG -c fsync $testfile
+echo "done"
+
+# close file
+exec 5>&-
+
+# success, all done
+_dmerror_cleanup
+
+status=0
+exit

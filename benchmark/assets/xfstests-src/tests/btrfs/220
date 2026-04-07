@@ -1,0 +1,355 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 220
+#
+# Test all existent mount options of btrfs
+# * device= argument is already being test by btrfs/125
+# * space cache test already covered by test btrfs/131
+. ./common/preamble
+_begin_fstest auto quick remount
+
+_register_cleanup "cleanup"
+
+. ./common/filter
+
+_require_scratch
+
+cleanup()
+{
+	cd /
+	rm -f $tmp.*
+}
+
+# Compare the mounted flags with $opt_check. When the comparison fails, $opt is
+# echoed to help to track which option was used to trigger the unexpected
+# results.
+test_mount_flags()
+{
+	local opt
+	local opt_check
+	local stripped
+	opt="$1"
+	opt_check="$2"
+
+	active_opt=$(cat /proc/self/mounts | grep $SCRATCH_MNT | \
+					$AWK_PROG '{ print $4 }')
+
+	if [ "$opt_check" != "$DEFAULT_OPTS" ]; then
+		# We only care about the common things between defaults and the
+		# active set, so strip out the uniq lines between the two, and
+		# then we'll add this to our $opt_check which should equal
+		# $active_opt.  We also strip 'rw' as we may be checking 'ro',
+		# so we need to adjust that accordingly
+		stripped=$(echo "$DEFAULT_OPTS,$active_opt" | tr ',' '\n' | \
+				sort | grep -v 'rw' | uniq -d | tr '\n' ',' | \
+				sed 's/.$//')
+		opt_check="$opt_check,$stripped"
+	fi
+
+	# We diff by putting our wanted opts together with the current opts,
+	# turning it into one option per line, sort'ing, and then printing out
+	# any uniq lines left.  This will catch anything that is set that we're
+	# not expecting, or anything that wasn't set that we wanted.
+	#
+	# We strip 'rw' because some tests flip ro, so just ignore rw.
+	diff=$(echo "$opt_check,$active_opt" | tr ',' '\n' | \
+		sort | grep -v 'rw' | uniq -u)
+	if [ -n "$diff" ]; then
+		echo "Unexepcted mount options, checking for '$opt_check' in '$active_opt' using '$opt'"
+	fi
+}
+
+# Mounts using opt ($1), remounts using remount_opt ($2), and remounts again
+# using opt again (1), checking if the mount opts are being enabled/disabled by
+# using _check arguments ($3 and $4)
+test_enable_disable_mount_opt()
+{
+	local opt
+	local opt_check
+	local remount_opt
+	local remount_opt_check
+	opt="$1"
+	opt_check="$2"
+	remount_opt="$3"
+	remount_opt_check="$4"
+
+	_scratch_mount "-o $opt"
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_remount $remount_opt
+
+	test_mount_flags $remount_opt $remount_opt_check
+
+	_scratch_remount $opt
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_unmount
+}
+
+# Checks if mount options are applied and reverted correctly.
+# By using options to mount ($1) and remount ($2), this function will mount,
+# remount, and the mount with the original args, checking if the mount options
+# match the _check args ($3 and $4).
+
+# Later, opt and remount_opt are swapped, testing the counterpart option if used
+# to first mount the fs.
+test_roundtrip_mount()
+{
+	local opt
+	local opt_check
+	local remount_opt
+	local remount_opt_check
+	opt="$1"
+	opt_check="$2"
+	remount_opt="$3"
+	remount_opt_check="$4"
+
+	# invert the args to make sure that both options work at mount and
+	# remount time
+	test_enable_disable_mount_opt $opt $opt_check $remount_opt $remount_opt_check
+	test_enable_disable_mount_opt $remount_opt $remount_opt_check $opt $opt_check
+}
+
+# Just mount and check if the options were mounted correctly by comparing the
+# results with $opt_check
+test_mount_opt()
+{
+	local opt
+	local opt_check
+	local active_opt
+	opt="$1"
+	opt_check="$2"
+
+	_scratch_mount "-o $opt"
+
+	test_mount_flags $opt $opt_check
+
+	_scratch_unmount
+}
+
+# Test mount options that should fail, usually by wrong arguments to options
+test_should_fail()
+{
+	local opt
+	opt="$1"
+
+	# wrong $opt on purpose, should fail
+	_try_scratch_mount "-o $opt" >/dev/null 2>&1
+	if [ $? -ne 0 ]; then
+		return
+	fi
+	echo "Option $opt should fail to mount"
+	_scratch_unmount
+}
+
+# Try to mount using $opt, and bail our if the mount fails without errors. If
+# the mount succeeds, then compare the mount options with $opt_check
+test_optional_mount_opts()
+{
+	local opt
+	local opt_check
+	opt="$1"
+	opt_check="$2"
+
+	# $opt not enabled, return without running any tests
+	_try_scratch_mount "-o $opt" >/dev/null 2>&1 || return
+	_scratch_unmount
+
+	# option enabled, run the test
+	test_mount_opt $opt $opt_check
+}
+
+# Testes related to subvolumes, from subvol and subvolid options.
+test_subvol()
+{
+	test_should_fail "subvol=vol2"
+
+	_scratch_mount "-o subvol=vol1"
+	if [ ! -f "$SCRATCH_MNT/file.txt" ]; then
+		echo "file.txt not found inside vol1 using subvol=vol1 mount option"
+	fi
+	_scratch_unmount
+
+	test_should_fail "subvolid=222"
+
+	_scratch_mount "-o subvolid=256"
+	if [ ! -f "$SCRATCH_MNT/file.txt" ]; then
+		echo "file.txt not found inside vol1 using subvolid=256 mount option"
+	fi
+	_scratch_unmount
+
+	# subvol and subvolid should point to the same subvolume
+	test_should_fail "-o subvol=vol1,subvolid=1234132"
+
+	test_mount_opt "subvol=vol1,subvolid=256" "subvolid=256,subvol=/vol1"
+	test_roundtrip_mount "subvol=vol1" "subvolid=256,subvol=/vol1" "subvolid=256" "subvolid=256,subvol=/vol1"
+}
+
+# These options are enable at kernel compile time, so no bother if they fail
+test_optional_kernel_features()
+{
+	test_should_fail "fragment=invalid"
+	test_optional_mount_opts "fragment=all" "fragment=data,fragment=metadata"
+	test_optional_mount_opts "fragment=data" "fragment=data"
+	test_optional_mount_opts "fragment=metadata" "fragment=metadata"
+}
+
+test_non_revertible_options()
+{
+	test_mount_opt "degraded" "degraded"
+
+	if [ "$enable_rescue_nologreplay" = true ]; then
+		#rescue=nologreplay should be used only with readonly
+		test_should_fail "rescue=nologreplay"
+		test_mount_opt "rescue=nologreplay,ro" "ro,rescue=nologreplay"
+	else
+		# nologreplay should be used only with readonly
+		test_should_fail "nologreplay"
+		test_mount_opt "nologreplay,ro" "ro,nologreplay"
+	fi
+
+	test_mount_opt "rescan_uuid_tree" "rescan_uuid_tree"
+	test_mount_opt "skip_balance" "skip_balance"
+	test_mount_opt "user_subvol_rm_allowed" "user_subvol_rm_allowed"
+
+	test_should_fail "rescue=invalid"
+}
+
+test_one_shot_options()
+{
+	if [ "$enable_clear_cache_shown" = true ]; then
+		test_mount_opt "clear_cache" "clear_cache"
+	else
+		test_mount_opt "clear_cache" ""
+	fi
+}
+
+# All these options can be reverted (with their "no" counterpart), or can have
+# their values set to default on remount
+test_revertible_options()
+{
+	test_roundtrip_mount "acl" "$DEFAULT_OPTS" "noacl" "noacl"
+	test_roundtrip_mount "autodefrag" "autodefrag" "noautodefrag" "$DEFAULT_OPTS"
+	test_roundtrip_mount "barrier" "$DEFAULT_OPTS" "nobarrier" "nobarrier"
+
+	test_should_fail "commit=-10"
+	# commit=0 sets the default, so btrfs hides this mount opt
+	test_roundtrip_mount "commit=35" "commit=35" "commit=0" "$DEFAULT_OPTS"
+
+	test_should_fail "compress=invalid"
+	test_should_fail "compress-force=invalid"
+	test_roundtrip_mount "compress" "compress=zlib:3" "compress=lzo" "compress=lzo"
+	test_roundtrip_mount "compress=zstd" "compress=zstd:3" "compress=no" "$DEFAULT_OPTS"
+	test_roundtrip_mount "compress-force=no" "$DEFAULT_OPTS" "compress-force=zstd" "compress-force=zstd:3"
+	# zlib's max level is 9 and zstd's max level is 15
+	test_roundtrip_mount "compress=zlib:20" "compress=zlib:9" "compress=zstd:16" "compress=zstd:15"
+	test_roundtrip_mount "compress-force=lzo" "compress-force=lzo" "compress-force=zlib:4" "compress-force=zlib:4"
+
+	if ! _scratch_btrfs_is_zoned; then
+		# on remount, if we only pass datacow after nodatacow was used it will remain with nodatasum
+		test_roundtrip_mount "nodatacow" "nodatasum,nodatacow" "datacow,datasum" "$DEFAULT_OPTS"
+		# nodatacow disabled compression
+		test_roundtrip_mount "compress-force" "compress-force=zlib:3" "nodatacow" "nodatasum,nodatacow"
+
+		# nodatacow disabled both datacow and datasum, and datasum enabled datacow and datasum
+		test_roundtrip_mount "nodatacow" "nodatasum,nodatacow" "datasum" "$DEFAULT_OPTS"
+		test_roundtrip_mount "nodatasum" "nodatasum" "datasum" "$DEFAULT_OPTS"
+	fi
+
+	test_should_fail "discard=invalid"
+	if [ "$enable_discard_sync" = true ]; then
+		test_roundtrip_mount "discard" "discard" "discard=sync" "discard"
+		if ! _scratch_btrfs_is_zoned; then
+			test_roundtrip_mount "discard=async" "discard=async" "discard=sync" "discard"
+		fi
+		test_roundtrip_mount "discard=sync" "discard" "nodiscard" "$DEFAULT_NODISCARD_OPTS"
+	else
+		test_roundtrip_mount "discard" "discard" "discard" "discard"
+		test_roundtrip_mount "discard" "discard" "nodiscard" "$DEFAULT_NODISCARD_OPTS"
+	fi
+
+	test_roundtrip_mount "enospc_debug" "enospc_debug" "noenospc_debug" "$DEFAULT_OPTS"
+
+	test_should_fail "fatal_errors=pani"
+	# fatal_errors=bug is the default
+	test_roundtrip_mount "fatal_errors=panic" "fatal_errors=panic" "fatal_errors=bug" "$DEFAULT_OPTS"
+
+	test_roundtrip_mount "flushoncommit" "flushoncommit" "noflushoncommit" "$DEFAULT_OPTS"
+
+	# 2048 is the max_inline default value
+	test_roundtrip_mount "max_inline=1024" "max_inline=1024" "max_inline=2048" "$DEFAULT_OPTS"
+
+	test_roundtrip_mount "metadata_ratio=0" "$DEFAULT_OPTS" "metadata_ratio=10" "metadata_ratio=10"
+
+	# ssd_spread implies ssd, while nossd_spread only disables ssd_spread
+	test_roundtrip_mount "ssd_spread" "ssd_spread" "nossd" "nossd"
+	test_roundtrip_mount "ssd" "ssd" "nossd" "nossd"
+	test_mount_opt "ssd" "ssd"
+
+	test_should_fail "thread_pool=-10"
+	test_should_fail "thread_pool=0"
+	test_roundtrip_mount "thread_pool=10" "thread_pool=10" "thread_pool=50" "thread_pool=50"
+
+	test_roundtrip_mount "notreelog" "notreelog" "treelog" "$DEFAULT_OPTS"
+}
+
+# Find out if the running kernel supports the -o discard=sync option.
+_scratch_mkfs >/dev/null
+MOUNT_OPTIONS=
+enable_discard_sync=false
+_try_scratch_mount "-o discard=sync" > /dev/null 2>&1 && \
+	{ enable_discard_sync=true; _scratch_unmount; }
+
+enable_rescue_nologreplay=false
+_try_scratch_mount "-o ro,rescue=nologreplay" > /dev/null 2>&1 && \
+	{ enable_rescue_nologreplay=true; _scratch_unmount; }
+
+enable_clear_cache_shown=false
+_try_scratch_mount "-o clear_cache" > /dev/null 2>&1 && \
+	{ shown_opts=$(cat /proc/self/mounts | grep $SCRATCH_MNT | \
+		       $AWK_PROG '{ print $4 }')
+	  echo $shown_opts | grep -q clear_cache && enable_clear_cache_shown=true
+	  _scratch_unmount; }
+
+_scratch_mkfs >/dev/null
+
+# This test checks mount options, so having random MOUNT_OPTIONS set could
+# affect the results of a few of these tests.
+MOUNT_OPTIONS=
+
+# create a subvolume that will be used later
+_scratch_mount
+
+# We need to save the current default options so we can validate our changes
+# from one mount option to the next one.
+DEFAULT_OPTS=$(cat /proc/self/mounts | grep $SCRATCH_MNT | \
+		$AWK_PROG '{ print $4 }')
+
+# Since 63a7cb130718 ("btrfs: auto enable discard=async when possible"),
+# "discard=async" will be automatically enabled if the device supports.
+# This can screw up our test against nodiscard options, thus remove the
+# default "discard=async" mount option for "nodiscard" tests.
+DEFAULT_NODISCARD_OPTS=$(echo -n "$DEFAULT_OPTS" | $SED_PROG 's/,discard=async//')
+
+$BTRFS_UTIL_PROG subvolume create "$SCRATCH_MNT/vol1" > /dev/null
+touch "$SCRATCH_MNT/vol1/file.txt"
+_scratch_unmount
+
+test_optional_kernel_features
+
+test_non_revertible_options
+
+test_one_shot_options
+
+test_revertible_options
+
+test_subvol
+
+echo "Silence is golden"
+
+status=0
+exit

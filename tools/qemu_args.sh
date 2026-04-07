@@ -11,6 +11,7 @@
 #  - NETDEV: "user" or "tap";
 #  - VHOST: "off" or "on";
 #  - VSOCK: "off" or "on";
+#  - ENABLE_KVM: "1" to append "-enable-kvm" when /dev/kvm is available;
 #  - CONSOLE: "hvc0" to enable virtio console;
 #  - SMP: number of CPUs;
 #  - MEM: amount of memory, e.g. "8G";
@@ -21,6 +22,16 @@ VHOST=${VHOST:-"off"}
 VSOCK=${VSOCK:-"off"}
 NETDEV=${NETDEV:-"user"}
 CONSOLE=${CONSOLE:-"hvc0"}
+ENABLE_KVM=${ENABLE_KVM:-"0"}
+
+KVM_ARGS=""
+if [ "$ENABLE_KVM" = "1" ]; then
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        KVM_ARGS="-enable-kvm"
+    else
+        echo "[$1] ENABLE_KVM=1 but /dev/kvm is not accessible, fallback to TCG" 1>&2
+    fi
+fi
 
 SSH_RAND_PORT=${SSH_PORT:-$(shuf -i 1024-65535 -n 1)}
 NGINX_RAND_PORT=${NGINX_PORT:-$(shuf -i 1024-65535 -n 1)}
@@ -66,6 +77,7 @@ if [ "$1" = "tdx" ]; then
         -monitor pty \
         -nodefaults \
         -bios /root/ovmf/release/OVMF.fd \
+        $KVM_ARGS \
         -cpu host,-kvm-steal-time,pmu=off \
         -machine q35,kernel-irqchip=split,confidential-guest-support=tdx0 \
         -object '$TDX_OBJECT' \
@@ -85,6 +97,7 @@ if [ "$1" = "tdx" ]; then
 fi
 
 COMMON_QEMU_ARGS="\
+    $KVM_ARGS \
     -cpu Icelake-Server,+x2apic \
     -smp ${SMP:-1} \
     -m ${MEM:-8G} \

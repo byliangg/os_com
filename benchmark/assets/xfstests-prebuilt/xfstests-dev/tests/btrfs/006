@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/006
+#
+# run basic btrfs information commands in various ways
+# sanity tests: filesystem show, label, sync, and device stats
+#
+. ./common/preamble
+_begin_fstest auto quick volume
+
+. ./common/filter.btrfs
+
+_require_scratch
+_require_scratch_dev_pool
+
+FIRST_POOL_DEV=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}'`
+LAST_POOL_DEV=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $NF}'`
+TOTAL_DEVS=`echo $SCRATCH_DEV_POOL | wc -w`
+LABEL=TestLabel.$seq
+
+echo "Scratch $SCRATCH_DEV First $FIRST_POOL_DEV last $LAST_POOL_DEV Total $TOTAL_DEVS" > $seqres.full
+
+_scratch_pool_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+
+# These have to be done unmounted...?
+echo "== Set filesystem label to $LABEL"
+$BTRFS_UTIL_PROG filesystem label $SCRATCH_DEV $LABEL
+echo "== Get filesystem label"
+$BTRFS_UTIL_PROG filesystem label $SCRATCH_DEV
+
+echo "== Mount."
+_scratch_mount
+
+echo "== Show filesystem by label"
+$BTRFS_UTIL_PROG filesystem show $LABEL | _filter_btrfs_filesystem_show $TOTAL_DEVS
+UUID=`$BTRFS_UTIL_PROG filesystem show $LABEL | grep uuid: | $AWK_PROG '{print $NF}'`
+
+echo "UUID $UUID" >> $seqres.full
+
+echo "== Show filesystem by UUID"
+$BTRFS_UTIL_PROG filesystem show $UUID | _filter_btrfs_filesystem_show $TOTAL_DEVS $UUID
+
+echo "== Sync filesystem"
+$BTRFS_UTIL_PROG filesystem sync $SCRATCH_MNT > /dev/null
+
+echo "== Show device stats by mountpoint"
+$BTRFS_UTIL_PROG device stats $SCRATCH_MNT | \
+    _filter_btrfs_device_stats $TOTAL_DEVS | \
+    _filter_spaces
+echo "== Show device stats by first/scratch dev"
+$BTRFS_UTIL_PROG device stats $SCRATCH_DEV | \
+    _filter_btrfs_device_stats | \
+    _filter_spaces
+echo "== Show device stats by second dev"
+$BTRFS_UTIL_PROG device stats $FIRST_POOL_DEV | \
+    sed -e "s,$FIRST_POOL_DEV,FIRST_POOL_DEV,g" | \
+    _filter_spaces
+echo "== Show device stats by last dev"
+$BTRFS_UTIL_PROG device stats $LAST_POOL_DEV | \
+    sed -e "s,$LAST_POOL_DEV,LAST_POOL_DEV,g" | \
+    _filter_spaces
+
+# success, all done
+status=0
+exit

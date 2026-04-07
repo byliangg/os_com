@@ -1,0 +1,5 @@
+QA output created by 501
+File bar digest before power failure:
+69319d0343ab8f5ea564167da445addc  SCRATCH_MNT/bar
+File bar digest after power failure:
+69319d0343ab8f5ea564167da445addc  SCRATCH_MNT/bar

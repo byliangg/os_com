@@ -1,0 +1,70 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 093
+#
+# Test clearing of capabilities on write.
+#
+. ./common/preamble
+_begin_fstest attr cap auto
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+    [ -n "$TEST_DIR" ] && rm -f $file
+}
+
+filefilter()
+{
+    sed -e "s#$file#file#"
+}
+
+
+_require_test
+_require_attrs security
+_require_user
+_require_test_program "writemod"
+_require_command "$SETCAP_PROG" "setcap"
+_require_command "$GETCAP_PROG" "getcap"
+
+echo ""
+file=$TEST_DIR/$seq.file
+
+rm -f $file
+touch $file
+
+echo "**** Verifying that appending to file clears capabilities ****"
+$SETCAP_PROG cap_chown+ep $file
+_getcap $file | filefilter
+echo data1 >> $file
+cat $file
+_getcap $file | filefilter
+echo
+
+echo "**** Verifying that appending to file doesn't clear other xattrs ****"
+$SETCAP_PROG cap_chown+ep $file
+$SETFATTR_PROG -n trusted.name -v value $file
+echo data2 >> $file
+cat $file
+_getfattr -m '^trusted\.*' --absolute-names $file | filefilter
+
+echo "**** Verifying that chmod doesn't affect open file descriptors ****"
+rm -f $file
+touch $file
+chown $qa_user $file
+chmod ugo+w $TEST_DIR
+# don't use $here/src/writemod, as we're running it as a regular user, and
+# $here may contain path component that a regular user doesn't have search
+# permission
+_su $qa_user -c "src/writemod $file" | filefilter
+cat $file
+
+# success, all done
+status=0
+exit

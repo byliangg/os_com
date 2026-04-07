@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. ext4/039
+#
+# Test data journaling flag switch for a single file  
+#
+. ./common/preamble
+_begin_fstest auto enospc rw
+
+# ext3 and ext4 don't support direct IO in journalling mode
+write_opt_list="iflag=noatime conv=notrunc conv=fsync"
+
+# Import common functions.
+. ./common/filter
+_workout()
+{
+	echo "Switch data journalling mode. Silence is golden."
+	chattr_opt_list="+j -j +jS -j"
+	idx=0
+	#
+	for write_opt in $write_opt_list
+	do
+		idx=$((idx + 1))
+		for chattr_opt in $chattr_opt_list
+		do
+		    
+			echo "OP write_opt: $write_opt 4M, \
+chattr_opt: $chattr_opt" >>$seqres.full
+			dd if=/dev/zero of=$SCRATCH_MNT/file.$idx \
+				bs=1M count=4 $write_opt \
+				>> $seqres.full 2>&1 || exit
+			$CHATTR_PROG $chattr_opt $SCRATCH_MNT/file.$idx >> $seqres.full \
+				|| exit
+		done
+	done
+	sync
+	# Same as previous test, but for one file,
+	# and with ENOSPC triggering
+	for write_opt in $write_opt_list
+	do
+		idx=$((idx + 1))
+		for chattr_opt in $chattr_opt_list
+		do
+
+			echo "OP write_opt: $write_opt ENOSPC, \
+chattr_opt: $chattr_opt" >>$seqres.full
+			dd if=/dev/zero of=$SCRATCH_MNT/file.$idx \
+				bs=1M $write_opt >> $seqres.full 2>&1
+			$CHATTR_PROG $chattr_opt $SCRATCH_MNT/file.$idx \
+				>> $seqres.full || exit
+		done
+		sync
+		unlink $SCRATCH_MNT/file.$idx
+	done
+}
+
+_exclude_fs ext2
+
+_require_scratch
+_exclude_scratch_mount_option dax
+
+_scratch_mkfs_sized $((64 * 1024 * 1024)) >> $seqres.full 2>&1
+_scratch_mount
+
+if ! _workout; then
+	echo "workout failed"
+	_scratch_unmount
+	status=1
+	exit
+fi
+
+if ! _scratch_unmount; then
+	echo "failed to umount"
+	status=1
+	exit
+fi
+echo "Check filesystem"
+status=0
+exit

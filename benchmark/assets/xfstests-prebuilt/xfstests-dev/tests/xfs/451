@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 451
+#
+# Make sure xfs_repair can repair root inode parent's pointer
+# when it contains a bogus ino when it's using shot form directory
+
+. ./common/preamble
+_begin_fstest auto quick metadata repair
+
+# Import common functions.
+. ./common/filter
+
+echo "Silence is golden"
+
+
+# Modify as appropriate.
+_require_scratch
+
+_scratch_mkfs >> /dev/null 2>&1
+
+rootino=$(_scratch_xfs_get_metadata_field 'rootino' 'sb 0')
+
+prefix=$(_scratch_get_sfdir_prefix ${rootino} || \
+			_fail "Cannot determine sfdir prefix")
+
+# Corrupt root inode parent pointer
+_scratch_xfs_set_metadata_field "${prefix}.hdr.parent.i4" 0 "inode ${rootino}"\
+						>> $seqres.full 2>&1
+
+_scratch_xfs_repair >> $seqres.full 2>&1
+
+# Post-test integrity check will detect any remaining corruption
+
+status=0
+exit

@@ -1,0 +1,199 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Huawei.  All Rights Reserved.
+#
+# FS QA Test No. 045
+#
+# Test fsck.overlay how to deal with whiteouts in overlayfs.
+#
+. ./common/preamble
+_begin_fstest auto quick fsck
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch_nocheck
+_require_attrs trusted
+_require_command "$FSCK_OVERLAY_PROG" fsck.overlay
+
+OVL_XATTR_OPAQUE_VAL=y
+OVL_XATTR_IMPURE_VAL=y
+
+# remove all files from previous tests
+_scratch_mkfs
+
+# Check whiteout
+check_whiteout()
+{
+	for arg in $*; do
+		local ttype=`stat -c "%F:%t,%T" $arg`
+
+		[[ "$ttype" == "character special file:0,0" ]] || \
+			echo "Valid whiteout removed incorrectly"
+	done
+}
+
+# Create a whiteout
+make_whiteout()
+{
+	for arg in $*; do
+		mknod $arg c 0 0
+	done
+}
+
+# Create an opaque directory
+make_opaque_dir()
+{
+	local target=$1
+
+	mkdir -p $target
+	$SETFATTR_PROG -n $OVL_XATTR_OPAQUE -v $OVL_XATTR_OPAQUE_VAL $target
+}
+
+# Create impure directories
+make_impure_dir()
+{
+	for dir in $*; do
+		mkdir -p $dir
+		$SETFATTR_PROG -n $OVL_XATTR_IMPURE -v $OVL_XATTR_IMPURE_VAL $dir
+	done
+}
+
+# Create a redirect directory
+make_redirect_dir()
+{
+	local target=$1
+	local value=$2
+
+	mkdir -p $target
+	$SETFATTR_PROG -n $OVL_XATTR_REDIRECT -v $value $target
+}
+
+# Create test directories
+lowerdir=$OVL_BASE_SCRATCH_MNT/lower
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+
+make_test_dirs()
+{
+	rm -rf $lowerdir $lowerdir2 $upperdir $workdir
+	mkdir -p $lowerdir $lowerdir2 $upperdir $workdir
+}
+
+# Test orphan whiteout in lower and upper layer, should remove
+echo "+ Orphan whiteout"
+make_test_dirs
+make_whiteout $lowerdir/foo $upperdir/{foo,bar}
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+ls $lowerdir
+ls $upperdir
+
+# Test valid whiteout covering lower target, should not remove
+echo "+ Valid whiteout"
+make_test_dirs
+touch $lowerdir2/{foo,bar}
+make_whiteout $upperdir/foo $lowerdir/bar
+
+_overlay_fsck_expect $FSCK_OK "$lowerdir:$lowerdir2" $upperdir $workdir -p
+check_whiteout $upperdir/foo $lowerdir/bar
+
+# Test orphan whiteout in opaque directory, should remove
+echo "+ Orphan whiteout(2)"
+make_test_dirs
+mkdir $lowerdir/testdir
+touch $lowerdir/testdir/foo
+make_opaque_dir $upperdir/testdir
+make_whiteout $upperdir/testdir/foo
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+ls $upperdir/testdir
+
+# Test orphan whiteout whose parent path is not an merged directory,
+# should remove
+echo "+ Orphan whiteout(3)"
+make_test_dirs
+mkdir $lowerdir2/{testdir1,testdir2,testdir3}
+touch $lowerdir2/{testdir1/foo,testdir2/foo,testdir3/foo}
+mkdir $upperdir/{testdir1,testdir2,testdir3,testdir4}
+touch $lowerdir/testdir1
+make_whiteout $lowerdir/testdir2
+make_opaque_dir $lowerdir/testdir3
+make_whiteout $upperdir/{testdir1/foo,/testdir2/foo,testdir3/foo,testdir4/foo}
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT "$lowerdir:$lowerdir2" $upperdir $workdir -p
+ls $upperdir/testdir1
+ls $upperdir/testdir2
+ls $upperdir/testdir3
+ls $upperdir/testdir4
+
+# Test orphan whiteout in redirect directory, should remove
+echo "+ Orphan whiteout(4)"
+make_test_dirs
+mkdir $lowerdir/{testdir,origin}
+touch $lowerdir/testdir/foo
+make_redirect_dir $upperdir/testdir "origin"
+make_whiteout $upperdir/testdir/foo
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+ls $upperdir/testdir
+
+# Test valid whiteout in redirect directory cover file in lower
+# redirect origin directory, should not remove
+echo "+ Valid whiteout(2)"
+make_test_dirs
+mkdir $lowerdir/origin
+touch $lowerdir/origin/foo
+make_impure_dir $upperdir
+make_redirect_dir $upperdir/testdir "origin"
+make_whiteout $upperdir/origin $upperdir/testdir/foo
+
+_overlay_fsck_expect $FSCK_OK $lowerdir $upperdir $workdir -p
+check_whiteout $upperdir/testdir/foo
+
+# Test valid whiteout covering lower target whose parent directory
+# merge with a redirect directory in the middle layer, should not remove.
+echo "+ Valid whiteout(3)"
+make_test_dirs
+mkdir -p $lowerdir2/origin/subdir
+touch $lowerdir2/origin/subdir/foo
+make_redirect_dir $lowerdir/testdir "origin"
+mkdir -p $upperdir/testdir/subdir
+make_whiteout $lowerdir/origin $upperdir/testdir/subdir/foo
+make_impure_dir $upperdir/testdir $upperdir
+
+_overlay_fsck_expect $FSCK_OK "$lowerdir:$lowerdir2" $upperdir $workdir -p
+check_whiteout $upperdir/testdir/subdir/foo
+
+# Test invalid whiteout in opaque subdirectory in a redirect directory,
+# should remove
+echo "+ Orphan whiteout(5)"
+make_test_dirs
+mkdir -p $lowerdir/origin/subdir
+touch $lowerdir/origin/subdir/foo
+make_redirect_dir $upperdir/testdir "origin"
+make_opaque_dir $upperdir/testdir/subdir
+make_whiteout $upperdir/testdir/subdir/foo
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+ls $upperdir/testdir/subdir
+
+# Test valid whiteout in reidrect subdirectory in a opaque directory
+# covering lower target, should not remove
+echo "+ Valid whiteout(4)"
+make_test_dirs
+mkdir $lowerdir/origin
+touch $lowerdir/origin/foo
+make_opaque_dir $upperdir/testdir
+make_redirect_dir $upperdir/testdir/subdir "/origin"
+make_whiteout $upperdir/origin $upperdir/testdir/subdir/foo
+make_impure_dir $upperdir/testdir
+
+_overlay_fsck_expect $FSCK_OK $lowerdir $upperdir $workdir -p
+check_whiteout $upperdir/testdir/subdir/foo
+
+# success, all done
+status=0
+exit

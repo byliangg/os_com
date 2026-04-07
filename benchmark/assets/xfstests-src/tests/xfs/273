@@ -1,0 +1,94 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 273
+#
+# Populate filesystem, check that fsmap -n10000 matches fsmap -n1.
+#
+. ./common/preamble
+_begin_fstest auto rmap fsmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf "$tmp".* $TEST_DIR/a $TEST_DIR/b
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/populate
+
+_require_scratch
+_require_populate_commands
+_require_xfs_io_command "fsmap"
+
+_fixed_by_kernel_commit a440a28ddbdc "xfs: fix off-by-one error in fsmap"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_populate_cached nofill > $seqres.full 2>&1
+
+echo "Compare fsmap" | tee -a $seqres.full
+_scratch_mount
+$XFS_IO_PROG -c 'fsmap -v -n 65536' $SCRATCH_MNT | grep -v 'EXT:' > $TEST_DIR/a
+$XFS_IO_PROG -c 'fsmap -v -n 1' $SCRATCH_MNT | grep -v 'EXT:' > $TEST_DIR/b
+cat $TEST_DIR/a $TEST_DIR/b >> $seqres.full
+
+diff -uw $TEST_DIR/a $TEST_DIR/b
+
+# Do we have mappings for every sector on the device?
+ddev_fsblocks=$(_xfs_statfs_field "$SCRATCH_MNT" geom.datablocks)
+rtdev_fsblocks=$(_xfs_statfs_field "$SCRATCH_MNT" geom.rtblocks)
+fsblock_bytes=$(_xfs_statfs_field "$SCRATCH_MNT" geom.bsize)
+
+ddev_daddrs=$((ddev_fsblocks * fsblock_bytes / 512))
+rtdev_daddrs=$((rtdev_fsblocks * fsblock_bytes / 512))
+
+ddev_devno=$(stat -c '%t:%T' $SCRATCH_DEV)
+if [ "$USE_EXTERNAL" = "yes" ] && [ -n "$SCRATCH_RTDEV" ]; then
+	rtdev_devno=$(stat -c '%t:%T' $SCRATCH_RTDEV)
+elif $XFS_INFO_PROG $SCRATCH_MNT | grep -q 'zoned=1'; then
+	# no external rt device and zoned=1 means fsmap reports internal device
+	# numbers instead of block major/minor.
+	ddev_devno="0:1"
+	rtdev_devno="0:3"
+fi
+
+$XFS_IO_PROG -c 'fsmap -m -n 65536' $SCRATCH_MNT | awk -F ',' \
+	-v data_devno=$ddev_devno \
+	-v rt_devno=$rtdev_devno \
+	-v data_daddrs=$ddev_daddrs \
+	-v rt_daddrs=$rtdev_daddrs \
+'BEGIN {
+	next_daddr[data_devno] = 0;
+	next_daddr[rt_devno] = 0;
+}
+{
+	if ($1 == "EXT")
+		next
+	devno = sprintf("%x:%x", $2, $3);
+	if (devno != data_devno && devno != rt_devno)
+		next
+
+	if (next_daddr[devno] < $4)
+		printf("%sh: expected daddr %d, saw \"%s\"\n", devno,
+				next_daddr[devno], $0);
+		n = $5 + 1;
+		if (n > next_daddr[devno])
+		       next_daddr[devno] = n;
+}
+END {
+	if (data_daddrs != next_daddr[data_devno])
+		printf("%sh: fsmap stops at %d, expected %d\n",
+				data_devno, next_daddr[data_devno], data_daddrs);
+	if (rt_devno != "" && rt_daddrs != next_daddr[rt_devno])
+		printf("%sh: fsmap stops at %d, expected %d\n",
+				rt_devno, next_daddr[rt_devno], rt_daddrs);
+}'
+
+# success, all done
+status=0
+exit

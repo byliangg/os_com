@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 037
+#
+# Verify that replacing a xattr's value is an atomic operation.
+# This is motivated by an issue in btrfs where replacing a xattr's value
+# wasn't an atomic operation, it consisted of removing the old value and
+# then inserting the new value in a btree. This made readers (getxattr
+# and listxattrs) not getting neither the old nor the new value during
+# a short time window.
+#
+# The btrfs issue was fixed by the following linux kernel patch:
+#
+#    Btrfs: make xattr replace operations atomic
+#
+. ./common/preamble
+_begin_fstest auto quick attr metadata
+
+# Override the default cleanup function.
+_cleanup()
+{
+	kill $setter_pid
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch
+_require_attrs
+
+xattr_name="user.something"
+xattr_value1="foobar"
+xattr_value2="rabbit_hole"
+
+set_xattr_loop()
+{
+	local name=$1
+	local cur_val=$xattr_value1
+	while true; do
+		$SETFATTR_PROG -n $xattr_name -v $cur_val $SCRATCH_MNT/$name
+		if [ "$cur_val" == "$xattr_value1" ]; then
+			cur_val=$xattr_value2
+		else
+			cur_val=$xattr_value1
+		fi
+	done
+}
+
+value_filter()
+{
+	grep "$xattr_name=" | cut -d '=' -f 2 | \
+		sed -e "s/$xattr_value1/GOOD/" -e "s/$xattr_value2/GOOD/"
+}
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+test_file="test_xattr_replace"
+touch $SCRATCH_MNT/$test_file
+$SETFATTR_PROG -n $xattr_name -v $xattr_value1 $SCRATCH_MNT/$test_file
+
+set_xattr_loop $test_file &
+setter_pid=$!
+
+for ((i = 0; i < 1000; i++)); do
+	_getfattr --absolute-names -n $xattr_name \
+		$SCRATCH_MNT/$test_file | value_filter
+done
+
+status=0
+exit

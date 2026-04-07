@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 281
+#
+# Test that xfsdump can generate a format 2 dump.
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+_require_legacy_v2_format
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_fill
+
+echo "*** Dump using format 2"
+_do_dump_file -K
+
+echo "*** Verify it's a format 2 dump"
+file $dump_file | cut -d: -f 2
+
+echo "*** Restoring format 2 dump"
+_do_restore_file
+_diff_compare
+
+# success, all done
+status=0
+exit

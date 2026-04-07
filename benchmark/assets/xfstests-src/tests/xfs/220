@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Christoph Hellwig.  All Rights Reserved.
+#
+# FS QA Test No. 220
+#
+# Test quota off handling.
+#
+# Based on bug reports from Utako Kusaka <u-kusaka@wm.jp.nec.com> and
+# Ryota Yamauchi <r-yamauchi@vf.jp.nec.com>.
+#
+. ./common/preamble
+_begin_fstest auto quota quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_scratch_unmount >/dev/null 2>&1
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+_require_scratch
+_require_quota
+
+# Only mount with the specific quota options mentioned below
+_qmount_option "defaults"
+
+echo "Silence is golden."
+
+# create scratch filesystem
+_scratch_mkfs_xfs >/dev/null 2>&1
+
+# mount  with quotas enabled
+_scratch_mount -o uquota
+_force_vfs_quota_testing $SCRATCH_MNT	 # golden output encodes block usage
+
+# turn off quota
+$XFS_QUOTA_PROG -x -c off $SCRATCH_DEV
+
+# and unmount (this used to crash)
+_scratch_unmount
+
+# create scratch filesystem
+_scratch_mkfs_xfs >/dev/null 2>&1
+
+# mount  with quotas enabled
+_scratch_mount -o uquota
+_force_vfs_quota_testing $SCRATCH_MNT	 # golden output encodes block usage
+
+# turn off quota accounting...
+$XFS_QUOTA_PROG -x -c off $SCRATCH_DEV
+
+# ...but if the kernel doesn't support turning off accounting, remount with
+# noquota option to turn it off...
+if $XFS_QUOTA_PROG -x -c 'state -u' $SCRATCH_DEV | grep -q 'Accounting: ON'; then
+	_scratch_unmount
+	_scratch_mount -o noquota
+fi
+
+before_freesp=$(_get_available_space $SCRATCH_MNT)
+
+# ...and remove space allocated to the quota files
+# (this used to give wrong ENOSYS returns in 2.6.31)
+$XFS_QUOTA_PROG -x -c remove $SCRATCH_DEV
+
+# Make sure we actually freed the space used by dquot 0
+after_freesp=$(_get_available_space $SCRATCH_MNT)
+delta=$((after_freesp - before_freesp))
+
+echo "freesp $before_freesp -> $after_freesp ($delta)" >> $seqres.full
+if [ $before_freesp -ge $after_freesp ]; then
+	echo "expected Q_XQUOTARM to free space"
+fi
+
+# and unmount again
+_scratch_unmount
+
+status=0
+exit $status

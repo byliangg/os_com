@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Christoph Hellwig.
+#
+# FS QA Test No. 385
+#
+# Make sure renames accross project boundaries are properly rejected
+# and that we don't use the wrong lock flags internally.
+#
+# Based on a report and testcase from Arkadiusz Miskiewicz <arekm@maven.pl>
+#
+. ./common/preamble
+_begin_fstest quota auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_scratch_unmount
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+_require_scratch
+_require_quota
+_require_xfs_quota_foreign
+
+#
+# Setup temporary replacements for /etc/projects and /etc/projid
+#
+cat >$tmp.projects <<EOF
+42:$SCRATCH_MNT/t
+EOF
+
+cat >$tmp.projid <<EOF
+answer:42
+EOF
+
+#
+# And make sure we always use our replacements
+#
+quota_cmd="$XFS_QUOTA_PROG -D $tmp.projects -P $tmp.projid"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_enable_pquota
+_qmount_option "prjquota"
+_qmount
+_require_prjquota $SCRATCH_DEV
+
+#
+# Create the project root
+#
+mkdir $SCRATCH_MNT/t
+
+$quota_cmd -x -c 'project -s answer' $SCRATCH_MNT >/dev/null 2>&1
+$quota_cmd -x -c 'limit -p bhard=100m answer' $SCRATCH_MNT
+
+touch $SCRATCH_MNT/test
+
+#
+# Try renaming a file into the project.  This should fail.
+#
+# We repeat this a couple thousand times as a single rename couldn't
+# always trigger the wrong unlock flags bug we had in older kernels.
+#
+for i in `seq 1 2000`; do
+    $here/src/rename test t/test
+done
+
+# success, all done
+echo "*** done"
+status=0

@@ -1,0 +1,1545 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2017 Oracle.  All Rights Reserved.
+#
+# Routines for fuzzing and scrubbing a filesystem.
+
+# Modify various files after a fuzzing operation
+_scratch_fuzz_modify() {
+	local fsstress_args=(-n $((TIME_FACTOR * 10000)) -p $((LOAD_FACTOR * 4)) )
+	test -n "${FUZZ_REWRITE_DURATION}" && fsstress_args+=("--duration=${FUZZ_REWRITE_DURATION}")
+
+	echo "+++ stressing filesystem"
+	mkdir -p $SCRATCH_MNT/data
+	[ "$FSTYP" == "xfs" ] && _xfs_force_bdev data $SCRATCH_MNT/data
+	_run_fsstress "${fsstress_args[@]}" -d $SCRATCH_MNT/data
+
+	if [ "$FSTYP" = "xfs" ]; then
+		if _xfs_has_feature "$SCRATCH_MNT" realtime; then
+			mkdir -p $SCRATCH_MNT/rt
+			_xfs_force_bdev realtime $SCRATCH_MNT/rt
+			_run_fsstress "${fsstress_args[@]}" -d $SCRATCH_MNT/rt
+		else
+			echo "+++ xfs realtime not configured"
+		fi
+	fi
+}
+
+# Try to access files after fuzzing
+_scratch_fuzz_test() {
+	echo "+++ ls -laR" >> $seqres.full
+	ls -laR "${SCRATCH_MNT}/test.1/" >/dev/null 2>&1
+
+	echo "+++ cat files" >> $seqres.full
+	(find "${SCRATCH_MNT}/test.1/" -type f -size -1048576k -print0 | xargs -0 cat) >/dev/null 2>&1
+}
+
+# Do we have an online scrub program?
+_require_scrub() {
+	case "${FSTYP}" in
+	"xfs")
+		test -x "$XFS_SCRUB_PROG" || _notrun "xfs_scrub not found"
+		;;
+	*)
+		_notrun "No online scrub program for ${FSTYP}."
+		;;
+	esac
+}
+
+# Scrub the scratch filesystem metadata (online)
+_scratch_scrub() {
+	case "${FSTYP}" in
+	"xfs")
+		$XFS_SCRUB_PROG -d -T -v "$@" $SCRATCH_MNT
+		;;
+	*)
+		_fail "No online scrub program for ${FSTYP}."
+		;;
+	esac
+}
+
+# Expand indexed keys (i.e. arrays) into a long format so that we can filter
+# the array indices individually, and pass regular keys right through.
+#
+# For example, "u3.bmx[0-1] = [foo,bar]" is exploded into:
+# u3.bmx[0] = [foo,bar]
+# u3.bmx[1] = [foo,bar]
+#
+# Note that we restrict array indices to [0-9] to reduce fuzz runtime.  The
+# minimum and maximum array indices can be changed by setting the variables
+# SCRATCH_XFS_{MIN,MAX}_ARRAY_IDX.
+#
+# Also filter padding fields.
+__explode_xfs_db_fields() {
+	local min_idx="${SCRATCH_XFS_MIN_ARRAY_IDX}"
+	local max_idx="${SCRATCH_XFS_MAX_ARRAY_IDX}"
+
+	test -z "${min_idx}" && min_idx=0
+	test -z "${max_idx}" && max_idx=9
+	test "${max_idx}" = "none" && max_idx=99999
+
+	grep ' = ' | \
+	sed -e 's/^\([.a-zA-Z0-9_]*\)\[\([0-9]*\)-\([0-9]*\)\]\(.*\) = \(.*\)$/\1[%d]\4 \2 \3 = \5/g' \
+	    -e 's/^\([.a-zA-Z0-9_]*\)\[\([0-9]*\)\]\(.*\) = \(.*\)$/\1[%d]\3 \2 \2 = \4/g' | \
+	while read name col1 col2 rest; do
+		if [[ "${name}" == *pad* ]]; then
+			continue
+		fi
+
+		if [ "${col1}" = "=" ]; then
+			echo "${name} ${col1} ${col2} ${rest}"
+			continue
+		fi
+
+		test "${min_idx}" -gt "${col1}" && col1="${min_idx}"
+		test "${max_idx}" -lt "${col2}" && col2="${max_idx}"
+
+		seq "${col1}" "${col2}" | while read idx; do
+			printf "${name} %s\n" "${idx}" "${rest}"
+		done
+	done
+}
+
+# Filter out metadata fields that are completely controlled by userspace
+# or are arbitrary bit sequences.  In other words, fields where the filesystem
+# does no validation.
+__filter_unvalidated_xfs_db_fields() {
+	sed -e '/\.sec/d' \
+	    -e '/\.nsec/d' \
+	    -e '/^lsn$/d' \
+	    -e '/\.lsn/d' \
+	    -e '/^core.flushiter/d' \
+	    -e '/^core.dmevmask/d' \
+	    -e '/^core.dmstate/d' \
+	    -e '/^core.gen/d' \
+	    -e '/^core.prealloc/d' \
+	    -e '/^core.immutable/d' \
+	    -e '/^core.append/d' \
+	    -e '/^core.sync/d' \
+	    -e '/^core.noatime/d' \
+	    -e '/^core.nodump/d' \
+	    -e '/^core.nodefrag/d' \
+	    -e '/^v3.dax/d' \
+	    -e '/^nvlist.*value/d' \
+	    -e '/^entries.*root/d' \
+	    -e '/^entries.*secure/d' \
+	    -e '/^a.sfattr.list.*value/d' \
+	    -e '/^a.sfattr.list.*root/d' \
+	    -e '/^a.sfattr.list.*secure/d' \
+	    -e '/^core.filestream/d' \
+	    -e '/^v3.bigtime/d' \
+	    -e '/\.rtbwarns/d' \
+	    -e '/\.[ib]warns/d'
+}
+
+# Filter the xfs_db print command's field debug information
+# into field name and type.
+__filter_xfs_db_print_fields() {
+	filter="$1"
+	if [ -z "${filter}" ] || [ "${filter}" = "nofilter" ]; then
+		filter='^'
+	fi
+	__explode_xfs_db_fields | while read key equals value; do
+		fuzzkey="$(echo "${key}")"
+		if [ -z "${fuzzkey}" ]; then
+			continue
+		elif [[ "${value}" == "["* ]]; then
+			echo "${value}" | sed -e 's/^.//g' -e 's/.$//g' -e 's/,/\n/g' | while read subfield; do
+				echo "${fuzzkey}.${subfield}"
+			done
+		else
+			echo "${fuzzkey}"
+		fi
+	done | grep -E "${filter}" | __filter_unvalidated_xfs_db_fields
+}
+
+# Dump the current contents of a metadata object.
+# All arguments are xfs_db commands to locate the metadata.
+_scratch_xfs_dump_metadata() {
+	local cmds=()
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+	_scratch_xfs_db "${cmds[@]}" -c print
+}
+
+# Decide from the output of the xfs_db "stack" command if the debugger's io
+# cursor is pointed at a block that is an unstructured data format (blob).
+__scratch_xfs_detect_blob_from_stack() {
+	grep -q -E 'inode.*, type (data|rtsummary|rtbitmap)'
+}
+
+# Navigate to some part of the filesystem and print the field info.
+# The first argument is an grep filter for the fields
+# The rest of the arguments are xfs_db commands to locate the metadata.
+_scratch_xfs_list_metadata_fields() {
+	filter="$1"
+	shift
+	if [ -n "${SCRATCH_XFS_LIST_METADATA_FIELDS}" ]; then
+		echo "${SCRATCH_XFS_LIST_METADATA_FIELDS}" | tr '[ ,]' '[\n\n]'
+		return;
+	fi
+
+	local cmds=()
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+
+	# Does the path argument point towards something that is an
+	# unstructured blob?
+	if _scratch_xfs_db "${cmds[@]}" -c stack 2>/dev/null | \
+			__scratch_xfs_detect_blob_from_stack; then
+		echo "<blob>"
+		return
+	fi
+
+	_scratch_xfs_db "${cmds[@]}" -c print | \
+		__filter_xfs_db_print_fields "${filter}"
+}
+
+# Fuzz a metadata field
+# The first arg is the field name
+# The second arg is the xfs_db fuzz verb
+# The rest of the arguments are xfs_db commands to find the metadata.
+_scratch_xfs_fuzz_metadata_field() {
+	key="$1"
+	value="$2"
+	shift; shift
+
+	if [[ "${key}" == *crc ]]; then
+		fuzz_arg="-c"
+	else
+		fuzz_arg="-d"
+	fi
+	oldval="$(_scratch_xfs_get_metadata_field "${key}" "$@")"
+
+	local cmds=()
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+	while true; do
+		_scratch_xfs_db -x "${cmds[@]}" -c "fuzz ${fuzz_arg} ${key} ${value}"
+		echo
+		newval="$(_scratch_xfs_get_metadata_field "${key}" "$@" 2> /dev/null)"
+		if [ "${key}" != "random" ] || [ "${oldval}" != "${newval}" ]; then
+			break;
+		fi
+	done
+	if [ "${oldval}" = "${newval}" ]; then
+		echo "Field ${key} already set to ${newval}, skipping test."
+		return 1
+	fi
+	return 0
+}
+
+# List the fuzzing verbs available for unstructured blobs
+__scratch_xfs_list_blob_fuzz_verbs() {
+		cat << ENDL
+zeroes
+ones
+firstbit
+middlebit
+lastbit
+random
+ENDL
+}
+
+# Fuzz a metadata blob
+# The first arg is a blob fuzzing verb
+# The rest of the arguments are xfs_db commands to find the metadata.
+_scratch_xfs_fuzz_metadata_blob() {
+	local fuzzverb="$1"
+	shift
+	local trashcmd=(blocktrash -z)
+
+	local cmds=()
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+
+	local bytecount=$(_scratch_xfs_db "${cmds[@]}" -c "stack" | grep 'byte.*length' | awk '{print $5}')
+	local bitmax=$((bytecount * 8))
+
+	case "${fuzzverb}" in
+	"zeroes")
+		trashcmd+=(-0 -o 0 -x "${bitmax}" -y "${bitmax}");;
+	"ones")
+		trashcmd+=(-1 -o 0 -x "${bitmax}" -y "${bitmax}");;
+	"firstbit")
+		trashcmd+=(-2 -o 0 -x 1 -y 1);;
+	"middlebit")
+		trashcmd+=(-2 -o $((bitmax / 2)) -x 1 -y 1);;
+	"lastbit")
+		trashcmd+=(-2 -o "${bitmax}" -x 1 -y 1);;
+	"random")
+		trashcmd+=(-3 -o 0 -x "${bitmax}" -y "${bitmax}");;
+	*)
+		echo "Unknown blob fuzz verb \"${fuzzverb}\"."
+		return 1
+		;;
+	esac
+
+	trashcmd="${trashcmd[@]}"
+	oldval="$(_scratch_xfs_get_metadata_field "" "$@")"
+	while true; do
+		_scratch_xfs_db -x "${cmds[@]}" -c "${trashcmd}"
+		echo
+		newval="$(_scratch_xfs_get_metadata_field "" "$@" 2> /dev/null)"
+		if [ "${fuzzverb}" != "random" ] || [ "${oldval}" != "${newval}" ]; then
+			break;
+		fi
+	done
+	if [ "${oldval}" = "${newval}" ]; then
+		echo "Blob already set to new value, skipping test."
+		return 1
+	fi
+	return 0
+}
+
+# Try to forcibly unmount the scratch fs
+__scratch_xfs_fuzz_unmount()
+{
+	while _scratch_unmount 2>/dev/null; do sleep 0.2; done
+}
+
+# Restore metadata to scratch device prior to field-fuzzing.
+__scratch_xfs_fuzz_mdrestore()
+{
+	__scratch_xfs_fuzz_unmount
+	_scratch_xfs_mdrestore "${POPULATE_METADUMP}" || \
+		_fail "${POPULATE_METADUMP}: Could not find metadump to restore?"
+}
+
+__fuzz_notify() {
+	echo '========================================'
+	echo "$*"
+	echo '========================================'
+	_kernlog "$*"
+}
+
+# Perform the online repair part of a fuzz test.
+__scratch_xfs_fuzz_field_online() {
+	local fuzz_action="$1"
+
+	# Mount or else we can't do anything online
+	__fuzz_notify "+ Mount filesystem to try online repair"
+	_try_scratch_mount 2>&1
+	res=$?
+	if [ $res -ne 0 ]; then
+		(>&2 echo "${fuzz_action}: mount failed ($res).")
+		return 1
+	fi
+
+	# Make sure online scrub will catch whatever we fuzzed
+	__fuzz_notify "++ Detect fuzzed field (online)"
+	_scratch_scrub -n -a 1 -e continue 2>&1
+	res=$?
+	test $res -eq 0 && \
+		(>&2 echo "${fuzz_action}: online scrub didn't fail.")
+
+	# Does the health status report reflect the corruption?
+	if [ $res -ne 0 ]; then
+		__fuzz_notify "++ Detect fuzzed field ill-health report"
+		_check_xfs_health $SCRATCH_MNT 2>&1
+		res=$?
+		test $res -ne 1 && \
+			(>&2 echo "${fuzz_action}: online health check failed ($res).")
+	fi
+
+	# Try fixing the filesystem online
+	__fuzz_notify "++ Try to repair filesystem (online)"
+	_scratch_scrub 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: online repair failed ($res).")
+
+	# Online scrub should pass now
+	__fuzz_notify "++ Make sure error is gone (online)"
+	_scratch_scrub -n -a 1 -e continue 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: online re-scrub failed ($res).")
+
+	__scratch_xfs_fuzz_unmount
+
+	# Offline scrub should pass now
+	__fuzz_notify "+ Make sure error is gone (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: offline re-scrub failed ($res).")
+
+	return 0
+}
+
+# Perform the offline repair part of a fuzz test.
+__scratch_xfs_fuzz_field_offline() {
+	local fuzz_action="$1"
+
+	# Make sure offline scrub will catch whatever we fuzzed
+	__fuzz_notify "+ Detect fuzzed field (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -eq 0 && \
+		(>&2 echo "${fuzz_action}: offline scrub didn't fail.")
+
+	# Repair the filesystem offline
+	__fuzz_notify "+ Try to repair the filesystem (offline)"
+	_repair_scratch_fs -P 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: offline repair failed ($res).")
+
+	# See if repair finds a clean fs
+	__fuzz_notify "+ Make sure error is gone (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: offline re-scrub failed ($res).")
+
+	return 0
+}
+
+# Perform the no-repair part of a fuzz test.
+__scratch_xfs_fuzz_field_norepair() {
+	local fuzz_action="$1"
+
+	# Make sure offline scrub will catch whatever we fuzzed
+	__fuzz_notify "+ Detect fuzzed field (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -eq 0 && \
+		(>&2 echo "${fuzz_action}: offline scrub didn't fail.")
+
+	# Mount or else we can't do anything in norepair mode
+	__fuzz_notify "+ Mount filesystem to try online scan"
+	_try_scratch_mount 2>&1
+	res=$?
+	if [ $res -ne 0 ]; then
+		(>&2 echo "${fuzz_action}: mount failed ($res).")
+		return 1
+	fi
+
+	# Skip scrub and health check if scrub is not supported
+	if ! _supports_xfs_scrub $SCRATCH_MNT $SCRATCH_DEV; then
+		__scratch_xfs_fuzz_unmount
+		return 0
+	fi
+
+	# Make sure online scrub will catch whatever we fuzzed
+	__fuzz_notify "++ Detect fuzzed field (online)"
+	_scratch_scrub -n -a 1 -e continue 2>&1
+	res=$?
+	test $res -eq 0 && \
+		(>&2 echo "${fuzz_action}: online scrub didn't fail.")
+
+	# Does the health status report reflect the corruption?
+	if [ $res -ne 0 ]; then
+		__fuzz_notify "++ Detect fuzzed field ill-health report"
+		_check_xfs_health $SCRATCH_MNT 2>&1
+		res=$?
+		test $res -ne 1 && \
+			(>&2 echo "${fuzz_action}: online health check failed ($res).")
+	fi
+
+	__scratch_xfs_fuzz_unmount
+
+	return 0
+}
+
+# Perform the online-then-offline repair part of a fuzz test.
+__scratch_xfs_fuzz_field_both() {
+	local fuzz_action="$1"
+
+	# Make sure offline scrub will catch whatever we fuzzed
+	__fuzz_notify "+ Detect fuzzed field (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -eq 0 && \
+		(>&2 echo "${fuzz_action}: offline scrub didn't fail.")
+
+	# Mount or else we can't do anything in both repair mode
+	__fuzz_notify "+ Mount filesystem to try both repairs"
+	_try_scratch_mount 2>&1
+	res=$?
+	if [ $res -ne 0 ]; then
+		(>&2 echo "${fuzz_action}: mount failed ($res).")
+	else
+		# Make sure online scrub will catch whatever we fuzzed
+		__fuzz_notify "++ Detect fuzzed field (online)"
+		_scratch_scrub -n -a 1 -e continue 2>&1
+		res=$?
+		test $res -eq 0 && \
+			(>&2 echo "${fuzz_action}: online scrub didn't fail.")
+
+		# Does the health status report reflect the corruption?
+		if [ $res -ne 0 ]; then
+			__fuzz_notify "++ Detect fuzzed field ill-health report"
+			_check_xfs_health $SCRATCH_MNT 2>&1
+			res=$?
+			test $res -ne 1 && \
+				(>&2 echo "${fuzz_action}: online health check failed ($res).")
+		fi
+
+		# Try fixing the filesystem online
+		__fuzz_notify "++ Try to repair filesystem (online)"
+		_scratch_scrub 2>&1
+		res=$?
+		test $res -ne 0 && \
+			(>&2 echo "${fuzz_action}: online repair failed ($res).")
+
+		__scratch_xfs_fuzz_unmount
+	fi
+
+	# Repair the filesystem offline if online repair failed?
+	if [ $res -ne 0 ]; then
+		__fuzz_notify "+ Try to repair the filesystem (offline)"
+		_repair_scratch_fs -P 2>&1
+		res=$?
+		test $res -ne 0 && \
+			(>&2 echo "${fuzz_action}: offline repair failed ($res).")
+	fi
+
+	# See if repair finds a clean fs
+	__fuzz_notify "+ Make sure error is gone (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: offline re-scrub failed ($res).")
+
+	# Mount so that we can see what scrub says after we've fixed the fs
+	__fuzz_notify "+ Re-mount filesystem to re-try online scan"
+	_try_scratch_mount 2>&1
+	res=$?
+	if [ $res -ne 0 ]; then
+		(>&2 echo "${fuzz_action}: mount failed ($res).")
+		return 1
+	fi
+
+	# Online scrub should pass now
+	__fuzz_notify "++ Make sure error is gone (online)"
+	_scratch_scrub -n -a 1 -e continue 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: online re-scrub failed ($res).")
+
+	__scratch_xfs_fuzz_unmount
+
+	return 0
+}
+
+# Assess the state of the filesystem after a repair strategy has been run by
+# trying to make changes to it.
+_scratch_xfs_fuzz_field_modifyfs() {
+	local fuzz_action="$1"
+	local repair="$2"
+
+	# Try to mount the filesystem so that we can make changes
+	__fuzz_notify "+ Mount filesystem to make changes"
+	_try_scratch_mount 2>&1
+	res=$?
+	if [ $res -ne 0 ]; then
+		(>&2 echo "${fuzz_action}: pre-mod mount failed ($res).")
+		return $res
+	fi
+
+	# Try modifying the filesystem again
+	__fuzz_notify "++ Try to write filesystem again"
+	_scratch_fuzz_modify 2>&1
+
+	# If we didn't repair anything, there's no point in checking further,
+	# the fs is still corrupt.
+	if [ "${repair}" = "none" ]; then
+		__scratch_xfs_fuzz_unmount
+		return 0
+	fi
+
+	# Run an online check to make sure the fs is still ok, unless we
+	# are running the norepair strategy.
+	__fuzz_notify "+ Re-check the filesystem (online)"
+	_scratch_scrub -n -e continue 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: online post-mod scrub failed ($res).")
+
+	__scratch_xfs_fuzz_unmount
+
+	# Run an offline check to make sure the fs is still ok, unless we
+	# are running the norepair strategy.
+	__fuzz_notify "+ Re-check the filesystem (offline)"
+	_scratch_xfs_repair -P -n 2>&1
+	res=$?
+	test $res -ne 0 && \
+		(>&2 echo "${fuzz_action}: offline post-mod scrub failed ($res).")
+
+	return 0
+}
+
+# Fuzz one field of some piece of metadata.
+# First arg is the field name
+# Second arg is the fuzz verb (ones, zeroes, random, add, sub...)
+# Third arg is the repair mode (online, offline, both, none)
+__scratch_xfs_fuzz_field_test() {
+	field="$1"
+	fuzzverb="$2"
+	repair="$3"
+	shift; shift; shift
+
+	# Set the new field value
+	__fuzz_notify "+ Fuzz ${field} = ${fuzzverb}"
+	if [ "$field" = "<blob>" ]; then
+		_scratch_xfs_fuzz_metadata_blob ${fuzzverb} "$@"
+	else
+		_scratch_xfs_fuzz_metadata_field "${field}" ${fuzzverb} "$@"
+	fi
+	res=$?
+	test $res -ne 0 && return
+
+	# Try to catch the error with whatever repair strategy we picked.
+	# The fs should not be mounted before or after the strategy call.
+	local fuzz_action="${field} = ${fuzzverb}"
+	case "${repair}" in
+	"online")
+		__scratch_xfs_fuzz_field_online "${fuzz_action}"
+		res=$?
+		;;
+	"offline")
+		__scratch_xfs_fuzz_field_offline "${fuzz_action}"
+		res=$?
+		;;
+	"none")
+		__scratch_xfs_fuzz_field_norepair "${fuzz_action}"
+		res=$?
+		;;
+	"both")
+		__scratch_xfs_fuzz_field_both "${fuzz_action}"
+		res=$?
+		;;
+	*)
+		(>&2 echo "unknown repair strategy ${repair}.")
+		res=2
+		;;
+	esac
+	test $res -eq 0 || return $res
+
+	# See what happens when we modify the fs
+	_scratch_xfs_fuzz_field_modifyfs "${fuzz_action}" "${repair}"
+	return $?
+}
+
+# Make sure we have all the pieces we need for field fuzzing
+_require_scratch_xfs_fuzz_fields()
+{
+	_require_scratch_nocheck
+	_require_scrub
+	_require_populate_commands
+	_scratch_mkfs_xfs >/dev/null 2>&1
+	_require_xfs_db_command "fuzz"
+}
+
+# Sets the array SCRATCH_XFS_DIR_FUZZ_TYPES to the list of directory formats
+# available for fuzzing.  Each list item must match one of the /S_IFDIR.FMT_*
+# files created by the fs population code.  Users can override this by setting
+# SCRATCH_XFS_LIST_FUZZ_DIRTYPE in the environment.  BTREE is omitted here
+# because that refers to the fork format and does not affect the directory
+# structure at all.
+_scratch_xfs_set_dir_fuzz_types() {
+	if [ -n "${SCRATCH_XFS_LIST_FUZZ_DIRTYPE}" ]; then
+		mapfile -t SCRATCH_XFS_DIR_FUZZ_TYPES < \
+				<(echo "${SCRATCH_XFS_LIST_FUZZ_DIRTYPE}" | tr '[ ,]' '[\n\n]')
+		return
+	fi
+
+	SCRATCH_XFS_DIR_FUZZ_TYPES=(BLOCK LEAF LEAFN NODE)
+}
+
+# Sets the array SCRATCH_XFS_XATTR_FUZZ_TYPES to the list of xattr formats
+# available for fuzzing.  Each list item must match one of the /ATTR.FMT_*
+# files created by the fs population code.  Users can override this by setting
+# SCRATCH_XFS_LIST_FUZZ_XATTRTYPE in the environment.  BTREE is omitted here
+# because that refers to the fork format and does not affect the extended
+# attribute structure at all.
+_scratch_xfs_set_xattr_fuzz_types() {
+	if [ -n "${SCRATCH_XFS_LIST_FUZZ_XATTRTYPE}" ]; then
+		mapfile -t SCRATCH_XFS_XATTR_FUZZ_TYPES < \
+				<(echo "${SCRATCH_XFS_LIST_FUZZ_XATTRTYPE}" | tr '[ ,]' '[\n\n]')
+		return
+	fi
+
+	SCRATCH_XFS_XATTR_FUZZ_TYPES=(EXTENTS_REMOTE3K EXTENTS_REMOTE4K LEAF NODE)
+}
+
+# Sets the array SCRATCH_XFS_QUOTA_FUZZ_IDS to the list of dquot ids available
+# for fuzzing.  By default, this list contains 0 (root), 4242 (non-root), and
+# 8484 (zero counts).  Users can override this by setting
+# SCRATCH_XFS_LIST_FUZZ_QUOTAIDS in the environment.
+_scratch_xfs_set_quota_fuzz_ids() {
+	if [ -n "${SCRATCH_XFS_LIST_FUZZ_QUOTAIDS}" ]; then
+		mapfile -t SCRATCH_XFS_QUOTA_FUZZ_IDS < \
+				<(echo "${SCRATCH_XFS_LIST_FUZZ_QUOTAIDS}" | tr '[ ,]' '[\n\n]')
+		return
+	fi
+
+	SCRATCH_XFS_QUOTA_FUZZ_IDS=(0 4242 8484)
+}
+
+# Grab the list of available fuzzing verbs
+_scratch_xfs_list_fuzz_verbs() {
+	if [ -n "${SCRATCH_XFS_LIST_FUZZ_VERBS}" ]; then
+		echo "${SCRATCH_XFS_LIST_FUZZ_VERBS}" | tr '[ ,]' '[\n\n]'
+		return;
+	fi
+
+	local cmds=()
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+	test "${#cmds[@]}" -eq 0 && cmds=('-c' 'sb 0')
+
+	# Does the path argument point towards something that is an
+	# unstructured blob?
+	if _scratch_xfs_db "${cmds[@]}" -c stack 2>/dev/null | \
+			__scratch_xfs_detect_blob_from_stack; then
+		__scratch_xfs_list_blob_fuzz_verbs
+		return
+	fi
+
+	_scratch_xfs_db -x "${cmds[@]}" -c 'fuzz' | grep '^Fuzz commands:' | \
+		sed -e 's/[,.]//g' -e 's/Fuzz commands: //g' -e 's/ /\n/g' | \
+		grep -v '^random$'
+}
+
+# Fuzz some of the fields of some piece of metadata
+# The first argument is an grep filter for the field names
+# The second argument is the repair mode (online, offline, both)
+# The rest of the arguments are xfs_db commands to locate the metadata.
+#
+# Users can specify the fuzz verbs via SCRATCH_XFS_LIST_FUZZ_VERBS
+# They can specify the fields via SCRATCH_XFS_LIST_METADATA_FIELDS
+_scratch_xfs_fuzz_metadata() {
+	filter="$1"
+	repair="$2"
+	shift; shift
+
+	fields="$(_scratch_xfs_list_metadata_fields "${filter}" "$@")"
+	verbs="$(_scratch_xfs_list_fuzz_verbs "$@")"
+	echo "Fields we propose to fuzz with the \"${repair}\" repair strategy: $@"
+	echo $(echo "${fields}")
+	echo "Verbs we propose to fuzz with:"
+	echo $(echo "${verbs}")
+	echo "Current metadata object state:"
+	_scratch_xfs_dump_metadata "$@"
+
+	# Always capture full core dumps from crashing tools
+	ulimit -c unlimited
+
+	_xfs_skip_online_rebuild
+	_xfs_skip_offline_rebuild
+
+	echo "${fields}" | while read field; do
+		echo "${verbs}" | while read fuzzverb; do
+			__scratch_xfs_fuzz_mdrestore
+			__scratch_xfs_fuzz_field_test "${field}" "${fuzzverb}" "${repair}" "$@"
+
+			# Collect compresssed coredumps in the test results
+			# directory if the sysadmin didn't override the default
+			# coredump strategy.
+			for i in core core.*; do
+				test -f "$i" || continue
+				_save_coredump "$i"
+			done
+		done
+	done
+}
+
+# Functions to race fsstress, fs freeze, and xfs metadata scrubbing against
+# each other to shake out bugs in xfs online repair.
+
+# Filter freeze and thaw loop output so that we don't tarnish the golden output
+# if the kernel temporarily won't let us freeze.
+__stress_freeze_filter_output() {
+	_filter_scratch | \
+		sed -e '/Device or resource busy/d' \
+		    -e '/Invalid argument/d'
+}
+
+# Filter scrub output so that we don't tarnish the golden output if the fs is
+# too busy to scrub.  Note: Tests should _notrun if the scrub type is not
+# supported.  Callers can provide extra strings to filter out as function
+# arguments.
+__stress_scrub_filter_output() {
+	local extra_args=()
+
+	for arg in "$@"; do
+		extra_args+=(-e "/${arg}/d")
+	done
+
+	_filter_scratch | \
+		sed -e '/Device or resource busy/d' \
+		    -e '/Optimization possible/d' \
+		    -e '/No space left on device/d' \
+		    "${extra_args[@]}"
+}
+
+# Decide if the scratch filesystem is still alive.
+__stress_scrub_scratch_alive() {
+	# If we can't stat the scratch filesystem, there's a reasonably good
+	# chance that the fs shut down, which is not good.
+	stat "$SCRATCH_MNT" &>/dev/null
+}
+
+# Decide if we want to keep running stress tests.  The first argument is the
+# stop time, and second argument is the path to the sentinel file.
+__stress_scrub_running() {
+	test -e "$2" && test "$(date +%s)" -lt "$1" && __stress_scrub_scratch_alive
+}
+
+# Run fs freeze and thaw in a tight loop.
+__stress_scrub_freeze_loop() {
+	local end="$1"
+	local runningfile="$2"
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		$XFS_IO_PROG -x -c 'freeze' -c 'thaw' $SCRATCH_MNT 2>&1 | \
+			__stress_freeze_filter_output
+	done
+}
+
+# Run individual xfs_io commands in a tight loop.
+__stress_xfs_io_loop() {
+	local end="$1"
+	local runningfile="$2"
+	shift; shift
+
+	local xfs_io_args=()
+	for arg in "$@"; do
+		xfs_io_args+=('-c' "$arg")
+	done
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		$XFS_IO_PROG -x "${xfs_io_args[@]}" "$SCRATCH_MNT" \
+				> /dev/null 2>> $seqres.full
+	done
+}
+
+# Run individual XFS online fsck commands in a tight loop with xfs_io.
+__stress_one_scrub_loop() {
+	local end="$1"
+	local runningfile="$2"
+	local scrub_tgt="$3"
+	local scrub_startat="$4"
+	local start_agno="$5"
+	local start_rgno="$6"
+	shift; shift; shift; shift; shift; shift
+	local agcount="$(_xfs_mount_agcount $SCRATCH_MNT)"
+	local rgcount="$(_xfs_mount_rgcount $SCRATCH_MNT)"
+
+	local xfs_io_args=()
+	for arg in "$@"; do
+		if [ -n "$SCRUBSTRESS_USE_FORCE_REBUILD" ]; then
+			arg="$(echo "$arg" | sed -e 's/^repair/repair -R/g')"
+		fi
+		if echo "$arg" | grep -q -w '%agno%'; then
+			# Substitute the AG number
+			for ((agno = start_agno; agno < agcount; agno++)); do
+				local ag_arg="$(echo "$arg" | sed -e "s|%agno%|$agno|g")"
+				xfs_io_args+=('-c' "$ag_arg")
+			done
+		elif echo "$arg" | grep -q -w '%rgno%'; then
+			# Substitute the rtgroup number
+			for ((rgno = start_rgno; rgno < rgcount; rgno++)); do
+				local rg_arg="$(echo "$arg" | sed -e "s|%rgno%|$rgno|g")"
+				xfs_io_args+=('-c' "$rg_arg")
+			done
+		else
+			xfs_io_args+=('-c' "$arg")
+		fi
+	done
+
+	local extra_filters=()
+	case "$scrub_tgt" in
+	"%file%"|"%datafile%"|"%attrfile%")
+		extra_filters+=('No such file or directory' 'No such device or address')
+		;;
+	"%dir%")
+		extra_filters+=('No such file or directory' 'Not a directory')
+		;;
+	"%regfile%"|"%cowfile%")
+		extra_filters+=('No such file or directory')
+		;;
+	esac
+
+	local target_cmd=(echo -en "$scrub_tgt\0")
+	case "$scrub_tgt" in
+	"%file%")	target_cmd=($here/src/xfsfind -0q  "$SCRATCH_MNT");;
+	"%attrfile%")	target_cmd=($here/src/xfsfind -0qa "$SCRATCH_MNT");;
+	"%datafile%")	target_cmd=($here/src/xfsfind -0qb "$SCRATCH_MNT");;
+	"%dir%")	target_cmd=($here/src/xfsfind -0qd "$SCRATCH_MNT");;
+	"%regfile%")	target_cmd=($here/src/xfsfind -0qr "$SCRATCH_MNT");;
+	"%cowfile%")	target_cmd=($here/src/xfsfind -0qs "$SCRATCH_MNT");;
+	esac
+
+	while __stress_scrub_running "$scrub_startat" "$runningfile"; do
+		sleep 1
+	done
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		# Attach the stdout of xfsfind to fd 77 so that we can read
+		# pathnames from that file descriptor without passing the pipe
+		# to the loop body as stdin.
+		exec 77< <("${target_cmd[@]}" 2>> $seqres.full)
+		while read -u 77 -d '' fname; do
+			$XFS_IO_PROG -x "${xfs_io_args[@]}" "$fname" 2>&1 | \
+				__stress_scrub_filter_output "${extra_filters[@]}"
+			__stress_scrub_running "$end" "$runningfile" || break
+		done
+		exec 77<&-
+	done
+}
+
+# Run xfs_scrub online fsck in a tight loop.
+__stress_xfs_scrub_loop() {
+	local end="$1"
+	local runningfile="$2"
+	local scrub_startat="$3"
+	shift; shift; shift
+	local signal_ret="$(( $(kill -l SIGPIPE) + 128 ))"
+	local scrublog="$tmp.scrub"
+
+	while __stress_scrub_running "$scrub_startat" "$runningfile"; do
+		sleep 1
+	done
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		_scratch_scrub "$@" &> $scrublog
+		res=$?
+		if [ "$res" -eq "$signal_ret" ]; then
+			# Ignore SIGPIPE because the cleanup function sends
+			# that to terminate xfs_scrub
+			res=0
+		fi
+		echo "xfs_scrub exits with $res at $(date)" >> $seqres.full
+		if [ "$res" -ge 128 ]; then
+			# Report scrub death due to fatal signals
+			echo "xfs_scrub died with SIG$(kill -l $res)"
+			cat $scrublog >> $seqres.full 2>/dev/null
+		elif [ "$((res & 0x1))" -gt 0 ]; then
+			# Report uncorrected filesystem errors
+			echo "xfs_scrub reports uncorrected errors:"
+			grep -E '(Repair unsuccessful;|Corruption:)' $scrublog
+			cat $scrublog >> $seqres.full 2>/dev/null
+		fi
+		rm -f $scrublog
+	done
+}
+
+# Clean the scratch filesystem between rounds of fsstress if there is 2%
+# available space or less because that isn't an interesting stress test.
+#
+# Returns 0 if we cleared anything, and 1 if we did nothing.
+__stress_scrub_clean_scratch() {
+	local used_pct="$(_used $SCRATCH_DEV)"
+
+	test "$used_pct" -lt 98 && return 1
+
+	echo "Clearing scratch fs at $(date)" >> $seqres.full
+	rm -r -f $SCRATCH_MNT/p*
+	return 0
+}
+
+# Compute a --duration= interval for fsx and fsstress
+___stress_scrub_duration()
+{
+	local end="$1"
+	local remount_period="$2"
+	local now="$(date +%s)"
+	local delta="$((end - now))"
+
+	test "$delta" -lt 0 && delta=0
+
+	test -n "$remount_period" && test "$remount_period" -lt "$delta" && \
+		delta="$remount_period"
+
+	echo "--duration=$delta"
+}
+
+# Run fsx and record outcome
+___scrub_run_fsx() {
+	$FSX_PROG "$@" >> $seqres.full
+	local res=$?
+	echo "fsx $* exits with $res at $(date)" >> $seqres.full
+	test "$res" -ne 0 && touch "$tmp.killfsx"
+}
+
+# Run fsx while we're testing online fsck.
+__stress_scrub_fsx_loop() {
+	local end="$1"
+	local runningfile="$2"
+	local remount_period="$3"
+	local stress_tgt="$4"	# ignored
+	local focus=(-q -X)	# quiet, validate file contents
+	local duration
+	local has_rt
+	local d_args r_args
+
+	test $FSTYP = "xfs" && _xfs_has_feature "$SCRATCH_MNT" realtime && \
+		has_rt=1
+
+	focus+=(-o $((128000 * LOAD_FACTOR)) )
+	focus+=(-l $((600000 * LOAD_FACTOR)) )
+
+	if [ -n "$has_rt" ]; then
+		local rdir="$SCRATCH_MNT/rt"
+		local ddir="$SCRATCH_MNT/data"
+
+		mkdir -p "$rdir" "$ddir"
+		$XFS_IO_PROG -c 'chattr +rt' "$rdir"
+		$XFS_IO_PROG -c 'chattr -rt' "$ddir"
+
+		r_args="$FSX_AVOID ${focus[*]} $rdir/fsx"
+		d_args="$FSX_AVOID ${focus[*]} $ddir/fsx"
+		echo "Running $FSX_PROG $d_args" >> $seqres.full
+		echo "Running $FSX_PROG $r_args" >> $seqres.full
+	else
+		d_args="$FSX_AVOID ${focus[*]} $SCRATCH_MNT/fsx"
+		echo "Running $FSX_PROG $d_args" >> $seqres.full
+	fi
+
+	rm -f "$tmp.killfsx"
+	if [ -n "$remount_period" ]; then
+		local mode="rw"
+		local rw_arg=""
+		while __stress_scrub_running "$end" "$runningfile"; do
+			# Need to recheck running conditions if we cleared
+			# anything.
+			test "$mode" = "rw" && __stress_scrub_clean_scratch && continue
+
+			duration=$(___stress_scrub_duration "$end" "$remount_period")
+			___scrub_run_fsx $duration $d_args $rw_arg &
+			test -n "$has_rt" && ___scrub_run_fsx $duration $r_args $rw_arg &
+			wait
+			test -e "$tmp.killfsx" && break
+
+			if [ "$mode" = "rw" ]; then
+				mode="ro"
+				rw_arg="-t 0 -w 0 -FHzCIJBE0"
+			else
+				mode="rw"
+				rw_arg=""
+			fi
+
+			# Try remounting until we get the result we wanted
+			while ! _scratch_remount "$mode" &>/dev/null && \
+			      __stress_scrub_running "$end" "$runningfile"; do
+				sleep 0.2
+			done
+		done
+		rm -f "$runningfile" "$tmp.killfsx"
+		return 0
+	fi
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		# Need to recheck running conditions if we cleared anything
+		__stress_scrub_clean_scratch && continue
+		duration=$(___stress_scrub_duration "$end" "$remount_period")
+		___scrub_run_fsx $duration $d_args &
+		test -n "$has_rt" && ___scrub_run_fsx $duration $r_args &
+		wait
+		test -e "$tmp.killfsx" && break
+	done
+	rm -f "$runningfile" "$tmp.killfsx"
+}
+
+# Run fsstress and record outcome
+___scrub_run_fsstress() {
+	_run_fsstress "$@"
+	local res=$?
+	echo "fsstress $* exits with $res at $(date)" >> $seqres.full
+	test "$res" -ne 0 && touch "$tmp.killstress"
+}
+
+# Run fsstress while we're testing online fsck.
+__stress_scrub_fsstress_loop() {
+	local end="$1"
+	local runningfile="$2"
+	local remount_period="$3"
+	local stress_tgt="$4"
+	local focus=(-p 4)
+	local res res2
+	local duration
+	local has_rt
+	local d_args r_args
+
+	test $FSTYP = "xfs" && _xfs_has_feature "$SCRATCH_MNT" realtime && \
+		has_rt=1
+
+	case "$stress_tgt" in
+	"parent")
+		focus+=('-z')
+
+		# Create a directory tree very gradually
+		for op in creat link mkdir; do
+			focus+=('-f' "${op}=2")
+		done
+		focus+=('-f' 'unlink=1' '-f' 'rmdir=1')
+
+		# But do a lot of renames to cycle parent pointers
+		for op in rename rnoreplace rexchange; do
+			focus+=('-f' "${op}=40")
+		done
+		;;
+	"dir")
+		focus+=('-z')
+
+		# Create a directory tree rapidly
+		for op in creat link mkdir mknod symlink; do
+			focus+=('-f' "${op}=8")
+		done
+		focus+=('-f' 'rmdir=2' '-f' 'unlink=8')
+
+		# Rename half as often
+		for op in rename rnoreplace rexchange; do
+			focus+=('-f' "${op}=4")
+		done
+
+		# Read and sync occasionally
+		for op in getdents stat fsync; do
+			focus+=('-f' "${op}=1")
+		done
+		;;
+	"xattr")
+		focus+=('-z')
+
+		# Create a directory tree slowly
+		for op in creat ; do
+			focus+=('-f' "${op}=2")
+		done
+		for op in unlink rmdir; do
+			focus+=('-f' "${op}=1")
+		done
+
+		# Create xattrs rapidly
+		for op in attr_set setfattr; do
+			focus+=('-f' "${op}=80")
+		done
+
+		# Remove xattrs 1/4 as quickly
+		for op in attr_remove removefattr; do
+			focus+=('-f' "${op}=20")
+		done
+
+		# Read and sync occasionally
+		for op in listfattr getfattr fsync; do
+			focus+=('-f' "${op}=10")
+		done
+		;;
+	"writeonly")
+		# Only do things that cause filesystem writes
+		focus+=('-w')
+		;;
+	"default")
+		# No new arguments
+		;;
+	"symlink")
+		focus+=('-z')
+
+		# Only create, read, and delete symbolic links
+		focus+=('-f' 'symlink=4')
+		focus+=('-f' 'readlink=10')
+		focus+=('-f' 'unlink=1')
+		;;
+	"mknod")
+		focus+=('-z')
+
+		# Only create and delete special files
+		focus+=('-f' 'mknod=4')
+		focus+=('-f' 'getdents=100')
+		focus+=('-f' 'unlink=1')
+		;;
+	*)
+		echo "$stress_tgt: Unrecognized stress target, using defaults."
+		;;
+	esac
+
+	if [ -n "$has_rt" ]; then
+		local rdir="$SCRATCH_MNT/rt"
+		local ddir="$SCRATCH_MNT/data"
+
+		mkdir -p "$rdir" "$ddir"
+		$XFS_IO_PROG -c 'chattr +rt' "$rdir"
+		$XFS_IO_PROG -c 'chattr -rt' "$ddir"
+
+		r_args=$(_scale_fsstress_args -d "$rdir" "${focus[@]}")
+		d_args=$(_scale_fsstress_args -d "$ddir" "${focus[@]}")
+		echo "Running $FSSTRESS_PROG $d_args" >> $seqres.full
+		echo "Running $FSSTRESS_PROG $r_args" >> $seqres.full
+	else
+		d_args=$(_scale_fsstress_args -d $SCRATCH_MNT "${focus[@]}")
+		echo "Running $FSSTRESS_PROG $d_args" >> $seqres.full
+	fi
+
+	rm -f "$tmp.killstress"
+	if [ -n "$remount_period" ]; then
+		local mode="rw"
+		local rw_arg=""
+		while __stress_scrub_running "$end" "$runningfile"; do
+			# Need to recheck running conditions if we cleared
+			# anything.
+			test "$mode" = "rw" && __stress_scrub_clean_scratch && continue
+
+			duration=$(___stress_scrub_duration "$end" "$remount_period")
+			___scrub_run_fsstress $duration $d_args $rw_arg &
+			test -n "$has_rt" && ___scrub_run_fsstress $duration $r_args $rw_arg &
+			wait
+			test -e "$tmp.killstress" && break
+
+			if [ "$mode" = "rw" ]; then
+				mode="ro"
+				rw_arg="-R"
+			else
+				mode="rw"
+				rw_arg=""
+			fi
+
+			# Try remounting until we get the result we wanted
+			while ! _scratch_remount "$mode" &>/dev/null && \
+			      __stress_scrub_running "$end" "$runningfile"; do
+				sleep 0.2
+			done
+		done
+		rm -f "$runningfile" "$tmp.killstress"
+		return 0
+	fi
+
+	while __stress_scrub_running "$end" "$runningfile"; do
+		# Need to recheck running conditions if we cleared anything
+		__stress_scrub_clean_scratch && continue
+		duration=$(___stress_scrub_duration "$end" "$remount_period")
+		___scrub_run_fsstress $duration $d_args &
+		test -n "$has_rt" && ___scrub_run_fsstress $duration $r_args &
+		wait
+		test -e "$tmp.killstress" && break
+	done
+	rm -f "$runningfile" "$tmp.killstress"
+}
+
+# Make sure we have everything we need to run stress and scrub
+_require_xfs_stress_scrub() {
+	_require_xfs_io_command "scrub"
+	_require_test_program "xfsfind"
+	_require_freeze
+	command -v _filter_scratch &>/dev/null || \
+		_notrun 'xfs scrub stress test requires common/filter'
+}
+
+# Make sure that we can force repairs either by error injection or passing
+# FORCE_REBUILD via ioctl.
+__require_xfs_stress_force_rebuild() {
+	local output="$($XFS_IO_PROG -x -c 'repair -R probe' $SCRATCH_MNT 2>&1)"
+	test -z "$output" && return
+	_require_xfs_io_error_injection "force_repair"
+}
+
+# Make sure we have everything we need to run stress and online repair
+_require_xfs_stress_online_repair() {
+	_require_xfs_stress_scrub
+	_require_xfs_io_command "repair"
+	command -v _require_xfs_io_error_injection &>/dev/null || \
+		_notrun 'xfs repair stress test requires common/inject'
+	__require_xfs_stress_force_rebuild
+	_require_freeze
+}
+
+# Clean up after the loops in case they didn't do it themselves.
+_scratch_xfs_stress_scrub_cleanup() {
+	rm -f "$runningfile"
+	echo "Cleaning up scrub stress run at $(date)" >> $seqres.full
+
+	echo "Killing stressor processes at $(date)" >> $seqres.full
+	_kill_fsstress
+	_pkill --echo -PIPE xfs_io >> $seqres.full 2>&1
+	_pkill --echo -PIPE fsx >> $seqres.full 2>&1
+	_pkill --echo -PIPE xfs_scrub >> $seqres.full 2>&1
+
+	# Tests are not allowed to exit with the scratch fs frozen.  If we
+	# started a fs freeze/thaw background loop, wait for that loop to exit
+	# and then thaw the filesystem.  Cleanup for the freeze loop must be
+	# performed prior to waiting for the other children to avoid triggering
+	# a race condition that can hang fstests.
+	#
+	# If the xfs_io -c freeze process is asleep waiting for a write lock on
+	# s_umount or sb_write when the kill signal is delivered, it will
+	# not check for pending signals until after it has frozen the fs.  If
+	# even one thread of the stress test processes (xfs_io, fsstress, etc.)
+	# is waiting for read locks on sb_write when the kill signals are
+	# delivered, they will block in the kernel until someone thaws the fs,
+	# and the `wait' below will wait forever.
+	#
+	# Hence we issue the kill, wait for the freezer loop to exit, thaw
+	# the filesystem, and wait for the rest of the children.
+	if [ -n "$__SCRUB_STRESS_FREEZE_PID" ]; then
+		echo "Waiting for fs freezer $__SCRUB_STRESS_FREEZE_PID to exit at $(date)" >> $seqres.full
+		wait "$__SCRUB_STRESS_FREEZE_PID"
+
+		echo "Thawing filesystem at $(date)" >> $seqres.full
+		$XFS_IO_PROG -x -c 'thaw' $SCRATCH_MNT >> $seqres.full 2>&1
+		__SCRUB_STRESS_FREEZE_PID=""
+	fi
+
+	# Wait for the remaining children to exit.
+	echo "Waiting for children to exit at $(date)" >> $seqres.full
+	wait
+	echo "Children exited as of $(date)" >> $seqres.full
+
+	# Ensure the scratch fs is also writable before we exit.
+	if [ -n "$__SCRUB_STRESS_REMOUNT_LOOP" ]; then
+		echo "Remounting rw at $(date)" >> $seqres.full
+		_scratch_remount rw >> $seqres.full 2>&1
+		__SCRUB_STRESS_REMOUNT_LOOP=""
+	fi
+
+	echo "Cleanup finished at $(date)" >> $seqres.full
+}
+
+# Make sure the provided scrub/repair commands actually work on the scratch
+# filesystem before we start running them in a loop.
+__stress_scrub_check_commands() {
+	local scrub_tgt="$1"
+	local start_agno="$2"
+	local start_rgno="$3"
+	shift; shift; shift
+	local rgcount="$(_xfs_mount_rgcount $SCRATCH_MNT)"
+
+	local cooked_tgt="$scrub_tgt"
+	case "$scrub_tgt" in
+	"%file%"|"%dir%")
+		cooked_tgt="$SCRATCH_MNT"
+		;;
+	"%regfile%"|"%datafile%")
+		cooked_tgt="$SCRATCH_MNT/testfile"
+		echo test > "$cooked_tgt"
+		;;
+	"%attrfile%")
+		cooked_tgt="$SCRATCH_MNT/testfile"
+		$XFS_IO_PROG -f -c 'pwrite -S 0x58 0 64k' "$cooked_tgt" &>/dev/null
+		attr -s attrname "$cooked_tgt" < "$cooked_tgt" &>/dev/null
+		;;
+	"%cowfile%")
+		cooked_tgt="$SCRATCH_MNT/testfile"
+		$XFS_IO_PROG -f -c 'pwrite -S 0x58 0 128k' "$cooked_tgt" &>/dev/null
+		_cp_reflink "$cooked_tgt" "$cooked_tgt.1"
+		$XFS_IO_PROG -f -c 'pwrite -S 0x58 0 1' "$cooked_tgt.1" &>/dev/null
+		;;
+	esac
+
+	for arg in "$@"; do
+		local cooked_arg="$arg"
+		if [ -n "$SCRUBSTRESS_USE_FORCE_REBUILD" ]; then
+			cooked_arg="$(echo "$cooked_arg" | sed -e 's/^repair/repair -R/g')"
+		fi
+		cooked_arg="$(echo "$cooked_arg" | sed -e "s/%agno%/$start_agno/g")"
+		if echo "$cooked_arg" | grep -q -w '%rgno%'; then
+			test "$rgcount" -eq 0 && continue
+			cooked_arg="$(echo "$cooked_arg" | sed -e "s/%rgno%/$start_rgno/g")"
+		fi
+		testio=`$XFS_IO_PROG -x -c "$cooked_arg" "$cooked_tgt" 2>&1`
+		echo $testio | grep -q "Unknown type" && \
+			_notrun "xfs_io scrub subcommand support is missing"
+		echo $testio | grep -q "Inappropriate ioctl" && \
+			_notrun "kernel scrub ioctl is missing"
+		echo $testio | grep -q "No such file or directory" && \
+			_notrun "kernel does not know about: $arg"
+		echo $testio | grep -q "Operation not supported" && \
+			_notrun "kernel does not support: $arg"
+	done
+}
+
+# Start scrub, freeze, and fsstress in background looping processes, and wait
+# for 30*TIME_FACTOR seconds to see if the filesystem goes down.  Callers
+# must call _scratch_xfs_stress_scrub_cleanup from their cleanup functions.
+#
+# Various options include:
+#
+# -a	For %agno% substitution, start with this AG instead of AG 0.
+# -f	Run a freeze/thaw loop while we're doing other things.  Defaults to
+#	disabled, unless XFS_SCRUB_STRESS_FREEZE is set.
+# -i	Pass this command to xfs_io to exercise something that is not scrub
+#	in a separate loop.  If zero -i options are specified, do not run.
+#	Callers must check each of these commands (via _require_xfs_io_command)
+#	before calling here.
+# -R	For %rgno% substitution, start with this rtgroup instead of rtgroup 0.
+# -r	Run fsstress for this amount of time, then remount the fs ro or rw.
+#	The default is to run fsstress continuously with no remount, unless
+#	XFS_SCRUB_STRESS_REMOUNT_PERIOD is set.
+# -s	Pass this command to xfs_io to test scrub.  If zero -s options are
+#	specified, xfs_io will not be run.
+# -S	Pass this option to xfs_scrub.  If zero -S options are specified,
+#	xfs_scrub will not be run.  To select repair mode, pass '-k' or '-v'.
+# -t	Run online scrub against this file; $SCRATCH_MNT is the default.
+#	Special values are as follows:
+#
+#	%file%		all files
+#	%regfile%	regular files
+#	%dir%		direct
+#	%datafile%	regular files with data blocks
+#	%attrfile%	regular files with xattr blocks
+#	%cowfile%	regular files with shared blocks
+#
+#	File selection races with fsstress, so the selection is best-effort.
+# -w	Delay the start of the scrub/repair loop by this number of seconds.
+#	Defaults to no delay unless XFS_SCRUB_STRESS_DELAY is set.  This value
+#	will be clamped to ten seconds before the end time.
+# -x	Focus on this type of fsstress operation.  Possible values:
+#
+#       'dir': Grow the directory trees as much as possible.
+#       'xattr': Grow extended attributes in a small tree.
+#       'default': Run fsstress with default arguments.
+#       'writeonly': Only perform fs updates, no reads.
+#       'symlink': Only create symbolic links.
+#       'mknod': Only create special files.
+#       'parent': Focus on updating parent pointers
+#
+#       The default is 'default' unless XFS_SCRUB_STRESS_TARGET is set.
+# -X	Run this program to exercise the filesystem.  Currently supported
+#       options are 'fsx' and 'fsstress'.  The default is 'fsstress'.
+_scratch_xfs_stress_scrub() {
+	local one_scrub_args=()
+	local xfs_scrub_args=()
+	local scrub_tgt="$SCRATCH_MNT"
+	local runningfile="$tmp.fsstress"
+	local freeze="${XFS_SCRUB_STRESS_FREEZE}"
+	local scrub_delay="${XFS_SCRUB_STRESS_DELAY:--1}"
+	local exerciser="fsstress"
+	local io_args=()
+	local remount_period="${XFS_SCRUB_STRESS_REMOUNT_PERIOD}"
+	local stress_tgt="${XFS_SCRUB_STRESS_TARGET:-default}"
+	local start_agno=0
+	local start_rgno=0
+
+	__SCRUB_STRESS_FREEZE_PID=""
+	__SCRUB_STRESS_REMOUNT_LOOP=""
+	rm -f "$runningfile"
+	touch "$runningfile"
+
+	OPTIND=1
+	while getopts "a:fi:r:R:s:S:t:w:x:X:" c; do
+		case "$c" in
+			a) start_agno="$OPTARG";;
+			f) freeze=yes;;
+			i) io_args+=("$OPTARG");;
+			r) remount_period="$OPTARG";;
+			R) start_rgno="$OPTARG";;
+			s) one_scrub_args+=("$OPTARG");;
+			S) xfs_scrub_args+=("$OPTARG");;
+			t) scrub_tgt="$OPTARG";;
+			w) scrub_delay="$OPTARG";;
+			x) stress_tgt="$OPTARG";;
+			X) exerciser="$OPTARG";;
+			*) return 1; ;;
+		esac
+	done
+
+	__stress_scrub_check_commands "$scrub_tgt" "$start_agno" "$start_rgno" \
+			"${one_scrub_args[@]}"
+
+	if ! command -v "__stress_scrub_${exerciser}_loop" &>/dev/null; then
+		echo "${exerciser}: Unknown fs exercise program."
+		return 1
+	fi
+
+	if [ "${#xfs_scrub_args[@]}" -gt 0 ]; then
+		_scratch_scrub "${xfs_scrub_args[@]}" &> "$tmp.scrub"
+		res=$?
+		if [ $res -ne 0 ]; then
+			echo "xfs_scrub ${xfs_scrub_args[@]} failed, err $res" >> $seqres.full
+			cat "$tmp.scrub" >> $seqres.full
+			rm -f "$tmp.scrub"
+			_notrun 'scrub not supported on scratch filesystem'
+		fi
+		rm -f "$tmp.scrub"
+	fi
+
+	_xfs_skip_online_rebuild
+	_xfs_skip_offline_rebuild
+
+	local start="$(date +%s)"
+	local end
+	if [ -n "$SOAK_DURATION" ]; then
+		end="$((start + SOAK_DURATION))"
+	else
+		end="$((start + (30 * TIME_FACTOR) ))"
+	fi
+	local scrub_startat="$((start + scrub_delay))"
+	test "$scrub_startat" -gt "$((end - 10))" &&
+		scrub_startat="$((end - 10))"
+
+	echo "Loop started at $(date --date="@${start}")," \
+		   "ending at $(date --date="@${end}")" >> $seqres.full
+
+	if [ -n "$remount_period" ]; then
+		__SCRUB_STRESS_REMOUNT_LOOP="1"
+	fi
+
+	"__stress_scrub_${exerciser}_loop" "$end" "$runningfile" \
+			"$remount_period" "$stress_tgt" &
+	# The loop is a background process, so _FSSTRESS_PID is set in that
+	# child.  Unfortunately, this process doesn't know about it.  Therefore
+	# we need to set _FSSTRESS_PID ourselves so that cleanup tries to kill
+	# fsstress.
+	test "${exerciser}" = "fsstress" && _FSSTRESS_PID=$!
+
+	if [ -n "$freeze" ]; then
+		__stress_scrub_freeze_loop "$end" "$runningfile" &
+		__SCRUB_STRESS_FREEZE_PID="$!"
+	fi
+
+	if [ "${#io_args[@]}" -gt 0 ]; then
+		__stress_xfs_io_loop "$end" "$runningfile" \
+				"${io_args[@]}" &
+	fi
+
+	if [ "${#one_scrub_args[@]}" -gt 0 ]; then
+		__stress_one_scrub_loop "$end" "$runningfile" "$scrub_tgt" \
+				"$scrub_startat" "$start_agno" "$start_rgno" \
+				"${one_scrub_args[@]}" &
+	fi
+
+	if [ "${#xfs_scrub_args[@]}" -gt 0 ]; then
+		__stress_xfs_scrub_loop "$end" "$runningfile" "$scrub_startat" \
+				"${xfs_scrub_args[@]}" &
+	fi
+
+	# Wait until the designated end time or fsstress dies, then kill all of
+	# our background processes.
+	while __stress_scrub_running "$end" "$runningfile"; do
+		sleep 1
+	done
+	_scratch_xfs_stress_scrub_cleanup
+
+	# Warn the user if we think the scratch filesystem went down.
+	__stress_scrub_scratch_alive || \
+		echo "Did the scratch filesystem die?"
+
+	echo "Loop finished at $(date)" >> $seqres.full
+}
+
+# Decide if we're going to force repairs either by error injection or passing
+# FORCE_REBUILD via ioctl.
+__scratch_xfs_stress_setup_force_rebuild() {
+	local output="$($XFS_IO_PROG -x -c 'repair -R probe' $SCRATCH_MNT 2>&1)"
+
+	if [ -z "$output" ]; then
+		SCRUBSTRESS_USE_FORCE_REBUILD=1
+		return
+	fi
+
+	$XFS_IO_PROG -x -c 'inject force_repair' $SCRATCH_MNT
+}
+
+# Start online repair, freeze, and fsstress in background looping processes,
+# and wait for 30*TIME_FACTOR seconds to see if the filesystem goes down.
+# Same requirements and arguments as _scratch_xfs_stress_scrub.
+_scratch_xfs_stress_online_repair() {
+	__scratch_xfs_stress_setup_force_rebuild
+	XFS_SCRUB_FORCE_REPAIR=1 _scratch_xfs_stress_scrub "$@"
+}

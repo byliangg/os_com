@@ -278,16 +278,39 @@ impl ExtentNode {
 }
 
 impl ExtentNode {
+    fn entry_capacity(&self, entry_size: usize) -> usize {
+        match &self.data {
+            NodeData::Root(_) => {
+                (15 * size_of::<u32>() - size_of::<Ext4ExtentHeader>()) / entry_size
+            }
+            NodeData::Internal(internal_data) => {
+                internal_data
+                    .len()
+                    .saturating_sub(size_of::<Ext4ExtentHeader>())
+                    / entry_size
+            }
+        }
+    }
+
+    fn valid_entries_count(&self, entry_size: usize) -> Option<usize> {
+        let entries = self.header.entries_count as usize;
+        if entries == 0 {
+            return None;
+        }
+        let capacity = self.entry_capacity(entry_size);
+        if entries > capacity {
+            return None;
+        }
+        Some(entries)
+    }
+
     /// Binary search for the rightmost extent whose first block is <= `lblock`.
     /// Returns `None` for empty nodes.
     pub fn binsearch_extent_pos(&self, lblock: Ext4Lblk) -> Option<usize> {
-        if self.header.entries_count == 0 {
-            return None;
-        }
+        let entries = self.valid_entries_count(size_of::<Ext4Extent>())?;
 
         match &self.data {
             NodeData::Root(root_data) => {
-                let entries = self.header.entries_count as usize;
                 let mut l = 0usize;
                 let mut r = entries;
 
@@ -305,7 +328,6 @@ impl ExtentNode {
                 Some(l.saturating_sub(1))
             }
             NodeData::Internal(internal_data) => {
-                let entries = self.header.entries_count as usize;
                 let mut l = 0usize;
                 let mut r = entries;
 
@@ -341,9 +363,7 @@ impl ExtentNode {
 
     /// Binary search for the closest index of the given block.
     pub fn binsearch_idx(&self, lblock: Ext4Lblk) -> Option<usize> {
-        if self.header.entries_count == 0 {
-            return None;
-        }
+        let entries = self.valid_entries_count(size_of::<Ext4ExtentIndex>())?;
 
         match &self.data {
             NodeData::Root(root_data) => {
@@ -352,7 +372,7 @@ impl ExtentNode {
                 let indexes = &root_data[start..];
 
                 let mut l = 1; // Skip the first index
-                let mut r = self.header.entries_count as usize - 1;
+                let mut r = entries - 1;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
@@ -381,7 +401,7 @@ impl ExtentNode {
                 let indexes = &internal_data[start..];
 
                 let mut l = 0;
-                let mut r = (self.header.entries_count - 1) as usize;
+                let mut r = entries - 1;
 
                 while l <= r {
                     let m = l + (r - l) / 2;
@@ -409,17 +429,44 @@ impl ExtentNode {
 
     /// Get the index node at the given position.
     pub fn get_index(&self, pos: usize) -> Result<Ext4ExtentIndex> {
+        let Some(entries) = self.valid_entries_count(size_of::<Ext4ExtentIndex>()) else {
+            return return_errno_with_message!(Errno::EIO, "invalid extent index entries_count");
+        };
+        if pos >= entries {
+            return return_errno_with_message!(Errno::EIO, "extent index position out of range");
+        }
+
         match &self.data {
             NodeData::Root(root_data) => {
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
                 let offset = pos * size_of::<Ext4ExtentIndex>() / 4;
+                let need = size_of::<Ext4ExtentIndex>() / 4;
+                if offset
+                    .checked_add(need)
+                    .map_or(true, |end| end > indexes.len())
+                {
+                    return return_errno_with_message!(
+                        Errno::EIO,
+                        "extent index offset out of bounds"
+                    );
+                }
                 Ok(Ext4ExtentIndex::load_from_u32(&indexes[offset..]))
             }
             NodeData::Internal(internal_data) => {
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
                 let offset = pos * size_of::<Ext4ExtentIndex>();
+                let need = size_of::<Ext4ExtentIndex>();
+                if offset
+                    .checked_add(need)
+                    .map_or(true, |end| end > indexes.len())
+                {
+                    return return_errno_with_message!(
+                        Errno::EIO,
+                        "extent index offset out of bounds"
+                    );
+                }
                 Ok(Ext4ExtentIndex::load_from_u8(&indexes[offset..]))
             }
         }
@@ -427,17 +474,36 @@ impl ExtentNode {
 
     /// Get the extent node at the given position.
     pub fn get_extent(&self, pos: usize) -> Option<Ext4Extent> {
+        let entries = self.valid_entries_count(size_of::<Ext4Extent>())?;
+        if pos >= entries {
+            return None;
+        }
+
         match &self.data {
             NodeData::Root(root_data) => {
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let extents = &root_data[start..];
                 let offset = pos * size_of::<Ext4Extent>() / 4;
+                let need = size_of::<Ext4Extent>() / 4;
+                if offset
+                    .checked_add(need)
+                    .map_or(true, |end| end > extents.len())
+                {
+                    return None;
+                }
                 Some(Ext4Extent::load_from_u32(&extents[offset..]))
             }
             NodeData::Internal(internal_data) => {
                 let start = size_of::<Ext4ExtentHeader>();
                 let extents = &internal_data[start..];
                 let offset = pos * size_of::<Ext4Extent>();
+                let need = size_of::<Ext4Extent>();
+                if offset
+                    .checked_add(need)
+                    .map_or(true, |end| end > extents.len())
+                {
+                    return None;
+                }
                 Some(Ext4Extent::load_from_u8(&extents[offset..]))
             }
         }

@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 528
+#
+# Check that statx btime (aka creation time) is plausibly close to when
+# we created a file.  A bug caught during code review of xfs patches revealed
+# that there weren't any sanity checks of the btime values.
+#
+. ./common/preamble
+_begin_fstest auto quick
+testfile=$TEST_DIR/$seq.txt
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $testfile
+}
+
+# Import common functions.
+. ./common/attr
+. ./common/filter
+
+_require_test
+_require_xfs_io_command "statx" "-r"
+_require_btime
+
+rm -f $testfile
+
+# Create a file and the time we created it
+now=$(date +%s)
+touch $testfile
+
+# Make sure the reported btime is within 5 seconds of the time we recorded
+# just prior to creating the file.
+btime=$(date +%s -d "$($XFS_IO_PROG -c "statx -v -m $STATX_BTIME" $testfile | \
+	grep 'stat.btime =' | cut -d '=' -f 2)")
+test -n "$btime" || echo "error: did not see btime in output??"
+
+_within_tolerance "btime" "$btime" "$now" 1 5 -v
+
+status=0
+exit

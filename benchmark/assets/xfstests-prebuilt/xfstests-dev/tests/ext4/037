@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test ext4/037
+#
+# Test mount a needs_recovery partition with noload option.
+# ext4 used to Oops until part of this commit:
+#
+# 744692d ext4: use ext4_get_block_write in buffer write
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+
+# nofsck as we modify sb via debugfs
+_require_scratch_nocheck
+
+echo "Silence is golden"
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# set needs_recovery feature bit
+debugfs -w -R "feature +needs_recovery" $SCRATCH_DEV \
+	>>$seqres.full 2>&1
+
+# mount with noload option
+_try_scratch_mount "-o noload" >>$seqres.full 2>&1
+
+# success, all done
+status=0
+exit

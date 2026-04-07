@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 CTERA Networks. All Rights Reserved.
+#
+# FSQA Test No. 061
+#
+# Test memory mapped data inconsistencies
+#
+# This is a variant of test overlay/016 with mread instead of pread.
+#
+# This simple test demonstrates a known issue with overlayfs:
+# - process A created shared ro mmap on file F
+# - process B created shared rw mmap on file F
+# - process B writes new data to shared mmap
+# - process A reads old data from shared mmap
+#
+. ./common/preamble
+_begin_fstest posix copyup mmap
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "open"
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# Create our test files.
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+echo "This is old news" > $lowerdir/foo
+
+_scratch_mount
+
+filter_xfs_io_mmap()
+{
+	# filter out these lines:
+	# [000] 0x7f3d9aece000 - 0x7f3d9aece010 r--  SCRATCH_MNT/foo (0 : 16)
+	grep -Fv '[00'
+}
+
+#
+# mmap MAP_SHARED|PROT_READ of rofd
+# mmap MAP_SHARED|PROT_WRITE of rwfd
+# write to rw mmap
+# read from ro mmap
+#
+$XFS_IO_PROG -r $SCRATCH_MNT/foo \
+	-C "mmap -r 0 16" \
+	-C "close" \
+	-C "open $SCRATCH_MNT/foo" \
+	-C "mmap -w 0 16" \
+	-C "close" \
+	-C "mwrite -S 0x61 0 16" \
+	-C "munmap" \
+	-C "mread -v 0 16" \
+| _filter_xfs_io | _filter_scratch | filter_xfs_io_mmap
+
+_scratch_cycle_mount
+
+# Verify mmap write after close has persisted through mount cycle
+echo "After mount cycle:"
+$XFS_IO_PROG -r $SCRATCH_MNT/foo \
+	-C "mmap -r 0 16" \
+	-C "mread -v 0 16" \
+| _filter_xfs_io | _filter_scratch
+
+status=0
+exit

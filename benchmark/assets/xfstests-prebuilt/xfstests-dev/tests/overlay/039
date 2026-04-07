@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Huawei.  All Rights Reserved.
+#
+# FS QA Test 039
+#
+# Test access time update issue for directories in upper layer.
+#
+# Upstream Commit cd91304e7190 ("ovl: fix relatime for directories")
+# fixed this issue.
+#
+. ./common/preamble
+_begin_fstest auto quick atime
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_relatime
+
+# remove all files from previous runs
+_scratch_mkfs
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $upperdir/test
+
+_scratch_mount "-o relatime"
+
+# access test dir, it's access time will be updated normally
+ls $SCRATCH_MNT/test
+
+pre_access_time=`stat -c "%X" $SCRATCH_MNT/test`
+
+# In relatime mode, access time is only updated if the previous
+# access time was earlier than the current modify or change time,
+# so trigger modify and change time update.
+touch $SCRATCH_MNT/test/foo
+sleep 1
+
+# access test dir again
+ls $SCRATCH_MNT/test > /dev/null 2>&1
+
+cur_access_time=`stat -c "%X" $SCRATCH_MNT/test`
+
+# compare the results, current access time should later than the previous one
+if [ $cur_access_time -le $pre_access_time ] ; then
+	echo "Access time is not updated correctly."
+fi
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

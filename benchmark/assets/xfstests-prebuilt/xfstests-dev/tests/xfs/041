@@ -1,0 +1,82 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 041
+#
+# growfs QA tests - repeatedly fill/grow the filesystem
+# check the filesystem contents after each operation
+#
+set +x
+
+. ./common/preamble
+_begin_fstest growfs ioctl auto
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    _scratch_unmount
+    rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_no_large_scratch_dev
+_scratch_unmount 2>/dev/null
+
+_fill()
+{
+    if [ $# -ne 1 ]; then echo "Usage: _fill \"path\"" 1>&2 ; exit 1; fi
+    _do "Fill filesystem" \
+	"$here/src/fill2fs --verbose --dir=$1 --seed=0 --filesize=65536 --stddev=32768 --list=- >>$tmp.manifest"
+}
+
+_do_die_on_error=message_only
+agsize=32
+echo -n "Make $agsize megabyte filesystem on SCRATCH_DEV and mount... "
+_scratch_mkfs_xfs -dsize=${agsize}m,agcount=1 2>&1 >/dev/null
+bsize=`_scratch_mkfs_xfs -dsize=${agsize}m,agcount=1 2>&1 | _filter_mkfs 2>&1 \
+		| perl -ne 'if (/dbsize=(\d+)/) {print $1;}'`
+onemeginblocks=`expr 1048576 / $bsize`
+_scratch_mount
+
+# Growing the data device doesn't work with an internal RT volume directly
+# following the data device.  But even without that this test forces data
+# to the data device, which often is tiny on zoned file systems.
+_require_xfs_scratch_non_zoned
+
+# We're growing the data device, so force new file creation there
+_xfs_force_bdev data $SCRATCH_MNT
+
+echo "done"
+
+# full allocation group -> partial; partial -> expand partial + new partial;
+# partial -> expand partial; partial -> full
+# cycle through 33m -> 67m -> 75m -> 96m
+for size in 33 67 75 96
+do
+    grow_size=`expr $size \* $onemeginblocks`
+    _fill $SCRATCH_MNT/fill_$size
+    _do "Grow filesystem to ${size}m" "xfs_growfs -D $grow_size $SCRATCH_MNT"
+    echo -n "Flush filesystem... "
+    _do "_scratch_unmount"
+    _do "_try_scratch_mount"
+    echo "done"
+    echo -n "Check files... "
+    if ! _do "$here/src/fill2fs_check $tmp.manifest"; then
+      echo "fail (see $seqres.full)"
+      _do "cat $tmp.manifest"
+      _do "ls -altrR $SCRATCH_MNT"
+      _do "dd if=$SCRATCH_DEV bs=4096 count=$grow_size | gzip -9 > $seq.fsimage.gz"
+      status=1 ; exit
+    fi
+    echo "done"
+done
+
+# success, all done
+echo "Growfs tests passed."
+status=0 ; exit

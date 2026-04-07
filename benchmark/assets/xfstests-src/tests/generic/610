@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 610
+#
+# Test a fallocate() zero range operation against a large file range for which
+# there are many small extents allocated. Verify the operation does not fail
+# and the respective range return zeroes on subsequent reads.
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc zero punch
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "fzero"
+_require_xfs_io_command "fpunch"
+_require_test_program "punch-alternating"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create a file with many small extents. To speed up file creation, do
+# buffered writes and then punch a hole on every other block.
+$XFS_IO_PROG -f -c "pwrite -S 0xab -b 10M 0 100M" \
+	$SCRATCH_MNT/foobar >>$seqres.full
+$here/src/punch-alternating $SCRATCH_MNT/foobar >>$seqres.full
+
+# For btrfs, trigger a transaction commit to force metadata COW for the
+# following fallocate zero range operation.
+_scratch_sync
+
+$XFS_IO_PROG -c "fzero 0 100M" $SCRATCH_MNT/foobar
+
+# Check the file content after umounting and mounting again the fs, to verify
+# everything was persisted.
+_scratch_cycle_mount
+
+echo "File content after zero range operation:"
+od -A d -t x1 $SCRATCH_MNT/foobar
+
+status=0
+exit

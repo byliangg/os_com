@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Alibaba Group.  All Rights Reserved.
+#
+# FS QA Test No. 316
+#
+# Test Generic fallocate hole punching w/o unwritten extent
+#
+. ./common/preamble
+_begin_fstest auto quick punch fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+
+_require_test
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "fiemap"
+
+testfile=$TEST_DIR/$seq.$$
+
+# Standard punch hole tests
+_test_generic_punch -u pwrite fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Delayed allocation punch hole tests
+_test_generic_punch -u -d pwrite fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Multi hole punch tests
+_test_generic_punch -u -k pwrite fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# Delayed allocation multi punch hole tests
+_test_generic_punch -u -d -k pwrite fpunch fpunch fiemap _filter_hole_fiemap $testfile
+
+# success, all done
+status=0
+exit

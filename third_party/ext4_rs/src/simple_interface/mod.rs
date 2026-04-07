@@ -151,14 +151,35 @@ impl Ext4 {
     /// Lookup a child entry under a specific directory inode.
     pub fn ext4_lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
         let mut search_result = Ext4DirSearchResult::new(Ext4DirEntry::default());
-        self.dir_find_entry(parent, name, &mut search_result)?;
-        Ok(search_result.dentry.inode)
+        match self.dir_find_entry(parent, name, &mut search_result) {
+            Ok(_) => Ok(search_result.dentry.inode),
+            Err(e) => {
+                log::error!(
+                    "ext4_lookup_at failed: parent={} name='{}' err={:?}",
+                    parent,
+                    name,
+                    e
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Create a file under a specific directory inode and return new inode number.
     pub fn ext4_create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
-        let inode_ref = self.create(parent, name, mode)?;
-        Ok(inode_ref.inode_num)
+        match self.create(parent, name, mode) {
+            Ok(inode_ref) => Ok(inode_ref.inode_num),
+            Err(e) => {
+                log::error!(
+                    "ext4_create_at failed: parent={} name='{}' mode={:#o} err={:?}",
+                    parent,
+                    name,
+                    mode,
+                    e
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Create a directory under a specific directory inode and return new inode number.
@@ -177,11 +198,6 @@ impl Ext4 {
         let mut child_inode_ref = self.get_inode_ref(child_inode);
         if child_inode_ref.inode.is_dir() {
             return_errno_with_message!(Errno::EISDIR, "target is a directory");
-        }
-
-        let child_link_cnt = child_inode_ref.inode.links_count();
-        if child_link_cnt == 1 {
-            self.truncate_inode(&mut child_inode_ref, 0)?;
         }
 
         let mut parent_inode_ref = self.get_inode_ref(parent);
@@ -244,10 +260,6 @@ impl Ext4 {
             } else {
                 if new_inode_ref.inode.is_dir() {
                     return_errno_with_message!(Errno::EISDIR, "cannot overwrite directory");
-                }
-
-                if new_inode_ref.inode.links_count() == 1 {
-                    self.truncate_inode(&mut new_inode_ref, 0)?;
                 }
                 let mut parent_inode_ref = self.get_inode_ref(new_parent);
                 self.unlink(&mut parent_inode_ref, &mut new_inode_ref, new_name)?;

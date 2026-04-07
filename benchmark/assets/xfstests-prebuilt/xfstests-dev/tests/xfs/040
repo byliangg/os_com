@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 040
+#
+# compare-libxfs test
+#
+# The purpose of this test is only to nag the maintainer of xfsprogs to try to
+# keep xfsprogs's libxfs files in sync with the latest kernel's libxfs. There
+# is no functional need for anyone to actually run this test to confirm
+# proper XFS functionalilty, this is an xfsprogs maintainer test.
+#
+. ./common/preamble
+_begin_fstest other auto
+
+# Import common functions.
+. ./common/filter
+
+[ -z "$KWORKAREA" ] && \
+	_notrun "Can't run libxfs-diff without KWORKAREA set"
+[ -d "$KWORKAREA/fs/xfs" ] || \
+	_notrun "Can't find XFS source under \"$KWORKAREA\""
+
+[ -z "$WORKAREA" ] && \
+	_notrun "Can't run libxfs-diff without WORKAREA set"
+[ -f "$WORKAREA/tools/libxfs-diff" ] || \
+	_notrun "Can't find libxfs-diff tool under \"$WORKAREA\""
+
+filter_libxfs_diff() {
+	sed -e 's/^--- libxfs/--- xfsprogs\/libxfs/g' \
+	    -e 's/^+++ .*libxfs/+++ kernel\/libxfs/g' \
+	    -e 's/^@@.*$/@@ -XXXX,X +YYYY,Y @@/g'
+}
+
+# Compare the two libxfses
+(cd "$WORKAREA" ; ./tools/libxfs-diff "$KWORKAREA/fs/xfs/libxfs") | filter_libxfs_diff | tee -a $seqres.full
+
+# success, all done
+status=0
+exit

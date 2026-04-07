@@ -1,0 +1,80 @@
+QA output created by 063
+	1. into a hole
+72b5e7556a604b06e790401ecc7b5b2d
+	2. into allocated space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..895]: extent
+85150f56d1f598daa2776771bbfb8347
+	3. into unwritten space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..895]: extent
+4c4c2b9ddb351ce0383f1cbde06d9f47
+	4. hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..895]: extent
+8261145c98c99a577e6f3876525853ed
+	5. hole -> unwritten
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..895]: extent
+d8c5d68c8915b699e85d5391e0ad33a1
+	6. data -> hole
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..511]: extent
+3: [512..767]: hole
+4: [768..895]: extent
+097cbf706ff92b327228097f81e71f9e
+	7. data -> unwritten
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..767]: extent
+3: [768..895]: hole
+d4630e9bd614ad38e582e2a96402cb6a
+	8. unwritten -> hole
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..511]: extent
+3: [512..639]: hole
+4: [640..895]: extent
+5b22d2fff0e44ea788fc4659fe992252
+	9. unwritten -> data
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..767]: extent
+3: [768..895]: hole
+8261145c98c99a577e6f3876525853ed
+	10. hole -> data -> hole
+0: [0..127]: extent
+1: [128..639]: hole
+2: [640..1023]: extent
+215afdd4acf40cd6e85ce3070d7651b9
+	11. data -> hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+3: [640..767]: hole
+4: [768..1023]: extent
+59318afefe51e77755ae7d3ef45cd067
+	12. unwritten -> data -> unwritten
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..1023]: extent
+215afdd4acf40cd6e85ce3070d7651b9
+	13. data -> unwritten -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..1023]: extent
+14f9fdcf7f1920275e6de2b342441a24
+	14. data -> hole @ EOF
+0: [0..383]: extent
+1: [384..639]: hole
+2: [640..895]: extent
+222a22b39253359b4afd167b9f150530
+	15. data -> hole @ 0
+0: [0..255]: hole
+1: [256..895]: extent
+3f701b5bae2bec1d49dd68b17fa334e5

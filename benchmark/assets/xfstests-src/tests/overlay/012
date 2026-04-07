@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 012
+#
+# The upper dentry may become stale before we remove it from
+# overlay, e.g. file was removed from upperdir directly, which
+# triggered warning/oops in ovl_remove_and_whiteout().
+#
+# Commit cfc9fde0b07c ("ovl: verify upper dentry in
+# ovl_remove_and_whiteout()") fixed this issue.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+# remove all files from previous runs
+_scratch_mkfs
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $lowerdir/test
+
+_scratch_mount
+
+# remove test file to create a whiteout
+rmdir $SCRATCH_MNT/test
+
+# create the test file again and remove it from upperdir directly, make the
+# upper dentry become stale
+touch $SCRATCH_MNT/test
+rm $upperdir/test
+# try to remove test file from overlay dir, trigger ovl_remove_and_whiteout, it
+# should see stale file handle error, and no warnings/oops are expected.
+rm $SCRATCH_MNT/test 2>&1 | _filter_scratch
+
+# success, all done
+status=0
+exit

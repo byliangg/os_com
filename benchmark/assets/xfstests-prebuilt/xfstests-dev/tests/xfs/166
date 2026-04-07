@@ -1,0 +1,83 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 166
+#
+# ->page-mkwrite test - unwritten extents and mmap
+#
+. ./common/preamble
+_begin_fstest rw metadata auto quick prealloc mmap
+
+# Import common functions.
+. ./common/filter
+
+# assumes 1st, 3rd and 5th blocks are single written blocks,
+# the others are unwritten.
+_filter_blocks()
+{
+	$AWK_PROG -v file_size=$FILE_SIZE '
+/^ +[0-9]/ {
+	if (!written_size) {
+		written_size = $6
+		unwritten1 = ((file_size/512) / 2) - written_size
+		unwritten2 = ((file_size/512) / 2) - 2 * written_size
+	}
+
+	# is the extent unwritten?
+	unwritten_ext = 0;
+	if ($7 >= 10000)
+		unwritten_ext = 1;
+
+	size = "RIGHT"
+	flags = "GOOD"
+	if (unwritten_ext) {
+		if (unwritten1) {
+			if ($6 != unwritten1)
+				size = "WRONG"
+			unwritten1 = 0;
+		} else if ($6 != unwritten2) {
+			size = "WRONG"
+		}
+	} else {
+		if ($6 != written_size)
+			size = "WRONG"
+	}
+	print $1, "[AA..BB]", "XX..YY", "AG", "(AA..BB)", size, flags
+}'
+}
+
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs_xfs >/dev/null 2>&1
+_scratch_mount
+
+TEST_FILE=$SCRATCH_MNT/test_file
+TEST_PROG=$here/src/unwritten_mmap
+
+# Beginning with 5.18, some filesystems support creating large folios for the
+# page cache.  A system with 64k pages can create 256k folios, which means
+# that with the old file size of 1M, the last half of the file is completely
+# converted from unwritten to written by page_mkwrite.  The test will fail on
+# the golden output when this happens, so increase the size from the original
+# 1MB file size to at least (6 * 256k == 1.5MB) prevent this from happening.
+#
+# However, increasing the file size to around 2MB causes regressions when fsdax
+# is enabled because fsdax will try to use PMD entries for the mappings.  Hence
+# we need to set the file size to (6 * 2MB == 12MB) to cover all cases.
+FILE_SIZE=$((12 * 1048576))
+
+# The xfs_bmap results in the golden output requires file allocations to align
+# to 1M boundaries.
+_require_congruent_file_oplen $SCRATCH_MNT $FILE_SIZE
+
+rm -f $TEST_FILE
+$TEST_PROG $FILE_SIZE $TEST_FILE
+
+xfs_bmap -vp $TEST_FILE >> $seqres.full
+xfs_bmap -vp $TEST_FILE | _filter_blocks
+
+status=0
+exit

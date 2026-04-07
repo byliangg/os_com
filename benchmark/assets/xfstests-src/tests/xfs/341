@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 341
+#
+# Cross-link file block into rtrmapbt and see if repair fixes it.
+#
+. ./common/preamble
+_begin_fstest auto quick rmap realtime prealloc repair
+
+# Import common functions.
+. ./common/filter
+
+_require_realtime
+_require_xfs_scratch_rmapbt
+_require_test_program "punch-alternating"
+_disable_dmesg_check
+_require_xfs_io_command "falloc"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs | _filter_mkfs 2>$tmp.mkfs >/dev/null
+. $tmp.mkfs
+cat $tmp.mkfs > "$seqres.full" 2>&1
+_scratch_mount
+blksz="$(_get_block_size $SCRATCH_MNT)"
+
+rtextsz_blks=$((rtextsz / blksz))
+
+# inode core size is at least 176 bytes; btree header is 56 bytes;
+# rtrmap record is 24 bytes; and rtrmap key/pointer are 48 bytes.
+i_core_size="$(_xfs_get_inode_core_bytes $SCRATCH_MNT)"
+i_ptrs=$(( (isize - i_core_size) / 48 ))
+bt_recs=$(( (blksz - 56) / 24 ))
+
+blocks=$((i_ptrs * bt_recs + 1))
+len=$((blocks * rtextsz))
+
+echo "Create some files"
+$XFS_IO_PROG -f -R -c "falloc 0 $len" -c "pwrite -S 0x68 -b 1048576 0 $len" $SCRATCH_MNT/f1 >> $seqres.full
+$XFS_IO_PROG -f -R -c "falloc 0 $len" -c "pwrite -S 0x68 -b 1048576 0 $len" $SCRATCH_MNT/f2 >> $seqres.full
+$here/src/punch-alternating $SCRATCH_MNT/f1 >> "$seqres.full"
+$here/src/punch-alternating $SCRATCH_MNT/f2 >> "$seqres.full"
+echo garbage > $SCRATCH_MNT/f3
+ino=$(stat -c '%i' $SCRATCH_MNT/f3)
+_scratch_unmount
+
+echo "Corrupt fs"
+fsbno=$(_scratch_xfs_db -c "inode $ino" -c 'bmap' | grep 'flag 0' | head -n 1 | \
+	sed -e 's/^.*startblock \([0-9]*\) .*$/\1/g')
+
+_scratch_xfs_db -x -c 'path -m /rtgroups/0.rmap' \
+	-c "write u3.rtrmapbt.ptrs[1] $fsbno" -c 'p' >> $seqres.full
+_scratch_mount
+
+echo "Repair fs"
+_scratch_unmount 2>&1 | _filter_scratch
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "Try to create more files (again)"
+_scratch_mount
+$XFS_IO_PROG -f -R -c "pwrite -S 0x68 0 9999" $SCRATCH_MNT/f4 >> $seqres.full
+
+# success, all done
+status=0
+exit

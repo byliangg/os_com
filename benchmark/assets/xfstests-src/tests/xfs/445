@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 445
+#
+# Test the XFS filestreams allocator for use-after-free inode access. The
+# filestreams allocator uses the MRU and historically kept around unreferenced
+# inode pointers in each element. These pointers could outlive the inodes they
+# referred to and thus lead to access of freed or reused memory when the MRU
+# element was reaped. Test for this problem by performing filestream allocations
+# against short-lived parent directory inodes.
+#
+# Note that some form of kernel debug mechanism for use-after-free detection
+# (i.e., KASAN) is required for this test to reproduce the original problem.
+# This is because XFS uses a kmem cache for xfs_inode objects which means that
+# the backing pages for freed inodes may still reside in the cache with the
+# freed inodes in a partially initialized state.
+#
+. ./common/preamble
+_begin_fstest auto quick filestreams prealloc
+
+# Import common functions.
+. ./common/filter
+. ./common/filestreams
+
+drop_caches()
+{
+	while [ true ]; do
+		echo 2 > /proc/sys/vm/drop_caches
+		sleep 1
+	done
+}
+
+# Modify as appropriate.
+_require_scratch_size $((2*1024*1024)) # kb
+_require_xfs_io_command "falloc"
+
+# check for filestreams
+_check_filestreams_support || _notrun "filestreams not available"
+
+# Disable the scratch rt device to avoid test failures relating to the rt
+# bitmap consuming free space in our small data device and throwing off the
+# filestreams allocator.
+unset SCRATCH_RTDEV
+
+# use small AGs for frequent stream switching
+_scratch_mkfs_xfs -d agsize=20m,size=2g >> $seqres.full 2>&1
+_scratch_mount "-o filestreams"
+
+# start background inode reclaim
+drop_caches &
+pid=$!
+
+# Stress the filestreams allocator via continuous allocation to a file under
+# different parent dirs. Remove the old dirs as the file is moved so the MRU
+# references point to an unlinked inode by the time they are removed. If the
+# old dir inodes are reclaimed and associated memory reused, MRU cleanup can
+# access the inode after it's been freed.
+dir=$SCRATCH_MNT
+for i in $(seq 0 90); do
+	mkdir -p $dir/$i
+	$XFS_IO_PROG -fc "falloc $(($i * 20))m 20m" $dir/$i/file
+
+	mkdir -p $dir/$((i + 1))
+	mv $dir/$i/file $dir/$((i + 1))/file
+	rmdir $dir/$i
+
+	# throttle to ensure this loop sees several cache reclaims
+	sleep 0.1
+done
+
+kill $pid 2> /dev/null
+wait $pid 2> /dev/null
+
+echo Silence is golden
+
+# success, all done
+status=0
+exit

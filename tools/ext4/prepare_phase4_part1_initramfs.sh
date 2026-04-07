@@ -5,8 +5,8 @@ set -euo pipefail
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "${ROOT_DIR}"
 
-SRC_IMG=${1:-"${ROOT_DIR}/.local/initramfs_phase3.cpio.gz"}
-OUT_IMG=${2:-"${ROOT_DIR}/.local/initramfs_phase4_part1.cpio.gz"}
+SRC_IMG=${1:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase3.cpio.gz"}
+OUT_IMG=${2:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase4_part1.cpio.gz"}
 
 if [ ! -f "${SRC_IMG}" ]; then
   echo "Error: source initramfs not found: ${SRC_IMG}" >&2

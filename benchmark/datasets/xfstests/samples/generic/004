@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Christoph Hellwig.  All Rights Reserved.
+#
+# FS QA Test No. 004
+#
+# Test O_TMPFILE opens, and linking them back into the namespace.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f ${testfile}
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_xfs_io_command "-T"
+_require_xfs_io_command "flink"
+
+testfile="${TEST_DIR}/tst-tmpfile-flink"
+
+# test creating a r/w tmpfile, do I/O and link it into the namespace
+$XFS_IO_PROG -T \
+	-c "pwrite 0 4096" \
+	-c "pread 0 4096" \
+	-c "flink ${testfile}" \
+	${TEST_DIR} | _filter_xfs_io
+
+rm ${testfile}
+
+# test creating a r/o tmpfile.  Should fail
+$XFS_IO_PROG -Tr ${TEST_DIR} -c "close" 2>&1 | _filter_test_dir
+
+# success, all done
+status=0
+exit

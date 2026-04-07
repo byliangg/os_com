@@ -1,0 +1,70 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 032
+#
+# Test xfs_copy for all filesystem sector size / block size
+# combinations possible on this platform.
+#
+. ./common/preamble
+_begin_fstest copy auto quick
+
+status=0	# success is the default!
+
+# Import common functions.
+
+
+_require_scratch
+_require_test_program "feature"
+_require_xfs_copy
+
+SECTORSIZE=`blockdev --getss $SCRATCH_DEV`
+PAGESIZE=`$here/src/feature -s`
+IMGFILE=$TEST_DIR/${seq}_copy.img
+
+echo "Silence is golden."
+
+do_copy()
+{
+	local opts="$*"
+
+	$XFS_COPY_PROG $opts $SCRATCH_DEV $IMGFILE >> $seqres.full 2>&1 || \
+		_fail "xfs_copy $opts failed for Sector size $SECTORSIZE Block size $BLOCKSIZE"
+	# Must use "-n" to get exit code; without it xfs_repair always returns 0
+	$XFS_REPAIR_PROG -n -f $IMGFILE >> $seqres.full 2>&1 || \
+		_fail "xfs_copy $opts corrupted for Sector size $SECTORSIZE Block size $BLOCKSIZE"
+}
+
+for ((; SECTORSIZE <= 65536; SECTORSIZE *= 2)); do
+	for ((BLOCKSIZE = SECTORSIZE; BLOCKSIZE <= 65536; BLOCKSIZE *= 2)); do
+		echo "=== Sector size $SECTORSIZE Block size $BLOCKSIZE ==" >> $seqres.full
+		_scratch_mkfs -s size=$SECTORSIZE -b size=$BLOCKSIZE -d size=1g >> $seqres.full 2>&1
+		# Maybe return error at here, e.g: mkfs.xfs -m crc=1 -b size=512
+		if [ $? -ne 0 ]; then
+			continue
+		fi
+		if ! _try_scratch_mount >> $seqres.full 2>&1 ; then
+			if [ $BLOCKSIZE -le $PAGESIZE ]; then
+				_fail "mount $(_scratch_mount_options $*) failed"
+			fi
+
+			# Not all kernels support blocksize > pagesize
+			# filesystems, so we move on to the next sector size if
+			# mount fails.
+			break
+		fi
+		# light population of the fs
+		_run_fsstress -n 100 -d $SCRATCH_MNT
+		_scratch_unmount
+
+		# Test "duplicate" copy at first, if $XFS_COPY_PROG won't do it.
+		if [[ ! "$XFS_COPY_PROG" =~ -d ]]; then
+			do_copy -d
+		fi
+		do_copy
+	done
+done
+
+# success, all done
+exit

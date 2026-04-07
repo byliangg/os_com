@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 175
+#
+# See how well reflink handles reflinking the same block a million times.
+#
+. ./common/preamble
+_begin_fstest auto clone
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount >> "$seqres.full" 2>&1
+
+testdir="$SCRATCH_MNT/test-$seq"
+mkdir "$testdir"
+
+echo "Create a one block file"
+blksz="$(_get_file_block_size $testdir)"
+_pwrite_byte 0x61 0 $blksz "$testdir/file1" >> "$seqres.full"
+
+fnr=19
+echo "Create extents"
+for i in $(seq 0 $fnr); do
+	echo " ++ Reflink size $i, $((2 ** i)) blocks" >> "$seqres.full"
+	n=$(( (2 ** i) * blksz))
+	_reflink_range "$testdir/file1" 0 "$testdir/file1" $n $n >> "$seqres.full"
+done
+_scratch_cycle_mount
+
+echo "Reflink the big file"
+blks=$((2 ** (fnr + 1) ))
+bytes=$((blks * blksz))
+echo "reflinking $blks blocks, $bytes bytes" >> "$seqres.full"
+_reflink_range "$testdir/file1" 0 "$testdir/file2" 0 $bytes >> "$seqres.full"
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,543 @@
+#
+# overlayfs specific common functions.
+#
+. ./common/module
+
+# Export overlayfs xattrs and constant value
+export OVL_XATTR_OPAQUE="trusted.overlay.opaque"
+export OVL_XATTR_REDIRECT="trusted.overlay.redirect"
+export OVL_XATTR_IMPURE="trusted.overlay.impure"
+export OVL_XATTR_ORIGIN="trusted.overlay.origin"
+export OVL_XATTR_NLINK="trusted.overlay.nlink"
+export OVL_XATTR_UPPER="trusted.overlay.upper"
+export OVL_XATTR_METACOPY="trusted.overlay.metacopy"
+
+if [ -n "$OVL_BASE_FSTYP" ];then
+	_source_specific_fs $OVL_BASE_FSTYP
+fi
+
+# helper function to do the actual overlayfs mount operation
+# accepts "-" as upperdir for non-upper overlayfs
+_overlay_mount_dirs()
+{
+	local lowerdir=$1
+	local upperdir=$2
+	local workdir=$3
+	shift 3
+	local diropts="-olowerdir=$lowerdir"
+
+	[ -n "$upperdir" ] && [ "$upperdir" != "-" ] && \
+		diropts+=",upperdir=$upperdir,workdir=$workdir"
+
+	$MOUNT_PROG -t overlay $diropts `_common_dev_mount_options $*`
+}
+
+# Mount with mnt/dev of scratch mount and custom mount options
+_overlay_scratch_mount_opts()
+{
+	$MOUNT_PROG -t overlay $OVL_BASE_SCRATCH_MNT $SCRATCH_MNT $*
+}
+
+# Mount with same options/mnt/dev of scratch mount, but optionally
+# with different lower/upper/work dirs
+_overlay_scratch_mount_dirs()
+{
+	local lowerdir=$1
+	local upperdir=$2
+	local workdir=$3
+	shift 3
+
+	_overlay_mount_dirs $lowerdir $upperdir $workdir \
+				$* $OVL_BASE_SCRATCH_MNT $SCRATCH_MNT
+}
+
+_overlay_mkdirs()
+{
+	local dir=$1
+
+	mkdir -p $dir/$OVL_UPPER
+	mkdir -p $dir/$OVL_LOWER
+	mkdir -p $dir/$OVL_WORK
+	mkdir -p $dir/$OVL_MNT
+}
+
+# Given a base fs dir, set up overlay directories and mount on the given mnt.
+# The dir is used as the mount device so it can be seen from df or mount
+_overlay_mount()
+{
+	local dir=$1
+	local mnt=$2
+	shift 2
+
+	_supports_filetype $dir || _notrun "upper fs needs to support d_type"
+
+	_overlay_mkdirs $dir
+
+	_overlay_mount_dirs $dir/$OVL_LOWER $dir/$OVL_UPPER $dir/$OVL_WORK \
+				$* $dir $mnt
+}
+
+_overlay_base_mount()
+{
+	local devname=$1
+	local mntname=$2
+	local dev=$3
+	local mnt=$4
+	shift 4
+
+	if [ -z "$dev" -o -z "$mnt" ] || \
+		_check_mounted_on $devname $dev $mntname $mnt; then
+		_idmapped_mount $dev $mnt
+		# no base fs or already mounted
+		return 0
+	elif [ $? -ne 1 ]; then
+		# base fs mounted but not on mount point
+		return 1
+	fi
+
+	if [ $OVL_BASE_FSTYP ]; then
+		_mount -t $OVL_BASE_FSTYP $* $dev $mnt
+	else
+		_mount $* $dev $mnt
+	fi
+
+	_idmapped_mount $dev $mnt
+}
+
+_overlay_base_test_mount()
+{
+	_overlay_base_mount OVL_BASE_TEST_DEV OVL_BASE_TEST_DIR \
+			"$OVL_BASE_TEST_DEV" "$OVL_BASE_TEST_DIR" \
+			$TEST_FS_MOUNT_OPTS $SELINUX_MOUNT_OPTIONS
+}
+
+_overlay_test_mount()
+{
+	_overlay_base_test_mount && \
+		_overlay_mount $OVL_BASE_TEST_DIR $TEST_DIR $*
+}
+
+_overlay_base_scratch_mount()
+{
+	_overlay_base_mount OVL_BASE_SCRATCH_DEV OVL_BASE_SCRATCH_MNT \
+			"$OVL_BASE_SCRATCH_DEV" "$OVL_BASE_SCRATCH_MNT" \
+			$OVL_BASE_MOUNT_OPTIONS $SELINUX_MOUNT_OPTIONS
+}
+
+_overlay_scratch_mount()
+{
+	if echo "$*" | grep -q remount; then
+		# By default, libmount merges remount options with old mount options.
+		# overlayfs does not support re-configuring the same mount options.
+		# We workaround this problem with --options-mode ignore.
+		$MOUNT_PROG $SCRATCH_MNT --options-mode ignore $*
+		return
+	fi
+
+	_overlay_base_scratch_mount && \
+		_overlay_mount $OVL_BASE_SCRATCH_MNT $SCRATCH_MNT $*
+}
+
+_overlay_base_unmount()
+{
+	local dev=$1
+	local mnt=$2
+
+	[ -n "$dev" -a -n "$mnt" ] || return 0
+
+	_unmount $mnt
+}
+
+_overlay_test_unmount()
+{
+	_unmount $TEST_DIR
+	_overlay_base_unmount "$OVL_BASE_TEST_DEV" "$OVL_BASE_TEST_DIR"
+}
+
+_overlay_scratch_unmount()
+{
+	_unmount $SCRATCH_MNT
+	_overlay_base_unmount "$OVL_BASE_SCRATCH_DEV" "$OVL_BASE_SCRATCH_MNT"
+}
+
+# Check that a specific overlayfs feature is supported
+_check_overlay_feature()
+{
+	local feature=$1
+	local dev=$2
+	local mnt=$3
+
+	# overalyfs features (e.g. redirect_dir, index) are
+	# configurable from Kconfig (the build default), by module
+	# parameter (the system default) and per mount by mount
+	# option ${feature}=[on|off].
+	local default=`_get_fs_module_param ${feature}`
+	[ "$default" = Y ] || [ "$default" = N ] || \
+		_notrun "feature '${feature}' not supported by ${FSTYP}"
+
+	# Check options to be sure. For example, Overlayfs will fallback to
+	# index=off if underlying fs does not support file handles.
+	# Overlayfs only displays mount option if it differs from the default.
+	# Overlayfs may enable the feature, but fallback to read-only mount.
+	((( [ "$default" = N ] && _fs_options $dev | grep -q "${feature}=on" ) || \
+	  ( [ "$default" = Y ] && ! _fs_options $dev | grep -q "${feature}=off" )) && \
+	    touch $mnt/foo 2>/dev/null ) || \
+	        _notrun "${FSTYP} feature '${feature}' cannot be enabled on ${dev}"
+}
+
+# Require a set of overlayfs features
+_require_scratch_overlay_features()
+{
+	local features=( $* )
+	local opts="rw"
+
+	for feature in ${features[*]}; do
+		# If the module parameter does not exist then there is no
+		# point in checking the mount option.
+		_get_fs_module_param ${feature} > /dev/null 2>&1 || \
+			_notrun "feature '${feature}' not supported by overlay"
+		opts+=",${feature}=on"
+	done
+
+	_scratch_mkfs > /dev/null 2>&1
+	_try_scratch_mount -o $opts || \
+	        _notrun "overlay features '${features[*]}' cannot be enabled on ${SCRATCH_DEV}"
+
+	for feature in ${features[*]}; do
+		_check_overlay_feature ${feature} $SCRATCH_DEV $SCRATCH_MNT
+	done
+
+	_scratch_unmount
+}
+
+_check_scratch_overlay_xattr_escapes()
+{
+	local testfile=$1
+
+	touch $testfile
+	! ($GETFATTR_PROG -n trusted.overlay.foo $testfile 2>&1 | grep -E -q "not (permitted|supported)")
+}
+
+_require_scratch_overlay_xattr_escapes()
+{
+	_scratch_mkfs > /dev/null 2>&1
+	_scratch_mount
+
+        _check_scratch_overlay_xattr_escapes $SCRATCH_MNT/file || \
+                  _notrun "xattr escaping is not supported by overlay"
+
+	_scratch_unmount
+}
+
+_require_scratch_overlay_verity()
+{
+	local lowerdirs="$OVL_BASE_SCRATCH_MNT/$OVL_UPPER:$OVL_BASE_SCRATCH_MNT/$OVL_LOWER"
+
+	_require_scratch_verity "$OVL_BASE_FSTYP" "$OVL_BASE_SCRATCH_MNT"
+
+	_scratch_mkfs > /dev/null 2>&1
+	_overlay_scratch_mount_dirs "$lowerdirs" "-" "-" \
+		-o ro,redirect_dir=follow,metacopy=on,verity=on > /dev/null 2>&1 || \
+	        _notrun "overlay verity not supported on ${SCRATCH_DEV}"
+
+	_scratch_unmount
+}
+
+# Check kernel support for <lowerdirs>::<lowerdatadir> format
+_require_scratch_overlay_lowerdata_layers()
+{
+	local lowerdirs="$OVL_BASE_SCRATCH_MNT/$OVL_UPPER::$OVL_BASE_SCRATCH_MNT/$OVL_LOWER"
+
+	_scratch_mkfs > /dev/null 2>&1
+	_overlay_scratch_mount_dirs "$lowerdirs" "-" "-" \
+		-o ro,redirect_dir=follow,metacopy=on > /dev/null 2>&1 || \
+	        _notrun "overlay data-only layers not supported on ${SCRATCH_DEV}"
+
+	_scratch_unmount
+}
+
+# Check kernel support for lowerdir+=<lowerdir>,datadir+=<lowerdatadir> format
+_require_scratch_overlay_lowerdir_add_layers()
+{
+	local lowerdir="$OVL_BASE_SCRATCH_MNT/$OVL_UPPER"
+	local datadir="$OVL_BASE_SCRATCH_MNT/$OVL_LOWER"
+
+	_scratch_mkfs > /dev/null 2>&1
+	_overlay_scratch_mount_opts \
+		-o"lowerdir+=$lowerdir,datadir+=$datadir" \
+		-o"redirect_dir=follow,metacopy=on" > /dev/null 2>&1 || \
+	        _notrun "overlay lowerdir+,datadir+ not supported on ${SCRATCH_DEV}"
+
+	_scratch_unmount
+}
+
+# Check kernel support for datadir+=<datadir> without "metacopy=on" option
+_require_scratch_overlay_datadir_without_metacopy()
+{
+	local lowerdir="$OVL_BASE_SCRATCH_MNT/$OVL_UPPER"
+	local datadir="$OVL_BASE_SCRATCH_MNT/$OVL_LOWER"
+
+	_scratch_mkfs > /dev/null 2>&1
+	_overlay_scratch_mount_opts \
+		-o"lowerdir+=$lowerdir,datadir+=$datadir" > /dev/null 2>&1 || \
+	        _notrun "overlay datadir+ without metacopy not supported on ${SCRATCH_DEV}"
+
+	_scratch_unmount
+
+}
+
+
+# Helper function to check underlying dirs of overlay filesystem
+_overlay_fsck_dirs()
+{
+	local lowerdir=$1
+	local upperdir=$2
+	local workdir=$3
+	shift 3
+
+	[[ ! -x "$FSCK_OVERLAY_PROG" ]] && return 0
+
+	$FSCK_OVERLAY_PROG -o lowerdir=$lowerdir -o upperdir=$upperdir \
+			   -o workdir=$workdir $*
+}
+
+# Run fsck and check for expected return value
+_overlay_fsck_expect()
+{
+	# The first arguments is the expected fsck program exit code, the
+	# remaining arguments are the input parameters of the fsck program.
+	local expect_ret=$1
+	local lowerdir=$2
+	local upperdir=$3
+	local workdir=$4
+	shift 4
+
+	_overlay_fsck_dirs $lowerdir $upperdir $workdir $* >> \
+			$seqres.full 2>&1
+	fsck_ret=$?
+
+	[[ "$fsck_ret" == "$expect_ret" ]] || \
+		echo "expect fsck.overlay to return $expect_ret, but got $fsck_ret"
+}
+
+_overlay_check_dirs()
+{
+	local lowerdir=$1
+	local upperdir=$2
+	local workdir=$3
+	shift 3
+	local err=0
+
+	_overlay_fsck_dirs $lowerdir $upperdir $workdir \
+			   $FSCK_OPTIONS $* >>$tmp.fsck 2>&1
+	if [ $? -ne 0 ]; then
+		_log_err "_overlay_check_fs: overlayfs on $lowerdir,$upperdir,$workdir is inconsistent"
+
+		echo "*** fsck.overlay output ***"	>>$seqres.full
+		cat $tmp.fsck				>>$seqres.full
+		echo "*** end fsck.overlay output"	>>$seqres.full
+
+		echo "*** mount output ***"		>>$seqres.full
+		_mount					>>$seqres.full
+		echo "*** end mount output"		>>$seqres.full
+
+		err=1
+	fi
+	rm -f $tmp.fsck
+
+	return $err
+}
+
+# Check the same mnt/dev of _check_overlay_scratch_fs but non-default
+# underlying scratch dirs of overlayfs, it needs lower/upper/work dirs
+# provided as arguments, and it's useful for non-default setups such
+# as multiple lower layers
+_overlay_check_scratch_dirs()
+{
+	local lowerdir=$1
+	local upperdir=$2
+	local workdir=$3
+	shift 3
+
+	# Need to umount overlay for scratch dir check
+	local ovl_mounted=`_is_dir_mountpoint $SCRATCH_MNT`
+	[ -z "$ovl_mounted" ] || _unmount $SCRATCH_MNT
+
+	# Check dirs with extra overlay options
+	_overlay_check_dirs $lowerdir $upperdir $workdir $*
+	local ret=$?
+
+	if [ $ret -eq 0 -a -n "$ovl_mounted" ]; then
+		# overlay was mounted, remount with extra mount options
+		_overlay_scratch_mount_dirs $lowerdir $upperdir \
+					    $workdir $*
+		ret=$?
+	fi
+
+	return $ret
+}
+
+_overlay_check_fs()
+{
+	# The first arguments is overlay mount point use for checking
+	# overlay filesystem is mounted or not, the remaining arquments
+	# use for mounting overlay base filesystem if it was not mounted.
+	# We shift one to aligns arguments for _overlay_base_mount.
+	local ovl_mnt=$1
+	shift 1
+
+	local base_dev=$3
+	local base_mnt=$4
+
+	[ "$FSTYP" = overlay ] || return 0
+
+	# Base fs needs to be mounted to check overlay dirs
+	local base_fstype=""
+	local ovl_mounted=""
+
+	[ -z "$base_dev" ] || \
+		base_fstype=`_fs_type $base_dev`
+
+	# If base_dev is set but base_fstype is empty, base fs is not
+	# mounted, we need to mount base fs. Otherwise, we need to
+	# check and umount overlayfs if it was mounted.
+	if [ -n "$base_dev" -a -z "$base_fstype" ]; then
+		_overlay_base_mount $*
+	else
+		# Check and umount overlay for dir check
+		ovl_mounted=`_is_dir_mountpoint $ovl_mnt`
+		[ -z "$ovl_mounted" ] || _unmount $ovl_mnt
+	fi
+
+	_overlay_check_dirs $base_mnt/$OVL_LOWER $base_mnt/$OVL_UPPER \
+			    $base_mnt/$OVL_WORK
+	local ret=$?
+
+	if [ -n "$base_dev" -a -z "$base_fstype" ]; then
+		_overlay_base_unmount "$base_dev" "$base_mnt"
+	elif [ $ret -eq 0 -a -n "$ovl_mounted" ]; then
+		# overlay was mounted, remount besides extra mount options
+		_overlay_mount $base_mnt $ovl_mnt
+		ret=$?
+	fi
+
+	if [ $ret != 0 ]; then
+		status=1
+		if [ "$iam" != "check" ]; then
+			exit 1
+		fi
+		return 1
+	fi
+
+	return 0
+}
+
+_check_overlay_test_fs()
+{
+	_overlay_check_fs "$TEST_DIR" \
+		OVL_BASE_TEST_DEV OVL_BASE_TEST_DIR \
+		"$OVL_BASE_TEST_DEV" "$OVL_BASE_TEST_DIR" \
+		$TEST_FS_MOUNT_OPTS $SELINUX_MOUNT_OPTIONS
+}
+
+_check_overlay_scratch_fs()
+{
+	_overlay_check_fs "$SCRATCH_MNT" \
+		OVL_BASE_SCRATCH_DEV OVL_BASE_SCRATCH_MNT \
+		"$OVL_BASE_SCRATCH_DEV" "$OVL_BASE_SCRATCH_MNT" \
+		$OVL_BASE_MOUNT_OPTIONS $SELINUX_MOUNT_OPTIONS
+}
+
+_repair_overlay_scratch_fs()
+{
+	# Base fs needs to be mounted for overlayfs check
+	_overlay_base_scratch_mount
+	_overlay_fsck_dirs $OVL_BASE_SCRATCH_MNT/$OVL_LOWER \
+		$OVL_BASE_SCRATCH_MNT/$OVL_UPPER \
+		$OVL_BASE_SCRATCH_MNT/$OVL_WORK -y
+	local res=$?
+	case $res in
+	$FSCK_OK|$FSCK_NONDESTRUCT)
+		res=0
+		;;
+	*)
+		_dump_err2 "fsck.overlay failed, err=$res"
+		;;
+	esac
+	return $res
+}
+
+# This test requires that unionmount testsuite is installed at
+# $UNIONMOUNT_TESTSUITE and that it supports configuring layers and overlay
+# mount paths via UNIONMOUNT_* environment variables.
+_require_unionmount_testsuite()
+{
+	[ -x "$UNIONMOUNT_TESTSUITE/run" ] || \
+		_notrun "unionmount testsuite required."
+
+	# Verify that UNIONMOUNT_* vars are supported
+	local usage=`UNIONMOUNT_BASEDIR=_ "$UNIONMOUNT_TESTSUITE/run" 2>&1`
+	echo $usage | grep -wq "UNIONMOUNT_BASEDIR" || \
+		_notrun "newer version of unionmount testsuite required."
+
+	[ -n "$OVERLAY_MOUNT_OPTIONS" ] || return
+	# If custom overlay mount options are used
+	# verify that UNIONMOUNT_MNTOPTIONS var is supported
+	local usage=`UNIONMOUNT_MNTOPTIONS=_ "$UNIONMOUNT_TESTSUITE/run" 2>&1`
+	echo $usage | grep -wq "UNIONMOUNT_MNTOPTIONS" || \
+		_notrun "newer version of unionmount testsuite required to support OVERLAY_MOUNT_OPTIONS."
+}
+
+# transform overlay xattrs (trusted.overlay -> user.overlay)
+_overlay_trusted_to_user()
+{
+	local dir=$1
+
+	for file in `find $dir`; do
+		_getfattr --absolute-names -d -m '^trusted.overlay.(redirect|metacopy)$' $file  | sed 's/^trusted/user/' | $SETFATTR_PROG --restore=-
+		for xattr in `_getfattr --absolute-names -d -m '^trusted.overlay.' $file  | tail -n +2 | cut -d= -f1`; do
+			$SETFATTR_PROG -x $xattr $file;
+		done
+	done
+}
+
+_unionmount_testsuite_run()
+{
+	[ "$FSTYP" = overlay ] || \
+		_notrun "Filesystem $FSTYP not supported with unionmount testsuite."
+
+	# Provide the mounted base fs for upper and lower dirs and the
+	# overlay mount point.
+	# unionmount testsuite will perform the overlay mount.
+	# test fs is used for lower layer in non-samefs runs.
+	# scratch fs is used for upper layer in non-samefs runs and
+	# for both layers in samefs runs.
+	if (echo $* | grep -qv samefs) ; then
+		_overlay_base_test_mount
+		export UNIONMOUNT_LOWERDIR=$OVL_BASE_TEST_DIR/union
+	fi
+	export UNIONMOUNT_BASEDIR=$OVL_BASE_SCRATCH_MNT/union
+	export UNIONMOUNT_MNTOPTIONS="$OVERLAY_MOUNT_OPTIONS"
+
+	_scratch_mkfs
+	rm -rf $UNIONMOUNT_BASEDIR $UNIONMOUNT_LOWERDIR
+	mkdir -p $UNIONMOUNT_BASEDIR $UNIONMOUNT_LOWERDIR
+
+	cd $UNIONMOUNT_TESTSUITE
+	echo "run $* ..." > $seqres.full
+	./run $* >> $seqres.full || \
+		echo "unionmount testsuite failed! see $seqres.full for details."
+}
+
+_unionmount_testsuite_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+
+	[ -n "$UNIONMOUNT_BASEDIR" ] || return 0
+
+	# Cleanup overlay mount after unionmount testsuite run
+	cd $UNIONMOUNT_TESTSUITE
+	echo "run --clean-up ..." >> $seqres.full
+	./run --clean-up >> $seqres.full 2>&1
+}

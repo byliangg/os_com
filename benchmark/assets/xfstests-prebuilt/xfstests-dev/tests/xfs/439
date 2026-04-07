@@ -1,0 +1,63 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 FUJITSU.  All Rights Reserved.
+#
+# FS QA Test No. 439
+#
+# Regression test for commit:
+# 9c92ee2 ("xfs: validate sb_logsunit is a multiple of the fs blocksize")
+#
+# If log stripe unit isn't a multiple of the fs blocksize and mounting,
+# the invalid sb_logsunit leads to crash as soon as we try to write to
+# the log.
+#
+. ./common/preamble
+_begin_fstest auto quick fuzzers log
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+
+# We corrupt XFS on purpose, and check if assert failures would crash the
+# system when trying to xfs_log_mount.  Hence this is a regression test for:
+_fixed_by_kernel_commit 9c92ee208b1f \
+	"xfs: validate sb_logsunit is a multiple of the fs blocksize"
+
+# This used to be _require_no_xfs_bug_on_assert, but now we've fixed the sb
+# verifier to reject this before xfs_log_mount gets to it:
+_fixed_by_kernel_commit f1e1765aad7d \
+	"xfs: journal geometry is not properly bounds checked"
+
+rm -f "$seqres.full"
+
+# Format
+_scratch_mkfs > $seqres.full 2>&1 || _fail "mkfs failed"
+
+# Set logsunit to a value which is not a multiple of the fs blocksize
+blksz=$(_scratch_xfs_get_sb_field blocksize)
+_scratch_xfs_set_sb_field logsunit $((blksz - 1)) >> $seqres.full 2>&1
+
+# Check if logsunit is set correctly
+lsunit=$(_scratch_xfs_get_sb_field logsunit 2>/dev/null)
+[ $lsunit -ne $((blksz - 1)) ] && _notrun "failed to set sb_logsunit"
+
+# Mount and writing log may trigger a crash on buggy kernel
+# The fix applied kernel refuses to mount, so a mount failure is
+# expected
+if _try_scratch_mount >> $seqres.full 2>&1; then
+	for i in $(seq 1 1000); do
+		echo > ${SCRATCH_MNT}/$i
+	done
+	_scratch_unmount
+fi
+
+# We may trigger assert related WARNINGs if we corrupt log on a CONFIG_XFS_WARN
+# or CONFIG_XFS_DEBUG (when bug_on_assert is disabled) build, so filter them.
+_check_dmesg _filter_assert_dmesg
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

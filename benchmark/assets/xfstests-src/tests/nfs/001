@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc., All Rights Reserved.
+#
+# FS QA Test 001
+#
+# Test nfs4_getfacl gets ACL list correctly from server when the ACL length is
+# close enough to the end of a page. On buggy NFS client getxattr could return
+# ERANGE. Upstream commit ed92d8c137b7 ("NFSv4: fix getacl ERANGE for some ACL
+# buffer sizes") fixed this bug.
+#
+. ./common/preamble
+_begin_fstest auto quick nfs4_acl acl
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $acltest.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test_nfs_version 4
+_require_command $NFS4_SETFACL_PROG "nfs4_setfacl"
+_require_command $NFS4_GETFACL_PROG "nfs4_getfacl"
+
+acltest=$TEST_DIR/acltest.$seq
+rm -f $acltest.*
+touch $acltest.file $acltest.list
+
+# Setup a carefully made ACE list to make attr buffer length is close enough to
+# PAGE_SIZE (size is 4088 in this case, and this only works for 4k page size)
+# that leaves too little room for adding extra attr bitmap in this page
+echo "A::OWNER@:RW" >$acltest.list
+for ((i=9802; i < 10002; i++)); do echo "A::$i:RW" >>$acltest.list; done
+echo "A::GROUP@:RW" >>$acltest.list
+echo "A::EVERYONE@:RW" >>$acltest.list
+
+# Save ACL to testfile
+$NFS4_SETFACL_PROG -S $acltest.list $acltest.file
+
+# Dump ACL, expect correct number of ACE entries
+$NFS4_GETFACL_PROG $acltest.file >>$seqres.full 2>&1
+$NFS4_GETFACL_PROG $acltest.file | grep -c "^A"
+
+# success, all done
+status=0
+exit

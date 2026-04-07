@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 280
+#
+# Test quota vs. suspend/freeze deadlock, 
+# dcdbed85 quota: Fix deadlock with suspend and quotas
+#
+. ./common/preamble
+_begin_fstest auto quota freeze
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	[ -n "$pid" ] && kill -9 $pid 2>/dev/null
+	wait $pid
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_freeze
+
+
+# Modify as appropriate.
+
+_scratch_unmount 2>/dev/null
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount "-o usrquota,grpquota"
+quotacheck -u -g $SCRATCH_MNT 2>/dev/null
+quotaon $SCRATCH_MNT 2>/dev/null
+xfs_freeze -f $SCRATCH_MNT
+setquota -u root 1 2 3 4 $SCRATCH_MNT &
+pid=$!
+sleep 1
+xfs_freeze -u $SCRATCH_MNT
+wait $pid
+unset pid
+
+# Failure comes in the form of a deadlock.
+
+# success, all done
+status=0
+exit

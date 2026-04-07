@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 302
+#
+# Dump and restore partialmax + 1 wholly-sparse files
+#
+. ./common/preamble
+_begin_fstest auto dump
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _cleanup_dump
+    cd /
+    rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dump
+
+
+# Modify as appropriate.
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+echo "Silence is golden."
+mkdir $dump_dir >> $seqres.full 2>&1 || _fail "mkdir \"$dump_dir\" failed"
+for i in `seq 1 4`; do
+	$XFS_IO_PROG -f -c "truncate 1t" $dump_dir/sparsefile$i \
+		>> $seqres.full 2>&1 || _fail "failed to create sparsefile\"$i\""
+done
+# Dump and restore the files
+_prepare_restore_dir
+$XFSDUMP_PROG -L session -M label1 -M label2 -f $tmp.stream1 \
+	-f $tmp.stream2 $SCRATCH_MNT -s $dump_sdir \
+	>> $seqres.full 2>&1 || _fail "dump failed"
+$XFSRESTORE_PROG -F -f $tmp.stream1 -f $tmp.stream2 $restore_dir \
+	>> $seqres.full 2>&1 || _fail "restore failed"
+status=0
+exit 

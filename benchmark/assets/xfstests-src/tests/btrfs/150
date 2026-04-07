@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle.  All Rights Reserved.
+#
+# FS QA Test btrfs/150
+#
+# This is a regression test which ends up with a kernel oops in btrfs.
+# It occurs when btrfs's read repair happens while reading a compressed
+# extent.
+# The patch to fix it is
+#	Btrfs: fix kernel oops while reading compressed data
+#
+. ./common/preamble
+_begin_fstest auto quick dangerous read_repair compress raid
+
+. ./common/filter
+. ./common/fail_make_request
+
+_require_debugfs
+_require_scratch
+_require_fail_make_request
+_require_scratch_dev_pool 2
+_scratch_dev_pool_get 2
+
+enable_io_failure()
+{
+	_allow_fail_make_request 100 1000 > /dev/null
+	echo 1 > $DEBUGFS_MNT/fail_make_request/task-filter
+	_start_fail_scratch_dev > /dev/null
+}
+
+disable_io_failure()
+{
+	_disallow_fail_make_request > /dev/null
+	echo 0 > $DEBUGFS_MNT/fail_make_request/task-filter
+	_stop_fail_scratch_dev > /dev/null
+}
+
+_check_minimal_fs_size $(( 1024 * 1024 * 1024 ))
+_scratch_pool_mkfs "-d raid1 -b 1G" >> $seqres.full 2>&1
+
+# It doesn't matter which compression algorithm we use.
+_scratch_mount -ocompress
+
+# Create a file with all data being compressed
+$XFS_IO_PROG -f -c "pwrite -W 0 8K" $SCRATCH_MNT/foobar | _filter_xfs_io
+
+# Raid1 consists of two copies and btrfs decides which copy to read by reader's
+# %pid.  Now we inject errors to copy #1 and copy #0 is good.  We want to read
+# the bad copy to trigger read-repair.
+while [[ -z $result ]]; do
+	# invalidate the page cache
+	$XFS_IO_PROG -f -c "fadvise -d 0 8K" $SCRATCH_MNT/foobar
+
+	enable_io_failure
+
+	result=$(bash -c "
+	if [ \$((\$\$ % 2)) == 1 ]; then
+		echo 1 > /proc/\$\$/make-it-fail
+		exec $XFS_IO_PROG -c \"pread 0 8K\" \$SCRATCH_MNT/foobar
+	fi")
+
+	disable_io_failure
+done
+
+_scratch_dev_pool_put
+# success, all done
+status=0
+exit

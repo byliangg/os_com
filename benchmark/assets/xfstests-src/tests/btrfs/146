@@ -1,0 +1,72 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Jeff Layton <jlayton@redhat.com>
+#
+# FS QA Test No. 146
+#
+# Open a file several times, write to it, fsync on all fds and make sure that
+# they all return 0. Change the device to start throwing errors. Write again
+# on all fds and fsync on all fds. Ensure that we get errors on all of them.
+# Then fsync on all one last time and verify that all return 0.
+#
+. ./common/preamble
+_begin_fstest auto quick eio raid
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+    _dmerror_cleanup
+}
+
+. ./common/filter
+. ./common/dmerror
+
+_require_scratch
+_require_scratch_dev_pool
+_require_dm_target error
+_require_test_program fsync-err
+_require_test_program dmerror
+
+# bring up dmerror device
+_dmerror_init
+
+# Replace first device with error-test device
+old_SCRATCH_DEV=$SCRATCH_DEV
+SCRATCH_DEV_POOL=`echo $SCRATCH_DEV_POOL | perl -pe "s#$SCRATCH_DEV#$DMERROR_DEV#"`
+SCRATCH_DEV=$DMERROR_DEV
+
+echo "Format and mount"
+
+# Build a filesystem with 2 devices that stripes the data across
+# both devices, but mirrors metadata across both. Then, make one
+# of the devices fail and test what it does.
+_scratch_pool_mkfs "-d raid0 -m raid1" > $seqres.full 2>&1
+_scratch_mount
+
+# How much do we need to write? We need to hit all of the stripes. btrfs uses a
+# fixed 64k stripesize, so write enough to hit each one. In the case of
+# compression, each 128K input data chunk will be compressed to 4K (because of
+# the characters written are duplicate). Therefore we have to write
+# (128K * 16) = 2048K to make sure every stripe can be hit.
+number_of_devices=`echo $SCRATCH_DEV_POOL | wc -w`
+write_kb=$(($number_of_devices * 2048))
+_require_fs_space $SCRATCH_MNT $write_kb
+
+testfile=$SCRATCH_MNT/fsync-err-test
+
+SCRATCH_DEV=$old_SCRATCH_DEV
+$here/src/fsync-err -b $(($write_kb * 1024)) -d "$here/src/dmerror $seq" $testfile
+
+# success, all done
+_dmerror_load_working_table
+
+# fs may be corrupt after this -- attempt to repair it
+_repair_scratch_fs >> $seqres.full
+
+# remove dmerror device
+_dmerror_cleanup
+
+status=0
+exit

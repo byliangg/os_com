@@ -1,0 +1,86 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 414
+#
+# Check that reflinking adjacent blocks in a file produces a single
+# block mapping extent.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap prealloc
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fiemap"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+blocks=32
+blksz=65536
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+sz=$((blocks * blksz))
+
+echo "Create the original files"
+$XFS_IO_PROG -f -c "falloc 0 $sz" $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+seq 0 $blksz $((sz - blksz)) | while read offset; do
+	_reflink_range $testdir/file1 $offset $testdir/file2 $offset $blksz >> $seqres.full
+done
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+
+echo "Check extent counts"
+f1=$(_count_extents $testdir/file1)
+f2=$(_count_extents $testdir/file2)
+s1=$($XFS_IO_PROG -c 'fiemap -v' $testdir/file1 | awk '{print $5}' | grep -c '0x.*[2367aAbBfF]...$')
+s2=$($XFS_IO_PROG -c 'fiemap -v' $testdir/file2 | awk '{print $5}' | grep -c '0x.*[2367aAbBfF]...$')
+
+# Did the fs combine the extent mappings when we made f2?
+test $f1 -eq $f2 || echo "f1 ($f1) != f2 ($f2)"
+test $s1 -eq $s2 || echo "s1 ($s1) != s2 ($s2)"
+test $f1 -eq $s1 || echo "f1 ($f1) != s1 ($f1)"
+test $f2 -eq $s2 || echo "f2 ($f2) != s2 ($f2)"
+
+_scratch_cycle_mount
+
+echo "Compare files after remounting"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+
+echo "Check extent counts"
+f1=$(_count_extents $testdir/file1)
+f2=$(_count_extents $testdir/file2)
+s1=$($XFS_IO_PROG -c 'fiemap -v' $testdir/file1 | awk '{print $5}' | grep -c '0x.*[2367aAbBfF]...$')
+s2=$($XFS_IO_PROG -c 'fiemap -v' $testdir/file2 | awk '{print $5}' | grep -c '0x.*[2367aAbBfF]...$')
+
+# Are the mappings still combined?
+test $f1 -eq $f2 || echo "f1 ($f1) != f2 ($f2)"
+test $s1 -eq $s2 || echo "s1 ($s1) != s2 ($s2)"
+test $f1 -eq $s1 || echo "f1 ($f1) != s1 ($f1)"
+test $f2 -eq $s2 || echo "f2 ($f2) != s2 ($f2)"
+
+# success, all done
+status=0
+exit

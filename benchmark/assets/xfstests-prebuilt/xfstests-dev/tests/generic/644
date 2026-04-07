@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 Christian Brauner.  All Rights Reserved.
+#
+# FS QA Test 644
+#
+# Test that fscaps on idmapped mounts behave correctly.
+#
+. ./common/preamble
+_begin_fstest auto quick cap idmapped mount
+
+# get standard environment, filters and checks
+. ./common/filter
+
+
+_require_idmapped_mounts
+_require_test
+
+echo "Silence is golden"
+
+$here/src/vfs/vfstest --test-fscaps-regression \
+	--device "$TEST_DEV" --mount "$TEST_DIR" --fstype "$FSTYP"
+
+status=$?
+exit

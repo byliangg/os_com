@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. ext4/003
+#
+# Regression test for commit:
+# b5b6077 ext4: fix wrong assert in ext4_mb_normalize_request()
+# This testcase checks whether this bug has been fixed.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _scratch_unmount
+}
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_scratch_ext4_feature "bigalloc"
+
+BLOCK_SIZE=$(_get_page_size)
+features=bigalloc
+if echo "${MOUNT_OPTIONS}" | grep -q 'test_dummy_encryption' ; then
+    features+=",encrypt"
+fi
+$MKFS_EXT4_PROG -F -b $BLOCK_SIZE -O $features -C $(($BLOCK_SIZE * 16)) -g 256 $SCRATCH_DEV 512m \
+	>> $seqres.full 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -f -c "pwrite 0 256m -b 1M" $SCRATCH_MNT/testfile 2>&1 | \
+	_filter_xfs_io
+
+status=0
+exit

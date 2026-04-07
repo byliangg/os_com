@@ -1,0 +1,31 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Calvin Owens.  All Rights Reserved.
+#
+# FS QA Test 420
+#
+# Verify fallocate(mode=FALLOC_FL_KEEP_SIZE|FALLOC_FL_PUNCH_HOLE) does
+# not alter the file size.
+#
+. ./common/preamble
+_begin_fstest auto quick punch
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_xfs_io_command fpunch
+
+testfile="${TEST_DIR}/testfile.$seq"
+
+echo "Testing fallocate(mode=FALLOC_FL_KEEP_SIZE|FALLOC_FL_PUNCH_HOLE)"
+$XFS_IO_PROG -f -t -c "pwrite -b 2048 0 2048" $testfile | head -n1
+# fpunch from xfs_io has KEEP_SIZE flag set
+$XFS_IO_PROG -c "fpunch 2048 2048" $testfile
+$XFS_IO_PROG -c "stat" $testfile | grep -F 'stat.size'
+
+# success, all done
+status=0
+exit

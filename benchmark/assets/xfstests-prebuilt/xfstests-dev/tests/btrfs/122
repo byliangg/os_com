@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/122
+#
+# Test that qgroup counts are valid after snapshot creation. This has
+# been broken in btrfs since Linux v4.1
+#
+. ./common/preamble
+_begin_fstest auto quick snapshot qgroup
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+
+_scratch_mkfs >> $seqres.full
+_scratch_mount
+_btrfs quota enable $SCRATCH_MNT
+
+mkdir "$SCRATCH_MNT/snaps"
+
+# First make some simple snapshots - the bug was initially reproduced like this
+_btrfs subvolume snapshot $SCRATCH_MNT "$SCRATCH_MNT/snaps/empty1"
+_btrfs subvolume snapshot $SCRATCH_MNT "$SCRATCH_MNT/snaps/empty2"
+
+# This forces the fs tree out past level 0, adding at least one tree
+# block which must be properly accounted for when we make our next
+# snapshots.
+mkdir "$SCRATCH_MNT/data"
+for i in `seq 0 640`; do
+	$XFS_IO_PROG -f -c "pwrite 0 1M" "$SCRATCH_MNT/data/file$i" > /dev/null 2>&1
+done
+
+# Snapshot twice.
+_btrfs subvolume snapshot $SCRATCH_MNT "$SCRATCH_MNT/snaps/snap1"
+_btrfs subvolume snapshot $SCRATCH_MNT "$SCRATCH_MNT/snaps/snap2"
+
+_scratch_unmount
+
+# qgroup will be checked by fstest at _check_scratch_fs()
+status=0
+exit

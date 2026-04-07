@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. generic/319
+#
+# Regression test to make sure a directory inherits the default ACL from
+# its parent directory. This test was motivated by an issue reported by
+# a btrfs user. That issue is fixed and described by the following btrfs
+# kernel patch:
+#
+#     https://patchwork.kernel.org/patch/3046931/
+#
+. ./common/preamble
+_begin_fstest acl auto quick perms
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_acls
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/testdir
+setfacl -d --set u::rwx,g::rwx,o::- $SCRATCH_MNT/testdir
+getfacl -n --absolute-names $SCRATCH_MNT/testdir | _filter_scratch
+
+mkdir $SCRATCH_MNT/testdir/testsubdir
+getfacl -n --absolute-names $SCRATCH_MNT/testdir/testsubdir | _filter_scratch
+
+# success, all done
+status=0
+exit

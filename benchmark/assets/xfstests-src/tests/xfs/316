@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 316
+#
+# Reflink a file with a few dozen extents, CoW a few blocks, and rm.
+# Force XFS into "two refcount updates per transaction" mode.
+#
+. ./common/preamble
+_begin_fstest auto quick clone punch
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_scratch_unmount > /dev/null 2>&1
+	rm -rf $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/inject
+
+_require_cp_reflink
+_require_scratch_reflink
+_require_error_injection
+_require_xfs_io_command "fpunch"
+_require_xfs_io_error_injection "refcount_continue_update"
+
+blksz=65536
+blks=64
+sz=$((blksz * blks))
+echo "Format filesystem"
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount >> $seqres.full
+
+echo "Create files"
+_pwrite_byte 0x66 0 $sz $SCRATCH_MNT/file1 >> $seqres.full
+_cp_reflink $SCRATCH_MNT/file1 $SCRATCH_MNT/file2
+_cp_reflink $SCRATCH_MNT/file1 $SCRATCH_MNT/file3
+
+# Punch holes in file3
+seq 1 2 $blks | while read off; do
+	$XFS_IO_PROG -c "fpunch $((off * blksz)) $blksz" $SCRATCH_MNT/file3 >> $seqres.full
+done
+_scratch_sync
+
+echo "Check files"
+md5sum $SCRATCH_MNT/file1 | _filter_scratch
+md5sum $SCRATCH_MNT/file2 | _filter_scratch
+md5sum $SCRATCH_MNT/file3 | _filter_scratch
+
+echo "Inject error"
+_scratch_inject_error "refcount_continue_update"
+
+echo "CoW all the blocks"
+$XFS_IO_PROG -c "pwrite -W -S 0x67 -b $sz 0 $((blks * blksz))" $SCRATCH_MNT/file2 >> $seqres.full
+
+echo "Remount to replay log"
+_scratch_remount_dump_log >> $seqres.full
+
+echo "FS should be online, touch should succeed"
+touch $SCRATCH_MNT/goodfs
+
+echo "Check files again"
+md5sum $SCRATCH_MNT/file1 | _filter_scratch
+md5sum $SCRATCH_MNT/file2 | _filter_scratch
+md5sum $SCRATCH_MNT/file3 | _filter_scratch
+
+echo "Done"
+
+# success, all done
+status=0
+exit

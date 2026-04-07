@@ -1,0 +1,87 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 045
+#
+# Test for NULL files problem
+#
+. ./common/preamble
+_begin_fstest shutdown metadata log auto fiemap
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_scratch_shutdown
+_require_xfs_io_command "fiemap"
+_scratch_mkfs >/dev/null 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_scratch_mount
+
+# create files
+i=1;
+while [ $i -lt 1000 ]
+do
+	file=$SCRATCH_MNT/$i
+	$XFS_IO_PROG -f -c "pwrite -b 64k -S 0xff 0 64k" $file > /dev/null
+	if [ $? -ne 0 ]
+	then
+		echo error creating/writing file $file
+		exit
+	fi
+	$XFS_IO_PROG -c "truncate 32k" $file > /dev/null
+	if [ $? -ne 0 ]
+	then
+		echo error truncating file $file
+		exit
+	fi
+	let i=$i+1
+done
+
+# give the system a chance to write something out
+sleep 10
+
+_scratch_shutdown
+
+_scratch_unmount
+_scratch_mount
+_scratch_unmount
+if [ ! _check_scratch_fs ]
+then
+	echo error detected in filesystem
+	exit
+fi
+_scratch_mount
+
+# check file size and contents
+i=1;
+while [ $i -lt 1000 ]
+do
+	file=$SCRATCH_MNT/$i
+	# if file does not exist, the create was not logged, skip it
+	if [ -e $file ]
+	then
+		# if file size is zero it cannot be corrupt, skip it
+		if [ -s $file ]
+		then
+			# if file has non-zero size but no extents then it's contents will be NULLs, bad.
+			num_extents=`_count_extents $file`
+			num_holes=`_count_holes $file`
+			if [ $num_extents -eq 0 ]; then
+				echo corrupt file $file - non-zero size but no extents
+			elif [ $num_holes -ne 0 ]; then
+				echo corrupt file $file - contains holes
+			else
+				rm -f $file
+			fi
+		else
+			rm -f $file
+		fi
+	fi
+	let i=$i+1
+done
+
+status=0
+exit

@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. 446
+#
+# Regression test for commit:
+# 04197b3 ("xfs: don't BUG() on mixed direct and mapped I/O")
+#
+# This case tests a race between a direct I/O read and a
+# mapped write to a hole in a file.  On xfs filesystem, it
+# will trigger a BUG_ON().
+#
+. ./common/preamble
+_begin_fstest auto quick rw punch mmap
+
+# get standard environment and checks
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "truncate"
+_require_xfs_io_command "fpunch"
+_require_odirect
+
+# format and mount
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+filesz=$((65536 * 2))
+
+# create a test file with a hole
+$XFS_IO_PROG -f -c "truncate $((filesz * 2))" $SCRATCH_MNT/file >> $seqres.full
+
+# run a background dio read to a hole in a loop
+for i in `seq 0 999`; do
+	$XFS_IO_PROG -d -c "pread 0 $filesz" $SCRATCH_MNT/file > /dev/null 2>&1
+done &
+
+dread_pid=$!
+
+# run mapped write to the same hole as dio read
+# loop until background dio read exits
+while kill -s 0 $dread_pid >/dev/null 2>&1; do
+	$XFS_IO_PROG -c "mmap 0 $filesz" -c "mwrite 0 $filesz" $SCRATCH_MNT/file \
+		> /dev/null
+	$XFS_IO_PROG -c "fpunch 0 $filesz" $SCRATCH_MNT/file > /dev/null
+done
+
+wait $dread_pid > /dev/null 2>&1
+
+echo "Silence is golden"
+
+# check dmesg, filtering out expected warnings about mixed mmap/dio
+# and umount first in case umount triggers warnings
+_scratch_unmount
+_check_dmesg _filter_aiodio_dmesg
+
+status=$?
+exit

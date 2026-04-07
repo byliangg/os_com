@@ -1,0 +1,33 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.
+#
+# FS QA Test No. 437
+#
+# find-api-violations test
+#
+# The purpose of this test is ensure that the xfsprogs programs use the
+# libxfs_ symbols (in libxfs-api-defs.h) instead of raw xfs_ functions.
+# This is for the maintainers; it's not a functionality test.
+#
+. ./common/preamble
+_begin_fstest auto quick other
+
+# Import common functions.
+. ./common/filter
+
+[ -z "$WORKAREA" ] && \
+	_notrun "Can't run find-api-violations.sh without WORKAREA set"
+[ -f "$WORKAREA/tools/find-api-violations.sh" ] || \
+	_notrun "Can't find find-api-violations.sh tool under \"$WORKAREA\""
+
+echo "Silence is golden."
+
+# Look for API usage problems.  Old versions of the script have an improperly
+# specified grep pattern that is mistaken for a (broken) range specifier in
+# LC_ALL=C, so use English instead.
+(cd "$WORKAREA" ; LC_ALL="en_US.UTF-8" bash ./tools/find-api-violations.sh ) | tee -a $seqres.full
+
+# success, all done
+status=0
+exit

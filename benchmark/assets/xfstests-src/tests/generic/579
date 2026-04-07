@@ -1,0 +1,104 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright 2019 Google LLC
+#
+# FS QA Test generic/579
+#
+# Stress test for fs-verity.  This tests enabling fs-verity on multiple files
+# concurrently with concurrent readers on those files (with reads occurring
+# before, during, and after the fs-verity enablement), while fsstress is also
+# running on the same filesystem.
+#
+. ./common/preamble
+_begin_fstest auto stress verity
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Stop all subprocesses.
+	_kill_fsstress
+	touch $tmp.done
+	wait
+
+	_restore_fsverity_signatures
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/verity
+
+_require_scratch_verity
+_disable_fsverity_signatures
+
+_scratch_mkfs_verity &>> $seqres.full
+_scratch_mount
+
+fsv_file_size=10000000
+nproc_enabler=$((4 * LOAD_FACTOR))
+nproc_reader=$((6 * LOAD_FACTOR))
+nproc_stress=$((3 * LOAD_FACTOR))
+runtime=$((20 * TIME_FACTOR))
+
+# Create the test files and start the fs-verity enabler processes.
+for ((proc = 0; proc < nproc_enabler; proc++)); do
+	orig_file=$SCRATCH_MNT/orig$proc
+	fsv_file=$SCRATCH_MNT/fsv$proc
+	head -c $fsv_file_size /dev/urandom > $orig_file
+	(
+		while [ ! -e $tmp.done ]; do
+			rm -f $fsv_file
+			cp $orig_file $fsv_file
+			_fsv_enable $fsv_file
+			# Give the readers some time to read from the file.
+			sleep 0.$((RANDOM % 100))
+		done
+	) &
+done
+
+# Start the reader processes.
+for ((proc = 0; proc < nproc_reader; proc++)); do
+	(
+		while [ ! -e $tmp.done ]; do
+			# Choose a random file for each iteration, so that
+			# sometimes multiple processes read from the same file.
+			i=$((RANDOM % nproc_enabler))
+			orig_file=$SCRATCH_MNT/orig$i
+			fsv_file=$SCRATCH_MNT/fsv$i
+
+			# After the copy from $orig_file to $fsv_file has
+			# completed, the contents of these two files should
+			# match, regardless of whether verity has been enabled
+			# or not yet (or is currently being enabled).
+			cmp $orig_file $fsv_file |& _filter_scratch | \
+				sed -e "s/'//g" | \
+				grep -v "SCRATCH_MNT/fsv$i: No such file or directory" | \
+				grep -v "EOF on SCRATCH_MNT/fsv$i"
+
+			_fsv_measure $fsv_file 2>&1 >/dev/null | \
+				grep -v "No such file or directory" | \
+				grep -v "No data available"
+		done
+	) &
+done
+
+# Start a process that occasionally runs 'sync && drop_caches'.  This makes more
+# reads go through fs-verity for real, rather than just returning pagecache.
+(
+	while [ ! -e $tmp.done ]; do
+		sleep 2.$((RANDOM % 100))
+		_scratch_sync && echo 3 > /proc/sys/vm/drop_caches
+	done
+) &
+
+# Start the fsstress processes.
+_run_fsstress_bg -p $nproc_stress -l 0 -d $SCRATCH_MNT/stressdir
+
+# Run for a while.
+sleep $runtime
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

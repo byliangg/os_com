@@ -1,0 +1,72 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 207
+#
+# Test setting the extsz and cowextsz hints:
+# - Ensure that we can set both on a zero-byte file.
+# - Ensure that we can set only cowextsz on a many-byte file.
+# - Ensure that whatever we set we get back later.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "cowextsize"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+_xfs_force_bdev data $SCRATCH_MNT
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original files"
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 0" $testdir/file1 >> $seqres.full
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 1048576" $testdir/file2 >> $seqres.full
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 0" $testdir/file3 >> $seqres.full
+_scratch_cycle_mount
+
+echo "Set extsz and cowextsz on zero byte file"
+$XFS_IO_PROG -c "extsize 1048576" $testdir/file1 | _filter_scratch
+$XFS_IO_PROG -c "cowextsize 1048576" $testdir/file1 | _filter_scratch
+
+echo "Set extsz and cowextsz on 1Mbyte file"
+$XFS_IO_PROG -c "extsize 1048576" $testdir/file2 | _filter_scratch
+$XFS_IO_PROG -c "cowextsize 1048576" $testdir/file2 | _filter_scratch
+_scratch_cycle_mount
+
+echo "Check extsz and cowextsz settings on zero byte file"
+$XFS_IO_PROG -c "extsize" $testdir/file1 | _filter_scratch
+$XFS_IO_PROG -c "cowextsize" $testdir/file1 | _filter_scratch
+
+echo "Check extsz and cowextsz settings on 1Mbyte file"
+$XFS_IO_PROG -c "extsize" $testdir/file2 | _filter_scratch
+$XFS_IO_PROG -c "cowextsize" $testdir/file2 | _filter_scratch
+
+echo "Set cowextsize and check flag"
+$XFS_IO_PROG -c "cowextsize 1048576" $testdir/file3 | _filter_scratch
+_scratch_cycle_mount
+
+_test_fsxattr_xflag "$testdir/file3" "cowextsize" && echo "C flag set" || \
+	echo "C flag unset"
+$XFS_IO_PROG -c "cowextsize" $testdir/file3 | _filter_scratch
+
+echo "Unset cowextsize and check flag"
+$XFS_IO_PROG -c "cowextsize 0" $testdir/file3 | _filter_scratch
+_scratch_cycle_mount
+
+_test_fsxattr_xflag "$testdir/file3" "cowextsize" && echo "C flag set" || \
+	echo "C flag unset"
+$XFS_IO_PROG -c "cowextsize" $testdir/file3 | _filter_scratch
+
+status=0
+exit

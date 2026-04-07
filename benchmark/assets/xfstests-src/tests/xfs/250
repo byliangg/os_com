@@ -1,0 +1,77 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 250
+#
+# Bmap btree corruption regression test
+#
+. ./common/preamble
+_begin_fstest auto quick rw prealloc metadata
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_unmount $LOOP_MNT 2>/dev/null
+	[ -n "$loop_dev" ] && _destroy_loop_device $loop_dev
+	rm -f $LOOP_IMG
+	rmdir $LOOP_MNT
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_loop
+_require_xfs_io_command "falloc"
+
+LOOP_IMG=$TEST_DIR/$seq.fs
+LOOP_MNT=$TEST_DIR/$seq.mnt
+
+_filter_io()
+{
+	sed -e '/.* ops; /d'
+}
+
+
+echo "*** create loop mount point"
+rmdir $LOOP_MNT 2>/dev/null
+mkdir -p $LOOP_MNT || _fail "cannot create loopback mount point"
+
+_test_loop()
+{
+	size=$1
+	agsize=$2
+	fsize=$3
+
+	dparam="file,name=$LOOP_IMG,size=$size"
+	if [ -n "$agsize" ]; then
+		dparam="$dparam,agsize=$agsize"
+	fi
+
+	echo "*** mkfs loop file (size=$size)"
+	$MKFS_XFS_PROG -d $dparam \
+		| _filter_mkfs 2>/dev/null
+
+	echo "*** mount loop filesystem"
+	loop_dev=$(_create_loop_device $LOOP_IMG)
+	mount $loop_dev $LOOP_MNT
+
+	echo "*** preallocate large file"
+	$XFS_IO_PROG -f -c "resvsp 0 $fsize" $LOOP_MNT/foo | _filter_io
+
+	echo "*** unmount loop filesystem"
+	_unmount $LOOP_MNT > /dev/null 2>&1
+
+	echo "*** check loop filesystem"
+	_check_xfs_filesystem $loop_dev none none
+	_destroy_loop_device $loop_dev
+	unset loop_dev
+}
+
+_test_loop 50g 16m 40G
+echo "*** done"
+status=0
+exit

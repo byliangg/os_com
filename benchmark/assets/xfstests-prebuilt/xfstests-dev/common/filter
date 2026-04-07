@@ -1,0 +1,719 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# standard filters
+
+# Checks that given_value is in range of correct_value +/- tolerance.
+# Tolerance can be an absolute value or a percentage of the correct value
+# (see examples with tolerances below).
+# Outputs suitable message to stdout if it's not in range.
+#
+# A verbose option, -v, may be used as the LAST argument
+# 
+# e.g. 
+# foo: 0.0298 = 0.03 +/- 5%
+# _within_tolerance "foo" 0.0298 0.03 5%  
+# 
+# foo: 0.0298 = 0.03 +/- 0.01
+# _within_tolerance "foo" 0.0298 0.03 0.01
+#
+# foo: 0.0298 = 0.03 -0.01 +0.002
+# _within_tolerance "foo" 0.0298 0.03 0.01 0.002
+#
+# foo: verbose output of 0.0298 = 0.03 +/- 5% 
+# _within_tolerance "foo" 0.0298 0.03 5% -v 
+_within_tolerance()
+{
+  _name=$1
+  _given_val=$2
+  _correct_val=$3
+  _mintol=$4
+  _maxtol=$_mintol
+  _verbose=0
+  _debug=false
+
+  # maxtol arg is optional
+  # verbose arg is optional
+  if [ $# -ge 5 ]
+  then 
+     if [ "$5" = "-v" ]
+     then
+	_verbose=1
+     else
+        _maxtol=$5
+     fi
+  fi
+  if [ $# -ge 6 ]
+  then
+     [ "$6" = "-v" ] && _verbose=1
+  fi
+
+  # find min with or without %
+  _mintolerance=`echo $_mintol | sed -e 's/%//'` 
+  if [ $_mintol = $_mintolerance ]
+  then 
+      _min=`echo "scale=5; $_correct_val-$_mintolerance" | bc`
+  else
+      _min=`echo "scale=5; $_correct_val-$_mintolerance*0.01*$_correct_val" | bc`
+  fi
+
+  # find max with or without %
+  _maxtolerance=`echo $_maxtol | sed -e 's/%//'` 
+  if [ $_maxtol = $_maxtolerance ]
+  then 
+      _max=`echo "scale=5; $_correct_val+$_maxtolerance" | bc`
+  else
+      _max=`echo "scale=5; $_correct_val+$_maxtolerance*0.01*$_correct_val" | bc`
+  fi
+
+  $_debug && echo "min = $_min"
+  $_debug && echo "max = $_max"
+
+  cat <<EOF >$tmp.bc.1
+scale=5;
+if ($_min <= $_given_val) 1;
+if ($_min > $_given_val) 0; 
+EOF
+
+  cat <<EOF >$tmp.bc.2
+scale=5;
+if ($_given_val <= $_max) 1;
+if ($_given_val > $_max) 0;
+EOF
+
+  _above_min=`bc <$tmp.bc.1`
+  _below_max=`bc <$tmp.bc.2`
+
+  rm -f $tmp.bc.[12]
+
+  _in_range=`expr $_above_min \& $_below_max` 
+
+  # fix up min, max precision for output
+  # can vary for 5.3, 6.2
+
+  # remove any trailing zeroes from min, max if they have fractional parts
+  _min=`echo $_min | sed -e '/\./s/0*$//' -e 's/\.$//'`
+  _max=`echo $_max | sed -e '/\./s/0*$//' -e 's/\.$//'`
+
+  if [ $_in_range -eq 1 ] 
+  then
+	[ $_verbose -eq 1 ] && echo $_name is in range
+	return 0
+  else
+	[ $_verbose -eq 1 ] && echo $_name has value of $_given_val
+	[ $_verbose -eq 1 ] && echo $_name is NOT in range $_min .. $_max	
+	return 1
+  fi
+}
+
+# ctime(3) dates
+#
+_filter_date()
+{
+    sed \
+	-e 's/[A-Z][a-z][a-z] [A-z][a-z][a-z]  *[0-9][0-9]* [0-9][0-9]:[0-9][0-9]:[0-9][0-9] [0-9][0-9][0-9][0-9]$/DATE/'
+}
+
+# prints filtered output on stdout, values (use eval) on stderr
+# Non XFS filesystems always return a 4k block size and a 256 byte inode.
+_filter_mkfs()
+{
+    case $FSTYP in
+    xfs)
+	_xfs_filter_mkfs "$@"
+	;;
+    *)
+	cat - >/dev/null
+	perl -e 'print STDERR "dbsize=4096\nisize=256\n"'
+	return ;;
+    esac
+}
+
+# prints the bits we care about in growfs
+# 
+_filter_growfs()
+{
+    perl -ne '
+    if (/^data\s+=\s+bsize=(\d+)\s+blocks=(\d+), imaxpct=(\d+)/) {
+        print "xfs_growfs --BlockSize=$1 --Blocks=$2\n";
+    }
+    elsif (/^data/) {
+        print;
+    }'
+}
+
+_filter_dd()
+{
+    $AWK_PROG '
+        /records in/                { next }
+        /records out/               { next }
+        /No space left on device/   { print "   !!! disk full (expected)" 
+                                      next }
+                                    { print "   *** " $0 }
+    '
+}
+
+common_line_filter()
+{
+    perl -ne 'if (/.*:(.*)/) {
+        if ( "$last_line" ne "$1" ) { print "$_"; $first_match=1; }
+        elsif ( $first_match==1 ) { print "*\n"; $first_match=0; }
+        $last_line="$1";
+    }
+    else {
+        print $_; $last_line=$_;
+    }'
+}
+
+_filter_xfs_io()
+{
+    # Apart from standard numeric values, we also filter out 'inf', 'nan', and
+    # '-nan' which can result from division in some cases
+    sed -e "s/[0-9/.]* [GMKiBbytes]*, [0-9]* ops\; [0-9/:. sec]* ([infa0-9/.-]* [EPGMKiBbytes]*\/sec and [infa0-9/.-]* ops\/sec)/XXX Bytes, X ops\; XX:XX:XX.X (XXX YYY\/sec and XXX ops\/sec)/"
+}
+
+# Also filter out the offset part of xfs_io output
+# Some test cases may be affected by underlaying extent/chunk layout change,
+# so wipe out this part to avoid golden output difference
+_filter_xfs_io_offset()
+{
+    # filter out " at offset XXX" and offset of "pread -v"
+    _filter_xfs_io | sed -e "s/ at offset [0-9]*$//" -e "s/^[0-9a-f]\+:/XXXXXXXX:/"
+}
+
+# stderr filter for xfs_io to handle change of error output format (e.g.
+# pwrite64 -> pwrite).
+_filter_xfs_io_error()
+{
+	sed -e "s/^\(.*\)64\(: .*$\)/\1\2/"
+}
+
+_filter_xfs_io_unique()
+{
+    common_line_filter | _filter_xfs_io
+}
+
+_filter_xfs_io_units_modified()
+{
+	UNIT=$1
+	UNIT_SIZE=$2
+
+	$AWK_PROG -v unit="$UNIT" -v unit_size=$UNIT_SIZE '
+		/wrote/ {
+			split($2, bytes, "/")
+
+			bytes_written = strtonum(bytes[1])
+
+			offset = strtonum($NF)
+
+			unit_start = offset / unit_size
+			unit_start = int(unit_start)
+			unit_end = (offset + bytes_written - 1) / unit_size
+			unit_end = int(unit_end)
+
+			printf("%ss modified: [%d - %d]\n", unit, unit_start, unit_end)
+
+			next
+		}
+	'
+}
+
+_filter_xfs_io_blocks_modified()
+{
+	BLOCK_SIZE=$(_get_file_block_size $SCRATCH_MNT)
+
+	_filter_xfs_io_units_modified "Block" $BLOCK_SIZE
+}
+
+_filter_xfs_io_pages_modified()
+{
+	PAGE_SIZE=$(_get_page_size)
+
+	_filter_xfs_io_units_modified "Page" $PAGE_SIZE
+}
+
+_filter_xfs_io_numbers()
+{
+        _filter_xfs_io | sed -E 's/[0-9]+/XXXX/g'
+}
+
+_filter_test_dir()
+{
+	# TEST_DEV may be a prefix of TEST_DIR (e.g. /mnt, /mnt/ovl-mnt)
+	# so substitute TEST_DIR first
+	sed -e "s,\B$TEST_DIR,TEST_DIR,g" \
+	    -e "s,\B$TEST_DEV,TEST_DEV,g"
+}
+
+_filter_scratch()
+{
+	# SCRATCH_DEV may be a prefix of SCRATCH_MNT (e.g. /mnt, /mnt/ovl-mnt)
+	# so substitute SCRATCH_MNT first
+	sed -e "s,\B$SCRATCH_MNT,SCRATCH_MNT,g" \
+	    -e "s,\B$SCRATCH_DEV,SCRATCH_DEV,g" \
+	    -e "/.use_space/d"
+}
+
+_filter_testdir_and_scratch()
+{
+	# filter both $TEST_DIR and $SCRATCH_MNT, but always filter the longer
+	# string first if the other string is a substring of the first one
+	if echo "$TEST_DIR" | grep -q "$SCRATCH_MNT"; then
+		_filter_test_dir | _filter_scratch
+	else
+		_filter_scratch | _filter_test_dir
+	fi
+}
+
+# Turn any device in the scratch pool into SCRATCH_DEV
+_filter_scratch_pool()
+{
+	FILTER_STRINGS=`echo $SCRATCH_DEV_POOL | sed -e 's/\s\+/\\\|/g'`
+	sed -e "s,$FILTER_STRINGS,SCRATCH_DEV,g"
+}
+
+_filter_spaces()
+{
+	sed -e "s/\s\+/ /g"
+}
+
+_filter_quota()
+{
+	# Long dev name might be split onto its own line; last
+	# seds remove that newline if present
+	_filter_testdir_and_scratch | _filter_spaces | \
+	sed -e 'N;s/SCRATCH_DEV\n/SCRATCH_DEV/g' | \
+	sed -e 'N;s/TEST_DEV\n/TEST_DEV/g'
+}
+
+_filter_project_quota()
+{
+	# Project ID 0 is always present on disk but was not reported
+	# until the GETNEXTQUOTA ioctl came into use.  Filter it out.
+	# But if you specify a name for ID 0, that means you want to
+	# deal with it by yourself, this function won't filter it out.
+	_filter_quota | grep -v "^#0 \|^(null) "
+}
+
+# Account for different "ln" failure messages
+_filter_ln()
+{
+	sed -e "s,\(creating symbolic link .*\) to .*: ,\1: ," \
+	    -e "s,failed to create,creating,"
+}
+
+# If given an arg, filter *that* UUID string
+# Otherwise look for something that looks like a generic UUID
+_filter_uuid()
+{
+	if [ ! -z $1 ]; then
+		UUID=$1
+		sed -e "s/\(uuid[ :=]\+\) $UUID/\1 <EXACTUUID>/i"
+	else
+		sed -e "s/\(uuid[ :=]\+\) [0-9a-f-][0-9a-f-]*/\1 <UUID>/ig"
+	fi
+}
+
+# In mixed group the added disks may have zero used size
+_filter_zero_size()
+{
+	sed -e "s/0\.00/<SIZE>/g"
+}
+
+# Filter out sizes like 6.14MB etc
+_filter_size()
+{
+	sed -e "s/[0-9\.]\+\s\?[b|k|m|g|t][i]\?[b]\?/<SIZE>/ig"
+}
+
+# Convert string read from stdin like 128K to bytes and print it to stdout
+_filter_size_to_bytes()
+{
+	read size
+	suffix=${size:${#size}-1}
+	mul=1
+	case $suffix in
+		k|K) mul=1024 ;;
+		m|M) mul=$((1024*1024)) ;;
+		g|G) mul=$((1024*1024*1024)) ;;
+		t|T) mul=$((1024*1024*1024*1024)) ;;
+	esac
+	echo $((${size:0:${#size}-1}*$mul))
+}
+
+# Print trimmed bytes of fstrim
+# Starting from util-linux v2.23 fstrim usees human readable sizes in
+# verbose output
+_filter_fstrim()
+{
+	grep -Eo "[0-9]+ bytes" | $AWK_PROG '{print $1}'
+}
+
+# Remove the ending dot appended to mount error message, util-linux 2.30
+# starts to do so.
+_filter_ending_dot()
+{
+	sed -e "s/\.$//"
+}
+
+# Older mount output referred to "block device" when mounting RO devices. It's
+# gone in newer versions. v2.30 changed the output again. This filter is to
+# unify all read-only mount messages across all util-linux versions.
+#
+# for a successful ro mount:
+# ancient:	   mount: block device <device> is write-protected, mounting read-only
+# prior to v2.30:  mount: <device> is write-protected, mounting read-only
+# v2.30 and later: mount: <mountpoint>: WARNING: device write-protected, mounted read-only.
+#
+# a failed ro mount:
+# ancient (two-line message):
+# mount: block device <device> is write-protected, mounting read-only
+# mount: cannot mount block device <device> read-only
+# prior to v2.30 (two-line message):
+# mount: <device> is write-protected, mounting read-only
+# mount: cannot mount <device> read-only
+# v2.30 and later (single-line message):
+# mount: <mountpoint>: cannot mount <device> read-only.
+#
+# a failed rw remount:
+# ancient:	   mount: cannot remount block device <device> read-write, is write-protected
+# prior to v2.30:  mount: cannot remount <device> read-write, is write-protected
+# v2.30 and later: mount: <mountpoint>: cannot remount <device> read-write, is write-protected.
+# v2.38 and later:
+# dmesg(1) may have more information after failed mount mount system call
+#
+# Now use _filter_ro_mount to unify all these differences across old & new
+# util-linux versions. So the filtered format would be:
+#
+# successful ro mount:
+# mount: device write-protected, mounting read-only
+#
+# failed ro mount:
+# mount: device write-protected, mounting read-only
+# mount: cannot mount device read-only
+#
+# failed rw remount:
+# mount: cannot remount device read-write, is write-protected
+_filter_ro_mount() {
+	perl -ne '
+	if (/write-protected, mount.*read-only/) {
+		# filter successful ro mount, and first line of prior to v2.30
+		# format failed ro mount
+		print "mount: device write-protected, mounting read-only\n";
+	} elsif (/mount: .*: cannot mount.*read-only/) {
+		# filter v2.30 format failed ro mount, convert single-line
+		# message to two-line message
+		print "mount: device write-protected, mounting read-only\n";
+		print "mount: cannot mount device read-only\n";
+	} elsif (/^mount: cannot mount .* read-only$/) {
+		# filter prior to v2.30 format failed ro mount
+		print "mount: cannot mount device read-only\n";
+	} elsif (/mount:.* cannot remount .* read-write.*/) {
+		# filter failed rw remount
+		print "mount: cannot remount device read-write, is write-protected\n";
+	} else {
+		print "$_";
+	}' | grep -v "dmesg(1) may have more information after failed mount" | \
+	_filter_ending_dot
+}
+
+# Filter a failed mount output due to EUCLEAN and USTALE, util-linux changed
+# the message several times.
+#
+# prior to v2.21:
+# mount: Structure needs cleaning
+# v2.21 to v2.29:
+# mount: mount <device> on <mountpoint> failed: Structure needs cleaning
+# v2.30 and later:
+# mount: <mountpoint>: mount(2) system call failed: Structure needs cleaning.
+# v2.38 and later:
+# dmesg(1) may have more information after failed mount mount system call
+#
+# Kernels post 6.x may have CONFIG_BLK_DEV_WRITE_MOUNTED=y which prevents mount
+# from opening the block device on a mounted filesytsem:
+# mount: <dev>: Can't open blockdev
+#
+# This is also true for ESTALE error. So let's remove all the changing parts
+# and keep the 'prior to v2.21' format:
+# mount: Structure needs cleaning
+# mount: Stale file handle
+_filter_error_mount()
+{
+	grep -v "dmesg(1) may have more information after failed mount" | \
+		sed -e "s/mount:\(.*failed:\)/mount:/" \
+		    -e "s/mount: SCRATCH_DEV: Can't open blockdev/mount: TEST_DIR\/extra_mnt: SCRATCH_DEV already mounted or mount point busy/" |\
+		    _filter_ending_dot
+}
+
+# Similar to _filter_error_mount, filter a busy mount output.
+# Turn both old (prior to util-linux v2.30) and new (v2.30 and later) format to
+# a simple one. e.g.
+# old: mount: <device> is already mounted or <mountpoint> busy
+# new: mount: <mountpoint>: <device> already mounted or mount point busy.
+# filtered: mount: device already mounted or mount point busy
+# v2.38 and later, filter out:
+# dmesg(1) may have more information after failed mount mount system call
+_filter_busy_mount()
+{
+	grep -v "dmesg(1) may have more information after failed mount" | \
+	sed -e "s/.*: .* already mounted or .* busy/mount: device already mounted or mount point busy/" | \
+		_filter_ending_dot
+}
+
+_filter_od()
+{
+	BLOCK_SIZE=$(_get_file_block_size $SCRATCH_MNT)
+	$AWK_PROG -v block_size=$BLOCK_SIZE '
+		/^[0-9]+/ {
+			offset = strtonum("0"$1);
+			$1 = sprintf("%o", offset / block_size);
+			print $0;
+		}
+		/\*/
+	'
+}
+
+# Remove quotes from failed mknod calls. Starting with Coreutils v8.25,
+# mknod errors print unquoted filenames
+_filter_mknod()
+{
+	sed -e "s/mknod: [\`']\(.*\)': File exists/mknod: \1: File exists/"
+}
+
+# Remove leading "rename" in "mv -v" output
+_filter_mv()
+{
+	sed -e "s/^renamed //"
+}
+
+# New stat(1) uses statx(2)
+_filter_stat()
+{
+	sed -e "s/\<cannot stat\>/cannot statx/"
+}
+
+# touch v9.0+ modified part of the message printed on error.  Filter the
+# generic part out, but preserve the strerror() part, which is
+# actually useful for debugging and usually stable.
+_filter_touch()
+{
+	sed -e "s/.* '\(.*\)':\(.*\)/touch: '\1':\2/"
+}
+
+_filter_lostfound()
+{
+	sed -e '/^lost+found$/d'
+}
+
+_filter_ovl_dirs()
+{
+	sed -e "s,$OVL_LOWER,OVL_LOWER,g" \
+	    -e "s,$OVL_UPPER,OVL_UPPER,g" \
+	    -e "s,$OVL_WORK,OVL_WORK,g"
+}
+
+# interpret filefrag output,
+# eg. "physical 1234, length 10, logical 5678" -> "1234#10#5678"
+_filter_filefrag()
+{
+	perl -ne '
+	if (/blocks? of (\d+) bytes/) {
+		$blocksize = $1;
+		next
+	}
+	($ext, $logical, $physical, $length) =
+		(/^\s*(\d+):\s+(\d+)..\s+\d+:\s+(\d+)..\s+\d+:\s+(\d+):/)
+	or next;
+	($flags) = /.*:\s*(\S*)$/;
+	print $physical * $blocksize, "#",
+	      $length * $blocksize, "#",
+	      $logical * $blocksize, "#",
+	      $flags, "\n"'
+}
+
+# Clean up the extents list output of 'xfs_io -c fiemap', e.g.
+#
+#	file:
+#		0: [0..79]: 628365312..628365391
+#		1: [80..159]: hole
+#		2: [160..319]: 628365472..628365631
+# =>
+#	0  79   628365312  628365391
+#	160  319   628365472  628365631
+#
+# The fields are:
+#
+#	first_logical_block last_logical_block first_physical_block last_physical_block
+#
+# Blocks are 512 bytes, and holes are omitted.
+#
+_filter_xfs_io_fiemap()
+{
+	 grep -E '^[[:space:]]+[0-9]+:' \
+		 | grep -v '\<hole\>' \
+		 | sed -E 's/^[[:space:]]+[0-9]+://' \
+		 | tr '][.:' ' '
+}
+
+# We generate WARNINGs on purpose when applications mix buffered/mmap IO with
+# direct IO on the same file. This is a helper for _check_dmesg() to filter out
+# such warnings.
+_filter_aiodio_dmesg()
+{
+	local warn1="WARNING:.*fs/xfs/xfs_file\.c:.*xfs_file_dio_aio_write.*"
+	local warn2="WARNING:.*fs/xfs/xfs_file\.c:.*xfs_file_dio_aio_read.*"
+	local warn3="WARNING:.*fs/xfs/xfs_file\.c:.*xfs_file_read_iter.*"
+	local warn4="WARNING:.*fs/xfs/xfs_file\.c:.*xfs_file_aio_read.*"
+	local warn5="WARNING:.*fs/iomap\.c:.*iomap_dio_rw.*"
+	local warn6="WARNING:.*fs/xfs/xfs_aops\.c:.*__xfs_get_blocks.*"
+	local warn7="WARNING:.*fs/iomap\.c:.*iomap_dio_actor.*"
+	local warn8="WARNING:.*fs/iomap\.c:.*iomap_dio_complete.*"
+	local warn9="WARNING:.*fs/direct-io\.c:.*dio_complete.*"
+	local warn10="WARNING:.*fs/iomap/direct-io\.c:.*iomap_dio_actor.*"
+	sed -e "s#$warn1#Intentional warnings in xfs_file_dio_aio_write#" \
+	    -e "s#$warn2#Intentional warnings in xfs_file_dio_aio_read#" \
+	    -e "s#$warn3#Intentional warnings in xfs_file_read_iter#" \
+	    -e "s#$warn4#Intentional warnings in xfs_file_aio_read#" \
+	    -e "s#$warn5#Intentional warnings in iomap_dio_rw#" \
+	    -e "s#$warn6#Intentional warnings in __xfs_get_blocks#" \
+	    -e "s#$warn7#Intentional warnings in iomap_dio_actor#" \
+	    -e "s#$warn8#Intentional warnings in iomap_dio_complete#" \
+	    -e "s#$warn9#Intentional warnings in dio_complete#" \
+	    -e "s#$warn10#Intentional warnings in iomap_dio_actor#"
+}
+
+# We generate assert related WARNINGs on purpose and make sure test doesn't fail
+# because of these warnings. This is a helper for _check_dmesg() to filter out
+# them.
+_filter_assert_dmesg()
+{
+	local warn1="WARNING:.*fs/xfs/xfs_message\.c:.*asswarn.*"
+	local warn2="WARNING:.*fs/xfs/xfs_message\.c:.*assfail.*"
+	sed -e "s#$warn1#Intentional warnings in asswarn#" \
+	    -e "s#$warn2#Intentional warnings in assfail#"
+}
+
+# With version 2.41 of libcap, the output format of getcap changed.
+# More specifically such change was added by the following commit:
+#
+# commit 177cd418031b1acfcf73fe3b1af9f3279828681c
+# Author: Andrew G. Morgan <morgan@kernel.org>
+# Date:   Tue Jul 21 22:58:05 2020 -0700
+#
+#     A more compact form for the text representation of capabilities.
+#
+#     While this does not change anything about the supported range of
+#     equivalent text specifications for capabilities, as accepted by
+#     cap_from_text(), this does alter the preferred output format of
+#     cap_to_text() to be two characters shorter in most cases. That is,
+#     what used to be summarized as:
+#
+#        "= cap_foo+..."
+#
+#     is now converted to the equivalent text:
+#
+#        "cap_foo=..."
+#
+#     which is also more intuitive.
+#
+_filter_getcap()
+{
+        sed -e "s/= //" -e "s/\+/=/g"
+}
+
+# Filter user/group/project id numbers out of quota reports, and standardize
+# the block counts to use filesystem block size.  Callers must set the id and
+# bsize variables before calling this function.  The HIDDEN_QUOTA_FILES variable
+# (by default zero) is the number of root files to filter out of the inode
+# count part of the quota report.
+_filter_quota_report()
+{
+	test -n "$id" || echo "id must be set"
+	test -n "$bsize" || echo "block size must be set"
+	test -n "$HIDDEN_QUOTA_FILES" || HIDDEN_QUOTA_FILES=0
+
+	tr -s '[:space:]' | \
+	perl -npe '
+		s/^\#'$id' /[NAME] /g;
+		s/^\#0 \d+ /[ROOT] 0 /g;
+		s/6 days/7 days/g' |
+	perl -npe '
+		$val = '"$HIDDEN_QUOTA_FILES"';
+		if ($ENV{'LARGE_SCRATCH_DEV'}) {
+			$val = $ENV{'NUM_SPACE_FILES'};
+		}
+		s/(^\[ROOT\] \S+ \S+ \S+ \S+ \[--------\] )(\S+)/$1@{[$2 - $val]}/g' |
+	sed -e 's/ 65535 \[--------\]/ 00 \[--------\]/g' |
+	perl -npe '
+		s|^(.*?) (\d+) (\d+) (\d+)|$1 @{[$2 * 1024 /'$bsize']} @{[$3 * 1024 /'$bsize']} @{[$4 * 1024 /'$bsize']}|'
+}
+
+#
+# Bash 5.1+ adds "line 1: " when reporting an error when running a
+# command via the -c option.  For example, "bash -c 'echo foo > /'"
+# will result in the error "bash: line 1: /: Is a directory" when
+# earlier versions of bash would omit the "line 1: " annotation.
+#
+_filter_bash()
+{
+	sed -e "s/^bash: line 1: /bash: /"
+}
+
+_filter_trailing_whitespace()
+{
+	sed -E -e "s/\s+$//"
+}
+
+# Catch -any- EIO error regardless of it's source and replace it with the
+# supplied error message.
+_filter_flakey_EIO()
+{
+	local message="$*"
+
+	sed -e "s#.*: Input\/output error#$message#"
+}
+
+# Filters
+#      +./common/rc: line 5085: echo: write error: Invalid argument
+# to
+# 	Invalid argument
+_filter_sysfs_error()
+{
+	sed 's/.*: \(.*\)$/\1/'
+}
+
+# General filter of file attribute characters, do not call directly
+__filter_file_attributes()
+{
+	local filter="$1"
+	shift
+
+	if [[ $1 == ~* ]]; then
+		regex=$(echo "[${filter}]" | tr -d "$1")
+	else
+		regex="[$1]"
+	fi
+	awk "{ printf \"%s \", gensub(\"$regex\", \"-\", \"g\", \$1) } {print \$2}"
+}
+
+# Filter src/file_attr.c file attribute characters, which for now match the
+# xfs_io lsattr file attribute characters.
+#
+# WARNING: Be careful, this does not filter ext4 lsattr characters!
+#
+# To filter X:
+# 	... | _filter_vfs_file_attributes X
+# To filter X and Y:
+# 	... | _filter_vfs_file_attributes XY
+# Or to filter all except X
+# 	... | _filter_vfs_file_attributes ~X
+# Or to filter all except X and Y
+# 	... | _filter_vfs_file_attributes ~XY
+_filter_vfs_file_attributes()
+{
+	__filter_file_attributes aACdeEfinpPrsStxX "$@"
+}
+
+# make sure this script returns success
+/bin/true
