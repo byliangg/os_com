@@ -1,10 +1,10 @@
 # Asterinas EXT4 Environment（Current, stage4）
 
-更新时间：2026-04-07 19:45（Asia/Shanghai）
+更新时间：2026-04-07 20:30（Asia/Shanghai）
 
 ## 1. 当前状态
 
-1. 分支：`stage4`
+1. 分支：`stage-1234-sumup`（基于 `stage4` 阶段成果）
 2. 测试执行位置：Docker 容器内（宿主机只负责启动）
 3. 结果口径：
    - `phase4_good`：`pass=6 fail=0 notrun=14 static_blocked=20 denominator=6`
@@ -42,8 +42,17 @@ PHASE4_DOCKER_MODE=phase3_only ENABLE_KVM=1 XFSTESTS_CASE_TIMEOUT_SEC=900 KLOG_L
 PHASE4_DOCKER_MODE=lmbench_only ENABLE_KVM=1 KLOG_LEVEL=error ./tools/ext4/run_phase4_in_docker.sh
 ```
 
+若 `phase3_only` 触发 QEMU `hostfwd` 端口冲突，可固定端口后重跑：
+
+```bash
+PHASE4_DOCKER_MODE=phase3_only ENABLE_KVM=1 XFSTESTS_CASE_TIMEOUT_SEC=900 KLOG_LEVEL=error \
+SSH_PORT=42222 NGINX_PORT=48080 REDIS_PORT=46379 IPERF_PORT=45201 \
+LMBENCH_TCP_LAT_PORT=41234 LMBENCH_TCP_BW_PORT=41236 MEMCACHED_PORT=41121 \
+./tools/ext4/run_phase4_in_docker.sh
+```
+
 ## 5. 关键日志路径
 
-1. `benchmark/logs/phase4_good_20260407_112525.log`
-2. `benchmark/logs/phase3_base_guard_20260407_113342.log`
-3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_114043.tsv`
+1. `benchmark/logs/phase4_good_20260407_120958.log`
+2. `benchmark/logs/phase3_base_guard_20260407_122320.log`
+3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_121811.tsv`

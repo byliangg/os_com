@@ -18,7 +18,7 @@
 ## 2. 仓库状态说明
 
 - `ext4_rs` 已内嵌到 Asterinas 工作区：
-  - `third_party/ext4_rs`
+  - `kernel/libs/ext4_rs`
 - 不再依赖外部同级目录 `../ext4_rs`。
 
 ## 3. 前置条件

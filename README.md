@@ -17,6 +17,7 @@
 1. 已完成一组可运行的 EXT4 核心功能链路，覆盖基础文件读写与目录操作相关场景。
 2. 已修复历史关键问题：针对 legacy block map 路径的兼容处理（含 direct/single/double/triple 逻辑分支），解决了此前 `generic/013`、`generic/084` 等场景中的目录查找异常。
 3. 已形成稳定的阶段测试入口脚本与日志归档流程。
+4. 已完成 `ext4_rs` 工程目录迁移：`third_party/ext4_rs -> kernel/libs/ext4_rs`，并保持 workspace 依赖方式不变。
 
 ### 2.2 测试状态（最新一轮）
 
@@ -30,9 +31,9 @@
 
 最新日志见：
 
-1. `benchmark/logs/phase4_good_20260407_112525.log`
-2. `benchmark/logs/phase3_base_guard_20260407_114626.log`
-3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_114043.tsv`
+1. `benchmark/logs/phase4_good_20260407_120958.log`
+2. `benchmark/logs/phase3_base_guard_20260407_122320.log`
+3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_121811.tsv`
 
 ## 3. 测试体系说明
 

@@ -1,6 +1,6 @@
 # Asterinas EXT4 Benchmark/Test 汇总（stage4）
 
-更新时间：2026-04-07 19:45（Asia/Shanghai）
+更新时间：2026-04-07 20:30（Asia/Shanghai）
 
 ## 1. 目录调整（已独立到仓库内）
 
@@ -51,16 +51,28 @@ KLOG_LEVEL=error \
 ./tools/ext4/run_phase4_in_docker.sh
 ```
 
+说明：若 `phase3` 遇到 QEMU `hostfwd` 端口冲突，可固定端口后重跑，例如：
+
+```bash
+PHASE4_DOCKER_MODE=phase3_only \
+ENABLE_KVM=1 \
+XFSTESTS_CASE_TIMEOUT_SEC=900 \
+KLOG_LEVEL=error \
+SSH_PORT=42222 NGINX_PORT=48080 REDIS_PORT=46379 IPERF_PORT=45201 \
+LMBENCH_TCP_LAT_PORT=41234 LMBENCH_TCP_BW_PORT=41236 MEMCACHED_PORT=41121 \
+./tools/ext4/run_phase4_in_docker.sh
+```
+
 ## 4. 可复核数据位置
 
 1. 原始日志：
-   - `benchmark/logs/phase4_good_20260407_112525.log`
-   - `benchmark/logs/phase3_base_guard_20260407_113342.log`
-   - `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_114043.tsv`
+   - `benchmark/logs/phase4_good_20260407_120958.log`
+   - `benchmark/logs/phase3_base_guard_20260407_122320.log`
+   - `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_121811.tsv`
 2. 仓库内副本：
-   - `benchmark/datasets/results/phase4_good_20260407_112525.log`
-   - `benchmark/datasets/results/phase3_base_guard_20260407_113342.log`
-   - `benchmark/datasets/results/phase4_part3_lmbench_summary_20260407_114043.tsv`
+   - `benchmark/datasets/results/phase4_good_20260407_120958.log`
+   - `benchmark/datasets/results/phase3_base_guard_20260407_122320.log`
+   - `benchmark/datasets/results/phase4_part3_lmbench_summary_20260407_121811.tsv`
 3. 用例定义与样例：
    - `benchmark/datasets/xfstests/lists/*.list`
    - `benchmark/datasets/xfstests/blocked/*.tsv`
