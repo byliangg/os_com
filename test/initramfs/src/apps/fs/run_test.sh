@@ -4,6 +4,18 @@
 
 set -e
 
+require_mount_type() {
+    local mount_point="$1"
+    local expected_fs="$2"
+
+    if ! awk -v m="${mount_point}" -v f="${expected_fs}" '$2 == m && $3 == f { found = 1 } END { exit(found ? 0 : 1) }' /proc/mounts; then
+        echo "Error: Required mount ${mount_point} with type ${expected_fs} is missing."
+        echo "Current /proc/mounts entries for ${mount_point}:"
+        awk -v m="${mount_point}" '$2 == m { print }' /proc/mounts || true
+        return 1
+    fi
+}
+
 check_file_size() {
     local file_name="$1"
     local expected_size="$2"
@@ -86,6 +98,8 @@ test_mount_bind_file() {
 }
 
 echo "Start ext2 fs test......"
+require_mount_type "/ext2" "ext2"
+require_mount_type "/exfat" "exfat"
 test_ext2 "/ext2" "test_file.txt"
 ./ext2/mknod
 ./ext2/unix_socket

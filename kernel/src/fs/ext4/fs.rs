@@ -407,8 +407,12 @@ pub(super) struct Ext4Fs {
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
     mount_flags_bits: AtomicU32,
+    crash_journal_enabled: bool,
     crash_journal_lock: Mutex<()>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
+    inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
+    inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
 }
@@ -417,14 +421,19 @@ impl Ext4Fs {
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<Self> {
         let adapter = Arc::new(KernelBlockDeviceAdapter::new(block_device.clone()));
         let ext4 = Ext4::open(adapter.clone());
+        let crash_journal_enabled = Self::is_crash_journal_enabled();
 
         let fs = Arc::new_cyclic(|weak_ref| Self {
             inner: Mutex::new(ext4),
             block_device,
             adapter,
             mount_flags_bits: AtomicU32::new(PerMountFlags::default().bits()),
+            crash_journal_enabled,
             crash_journal_lock: Mutex::new(()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
+            inode_atime_cache: Mutex::new(BTreeMap::new()),
+            inode_ctime_cache: Mutex::new(BTreeMap::new()),
+            inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
         });
@@ -466,6 +475,46 @@ impl Ext4Fs {
         self.run_ext4(|ext4| ext4.ext4_set_inode_times(ino, atime, mtime, ctime).map(|_| ()))
     }
 
+    pub(super) fn set_inode_mode(&self, ino: u32, mode: u16) -> Result<()> {
+        self.run_ext4(|ext4| ext4.ext4_set_inode_mode(ino, mode).map(|_| ()))?;
+        self.touch_ctime(ino)
+    }
+
+    pub(super) fn set_inode_uid(&self, ino: u32, uid: u32) -> Result<()> {
+        let uid = u16::try_from(uid)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "uid exceeds ext4 uid width"))?;
+        self.run_ext4(|ext4| ext4.ext4_set_inode_uid(ino, uid).map(|_| ()))?;
+        self.touch_ctime(ino)
+    }
+
+    pub(super) fn set_inode_gid(&self, ino: u32, gid: u32) -> Result<()> {
+        let gid = u16::try_from(gid)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "gid exceeds ext4 gid width"))?;
+        self.run_ext4(|ext4| ext4.ext4_set_inode_gid(ino, gid).map(|_| ()))?;
+        self.touch_ctime(ino)
+    }
+
+    pub(super) fn set_inode_rdev(&self, ino: u32, rdev: u64) -> Result<()> {
+        let rdev = u32::try_from(rdev)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "rdev exceeds ext4 rdev width"))?;
+        self.run_ext4(|ext4| ext4.ext4_set_inode_rdev(ino, rdev).map(|_| ()))?;
+        self.touch_ctime(ino)
+    }
+
+    pub(super) fn mknod_at(
+        &self,
+        parent: u32,
+        name: &str,
+        mode: u16,
+        rdev: Option<u64>,
+    ) -> Result<u32> {
+        let ino = self.create_at(parent, name, mode)?;
+        if let Some(rdev) = rdev {
+            self.set_inode_rdev(ino, rdev)?;
+        }
+        Ok(ino)
+    }
+
     fn mount_flags(&self) -> PerMountFlags {
         PerMountFlags::from_bits_truncate(self.mount_flags_bits.load(Ordering::Relaxed))
     }
@@ -499,17 +548,50 @@ impl Ext4Fs {
             return Ok(());
         }
         let now = Self::now_unix_seconds_u32();
-        self.set_inode_times(ino, Some(now), None, None)
+        {
+            let mut cache = self.inode_atime_cache.lock();
+            if cache.get(&ino).copied() == Some(now) {
+                return Ok(());
+            }
+            cache.insert(ino, now);
+        }
+        if let Err(err) = self.set_inode_times(ino, Some(now), None, None) {
+            self.inode_atime_cache.lock().remove(&ino);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn touch_mtime_ctime(&self, ino: u32) -> Result<()> {
         let now = Self::now_unix_seconds_u32();
-        self.set_inode_times(ino, None, Some(now), Some(now))
+        {
+            let mut cache = self.inode_mtime_ctime_cache.lock();
+            if cache.get(&ino).copied() == Some(now) {
+                return Ok(());
+            }
+            cache.insert(ino, now);
+        }
+        if let Err(err) = self.set_inode_times(ino, None, Some(now), Some(now)) {
+            self.inode_mtime_ctime_cache.lock().remove(&ino);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn touch_ctime(&self, ino: u32) -> Result<()> {
         let now = Self::now_unix_seconds_u32();
-        self.set_inode_times(ino, None, None, Some(now))
+        {
+            let mut cache = self.inode_ctime_cache.lock();
+            if cache.get(&ino).copied() == Some(now) {
+                return Ok(());
+            }
+            cache.insert(ino, now);
+        }
+        if let Err(err) = self.set_inode_times(ino, None, None, Some(now)) {
+            self.inode_ctime_cache.lock().remove(&ino);
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn touch_birth_times(&self, ino: u32) -> Result<()> {
@@ -721,7 +803,41 @@ impl Ext4Fs {
         }
     }
 
+    fn is_crash_journal_enabled() -> bool {
+        let Some(kcmd) = KCMDLINE.get() else {
+            return false;
+        };
+        let Some(args) = kcmd.get_module_args("ext4fs") else {
+            return false;
+        };
+
+        for arg in args {
+            match arg {
+                ModuleArg::Arg(key) => {
+                    let key = key.as_c_str().to_bytes();
+                    if key == b"replay_hold" || key == b"crash_journal" {
+                        return true;
+                    }
+                }
+                ModuleArg::KeyVal(key, value) => {
+                    let key = key.as_c_str().to_bytes();
+                    let value = value.as_c_str().to_bytes();
+                    if (key == b"replay_hold" || key == b"crash_journal")
+                        && (value == b"1" || value == b"true" || value == b"yes")
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn run_journaled<T>(&self, op: Option<CrashJournalOp>, apply: impl FnOnce() -> Result<T>) -> Result<T> {
+        if !self.crash_journal_enabled {
+            return apply();
+        }
         let Some(op) = op else {
             return apply();
         };
@@ -979,10 +1095,34 @@ impl Ext4Fs {
         caches.remove(&ino);
     }
 
+    fn clear_inode_touch_cache(&self, ino: u32) {
+        self.inode_atime_cache.lock().remove(&ino);
+        self.inode_ctime_cache.lock().remove(&ino);
+        self.inode_mtime_ctime_cache.lock().remove(&ino);
+    }
+
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
-        // Keep lookup strongly consistent under concurrent create/unlink/rename workloads.
-        // Directory-entry cache is currently conservative-disabled for correctness.
-        self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))
+        match self.lookup_cache(parent, name) {
+            DirLookupCacheResult::Hit(ino) => return Ok(ino),
+            DirLookupCacheResult::Miss => {
+                return_errno_with_message!(Errno::ENOENT, "entry not found in directory cache");
+            }
+            DirLookupCacheResult::Unknown => {}
+        }
+
+        if self.load_dir_cache_if_needed(parent).is_ok() {
+            match self.lookup_cache(parent, name) {
+                DirLookupCacheResult::Hit(ino) => return Ok(ino),
+                DirLookupCacheResult::Miss => {
+                    return_errno_with_message!(Errno::ENOENT, "entry not found in directory cache");
+                }
+                DirLookupCacheResult::Unknown => {}
+            }
+        }
+
+        let ino = self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))?;
+        self.cache_insert_entry(parent, name, ino);
+        Ok(ino)
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
@@ -1034,6 +1174,7 @@ impl Ext4Fs {
         };
         self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_unlink_at(parent, name)))?;
         self.cache_remove_entry(parent, name);
+        self.clear_inode_touch_cache(target_ino);
         self.touch_mtime_ctime(parent)?;
         Ok(())
     }
@@ -1060,6 +1201,7 @@ impl Ext4Fs {
         self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_rmdir_at(parent, name)))?;
         self.cache_remove_entry(parent, name);
         self.cache_remove_dir(child_ino);
+        self.clear_inode_touch_cache(child_ino);
         self.touch_mtime_ctime(parent)?;
         Ok(())
     }
@@ -1101,6 +1243,7 @@ impl Ext4Fs {
             if ino != old_ino {
                 self.cache_remove_entry(new_parent, new_name);
                 self.cache_insert_entry(new_parent, new_name, old_ino);
+                self.clear_inode_touch_cache(ino);
             }
         }
 

@@ -9,7 +9,7 @@ use ostd::{
     task::Task,
 };
 
-use super::{PosixThread, ThreadLocal, thread_table};
+use super::{AsPosixThread, PosixThread, ThreadLocal, thread_table};
 use crate::{
     fs::{file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
@@ -131,7 +131,7 @@ impl PosixThreadBuilder {
         self
     }
 
-    pub fn build(self) -> Arc<Task> {
+    pub fn build(self) -> Result<Arc<Task>> {
         let Self {
             tid,
             user_ctx,
@@ -163,54 +163,56 @@ impl PosixThreadBuilder {
 
         let vmar = process.upgrade().unwrap().lock_vmar().dup_vmar().unwrap();
 
-        Arc::new_cyclic(|weak_task| {
-            let posix_thread = {
-                let prof_clock = ProfClock::new();
-                let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
-                let prof_timer_manager = TimerManager::new(prof_clock.clone());
+        let posix_thread = {
+            let prof_clock = ProfClock::new();
+            let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
+            let prof_timer_manager = TimerManager::new(prof_clock.clone());
 
-                PosixThread {
-                    process,
-                    task: weak_task.clone(),
-                    tid: AtomicU32::new(tid),
-                    name: Mutex::new(thread_name),
-                    credentials,
-                    fs: RwMutex::new(fs.clone()),
-                    file_table: Mutex::new(Some(file_table.clone_ro())),
-                    sig_mask,
-                    sig_queues,
-                    signalled_waker: SpinLock::new(None),
-                    prof_clock,
-                    virtual_timer_manager,
-                    prof_timer_manager,
-                    io_priority: AtomicU32::new(0),
-                    ns_proxy: Mutex::new(Some(ns_proxy.clone())),
-                    timer_slack_ns: AtomicU64::new(default_timer_slack_ns),
-                    default_timer_slack_ns: AtomicU64::new(default_timer_slack_ns),
-                }
-            };
+            PosixThread {
+                process,
+                task: spin::Once::new(),
+                tid: AtomicU32::new(tid),
+                name: Mutex::new(thread_name),
+                credentials,
+                fs: RwMutex::new(fs.clone()),
+                file_table: Mutex::new(Some(file_table.clone_ro())),
+                sig_mask,
+                sig_queues,
+                signalled_waker: SpinLock::new(None),
+                prof_clock,
+                virtual_timer_manager,
+                prof_timer_manager,
+                io_priority: AtomicU32::new(0),
+                ns_proxy: Mutex::new(Some(ns_proxy.clone())),
+                timer_slack_ns: AtomicU64::new(default_timer_slack_ns),
+                default_timer_slack_ns: AtomicU64::new(default_timer_slack_ns),
+            }
+        };
 
-            let cpu_affinity = CpuSet::new_full();
-            let thread = Arc::new(Thread::new(
-                weak_task.clone(),
-                posix_thread,
-                cpu_affinity,
-                sched_policy,
-            ));
+        let cpu_affinity = CpuSet::new_full();
+        let thread = Arc::new(Thread::new(posix_thread, cpu_affinity, sched_policy));
 
-            let thread_local = ThreadLocal::new(
-                set_child_tid,
-                clear_child_tid,
-                vmar,
-                file_table,
-                fs,
-                fpu_context,
-                user_ns,
-                ns_proxy,
-            );
+        let thread_local = ThreadLocal::new(
+            set_child_tid,
+            clear_child_tid,
+            vmar,
+            file_table,
+            fs,
+            fpu_context,
+            user_ns,
+            ns_proxy,
+        );
 
-            thread_table::add_thread(tid, thread.clone());
-            task::create_new_user_task(user_ctx, thread, thread_local, is_init_process)
-        })
+        let task = Arc::new(task::create_new_user_task(
+            user_ctx,
+            thread.clone(),
+            thread_local,
+            is_init_process,
+        )?);
+        thread.bind_task(&task);
+        thread.as_posix_thread().unwrap().bind_task(&task);
+        thread_table::add_thread(tid, thread);
+
+        Ok(task)
     }
 }

@@ -12,6 +12,22 @@ BENCHMARK_NAME=$1
 SYSTEM="${2:-asterinas}"
 echo "Running benchmark: ${BENCHMARK_NAME} on ${SYSTEM}"
 
+is_ext4_benchmark() {
+    case "${BENCHMARK_NAME}" in
+        */ext4_*|ext4_*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+is_mountpoint_present() {
+    local mp="$1"
+    awk -v p="${mp}" '$2==p { found=1; exit 0 } END { exit(found ? 0 : 1) }' /proc/mounts
+}
+
 print_help() {
     echo "Usage: $0 <benchmark_name> <system_type>"
     echo "  benchmark_name: The name of the benchmark to run."
@@ -48,11 +64,22 @@ prepare_system() {
         ip link set lo up
         ip link set eth0 up
         ifconfig eth0 10.0.2.15
-        # Mount ext2
-        mount -t ext2 /dev/vda /ext2
+        mkdir -p /ext2 /ext4
+        if is_ext4_benchmark; then
+            mount -t ext4 /dev/vda /ext4
+            echo "Mounted ext4 benchmark fs on /dev/vda -> /ext4"
+        else
+            mount -t ext2 /dev/vda /ext2
+            echo "Mounted ext2 benchmark fs on /dev/vda -> /ext2"
+        fi
     elif [ "$SYSTEM" = "asterinas" ]; then
-        # Asterinas-specific preparation (if any)
-        :
+        if is_ext4_benchmark; then
+            mkdir -p /ext4
+            if ! is_mountpoint_present /ext4; then
+                mount -t ext4 /dev/vda /ext4
+            fi
+            echo "Mounted ext4 benchmark fs on /dev/vda -> /ext4"
+        fi
     else
         echo "Error: Unknown system type. Please set SYSTEM to 'linux' or 'asterinas'."
         exit 1

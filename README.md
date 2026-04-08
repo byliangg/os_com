@@ -1,4 +1,4 @@
-# Asterinas EXT4 赛题版本（Stage4）
+# Asterinas EXT4 赛题版本（Stage6）
 
 ## 1. 项目概述
 
@@ -8,7 +8,7 @@
 2. 通过 xfstests 与 lmbench 建立可重复、可追踪的功能与性能验证流程。
 3. 将测试输入、输出、运行资产统一收敛到仓库内，降低环境漂移风险，支持跨环境直接复现。
 
-本版本重点覆盖 `stage4` 阶段工作，测试默认在 Docker 环境中执行。
+本版本重点覆盖 `stage6` 阶段工作，测试默认在 Docker 环境中执行。
 
 ## 2. 当前完成情况
 
@@ -21,19 +21,36 @@
 
 ### 2.2 测试状态（最新一轮）
 
-1. `phase4_good`（基于 `phase4_good.list` 共 40 个候选）：
-   `PASS=6`，`FAIL=0`，`NOTRUN=14`，`STATIC_BLOCKED=20`，脚本口径 `pass_rate=100%`。
-   当前通过样例：`generic/001, 006, 013, 028, 035, 084`。
-2. `phase3_base`（基于 `phase3_base.list` 共 40 个候选）：
-   `PASS=4`，`FAIL=0`，`NOTRUN=14`，`STATIC_BLOCKED=22`，脚本口径 `pass_rate=100%`。
-   当前通过样例：`generic/006, 013, 028, 084`。
-3. `lmbench`：`8/8` 通过，覆盖 VFS 延迟与小文件/拷贝吞吐测试。
+1. `phase3_only`：PASS  
+   `pass=10 fail=0 notrun=6 static_blocked=24 denominator=10 pass_rate=100.00%`
+2. `phase4_good`：PASS  
+   `pass=12 fail=0 notrun=6 static_blocked=22 denominator=12 pass_rate=100.00%`
+3. `phase6_only`：PASS  
+   `pass=25 fail=0 notrun=0 static_blocked=26 denominator=25 pass_rate=100.00%`
+4. `lmbench_only`：PASS（8/8）
+5. `crash_only`：PASS（`3 场景 x 3 轮 = 9/9`）
+6. `phase6_perf_compare`：FAIL（Linux EXT4 对照性能，`8项 x 3轮`）  
+   `overall_avg_ratio=0.166079`（目标阈值 `0.80`）
 
 最新日志见：
 
-1. `benchmark/logs/phase4_good_20260407_120958.log`
-2. `benchmark/logs/phase3_base_guard_20260407_122320.log`
-3. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260407_121811.tsv`
+1. `benchmark/logs/phase3_base_guard_20260408_071539.log`
+2. `benchmark/logs/phase4_good_20260408_072542.log`
+3. `benchmark/logs/phase6_good_20260408_094026.log`
+4. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260408_073643.tsv`
+5. `benchmark/logs/crash/phase4_part3_crash_summary_20260408_114539.tsv`
+6. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_report.txt`
+7. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_aggregate.tsv`
+
+### 2.3 与“良好”指标的差异
+
+按当前赛题“良好”口径，核心差异如下：
+
+1. `xfstests` 阶段集通过率（`>=90%`）：已满足（`phase6_only` 为 `25/25`，`pass_rate=100%`）。
+2. 基础崩溃恢复证据链：已满足（固定 3 场景、每场景 3 轮、日志可复现）。
+3. Linux EXT4 对照性能（目标 `>=80%`）：未满足，当前 `overall_avg_ratio=0.166079`。
+
+结论：当前“良好”指标只差性能对照这一项。
 
 ## 3. 测试体系说明
 
@@ -42,7 +59,10 @@
 当前主要使用以下模式：
 
 1. `phase4_good`
-2. `phase3_base`
+2. `phase3_only`
+3. `phase6_only`
+4. `lmbench_only`
+5. `crash_only`
 
 对应用例集合与静态排除列表在：
 
@@ -60,10 +80,10 @@
 
 ### 3.3 当前样例覆盖范围（概览）
 
-1. 已稳定通过的 xfstests 样例主要覆盖：基础文件创建/读写/截断、目录查找与路径遍历等核心链路（如 `generic/001/006/013/028/035/084`）。
-2. 当前 `NOTRUN` 样例主要受能力或工具依赖限制：例如 hardlink、`shutdown/freezing`、`attr` 工具缺失、`O_DIRECT`、scratch 设备容量限制。
-3. `STATIC_BLOCKED` 样例主要是阶段性未纳入范围的语义：如 hardlink/symlink、`O_TMPFILE/flink`、`renameat2`、`fallocate/collapse-range/fiemap`、xattr/chacl 等。
-4. lmbench 当前覆盖 8 项：`open/stat/fstat/read/write` 延迟、`create+delete(0k/10k)`、`copy_files_bw`。
+1. 当前 `phase6` 候选池为 `51`，静态排除 `26`，理论可运行集合 `25`。
+2. 当前门禁运行集合 `25/25` 均通过（`phase6_only`）。
+3. `STATIC_BLOCKED` 主要是阶段性能力外语义：如 AIO、hardlink/symlink、`O_TMPFILE/flink`、`renameat2`、`fallocate/collapse-range/fiemap`、xattr/chacl 等。
+4. lmbench 覆盖 8 项：`open/stat/fstat/read/write` 延迟、`create+delete(0k/10k)`、`copy_files_bw`。
 
 ## 4. 一键测试（推荐）
 
@@ -91,6 +111,68 @@ PHASE4_DOCKER_MODE=lmbench_only \
 ENABLE_KVM=1 \
 KLOG_LEVEL=error \
 ./tools/ext4/run_phase4_in_docker.sh
+
+# 4) phase6 功能门禁
+PHASE4_DOCKER_MODE=phase6_only \
+ENABLE_KVM=1 \
+KLOG_LEVEL=error \
+./tools/ext4/run_phase4_in_docker.sh
+
+# 5) Linux EXT4 对照性能（8项x3轮）
+PERF_ROUNDS=3 \
+BENCH_ENABLE_KVM=1 \
+PERF_CASE_TIMEOUT_SEC=600 \
+./tools/ext4/run_phase6_perf_compare_in_docker.sh
+
+# 6) 通用回归（非 ext4），用于检查 kernel 改动是否波及其他子系统
+# 说明：
+# - 先重建 ext2/exfat 镜像，避免被 xfstests 流程污染
+# - 该回归建议 ENABLE_KVM=0，规避部分环境下 qemu accel 参数冲突
+./tools/reset_ext2_exfat_images.sh
+
+PROXY_HTTP=http://127.0.0.1:7890
+PROXY_SOCKS=socks5://127.0.0.1:7890
+DOCKER_TAG=$(cat DOCKER_IMAGE_VERSION 2>/dev/null || cat VERSION)
+LOG=benchmark/logs/others_general_$(date +%Y%m%d_%H%M%S).log
+
+docker run --rm --privileged --network=host \
+  -v /dev:/dev \
+  -v "$PWD":/root/asterinas \
+  -w /root/asterinas \
+  -e http_proxy="$PROXY_HTTP" \
+  -e https_proxy="$PROXY_HTTP" \
+  -e all_proxy="$PROXY_SOCKS" \
+  -e HTTP_PROXY="$PROXY_HTTP" \
+  -e HTTPS_PROXY="$PROXY_HTTP" \
+  -e ALL_PROXY="$PROXY_SOCKS" \
+  "asterinas/asterinas:${DOCKER_TAG}" \
+  bash -lc '
+set -euo pipefail
+mkdir -p /root/.cargo/bin
+cat >/root/.cargo/bin/cargo-osdk << "EOS"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ASTERINAS_ROOT:-/root/asterinas}
+BIN="${ROOT}/target_lby/debug/cargo-osdk"
+STAMP="${ROOT}/target_lby/.cargo_osdk_local_dev"
+if [ ! -x "${BIN}" ] || [ ! -f "${STAMP}" ]; then
+  if [ -x "${BIN}" ] && [ ! -f "${STAMP}" ]; then
+    cargo clean --manifest-path "${ROOT}/osdk/Cargo.toml" -p cargo-osdk || true
+  fi
+  OSDK_LOCAL_DEV=1 cargo build --manifest-path "${ROOT}/osdk/Cargo.toml" --bin cargo-osdk
+  mkdir -p "$(dirname "${STAMP}")"
+  touch "${STAMP}"
+fi
+exec "${BIN}" "$@"
+EOS
+chmod +x /root/.cargo/bin/cargo-osdk
+export VDSO_LIBRARY_DIR=/root/asterinas/benchmark/assets/linux_vdso
+export CARGO_TARGET_DIR=/root/asterinas/target_lby
+timeout 5400s make AUTO_TEST=test ENABLE_KVM=0 LOG_LEVEL=error CONSOLE=ttyS0 BOOT_METHOD=qemu-direct OVMF=off RELEASE_LTO=1 run_kernel
+' | tee "$LOG"
+
+echo "通用回归日志：$LOG"
+grep -E "mount: mounting /dev/vda|mount: mounting /dev/vdb|All test in /test/fs passed|All general tests passed" "$LOG" | tail -n 20
 ```
 
 ## 5. 目录与文档索引
@@ -151,11 +233,11 @@ test -f benchmark/assets/linux_vdso/vdso_x86_64.so
 
 ## 8. 当前边界与后续方向
 
-当前结果体现的是 `stage4` 阶段可运行能力与门禁通过状态。后续可继续推进：
+当前结果体现的是 `stage6` 阶段可运行能力与门禁通过状态。后续优先方向：
 
-1. 扩大 xfstests 可运行集合，减少 `NOTRUN/STATIC_BLOCKED`。
-2. 完善更高阶段的功能覆盖（例如更多 POSIX 语义、崩溃一致性、并发场景）。
-3. 进一步沉淀自动化验收规范与提交前自检流程。
+1. 进入性能优化并持续复跑 Linux EXT4 对照性能，目标将 `overall_avg_ratio` 从 `0.166079` 提升到 `>=0.80`。
+2. 在不回退现有通过率的前提下，继续扩大 xfstests 可运行集合，逐步减少 `STATIC_BLOCKED`。
+3. 继续沉淀自动化验收规范与提交前自检流程。
 
 ## 9. 致谢与来源说明
 

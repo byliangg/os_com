@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Average open latency on Linux",
+    "unit": "µs",
+    "value": "0.5083",
+    "extra": "linux_result"
+  },
+  {
+    "name": "Average open latency on Asterinas",
+    "unit": "µs",
+    "value": "568.1053",
+    "extra": "aster_result"
+  }
+]

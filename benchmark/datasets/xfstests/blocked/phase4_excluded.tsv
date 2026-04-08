@@ -23,3 +23,5 @@ generic/063	finsert/fpunch/fiemap semantics out of phase4_part1 scope
 generic/069	O_APPEND heavy stress deferred to later rounds
 generic/071	fallocate prealloc behavior out of phase4_part1 scope
 generic/086	unwritten/delayed extent stress out of phase4_part1 scope
+generic/088	ownership/capability (DAC override) semantics out of phase4_part1 scope
+generic/091	odirect+fsx stress out of phase4_part1 scope

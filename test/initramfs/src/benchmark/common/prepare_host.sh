@@ -40,7 +40,12 @@ prepare_libs() {
 
 # Prepare fs for Linux
 prepare_fs() {
-    # Disable unsupported ext2 features of Asterinas on Linux to ensure fairness
-    mke2fs -F -O ^ext_attr -O ^resize_inode -O ^dir_index ${BENCHMARK_ROOT}/../../build/ext2.img
+    if [[ "${benchmark:-}" == */ext4_* || "${benchmark:-}" == ext4_* ]]; then
+        # Ext4 benchmark: keep Linux side media as ext4.
+        mkfs.ext4 -F "${BENCHMARK_ROOT}/../../build/ext2.img"
+    else
+        # Ext2/non-ext4 benchmark: keep historical ext2 compatibility profile.
+        mke2fs -F -O ^ext_attr -O ^resize_inode -O ^dir_index "${BENCHMARK_ROOT}/../../build/ext2.img"
+    fi
     make initramfs BENCHMARK=${benchmark}
 }

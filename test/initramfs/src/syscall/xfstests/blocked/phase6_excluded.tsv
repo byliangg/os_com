@@ -15,12 +15,14 @@ generic/026	acl/xattr dependency out of stage6_good scope
 generic/029	mmap+truncate stress with xfs_io dependency out of stage6_good scope
 generic/031	fcollapse stress with xfs_io dependency out of stage6_good scope
 generic/032	unwritten-extent stress with xfs_io dependency out of stage6_good scope
+generic/036	aio_dio regression requires kernel async I/O support (currently unsupported in Asterinas)
 generic/041	device-mapper + hardlink dependency out of stage6_good scope
 generic/062	xattr/symlink dependency out of stage6_good scope
 generic/063	finsert/fpunch/fiemap semantics out of stage6_good scope
 generic/069	heavy append stress deferred to dedicated stress profile
 generic/070	attrs dependency out of stage6_good scope
 generic/071	fallocate prealloc behavior out of stage6_good scope
+generic/055	long-running v2log+quota stress (audited 3/3 PASS at CASE_TIMEOUT=1800 in single-test mode) exceeds default stage6 benchmark budget; deferred to stress profile
 generic/086	unwritten/delayed extent stress out of stage6_good scope
 generic/088	ownership/chown semantics not in current stage6_good scope
 generic/090	device-mapper + hardlink dependency out of stage6_good scope

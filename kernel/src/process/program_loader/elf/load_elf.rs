@@ -3,6 +3,7 @@
 //! ELF file parser.
 
 use align_ext::AlignExt;
+use ostd::mm::VmIo;
 
 use super::{
     elf_file::{ElfHeaders, LoadablePhdr},
@@ -18,6 +19,7 @@ use crate::{
     util::random::getrandom,
     vm::{
         perms::VmPerms,
+        vmo::VmoOptions,
         vmar::{VMAR_CAP_ADDR, VMAR_LOWEST_ADDR, Vmar},
     },
 };
@@ -355,10 +357,6 @@ fn map_segment_vmo(
     vmar: &Vmar,
     map_at: Vaddr,
 ) -> Result<()> {
-    let Some(elf_vmo) = elf_file.inode().page_cache() else {
-        return_errno_with_message!(Errno::ENOEXEC, "the executable has no page cache");
-    };
-
     let virt_range = loadable_phdr.virt_range();
     let file_range = loadable_phdr.file_range();
     trace!(
@@ -382,11 +380,36 @@ fn map_segment_vmo(
     let offset = map_at.align_down(PAGE_SIZE);
 
     if segment_size != 0 {
+        let (segment_vmo, segment_vmo_offset) = if let Some(elf_vmo) = elf_file.inode().page_cache() {
+            (elf_vmo, segment_offset)
+        } else {
+            // Fallback for file systems without page-cache backed executable mappings
+            // (e.g., current ext4 implementation): materialize current segment bytes
+            // into an anonymous VMO and map from there.
+            let segment_vmo = VmoOptions::new(segment_size).alloc()?;
+            let file_data_len = file_range.end.saturating_sub(file_range.start);
+            if file_data_len > 0 {
+                let mut file_data = vec![0u8; file_data_len];
+                let read_len = elf_file
+                    .inode()
+                    .read_bytes_at(file_range.start, file_data.as_mut_slice())?;
+                if read_len == 0 {
+                    return_errno_with_message!(
+                        Errno::ENOEXEC,
+                        "failed to read executable segment bytes"
+                    );
+                }
+                let write_offset = file_range.start.saturating_sub(segment_offset);
+                segment_vmo.write_bytes(write_offset, &file_data[..read_len])?;
+            }
+            (segment_vmo, 0)
+        };
+
         let mut vm_map_options = vmar
             .new_map(segment_size, perms)?
-            .vmo(elf_vmo.clone())
+            .vmo(segment_vmo)
             .path(elf_file.clone())
-            .vmo_offset(segment_offset)
+            .vmo_offset(segment_vmo_offset)
             .can_overwrite(true);
         vm_map_options = vm_map_options.offset(offset).handle_page_faults_around();
         let map_addr = vm_map_options.build()?;

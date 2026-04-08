@@ -59,21 +59,14 @@ impl ThreadOptions {
             current_thread!().exit();
         };
 
-        Arc::new_cyclic(|weak_task| {
-            let thread = {
-                let kernel_thread = KernelThread;
-                let cpu_affinity = self.cpu_affinity;
-                let sched_policy = self.sched_policy;
-                Arc::new(Thread::new(
-                    weak_task.clone(),
-                    kernel_thread,
-                    cpu_affinity,
-                    sched_policy,
-                ))
-            };
+        let kernel_thread = KernelThread;
+        let cpu_affinity = self.cpu_affinity;
+        let sched_policy = self.sched_policy;
+        let thread = Arc::new(Thread::new(kernel_thread, cpu_affinity, sched_policy));
 
-            TaskOptions::new(thread_fn).data(thread).build().unwrap()
-        })
+        let task = Arc::new(TaskOptions::new(thread_fn).data(thread.clone()).build().unwrap());
+        thread.bind_task(&task);
+        task
     }
 
     /// Builds a new kernel thread and runs it immediately.

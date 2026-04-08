@@ -9,6 +9,7 @@ use ostd::{
     cpu::{AtomicCpuSet, CpuId, CpuSet},
     task::Task,
 };
+use spin::Once;
 
 use crate::{
     prelude::*,
@@ -68,7 +69,7 @@ pub(super) fn init() {
 pub struct Thread {
     // immutable part
     /// Low-level info
-    task: Weak<Task>,
+    task: Once<Weak<Task>>,
     /// Data: Posix thread info/Kernel thread Info
     data: Box<dyn Send + Sync + Any>,
 
@@ -83,18 +84,21 @@ pub struct Thread {
 impl Thread {
     /// Never call these function directly
     pub fn new(
-        task: Weak<Task>,
         data: impl Send + Sync + Any,
         cpu_affinity: CpuSet,
         sched_policy: SchedPolicy,
     ) -> Self {
         Thread {
-            task,
+            task: Once::new(),
             data: Box::new(data),
             is_exited: AtomicBool::new(false),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
             sched_attr: SchedAttr::new(sched_policy),
         }
+    }
+
+    pub fn bind_task(&self, task: &Arc<Task>) {
+        self.task.call_once(|| Arc::downgrade(task));
     }
 
     /// Returns the current thread.
@@ -108,13 +112,22 @@ impl Thread {
     /// Returns the task associated with this thread.
     #[expect(dead_code)]
     pub fn task(&self) -> Arc<Task> {
-        self.task.upgrade().unwrap()
+        self.task
+            .get()
+            .expect("thread task is not bound yet")
+            .upgrade()
+            .unwrap()
     }
 
     /// Runs this thread at once.
     #[track_caller]
     pub fn run(&self) {
-        self.task.upgrade().unwrap().run();
+        self.task
+            .get()
+            .expect("thread task is not bound yet")
+            .upgrade()
+            .unwrap()
+            .run();
     }
 
     /// Returns whether the thread is exited.

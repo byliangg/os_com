@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Number of created/deleted files on Linux",
+    "unit": "number",
+    "value": "110920",
+    "extra": "linux_result"
+  },
+  {
+    "name": "Number of created/deleted files on Asterinas",
+    "unit": "number",
+    "value": "2",
+    "extra": "aster_result"
+  }
+]

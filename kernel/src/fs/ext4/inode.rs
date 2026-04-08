@@ -3,13 +3,18 @@
 use alloc::format;
 use core::time::Duration;
 
+use device_id::DeviceId;
 use ext4_rs::{EXT4_ROOT_INODE, InodeFileType, SimpleInodeMeta};
 
 use super::fs::Ext4Fs;
 use crate::{
-    fs::utils::{
-        DirentVisitor, Extension, FileSystem, Inode, InodeIo, InodeMode, InodeType, Metadata,
-        StatusFlags, SymbolicLink,
+    device,
+    fs::{
+        inode_handle::FileIo,
+        utils::{
+            AccessMode, DirentVisitor, Extension, FileSystem, Inode, InodeIo, InodeMode,
+            InodeType, Metadata, MknodType, StatusFlags, SymbolicLink,
+        },
     },
     prelude::*,
     process::{Gid, Uid},
@@ -248,7 +253,9 @@ impl Inode for Ext4Inode {
     }
 
     fn set_mode(&self, _mode: InodeMode) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "set_mode is not supported in stage1");
+        let fs = self.ext4_fs()?;
+        let requested_mode = _mode.bits() as u16 & 0x0FFF;
+        fs.set_inode_mode(self.ino, requested_mode)
     }
 
     fn owner(&self) -> Result<Uid> {
@@ -256,7 +263,8 @@ impl Inode for Ext4Inode {
     }
 
     fn set_owner(&self, _uid: Uid) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "set_owner is not supported in stage1");
+        let fs = self.ext4_fs()?;
+        fs.set_inode_uid(self.ino, _uid.into())
     }
 
     fn group(&self) -> Result<Gid> {
@@ -264,7 +272,36 @@ impl Inode for Ext4Inode {
     }
 
     fn set_group(&self, _gid: Gid) -> Result<()> {
-        return_errno_with_message!(Errno::EOPNOTSUPP, "set_group is not supported in stage1");
+        let fs = self.ext4_fs()?;
+        fs.set_inode_gid(self.ino, _gid.into())
+    }
+
+    fn open(
+        &self,
+        _access_mode: AccessMode,
+        _status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn FileIo>>> {
+        let inode_type = self.type_();
+        match inode_type {
+            InodeType::BlockDevice | InodeType::CharDevice => {
+                let metadata = self.metadata();
+                let Some(device_id) = DeviceId::from_encoded_u64(metadata.rdev) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the device ID is invalid",
+                    )));
+                };
+                let device_type = inode_type.device_type().unwrap();
+                let Some(device) = device::lookup(device_type, device_id) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the required device ID does not exist",
+                    )));
+                };
+                Some(device.open())
+            }
+            _ => None,
+        }
     }
 
     fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
@@ -283,6 +320,23 @@ impl Inode for Ext4Inode {
             return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported inode type in stage1");
         };
 
+        Ok(fs.make_inode(child_ino, self.join_child_path(name)))
+    }
+
+    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
+        if self.type_() != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let (inode_type, rdev) = match type_ {
+            MknodType::NamedPipe => (InodeType::NamedPipe, None),
+            MknodType::CharDevice(dev) => (InodeType::CharDevice, Some(dev)),
+            MknodType::BlockDevice(dev) => (InodeType::BlockDevice, Some(dev)),
+        };
+
+        let fs = self.ext4_fs()?;
+        let ext4_mode = Self::ext4_mode(inode_type, mode)?;
+        let child_ino = fs.mknod_at(self.ino, name, ext4_mode, rdev)?;
         Ok(fs.make_inode(child_ino, self.join_child_path(name)))
     }
 

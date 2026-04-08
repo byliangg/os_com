@@ -405,7 +405,7 @@ fn clone_child_task(
         thread_builder = clone_child_cleartid(thread_builder, clone_args.child_tid, clone_flags);
         thread_builder = clone_child_settid(thread_builder, clone_args.child_tid, clone_flags);
 
-        thread_builder.build()
+        thread_builder.build()?
     };
 
     process
@@ -541,7 +541,7 @@ fn clone_child_process(
             child_user_ns,
             child_thread_builder,
         )
-    };
+    }?;
 
     clone_pidfd(ctx, &child, clone_flags, clone_args.pidfd)?;
 
@@ -736,7 +736,7 @@ fn create_child_process(
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     user_ns: Arc<UserNamespace>,
     thread_builder: PosixThreadBuilder,
-) -> Arc<Process> {
+) -> Result<Arc<Process>> {
     let child_proc = Process::new(
         pid,
         vmar,
@@ -747,10 +747,15 @@ fn create_child_process(
         user_ns,
     );
 
-    let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build();
-    child_proc.tasks().lock().insert(child_task).unwrap();
+    let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build()?;
+    child_proc.tasks().lock().insert(child_task).map_err(|_| {
+        Error::with_message(
+            Errno::EINTR,
+            "the child process exited while inserting its initial task",
+        )
+    })?;
 
-    child_proc
+    Ok(child_proc)
 }
 
 fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &Arc<Process>) {

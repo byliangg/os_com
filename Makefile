@@ -191,7 +191,7 @@ endif
 
 ifeq ($(ENABLE_KVM), 1)
 	ifeq ($(OSDK_TARGET_ARCH), x86_64)
-	CARGO_OSDK_COMMON_ARGS += --qemu-args="-accel kvm"
+	CARGO_OSDK_COMMON_ARGS += --qemu-args="-enable-kvm"
 	endif
 endif
 

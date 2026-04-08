@@ -26,6 +26,7 @@ PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
 XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
+XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE:-0}
 XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC:-600}
 XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN:-0}
 XFSTESTS_CHILD_XTRACE=${XFSTESTS_CHILD_XTRACE:-0}
@@ -74,10 +75,13 @@ run_crash_prepare_once() {
   local run_pid=$!
 
   local marker="replay hold point reached for op=${hold_op}"
+  marker_seen_in_log() {
+    grep -aF -q "${marker}" "${log_file}" 2>/dev/null
+  }
   local marker_seen=0
   local i=0
   while [ "${i}" -lt "${CRASH_PREPARE_WAIT_SEC}" ]; do
-    if rg -q "${marker}" "${log_file}" 2>/dev/null; then
+    if marker_seen_in_log; then
       marker_seen=1
       break
     fi
@@ -134,7 +138,7 @@ run_crash_verify_once() {
     return ${rc}
   fi
 
-  if ! rg -q "EXT4_CRASH_VERIFY_PASS scenario=${scenario}" "${log_file}"; then
+  if ! grep -aF -q "EXT4_CRASH_VERIFY_PASS scenario=${scenario}" "${log_file}" 2>/dev/null; then
     echo "[FAIL] crash verify marker missing: scenario=${scenario} round=${round}" >&2
     tail -n 120 "${log_file}" >&2 || true
     return 1
@@ -195,6 +199,7 @@ run_xfstests_mode() {
     --kcmd-args='XFSTESTS_SCRATCH_MNT=/ext4_scratch' \
     --kcmd-args='XFSTESTS_SKIP_MKFS=1' \
     --kcmd-args='XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST}' \
+    --kcmd-args='XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE}' \
     --kcmd-args='XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC}' \
     --kcmd-args='XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN}' \
     --kcmd-args='XFSTESTS_CHILD_XTRACE=${XFSTESTS_CHILD_XTRACE}' \

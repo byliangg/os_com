@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Average file copy bandwidth on Linux",
+    "unit": "MB/s",
+    "value": "2070.8138",
+    "extra": "linux_result"
+  },
+  {
+    "name": "Average file copy bandwidth on Asterinas",
+    "unit": "MB/s",
+    "value": "7.4306",
+    "extra": "aster_result"
+  }
+]

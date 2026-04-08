@@ -1,0 +1,9 @@
+bench	rounds	ratio_avg
+ext4_copy_files_bw	3	0.003394
+ext4_create_delete_files_0k_ops	3	0.009373
+ext4_create_delete_files_10k_ops	3	0.002614
+ext4_vfs_fstat_lat	3	0.001925
+ext4_vfs_open_lat	3	0.000929
+ext4_vfs_read_lat	3	0.742154
+ext4_vfs_stat_lat	3	0.000927
+ext4_vfs_write_lat	3	0.567317

@@ -28,7 +28,7 @@ pub fn create_new_user_task(
     thread_ref: Arc<Thread>,
     thread_local: ThreadLocal,
     is_init_process: bool,
-) -> Task {
+) -> Result<Task> {
     let user_task_entry = move |user_ctx: UserContext| {
         let current_task = Task::current().unwrap();
         let current_thread = current_task.as_thread().unwrap();
@@ -133,5 +133,5 @@ pub fn create_new_user_task(
     .data(thread_ref)
     .local_data(thread_local)
     .build()
-    .expect("spawn task failed")
+    .map_err(Into::into)
 }

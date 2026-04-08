@@ -3,6 +3,7 @@
 use core::time::Duration;
 
 use ostd::mm::VmIo;
+use ostd::task::Task;
 
 use super::{SyscallReturn, constants::MAX_FILENAME_LEN};
 use crate::{
@@ -10,8 +11,10 @@ use crate::{
     fs::{
         file_table::FileDesc,
         path::{AT_FDCWD, FsPath, Path},
+        utils::Permission,
     },
     prelude::*,
+    process::{Uid, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     time::{clocks::RealTimeCoarseClock, timespec_t, timeval_t},
 };
 
@@ -112,6 +115,8 @@ struct Utimbuf {
 }
 
 fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn> {
+    check_utimens_permission(path, times.as_ref())?;
+
     let (atime, mtime, ctime) = match times {
         Some(times) => {
             if !times.atime.is_valid() || !times.mtime.is_valid() {
@@ -146,6 +151,45 @@ fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn>
     path.set_ctime(ctime);
     fs::notify::on_attr_change(path);
     Ok(SyscallReturn::Return(0))
+}
+
+fn check_utimens_permission(path: &Path, times: Option<&TimeSpecPair>) -> Result<()> {
+    let Some(task) = Task::current() else {
+        return Ok(());
+    };
+    let Some(thread) = task.as_posix_thread() else {
+        return Ok(());
+    };
+    let creds = thread.credentials();
+
+    let file_owner = path.owner()?;
+    let fsuid = creds.fsuid();
+    let is_owner = file_owner == fsuid;
+    let has_fowner = creds.effective_capset().contains(CapSet::FOWNER);
+    let owner_or_privileged = is_owner || has_fowner || fsuid == Uid::new_root();
+
+    let mut require_owner_or_privileged = false;
+    if let Some(times) = times {
+        let atime_now_or_omit = times.atime.is_utime_now() || times.atime.is_utime_omit();
+        let mtime_now_or_omit = times.mtime.is_utime_now() || times.mtime.is_utime_omit();
+        require_owner_or_privileged = !(atime_now_or_omit && mtime_now_or_omit);
+    }
+
+    if require_owner_or_privileged {
+        if !owner_or_privileged {
+            return_errno_with_message!(
+                Errno::EPERM,
+                "setting explicit file timestamps requires ownership or CAP_FOWNER"
+            );
+        }
+        return Ok(());
+    }
+
+    if owner_or_privileged {
+        return Ok(());
+    }
+
+    path.inode().check_permission(Permission::MAY_WRITE)
 }
 
 // Common function to handle updating file times, supporting both fd and path based operations

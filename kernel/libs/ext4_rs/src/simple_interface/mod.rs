@@ -321,6 +321,40 @@ impl Ext4 {
         Ok(EOK)
     }
 
+    /// Update inode mode while keeping inode type bits unchanged.
+    pub fn ext4_set_inode_mode(&self, inode: u32, mode: u16) -> Result<usize> {
+        let mut inode_ref = self.get_inode_ref(inode);
+        let current = inode_ref.inode.mode();
+        let next = (current & EXT4_INODE_MODE_TYPE_MASK) | (mode & EXT4_INODE_MODE_PERM_MASK);
+        inode_ref.inode.set_mode(next);
+        self.write_back_inode(&mut inode_ref);
+        Ok(EOK)
+    }
+
+    /// Update inode owner uid.
+    pub fn ext4_set_inode_uid(&self, inode: u32, uid: u16) -> Result<usize> {
+        let mut inode_ref = self.get_inode_ref(inode);
+        inode_ref.inode.set_uid(uid);
+        self.write_back_inode(&mut inode_ref);
+        Ok(EOK)
+    }
+
+    /// Update inode group gid.
+    pub fn ext4_set_inode_gid(&self, inode: u32, gid: u16) -> Result<usize> {
+        let mut inode_ref = self.get_inode_ref(inode);
+        inode_ref.inode.set_gid(gid);
+        self.write_back_inode(&mut inode_ref);
+        Ok(EOK)
+    }
+
+    /// Update inode device id (stored in i_faddr in current ext4_rs).
+    pub fn ext4_set_inode_rdev(&self, inode: u32, rdev: u32) -> Result<usize> {
+        let mut inode_ref = self.get_inode_ref(inode);
+        inode_ref.inode.set_faddr(rdev);
+        self.write_back_inode(&mut inode_ref);
+        Ok(EOK)
+    }
+
     /// Get simplified inode metadata.
     pub fn ext4_stat(&self, inode: u32) -> SimpleInodeMeta {
         let inode_ref = self.get_inode_ref(inode);

@@ -118,16 +118,19 @@ run_benchmark() {
      done <<< "$runtime_configs_str"
 
     # Prepare commands for Asterinas and Linux using arrays
+    local bench_enable_kvm="${BENCH_ENABLE_KVM:-1}"
+    local bench_aster_netdev="${BENCH_ASTER_NETDEV:-tap}"
+    local bench_aster_vhost="${BENCH_ASTER_VHOST:-on}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
     asterinas_cmd_arr+=(
         "SMP=${smp_val}"
         "MEM=${mem_val}"
-        ENABLE_KVM=1
+        "ENABLE_KVM=${bench_enable_kvm}"
         RELEASE_LTO=1
-        NETDEV=tap
-        VHOST=on
+        "NETDEV=${bench_aster_netdev}"
+        "VHOST=${bench_aster_vhost}"
     )
     if [[ "$platform" == "tdx" ]]; then
         asterinas_cmd_arr+=(INTEL_TDX=1)
