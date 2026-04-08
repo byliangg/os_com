@@ -222,7 +222,11 @@ impl Ext4 {
             return_errno_with_message!(Errno::ENOENT, "logical block not mapped");
         }
 
-        return_errno_with_message!(Errno::EIO, "search extent fail");
+        let err = search_path.err().unwrap();
+        if err.error() == Errno::ENOENT {
+            return_errno_with_message!(Errno::ENOENT, "logical block not mapped");
+        }
+        Err(err)
     }
 
     /// Allocate a new block

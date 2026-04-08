@@ -1,0 +1,28 @@
+# test\treason
+# Static exclusions for stage6-good scope.
+# Keep only cases that are clearly outside "good" target or require unavailable tooling.
+
+generic/002	hardlink semantics out of stage6_good scope
+generic/004	O_TMPFILE/flink support out of stage6_good scope
+generic/005	symlink semantics out of stage6_good scope
+generic/010	xfstests dbtest helper not built in shipped prebuilt environment
+generic/017	fallocate collapse-range semantics out of stage6_good scope
+generic/021	fpunch/fcollapse/fiemap semantics out of stage6_good scope
+generic/022	delalloc + collapse-range semantics out of stage6_good scope
+generic/023	renameat2 + symlink semantics out of stage6_good scope
+generic/024	renameat2 + symlink semantics out of stage6_good scope
+generic/026	acl/xattr dependency out of stage6_good scope
+generic/029	mmap+truncate stress with xfs_io dependency out of stage6_good scope
+generic/031	fcollapse stress with xfs_io dependency out of stage6_good scope
+generic/032	unwritten-extent stress with xfs_io dependency out of stage6_good scope
+generic/041	device-mapper + hardlink dependency out of stage6_good scope
+generic/062	xattr/symlink dependency out of stage6_good scope
+generic/063	finsert/fpunch/fiemap semantics out of stage6_good scope
+generic/069	heavy append stress deferred to dedicated stress profile
+generic/070	attrs dependency out of stage6_good scope
+generic/071	fallocate prealloc behavior out of stage6_good scope
+generic/086	unwritten/delayed extent stress out of stage6_good scope
+generic/088	ownership/chown semantics not in current stage6_good scope
+generic/090	device-mapper + hardlink dependency out of stage6_good scope
+generic/091	odirect+fsx stress out of stage6_good scope
+generic/093	attrs/user-mode tooling dependency out of stage6_good scope

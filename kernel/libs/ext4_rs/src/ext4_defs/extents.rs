@@ -367,62 +367,44 @@ impl ExtentNode {
 
         match &self.data {
             NodeData::Root(root_data) => {
-                // Root node handling
                 let start = size_of::<Ext4ExtentHeader>() / 4;
                 let indexes = &root_data[start..];
+                let mut l = 0usize;
+                let mut r = entries;
 
-                let mut l = 1; // Skip the first index
-                let mut r = entries - 1;
-
-                while l <= r {
+                while l < r {
                     let m = l + (r - l) / 2;
-                    let offset = m * size_of::<Ext4ExtentIndex>() / 4; // Convert to u32 offset
+                    let offset = m * size_of::<Ext4ExtentIndex>() / 4;
                     let extent_index = Ext4ExtentIndex::load_from_u32(&indexes[offset..]);
-
                     if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;
                     }
                 }
 
-                if l == 0 {
-                    return None;
-                }
-
-                Some(l - 1)
+                // For holes before the first indexed range we still need to descend into
+                // the left-most child (index 0) to find insertion/remap position.
+                Some(l.saturating_sub(1))
             }
             NodeData::Internal(internal_data) => {
-                // Internal node handling
                 let start = size_of::<Ext4ExtentHeader>();
                 let indexes = &internal_data[start..];
+                let mut l = 0usize;
+                let mut r = entries;
 
-                let mut l = 0;
-                let mut r = entries - 1;
-
-                while l <= r {
+                while l < r {
                     let m = l + (r - l) / 2;
                     let offset = m * size_of::<Ext4ExtentIndex>();
                     let extent_index = Ext4ExtentIndex::load_from_u8(&indexes[offset..]);
-
                     if lblock < extent_index.first_block {
-                        if m == 0 {
-                            break; // Prevent underflow
-                        }
-                        r = m - 1;
+                        r = m;
                     } else {
                         l = m + 1;
                     }
                 }
 
-                if l == 0 {
-                    return None;
-                }
-
-                Some(l - 1)
+                Some(l.saturating_sub(1))
             }
         }
     }

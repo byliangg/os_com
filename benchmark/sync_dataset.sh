@@ -12,8 +12,10 @@ mkdir -p benchmark/datasets/results benchmark/logs benchmark/logs/lmbench
 
 cp -f test/initramfs/src/syscall/xfstests/testcases/phase3_base.list benchmark/datasets/xfstests/lists/
 cp -f test/initramfs/src/syscall/xfstests/testcases/phase4_good.list benchmark/datasets/xfstests/lists/
+cp -f test/initramfs/src/syscall/xfstests/testcases/phase6_good.list benchmark/datasets/xfstests/lists/
 cp -f test/initramfs/src/syscall/xfstests/blocked/phase3_excluded.tsv benchmark/datasets/xfstests/blocked/
 cp -f test/initramfs/src/syscall/xfstests/blocked/phase4_excluded.tsv benchmark/datasets/xfstests/blocked/
+cp -f test/initramfs/src/syscall/xfstests/blocked/phase6_excluded.tsv benchmark/datasets/xfstests/blocked/
 
 rm -f benchmark/datasets/xfstests/samples/generic/*
 while IFS= read -r line; do
@@ -23,7 +25,12 @@ while IFS= read -r line; do
   for extra in "${GENERIC_SRC}/${case_id}".out "${GENERIC_SRC}/${case_id}".out.* "${GENERIC_SRC}/${case_id}".cfg; do
     [ -f "${extra}" ] && cp -f "${extra}" benchmark/datasets/xfstests/samples/generic/
   done
-done < benchmark/datasets/xfstests/lists/phase4_good.list
+done < <(
+  cat \
+    benchmark/datasets/xfstests/lists/phase3_base.list \
+    benchmark/datasets/xfstests/lists/phase4_good.list \
+    benchmark/datasets/xfstests/lists/phase6_good.list | sort -u
+)
 
 cp -f "${SRC_XFSTESTS}/LICENSES/GPL-2.0" benchmark/datasets/xfstests/licenses/GPL-2.0 || true
 cp -f "${SRC_XFSTESTS}/README" benchmark/datasets/xfstests/licenses/README.upstream || true
@@ -38,7 +45,7 @@ cat > benchmark/datasets/xfstests/README.md <<EOT
 
 - \`lists/\`：阶段候选用例清单。
 - \`blocked/\`：静态排除用例及原因。
-- \`samples/generic/\`：从上游 \`xfstests\` 拷贝的 \`tests/generic/*\` 脚本与期望输出（基于 \`phase4_good.list\`）。
+- \`samples/generic/\`：从上游 \`xfstests\` 拷贝的 \`tests/generic/*\` 脚本与期望输出（基于 \`phase3+phase4+phase6\` 用例并集）。
 - \`licenses/\`：上游许可与参考文件。
 
 ## 上游来源

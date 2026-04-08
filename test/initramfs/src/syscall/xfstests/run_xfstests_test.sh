@@ -24,6 +24,8 @@ PHASE3_BASE_LIST=${SCRIPT_DIR}/testcases/phase3_base.list
 PHASE3_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase3_excluded.tsv
 PHASE4_GOOD_LIST=${SCRIPT_DIR}/testcases/phase4_good.list
 PHASE4_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase4_excluded.tsv
+PHASE6_GOOD_LIST=${SCRIPT_DIR}/testcases/phase6_good.list
+PHASE6_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase6_excluded.tsv
 
 BASE_LIST=""
 STATIC_EXCLUDED=""
@@ -528,7 +530,92 @@ END {
 EOF
 chmod +x "${SHIM_DIR}/findmnt"
 
+# xfs_io is used by common/rc sparse-file probing. Some minimal roots do not
+# provide a working xfs_io binary; emulate the probe command when needed.
+cat > "${SHIM_DIR}/xfs_io" <<'EOF'
+#!/bin/bash
+set -eu
+orig_args=("$@")
+cmd=""
+target=""
+real=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c)
+            cmd="${2:-}"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            target="$1"
+            shift
+            ;;
+    esac
+done
+
+for cand in /usr/sbin/xfs_io /usr/bin/xfs_io /sbin/xfs_io /bin/xfs_io /opt/xfstests/tools/xfs_io; do
+    if [ -x "${cand}" ]; then
+        real="${cand}"
+        break
+    fi
+done
+
+if [ -n "${real}" ]; then
+    if [ "${XFSTESTS_XFS_IO_DEBUG:-0}" = "1" ]; then
+        echo "xfs_io shim: use real ${real}" >&2
+    fi
+    exec "${real}" "${orig_args[@]}"
+fi
+
+if [ -n "${cmd}" ] && [ -n "${target}" ] && [[ "${cmd}" == pwrite* ]]; then
+    if [[ "${cmd}" =~ ([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+        off="${BASH_REMATCH[1]}"
+        len="${BASH_REMATCH[2]}"
+        fill_token="0x00"
+        if [[ "${cmd}" =~ -S[[:space:]]+([^[:space:]]+) ]]; then
+            fill_token="${BASH_REMATCH[1]}"
+        fi
+        fill_val=$((fill_token)) || fill_val=0
+        mnt_line=$(awk -v p="${target}" '
+            BEGIN { best_len = -1; best = "<none>" }
+            {
+                mp = $2
+                if (index(p, mp) == 1 && length(mp) > best_len) {
+                    best_len = length(mp)
+                    best = $0
+                }
+            }
+            END { print best }
+        ' /proc/mounts 2>/dev/null || true)
+        if [ "${XFSTESTS_XFS_IO_DEBUG:-0}" = "1" ]; then
+            echo "xfs_io shim: emulate pwrite off=${off} len=${len} fill=${fill_token} target=${target}" >&2
+            echo "xfs_io shim: mount ${mnt_line}" >&2
+        fi
+        mkdir -p "$(dirname "${target}")"
+        : > "${target}"
+        if [ "${fill_val}" -eq 0 ]; then
+            dd if=/dev/zero of="${target}" bs=1 seek="${off}" count="${len}" conv=notrunc >/dev/null 2>&1 || true
+        else
+            fill_chr=$(printf "\\$(printf '%03o' "$((fill_val & 255))")")
+            yes "${fill_chr}" | tr -d '\n' | head -c "${len}" | \
+                dd of="${target}" bs=1 seek="${off}" count="${len}" conv=notrunc >/dev/null 2>&1 || true
+        fi
+        [ -e "${target}" ] && exit 0
+    fi
+fi
+
+exit 1
+EOF
+chmod +x "${SHIM_DIR}/xfs_io"
+
 export PATH="${SHIM_DIR}:${PATH}"
+export XFS_IO_PROG="${SHIM_DIR}/xfs_io"
 
 export FSTYP=ext4
 export TEST_DEV
@@ -682,6 +769,79 @@ findmnt_probe_rc=$?
 set -e
 echo "xfstests probe: shim grep rc=${grep_probe_rc} shim readlink rc=${readlink_probe_rc} shim findmnt rc=${findmnt_probe_rc}" >&2
 
+log_sparse_probe() {
+    probe_file="${TEST_DIR}/$${RANDOM}.sparseprobe"
+    probe_log="/tmp/xfstests_sparse_probe.log"
+    probe_mounted_by_us=0
+
+    if ! awk -v t="${TEST_DIR}" '$2==t { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts >/dev/null 2>&1; then
+        if mount "${TEST_DEV}" "${TEST_DIR}" >/dev/null 2>&1; then
+            probe_mounted_by_us=1
+        fi
+    fi
+    probe_mount_line=$(awk -v t="${TEST_DIR}" '$2==t {print; exit}' /proc/mounts 2>/dev/null || true)
+    [ -n "${probe_mount_line}" ] || probe_mount_line="<none>"
+    echo "xfstests sparse probe mount: ${probe_mount_line}" >&2
+
+    rm -f "${probe_file}" "${probe_log}" >/dev/null 2>&1 || true
+
+    set +e
+    "${XFS_IO_PROG}" -f -c 'pwrite -b 51200 -S 0x61 1638400 51200' "${probe_file}" >"${probe_log}" 2>&1
+    probe_rc=$?
+    set -e
+
+    probe_du_kb=$(du -sk "${probe_file}" 2>/dev/null | awk '{print $1}' || true)
+    probe_size=$(stat -c '%s' "${probe_file}" 2>/dev/null || echo "NA")
+    probe_blocks=$(stat -c '%b' "${probe_file}" 2>/dev/null || echo "NA")
+    [ -n "${probe_du_kb}" ] || probe_du_kb="NA"
+    echo "xfstests sparse probe: rc=${probe_rc} size_bytes=${probe_size} blocks_512b=${probe_blocks} du_kb=${probe_du_kb} file=${probe_file}" >&2
+    sed -n '1,3p' "${probe_log}" >&2 || true
+
+    probe_method() {
+        method="$1"
+        file="$2"
+        cmd="$3"
+        rm -f "${file}" >/dev/null 2>&1 || true
+        set +e
+        /bin/bash -lc "${cmd}" >/tmp/xfstests_sparse_probe_method.log 2>&1
+        mrc=$?
+        set -e
+        m_du=$(du -sk "${file}" 2>/dev/null | awk '{print $1}' || true)
+        m_size=$(stat -c '%s' "${file}" 2>/dev/null || echo "NA")
+        m_blocks=$(stat -c '%b' "${file}" 2>/dev/null || echo "NA")
+        [ -n "${m_du}" ] || m_du="NA"
+        echo "xfstests sparse method: ${method} rc=${mrc} size_bytes=${m_size} blocks_512b=${m_blocks} du_kb=${m_du}" >&2
+        sed -n '1,2p' /tmp/xfstests_sparse_probe_method.log >&2 || true
+        rm -f "${file}" /tmp/xfstests_sparse_probe_method.log >/dev/null 2>&1 || true
+    }
+
+    probe_method \
+        "dd_seek_write" \
+        "${TEST_DIR}/$${RANDOM}.method_dd_write" \
+        "dd if=/dev/zero of='${TEST_DIR}/$${RANDOM}.method_dd_write' bs=1 seek=1638400 count=51200 conv=notrunc"
+    probe_method \
+        "dd_seek_zero_count" \
+        "${TEST_DIR}/$${RANDOM}.method_dd_zero" \
+        "dd if=/dev/zero of='${TEST_DIR}/$${RANDOM}.method_dd_zero' bs=1 seek=1689600 count=0 conv=notrunc"
+    probe_method \
+        "truncate_only" \
+        "${TEST_DIR}/$${RANDOM}.method_truncate" \
+        "truncate -s 1689600 '${TEST_DIR}/$${RANDOM}.method_truncate'"
+    probe_method \
+        "dd_small_seek" \
+        "${TEST_DIR}/$${RANDOM}.method_dd_small" \
+        "dd if=/dev/zero of='${TEST_DIR}/$${RANDOM}.method_dd_small' bs=1 seek=10 count=1 conv=notrunc"
+
+    rm -f "${probe_file}" "${probe_log}" >/dev/null 2>&1 || true
+    if [ "${probe_mounted_by_us}" = "1" ]; then
+        umount "${TEST_DIR}" >/dev/null 2>&1 || true
+    fi
+}
+
+if [ "${XFSTESTS_SPARSE_PROBE_LOG:-0}" = "1" ]; then
+    log_sparse_probe
+fi
+
 resolve_exec() {
     for p in "$@"; do
         [ -n "${p}" ] || continue
@@ -739,6 +899,10 @@ case "${MODE}" in
     phase4_good)
         BASE_LIST=${PHASE4_GOOD_LIST}
         STATIC_EXCLUDED=${PHASE4_STATIC_EXCLUDED}
+        ;;
+    phase6_good)
+        BASE_LIST=${PHASE6_GOOD_LIST}
+        STATIC_EXCLUDED=${PHASE6_STATIC_EXCLUDED}
         ;;
     *)
         echo "Error: unsupported XFSTESTS_MODE=${MODE}" >&2
@@ -818,8 +982,14 @@ is_static_blocked() {
 record_notrun() {
     test_name="$1"
     reason="$2"
+    test_log_file="${3:-}"
     printf "%s\tNOTRUN\tNA\t%s\n" "${test_name}" "${reason}" >>"${RESULTS_FILE}"
     printf "%s\t%s\n" "${test_name}" "${reason}" >>"${EXCLUDED_FILE}"
+    if [ -n "${test_log_file}" ] && [ -f "${test_log_file}" ]; then
+        echo "----- NOTRUN LOG TAIL: ${test_name} -----" >&2
+        tail -n 80 "${test_log_file}" >&2 || true
+        echo "----- END NOTRUN LOG TAIL -----" >&2
+    fi
     NOTRUN_COUNT=$((NOTRUN_COUNT + 1))
 }
 
@@ -875,7 +1045,7 @@ while IFS= read -r test_name; do
     if [ -n "${notrun_line}" ]; then
         reason=$(echo "${notrun_line}" | tr '\t' ' ')
         [ -z "${reason}" ] && reason="runtime notrun"
-        record_notrun "${test_name}" "${reason}"
+        record_notrun "${test_name}" "${reason}" "${test_log}"
         continue
     fi
 
@@ -908,12 +1078,18 @@ while IFS= read -r test_name; do
             cat /tmp/xfstests_child_xtrace.log >&2 || true
             echo "----- END CHILD XTRACE -----" >&2
         fi
-        if [ "${rc}" -eq 124 ]; then
-            full_log="${XFSTESTS_DEV_DIR}/results/${test_name}.full"
-            if [ -f "${full_log}" ]; then
+        full_log="${XFSTESTS_DEV_DIR}/results/${test_name}.full"
+        if [ -f "${full_log}" ]; then
+            if [ "${rc}" -eq 124 ]; then
                 echo "----- TIMEOUT FULL LOG TAIL: ${test_name} -----" >&2
-                tail -n 120 "${full_log}" >&2 || true
+            else
+                echo "----- FULL LOG TAIL: ${test_name} -----" >&2
+            fi
+            tail -n 160 "${full_log}" >&2 || true
+            if [ "${rc}" -eq 124 ]; then
                 echo "----- END TIMEOUT FULL LOG TAIL -----" >&2
+            else
+                echo "----- END FULL LOG TAIL -----" >&2
             fi
         fi
         bad_out="${XFSTESTS_DEV_DIR}/results/${test_name}.out.bad"

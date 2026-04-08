@@ -5,6 +5,11 @@ use crate::utils::*;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    #[inline]
+    pub fn sync_runtime_block_size(&self) {
+        set_runtime_block_size(self.super_block.block_size() as usize);
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();
@@ -186,7 +191,12 @@ impl Ext4 {
             }
             // rmdir removes both "." and ".." references.
             child.inode.set_links_count(0);
-            free_child = true;
+            // Keep directory inode allocated when nlink drops to zero.
+            // Similar to regular-file unlink, immediate bitmap recycle can
+            // reuse inode numbers while other references still exist
+            // (e.g. concurrent cwd/path walkers), causing lookup corruption.
+            // We do not yet have orphan-cleanup on last ref, so defer recycle.
+            self.write_back_inode(child);
             self.write_back_inode(parent);
         } else {
             let child_links = child.inode.links_count();

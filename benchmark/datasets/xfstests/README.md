@@ -6,13 +6,13 @@
 
 - `lists/`：阶段候选用例清单。
 - `blocked/`：静态排除用例及原因。
-- `samples/generic/`：从上游 `xfstests` 拷贝的 `tests/generic/*` 脚本与期望输出（基于 `phase4_good.list`）。
+- `samples/generic/`：从上游 `xfstests` 拷贝的 `tests/generic/*` 脚本与期望输出（基于 `phase3+phase4+phase6` 用例并集）。
 - `licenses/`：上游许可与参考文件。
 
 ## 上游来源
 
 - 同步来源目录：/home/lby/os_com/asterinas/benchmark/assets/xfstests-src
-- 上游版本：3ded3e13c008326d197d11ac975049ed1f8ec922
+- 上游版本：a7b2080d1e8676a8a6635816ac13e4011ba87688
 
 ## 同步方式
 

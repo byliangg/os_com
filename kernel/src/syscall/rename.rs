@@ -59,15 +59,18 @@ pub fn sys_renameat2(
         (path_resolver.lookup(&new_fs_path)?, new_name)
     };
 
-    // Check the absolute path
-    // FIXME: Using string prefix matching to check for path containment is incorrect.
-    // It doesn't handle path components like '..' or '.' properly.
+    // Check the absolute path for directory self-nesting only.
+    // File renames such as "/a/file" -> "/a/file.new" must be allowed.
+    // For directories, reject moving a directory into its own descendant.
     let old_abs_path = path_resolver.make_abs_path(&old_path).into_string();
     let new_abs_path = path_resolver.make_abs_path(&new_dir_path).into_string() + "/" + new_name;
-    if new_abs_path.starts_with(&old_abs_path) {
-        if new_abs_path.len() == old_abs_path.len() {
+    if old_path.type_() == InodeType::Dir {
+        if new_abs_path == old_abs_path {
             return Ok(SyscallReturn::Return(0));
-        } else {
+        }
+        let mut old_dir_prefix = old_abs_path.clone();
+        old_dir_prefix.push('/');
+        if new_abs_path.starts_with(&old_dir_prefix) {
             return_errno_with_message!(
                 Errno::EINVAL,
                 "the new path contains a path prefix of the old path"

@@ -154,12 +154,20 @@ impl Ext4 {
         match self.dir_find_entry(parent, name, &mut search_result) {
             Ok(_) => Ok(search_result.dentry.inode),
             Err(e) => {
-                log::error!(
-                    "ext4_lookup_at failed: parent={} name='{}' err={:?}",
-                    parent,
-                    name,
-                    e
-                );
+                if e.error() == Errno::ENOENT {
+                    log::debug!(
+                        "ext4_lookup_at miss: parent={} name='{}'",
+                        parent,
+                        name
+                    );
+                } else {
+                    log::error!(
+                        "ext4_lookup_at failed: parent={} name='{}' err={:?}",
+                        parent,
+                        name,
+                        e
+                    );
+                }
                 Err(e)
             }
         }
@@ -286,10 +294,31 @@ impl Ext4 {
     /// Truncate a file inode to the specified size.
     pub fn ext4_truncate(&self, inode: u32, new_size: u64) -> Result<usize> {
         let mut inode_ref = self.get_inode_ref(inode);
-        if new_size > inode_ref.inode.size() {
-            return_errno_with_message!(Errno::EFBIG, "extend by truncate is not supported");
-        }
         self.truncate_inode(&mut inode_ref, new_size)
+    }
+
+    /// Update inode timestamps (seconds since epoch).
+    ///
+    /// `None` means keeping the existing value.
+    pub fn ext4_set_inode_times(
+        &self,
+        inode: u32,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+    ) -> Result<usize> {
+        let mut inode_ref = self.get_inode_ref(inode);
+        if let Some(v) = atime {
+            inode_ref.inode.set_atime(v);
+        }
+        if let Some(v) = mtime {
+            inode_ref.inode.set_mtime(v);
+        }
+        if let Some(v) = ctime {
+            inode_ref.inode.set_ctime(v);
+        }
+        self.write_back_inode(&mut inode_ref);
+        Ok(EOK)
     }
 
     /// Get simplified inode metadata.

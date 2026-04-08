@@ -33,7 +33,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let total_blocks: u64 = inode_size / block_size as u64;
+        let total_blocks: u64 = (inode_size + block_size as u64 - 1) / block_size as u64;
 
         // iterate all blocks
         while iblock < total_blocks {
@@ -114,7 +114,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size = inode_ref.inode.size();
-        let total_blocks = inode_size / block_size as u64;
+        let total_blocks = (inode_size + block_size as u64 - 1) / block_size as u64;
 
         // start from the first logical block
         let mut iblock = 0;
@@ -161,7 +161,7 @@ impl Ext4 {
         }
 
         let inode_size = inode_ref.inode.size();
-        let total_blocks = inode_size / block_size as u64;
+        let total_blocks = (inode_size + block_size as u64 - 1) / block_size as u64;
         let mut iblock = 0u64;
 
         while iblock < total_blocks {
@@ -233,7 +233,7 @@ impl Ext4 {
         let block_size = self.super_block.block_size() as usize;
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let total_blocks: u64 = inode_size / block_size as u64;
+        let total_blocks: u64 = (inode_size + block_size as u64 - 1) / block_size as u64;
 
         // Fast path: most appends can be satisfied by the last directory block.
         // This avoids repeatedly rescanning all earlier blocks for bulk creates.
@@ -481,7 +481,7 @@ impl Ext4 {
 
         // calculate total blocks
         let inode_size: u64 = parent.inode.size();
-        let total_blocks: u64 = inode_size / block_size as u64;
+        let total_blocks: u64 = (inode_size + block_size as u64 - 1) / block_size as u64;
 
         // iterate all blocks
         while iblock < total_blocks {

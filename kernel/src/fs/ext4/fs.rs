@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{BlockDevice, SECTOR_SIZE};
 use aster_cmdline::{KCMDLINE, ModuleArg};
@@ -13,8 +13,11 @@ use ostd::mm::VmIo;
 
 use crate::{
     fs::{
+        path::PerMountFlags,
         registry::{FsProperties, FsType},
-        utils::{FileSystem, FsEventSubscriberStats, FsFlags, Inode, NAME_MAX, SuperBlock},
+        utils::{
+            FileSystem, FsEventSubscriberStats, FsFlags, Inode, StatusFlags, SuperBlock, NAME_MAX,
+        },
     },
     prelude::*,
 };
@@ -42,6 +45,11 @@ const CRASH_JOURNAL_OP_RENAME: u32 = 5;
 const CRASH_JOURNAL_OP_WRITE: u32 = 6;
 const CRASH_JOURNAL_OP_TRUNCATE: u32 = 7;
 const CRASH_JOURNAL_MAX_WRITE_BYTES: usize = 192;
+
+// ext4_rs currently stores runtime block size in a global variable.
+// Serialize ext4_rs calls across mounted ext4 instances to avoid
+// cross-filesystem block-size races during xfstests mkfs/remount cycles.
+static EXT4_RS_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug)]
 enum CrashJournalOp {
@@ -398,6 +406,7 @@ pub(super) struct Ext4Fs {
     inner: Mutex<Ext4>,
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
+    mount_flags_bits: AtomicU32,
     crash_journal_lock: Mutex<()>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
@@ -413,6 +422,7 @@ impl Ext4Fs {
             inner: Mutex::new(ext4),
             block_device,
             adapter,
+            mount_flags_bits: AtomicU32::new(PerMountFlags::default().bits()),
             crash_journal_lock: Mutex::new(()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -438,13 +448,84 @@ impl Ext4Fs {
         Ok(())
     }
 
+    #[inline]
+    fn now_unix_seconds_u32() -> u32 {
+        let secs = crate::time::clocks::RealTimeCoarseClock::get()
+            .read_time()
+            .as_secs();
+        u32::try_from(secs).unwrap_or(u32::MAX)
+    }
+
+    pub(super) fn set_inode_times(
+        &self,
+        ino: u32,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+    ) -> Result<()> {
+        self.run_ext4(|ext4| ext4.ext4_set_inode_times(ino, atime, mtime, ctime).map(|_| ()))
+    }
+
+    fn mount_flags(&self) -> PerMountFlags {
+        PerMountFlags::from_bits_truncate(self.mount_flags_bits.load(Ordering::Relaxed))
+    }
+
+    fn should_touch_atime(&self, ino: u32, status_flags: StatusFlags) -> bool {
+        if status_flags.contains(StatusFlags::O_NOATIME) {
+            return false;
+        }
+
+        let mount_flags = self.mount_flags();
+        if mount_flags.contains(PerMountFlags::RDONLY) || mount_flags.contains(PerMountFlags::NOATIME)
+        {
+            return false;
+        }
+
+        if mount_flags.contains(PerMountFlags::STRICTATIME) {
+            return true;
+        }
+
+        match self.stat(ino) {
+            Ok(meta) => meta.atime <= meta.mtime || meta.atime <= meta.ctime,
+            Err(err) => {
+                warn!("ext4: failed to stat inode {} for atime policy: {:?}", ino, err);
+                false
+            }
+        }
+    }
+
+    fn touch_atime(&self, ino: u32, status_flags: StatusFlags) -> Result<()> {
+        if !self.should_touch_atime(ino, status_flags) {
+            return Ok(());
+        }
+        let now = Self::now_unix_seconds_u32();
+        self.set_inode_times(ino, Some(now), None, None)
+    }
+
+    fn touch_mtime_ctime(&self, ino: u32) -> Result<()> {
+        let now = Self::now_unix_seconds_u32();
+        self.set_inode_times(ino, None, Some(now), Some(now))
+    }
+
+    fn touch_ctime(&self, ino: u32) -> Result<()> {
+        let now = Self::now_unix_seconds_u32();
+        self.set_inode_times(ino, None, None, Some(now))
+    }
+
+    fn touch_birth_times(&self, ino: u32) -> Result<()> {
+        let now = Self::now_unix_seconds_u32();
+        self.set_inode_times(ino, Some(now), Some(now), Some(now))
+    }
+
     pub(super) fn run_ext4<T>(
         &self,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
     ) -> Result<T> {
         self.prepare_ext4_io();
+        let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
         let result = {
             let inner = self.lock_inner();
+            inner.sync_runtime_block_size();
             f(&inner).map_err(map_ext4_error)?
         };
         self.finish_ext4_io()?;
@@ -453,8 +534,10 @@ impl Ext4Fs {
 
     pub(super) fn run_ext4_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
         self.prepare_ext4_io();
+        let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
         let result = {
             let inner = self.lock_inner();
+            inner.sync_runtime_block_size();
             f(&inner)
         };
         self.finish_ext4_io()?;
@@ -897,26 +980,9 @@ impl Ext4Fs {
     }
 
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
-        match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(ino) => return Ok(ino),
-            DirLookupCacheResult::Miss => {
-                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
-            }
-            DirLookupCacheResult::Unknown => {}
-        }
-
-        self.load_dir_cache_if_needed(parent)?;
-        match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(ino) => return Ok(ino),
-            DirLookupCacheResult::Miss => {
-                return_errno_with_message!(Errno::ENOENT, "No such file or directory");
-            }
-            DirLookupCacheResult::Unknown => {}
-        }
-
-        let ino = self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))?;
-        self.cache_insert_entry(parent, name, ino);
-        Ok(ino)
+        // Keep lookup strongly consistent under concurrent create/unlink/rename workloads.
+        // Directory-entry cache is currently conservative-disabled for correctness.
+        self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
@@ -934,6 +1000,8 @@ impl Ext4Fs {
         })?;
         self.cache_insert_entry(parent, name, ino);
         self.cache_remove_dir(ino);
+        self.touch_birth_times(ino)?;
+        self.touch_mtime_ctime(parent)?;
         Ok(ino)
     }
 
@@ -948,30 +1016,51 @@ impl Ext4Fs {
         })?;
         self.cache_insert_entry(parent, name, ino);
         self.cache_remove_dir(ino);
+        self.touch_birth_times(ino)?;
+        self.touch_mtime_ctime(parent)?;
         Ok(ino)
     }
 
     pub(super) fn unlink_at(&self, parent: u32, name: &str) -> Result<()> {
+        let target_ino = self.lookup_at(parent, name)?;
+        let target_meta = self.stat(target_ino)?;
+        if target_meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
+            return_errno!(Errno::EISDIR);
+        }
+
         let op = CrashJournalOp::Unlink {
             parent,
             name: name.to_string(),
         };
         self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_unlink_at(parent, name)))?;
         self.cache_remove_entry(parent, name);
+        self.touch_mtime_ctime(parent)?;
         Ok(())
     }
 
     pub(super) fn rmdir_at(&self, parent: u32, name: &str) -> Result<()> {
-        let child_ino = self.lookup_at(parent, name).ok();
+        let child_ino = self.lookup_at(parent, name)?;
+        let child_meta = self.stat(child_ino)?;
+        if child_meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+            return_errno!(Errno::ENOTDIR);
+        }
+
+        let entries = self.readdir(child_ino)?;
+        let has_real_child = entries
+            .iter()
+            .any(|entry| entry.name != "." && entry.name != "..");
+        if has_real_child {
+            return_errno!(Errno::ENOTEMPTY);
+        }
+
         let op = CrashJournalOp::Rmdir {
             parent,
             name: name.to_string(),
         };
         self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_rmdir_at(parent, name)))?;
         self.cache_remove_entry(parent, name);
-        if let Some(child_ino) = child_ino {
-            self.cache_remove_dir(child_ino);
-        }
+        self.cache_remove_dir(child_ino);
+        self.touch_mtime_ctime(parent)?;
         Ok(())
     }
 
@@ -1015,21 +1104,60 @@ impl Ext4Fs {
             }
         }
 
+        self.touch_mtime_ctime(old_parent)?;
+        if new_parent != old_parent {
+            self.touch_mtime_ctime(new_parent)?;
+        }
+        self.touch_ctime(old_ino)?;
+
         Ok(())
     }
 
-    pub(super) fn read_at(&self, ino: u32, offset: usize, data: &mut [u8]) -> Result<usize> {
-        self.run_ext4(|ext4| ext4.ext4_read_at(ino, offset, data))
+    pub(super) fn read_at(
+        &self,
+        ino: u32,
+        offset: usize,
+        data: &mut [u8],
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        let read_len = self.run_ext4(|ext4| ext4.ext4_read_at(ino, offset, data))?;
+        if read_len > 0 {
+            self.touch_atime(ino, status_flags)?;
+        }
+        Ok(read_len)
     }
 
     pub(super) fn write_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {
         let op = CrashJournalOp::for_small_write(ino, offset, data);
-        self.run_journaled(op, || self.run_ext4(|ext4| ext4.ext4_write_at(ino, offset, data)))
+        let written = self
+            .run_journaled(op, || self.run_ext4(|ext4| ext4.ext4_write_at(ino, offset, data)))
+            .map_err(|err| {
+                error!(
+                    "ext4 write_at failed: ino={} offset={} len={} err={:?}",
+                    ino,
+                    offset,
+                    data.len(),
+                    err
+                );
+                err
+            })?;
+        if written > 0 {
+            self.touch_mtime_ctime(ino)?;
+        }
+        Ok(written)
     }
 
     pub(super) fn truncate(&self, ino: u32, new_size: u64) -> Result<()> {
         let op = CrashJournalOp::Truncate { ino, new_size };
-        self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_truncate(ino, new_size)))?;
+        self.run_journaled(Some(op), || self.run_ext4(|ext4| ext4.ext4_truncate(ino, new_size)))
+            .map_err(|err| {
+                error!(
+                    "ext4 truncate failed: ino={} new_size={} err={:?}",
+                    ino, new_size, err
+                );
+                err
+            })?;
+        self.touch_mtime_ctime(ino)?;
         Ok(())
     }
 
@@ -1096,6 +1224,11 @@ impl FileSystem for Ext4Fs {
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
         &self.fs_event_subscriber_stats
+    }
+
+    fn set_mount_flags(&self, mount_flags_bits: u32) {
+        self.mount_flags_bits
+            .store(mount_flags_bits, Ordering::Relaxed);
     }
 }
 

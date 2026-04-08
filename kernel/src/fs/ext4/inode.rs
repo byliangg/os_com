@@ -128,7 +128,7 @@ impl InodeIo for Ext4Inode {
         &self,
         offset: usize,
         writer: &mut VmWriter,
-        _status_flags: StatusFlags,
+        status_flags: StatusFlags,
     ) -> Result<usize> {
         if writer.avail() == 0 {
             return Ok(0);
@@ -139,7 +139,7 @@ impl InodeIo for Ext4Inode {
 
         let fs = self.ext4_fs()?;
         let mut data = vec![0u8; writer.avail()];
-        let read_len = fs.read_at(self.ino, offset, data.as_mut_slice())?;
+        let read_len = fs.read_at(self.ino, offset, data.as_mut_slice(), status_flags)?;
         writer.write_fallible(&mut VmReader::from(&data[..read_len]).to_fallible())?;
         Ok(read_len)
     }
@@ -200,19 +200,40 @@ impl Inode for Ext4Inode {
         Duration::from_secs(self.stat_meta().atime as u64)
     }
 
-    fn set_atime(&self, _time: Duration) {}
+    fn set_atime(&self, time: Duration) {
+        if let Ok(fs) = self.ext4_fs() {
+            let secs = u32::try_from(time.as_secs()).unwrap_or(u32::MAX);
+            if let Err(err) = fs.set_inode_times(self.ino, Some(secs), None, None) {
+                warn!("ext4: set_atime failed for ino {}: {:?}", self.ino, err);
+            }
+        }
+    }
 
     fn mtime(&self) -> Duration {
         Duration::from_secs(self.stat_meta().mtime as u64)
     }
 
-    fn set_mtime(&self, _time: Duration) {}
+    fn set_mtime(&self, time: Duration) {
+        if let Ok(fs) = self.ext4_fs() {
+            let secs = u32::try_from(time.as_secs()).unwrap_or(u32::MAX);
+            if let Err(err) = fs.set_inode_times(self.ino, None, Some(secs), None) {
+                warn!("ext4: set_mtime failed for ino {}: {:?}", self.ino, err);
+            }
+        }
+    }
 
     fn ctime(&self) -> Duration {
         Duration::from_secs(self.stat_meta().ctime as u64)
     }
 
-    fn set_ctime(&self, _time: Duration) {}
+    fn set_ctime(&self, time: Duration) {
+        if let Ok(fs) = self.ext4_fs() {
+            let secs = u32::try_from(time.as_secs()).unwrap_or(u32::MAX);
+            if let Err(err) = fs.set_inode_times(self.ino, None, None, Some(secs)) {
+                warn!("ext4: set_ctime failed for ino {}: {:?}", self.ino, err);
+            }
+        }
+    }
 
     fn ino(&self) -> u64 {
         self.ino as u64
@@ -373,6 +394,10 @@ impl Inode for Ext4Inode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.ext4_fs().unwrap()
+    }
+
+    fn is_dentry_cacheable(&self) -> bool {
+        false
     }
 
     fn extension(&self) -> &Extension {

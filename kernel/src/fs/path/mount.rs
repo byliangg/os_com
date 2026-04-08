@@ -224,7 +224,7 @@ impl Mount {
     ) -> Arc<Self> {
         let id = ID_ALLOCATOR.get().unwrap().lock().alloc().unwrap();
 
-        Arc::new_cyclic(|weak_self| Self {
+        let mount = Arc::new_cyclic(|weak_self| Self {
             id,
             root_dentry: Dentry::new_root(fs.root_inode()),
             mountpoint: RwLock::new(None),
@@ -236,7 +236,9 @@ impl Mount {
             mnt_ns,
             flags: AtomicPerMountFlags::new(flags),
             this: weak_self.clone(),
-        })
+        });
+        mount.fs.set_mount_flags(flags.bits());
+        mount
     }
 
     /// Gets the mount ID.
@@ -495,13 +497,14 @@ impl Mount {
 
         let need_inherit_atime = !mount_flags.intersects(ATIME_MASK | PerMountFlags::NODIRATIME);
 
-        if need_inherit_atime {
+        let new_flags = if need_inherit_atime {
             let old_flags = self.flags.load(Ordering::Relaxed);
-            let new_flags = mount_flags | (old_flags & ATIME_MASK);
-            self.flags.store(new_flags, Ordering::Relaxed);
+            mount_flags | (old_flags & ATIME_MASK)
         } else {
-            self.flags.store(mount_flags, Ordering::Relaxed);
-        }
+            mount_flags
+        };
+        self.flags.store(new_flags, Ordering::Relaxed);
+        self.fs.set_mount_flags(new_flags.bits());
 
         Ok(())
     }

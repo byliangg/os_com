@@ -7,6 +7,69 @@ use crate::utils::crc::*;
 
 
 impl Ext4 {
+    fn update_index_first_block_in_node(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        node: &ExtentPathNode,
+        pos: usize,
+        first_block: u32,
+    ) -> Result<()> {
+        let block_size = self.super_block.block_size() as usize;
+        let idx_size = core::mem::size_of::<Ext4ExtentIndex>();
+        let header_size = core::mem::size_of::<Ext4ExtentHeader>();
+
+        if node.pblock_of_node == 0 {
+            let entries = node.header.entries_count as usize;
+            if pos >= entries {
+                return return_errno_with_message!(
+                    Errno::EINVAL,
+                    "root index position out of range"
+                );
+            }
+            unsafe {
+                let header_ptr = inode_ref.inode.block.as_mut_ptr() as *mut Ext4ExtentHeader;
+                let index_ptr = header_ptr.add(1) as *mut Ext4ExtentIndex;
+                (*index_ptr.add(pos)).first_block = first_block;
+            }
+            self.write_back_inode(inode_ref);
+            return Ok(());
+        }
+
+        let mut node_block = Block::load(&self.block_device, node.pblock_of_node * block_size);
+        let header: Ext4ExtentHeader = node_block.read_offset_as(0);
+        let entries = header.entries_count as usize;
+        if pos >= entries {
+            return return_errno_with_message!(Errno::EINVAL, "index position out of range");
+        }
+
+        let idx_off = header_size + pos * idx_size;
+        let idx: &mut Ext4ExtentIndex = node_block.read_offset_as_mut(idx_off);
+        idx.first_block = first_block;
+        node_block.sync_blk_to_disk(&self.block_device);
+        let _ = self.set_extent_block_checksum(inode_ref, node.pblock_of_node);
+        Ok(())
+    }
+
+    fn propagate_first_block_to_ancestors(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        search_path: &SearchPath,
+        mut child_level: usize,
+        first_block: u32,
+    ) -> Result<()> {
+        while child_level > 0 {
+            let parent_level = child_level - 1;
+            let parent_node = &search_path.path[parent_level];
+            let parent_pos = parent_node.position;
+            self.update_index_first_block_in_node(inode_ref, parent_node, parent_pos, first_block)?;
+            if parent_pos != 0 {
+                break;
+            }
+            child_level = parent_level;
+        }
+        Ok(())
+    }
+
     /// Find an extent in the extent tree.
     ///
     /// Params:
@@ -453,10 +516,21 @@ impl Ext4 {
             }
 
             
-            // Not empty, insert at search result pos + 1
-            log::info!("[insert_new_extent] Inserting at root at position {} (entries: {})", 
-                node.position + 1, header.entries_count);
-            let insert_pos = node.position + 1;
+            // Not empty, choose insert position by key order.
+            let insert_pos = if let Some(cur) = node.extent {
+                if new_extent.first_block < cur.first_block {
+                    node.position
+                } else {
+                    node.position + 1
+                }
+            } else {
+                node.position + 1
+            };
+            log::info!(
+                "[insert_new_extent] Inserting at root at position {} (entries: {})",
+                insert_pos,
+                header.entries_count
+            );
             let entries = header.entries_count as usize;
             if insert_pos < entries {
                 for i in (insert_pos..entries).rev() {
@@ -466,6 +540,7 @@ impl Ext4 {
             }
             *inode_ref.inode.root_extent_mut_at(insert_pos) = *new_extent;
             inode_ref.inode.root_extent_header_mut().entries_count += 1;
+            self.write_back_inode(inode_ref);
             
             log::debug!("[insert_new_extent] Successfully inserted at root:");
             log::debug!("  - Root header: magic={:x}, entries={}, max={}, depth={}", 
@@ -477,14 +552,25 @@ impl Ext4 {
             return Ok(());
         } else {
             // insert at nonroot
-            log::info!("[insert_new_extent] Inserting at non-root node at depth {}, position {}", 
-                depth, node.position + 1);
+            let insert_pos = if let Some(cur) = node.extent {
+                if new_extent.first_block < cur.first_block {
+                    node.position
+                } else {
+                    node.position + 1
+                }
+            } else {
+                node.position + 1
+            };
+            log::info!(
+                "[insert_new_extent] Inserting at non-root node at depth {}, position {}",
+                depth,
+                insert_pos
+            );
 
             // load block
             let node_block = node.pblock_of_node;
             let mut ext4block =
             Block::load(&self.block_device, node_block * block_size);
-            let insert_pos = node.position + 1;
             let extent_size = core::mem::size_of::<Ext4Extent>();
             let ext_header_size = core::mem::size_of::<Ext4ExtentHeader>();
             let entries_count = {
@@ -531,7 +617,7 @@ impl Ext4 {
             log::debug!("  - Node header: entries={}, max={}, depth={}", 
                 node_header_entries, node_header_max, depth);
             log::debug!("  - Block address: {}", node_block);
-            log::debug!("  - Extent position: {}", node.position + 1);
+            log::debug!("  - Extent position: {}", insert_pos);
             log::debug!("  - Extent: logical={}, physical={}, length={}", 
                 new_extent.first_block, new_extent.get_pblock(), new_extent.get_actual_len());
 
@@ -555,20 +641,6 @@ impl Ext4 {
         // a new index into its parent (currently supports parent at root).
         if depth > 0 {
             let parent = &search_path.path[depth - 1];
-            if parent.pblock_of_node != 0 {
-                return return_errno_with_message!(
-                    Errno::ENOTSUP,
-                    "split leaf with non-root parent is not supported"
-                );
-            }
-
-            let root_header = inode_ref.inode.root_extent_header();
-            if root_header.entries_count >= root_header.max_entries_count {
-                // Root index is full, grow and retry.
-                self.ext_grow_indepth(inode_ref)?;
-                return self.insert_extent(inode_ref, new_extent);
-            }
-
             let new_leaf_block = self.balloc_alloc_block(inode_ref, None)?;
             let mut leaf_block = Block::load(&self.block_device, new_leaf_block as usize * block_size);
             leaf_block.data.fill(0);
@@ -600,26 +672,93 @@ impl Ext4 {
             leaf_block.sync_blk_to_disk(&self.block_device);
             let _ = self.set_extent_block_checksum(inode_ref, new_leaf_block as usize);
 
-            let parent_entries = root_header.entries_count as usize;
-            let insert_pos = parent.position + 1;
-            unsafe {
-                let header_ptr = inode_ref.inode.block.as_mut_ptr() as *mut Ext4ExtentHeader;
-                let index_ptr = header_ptr.add(1) as *mut Ext4ExtentIndex;
+            let insert_pos = if let Some(cur_idx) = parent.index {
+                if new_extent.first_block < cur_idx.first_block {
+                    parent.position
+                } else {
+                    parent.position + 1
+                }
+            } else {
+                parent.position + 1
+            };
 
-                if insert_pos < parent_entries {
-                    for i in (insert_pos..parent_entries).rev() {
-                        let moved = *index_ptr.add(i);
-                        *index_ptr.add(i + 1) = moved;
-                    }
+            if parent.pblock_of_node == 0 {
+                // Parent is root index node stored in inode body.
+                let root_header = inode_ref.inode.root_extent_header();
+                if root_header.entries_count >= root_header.max_entries_count {
+                    // Root index is full, grow and retry.
+                    self.ext_grow_indepth(inode_ref)?;
+                    return self.insert_extent(inode_ref, new_extent);
                 }
 
-                let new_index = index_ptr.add(insert_pos);
-                (*new_index).first_block = new_extent.first_block;
-                (*new_index).store_pblock(new_leaf_block);
-                (*new_index).padding = 0;
+                let parent_entries = root_header.entries_count as usize;
+                unsafe {
+                    let header_ptr = inode_ref.inode.block.as_mut_ptr() as *mut Ext4ExtentHeader;
+                    let index_ptr = header_ptr.add(1) as *mut Ext4ExtentIndex;
+
+                    if insert_pos < parent_entries {
+                        for i in (insert_pos..parent_entries).rev() {
+                            let moved = *index_ptr.add(i);
+                            *index_ptr.add(i + 1) = moved;
+                        }
+                    }
+
+                    let new_index = index_ptr.add(insert_pos);
+                    (*new_index).first_block = new_extent.first_block;
+                    (*new_index).store_pblock(new_leaf_block);
+                    (*new_index).padding = 0;
+                }
+                inode_ref.inode.root_extent_header_mut().entries_count += 1;
+                self.write_back_inode(inode_ref);
+                return Ok(());
             }
-            inode_ref.inode.root_extent_header_mut().entries_count += 1;
-            self.write_back_inode(inode_ref);
+
+            // Parent is a non-root internal node in an extent block.
+            let mut parent_block =
+                Block::load(&self.block_device, parent.pblock_of_node * block_size);
+            let parent_header: Ext4ExtentHeader = parent_block.read_offset_as(0);
+            let parent_entries = parent_header.entries_count as usize;
+            let parent_max = parent_header.max_entries_count as usize;
+            if parent_entries >= parent_max {
+                return return_errno_with_message!(
+                    Errno::ENOTSUP,
+                    "split leaf with full non-root parent is not supported"
+                );
+            }
+
+            let index_size = core::mem::size_of::<Ext4ExtentIndex>();
+            let header_size = core::mem::size_of::<Ext4ExtentHeader>();
+            if insert_pos < parent_entries {
+                let src = header_size + insert_pos * index_size;
+                let dst = header_size + (insert_pos + 1) * index_size;
+                let bytes_to_move = (parent_entries - insert_pos) * index_size;
+                parent_block
+                    .data
+                    .copy_within(src..src + bytes_to_move, dst);
+            }
+
+            let idx_off = header_size + insert_pos * index_size;
+            {
+                let new_index: &mut Ext4ExtentIndex = parent_block.read_offset_as_mut(idx_off);
+                new_index.first_block = new_extent.first_block;
+                new_index.store_pblock(new_leaf_block);
+                new_index.padding = 0;
+            }
+            {
+                let header: &mut Ext4ExtentHeader = parent_block.read_offset_as_mut(0);
+                header.entries_count += 1;
+            }
+
+            parent_block.sync_blk_to_disk(&self.block_device);
+            let _ = self.set_extent_block_checksum(inode_ref, parent.pblock_of_node);
+            if insert_pos == 0 {
+                self.propagate_first_block_to_ancestors(
+                    inode_ref,
+                    search_path,
+                    depth - 1,
+                    new_extent.first_block,
+                )?;
+            }
             return Ok(());
         }
 

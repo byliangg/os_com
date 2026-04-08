@@ -31,10 +31,14 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase3_base.lis
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase3_base.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase4_good.list \
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase4_good.list"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase6_good.list \
+  "${ROOTFS_DIR}/opt/xfstests/testcases/phase6_good.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase3_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase3_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase4_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase4_excluded.tsv"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase6_excluded.tsv \
+  "${ROOTFS_DIR}/opt/xfstests/blocked/phase6_excluded.tsv"
 
 mkdir -p "$(dirname "${OUT_IMG}")"
 echo "[INFO] Repacking to ${OUT_IMG} ..."

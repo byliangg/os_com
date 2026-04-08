@@ -178,6 +178,11 @@ pub trait FileSystem: Any + Sync + Send {
         Ok(())
     }
 
+    /// Notifies file systems that per-mount flags have changed.
+    ///
+    /// The bit layout follows `PerMountFlags` in `fs/path/mount.rs`.
+    fn set_mount_flags(&self, _mount_flags_bits: u32) {}
+
     /// Returns the FS event subscriber stats of this file system.
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats;
 }
