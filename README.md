@@ -1,4 +1,4 @@
-# Asterinas EXT4 赛题版本（Stage6）
+# Asterinas EXT4 赛题版本（Stage7）
 
 ## 1. 项目概述
 
@@ -8,7 +8,8 @@
 2. 通过 xfstests 与 lmbench 建立可重复、可追踪的功能与性能验证流程。
 3. 将测试输入、输出、运行资产统一收敛到仓库内，降低环境漂移风险，支持跨环境直接复现。
 
-本版本重点覆盖 `stage6` 阶段工作，测试默认在 Docker 环境中执行。
+本版本当前按 `stage7` 阶段推进，测试默认在 Docker 环境中执行。  
+说明：测试脚本中的 `phase6_*`（如 `phase6_only`）是历史入口命名，stage7 继续沿用；phase6 文档保留为历史归档。
 
 ## 2. 当前完成情况
 
@@ -25,30 +26,32 @@
    `pass=10 fail=0 notrun=6 static_blocked=24 denominator=10 pass_rate=100.00%`
 2. `phase4_good`：PASS  
    `pass=12 fail=0 notrun=6 static_blocked=22 denominator=12 pass_rate=100.00%`
-3. `phase6_only`：PASS  
+3. `phase6_only`：PASS（stage7 当前门禁）  
    `pass=25 fail=0 notrun=0 static_blocked=26 denominator=25 pass_rate=100.00%`
 4. `lmbench_only`：PASS（8/8）
 5. `crash_only`：PASS（`3 场景 x 3 轮 = 9/9`）
-6. `phase6_perf_compare`：FAIL（Linux EXT4 对照性能，`8项 x 3轮`）  
-   `overall_avg_ratio=0.166079`（目标阈值 `0.80`）
+6. `others_test`：PASS（非 ext4 通用回归）
+7. `phase6_perf_compare`：FAIL（stage7 当前性能门禁，Linux EXT4 对照，`8项 x 3轮`）  
+   `overall_avg_ratio=0.350293`（目标阈值 `0.80`）
 
 最新日志见：
 
-1. `benchmark/logs/phase3_base_guard_20260408_071539.log`
-2. `benchmark/logs/phase4_good_20260408_072542.log`
-3. `benchmark/logs/phase6_good_20260408_094026.log`
-4. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260408_073643.tsv`
-5. `benchmark/logs/crash/phase4_part3_crash_summary_20260408_114539.tsv`
-6. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_report.txt`
-7. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_aggregate.tsv`
+1. `benchmark/logs/phase3_base_guard_20260409_045752.log`
+2. `benchmark/logs/phase4_good_20260409_050505.log`
+3. `benchmark/logs/phase6_good_20260409_122044.log`
+4. `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260409_051131.tsv`
+5. `benchmark/logs/crash/phase4_part3_crash_summary_20260409_051328.tsv`
+6. `benchmark/logs/others_general_20260409_203930.log`
+7. `benchmark/logs/perf_compare/20260409_122735/phase6_perf_compare_report.txt`
+8. `benchmark/logs/perf_compare/20260409_122735/phase6_perf_compare_aggregate.tsv`
 
 ### 2.3 与“良好”指标的差异
 
 按当前赛题“良好”口径，核心差异如下：
 
-1. `xfstests` 阶段集通过率（`>=90%`）：已满足（`phase6_only` 为 `25/25`，`pass_rate=100%`）。
+1. `xfstests` 阶段集通过率（`>=90%`）：已满足（当前门禁 `phase6_only` 为 `25/25`，`pass_rate=100%`）。
 2. 基础崩溃恢复证据链：已满足（固定 3 场景、每场景 3 轮、日志可复现）。
-3. Linux EXT4 对照性能（目标 `>=80%`）：未满足，当前 `overall_avg_ratio=0.166079`。
+3. Linux EXT4 对照性能（目标 `>=80%`）：未满足，当前 `overall_avg_ratio=0.350293`。
 
 结论：当前“良好”指标只差性能对照这一项。
 
@@ -80,7 +83,7 @@
 
 ### 3.3 当前样例覆盖范围（概览）
 
-1. 当前 `phase6` 候选池为 `51`，静态排除 `26`，理论可运行集合 `25`。
+1. 当前门禁候选池（历史命名 `phase6`）为 `51`，静态排除 `26`，理论可运行集合 `25`。
 2. 当前门禁运行集合 `25/25` 均通过（`phase6_only`）。
 3. `STATIC_BLOCKED` 主要是阶段性能力外语义：如 AIO、hardlink/symlink、`O_TMPFILE/flink`、`renameat2`、`fallocate/collapse-range/fiemap`、xattr/chacl 等。
 4. lmbench 覆盖 8 项：`open/stat/fstat/read/write` 延迟、`create+delete(0k/10k)`、`copy_files_bw`。
@@ -112,7 +115,7 @@ ENABLE_KVM=1 \
 KLOG_LEVEL=error \
 ./tools/ext4/run_phase4_in_docker.sh
 
-# 4) phase6 功能门禁
+# 4) 功能门禁（脚本名 `phase6_only`）
 PHASE4_DOCKER_MODE=phase6_only \
 ENABLE_KVM=1 \
 KLOG_LEVEL=error \
@@ -188,6 +191,8 @@ grep -E "mount: mounting /dev/vda|mount: mounting /dev/vdb|All test in /test/fs 
 | `benchmark/datasets/results/` | 归档后的稳定结果快照（便于 git 追踪） |
 | `tools/ext4/run_phase4_in_docker.sh` | 主测试入口（Docker） |
 | `tools/ext4/run_phase4_part3.sh` | phase3/phase4/lmbench 组合执行逻辑 |
+| `../asterinas_ext4_phase7_qualified_plan.md` | 当前阶段（stage7）任务清单与验收口径 |
+| `../phase7_milestone.md` | 当前阶段（stage7）里程碑与问题跟踪 |
 
 历史阶段文档（保留）示例：
 
@@ -233,9 +238,9 @@ test -f benchmark/assets/linux_vdso/vdso_x86_64.so
 
 ## 8. 当前边界与后续方向
 
-当前结果体现的是 `stage6` 阶段可运行能力与门禁通过状态。后续优先方向：
+当前结果体现的是 `stage7` 阶段的当前可运行能力与门禁通过状态。后续优先方向：
 
-1. 进入性能优化并持续复跑 Linux EXT4 对照性能，目标将 `overall_avg_ratio` 从 `0.166079` 提升到 `>=0.80`。
+1. 进入性能优化并持续复跑 Linux EXT4 对照性能，目标将 `overall_avg_ratio` 从 `0.350293` 提升到 `>=0.80`。
 2. 在不回退现有通过率的前提下，继续扩大 xfstests 可运行集合，逐步减少 `STATIC_BLOCKED`。
 3. 继续沉淀自动化验收规范与提交前自检流程。
 

@@ -3,6 +3,10 @@ use crate::prelude::*;
 use crate::return_errno_with_message;
 use crate::utils::bitmap::*;
 
+// Superblock free-block counter is currently not a scheduling hot-path input.
+// Skipping per-allocation superblock writeback reduces metadata write amplification.
+const HOTPATH_SYNC_SUPERBLOCK: bool = false;
+
 impl Ext4 {
     /// Return the first candidate bit index in a block group that is not known
     /// to belong to ext4 metadata/system-reserved regions.
@@ -11,8 +15,12 @@ impl Ext4 {
 
         if let Some(zones) = &self.system_zone_cache {
             for zone in zones {
-                if zone.group != bgid {
+                // `zones` are populated in group order.
+                if zone.group < bgid {
                     continue;
+                }
+                if zone.group > bgid {
+                    break;
                 }
                 let next_blk = zone.end_blk.saturating_add(1);
                 let next_idx = self.addr_to_idx_bg(next_blk);
@@ -357,7 +365,9 @@ impl Ext4 {
         let mut super_blk_free_blocks = super_block.free_blocks_count();
         super_blk_free_blocks -= 1;
         super_block.set_free_blocks_count(super_blk_free_blocks);
-        super_block.sync_to_disk_with_csum(&self.block_device);
+        if HOTPATH_SYNC_SUPERBLOCK {
+            super_block.sync_to_disk_with_csum(&self.block_device);
+        }
 
         // Update inode blocks (different block size!) count
         let mut inode_blocks = inode_ref.inode.blocks_count();
@@ -434,7 +444,9 @@ impl Ext4 {
 
             super_blk_free_blocks += free_cnt as u64;
             super_block.set_free_blocks_count(super_blk_free_blocks);
-            super_block.sync_to_disk_with_csum(&self.block_device);
+            if HOTPATH_SYNC_SUPERBLOCK {
+                super_block.sync_to_disk_with_csum(&self.block_device);
+            }
 
             /* Update inode blocks (different block size!) count */
             let mut inode_blocks = inode_ref.inode.blocks_count();
@@ -454,7 +466,7 @@ impl Ext4 {
     }
 
 
-    pub fn is_system_reserved_block(&self, block_num: u64, _bgid: u32) -> bool {
+    pub fn is_system_reserved_block(&self, block_num: u64, bgid: u32) -> bool {
 
         // 如果缓存未初始化，则不判断
         if self.system_zone_cache.is_none() {
@@ -463,6 +475,12 @@ impl Ext4 {
         // 查缓存
         if let Some(zones) = &self.system_zone_cache {
             for zone in zones {
+                if zone.group < bgid {
+                    continue;
+                }
+                if zone.group > bgid {
+                    break;
+                }
                 if block_num >= zone.start_blk && block_num <= zone.end_blk {
                     return true;
                 }
@@ -509,6 +527,7 @@ impl Ext4 {
         let mut bgid = *start_bgid;
         let mut result = Vec::with_capacity(count);
         let mut remaining = count;
+        let mut last_alloc_bgid = None;
         
         // Search through all block groups
         let mut groups_checked = 0;
@@ -630,6 +649,7 @@ impl Ext4 {
                                 prev_block, block_num, block_num - prev_block);
                         }
                     }
+
                 }
             }
             
@@ -644,11 +664,13 @@ impl Ext4 {
                 block_group.set_free_blocks_count(new_free_count as u32);
                 block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, super_block);
                 
-                // Update superblock free blocks count
-                let mut sb_copy = *super_block;
-                let sb_free_blocks = sb_copy.free_blocks_count();
-                sb_copy.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
-                sb_copy.sync_to_disk_with_csum(&self.block_device);
+                // Update superblock free blocks count only when hot-path sync is enabled.
+                if HOTPATH_SYNC_SUPERBLOCK {
+                    let mut sb_copy = *super_block;
+                    let sb_free_blocks = sb_copy.free_blocks_count();
+                    sb_copy.set_free_blocks_count(sb_free_blocks - found_blocks as u64);
+                    sb_copy.sync_to_disk_with_csum(&self.block_device);
+                }
                 
                 // Update inode blocks count
                 let blocks_per_fs_block = block_size as u64 / EXT4_INODE_BLOCK_SIZE as u64;
@@ -658,6 +680,7 @@ impl Ext4 {
                 
                 // Decrement remaining blocks to allocate
                 remaining -= found_blocks;
+                last_alloc_bgid = Some(bgid);
                 
                 log::debug!("[Block Alloc] Allocated {} blocks from bg {}", found_blocks, bgid);
             }
@@ -678,7 +701,7 @@ impl Ext4 {
         }
         
         // Update start_bgid to continue from where we left off next time
-        *start_bgid = bgid;
+        *start_bgid = last_alloc_bgid.unwrap_or(bgid);
         
         // Write back inode to save block count changes
         if allocated_count > 0 {

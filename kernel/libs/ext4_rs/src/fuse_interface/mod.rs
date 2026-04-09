@@ -274,6 +274,8 @@ impl Ext4 {
 
         // to do if child already exists we should not add . and .. in child directory
         self.link(&mut parent_inode_ref, &mut child_inode_ref, newname)?;
+        self.write_back_inode(&mut parent_inode_ref);
+        self.write_back_inode(&mut child_inode_ref);
 
         Ok(EOK)
     }

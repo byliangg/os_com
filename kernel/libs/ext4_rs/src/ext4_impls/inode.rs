@@ -134,9 +134,15 @@ impl Ext4 {
         let inode_size = super_block.inode_size as u64;
         let group = (inode_num - 1) / inodes_per_group;
         let index = (inode_num - 1) % inodes_per_group;
-        let block_group =
-            Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
-        let inode_table_blk_num = block_group.get_inode_table_blk_num();
+        let inode_table_blk_num = self
+            .inode_table_blk_cache
+            .as_ref()
+            .and_then(|cache| cache.get(group as usize).copied())
+            .unwrap_or_else(|| {
+                let block_group =
+                    Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
+                block_group.get_inode_table_blk_num() as u64
+            });
 
         inode_table_blk_num as usize * block_size + index as usize * inode_size as usize
     }
@@ -398,9 +404,9 @@ impl Ext4 {
     ///
     /// Returns:
     /// `Result<u32>` - inode number
-    pub fn alloc_inode(&self, is_dir: bool) -> Result<u32> {
+    pub fn alloc_inode(&self, is_dir: bool, preferred_bgid: Option<u32>) -> Result<u32> {
         // Allocate inode
-        let inode_num = self.ialloc_alloc_inode(is_dir)?;
+        let inode_num = self.ialloc_alloc_inode(is_dir, preferred_bgid)?;
 
         Ok(inode_num)
     }

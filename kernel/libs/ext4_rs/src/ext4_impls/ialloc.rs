@@ -3,19 +3,22 @@ use crate::prelude::*;
 use crate::return_errno_with_message;
 use crate::utils::bitmap::*;
 
+// Superblock free-inode counters are not consumed on the in-kernel fast path.
+// Avoid per-op superblock writeback in hot create/unlink loops.
+const HOTPATH_SYNC_SUPERBLOCK: bool = false;
+
 impl Ext4 {
-    pub fn ialloc_alloc_inode(&self, is_dir: bool) -> Result<u32> {
+    pub fn ialloc_alloc_inode(&self, is_dir: bool, preferred_bgid: Option<u32>) -> Result<u32> {
         let block_size = self.super_block.block_size() as usize;
-        let mut bgid = 0;
         let bg_count = self.super_block.block_group_count();
+        if bg_count == 0 {
+            return_errno_with_message!(Errno::EINVAL, "invalid block group count");
+        }
+        let mut bgid = preferred_bgid.unwrap_or(0) % bg_count;
+        let mut scanned = 0u32;
         let mut super_block = self.super_block;
 
-        while bgid <= bg_count {
-            if bgid == bg_count {
-                bgid = 0;
-                continue;
-            }
-
+        while scanned < bg_count {
             let mut bg =
                 Ext4BlockGroup::load_new(&self.block_device, &super_block, bgid as usize);
 
@@ -32,9 +35,20 @@ impl Ext4 {
 
                 let mut bitmap_data = &mut raw_data[..];
 
-                let mut idx_in_bg = 0;
-
-                ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg);
+                // Hot path hint: inode allocation in our workload is mostly append-like,
+                // so start from the used-prefix tail instead of scanning from 0 each time.
+                let mut idx_in_bg = inodes_in_bg.saturating_sub(free_inodes as u32);
+                let found = ext4_bmap_bit_find_clr(
+                    bitmap_data,
+                    idx_in_bg,
+                    inodes_in_bg,
+                    &mut idx_in_bg,
+                ) || ext4_bmap_bit_find_clr(bitmap_data, 0, inodes_in_bg, &mut idx_in_bg);
+                if !found {
+                    bgid = (bgid + 1) % bg_count;
+                    scanned += 1;
+                    continue;
+                }
                 ext4_bmap_bit_set(bitmap_data, idx_in_bg);
 
                 // update bitmap in disk
@@ -65,7 +79,9 @@ impl Ext4 {
 
                 /* Update superblock */
                 super_block.decrease_free_inodes_count();
-                super_block.sync_to_disk_with_csum(&self.block_device);
+                if HOTPATH_SYNC_SUPERBLOCK {
+                    super_block.sync_to_disk_with_csum(&self.block_device);
+                }
 
                 /* Compute the absolute i-nodex number */
                 let inodes_per_group = super_block.inodes_per_group();
@@ -74,7 +90,8 @@ impl Ext4 {
                 return Ok(inode_num);
             }
 
-            bgid += 1;
+            bgid = (bgid + 1) % bg_count;
+            scanned += 1;
         }
 
         return_errno_with_message!(Errno::ENOSPC, "alloc inode fail");
@@ -118,6 +135,8 @@ impl Ext4 {
         bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
 
         super_block.increase_free_inodes_count();
-        super_block.sync_to_disk_with_csum(&self.block_device);
+        if HOTPATH_SYNC_SUPERBLOCK {
+            super_block.sync_to_disk_with_csum(&self.block_device);
+        }
     }
 }

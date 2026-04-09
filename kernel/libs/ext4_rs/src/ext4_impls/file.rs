@@ -7,6 +7,7 @@ use crate::ext4_defs::*;
 // Keep sparse-write allocation modest: large enough to avoid pathological
 // one-block extent growth under fsstress, but still conservative for generic/014.
 const WRITE_PREALLOC_BLOCKS: u32 = 16;
+const WRITE_FULL_BLOCK_BATCH_MAX: usize = 4096;
 
 impl Ext4 {
     /// Link a child inode to a parent directory
@@ -28,7 +29,6 @@ impl Ext4 {
 
         // at this point should insert to existing block
         self.dir_add_entry(parent, child, name)?;
-        self.write_back_inode_without_csum(parent);
 
         // If this is the first link. add '.' and '..' entries
         if child.inode.is_dir() {
@@ -71,22 +71,22 @@ impl Ext4 {
     pub fn create(&self, parent: u32, name: &str, inode_mode: u16) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
-        // let mut child_inode_ref = self.create_inode(inode_mode)?;
-        let init_child_ref = self.create_inode(inode_mode)?;
-
-        self.write_back_inode_without_csum(&init_child_ref);
-        // load new
-        let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
+        let mut child_inode_ref = self.create_inode(inode_mode, None)?;
+        let child_is_dir = child_inode_ref.inode.is_dir();
 
         self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
 
-        self.write_back_inode(&mut parent_inode_ref);
+        // For regular-file create, parent inode metadata is unchanged in ext4_rs link path;
+        // avoid redundant parent inode writeback on create hot paths.
+        if child_is_dir {
+            self.write_back_inode(&mut parent_inode_ref);
+        }
         self.write_back_inode(&mut child_inode_ref);
 
         Ok(child_inode_ref)
     }
 
-    pub fn create_inode(&self, inode_mode: u16) -> Result<Ext4InodeRef> {
+    pub fn create_inode(&self, inode_mode: u16, preferred_bgid: Option<u32>) -> Result<Ext4InodeRef> {
 
         // Extract only file-type bits; permission bits are not part of `InodeFileType`.
         let inode_file_type = match InodeFileType::from_bits(inode_mode & EXT4_INODE_MODE_TYPE_MASK) {
@@ -97,7 +97,7 @@ impl Ext4 {
         let is_dir = inode_file_type == InodeFileType::S_IFDIR;
 
         // allocate inode
-        let inode_num = self.alloc_inode(is_dir)?;
+        let inode_num = self.alloc_inode(is_dir, preferred_bgid)?;
 
         // initialize inode
         let mut inode = Ext4Inode::default();
@@ -139,19 +139,17 @@ impl Ext4 {
     pub fn create_with_attr(&self, parent: u32, name: &str, inode_mode: u16, uid:u16, gid: u16) -> Result<Ext4InodeRef> {
         let mut parent_inode_ref = self.get_inode_ref(parent);
 
-        // let mut child_inode_ref = self.create_inode(inode_mode)?;
-        let mut init_child_ref = self.create_inode(inode_mode)?;
+        let mut child_inode_ref = self.create_inode(inode_mode, None)?;
+        let child_is_dir = child_inode_ref.inode.is_dir();
 
-        init_child_ref.inode.set_uid(uid);
-        init_child_ref.inode.set_gid(gid);
-
-        self.write_back_inode_without_csum(&init_child_ref);
-        // load new
-        let mut child_inode_ref = self.get_inode_ref(init_child_ref.inode_num);
+        child_inode_ref.inode.set_uid(uid);
+        child_inode_ref.inode.set_gid(gid);
 
         self.link(&mut parent_inode_ref, &mut child_inode_ref, name)?;
 
-        self.write_back_inode(&mut parent_inode_ref);
+        if child_is_dir {
+            self.write_back_inode(&mut parent_inode_ref);
+        }
         self.write_back_inode(&mut child_inode_ref);
 
         Ok(child_inode_ref)
@@ -205,13 +203,43 @@ impl Ext4 {
         let mut cursor = 0;
         let mut total_bytes_read = 0;
         let mut iblock = iblock_start;
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        let mut resolve_pblock = |lblock: u32| -> Result<Ext4Fsblk> {
+            if let Some((start, end, pstart)) = extent_cache {
+                if lblock >= start && lblock < end {
+                    return Ok(pstart + (lblock - start) as u64);
+                }
+            }
+
+            let search_path = self.find_extent(&inode_ref, lblock)?;
+            let node = search_path
+                .path
+                .last()
+                .ok_or_else(|| Ext4Error::new(Errno::ENOENT))?;
+            let extent = node
+                .extent
+                .ok_or_else(|| Ext4Error::new(Errno::ENOENT))?;
+
+            let ext_start = extent.get_first_block();
+            let ext_len = extent.get_actual_len() as u32;
+            let Some(ext_end) = ext_start.checked_add(ext_len) else {
+                return Err(Ext4Error::new(Errno::EIO));
+            };
+            if lblock < ext_start || lblock >= ext_end {
+                return Err(Ext4Error::new(Errno::ENOENT));
+            }
+
+            let pstart = extent.get_pblock();
+            extent_cache = Some((ext_start, ext_end, pstart));
+            Ok(pstart + (lblock - ext_start) as u64)
+        };
 
         // Unaligned read at the beginning
         if unaligned_start_offset > 0 {
             let adjust_read_size = min(block_size - unaligned_start_offset, read_buf_len);
 
             // get iblock physical block id
-            match self.get_pblock_idx(&inode_ref, iblock as u32) {
+            match resolve_pblock(iblock as u32) {
                 Ok(pblock_idx) => {
                     // read data
                     let data = self.block_device.read_offset(pblock_idx as usize * block_size);
@@ -255,7 +283,7 @@ impl Ext4 {
             
 
             // get iblock physical block id
-            match self.get_pblock_idx(&inode_ref, iblock as u32) {
+            match resolve_pblock(iblock as u32) {
                 Ok(pblock_idx) => {
                     // read data
                     let data = self.block_device.read_offset(pblock_idx as usize * block_size);
@@ -433,47 +461,106 @@ impl Ext4 {
         let file_size = inode_ref.inode.size();
 
         let iblock_start = offset / block_size;
-        let mut start_bgid = 0;
+        let write_end = offset
+            .checked_add(write_buf.len())
+            .ok_or_else(|| Ext4Error::new(Errno::EINVAL))?;
+        let iblock_end = write_end.div_ceil(block_size);
+        let mut start_bgid = self.get_bgid_of_inode(inode_ref.inode_num);
+        if iblock_start > 0 {
+            if let Ok(prev_pblock) = self.get_pblock_idx(&inode_ref, (iblock_start - 1) as u32) {
+                start_bgid = self.get_bgid_of_block(prev_pblock);
+            }
+        }
+        self.ensure_write_range_mapped(
+            &mut inode_ref,
+            iblock_start as u32,
+            iblock_end as u32,
+            &mut start_bgid,
+        )
+        .map_err(|e| {
+            log::error!(
+                "[write_at] ensure_write_range_mapped failed: inode={} lblock_range=[{}, {}) offset={} len={} err={:?}",
+                inode,
+                iblock_start,
+                iblock_end,
+                offset,
+                write_buf.len(),
+                e
+            );
+            e
+        })?;
+
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
         let mut resolve_pblock = |lblock: u32| -> Result<Ext4Fsblk> {
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(pblock) => return Ok(pblock),
-                Err(e) if e.error() == Errno::ENOENT => {}
-                Err(e) => {
-                    log::error!(
-                        "[write_at] get_pblock_idx failed: inode={} lblock={} offset={} len={} err={:?}",
-                        inode,
-                        lblock,
-                        offset,
-                        write_buf.len(),
-                        e
-                    );
-                    return Err(e);
+            if let Some((start, end, pstart)) = extent_cache {
+                if lblock >= start && lblock < end {
+                    return Ok(pstart + (lblock - start) as u64);
                 }
             }
 
-            self.ensure_write_range_mapped(
-                &mut inode_ref,
-                lblock,
-                lblock + 1,
-                &mut start_bgid,
-            )
-            .map_err(|e| {
-                log::error!(
-                    "[write_at] ensure_write_range_mapped failed: inode={} lblock={} offset={} len={} err={:?}",
-                    inode,
-                    lblock,
-                    offset,
-                    write_buf.len(),
-                    e
-                );
-                e
-            })?;
+            match self.find_extent(&inode_ref, lblock) {
+                Ok(search_path) => {
+                    let Some(node) = search_path.path.last() else {
+                        let e = Ext4Error::new(Errno::ENOENT);
+                        log::error!(
+                            "[write_at] find_extent missing leaf: inode={} lblock={} offset={} len={} err={:?}",
+                            inode,
+                            lblock,
+                            offset,
+                            write_buf.len(),
+                            e
+                        );
+                        return Err(e);
+                    };
+                    let Some(extent) = node.extent else {
+                        let e = Ext4Error::new(Errno::ENOENT);
+                        log::error!(
+                            "[write_at] find_extent no extent: inode={} lblock={} offset={} len={} err={:?}",
+                            inode,
+                            lblock,
+                            offset,
+                            write_buf.len(),
+                            e
+                        );
+                        return Err(e);
+                    };
 
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(pblock) => Ok(pblock),
+                    let ext_start = extent.get_first_block();
+                    let ext_len = extent.get_actual_len() as u32;
+                    let Some(ext_end) = ext_start.checked_add(ext_len) else {
+                        let e = Ext4Error::new(Errno::EIO);
+                        log::error!(
+                            "[write_at] extent overflow: inode={} lblock={} offset={} len={} err={:?}",
+                            inode,
+                            lblock,
+                            offset,
+                            write_buf.len(),
+                            e
+                        );
+                        return Err(e);
+                    };
+                    if lblock < ext_start || lblock >= ext_end {
+                        let e = Ext4Error::new(Errno::ENOENT);
+                        log::error!(
+                            "[write_at] find_extent miss: inode={} lblock={} extent=[{}, {}) offset={} len={} err={:?}",
+                            inode,
+                            lblock,
+                            ext_start,
+                            ext_end,
+                            offset,
+                            write_buf.len(),
+                            e
+                        );
+                        return Err(e);
+                    }
+
+                    let pstart = extent.get_pblock();
+                    extent_cache = Some((ext_start, ext_end, pstart));
+                    Ok(pstart + (lblock - ext_start) as u64)
+                }
                 Err(e) => {
                     log::error!(
-                        "[write_at] mapping still missing after allocation: inode={} lblock={} offset={} len={} err={:?}",
+                        "[write_at] get_pblock_idx failed after pre-map: inode={} lblock={} offset={} len={} err={:?}",
                         inode,
                         lblock,
                         offset,
@@ -494,10 +581,6 @@ impl Ext4 {
             let pblock_idx = resolve_pblock(iblk_idx as u32)?;
             let mut block = Block::load(&self.block_device, pblock_idx as usize * block_size);
 
-            let existing = self.block_device.read_offset(pblock_idx as usize * block_size);
-            let copy_len = min(block.data.len(), existing.len());
-            block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
-
             block.write_offset(unaligned, &write_buf[written..written + len], len);
             block.sync_blk_to_disk(&self.block_device);
 
@@ -507,18 +590,35 @@ impl Ext4 {
 
         while written < write_buf.len() {
             let pblock_idx = resolve_pblock(iblk_idx as u32)?;
-            let block_offset = pblock_idx as usize * block_size;
-            let mut block = Block::load(&self.block_device, block_offset);
             let write_size = min(block_size, write_buf.len() - written);
 
             if write_size < block_size {
-                let existing = self.block_device.read_offset(block_offset);
-                let copy_len = min(block.data.len(), existing.len());
-                block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
-            }
+                let block_offset = pblock_idx as usize * block_size;
+                let mut block = Block::load(&self.block_device, block_offset);
+                block.write_offset(0, &write_buf[written..written + write_size], write_size);
+                block.sync_blk_to_disk(&self.block_device);
+            } else {
+                let remaining_blocks = (write_buf.len() - written) / block_size;
+                let max_batch_blocks = min(remaining_blocks, WRITE_FULL_BLOCK_BATCH_MAX);
+                let mut batch_blocks = 1usize;
 
-            block.write_offset(0, &write_buf[written..written + write_size], write_size);
-            block.sync_blk_to_disk(&self.block_device);
+                while batch_blocks < max_batch_blocks {
+                    let next_lblk = iblk_idx + batch_blocks;
+                    let next_pblk = resolve_pblock(next_lblk as u32)?;
+                    if next_pblk != pblock_idx + batch_blocks as u64 {
+                        break;
+                    }
+                    batch_blocks += 1;
+                }
+
+                let batch_bytes = batch_blocks * block_size;
+                let block_offset = pblock_idx as usize * block_size;
+                self.block_device
+                    .write_offset(block_offset, &write_buf[written..written + batch_bytes]);
+                written += batch_bytes;
+                iblk_idx += batch_blocks;
+                continue;
+            }
 
             written += write_size;
             iblk_idx += 1;

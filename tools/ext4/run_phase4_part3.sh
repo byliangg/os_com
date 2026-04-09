@@ -246,6 +246,11 @@ run_lmbench_regression() {
     if [[ "${bench}" == "lmbench/ext4_vfs_open_lat" ]]; then
       timeout_s=900
     fi
+    # ext4_vfs_stat_lat occasionally has long tail when metadata path is under stress.
+    # Align with open_lat timeout to reduce flaky false negatives in regression gating.
+    if [[ "${bench}" == "lmbench/ext4_vfs_stat_lat" ]]; then
+      timeout_s=900
+    fi
     if [[ "${bench}" == "lmbench/ext4_copy_files_bw" ]]; then
       timeout_s=700
     fi

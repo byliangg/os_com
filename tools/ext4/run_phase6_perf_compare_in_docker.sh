@@ -14,6 +14,8 @@ CONTAINER_LOG_ROOT=${CONTAINER_LOG_ROOT:-${CONTAINER_WORKDIR}/benchmark/logs/per
 PERF_ROUNDS=${PERF_ROUNDS:-3}
 PERF_RATIO_THRESHOLD=${PERF_RATIO_THRESHOLD:-0.80}
 PERF_CASE_TIMEOUT_SEC=${PERF_CASE_TIMEOUT_SEC:-600}
+PERF_WARMUP_BENCH=${PERF_WARMUP_BENCH:-ext4_vfs_open_lat}
+PERF_WARMUP_TIMEOUT_SEC=${PERF_WARMUP_TIMEOUT_SEC:-1200}
 # Comma-separated bench names without "lmbench/" prefix.
 # Example: PERF_BENCHES=ext4_vfs_open_lat,ext4_copy_files_bw
 PERF_BENCHES=${PERF_BENCHES:-}
@@ -38,6 +40,8 @@ DOCKER_ENV_ARGS=(
   -e PERF_ROUNDS="${PERF_ROUNDS}"
   -e PERF_RATIO_THRESHOLD="${PERF_RATIO_THRESHOLD}"
   -e PERF_CASE_TIMEOUT_SEC="${PERF_CASE_TIMEOUT_SEC}"
+  -e PERF_WARMUP_BENCH="${PERF_WARMUP_BENCH}"
+  -e PERF_WARMUP_TIMEOUT_SEC="${PERF_WARMUP_TIMEOUT_SEC}"
   -e PERF_BENCHES="${PERF_BENCHES}"
   -e BENCH_ENABLE_KVM="${BENCH_ENABLE_KVM}"
   -e BENCH_ASTER_NETDEV="${BENCH_ASTER_NETDEV}"
@@ -112,6 +116,23 @@ AGG_TSV="${RUN_DIR}/phase6_perf_compare_aggregate.tsv"
 REPORT_TXT="${RUN_DIR}/phase6_perf_compare_report.txt"
 
 printf "bench\tround\tlinux\tasterinas\tbigger_is_better\tratio\tstatus\tjson\n" >"${DETAIL_TSV}"
+
+if [ -n "${PERF_WARMUP_BENCH}" ]; then
+  warmup_job="lmbench/${PERF_WARMUP_BENCH}"
+  warmup_log="${RUN_DIR}/warmup_${PERF_WARMUP_BENCH}.log"
+  echo "[WARMUP] job=${warmup_job} timeout=${PERF_WARMUP_TIMEOUT_SEC}s"
+  set +e
+  BENCH_ENABLE_KVM="${BENCH_ENABLE_KVM}" \
+  BENCH_ASTER_NETDEV="${BENCH_ASTER_NETDEV}" \
+  BENCH_ASTER_VHOST="${BENCH_ASTER_VHOST}" \
+  timeout "${PERF_WARMUP_TIMEOUT_SEC}" \
+    bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${warmup_job}" x86_64 >"${warmup_log}" 2>&1
+  warmup_rc=$?
+  set -e
+  if [ "${warmup_rc}" -ne 0 ]; then
+    echo "[WARN] warmup failed (rc=${warmup_rc}), see ${warmup_log}" >&2
+  fi
+fi
 
 for round in $(seq 1 "${PERF_ROUNDS}"); do
   for bench in "${benches[@]}"; do
@@ -240,6 +261,7 @@ EOF
 echo "[INFO] image=${IMAGE_NAME}"
 echo "[INFO] rounds=${PERF_ROUNDS} ratio_threshold=${PERF_RATIO_THRESHOLD}"
 echo "[INFO] case_timeout_sec=${PERF_CASE_TIMEOUT_SEC}"
+echo "[INFO] warmup_bench=${PERF_WARMUP_BENCH:-<none>} warmup_timeout_sec=${PERF_WARMUP_TIMEOUT_SEC}"
 echo "[INFO] aster_kvm=${BENCH_ENABLE_KVM} aster_netdev=${BENCH_ASTER_NETDEV} aster_vhost=${BENCH_ASTER_VHOST}"
 if [ -n "${PERF_BENCHES}" ]; then
   echo "[INFO] benches=${PERF_BENCHES}"

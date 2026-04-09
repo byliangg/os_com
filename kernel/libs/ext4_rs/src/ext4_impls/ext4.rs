@@ -55,6 +55,18 @@ impl Ext4 {
         }
         zones
     }
+
+    fn build_inode_table_blk_cache(&self) -> Vec<u64> {
+        let group_count = self.super_block.block_group_count();
+        let mut cache = Vec::with_capacity(group_count as usize);
+        for bgid in 0..group_count {
+            let block_group =
+                Ext4BlockGroup::load_new(&self.block_device, &self.super_block, bgid as usize);
+            cache.push(block_group.get_inode_table_blk_num() as u64);
+        }
+        cache
+    }
+
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
         // Superblock is always located at byte offset 1024, read with default
@@ -74,11 +86,14 @@ impl Ext4 {
             block_device,
             super_block,
             system_zone_cache: None,
+            inode_table_blk_cache: None,
         };
         let zones = ext4_tmp.get_system_zone();
+        let inode_table_blk_cache = ext4_tmp.build_inode_table_blk_cache();
 
         Ext4 {
             system_zone_cache: Some(zones),
+            inode_table_blk_cache: Some(inode_table_blk_cache),
             ..ext4_tmp
         }
     }

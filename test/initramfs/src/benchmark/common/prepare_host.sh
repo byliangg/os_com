@@ -40,7 +40,8 @@ prepare_libs() {
 
 # Prepare fs for Linux
 prepare_fs() {
-    if [[ "${benchmark:-}" == */ext4_* || "${benchmark:-}" == ext4_* ]]; then
+    local bench_name="${1:-${benchmark:-}}"
+    if [[ "${bench_name}" == */ext4_* || "${bench_name}" == ext4_* ]]; then
         # Ext4 benchmark: keep Linux side media as ext4.
         mkfs.ext4 -F "${BENCHMARK_ROOT}/../../build/ext2.img"
     else

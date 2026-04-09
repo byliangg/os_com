@@ -237,6 +237,7 @@ impl Ext4 {
 
         // Fast path: most appends can be satisfied by the last directory block.
         // This avoids repeatedly rescanning all earlier blocks for bulk creates.
+        let mut scan_end = total_blocks;
         if total_blocks > 0 {
             let last_iblock = total_blocks - 1;
             let pblock = self.get_pblock_idx(parent, last_iblock as u32)?;
@@ -254,11 +255,13 @@ impl Ext4 {
                 ext4block.sync_blk_to_disk(&self.block_device);
                 return Ok(EOK);
             }
+            // Fast path already checked the last block, avoid a duplicate scan.
+            scan_end = last_iblock;
         }
 
         // iterate all blocks
         let mut iblock = 0;
-        while iblock < total_blocks {
+        while iblock < scan_end {
             // get physical block id of a logical block id
             let pblock = self.get_pblock_idx(parent, iblock as u32)?;
 
@@ -374,9 +377,6 @@ impl Ext4 {
                 de.copy_to_slice(&mut block.data, offset);
                 new_entry.copy_to_slice(&mut block.data, offset + sz);
 
-                // Sync to disk
-                block.sync_blk_to_disk(&self.block_device);
-
                 return Ok(EOK);
             }
 
@@ -432,23 +432,16 @@ impl Ext4 {
 
         // If entry is not the first in block, it must be merged with previous entry
         if pos != 0 {
-            let mut offset = 0;
-
-            // Start from the first entry in block
-            let mut tmp_de: Ext4DirEntry = ext4block.read_offset_as(offset);
-            let mut de_len = tmp_de.entry_len();
+            // Reuse predecessor offset already found during dir_find_in_block,
+            // avoid a second linear scan in the same block for unlink hot paths.
+            let offset = result.prev_offset;
+            if offset >= pos {
+                return_errno_with_message!(Errno::EIO, "invalid predecessor offset");
+            }
+            let prev_de: Ext4DirEntry = ext4block.read_offset_as(offset);
+            let de_len = prev_de.entry_len();
             if de_len == 0 || de_len as usize > block_size - offset {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
-            }
-
-            // Find direct predecessor of removed entry
-            while (offset + de_len as usize) < pos {
-                offset += de_len as usize;
-                tmp_de = ext4block.read_offset_as(offset);
-                de_len = tmp_de.entry_len();
-                if de_len == 0 || de_len as usize > block_size - offset {
-                    return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
-                }
             }
             if de_len as usize + offset != pos {
                 return_errno_with_message!(Errno::EIO, "invalid predecessor calculation");

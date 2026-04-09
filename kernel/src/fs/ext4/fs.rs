@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, VecDeque},
+    string::String,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use aster_block::{BlockDevice, SECTOR_SIZE};
@@ -45,6 +49,7 @@ const CRASH_JOURNAL_OP_RENAME: u32 = 5;
 const CRASH_JOURNAL_OP_WRITE: u32 = 6;
 const CRASH_JOURNAL_OP_TRUNCATE: u32 = 7;
 const CRASH_JOURNAL_MAX_WRITE_BYTES: usize = 192;
+const ADAPTER_READ_CACHE_CAPACITY: usize = 4096;
 
 // ext4_rs currently stores runtime block size in a global variable.
 // Serialize ext4_rs calls across mounted ext4 instances to avoid
@@ -282,6 +287,13 @@ enum DirLookupCacheResult {
 struct KernelBlockDeviceAdapter {
     inner: Arc<dyn BlockDevice>,
     io_failed: AtomicBool,
+    read_cache: Mutex<AdapterReadCache>,
+}
+
+#[derive(Debug, Default)]
+struct AdapterReadCache {
+    blocks: BTreeMap<usize, Vec<u8>>,
+    fifo: VecDeque<usize>,
 }
 
 impl KernelBlockDeviceAdapter {
@@ -289,6 +301,7 @@ impl KernelBlockDeviceAdapter {
         Self {
             inner,
             io_failed: AtomicBool::new(false),
+            read_cache: Mutex::new(AdapterReadCache::default()),
         }
     }
 
@@ -318,6 +331,54 @@ impl KernelBlockDeviceAdapter {
     fn device_size_bytes(&self) -> usize {
         self.inner.metadata().nr_sectors.saturating_mul(SECTOR_SIZE)
     }
+
+    fn cache_get_block(&self, offset: usize) -> Option<Vec<u8>> {
+        self.read_cache.lock().blocks.get(&offset).cloned()
+    }
+
+    fn cache_insert_block(&self, offset: usize, data: Vec<u8>) {
+        if data.len() != EXT4_BLOCK_SIZE {
+            return;
+        }
+        let mut cache = self.read_cache.lock();
+        if let Some(existing) = cache.blocks.get_mut(&offset) {
+            *existing = data;
+            return;
+        }
+
+        cache.blocks.insert(offset, data);
+        cache.fifo.push_back(offset);
+        while cache.blocks.len() > ADAPTER_READ_CACHE_CAPACITY {
+            let Some(victim) = cache.fifo.pop_front() else {
+                break;
+            };
+            cache.blocks.remove(&victim);
+        }
+    }
+
+    fn cache_invalidate_overlapping(&self, offset: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let Some(write_end) = offset.checked_add(len) else {
+            return;
+        };
+        let mut cache = self.read_cache.lock();
+        let keys: Vec<usize> = cache
+            .blocks
+            .iter()
+            .filter_map(|(cached_off, _)| {
+                let Some(cached_end) = cached_off.checked_add(EXT4_BLOCK_SIZE) else {
+                    return None;
+                };
+                let overlap = *cached_off < write_end && cached_end > offset;
+                overlap.then_some(*cached_off)
+            })
+            .collect();
+        for key in keys {
+            cache.blocks.remove(&key);
+        }
+    }
 }
 
 impl Ext4BlockDevice for KernelBlockDeviceAdapter {
@@ -337,6 +398,22 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
             return vec![0u8; EXT4_BLOCK_SIZE];
         }
 
+        // Fast path: aligned fixed-size block read (the common ext4_rs case).
+        if offset % SECTOR_SIZE == 0 {
+            if let Some(cached) = self.cache_get_block(offset) {
+                return cached;
+            }
+            let mut data = vec![0u8; EXT4_BLOCK_SIZE];
+            let mut writer = VmWriter::from(data.as_mut_slice()).to_fallible();
+            if let Err(err) = self.inner.read(offset, &mut writer) {
+                self.mark_io_failure();
+                error!("ext4 block read failed at offset {}: {:?}", offset, err);
+                return vec![0u8; EXT4_BLOCK_SIZE];
+            }
+            self.cache_insert_block(offset, data.clone());
+            return data;
+        }
+
         let aligned_start = Self::align_down(offset);
         let aligned_end = Self::align_up(offset + EXT4_BLOCK_SIZE);
         let aligned_len = aligned_end - aligned_start;
@@ -350,7 +427,9 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         }
 
         let start = offset - aligned_start;
-        aligned[start..start + EXT4_BLOCK_SIZE].to_vec()
+        let data = aligned[start..start + EXT4_BLOCK_SIZE].to_vec();
+        self.cache_insert_block(offset, data.clone());
+        data
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
@@ -370,6 +449,24 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
                 "ext4 block write out of range: offset={} len={} device_size={}",
                 offset, data.len(), dev_size
             );
+            return;
+        }
+
+        self.cache_invalidate_overlapping(offset, data.len());
+
+        // Fast path: fully sector-aligned write (the common ext4_rs case).
+        if offset % SECTOR_SIZE == 0 && data.len() % SECTOR_SIZE == 0 {
+            let mut reader = VmReader::from(data).to_fallible();
+            if let Err(err) = self.inner.write(offset, &mut reader) {
+                self.mark_io_failure();
+                error!("ext4 block write failed at offset {}: {:?}", offset, err);
+                return;
+            }
+
+            // Keep hot 4K-aligned writes coherent in cache.
+            if data.len() == EXT4_BLOCK_SIZE {
+                self.cache_insert_block(offset, data.to_vec());
+            }
             return;
         }
 
@@ -410,6 +507,7 @@ pub(super) struct Ext4Fs {
     crash_journal_enabled: bool,
     crash_journal_lock: Mutex<()>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
+    inode_meta_cache: Mutex<BTreeMap<u32, SimpleInodeMeta>>,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
@@ -431,6 +529,7 @@ impl Ext4Fs {
             crash_journal_enabled,
             crash_journal_lock: Mutex::new(()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
+            inode_meta_cache: Mutex::new(BTreeMap::new()),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
@@ -472,11 +571,14 @@ impl Ext4Fs {
         mtime: Option<u32>,
         ctime: Option<u32>,
     ) -> Result<()> {
-        self.run_ext4(|ext4| ext4.ext4_set_inode_times(ino, atime, mtime, ctime).map(|_| ()))
+        self.run_ext4(|ext4| ext4.ext4_set_inode_times(ino, atime, mtime, ctime).map(|_| ()))?;
+        self.invalidate_inode_meta_cache(ino);
+        Ok(())
     }
 
     pub(super) fn set_inode_mode(&self, ino: u32, mode: u16) -> Result<()> {
         self.run_ext4(|ext4| ext4.ext4_set_inode_mode(ino, mode).map(|_| ()))?;
+        self.invalidate_inode_meta_cache(ino);
         self.touch_ctime(ino)
     }
 
@@ -484,6 +586,7 @@ impl Ext4Fs {
         let uid = u16::try_from(uid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "uid exceeds ext4 uid width"))?;
         self.run_ext4(|ext4| ext4.ext4_set_inode_uid(ino, uid).map(|_| ()))?;
+        self.invalidate_inode_meta_cache(ino);
         self.touch_ctime(ino)
     }
 
@@ -491,6 +594,7 @@ impl Ext4Fs {
         let gid = u16::try_from(gid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "gid exceeds ext4 gid width"))?;
         self.run_ext4(|ext4| ext4.ext4_set_inode_gid(ino, gid).map(|_| ()))?;
+        self.invalidate_inode_meta_cache(ino);
         self.touch_ctime(ino)
     }
 
@@ -498,6 +602,7 @@ impl Ext4Fs {
         let rdev = u32::try_from(rdev)
             .map_err(|_| Error::with_message(Errno::EINVAL, "rdev exceeds ext4 rdev width"))?;
         self.run_ext4(|ext4| ext4.ext4_set_inode_rdev(ino, rdev).map(|_| ()))?;
+        self.invalidate_inode_meta_cache(ino);
         self.touch_ctime(ino)
     }
 
@@ -1030,7 +1135,13 @@ impl Ext4Fs {
     }
 
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
-        self.run_ext4_noerr(|ext4| ext4.ext4_stat(ino))
+        if let Some(meta) = self.inode_meta_cache.lock().get(&ino).copied() {
+            return Ok(meta);
+        }
+
+        let meta = self.run_ext4_noerr(|ext4| ext4.ext4_stat(ino))?;
+        self.inode_meta_cache.lock().insert(ino, meta);
+        Ok(meta)
     }
 
     fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
@@ -1096,9 +1207,14 @@ impl Ext4Fs {
     }
 
     fn clear_inode_touch_cache(&self, ino: u32) {
+        self.invalidate_inode_meta_cache(ino);
         self.inode_atime_cache.lock().remove(&ino);
         self.inode_ctime_cache.lock().remove(&ino);
         self.inode_mtime_ctime_cache.lock().remove(&ino);
+    }
+
+    fn invalidate_inode_meta_cache(&self, ino: u32) {
+        self.inode_meta_cache.lock().remove(&ino);
     }
 
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
@@ -1142,6 +1258,7 @@ impl Ext4Fs {
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
         self.touch_mtime_ctime(parent)?;
+        self.invalidate_inode_meta_cache(parent);
         Ok(ino)
     }
 
@@ -1158,6 +1275,7 @@ impl Ext4Fs {
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
         self.touch_mtime_ctime(parent)?;
+        self.invalidate_inode_meta_cache(parent);
         Ok(ino)
     }
 
@@ -1176,6 +1294,7 @@ impl Ext4Fs {
         self.cache_remove_entry(parent, name);
         self.clear_inode_touch_cache(target_ino);
         self.touch_mtime_ctime(parent)?;
+        self.invalidate_inode_meta_cache(parent);
         Ok(())
     }
 
@@ -1203,6 +1322,7 @@ impl Ext4Fs {
         self.cache_remove_dir(child_ino);
         self.clear_inode_touch_cache(child_ino);
         self.touch_mtime_ctime(parent)?;
+        self.invalidate_inode_meta_cache(parent);
         Ok(())
     }
 
@@ -1250,8 +1370,14 @@ impl Ext4Fs {
         self.touch_mtime_ctime(old_parent)?;
         if new_parent != old_parent {
             self.touch_mtime_ctime(new_parent)?;
+            self.invalidate_inode_meta_cache(new_parent);
         }
         self.touch_ctime(old_ino)?;
+        self.invalidate_inode_meta_cache(old_parent);
+        self.invalidate_inode_meta_cache(old_ino);
+        if let Some(ino) = overwritten_ino {
+            self.invalidate_inode_meta_cache(ino);
+        }
 
         Ok(())
     }
@@ -1286,6 +1412,7 @@ impl Ext4Fs {
             })?;
         if written > 0 {
             self.touch_mtime_ctime(ino)?;
+            self.invalidate_inode_meta_cache(ino);
         }
         Ok(written)
     }
@@ -1301,6 +1428,7 @@ impl Ext4Fs {
                 err
             })?;
         self.touch_mtime_ctime(ino)?;
+        self.invalidate_inode_meta_cache(ino);
         Ok(())
     }
 

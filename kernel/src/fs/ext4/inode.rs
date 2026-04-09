@@ -451,7 +451,10 @@ impl Inode for Ext4Inode {
     }
 
     fn is_dentry_cacheable(&self) -> bool {
-        false
+        // ext4 dentries support VFS-level cache coherence via create/unlink/rename/rmdir
+        // hooks in path/dentry + fs/ext4 paths, so enabling cache avoids hot-path
+        // repeated lookups in open/stat latency benchmarks.
+        true
     }
 
     fn extension(&self) -> &Extension {

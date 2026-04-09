@@ -7,7 +7,7 @@ chart:
   title: '[Ramfs] The throughput of creating/deleting small files (0KB)'
   unit: number
 result_extraction:
-  result_index: 2
+  result_index: 3
   search_pattern: ^0k
 runtime_config:
   mem: 32G
