@@ -157,7 +157,33 @@ BENCH_ENABLE_KVM=1 \
 PERF_CASE_TIMEOUT_SEC=600 \
 ./tools/ext4/run_phase6_perf_compare_in_docker.sh
 
-# 6) 通用回归（非 ext4），用于检查 kernel 改动是否波及其他子系统
+# 6) EXT4 fio 单项对照（一键，顺序写）
+LOG=benchmark/logs/perf_compare/fio_ext4_seq_write_$(date +%Y%m%d_%H%M%S).log
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_write_bw x86_64 >"$LOG" 2>&1
+echo "fio 顺序写日志：$LOG"
+
+# 7) EXT4 fio 单项对照（一键，顺序读）
+LOG=benchmark/logs/perf_compare/fio_ext4_seq_read_$(date +%Y%m%d_%H%M%S).log
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_read_bw x86_64 >"$LOG" 2>&1
+echo "fio 顺序读日志：$LOG"
+
+# 8) EXT4 fio 双项串行对照（一键，先写后读）
+for JOB in fio/ext4_seq_write_bw fio/ext4_seq_read_bw; do
+   LOG=benchmark/logs/perf_compare/${JOB##*/}_$(date +%Y%m%d_%H%M%S).log
+   BENCH_ENABLE_KVM=1 \
+   BENCH_ASTER_NETDEV=tap \
+   BENCH_ASTER_VHOST=on \
+   bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "$JOB" x86_64 >"$LOG" 2>&1
+   echo "$JOB 日志：$LOG"
+done
+
+# 9) 通用回归（非 ext4），用于检查 kernel 改动是否波及其他子系统
 # 说明：
 # - 先重建 ext2/exfat 镜像，避免被 xfstests 流程污染
 # - 该回归建议 ENABLE_KVM=0，规避部分环境下 qemu accel 参数冲突
