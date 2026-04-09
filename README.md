@@ -1,4 +1,4 @@
-# Asterinas EXT4 赛题版本（Stage6）
+# Asterinas EXT4 赛题版本（Stage7）
 
 ## 1. 项目概述
 
@@ -8,7 +8,7 @@
 2. 通过 xfstests 与 lmbench 建立可重复、可追踪的功能与性能验证流程。
 3. 将测试输入、输出、运行资产统一收敛到仓库内，降低环境漂移风险，支持跨环境直接复现。
 
-本版本重点覆盖 `stage6` 阶段工作，测试默认在 Docker 环境中执行。
+本版本重点覆盖 `stage7` 阶段工作，测试默认在 Docker 环境中执行。
 
 ## 2. 当前完成情况
 
@@ -18,6 +18,17 @@
 2. 已修复历史关键问题：针对 legacy block map 路径的兼容处理（含 direct/single/double/triple 逻辑分支），解决了此前 `generic/013`、`generic/084` 等场景中的目录查找异常。
 3. 已形成稳定的阶段测试入口脚本与日志归档流程。
 4. 已完成 `ext4_rs` 工程目录迁移：`third_party/ext4_rs -> kernel/libs/ext4_rs`，并保持 workspace 依赖方式不变。
+5. 已新增 EXT4 fio 单项对照作业：`fio/ext4_seq_write_bw`、`fio/ext4_seq_read_bw`，并接入 `bench_linux_and_aster.sh` 统一对比口径。
+6. 已完成 Stage7 写路径优化：
+   1. `ext4_rs::write_at` 改为“整段预映射 + 连续物理块批量写”，避免原先按 4KiB 块逐次读改写导致的 I/O 放大。
+   2. 对“块对齐的追加写”增加快速预分配分支，减少 `ensure_write_range_mapped` 逐块探测开销。
+7. 已完成 Stage7 读路径优化：
+   1. `ext4_rs::read_at` 增加 extent 命中缓存，减少顺序读中重复 extent tree 查询。
+   2. 引入复用缓冲读取路径，减少每块 `Vec` 分配/拷贝。
+8. 已完成内核 EXT4 设备适配层优化：
+   1. 增加 `read_offset_into` 接口，用于向已有缓冲区读取。
+   2. 对齐读写命中 fast path 时直接走设备读写，减少中间对齐缓冲。
+9. 已修正 fio 对比流程公平性：Asterinas/Linux 均基于重新 prepare 后的镜像执行，避免镜像状态不对称。
 
 ### 2.2 测试状态（最新一轮）
 
@@ -31,6 +42,13 @@
 5. `crash_only`：PASS（`3 场景 x 3 轮 = 9/9`）
 6. `phase6_perf_compare`：FAIL（Linux EXT4 对照性能，`8项 x 3轮`）  
    `overall_avg_ratio=0.166079`（目标阈值 `0.80`）
+7. `fio_ext4_compare`：FAIL（目标阈值 `0.80`，单线程口径 `numjobs=1`）
+   1. 基线（Stage6 公平对照）：
+      1. 顺序写：Asterinas `7780KiB/s` vs Linux `1197MiB/s`（约 `0.635%`）
+      2. 顺序读：Asterinas `12.1MiB/s` vs Linux `5101MiB/s`（约 `0.237%`）
+   2. Stage7 最新（2026-04-09）：
+      1. 顺序写：Asterinas `609MiB/s` vs Linux `1134MiB/s`（约 `53.704%`，较基线约 `80.16x`）
+      2. 顺序读：Asterinas `36.3MiB/s` vs Linux `5153MiB/s`（约 `0.704%`，较基线约 `3.00x`）
 
 最新日志见：
 
@@ -41,6 +59,10 @@
 5. `benchmark/logs/crash/phase4_part3_crash_summary_20260408_114539.tsv`
 6. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_report.txt`
 7. `benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_aggregate.tsv`
+8. `benchmark/logs/perf_compare/fio_ext4_seq_write_fair_20260409_174226.log`
+9. `benchmark/logs/perf_compare/fio_ext4_seq_read_fair_20260409_174908.log`
+10. `benchmark/logs/perf_compare/fio_ext4_seq_write_opt3b_afterpatch_20260409_193147.log`
+11. `benchmark/logs/perf_compare/fio_ext4_seq_read_opt3b_afterpatch_20260409_193920.log`
 
 ### 2.3 与“良好”指标的差异
 
@@ -49,8 +71,19 @@
 1. `xfstests` 阶段集通过率（`>=90%`）：已满足（`phase6_only` 为 `25/25`，`pass_rate=100%`）。
 2. 基础崩溃恢复证据链：已满足（固定 3 场景、每场景 3 轮、日志可复现）。
 3. Linux EXT4 对照性能（目标 `>=80%`）：未满足，当前 `overall_avg_ratio=0.166079`。
+4. fio EXT4 对照性能（目标 `>=80%`）：未满足。
+   1. 顺序写已从极低基线提升到 `53.704%`。
+   2. 顺序读仍仅 `0.704%`，是 Stage7 之后的主要性能瓶颈。
 
-结论：当前“良好”指标只差性能对照这一项。
+结论：当前“良好”指标仍主要卡在 Linux EXT4 对照性能，其中读路径是下一阶段核心攻关项。
+
+### 2.4 Stage7 今日增量（2026-04-09）
+
+1. 新增并跑通 EXT4 fio 对照链路（Asterinas vs Linux）。
+2. 修正了 fio 对比流程公平性与结果口径（以原始 fio `Run status` 为准）。
+3. 完成了 EXT4 写路径批量化、追加写快速预分配、设备适配层 fast path 优化。
+4. 完成了 EXT4 读路径 extent 缓存与缓冲复用优化。
+5. 完成多轮容器内复测并归档日志，形成 Stage7 可协作追踪证据。
 
 ## 3. 测试体系说明
 
@@ -233,11 +266,12 @@ test -f benchmark/assets/linux_vdso/vdso_x86_64.so
 
 ## 8. 当前边界与后续方向
 
-当前结果体现的是 `stage6` 阶段可运行能力与门禁通过状态。后续优先方向：
+当前结果体现的是 `stage7` 阶段在写路径上的显著改进与读路径瓶颈定位。后续优先方向：
 
-1. 进入性能优化并持续复跑 Linux EXT4 对照性能，目标将 `overall_avg_ratio` 从 `0.166079` 提升到 `>=0.80`。
-2. 在不回退现有通过率的前提下，继续扩大 xfstests 可运行集合，逐步减少 `STATIC_BLOCKED`。
-3. 继续沉淀自动化验收规范与提交前自检流程。
+1. 持续优化 EXT4 顺序读路径（重点：批量读/预读、进一步减少映射查询与同步等待），目标优先把 fio 读对照占比提升到两位数以上。
+2. 在保持当前写路径收益不回退的前提下，继续冲刺 Linux EXT4 对照 `>=80%`。
+3. 在不回退现有通过率的前提下，继续扩大 xfstests 可运行集合，逐步减少 `STATIC_BLOCKED`。
+4. 继续沉淀自动化验收规范与提交前自检流程。
 
 ## 9. 致谢与来源说明
 

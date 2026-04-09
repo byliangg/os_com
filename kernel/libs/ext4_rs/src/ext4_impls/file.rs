@@ -168,104 +168,88 @@ impl Ext4 {
     /// `Result<usize>` - number of bytes read
     pub fn read_at(&self, inode: u32, offset: usize, read_buf: &mut [u8]) -> Result<usize> {
         let block_size = self.super_block.block_size() as usize;
-        // read buf is empty, return 0
         let mut read_buf_len = read_buf.len();
         if read_buf_len == 0 {
-            log::error!("[Read] Empty read buffer, returning 0");
             return Ok(0);
         }
 
-        // get the inode reference
         let inode_ref = self.get_inode_ref(inode);
-        let file_size = inode_ref.inode.size();
-        let total_blocks = (file_size + block_size as u64 - 1) / block_size as u64;
+        let file_size = inode_ref.inode.size() as usize;
 
-        // if the offset is greater than the file size, return 0
-        if offset >= file_size as usize {
+        if offset >= file_size {
             return Ok(0);
         }
 
-        // adjust the read buffer size if the read buffer size is greater than the file size
-        if offset + read_buf_len > file_size as usize {
-            read_buf_len = file_size as usize - offset;
-            log::trace!("[Read] Adjusted read size to {} bytes to not exceed file size (offset: {}, file_size: {})", 
-                read_buf_len, offset, file_size);
+        if offset + read_buf_len > file_size {
+            read_buf_len = file_size - offset;
         }
 
-        // calculate the start block and unaligned size
-        let iblock_start = offset / block_size;
-        let iblock_last = (offset + read_buf_len + block_size - 1) / block_size; // round up to include the last partial block
-        let unaligned_start_offset = offset % block_size;
-        
-        // Ensure we don't read beyond the last block
-        let iblock_last = min(iblock_last, total_blocks as usize);
-        
-
-        // Buffer to keep track of read bytes
-        let mut cursor = 0;
-        let mut total_bytes_read = 0;
-        let mut iblock = iblock_start;
-
-        // Unaligned read at the beginning
-        if unaligned_start_offset > 0 {
-            let adjust_read_size = min(block_size - unaligned_start_offset, read_buf_len);
-
-            // get iblock physical block id
-            match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(pblock_idx) => {
-                    // read data
-                    let data = self.block_device.read_offset(pblock_idx as usize * block_size);
-
-                    // copy data to read buffer
-                    read_buf[cursor..cursor + adjust_read_size].copy_from_slice(
-                        &data[unaligned_start_offset..unaligned_start_offset + adjust_read_size],
-                    );
+        let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        let mut resolve_pblock = |lblock: u32| -> Result<Option<Ext4Fsblk>> {
+            if uses_extents {
+                if let Some((ext_start, ext_end, pblock_start)) = extent_cache {
+                    if lblock >= ext_start && lblock < ext_end {
+                        return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                    }
                 }
-                Err(e) if e.error() == Errno::ENOENT => {
-                    // Sparse hole: return zero-filled bytes.
-                    read_buf[cursor..cursor + adjust_read_size].fill(0);
+
+                match self.find_extent(&inode_ref, lblock) {
+                    Ok(path) => {
+                        let mapped = path.path.last().and_then(|node| node.extent).and_then(|extent| {
+                            let ext_start = extent.get_first_block();
+                            let ext_len = extent.get_actual_len() as u32;
+                            let ext_end = ext_start.checked_add(ext_len)?;
+                            if lblock < ext_start || lblock >= ext_end {
+                                return None;
+                            }
+                            let pblock_start = extent.get_pblock();
+                            Some((ext_start, ext_end, pblock_start))
+                        });
+
+                        if let Some((ext_start, ext_end, pblock_start)) = mapped {
+                            extent_cache = Some((ext_start, ext_end, pblock_start));
+                            return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                        }
+
+                        Ok(None)
+                    }
+                    Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                    Err(e) => Err(e),
                 }
-                Err(_) => {
-                    return_errno_with_message!(
-                        Errno::EIO,
-                        "Failed to get physical block for logical block"
-                    );
-                }
-            }
-
-            // update cursor and total bytes read
-            cursor += adjust_read_size;
-            total_bytes_read += adjust_read_size;
-            iblock += 1;
-        }
-
-        // Continue with full block reads
-        while total_bytes_read < read_buf_len && iblock < iblock_last {
-            let mut read_length = min(block_size, read_buf_len - total_bytes_read);
-            
-            // Check if this is the last block of the file
-            if iblock as u64 >= total_blocks - 1 {
-                let remaining_bytes = file_size as usize - (iblock * block_size);
-                let actual_read_length = min(read_length, remaining_bytes);
-
-                if actual_read_length < read_length {
-                    read_length = actual_read_length;
+            } else {
+                match self.get_pblock_idx(&inode_ref, lblock) {
+                    Ok(pblock) => Ok(Some(pblock)),
+                    Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                    Err(e) => Err(e),
                 }
             }
-            
+        };
 
-            // get iblock physical block id
-            match self.get_pblock_idx(&inode_ref, iblock as u32) {
-                Ok(pblock_idx) => {
-                    // read data
-                    let data = self.block_device.read_offset(pblock_idx as usize * block_size);
-                    // log::trace!("[Read] Read block data - physical_block: {}, data_len: {}", pblock_idx, data.len());
+        let mut block_data = vec![0u8; block_size];
+        let mut cursor = 0usize;
+        let mut current_offset = offset;
 
-                    // copy data to read buffer
-                    read_buf[cursor..cursor + read_length].copy_from_slice(&data[..read_length]);
+        while cursor < read_buf_len {
+            let lblock = (current_offset / block_size) as u32;
+            let block_inner_offset = current_offset % block_size;
+            let read_length = min(read_buf_len - cursor, block_size - block_inner_offset);
+
+            match resolve_pblock(lblock) {
+                Ok(Some(pblock_idx)) => {
+                    let pblock = usize::try_from(pblock_idx)
+                        .map_err(|_| Ext4Error::new(Errno::EIO))?;
+                    let block_offset = pblock
+                        .checked_mul(block_size)
+                        .ok_or_else(|| Ext4Error::new(Errno::EIO))?;
+
+                    self.block_device
+                        .read_offset_into(block_offset, block_data.as_mut_slice());
+                    read_buf[cursor..cursor + read_length].copy_from_slice(
+                        &block_data[block_inner_offset..block_inner_offset + read_length],
+                    );
                 }
-                Err(e) if e.error() == Errno::ENOENT => {
-                    // Sparse hole: return zero-filled bytes.
+                Ok(None) => {
                     read_buf[cursor..cursor + read_length].fill(0);
                 }
                 Err(_) => {
@@ -276,13 +260,11 @@ impl Ext4 {
                 }
             }
 
-            // update cursor and total bytes read
             cursor += read_length;
-            total_bytes_read += read_length;
-            iblock += 1;
+            current_offset += read_length;
         }
 
-        Ok(total_bytes_read)
+        Ok(read_buf_len)
     }
 
     fn insert_allocated_blocks_as_extents(
@@ -432,96 +414,215 @@ impl Ext4 {
         let mut inode_ref = self.get_inode_ref(inode);
         let file_size = inode_ref.inode.size();
 
+        let write_end = offset
+            .checked_add(write_buf.len())
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
         let iblock_start = offset / block_size;
-        let mut start_bgid = 0;
-        let mut resolve_pblock = |lblock: u32| -> Result<Ext4Fsblk> {
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(pblock) => return Ok(pblock),
-                Err(e) if e.error() == Errno::ENOENT => {}
-                Err(e) => {
-                    log::error!(
-                        "[write_at] get_pblock_idx failed: inode={} lblock={} offset={} len={} err={:?}",
-                        inode,
-                        lblock,
-                        offset,
-                        write_buf.len(),
-                        e
-                    );
-                    return Err(e);
-                }
-            }
+        let iblock_end = (write_end - 1) / block_size + 1;
 
+        let lblock_start = u32::try_from(iblock_start)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_end = u32::try_from(iblock_end)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+
+        let mut start_bgid = 0;
+        let file_size_usize = usize::try_from(file_size).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let aligned_append = offset >= file_size_usize
+            && offset % block_size == 0
+            && file_size_usize % block_size == 0;
+
+        let mapping_result = if aligned_append {
+            match self.get_pblock_idx(&inode_ref, lblock_start) {
+                Ok(_) => self.ensure_write_range_mapped(
+                    &mut inode_ref,
+                    lblock_start,
+                    lblock_end,
+                    &mut start_bgid,
+                ),
+                Err(e) if e.error() == Errno::ENOENT => {
+                    let want_blocks = (lblock_end - lblock_start) as usize;
+                    let allocated_blocks =
+                        self.balloc_alloc_block_batch(&mut inode_ref, &mut start_bgid, want_blocks)?;
+                    if allocated_blocks.is_empty() {
+                        return_errno_with_message!(
+                            Errno::ENOSPC,
+                            "no free blocks while mapping write range"
+                        );
+                    }
+
+                    let inserted = self.insert_allocated_blocks_as_extents(
+                        &mut inode_ref,
+                        lblock_start,
+                        &allocated_blocks,
+                    )?;
+
+                    if inserted < want_blocks {
+                        self.ensure_write_range_mapped(
+                            &mut inode_ref,
+                            lblock_start + inserted as u32,
+                            lblock_end,
+                            &mut start_bgid,
+                        )
+                    } else {
+                        Ok(inserted)
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        } else {
             self.ensure_write_range_mapped(
                 &mut inode_ref,
-                lblock,
-                lblock + 1,
+                lblock_start,
+                lblock_end,
                 &mut start_bgid,
             )
-            .map_err(|e| {
-                log::error!(
-                    "[write_at] ensure_write_range_mapped failed: inode={} lblock={} offset={} len={} err={:?}",
-                    inode,
-                    lblock,
-                    offset,
-                    write_buf.len(),
-                    e
-                );
-                e
-            })?;
+        };
 
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(pblock) => Ok(pblock),
-                Err(e) => {
+        mapping_result.map_err(|e| {
+            log::error!(
+                "[write_at] ensure_write_range_mapped failed: inode={} lblock=[{}, {}) offset={} len={} err={:?}",
+                inode,
+                lblock_start,
+                lblock_end,
+                offset,
+                write_buf.len(),
+                e
+            );
+            e
+        })?;
+
+        let block_offset = |pblock_idx: Ext4Fsblk| -> Result<usize> {
+            let pblock = usize::try_from(pblock_idx).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            pblock
+                .checked_mul(block_size)
+                .ok_or_else(|| Ext4Error::new(Errno::EFBIG))
+        };
+
+        let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        let mut resolve_pblock = |lblock: u32| -> Result<Ext4Fsblk> {
+            if uses_extents {
+                if let Some((ext_start, ext_end, pblock_start)) = extent_cache {
+                    if lblock >= ext_start && lblock < ext_end {
+                        return Ok(pblock_start + (lblock - ext_start) as u64);
+                    }
+                }
+
+                match self.find_extent(&inode_ref, lblock) {
+                    Ok(path) => {
+                        let mapped = path.path.last().and_then(|node| node.extent).and_then(|extent| {
+                            let ext_start = extent.get_first_block();
+                            let ext_len = extent.get_actual_len() as u32;
+                            let ext_end = ext_start.checked_add(ext_len)?;
+                            if lblock < ext_start || lblock >= ext_end {
+                                return None;
+                            }
+                            let pblock_start = extent.get_pblock();
+                            Some((ext_start, ext_end, pblock_start))
+                        });
+
+                        if let Some((ext_start, ext_end, pblock_start)) = mapped {
+                            extent_cache = Some((ext_start, ext_end, pblock_start));
+                            return Ok(pblock_start + (lblock - ext_start) as u64);
+                        }
+
+                        log::error!(
+                            "[write_at] mapping missing after map: inode={} lblock={} offset={} len={}",
+                            inode,
+                            lblock,
+                            offset,
+                            write_buf.len()
+                        );
+                        return_errno_with_message!(
+                            Errno::ENOENT,
+                            "write mapping missing after allocation"
+                        )
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[write_at] find_extent failed after map: inode={} lblock={} offset={} len={} err={:?}",
+                            inode,
+                            lblock,
+                            offset,
+                            write_buf.len(),
+                            e
+                        );
+                        Err(e)
+                    }
+                }
+            } else {
+                self.get_pblock_idx(&inode_ref, lblock).map_err(|e| {
                     log::error!(
-                        "[write_at] mapping still missing after allocation: inode={} lblock={} offset={} len={} err={:?}",
+                        "[write_at] get_pblock_idx failed after map: inode={} lblock={} offset={} len={} err={:?}",
                         inode,
                         lblock,
                         offset,
                         write_buf.len(),
                         e
                     );
-                    Err(e)
-                }
+                    e
+                })
             }
         };
 
         let mut written = 0usize;
-        let mut iblk_idx = iblock_start;
+        let mut iblk_idx = lblock_start;
         let unaligned = offset % block_size;
+        let mut block_data = vec![0u8; block_size];
 
-        if unaligned > 0 && written < write_buf.len() {
+        if unaligned > 0 {
             let len = min(write_buf.len() - written, block_size - unaligned);
-            let pblock_idx = resolve_pblock(iblk_idx as u32)?;
-            let mut block = Block::load(&self.block_device, pblock_idx as usize * block_size);
+            let pblock_idx = resolve_pblock(iblk_idx)?;
+            let blk_off = block_offset(pblock_idx)?;
 
-            let existing = self.block_device.read_offset(pblock_idx as usize * block_size);
-            let copy_len = min(block.data.len(), existing.len());
-            block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
+            self.block_device
+                .read_offset_into(blk_off, block_data.as_mut_slice());
 
-            block.write_offset(unaligned, &write_buf[written..written + len], len);
-            block.sync_blk_to_disk(&self.block_device);
+            block_data[unaligned..unaligned + len]
+                .copy_from_slice(&write_buf[written..written + len]);
+            self.block_device.write_offset(blk_off, block_data.as_slice());
 
             written += len;
             iblk_idx += 1;
         }
 
-        while written < write_buf.len() {
-            let pblock_idx = resolve_pblock(iblk_idx as u32)?;
-            let block_offset = pblock_idx as usize * block_size;
-            let mut block = Block::load(&self.block_device, block_offset);
-            let write_size = min(block_size, write_buf.len() - written);
+        while write_buf.len() - written >= block_size {
+            let run_start_lblk = iblk_idx;
+            let run_start_written = written;
+            let run_start_pblk = resolve_pblock(run_start_lblk)?;
 
-            if write_size < block_size {
-                let existing = self.block_device.read_offset(block_offset);
-                let copy_len = min(block.data.len(), existing.len());
-                block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
+            let mut run_blocks = 1usize;
+            let full_blocks_remaining = (write_buf.len() - written) / block_size;
+            while run_blocks < full_blocks_remaining {
+                let next_lblk = run_start_lblk + run_blocks as u32;
+                let next_pblk = resolve_pblock(next_lblk)?;
+                if next_pblk != run_start_pblk + run_blocks as u64 {
+                    break;
+                }
+                run_blocks += 1;
             }
 
-            block.write_offset(0, &write_buf[written..written + write_size], write_size);
-            block.sync_blk_to_disk(&self.block_device);
+            let run_bytes = run_blocks * block_size;
+            let run_off = block_offset(run_start_pblk)?;
+            self.block_device
+                .write_offset(run_off, &write_buf[run_start_written..run_start_written + run_bytes]);
 
-            written += write_size;
-            iblk_idx += 1;
+            written += run_bytes;
+            iblk_idx += run_blocks as u32;
+        }
+
+        if written < write_buf.len() {
+            let len = write_buf.len() - written;
+            let pblock_idx = resolve_pblock(iblk_idx)?;
+            let blk_off = block_offset(pblock_idx)?;
+
+            self.block_device
+                .read_offset_into(blk_off, block_data.as_mut_slice());
+
+            block_data[..len].copy_from_slice(&write_buf[written..written + len]);
+            self.block_device.write_offset(blk_off, block_data.as_slice());
+
+            written += len;
         }
 
         let new_size = offset + written;

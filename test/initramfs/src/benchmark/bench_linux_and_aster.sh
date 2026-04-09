@@ -170,9 +170,12 @@ run_benchmark() {
     # Run the benchmark depending on the mode
     case "${run_mode}" in
         "guest_only")
+            # Ensure Asterinas and Linux both run on a freshly prepared image.
+            prepare_fs
             echo "Running benchmark ${benchmark} on Asterinas..."
             # Execute directly from array, redirect stderr to stdout, then tee
             "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
+
             prepare_fs
             echo "Running benchmark ${benchmark} on Linux..."
             # Execute directly from array, redirect stderr to stdout, then tee

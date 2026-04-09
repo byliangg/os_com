@@ -322,35 +322,59 @@ impl KernelBlockDeviceAdapter {
 
 impl Ext4BlockDevice for KernelBlockDeviceAdapter {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
+        let mut data = vec![0u8; EXT4_BLOCK_SIZE];
+        self.read_offset_into(offset, data.as_mut_slice());
+        data
+    }
+
+    fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
+        if out.is_empty() {
+            return;
+        }
+
+        let read_len = out.len();
         let dev_size = self.device_size_bytes();
-        let Some(read_end) = offset.checked_add(EXT4_BLOCK_SIZE) else {
+        let Some(read_end) = offset.checked_add(read_len) else {
             self.mark_io_failure();
             error!("ext4 block read overflow at offset {}", offset);
-            return vec![0u8; EXT4_BLOCK_SIZE];
+            out.fill(0);
+            return;
         };
         if read_end > dev_size {
             self.mark_io_failure();
             error!(
                 "ext4 block read out of range: offset={} len={} device_size={}",
-                offset, EXT4_BLOCK_SIZE, dev_size
+                offset, read_len, dev_size
             );
-            return vec![0u8; EXT4_BLOCK_SIZE];
+            out.fill(0);
+            return;
         }
 
         let aligned_start = Self::align_down(offset);
-        let aligned_end = Self::align_up(offset + EXT4_BLOCK_SIZE);
+        let aligned_end = Self::align_up(offset + read_len);
         let aligned_len = aligned_end - aligned_start;
+
+        if aligned_start == offset && aligned_len == read_len {
+            let mut writer = VmWriter::from(&mut out[..]).to_fallible();
+            if let Err(err) = self.inner.read(offset, &mut writer) {
+                self.mark_io_failure();
+                error!("ext4 block read failed at offset {}: {:?}", offset, err);
+                out.fill(0);
+            }
+            return;
+        }
 
         let mut aligned = vec![0u8; aligned_len];
         let mut writer = VmWriter::from(aligned.as_mut_slice()).to_fallible();
         if let Err(err) = self.inner.read(aligned_start, &mut writer) {
             self.mark_io_failure();
             error!("ext4 block read failed at offset {}: {:?}", offset, err);
-            return vec![0u8; EXT4_BLOCK_SIZE];
+            out.fill(0);
+            return;
         }
 
         let start = offset - aligned_start;
-        aligned[start..start + EXT4_BLOCK_SIZE].to_vec()
+        out.copy_from_slice(&aligned[start..start + read_len]);
     }
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
@@ -376,6 +400,16 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         let aligned_start = Self::align_down(offset);
         let aligned_end = Self::align_up(offset + data.len());
         let aligned_len = aligned_end - aligned_start;
+
+        if aligned_start == offset && aligned_len == data.len() {
+            let mut reader = VmReader::from(data).to_fallible();
+            if let Err(err) = self.inner.write(offset, &mut reader) {
+                self.mark_io_failure();
+                error!("ext4 block write failed at offset {}: {:?}", offset, err);
+            }
+            return;
+        }
+
         let mut aligned = vec![0u8; aligned_len];
 
         // Preserve neighboring bytes when ext4_rs issues unaligned writes.

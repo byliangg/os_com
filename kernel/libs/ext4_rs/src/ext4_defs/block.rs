@@ -3,6 +3,18 @@ use super::runtime_block_size;
 
 pub trait BlockDevice: Send + Sync + Any {
     fn read_offset(&self, offset: usize) -> Vec<u8>;
+    fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
+        if out.is_empty() {
+            return;
+        }
+
+        let data = self.read_offset(offset);
+        let copy_len = core::cmp::min(out.len(), data.len());
+        out[..copy_len].copy_from_slice(&data[..copy_len]);
+        if copy_len < out.len() {
+            out[copy_len..].fill(0);
+        }
+    }
     fn write_offset(&self, offset: usize, data: &[u8]);
 }
 
