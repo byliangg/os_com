@@ -1,0 +1,316 @@
+Running benchmark lmbench/ext4_vfs_open_lat...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 706074d6-23e4-475f-ac87-4e5d7fb486ad
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/9jzjxs6c909bhj5i53xgxb88gp6pw125-benchmark-0.1.0.drv
+  /nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv
+  /nix/store/ddm3dsyzh3yn7ig3iymp2cs9ir04fp4q-runtime-deps.drv
+  /nix/store/b1kp40kx05vd92rrmhiiri4b5dx52gq4-initramfs.drv
+building '/nix/store/9jzjxs6c909bhj5i53xgxb88gp6pw125-benchmark-0.1.0.drv'...
+building '/nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv'...
+resolv.conf is generated from the host's /etc/resolv.conf
+building '/nix/store/ddm3dsyzh3yn7ig3iymp2cs9ir04fp4q-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/b1kp40kx05vd92rrmhiiri4b5dx52gq4-initramfs.drv'...
+/nix/store/4ddp56lj7737navk870lxm3v2j69ssjc-initramfs
+this derivation will be built:
+  /nix/store/hbpzv57x9biznwwpqwg8qk10cg1ffa40-initramfs-image.drv
+building '/nix/store/hbpzv57x9biznwwpqwg8qk10cg1ffa40-initramfs-image.drv'...
+/build/tmp.XliHyfpwsi /build
+176094 blocks
+/build
+/nix/store/rr66imhmf0f05wc3z37swc7psa6zkc8i-initramfs-image
+Running benchmark lmbench/ext4_vfs_open_lat on Asterinas...
+these 3 derivations will be built:
+  /nix/store/qndxgpw799w25jm7vsmn138gyyis60qs-benchmark-0.1.0.drv
+  /nix/store/8hnsxmv428a15k03ax0k0mbq03w3fj2k-runtime-deps.drv
+  /nix/store/znh740circ3bgckhx5v3330i7y54gw73-initramfs.drv
+building '/nix/store/qndxgpw799w25jm7vsmn138gyyis60qs-benchmark-0.1.0.drv'...
+building '/nix/store/8hnsxmv428a15k03ax0k0mbq03w3fj2k-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/znh740circ3bgckhx5v3330i7y54gw73-initramfs.drv'...
+/nix/store/q0yllf348r5jm86fwnqc4py7h1r265kn-initramfs
+these 4 derivations will be built:
+  /nix/store/zq4z5f8sr47dfmsccizi5swialxivnlk-benchmark-0.1.0.drv
+  /nix/store/2a017gw97jjdjjbbg7kvbbqig0ay9c6q-runtime-deps.drv
+  /nix/store/lqrjldz7vm3gaj093hsjqiqdkkf8bhbf-initramfs.drv
+  /nix/store/2gi5ck017z7h7a75pyr2ls9nqimpsn9s-initramfs-image.drv
+building '/nix/store/zq4z5f8sr47dfmsccizi5swialxivnlk-benchmark-0.1.0.drv'...
+building '/nix/store/2a017gw97jjdjjbbg7kvbbqig0ay9c6q-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/lqrjldz7vm3gaj093hsjqiqdkkf8bhbf-initramfs.drv'...
+building '/nix/store/2gi5ck017z7h7a75pyr2ls9nqimpsn9s-initramfs-image.drv'...
+/build/tmp.on6Tz4W4Kc /build
+176059 blocks
+/build
+/nix/store/mvl5xm70f81k79bak719skwszklxf8zk-initramfs-image
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+ Downloading crates ...
+  Downloaded acpi v5.2.0
+  Downloaded aead v0.4.3
+  Downloaded bitflags v1.3.2
+  Downloaded byteorder v1.5.0
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded serde_spanned v0.6.9
+  Downloaded never-say-never v6.6.666
+  Downloaded volatile v0.4.6
+  Downloaded proc-macro2 v1.0.106
+  Downloaded paste v1.0.15
+  Downloaded libflate_lz77 v2.2.0
+  Downloaded hash32 v0.3.1
+  Downloaded toml v0.7.8
+  Downloaded num-conv v0.2.1
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded managed v0.8.0
+  Downloaded log v0.4.29
+  Downloaded crc32fast v1.5.0
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded multiboot2 v0.24.1
+  Downloaded cipher v0.3.0
+  Downloaded defmt-parser v1.0.0
+  Downloaded ctr v0.8.0
+  Downloaded takeable v0.2.2
+  Downloaded spin v0.9.8
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded core2 v0.4.0
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded time-core v0.1.8
+  Downloaded bit_field v0.10.3
+  Downloaded unwinding v0.2.8
+  Downloaded wyz v0.5.1
+  Downloaded universal-hash v0.4.1
+  Downloaded uguid v2.2.1
+  Downloaded toml_datetime v0.6.11
+  Downloaded adler32 v1.2.0
+  Downloaded zero v0.1.3
+  Downloaded xmas-elf v0.10.0
+  Downloaded owo-colors v4.3.0
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded unicode-ident v1.0.24
+  Downloaded lru v0.16.3
+  Downloaded generic-array v0.14.9
+  Downloaded subtle v2.4.1
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded bitflags v2.11.0
+  Downloaded volatile v0.6.1
+  Downloaded allocator-api2 v0.2.21
+  Downloaded tap v1.0.1
+  Downloaded darling_macro v0.13.4
+  Downloaded polyval v0.5.3
+  Downloaded darling_core v0.13.4
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ghash v0.4.4
+  Downloaded time v0.3.47
+  Downloaded powerfmt v0.2.0
+  Downloaded num-traits v0.2.19
+  Downloaded extension-traits v1.0.1
+  Downloaded cobs v0.3.0
+  Downloaded toml_edit v0.19.15
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded semver v1.0.28
+  Downloaded defmt v1.0.1
+  Downloaded winnow v0.5.40
+  Downloaded once_cell v1.21.4
+  Downloaded thiserror-impl v2.0.18
+  Downloaded getset v0.1.6
+  Downloaded deranged v0.5.8
+  Downloaded darling v0.13.4
+  Downloaded autocfg v1.5.0
+  Downloaded rand_core v0.9.5
+  Downloaded intrusive-collections v0.9.7
+  Downloaded ext-trait v1.0.1
+  Downloaded font8x8 v0.2.7
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded radium v0.7.0
+  Downloaded nougat v0.2.4
+  Downloaded x86_64 v0.14.13
+  Downloaded funty v2.0.0
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded opaque-debug v0.3.1
+  Downloaded dary_heap v0.3.8
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded memoffset v0.9.1
+  Downloaded rustversion v1.0.22
+  Downloaded defmt v0.3.100
+  Downloaded ptr_meta v0.3.1
+  Downloaded ghost v0.1.20
+  Downloaded quote v1.0.45
+  Downloaded thiserror v2.0.18
+  Downloaded lending-iterator v0.1.7
+  Downloaded hash32 v0.2.1
+  Downloaded foldhash v0.2.0
+  Downloaded defmt-macros v1.0.1
+  Downloaded tdx-guest v0.2.4
+  Downloaded bittle v0.5.7
+  Downloaded postcard v1.1.3
+  Downloaded rle-decode-fast v1.0.3
+  Downloaded libflate v2.2.1
+  Downloaded const_format v0.2.35
+  Downloaded heapless v0.7.17
+  Downloaded bitvec v1.0.1
+  Downloaded itertools v0.10.5
+  Downloaded raw-cpuid v10.7.0
+  Downloaded aes-gcm v0.9.4
+  Downloaded indexmap v2.13.1
+  Downloaded aes v0.7.5
+  Downloaded heapless v0.8.0
+  Downloaded memchr v2.8.0
+  Downloaded uefi-raw v0.12.0
+  Downloaded zerocopy v0.8.48
+  Downloaded x86 v0.52.0
+  Downloaded multiboot2-common v0.3.0
+  Downloaded iced-x86 v1.21.0
+  Downloaded libc v0.2.184
+  Downloaded json v0.12.4
+  Downloaded gimli v0.28.1
+  Downloaded gimli v0.32.3
+  Downloaded syn v2.0.117
+  Downloaded hashbrown v0.14.5
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded rustc-literal-escaper v0.0.5
+  Downloaded getopts v0.2.24
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 24.97s
+grub-mkrescue: warning: cannot open directory `/usr/local/grub/share/locale': No such file or directory.
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/root/asterinas/target/osdk/aster-kernel-osdk-bin.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data,  940g free
+Added to ISO image: directory '/'='/tmp/grub.yIm3rS'
+xorriso : UPDATE :     298 files added in 1 seconds
+Added to ISO image: directory '/'='/root/asterinas/target/osdk/iso_root'
+xorriso : UPDATE :     303 files added in 1 seconds
+ISO image produced: 23112 sectors
+Written to medium : 23112 sectors at LBA 0
+Writing to 'stdio:/root/asterinas/target/osdk/aster-kernel-osdk-bin.iso' completed successfully.
+
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.pku [bit 3]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+qemu-system-x86_64: -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off: Failed to get "write" lock
+Is another process using the image [./test/initramfs/build/ext2.img]?
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 2e489633-379e-498c-adb6-faf955960714
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 3 derivations will be built:
+  /nix/store/n8r955ymynksjps7465blcdi23wgh4ac-benchmark-0.1.0.drv
+  /nix/store/axklacsizpncvbx000as5nj8v5ms9w03-runtime-deps.drv
+  /nix/store/0dxh6s31d8fbckgp6y1pkwhg9idq6ncc-initramfs.drv
+building '/nix/store/n8r955ymynksjps7465blcdi23wgh4ac-benchmark-0.1.0.drv'...
+building '/nix/store/axklacsizpncvbx000as5nj8v5ms9w03-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/0dxh6s31d8fbckgp6y1pkwhg9idq6ncc-initramfs.drv'...
+/nix/store/64i35j6dig9qvs2jrw97v3b6728ihs4p-initramfs
+this derivation will be built:
+  /nix/store/xbil62v4gz31vb76fd0c49q1knj6lsab-initramfs-image.drv
+building '/nix/store/xbil62v4gz31vb76fd0c49q1knj6lsab-initramfs-image.drv'...
+/build/tmp.d0JNDHuGrv /build
+176079 blocks
+/build
+/nix/store/m9hbaqcg1jzpcyqp14ylzz0g237nng0j-initramfs-image
+Running benchmark lmbench/ext4_vfs_open_lat on Linux...
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.pku [bit 3]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+qemu-system-x86_64: -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off: Failed to get "write" lock
+Is another process using the image [/root/asterinas/test/initramfs/src/benchmark/../../build/ext2.img]?

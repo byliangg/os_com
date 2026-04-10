@@ -1,0 +1,35 @@
+Running benchmark fio/ext4_seq_write_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: f3b8e119-a1da-45bf-9e5b-9b96599cb7b6
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/6lxvplf0mrwz9lracz0djhclm0744zl5-benchmark-0.1.0.drv
+  /nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv
+  /nix/store/n28idbrpacxqwqg6n2s24k6ljmd163lr-runtime-deps.drv
+  /nix/store/s1s757rn9kmnnjrxbas317ll08kl0hnz-initramfs.drv
+building '/nix/store/6lxvplf0mrwz9lracz0djhclm0744zl5-benchmark-0.1.0.drv'...
+building '/nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv'...
+resolv.conf is generated from the host's /etc/resolv.conf
+building '/nix/store/n28idbrpacxqwqg6n2s24k6ljmd163lr-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/s1s757rn9kmnnjrxbas317ll08kl0hnz-initramfs.drv'...
+/nix/store/x3xw2yd7dvvg9sa8j3sp2ybkv8261haz-initramfs
+this derivation will be built:
+  /nix/store/cdj0p8mr2rp3n009d0i1n91n7manhxwy-initramfs-image.drv
+building '/nix/store/cdj0p8mr2rp3n009d0i1n91n7manhxwy-initramfs-image.drv'...
+/build/tmp.Tviuf7Kqjm /build
+176064 blocks
+/build
+error: cannot create symlink '/root/asterinas/test/initramfs/build/initramfs.cpio.gz'; already exists
+make[1]: *** [Makefile:65: /root/asterinas/test/initramfs/build/initramfs.cpio.gz] Error 1
+make: *** [Makefile:308: initramfs] Error 2

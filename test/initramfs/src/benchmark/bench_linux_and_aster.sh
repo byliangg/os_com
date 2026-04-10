@@ -18,7 +18,32 @@ fi
 # Set up paths
 BENCHMARK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${BENCHMARK_ROOT}/common/prepare_host.sh"
-RESULT_TEMPLATE="${BENCHMARK_ROOT}/result_template.json"
+
+resolve_writable_path() {
+    local target="$1"
+
+    if [[ -e "${target}" && ! -w "${target}" ]]; then
+        rm -f "${target}" >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p "$(dirname "${target}")" >/dev/null 2>&1 || true
+    if touch "${target}" >/dev/null 2>&1; then
+        echo "${target}"
+        return 0
+    fi
+
+    local fallback="/tmp/${USER:-user}_$(basename "${target}").$$"
+    touch "${fallback}" || {
+        echo "Error: failed to create writable output file for ${target}" >&2
+        exit 1
+    }
+    echo "Warning: ${target} is not writable, using ${fallback}" >&2
+    echo "${fallback}"
+}
+
+LINUX_OUTPUT="$(resolve_writable_path "${LINUX_OUTPUT}")"
+ASTER_OUTPUT="$(resolve_writable_path "${ASTER_OUTPUT}")"
+RESULT_TEMPLATE="$(resolve_writable_path "${BENCHMARK_ROOT}/result_template.json")"
 
 # Parse benchmark results
 parse_raw_results() {
@@ -26,6 +51,7 @@ parse_raw_results() {
     local nth_occurrence="$2"
     local result_index="$3"
     local result_file="$4"
+    result_file="$(resolve_writable_path "${result_file}")"
 
     # Extract and sanitize numeric results
     local linux_result aster_result
@@ -122,6 +148,13 @@ run_benchmark() {
     local bench_aster_netdev="${BENCH_ASTER_NETDEV:-tap}"
     local bench_aster_vhost="${BENCH_ASTER_VHOST:-on}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
+    if ! command -v nix-build >/dev/null 2>&1; then
+        asterinas_cmd_arr+=(SKIP_INITRAMFS_BUILD=1)
+    fi
+    local vdso_library_dir="${VDSO_LIBRARY_DIR:-${PROJECT_ROOT}/benchmark/assets/linux_vdso}"
+    if [[ -d "${vdso_library_dir}" ]]; then
+        asterinas_cmd_arr+=("VDSO_LIBRARY_DIR=${vdso_library_dir}")
+    fi
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
     asterinas_cmd_arr+=(

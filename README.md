@@ -120,10 +120,27 @@
 
 ## 4. 一键测试（推荐）
 
+### 4.0 给队友复现（单命令）
+
+如果队友已经 `git clone` 本仓库并进入任意子目录，可直接执行：
+
+```bash
+cd "$(git rev-parse --show-toplevel)" && bash ./run_final_test.sh
+```
+
+说明：
+
+1. 上述命令会自动回到仓库根目录并执行当前推荐入口脚本。
+2. 该脚本会输出 Asterinas/Linux 的 fio 顺序读对比结果与日志路径。
+
 在仓库根目录执行：
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/mafake/os_com
+
+# 快速单项对照（推荐）
+# 说明：执行 fio ext4 顺序读（Asterinas vs Linux）并自动打印结果
+bash ./run_final_test.sh
 
 # 1) phase4
 PHASE4_DOCKER_MODE=phase4_good \
@@ -157,30 +174,69 @@ BENCH_ENABLE_KVM=1 \
 PERF_CASE_TIMEOUT_SEC=600 \
 ./tools/ext4/run_phase6_perf_compare_in_docker.sh
 
+DOCKER_TAG=$(cat DOCKER_IMAGE_VERSION 2>/dev/null || cat VERSION)
+IMAGE="asterinas/asterinas:${DOCKER_TAG}"
+
+run_fio_ext4_case_in_docker() {
+   local JOB="$1"
+   local LOG="$2"
+
+   docker run --rm --privileged --network=host \
+      -v /dev:/dev \
+      -v "$PWD":/root/asterinas \
+      -w /root/asterinas \
+      -e http_proxy \
+      -e https_proxy \
+      -e all_proxy \
+      -e HTTP_PROXY \
+      -e HTTPS_PROXY \
+      -e ALL_PROXY \
+      -e BENCH_ENABLE_KVM=1 \
+      -e BENCH_ASTER_NETDEV=tap \
+      -e BENCH_ASTER_VHOST=on \
+      -e BENCH_JOB="$JOB" \
+      "$IMAGE" \
+      bash -lc '
+set -euo pipefail
+mkdir -p /root/.cargo/bin
+cat >/root/.cargo/bin/cargo-osdk << "EOS"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ASTERINAS_ROOT:-/root/asterinas}
+BIN="${ROOT}/target_lby/debug/cargo-osdk"
+STAMP="${ROOT}/target_lby/.cargo_osdk_local_dev"
+if [ ! -x "${BIN}" ] || [ ! -f "${STAMP}" ]; then
+   if [ -x "${BIN}" ] && [ ! -f "${STAMP}" ]; then
+      cargo clean --manifest-path "${ROOT}/osdk/Cargo.toml" -p cargo-osdk || true
+   fi
+   OSDK_LOCAL_DEV=1 cargo build --manifest-path "${ROOT}/osdk/Cargo.toml" --bin cargo-osdk
+   mkdir -p "$(dirname "${STAMP}")"
+   touch "${STAMP}"
+fi
+exec "${BIN}" "$@"
+EOS
+chmod +x /root/.cargo/bin/cargo-osdk
+export VDSO_LIBRARY_DIR=/root/asterinas/benchmark/assets/linux_vdso
+export CARGO_TARGET_DIR=/root/asterinas/target_lby
+timeout 5400 bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${BENCH_JOB}" x86_64
+' >"$LOG" 2>&1
+}
+
 # 6) EXT4 fio 单项对照（一键，顺序写）
 LOG=benchmark/logs/perf_compare/fio_ext4_seq_write_$(date +%Y%m%d_%H%M%S).log
-BENCH_ENABLE_KVM=1 \
-BENCH_ASTER_NETDEV=tap \
-BENCH_ASTER_VHOST=on \
-bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_write_bw x86_64 >"$LOG" 2>&1
+run_fio_ext4_case_in_docker fio/ext4_seq_write_bw "$LOG"
 echo "fio 顺序写日志：$LOG"
 
 # 7) EXT4 fio 单项对照（一键，顺序读）
 LOG=benchmark/logs/perf_compare/fio_ext4_seq_read_$(date +%Y%m%d_%H%M%S).log
-BENCH_ENABLE_KVM=1 \
-BENCH_ASTER_NETDEV=tap \
-BENCH_ASTER_VHOST=on \
-bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_read_bw x86_64 >"$LOG" 2>&1
+run_fio_ext4_case_in_docker fio/ext4_seq_read_bw "$LOG"
 echo "fio 顺序读日志：$LOG"
 
 # 8) EXT4 fio 双项串行对照（一键，先写后读）
 for JOB in fio/ext4_seq_write_bw fio/ext4_seq_read_bw; do
-   LOG=benchmark/logs/perf_compare/${JOB##*/}_$(date +%Y%m%d_%H%M%S).log
-   BENCH_ENABLE_KVM=1 \
-   BENCH_ASTER_NETDEV=tap \
-   BENCH_ASTER_VHOST=on \
-   bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "$JOB" x86_64 >"$LOG" 2>&1
-   echo "$JOB 日志：$LOG"
+    LOG=benchmark/logs/perf_compare/${JOB##*/}_$(date +%Y%m%d_%H%M%S).log
+    run_fio_ext4_case_in_docker "$JOB" "$LOG"
+    echo "$JOB 日志：$LOG"
 done
 
 # 9) 通用回归（非 ext4），用于检查 kernel 改动是否波及其他子系统
@@ -277,7 +333,7 @@ grep -E "mount: mounting /dev/vda|mount: mounting /dev/vdb|All test in /test/fs 
 在跑测试前建议先检查：
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/mafake/os_com
 
 test -f benchmark/assets/initramfs/initramfs_phase3.cpio.gz
 test -d benchmark/assets/xfstests-prebuilt/xfstests-dev

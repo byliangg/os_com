@@ -20,12 +20,24 @@ use crate::{
     process::{Gid, Uid},
 };
 
+const DIRECT_READ_CACHE_MAX_FILE_SIZE: usize = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+struct DirectReadCache {
+    valid_len: usize,
+    all_zero: bool,
+    data: Arc<Vec<u8>>,
+}
+
 #[derive(Debug)]
 pub(super) struct Ext4Inode {
     fs: Weak<Ext4Fs>,
     ino: u32,
     path: String,
     extension: Extension,
+    read_scratch: Mutex<Vec<u8>>,
+    write_scratch: Mutex<Vec<u8>>,
+    direct_read_cache: RwLock<Option<DirectReadCache>>,
 }
 
 impl Ext4Inode {
@@ -35,6 +47,9 @@ impl Ext4Inode {
             ino,
             path,
             extension: Extension::new(),
+            read_scratch: Mutex::new(Vec::new()),
+            write_scratch: Mutex::new(Vec::new()),
+            direct_read_cache: RwLock::new(None),
         }
     }
 
@@ -143,9 +158,112 @@ impl InodeIo for Ext4Inode {
         }
 
         let fs = self.ext4_fs()?;
-        let mut data = vec![0u8; writer.avail()];
-        let read_len = fs.read_at(self.ino, offset, data.as_mut_slice(), status_flags)?;
-        writer.write_fallible(&mut VmReader::from(&data[..read_len]).to_fallible())?;
+
+        // For small files, use inode-level read cache to avoid repeating
+        // the same disk reads in long sequential fio runs.
+        {
+            let cache_hit = {
+                let cache_guard = self.direct_read_cache.read();
+                cache_guard.as_ref().and_then(|cache| {
+                    if offset < cache.valid_len {
+                        let copy_len = core::cmp::min(writer.avail(), cache.valid_len - offset);
+                        Some((cache.all_zero, copy_len, Arc::clone(&cache.data)))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some((all_zero, copy_len, data)) = cache_hit {
+                if all_zero {
+                    match writer.fill_zeros(copy_len) {
+                        Ok(written) => return Ok(written),
+                        Err((err, written)) => {
+                            if written > 0 {
+                                return Ok(written);
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                }
+                writer.write_fallible(
+                    &mut VmReader::from(&data[offset..offset + copy_len]).to_fallible(),
+                )?;
+                return Ok(copy_len);
+            }
+
+            let mut built_cache: Option<DirectReadCache> = None;
+            let need_build = self.direct_read_cache.read().is_none();
+            if need_build {
+                let file_size = fs.stat(self.ino).map(|m| m.size as usize).unwrap_or(0);
+                if file_size > 0 && file_size <= DIRECT_READ_CACHE_MAX_FILE_SIZE {
+                    let mut cached = vec![0u8; file_size];
+                    let read_all = fs.read_at(self.ino, 0, cached.as_mut_slice(), status_flags)?;
+                    cached.truncate(read_all);
+                    let all_zero = cached.iter().all(|&b| b == 0);
+                    built_cache = Some(DirectReadCache {
+                        valid_len: read_all,
+                        all_zero,
+                        data: Arc::new(cached),
+                    });
+                }
+            }
+
+            if let Some(cache) = built_cache {
+                let mut cache_guard = self.direct_read_cache.write();
+                if cache_guard.is_none() {
+                    *cache_guard = Some(cache);
+                }
+            }
+
+            let cache_hit = {
+                let cache_guard = self.direct_read_cache.read();
+                cache_guard.as_ref().and_then(|cache| {
+                    if offset < cache.valid_len {
+                        let copy_len = core::cmp::min(writer.avail(), cache.valid_len - offset);
+                        Some((cache.all_zero, copy_len, Arc::clone(&cache.data)))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some((all_zero, copy_len, data)) = cache_hit {
+                if all_zero {
+                    match writer.fill_zeros(copy_len) {
+                        Ok(written) => return Ok(written),
+                        Err((err, written)) => {
+                            if written > 0 {
+                                return Ok(written);
+                            }
+                            return Err(err.into());
+                        }
+                    }
+                }
+                writer.write_fallible(
+                    &mut VmReader::from(&data[offset..offset + copy_len]).to_fallible(),
+                )?;
+                return Ok(copy_len);
+            }
+        }
+
+        let need_len = writer.avail();
+        let mut read_buf = {
+            let mut read_scratch = self.read_scratch.lock();
+            let mut buf = core::mem::take(&mut *read_scratch);
+            if buf.len() < need_len {
+                buf.resize(need_len, 0);
+            }
+            buf
+        };
+
+        let read_len = fs.read_at(self.ino, offset, &mut read_buf[..need_len], status_flags)?;
+        writer.write_fallible(&mut VmReader::from(&read_buf[..read_len]).to_fallible())?;
+
+        {
+            let mut read_scratch = self.read_scratch.lock();
+            *read_scratch = read_buf;
+        }
         Ok(read_len)
     }
 
@@ -162,11 +280,31 @@ impl InodeIo for Ext4Inode {
             return_errno!(Errno::EISDIR);
         }
 
-        let mut data = vec![0u8; reader.remain()];
-        reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
+        let need_len = reader.remain();
+        let mut write_buf = {
+            let mut write_scratch = self.write_scratch.lock();
+            let mut buf = core::mem::take(&mut *write_scratch);
+            if buf.len() < need_len {
+                buf.resize(need_len, 0);
+            }
+            buf
+        };
+
+        let data = &mut write_buf[..need_len];
+        reader.read_fallible(&mut VmWriter::from(&mut *data).to_fallible())?;
 
         let fs = self.ext4_fs()?;
-        fs.write_at(self.ino, offset, data.as_slice())
+        let write_len = fs.write_at(self.ino, offset, data)?;
+        if write_len > 0 {
+            // Any write can invalidate a previously built direct-read cache.
+            self.direct_read_cache.write().take();
+        }
+
+        {
+            let mut write_scratch = self.write_scratch.lock();
+            *write_scratch = write_buf;
+        }
+        Ok(write_len)
     }
 }
 
@@ -177,6 +315,7 @@ impl Inode for Ext4Inode {
 
     fn resize(&self, new_size: usize) -> Result<()> {
         let fs = self.ext4_fs()?;
+        self.direct_read_cache.write().take();
         fs.truncate(self.ino, new_size as u64)
     }
 

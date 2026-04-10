@@ -7,6 +7,10 @@ use crate::ext4_defs::*;
 // Keep sparse-write allocation modest: large enough to avoid pathological
 // one-block extent growth under fsstress, but still conservative for generic/014.
 const WRITE_PREALLOC_BLOCKS: u32 = 16;
+// Upper bound for contiguous full-block read batching on extent-backed files.
+// 16384 * 4KiB = 64MiB per batch, further reducing I/O call count for
+// large sequential reads like fio ext4_seq_read_bw (128MiB file).
+const READ_BATCH_MAX_BLOCKS: usize = 16384;
 
 impl Ext4 {
     /// Link a child inode to a parent directory
@@ -186,11 +190,13 @@ impl Ext4 {
 
         let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
         let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
-        let mut resolve_pblock = |lblock: u32| -> Result<Option<Ext4Fsblk>> {
+        let mut resolve_pblock = |lblock: u32,
+                                  cache: &mut Option<(u32, u32, Ext4Fsblk)>|
+         -> Result<(Option<Ext4Fsblk>, Option<u32>)> {
             if uses_extents {
-                if let Some((ext_start, ext_end, pblock_start)) = extent_cache {
+                if let Some((ext_start, ext_end, pblock_start)) = *cache {
                     if lblock >= ext_start && lblock < ext_end {
-                        return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                        return Ok((Some(pblock_start + (lblock - ext_start) as u64), Some(ext_end)));
                     }
                 }
 
@@ -208,25 +214,25 @@ impl Ext4 {
                         });
 
                         if let Some((ext_start, ext_end, pblock_start)) = mapped {
-                            extent_cache = Some((ext_start, ext_end, pblock_start));
-                            return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                            *cache = Some((ext_start, ext_end, pblock_start));
+                            return Ok((Some(pblock_start + (lblock - ext_start) as u64), Some(ext_end)));
                         }
 
-                        Ok(None)
+                        Ok((None, None))
                     }
-                    Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                    Err(e) if e.error() == Errno::ENOENT => Ok((None, None)),
                     Err(e) => Err(e),
                 }
             } else {
                 match self.get_pblock_idx(&inode_ref, lblock) {
-                    Ok(pblock) => Ok(Some(pblock)),
-                    Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                    Ok(pblock) => Ok((Some(pblock), None)),
+                    Err(e) if e.error() == Errno::ENOENT => Ok((None, None)),
                     Err(e) => Err(e),
                 }
             }
         };
 
-        let mut block_data = vec![0u8; block_size];
+        let mut block_data: Option<Vec<u8>> = None;
         let mut cursor = 0usize;
         let mut current_offset = offset;
 
@@ -235,22 +241,62 @@ impl Ext4 {
             let block_inner_offset = current_offset % block_size;
             let read_length = min(read_buf_len - cursor, block_size - block_inner_offset);
 
-            match resolve_pblock(lblock) {
-                Ok(Some(pblock_idx)) => {
+            match resolve_pblock(lblock, &mut extent_cache) {
+                Ok((Some(pblock_idx), extent_end)) => {
                     let pblock = usize::try_from(pblock_idx)
                         .map_err(|_| Ext4Error::new(Errno::EIO))?;
                     let block_offset = pblock
                         .checked_mul(block_size)
                         .ok_or_else(|| Ext4Error::new(Errno::EIO))?;
 
-                    self.block_device
-                        .read_offset_into(block_offset, block_data.as_mut_slice());
-                    read_buf[cursor..cursor + read_length].copy_from_slice(
-                        &block_data[block_inner_offset..block_inner_offset + read_length],
-                    );
+                    // Fast path: aligned reads inside one extent can be batched directly
+                    // into destination buffer to reduce syscall and memcpy overhead.
+                    if block_inner_offset == 0 {
+                        let remaining_full_blocks = (read_buf_len - cursor) / block_size;
+                        if remaining_full_blocks > 0 {
+                            let extent_blocks = extent_end
+                                .map(|end| end.saturating_sub(lblock) as usize)
+                                .unwrap_or(1);
+                            let batch_blocks = min(
+                                remaining_full_blocks,
+                                min(extent_blocks.max(1), READ_BATCH_MAX_BLOCKS),
+                            );
+
+                            if batch_blocks > 1 {
+                                let batch_len = batch_blocks * block_size;
+                                self.block_device.read_offset_into(
+                                    block_offset,
+                                    &mut read_buf[cursor..cursor + batch_len],
+                                );
+                                cursor += batch_len;
+                                current_offset += batch_len;
+                                continue;
+                            }
+                        }
+                    }
+
+                    if block_inner_offset == 0 && read_length == block_size {
+                        self.block_device
+                            .read_offset_into(block_offset, &mut read_buf[cursor..cursor + read_length]);
+                    } else {
+                        if block_data.is_none() {
+                            block_data = Some(vec![0u8; block_size]);
+                        }
+                        let block_data_ref = block_data.as_mut().unwrap();
+                        self.block_device
+                            .read_offset_into(block_offset, block_data_ref.as_mut_slice());
+                        read_buf[cursor..cursor + read_length].copy_from_slice(
+                            &block_data_ref[block_inner_offset..block_inner_offset + read_length],
+                        );
+                    }
+
+                    cursor += read_length;
+                    current_offset += read_length;
                 }
-                Ok(None) => {
+                Ok((None, _)) => {
                     read_buf[cursor..cursor + read_length].fill(0);
+                    cursor += read_length;
+                    current_offset += read_length;
                 }
                 Err(_) => {
                     return_errno_with_message!(
@@ -259,9 +305,6 @@ impl Ext4 {
                     );
                 }
             }
-
-            cursor += read_length;
-            current_offset += read_length;
         }
 
         Ok(read_buf_len)
@@ -568,61 +611,41 @@ impl Ext4 {
         let mut written = 0usize;
         let mut iblk_idx = lblock_start;
         let unaligned = offset % block_size;
-        let mut block_data = vec![0u8; block_size];
 
-        if unaligned > 0 {
+        if unaligned > 0 && written < write_buf.len() {
             let len = min(write_buf.len() - written, block_size - unaligned);
             let pblock_idx = resolve_pblock(iblk_idx)?;
             let blk_off = block_offset(pblock_idx)?;
+            let mut block = Block::load(&self.block_device, blk_off);
 
-            self.block_device
-                .read_offset_into(blk_off, block_data.as_mut_slice());
+            let existing = self.block_device.read_offset(blk_off);
+            let copy_len = min(block.data.len(), existing.len());
+            block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
 
-            block_data[unaligned..unaligned + len]
-                .copy_from_slice(&write_buf[written..written + len]);
-            self.block_device.write_offset(blk_off, block_data.as_slice());
+            block.write_offset(unaligned, &write_buf[written..written + len], len);
+            block.sync_blk_to_disk(&self.block_device);
 
             written += len;
             iblk_idx += 1;
         }
 
-        while write_buf.len() - written >= block_size {
-            let run_start_lblk = iblk_idx;
-            let run_start_written = written;
-            let run_start_pblk = resolve_pblock(run_start_lblk)?;
-
-            let mut run_blocks = 1usize;
-            let full_blocks_remaining = (write_buf.len() - written) / block_size;
-            while run_blocks < full_blocks_remaining {
-                let next_lblk = run_start_lblk + run_blocks as u32;
-                let next_pblk = resolve_pblock(next_lblk)?;
-                if next_pblk != run_start_pblk + run_blocks as u64 {
-                    break;
-                }
-                run_blocks += 1;
-            }
-
-            let run_bytes = run_blocks * block_size;
-            let run_off = block_offset(run_start_pblk)?;
-            self.block_device
-                .write_offset(run_off, &write_buf[run_start_written..run_start_written + run_bytes]);
-
-            written += run_bytes;
-            iblk_idx += run_blocks as u32;
-        }
-
-        if written < write_buf.len() {
-            let len = write_buf.len() - written;
+        while written < write_buf.len() {
             let pblock_idx = resolve_pblock(iblk_idx)?;
             let blk_off = block_offset(pblock_idx)?;
+            let mut block = Block::load(&self.block_device, blk_off);
+            let write_size = min(block_size, write_buf.len() - written);
 
-            self.block_device
-                .read_offset_into(blk_off, block_data.as_mut_slice());
+            if write_size < block_size {
+                let existing = self.block_device.read_offset(blk_off);
+                let copy_len = min(block.data.len(), existing.len());
+                block.data[..copy_len].copy_from_slice(&existing[..copy_len]);
+            }
 
-            block_data[..len].copy_from_slice(&write_buf[written..written + len]);
-            self.block_device.write_offset(blk_off, block_data.as_slice());
+            block.write_offset(0, &write_buf[written..written + write_size], write_size);
+            block.sync_blk_to_disk(&self.block_device);
 
-            written += len;
+            written += write_size;
+            iblk_idx += 1;
         }
 
         let new_size = offset + written;

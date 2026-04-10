@@ -307,14 +307,20 @@ check_vdso:
 initramfs: check_vdso
 	@$(MAKE) --no-print-directory -C test/initramfs
 
+ifeq ($(SKIP_INITRAMFS_BUILD),1)
+KERNEL_BUILD_DEPS := $(CARGO_OSDK)
+else
+KERNEL_BUILD_DEPS := initramfs $(CARGO_OSDK)
+endif
+
 # Build the kernel with an initramfs
 .PHONY: kernel
-kernel: initramfs $(CARGO_OSDK)
+kernel: $(KERNEL_BUILD_DEPS)
 	@cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
 
 # Build the kernel with an initramfs and then run it
 .PHONY: run_kernel
-run_kernel: initramfs $(CARGO_OSDK)
+run_kernel: $(KERNEL_BUILD_DEPS)
 	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), syscall)

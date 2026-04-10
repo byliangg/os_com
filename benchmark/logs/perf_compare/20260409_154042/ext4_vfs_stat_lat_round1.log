@@ -1,0 +1,183 @@
+Running benchmark lmbench/ext4_vfs_stat_lat...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 731083da-c078-4bac-af52-246fa9d50eaf
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 3 derivations will be built:
+  /nix/store/kzsvq3p7i8bar9wxqj9siwhi4ffjmj1z-benchmark-0.1.0.drv
+  /nix/store/c7y9q7md20gz2wgbjxk0py3swyba2qz0-runtime-deps.drv
+  /nix/store/92nlimf5bhc3x5wf8lbwwxddf6lv9x2k-initramfs.drv
+building '/nix/store/kzsvq3p7i8bar9wxqj9siwhi4ffjmj1z-benchmark-0.1.0.drv'...
+building '/nix/store/c7y9q7md20gz2wgbjxk0py3swyba2qz0-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/92nlimf5bhc3x5wf8lbwwxddf6lv9x2k-initramfs.drv'...
+/nix/store/ksifznjpyg01qg0wzslmbsy4zf4z4gc2-initramfs
+this derivation will be built:
+  /nix/store/6nskzjd25a8jvwq53qjc3qzpwacflla9-initramfs-image.drv
+building '/nix/store/6nskzjd25a8jvwq53qjc3qzpwacflla9-initramfs-image.drv'...
+/build/tmp.tmqsMcVFaD /build
+176084 blocks
+/build
+/nix/store/490xd2cwaqy2kk10h4c4m6hcflfr6ygf-initramfs-image
+Running benchmark lmbench/ext4_vfs_stat_lat on Asterinas...
+these 3 derivations will be built:
+  /nix/store/sqa910n9nsz3i324k8m2wrbkac537nv8-benchmark-0.1.0.drv
+  /nix/store/1ndsxlrs3s36lvxinixvd8pmssp2bzja-runtime-deps.drv
+  /nix/store/sl3cx05yzj74pxci0nwq4l8z7ycca55b-initramfs.drv
+building '/nix/store/sqa910n9nsz3i324k8m2wrbkac537nv8-benchmark-0.1.0.drv'...
+building '/nix/store/1ndsxlrs3s36lvxinixvd8pmssp2bzja-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/sl3cx05yzj74pxci0nwq4l8z7ycca55b-initramfs.drv'...
+/nix/store/c4vy90y1ivx46ddaw84nmjds4cy5mhgz-initramfs
+these 4 derivations will be built:
+  /nix/store/adiw39wf4y8391wd4ixsz70brzvd1rj5-benchmark-0.1.0.drv
+  /nix/store/mzncmx5zqkw48sfjdwk20m5y0yc9fw6h-runtime-deps.drv
+  /nix/store/b5l7p40vrfsk9f02jgc81rap3yyf7rr2-initramfs.drv
+  /nix/store/5ncx5sbjrkzmi7622lb1xdpvhf9mja4f-initramfs-image.drv
+building '/nix/store/adiw39wf4y8391wd4ixsz70brzvd1rj5-benchmark-0.1.0.drv'...
+building '/nix/store/mzncmx5zqkw48sfjdwk20m5y0yc9fw6h-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/b5l7p40vrfsk9f02jgc81rap3yyf7rr2-initramfs.drv'...
+building '/nix/store/5ncx5sbjrkzmi7622lb1xdpvhf9mja4f-initramfs-image.drv'...
+/build/tmp.VsLZJsiiKT /build
+176063 blocks
+/build
+/nix/store/wq1ywwkc0llirpcr53had1is9cafw0sq-initramfs-image
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `id-alloc` (lib) generated 1 warning
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 0.10s
+grub-mkrescue: warning: cannot open directory `/usr/local/grub/share/locale': No such file or directory.
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/root/asterinas/target/osdk/aster-kernel-osdk-bin.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data,  940g free
+Added to ISO image: directory '/'='/tmp/grub.2iXNj2'
+xorriso : UPDATE :     298 files added in 1 seconds
+Added to ISO image: directory '/'='/root/asterinas/target/osdk/iso_root'
+xorriso : UPDATE :     303 files added in 1 seconds
+ISO image produced: 23111 sectors
+Written to medium : 23111 sectors at LBA 0
+Writing to 'stdio:/root/asterinas/target/osdk/aster-kernel-osdk-bin.iso' completed successfully.
+
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.pku [bit 3]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+qemu-system-x86_64: -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off: Failed to get "write" lock
+Is another process using the image [./test/initramfs/build/ext2.img]?
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 6940a26b-8821-40e1-8b15-d4ba0142089e
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 3 derivations will be built:
+  /nix/store/8n9vd2xrr0r7s8gnsqaiwzigr10d58b0-benchmark-0.1.0.drv
+  /nix/store/3c7pm55ibx8ayshg9amcl757d6vyddsp-runtime-deps.drv
+  /nix/store/91nnxmfmgrciywm87glp6bx8yknnxgip-initramfs.drv
+building '/nix/store/8n9vd2xrr0r7s8gnsqaiwzigr10d58b0-benchmark-0.1.0.drv'...
+building '/nix/store/3c7pm55ibx8ayshg9amcl757d6vyddsp-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/91nnxmfmgrciywm87glp6bx8yknnxgip-initramfs.drv'...
+/nix/store/msvq4qy6x86n5i1hiswcpi5jafpzkjg8-initramfs
+this derivation will be built:
+  /nix/store/n4haag4m6y0lbp9lsbankjx5rziwl4qm-initramfs-image.drv
+building '/nix/store/n4haag4m6y0lbp9lsbankjx5rziwl4qm-initramfs-image.drv'...
+/build/tmp.iP7LRKSAk0 /build
+176099 blocks
+/build
+/nix/store/rj5a5v51x791dr1z2wzsxyxks1cj5qg6-initramfs-image
+Running benchmark lmbench/ext4_vfs_stat_lat on Linux...
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.pku [bit 3]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+qemu-system-x86_64: -device virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off: Failed to get "write" lock
+Is another process using the image [/root/asterinas/test/initramfs/src/benchmark/../../build/ext2.img]?

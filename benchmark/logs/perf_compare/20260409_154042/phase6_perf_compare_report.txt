@@ -1,0 +1,6 @@
+phase6_perf_compare_run_dir=/root/asterinas/benchmark/logs/perf_compare/20260409_154042
+detail_tsv=/root/asterinas/benchmark/logs/perf_compare/20260409_154042/phase6_perf_compare_detail.tsv
+aggregate_tsv=/root/asterinas/benchmark/logs/perf_compare/20260409_154042/phase6_perf_compare_aggregate.tsv
+overall_avg_ratio=nan
+threshold=0.80
+overall_status=FAIL

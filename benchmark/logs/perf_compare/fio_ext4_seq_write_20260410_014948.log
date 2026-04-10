@@ -1,0 +1,19 @@
+Running benchmark fio/ext4_seq_write_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: fc897d1b-2d14-4465-a187-72d0927055e9
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+nix-build not found, using prebuilt initramfs: /home/mafake/os_com/benchmark/assets/initramfs/initramfs_phase3.cpio.gz
+Running benchmark fio/ext4_seq_write_bw on Asterinas...
+/bin/bash: line 1: cargo: command not found
+make[1]: *** [Makefile:277: install_osdk] Error 127
+make: *** [Makefile:281: /home/mafake/.cargo/bin/cargo-osdk] Error 2

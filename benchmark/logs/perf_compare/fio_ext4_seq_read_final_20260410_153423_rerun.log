@@ -1,0 +1,19 @@
+===== 直接运行 fio 顺序读性能测试 =====
+
+启动容器，运行测试...
+预期耗时：3-5 分钟
+日志文件：benchmark/logs/perf_compare/fio_ext4_seq_read_final_20260410_153423.log
+
+检测到预热缓存标记，跳过预热阶段（加速本轮启动）...
+
+测试完成！
+
+===== 性能测试结果 =====
+Linux 带宽:          1816.0 MB/s
+Asterinas 带宽:      2071.0 MB/s
+性能比例:            114.04%
+相比基线改进:        +5321.5%
+
+✓✓✓ 达到目标阈值 (>=80%)!
+
+完整日志: benchmark/logs/perf_compare/fio_ext4_seq_read_final_20260410_153423.log

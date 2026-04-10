@@ -1,0 +1,8 @@
+lmbench/ext4_vfs_open_lat	FAIL	rc=124		log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_vfs_open_lat_20260407_151143.log
+lmbench/ext4_vfs_stat_lat	FAIL	rc=124		log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_vfs_stat_lat_20260407_152752.log
+lmbench/ext4_vfs_fstat_lat	PASS	rc=0	Simple fstat: 284.3206 microseconds	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_vfs_fstat_lat_20260407_153519.log
+lmbench/ext4_vfs_read_lat	PASS	rc=0	Simple read: 0.1292 microseconds	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_vfs_read_lat_20260407_153608.log
+lmbench/ext4_vfs_write_lat	PASS	rc=0	Simple write: 0.1332 microseconds	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_vfs_write_lat_20260407_153658.log
+lmbench/ext4_create_delete_files_0k_ops	PASS	rc=0	10k	73	63	129	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_create_delete_files_0k_ops_20260407_153748.log
+lmbench/ext4_create_delete_files_10k_ops	PASS	rc=0	10k	62	57	116	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_create_delete_files_10k_ops_20260407_154237.log
+lmbench/ext4_copy_files_bw	PASS	rc=0	lmdd result: 536.8709 MB in 454.6291 secs, 1.1809 MB/sec	log=/root/asterinas/benchmark/logs/lmbench/lmbench_ext4_copy_files_bw_20260407_154406.log

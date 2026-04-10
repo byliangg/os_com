@@ -1,0 +1,100 @@
+Running benchmark fio/ext4_seq_read_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 238f3441-f474-4653-a9eb-635a5d7ff0ea
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv
+  /nix/store/j8fnk5wbyqqn6c8vzljlizrmr3yysicz-benchmark-0.1.0.drv
+  /nix/store/6a94cxb85ghszd6s1rry0qpws00vd2dl-runtime-deps.drv
+  /nix/store/hjbq85bfs16fxdf25nc37jrrf7mwwa9q-initramfs.drv
+building '/nix/store/j8fnk5wbyqqn6c8vzljlizrmr3yysicz-benchmark-0.1.0.drv'...
+building '/nix/store/9qn45difbg9j47rjf0cmm1iih380wkr7-resolv-conf.drv'...
+resolv.conf is generated from the host's /etc/resolv.conf
+building '/nix/store/6a94cxb85ghszd6s1rry0qpws00vd2dl-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/hjbq85bfs16fxdf25nc37jrrf7mwwa9q-initramfs.drv'...
+/nix/store/25xpp629fig1hb0m6agzvs03ydiwnvhn-initramfs
+this derivation will be built:
+  /nix/store/yv4q37d9iwxzjk65k14lwc455rf35lw2-initramfs-image.drv
+building '/nix/store/yv4q37d9iwxzjk65k14lwc455rf35lw2-initramfs-image.drv'...
+/build/tmp.JVa6AXV2yE /build
+176078 blocks
+/build
+/nix/store/8n5jmpg506kkwhyljjd7x51d694j59fp-initramfs-image
+Running benchmark fio/ext4_seq_read_bw on Asterinas...
+these 3 derivations will be built:
+  /nix/store/bmdq2656s6rscnfb0ycz6i2cjl5s4y8d-benchmark-0.1.0.drv
+  /nix/store/s6kqlg2abqnqa7jjkgrvbjg8fckfjs8w-runtime-deps.drv
+  /nix/store/sa1bp1fs2iys94kpvs5gfax3fi150qm6-initramfs.drv
+building '/nix/store/bmdq2656s6rscnfb0ycz6i2cjl5s4y8d-benchmark-0.1.0.drv'...
+building '/nix/store/s6kqlg2abqnqa7jjkgrvbjg8fckfjs8w-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/sa1bp1fs2iys94kpvs5gfax3fi150qm6-initramfs.drv'...
+/nix/store/9nmdd6zxqj7rz5z1bzipnh0zm5z7lzpm-initramfs
+these 4 derivations will be built:
+  /nix/store/dram3jppwz65j0spqxmvbr5bixg15s0d-benchmark-0.1.0.drv
+  /nix/store/4271vqp2pzz5a8684gxcyw0zby823ndd-runtime-deps.drv
+  /nix/store/dr3qkyq5pim5lmjsf89y8783vgv0szic-initramfs.drv
+  /nix/store/qahmy65ch0j928snq97a3qrj39yqkcq9-initramfs-image.drv
+building '/nix/store/dram3jppwz65j0spqxmvbr5bixg15s0d-benchmark-0.1.0.drv'...
+building '/nix/store/4271vqp2pzz5a8684gxcyw0zby823ndd-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/dr3qkyq5pim5lmjsf89y8783vgv0szic-initramfs.drv'...
+building '/nix/store/qahmy65ch0j928snq97a3qrj39yqkcq9-initramfs-image.drv'...
+/build/tmp.QlQAvT7R2d /build
+176065 blocks
+/build
+/nix/store/wd8gy2da6wkdzbl3xgsj3yi17hmq6zk2-initramfs-image
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `ostd-test` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-kernel v0.1.0 (/root/asterinas/kernel)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/target_lby/osdk/aster-kernel-run-base)

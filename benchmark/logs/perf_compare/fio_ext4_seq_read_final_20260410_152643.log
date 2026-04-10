@@ -1,0 +1,84 @@
++ local tries=2
++ shift
++ local i
+++ seq 1 2
++ for i in $(seq 1 "$tries")
++ docker exec -e RUSTUP_DIST_SERVER -e RUSTUP_UPDATE_ROOT -e http_proxy -e https_proxy -e all_proxy -e HTTP_PROXY -e HTTPS_PROXY -e ALL_PROXY -e BENCH_ENABLE_KVM=1 -e BENCH_ASTER_NETDEV=tap -e BENCH_ASTER_VHOST=on -e BENCH_JOB=fio/ext4_seq_read_bw oscom_fio_runner bash -lc '
+set -euo pipefail
+export ASTERINAS_ROOT=/root/asterinas
+export CARGO_TARGET_DIR=/root/asterinas/target_lby  
+export VDSO_LIBRARY_DIR=/root/asterinas/benchmark/assets/linux_vdso
+export RUSTUP_MAX_RETRIES=10
+export CARGO_HTTP_TIMEOUT=180
+export CARGO_NET_RETRY=10
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+export GIT_HTTP_LOW_SPEED_LIMIT=1024
+export GIT_HTTP_LOW_SPEED_TIME=30
+
+cd /root/asterinas
+
+# Kill any leftovers from previous interrupted runs in reused container.
+pkill -f "bench_linux_and_aster.sh|qemu-system-x86_64|cargo-osdk osdk run" >/dev/null 2>&1 || true
+
+mkdir -p /root/.cargo/bin
+cat >/root/.cargo/bin/cargo-osdk << "EOS"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ASTERINAS_ROOT:-/root/asterinas}
+BIN="${ROOT}/target_lby/debug/cargo-osdk"
+STAMP="${ROOT}/target_lby/.cargo_osdk_local_dev"
+if [ ! -x "${BIN}" ] || [ ! -f "${STAMP}" ]; then
+  OSDK_LOCAL_DEV=1 cargo build --manifest-path "${ROOT}/osdk/Cargo.toml" --bin cargo-osdk
+  mkdir -p "$(dirname "${STAMP}")"
+  touch "${STAMP}"
+fi
+exec "${BIN}" "$@"
+EOS
+chmod +x /root/.cargo/bin/cargo-osdk
+
+timeout 5400 bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${BENCH_JOB}" x86_64
+'
++ echo '第 1/2 次失败，准备重试...'
+第 1/2 次失败，准备重试...
++ '[' 1 -lt 2 ']'
++ sleep 3
++ for i in $(seq 1 "$tries")
++ docker exec -e RUSTUP_DIST_SERVER -e RUSTUP_UPDATE_ROOT -e http_proxy -e https_proxy -e all_proxy -e HTTP_PROXY -e HTTPS_PROXY -e ALL_PROXY -e BENCH_ENABLE_KVM=1 -e BENCH_ASTER_NETDEV=tap -e BENCH_ASTER_VHOST=on -e BENCH_JOB=fio/ext4_seq_read_bw oscom_fio_runner bash -lc '
+set -euo pipefail
+export ASTERINAS_ROOT=/root/asterinas
+export CARGO_TARGET_DIR=/root/asterinas/target_lby  
+export VDSO_LIBRARY_DIR=/root/asterinas/benchmark/assets/linux_vdso
+export RUSTUP_MAX_RETRIES=10
+export CARGO_HTTP_TIMEOUT=180
+export CARGO_NET_RETRY=10
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+export GIT_HTTP_LOW_SPEED_LIMIT=1024
+export GIT_HTTP_LOW_SPEED_TIME=30
+
+cd /root/asterinas
+
+# Kill any leftovers from previous interrupted runs in reused container.
+pkill -f "bench_linux_and_aster.sh|qemu-system-x86_64|cargo-osdk osdk run" >/dev/null 2>&1 || true
+
+mkdir -p /root/.cargo/bin
+cat >/root/.cargo/bin/cargo-osdk << "EOS"
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ASTERINAS_ROOT:-/root/asterinas}
+BIN="${ROOT}/target_lby/debug/cargo-osdk"
+STAMP="${ROOT}/target_lby/.cargo_osdk_local_dev"
+if [ ! -x "${BIN}" ] || [ ! -f "${STAMP}" ]; then
+  OSDK_LOCAL_DEV=1 cargo build --manifest-path "${ROOT}/osdk/Cargo.toml" --bin cargo-osdk
+  mkdir -p "$(dirname "${STAMP}")"
+  touch "${STAMP}"
+fi
+exec "${BIN}" "$@"
+EOS
+chmod +x /root/.cargo/bin/cargo-osdk
+
+timeout 5400 bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${BENCH_JOB}" x86_64
+'
++ echo '第 2/2 次失败，准备重试...'
+第 2/2 次失败，准备重试...
++ '[' 2 -lt 2 ']'
++ return 1
