@@ -144,6 +144,40 @@ impl Ext4 {
         Ok(mappings)
     }
 
+    fn collect_allocated_block_ranges(
+        &self,
+        lblock_start: u32,
+        allocated_blocks: &[Ext4Fsblk],
+    ) -> Vec<SimpleBlockRange> {
+        let mut mappings = Vec::new();
+        if allocated_blocks.is_empty() {
+            return mappings;
+        }
+
+        let mut logical = lblock_start;
+        let mut seg_begin = 0usize;
+        while seg_begin < allocated_blocks.len() {
+            let mut seg_end = seg_begin + 1;
+            while seg_end < allocated_blocks.len()
+                && allocated_blocks[seg_end] == allocated_blocks[seg_end - 1] + 1
+            {
+                seg_end += 1;
+            }
+
+            let run_len = (seg_end - seg_begin) as u32;
+            Self::push_block_range(
+                &mut mappings,
+                logical,
+                allocated_blocks[seg_begin],
+                run_len,
+            );
+            logical = logical.saturating_add(run_len);
+            seg_begin = seg_end;
+        }
+
+        mappings
+    }
+
     /// Link a child inode to a parent directory
     ///
     /// Params:
@@ -599,6 +633,7 @@ impl Ext4 {
             usize::try_from(file_size).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
         let aligned_append =
             offset >= file_size_usize && file_size_usize % block_size == 0;
+        let mut fast_mappings: Option<Vec<SimpleBlockRange>> = None;
 
         if aligned_append {
             match self.get_pblock_idx(&inode_ref, lblock_start) {
@@ -626,6 +661,12 @@ impl Ext4 {
                         lblock_start,
                         &allocated_blocks,
                     )?;
+                    if inserted >= want_blocks && allocated_blocks.len() >= want_blocks {
+                        fast_mappings = Some(self.collect_allocated_block_ranges(
+                            lblock_start,
+                            &allocated_blocks[..want_blocks],
+                        ));
+                    }
                     if inserted < want_blocks {
                         self.ensure_write_range_mapped(
                             &mut inode_ref,
@@ -652,6 +693,10 @@ impl Ext4 {
             }
             inode_ref.inode.set_size(write_end as u64);
             self.write_back_inode(&mut inode_ref);
+        }
+
+        if let Some(mappings) = fast_mappings {
+            return Ok(mappings);
         }
 
         self.collect_block_ranges(&inode_ref, lblock_start, lblock_end - lblock_start)
@@ -759,71 +804,18 @@ impl Ext4 {
                 .ok_or_else(|| Ext4Error::new(Errno::EFBIG))
         };
 
-        let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
-        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
         let mut resolve_pblock = |lblock: u32| -> Result<Ext4Fsblk> {
-            if uses_extents {
-                if let Some((ext_start, ext_end, pblock_start)) = extent_cache {
-                    if lblock >= ext_start && lblock < ext_end {
-                        return Ok(pblock_start + (lblock - ext_start) as u64);
-                    }
-                }
-
-                match self.find_extent(&inode_ref, lblock) {
-                    Ok(path) => {
-                        let mapped = path.path.last().and_then(|node| node.extent).and_then(|extent| {
-                            let ext_start = extent.get_first_block();
-                            let ext_len = extent.get_actual_len() as u32;
-                            let ext_end = ext_start.checked_add(ext_len)?;
-                            if lblock < ext_start || lblock >= ext_end {
-                                return None;
-                            }
-                            let pblock_start = extent.get_pblock();
-                            Some((ext_start, ext_end, pblock_start))
-                        });
-
-                        if let Some((ext_start, ext_end, pblock_start)) = mapped {
-                            extent_cache = Some((ext_start, ext_end, pblock_start));
-                            return Ok(pblock_start + (lblock - ext_start) as u64);
-                        }
-
-                        log::error!(
-                            "[write_at] mapping missing after map: inode={} lblock={} offset={} len={}",
-                            inode,
-                            lblock,
-                            offset,
-                            write_buf.len()
-                        );
-                        return_errno_with_message!(
-                            Errno::ENOENT,
-                            "write mapping missing after allocation"
-                        )
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "[write_at] find_extent failed after map: inode={} lblock={} offset={} len={} err={:?}",
-                            inode,
-                            lblock,
-                            offset,
-                            write_buf.len(),
-                            e
-                        );
-                        Err(e)
-                    }
-                }
-            } else {
-                self.get_pblock_idx(&inode_ref, lblock).map_err(|e| {
-                    log::error!(
-                        "[write_at] get_pblock_idx failed after map: inode={} lblock={} offset={} len={} err={:?}",
-                        inode,
-                        lblock,
-                        offset,
-                        write_buf.len(),
-                        e
-                    );
+            self.get_pblock_idx(&inode_ref, lblock).map_err(|e| {
+                log::error!(
+                    "[write_at] get_pblock_idx failed after map: inode={} lblock={} offset={} len={} err={:?}",
+                    inode,
+                    lblock,
+                    offset,
+                    write_buf.len(),
                     e
-                })
-            }
+                );
+                e
+            })
         };
 
         let mut written = 0usize;

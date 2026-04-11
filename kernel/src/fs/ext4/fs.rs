@@ -290,6 +290,7 @@ struct DirectReadCache {
     file_offset: usize,
     len: usize,
     plan_window: usize,
+    last_atime_sec: u32,
     mappings: Vec<SimpleBlockRange>,
 }
 
@@ -665,13 +666,11 @@ impl Ext4Fs {
     }
 
     fn write_zeros(writer: &mut VmWriter, len: usize) -> Result<()> {
-        let zeros = [0u8; EXT4_BLOCK_SIZE];
-        let mut remaining = len;
-        while remaining > 0 {
-            let chunk = remaining.min(zeros.len());
-            writer.write_fallible(&mut VmReader::from(&zeros[..chunk]).to_fallible())?;
-            remaining -= chunk;
-        }
+        debug_assert!(len <= writer.avail());
+        let zeroed = writer
+            .fill_zeros(len)
+            .map_err(|(err, _)| Error::from(err))?;
+        debug_assert_eq!(zeroed, len);
         Ok(())
     }
 
@@ -691,9 +690,26 @@ impl Ext4Fs {
         let start_lblock = offset / block_size;
         let end_lblock = end / block_size;
         let mut sliced = Vec::new();
+        let mut left = 0usize;
+        let mut right = mappings.len();
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let mapping = &mappings[mid];
+            let mapping_end = (mapping.lblock as usize)
+                .checked_add(mapping.len as usize)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped range overflow"))?;
+            if mapping_end <= start_lblock {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
 
-        for mapping in mappings {
+        for mapping in mappings.iter().skip(left) {
             let mapping_start = mapping.lblock as usize;
+            if mapping_start >= end_lblock {
+                break;
+            }
             let mapping_end = mapping_start
                 .checked_add(mapping.len as usize)
                 .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped range overflow"))?;
@@ -768,23 +784,91 @@ impl Ext4Fs {
             return Ok((0, Vec::new()));
         }
 
+        let direct_len = cached_len.min(requested_direct_len);
+        let mappings = Self::slice_mappings_for_range(offset, direct_len, &cached_mappings)?;
         self.inode_direct_read_cache.lock().insert(
             ino,
             DirectReadCache {
                 file_offset: offset,
                 len: cached_len,
                 plan_window: next_plan_window,
-                mappings: cached_mappings.clone(),
+                last_atime_sec: 0,
+                mappings: cached_mappings,
             },
         );
-
-        let direct_len = cached_len.min(requested_direct_len);
-        let mappings = Self::slice_mappings_for_range(offset, direct_len, &cached_mappings)?;
         Ok((direct_len, mappings))
+    }
+
+    fn mappings_fully_cover_range(
+        offset: usize,
+        len: usize,
+        mappings: &[SimpleBlockRange],
+    ) -> Result<bool> {
+        if len == 0 {
+            return Ok(true);
+        }
+
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O range overflow"))?;
+        let mut current_lblock = offset / EXT4_BLOCK_SIZE;
+        let end_lblock = end / EXT4_BLOCK_SIZE;
+
+        for mapping in mappings {
+            let mapping_start = mapping.lblock as usize;
+            if mapping_start != current_lblock {
+                return Ok(false);
+            }
+            current_lblock = mapping_start
+                .checked_add(mapping.len as usize)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped range overflow"))?;
+            if current_lblock > end_lblock {
+                return Ok(false);
+            }
+        }
+
+        Ok(current_lblock == end_lblock)
+    }
+
+    fn plan_direct_write_overwrite_cached(
+        &self,
+        ino: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<Option<Vec<SimpleBlockRange>>> {
+        let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, len)?;
+        if direct_len != len {
+            return Ok(None);
+        }
+        if !Self::mappings_fully_cover_range(offset, len, &mappings)? {
+            return Ok(None);
+        }
+        Ok(Some(mappings))
     }
 
     fn invalidate_direct_read_cache(&self, ino: u32) {
         self.inode_direct_read_cache.lock().remove(&ino);
+    }
+
+    fn touch_atime_after_direct_read(&self, ino: u32, status_flags: StatusFlags) -> Result<()> {
+        let Some(_) = self.should_consider_atime_update(status_flags) else {
+            return Ok(());
+        };
+
+        let now = Self::now_unix_seconds_u32();
+        {
+            let cache = self.inode_direct_read_cache.lock();
+            if cache.get(&ino).map(|entry| entry.last_atime_sec) == Some(now) {
+                return Ok(());
+            }
+        }
+
+        self.touch_atime(ino, status_flags)?;
+
+        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
+            entry.last_atime_sec = now;
+        }
+        Ok(())
     }
 
     pub(super) fn run_ext4<T>(
@@ -1472,8 +1556,10 @@ impl Ext4Fs {
         }
 
         let mut bio_waiter = BioWaiter::new();
+        let mut bio_segments = Vec::with_capacity(mappings.len());
         for mapping in &mappings {
             let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::FromDevice);
+            bio_segments.push(bio_segment.clone());
             let waiter = self
                 .block_device
                 .read_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
@@ -1485,28 +1571,29 @@ impl Ext4Fs {
         }
 
         let mut current_offset = offset;
-        for (bio, mapping) in bio_waiter.reqs().zip(mappings.iter()) {
+        let request_end = offset
+            .checked_add(direct_len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O range overflow"))?;
+        for (mapping, segment) in mappings.iter().zip(bio_segments.iter()) {
             let file_offset = (mapping.lblock as usize)
                 .checked_mul(EXT4_BLOCK_SIZE)
                 .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O offset overflow"))?;
             if current_offset < file_offset {
                 Self::write_zeros(writer, file_offset - current_offset)?;
             }
-            for segment in bio.segments() {
-                segment
-                    .reader()
-                    .map_err(Self::vm_io_error)?
-                    .read_fallible(writer)
-                    .map_err(|(e, _)| Error::from(e))?;
-            }
+            segment
+                .reader()
+                .map_err(Self::vm_io_error)?
+                .read_fallible(writer)
+                .map_err(|(e, _)| Error::from(e))?;
             current_offset = file_offset + mapping.len as usize * EXT4_BLOCK_SIZE;
         }
 
-        if current_offset < offset + direct_len {
-            Self::write_zeros(writer, offset + direct_len - current_offset)?;
+        if current_offset < request_end {
+            Self::write_zeros(writer, request_end - current_offset)?;
         }
 
-        self.touch_atime(ino, status_flags)?;
+        self.touch_atime_after_direct_read(ino, status_flags)?;
         Ok(direct_len)
     }
 
@@ -1542,8 +1629,16 @@ impl Ext4Fs {
             return Ok(0);
         }
 
+        let mut reused_read_mapping_cache = false;
         let mappings =
-            self.run_ext4(|ext4| ext4.ext4_prepare_write_at(ino, offset, write_len))?;
+            if let Some(cached_mappings) =
+                self.plan_direct_write_overwrite_cached(ino, offset, write_len)?
+            {
+                reused_read_mapping_cache = true;
+                cached_mappings
+            } else {
+                self.run_ext4(|ext4| ext4.ext4_prepare_write_at(ino, offset, write_len))?
+            };
 
         let mut bio_waiter = BioWaiter::new();
 
@@ -1564,7 +1659,9 @@ impl Ext4Fs {
             return_errno!(Errno::EIO);
         }
 
-        self.invalidate_direct_read_cache(ino);
+        if !reused_read_mapping_cache {
+            self.invalidate_direct_read_cache(ino);
+        }
         self.touch_mtime_ctime(ino)?;
         Ok(write_len)
     }
