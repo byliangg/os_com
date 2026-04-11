@@ -984,6 +984,7 @@ impl<Fallibility> VmWriter<'_, Fallibility> {
 
         self
     }
+
 }
 
 impl<'a> From<&'a mut [u8]> for VmWriter<'a, Infallible> {

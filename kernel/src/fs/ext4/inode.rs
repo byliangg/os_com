@@ -143,6 +143,13 @@ impl InodeIo for Ext4Inode {
         }
 
         let fs = self.ext4_fs()?;
+        if status_flags.contains(StatusFlags::O_DIRECT) {
+            if offset % ext4_rs::BLOCK_SIZE != 0 || writer.avail() % ext4_rs::BLOCK_SIZE != 0 {
+                return_errno_with_message!(Errno::EINVAL, "not block-aligned");
+            }
+            return fs.read_direct_at(self.ino, offset, writer, status_flags);
+        }
+
         let mut data = vec![0u8; writer.avail()];
         let read_len = fs.read_at(self.ino, offset, data.as_mut_slice(), status_flags)?;
         writer.write_fallible(&mut VmReader::from(&data[..read_len]).to_fallible())?;
@@ -153,7 +160,7 @@ impl InodeIo for Ext4Inode {
         &self,
         offset: usize,
         reader: &mut VmReader,
-        _status_flags: StatusFlags,
+        status_flags: StatusFlags,
     ) -> Result<usize> {
         if reader.remain() == 0 {
             return Ok(0);
@@ -162,10 +169,16 @@ impl InodeIo for Ext4Inode {
             return_errno!(Errno::EISDIR);
         }
 
+        let fs = self.ext4_fs()?;
+        if status_flags.contains(StatusFlags::O_DIRECT) {
+            if offset % ext4_rs::BLOCK_SIZE != 0 || reader.remain() % ext4_rs::BLOCK_SIZE != 0 {
+                return_errno_with_message!(Errno::EINVAL, "not block-aligned");
+            }
+            return fs.write_direct_at(self.ino, offset, reader);
+        }
+
         let mut data = vec![0u8; reader.remain()];
         reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
-
-        let fs = self.ext4_fs()?;
         fs.write_at(self.ino, offset, data.as_slice())
     }
 }

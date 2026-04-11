@@ -1,7 +1,8 @@
+use crate::ext4_defs::*;
 use crate::prelude::*;
 use crate::return_errno_with_message;
+use crate::simple_interface::SimpleBlockRange;
 use crate::utils::path_check;
-use crate::ext4_defs::*;
 // use std::time::{Duration, Instant};
 
 // Keep sparse-write allocation modest: large enough to avoid pathological
@@ -9,6 +10,140 @@ use crate::ext4_defs::*;
 const WRITE_PREALLOC_BLOCKS: u32 = 16;
 
 impl Ext4 {
+    fn push_block_range(
+        mappings: &mut Vec<SimpleBlockRange>,
+        lblock: u32,
+        pblock: u64,
+        len: u32,
+    ) {
+        if len == 0 {
+            return;
+        }
+
+        if let Some(last) = mappings.last_mut() {
+            let last_lend = last.lblock.saturating_add(last.len);
+            let last_pend = last.pblock.saturating_add(last.len as u64);
+            if last_lend == lblock && last_pend == pblock {
+                last.len = last.len.saturating_add(len);
+                return;
+            }
+        }
+
+        mappings.push(SimpleBlockRange { lblock, pblock, len });
+    }
+
+    fn resolve_block_mapping(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        uses_extents: bool,
+        extent_cache: &mut Option<(u32, u32, Ext4Fsblk)>,
+        lblock: u32,
+    ) -> Result<Option<Ext4Fsblk>> {
+        if uses_extents {
+            if let Some((ext_start, ext_end, pblock_start)) = *extent_cache {
+                if lblock >= ext_start && lblock < ext_end {
+                    return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                }
+            }
+
+            match self.find_extent(inode_ref, lblock) {
+                Ok(path) => {
+                    let mapped = path.path.last().and_then(|node| node.extent).and_then(|extent| {
+                        let ext_start = extent.get_first_block();
+                        let ext_len = extent.get_actual_len() as u32;
+                        let ext_end = ext_start.checked_add(ext_len)?;
+                        if lblock < ext_start || lblock >= ext_end {
+                            return None;
+                        }
+                        let pblock_start = extent.get_pblock();
+                        Some((ext_start, ext_end, pblock_start))
+                    });
+
+                    if let Some((ext_start, ext_end, pblock_start)) = mapped {
+                        *extent_cache = Some((ext_start, ext_end, pblock_start));
+                        return Ok(Some(pblock_start + (lblock - ext_start) as u64));
+                    }
+
+                    Ok(None)
+                }
+                Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            match self.get_pblock_idx(inode_ref, lblock) {
+                Ok(pblock) => Ok(Some(pblock)),
+                Err(e) if e.error() == Errno::ENOENT => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    fn collect_block_ranges(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        lblock_start: u32,
+        lblock_count: u32,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        if lblock_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let lblock_end = lblock_start
+            .checked_add(lblock_count)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        let mut mappings = Vec::new();
+        let mut cursor = lblock_start;
+
+        while cursor < lblock_end {
+            let Some(pblock_start) =
+                self.resolve_block_mapping(inode_ref, uses_extents, &mut extent_cache, cursor)?
+            else {
+                cursor += 1;
+                continue;
+            };
+
+            if uses_extents {
+                if let Some((ext_start, ext_end, cached_pblock_start)) = extent_cache {
+                    if cursor >= ext_start && cursor < ext_end {
+                        let run_end = ext_end.min(lblock_end);
+                        Self::push_block_range(
+                            &mut mappings,
+                            cursor,
+                            cached_pblock_start + (cursor - ext_start) as u64,
+                            run_end - cursor,
+                        );
+                        cursor = run_end;
+                        continue;
+                    }
+                }
+            }
+
+            let run_start = cursor;
+            cursor += 1;
+            while cursor < lblock_end {
+                let Some(next_pblock) = self.resolve_block_mapping(
+                    inode_ref,
+                    uses_extents,
+                    &mut extent_cache,
+                    cursor,
+                )?
+                else {
+                    break;
+                };
+                if next_pblock != pblock_start + (cursor - run_start) as u64 {
+                    break;
+                }
+                cursor += 1;
+            }
+
+            Self::push_block_range(&mut mappings, run_start, pblock_start, cursor - run_start);
+        }
+
+        Ok(mappings)
+    }
+
     /// Link a child inode to a parent directory
     ///
     /// Params:
@@ -267,6 +402,45 @@ impl Ext4 {
         Ok(read_buf_len)
     }
 
+    pub fn map_blocks(
+        &self,
+        inode: u32,
+        lblock_start: u32,
+        lblock_count: u32,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        let inode_ref = self.get_inode_ref(inode);
+        self.collect_block_ranges(&inode_ref, lblock_start, lblock_count)
+    }
+
+    pub fn plan_direct_read(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<(usize, Vec<SimpleBlockRange>)> {
+        let block_size = self.super_block.block_size() as usize;
+        if len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let inode_ref = self.get_inode_ref(inode);
+        let file_size =
+            usize::try_from(inode_ref.inode.size()).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let read_end = offset.saturating_add(len).min(file_size);
+        let read_len = read_end.saturating_sub(offset);
+        let direct_len = read_len / block_size * block_size;
+        if direct_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let lblock_start =
+            u32::try_from(offset / block_size).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_count =
+            u32::try_from(direct_len / block_size).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let mappings = self.collect_block_ranges(&inode_ref, lblock_start, lblock_count)?;
+        Ok((direct_len, mappings))
+    }
+
     fn insert_allocated_blocks_as_extents(
         &self,
         inode_ref: &mut Ext4InodeRef,
@@ -394,6 +568,93 @@ impl Ext4 {
         }
 
         Ok(allocated_total)
+    }
+
+    pub fn prepare_write_at(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        let block_size = self.super_block.block_size() as usize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        if offset % block_size != 0 || len % block_size != 0 {
+            return_errno_with_message!(Errno::EINVAL, "direct write range is not block aligned");
+        }
+
+        let mut inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size();
+        let write_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_start = u32::try_from(offset / block_size)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_end = u32::try_from(write_end / block_size)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+
+        let mut start_bgid = 0;
+        let file_size_usize =
+            usize::try_from(file_size).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let aligned_append =
+            offset >= file_size_usize && file_size_usize % block_size == 0;
+
+        if aligned_append {
+            match self.get_pblock_idx(&inode_ref, lblock_start) {
+                Ok(_) => {
+                    self.ensure_write_range_mapped(
+                        &mut inode_ref,
+                        lblock_start,
+                        lblock_end,
+                        &mut start_bgid,
+                    )?;
+                }
+                Err(e) if e.error() == Errno::ENOENT => {
+                    let want_blocks = (lblock_end - lblock_start) as usize;
+                    let allocated_blocks = self
+                        .balloc_alloc_block_batch(&mut inode_ref, &mut start_bgid, want_blocks)?;
+                    if allocated_blocks.is_empty() {
+                        return_errno_with_message!(
+                            Errno::ENOSPC,
+                            "no free blocks while mapping write range"
+                        );
+                    }
+
+                    let inserted = self.insert_allocated_blocks_as_extents(
+                        &mut inode_ref,
+                        lblock_start,
+                        &allocated_blocks,
+                    )?;
+                    if inserted < want_blocks {
+                        self.ensure_write_range_mapped(
+                            &mut inode_ref,
+                            lblock_start + inserted as u32,
+                            lblock_end,
+                            &mut start_bgid,
+                        )?;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            self.ensure_write_range_mapped(
+                &mut inode_ref,
+                lblock_start,
+                lblock_end,
+                &mut start_bgid,
+            )?;
+        }
+
+        if write_end > file_size as usize {
+            if write_end > EXT4_MAX_FILE_SIZE as usize {
+                return_errno_with_message!(Errno::EFBIG, "file size too large");
+            }
+            inode_ref.inode.set_size(write_end as u64);
+            self.write_back_inode(&mut inode_ref);
+        }
+
+        self.collect_block_ranges(&inode_ref, lblock_start, lblock_end - lblock_start)
     }
 
     /// Write data to a file at a given offset

@@ -84,6 +84,7 @@ run_benchmark() {
     local benchmark="$1"
     local run_mode="$2"
     local runtime_configs_str="$3" # String with key=value pairs, one per line
+    local bench_run_only="${BENCH_RUN_ONLY:-both}"
 
     echo "Preparing libraries..."
     prepare_libs
@@ -171,15 +172,19 @@ run_benchmark() {
     case "${run_mode}" in
         "guest_only")
             # Ensure Asterinas and Linux both run on a freshly prepared image.
-            prepare_fs
-            echo "Running benchmark ${benchmark} on Asterinas..."
-            # Execute directly from array, redirect stderr to stdout, then tee
-            "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
+            if [[ "${bench_run_only}" != "linux" ]]; then
+                prepare_fs
+                echo "Running benchmark ${benchmark} on Asterinas..."
+                # Execute directly from array, redirect stderr to stdout, then tee
+                "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
+            fi
 
-            prepare_fs
-            echo "Running benchmark ${benchmark} on Linux..."
-            # Execute directly from array, redirect stderr to stdout, then tee
-            "${linux_cmd_arr[@]}" 2>&1 | tee "${LINUX_OUTPUT}"
+            if [[ "${bench_run_only}" != "asterinas" ]]; then
+                prepare_fs
+                echo "Running benchmark ${benchmark} on Linux..."
+                # Execute directly from array, redirect stderr to stdout, then tee
+                "${linux_cmd_arr[@]}" 2>&1 | tee "${LINUX_OUTPUT}"
+            fi
             ;;
         "host_guest")
             # Note: host_guest_bench_runner.sh expects commands as single strings.
@@ -229,9 +234,14 @@ cleanup() {
 main() {
     local benchmark="$1"
     local platform="$2"
+    local bench_run_only="${BENCH_RUN_ONLY:-both}"
 
     if [[ -z "${BENCHMARK_ROOT}/${benchmark}" ]]; then
         echo "Error: No benchmark specified" >&2
+        exit 1
+    fi
+    if [[ "${bench_run_only}" != "both" && "${bench_run_only}" != "asterinas" && "${bench_run_only}" != "linux" ]]; then
+        echo "Error: BENCH_RUN_ONLY must be one of: both, asterinas, linux" >&2
         exit 1
     fi
     echo "Running benchmark $benchmark..."
@@ -265,13 +275,17 @@ main() {
     # Run the benchmark, passing the config string
     run_benchmark "$benchmark" "$run_mode" "$runtime_configs_str"
 
-    # Parse results if benchmark configuration exists
-    if [[ -f "$bench_result" ]]; then
-        parse_results "$bench_result"
+    if [[ "${bench_run_only}" == "both" ]]; then
+        # Parse results if benchmark configuration exists
+        if [[ -f "$bench_result" ]]; then
+            parse_results "$bench_result"
+        else
+            for job in "${BENCHMARK_ROOT}/${benchmark}"/bench_results/*; do
+                [[ -f "$job" ]] && parse_results "$job"
+            done
+        fi
     else
-        for job in "${BENCHMARK_ROOT}/${benchmark}"/bench_results/*; do
-            [[ -f "$job" ]] && parse_results "$job"
-        done
+        echo "Skipping result aggregation because BENCH_RUN_ONLY=${bench_run_only}."
     fi
 
     # Cleanup temporary files

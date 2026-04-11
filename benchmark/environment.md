@@ -1,6 +1,46 @@
-# Asterinas EXT4 Environment（Current, stage4 + stage6）
+# Asterinas EXT4 Environment（Current, stage7）
 
-更新时间：2026-04-08 22:55（Asia/Shanghai）
+更新时间：2026-04-10（Asia/Shanghai）
+
+## 0. 最新复现参数（2026-04-10）
+
+1. 分支：`stage7`
+2. 执行方式：Docker
+3. 日志根目录：`benchmark/logs/stage7_run_20260410_170858/`
+4. fio 参数：
+   - `BENCH_ENABLE_KVM=1`
+   - `BENCH_ASTER_NETDEV=tap`
+   - `BENCH_ASTER_VHOST=on`
+5. lmbench 对比参数：
+   - `PERF_ROUNDS=1`
+   - `PERF_CASE_TIMEOUT_SEC=600`
+   - `BENCH_ENABLE_KVM=1`
+   - `BENCH_ASTER_NETDEV=tap`
+   - `BENCH_ASTER_VHOST=on`
+6. xfstests 参数：
+   - `phase3_only` / `phase4_good`：`ENABLE_KVM=1 XFSTESTS_CASE_TIMEOUT_SEC=900`
+   - `phase6_only`：`ENABLE_KVM=1`
+7. crash 参数：`ENABLE_KVM=1 CRASH_ROUNDS=2`
+8. others/general 参数：`ENABLE_KVM=0`
+9. 结果摘要：
+   - `fio write ratio=0.176775`
+   - `fio read ratio=0.084592`
+   - `phase6_perf_compare overall_avg_ratio=0.161503`
+   - `phase3/phase4/phase6/crash=PASS`
+   - `others_general` 首次失败、重试 PASS
+
+关键日志：
+
+1. `benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_write_bw_20260410_090958.log`
+2. `benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_read_bw_20260410_091849.log`
+3. `benchmark/logs/stage7_run_20260410_170858/perf_compare/20260410_093228/phase6_perf_compare_report.txt`
+4. `benchmark/logs/stage7_run_20260410_170858/suite/phase6/phase6_good_20260410_093859.log`
+5. `benchmark/logs/stage7_run_20260410_170858/suite/phase3/phase3_base_guard_20260410_095418.log`
+6. `benchmark/logs/stage7_run_20260410_170858/suite/phase4/phase4_good_20260410_100230.log`
+7. `benchmark/logs/stage7_run_20260410_170858/suite/crash/crash/phase4_part3_crash_summary_20260410_101135.tsv`
+8. `benchmark/logs/stage7_run_20260410_170858/others_general_retry_20260410_181656.log`
+
+说明：本节补充 `stage7` 现状复现；下方旧内容保留作历史参考。
 
 ## 1. 当前分支与执行口径
 
@@ -48,7 +88,7 @@
 ## 4. 复现命令
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 
 # phase3 guard
 PHASE4_DOCKER_MODE=phase3_only \

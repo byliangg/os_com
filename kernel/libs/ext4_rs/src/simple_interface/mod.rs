@@ -39,6 +39,13 @@ pub struct SimpleInodeMeta {
     pub flags: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SimpleBlockRange {
+    pub lblock: u32,
+    pub pblock: u64,
+    pub len: u32,
+}
+
 
 /// simple interface for ext4
 impl Ext4 {
@@ -284,6 +291,36 @@ impl Ext4 {
     /// Read bytes from a file inode.
     pub fn ext4_read_at(&self, inode: u32, offset: usize, read_buf: &mut [u8]) -> Result<usize> {
         self.read_at(inode, offset, read_buf)
+    }
+
+    /// Map a logical block range to contiguous physical block ranges.
+    pub fn ext4_map_blocks(
+        &self,
+        inode: u32,
+        lblock_start: u32,
+        lblock_count: u32,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        self.map_blocks(inode, lblock_start, lblock_count)
+    }
+
+    /// Build a direct-read plan with a single inode load.
+    pub fn ext4_plan_direct_read(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<(usize, Vec<SimpleBlockRange>)> {
+        self.plan_direct_read(inode, offset, len)
+    }
+
+    /// Prepare a write range by allocating missing blocks and returning the final mapping.
+    pub fn ext4_prepare_write_at(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        self.prepare_write_at(inode, offset, len)
     }
 
     /// Write bytes to a file inode.

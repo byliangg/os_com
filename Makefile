@@ -274,7 +274,7 @@ install_osdk:
 	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
 	@# without the need to publish the changes of OSDK's self-hosted
 	@# dependencies to `crates.io`.
-	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+	@OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path osdk
 
 # This will install and update OSDK automatically
 $(CARGO_OSDK): $(OSDK_SRC_FILES)

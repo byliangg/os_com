@@ -12,10 +12,10 @@
 1. 当前工作分支：`stage4`
 2. 当前最好结果：
    - `generic/013` 单测可通过（`rc=0`）
-   - 日志：`/home/lby/os_com/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_single_generic013_afterbounds_20260407_114356.log`
+   - 日志：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_single_generic013_afterbounds_20260407_114356.log`
 3. 当前未打通项：
    - `phase4_good` 全量仍失败（`2 pass / 18 fail`）
-   - 关键日志：`/home/lby/os_com/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_full_afterbounds_20260407_115151.log`
+   - 关键日志：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_full_afterbounds_20260407_115151.log`
 
 ## 3. 机器与工具版本（实际检测值）
 
@@ -31,26 +31,26 @@
 
 ## 4. 干净环境目录（当前保留）
 
-仓库根：`/home/lby/os_com/asterinas`
+仓库根：`/home/lby/os_com_codex/asterinas`
 
 保留并使用：
 
-1. 构建目录：`/home/lby/os_com/asterinas/target_lby`
-2. 日志目录：`/home/lby/os_com/asterinas/stage4_ext4_logs_restore_runp3_v10`
-3. 基础 initramfs：`/home/lby/os_com/asterinas/.local/initramfs_phase3.cpio.gz`
+1. 构建目录：`/home/lby/os_com_codex/asterinas/target_lby`
+2. 日志目录：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10`
+3. 基础 initramfs：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase3.cpio.gz`
 4. 当前推荐 initramfs：
-   - 实体：`/home/lby/os_com/asterinas/.local/initramfs_phase4_part3_stage4fix_v19.cpio.gz`
-   - 入口（符号链接）：`/home/lby/os_com/asterinas/.local/initramfs_phase4_part3.cpio.gz`
-5. VDSO：`/home/lby/os_com/asterinas/.local/linux_vdso`
-6. xfstests 预构建目录：`/home/lby/os_com/asterinas/.local/xfstests-prebuilt`
-7. xfstests 源目录：`/home/lby/os_com/asterinas/.local/xfstests-src`
+   - 实体：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3_stage4fix_v19.cpio.gz`
+   - 入口（符号链接）：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3.cpio.gz`
+5. VDSO：`/home/lby/os_com_codex/asterinas/.local/linux_vdso`
+6. xfstests 预构建目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-prebuilt`
+7. xfstests 源目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-src`
 
 说明：已经清理历史 `target_*` 和旧 `stage4/5/6` 日志，只保留上述最小集合。
 
 ## 5. 环境变量（统一口径）
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 
 export PATH=/home/lby/.local/bin:$PATH
 export CARGO_TARGET_DIR=$(pwd)/target_lby
@@ -86,19 +86,19 @@ command -v rg
 ### 6.2 需要重建 xfstests 预构建时
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 tools/ext4/prepare_xfstests_prebuilt.sh \
-  /home/lby/os_com/asterinas/.local/xfstests-prebuilt \
-  /home/lby/os_com/asterinas/.local/xfstests-src
+  /home/lby/os_com_codex/asterinas/.local/xfstests-prebuilt \
+  /home/lby/os_com_codex/asterinas/.local/xfstests-src
 ```
 
 ### 6.3 需要重建 part3 initramfs 时
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 tools/ext4/prepare_phase4_part3_initramfs.sh \
-  /home/lby/os_com/asterinas/.local/initramfs_phase3.cpio.gz \
-  /home/lby/os_com/asterinas/.local/initramfs_phase4_part3.cpio.gz
+  /home/lby/os_com_codex/asterinas/.local/initramfs_phase3.cpio.gz \
+  /home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3.cpio.gz
 ```
 
 ## 7. 运行命令（phase4）
@@ -106,7 +106,7 @@ tools/ext4/prepare_phase4_part3_initramfs.sh \
 ### 7.1 全流程（part3 脚本）
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 
 env VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso PATH=/home/lby/.local/bin:$PATH \
     CARGO_TARGET_DIR=$(pwd)/target_lby BOOT_METHOD=qemu-direct OVMF=off \
@@ -117,7 +117,7 @@ env VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso PATH=/home/lby/.local/bin:$PATH \
 ### 7.2 只跑 `generic/013`（定位）
 
 ```bash
-cd /home/lby/os_com/asterinas/kernel
+cd /home/lby/os_com_codex/asterinas/kernel
 
 timeout 1800s cargo osdk run \
   --kcmd-args='ostd.log_level=error' \
@@ -153,21 +153,21 @@ timeout 1800s cargo osdk run \
 
 1. 本环境当前不是 Docker 封装链路，按仓库脚本 + QEMU 直跑。
 2. 曾出现“历史 root 权限污染目录”问题，已从仓库移出：
-   - `/home/lby/os_com/garbage/asterinas_target_root_polluted_20260407`
-   - `/home/lby/os_com/garbage/asterinas_osdk_target_root_polluted_20260407`
-   - `/home/lby/os_com/garbage/asterinas_target_lby_root_backup_20260407`
+   - `/home/lby/os_com_codex/garbage/asterinas_target_root_polluted_20260407`
+   - `/home/lby/os_com_codex/garbage/asterinas_osdk_target_root_polluted_20260407`
+   - `/home/lby/os_com_codex/garbage/asterinas_target_lby_root_backup_20260407`
 3. 如需彻底删掉上述垃圾隔离目录，需要 root 权限：
 
 ```bash
-sudo rm -rf /home/lby/os_com/garbage/asterinas_target_root_polluted_20260407 \
-            /home/lby/os_com/garbage/asterinas_osdk_target_root_polluted_20260407 \
-            /home/lby/os_com/garbage/asterinas_target_lby_root_backup_20260407
+sudo rm -rf /home/lby/os_com_codex/garbage/asterinas_target_root_polluted_20260407 \
+            /home/lby/os_com_codex/garbage/asterinas_osdk_target_root_polluted_20260407 \
+            /home/lby/os_com_codex/garbage/asterinas_target_lby_root_backup_20260407
 ```
 
 ## 10. 一次性快速复现（最短路径）
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 export PATH=/home/lby/.local/bin:$PATH
 export CARGO_TARGET_DIR=$(pwd)/target_lby
 export VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso

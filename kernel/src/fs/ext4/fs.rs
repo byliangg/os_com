@@ -3,13 +3,20 @@
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use aster_block::{BlockDevice, SECTOR_SIZE};
+use aster_block::{
+    bio::{BioDirection, BioSegment, BioStatus, BioWaiter},
+    id::Bid,
+    BlockDevice, SECTOR_SIZE,
+};
 use aster_cmdline::{KCMDLINE, ModuleArg};
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
-    SimpleDirEntry, SimpleInodeMeta,
+    SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
 };
-use ostd::mm::VmIo;
+use ostd::{
+    mm::{VmIo, VmWriter, io_util::HasVmReaderWriter},
+    Error as OstdError,
+};
 
 use crate::{
     fs::{
@@ -278,6 +285,14 @@ enum DirLookupCacheResult {
     Unknown,
 }
 
+#[derive(Clone, Debug)]
+struct DirectReadCache {
+    file_offset: usize,
+    len: usize,
+    plan_window: usize,
+    mappings: Vec<SimpleBlockRange>,
+}
+
 #[derive(Debug)]
 struct KernelBlockDeviceAdapter {
     inner: Arc<dyn BlockDevice>,
@@ -444,6 +459,7 @@ pub(super) struct Ext4Fs {
     crash_journal_enabled: bool,
     crash_journal_lock: Mutex<()>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
+    inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
@@ -465,6 +481,7 @@ impl Ext4Fs {
             crash_journal_enabled,
             crash_journal_lock: Mutex::new(()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
+            inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
@@ -553,35 +570,43 @@ impl Ext4Fs {
         PerMountFlags::from_bits_truncate(self.mount_flags_bits.load(Ordering::Relaxed))
     }
 
-    fn should_touch_atime(&self, ino: u32, status_flags: StatusFlags) -> bool {
+    fn should_consider_atime_update(&self, status_flags: StatusFlags) -> Option<PerMountFlags> {
         if status_flags.contains(StatusFlags::O_NOATIME) {
-            return false;
+            return None;
         }
 
         let mount_flags = self.mount_flags();
         if mount_flags.contains(PerMountFlags::RDONLY) || mount_flags.contains(PerMountFlags::NOATIME)
         {
-            return false;
+            return None;
         }
 
-        if mount_flags.contains(PerMountFlags::STRICTATIME) {
-            return true;
-        }
-
-        match self.stat(ino) {
-            Ok(meta) => meta.atime <= meta.mtime || meta.atime <= meta.ctime,
-            Err(err) => {
-                warn!("ext4: failed to stat inode {} for atime policy: {:?}", ino, err);
-                false
-            }
-        }
+        Some(mount_flags)
     }
 
     fn touch_atime(&self, ino: u32, status_flags: StatusFlags) -> Result<()> {
-        if !self.should_touch_atime(ino, status_flags) {
+        let Some(mount_flags) = self.should_consider_atime_update(status_flags) else {
             return Ok(());
-        }
+        };
+
         let now = Self::now_unix_seconds_u32();
+        {
+            if self.inode_atime_cache.lock().get(&ino).copied() == Some(now) {
+                return Ok(());
+            }
+        }
+
+        if !mount_flags.contains(PerMountFlags::STRICTATIME) {
+            match self.stat(ino) {
+                Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => return Ok(()),
+                Ok(_) => {}
+                Err(err) => {
+                    warn!("ext4: failed to stat inode {} for atime policy: {:?}", ino, err);
+                    return Ok(());
+                }
+            }
+        }
+
         {
             let mut cache = self.inode_atime_cache.lock();
             if cache.get(&ino).copied() == Some(now) {
@@ -589,6 +614,7 @@ impl Ext4Fs {
             }
             cache.insert(ino, now);
         }
+
         if let Err(err) = self.set_inode_times(ino, Some(now), None, None) {
             self.inode_atime_cache.lock().remove(&ino);
             return Err(err);
@@ -631,6 +657,134 @@ impl Ext4Fs {
     fn touch_birth_times(&self, ino: u32) -> Result<()> {
         let now = Self::now_unix_seconds_u32();
         self.set_inode_times(ino, Some(now), Some(now), Some(now))
+    }
+
+    fn vm_io_error(err: OstdError) -> Error {
+        let _ = err;
+        Error::with_message(Errno::EFAULT, "vm I/O failed")
+    }
+
+    fn write_zeros(writer: &mut VmWriter, len: usize) -> Result<()> {
+        let zeros = [0u8; EXT4_BLOCK_SIZE];
+        let mut remaining = len;
+        while remaining > 0 {
+            let chunk = remaining.min(zeros.len());
+            writer.write_fallible(&mut VmReader::from(&zeros[..chunk]).to_fallible())?;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
+
+    fn slice_mappings_for_range(
+        offset: usize,
+        len: usize,
+        mappings: &[SimpleBlockRange],
+    ) -> Result<Vec<SimpleBlockRange>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let block_size = EXT4_BLOCK_SIZE;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O range overflow"))?;
+        let start_lblock = offset / block_size;
+        let end_lblock = end / block_size;
+        let mut sliced = Vec::new();
+
+        for mapping in mappings {
+            let mapping_start = mapping.lblock as usize;
+            let mapping_end = mapping_start
+                .checked_add(mapping.len as usize)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped range overflow"))?;
+            let overlap_start = mapping_start.max(start_lblock);
+            let overlap_end = mapping_end.min(end_lblock);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            sliced.push(SimpleBlockRange {
+                lblock: overlap_start as u32,
+                pblock: mapping.pblock + (overlap_start - mapping_start) as u64,
+                len: (overlap_end - overlap_start) as u32,
+            });
+        }
+
+        Ok(sliced)
+    }
+
+    fn plan_direct_read_cached(
+        &self,
+        ino: u32,
+        offset: usize,
+        requested_len: usize,
+    ) -> Result<(usize, Vec<SimpleBlockRange>)> {
+        const DIRECT_READ_PLAN_BASE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
+        const DIRECT_READ_PLAN_MAX_WINDOW_BYTES: usize = 256 * 1024 * 1024;
+
+        if requested_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let requested_direct_len = requested_len / EXT4_BLOCK_SIZE * EXT4_BLOCK_SIZE;
+        if requested_direct_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut next_plan_window = requested_len.max(DIRECT_READ_PLAN_BASE_WINDOW_BYTES);
+        next_plan_window = next_plan_window.min(DIRECT_READ_PLAN_MAX_WINDOW_BYTES);
+
+        {
+            let cache = self.inode_direct_read_cache.lock();
+            if let Some(entry) = cache.get(&ino) {
+                let cache_end = entry.file_offset.saturating_add(entry.len);
+                let request_end = offset.saturating_add(requested_direct_len);
+                if offset >= entry.file_offset && request_end <= cache_end {
+                    let mappings =
+                        Self::slice_mappings_for_range(offset, requested_direct_len, &entry.mappings)?;
+                    return Ok((requested_direct_len, mappings));
+                }
+
+                let sequential_continuation =
+                    offset >= entry.file_offset && offset <= cache_end && request_end > cache_end;
+                let restart_after_eof =
+                    offset == 0 && entry.file_offset > 0 && entry.len < entry.plan_window;
+
+                if sequential_continuation {
+                    next_plan_window = entry
+                        .plan_window
+                        .saturating_mul(2)
+                        .min(DIRECT_READ_PLAN_MAX_WINDOW_BYTES)
+                        .max(next_plan_window);
+                } else if restart_after_eof {
+                    next_plan_window = entry.plan_window.max(next_plan_window);
+                }
+            }
+        }
+
+        let (cached_len, cached_mappings) =
+            self.run_ext4(|ext4| ext4.ext4_plan_direct_read(ino, offset, next_plan_window))?;
+        if cached_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        self.inode_direct_read_cache.lock().insert(
+            ino,
+            DirectReadCache {
+                file_offset: offset,
+                len: cached_len,
+                plan_window: next_plan_window,
+                mappings: cached_mappings.clone(),
+            },
+        );
+
+        let direct_len = cached_len.min(requested_direct_len);
+        let mappings = Self::slice_mappings_for_range(offset, direct_len, &cached_mappings)?;
+        Ok((direct_len, mappings))
+    }
+
+    fn invalidate_direct_read_cache(&self, ino: u32) {
+        self.inode_direct_read_cache.lock().remove(&ino);
     }
 
     pub(super) fn run_ext4<T>(
@@ -1130,6 +1284,7 @@ impl Ext4Fs {
     }
 
     fn clear_inode_touch_cache(&self, ino: u32) {
+        self.invalidate_direct_read_cache(ino);
         self.inode_atime_cache.lock().remove(&ino);
         self.inode_ctime_cache.lock().remove(&ino);
         self.inode_mtime_ctime_cache.lock().remove(&ino);
@@ -1304,6 +1459,57 @@ impl Ext4Fs {
         Ok(read_len)
     }
 
+    pub(super) fn read_direct_at(
+        &self,
+        ino: u32,
+        offset: usize,
+        writer: &mut VmWriter,
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, writer.avail())?;
+        if direct_len == 0 {
+            return Ok(0);
+        }
+
+        let mut bio_waiter = BioWaiter::new();
+        for mapping in &mappings {
+            let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::FromDevice);
+            let waiter = self
+                .block_device
+                .read_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
+            bio_waiter.concat(waiter);
+        }
+
+        if Some(BioStatus::Complete) != bio_waiter.wait() {
+            return_errno!(Errno::EIO);
+        }
+
+        let mut current_offset = offset;
+        for (bio, mapping) in bio_waiter.reqs().zip(mappings.iter()) {
+            let file_offset = (mapping.lblock as usize)
+                .checked_mul(EXT4_BLOCK_SIZE)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O offset overflow"))?;
+            if current_offset < file_offset {
+                Self::write_zeros(writer, file_offset - current_offset)?;
+            }
+            for segment in bio.segments() {
+                segment
+                    .reader()
+                    .map_err(Self::vm_io_error)?
+                    .read_fallible(writer)
+                    .map_err(|(e, _)| Error::from(e))?;
+            }
+            current_offset = file_offset + mapping.len as usize * EXT4_BLOCK_SIZE;
+        }
+
+        if current_offset < offset + direct_len {
+            Self::write_zeros(writer, offset + direct_len - current_offset)?;
+        }
+
+        self.touch_atime(ino, status_flags)?;
+        Ok(direct_len)
+    }
+
     pub(super) fn write_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {
         let op = CrashJournalOp::for_small_write(ino, offset, data);
         let written = self
@@ -1319,9 +1525,48 @@ impl Ext4Fs {
                 err
             })?;
         if written > 0 {
+            self.invalidate_direct_read_cache(ino);
             self.touch_mtime_ctime(ino)?;
         }
         Ok(written)
+    }
+
+    pub(super) fn write_direct_at(
+        &self,
+        ino: u32,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+
+        let mappings =
+            self.run_ext4(|ext4| ext4.ext4_prepare_write_at(ino, offset, write_len))?;
+
+        let mut bio_waiter = BioWaiter::new();
+
+        for mapping in &mappings {
+            let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::ToDevice);
+            bio_segment
+                .writer()
+                .map_err(Self::vm_io_error)?
+                .write_fallible(reader)
+                .map_err(|(e, _)| Error::from(e))?;
+            let waiter = self
+                .block_device
+                .write_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
+            bio_waiter.concat(waiter);
+        }
+
+        if Some(BioStatus::Complete) != bio_waiter.wait() {
+            return_errno!(Errno::EIO);
+        }
+
+        self.invalidate_direct_read_cache(ino);
+        self.touch_mtime_ctime(ino)?;
+        Ok(write_len)
     }
 
     pub(super) fn truncate(&self, ino: u32, new_size: u64) -> Result<()> {
@@ -1334,6 +1579,7 @@ impl Ext4Fs {
                 );
                 err
             })?;
+        self.invalidate_direct_read_cache(ino);
         self.touch_mtime_ctime(ino)?;
         Ok(())
     }

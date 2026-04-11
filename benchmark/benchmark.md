@@ -1,6 +1,35 @@
-# Asterinas EXT4 Benchmark/Test 汇总（stage4 + stage6）
+# Asterinas EXT4 Benchmark/Test 汇总（stage7）
 
-更新时间：2026-04-08 22:55（Asia/Shanghai）
+更新时间：2026-04-10（Asia/Shanghai）
+
+## 0. 最新复现（2026-04-10）
+
+1. `fio/ext4_seq_write_bw`：完成 Linux 对比  
+   结果：`Asterinas=513 MB/s`，`Linux=2902 MB/s`，`ratio=0.176775`  
+   日志：`benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_write_bw_20260410_090958.log`
+2. `fio/ext4_seq_read_bw`：完成 Linux 对比  
+   结果：`Asterinas=112 MB/s`，`Linux=1324 MB/s`，`ratio=0.084592`  
+   日志：`benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_read_bw_20260410_091849.log`
+3. `phase6_perf_compare`：完成 Linux EXT4 对照性能单轮复现（8 项）  
+   统计：`overall_avg_ratio=0.161503 < 0.80`  
+   报告：`benchmark/logs/stage7_run_20260410_170858/perf_compare/20260410_093228/phase6_perf_compare_report.txt`  
+   汇总：`benchmark/logs/stage7_run_20260410_170858/perf_compare/20260410_093228/phase6_perf_compare_aggregate.tsv`
+4. `phase6_only`：PASS  
+   统计：`pass=25 fail=0 notrun=0 static_blocked=26 denominator=25 pass_rate=100.00% threshold=90%`  
+   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase6/phase6_good_20260410_093859.log`
+5. `phase3_only`：PASS  
+   统计：`pass=10 fail=0 notrun=6 static_blocked=24 denominator=10 pass_rate=100.00% threshold=90%`  
+   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase3/phase3_base_guard_20260410_095418.log`
+6. `phase4_good`：PASS  
+   统计：`pass=12 fail=0 notrun=6 static_blocked=22 denominator=12 pass_rate=100.00% threshold=90%`  
+   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase4/phase4_good_20260410_100230.log`
+7. `crash_only`：PASS（`3 场景 x 2 轮 = 6/6`）  
+   汇总：`benchmark/logs/stage7_run_20260410_170858/suite/crash/crash/phase4_part3_crash_summary_20260410_101135.tsv`
+8. `others_general`：首次失败、重试通过  
+   失败日志：`benchmark/logs/stage7_run_20260410_170858/others_general_20260410_181255.log`  
+   通过日志：`benchmark/logs/stage7_run_20260410_170858/others_general_retry_20260410_181656.log`
+
+说明：本节记录 `stage7` 当前复现结果；下方历史内容保留作参考。
 
 ## 1. 当前结论（Docker 内实跑）
 
@@ -41,7 +70,7 @@
 
 ## 3. 一键命令
 
-在宿主机 `/home/lby/os_com/asterinas` 执行：
+在宿主机 `/home/lby/os_com_codex/asterinas` 执行：
 
 ```bash
 # phase3 guard
@@ -83,6 +112,13 @@ BENCH_ENABLE_KVM=1 \
 PERF_CASE_TIMEOUT_SEC=600 \
 ./tools/ext4/run_phase6_perf_compare_in_docker.sh
 ```
+
+调试说明：
+
+- P1 当前允许在容器内临时使用 `BENCH_RUN_ONLY=asterinas` 或 `BENCH_RUN_ONLY=linux`，让 `test/initramfs/src/benchmark/bench_linux_and_aster.sh` 只跑单边，缩短 fio 排障回路。
+- 单边模式只用于定位性能回归或观察 Asterinas 自身多轮波动，不用于生成最终比例结果。
+- 需要写入正式对比结论时，仍应保持默认 `BENCH_RUN_ONLY=both` 跑完整双边对照。
+- 最终提交代码前，应恢复按默认双边流程使用 benchmark 脚本，不把单边模式当作最终工作流。
 
 ## 4. 目录说明
 

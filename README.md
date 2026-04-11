@@ -123,7 +123,7 @@
 在仓库根目录执行：
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 
 # 1) phase4
 PHASE4_DOCKER_MODE=phase4_good \
@@ -277,7 +277,7 @@ grep -E "mount: mounting /dev/vda|mount: mounting /dev/vdb|All test in /test/fs 
 在跑测试前建议先检查：
 
 ```bash
-cd /home/lby/os_com/asterinas
+cd /home/lby/os_com_codex/asterinas
 
 test -f benchmark/assets/initramfs/initramfs_phase3.cpio.gz
 test -d benchmark/assets/xfstests-prebuilt/xfstests-dev

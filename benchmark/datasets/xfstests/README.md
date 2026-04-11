@@ -11,7 +11,7 @@
 
 ## 上游来源
 
-- 同步来源目录：/home/lby/os_com/asterinas/benchmark/assets/xfstests-src
+- 同步来源目录：/home/lby/os_com_codex/asterinas/benchmark/assets/xfstests-src
 - 上游版本：a7b2080d1e8676a8a6635816ac13e4011ba87688
 
 ## 同步方式

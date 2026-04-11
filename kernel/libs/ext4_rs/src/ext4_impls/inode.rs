@@ -134,9 +134,7 @@ impl Ext4 {
         let inode_size = super_block.inode_size as u64;
         let group = (inode_num - 1) / inodes_per_group;
         let index = (inode_num - 1) % inodes_per_group;
-        let block_group =
-            Ext4BlockGroup::load_new(&self.block_device, &super_block, group as usize);
-        let inode_table_blk_num = block_group.get_inode_table_blk_num();
+        let inode_table_blk_num = self.inode_table_blocks[group as usize];
 
         inode_table_blk_num as usize * block_size + index as usize * inode_size as usize
     }
