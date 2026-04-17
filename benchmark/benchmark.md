@@ -100,6 +100,18 @@
 
 - 脚本：`asterinas/test/initramfs/src/benchmark/fio/ext4_seq_read_bw/run.sh`
 
+### 3.5 ext4 write/read 摘要复跑脚本
+
+```bash
+cd /home/lby/os_com_codex
+./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh`
+- 行为：顺序执行 `fio/ext4_seq_write_bw` 与 `fio/ext4_seq_read_bw`
+- 终端输出：默认不输出 benchmark 过程日志，只打印每项的 `Asterinas`、`Linux`、`ratio`
+- 排障方式：如需保留临时日志，可使用 `KEEP_LOGS=1 ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh`
+
 ## 4. 本轮执行方式
 
 - 工作树：`/home/lby/os_com_codex`

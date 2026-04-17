@@ -145,3 +145,120 @@ Key test matrices:
   (boot, syscall, general), multiple boot protocols, SMP configurations.
 - RISC-V 64, LoongArch 64, and Intel TDX have dedicated workflows.
 - License headers and SCML validation are also checked.
+
+---
+
+# ext4 性能优化项目 — Agent 工作指南
+
+## 项目概览
+
+在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
+
+- **性能目标**：fio 顺序读写 >= 90%（Phase 1 已达成：read 95.79%、write 90.48%）
+- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写（feature_jbd2 阶段推进）
+
+## 工作树约定
+
+- 当前唯一有效工作树是 `/home/lby/os_com_codex`
+- 后续代码修改、benchmark、文档同步默认都在 `/home/lby/os_com_codex` 下进行
+- 如果出现多个目录副本，以 `/home/lby/os_com_codex` 为准
+
+## 关键文件索引
+
+| 文件 | 用途 |
+|------|------|
+| `environment.md` | 环境指引：记录当前推荐工作目录、Docker/代理/KVM 约定、benchmark 执行注意事项；根目录与仓库内对应副本需同步维护 |
+| `benchmark.md` | benchmark 指引与最新结果快照 |
+| `analysis_phase1.md` | 性能优化 Phase 1 诊断报告（已完成，95.79%）|
+| `optimize_plan_phase1.md` | 性能优化 Phase 1 计划（已完成）|
+| `optimize_phase1_milestone.md` | 性能优化 Phase 1 进度跟踪（已完成）|
+| `feature_jbd2_phase1_analysis.md` | JBD2 功能 Phase 1 问题分析 |
+| `feature_jbd2_phase1_plan.md` | JBD2 功能 Phase 1 实现计划 |
+| `feature_jbd2_phase1_milestone.md` | JBD2 功能 Phase 1 进度跟踪 |
+| `赛题要求.md` | 比赛评审标准 |
+
+## 仓库结构
+
+| 路径 | 说明 |
+|------|------|
+| `asterinas/` | 主仓库（所有代码改动在此） |
+| `asterinas/kernel/src/fs/ext4/` | ext4 内核集成层（fs.rs, inode.rs, mod.rs） |
+| `asterinas/kernel/libs/ext4_rs/` | ext4 核心库（extent, balloc, file, dir 等） |
+| `asterinas/kernel/src/fs/ext2/` | ext2 参考实现（PageCache、bio 集成的范例） |
+| `asterinas/kernel/src/fs/utils/page_cache.rs` | Asterinas PageCache 基础设施 |
+| `asterinas/kernel/comps/block/` | bio 层、BioSegment、请求合并 |
+| `asterinas/test/` | 功能测试 |
+| `asterinas/benchmark/` | 性能测试日志 |
+| `ext4_rs/` | 合并前的原始 ext4_rs 仓库（仅供参考） |
+
+补充说明：
+
+- 根目录文档 `environment.md`、`benchmark.md` 是顶层工作指引。
+- 仓库内存在对应副本：`asterinas/environment.md`、`asterinas/benchmark/benchmark.md`。
+- 修改环境或 benchmark 口径时，默认需要同步检查并更新这两处文档，避免根目录说明与仓库内记录不一致。
+
+## 每阶段工作流程
+
+每个 Phase 严格按以下流程执行：
+
+### 1. 规划阶段
+
+- 性能优化阶段：阅读 `optimize_plan_phase1.md` 和 `analysis_phase1.md`
+- JBD2 功能阶段：阅读 `feature_jbd2_phase1_plan.md` 和 `feature_jbd2_phase1_analysis.md`
+- 确定要修改的文件和函数
+- 如有需要，先阅读 ext2 对应实现作为参考
+
+### 2. 实现阶段
+
+- 在 `asterinas/` 仓库中进行代码修改
+- 每个 Phase 聚焦一个明确目标，不做超出范围的改动
+- 关键原则：
+  - 不破坏现有功能测试
+  - 参考 ext2 的实现模式
+  - 优先最小改动、最大收益
+
+### 3. 验证阶段
+
+- 在 Docker 中运行性能测试和功能回归测试
+- Docker 环境：`asterinas/asterinas:0.17.0-20260227`
+- 进入方式：
+  ```bash
+  docker run -it --privileged --network=host --device=/dev/kvm -v /dev:/dev \
+    -v $(pwd)/asterinas:/root/asterinas \
+    asterinas/asterinas:0.17.0-20260227
+  ```
+- fio 测试参数：`BENCH_ENABLE_KVM=1 BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on`
+- lmbench 测试参数：`PERF_ROUNDS=1 PERF_CASE_TIMEOUT_SEC=600 BENCH_ENABLE_KVM=1 BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on`
+
+### 4. 记录阶段
+
+- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 阶段：`feature_jbd2_phase1_milestone.md`）对应 Step 下：
+  - **改动概要**：简述做了什么
+  - **涉及文件**：列出修改的文件路径
+  - **性能结果**：贴上新的性能数据表格，与基线对比
+  - **功能回归**：记录功能测试是否通过
+- 更新变更日志表格
+- 如有必要，同步更新对应的 plan 和 analysis 文档
+
+## 阶段总览
+
+### 性能优化系列（optimize_phase）
+
+| Phase | 目标 | 状态 |
+|-------|------|------|
+| optimize_phase1 | O_DIRECT speculative readahead，fio read/write >= 90% | ✅ 已完成（read 95.79%，write 90.48%） |
+
+### JBD2 功能系列（feature_jbd2）
+
+| Phase | 目标 | 状态 |
+|-------|------|------|
+| feature_jbd2_phase1 | JBD2 事务管理、日志刷盘、全量崩溃恢复 | 进行中 |
+| feature_jbd2_phase2 | 多文件并发读写、xfstests 全量 >= 95% | 未开始 |
+
+## 注意事项
+
+- fio 使用 `direct=1`（O_DIRECT），PageCache 对 fio 测试无效，必须实现 bio 直接 I/O
+- lmbench 走缓冲 I/O，PageCache + inode 缓存对其有效
+- 全局锁 `EXT4_RS_RUNTIME_LOCK` 的根因是 ext4_rs 的全局 `runtime_block_size` 变量
+- ext2 是最好的参考实现，位于 `asterinas/kernel/src/fs/ext2/`
+- 每次改动后必须确认 phase3/phase4/phase6/crash 功能测试不回归

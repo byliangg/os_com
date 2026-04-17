@@ -140,6 +140,24 @@ PERF_CASE_TIMEOUT_SEC=600 \
 ./tools/ext4/run_phase6_perf_compare_in_docker.sh
 ```
 
+### 4.1 ext4 fio 双项摘要复跑
+
+```bash
+cd /home/lby/os_com_codex
+./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+说明：
+
+1. 该脚本顺序执行 `fio/ext4_seq_write_bw` 和 `fio/ext4_seq_read_bw`。
+2. 默认不输出 benchmark 过程日志，只在最后打印 `Asterinas`、`Linux`、`ratio` 摘要。
+3. 如需保留临时日志用于排障，可执行：
+
+```bash
+cd /home/lby/os_com_codex
+KEEP_LOGS=1 ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
 可选参数（覆盖默认）：
 
 1. `XFSTESTS_CASE_TIMEOUT_SEC`

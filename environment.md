@@ -17,6 +17,12 @@
    - `phase4_good` 全量仍失败（`2 pass / 18 fail`）
    - 关键日志：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_full_afterbounds_20260407_115151.log`
 
+补充：
+
+1. 当前 ext4 fio 双项摘要复跑脚本是 `test/initramfs/src/benchmark/fio/run_ext4_summary.sh`。
+2. 该脚本会顺序执行 `ext4_seq_write_bw` 与 `ext4_seq_read_bw`。
+3. 默认不输出 benchmark 过程日志，只在最后打印 `Asterinas`、`Linux`、`ratio` 摘要。
+
 ## 3. 机器与工具版本（实际检测值）
 
 1. OS：Ubuntu 24.04.1 LTS
