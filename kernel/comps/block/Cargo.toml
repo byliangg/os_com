@@ -7,6 +7,8 @@ edition.workspace = true
 
 [dependencies]
 align_ext.workspace = true
+aster-logger.workspace = true
+aster-time.workspace = true
 aster-util.workspace = true
 bitvec.workspace = true
 component.workspace = true

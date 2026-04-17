@@ -2,6 +2,7 @@
 
 use core::sync::atomic::AtomicU64;
 
+use aster_time::read_monotonic_time;
 use align_ext::AlignExt;
 use aster_util::mem_obj_slice::Slice;
 use bitvec::array::BitArray;
@@ -30,6 +31,282 @@ use crate::{BLOCK_SIZE, SECTOR_SIZE, prelude::*};
 #[derive(Debug)]
 pub struct Bio(Arc<BioInner>);
 
+struct ReadBioProfileStats {
+    read_bios: AtomicU64,
+    read_bytes: AtomicU64,
+    read_segments: AtomicU64,
+    large_read_bios: AtomicU64,
+    large_read_bytes: AtomicU64,
+    large_read_segments: AtomicU64,
+    queue_wait_ns: AtomicU64,
+    dispatch_ns: AtomicU64,
+    irq_delivery_ns: AtomicU64,
+    irq_reap_ns: AtomicU64,
+    resp_sync_ns: AtomicU64,
+    device_wait_ns: AtomicU64,
+    dma_sync_ns: AtomicU64,
+    complete_ns: AtomicU64,
+    large_queue_wait_ns: AtomicU64,
+    large_dispatch_ns: AtomicU64,
+    large_irq_delivery_ns: AtomicU64,
+    large_irq_reap_ns: AtomicU64,
+    large_resp_sync_ns: AtomicU64,
+    large_device_wait_ns: AtomicU64,
+    large_dma_sync_ns: AtomicU64,
+    large_complete_ns: AtomicU64,
+    max_total_ns: AtomicU64,
+}
+
+impl ReadBioProfileStats {
+    const LOG_INTERVAL_BIOS: u64 = 8_192;
+    const LARGE_READ_THRESHOLD_BYTES: u64 = 512 * 1024;
+
+    const fn new() -> Self {
+        Self {
+            read_bios: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            read_segments: AtomicU64::new(0),
+            large_read_bios: AtomicU64::new(0),
+            large_read_bytes: AtomicU64::new(0),
+            large_read_segments: AtomicU64::new(0),
+            queue_wait_ns: AtomicU64::new(0),
+            dispatch_ns: AtomicU64::new(0),
+            irq_delivery_ns: AtomicU64::new(0),
+            irq_reap_ns: AtomicU64::new(0),
+            resp_sync_ns: AtomicU64::new(0),
+            device_wait_ns: AtomicU64::new(0),
+            dma_sync_ns: AtomicU64::new(0),
+            complete_ns: AtomicU64::new(0),
+            large_queue_wait_ns: AtomicU64::new(0),
+            large_dispatch_ns: AtomicU64::new(0),
+            large_irq_delivery_ns: AtomicU64::new(0),
+            large_irq_reap_ns: AtomicU64::new(0),
+            large_resp_sync_ns: AtomicU64::new(0),
+            large_device_wait_ns: AtomicU64::new(0),
+            large_dma_sync_ns: AtomicU64::new(0),
+            large_complete_ns: AtomicU64::new(0),
+            max_total_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_read_bio(
+        &self,
+        bytes: u64,
+        segments: u64,
+        queue_wait_ns: u64,
+        dispatch_ns: u64,
+        irq_delivery_ns: u64,
+        irq_reap_ns: u64,
+        resp_sync_ns: u64,
+        device_wait_ns: u64,
+        dma_sync_ns: u64,
+        complete_ns: u64,
+        total_ns: u64,
+    ) -> u64 {
+        let bios = self.read_bios.fetch_add(1, Ordering::Relaxed) + 1;
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.read_segments.fetch_add(segments, Ordering::Relaxed);
+        self.queue_wait_ns.fetch_add(queue_wait_ns, Ordering::Relaxed);
+        self.dispatch_ns.fetch_add(dispatch_ns, Ordering::Relaxed);
+        self.irq_delivery_ns
+            .fetch_add(irq_delivery_ns, Ordering::Relaxed);
+        self.irq_reap_ns.fetch_add(irq_reap_ns, Ordering::Relaxed);
+        self.resp_sync_ns.fetch_add(resp_sync_ns, Ordering::Relaxed);
+        self.device_wait_ns.fetch_add(device_wait_ns, Ordering::Relaxed);
+        self.dma_sync_ns.fetch_add(dma_sync_ns, Ordering::Relaxed);
+        self.complete_ns.fetch_add(complete_ns, Ordering::Relaxed);
+        if bytes >= Self::LARGE_READ_THRESHOLD_BYTES {
+            self.large_read_bios.fetch_add(1, Ordering::Relaxed);
+            self.large_read_bytes.fetch_add(bytes, Ordering::Relaxed);
+            self.large_read_segments.fetch_add(segments, Ordering::Relaxed);
+            self.large_queue_wait_ns
+                .fetch_add(queue_wait_ns, Ordering::Relaxed);
+            self.large_dispatch_ns
+                .fetch_add(dispatch_ns, Ordering::Relaxed);
+            self.large_irq_delivery_ns
+                .fetch_add(irq_delivery_ns, Ordering::Relaxed);
+            self.large_irq_reap_ns
+                .fetch_add(irq_reap_ns, Ordering::Relaxed);
+            self.large_resp_sync_ns
+                .fetch_add(resp_sync_ns, Ordering::Relaxed);
+            self.large_device_wait_ns
+                .fetch_add(device_wait_ns, Ordering::Relaxed);
+            self.large_dma_sync_ns
+                .fetch_add(dma_sync_ns, Ordering::Relaxed);
+            self.large_complete_ns
+                .fetch_add(complete_ns, Ordering::Relaxed);
+        }
+        self.update_max_total_ns(total_ns);
+        bios
+    }
+
+    fn update_max_total_ns(&self, total_ns: u64) {
+        let mut current = self.max_total_ns.load(Ordering::Relaxed);
+        while total_ns > current {
+            match self.max_total_ns.compare_exchange_weak(
+                current,
+                total_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn reset(&self) {
+        self.read_bios.store(0, Ordering::Relaxed);
+        self.read_bytes.store(0, Ordering::Relaxed);
+        self.read_segments.store(0, Ordering::Relaxed);
+        self.large_read_bios.store(0, Ordering::Relaxed);
+        self.large_read_bytes.store(0, Ordering::Relaxed);
+        self.large_read_segments.store(0, Ordering::Relaxed);
+        self.queue_wait_ns.store(0, Ordering::Relaxed);
+        self.dispatch_ns.store(0, Ordering::Relaxed);
+        self.irq_delivery_ns.store(0, Ordering::Relaxed);
+        self.irq_reap_ns.store(0, Ordering::Relaxed);
+        self.resp_sync_ns.store(0, Ordering::Relaxed);
+        self.device_wait_ns.store(0, Ordering::Relaxed);
+        self.dma_sync_ns.store(0, Ordering::Relaxed);
+        self.complete_ns.store(0, Ordering::Relaxed);
+        self.large_queue_wait_ns.store(0, Ordering::Relaxed);
+        self.large_dispatch_ns.store(0, Ordering::Relaxed);
+        self.large_irq_delivery_ns.store(0, Ordering::Relaxed);
+        self.large_irq_reap_ns.store(0, Ordering::Relaxed);
+        self.large_resp_sync_ns.store(0, Ordering::Relaxed);
+        self.large_device_wait_ns.store(0, Ordering::Relaxed);
+        self.large_dma_sync_ns.store(0, Ordering::Relaxed);
+        self.large_complete_ns.store(0, Ordering::Relaxed);
+        self.max_total_ns.store(0, Ordering::Relaxed);
+    }
+}
+
+static READ_BIO_PROFILE_STATS: ReadBioProfileStats = ReadBioProfileStats::new();
+const BIO_FLAG_PREFER_FAST_SUBMIT: u32 = 1 << 0;
+
+pub fn reset_read_bio_profile() {
+    READ_BIO_PROFILE_STATS.reset();
+}
+
+#[inline]
+fn monotonic_nanos() -> u64 {
+    let duration = read_monotonic_time();
+    duration
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(duration.subsec_nanos()))
+}
+
+fn maybe_log_read_bio_profile(bios: u64) {
+    if bios == 0 || bios % ReadBioProfileStats::LOG_INTERVAL_BIOS != 0 {
+        return;
+    }
+
+    let bytes = READ_BIO_PROFILE_STATS.read_bytes.load(Ordering::Relaxed);
+    let segments = READ_BIO_PROFILE_STATS.read_segments.load(Ordering::Relaxed);
+    let queue_wait_ns = READ_BIO_PROFILE_STATS.queue_wait_ns.load(Ordering::Relaxed);
+    let dispatch_ns = READ_BIO_PROFILE_STATS.dispatch_ns.load(Ordering::Relaxed);
+    let irq_delivery_ns = READ_BIO_PROFILE_STATS.irq_delivery_ns.load(Ordering::Relaxed);
+    let irq_reap_ns = READ_BIO_PROFILE_STATS.irq_reap_ns.load(Ordering::Relaxed);
+    let resp_sync_ns = READ_BIO_PROFILE_STATS.resp_sync_ns.load(Ordering::Relaxed);
+    let device_wait_ns = READ_BIO_PROFILE_STATS.device_wait_ns.load(Ordering::Relaxed);
+    let dma_sync_ns = READ_BIO_PROFILE_STATS.dma_sync_ns.load(Ordering::Relaxed);
+    let complete_ns = READ_BIO_PROFILE_STATS.complete_ns.load(Ordering::Relaxed);
+    let large_bios = READ_BIO_PROFILE_STATS.large_read_bios.load(Ordering::Relaxed);
+    let large_bytes = READ_BIO_PROFILE_STATS.large_read_bytes.load(Ordering::Relaxed);
+    let large_segments = READ_BIO_PROFILE_STATS.large_read_segments.load(Ordering::Relaxed);
+    let large_queue_wait_ns = READ_BIO_PROFILE_STATS.large_queue_wait_ns.load(Ordering::Relaxed);
+    let large_dispatch_ns = READ_BIO_PROFILE_STATS.large_dispatch_ns.load(Ordering::Relaxed);
+    let large_irq_delivery_ns = READ_BIO_PROFILE_STATS
+        .large_irq_delivery_ns
+        .load(Ordering::Relaxed);
+    let large_irq_reap_ns = READ_BIO_PROFILE_STATS
+        .large_irq_reap_ns
+        .load(Ordering::Relaxed);
+    let large_resp_sync_ns = READ_BIO_PROFILE_STATS
+        .large_resp_sync_ns
+        .load(Ordering::Relaxed);
+    let large_device_wait_ns =
+        READ_BIO_PROFILE_STATS.large_device_wait_ns.load(Ordering::Relaxed);
+    let large_dma_sync_ns = READ_BIO_PROFILE_STATS.large_dma_sync_ns.load(Ordering::Relaxed);
+    let large_complete_ns = READ_BIO_PROFILE_STATS.large_complete_ns.load(Ordering::Relaxed);
+    let max_total_ns = READ_BIO_PROFILE_STATS.max_total_ns.load(Ordering::Relaxed);
+
+    aster_logger::_print(format_args!(
+        concat!(
+            "[block-profile] read-bio bios={} bytes={} avg_bytes={} avg_segments_x100={} ",
+            "avg_queue_wait_us={} avg_dispatch_us={} avg_device_wait_us={} ",
+            "avg_irq_delivery_us={} avg_irq_reap_us={} avg_resp_sync_us={} ",
+            "avg_dma_sync_us={} avg_complete_us={} large_bios={} large_avg_bytes={} ",
+            "large_avg_segments_x100={} large_avg_queue_wait_us={} ",
+            "large_avg_dispatch_us={} large_avg_device_wait_us={} ",
+            "large_avg_irq_delivery_us={} large_avg_irq_reap_us={} large_avg_resp_sync_us={} ",
+            "large_avg_dma_sync_us={} large_avg_complete_us={} max_total_us={}\n"
+        ),
+        bios,
+        bytes,
+        bytes / bios,
+        segments.saturating_mul(100) / bios,
+        queue_wait_ns / bios / 1_000,
+        dispatch_ns / bios / 1_000,
+        device_wait_ns / bios / 1_000,
+        irq_delivery_ns / bios / 1_000,
+        irq_reap_ns / bios / 1_000,
+        resp_sync_ns / bios / 1_000,
+        dma_sync_ns / bios / 1_000,
+        complete_ns / bios / 1_000,
+        large_bios,
+        if large_bios == 0 { 0 } else { large_bytes / large_bios },
+        if large_bios == 0 {
+            0
+        } else {
+            large_segments.saturating_mul(100) / large_bios
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_queue_wait_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_dispatch_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_device_wait_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_irq_delivery_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_irq_reap_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_resp_sync_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_dma_sync_ns / large_bios / 1_000
+        },
+        if large_bios == 0 {
+            0
+        } else {
+            large_complete_ns / large_bios / 1_000
+        },
+        max_total_ns / 1_000,
+    ));
+}
+
 impl Bio {
     /// Constructs a new `Bio`.
     ///
@@ -54,7 +331,15 @@ impl Bio {
             sid_offset: AtomicU64::new(0),
             segments,
             complete_fn,
+            flags: AtomicU32::new(0),
             status: AtomicU32::new(BioStatus::Init as u32),
+            submit_ns: AtomicU64::new(0),
+            dequeue_ns: AtomicU64::new(0),
+            device_submit_ns: AtomicU64::new(0),
+            irq_enter_ns: AtomicU64::new(0),
+            used_reaped_ns: AtomicU64::new(0),
+            irq_seen_ns: AtomicU64::new(0),
+            dma_sync_done_ns: AtomicU64::new(0),
             wait_queue: WaitQueue::new(),
         });
         Self(inner)
@@ -80,6 +365,13 @@ impl Bio {
         self.0.status()
     }
 
+    /// Hints the block layer that the bio is worth trying on a fast submit path.
+    pub fn prefer_fast_submit(&self) {
+        self.0
+            .flags
+            .fetch_or(BIO_FLAG_PREFER_FAST_SUBMIT, Ordering::Relaxed);
+    }
+
     /// Submits self to the `block_device` asynchronously.
     ///
     /// Returns a `BioWaiter` to the caller to wait for its completion.
@@ -88,6 +380,8 @@ impl Bio {
     ///
     /// The caller must not submit a `Bio` more than once. Otherwise, a panic shall be triggered.
     pub fn submit(&self, block_device: &dyn BlockDevice) -> Result<BioWaiter, BioEnqueueError> {
+        self.0.submit_ns.store(monotonic_nanos(), Ordering::Relaxed);
+
         // Change the status from "Init" to "Submit".
         let result = self.0.status.compare_exchange(
             BioStatus::Init as u32,
@@ -252,7 +546,7 @@ impl Default for BioWaiter {
 /// A submitted `Bio` object.
 ///
 /// The request queue of block device only accepts a `SubmittedBio` into the queue.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SubmittedBio(Arc<BioInner>);
 
 impl SubmittedBio {
@@ -286,6 +580,34 @@ impl SubmittedBio {
         self.0.status()
     }
 
+    pub fn prefers_fast_submit(&self) -> bool {
+        self.0.flags.load(Ordering::Relaxed) & BIO_FLAG_PREFER_FAST_SUBMIT != 0
+    }
+
+    pub fn mark_dequeued(&self, timestamp_ns: u64) {
+        self.0.dequeue_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
+    pub fn mark_device_submitted(&self, timestamp_ns: u64) {
+        self.0.device_submit_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
+    pub fn mark_irq_entered(&self, timestamp_ns: u64) {
+        self.0.irq_enter_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
+    pub fn mark_used_reaped(&self, timestamp_ns: u64) {
+        self.0.used_reaped_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
+    pub fn mark_irq_seen(&self, timestamp_ns: u64) {
+        self.0.irq_seen_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
+    pub fn mark_dma_sync_done(&self, timestamp_ns: u64) {
+        self.0.dma_sync_done_ns.store(timestamp_ns, Ordering::Relaxed);
+    }
+
     /// Completes the `Bio` with the `status` and invokes the callback function.
     ///
     /// When the driver finishes the request for this `Bio`, it will call this method.
@@ -300,6 +622,44 @@ impl SubmittedBio {
             Ordering::Relaxed,
         );
         assert!(result.is_ok());
+
+        if status == BioStatus::Complete && self.type_() == BioType::Read {
+            let complete_ns = monotonic_nanos();
+            let submit_ns = self.0.submit_ns.load(Ordering::Relaxed);
+            let dequeue_ns = self.0.dequeue_ns.load(Ordering::Relaxed);
+            let device_submit_ns = self.0.device_submit_ns.load(Ordering::Relaxed);
+            let irq_enter_ns = self.0.irq_enter_ns.load(Ordering::Relaxed);
+            let used_reaped_ns = self.0.used_reaped_ns.load(Ordering::Relaxed);
+            let irq_seen_ns = self.0.irq_seen_ns.load(Ordering::Relaxed);
+            let dma_sync_done_ns = self.0.dma_sync_done_ns.load(Ordering::Relaxed);
+            let bytes = u64::try_from(self.0.nbytes()).unwrap_or(u64::MAX);
+            let segments = u64::try_from(self.0.segments.len()).unwrap_or(u64::MAX);
+
+            let queue_wait_ns = dequeue_ns.saturating_sub(submit_ns);
+            let dispatch_ns = device_submit_ns.saturating_sub(dequeue_ns);
+            let irq_delivery_ns = irq_enter_ns.saturating_sub(device_submit_ns);
+            let irq_reap_ns = used_reaped_ns.saturating_sub(irq_enter_ns);
+            let resp_sync_ns = irq_seen_ns.saturating_sub(used_reaped_ns);
+            let device_wait_ns = irq_seen_ns.saturating_sub(device_submit_ns);
+            let dma_sync_ns = dma_sync_done_ns.saturating_sub(irq_seen_ns);
+            let complete_path_ns = complete_ns.saturating_sub(dma_sync_done_ns);
+            let total_ns = complete_ns.saturating_sub(submit_ns);
+
+            let bios = READ_BIO_PROFILE_STATS.record_read_bio(
+                bytes,
+                segments,
+                queue_wait_ns,
+                dispatch_ns,
+                irq_delivery_ns,
+                irq_reap_ns,
+                resp_sync_ns,
+                device_wait_ns,
+                dma_sync_ns,
+                complete_path_ns,
+                total_ns,
+            );
+            maybe_log_read_bio_profile(bios);
+        }
 
         self.0.wait_queue.wake_all();
         if let Some(complete_fn) = self.0.complete_fn {
@@ -320,8 +680,24 @@ struct BioInner {
     segments: Vec<BioSegment>,
     /// The I/O completion method
     complete_fn: Option<fn(&SubmittedBio)>,
+    /// Per-bio submission hints consumed by the block layer.
+    flags: AtomicU32,
     /// The I/O status
     status: AtomicU32,
+    /// Timestamp when the bio is submitted by the filesystem.
+    submit_ns: AtomicU64,
+    /// Timestamp when the software request queue dequeues the bio.
+    dequeue_ns: AtomicU64,
+    /// Timestamp when the driver submits descriptors to the virtqueue.
+    device_submit_ns: AtomicU64,
+    /// Timestamp when the IRQ handler starts processing the completed request.
+    irq_enter_ns: AtomicU64,
+    /// Timestamp when the used ring entry is popped and the request is reaped.
+    used_reaped_ns: AtomicU64,
+    /// Timestamp when the IRQ handler observes completion.
+    irq_seen_ns: AtomicU64,
+    /// Timestamp after read DMA buffers are synchronized from device.
+    dma_sync_done_ns: AtomicU64,
     /// The wait queue for I/O completion
     wait_queue: WaitQueue,
 }
@@ -337,6 +713,10 @@ impl BioInner {
 
     pub fn segments(&self) -> &[BioSegment] {
         &self.segments
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.segments.iter().map(BioSegment::nbytes).sum()
     }
 
     pub fn status(&self) -> BioStatus {

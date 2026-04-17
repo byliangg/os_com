@@ -15,6 +15,7 @@ aster-pci.workspace = true
 aster-rights.workspace = true
 aster-softirq.workspace = true
 aster-systree.workspace = true
+aster-time.workspace = true
 aster-util.workspace = true
 bitflags.workspace = true
 component.workspace = true

@@ -47,6 +47,23 @@ impl dyn BlockDevice {
         bio.submit(self)
     }
 
+    /// Asynchronously reads contiguous blocks starting from the `bid` and hints
+    /// that the request is a speculative prefetch worth attempting on a fast submit path.
+    pub fn read_blocks_async_prefetch(
+        &self,
+        bid: Bid,
+        bio_segment: BioSegment,
+    ) -> Result<BioWaiter, BioEnqueueError> {
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::from(bid),
+            vec![bio_segment],
+            Some(general_complete_fn),
+        );
+        bio.prefer_fast_submit();
+        bio.submit(self)
+    }
+
     /// Synchronously writes contiguous blocks starting from the `bid`.
     pub fn write_blocks(
         &self,

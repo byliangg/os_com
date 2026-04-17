@@ -13,6 +13,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
+use aster_time::read_monotonic_time;
 use aster_block::{
     BlockDeviceMeta, EXTENDED_DEVICE_ID_ALLOCATOR, PartitionInfo, PartitionNode,
     bio::{BioEnqueueError, BioStatus, BioType, SubmittedBio, bio_segment_pool_init},
@@ -59,6 +60,8 @@ pub struct BlockDevice {
 }
 
 impl BlockDevice {
+    const FAST_READ_SUBMIT_MIN_BYTES: usize = 512 * 1024;
+
     /// Returns the formatted device name.
     ///
     /// The device name starts at "vda". The 26th device is "vdz" and the 27th is "vdaa".
@@ -130,10 +133,35 @@ impl BlockDevice {
         support_features.remove(BlockFeatures::MQ);
         support_features.bits
     }
+
+    fn should_try_fast_submit(&self, bio: &SubmittedBio) -> bool {
+        bio.prefers_fast_submit()
+            && bio.type_() == BioType::Read
+            && self.queue.num_requests() == 0
+            && bio.segments().len() == 1
+            && bio
+                .segments()
+                .first()
+                .map(|segment| segment.nbytes())
+                .unwrap_or(0)
+                >= Self::FAST_READ_SUBMIT_MIN_BYTES
+    }
+
+    fn try_submit_read_fast(&self, bio: &SubmittedBio) -> bool {
+        if !self.should_try_fast_submit(bio) {
+            return false;
+        }
+
+        self.device.try_read(BioRequest::from(bio.clone())).is_ok()
+    }
 }
 
 impl aster_block::BlockDevice for BlockDevice {
     fn enqueue(&self, bio: SubmittedBio) -> Result<(), BioEnqueueError> {
+        if self.try_submit_read_fast(&bio) {
+            return Ok(());
+        }
+
         self.queue.enqueue(bio)
     }
 
@@ -282,6 +310,7 @@ impl DeviceInner {
         // IRQs have already been disabled,
         // so there is no need to call `disable_irq`.
         loop {
+            let irq_enter_ns = monotonic_nanos();
             // Pops the complete request
             let complete_request = {
                 let mut queue = self.queue.lock();
@@ -290,6 +319,16 @@ impl DeviceInner {
                 };
                 self.submitted_requests.lock().remove(&token).unwrap()
             };
+            complete_request
+                .bio_request
+                .bios()
+                .for_each(|bio| bio.mark_irq_entered(irq_enter_ns));
+
+            let used_reaped_ns = monotonic_nanos();
+            complete_request
+                .bio_request
+                .bios()
+                .for_each(|bio| bio.mark_used_reaped(used_reaped_ns));
 
             // Handles the response
             let id = complete_request.id as usize;
@@ -304,6 +343,12 @@ impl DeviceInner {
                 _ => panic!("io error in block device"),
             };
 
+            let irq_seen_ns = monotonic_nanos();
+            complete_request
+                .bio_request
+                .bios()
+                .for_each(|bio| bio.mark_irq_seen(irq_seen_ns));
+
             // Synchronize DMA mapping if read from the device
             if let BioType::Read = complete_request.bio_request.type_() {
                 complete_request
@@ -317,6 +362,12 @@ impl DeviceInner {
                     .for_each(|dma_slice| dma_slice.sync_from_device().unwrap());
             }
 
+            let dma_sync_done_ns = monotonic_nanos();
+            complete_request
+                .bio_request
+                .bios()
+                .for_each(|bio| bio.mark_dma_sync_done(dma_sync_done_ns));
+
             // Completes the bio request
             complete_request.bio_request.bios().for_each(|bio| {
                 bio.complete(BioStatus::Complete);
@@ -329,6 +380,83 @@ impl DeviceInner {
     }
 
     /// Reads data from the device, this function is non-blocking.
+    fn try_read(&self, bio_request: BioRequest) -> core::result::Result<(), BioRequest> {
+        let num_segments = bio_request.num_segments();
+        let num_used_descs = num_segments + 2;
+        if num_used_descs > Self::QUEUE_SIZE as usize {
+            panic!("The request size surpasses the queue size");
+        }
+
+        let mut queue = self.queue.disable_irq().lock();
+        if num_used_descs > queue.available_desc() {
+            return Err(bio_request);
+        }
+
+        let Some(id) = self.id_allocator.try_alloc() else {
+            return Err(bio_request);
+        };
+
+        let dequeue_ns = monotonic_nanos();
+        bio_request
+            .bios()
+            .for_each(|bio| bio.mark_dequeued(dequeue_ns));
+
+        let req_slice = {
+            let req_slice = Slice::new(
+                self.block_requests.clone(),
+                id * REQ_SIZE..(id + 1) * REQ_SIZE,
+            );
+            let req = BlockReq {
+                type_: ReqType::In as _,
+                reserved: 0,
+                sector: bio_request.sid_range().start.to_raw(),
+            };
+            req_slice.write_val(0, &req).unwrap();
+            req_slice.sync_to_device().unwrap();
+            req_slice
+        };
+
+        let resp_slice = {
+            let resp_slice = Slice::new(
+                self.block_responses.clone(),
+                id * RESP_SIZE..(id + 1) * RESP_SIZE,
+            );
+            resp_slice.write_val(0, &BlockResp::default()).unwrap();
+            resp_slice.sync_to_device().unwrap();
+            resp_slice
+        };
+
+        let outputs = {
+            let mut outputs: Vec<&Slice<_>> = Vec::with_capacity(num_segments + 1);
+            let dma_slices_iter = bio_request.bios().flat_map(|bio| {
+                bio.segments()
+                    .iter()
+                    .map(|segment| segment.inner_dma_slice())
+            });
+            outputs.extend(dma_slices_iter);
+            outputs.push(&resp_slice);
+            outputs
+        };
+
+        let token = queue
+            .add_dma_buf(&[&req_slice], outputs.as_slice())
+            .expect("add queue failed");
+        if queue.should_notify() {
+            queue.notify();
+        }
+
+        let device_submit_ns = monotonic_nanos();
+        bio_request
+            .bios()
+            .for_each(|bio| bio.mark_device_submitted(device_submit_ns));
+        let submitted_request = SubmittedRequest::new(id as u16, bio_request);
+        self.submitted_requests
+            .disable_irq()
+            .lock()
+            .insert(token, submitted_request);
+        Ok(())
+    }
+
     fn read(&self, bio_request: BioRequest) {
         let id = self.id_allocator.alloc();
         let req_slice = {
@@ -387,6 +515,10 @@ impl DeviceInner {
             }
 
             // Records the submitted request
+            let device_submit_ns = monotonic_nanos();
+            bio_request
+                .bios()
+                .for_each(|bio| bio.mark_device_submitted(device_submit_ns));
             let submitted_request = SubmittedRequest::new(id as u16, bio_request);
             self.submitted_requests
                 .disable_irq()
@@ -454,6 +586,10 @@ impl DeviceInner {
             }
 
             // Records the submitted request
+            let device_submit_ns = monotonic_nanos();
+            bio_request
+                .bios()
+                .for_each(|bio| bio.mark_device_submitted(device_submit_ns));
             let submitted_request = SubmittedRequest::new(id as u16, bio_request);
             self.submitted_requests
                 .disable_irq()
@@ -508,6 +644,10 @@ impl DeviceInner {
             }
 
             // Records the submitted request
+            let device_submit_ns = monotonic_nanos();
+            bio_request
+                .bios()
+                .for_each(|bio| bio.mark_device_submitted(device_submit_ns));
             let submitted_request = SubmittedRequest::new(id as u16, bio_request);
             self.submitted_requests
                 .disable_irq()
@@ -516,6 +656,15 @@ impl DeviceInner {
             return;
         }
     }
+}
+
+#[inline]
+fn monotonic_nanos() -> u64 {
+    let duration = read_monotonic_time();
+    duration
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(duration.subsec_nanos()))
 }
 
 /// A submitted bio request for callback.

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_block::{
-    bio::{BioDirection, BioSegment, BioStatus, BioWaiter},
+    bio::{BioDirection, BioSegment, BioStatus, BioWaiter, reset_read_bio_profile},
     id::Bid,
     BlockDevice, SECTOR_SIZE,
 };
+use aster_time::read_monotonic_time;
 use aster_cmdline::{KCMDLINE, ModuleArg};
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
@@ -100,6 +101,117 @@ struct CrashJournalRecord {
     state: u32,
     op: u32,
     payload: Vec<u8>,
+}
+
+struct DirectReadProfileStats {
+    read_calls: AtomicU64,
+    read_bytes: AtomicU64,
+    total_mappings: AtomicU64,
+    mapped_bytes: AtomicU64,
+    zero_fill_bytes: AtomicU64,
+    max_mappings: AtomicU64,
+    max_mapped_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    plan_ns: AtomicU64,
+    alloc_ns: AtomicU64,
+    submit_ns: AtomicU64,
+    wait_ns: AtomicU64,
+    copy_ns: AtomicU64,
+}
+
+impl DirectReadProfileStats {
+    const LOG_INTERVAL_READS: u64 = 8_192;
+
+    const fn new() -> Self {
+        Self {
+            read_calls: AtomicU64::new(0),
+            read_bytes: AtomicU64::new(0),
+            total_mappings: AtomicU64::new(0),
+            mapped_bytes: AtomicU64::new(0),
+            zero_fill_bytes: AtomicU64::new(0),
+            max_mappings: AtomicU64::new(0),
+            max_mapped_bytes: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            plan_ns: AtomicU64::new(0),
+            alloc_ns: AtomicU64::new(0),
+            submit_ns: AtomicU64::new(0),
+            wait_ns: AtomicU64::new(0),
+            copy_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_cache_hit(&self) {
+        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cache_miss(&self) {
+        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_read(
+        &self,
+        bytes: usize,
+        mappings: usize,
+        mapped_bytes: usize,
+        zero_fill_bytes: usize,
+        plan_ns: u64,
+        alloc_ns: u64,
+        submit_ns: u64,
+        wait_ns: u64,
+        copy_ns: u64,
+    ) -> u64 {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mappings = u64::try_from(mappings).unwrap_or(u64::MAX);
+        let mapped_bytes = u64::try_from(mapped_bytes).unwrap_or(u64::MAX);
+        let zero_fill_bytes = u64::try_from(zero_fill_bytes).unwrap_or(u64::MAX);
+
+        let reads = self.read_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.total_mappings.fetch_add(mappings, Ordering::Relaxed);
+        self.mapped_bytes.fetch_add(mapped_bytes, Ordering::Relaxed);
+        self.zero_fill_bytes
+            .fetch_add(zero_fill_bytes, Ordering::Relaxed);
+        self.update_max_mappings(mappings);
+        self.update_max_mapped_bytes(mapped_bytes);
+        self.plan_ns.fetch_add(plan_ns, Ordering::Relaxed);
+        self.alloc_ns.fetch_add(alloc_ns, Ordering::Relaxed);
+        self.submit_ns.fetch_add(submit_ns, Ordering::Relaxed);
+        self.wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        self.copy_ns.fetch_add(copy_ns, Ordering::Relaxed);
+        reads
+    }
+
+    fn update_max_mappings(&self, mappings: u64) {
+        let mut current = self.max_mappings.load(Ordering::Relaxed);
+        while mappings > current {
+            match self.max_mappings.compare_exchange_weak(
+                current,
+                mappings,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn update_max_mapped_bytes(&self, mapped_bytes: u64) {
+        let mut current = self.max_mapped_bytes.load(Ordering::Relaxed);
+        while mapped_bytes > current {
+            match self.max_mapped_bytes.compare_exchange_weak(
+                current,
+                mapped_bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 impl CrashJournalOp {
@@ -285,12 +397,29 @@ enum DirLookupCacheResult {
     Unknown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct PendingDirectRead {
+    offset: usize,
+    len: usize,
+    mappings: Vec<SimpleBlockRange>,
+    waiter: BioWaiter,
+}
+
+#[derive(Debug)]
+struct PreparedDirectRead {
+    offset: usize,
+    len: usize,
+    mappings: Vec<SimpleBlockRange>,
+}
+
+#[derive(Debug)]
 struct DirectReadCache {
     file_offset: usize,
     len: usize,
     plan_window: usize,
     last_atime_sec: u32,
+    last_read_end: usize,
+    pending: Option<PendingDirectRead>,
     mappings: Vec<SimpleBlockRange>,
 }
 
@@ -464,6 +593,8 @@ pub(super) struct Ext4Fs {
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    direct_read_profile_started: AtomicBool,
+    direct_read_profile: DirectReadProfileStats,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
 }
@@ -486,6 +617,8 @@ impl Ext4Fs {
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
+            direct_read_profile_started: AtomicBool::new(false),
+            direct_read_profile: DirectReadProfileStats::new(),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
         });
@@ -515,6 +648,76 @@ impl Ext4Fs {
             .read_time()
             .as_secs();
         u32::try_from(secs).unwrap_or(u32::MAX)
+    }
+
+    #[inline]
+    fn monotonic_nanos() -> u64 {
+        let duration = read_monotonic_time();
+        duration
+            .as_secs()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::from(duration.subsec_nanos()))
+    }
+
+    fn maybe_log_direct_read_profile(&self, reads: u64) {
+        if reads == 0 || reads % DirectReadProfileStats::LOG_INTERVAL_READS != 0 {
+            return;
+        }
+
+        let total_bytes = self.direct_read_profile.read_bytes.load(Ordering::Relaxed);
+        let total_mappings = self
+            .direct_read_profile
+            .total_mappings
+            .load(Ordering::Relaxed);
+        let mapped_bytes = self.direct_read_profile.mapped_bytes.load(Ordering::Relaxed);
+        let zero_fill_bytes = self
+            .direct_read_profile
+            .zero_fill_bytes
+            .load(Ordering::Relaxed);
+        let cache_hits = self.direct_read_profile.cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self.direct_read_profile.cache_misses.load(Ordering::Relaxed);
+        let max_mappings = self
+            .direct_read_profile
+            .max_mappings
+            .load(Ordering::Relaxed);
+        let max_mapped_bytes = self
+            .direct_read_profile
+            .max_mapped_bytes
+            .load(Ordering::Relaxed);
+        let plan_ns = self.direct_read_profile.plan_ns.load(Ordering::Relaxed);
+        let alloc_ns = self.direct_read_profile.alloc_ns.load(Ordering::Relaxed);
+        let submit_ns = self.direct_read_profile.submit_ns.load(Ordering::Relaxed);
+        let wait_ns = self.direct_read_profile.wait_ns.load(Ordering::Relaxed);
+        let copy_ns = self.direct_read_profile.copy_ns.load(Ordering::Relaxed);
+
+        println!(
+            "[ext4-profile] direct-read reads={} bytes={} avg_bytes={} avg_mapped_bytes={} avg_zero_fill_bytes={} max_mapped_bytes={} cache_hit={} cache_miss={} avg_mappings_x100={} max_mappings={} avg_plan_us={} avg_alloc_us={} avg_submit_us={} avg_wait_us={} avg_copy_us={}",
+            reads,
+            total_bytes,
+            total_bytes / reads,
+            mapped_bytes / reads,
+            zero_fill_bytes / reads,
+            max_mapped_bytes,
+            cache_hits,
+            cache_misses,
+            total_mappings.saturating_mul(100) / reads,
+            max_mappings,
+            plan_ns / reads / 1_000,
+            alloc_ns / reads / 1_000,
+            submit_ns / reads / 1_000,
+            wait_ns / reads / 1_000,
+            copy_ns / reads / 1_000,
+        );
+    }
+
+    fn maybe_start_direct_read_profile(&self) {
+        if self
+            .direct_read_profile_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            reset_read_bio_profile();
+        }
     }
 
     pub(super) fn set_inode_times(
@@ -735,8 +938,8 @@ impl Ext4Fs {
         offset: usize,
         requested_len: usize,
     ) -> Result<(usize, Vec<SimpleBlockRange>)> {
-        const DIRECT_READ_PLAN_BASE_WINDOW_BYTES: usize = 64 * 1024 * 1024;
-        const DIRECT_READ_PLAN_MAX_WINDOW_BYTES: usize = 256 * 1024 * 1024;
+        const DIRECT_READ_PLAN_BASE_WINDOW_BYTES: usize = 128 * 1024 * 1024;
+        const DIRECT_READ_PLAN_MAX_WINDOW_BYTES: usize = 512 * 1024 * 1024;
 
         if requested_len == 0 {
             return Ok((0, Vec::new()));
@@ -756,6 +959,7 @@ impl Ext4Fs {
                 let cache_end = entry.file_offset.saturating_add(entry.len);
                 let request_end = offset.saturating_add(requested_direct_len);
                 if offset >= entry.file_offset && request_end <= cache_end {
+                    self.direct_read_profile.record_cache_hit();
                     let mappings =
                         Self::slice_mappings_for_range(offset, requested_direct_len, &entry.mappings)?;
                     return Ok((requested_direct_len, mappings));
@@ -778,6 +982,7 @@ impl Ext4Fs {
             }
         }
 
+        self.direct_read_profile.record_cache_miss();
         let (cached_len, cached_mappings) =
             self.run_ext4(|ext4| ext4.ext4_plan_direct_read(ino, offset, next_plan_window))?;
         if cached_len == 0 {
@@ -793,6 +998,8 @@ impl Ext4Fs {
                 len: cached_len,
                 plan_window: next_plan_window,
                 last_atime_sec: 0,
+                last_read_end: 0,
+                pending: None,
                 mappings: cached_mappings,
             },
         );
@@ -846,8 +1053,190 @@ impl Ext4Fs {
         Ok(Some(mappings))
     }
 
+    fn clear_pending_direct_read(&self, ino: u32) {
+        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
+            entry.pending = None;
+        }
+    }
+
     fn invalidate_direct_read_cache(&self, ino: u32) {
         self.inode_direct_read_cache.lock().remove(&ino);
+    }
+
+    fn take_matching_pending_direct_read(
+        &self,
+        ino: u32,
+        offset: usize,
+        max_len: usize,
+    ) -> Option<PendingDirectRead> {
+        let mut cache = self.inode_direct_read_cache.lock();
+        let entry = cache.get_mut(&ino)?;
+        let pending = entry.pending.take()?;
+        if pending.offset == offset && pending.len <= max_len {
+            Some(pending)
+        } else {
+            None
+        }
+    }
+
+    fn note_completed_direct_read(&self, ino: u32, offset: usize, direct_len: usize) {
+        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
+            entry.last_read_end = offset.saturating_add(direct_len);
+        }
+    }
+
+    fn submit_direct_read_request_with_hint(
+        &self,
+        mappings: &[SimpleBlockRange],
+        prefer_fast_submit: bool,
+    ) -> Result<(BioWaiter, u64, u64)> {
+        let mut bio_waiter = BioWaiter::new();
+        let mut alloc_ns = 0u64;
+        let mut submit_ns = 0u64;
+
+        for mapping in mappings {
+            let alloc_start = Self::monotonic_nanos();
+            let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::FromDevice);
+            alloc_ns = alloc_ns.saturating_add(Self::monotonic_nanos().saturating_sub(alloc_start));
+            let submit_start = Self::monotonic_nanos();
+            let waiter = if prefer_fast_submit {
+                self.block_device
+                    .read_blocks_async_prefetch(Bid::new(mapping.pblock), bio_segment)?
+            } else {
+                self.block_device
+                    .read_blocks_async(Bid::new(mapping.pblock), bio_segment)?
+            };
+            submit_ns =
+                submit_ns.saturating_add(Self::monotonic_nanos().saturating_sub(submit_start));
+            bio_waiter.concat(waiter);
+        }
+
+        Ok((bio_waiter, alloc_ns, submit_ns))
+    }
+
+    fn wait_direct_read(&self, bio_waiter: &BioWaiter) -> Result<u64> {
+        let wait_start = Self::monotonic_nanos();
+        if Some(BioStatus::Complete) != bio_waiter.wait() {
+            return_errno!(Errno::EIO);
+        }
+        Ok(Self::monotonic_nanos().saturating_sub(wait_start))
+    }
+
+    fn copy_completed_direct_read(
+        &self,
+        offset: usize,
+        direct_len: usize,
+        mappings: &[SimpleBlockRange],
+        bio_waiter: &BioWaiter,
+        writer: &mut VmWriter,
+    ) -> Result<(usize, u64)> {
+        let mut current_offset = offset;
+        let request_end = offset
+            .checked_add(direct_len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O range overflow"))?;
+        let copy_start = Self::monotonic_nanos();
+        let mut mapped_bytes = 0usize;
+
+        for (mapping, bio) in mappings.iter().zip(bio_waiter.reqs()) {
+            let file_offset = (mapping.lblock as usize)
+                .checked_mul(EXT4_BLOCK_SIZE)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O offset overflow"))?;
+            if current_offset < file_offset {
+                Self::write_zeros(writer, file_offset - current_offset)?;
+            }
+
+            let segment = bio
+                .segments()
+                .first()
+                .ok_or_else(|| Error::with_message(Errno::EIO, "missing direct read segment"))?;
+            segment
+                .reader()
+                .map_err(Self::vm_io_error)?
+                .read_fallible(writer)
+                .map_err(|(e, _)| Error::from(e))?;
+            mapped_bytes = mapped_bytes.saturating_add(mapping.len as usize * EXT4_BLOCK_SIZE);
+            current_offset = file_offset + mapping.len as usize * EXT4_BLOCK_SIZE;
+        }
+
+        if current_offset < request_end {
+            Self::write_zeros(writer, request_end - current_offset)?;
+        }
+
+        let copy_ns = Self::monotonic_nanos().saturating_sub(copy_start);
+        Ok((mapped_bytes, copy_ns))
+    }
+
+    fn maybe_prepare_speculative_direct_read(
+        &self,
+        ino: u32,
+        offset: usize,
+        direct_len: usize,
+    ) -> Result<(Option<PreparedDirectRead>, u64)> {
+        const SPECULATIVE_DIRECT_READ_MIN_BYTES: usize = 512 * 1024;
+
+        if direct_len < SPECULATIVE_DIRECT_READ_MIN_BYTES {
+            return Ok((None, 0));
+        }
+
+        let next_offset = match offset.checked_add(direct_len) {
+            Some(next_offset) => next_offset,
+            None => return Ok((None, 0)),
+        };
+
+        {
+            let cache = self.inode_direct_read_cache.lock();
+            let Some(entry) = cache.get(&ino) else {
+                return Ok((None, 0));
+            };
+            if entry.pending.is_some() {
+                return Ok((None, 0));
+            }
+            if offset != 0 && entry.last_read_end != offset {
+                return Ok((None, 0));
+            }
+        }
+
+        let plan_start = Self::monotonic_nanos();
+        let (next_len, next_mappings) = self.plan_direct_read_cached(ino, next_offset, direct_len)?;
+        let plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
+        if next_len < SPECULATIVE_DIRECT_READ_MIN_BYTES {
+            return Ok((None, plan_ns));
+        }
+        if !Self::mappings_fully_cover_range(next_offset, next_len, &next_mappings)? {
+            return Ok((None, plan_ns));
+        }
+
+        Ok((
+            Some(PreparedDirectRead {
+                offset: next_offset,
+                len: next_len,
+                mappings: next_mappings,
+            }),
+            plan_ns,
+        ))
+    }
+
+    fn submit_prepared_speculative_direct_read(
+        &self,
+        ino: u32,
+        prepared: Option<PreparedDirectRead>,
+    ) -> Result<(u64, u64)> {
+        let Some(prepared) = prepared else {
+            return Ok((0, 0));
+        };
+
+        let (waiter, alloc_ns, submit_ns) =
+            self.submit_direct_read_request_with_hint(&prepared.mappings, true)?;
+        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
+            entry.pending = Some(PendingDirectRead {
+                offset: prepared.offset,
+                len: prepared.len,
+                mappings: prepared.mappings,
+                waiter,
+            });
+        }
+
+        Ok((alloc_ns, submit_ns))
     }
 
     fn touch_atime_after_direct_read(&self, ino: u32, status_flags: StatusFlags) -> Result<()> {
@@ -1550,50 +1939,58 @@ impl Ext4Fs {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, writer.avail())?;
-        if direct_len == 0 {
-            return Ok(0);
-        }
+        self.maybe_start_direct_read_profile();
 
-        let mut bio_waiter = BioWaiter::new();
-        let mut bio_segments = Vec::with_capacity(mappings.len());
-        for mapping in &mappings {
-            let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::FromDevice);
-            bio_segments.push(bio_segment.clone());
-            let waiter = self
-                .block_device
-                .read_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
-            bio_waiter.concat(waiter);
-        }
-
-        if Some(BioStatus::Complete) != bio_waiter.wait() {
-            return_errno!(Errno::EIO);
-        }
-
-        let mut current_offset = offset;
-        let request_end = offset
-            .checked_add(direct_len)
-            .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O range overflow"))?;
-        for (mapping, segment) in mappings.iter().zip(bio_segments.iter()) {
-            let file_offset = (mapping.lblock as usize)
-                .checked_mul(EXT4_BLOCK_SIZE)
-                .ok_or_else(|| Error::with_message(Errno::EFBIG, "direct I/O offset overflow"))?;
-            if current_offset < file_offset {
-                Self::write_zeros(writer, file_offset - current_offset)?;
+        let mut plan_ns = 0u64;
+        let mut alloc_ns = 0u64;
+        let mut submit_ns = 0u64;
+        let (direct_len, mappings, bio_waiter) = if let Some(pending) =
+            self.take_matching_pending_direct_read(ino, offset, writer.avail())
+        {
+            (pending.len, pending.mappings, pending.waiter)
+        } else {
+            let plan_start = Self::monotonic_nanos();
+            let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, writer.avail())?;
+            plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
+            if direct_len == 0 {
+                return Ok(0);
             }
-            segment
-                .reader()
-                .map_err(Self::vm_io_error)?
-                .read_fallible(writer)
-                .map_err(|(e, _)| Error::from(e))?;
-            current_offset = file_offset + mapping.len as usize * EXT4_BLOCK_SIZE;
-        }
 
-        if current_offset < request_end {
-            Self::write_zeros(writer, request_end - current_offset)?;
-        }
+            let (bio_waiter, current_alloc_ns, current_submit_ns) =
+                self.submit_direct_read_request_with_hint(&mappings, false)?;
+            alloc_ns = alloc_ns.saturating_add(current_alloc_ns);
+            submit_ns = submit_ns.saturating_add(current_submit_ns);
+            (direct_len, mappings, bio_waiter)
+        };
 
+        let (prepared_next_read, next_plan_ns) =
+            self.maybe_prepare_speculative_direct_read(ino, offset, direct_len)?;
+        plan_ns = plan_ns.saturating_add(next_plan_ns);
+
+        let wait_ns = self.wait_direct_read(&bio_waiter)?;
+        let (next_alloc_ns, next_submit_ns) =
+            self.submit_prepared_speculative_direct_read(ino, prepared_next_read)?;
+        alloc_ns = alloc_ns.saturating_add(next_alloc_ns);
+        submit_ns = submit_ns.saturating_add(next_submit_ns);
+
+        let (mapped_bytes, copy_ns) =
+            self.copy_completed_direct_read(offset, direct_len, &mappings, &bio_waiter, writer)?;
+        let zero_fill_bytes = direct_len.saturating_sub(mapped_bytes);
+
+        self.note_completed_direct_read(ino, offset, direct_len);
         self.touch_atime_after_direct_read(ino, status_flags)?;
+        let reads = self.direct_read_profile.record_read(
+            direct_len,
+            mappings.len(),
+            mapped_bytes,
+            zero_fill_bytes,
+            plan_ns,
+            alloc_ns,
+            submit_ns,
+            wait_ns,
+            copy_ns,
+        );
+        self.maybe_log_direct_read_profile(reads);
         Ok(direct_len)
     }
 
@@ -1659,6 +2056,7 @@ impl Ext4Fs {
             return_errno!(Errno::EIO);
         }
 
+        self.clear_pending_direct_read(ino);
         if !reused_read_mapping_cache {
             self.invalidate_direct_read_cache(ino);
         }

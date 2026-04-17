@@ -38,6 +38,11 @@ impl SyncIdAlloc {
             .wait_until(|| self.id_allocator.disable_irq().lock().alloc())
     }
 
+    /// Attempts to allocate a new ID without blocking.
+    pub fn try_alloc(&self) -> Option<usize> {
+        self.id_allocator.disable_irq().lock().alloc()
+    }
+
     /// Deallocates an ID.
     ///
     /// This method assumes that the caller is in the context of an IRQ handler.

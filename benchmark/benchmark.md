@@ -1,129 +1,137 @@
-# Asterinas EXT4 Benchmark/Test 汇总（stage7）
+# Asterinas EXT4 Benchmark 最新结果快照
 
-更新时间：2026-04-10（Asia/Shanghai）
+更新时间：2026-04-17（Asia/Shanghai）
 
-## 0. 最新复现（2026-04-10）
+## 1. 本文用途
 
-1. `fio/ext4_seq_write_bw`：完成 Linux 对比  
-   结果：`Asterinas=513 MB/s`，`Linux=2902 MB/s`，`ratio=0.176775`  
-   日志：`benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_write_bw_20260410_090958.log`
-2. `fio/ext4_seq_read_bw`：完成 Linux 对比  
-   结果：`Asterinas=112 MB/s`，`Linux=1324 MB/s`，`ratio=0.084592`  
-   日志：`benchmark/logs/stage7_run_20260410_170858/perf_compare/ext4_seq_read_bw_20260410_091849.log`
-3. `phase6_perf_compare`：完成 Linux EXT4 对照性能单轮复现（8 项）  
-   统计：`overall_avg_ratio=0.161503 < 0.80`  
-   报告：`benchmark/logs/stage7_run_20260410_170858/perf_compare/20260410_093228/phase6_perf_compare_report.txt`  
-   汇总：`benchmark/logs/stage7_run_20260410_170858/perf_compare/20260410_093228/phase6_perf_compare_aggregate.tsv`
-4. `phase6_only`：PASS  
-   统计：`pass=25 fail=0 notrun=0 static_blocked=26 denominator=25 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase6/phase6_good_20260410_093859.log`
-5. `phase3_only`：PASS  
-   统计：`pass=10 fail=0 notrun=6 static_blocked=24 denominator=10 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase3/phase3_base_guard_20260410_095418.log`
-6. `phase4_good`：PASS  
-   统计：`pass=12 fail=0 notrun=6 static_blocked=22 denominator=12 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/stage7_run_20260410_170858/suite/phase4/phase4_good_20260410_100230.log`
-7. `crash_only`：PASS（`3 场景 x 2 轮 = 6/6`）  
-   汇总：`benchmark/logs/stage7_run_20260410_170858/suite/crash/crash/phase4_part3_crash_summary_20260410_101135.tsv`
-8. `others_general`：首次失败、重试通过  
-   失败日志：`benchmark/logs/stage7_run_20260410_170858/others_general_20260410_181255.log`  
-   通过日志：`benchmark/logs/stage7_run_20260410_170858/others_general_retry_20260410_181656.log`
+- 本文件只保留当前最新一轮已确认的 benchmark 结果。
+- 旧历史结果、旧阶段记录、旧对比结论已全部移除。
+- 环境准备、代理、Docker、KVM 与复现注意事项请看 `environment.md`。
 
-说明：本节记录 `stage7` 当前复现结果；下方历史内容保留作参考。
+## 2. 当前结果总览
 
-## 1. 当前结论（Docker 内实跑）
+### 2.1 ext2 顺序写
 
-1. `phase3_only`：PASS  
-   统计：`pass=10 fail=0 notrun=6 static_blocked=24 denominator=10 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/phase3_base_guard_20260408_071539.log`
-2. `phase4_good`：PASS  
-   统计：`pass=12 fail=0 notrun=6 static_blocked=22 denominator=12 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/phase4_good_20260408_072542.log`
-3. `phase6_only`：PASS（最新门禁）  
-   统计：`pass=25 fail=0 notrun=0 static_blocked=26 denominator=25 pass_rate=100.00% threshold=90%`  
-   日志：`benchmark/logs/phase6_good_20260408_094026.log`
-4. `lmbench_only`：PASS（8/8）  
-   汇总：`benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260408_073643.tsv`
-5. `crash_only`：PASS（基础崩溃恢复证据链）  
-   统计：`3 场景 x 3 轮 = 9/9 PASS`  
-   汇总：`benchmark/logs/crash/phase4_part3_crash_summary_20260408_114539.tsv`
-6. `phase6_perf_compare`：FAIL（Linux EXT4 对照性能，8项x3轮）  
-   统计：`overall_avg_ratio=0.166079 < 0.80`  
-   目录：`benchmark/logs/perf_compare/20260408_142155/`  
-   汇总：`benchmark/logs/perf_compare/20260408_142155/phase6_perf_compare_aggregate.tsv`
+- job：`fio/ext2_seq_write_bw`
+- Asterinas：`2973 MB/s`
+- Linux：`2488 MB/s`
+- ratio：`119.49%`
+- 结果文件：`asterinas/result_fio-ext2_seq_write_bw.json`
 
-说明：当前统计口径分母为 `PASS + FAIL`，`NOTRUN/STATIC_BLOCKED` 不计入分母。
+### 2.2 ext2 顺序读
 
-## 2. 关键状态更新（本轮）
+- job：`fio/ext2_seq_read_bw`
+- Asterinas：`3577 MB/s`
+- Linux：`5027 MB/s`
+- ratio：`71.16%`
+- 结果文件：`asterinas/result_fio-ext2_seq_read_bw.json`
 
-1. P0 Step2 已完成：崩溃恢复证据链达到“固定场景 + 多轮复验 + 日志可复现”出口标准。
-2. 证据核验口径：
-   - `prepare` 日志命中 `replay hold point reached`
-   - `verify` 日志命中 `EXT4_CRASH_VERIFY_PASS`
-   - summary 中 `9` 组全部 `PASS`
-3. phase6 功能门禁维持 `25/25` 全通过，不受本轮 crash 复验影响。
-4. `generic/055` 已完成 3 轮审计复验（`CASE_TIMEOUT=1800`）：
-   - `benchmark/logs/phase6_good_20260408_115358.log`
-   - `benchmark/logs/phase6_good_20260408_121348.log`
-   - `benchmark/logs/phase6_good_20260408_123334.log`
-5. `generic/055` 审计结论：扩展预算下稳定 PASS；默认 phase6 门禁预算保持不变，继续按 stress profile 排除。
+### 2.3 ext4 顺序写
 
-## 3. 一键命令
+- job：`fio/ext4_seq_write_bw`
+- Asterinas：`2651 MB/s`
+- Linux：`2930 MB/s`
+- ratio：`90.48%`
+- 结果文件：`asterinas/result_fio-ext4_seq_write_bw.json`
 
-在宿主机 `/home/lby/os_com_codex/asterinas` 执行：
+### 2.4 ext4 顺序读
+
+- job：`fio/ext4_seq_read_bw`
+- Asterinas：`4870 MB/s`
+- Linux：`5084 MB/s`
+- ratio：`95.79%`
+- 结果文件：`asterinas/result_fio-ext4_seq_read_bw.json`
+
+## 3. 当前 fio 参数口径
+
+当前 ext2 与 ext4 采用同一套 fio 参数，只有 `filename` 和 `rw/name` 随测试项变化。
+
+统一参数：
 
 ```bash
-# phase3 guard
-PHASE4_DOCKER_MODE=phase3_only \
-ENABLE_KVM=1 \
-XFSTESTS_CASE_TIMEOUT_SEC=900 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# phase4 good
-PHASE4_DOCKER_MODE=phase4_good \
-ENABLE_KVM=1 \
-XFSTESTS_CASE_TIMEOUT_SEC=900 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# phase6 good
-PHASE4_DOCKER_MODE=phase6_only \
-ENABLE_KVM=1 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# lmbench
-PHASE4_DOCKER_MODE=lmbench_only \
-ENABLE_KVM=1 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# crash evidence (3 scenes x 3 rounds)
-PHASE4_DOCKER_MODE=crash_only \
-ENABLE_KVM=1 \
-CRASH_ROUNDS=3 \
-KLOG_LEVEL=warn \
-./tools/ext4/run_phase4_in_docker.sh
-
-# Linux EXT4 对照性能（8项x3轮）
-PERF_ROUNDS=3 \
-BENCH_ENABLE_KVM=1 \
-PERF_CASE_TIMEOUT_SEC=600 \
-./tools/ext4/run_phase6_perf_compare_in_docker.sh
+-size=1G -bs=1M \
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 \
+-time_based=1 -ramp_time=60 -runtime=100
 ```
 
-调试说明：
+四个 job 的完整口径如下。
 
-- P1 当前允许在容器内临时使用 `BENCH_RUN_ONLY=asterinas` 或 `BENCH_RUN_ONLY=linux`，让 `test/initramfs/src/benchmark/bench_linux_and_aster.sh` 只跑单边，缩短 fio 排障回路。
-- 单边模式只用于定位性能回归或观察 Asterinas 自身多轮波动，不用于生成最终比例结果。
-- 需要写入正式对比结论时，仍应保持默认 `BENCH_RUN_ONLY=both` 跑完整双边对照。
-- 最终提交代码前，应恢复按默认双边流程使用 benchmark 脚本，不把单边模式当作最终工作流。
+### 3.1 ext2_seq_write_bw
 
-## 4. 目录说明
+```bash
+/benchmark/bin/fio -rw=write -filename=/ext2/fio-test -name=seqwrite \
+-size=1G -bs=1M \
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 \
+-time_based=1 -ramp_time=60 -runtime=100
+```
 
-1. `benchmark/benchmark.md`：测试汇总
-2. `benchmark/environment.md`：环境与复现口径
-3. `benchmark/datasets/xfstests/`：list、blocked、样例脚本
-4. `benchmark/logs/`：默认日志输出目录
-5. `benchmark/datasets/results/`：日志副本归档目录
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/ext2_seq_write_bw/run.sh`
+
+### 3.2 ext2_seq_read_bw
+
+```bash
+/benchmark/bin/fio -rw=read -filename=/ext2/fio-test -name=seqread \
+-size=1G -bs=1M \
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 \
+-time_based=1 -ramp_time=60 -runtime=100
+```
+
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/ext2_seq_read_bw/run.sh`
+
+### 3.3 ext4_seq_write_bw
+
+```bash
+/benchmark/bin/fio -rw=write -filename=/ext4/fio-test -name=seqwrite \
+-size=1G -bs=1M \
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 \
+-time_based=1 -ramp_time=60 -runtime=100
+```
+
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/ext4_seq_write_bw/run.sh`
+
+### 3.4 ext4_seq_read_bw
+
+```bash
+/benchmark/bin/fio -rw=read -filename=/ext4/fio-test -name=seqread \
+-size=1G -bs=1M \
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 \
+-time_based=1 -ramp_time=60 -runtime=100
+```
+
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/ext4_seq_read_bw/run.sh`
+
+## 4. 本轮执行方式
+
+- 工作树：`/home/lby/os_com_codex`
+- 主仓库：`/home/lby/os_com_codex/asterinas`
+- 执行环境：Docker `asterinas/asterinas:0.17.0-20260227`
+- benchmark 关键环境变量：
+  - `BENCH_ENABLE_KVM=1`
+  - `BENCH_ASTER_NETDEV=tap`
+  - `BENCH_ASTER_VHOST=on`
+- 代理：Clash `127.0.0.1:7890`
+
+实际使用的 benchmark 入口是：
+
+```bash
+bash test/initramfs/src/benchmark/bench_linux_and_aster.sh <job> x86_64
+```
+
+本轮涉及的 job：
+
+- `fio/ext2_seq_write_bw`
+- `fio/ext2_seq_read_bw`
+- `fio/ext4_seq_write_bw`
+- `fio/ext4_seq_read_bw`
+
+## 5. 当前观察与说明
+
+- ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。
+- 这几轮 Linux 对照侧都出现了 `kvm_intel: VMX not supported by CPU 0`。
+- 因此当前结果适合用于“本地最新观测值”和方案推进参考。
+- 如果后续要写正式 milestone 或对外结论，建议同时记录该环境现象，避免把 Linux 对照侧异常忽略掉。
+
+## 6. 对应仓库内文档
+
+- 根目录：`benchmark.md`
+- 仓库内同步副本：`asterinas/benchmark/benchmark.md`

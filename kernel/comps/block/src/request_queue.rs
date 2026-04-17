@@ -89,6 +89,14 @@ impl BioRequestSingleQueue {
             if num_requests > 0 {
                 let mut queue = self.queue.lock();
                 if let Some(request) = queue.pop_back() {
+                    let dequeue_time = aster_time::read_monotonic_time();
+                    let dequeue_ns = dequeue_time
+                        .as_secs()
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(u64::from(dequeue_time.subsec_nanos()));
+                    request
+                        .bios()
+                        .for_each(|bio| bio.mark_dequeued(dequeue_ns));
                     self.dec_num_requests();
                     return request;
                 }
