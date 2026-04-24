@@ -28,11 +28,37 @@ trap 'chmod -R u+w "${WORK_DIR}" 2>/dev/null || true; rm -rf "${WORK_DIR}" 2>/de
 ROOTFS_DIR="${WORK_DIR}/rootfs"
 mkdir -p "${ROOTFS_DIR}"
 
+install_host_tool_with_libs() {
+  local tool_path="$1"
+  local target_path="$2"
+
+  if [ ! -x "${tool_path}" ]; then
+    echo "[WARN] host tool missing, skip inject: ${tool_path}" >&2
+    return 0
+  fi
+
+  install -D -m 0755 "${tool_path}" "${ROOTFS_DIR}/${target_path}"
+
+  ldd "${tool_path}" 2>/dev/null | awk '
+    /=>/ {
+      if ($3 ~ /^\//) print $3
+    }
+    /^[[:space:]]*\// {
+      print $1
+    }
+  ' | while IFS= read -r lib; do
+    [ -n "${lib}" ] || continue
+    [ -f "${lib}" ] || continue
+    install -D -m 0644 "${lib}" "${ROOTFS_DIR}/${lib}"
+  done
+}
+
 echo "[INFO] Extracting ${SRC_IMG} ..."
 (
   cd "${ROOTFS_DIR}"
   gzip -dc "${SRC_IMG}" | cpio -idmu --quiet
 )
+chmod -R u+w "${ROOTFS_DIR}" 2>/dev/null || true
 
 echo "[INFO] Patching syscall/xfstests/ext4_crash scripts for phase4_part3 ..."
 install -D -m 0755 test/initramfs/src/syscall/run_syscall_test.sh \
@@ -45,14 +71,28 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase4_good.lis
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase4_good.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase6_good.list \
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase6_good.list"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/jbd_phase1.list \
+  "${ROOTFS_DIR}/opt/xfstests/testcases/jbd_phase1.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase3_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase3_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase4_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase4_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase6_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase6_excluded.tsv"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_excluded.tsv \
+  "${ROOTFS_DIR}/opt/xfstests/blocked/jbd_phase1_excluded.tsv"
 install -D -m 0755 test/initramfs/src/syscall/ext4_crash/run_ext4_crash_test.sh \
   "${ROOTFS_DIR}/opt/ext4_crash/run_ext4_crash_test.sh"
+
+echo "[INFO] Injecting host e2fsprogs tools into initramfs ..."
+install_host_tool_with_libs /usr/sbin/mkfs.ext4 /usr/sbin/mkfs.ext4
+install_host_tool_with_libs /usr/sbin/dumpe2fs /usr/sbin/dumpe2fs
+install_host_tool_with_libs /usr/sbin/e2fsck /usr/sbin/e2fsck
+
+echo "[INFO] Building xfstests file I/O helper ..."
+XFSTESTS_FSYNC_HELPER="${WORK_DIR}/fsync_file"
+${CC:-gcc} -O2 test/initramfs/src/syscall/xfstests/fsync_file.c -o "${XFSTESTS_FSYNC_HELPER}"
+install_host_tool_with_libs "${XFSTESTS_FSYNC_HELPER}" /opt/xfstests/fsync_file
 
 if [ -d "${XFSTESTS_PREBUILT_DIR}/xfstests-dev" ]; then
   echo "[INFO] Injecting xfstests prebuilt from ${XFSTESTS_PREBUILT_DIR} ..."

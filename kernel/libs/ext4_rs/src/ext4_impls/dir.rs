@@ -4,6 +4,41 @@ use crate::return_errno_with_message;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    fn log_dir_mapping_failure(
+        &self,
+        op: &str,
+        parent: &Ext4InodeRef,
+        name: &str,
+        iblock: u32,
+        err: &Ext4Error,
+    ) {
+        let root = parent.inode.root_extent_header();
+        let reloaded = self.get_inode_ref(parent.inode_num);
+        let reloaded_root = reloaded.inode.root_extent_header();
+        log::error!(
+            "[{}] dir mapping failed: parent={} name='{}' iblock={} err={:?} inmem_flags={:#x} inmem_size={} inmem_root={{magic:{:x},entries:{},max:{},depth:{}}} reloaded_flags={:#x} reloaded_size={} reloaded_root={{magic:{:x},entries:{},max:{},depth:{}}} inmem_blocks={:?} reloaded_blocks={:?}",
+            op,
+            parent.inode_num,
+            name,
+            iblock,
+            err,
+            parent.inode.flags(),
+            parent.inode.size(),
+            root.magic,
+            root.entries_count,
+            root.max_entries_count,
+            root.depth,
+            reloaded.inode.flags(),
+            reloaded.inode.size(),
+            reloaded_root.magic,
+            reloaded_root.entries_count,
+            reloaded_root.max_entries_count,
+            reloaded_root.depth,
+            parent.inode.block,
+            reloaded.inode.block
+        );
+    }
+
     /// Find a directory entry in a directory
     ///
     /// Params:
@@ -37,7 +72,13 @@ impl Ext4 {
 
         // iterate all blocks
         while iblock < total_blocks {
-            fblock = self.get_pblock_idx(&parent, iblock as u32)?;
+            fblock = match self.get_pblock_idx(&parent, iblock as u32) {
+                Ok(pblock) => pblock,
+                Err(e) => {
+                    self.log_dir_mapping_failure("dir_find_entry", &parent, name, iblock as u32, &e);
+                    return Err(e);
+                }
+            };
 
             // load physical block
             let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
@@ -82,6 +123,7 @@ impl Ext4 {
                 return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
             }
             if !de.unused() && de.compare_name(name) {
+                self.validate_inode_number(de.inode)?;
                 result.dentry = de;
                 result.offset = offset;
                 result.prev_offset = prev_de_offset;
@@ -224,6 +266,65 @@ impl Ext4 {
     ///
     /// Returns:
     /// `Result<usize>` - status of the operation
+    /// Add a directory entry, skipping the O(n) fallback scan of existing blocks.
+    /// Use only when the name is guaranteed absent AND the parent is append-dominated
+    /// (no prior deletions creating free slots in earlier blocks). Keeps this O(1).
+    /// Returns the absolute byte offset of the newly inserted entry in the directory stream.
+    pub fn dir_add_entry_unchecked(
+        &self,
+        parent: &mut Ext4InodeRef,
+        child: &Ext4InodeRef,
+        name: &str,
+    ) -> Result<u64> {
+        let block_size = self.super_block.block_size() as usize;
+        let inode_size: u64 = parent.inode.size();
+        let total_blocks: u64 = (inode_size + block_size as u64 - 1) / block_size as u64;
+
+        if total_blocks > 0 {
+            let last_iblock = total_blocks - 1;
+            let pblock = match self.get_pblock_idx(parent, last_iblock as u32) {
+                Ok(pblock) => pblock,
+                Err(e) => {
+                    self.log_dir_mapping_failure(
+                        "dir_add_entry_unchecked:last",
+                        parent,
+                        name,
+                        last_iblock as u32,
+                        &e,
+                    );
+                    return Err(e);
+                }
+            };
+            let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
+            if let Ok(within_offset) = self.try_insert_to_existing_block(
+                &mut ext4block,
+                name,
+                child.inode_num,
+                Self::inode_to_dir_entry_type(&child.inode),
+            ) {
+                self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                ext4block.sync_blk_to_disk(&self.metadata_writer);
+                return Ok(last_iblock * block_size as u64 + within_offset as u64);
+            }
+        }
+
+        // Last block is full (or dir is empty): allocate new block directly.
+        // Entry goes at offset 0 of the new (logical) block.
+        let new_iblock = total_blocks;
+        let new_block = self.append_inode_pblk(parent)?;
+        let mut new_ext4block =
+            Block::load(&self.block_device, new_block as usize * block_size);
+        self.insert_to_new_block(
+            &mut new_ext4block,
+            child.inode_num,
+            name,
+            Self::inode_to_dir_entry_type(&child.inode),
+        );
+        self.dir_set_csum(&mut new_ext4block, parent.inode.generation());
+        new_ext4block.sync_blk_to_disk(&self.metadata_writer);
+        Ok(new_iblock * block_size as u64)
+    }
+
     pub fn dir_add_entry(
         &self,
         parent: &mut Ext4InodeRef,
@@ -239,7 +340,13 @@ impl Ext4 {
         // This avoids repeatedly rescanning all earlier blocks for bulk creates.
         if total_blocks > 0 {
             let last_iblock = total_blocks - 1;
-            let pblock = self.get_pblock_idx(parent, last_iblock as u32)?;
+            let pblock = match self.get_pblock_idx(parent, last_iblock as u32) {
+                Ok(pblock) => pblock,
+                Err(e) => {
+                    self.log_dir_mapping_failure("dir_add_entry:last", parent, name, last_iblock as u32, &e);
+                    return Err(e);
+                }
+            };
             let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
             if self
                 .try_insert_to_existing_block(
@@ -251,7 +358,7 @@ impl Ext4 {
                 .is_ok()
             {
                 self.dir_set_csum(&mut ext4block, parent.inode.generation());
-                ext4block.sync_blk_to_disk(&self.block_device);
+                ext4block.sync_blk_to_disk(&self.metadata_writer);
                 return Ok(EOK);
             }
         }
@@ -260,7 +367,13 @@ impl Ext4 {
         let mut iblock = 0;
         while iblock < total_blocks {
             // get physical block id of a logical block id
-            let pblock = self.get_pblock_idx(parent, iblock as u32)?;
+            let pblock = match self.get_pblock_idx(parent, iblock as u32) {
+                Ok(pblock) => pblock,
+                Err(e) => {
+                    self.log_dir_mapping_failure("dir_add_entry:scan", parent, name, iblock as u32, &e);
+                    return Err(e);
+                }
+            };
 
             // load physical block
             let mut ext4block =
@@ -276,7 +389,7 @@ impl Ext4 {
             if result.is_ok() {
                 // set checksum
                 self.dir_set_csum(&mut ext4block, parent.inode.generation());
-                ext4block.sync_blk_to_disk(&self.block_device);
+                ext4block.sync_blk_to_disk(&self.metadata_writer);
 
                 return Ok(EOK);
             }
@@ -303,7 +416,7 @@ impl Ext4 {
 
         // set checksum
         self.dir_set_csum(&mut new_ext4block, parent.inode.generation());
-        new_ext4block.sync_blk_to_disk(&self.block_device);
+        new_ext4block.sync_blk_to_disk(&self.metadata_writer);
 
         Ok(EOK)
     }
@@ -375,9 +488,10 @@ impl Ext4 {
                 new_entry.copy_to_slice(&mut block.data, offset + sz);
 
                 // Sync to disk
-                block.sync_blk_to_disk(&self.block_device);
+                block.sync_blk_to_disk(&self.metadata_writer);
 
-                return Ok(EOK);
+                // Return within-block offset of the newly placed entry
+                return Ok(offset + sz);
             }
 
             // Move to the next entry
@@ -461,8 +575,56 @@ impl Ext4 {
         }
 
         self.dir_set_csum(&mut ext4block, parent.inode.generation());
-        ext4block.sync_blk_to_disk(&self.block_device);
+        ext4block.sync_blk_to_disk(&self.metadata_writer);
 
+        Ok(EOK)
+    }
+
+    /// Remove the directory entry at `abs_byte_offset` without scanning all blocks.
+    /// The offset must be the exact byte offset of the entry within the directory stream
+    /// (as returned by `dir_add_entry_unchecked` or `dir_get_entries_with_next_offset`).
+    pub fn dir_remove_entry_at_offset(
+        &self,
+        parent: &mut Ext4InodeRef,
+        abs_byte_offset: u64,
+    ) -> Result<usize> {
+        let block_size = self.super_block.block_size() as usize;
+        let iblock = (abs_byte_offset as usize) / block_size;
+        let offset_in_block = (abs_byte_offset as usize) % block_size;
+
+        let pblock = self.get_pblock_idx(parent, iblock as u32)?;
+        let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
+
+        // Invalidate the entry at the given offset
+        let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(offset_in_block);
+        let del_len = de_del.entry_len();
+        de_del.inode = 0;
+
+        // If not the first entry in the block, merge space into the predecessor
+        if offset_in_block != 0 {
+            let mut offset = 0usize;
+            let mut tmp_de: Ext4DirEntry = ext4block.read_offset_as(offset);
+            let mut de_len = tmp_de.entry_len();
+            if de_len == 0 || de_len as usize > block_size - offset {
+                return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
+            }
+            while (offset + de_len as usize) < offset_in_block {
+                offset += de_len as usize;
+                tmp_de = ext4block.read_offset_as(offset);
+                de_len = tmp_de.entry_len();
+                if de_len == 0 || de_len as usize > block_size - offset {
+                    return_errno_with_message!(Errno::EIO, "corrupted ext4 dir entry length");
+                }
+            }
+            if de_len as usize + offset != offset_in_block {
+                return_errno_with_message!(Errno::EIO, "invalid predecessor offset in dir_remove_entry_at_offset");
+            }
+            let tmp_de_mut: &mut Ext4DirEntry = ext4block.read_offset_as_mut(offset);
+            tmp_de_mut.entry_len = de_len + del_len;
+        }
+
+        self.dir_set_csum(&mut ext4block, parent.inode.generation());
+        ext4block.sync_blk_to_disk(&self.metadata_writer);
         Ok(EOK)
     }
 

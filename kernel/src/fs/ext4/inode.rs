@@ -452,11 +452,21 @@ impl Inode for Ext4Inode {
     }
 
     fn sync_all(&self) -> Result<()> {
-        self.ext4_fs()?.sync()
+        let fs = self.ext4_fs()?;
+        if self.type_() == InodeType::File {
+            fs.fsync_regular_file()
+        } else {
+            fs.sync()
+        }
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.ext4_fs()?.sync()
+        let fs = self.ext4_fs()?;
+        if self.type_() == InodeType::File {
+            fs.fsync_regular_file()
+        } else {
+            fs.sync()
+        }
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

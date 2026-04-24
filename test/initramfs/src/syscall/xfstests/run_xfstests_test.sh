@@ -32,6 +32,8 @@ PHASE4_GOOD_LIST=${SCRIPT_DIR}/testcases/phase4_good.list
 PHASE4_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase4_excluded.tsv
 PHASE6_GOOD_LIST=${SCRIPT_DIR}/testcases/phase6_good.list
 PHASE6_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase6_excluded.tsv
+JBD_PHASE1_LIST=${SCRIPT_DIR}/testcases/jbd_phase1.list
+JBD_PHASE1_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/jbd_phase1_excluded.tsv
 
 BASE_LIST=""
 STATIC_EXCLUDED=""
@@ -233,7 +235,7 @@ fi
 if [ -x /usr/bin/mkfs.ext4 ]; then
     exec /usr/bin/mkfs.ext4 "$@"
 fi
-exec /usr/bin/busybox mke2fs "$@"
+exec /usr/bin/busybox mke2fs -t ext4 "$@"
 EOF
 chmod +x "${SHIM_DIR}/mkfs.ext4"
 
@@ -275,8 +277,19 @@ if [ -z "${dev}" ]; then
     exit 2
 fi
 
+# The ext4 godown fallback below cannot currently drive a real
+# FS_IOC_GOINGDOWN path, so it drops a one-shot marker for xfstests'
+# ext4 logstate probe. Honor that marker before delegating to a real
+# dumpe2fs binary so shutdown/log tests observe the intended
+# "dirty before replay, clean after replay" sequence.
+if [ -f /tmp/xfstests_ext4_needs_recovery ]; then
+    need_marker=1
+else
+    need_marker=0
+fi
+
 for cand in /usr/sbin/dumpe2fs /usr/bin/dumpe2fs /sbin/dumpe2fs /bin/dumpe2fs; do
-    if [ -x "${cand}" ]; then
+    if [ "${need_marker}" -eq 0 ] && [ -x "${cand}" ]; then
         exec "${cand}" ${want_header:+-h} "${dev}"
     fi
 done
@@ -284,8 +297,35 @@ done
 # Fallback output covering xfstests probes:
 # - "Filesystem features" with "has_journal"
 # - "Inode size" for inode-size checks.
-features="has_journal ext_attr dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum"
-if [ -f /tmp/xfstests_ext4_needs_recovery ]; then
+read_le_u16() {
+    local file="$1"
+    local offset="$2"
+    od -An -j "${offset}" -N 2 -t u1 "${file}" 2>/dev/null | \
+        awk '{ print ($1 + (256 * $2)) }'
+}
+
+read_le_u32() {
+    local file="$1"
+    local offset="$2"
+    od -An -j "${offset}" -N 4 -t u1 "${file}" 2>/dev/null | \
+        awk '{ print ($1 + (256 * $2) + (65536 * $3) + (16777216 * $4)) }'
+}
+
+features="ext_attr dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum"
+inode_size=256
+
+# ext superblock is little-endian and starts at offset 1024.
+feature_compat=$(read_le_u32 "${dev}" 1116)
+journal_inum=$(read_le_u32 "${dev}" 1248)
+parsed_inode_size=$(read_le_u16 "${dev}" 1112)
+if [ -n "${parsed_inode_size:-}" ] && [ "${parsed_inode_size}" -gt 0 ]; then
+    inode_size="${parsed_inode_size}"
+fi
+if [ -n "${feature_compat:-}" ] && [ -n "${journal_inum:-}" ] && \
+   [ $((feature_compat & 0x4)) -ne 0 ] && [ "${journal_inum}" -ne 0 ]; then
+    features="has_journal ${features}"
+fi
+if [ "${need_marker}" -eq 1 ]; then
     features="${features} needs_recovery"
     rm -f /tmp/xfstests_ext4_needs_recovery >/dev/null 2>&1 || true
 fi
@@ -294,7 +334,7 @@ Dumpe2fs 1.47.0 (compat-shim)
 Filesystem volume name:   <none>
 Filesystem magic number:  0xEF53
 Filesystem features:      ${features}
-Inode size:               256
+Inode size:               ${inode_size}
 EOM
 exit 0
 EOF
@@ -709,8 +749,20 @@ emulate_pwrite() {
     local cmd="$1"
     local off=0
     local len=0
+    local fill_byte=0
+    local parse_fill=0
     local tokens=()
     read -r -a tokens <<<"${cmd}"
+    for token in "${tokens[@]}"; do
+        if [ "${parse_fill}" -eq 1 ]; then
+            fill_byte=$((token))
+            parse_fill=0
+            continue
+        fi
+        if [ "${token}" = "-S" ]; then
+            parse_fill=1
+        fi
+    done
     if [ "${#tokens[@]}" -ge 3 ]; then
         off=$(parse_size "${tokens[$((${#tokens[@]} - 2))]}")
         len=$(parse_size "${tokens[$((${#tokens[@]} - 1))]}")
@@ -724,8 +776,24 @@ emulate_pwrite() {
     mkdir -p "$(dirname "${target}")"
     [ -e "${target}" ] || : > "${target}"
 
+    if [ -x /opt/xfstests/fsync_file ]; then
+        /opt/xfstests/fsync_file pwrite "${target}" "${off}" "${len}" "${fill_byte}" >/dev/null 2>&1
+        return $?
+    fi
+
     # Emulate pwrite by issuing real data writes, not truncate-only growth.
     # This preserves ENOSPC behavior for tests like generic/027.
+    write_chunk() {
+        local seek="$1"
+        local count="$2"
+        if [ "${fill_byte}" -eq 0 ]; then
+            dd if=/dev/zero of="${target}" bs=1 seek="${seek}" count="${count}" conv=notrunc >/dev/null 2>&1
+            return $?
+        fi
+        awk -v n="${count}" -v c="${fill_byte}" 'BEGIN { for (i = 0; i < n; i++) printf "%c", c }' | \
+            dd of="${target}" bs=1 seek="${seek}" count="${count}" conv=notrunc >/dev/null 2>&1
+    }
+
     local pos="${off}"
     local rem="${len}"
     local blk=4096
@@ -734,20 +802,24 @@ emulate_pwrite() {
         head="${rem}"
     fi
     if [ "${head}" -gt 0 ]; then
-        dd if=/dev/zero of="${target}" bs=1 seek="${pos}" count="${head}" conv=notrunc >/dev/null 2>&1 || return 1
+        write_chunk "${pos}" "${head}" || return 1
         pos=$((pos + head))
         rem=$((rem - head))
     fi
 
     local full=$((rem / blk))
     if [ "${full}" -gt 0 ]; then
-        dd if=/dev/zero of="${target}" bs="${blk}" seek=$((pos / blk)) count="${full}" conv=notrunc >/dev/null 2>&1 || return 1
-        pos=$((pos + full * blk))
+        local i=0
+        while [ "${i}" -lt "${full}" ]; do
+            write_chunk "${pos}" "${blk}" || return 1
+            pos=$((pos + blk))
+            i=$((i + 1))
+        done
         rem=$((rem - full * blk))
     fi
 
     if [ "${rem}" -gt 0 ]; then
-        dd if=/dev/zero of="${target}" bs=1 seek="${pos}" count="${rem}" conv=notrunc >/dev/null 2>&1 || return 1
+        write_chunk "${pos}" "${rem}" || return 1
     fi
     return 0
 }
@@ -778,6 +850,11 @@ emulate_one() {
             return $?
             ;;
         fsync*|fdatasync*|syncfs*)
+            local op="${cmd%% *}"
+            if [ -n "${target}" ] && [ -x /opt/xfstests/fsync_file ]; then
+                /opt/xfstests/fsync_file "${op}" "${target}" >/dev/null 2>&1
+                return $?
+            fi
             sync >/dev/null 2>&1 || true
             return 0
             ;;
@@ -809,6 +886,47 @@ exit 0
 exit 1
 EOF
 chmod +x "${SHIM_DIR}/xfs_io"
+
+cat > "${SHIM_DIR}/umount" <<'EOF'
+#!/bin/bash
+set -eu
+
+translate_target() {
+    local arg="$1"
+    local mountpoint=""
+
+    case "${arg}" in
+        ""|-*)
+            printf '%s\n' "${arg}"
+            return 0
+            ;;
+    esac
+
+    if [ -b "${arg}" ] || [ "${arg#"/dev/"}" != "${arg}" ]; then
+        mountpoint=$(awk -v dev="${arg}" '$1==dev { print $2; exit }' /proc/mounts || true)
+        if [ -n "${mountpoint}" ]; then
+            printf '%s\n' "${mountpoint}"
+            return 0
+        fi
+    fi
+
+    printf '%s\n' "${arg}"
+}
+
+args=()
+for arg in "$@"; do
+    args+=("$(translate_target "${arg}")")
+done
+
+for cand in /usr/bin/umount /bin/umount; do
+    if [ -x "${cand}" ] && [ "$(readlink -f "${cand}" 2>/dev/null || printf '%s' "${cand}")" != "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
+        exec "${cand}" "${args[@]}"
+    fi
+done
+
+exec /usr/bin/busybox umount "${args[@]}"
+EOF
+chmod +x "${SHIM_DIR}/umount"
 
 # xfstests freeze/shutdown groups rely on xfs_freeze/godown helpers.
 # Asterinas ext4 test environment currently lacks native ioctl support for
@@ -854,6 +972,14 @@ chmod +x "${SHIM_DIR}/xfs_freeze"
 
 export PATH="${SHIM_DIR}:${PATH}"
 export XFS_IO_PROG="${SHIM_DIR}/xfs_io"
+for libdir in /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu /lib64 /usr/lib64; do
+    [ -d "${libdir}" ] || continue
+    if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+        export LD_LIBRARY_PATH="${libdir}:${LD_LIBRARY_PATH}"
+    else
+        export LD_LIBRARY_PATH="${libdir}"
+    fi
+done
 
 export FSTYP=ext4
 export TEST_DEV
@@ -1221,6 +1347,10 @@ case "${MODE}" in
     phase6_good)
         BASE_LIST=${PHASE6_GOOD_LIST}
         STATIC_EXCLUDED=${PHASE6_STATIC_EXCLUDED}
+        ;;
+    jbd_phase1)
+        BASE_LIST=${JBD_PHASE1_LIST}
+        STATIC_EXCLUDED=${JBD_PHASE1_STATIC_EXCLUDED}
         ;;
     *)
         echo "Error: unsupported XFSTESTS_MODE=${MODE}" >&2

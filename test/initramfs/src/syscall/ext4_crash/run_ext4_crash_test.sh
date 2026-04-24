@@ -6,6 +6,7 @@ set -eu
 
 PHASE=${EXT4_CRASH_PHASE:-verify}
 SCENARIO=${EXT4_CRASH_SCENARIO:-create_write}
+EXPECT=${EXT4_CRASH_EXPECT:-committed}
 TEST_DEV=${EXT4_CRASH_TEST_DEV:-/dev/vda}
 MNT_DIR=${EXT4_CRASH_MNT:-/ext4_crash_test}
 CASE_DIR_NAME=${EXT4_CRASH_CASE_DIR:-phase4_crash}
@@ -22,6 +23,21 @@ require_file_content() {
     [ -f "${file}" ] || fail "missing file ${file}"
     actual=$(cat "${file}" 2>/dev/null || true)
     [ "${actual}" = "${expected}" ] || fail "file content mismatch for ${file}"
+}
+
+require_file_size() {
+    file="$1"
+    expected="$2"
+    [ -f "${file}" ] || fail "missing file ${file}"
+    actual=$(wc -c < "${file}" 2>/dev/null | tr -d '[:space:]')
+    [ "${actual}" = "${expected}" ] || fail "file size mismatch for ${file}: got ${actual}, want ${expected}"
+}
+
+require_file_contains() {
+    file="$1"
+    needle="$2"
+    [ -f "${file}" ] || fail "missing file ${file}"
+    grep -F -q "${needle}" "${file}" 2>/dev/null || fail "file ${file} does not contain ${needle}"
 }
 
 ensure_mountpoint_unmounted() {
@@ -129,6 +145,133 @@ verify_truncate_append() {
     require_file_content "${CASE_DIR}/truncate_append.txt" "after-truncate-append"
 }
 
+prepare_large_write() {
+    mkdir -p "${CASE_DIR}"
+    dd if=/dev/zero of="${CASE_DIR}/large_write.tmp" bs=4096 count=1024 >/dev/null 2>&1
+    mv "${CASE_DIR}/large_write.tmp" "${CASE_DIR}/large_write.bin"
+}
+
+verify_large_write() {
+    require_file_size "${CASE_DIR}/large_write.bin" 4194304
+}
+
+prepare_fsync_durability() {
+    mkdir -p "${CASE_DIR}"
+    printf "fsync-durable-payload" > "${CASE_DIR}/fsync_durability.tmp"
+    sync
+    mv "${CASE_DIR}/fsync_durability.tmp" "${CASE_DIR}/fsync_durability.txt"
+}
+
+verify_fsync_durability() {
+    require_file_content "${CASE_DIR}/fsync_durability.txt" "fsync-durable-payload"
+}
+
+prepare_multi_file_create() {
+    mkdir -p "${CASE_DIR}/multi_tmp"
+    for i in 1 2 3 4 5 6 7 8; do
+        printf "multi-file-%s" "${i}" > "${CASE_DIR}/multi_tmp/file_${i}.txt"
+    done
+    mv "${CASE_DIR}/multi_tmp" "${CASE_DIR}/multi"
+}
+
+verify_multi_file_create() {
+    for i in 1 2 3 4 5 6 7 8; do
+        require_file_content "${CASE_DIR}/multi/file_${i}.txt" "multi-file-${i}"
+    done
+}
+
+prepare_dir_tree_churn() {
+    mkdir -p "${CASE_DIR}/tree/a/b/c" "${CASE_DIR}/tree/remove_me"
+    printf "tree-marker" > "${CASE_DIR}/tree/a/b/c/marker.txt"
+    rmdir "${CASE_DIR}/tree/remove_me"
+}
+
+verify_dir_tree_churn() {
+    require_file_content "${CASE_DIR}/tree/a/b/c/marker.txt" "tree-marker"
+    [ ! -e "${CASE_DIR}/tree/remove_me" ] || fail "removed directory still exists"
+}
+
+prepare_rename_across_dir() {
+    mkdir -p "${CASE_DIR}/src" "${CASE_DIR}/dst"
+    printf "rename-across-dir" > "${CASE_DIR}/src/item.txt"
+    mv "${CASE_DIR}/src/item.txt" "${CASE_DIR}/dst/item.txt"
+}
+
+verify_rename_across_dir() {
+    [ ! -e "${CASE_DIR}/src/item.txt" ] || fail "source still exists after cross-dir rename"
+    require_file_content "${CASE_DIR}/dst/item.txt" "rename-across-dir"
+}
+
+prepare_truncate_shrink() {
+    mkdir -p "${CASE_DIR}"
+    dd if=/dev/zero of="${CASE_DIR}/truncate_shrink.bin" bs=4096 count=4 >/dev/null 2>&1
+    : > "${CASE_DIR}/truncate_shrink.bin"
+}
+
+verify_truncate_shrink() {
+    require_file_size "${CASE_DIR}/truncate_shrink.bin" 0
+}
+
+prepare_append_concurrent() {
+    mkdir -p "${CASE_DIR}"
+    : > "${CASE_DIR}/append_concurrent.tmp"
+    for i in 1 2 3 4; do
+        (
+            printf "worker-%s\n" "${i}" >> "${CASE_DIR}/append_concurrent.tmp"
+        ) &
+    done
+    wait
+    printf "append-final\n" >> "${CASE_DIR}/append_concurrent.tmp"
+    mv "${CASE_DIR}/append_concurrent.tmp" "${CASE_DIR}/append_concurrent.txt"
+}
+
+verify_append_concurrent() {
+    require_file_contains "${CASE_DIR}/append_concurrent.txt" "append-final"
+}
+
+prepare_scenario() {
+    case "$1" in
+        create_write) prepare_create_write ;;
+        rename) prepare_rename ;;
+        truncate_append) prepare_truncate_append ;;
+        large_write) prepare_large_write ;;
+        fsync_durability) prepare_fsync_durability ;;
+        multi_file_create) prepare_multi_file_create ;;
+        dir_tree_churn) prepare_dir_tree_churn ;;
+        rename_across_dir) prepare_rename_across_dir ;;
+        truncate_shrink) prepare_truncate_shrink ;;
+        append_concurrent) prepare_append_concurrent ;;
+        *) fail "unknown scenario $1" ;;
+    esac
+}
+
+verify_scenario() {
+    case "$1" in
+        create_write) verify_create_write ;;
+        rename) verify_rename ;;
+        truncate_append) verify_truncate_append ;;
+        large_write) verify_large_write ;;
+        fsync_durability) verify_fsync_durability ;;
+        multi_file_create) verify_multi_file_create ;;
+        dir_tree_churn) verify_dir_tree_churn ;;
+        rename_across_dir) verify_rename_across_dir ;;
+        truncate_shrink) verify_truncate_shrink ;;
+        append_concurrent) verify_append_concurrent ;;
+        *) fail "unknown scenario $1" ;;
+    esac
+}
+
+verify_scenario_uncommitted() {
+    case "$1" in
+        create_write)
+            [ ! -e "${CASE_DIR}/create_write.txt" ] || fail "uncommitted create_write file exists"
+            ;;
+        *)
+            fail "uncommitted expectation is not implemented for scenario $1"
+            ;;
+    esac
+}
+
 case "${PHASE}" in
     prepare)
         ensure_device_unmounted "${TEST_DEV}"
@@ -137,20 +280,7 @@ case "${PHASE}" in
         fi
         mount_test_dev
 
-        case "${SCENARIO}" in
-            create_write)
-                prepare_create_write
-                ;;
-            rename)
-                prepare_rename
-                ;;
-            truncate_append)
-                prepare_truncate_append
-                ;;
-            *)
-                fail "unknown scenario ${SCENARIO}"
-                ;;
-        esac
+        prepare_scenario "${SCENARIO}"
 
         echo "EXT4_CRASH_PREPARE_DONE scenario=${SCENARIO}"
         # If kernel replay-hold injection is disabled, keep VM alive for host-side kill.
@@ -158,18 +288,15 @@ case "${PHASE}" in
         ;;
     verify)
         mount_test_dev
-        case "${SCENARIO}" in
-            create_write)
-                verify_create_write
+        case "${EXPECT}" in
+            committed)
+                verify_scenario "${SCENARIO}"
                 ;;
-            rename)
-                verify_rename
-                ;;
-            truncate_append)
-                verify_truncate_append
+            uncommitted)
+                verify_scenario_uncommitted "${SCENARIO}"
                 ;;
             *)
-                fail "unknown scenario ${SCENARIO}"
+                fail "unknown expectation ${EXPECT}"
                 ;;
         esac
         sync || true

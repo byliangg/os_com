@@ -25,6 +25,9 @@ BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/benchmark/assets/initramfs/initram
 PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
+CRASH_HOLD_STAGE=${CRASH_HOLD_STAGE:-after_commit}
+CRASH_SCENARIOS=${CRASH_SCENARIOS:-"create_write:write rename:rename truncate_append:write large_write:rename fsync_durability:rename multi_file_create:rename dir_tree_churn:rmdir truncate_shrink:truncate append_concurrent:rename"}
+CRASH_EXPECT=${CRASH_EXPECT:-committed}
 XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
 XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE:-0}
 XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC:-600}
@@ -39,6 +42,7 @@ RUN_CRASH_SUITE=${RUN_CRASH_SUITE:-1}
 RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD:-1}
 RUN_PHASE3_BASE=${RUN_PHASE3_BASE:-1}
 RUN_PHASE6_GOOD=${RUN_PHASE6_GOOD:-0}
+RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
 RUN_LMBENCH=${RUN_LMBENCH:-1}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
@@ -50,8 +54,9 @@ fi
 run_crash_prepare_once() {
   local scenario="$1"
   local hold_op="$2"
-  local round="$3"
-  local log_file="$4"
+  local hold_stage="$3"
+  local round="$4"
+  local log_file="$5"
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
@@ -66,6 +71,7 @@ run_crash_prepare_once() {
     --kcmd-args='EXT4_CRASH_SKIP_MKFS=1' \
     --kcmd-args='ext4fs.replay_hold=1' \
     --kcmd-args='ext4fs.replay_hold_op=${hold_op}' \
+    --kcmd-args='ext4fs.replay_hold_stage=${hold_stage}' \
     --init-args='/opt/syscall_test/run_syscall_test.sh' \
     --target-arch=x86_64 \
     --profile release-lto \
@@ -74,7 +80,7 @@ run_crash_prepare_once() {
     --initramfs='${INITRAMFS_IMG}'" >"${log_file}" 2>&1 &
   local run_pid=$!
 
-  local marker="replay hold point reached for op=${hold_op}"
+  local marker="replay hold point reached for op=${hold_op} stage=${hold_stage}"
   marker_seen_in_log() {
     grep -aF -q "${marker}" "${log_file}" 2>/dev/null
   }
@@ -110,8 +116,9 @@ run_crash_prepare_once() {
 
 run_crash_verify_once() {
   local scenario="$1"
-  local round="$2"
-  local log_file="$3"
+  local expect="$2"
+  local round="$3"
+  local log_file="$4"
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
@@ -123,6 +130,7 @@ run_crash_verify_once() {
     --kcmd-args='SYSCALL_TEST_SUITE=ext4_crash' \
     --kcmd-args='EXT4_CRASH_PHASE=verify' \
     --kcmd-args='EXT4_CRASH_SCENARIO=${scenario}' \
+    --kcmd-args='EXT4_CRASH_EXPECT=${expect}' \
     --init-args='/opt/syscall_test/run_syscall_test.sh' \
     --target-arch=x86_64 \
     --profile release-lto \
@@ -150,20 +158,20 @@ run_crash_verify_once() {
 run_crash_suite() {
   local summary="$1"
   : > "${summary}"
-  printf "round\tscenario\thold_op\tprepare_log\tverify_log\tresult\n" >> "${summary}"
+  printf "round\tscenario\thold_op\thold_stage\tprepare_log\tverify_log\tresult\n" >> "${summary}"
 
   local round
   for round in $(seq 1 "${CRASH_ROUNDS}"); do
-    for item in create_write:write rename:rename truncate_append:write; do
+    for item in ${CRASH_SCENARIOS}; do
       local scenario="${item%%:*}"
       local hold_op="${item##*:}"
       local prepare_log="${LOG_DIR}/crash/${scenario}_prepare_r${round}.log"
       local verify_log="${LOG_DIR}/crash/${scenario}_verify_r${round}.log"
 
-      run_crash_prepare_once "${scenario}" "${hold_op}" "${round}" "${prepare_log}"
-      run_crash_verify_once "${scenario}" "${round}" "${verify_log}"
-      printf "%s\t%s\t%s\t%s\t%s\tPASS\n" \
-        "${round}" "${scenario}" "${hold_op}" "${prepare_log}" "${verify_log}" >> "${summary}"
+      run_crash_prepare_once "${scenario}" "${hold_op}" "${CRASH_HOLD_STAGE}" "${round}" "${prepare_log}"
+      run_crash_verify_once "${scenario}" "${CRASH_EXPECT}" "${round}" "${verify_log}"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\tPASS\n" \
+        "${round}" "${scenario}" "${hold_op}" "${CRASH_HOLD_STAGE}" "${prepare_log}" "${verify_log}" >> "${summary}"
     done
   done
 
@@ -305,6 +313,7 @@ CRASH_SUMMARY="${LOG_DIR}/crash/phase4_part3_crash_summary_${TS}.tsv"
 PHASE4_LOG="${LOG_DIR}/phase4_good_${TS}.log"
 PHASE3_LOG="${LOG_DIR}/phase3_base_guard_${TS}.log"
 PHASE6_LOG="${LOG_DIR}/phase6_good_${TS}.log"
+JBD_PHASE1_LOG="${LOG_DIR}/jbd_phase1_${TS}.log"
 LMB_SUMMARY="${LOG_DIR}/lmbench/phase4_part3_lmbench_summary_${TS}.tsv"
 
 ANY_STAGE_RAN=0
@@ -337,6 +346,13 @@ else
   echo "[SKIP] phase6_good disabled (RUN_PHASE6_GOOD=${RUN_PHASE6_GOOD})"
 fi
 
+if [ "${RUN_JBD_PHASE1}" = "1" ]; then
+  run_xfstests_mode jbd_phase1 90 "${JBD_PHASE1_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] jbd_phase1 disabled (RUN_JBD_PHASE1=${RUN_JBD_PHASE1})"
+fi
+
 if [ "${RUN_LMBENCH}" = "1" ]; then
   run_lmbench_regression "${LMB_SUMMARY}"
   ANY_STAGE_RAN=1
@@ -345,7 +361,7 @@ else
 fi
 
 if [ "${ANY_STAGE_RAN}" -ne 1 ]; then
-  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_LMBENCH." >&2
+  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_LMBENCH." >&2
   exit 2
 fi
 

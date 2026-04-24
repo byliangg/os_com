@@ -860,6 +860,7 @@ version = "1.3.3"
 dependencies = [
  "bitflags 2.9.1",
  "log",
+ "spin",
 ]
 
 [[package]]

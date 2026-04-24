@@ -6,6 +6,11 @@ use crate::ext4_defs::*;
 
 impl Ext4 {
     #[inline]
+    pub fn write_metadata(&self, offset: usize, data: &[u8]) {
+        self.metadata_writer.write_metadata(offset, data);
+    }
+
+    #[inline]
     pub fn sync_runtime_block_size(&self) {
         set_runtime_block_size(self.super_block.block_size() as usize);
     }
@@ -82,6 +87,7 @@ impl Ext4 {
         // drop(block);
         
         let ext4_tmp = Ext4 {
+            metadata_writer: Arc::new(PassthroughMetadataWriter::new(block_device.clone())),
             block_device,
             super_block,
             system_zone_cache: None,

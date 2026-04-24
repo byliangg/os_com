@@ -1,0 +1,2 @@
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	create_write	write	before_commit	/root/asterinas/benchmark/logs/crash/create_write_prepare_r1.log	/root/asterinas/benchmark/logs/crash/create_write_verify_r1.log	PASS

@@ -1,285 +1,213 @@
-# Asterinas EXT4 赛题版本（optimize_phase_1）
+# Asterinas EXT4 + JBD2 赛题版本
 
-## 1. 项目概述
+本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 1 完成状态**：在 Asterinas 上实现 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery，并用 xfstests、crash matrix、fio 与编译/单测完成闭环验证。
 
-本仓库是基于 Asterinas 内核进行 EXT4 适配与验证的赛题工程版本，目标是：
+当前日期口径：2026-04-24（Asia/Shanghai）。
 
-1. 在 Asterinas 上实现并验证 EXT4 的核心文件系统能力。
-2. 通过 xfstests 与 lmbench 建立可重复、可追踪的功能与性能验证流程。
-3. 将测试输入、输出、运行资产统一收敛到仓库内，降低环境漂移风险，支持跨环境直接复现。
+## 当前状态
 
-本版本重点覆盖 `optimize_phase_1` 阶段工作（EXT4 fio 性能 Phase 1 优化），测试默认在 Docker 环境中执行。
+### 已完成
 
-## 2. 当前完成情况
+- EXT4 基础文件与目录能力：`create/open/close/read/write/truncate/lseek/mkdir/rmdir/unlink/rename/stat` 等核心路径已接入并持续通过阶段回归。
+- Extent 连续块管理：支持多块分配、extent tree 插入/删除/折叠修复，并修复 `generic/013`、`generic/068` 等长期暴露的一致性问题。
+- fio O_DIRECT 性能 Phase 1：顺序读写已达到守底目标，最新 JBD2 收口后结果为 read `93.49%`、write `87.01%`（对比 Linux ext4）。
+- JBD2 Phase 1：已完成完整事务管理、日志写盘、checkpoint、dirty journal recovery、crash 注入与旧 CrashJournal 移除。
 
-### 2.1 功能实现与修复
+### 仍在后续阶段
 
-1. 已完成一组可运行的 EXT4 核心功能链路，覆盖基础文件读写与目录操作相关场景。
-2. 已修复历史关键问题：针对 legacy block map 路径的兼容处理（含 direct/single/double/triple 逻辑分支），解决了此前 `generic/013`、`generic/084` 等场景中的目录查找异常。
-3. 已形成稳定的阶段测试入口脚本与日志归档流程。
-4. 已完成 `ext4_rs` 工程目录迁移：`third_party/ext4_rs -> kernel/libs/ext4_rs`，并保持 workspace 依赖方式不变。
-5. 已新增 EXT4 fio 单项对照作业：`fio/ext4_seq_write_bw`、`fio/ext4_seq_read_bw`，并接入 `bench_linux_and_aster.sh` 统一对比口径。
-6. 已完成 Stage7 写路径优化：
-   1. `ext4_rs::write_at` 改为“整段预映射 + 连续物理块批量写”，避免原先按 4KiB 块逐次读改写导致的 I/O 放大。
-   2. 对“块对齐的追加写”增加快速预分配分支，减少 `ensure_write_range_mapped` 逐块探测开销。
-7. 已完成 Stage7 读路径优化：
-   1. `ext4_rs::read_at` 增加 extent 命中缓存，减少顺序读中重复 extent tree 查询。
-   2. 引入复用缓冲读取路径，减少每块 `Vec` 分配/拷贝。
-8. 已完成内核 EXT4 设备适配层优化：
-   1. 增加 `read_offset_into` 接口，用于向已有缓冲区读取。
-   2. 对齐读写命中 fast path 时直接走设备读写，减少中间对齐缓冲。
-9. 已修正 fio 对比流程公平性：Asterinas/Linux 均基于重新 prepare 后的镜像执行，避免镜像状态不对称。
+- 多文件并发读写是 `feature_jbd2_phase2` 范围。
+- 更大范围 xfstests、更多 Linux ext4 兼容语义、并发吞吐优化和 PageCache 深度优化仍可继续推进。
 
-### 2.2 测试状态（optimize_phase_1 最终，2026-04-17）
+## JBD2 Phase 1 进展
 
-#### 功能回归
+JBD2 Phase 1 的目标是替换旧的自研 sector-based CrashJournal，改为使用与 Linux ext4/JBD2 兼容的 block-level journal 格式，并满足“日志刷盘、事务管理、全量崩溃恢复、多场景 crash 一致性”的优秀档核心要求。
 
-1. `phase3_base`：PASS（`pass_rate=100.00%`）
-2. `phase4_good`：PASS（`pass_rate=100.00%`）
-3. `phase6_good`：PASS（`pass_rate=100.00%`）
+本阶段已经完成：
 
-#### fio EXT4 对照（双边，`size=1G bs=1M ioengine=sync direct=1`）
+- 新增 JBD2 on-disk 数据结构：journal header、superblock v2、descriptor tag、commit block、revoke block header 与相关 feature/type 常量。
+- 复用 mkfs.ext4 创建的 journal inode（默认 inode 8），实现 journal inode 物理块映射、journal superblock 读取/校验、ring buffer head/tail 管理。
+- 新增 `JournalHandle`、`JournalTransaction`、`JournalRuntime`，按事务记录 metadata block 镜像、handle 生命周期、提交计划与 checkpoint 队列。
+- 新增 `MetadataWriter` 拦截层，superblock、inode、block group、bitmap、dir、extent 等 metadata 写入路径统一进入 JBD2 handle。
+- ordered mode 语义：文件 data block 仍写 home location，metadata 进入 journal；commit 前保证需要的数据写入顺序。
+- 实现 JBD2 commit 序列：descriptor block、metadata data block、commit block、journal superblock head/sequence 更新。
+- 实现 checkpoint：committed transaction 的 metadata block 批量回写 home block，随后推进 journal tail / `s_start`。
+- 实现标准 recovery 入口：mount 时根据 journal `s_start` 或 ext4 `needs_recovery` 扫描 descriptor/data/commit transaction，replay metadata，清空 journal，并清除 `needs_recovery`。
+- 新增 host 工具 `jbd2_probe`，支持 `show-super`、`write-probe-tx`、`recover`，用于离线构造 dirty journal 与验证 recovery。
+- 移除旧 CrashJournal 路径：旧 sector record、mount replay、sector 0 read/write、`crash_journal` 参数与 sync 清理分支均已删除。
 
-| 测试项 | Asterinas | Linux | 比值 | 目标 |
-|--------|-----------|-------|------|------|
-| ext4_seq_read_bw | 4870 MB/s | 5084 MB/s | **95.79%** | ≥80% ✅ |
-| ext4_seq_write_bw | 2651 MB/s | 2930 MB/s | **90.48%** | ≥80% ✅ |
+## 最新验证结果
 
-最新日志见：
+### 功能回归
 
-1. `benchmark/logs/fio_both_20260417_120541.log`
-2. `benchmark/logs/phase6_with_guard_20260417_120541.log`
-3. `benchmark/benchmark.md`
-
-### 2.3 与”良好”指标的对比
-
-按当前赛题”良好”口径：
-
-1. `xfstests` 阶段集通过率（`>=90%`）：**已满足**（`phase3/phase4/phase6` 均 `100%`）。
-2. fio EXT4 对照性能（目标 `>=80%`）：**已满足**（读 `95.79%`、写 `90.48%`）。
-
-### 2.4 optimize_phase_1 主要优化（2026-04-17）
-
-1. 实现 EXT4 O_DIRECT 读路径的 speculative readahead + double buffering（single-slot 版本）。
-2. 引入 bio fast-submit hint，speculative read request 在软件队列为空时直接提交到 virtqueue。
-3. 扩大 direct-read planning window（`64/256MiB` → `128/512MiB`），降低 cache miss 频率。
-4. fio 测试参数从 `size=128M` 统一对齐为 `size=1G`，与 ext2 口径一致。
-5. 上述优化将 ext4 顺序读从基线 `65.89%` 提升至 `95.79%`，实现目标突破。
-
-## 3. 测试体系说明
-
-### 3.1 xfstests 模式
-
-当前主要使用以下模式：
-
-1. `phase4_good`
-2. `phase3_only`
-3. `phase6_only`
-4. `lmbench_only`
-5. `crash_only`
-
-对应用例集合与静态排除列表在：
-
-1. `test/initramfs/src/syscall/xfstests/testcases/`
-2. `test/initramfs/src/syscall/xfstests/blocked/`
-
-### 3.2 结果口径
-
-当前脚本中 xfstests 通过率口径为：
-
-1. 分母 = `PASS + FAIL`
-2. `NOTRUN` 与 `STATIC_BLOCKED` 不计入分母
-
-因此阅读测试结果时，需要同时结合详细结果表看覆盖边界。
-
-### 3.3 当前样例覆盖范围（概览）
-
-1. 当前 `phase6` 候选池为 `51`，静态排除 `26`，理论可运行集合 `25`。
-2. 当前门禁运行集合 `25/25` 均通过（`phase6_only`）。
-3. `STATIC_BLOCKED` 主要是阶段性能力外语义：如 AIO、hardlink/symlink、`O_TMPFILE/flink`、`renameat2`、`fallocate/collapse-range/fiemap`、xattr/chacl 等。
-4. lmbench 覆盖 8 项：`open/stat/fstat/read/write` 延迟、`create+delete(0k/10k)`、`copy_files_bw`。
-
-## 4. 一键测试（推荐）
-
-在仓库根目录执行：
-
-```bash
-cd /home/lby/os_com_codex/asterinas
-
-# 1) phase4
-PHASE4_DOCKER_MODE=phase4_good \
-ENABLE_KVM=1 \
-XFSTESTS_CASE_TIMEOUT_SEC=900 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# 2) phase3
-PHASE4_DOCKER_MODE=phase3_only \
-ENABLE_KVM=1 \
-XFSTESTS_CASE_TIMEOUT_SEC=900 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# 3) lmbench
-PHASE4_DOCKER_MODE=lmbench_only \
-ENABLE_KVM=1 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# 4) phase6 功能门禁
-PHASE4_DOCKER_MODE=phase6_only \
-ENABLE_KVM=1 \
-KLOG_LEVEL=error \
-./tools/ext4/run_phase4_in_docker.sh
-
-# 5) Linux EXT4 对照性能（8项x3轮）
-PERF_ROUNDS=3 \
-BENCH_ENABLE_KVM=1 \
-PERF_CASE_TIMEOUT_SEC=600 \
-./tools/ext4/run_phase6_perf_compare_in_docker.sh
-
-# 6) EXT4 fio 单项对照（一键，顺序写）
-LOG=benchmark/logs/perf_compare/fio_ext4_seq_write_$(date +%Y%m%d_%H%M%S).log
-BENCH_ENABLE_KVM=1 \
-BENCH_ASTER_NETDEV=tap \
-BENCH_ASTER_VHOST=on \
-bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_write_bw x86_64 >"$LOG" 2>&1
-echo "fio 顺序写日志：$LOG"
-
-# 7) EXT4 fio 单项对照（一键，顺序读）
-LOG=benchmark/logs/perf_compare/fio_ext4_seq_read_$(date +%Y%m%d_%H%M%S).log
-BENCH_ENABLE_KVM=1 \
-BENCH_ASTER_NETDEV=tap \
-BENCH_ASTER_VHOST=on \
-bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_read_bw x86_64 >"$LOG" 2>&1
-echo "fio 顺序读日志：$LOG"
-
-# 8) EXT4 fio 双项串行对照（一键，先写后读）
-for JOB in fio/ext4_seq_write_bw fio/ext4_seq_read_bw; do
-   LOG=benchmark/logs/perf_compare/${JOB##*/}_$(date +%Y%m%d_%H%M%S).log
-   BENCH_ENABLE_KVM=1 \
-   BENCH_ASTER_NETDEV=tap \
-   BENCH_ASTER_VHOST=on \
-   bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "$JOB" x86_64 >"$LOG" 2>&1
-   echo "$JOB 日志：$LOG"
-done
-
-# 9) 通用回归（非 ext4），用于检查 kernel 改动是否波及其他子系统
-# 说明：
-# - 先重建 ext2/exfat 镜像，避免被 xfstests 流程污染
-# - 该回归建议 ENABLE_KVM=0，规避部分环境下 qemu accel 参数冲突
-./tools/reset_ext2_exfat_images.sh
-
-PROXY_HTTP=http://127.0.0.1:7890
-PROXY_SOCKS=socks5://127.0.0.1:7890
-DOCKER_TAG=$(cat DOCKER_IMAGE_VERSION 2>/dev/null || cat VERSION)
-LOG=benchmark/logs/others_general_$(date +%Y%m%d_%H%M%S).log
-
-docker run --rm --privileged --network=host \
-  -v /dev:/dev \
-  -v "$PWD":/root/asterinas \
-  -w /root/asterinas \
-  -e http_proxy="$PROXY_HTTP" \
-  -e https_proxy="$PROXY_HTTP" \
-  -e all_proxy="$PROXY_SOCKS" \
-  -e HTTP_PROXY="$PROXY_HTTP" \
-  -e HTTPS_PROXY="$PROXY_HTTP" \
-  -e ALL_PROXY="$PROXY_SOCKS" \
-  "asterinas/asterinas:${DOCKER_TAG}" \
-  bash -lc '
-set -euo pipefail
-mkdir -p /root/.cargo/bin
-cat >/root/.cargo/bin/cargo-osdk << "EOS"
-#!/usr/bin/env bash
-set -euo pipefail
-ROOT=${ASTERINAS_ROOT:-/root/asterinas}
-BIN="${ROOT}/target_lby/debug/cargo-osdk"
-STAMP="${ROOT}/target_lby/.cargo_osdk_local_dev"
-if [ ! -x "${BIN}" ] || [ ! -f "${STAMP}" ]; then
-  if [ -x "${BIN}" ] && [ ! -f "${STAMP}" ]; then
-    cargo clean --manifest-path "${ROOT}/osdk/Cargo.toml" -p cargo-osdk || true
-  fi
-  OSDK_LOCAL_DEV=1 cargo build --manifest-path "${ROOT}/osdk/Cargo.toml" --bin cargo-osdk
-  mkdir -p "$(dirname "${STAMP}")"
-  touch "${STAMP}"
-fi
-exec "${BIN}" "$@"
-EOS
-chmod +x /root/.cargo/bin/cargo-osdk
-export VDSO_LIBRARY_DIR=/root/asterinas/benchmark/assets/linux_vdso
-export CARGO_TARGET_DIR=/root/asterinas/target_lby
-timeout 5400s make AUTO_TEST=test ENABLE_KVM=0 LOG_LEVEL=error CONSOLE=ttyS0 BOOT_METHOD=qemu-direct OVMF=off RELEASE_LTO=1 run_kernel
-' | tee "$LOG"
-
-echo "通用回归日志：$LOG"
-grep -E "mount: mounting /dev/vda|mount: mounting /dev/vdb|All test in /test/fs passed|All general tests passed" "$LOG" | tail -n 20
-```
-
-## 5. 目录与文档索引
-
-| 文档/目录 | 作用 |
+| 测试项 | 最新结果 |
 | --- | --- |
-| `benchmark/README.md` | benchmark 子系统总览 |
-| `benchmark/benchmark.md` | 最新测试结论与结果摘要 |
-| `benchmark/environment.md` | 复现环境、依赖与命令说明 |
-| `benchmark/assets/README.md` | 测试运行资产说明（initramfs、xfstests、vDSO） |
-| `benchmark/datasets/xfstests/README.md` | xfstests 样例数据集说明 |
-| `benchmark/logs/` | 测试脚本默认日志输出目录 |
-| `benchmark/datasets/results/` | 归档后的稳定结果快照（便于 git 追踪） |
-| `tools/ext4/run_phase4_in_docker.sh` | 主测试入口（Docker） |
-| `tools/ext4/run_phase4_part3.sh` | phase3/phase4/lmbench 组合执行逻辑 |
+| `phase3_base_guard` | `10 PASS / 0 FAIL / 6 NOTRUN / 24 STATIC_BLOCKED` |
+| `phase4_good` | `12 PASS / 0 FAIL / 6 NOTRUN / 22 STATIC_BLOCKED` |
+| `phase6_good` | `25 PASS / 0 FAIL / 0 NOTRUN / 26 STATIC_BLOCKED` |
+| `jbd_phase1` | `6 PASS / 0 FAIL / 6 NOTRUN` |
+| JBD2 crash matrix | `9/9 PASS` |
+| commit 前/中 crash uncommitted 语义 | PASS |
+| dirty journal recovery | PASS（`jbd2_probe write-probe-tx -> recover -> e2fsck -fn`） |
 
-历史阶段文档（保留）示例：
+最新证据日志：
 
-1. `EXT4_PHASE2_REPRO.md`
-2. `EXT4_PHASE3_REPRO.md`
-3. `EXT4_PHASE3_PART1_SUMMARY.md`
-4. `asterinas_ext4_phase2_manual_test_commands.md`
+- `benchmark/logs/phase3_base_guard_20260424_070912.log`
+- `benchmark/logs/phase4_good_20260424_070912.log`
+- `benchmark/logs/phase6_good_20260424_070912.log`
+- `benchmark/logs/jbd_phase1_20260424_064149.log`
+- `benchmark/logs/crash/phase4_part3_crash_summary_20260424_063654.tsv`
+- `benchmark/logs/crash/phase4_part3_crash_summary_20260424_063948.tsv`
+- `benchmark/logs/crash/phase4_part3_crash_summary_20260424_064038.tsv`
 
-## 6. 复现所需运行资产
+严格关键词扫描为空，扫描范围包括 `ERROR`、`panic`、`BUG`、`logical block not mapped`、`mapped block out of range`、`Extentindex not found`、`ext4 write_at failed`、`Heap allocation error`、`Failed to allocate a large slot`。
 
-为降低对宿主 `.local` 的依赖，当前脚本默认读取仓库内资产：
+### fio EXT4 对照
 
-1. `benchmark/assets/initramfs/initramfs_phase3.cpio.gz`
-2. `benchmark/assets/xfstests-prebuilt/xfstests-dev`
-3. `benchmark/assets/linux_vdso/`
+fio 参数口径：`size=1G bs=1M ioengine=sync direct=1 numjobs=1 fsync_on_close=1 time_based=1 ramp_time=60 runtime=100`。
 
-对应默认路径已在脚本中切换完成，核心涉及：
+| 测试项 | Asterinas | Linux | 比值 | Phase 1 守底 |
+| --- | ---: | ---: | ---: | --- |
+| `ext4_seq_read_bw` | `4453 MB/s` | `4763 MB/s` | `93.49%` | PASS（>= 90%） |
+| `ext4_seq_write_bw` | `2417 MB/s` | `2778 MB/s` | `87.01%` | PASS（>= 85%） |
 
-1. `tools/ext4/run_phase4_in_docker.sh`
-2. `tools/ext4/run_phase4_part1.sh`
-3. `tools/ext4/run_phase4_part2.sh`
-4. `tools/ext4/run_phase4_part3.sh`
-5. `tools/ext4/prepare_phase4_part*_initramfs.sh`
-6. `tools/ext4/prepare_xfstests_prebuilt.sh`
+历史 optimize Phase 1 基线为 read `95.79%`、write `90.48%`。JBD2 Phase 1 收口后，read/write 相对基线均未超过 5 个百分点回退。
 
-## 7. 最小复现检查
+## 复现命令
 
-在跑测试前建议先检查：
+所有命令默认在仓库根目录执行：
 
 ```bash
 cd /home/lby/os_com_codex/asterinas
-
-test -f benchmark/assets/initramfs/initramfs_phase3.cpio.gz
-test -d benchmark/assets/xfstests-prebuilt/xfstests-dev
-test -f benchmark/assets/linux_vdso/vdso_x86_64.so
 ```
 
-环境前提：
+### 编译与单测
 
-1. 宿主机已安装 Docker。
-2. 宿主机可使用 `--privileged` 与 `/dev` 挂载能力。
-3. 建议支持 KVM（`ENABLE_KVM=1`），否则部分测试耗时会明显增加。
+```bash
+CARGO_TARGET_DIR=/tmp/os_com_codex_ext4_rs_target \
+cargo test -p ext4_rs --lib
 
-## 8. 当前边界与后续方向
+VDSO_LIBRARY_DIR="$(pwd)/benchmark/assets/linux_vdso" \
+CARGO_TARGET_DIR=/tmp/os_com_codex_kernel_target \
+cargo check -p aster-kernel --target x86_64-unknown-none
+```
 
-optimize_phase_1 已完成 fio 性能目标（读 `95.79%`、写 `90.48%`，均超过 `>=80%`）。后续可选方向：
+### xfstests 总体验收
 
-1. lmbench EXT4 对照性能（Phase 2：PageCache 集成，目标 copy/create_delete 等提升到 `>=80%`）。
-2. inode 元数据缓存（Phase 3：stat/fstat/open 延迟优化）。
-3. 在不回退现有通过率的前提下，继续扩大 xfstests 可运行集合，逐步减少 `STATIC_BLOCKED`。
-4. 继续沉淀自动化验收规范与提交前自检流程。
+```bash
+PHASE4_DOCKER_MODE=phase6_with_guard \
+ENABLE_KVM=1 \
+NETDEV=tap \
+VHOST=on \
+KLOG_LEVEL=error \
+bash tools/ext4/run_phase4_in_docker.sh
+```
 
-## 9. 致谢与来源说明
+该模式会串行覆盖 `phase4_good`、`phase3_base_guard` 与 `phase6_good`，适合作为 JBD2 Phase 1 的总体验收入口。
 
-本工程基于 Asterinas 社区项目进行赛题方向开发，保留原工程结构与许可证信息。
+### JBD2 专项 xfstests
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase1 \
+ENABLE_KVM=1 \
+RELEASE_LTO=0 \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+XFSTESTS_RUN_TIMEOUT_SEC=3600 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+`jbd_phase1` 列表位于：
+
+- `test/initramfs/src/syscall/xfstests/testcases/jbd_phase1.list`
+- `test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_excluded.tsv`
+
+### Crash 测试
+
+默认 9 场 JBD2 crash matrix：
+
+```bash
+PHASE4_DOCKER_MODE=crash_only \
+ENABLE_KVM=1 \
+NETDEV=tap \
+VHOST=on \
+CRASH_ROUNDS=1 \
+CRASH_HOLD_STAGE=after_commit \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+commit 前/中未提交语义验证示例：
+
+```bash
+PHASE4_DOCKER_MODE=crash_only \
+ENABLE_KVM=1 \
+NETDEV=tap \
+VHOST=on \
+CRASH_ROUNDS=1 \
+CRASH_SCENARIOS=create_write:write \
+CRASH_HOLD_STAGE=before_commit \
+CRASH_EXPECT=uncommitted \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+可用 `CRASH_HOLD_STAGE=before_commit_block` 覆盖 commit block 写入前的注入点。
+
+### fio 守底复跑
+
+```bash
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+该脚本顺序执行 `fio/ext4_seq_write_bw` 与 `fio/ext4_seq_read_bw`，默认只打印 Asterinas、Linux 与 ratio 摘要。需要保留过程日志时可加：
+
+```bash
+KEEP_LOGS=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+## 重要目录
+
+| 路径 | 作用 |
+| --- | --- |
+| `kernel/src/fs/ext4/` | Asterinas ext4 VFS 集成层，包含 mount、inode、JBD2 runtime 桥接、direct I/O 等 |
+| `kernel/libs/ext4_rs/` | EXT4 核心库，包含 extent、block allocator、dir、inode、JBD2 on-disk/recovery/transaction 逻辑 |
+| `kernel/libs/ext4_rs/src/ext4_impls/jbd2/` | JBD2 device、superblock、space、handle、transaction、journal、recovery 实现 |
+| `kernel/libs/ext4_rs/src/bin/jbd2_probe.rs` | host 侧 JBD2 验证工具 |
+| `test/initramfs/src/syscall/ext4_crash/` | crash matrix 测试脚本 |
+| `test/initramfs/src/syscall/xfstests/` | xfstests runner、case list、blocked list 与兼容 helper |
+| `test/initramfs/src/benchmark/fio/` | fio benchmark job 与 ext4 摘要脚本 |
+| `tools/ext4/` | Docker / initramfs / phase runner 入口 |
+| `benchmark/logs/` | 最新验证日志与 crash summary |
+| `benchmark/benchmark.md` | 当前 benchmark 快照 |
+
+## 文档索引
+
+本仓库的 `docs/` 目录保留了本赛题阶段文档：
+
+| 文档 | 作用 |
+| --- | --- |
+| `docs/feature_jbd2_phase1_analysis.md` | JBD2 Phase 1 问题分析 |
+| `docs/feature_jbd2_phase1_plan.md` | JBD2 Phase 1 实现计划 |
+| `docs/feature_jbd2_phase1_milestone.md` | JBD2 Phase 1 进度与验证记录 |
+| `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
+| `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
+| `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |
+| `docs/benchmark.md` | 根目录 benchmark 快照，与 `benchmark/benchmark.md` 同步 |
+| `docs/environment.md` | Docker、KVM、代理、benchmark 环境说明 |
+| `docs/赛题要求.md` | 比赛评审标准 |
+
+## 当前边界
+
+- Phase 1 为同步 commit/checkpoint 模型，没有引入后台 JBD2 commit 线程。
+- Revoke 机制已有结构与扫描骨架，当前 crash/recovery 验证覆盖的是本实现实际写出的 descriptor/data/commit 事务格式。
+- `rename_across_dir` crash 场景函数已保留，但 marker 触发不稳定，未纳入默认 crash matrix；默认矩阵已有 9 个场景并全部通过。
+- `STATIC_BLOCKED` 用例主要来自当前阶段未覆盖的 Linux ext4 语义或环境能力，例如 hardlink/symlink、AIO、xattr/chacl、renameat2、部分 fallocate/fiemap/collapse-range、device-mapper crash tests。
+- 多文件并发读写与更高并发吞吐优化属于下一阶段。
+
+## 来源说明
+
+本工程基于 Asterinas 社区项目进行 EXT4/JBD2 赛题方向开发，保留原工程结构与许可证信息。

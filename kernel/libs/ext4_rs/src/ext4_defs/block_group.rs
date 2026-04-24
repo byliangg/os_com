@@ -169,7 +169,7 @@ impl Ext4BlockGroup {
     /// Synchronize the block group data to disk.
     pub fn sync_block_group_to_disk(
         &self,
-        block_device: &Arc<dyn BlockDevice>,
+        metadata_writer: &Arc<dyn MetadataWriter>,
         bgid: usize,
         super_block: &Ext4Superblock,
     ) {
@@ -184,7 +184,7 @@ impl Ext4BlockGroup {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4BlockGroup>())
         };
-        block_device.write_offset(block_id * block_size + offset, data);
+        metadata_writer.write_metadata(block_id * block_size + offset, data);
     }
 
     /// Set the checksum of the block group descriptor.
@@ -196,12 +196,12 @@ impl Ext4BlockGroup {
     /// Synchronize the block group data to disk with checksum.
     pub fn sync_to_disk_with_csum(
         &mut self,
-        block_device: &Arc<dyn BlockDevice>,
+        metadata_writer: &Arc<dyn MetadataWriter>,
         bgid: usize,
         super_block: &Ext4Superblock,
     ) {
         self.set_block_group_checksum(bgid as u32, super_block);
-        self.sync_block_group_to_disk(block_device, bgid, super_block)
+        self.sync_block_group_to_disk(metadata_writer, bgid, super_block)
     }
 
     /// Set the block allocation bitmap checksum for this block group.

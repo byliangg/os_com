@@ -35,7 +35,7 @@ impl Ext4 {
         let mut blk = Block::load(&self.block_device, ind_block as usize * block_size);
         let ptr: &mut u32 = blk.read_offset_as_mut((idx as usize) * core::mem::size_of::<u32>());
         *ptr = val;
-        blk.sync_blk_to_disk(&self.block_device);
+        blk.sync_blk_to_disk(&self.metadata_writer);
         Ok(())
     }
 
@@ -46,9 +46,21 @@ impl Ext4 {
     ) -> Result<Ext4Fsblk> {
         let block_size = self.super_block.block_size() as usize;
         let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+        let fs_blocks = self.super_block.blocks_count() as u64;
 
         if lblock < EXT4_NDIR_BLOCKS {
             let p = inode_ref.inode.block[lblock as usize];
+            if p != 0 && (p as u64) >= fs_blocks {
+                log::error!(
+                    "[get_pblock_idx_legacy] direct block out of range: inode={} lblock={} pblock={} fs_blocks={} blocks={:?}",
+                    inode_ref.inode_num,
+                    lblock,
+                    p,
+                    fs_blocks,
+                    inode_ref.inode.block
+                );
+                return_errno_with_message!(Errno::EIO, "legacy direct block out of range");
+            }
             if p != 0 {
                 return Ok(p as u64);
             }
@@ -61,7 +73,30 @@ impl Ext4 {
             if ind_block == 0 {
                 return_errno_with_message!(Errno::ENOENT, "legacy indirect block absent");
             }
+            if (ind_block as u64) >= fs_blocks {
+                log::error!(
+                    "[get_pblock_idx_legacy] indirect block out of range: inode={} lblock={} ind_block={} fs_blocks={} blocks={:?}",
+                    inode_ref.inode_num,
+                    lblock,
+                    ind_block,
+                    fs_blocks,
+                    inode_ref.inode.block
+                );
+                return_errno_with_message!(Errno::EIO, "legacy indirect block out of range");
+            }
             let p = self.legacy_read_indirect_ptr(ind_block, rel)?;
+            if p != 0 && (p as u64) >= fs_blocks {
+                log::error!(
+                    "[get_pblock_idx_legacy] indirect data block out of range: inode={} lblock={} rel={} pblock={} ind_block={} fs_blocks={}",
+                    inode_ref.inode_num,
+                    lblock,
+                    rel,
+                    p,
+                    ind_block,
+                    fs_blocks
+                );
+                return_errno_with_message!(Errno::EIO, "legacy indirect data block out of range");
+            }
             if p != 0 {
                 return Ok(p as u64);
             }
@@ -139,8 +174,37 @@ impl Ext4 {
         inode_table_blk_num as usize * block_size + index as usize * inode_size as usize
     }
 
+    fn write_inode_image(&self, inode_num: u32, inode: &Ext4Inode) {
+        let block_size = self.super_block.block_size() as usize;
+        let inode_size = self.super_block.inode_size() as usize;
+        let inode_pos = self.inode_disk_pos(inode_num);
+        let block_offset = inode_pos / block_size * block_size;
+        let offset_in_block = inode_pos - block_offset;
+
+        let mut block = Block::load(&self.block_device, block_offset);
+        let inode_bytes = unsafe {
+            core::slice::from_raw_parts(inode as *const _ as *const u8, size_of::<Ext4Inode>())
+        };
+        let copy_len = core::cmp::min(inode_size, inode_bytes.len());
+        block.data[offset_in_block..offset_in_block + copy_len]
+            .copy_from_slice(&inode_bytes[..copy_len]);
+        if inode_size > copy_len {
+            block.data[offset_in_block + copy_len..offset_in_block + inode_size].fill(0);
+        }
+        block.sync_blk_to_disk(&self.metadata_writer);
+    }
+
+    pub fn validate_inode_number(&self, inode_num: u32) -> Result<()> {
+        if inode_num == 0 || inode_num > self.super_block.inodes_count {
+            return_errno_with_message!(Errno::EIO, "invalid inode number");
+        }
+        Ok(())
+    }
+
     /// Load the inode reference from the disk.
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
+        self.validate_inode_number(inode_num)
+            .expect("invalid inode number passed to get_inode_ref");
         let offset = self.inode_disk_pos(inode_num);
 
         let mut ext4block = Block::load(&self.block_device, offset);
@@ -155,35 +219,24 @@ impl Ext4 {
 
     /// write back inode with checksum
     pub fn write_back_inode(&self, inode_ref: &mut Ext4InodeRef) {
-        let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
-
         // make sure self.super_block is up-to-date
         inode_ref
             .inode
             .set_inode_checksum(&self.super_block, inode_ref.inode_num);
-        inode_ref
-            .inode
-            .sync_inode_to_disk(&self.block_device, inode_pos);
+        self.write_inode_image(inode_ref.inode_num, &inode_ref.inode);
     }
 
     /// write back inode with checksum
     pub fn write_back_inode_without_csum(&self, inode_ref: &Ext4InodeRef) {
-        let inode_pos = self.inode_disk_pos(inode_ref.inode_num);
-
-        inode_ref
-            .inode
-            .sync_inode_to_disk(&self.block_device, inode_pos);
+        self.write_inode_image(inode_ref.inode_num, &inode_ref.inode);
     }
 
-    /// Get physical block id of a logical block.
-    ///
-    /// Params:
-    /// inode_ref: &Ext4InodeRef - inode reference
-    /// lblock: Ext4Lblk - logical block id
-    ///
-    /// Returns:
-    /// `Result<Ext4Fsblk>` - physical block id
-    pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
+    fn get_pblock_idx_inner(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        lblock: Ext4Lblk,
+        allow_refresh: bool,
+    ) -> Result<Ext4Fsblk> {
         if !Self::inode_uses_extents(inode_ref) {
             return self.get_pblock_idx_legacy(inode_ref, lblock);
         }
@@ -217,14 +270,58 @@ impl Ext4 {
                 }
             }
 
+            if allow_refresh {
+                let reloaded = self.get_inode_ref(inode_ref.inode_num);
+                if reloaded.inode != inode_ref.inode {
+                    let retried = self.get_pblock_idx_inner(&reloaded, lblock, false);
+                    if retried.is_ok() {
+                        log::warn!(
+                            "[get_pblock_idx] refreshed stale inode view after unmapped lookup: inode={} lblock={} old_root={:?} new_root={:?}",
+                            inode_ref.inode_num,
+                            lblock,
+                            inode_ref.inode.root_extent_header(),
+                            reloaded.inode.root_extent_header()
+                        );
+                    }
+                    return retried;
+                }
+            }
             return_errno_with_message!(Errno::ENOENT, "logical block not mapped");
         }
 
         let err = search_path.err().unwrap();
         if err.error() == Errno::ENOENT {
+            if allow_refresh {
+                let reloaded = self.get_inode_ref(inode_ref.inode_num);
+                if reloaded.inode != inode_ref.inode {
+                    let retried = self.get_pblock_idx_inner(&reloaded, lblock, false);
+                    if retried.is_ok() {
+                        log::warn!(
+                            "[get_pblock_idx] refreshed stale inode view after missing extent path: inode={} lblock={} old_root={:?} new_root={:?}",
+                            inode_ref.inode_num,
+                            lblock,
+                            inode_ref.inode.root_extent_header(),
+                            reloaded.inode.root_extent_header()
+                        );
+                    }
+                    return retried;
+                }
+            }
             return_errno_with_message!(Errno::ENOENT, "logical block not mapped");
         }
         Err(err)
+    }
+
+    /// Get physical block id of a logical block.
+    ///
+    /// Params:
+    /// inode_ref: &Ext4InodeRef - inode reference
+    /// lblock: Ext4Lblk - logical block id
+    ///
+    /// Returns:
+    /// `Result<Ext4Fsblk>` - physical block id
+    pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
+        self.get_pblock_idx_inner(inode_ref, lblock, true)
     }
 
     /// Allocate a new block
@@ -251,14 +348,13 @@ impl Ext4 {
         ext4_bmap_bit_set(data, rel_blk_idx);
 
         block_group.set_block_group_balloc_bitmap_csum(&super_block, data);
-        self.block_device
-            .write_offset(block_bitmap_block as usize * block_size, data);
+        self.write_metadata(block_bitmap_block as usize * block_size, data);
 
         /* Update superblock free blocks count */
         let mut super_blk_free_blocks = super_block.free_blocks_count();
         super_blk_free_blocks -= 1;
         super_block.set_free_blocks_count(super_blk_free_blocks);
-        super_block.sync_to_disk_with_csum(&self.block_device);
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
 
         /* Update inode blocks (different block size!) count */
         let mut inode_blocks = inode_ref.inode.blocks_count();
@@ -270,7 +366,7 @@ impl Ext4 {
         let mut fb_cnt = block_group.get_free_blocks_count();
         fb_cnt -= 1;
         block_group.set_free_blocks_count(fb_cnt as u32);
-        block_group.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+        block_group.sync_to_disk_with_csum(&self.metadata_writer, bgid as usize, &super_block);
 
         Ok(rel_blk_idx as Ext4Fsblk)
     }
@@ -313,7 +409,7 @@ impl Ext4 {
 
                     let mut ind = Block::load(&self.block_device, ind_block as usize * block_size);
                     ind.data.fill(0);
-                    ind.sync_blk_to_disk(&self.block_device);
+                    ind.sync_blk_to_disk(&self.metadata_writer);
                 }
                 self.legacy_write_indirect_ptr(ind_block, rel, new_block_u32)?;
             }
@@ -386,6 +482,112 @@ impl Ext4 {
         inode_ref.inode.set_size(inode_size);
         self.write_back_inode(inode_ref);
 
+        Ok(new_block)
+    }
+
+    pub fn legacy_map_block_from(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        lblock: Ext4Lblk,
+        start_bgid: &mut u32,
+    ) -> Result<Ext4Fsblk> {
+        if Self::inode_uses_extents(inode_ref) {
+            return_errno_with_message!(Errno::EINVAL, "legacy mapping requested for extent inode");
+        }
+
+        match self.get_pblock_idx_legacy(inode_ref, lblock) {
+            Ok(mapped) => return Ok(mapped),
+            Err(err) if err.error() != Errno::ENOENT => return Err(err),
+            Err(_) => {}
+        }
+
+        let block_size = self.super_block.block_size() as usize;
+        let ptrs_per_block = (block_size / core::mem::size_of::<u32>()) as u32;
+
+        if lblock < EXT4_NDIR_BLOCKS {
+            let new_block = self.balloc_alloc_block_from(inode_ref, start_bgid)?;
+            let new_block_u32 =
+                u32::try_from(new_block).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            inode_ref.inode.block[lblock as usize] = new_block_u32;
+            self.write_back_inode(inode_ref);
+            return Ok(new_block);
+        }
+
+        let rel = lblock - EXT4_NDIR_BLOCKS;
+        if rel >= ptrs_per_block {
+            return_errno_with_message!(
+                Errno::ENOSPC,
+                "legacy mapping beyond single indirect is not supported"
+            );
+        }
+
+        let mut ind_block = inode_ref.inode.block[EXT4_IND_BLOCK];
+        if ind_block == 0 {
+            let allocated_blocks = self.balloc_alloc_block_batch(inode_ref, start_bgid, 2)?;
+            if allocated_blocks.len() < 2 {
+                return_errno_with_message!(
+                    Errno::ENOSPC,
+                    "legacy indirect mapping requires both indirect and data blocks"
+                );
+            }
+
+            let fresh_indirect = allocated_blocks[0];
+            let new_block = allocated_blocks[1];
+            if fresh_indirect == new_block {
+                log::error!(
+                    "[legacy_map_block_from] indirect/data allocation collision: inode={} lblock={} block={}",
+                    inode_ref.inode_num,
+                    lblock,
+                    new_block
+                );
+                return_errno_with_message!(
+                    Errno::EIO,
+                    "legacy indirect block allocation collided with data block"
+                );
+            }
+
+            ind_block = u32::try_from(fresh_indirect).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            inode_ref.inode.block[EXT4_IND_BLOCK] = ind_block;
+
+            let mut ind = Block::load(&self.block_device, ind_block as usize * block_size);
+            ind.data.fill(0);
+            ind.sync_blk_to_disk(&self.metadata_writer);
+            self.write_back_inode(inode_ref);
+
+            let new_block_u32 =
+                u32::try_from(new_block).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            self.legacy_write_indirect_ptr(ind_block, rel, new_block_u32)?;
+            return Ok(new_block);
+        }
+
+        let new_block = self.balloc_alloc_block_from(inode_ref, start_bgid)?;
+        let new_block_u32 = u32::try_from(new_block).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        self.legacy_write_indirect_ptr(ind_block, rel, new_block_u32)?;
+        Ok(new_block)
+    }
+
+    pub fn extent_map_block_from(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        lblock: Ext4Lblk,
+        start_bgid: &mut u32,
+    ) -> Result<Ext4Fsblk> {
+        if !Self::inode_uses_extents(inode_ref) {
+            return_errno_with_message!(Errno::EINVAL, "extent mapping requested for legacy inode");
+        }
+
+        match self.get_pblock_idx(inode_ref, lblock) {
+            Ok(mapped) => return Ok(mapped),
+            Err(err) if err.error() != Errno::ENOENT => return Err(err),
+            Err(_) => {}
+        }
+
+        let new_block = self.balloc_alloc_block_from(inode_ref, start_bgid)?;
+        let mut newex = Ext4Extent::default();
+        newex.first_block = lblock;
+        newex.store_pblock(new_block);
+        newex.block_count = 1;
+        self.insert_extent(inode_ref, &mut newex)?;
         Ok(new_block)
     }
 

@@ -463,11 +463,11 @@ impl Ext4Inode {
         }
     }
 
-    pub fn sync_inode_to_disk(&self, block_device: &Arc<dyn BlockDevice>, inode_pos: usize) {
+    pub fn sync_inode_to_disk(&self, metadata_writer: &Arc<dyn MetadataWriter>, inode_pos: usize) {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Inode>())
         };
-        block_device.write_offset(inode_pos, data);
+        metadata_writer.write_metadata(inode_pos, data);
     }
 
     pub fn root_extent_block(&self) -> u64 {

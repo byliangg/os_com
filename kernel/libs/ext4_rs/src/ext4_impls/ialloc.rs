@@ -38,8 +38,7 @@ impl Ext4 {
                 ext4_bmap_bit_set(bitmap_data, idx_in_bg);
 
                 // update bitmap in disk
-                self.block_device
-                    .write_offset(inode_bitmap_block as usize * block_size, bitmap_data);
+                self.write_metadata(inode_bitmap_block as usize * block_size, bitmap_data);
 
                 bg.set_block_group_ialloc_bitmap_csum(&super_block, bitmap_data);
 
@@ -61,11 +60,11 @@ impl Ext4 {
                     bg.set_itable_unused(&super_block, unused);
                 }
 
-                bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+                bg.sync_to_disk_with_csum(&self.metadata_writer, bgid as usize, &super_block);
 
                 /* Update superblock */
                 super_block.decrease_free_inodes_count();
-                super_block.sync_to_disk_with_csum(&self.block_device);
+                super_block.sync_to_disk_with_csum(&self.metadata_writer);
 
                 /* Compute the absolute i-nodex number */
                 let inodes_per_group = super_block.inodes_per_group();
@@ -101,8 +100,7 @@ impl Ext4 {
 
         // Set new checksum after modification
         // update bitmap in disk
-        self.block_device
-            .write_offset(inode_bitmap_block as usize * block_size, &bitmap_data);
+        self.write_metadata(inode_bitmap_block as usize * block_size, &bitmap_data);
         bg.set_block_group_ialloc_bitmap_csum(&super_block, &bitmap_data);
 
         // Update free inodes count in block group
@@ -115,9 +113,9 @@ impl Ext4 {
             bg.set_used_dirs_count(&self.super_block, used_dirs);
         }
 
-        bg.sync_to_disk_with_csum(&self.block_device, bgid as usize, &super_block);
+        bg.sync_to_disk_with_csum(&self.metadata_writer, bgid as usize, &super_block);
 
         super_block.increase_free_inodes_count();
-        super_block.sync_to_disk_with_csum(&self.block_device);
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
     }
 }

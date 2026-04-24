@@ -13,9 +13,11 @@ Set `XFSTESTS_PREBUILT_DIR` before building initramfs. The directory must contai
 
 1. `XFSTESTS_MODE=phase3_base` (default): blocking mode, computes pass-rate with phase3 rules.
 2. `XFSTESTS_MODE=phase4_good`: blocking mode, computes pass-rate with phase4-part1 candidate set.
-3. `XFSTESTS_MODE=generic_quick`: observation-only mode, always exits success and records log.
+3. `XFSTESTS_MODE=phase6_good`: blocking mode, stage6 "good" candidate set.
+4. `XFSTESTS_MODE=jbd_phase1`: blocking mode, JBD2 Phase 1 candidate set (journal replay, orphan recovery, ext4 journal-specific tests). Target threshold: 95%.
+5. `XFSTESTS_MODE=generic_quick`: observation-only mode, always exits success and records log.
 
-## Pass-rate rules (phase3_base / phase4_good)
+## Pass-rate rules (phase3_base / phase4_good / phase6_good / jbd_phase1)
 
 1. Denominator = `PASS + FAIL`
 2. Numerator = `PASS`

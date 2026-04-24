@@ -11,8 +11,36 @@ use crate::utils::path_check;
 pub use crate::ext4_defs::Ext4;
 pub use crate::ext4_defs::BLOCK_SIZE;
 pub use crate::ext4_defs::BlockDevice;
+pub use crate::ext4_defs::CommitBlock;
+pub use crate::ext4_defs::EXT4_FEATURE_INCOMPAT_RECOVER;
 pub use crate::ext4_defs::InodeFileType;
+pub use crate::ext4_defs::JBD2_CHECKSUM_BYTES;
+pub use crate::ext4_defs::JBD2_COMMIT_BLOCK;
+pub use crate::ext4_defs::JBD2_DESCRIPTOR_BLOCK;
+pub use crate::ext4_defs::JBD2_FEATURE_INCOMPAT_64BIT;
+pub use crate::ext4_defs::JBD2_FEATURE_INCOMPAT_CSUM_V2;
+pub use crate::ext4_defs::JBD2_FEATURE_INCOMPAT_CSUM_V3;
+pub use crate::ext4_defs::JBD2_FLAG_ESCAPE;
+pub use crate::ext4_defs::JBD2_FLAG_LAST_TAG;
+pub use crate::ext4_defs::JBD2_FLAG_SAME_UUID;
+pub use crate::ext4_defs::JBD2_MAGIC_NUMBER;
+pub use crate::ext4_defs::JournalBlockTag;
+pub use crate::ext4_defs::JournalBlockTag3;
+pub use crate::ext4_defs::JournalHeader;
+pub use crate::ext4_defs::JournalSuperblock;
+pub use crate::ext4_defs::MetadataWriter;
 pub use crate::ext4_defs::ROOT_INODE as EXT4_ROOT_INODE;
+pub use crate::ext4_impls::Jbd2Journal;
+pub use crate::ext4_impls::JournalCommitBlock;
+pub use crate::ext4_impls::JournalCommitPlan;
+pub use crate::ext4_impls::JournalCommitWriteStage;
+pub use crate::ext4_impls::JournalHandle;
+pub use crate::ext4_impls::JournalHandleSummary;
+pub use crate::ext4_impls::JournalRecoveryResult;
+pub use crate::ext4_impls::JournalRuntime;
+pub use crate::ext4_impls::JournalTransaction;
+pub use crate::ext4_impls::JournalTransactionState;
+pub use crate::ext4_impls::clear_operation_allocated_blocks;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {
@@ -205,6 +233,52 @@ impl Ext4 {
         }
         let inode_ref = self.create(parent, name, mode)?;
         Ok(inode_ref.inode_num)
+    }
+
+    /// Create a directory without checking whether the name already exists and
+    /// without scanning earlier directory blocks for free slots (append-only).
+    /// Returns `(child_ino, dir_byte_offset)` where `dir_byte_offset` is the
+    /// absolute byte offset of the new entry in the parent directory stream.
+    /// The caller MUST guarantee the name is absent (e.g. via a fully-loaded
+    /// directory cache) before calling this to avoid duplicate entries.
+    pub fn ext4_mkdir_unchecked_at(&self, parent: u32, name: &str, mode: u16) -> Result<(u32, u64)> {
+        let (inode_ref, dir_byte_offset) = self.create_unchecked(parent, name, mode)?;
+        Ok((inode_ref.inode_num, dir_byte_offset))
+    }
+
+    /// Remove an empty directory using a pre-computed byte offset in the parent's
+    /// directory stream, bypassing the O(n) `dir_find_entry` scan entirely.
+    /// The caller must verify the directory is empty before calling this.
+    pub fn ext4_rmdir_at_fast(
+        &self,
+        parent_ino: u32,
+        child_ino: u32,
+        dir_byte_offset: u64,
+    ) -> Result<usize> {
+        let mut parent_inode_ref = self.get_inode_ref(parent_ino);
+        let mut child_inode_ref = self.get_inode_ref(child_ino);
+
+        if !child_inode_ref.inode.is_dir() {
+            return_errno_with_message!(Errno::ENOTDIR, "target is not a directory");
+        }
+
+        // Free child's data blocks
+        self.truncate_inode(&mut child_inode_ref, 0)?;
+
+        // Remove the entry from the parent block (O(1) — no scan)
+        self.dir_remove_entry_at_offset(&mut parent_inode_ref, dir_byte_offset)?;
+
+        // Adjust link counts (same as unlink for directories)
+        let parent_links = parent_inode_ref.inode.links_count();
+        if parent_links > 0 {
+            parent_inode_ref.inode.set_links_count(parent_links - 1);
+        }
+        child_inode_ref.inode.set_links_count(0);
+
+        self.write_back_inode(&mut child_inode_ref);
+        self.write_back_inode(&mut parent_inode_ref);
+
+        Ok(EOK)
     }
 
     /// Remove a file under a specific directory inode.
@@ -415,17 +489,92 @@ impl Ext4 {
 
     /// Get simplified directory entries under a directory inode.
     pub fn ext4_readdir(&self, inode: u32) -> Vec<SimpleDirEntry> {
-        let entries = self.dir_get_entries_with_next_offset(inode);
+        // Iterate directory blocks directly to avoid a fat intermediate Vec<(Ext4DirEntry, usize)>.
+        // Ext4DirEntry is 264 bytes; for 65537 entries the intermediate Vec requires a single
+        // 34 MB contiguous allocation. SimpleDirEntry is ~56 bytes, keeping peak around 7 MB.
+        let block_size = self.super_block.block_size() as usize;
         let mut simple_entries = Vec::new();
-        for (entry, next_offset) in entries {
-            simple_entries.push(SimpleDirEntry {
-                inode: entry.inode,
-                de_type: entry.get_de_type(),
-                name: entry.get_name(),
-                next_offset,
-            });
+
+        let inode_ref = self.get_inode_ref(inode);
+        if !inode_ref.inode.is_dir() {
+            return simple_entries;
         }
+
+        let inode_size = inode_ref.inode.size();
+        let total_blocks = (inode_size + block_size as u64 - 1) / block_size as u64;
+        let mut iblock = 0u64;
+
+        while iblock < total_blocks {
+            if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
+                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let mut offset = 0usize;
+
+                while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
+                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                    let rec_len = de.entry_len() as usize;
+                    if rec_len == 0 || rec_len > block_size - offset {
+                        break;
+                    }
+                    if !de.unused() {
+                        let next_offset = iblock as usize * block_size + offset + rec_len;
+                        simple_entries.push(SimpleDirEntry {
+                            inode: de.inode,
+                            de_type: de.get_de_type(),
+                            name: de.get_name(),
+                            next_offset,
+                        });
+                    }
+                    offset += rec_len;
+                }
+            }
+            iblock += 1;
+        }
+
         simple_entries
+    }
+
+    /// Like `ext4_readdir` but also returns each entry's absolute byte offset in the
+    /// directory stream, as `(name, ino, entry_byte_offset)`. Used to populate the
+    /// kernel-layer directory cache with offsets for O(1) rmdir.
+    pub fn ext4_readdir_with_offsets(&self, inode: u32) -> Vec<(String, u32, u64)> {
+        // Iterate directory blocks directly to avoid building a fat Vec<(Ext4DirEntry, usize)>.
+        // Ext4DirEntry is 264 bytes; for 65537 entries the intermediate Vec would require a
+        // single 34 MB contiguous allocation (capacity doubles to 131072 × 272 bytes = 0x2200000).
+        // Building Vec<(String, u32, u64)> directly keeps peak allocation at ~5 MB.
+        let block_size = self.super_block.block_size() as usize;
+        let mut result = Vec::new();
+
+        let inode_ref = self.get_inode_ref(inode);
+        if !inode_ref.inode.is_dir() {
+            return result;
+        }
+
+        let inode_size = inode_ref.inode.size();
+        let total_blocks = (inode_size + block_size as u64 - 1) / block_size as u64;
+        let mut iblock = 0u64;
+
+        while iblock < total_blocks {
+            if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
+                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let mut offset = 0usize;
+
+                while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
+                    let de: Ext4DirEntry = ext4block.read_offset_as(offset);
+                    let rec_len = de.entry_len() as usize;
+                    if rec_len == 0 || rec_len > block_size - offset {
+                        break;
+                    }
+                    if !de.unused() {
+                        let entry_offset = (iblock as usize * block_size + offset) as u64;
+                        result.push((de.get_name(), de.inode, entry_offset));
+                    }
+                    offset += rec_len;
+                }
+            }
+            iblock += 1;
+        }
+
+        result
     }
 
     /// Read data from a file starting from a given offset.

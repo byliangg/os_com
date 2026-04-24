@@ -53,6 +53,7 @@ pub const EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE: u16 = 64;
 /// SuperBlock
 pub const SUPERBLOCK_OFFSET: usize = 1024;
 pub const EXT4_SUPERBLOCK_OS_HURD: u32 = 1;
+pub const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0004;
 
 /// File
 pub const EXT4_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16TB

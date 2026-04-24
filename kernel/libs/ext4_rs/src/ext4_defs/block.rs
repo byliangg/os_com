@@ -18,6 +18,26 @@ pub trait BlockDevice: Send + Sync + Any {
     fn write_offset(&self, offset: usize, data: &[u8]);
 }
 
+pub trait MetadataWriter: Send + Sync {
+    fn write_metadata(&self, offset: usize, data: &[u8]);
+}
+
+pub struct PassthroughMetadataWriter {
+    block_device: Arc<dyn BlockDevice>,
+}
+
+impl PassthroughMetadataWriter {
+    pub fn new(block_device: Arc<dyn BlockDevice>) -> Self {
+        Self { block_device }
+    }
+}
+
+impl MetadataWriter for PassthroughMetadataWriter {
+    fn write_metadata(&self, offset: usize, data: &[u8]) {
+        self.block_device.write_offset(offset, data);
+    }
+}
+
 pub struct Block {
     pub disk_offset: usize,
     pub data: Vec<u8>,
@@ -95,7 +115,7 @@ impl Block {
 }
 
 impl Block{
-    pub fn sync_blk_to_disk(&self, block_device: &Arc<dyn BlockDevice>){
-        block_device.write_offset(self.disk_offset, &self.data);
+    pub fn sync_blk_to_disk(&self, metadata_writer: &Arc<dyn MetadataWriter>){
+        metadata_writer.write_metadata(self.disk_offset, &self.data);
     }
 }

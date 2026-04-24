@@ -213,14 +213,14 @@ impl Ext4Superblock {
         self.free_blocks_count_hi = (free_blocks >> 32) as u32;
     }
 
-    pub fn sync_to_disk(&self, block_device: &Arc<dyn BlockDevice>) {
+    pub fn sync_to_disk(&self, metadata_writer: &Arc<dyn MetadataWriter>) {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
         };
-        block_device.write_offset(SUPERBLOCK_OFFSET, data);
+        metadata_writer.write_metadata(SUPERBLOCK_OFFSET, data);
     }
 
-    pub fn sync_to_disk_with_csum(&mut self, block_device: &Arc<dyn BlockDevice>) {
+    pub fn sync_to_disk_with_csum(&mut self, metadata_writer: &Arc<dyn MetadataWriter>) {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
         };
@@ -230,11 +230,47 @@ impl Ext4Superblock {
         let data = unsafe {
             core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
         };
-        block_device.write_offset(SUPERBLOCK_OFFSET, data);
+        metadata_writer.write_metadata(SUPERBLOCK_OFFSET, data);
     }
 
     pub fn incompat_features(&self) -> u32 {
         self.features_incompatible
+    }
+
+    pub fn compat_features(&self) -> u32 {
+        self.features_compatible
+    }
+
+    pub fn has_journal(&self) -> bool {
+        (self.features_compatible & EXT4_FEATURE_COMPAT_HAS_JOURNAL) != 0
+    }
+
+    pub fn needs_recovery(&self) -> bool {
+        (self.features_incompatible & EXT4_FEATURE_INCOMPAT_RECOVER) != 0
+    }
+
+    pub fn journal_uuid(&self) -> [u8; 16] {
+        self.journal_uuid
+    }
+
+    pub fn journal_inode_number(&self) -> u32 {
+        self.journal_inode_number
+    }
+
+    pub fn journal_blocks(&self) -> [u32; 17] {
+        self.journal_blocks
+    }
+
+    pub fn set_incompat_features(&mut self, features: u32) {
+        self.features_incompatible = features;
+    }
+
+    pub fn set_needs_recovery(&mut self, enabled: bool) {
+        if enabled {
+            self.features_incompatible |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        } else {
+            self.features_incompatible &= !EXT4_FEATURE_INCOMPAT_RECOVER;
+        }
     }
     
     pub fn reserved_gdt_blocks(&self) -> u16 {

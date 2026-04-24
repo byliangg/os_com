@@ -183,6 +183,7 @@ impl ReadBioProfileStats {
 }
 
 static READ_BIO_PROFILE_STATS: ReadBioProfileStats = ReadBioProfileStats::new();
+const READ_BIO_PROFILE_LOG_ENABLED: bool = false;
 const BIO_FLAG_PREFER_FAST_SUBMIT: u32 = 1 << 0;
 
 pub fn reset_read_bio_profile() {
@@ -199,6 +200,9 @@ fn monotonic_nanos() -> u64 {
 }
 
 fn maybe_log_read_bio_profile(bios: u64) {
+    if !READ_BIO_PROFILE_LOG_ENABLED {
+        return;
+    }
     if bios == 0 || bios % ReadBioProfileStats::LOG_INTERVAL_BIOS != 0 {
         return;
     }
