@@ -6,6 +6,8 @@ use super::{
     JournalTransactionState,
 };
 
+const JOURNAL_TRANSACTION_CREDIT_SOFT_LIMIT: u32 = 1024;
+
 #[derive(Debug, Clone)]
 pub struct JournalCommitBlock {
     pub block_nr: u64,
@@ -28,16 +30,37 @@ pub struct JournalCheckpointPlan {
     pub metadata_blocks: Vec<JournalCommitBlock>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalRuntimeDebugStats {
+    pub started_handles: u64,
+    pub finished_handles: u64,
+    pub active_handle_samples: u64,
+    pub active_handle_sample_sum: u64,
+    pub max_active_handles: u32,
+    pub max_running_handles: u32,
+    pub max_running_reserved_blocks: u32,
+    pub max_running_metadata_blocks: u32,
+    pub rotated_transactions: u64,
+    pub prepared_commits: u64,
+    pub finished_commits: u64,
+    pub finished_checkpoints: u64,
+    pub overlay_reads: u64,
+    pub overlay_hits: u64,
+    pub metadata_write_records: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct JournalRuntime {
     enabled: bool,
     block_size: usize,
     next_tid: u32,
+    next_handle_id: u64,
     running: Option<JournalTransaction>,
     prev_running: Option<JournalTransaction>,
     committing: Option<JournalTransaction>,
     checkpoint_list: VecDeque<JournalTransaction>,
     active_handles: VecDeque<JournalHandle>,
+    debug_stats: JournalRuntimeDebugStats,
 }
 
 impl JournalRuntime {
@@ -46,11 +69,13 @@ impl JournalRuntime {
             enabled: true,
             block_size,
             next_tid: first_tid.max(1),
+            next_handle_id: 1,
             running: None,
             prev_running: None,
             committing: None,
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
+            debug_stats: JournalRuntimeDebugStats::default(),
         }
     }
 
@@ -59,11 +84,13 @@ impl JournalRuntime {
             enabled: false,
             block_size,
             next_tid: 1,
+            next_handle_id: 1,
             running: None,
             prev_running: None,
             committing: None,
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
+            debug_stats: JournalRuntimeDebugStats::default(),
         }
     }
 
@@ -95,8 +122,44 @@ impl JournalRuntime {
         self.active_handles.front()
     }
 
+    pub fn has_active_handle(&self) -> bool {
+        !self.active_handles.is_empty()
+    }
+
+    pub fn debug_stats(&self) -> JournalRuntimeDebugStats {
+        self.debug_stats
+    }
+
     pub fn should_defer_metadata_write(&self) -> bool {
         self.enabled && !self.active_handles.is_empty()
+    }
+
+    fn observe_active_state(&mut self) {
+        let active_handles = self.active_handles.len() as u64;
+        self.debug_stats.active_handle_samples =
+            self.debug_stats.active_handle_samples.saturating_add(1);
+        self.debug_stats.active_handle_sample_sum = self
+            .debug_stats
+            .active_handle_sample_sum
+            .saturating_add(active_handles);
+        self.debug_stats.max_active_handles = self
+            .debug_stats
+            .max_active_handles
+            .max(active_handles as u32);
+        if let Some(transaction) = self.running.as_ref() {
+            self.debug_stats.max_running_handles = self
+                .debug_stats
+                .max_running_handles
+                .max(transaction.handle_count());
+            self.debug_stats.max_running_reserved_blocks = self
+                .debug_stats
+                .max_running_reserved_blocks
+                .max(transaction.admitted_reserved_blocks());
+            self.debug_stats.max_running_metadata_blocks = self
+                .debug_stats
+                .max_running_metadata_blocks
+                .max(transaction.modified_block_count() as u32);
+        }
     }
 
     fn latest_metadata_buffer(&self, block_nr: u64) -> Option<&super::JournalBuffer> {
@@ -127,11 +190,12 @@ impl JournalRuntime {
         None
     }
 
-    pub fn overlay_metadata_read(&self, offset: usize, out: &mut [u8]) -> bool {
+    pub fn overlay_metadata_read(&mut self, offset: usize, out: &mut [u8]) -> bool {
         if !self.enabled || self.block_size == 0 || out.is_empty() {
             return false;
         }
 
+        self.debug_stats.overlay_reads = self.debug_stats.overlay_reads.saturating_add(1);
         let Some(end) = offset.checked_add(out.len()) else {
             return false;
         };
@@ -160,6 +224,9 @@ impl JournalRuntime {
             overlaid = true;
         }
 
+        if overlaid {
+            self.debug_stats.overlay_hits = self.debug_stats.overlay_hits.saturating_add(1);
+        }
         overlaid
     }
 
@@ -206,6 +273,33 @@ impl JournalRuntime {
             })
     }
 
+    fn should_rotate_for_new_handle(&self, reserved_blocks: u32) -> bool {
+        self.enabled
+            && self.prev_running.is_none()
+            && self.running.as_ref().is_some_and(|transaction| {
+                transaction.handle_count() == 0
+                    && transaction.modified_block_count() != 0
+                    && transaction
+                        .admitted_reserved_blocks()
+                        .saturating_add(reserved_blocks)
+                        > JOURNAL_TRANSACTION_CREDIT_SOFT_LIMIT
+            })
+    }
+
+    fn rotate_running_transaction_for_admission(&mut self, reserved_blocks: u32) -> Option<u32> {
+        if !self.should_rotate_for_new_handle(reserved_blocks) {
+            return None;
+        }
+
+        let mut transaction = self.running.take()?;
+        transaction.set_state(JournalTransactionState::Locked);
+        let tid = transaction.tid();
+        self.prev_running = Some(transaction);
+        self.debug_stats.rotated_transactions =
+            self.debug_stats.rotated_transactions.saturating_add(1);
+        Some(tid)
+    }
+
     pub fn rotate_running_transaction(&mut self) -> Option<u32> {
         if !self.should_rotate_running_transaction(0) {
             return None;
@@ -215,6 +309,8 @@ impl JournalRuntime {
         transaction.set_state(JournalTransactionState::Locked);
         let tid = transaction.tid();
         self.prev_running = Some(transaction);
+        self.debug_stats.rotated_transactions =
+            self.debug_stats.rotated_transactions.saturating_add(1);
         Some(tid)
     }
 
@@ -266,36 +362,29 @@ impl JournalRuntime {
             return None;
         }
 
-        let transaction = self.running.get_or_insert_with(|| {
-            let tid = self.next_tid;
-            self.next_tid = self.next_tid.saturating_add(1);
-            JournalTransaction::new(tid)
-        });
-        // If a previous handle set state to Locked (handle_count dropped to 0),
-        // reset it to Running so the transaction correctly tracks active handles.
-        if transaction.state() == JournalTransactionState::Locked {
-            transaction.set_state(JournalTransactionState::Running);
-        }
-        transaction.register_handle(reserved_blocks, trigger_op);
-
-        let handle = JournalHandle::new(transaction.tid(), reserved_blocks);
-        self.active_handles.push_back(handle.clone());
-        Some(handle)
-    }
-
-    pub fn mark_active_handle_requires_data_sync(&mut self) {
-        if !self.enabled {
-            return;
-        }
-
-        let Some(handle) = self.active_handles.front_mut() else {
-            return;
+        self.rotate_running_transaction_for_admission(reserved_blocks);
+        let handle_id = self.next_handle_id;
+        self.next_handle_id = self.next_handle_id.saturating_add(1).max(1);
+        let transaction_id = {
+            let transaction = self.running.get_or_insert_with(|| {
+                let tid = self.next_tid;
+                self.next_tid = self.next_tid.saturating_add(1);
+                JournalTransaction::new(tid)
+            });
+            // If a previous handle set state to Locked (handle_count dropped to 0),
+            // reset it to Running so the transaction correctly tracks active handles.
+            if transaction.state() == JournalTransactionState::Locked {
+                transaction.set_state(JournalTransactionState::Running);
+            }
+            transaction.register_handle(reserved_blocks, trigger_op);
+            transaction.tid()
         };
-        handle.require_data_sync();
-        let transaction_id = handle.transaction_id();
-        if let Some(transaction) = self.transaction_mut(transaction_id) {
-            transaction.require_data_sync();
-        }
+
+        let handle = JournalHandle::new(handle_id, transaction_id, reserved_blocks);
+        self.active_handles.push_back(handle.clone());
+        self.debug_stats.started_handles = self.debug_stats.started_handles.saturating_add(1);
+        self.observe_active_state();
+        Some(handle)
     }
 
     fn transaction_mut(&mut self, tid: u32) -> Option<&mut JournalTransaction> {
@@ -329,35 +418,42 @@ impl JournalRuntime {
         let Some(pos) = self
             .active_handles
             .iter()
-            .position(|active| active.transaction_id() == handle.transaction_id())
+            .position(|active| active.handle_id() == handle.handle_id())
         else {
             return handle;
         };
         self.active_handles.remove(pos).unwrap_or(handle)
     }
 
-    fn active_handle_mut(&mut self) -> Option<&mut JournalHandle> {
-        self.active_handles.front_mut()
+    fn active_handle_mut_by_id(&mut self, handle_id: u64) -> Option<&mut JournalHandle> {
+        self.active_handles
+            .iter_mut()
+            .find(|handle| handle.handle_id() == handle_id)
     }
 
-    pub fn mark_handle_requires_data_sync(&mut self, transaction_id: u32) {
+    pub fn mark_handle_requires_data_sync(&mut self, handle_id: u64) {
         if !self.enabled {
             return;
         }
 
-        if let Some(handle) = self
-            .active_handles
-            .iter_mut()
-            .find(|handle| handle.transaction_id() == transaction_id)
-        {
+        let Some(transaction_id) = self.active_handle_mut_by_id(handle_id).map(|handle| {
             handle.require_data_sync();
-        }
+            handle.transaction_id()
+        }) else {
+            return;
+        };
         if let Some(transaction) = self.transaction_mut(transaction_id) {
             transaction.require_data_sync();
         }
     }
 
-    pub fn record_metadata_write<F>(&mut self, offset: usize, data: &[u8], mut load_block: F)
+    pub fn record_metadata_write_for_handle<F>(
+        &mut self,
+        handle_id: u64,
+        offset: usize,
+        data: &[u8],
+        mut load_block: F,
+    )
     where
         F: FnMut(u64) -> Vec<u8>,
     {
@@ -374,12 +470,14 @@ impl JournalRuntime {
             let chunk_len = min(block_size - block_offset, data.len() - consumed);
             let chunk = &data[consumed..consumed + chunk_len];
             let transaction_id = {
-                let Some(handle) = self.active_handle_mut() else {
+                let Some(handle) = self.active_handle_mut_by_id(handle_id) else {
                     return;
                 };
                 handle.record_metadata_block(block_nr);
                 handle.transaction_id()
             };
+            self.debug_stats.metadata_write_records =
+                self.debug_stats.metadata_write_records.saturating_add(1);
             let needs_base_image = self
                 .transaction_mut(transaction_id)
                 .is_some_and(|transaction| !transaction.has_buffer(block_nr));
@@ -399,6 +497,7 @@ impl JournalRuntime {
                 block_size,
                 || overlay_base.unwrap_or_else(|| load_block(block_nr)),
             );
+            self.observe_active_state();
 
             consumed += chunk_len;
         }
@@ -417,6 +516,8 @@ impl JournalRuntime {
             }
         }
 
+        self.debug_stats.finished_handles = self.debug_stats.finished_handles.saturating_add(1);
+        self.observe_active_state();
         Some(active.summary())
     }
 
@@ -450,12 +551,13 @@ impl JournalRuntime {
             .collect();
         let plan = JournalCommitPlan {
             tid: transaction.tid(),
-            reserved_blocks: transaction.reserved_blocks(),
+            reserved_blocks: transaction.admitted_reserved_blocks(),
             data_sync_required: transaction.data_sync_required(),
             trigger_op: transaction.trigger_op(),
             metadata_blocks,
         };
         self.committing = Some(transaction);
+        self.debug_stats.prepared_commits = self.debug_stats.prepared_commits.saturating_add(1);
         Some(plan)
     }
 
@@ -471,6 +573,7 @@ impl JournalRuntime {
         transaction.set_state(JournalTransactionState::Checkpoint);
         transaction.set_checkpoint_range(start_block, next_head);
         self.checkpoint_list.push_back(transaction);
+        self.debug_stats.finished_commits = self.debug_stats.finished_commits.saturating_add(1);
         true
     }
 
@@ -514,6 +617,8 @@ impl JournalRuntime {
             return None;
         }
         self.checkpoint_list.pop_front();
+        self.debug_stats.finished_checkpoints =
+            self.debug_stats.finished_checkpoints.saturating_add(1);
         let next_start = self
             .checkpoint_list
             .front()
@@ -561,13 +666,23 @@ impl JournalRuntime {
 mod tests {
     use super::*;
 
+    fn record_metadata(
+        runtime: &mut JournalRuntime,
+        handle: &JournalHandle,
+        offset: usize,
+        data: &[u8],
+    ) {
+        runtime.record_metadata_write_for_handle(handle.handle_id(), offset, data, |_| vec![0; 8]);
+    }
+
     #[test]
     fn prepare_commit_collects_full_metadata_blocks() {
         let mut runtime = JournalRuntime::new(8, 1);
         let handle = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(2, &[1, 2, 3], |_| vec![9; 8]);
+        runtime.record_metadata_write_for_handle(handle.handle_id(), 2, &[1, 2, 3], |_| vec![9; 8]);
         let summary = runtime.stop_handle(handle).unwrap();
 
+        assert_eq!(summary.handle_id, 1);
         assert_eq!(summary.modified_blocks, 1);
         assert!(runtime.commit_ready());
 
@@ -585,13 +700,13 @@ mod tests {
         let mut runtime = JournalRuntime::new(8, 1);
 
         let handle1 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(0, &[1], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle1, 0, &[1]);
         runtime.stop_handle(handle1).unwrap();
         let plan1 = runtime.prepare_commit().unwrap();
         assert!(runtime.finish_commit(plan1.tid, 5, 7));
 
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(8, &[2], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
         runtime.stop_handle(handle2).unwrap();
         let plan2 = runtime.prepare_commit().unwrap();
         assert!(runtime.finish_commit(plan2.tid, 7, 9));
@@ -617,13 +732,18 @@ mod tests {
         let mut runtime = JournalRuntime::new(8, 1);
 
         let handle1 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(8, &[1, 1, 1, 1], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle1, 8, &[1, 1, 1, 1]);
         runtime.stop_handle(handle1).unwrap();
         let plan1 = runtime.prepare_commit().unwrap();
         assert!(runtime.finish_commit(plan1.tid, 5, 7));
 
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(8, &[2, 2, 2, 2], |_| vec![9; 8]);
+        runtime.record_metadata_write_for_handle(
+            handle2.handle_id(),
+            8,
+            &[2, 2, 2, 2],
+            |_| vec![9; 8],
+        );
 
         let mut out = vec![0xFF; 8];
         assert!(runtime.overlay_metadata_read(8, &mut out));
@@ -637,13 +757,13 @@ mod tests {
         let mut runtime = JournalRuntime::new(8, 1);
 
         let handle1 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(8, &[1, 1, 1, 1], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle1, 8, &[1, 1, 1, 1]);
         runtime.stop_handle(handle1).unwrap();
         let plan1 = runtime.prepare_commit().unwrap();
         assert!(runtime.finish_commit(plan1.tid, 5, 7));
 
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(12, &[2, 2], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle2, 12, &[2, 2]);
 
         let running = runtime.running_transaction().unwrap();
         let buffer = running.buffer(1).unwrap();
@@ -653,12 +773,74 @@ mod tests {
     }
 
     #[test]
+    fn stop_handle_matches_unique_handle_id_not_transaction_id() {
+        let mut runtime = JournalRuntime::new(8, 1);
+
+        let handle1 = runtime.start_handle(3, None).unwrap();
+        let handle2 = runtime.start_handle(5, None).unwrap();
+        assert_eq!(handle1.transaction_id(), handle2.transaction_id());
+        assert_ne!(handle1.handle_id(), handle2.handle_id());
+
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
+        let summary2 = runtime.stop_handle(handle2).unwrap();
+        assert_eq!(summary2.handle_id, 2);
+        assert_eq!(summary2.reserved_blocks, 5);
+        assert_eq!(summary2.modified_blocks, 1);
+
+        let running = runtime.running_transaction().unwrap();
+        assert_eq!(running.handle_count(), 1);
+        assert_eq!(running.reserved_blocks(), 3);
+
+        let summary1 = runtime.stop_handle(handle1).unwrap();
+        assert_eq!(summary1.handle_id, 1);
+        assert_eq!(summary1.reserved_blocks, 3);
+        assert_eq!(summary1.modified_blocks, 0);
+        assert!(runtime.commit_ready());
+    }
+
+    #[test]
+    fn data_sync_mark_targets_unique_handle_id() {
+        let mut runtime = JournalRuntime::new(8, 1);
+
+        let handle1 = runtime.start_handle(3, None).unwrap();
+        let handle2 = runtime.start_handle(5, None).unwrap();
+        runtime.mark_handle_requires_data_sync(handle2.handle_id());
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
+
+        let summary1 = runtime.stop_handle(handle1).unwrap();
+        let summary2 = runtime.stop_handle(handle2).unwrap();
+        assert!(!summary1.data_sync_required);
+        assert!(summary2.data_sync_required);
+
+        let plan = runtime.prepare_commit().unwrap();
+        assert!(plan.data_sync_required);
+    }
+
+    #[test]
+    fn credit_admission_rotates_idle_transaction_before_overflow() {
+        let mut runtime = JournalRuntime::new(8, 1);
+
+        let handle1 = runtime.start_handle(1020, None).unwrap();
+        record_metadata(&mut runtime, &handle1, 0, &[1]);
+        runtime.stop_handle(handle1).unwrap();
+
+        let handle2 = runtime.start_handle(8, None).unwrap();
+        assert_eq!(handle2.transaction_id(), 2);
+        assert_eq!(runtime.prev_running_transaction().unwrap().tid(), 1);
+        assert_eq!(runtime.running_transaction().unwrap().tid(), 2);
+
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
+        runtime.stop_handle(handle2).unwrap();
+        assert!(runtime.batch_commit_ready(1));
+    }
+
+    #[test]
     fn rotation_closes_old_transaction_and_new_handles_use_next_tid() {
         let mut runtime = JournalRuntime::new(8, 1);
 
         let handle1 = runtime.start_handle(4, None).unwrap();
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(0, &[1], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle1, 0, &[1]);
         runtime.stop_handle(handle1).unwrap();
 
         assert!(runtime.should_rotate_running_transaction(1));
@@ -669,7 +851,7 @@ mod tests {
         let handle3 = runtime.start_handle(4, None).unwrap();
         assert_eq!(handle3.transaction_id(), 2);
 
-        runtime.record_metadata_write(8, &[2], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
         runtime.stop_handle(handle2).unwrap();
         assert!(runtime.batch_commit_ready(1));
 
@@ -678,7 +860,7 @@ mod tests {
         assert_eq!(plan1.metadata_blocks.len(), 2);
         assert!(runtime.finish_commit(plan1.tid, 5, 8));
 
-        runtime.record_metadata_write(16, &[3], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle3, 16, &[3]);
         runtime.stop_handle(handle3).unwrap();
 
         let plan2 = runtime.prepare_commit().unwrap();
@@ -692,12 +874,12 @@ mod tests {
 
         let handle1 = runtime.start_handle(4, None).unwrap();
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(0, &[1], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle1, 0, &[1]);
         runtime.stop_handle(handle1).unwrap();
         assert_eq!(runtime.rotate_running_transaction(), Some(1));
 
         let handle3 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write(8, &[2], |_| vec![0; 8]);
+        record_metadata(&mut runtime, &handle3, 8, &[2]);
         runtime.stop_handle(handle3).unwrap();
 
         assert!(!runtime.batch_commit_ready(1));

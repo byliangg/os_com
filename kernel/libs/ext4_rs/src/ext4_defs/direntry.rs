@@ -245,9 +245,8 @@ impl Ext4DirEntryTail{
         self.checksum = csum;
     }
 
-    pub fn copy_to_slice(&self, array: &mut [u8]) {
+    pub fn copy_to_slice(&self, array: &mut [u8], block_size: usize) {
         unsafe {
-        let block_size = runtime_block_size();
         let offset = block_size - core::mem::size_of::<Ext4DirEntryTail>();
         let de_ptr = self as *const Ext4DirEntryTail as *const u8;
         let array_ptr = array as *mut [u8] as *mut u8;

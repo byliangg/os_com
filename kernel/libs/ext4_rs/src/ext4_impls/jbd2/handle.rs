@@ -2,6 +2,7 @@ use crate::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct JournalHandle {
+    handle_id: u64,
     transaction_id: u32,
     reserved_blocks: u32,
     modified_blocks: BTreeSet<u64>,
@@ -10,6 +11,7 @@ pub struct JournalHandle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JournalHandleSummary {
+    pub handle_id: u64,
     pub transaction_id: u32,
     pub reserved_blocks: u32,
     pub modified_blocks: u32,
@@ -17,13 +19,18 @@ pub struct JournalHandleSummary {
 }
 
 impl JournalHandle {
-    pub fn new(transaction_id: u32, reserved_blocks: u32) -> Self {
+    pub fn new(handle_id: u64, transaction_id: u32, reserved_blocks: u32) -> Self {
         Self {
+            handle_id,
             transaction_id,
             reserved_blocks,
             modified_blocks: BTreeSet::new(),
             data_sync_required: false,
         }
+    }
+
+    pub fn handle_id(&self) -> u64 {
+        self.handle_id
     }
 
     pub fn transaction_id(&self) -> u32 {
@@ -52,6 +59,7 @@ impl JournalHandle {
 
     pub fn summary(&self) -> JournalHandleSummary {
         JournalHandleSummary {
+            handle_id: self.handle_id,
             transaction_id: self.transaction_id,
             reserved_blocks: self.reserved_blocks,
             modified_blocks: self.modified_blocks.len() as u32,

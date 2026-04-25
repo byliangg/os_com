@@ -13,7 +13,8 @@ use aster_cmdline::{KCMDLINE, ModuleArg};
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
     Jbd2Journal, JournalCommitWriteStage, JournalHandle, JournalRecoveryResult, JournalRuntime,
-    MetadataWriter as Ext4MetadataWriter,
+    LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter,
+    OperationAllocGuard as Ext4OperationAllocGuard,
     SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
 };
 use ostd::{
@@ -94,6 +95,14 @@ struct DirectReadProfileStats {
     submit_ns: AtomicU64,
     wait_ns: AtomicU64,
     copy_ns: AtomicU64,
+}
+
+struct Ext4RsRuntimeLockStats {
+    acquire_count: AtomicU64,
+    total_wait_ns: AtomicU64,
+    max_wait_ns: AtomicU64,
+    total_hold_ns: AtomicU64,
+    max_hold_ns: AtomicU64,
 }
 
 static GENERIC014_WRITE_PROGRESS: AtomicU64 = AtomicU64::new(0);
@@ -183,6 +192,46 @@ impl DirectReadProfileStats {
             match self.max_mapped_bytes.compare_exchange_weak(
                 current,
                 mapped_bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Ext4RsRuntimeLockStats {
+    const LOG_INTERVAL_ACQUIRES: u64 = 4_096;
+
+    const fn new() -> Self {
+        Self {
+            acquire_count: AtomicU64::new(0),
+            total_wait_ns: AtomicU64::new(0),
+            max_wait_ns: AtomicU64::new(0),
+            total_hold_ns: AtomicU64::new(0),
+            max_hold_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_wait(&self, wait_ns: u64) {
+        self.acquire_count.fetch_add(1, Ordering::Relaxed);
+        self.total_wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
+        Self::update_max(&self.max_wait_ns, wait_ns);
+    }
+
+    fn record_hold(&self, hold_ns: u64) {
+        self.total_hold_ns.fetch_add(hold_ns, Ordering::Relaxed);
+        Self::update_max(&self.max_hold_ns, hold_ns);
+    }
+
+    fn update_max(target: &AtomicU64, value: u64) {
+        let mut current = target.load(Ordering::Relaxed);
+        while value > current {
+            match target.compare_exchange_weak(
+                current,
+                value,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -405,19 +454,25 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
 struct JournalIoBridge {
     adapter: Arc<KernelBlockDeviceAdapter>,
     runtime: Arc<Mutex<Option<JournalRuntime>>>,
+    current_handle_id: Arc<Mutex<Option<u64>>>,
 }
 
 impl JournalIoBridge {
     fn new(
         adapter: Arc<KernelBlockDeviceAdapter>,
         runtime: Arc<Mutex<Option<JournalRuntime>>>,
+        current_handle_id: Arc<Mutex<Option<u64>>>,
     ) -> Self {
-        Self { adapter, runtime }
+        Self {
+            adapter,
+            runtime,
+            current_handle_id,
+        }
     }
 
     fn overlay_metadata_read(&self, offset: usize, out: &mut [u8]) {
-        let runtime_guard = self.runtime.lock();
-        let Some(runtime) = runtime_guard.as_ref() else {
+        let mut runtime_guard = self.runtime.lock();
+        let Some(runtime) = runtime_guard.as_mut() else {
             return;
         };
         runtime.overlay_metadata_read(offset, out);
@@ -450,14 +505,17 @@ impl Ext4BlockDevice for JournalIoBridge {
 impl Ext4MetadataWriter for JournalIoBridge {
     fn write_metadata(&self, offset: usize, data: &[u8]) {
         let mut defer_metadata_write = false;
+        let current_handle_id = *self.current_handle_id.lock();
         if let Some(runtime) = self.runtime.lock().as_mut() {
             let block_size = runtime.block_size();
-            runtime.record_metadata_write(offset, data, |block_nr| {
-                let block_offset = block_nr as usize * block_size;
-                let mut block_data = vec![0u8; block_size];
-                self.adapter.read_offset_into(block_offset, &mut block_data);
-                block_data
-            });
+            if let Some(handle_id) = current_handle_id {
+                runtime.record_metadata_write_for_handle(handle_id, offset, data, |block_nr| {
+                    let block_offset = block_nr as usize * block_size;
+                    let mut block_data = vec![0u8; block_size];
+                    self.adapter.read_offset_into(block_offset, &mut block_data);
+                    block_data
+                });
+            }
             defer_metadata_write = runtime.should_defer_metadata_write();
         }
         if defer_metadata_write {
@@ -474,6 +532,9 @@ pub(super) struct Ext4Fs {
     mount_flags_bits: AtomicU32,
     jbd2_journal: Mutex<Option<Jbd2Journal>>,
     jbd2_runtime: Arc<Mutex<Option<JournalRuntime>>>,
+    jbd2_current_handle_id: Arc<Mutex<Option<u64>>>,
+    alloc_guard: Arc<LocalOperationAllocGuard>,
+    next_alloc_operation_id: AtomicU64,
     jbd2_checkpoint_lock: Mutex<()>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
@@ -482,6 +543,7 @@ pub(super) struct Ext4Fs {
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     direct_read_profile_started: AtomicBool,
     direct_read_profile: DirectReadProfileStats,
+    runtime_lock_stats: Ext4RsRuntimeLockStats,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
 }
@@ -490,10 +552,18 @@ impl Ext4Fs {
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Arc<Self> {
         let adapter = Arc::new(KernelBlockDeviceAdapter::new(block_device.clone()));
         let jbd2_runtime = Arc::new(Mutex::new(None));
-        let journal_io = Arc::new(JournalIoBridge::new(adapter.clone(), jbd2_runtime.clone()));
+        let jbd2_current_handle_id = Arc::new(Mutex::new(None));
+        let alloc_guard = Arc::new(LocalOperationAllocGuard::new());
+        let journal_io = Arc::new(JournalIoBridge::new(
+            adapter.clone(),
+            jbd2_runtime.clone(),
+            jbd2_current_handle_id.clone(),
+        ));
         let mut ext4 = Ext4::open(journal_io.clone());
         let metadata_writer: Arc<dyn Ext4MetadataWriter> = journal_io;
         ext4.metadata_writer = metadata_writer;
+        let operation_alloc_guard: Arc<dyn Ext4OperationAllocGuard> = alloc_guard.clone();
+        ext4.alloc_guard = operation_alloc_guard;
         let fs = Arc::new_cyclic(|weak_ref| Self {
             inner: Mutex::new(ext4),
             block_device,
@@ -501,6 +571,9 @@ impl Ext4Fs {
             mount_flags_bits: AtomicU32::new(PerMountFlags::default().bits()),
             jbd2_journal: Mutex::new(None),
             jbd2_runtime: jbd2_runtime.clone(),
+            jbd2_current_handle_id: jbd2_current_handle_id.clone(),
+            alloc_guard: alloc_guard.clone(),
+            next_alloc_operation_id: AtomicU64::new(1),
             jbd2_checkpoint_lock: Mutex::new(()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
@@ -509,6 +582,7 @@ impl Ext4Fs {
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
             direct_read_profile_started: AtomicBool::new(false),
             direct_read_profile: DirectReadProfileStats::new(),
+            runtime_lock_stats: Ext4RsRuntimeLockStats::new(),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
         });
@@ -619,12 +693,21 @@ impl Ext4Fs {
 
         self.prepare_ext4_io();
         let superblock_result = {
-            let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+            let runtime_wait_start_ns = Self::monotonic_nanos();
+            let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+            self.record_ext4_rs_runtime_lock_wait(
+                Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+            );
+            let runtime_hold_start_ns = Self::monotonic_nanos();
             let mut inner = self.lock_inner();
-            inner.sync_runtime_block_size();
             let metadata_writer = inner.metadata_writer.clone();
             inner.super_block.set_needs_recovery(false);
             inner.super_block.sync_to_disk_with_csum(&metadata_writer);
+            drop(inner);
+            drop(runtime_guard);
+            self.record_ext4_rs_runtime_lock_hold(
+                Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+            );
             Ok::<(), Error>(())
         };
         let io_result = self.finish_ext4_io();
@@ -680,7 +763,6 @@ impl Ext4Fs {
     }
 
     fn start_jbd2_handle(&self, op: Option<&JournaledOp>) -> Option<JournalHandle> {
-        ext4_rs::clear_operation_allocated_blocks();
         let reserved_blocks = Self::estimate_jbd2_reserved_blocks(op);
         let trigger_op = op.map(|_| Self::jbd2_handle_op_name(op));
         let mut runtime_guard = self.jbd2_runtime.lock();
@@ -688,10 +770,33 @@ impl Ext4Fs {
         let handle = runtime.start_handle(reserved_blocks, trigger_op);
         if matches!(op, Some(JournaledOp::Write { .. })) {
             if let Some(handle) = handle.as_ref() {
-                runtime.mark_handle_requires_data_sync(handle.transaction_id());
+                runtime.mark_handle_requires_data_sync(handle.handle_id());
             }
         }
         handle
+    }
+
+    fn set_current_jbd2_handle(&self, handle: Option<&JournalHandle>) {
+        *self.jbd2_current_handle_id.lock() = handle.map(|handle| handle.handle_id());
+    }
+
+    fn next_alloc_operation_id(&self) -> u64 {
+        self.next_alloc_operation_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+            .max(1)
+    }
+
+    fn begin_alloc_operation(&self, operation_id: Option<u64>) -> u64 {
+        let operation_id = operation_id.unwrap_or_else(|| self.next_alloc_operation_id());
+        self.alloc_guard.begin_operation(operation_id);
+        operation_id
+    }
+
+    fn finish_alloc_operation(&self, operation_id: Option<u64>) {
+        if let Some(operation_id) = operation_id {
+            self.alloc_guard.finish_operation(operation_id);
+        }
     }
 
     fn finish_jbd2_handle(
@@ -709,13 +814,13 @@ impl Ext4Fs {
             .as_mut()
             .and_then(|runtime| runtime.stop_handle(handle));
         let Some(summary) = summary else {
-            ext4_rs::clear_operation_allocated_blocks();
             return;
         };
 
         debug!(
-            "ext4: jbd2 handle op={} tid={} reserved={} modified_blocks={} data_sync_required={} success={}",
+            "ext4: jbd2 handle op={} handle_id={} tid={} reserved={} modified_blocks={} data_sync_required={} success={}",
             op_name,
+            summary.handle_id,
             summary.transaction_id,
             summary.reserved_blocks,
             summary.modified_blocks,
@@ -743,7 +848,6 @@ impl Ext4Fs {
             let (rotated_tid, batch_commit_ready) = {
                 let mut rt = self.jbd2_runtime.lock();
                 let Some(runtime) = rt.as_mut() else {
-                    ext4_rs::clear_operation_allocated_blocks();
                     return;
                 };
                 let rotated_tid = if runtime
@@ -770,12 +874,14 @@ impl Ext4Fs {
             }
         }
 
-        ext4_rs::clear_operation_allocated_blocks();
     }
 
-    fn mark_active_jbd2_handle_requires_data_sync(&self) {
+    fn mark_current_jbd2_handle_requires_data_sync(&self) {
+        let Some(handle_id) = *self.jbd2_current_handle_id.lock() else {
+            return;
+        };
         if let Some(runtime) = self.jbd2_runtime.lock().as_mut() {
-            runtime.mark_active_handle_requires_data_sync();
+            runtime.mark_handle_requires_data_sync(handle_id);
         }
     }
 
@@ -783,7 +889,7 @@ impl Ext4Fs {
         self.jbd2_runtime
             .lock()
             .as_ref()
-            .is_some_and(|runtime| runtime.active_handle().is_some())
+            .is_some_and(|runtime| runtime.has_active_handle())
     }
 
     fn flush_pending_jbd2_transactions(&self) {
@@ -1211,6 +1317,80 @@ impl Ext4Fs {
             .as_secs()
             .saturating_mul(1_000_000_000)
             .saturating_add(u64::from(duration.subsec_nanos()))
+    }
+
+    fn record_ext4_rs_runtime_lock_wait(&self, wait_ns: u64) {
+        self.runtime_lock_stats.record_wait(wait_ns);
+    }
+
+    fn record_ext4_rs_runtime_lock_hold(&self, hold_ns: u64) {
+        self.runtime_lock_stats.record_hold(hold_ns);
+        let acquire_count = self
+            .runtime_lock_stats
+            .acquire_count
+            .load(Ordering::Relaxed);
+        if acquire_count % Ext4RsRuntimeLockStats::LOG_INTERVAL_ACQUIRES == 0 {
+            self.maybe_log_phase2_debug_stats(acquire_count);
+        }
+    }
+
+    fn maybe_log_phase2_debug_stats(&self, runtime_lock_acquires: u64) {
+        if runtime_lock_acquires == 0 {
+            return;
+        }
+        let total_wait_ns = self
+            .runtime_lock_stats
+            .total_wait_ns
+            .load(Ordering::Relaxed);
+        let total_hold_ns = self
+            .runtime_lock_stats
+            .total_hold_ns
+            .load(Ordering::Relaxed);
+        let max_wait_ns = self.runtime_lock_stats.max_wait_ns.load(Ordering::Relaxed);
+        let max_hold_ns = self.runtime_lock_stats.max_hold_ns.load(Ordering::Relaxed);
+        let jbd2_stats = self
+            .jbd2_runtime
+            .lock()
+            .as_ref()
+            .map(|runtime| runtime.debug_stats())
+            .unwrap_or_default();
+        let alloc_guard_stats = self.alloc_guard.debug_stats();
+        let avg_active_x100 = if jbd2_stats.active_handle_samples == 0 {
+            0
+        } else {
+            jbd2_stats
+                .active_handle_sample_sum
+                .saturating_mul(100)
+                / jbd2_stats.active_handle_samples
+        };
+
+        debug!(
+            "[ext4-phase2] runtime_lock_acquires={} avg_wait_us={} max_wait_us={} avg_hold_us={} max_hold_us={} jbd2_handles_started={} finished={} max_active={} avg_active_x100={} max_running_handles={} max_running_reserved={} max_running_metadata={} rotations={} commits_prepared={} commits_finished={} checkpoints={} overlay_reads={} overlay_hits={} metadata_writes={} alloc_clear_calls={} alloc_reserve_calls={} alloc_reserved_blocks={} alloc_contains_checks={} alloc_max_operation_blocks={}",
+            runtime_lock_acquires,
+            total_wait_ns / runtime_lock_acquires / 1_000,
+            max_wait_ns / 1_000,
+            total_hold_ns / runtime_lock_acquires / 1_000,
+            max_hold_ns / 1_000,
+            jbd2_stats.started_handles,
+            jbd2_stats.finished_handles,
+            jbd2_stats.max_active_handles,
+            avg_active_x100,
+            jbd2_stats.max_running_handles,
+            jbd2_stats.max_running_reserved_blocks,
+            jbd2_stats.max_running_metadata_blocks,
+            jbd2_stats.rotated_transactions,
+            jbd2_stats.prepared_commits,
+            jbd2_stats.finished_commits,
+            jbd2_stats.finished_checkpoints,
+            jbd2_stats.overlay_reads,
+            jbd2_stats.overlay_hits,
+            jbd2_stats.metadata_write_records,
+            alloc_guard_stats.clear_calls,
+            alloc_guard_stats.reserve_calls,
+            alloc_guard_stats.reserved_blocks,
+            alloc_guard_stats.contains_checks,
+            alloc_guard_stats.max_operation_blocks,
+        );
     }
 
     fn maybe_log_direct_read_profile(&self, reads: u64) {
@@ -1825,21 +2005,35 @@ impl Ext4Fs {
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
     ) -> Result<T> {
         self.prepare_ext4_io();
-        let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
         let preserve_alloc_guard = self.has_active_jbd2_handle();
+        let alloc_operation_id = if preserve_alloc_guard {
+            None
+        } else {
+            Some(self.begin_alloc_operation(None))
+        };
         if !preserve_alloc_guard {
-            ext4_rs::clear_operation_allocated_blocks();
+            self.alloc_guard.clear_current_operation();
         }
         let result = {
             let inner = self.lock_inner();
-            inner.sync_runtime_block_size();
-            f(&inner).map_err(map_ext4_error)?
+            f(&inner).map_err(map_ext4_error)
         };
         if !preserve_alloc_guard {
-            ext4_rs::clear_operation_allocated_blocks();
+            self.alloc_guard.clear_current_operation();
         }
+        self.finish_alloc_operation(alloc_operation_id);
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
         self.finish_ext4_io()?;
-        Ok(result)
+        result
     }
 
     fn run_inode_metadata_update<T>(
@@ -1860,19 +2054,33 @@ impl Ext4Fs {
 
     pub(super) fn run_ext4_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
         self.prepare_ext4_io();
-        let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
         let preserve_alloc_guard = self.has_active_jbd2_handle();
+        let alloc_operation_id = if preserve_alloc_guard {
+            None
+        } else {
+            Some(self.begin_alloc_operation(None))
+        };
         if !preserve_alloc_guard {
-            ext4_rs::clear_operation_allocated_blocks();
+            self.alloc_guard.clear_current_operation();
         }
         let result = {
             let inner = self.lock_inner();
-            inner.sync_runtime_block_size();
             f(&inner)
         };
         if !preserve_alloc_guard {
-            ext4_rs::clear_operation_allocated_blocks();
+            self.alloc_guard.clear_current_operation();
         }
+        self.finish_alloc_operation(alloc_operation_id);
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
         self.finish_ext4_io()?;
         Ok(result)
     }
@@ -1983,25 +2191,38 @@ impl Ext4Fs {
         self.prepare_ext4_io();
         let finish_io_start_ns = Self::monotonic_nanos();
         let (result, apply_elapsed_ns, finish_handle_elapsed_ns) = {
-            let _runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-            ext4_rs::clear_operation_allocated_blocks();
+            let runtime_wait_start_ns = Self::monotonic_nanos();
+            let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+            self.record_ext4_rs_runtime_lock_wait(
+                Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+            );
+            let runtime_hold_start_ns = Self::monotonic_nanos();
 
             let op_name = Self::jbd2_handle_op_name(op.as_ref());
             let jbd2_handle = self.start_jbd2_handle(op.as_ref());
+            let alloc_operation_id =
+                self.begin_alloc_operation(jbd2_handle.as_ref().map(|handle| handle.handle_id()));
+            self.alloc_guard.clear_current_operation();
+            self.set_current_jbd2_handle(jbd2_handle.as_ref());
 
             let apply_start_ns = Self::monotonic_nanos();
             let result = {
                 let inner = self.lock_inner();
-                inner.sync_runtime_block_size();
                 apply(&inner)
             };
             let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
+            self.set_current_jbd2_handle(None);
 
             let finish_handle_start_ns = Self::monotonic_nanos();
             self.finish_jbd2_handle(jbd2_handle, op_name, result.is_ok());
             let finish_handle_elapsed_ns =
                 Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
-            ext4_rs::clear_operation_allocated_blocks();
+            self.alloc_guard.clear_current_operation();
+            self.finish_alloc_operation(Some(alloc_operation_id));
+            drop(runtime_guard);
+            self.record_ext4_rs_runtime_lock_hold(
+                Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+            );
             (result, apply_elapsed_ns, finish_handle_elapsed_ns)
         };
 
@@ -2465,7 +2686,7 @@ impl Ext4Fs {
             cached_mappings
         } else {
             self.run_journaled_ext4(None, |ext4| {
-                self.mark_active_jbd2_handle_requires_data_sync();
+                self.mark_current_jbd2_handle_requires_data_sync();
                 let mappings = ext4
                     .ext4_prepare_write_at(ino, offset, write_len)
                     .map_err(map_ext4_error)?;

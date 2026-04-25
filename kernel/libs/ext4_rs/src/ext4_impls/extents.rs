@@ -19,7 +19,7 @@ impl Ext4 {
         expected_extent_pos: Option<(usize, Ext4Extent)>,
     ) -> bool {
         let block_size = self.super_block.block_size() as usize;
-        let block = Block::load(&self.block_device, block_addr * block_size);
+        let block = Block::load(&self.block_device, block_addr * block_size, block_size);
         let header: Ext4ExtentHeader = block.read_offset_as(0);
         if header.magic != EXT4_EXTENT_MAGIC
             || header.entries_count != expected_entries
@@ -130,7 +130,11 @@ impl Ext4 {
             return Ok(());
         }
 
-        let mut node_block = Block::load(&self.block_device, node.pblock_of_node * block_size);
+        let mut node_block = Block::load(
+            &self.block_device,
+            node.pblock_of_node * block_size,
+            block_size,
+        );
         let header: Ext4ExtentHeader = node_block.read_offset_as(0);
         let entries = header.entries_count as usize;
         if pos >= entries {
@@ -183,7 +187,7 @@ impl Ext4 {
         // Load the root node
         let root_data: &[u8; 60] =
             unsafe { core::mem::transmute::<&[u32; 15], &[u8; 60]>(&inode_ref.inode.block) };
-        let mut node = ExtentNode::load_from_data(root_data, true)?;
+        let mut node = ExtentNode::load_from_data(root_data, true, block_size)?;
 
         let mut depth = node.header.depth;
 
@@ -221,7 +225,7 @@ impl Ext4 {
                 } else if next_data.len() > block_size {
                     next_data.truncate(block_size);
                 }
-                node = ExtentNode::load_from_data_mut(&mut next_data, false)?;
+                node = ExtentNode::load_from_data_mut(&mut next_data, false, block_size)?;
                 depth -= 1;
                 search_path.depth += 1;
                 pblock_of_node = next_block_usize;
@@ -361,7 +365,7 @@ impl Ext4 {
         } else if data.len() > block_size {
             data.truncate(block_size);
         }
-        let extent_node = ExtentNode::load_from_data(&data, false)?;
+        let extent_node = ExtentNode::load_from_data(&data, false, block_size)?;
 
         match extent_node.get_extent(pos) {
             Some(extent) => Ok(extent),
@@ -398,7 +402,7 @@ impl Ext4 {
         } else if data.len() > block_size {
             data.truncate(block_size);
         }
-        let extent_node = ExtentNode::load_from_data(&data, false)?;
+        let extent_node = ExtentNode::load_from_data(&data, false, block_size)?;
 
         extent_node.get_index(pos)
     }
@@ -487,7 +491,7 @@ impl Ext4 {
             let node = &search_path.path[depth];
             let block = node.pblock_of_node;
             let new_ex_offset = core::mem::size_of::<Ext4ExtentHeader>() + core::mem::size_of::<Ext4Extent>() * (node.position);
-            let mut ext4block = Block::load(&self.block_device, block * block_size);
+            let mut ext4block = Block::load(&self.block_device, block * block_size, block_size);
             let left_ext:&mut Ext4Extent = ext4block.read_offset_as_mut(new_ex_offset);
 
             let unwritten = left_ext.is_unwritten();
@@ -566,7 +570,7 @@ impl Ext4 {
             // load block
             let node_block = node.pblock_of_node;
             let mut ext4block =
-            Block::load(&self.block_device, node_block * block_size);
+            Block::load(&self.block_device, node_block * block_size, block_size);
             let extent_size = core::mem::size_of::<Ext4Extent>();
             let ext_header_size = core::mem::size_of::<Ext4ExtentHeader>();
             let entries_count = {
@@ -632,7 +636,11 @@ impl Ext4 {
         if depth > 0 {
             let parent = &search_path.path[depth - 1];
             let new_leaf_block = self.balloc_alloc_block(inode_ref, None)?;
-            let mut leaf_block = Block::load(&self.block_device, new_leaf_block as usize * block_size);
+            let mut leaf_block = Block::load(
+                &self.block_device,
+                new_leaf_block as usize * block_size,
+                block_size,
+            );
             leaf_block.data.fill(0);
 
             let leaf_header = Ext4ExtentHeader::new(
@@ -709,7 +717,11 @@ impl Ext4 {
 
             // Parent is a non-root internal node in an extent block.
             let mut parent_block =
-                Block::load(&self.block_device, parent.pblock_of_node * block_size);
+                Block::load(
+                    &self.block_device,
+                    parent.pblock_of_node * block_size,
+                    block_size,
+                );
             let parent_header: Ext4ExtentHeader = parent_block.read_offset_as(0);
             let parent_entries = parent_header.entries_count as usize;
             let parent_max = parent_header.max_entries_count as usize;
@@ -778,7 +790,11 @@ impl Ext4 {
 
         // Load new block
         let mut new_ext4block =
-            Block::load(&self.block_device, new_block as usize * block_size);
+            Block::load(
+                &self.block_device,
+                new_block as usize * block_size,
+                block_size,
+            );
 
         // Clear new block to ensure no garbage data
         new_ext4block.data.fill(0);
@@ -998,7 +1014,7 @@ impl Ext4 {
                     continue;
                 }
                 let ext4block =
-                    Block::load(&self.block_device, node_pblock * block_size);
+                    Block::load(&self.block_device, node_pblock * block_size, block_size);
 
                 let header = search_path.path[i as usize].header;
                 let entries_count = header.entries_count;
@@ -1122,7 +1138,7 @@ impl Ext4 {
             // we are at root
             Block::load_inode_root_block(&inode_ref.inode.block)
         } else {
-            Block::load(&self.block_device, node_disk_pos)
+            Block::load(&self.block_device, node_disk_pos, block_size)
         };
 
         // depth 2 (leaf nodes)
@@ -1286,7 +1302,7 @@ impl Ext4 {
         let mut ext4block = if node_disk_pos == 0 {
             Block::load_inode_root_block(&inode_ref.inode.block)
         } else {
-            Block::load(&self.block_device, node_disk_pos)
+            Block::load(&self.block_device, node_disk_pos, block_size)
         };
 
         // If current index is not the last one, move subsequent indexes forward
@@ -1412,7 +1428,7 @@ impl Ext4 {
         if let Some(index) = path.index {
             let last_index_pos = header.entries_count as usize - 1;
             let node_disk_pos = path.pblock_of_node * block_size;
-            let ext4block = Block::load(&self.block_device, node_disk_pos);
+            let ext4block = Block::load(&self.block_device, node_disk_pos, block_size);
             let last_index: Ext4ExtentIndex =
                 ext4block.read_offset_as(size_of::<Ext4ExtentIndex>() * last_index_pos);
 
@@ -1434,7 +1450,7 @@ impl Ext4 {
     /// Calculate and set the extent block checksum in the extent tail
     fn set_extent_block_checksum(&self, inode_ref: &Ext4InodeRef, block_addr: usize) -> Result<()> {
         let block_size = self.super_block.block_size() as usize;
-        let mut ext4block = Block::load(&self.block_device, block_addr * block_size);
+        let mut ext4block = Block::load(&self.block_device, block_addr * block_size, block_size);
         self.set_extent_block_checksum_in_block(inode_ref, block_addr, &mut ext4block)?;
         ext4block.sync_blk_to_disk(&self.metadata_writer);
         Ok(())

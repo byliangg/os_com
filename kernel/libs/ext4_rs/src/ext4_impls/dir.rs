@@ -4,6 +4,10 @@ use crate::return_errno_with_message;
 use crate::ext4_defs::*;
 
 impl Ext4 {
+    fn is_unmapped_dir_block(err: &Ext4Error) -> bool {
+        err.error() == Errno::ENOENT
+    }
+
     fn log_dir_mapping_failure(
         &self,
         op: &str,
@@ -81,7 +85,11 @@ impl Ext4 {
             };
 
             // load physical block
-            let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+            let ext4block = Block::load(
+                &self.block_device,
+                fblock as usize * block_size,
+                block_size,
+            );
 
             // find entry in block
             let r = self.dir_find_in_block(&ext4block, name, result);
@@ -164,7 +172,11 @@ impl Ext4 {
         // iterate all blocks
         while iblock < total_blocks {
             if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
-                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let ext4block = Block::load(
+                    &self.block_device,
+                    fblock as usize * block_size,
+                    block_size,
+                );
                 let mut offset = 0;
 
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
@@ -208,7 +220,11 @@ impl Ext4 {
 
         while iblock < total_blocks {
             if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
-                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let ext4block = Block::load(
+                    &self.block_device,
+                    fblock as usize * block_size,
+                    block_size,
+                );
                 let mut offset = 0usize;
 
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
@@ -242,7 +258,7 @@ impl Ext4 {
 
         tail.tail_set_csum(&self.super_block, &parent_de, &dst_blk.data[..], ino_gen);
 
-        tail.copy_to_slice(&mut dst_blk.data);
+        tail.copy_to_slice(&mut dst_blk.data, block_size);
     }
 
     fn inode_to_dir_entry_type(inode: &Ext4Inode) -> DirEntryType {
@@ -295,7 +311,11 @@ impl Ext4 {
                     return Err(e);
                 }
             };
-            let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
+            let mut ext4block = Block::load(
+                &self.block_device,
+                pblock as usize * block_size,
+                block_size,
+            );
             if let Ok(within_offset) = self.try_insert_to_existing_block(
                 &mut ext4block,
                 name,
@@ -313,7 +333,11 @@ impl Ext4 {
         let new_iblock = total_blocks;
         let new_block = self.append_inode_pblk(parent)?;
         let mut new_ext4block =
-            Block::load(&self.block_device, new_block as usize * block_size);
+            Block::load(
+                &self.block_device,
+                new_block as usize * block_size,
+                block_size,
+            );
         self.insert_to_new_block(
             &mut new_ext4block,
             child.inode_num,
@@ -341,25 +365,41 @@ impl Ext4 {
         if total_blocks > 0 {
             let last_iblock = total_blocks - 1;
             let pblock = match self.get_pblock_idx(parent, last_iblock as u32) {
-                Ok(pblock) => pblock,
+                Ok(pblock) => Some(pblock),
                 Err(e) => {
-                    self.log_dir_mapping_failure("dir_add_entry:last", parent, name, last_iblock as u32, &e);
-                    return Err(e);
+                    if Self::is_unmapped_dir_block(&e) {
+                        None
+                    } else {
+                        self.log_dir_mapping_failure(
+                            "dir_add_entry:last",
+                            parent,
+                            name,
+                            last_iblock as u32,
+                            &e,
+                        );
+                        return Err(e);
+                    }
                 }
             };
-            let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
-            if self
-                .try_insert_to_existing_block(
-                    &mut ext4block,
-                    name,
-                    child.inode_num,
-                    Self::inode_to_dir_entry_type(&child.inode),
-                )
-                .is_ok()
-            {
-                self.dir_set_csum(&mut ext4block, parent.inode.generation());
-                ext4block.sync_blk_to_disk(&self.metadata_writer);
-                return Ok(EOK);
+            if let Some(pblock) = pblock {
+                let mut ext4block = Block::load(
+                    &self.block_device,
+                    pblock as usize * block_size,
+                    block_size,
+                );
+                if self
+                    .try_insert_to_existing_block(
+                        &mut ext4block,
+                        name,
+                        child.inode_num,
+                        Self::inode_to_dir_entry_type(&child.inode),
+                    )
+                    .is_ok()
+                {
+                    self.dir_set_csum(&mut ext4block, parent.inode.generation());
+                    ext4block.sync_blk_to_disk(&self.metadata_writer);
+                    return Ok(EOK);
+                }
             }
         }
 
@@ -370,14 +410,27 @@ impl Ext4 {
             let pblock = match self.get_pblock_idx(parent, iblock as u32) {
                 Ok(pblock) => pblock,
                 Err(e) => {
-                    self.log_dir_mapping_failure("dir_add_entry:scan", parent, name, iblock as u32, &e);
+                    if Self::is_unmapped_dir_block(&e) {
+                        iblock += 1;
+                        continue;
+                    }
+                    self.log_dir_mapping_failure(
+                        "dir_add_entry:scan",
+                        parent,
+                        name,
+                        iblock as u32,
+                        &e,
+                    );
                     return Err(e);
                 }
             };
 
             // load physical block
-            let mut ext4block =
-                Block::load(&self.block_device, pblock as usize * block_size);
+            let mut ext4block = Block::load(
+                &self.block_device,
+                pblock as usize * block_size,
+                block_size,
+            );
 
             let result = self.try_insert_to_existing_block(
                 &mut ext4block,
@@ -403,7 +456,11 @@ impl Ext4 {
 
         // load new block
         let mut new_ext4block =
-            Block::load(&self.block_device, new_block as usize * block_size);
+            Block::load(
+                &self.block_device,
+                new_block as usize * block_size,
+                block_size,
+            );
 
         // write new entry to the new block
         // must succeed, as we just allocated the block
@@ -525,7 +582,7 @@ impl Ext4 {
 
         // init tail for new block
         let tail = Ext4DirEntryTail::new();
-        tail.copy_to_slice(&mut block.data);
+        tail.copy_to_slice(&mut block.data, block_size);
     }
 
     pub fn dir_remove_entry(&self, parent: &mut Ext4InodeRef, path: &str) -> Result<usize> {
@@ -535,7 +592,11 @@ impl Ext4 {
 
         let r = self.dir_find_entry(parent.inode_num, path, &mut result)?;
 
-        let mut ext4block = Block::load(&self.block_device, result.pblock_id * block_size);
+        let mut ext4block = Block::load(
+            &self.block_device,
+            result.pblock_id * block_size,
+            block_size,
+        );
 
         // Invalidate entry first
         let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(result.offset);
@@ -593,7 +654,11 @@ impl Ext4 {
         let offset_in_block = (abs_byte_offset as usize) % block_size;
 
         let pblock = self.get_pblock_idx(parent, iblock as u32)?;
-        let mut ext4block = Block::load(&self.block_device, pblock as usize * block_size);
+        let mut ext4block = Block::load(
+            &self.block_device,
+            pblock as usize * block_size,
+            block_size,
+        );
 
         // Invalidate the entry at the given offset
         let de_del: &mut Ext4DirEntry = ext4block.read_offset_as_mut(offset_in_block);
@@ -650,7 +715,11 @@ impl Ext4 {
             fblock = self.get_pblock_idx(&parent, iblock as u32)?;
 
             // load physical block
-            let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+            let ext4block = Block::load(
+                &self.block_device,
+                fblock as usize * block_size,
+                block_size,
+            );
 
             // start from the first entry
             let mut offset = 0;

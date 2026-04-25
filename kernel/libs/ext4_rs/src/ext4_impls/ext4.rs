@@ -3,16 +3,12 @@ use crate::return_errno_with_message;
 use crate::utils::*;
 
 use crate::ext4_defs::*;
+use crate::ext4_impls::LocalOperationAllocGuard;
 
 impl Ext4 {
     #[inline]
     pub fn write_metadata(&self, offset: usize, data: &[u8]) {
         self.metadata_writer.write_metadata(offset, data);
-    }
-
-    #[inline]
-    pub fn sync_runtime_block_size(&self) {
-        set_runtime_block_size(self.super_block.block_size() as usize);
     }
 
     /// 获取system zone缓存
@@ -73,21 +69,15 @@ impl Ext4 {
     }
     /// Opens and loads an Ext4 from the `block_device`.
     pub fn open(block_device: Arc<dyn BlockDevice>) -> Self {
-        // Superblock is always located at byte offset 1024, read with default
-        // compile-time block size first, then switch runtime block size.
-        set_runtime_block_size(BLOCK_SIZE);
-
         // Load the superblock
-        let block = Block::load(&block_device, SUPERBLOCK_OFFSET);
+        let block = Block::load(&block_device, SUPERBLOCK_OFFSET, BLOCK_SIZE);
         let super_block: Ext4Superblock = block.read_as();
-
-        // ext4 supports 1KiB/2KiB/4KiB blocks in our current scope.
-        set_runtime_block_size(super_block.block_size() as usize);
 
         // drop(block);
         
         let ext4_tmp = Ext4 {
             metadata_writer: Arc::new(PassthroughMetadataWriter::new(block_device.clone())),
+            alloc_guard: Arc::new(LocalOperationAllocGuard::new()),
             block_device,
             super_block,
             system_zone_cache: None,

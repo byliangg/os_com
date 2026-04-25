@@ -39,7 +39,7 @@ install_host_tool_with_libs() {
 
   install -D -m 0755 "${tool_path}" "${ROOTFS_DIR}/${target_path}"
 
-  ldd "${tool_path}" 2>/dev/null | awk '
+  { ldd "${tool_path}" 2>/dev/null || true; } | awk '
     /=>/ {
       if ($3 ~ /^\//) print $3
     }
@@ -83,6 +83,8 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_exclud
   "${ROOTFS_DIR}/opt/xfstests/blocked/jbd_phase1_excluded.tsv"
 install -D -m 0755 test/initramfs/src/syscall/ext4_crash/run_ext4_crash_test.sh \
   "${ROOTFS_DIR}/opt/ext4_crash/run_ext4_crash_test.sh"
+install -D -m 0755 test/initramfs/src/syscall/ext4_phase2/run_ext4_phase2_concurrency.sh \
+  "${ROOTFS_DIR}/opt/ext4_phase2/run_ext4_phase2_concurrency.sh"
 
 echo "[INFO] Injecting host e2fsprogs tools into initramfs ..."
 install_host_tool_with_libs /usr/sbin/mkfs.ext4 /usr/sbin/mkfs.ext4
@@ -93,6 +95,14 @@ echo "[INFO] Building xfstests file I/O helper ..."
 XFSTESTS_FSYNC_HELPER="${WORK_DIR}/fsync_file"
 ${CC:-gcc} -O2 test/initramfs/src/syscall/xfstests/fsync_file.c -o "${XFSTESTS_FSYNC_HELPER}"
 install_host_tool_with_libs "${XFSTESTS_FSYNC_HELPER}" /opt/xfstests/fsync_file
+
+echo "[INFO] Building ext4 Phase 2 concurrency helper ..."
+EXT4_PHASE2_HELPER="${WORK_DIR}/phase2_concurrency"
+if ! ${CC:-gcc} -O2 -Wall -Wextra -static test/initramfs/src/syscall/ext4_phase2/phase2_concurrency.c -o "${EXT4_PHASE2_HELPER}"; then
+  echo "[WARN] static ext4 Phase 2 helper build failed; falling back to dynamic build" >&2
+  ${CC:-gcc} -O2 -Wall -Wextra test/initramfs/src/syscall/ext4_phase2/phase2_concurrency.c -o "${EXT4_PHASE2_HELPER}"
+fi
+install_host_tool_with_libs "${EXT4_PHASE2_HELPER}" /opt/ext4_phase2/phase2_concurrency
 
 if [ -d "${XFSTESTS_PREBUILT_DIR}/xfstests-dev" ]; then
   echo "[INFO] Injecting xfstests prebuilt from ${XFSTESTS_PREBUILT_DIR} ..."

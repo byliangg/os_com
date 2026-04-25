@@ -3,11 +3,6 @@ use crate::prelude::*;
 use crate::return_errno_with_message;
 use crate::utils::bitmap::*;
 
-use super::{
-    is_operation_allocated_block, reserve_operation_allocated_block,
-    reserve_operation_allocated_blocks,
-};
-
 impl Ext4 {
     fn verify_bitmap_bits_visible(
         &self,
@@ -54,7 +49,11 @@ impl Ext4 {
         target: Ext4Fsblk,
     ) -> Result<bool> {
         let block_size = self.super_block.block_size() as usize;
-        let node_block = Block::load(&self.block_device, node_pblock as usize * block_size);
+        let node_block = Block::load(
+            &self.block_device,
+            node_pblock as usize * block_size,
+            block_size,
+        );
         let header = Ext4ExtentHeader::load_from_u8(&node_block.data[..EXT4_EXTENT_HEADER_SIZE]);
         if header.magic != EXT4_EXTENT_MAGIC || header.depth != expected_depth {
             return Err(Ext4Error::new(Errno::EIO));
@@ -316,13 +315,17 @@ impl Ext4 {
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
             let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * block_size);
+                Block::load(
+                    &self.block_device,
+                    bmp_blk_adr as usize * block_size,
+                    block_size,
+                );
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
                 let block_num = self.bg_idx_to_addr(idx_in_bg, bgid);
                 if self.is_system_reserved_block(block_num, bgid)
-                    || is_operation_allocated_block(block_num)
+                    || self.alloc_guard.contains_current_block(block_num)
                     || self.inode_already_maps_block(inode_ref, block_num)
                 {
                     // 跳过 system zone
@@ -341,7 +344,7 @@ impl Ext4 {
 
                     /* Update free block counts */
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
-                    reserve_operation_allocated_block(alloc);
+                    self.alloc_guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -355,7 +358,7 @@ impl Ext4 {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(tmp_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid)
-                        || is_operation_allocated_block(block_num)
+                        || self.alloc_guard.contains_current_block(block_num)
                     {
                         continue;
                     }
@@ -372,7 +375,7 @@ impl Ext4 {
                         &[alloc],
                     );
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
-                    reserve_operation_allocated_block(alloc);
+                    self.alloc_guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -383,7 +386,7 @@ impl Ext4 {
                 // Check if this is a system reserved block
                 let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
                 if !self.is_system_reserved_block(block_num, bgid)
-                    && !is_operation_allocated_block(block_num)
+                    && !self.alloc_guard.contains_current_block(block_num)
                 {
                     ext4_bmap_bit_set(&mut bitmap_block.data, rel_blk_idx);
                     block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
@@ -397,7 +400,7 @@ impl Ext4 {
                         &[alloc],
                     );
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
-                    reserve_operation_allocated_block(alloc);
+                    self.alloc_guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -472,12 +475,16 @@ impl Ext4 {
             // Load block with bitmap
             let bmp_blk_adr = block_group.get_block_bitmap_block(super_block);
             let mut bitmap_block =
-                Block::load(&self.block_device, bmp_blk_adr as usize * block_size);
+                Block::load(
+                    &self.block_device,
+                    bmp_blk_adr as usize * block_size,
+                    block_size,
+                );
 
             // Check if goal is free
             if ext4_bmap_is_bit_clr(&bitmap_block.data, idx_in_bg) {
                 let block_num = self.bg_idx_to_addr(idx_in_bg, bgid);
-                if is_operation_allocated_block(block_num) {
+                if self.alloc_guard.contains_current_block(block_num) {
                     idx_in_bg = idx_in_bg.saturating_add(1);
                     continue;
                 }
@@ -497,7 +504,7 @@ impl Ext4 {
                 self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
 
                 *start_bgid = bgid;
-                reserve_operation_allocated_block(alloc);
+                self.alloc_guard.reserve_current_block(alloc);
                 return Ok(alloc);
             }
 
@@ -509,7 +516,7 @@ impl Ext4 {
                     // Check if this is a system reserved block
                     let block_num = self.bg_idx_to_addr(tmp_idx, bgid);
                     if self.is_system_reserved_block(block_num, bgid)
-                        || is_operation_allocated_block(block_num)
+                        || self.alloc_guard.contains_current_block(block_num)
                     {
                         continue;
                     }
@@ -528,7 +535,7 @@ impl Ext4 {
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
 
                     *start_bgid = bgid;
-                    reserve_operation_allocated_block(alloc);
+                    self.alloc_guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -539,7 +546,7 @@ impl Ext4 {
                 // Check if this is a system reserved block
                 let block_num = self.bg_idx_to_addr(rel_blk_idx, bgid);
                 if !self.is_system_reserved_block(block_num, bgid)
-                    && !is_operation_allocated_block(block_num)
+                    && !self.alloc_guard.contains_current_block(block_num)
                 {
                     ext4_bmap_bit_set(&mut bitmap_block.data, rel_blk_idx);
                     block_group.set_block_group_balloc_bitmap_csum(super_block, &bitmap_block.data);
@@ -555,7 +562,7 @@ impl Ext4 {
                     self.update_free_block_counts(inode_ref, &mut block_group, bgid as usize)?;
 
                     *start_bgid = bgid;
-                    reserve_operation_allocated_block(alloc);
+                    self.alloc_guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -791,7 +798,7 @@ impl Ext4 {
                         current_idx += 1;
                         continue;
                     }
-                    if is_operation_allocated_block(block_num) {
+                    if self.alloc_guard.contains_current_block(block_num) {
                         current_idx += 1;
                         continue;
                     }
@@ -855,7 +862,7 @@ impl Ext4 {
                         start_idx = rel_blk_idx + 1;
                         continue;
                     }
-                    if is_operation_allocated_block(block_num) {
+                    if self.alloc_guard.contains_current_block(block_num) {
                         start_idx = rel_blk_idx + 1;
                         continue;
                     }
@@ -965,7 +972,7 @@ impl Ext4 {
         
         // Write back inode to save block count changes
         if allocated_count > 0 {
-            reserve_operation_allocated_blocks(&result);
+            self.alloc_guard.reserve_current_blocks(&result);
             self.write_back_inode(inode_ref);
         }
         

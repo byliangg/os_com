@@ -21,7 +21,11 @@ impl Ext4 {
         if idx >= ptrs_per_block {
             return_errno_with_message!(Errno::EFBIG, "legacy indirect index out of range");
         }
-        let blk = Block::load(&self.block_device, ind_block as usize * block_size);
+        let blk = Block::load(
+            &self.block_device,
+            ind_block as usize * block_size,
+            block_size,
+        );
         let ptr: u32 = blk.read_offset_as((idx as usize) * core::mem::size_of::<u32>());
         Ok(ptr)
     }
@@ -32,7 +36,11 @@ impl Ext4 {
         if idx >= ptrs_per_block {
             return_errno_with_message!(Errno::EFBIG, "legacy indirect index out of range");
         }
-        let mut blk = Block::load(&self.block_device, ind_block as usize * block_size);
+        let mut blk = Block::load(
+            &self.block_device,
+            ind_block as usize * block_size,
+            block_size,
+        );
         let ptr: &mut u32 = blk.read_offset_as_mut((idx as usize) * core::mem::size_of::<u32>());
         *ptr = val;
         blk.sync_blk_to_disk(&self.metadata_writer);
@@ -181,7 +189,7 @@ impl Ext4 {
         let block_offset = inode_pos / block_size * block_size;
         let offset_in_block = inode_pos - block_offset;
 
-        let mut block = Block::load(&self.block_device, block_offset);
+        let mut block = Block::load(&self.block_device, block_offset, block_size);
         let inode_bytes = unsafe {
             core::slice::from_raw_parts(inode as *const _ as *const u8, size_of::<Ext4Inode>())
         };
@@ -205,9 +213,10 @@ impl Ext4 {
     pub fn get_inode_ref(&self, inode_num: u32) -> Ext4InodeRef {
         self.validate_inode_number(inode_num)
             .expect("invalid inode number passed to get_inode_ref");
+        let block_size = self.super_block.block_size() as usize;
         let offset = self.inode_disk_pos(inode_num);
 
-        let mut ext4block = Block::load(&self.block_device, offset);
+        let mut ext4block = Block::load(&self.block_device, offset, block_size);
 
         let inode: &mut Ext4Inode = ext4block.read_as_mut();
 
@@ -407,7 +416,11 @@ impl Ext4 {
                     ind_block = u32::try_from(fresh).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
                     inode_ref.inode.block[EXT4_IND_BLOCK] = ind_block;
 
-                    let mut ind = Block::load(&self.block_device, ind_block as usize * block_size);
+                    let mut ind = Block::load(
+                        &self.block_device,
+                        ind_block as usize * block_size,
+                        block_size,
+                    );
                     ind.data.fill(0);
                     ind.sync_blk_to_disk(&self.metadata_writer);
                 }
@@ -549,7 +562,11 @@ impl Ext4 {
             ind_block = u32::try_from(fresh_indirect).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
             inode_ref.inode.block[EXT4_IND_BLOCK] = ind_block;
 
-            let mut ind = Block::load(&self.block_device, ind_block as usize * block_size);
+            let mut ind = Block::load(
+                &self.block_device,
+                ind_block as usize * block_size,
+                block_size,
+            );
             ind.data.fill(0);
             ind.sync_blk_to_disk(&self.metadata_writer);
             self.write_back_inode(inode_ref);
@@ -841,7 +858,11 @@ impl Ext4 {
 
         // Walk down internal index blocks until we reach a leaf block.
         while remaining_depth > 0 {
-            let index_block = Block::load(&self.block_device, current_block as usize * block_size);
+            let index_block = Block::load(
+                &self.block_device,
+                current_block as usize * block_size,
+                block_size,
+            );
             let index_header = Ext4ExtentHeader::load_from_u8(&index_block.data[..]);
             if index_header.entries_count == 0 {
                 return return_errno_with_message!(Errno::ENOENT, "Invalid extent tree");
@@ -855,7 +876,11 @@ impl Ext4 {
             remaining_depth -= 1;
         }
 
-        let leaf_block = Block::load(&self.block_device, current_block as usize * block_size);
+        let leaf_block = Block::load(
+            &self.block_device,
+            current_block as usize * block_size,
+            block_size,
+        );
         let leaf_header = Ext4ExtentHeader::load_from_u8(&leaf_block.data[..]);
         if leaf_header.entries_count == 0 {
             return return_errno_with_message!(Errno::ENOENT, "No extent entries found");

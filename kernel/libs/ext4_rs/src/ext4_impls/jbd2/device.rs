@@ -83,7 +83,7 @@ impl JournalDevice {
             .checked_mul(self.fs_block_size as u64)
             .and_then(|v| usize::try_from(v).ok())
             .ok_or_else(|| Ext4Error::with_message(Errno::EINVAL, "journal block offset overflow"))?;
-        let block = Block::load(block_device, offset);
+        let block = Block::load(block_device, offset, self.fs_block_size as usize);
         Ok(block.data)
     }
 

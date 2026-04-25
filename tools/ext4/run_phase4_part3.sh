@@ -43,9 +43,15 @@ RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD:-1}
 RUN_PHASE3_BASE=${RUN_PHASE3_BASE:-1}
 RUN_PHASE6_GOOD=${RUN_PHASE6_GOOD:-0}
 RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
+RUN_PHASE2_CONCURRENCY=${RUN_PHASE2_CONCURRENCY:-0}
 RUN_LMBENCH=${RUN_LMBENCH:-1}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
+EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync"}
+EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
+EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
+EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED:-1}
+EXT4_PHASE2_TIMEOUT_SEC=${EXT4_PHASE2_TIMEOUT_SEC:-900}
 
 if [ ! -f "${INITRAMFS_IMG}" ]; then
   "${ROOT_DIR}/tools/ext4/prepare_phase4_part3_initramfs.sh" "${BASE_INITRAMFS}" "${INITRAMFS_IMG}"
@@ -234,6 +240,57 @@ run_xfstests_mode() {
   return 0
 }
 
+run_phase2_concurrency_suite() {
+  local log_file="$1"
+
+  pkill -f qemu-system >/dev/null 2>&1 || true
+  rm -f qemu.log kernel/qemu.log
+  truncate -s "${XFSTESTS_TEST_IMG_SIZE}" test/initramfs/build/ext2.img
+  mkfs.ext4 -F -b 4096 test/initramfs/build/ext2.img >/tmp/mkfs_ext4_phase2_concurrency.log 2>&1
+
+  set +e
+  timeout "${EXT4_PHASE2_TIMEOUT_SEC}s" bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
+    --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
+    --kcmd-args='console=${CONSOLE}' \
+    --kcmd-args='SYSCALL_TEST_SUITE=ext4_phase2' \
+    --kcmd-args='EXT4_PHASE2_TEST_DEV=/dev/vda' \
+    --kcmd-args='EXT4_PHASE2_MNT=/ext4_phase2' \
+    --kcmd-args='EXT4_PHASE2_SKIP_MKFS=1' \
+    --kcmd-args='EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES}' \
+    --kcmd-args='EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS}' \
+    --kcmd-args='EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS}' \
+    --kcmd-args='EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED}' \
+    --init-args='/opt/syscall_test/run_syscall_test.sh' \
+    --target-arch=x86_64 \
+    --profile release-lto \
+    --boot-method='${BOOT_METHOD}' \
+    --grub-boot-protocol=multiboot2 \
+    --initramfs='${INITRAMFS_IMG}'" >"${log_file}" 2>&1
+  local rc=$?
+  set -e
+
+  echo "[DONE] mode=jbd_phase2_concurrency rc=${rc} log=${log_file}"
+  if command -v rg >/dev/null 2>&1; then
+    rg -n "EXT4_PHASE2_|mode\\tpass\\tfail|jbd_phase2_concurrency\\t|All syscall tests passed|Error: ext4 Phase 2" "${log_file}" | tail -n 120 || true
+  else
+    grep -nE "EXT4_PHASE2_|mode[[:space:]]+pass[[:space:]]+fail|jbd_phase2_concurrency[[:space:]]|All syscall tests passed|Error: ext4 Phase 2" "${log_file}" | tail -n 120 || true
+  fi
+  if [ ${rc} -ne 0 ]; then
+    return ${rc}
+  fi
+  if ! grep -aF -q "EXT4_PHASE2_CONCURRENCY_PASS" "${log_file}" 2>/dev/null; then
+    echo "[FAIL] phase2 concurrency pass marker missing" >&2
+    tail -n 160 "${log_file}" >&2 || true
+    return 1
+  fi
+  if grep -aE "EXT4_PHASE2_FAIL|EXT4_PHASE2_RUNNER_FAIL|panic|BUG|logical block not mapped|mapped block out of range|Extentindex not found|ext4 write_at failed|Heap allocation error|Failed to allocate a large slot" "${log_file}" >/dev/null 2>&1; then
+    echo "[FAIL] phase2 concurrency strict scan matched error keyword" >&2
+    grep -aEn "EXT4_PHASE2_FAIL|EXT4_PHASE2_RUNNER_FAIL|panic|BUG|logical block not mapped|mapped block out of range|Extentindex not found|ext4 write_at failed|Heap allocation error|Failed to allocate a large slot" "${log_file}" >&2 || true
+    return 1
+  fi
+  return 0
+}
+
 run_lmbench_regression() {
   local summary="$1"
   : > "${summary}"
@@ -314,6 +371,7 @@ PHASE4_LOG="${LOG_DIR}/phase4_good_${TS}.log"
 PHASE3_LOG="${LOG_DIR}/phase3_base_guard_${TS}.log"
 PHASE6_LOG="${LOG_DIR}/phase6_good_${TS}.log"
 JBD_PHASE1_LOG="${LOG_DIR}/jbd_phase1_${TS}.log"
+PHASE2_CONCURRENCY_LOG="${LOG_DIR}/jbd_phase2_concurrency_${TS}.log"
 LMB_SUMMARY="${LOG_DIR}/lmbench/phase4_part3_lmbench_summary_${TS}.tsv"
 
 ANY_STAGE_RAN=0
@@ -353,6 +411,13 @@ else
   echo "[SKIP] jbd_phase1 disabled (RUN_JBD_PHASE1=${RUN_JBD_PHASE1})"
 fi
 
+if [ "${RUN_PHASE2_CONCURRENCY}" = "1" ]; then
+  run_phase2_concurrency_suite "${PHASE2_CONCURRENCY_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] phase2 concurrency disabled (RUN_PHASE2_CONCURRENCY=${RUN_PHASE2_CONCURRENCY})"
+fi
+
 if [ "${RUN_LMBENCH}" = "1" ]; then
   run_lmbench_regression "${LMB_SUMMARY}"
   ANY_STAGE_RAN=1
@@ -361,7 +426,7 @@ else
 fi
 
 if [ "${ANY_STAGE_RAN}" -ne 1 ]; then
-  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_LMBENCH." >&2
+  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_PHASE2_CONCURRENCY/RUN_LMBENCH." >&2
   exit 2
 fi
 
@@ -385,6 +450,16 @@ if [ "${RUN_PHASE6_GOOD}" = "1" ]; then
   echo "phase6_good_log=${PHASE6_LOG}"
 else
   echo "phase6_good_log=<disabled>"
+fi
+if [ "${RUN_JBD_PHASE1}" = "1" ]; then
+  echo "jbd_phase1_log=${JBD_PHASE1_LOG}"
+else
+  echo "jbd_phase1_log=<disabled>"
+fi
+if [ "${RUN_PHASE2_CONCURRENCY}" = "1" ]; then
+  echo "jbd_phase2_concurrency_log=${PHASE2_CONCURRENCY_LOG}"
+else
+  echo "jbd_phase2_concurrency_log=<disabled>"
 fi
 if [ "${RUN_LMBENCH}" = "1" ]; then
   echo "lmbench_summary=${LMB_SUMMARY}"

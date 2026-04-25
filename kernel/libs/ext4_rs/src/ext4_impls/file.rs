@@ -104,7 +104,11 @@ impl Ext4 {
         let block_size = self.super_block.block_size() as usize;
         let first_index = Ext4ExtentIndex::load_from_u32(&inode_ref.inode.block[3..]);
         let child_block = first_index.get_pblock();
-        let child = Block::load(&self.block_device, child_block as usize * block_size);
+        let child = Block::load(
+            &self.block_device,
+            child_block as usize * block_size,
+            block_size,
+        );
         let child_header = Ext4ExtentHeader::load_from_u8(&child.data[..EXT4_EXTENT_HEADER_SIZE]);
         let entry_size = if child_header.depth == 0 {
             EXT4_EXTENT_SIZE
@@ -227,7 +231,11 @@ impl Ext4 {
         let block_size = self.super_block.block_size() as usize;
         let first_index = Ext4ExtentIndex::load_from_u32(&inode_ref.inode.block[3..]);
         let child_block = first_index.get_pblock();
-        let child = Block::load(&self.block_device, child_block as usize * block_size);
+        let child = Block::load(
+            &self.block_device,
+            child_block as usize * block_size,
+            block_size,
+        );
         let child_header = Ext4ExtentHeader::load_from_u8(&child.data[..EXT4_EXTENT_HEADER_SIZE]);
         let child_capacity = child
             .data
@@ -1570,7 +1578,7 @@ impl Ext4 {
     //         total_blocks += 1;
 
     //         let write_start = Instant::now();
-    //         let mut block = Block::load(self.block_device.clone(), pblock_idx as usize * block_size);
+    //         let mut block = Block::load(&self.block_device, pblock_idx as usize * block_size, block_size);
     //         block.write_offset(unaligned, &write_buf[..len], len);
     //         let write_time = write_start.elapsed();
     //         total_write_time += write_time;
@@ -1605,7 +1613,7 @@ impl Ext4 {
 
     //         let write_start = Instant::now();
     //         let block_offset = pblock_idx as usize * block_size;
-    //         let mut block = Block::load(self.block_device.clone(), block_offset);
+    //         let mut block = Block::load(&self.block_device, block_offset, block_size);
     //         let write_size = min(block_size, write_buf_len - written);
     //         block.write_offset(0, &write_buf[written..written + write_size], write_size);
     //         let write_time = write_start.elapsed();

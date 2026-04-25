@@ -2,7 +2,7 @@
 
 本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 1 完成状态**：在 Asterinas 上实现 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery，并用 xfstests、crash matrix、fio 与编译/单测完成闭环验证。
 
-当前日期口径：2026-04-24（Asia/Shanghai）。
+当前日期口径：2026-04-25（Asia/Shanghai）。
 
 ## 当前状态
 
@@ -13,9 +13,10 @@
 - fio O_DIRECT 性能 Phase 1：顺序读写已达到守底目标，最新 JBD2 收口后结果为 read `93.49%`、write `87.01%`（对比 Linux ext4）。
 - JBD2 Phase 1：已完成完整事务管理、日志写盘、checkpoint、dirty journal recovery、crash 注入与旧 CrashJournal 移除。
 
-### 仍在后续阶段
+### Phase 2 已启动
 
-- 多文件并发读写是 `feature_jbd2_phase2` 范围。
+- 多文件并发读写是 `feature_jbd2_phase2` 范围；当前已完成 Phase 2 Step 0 并发测试资产、Step 1 锁顺序/低噪声观测点、Step 2 `runtime_block_size` 显式化、Step 3 JBD2 handle-local operation context、Step 4 operation allocated block guard 本地化。
+- Phase 2 按“先 correctness，再性能”推进：先盘点并修复全局锁、共享状态、JBD2 handle 归属、allocator guard、inode/目录/cache 并发风险，再恢复并发吞吐。
 - 更大范围 xfstests、更多 Linux ext4 兼容语义、并发吞吐优化和 PageCache 深度优化仍可继续推进。
 
 ## JBD2 Phase 1 进展
@@ -120,6 +121,27 @@ bash tools/ext4/run_phase4_in_docker.sh
 - `test/initramfs/src/syscall/xfstests/testcases/jbd_phase1.list`
 - `test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_excluded.tsv`
 
+### Phase 2 并发 baseline
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase2_concurrency \
+ENABLE_KVM=1 \
+NETDEV=tap \
+VHOST=on \
+EXT4_PHASE2_SEED=1 \
+EXT4_PHASE2_WORKERS=4 \
+EXT4_PHASE2_ROUNDS=8 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+该模式运行自研多文件并发 baseline，并执行严格关键词扫描；case 列表可通过 `EXT4_PHASE2_CASES=multi_file_write_verify,rename_churn` 缩小。
+
+Step 2 收口证据：`cargo check -p ext4_rs` PASS、`cargo test -p ext4_rs --lib` 21/21 PASS、`runtime_block_size` 残留扫描为空；`phase3_base_guard`、`phase4_good`、`phase6_good`、`jbd_phase1`、Phase 2 并发 baseline 与 9 场 crash matrix 均不回退。
+
+Step 3 收口证据：`cargo test -p ext4_rs --lib` 24/24 PASS；Phase 2 并发 baseline 5/5 PASS（`workers=4 rounds=8 seed=1`）；`phase3_base_guard`、`phase4_good`、`phase6_good`、`jbd_phase1` 与 9 场 crash matrix 均不回退。
+
+Step 4 收口证据：全局 `OP_ALLOCATED_BLOCKS` 已移除，allocator guard 改为 handle/operation-local；`cargo check -p ext4_rs` PASS、`cargo test -p ext4_rs --lib` 25/25 PASS；Phase 2 并发 smoke/baseline 5/5 PASS（`jbd_phase2_concurrency_20260425_034616.log`、`jbd_phase2_concurrency_20260425_034834.log`）；`phase3_base_guard`、`phase4_good`、`phase6_good`、`jbd_phase1` 与 9 场 crash matrix 均不回退。
+
 ### Crash 测试
 
 默认 9 场 JBD2 crash matrix：
@@ -193,6 +215,10 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | `docs/feature_jbd2_phase1_analysis.md` | JBD2 Phase 1 问题分析 |
 | `docs/feature_jbd2_phase1_plan.md` | JBD2 Phase 1 实现计划 |
 | `docs/feature_jbd2_phase1_milestone.md` | JBD2 Phase 1 进度与验证记录 |
+| `docs/feature_jbd2_phase2_analysis.md` | JBD2 Phase 2 并发正确性问题分析 |
+| `docs/feature_jbd2_phase2_plan.md` | JBD2 Phase 2 实现计划（先 correctness，再性能） |
+| `docs/feature_jbd2_phase2_lock_order.md` | JBD2 Phase 2 锁顺序、同步原语与回退约定 |
+| `docs/feature_jbd2_phase2_milestone.md` | JBD2 Phase 2 进度跟踪模板 |
 | `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
 | `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
 | `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |

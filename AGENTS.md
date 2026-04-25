@@ -154,8 +154,8 @@ Key test matrices:
 
 在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
 
-- **性能目标**：fio 顺序读写 >= 90%（Phase 1 已达成：read 95.79%、write 90.48%）
-- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写（feature_jbd2 阶段推进）
+- **性能目标**：fio 顺序读写 >= 90%（optimize Phase 1 已达成：read 95.79%、write 90.48%；JBD2 Phase 1 收口后 read 93.49%、write 87.01%）
+- **功能目标**：JBD2 完整事务管理、全量崩溃恢复已完成；多文件并发读写进入 feature_jbd2_phase2。
 
 ## 工作树约定
 
@@ -174,7 +174,11 @@ Key test matrices:
 | `optimize_phase1_milestone.md` | 性能优化 Phase 1 进度跟踪（已完成）|
 | `feature_jbd2_phase1_analysis.md` | JBD2 功能 Phase 1 问题分析 |
 | `feature_jbd2_phase1_plan.md` | JBD2 功能 Phase 1 实现计划 |
-| `feature_jbd2_phase1_milestone.md` | JBD2 功能 Phase 1 进度跟踪 |
+| `feature_jbd2_phase1_milestone.md` | JBD2 功能 Phase 1 进度跟踪（已完成） |
+| `feature_jbd2_phase2_analysis.md` / `docs/feature_jbd2_phase2_analysis.md` | JBD2 功能 Phase 2 并发正确性问题分析 |
+| `feature_jbd2_phase2_plan.md` / `docs/feature_jbd2_phase2_plan.md` | JBD2 功能 Phase 2 实现计划（先 correctness，再性能） |
+| `feature_jbd2_phase2_lock_order.md` / `docs/feature_jbd2_phase2_lock_order.md` | JBD2 功能 Phase 2 锁顺序、同步原语与回退约定 |
+| `feature_jbd2_phase2_milestone.md` / `docs/feature_jbd2_phase2_milestone.md` | JBD2 功能 Phase 2 进度跟踪模板 |
 | `赛题要求.md` | 比赛评审标准 |
 
 ## 仓库结构
@@ -204,7 +208,9 @@ Key test matrices:
 ### 1. 规划阶段
 
 - 性能优化阶段：阅读 `optimize_plan_phase1.md` 和 `analysis_phase1.md`
-- JBD2 功能阶段：阅读 `feature_jbd2_phase1_plan.md` 和 `feature_jbd2_phase1_analysis.md`
+- JBD2 功能阶段：
+  - Phase 1：阅读 `feature_jbd2_phase1_plan.md` 和 `feature_jbd2_phase1_analysis.md`
+  - Phase 2：阅读 `feature_jbd2_phase2_plan.md` 和 `feature_jbd2_phase2_analysis.md`
 - 确定要修改的文件和函数
 - 如有需要，先阅读 ext2 对应实现作为参考
 
@@ -232,7 +238,7 @@ Key test matrices:
 
 ### 4. 记录阶段
 
-- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 阶段：`feature_jbd2_phase1_milestone.md`）对应 Step 下：
+- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 Phase 1：`feature_jbd2_phase1_milestone.md`；JBD2 Phase 2：`feature_jbd2_phase2_milestone.md`）对应 Step 下：
   - **改动概要**：简述做了什么
   - **涉及文件**：列出修改的文件路径
   - **性能结果**：贴上新的性能数据表格，与基线对比
@@ -252,13 +258,13 @@ Key test matrices:
 
 | Phase | 目标 | 状态 |
 |-------|------|------|
-| feature_jbd2_phase1 | JBD2 事务管理、日志刷盘、全量崩溃恢复 | 进行中 |
-| feature_jbd2_phase2 | 多文件并发读写、xfstests 全量 >= 95% | 未开始 |
+| feature_jbd2_phase1 | JBD2 事务管理、日志刷盘、全量崩溃恢复 | ✅ 已完成（`jbd_phase1` 有效样本 100%，crash 9/9） |
+| feature_jbd2_phase2 | 多文件并发读写、xfstests core >= 95%，先 correctness 再性能 | 已启动（Step 0/1/2/3/4 完成） |
 
 ## 注意事项
 
 - fio 使用 `direct=1`（O_DIRECT），PageCache 对 fio 测试无效，必须实现 bio 直接 I/O
 - lmbench 走缓冲 I/O，PageCache + inode 缓存对其有效
-- 全局锁 `EXT4_RS_RUNTIME_LOCK` 的根因是 ext4_rs 的全局 `runtime_block_size` 变量
+- 全局锁 `EXT4_RS_RUNTIME_LOCK` 的历史直接根因是 ext4_rs 的全局 `runtime_block_size` 变量；Phase 2 Step 2 已移除该全局 block size 状态，Step 3/4 已显式化 JBD2 handle context 与 operation-local alloc guard，但拆锁仍需等 inode/目录 correctness 锁与 allocator block group 协议落地后再推进
 - ext2 是最好的参考实现，位于 `asterinas/kernel/src/fs/ext2/`
-- 每次改动后必须确认 phase3/phase4/phase6/crash 功能测试不回归
+- 每次改动后必须确认 phase3/phase4/phase6/jbd_phase1/crash 功能测试不回归；Phase 2 还必须增加并发 correctness 验证

@@ -1,23 +1,7 @@
 use bitflags::bitflags;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const BLOCK_SIZE: usize = 0x1000;                // 4KB
 pub const SECTORS_PER_BLOCK: usize = BLOCK_SIZE / 512;
-static RUNTIME_BLOCK_SIZE: AtomicUsize = AtomicUsize::new(BLOCK_SIZE);
-
-#[inline]
-pub fn set_runtime_block_size(block_size: usize) {
-    if matches!(block_size, 1024 | 2048 | 4096) {
-        RUNTIME_BLOCK_SIZE.store(block_size, Ordering::Relaxed);
-    } else {
-        RUNTIME_BLOCK_SIZE.store(BLOCK_SIZE, Ordering::Relaxed);
-    }
-}
-
-#[inline]
-pub fn runtime_block_size() -> usize {
-    RUNTIME_BLOCK_SIZE.load(Ordering::Relaxed)
-}
 
 pub type Ext4Lblk = u32;
 pub type Ext4Fsblk = u64;

@@ -213,7 +213,7 @@ impl Ext4Extent {
 
 impl ExtentNode {
     /// Load the extent node from the data.
-    pub fn load_from_data(data: &[u8], is_root: bool) -> Result<Self> {
+    pub fn load_from_data(data: &[u8], is_root: bool, block_size: usize) -> Result<Self> {
         if is_root {
             if data.len() != 15 * 4 {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
@@ -232,7 +232,7 @@ impl ExtentNode {
                 is_root,
             })
         } else {
-            if data.len() != runtime_block_size() {
+            if data.len() != block_size {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
             }
             let header = Ext4ExtentHeader::load_from_u8(&data[..size_of::<Ext4ExtentHeader>()]);
@@ -245,7 +245,7 @@ impl ExtentNode {
     }
 
     /// Load the extent node from the data mutably.
-    pub fn load_from_data_mut(data: &mut [u8], is_root: bool) -> Result<Self> {
+    pub fn load_from_data_mut(data: &mut [u8], is_root: bool, block_size: usize) -> Result<Self> {
         if is_root {
             if data.len() != 15 * 4 {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
@@ -264,7 +264,7 @@ impl ExtentNode {
                 is_root,
             })
         } else {
-            if data.len() != runtime_block_size() {
+            if data.len() != block_size {
                 return_errno_with_message!(Errno::EINVAL, "Invalid data length for root node");
             }
             let mut header = *Ext4ExtentHeader::load_from_u8_mut(&mut data[..size_of::<Ext4ExtentHeader>()]);
@@ -626,23 +626,25 @@ mod tests {
         // Create a valid root node data
         let mut data: [u8; 15 * 4] = [0; 15 * 4];
         data[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // set magic number
-        let node = ExtentNode::load_from_data(&data, true).expect("Failed to load root node");
+        let node = ExtentNode::load_from_data(&data, true, BLOCK_SIZE)
+            .expect("Failed to load root node");
         assert_eq!(node.header.magic, EXT4_EXTENT_MAGIC);
 
         // Create a valid internal node data
         let mut data: Vec<u8> = vec![0; BLOCK_SIZE];
         data[0..2].copy_from_slice(&EXT4_EXTENT_MAGIC.to_le_bytes()); // set magic number
-        let node = ExtentNode::load_from_data(&data, false).expect("Failed to load internal node");
+        let node = ExtentNode::load_from_data(&data, false, BLOCK_SIZE)
+            .expect("Failed to load internal node");
         assert_eq!(node.header.magic, EXT4_EXTENT_MAGIC);
 
         // Test invalid data length for root node
         let invalid_data: [u8; 10] = [0; 10];
-        let result = ExtentNode::load_from_data(&invalid_data, true);
+        let result = ExtentNode::load_from_data(&invalid_data, true, BLOCK_SIZE);
         assert!(result.is_err(), "Expected error for invalid root node data length");
 
         // Test invalid data length for internal node
         let invalid_data: [u8; BLOCK_SIZE - 1] = [0; BLOCK_SIZE - 1];
-        let result = ExtentNode::load_from_data(&invalid_data, false);
+        let result = ExtentNode::load_from_data(&invalid_data, false, BLOCK_SIZE);
         assert!(result.is_err(), "Expected error for invalid internal node data length");
     }
 

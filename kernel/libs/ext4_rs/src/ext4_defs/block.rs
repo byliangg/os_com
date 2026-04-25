@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use super::runtime_block_size;
 
 pub trait BlockDevice: Send + Sync + Any {
     fn read_offset(&self, offset: usize) -> Vec<u8>;
@@ -20,6 +19,23 @@ pub trait BlockDevice: Send + Sync + Any {
 
 pub trait MetadataWriter: Send + Sync {
     fn write_metadata(&self, offset: usize, data: &[u8]);
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperationAllocGuardDebugStats {
+    pub clear_calls: u64,
+    pub reserve_calls: u64,
+    pub reserved_blocks: u64,
+    pub contains_checks: u64,
+    pub max_operation_blocks: u64,
+}
+
+pub trait OperationAllocGuard: Send + Sync {
+    fn clear_current_operation(&self);
+    fn reserve_current_block(&self, block: crate::ext4_defs::Ext4Fsblk);
+    fn reserve_current_blocks(&self, blocks: &[crate::ext4_defs::Ext4Fsblk]);
+    fn contains_current_block(&self, block: crate::ext4_defs::Ext4Fsblk) -> bool;
+    fn debug_stats(&self) -> OperationAllocGuardDebugStats;
 }
 
 pub struct PassthroughMetadataWriter {
@@ -45,8 +61,7 @@ pub struct Block {
 
 impl Block {
     /// Load the block from the disk.
-    pub fn load(block_device: &Arc<dyn BlockDevice>, offset: usize) -> Self {
-        let block_size = runtime_block_size();
+    pub fn load(block_device: &Arc<dyn BlockDevice>, offset: usize, block_size: usize) -> Self {
         let mut data = block_device.read_offset(offset);
         if data.len() < block_size {
             data.resize(block_size, 0);

@@ -29,6 +29,8 @@ pub use crate::ext4_defs::JournalBlockTag3;
 pub use crate::ext4_defs::JournalHeader;
 pub use crate::ext4_defs::JournalSuperblock;
 pub use crate::ext4_defs::MetadataWriter;
+pub use crate::ext4_defs::OperationAllocGuard;
+pub use crate::ext4_defs::OperationAllocGuardDebugStats;
 pub use crate::ext4_defs::ROOT_INODE as EXT4_ROOT_INODE;
 pub use crate::ext4_impls::Jbd2Journal;
 pub use crate::ext4_impls::JournalCommitBlock;
@@ -40,7 +42,7 @@ pub use crate::ext4_impls::JournalRecoveryResult;
 pub use crate::ext4_impls::JournalRuntime;
 pub use crate::ext4_impls::JournalTransaction;
 pub use crate::ext4_impls::JournalTransactionState;
-pub use crate::ext4_impls::clear_operation_allocated_blocks;
+pub use crate::ext4_impls::LocalOperationAllocGuard;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {
@@ -506,7 +508,11 @@ impl Ext4 {
 
         while iblock < total_blocks {
             if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
-                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let ext4block = Block::load(
+                    &self.block_device,
+                    fblock as usize * block_size,
+                    block_size,
+                );
                 let mut offset = 0usize;
 
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {
@@ -555,7 +561,11 @@ impl Ext4 {
 
         while iblock < total_blocks {
             if let Ok(fblock) = self.get_pblock_idx(&inode_ref, iblock as u32) {
-                let ext4block = Block::load(&self.block_device, fblock as usize * block_size);
+                let ext4block = Block::load(
+                    &self.block_device,
+                    fblock as usize * block_size,
+                    block_size,
+                );
                 let mut offset = 0usize;
 
                 while offset < block_size - core::mem::size_of::<Ext4DirEntryTail>() {

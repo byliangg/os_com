@@ -35,6 +35,7 @@ pub struct JournalTransaction {
     buffers: BTreeMap<u64, JournalBuffer>,
     handle_count: u32,
     reserved_blocks: u32,
+    admitted_reserved_blocks: u32,
     data_sync_required: bool,
     trigger_op: Option<&'static str>,
     checkpoint_range: Option<JournalCheckpointRange>,
@@ -48,6 +49,7 @@ impl JournalTransaction {
             buffers: BTreeMap::new(),
             handle_count: 0,
             reserved_blocks: 0,
+            admitted_reserved_blocks: 0,
             data_sync_required: false,
             trigger_op: None,
             checkpoint_range: None,
@@ -72,6 +74,10 @@ impl JournalTransaction {
 
     pub fn reserved_blocks(&self) -> u32 {
         self.reserved_blocks
+    }
+
+    pub fn admitted_reserved_blocks(&self) -> u32 {
+        self.admitted_reserved_blocks
     }
 
     pub fn data_sync_required(&self) -> bool {
@@ -105,6 +111,9 @@ impl JournalTransaction {
     pub fn register_handle(&mut self, reserved_blocks: u32, trigger_op: Option<&'static str>) {
         self.handle_count = self.handle_count.saturating_add(1);
         self.reserved_blocks = self.reserved_blocks.saturating_add(reserved_blocks);
+        self.admitted_reserved_blocks = self
+            .admitted_reserved_blocks
+            .saturating_add(reserved_blocks);
         if trigger_op.is_some() {
             self.trigger_op = trigger_op;
         }

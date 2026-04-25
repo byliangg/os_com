@@ -48,7 +48,7 @@ impl Ext4BlockGroup {
         let block_id = first_data_block as usize + dsc_id + 1;
         let offset = (block_group_idx % dsc_cnt) * desc_size;
 
-        let ext4block = Block::load(block_device, block_id * block_size);
+        let ext4block = Block::load(block_device, block_id * block_size, block_size);
         let bg: Ext4BlockGroup = ext4block.read_offset_as(offset);
 
         bg

@@ -457,3 +457,27 @@ Passed all 1 tests
 ----- END NOTRUN LOG TAIL -----
 xfstests fsstate: pre:ext4/045 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr 24 08:55 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 24 08:55 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
 xfstests case start: ext4/045 timeout=1200s trace=0
+xfstests case done: ext4/045 rc=0
+xfstests fsstate: post:ext4/045 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr 24 08:55 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 24 08:55 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+jbd_phase1\t6\t0\t6\t0\t6\t100.00\t90
+===== jbd_phase1 detailed results =====
+test	status	rc	reason
+generic/068	PASS	0	
+generic/076	PASS	0	
+generic/083	PASS	0	
+generic/192	PASS	0	
+generic/530	NOTRUN	NA	generic/530        [not run] /opt/xfstests/xfstests-dev/src/t_open_tmpfiles not built
+ext4/021	PASS	0	
+ext4/022	NOTRUN	NA	ext4/022           [not run] debugfs utility required, skipped this test
+ext4/030	NOTRUN	NA	ext4/030           [not run] /dev/vdb ext4 does not support -o dax
+ext4/031	NOTRUN	NA	ext4/031           [not run] /dev/vdb ext4 does not support -o dax
+ext4/032	NOTRUN	NA	ext4/032           [not run] This test requires loopback device support
+ext4/033	NOTRUN	NA	ext4/033           [not run] dmsetup utility required, skipped this test
+ext4/045	PASS	0	
+xfstests jbd_phase1 passed: pass_rate=100.00% >= 90%
+summary=/tmp/xfstests_results/jbd_phase1_summary.tsv
+results=/tmp/xfstests_results/jbd_phase1_results.tsv
+excluded=/tmp/xfstests_results/jbd_phase1_excluded.tsv
+All syscall tests passed.
+[
