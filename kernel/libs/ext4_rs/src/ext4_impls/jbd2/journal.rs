@@ -1,5 +1,6 @@
 use crate::prelude::*;
 use core::cmp::{max, min};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::{
     JournalCheckpointRange, JournalHandle, JournalHandleSummary, JournalTransaction,
@@ -49,7 +50,7 @@ pub struct JournalRuntimeDebugStats {
     pub metadata_write_records: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct JournalRuntime {
     enabled: bool,
     block_size: usize,
@@ -61,6 +62,8 @@ pub struct JournalRuntime {
     checkpoint_list: VecDeque<JournalTransaction>,
     active_handles: VecDeque<JournalHandle>,
     debug_stats: JournalRuntimeDebugStats,
+    overlay_reads: AtomicU64,
+    overlay_hits: AtomicU64,
 }
 
 impl JournalRuntime {
@@ -76,6 +79,8 @@ impl JournalRuntime {
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
             debug_stats: JournalRuntimeDebugStats::default(),
+            overlay_reads: AtomicU64::new(0),
+            overlay_hits: AtomicU64::new(0),
         }
     }
 
@@ -91,6 +96,8 @@ impl JournalRuntime {
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
             debug_stats: JournalRuntimeDebugStats::default(),
+            overlay_reads: AtomicU64::new(0),
+            overlay_hits: AtomicU64::new(0),
         }
     }
 
@@ -127,7 +134,10 @@ impl JournalRuntime {
     }
 
     pub fn debug_stats(&self) -> JournalRuntimeDebugStats {
-        self.debug_stats
+        let mut stats = self.debug_stats;
+        stats.overlay_reads = self.overlay_reads.load(Ordering::Relaxed);
+        stats.overlay_hits = self.overlay_hits.load(Ordering::Relaxed);
+        stats
     }
 
     pub fn should_defer_metadata_write(&self) -> bool {
@@ -190,12 +200,12 @@ impl JournalRuntime {
         None
     }
 
-    pub fn overlay_metadata_read(&mut self, offset: usize, out: &mut [u8]) -> bool {
+    pub fn overlay_metadata_read(&self, offset: usize, out: &mut [u8]) -> bool {
         if !self.enabled || self.block_size == 0 || out.is_empty() {
             return false;
         }
 
-        self.debug_stats.overlay_reads = self.debug_stats.overlay_reads.saturating_add(1);
+        self.overlay_reads.fetch_add(1, Ordering::Relaxed);
         let Some(end) = offset.checked_add(out.len()) else {
             return false;
         };
@@ -225,7 +235,7 @@ impl JournalRuntime {
         }
 
         if overlaid {
-            self.debug_stats.overlay_hits = self.debug_stats.overlay_hits.saturating_add(1);
+            self.overlay_hits.fetch_add(1, Ordering::Relaxed);
         }
         overlaid
     }
@@ -277,8 +287,7 @@ impl JournalRuntime {
         self.enabled
             && self.prev_running.is_none()
             && self.running.as_ref().is_some_and(|transaction| {
-                transaction.handle_count() == 0
-                    && transaction.modified_block_count() != 0
+                transaction.modified_block_count() != 0
                     && transaction
                         .admitted_reserved_blocks()
                         .saturating_add(reserved_blocks)
@@ -831,6 +840,30 @@ mod tests {
 
         record_metadata(&mut runtime, &handle2, 8, &[2]);
         runtime.stop_handle(handle2).unwrap();
+        assert!(runtime.batch_commit_ready(1));
+    }
+
+    #[test]
+    fn credit_admission_rotates_active_transaction_before_overflow() {
+        let mut runtime = JournalRuntime::new(8, 1);
+
+        let handle1 = runtime.start_handle(1020, None).unwrap();
+        record_metadata(&mut runtime, &handle1, 0, &[1]);
+
+        let handle2 = runtime.start_handle(8, None).unwrap();
+        assert_eq!(handle2.transaction_id(), 2);
+        assert_eq!(runtime.prev_running_transaction().unwrap().tid(), 1);
+        assert_eq!(
+            runtime.prev_running_transaction().unwrap().handle_count(),
+            1
+        );
+        assert_eq!(runtime.running_transaction().unwrap().tid(), 2);
+
+        record_metadata(&mut runtime, &handle2, 8, &[2]);
+        runtime.stop_handle(handle2).unwrap();
+        assert!(!runtime.batch_commit_ready(1));
+
+        runtime.stop_handle(handle1).unwrap();
         assert!(runtime.batch_commit_ready(1));
     }
 

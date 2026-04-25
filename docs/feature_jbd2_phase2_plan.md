@@ -51,7 +51,7 @@
 
 ## Step 0：建立 Phase 2 基线与并发测试资产
 
-**状态：** 待开始
+**状态：** 已完成（baseline 已建立；仅作为全局串行 fence 下的不回退基线）
 **目标：** 先有能复现并发问题的测试，再开始拆锁。
 
 ### 方案
@@ -77,7 +77,7 @@
 
 ## Step 1：锁/状态可观测性与锁顺序文档化
 
-**状态：** 待开始
+**状态：** 已完成
 **目标：** 让后续拆锁可以定位死锁、长尾与错误归属。
 
 ### 方案
@@ -179,10 +179,65 @@
 - 并发写不同文件不出现重复物理块；
 - `generic/013`、`generic/014` 不回退。
 
+## Step 4.5：补齐 Step 3/4 的真实并发上下文语义
+
+**状态：** 已完成
+**目标：** 在进入 per-inode/per-directory 锁之前，消除 Step 3/4 中仍依赖 `EXT4_RS_RUNTIME_LOCK` 兜底的 single-slot current context，避免 Step 7 拆锁时暴露 metadata 归属错乱、allocator guard 串扰和 JBD2 read-side 瓶颈。
+
+### 背景
+
+Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 等历史风险，但当前集成层仍存在两个“当前操作”单槽状态：
+
+- Asterinas ext4 bridge 的 `jbd2_current_handle_id: Arc<Mutex<Option<u64>>>`；
+- ext4_rs `LocalOperationAllocGuard.current_operation: Mutex<u64>`。
+
+在 `EXT4_RS_RUNTIME_LOCK` 仍全局串行时，这两个 single-slot 不会被真实并发覆盖；一旦 Step 7 缩小全局锁，多 handle / 多 operation 交错会把 T1 的 metadata write 或 allocated block guard 操作路由到 T2。Step 4.5 的验收标准是让 Step 3/4 的 correctness 不再依赖全局串行 fence。
+
+### 方案
+
+1. 消除 JBD2 current handle single-slot：
+   - 优先将 metadata write 所需 handle id 作为显式上下文下传；
+   - 若短期必须保留隐式 current handle，至少改为可嵌套 push/pop guard，且文档标注它仍不是 Step 7 最终形态；
+   - `mark_current_jbd2_handle_requires_data_sync()` 同步改为显式 handle id 或 scoped guard 读取，不能被其他 operation 覆盖。
+2. 消除 allocator current operation single-slot：
+   - 将 `OperationAllocGuard` API 拆成带 operation id 的显式接口，例如 `reserve_for(op_id, block)` / `contains_for(op_id, block)`；
+   - ext4_rs allocator 路径必须能从当前 Ext4 operation context 取得稳定 operation id；
+   - `clear_current_operation()` 拆成语义明确的 API：切换/重置当前指针与丢弃某 operation 数据不能混用。
+3. 整理 lifecycle：
+   - 删除 `run_ext4*` / `run_journaled_ext4` 中 begin 后立即 clear 的模式；
+   - 嵌套 active handle 路径必须通过测试证明不会清空外层 operation guard；
+   - 对无 journal 路径提供明确的临时 operation context。
+4. 改造 JBD2 overlay read side：
+   - `overlay_reads` / `overlay_hits` 等 debug 计数改为 atomic 或独立统计结构；
+   - `JournalRuntime::overlay_metadata_read()` 改回 `&self`；
+   - Asterinas bridge 侧 overlay read 使用共享读路径，避免所有 ext4 metadata read 排队到 runtime 写锁。
+5. 处理 credit admission 口径：
+   - 对超过 soft limit 且 running transaction 仍有 active handle 的场景优先 rotate running TX，让新 handle 进入新 TX；
+   - 若 `prev_running` 已占用导致无法 rotate，后续需补 wait/backpressure，不得把该边界误标为拆锁后完整 admission。
+6. 补并发与嵌套单测：
+   - 两个 handle 交错 metadata write，验证写入归属不被覆盖；
+   - 两个 operation 交错 reserve/contains，验证 allocated block set 不串扰；
+   - nested guard preserve 分支必须覆盖外层 reserve 后内层 run_ext4 不误清空外层状态；
+   - overlay read side 只读路径不需要 runtime 独占写锁。
+7. 文档同步：
+   - milestone 明确 Step 0/3/4 的并发 baseline 只是“全局串行 fence 下的回归基线”，不是真实内核并发 correctness 证明；
+   - Step 5/6/7 的前置条件增加 Step 4.5 通过。
+
+### 验收
+
+- `jbd2_current_handle_id` 不再作为跨 operation 的全局 single-slot current handle source of truth；
+- `LocalOperationAllocGuard.current_operation` 不再作为跨 operation 的全局 single-slot current operation source of truth；
+- metadata write、data-sync 标记、allocator reserve/contains 在交错 handle/operation 单测下归属正确；
+- `overlay_metadata_read()` 为共享读接口，debug stats 不迫使读路径获取 runtime 写锁；
+- credit admission 的 rotate/wait/临时放行口径被代码或文档明确覆盖；
+- phase3/phase4/phase6/jbd_phase1/crash 与 Phase 2 concurrency baseline 不回退；
+- milestone 清楚标注：Step 4.5 通过前不得进入 Step 5 的实现阶段。
+
 ## Step 5：per-inode / per-directory correctness 锁
 
 **状态：** 待开始
 **目标：** 先以保守锁保护同 inode 与目录变更正确性。
+**前置条件：** Step 4.5 已验收通过。
 
 ### 方案
 

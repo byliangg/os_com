@@ -9,6 +9,7 @@ pub struct SystemZone {
     pub end_blk: u64,
 }
 
+#[derive(Clone)]
 pub struct Ext4 {
     pub block_device: Arc<dyn BlockDevice>,
     pub metadata_writer: Arc<dyn MetadataWriter>,

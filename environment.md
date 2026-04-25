@@ -70,6 +70,19 @@ export VHOST=off
 export CONSOLE=ttyS0
 ```
 
+首次进入工作树或 toolchain component 缺失时，可先跑仓库自带的一键准备脚本：
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+./tools/setup_dev_env.sh
+```
+
+该脚本会安装 `rust-src`、`rustfmt`、`rustc-dev`、`llvm-tools-preview` 与内核 target，并准备 `.local/linux_vdso`。如果只想补 Rust 组件、不碰 VDSO，可使用：
+
+```bash
+./tools/setup_dev_env.sh --no-vdso
+```
+
 可选代理（仅下载超时时打开，Clash 7890）：
 
 ```bash

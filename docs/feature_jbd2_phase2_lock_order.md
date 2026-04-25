@@ -12,6 +12,7 @@ Phase 2 会逐步把 Phase 1 依赖的全局串行化拆成显式同步。本文
 2. cache map 锁只保护内存 map 的短临界区，不在持锁状态下进入 ext4_rs、JBD2 或块设备 I/O。
 3. 多资源锁按稳定 key 排序获取；需要补锁时，如果新 key 可能排在已持锁之前，必须释放后按完整顺序重取。
 4. `EXT4_RS_RUNTIME_LOCK` 在 Step 7 前仍是 safety fence，不能在 Step 2 后提前缩空或删除。
+5. Step 4.5 通过前，Step 3/4 的 handle-local / operation-local 结论只视为全局串行 fence 下成立；不得据此进入 Step 5 的实现阶段或 Step 7 的拆锁阶段。
 
 ## 全局锁顺序
 
@@ -72,6 +73,14 @@ Phase 2 会逐步把 Phase 1 依赖的全局串行化拆成显式同步。本文
 - `overlay_metadata_read()` 不按 handle id 过滤。
 - 跨 transaction 读取顺序保持 `running -> prev_running -> committing -> checkpoint_list`，不能跨过未完成 commit 看到 future transaction。
 - `JournalHandle` 必须引入唯一 handle id / generation；`remove_active_handle()`、data sync 标记、metadata write 归属都按 handle id，不按 transaction id 或 FIFO front。
+- current handle 不能依赖跨 operation 的全局 single-slot mutex；Step 4.5 必须将 metadata write / data-sync 归属改为显式上下文，或在过渡期使用严格 scoped push/pop 并标注剩余风险。
+
+## Operation Context 可见性
+
+- allocator guard 必须按 operation id 访问，不能依赖跨 operation 的全局 current operation single-slot。
+- “切换当前 operation”与“丢弃某 operation 已分配块集合”是不同语义，API 命名和调用点必须区分。
+- 无 journal 路径也必须有明确 operation context；不得回退到全局默认 operation id 共享状态。
+- nested `run_ext4` / active handle 路径必须证明不会清空外层 operation guard。
 
 ## Ordered Mode / fsync
 

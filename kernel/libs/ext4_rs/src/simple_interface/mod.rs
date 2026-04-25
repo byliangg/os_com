@@ -9,6 +9,7 @@ use crate::utils::path_check;
 
 // export some definitions
 pub use crate::ext4_defs::Ext4;
+pub use crate::ext4_defs::Ext4Fsblk;
 pub use crate::ext4_defs::BLOCK_SIZE;
 pub use crate::ext4_defs::BlockDevice;
 pub use crate::ext4_defs::CommitBlock;
@@ -43,6 +44,7 @@ pub use crate::ext4_impls::JournalRuntime;
 pub use crate::ext4_impls::JournalTransaction;
 pub use crate::ext4_impls::JournalTransactionState;
 pub use crate::ext4_impls::LocalOperationAllocGuard;
+pub use crate::ext4_impls::OperationScopedAllocGuard;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {

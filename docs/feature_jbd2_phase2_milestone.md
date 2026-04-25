@@ -2,7 +2,7 @@
 
 首次更新时间：2026-04-24（Asia/Shanghai）
 
-当前状态：Phase 2 Step 0/1/2/3/4 已完成，准备进入 Step 5
+当前状态：Phase 2 Step 0/1/2/3/4/4.5 已完成，准备进入 Step 5
 
 ## Phase 1 收口基线
 
@@ -22,6 +22,7 @@
 - 固定回归集必须写明 `几/几`，不能只写百分比。
 - 并发测试必须校验内容、size、目录项集合、fsync 后持久性；不能只看程序退出码。
 - crash 测试必须区分 committed / uncommitted 语义，verify 阶段必须独立重挂载检查。
+- Step 0/3/4 已记录的 Phase 2 并发 baseline 均运行在 `EXT4_RS_RUNTIME_LOCK` 仍作为全局 safety fence 的模型下，只能作为不回退基线；真实内核并发 correctness 需在 Step 4.5 补齐上下文语义并于 Step 7 拆锁后重新验证。
 
 ## Step 0：建立 Phase 2 基线与并发测试资产
 
@@ -281,11 +282,86 @@
 - [x] nested active handle 不误清空外层 operation guard
 - [x] 固定回归不回退
 
+## Step 4.5：补齐 Step 3/4 的真实并发上下文语义
+
+**状态：** 已完成
+**对应 analysis：** G2、G3、G11、G14、G17
+**目标摘要：** 消除 Step 3/4 中仍依赖 `EXT4_RS_RUNTIME_LOCK` 兜底的 single-slot current handle / current operation，修复 JBD2 overlay read 独占锁瓶颈，并明确 credit admission 的 rotate/wait 口径。
+
+### 背景与已知缺口
+
+- Step 3 的 handle id 与 Step 4 的 operation id 已按 key 存储，但当前 handle / 当前 operation 仍分别由 `jbd2_current_handle_id: Arc<Mutex<Option<u64>>>` 与 `LocalOperationAllocGuard.current_operation: Mutex<u64>` 表示。
+- 在当前全局串行 fence 下，上述 single-slot 不会被真实并发覆盖；Step 7 缩小 `EXT4_RS_RUNTIME_LOCK` 后，metadata write、data-sync 标记、allocator reserve/contains 可能被路由到其他 operation。
+- `JournalRuntime::overlay_metadata_read(&mut self, ...)` 为更新 debug stats 获取可变 runtime，导致 ext4 metadata read 侧无法走共享读路径。
+- credit admission 原先只覆盖 idle running transaction rotate；active handle 共用 running TX 时会继续累加 credit，需在 Step 4.5 补上 active over-soft-limit rotate 或等价 backpressure。
+
+### 改动概要
+
+- 移除 Asterinas ext4 集成层的 `jbd2_current_handle_id` single-slot；`JournalIoBridge` 不再从全局 current handle 读取 metadata 归属。
+- 新增 `JournalOperationMetadataWriter`，`run_journaled_ext4()` 会为每个 JBD2 handle 构造固定 handle id 的 metadata writer，并把 ext4_rs 操作运行在带上下文的 `Ext4` 视图上。
+- 移除 `LocalOperationAllocGuard.current_operation` single-slot；guard 内部只保存 `operation_id -> allocated block set`，新增显式 `reserve_block_for_operation()` / `contains_block_for_operation()` / `clear_operation()` API。
+- 新增 ext4_rs `OperationScopedAllocGuard`，`run_ext4*` / `run_journaled_ext4()` 为每次 operation 注入固定 operation id 的 alloc guard wrapper。
+- 清理 `run_ext4*` / `run_journaled_ext4()` 中 begin 后立即 `clear_current_operation()` 的 lifecycle 反模式；operation 数据只在 `finish_alloc_operation()` 时按 id 清理。
+- `JournalRuntime::overlay_metadata_read()` 改为 `&self`；`overlay_reads` / `overlay_hits` 从普通 debug stats 字段迁出为 `AtomicU64`，Asterinas bridge 侧 `jbd2_runtime` 从 `Mutex` 改为 `RwMutex`，overlay read 使用 read guard。
+- direct write prepare 路径不再调用 `mark_current_jbd2_handle_requires_data_sync()`；改为以 `JournaledOp::Write { len }` 启动 handle，由 `start_jbd2_handle()` 按 handle id 标记 data-sync。
+- 新增 alloc guard 交错 operation 单测，覆盖两个 operation 交错 reserve/contains 不串扰。
+- 新增 scoped guard nested 单测，覆盖内层 scoped operation `clear_current_operation()` 不会清空外层 operation guard 状态。
+- Step 0/3/4 baseline 注释已同步，明确其不是拆锁后的真实并发证明。
+- credit admission 的 soft-limit 判断不再要求 running TX idle；当 active running TX 已记录 metadata 且新 handle 会超过 soft limit 时，先 rotate 到 `prev_running`，新 handle 进入新 running TX。
+
+### 涉及文件
+
+- `asterinas/kernel/src/fs/ext4/fs.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_defs/block.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_defs/ext4.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/alloc_guard.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/balloc.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/jbd2/journal.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/jbd2/transaction.rs`
+- `feature_jbd2_phase2_plan.md`
+- `feature_jbd2_phase2_milestone.md`
+- `feature_jbd2_phase2_lock_order.md`
+- `asterinas/docs/feature_jbd2_phase2_plan.md`
+- `asterinas/docs/feature_jbd2_phase2_milestone.md`
+- `asterinas/docs/feature_jbd2_phase2_lock_order.md`
+
+### 功能回归
+
+| 测试项 | 结果 |
+|--------|------|
+| `cargo check -p ext4_rs` | PASS（warning only：`error_in_core` stable） |
+| `cargo test -p ext4_rs --lib` | PASS（28/28，新增 `local_guard_interleaved_operations_do_not_share_current_slot`、`credit_admission_rotates_active_transaction_before_overflow`、`scoped_guard_nested_clear_preserves_outer_operation`） |
+| `VDSO_LIBRARY_DIR=/home/lby/os_com_codex/asterinas/.local/linux_vdso CARGO_TARGET_DIR=/tmp/os_com_codex_kernel_target cargo check -p aster-kernel --target x86_64-unknown-none` | PASS |
+| handle/operation 交错单测 | PASS（operation/scoped wrapper 交错已覆盖；handle 归属通过 scoped metadata writer + 既有 JBD2 handle id 单测覆盖） |
+| nested guard preserve 单测 | PASS（新增 `scoped_guard_nested_clear_preserves_outer_operation`） |
+| overlay read-side lock/统计单测或扫描 | PASS（代码扫描：`overlay_metadata_read(&mut`、`jbd2_runtime.lock()`、`jbd2_current_handle_id` 无命中；runtime 使用 `RwMutex` read/write） |
+| credit admission active-handle over-soft-limit 单测或文档断言 | PASS（新增 `credit_admission_rotates_active_transaction_before_overflow`；active old TX 留在 `prev_running`，new handle 使用新 TX） |
+| Phase 2 并发 baseline | PASS（5/5，`workers=4 rounds=8 seed=1`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260425_054223.log`，严格关键词扫描为空） |
+| `phase3_base_guard` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase3_base_guard_20260425_055334.log`，严格关键词扫描为空） |
+| `phase4_good` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase4_good_20260425_055334.log`，严格关键词扫描为空） |
+| `phase6_good` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase6_good_20260425_061522.log`，严格关键词扫描为空） |
+| `jbd_phase1` | PASS（12/12，日志：`asterinas/benchmark/logs/jbd_phase1_20260425_063028.log`，严格关键词扫描为空） |
+| crash matrix | PASS（27/27，summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260425_064709.tsv`，verify 日志严格关键词扫描为空） |
+
+### 验收项
+
+- [x] `jbd2_current_handle_id` 不再作为跨 operation 的全局 single-slot current handle source of truth
+- [x] metadata write 与 data-sync 标记不再依赖全局 current handle slot
+- [x] `LocalOperationAllocGuard.current_operation` 不再作为跨 operation 的全局 single-slot current operation source of truth
+- [x] allocator reserve/contains 在交错 operation 下不串扰
+- [x] nested active handle / nested run_ext4 不误清空外层 operation guard
+- [x] `run_ext4*` / `run_journaled_ext4` 不再存在 begin 后立即 clear 的 lifecycle 反模式
+- [x] `overlay_metadata_read()` 为共享读接口，debug stats 不迫使读路径获取 runtime 写锁
+- [x] credit admission 的 rotate/wait/临时放行边界被代码或文档明确覆盖
+- [x] Step 0/3/4 baseline 已标注为全局串行 fence 下的不回退基线
+- [x] 固定回归不回退
+
 ## Step 5：per-inode / per-directory correctness 锁
 
 **状态：** 待开始
 **对应 analysis：** G5、G6、G7、G8、G12、G13
 **目标摘要：** 保守保护同 inode 写侧、目录 mutation、buffered 直通路径、direct read cache、fsync 与 orphan inode 语义。
+**前置条件：** Step 4.5 已验收通过。
 
 ### 改动概要
 
@@ -431,3 +507,8 @@
 | 2026-04-24 | 完成 Step 2 `runtime_block_size` 显式化 | Codex | 全局 block size 状态已移除，phase3/phase4/phase6/jbd_phase1/crash/phase2 baseline 均不回退 |
 | 2026-04-25 | 完成 Step 3 JBD2 handle-local operation context | Codex | handle id、显式 metadata context、按 handle id data-sync、credit admission 已接入，固定回归不回退 |
 | 2026-04-25 | 完成 Step 4 operation allocated block guard 本地化 | Codex | 全局 `OP_ALLOCATED_BLOCKS` 已移除，handle/operation-local guard 已接入，phase2/phase3/phase4/phase6/jbd_phase1/crash 均不回退 |
+| 2026-04-25 | 新增 Step 4.5 修补计划与 milestone 模板 | Codex | 暂缓 Step 5，先补齐 Step 3/4 的真实并发上下文语义 |
+| 2026-04-25 | Step 4.5 P0 代码修补 | Codex | 去除 `jbd2_current_handle_id` 与 `LocalOperationAllocGuard.current_operation` single-slot；overlay read 改共享读；ext4_rs 与 aster-kernel check 通过 |
+| 2026-04-25 | Step 4.5 active credit admission 修补 | Codex | over-soft-limit 时 active running TX 可 rotate 到 `prev_running`，新增 active-handle credit 单测，`cargo test -p ext4_rs --lib` 27/27 |
+| 2026-04-25 | Step 4.5 Docker 固定回归 | Codex | Phase 2 baseline、phase3、phase4、phase6、jbd_phase1、crash matrix 均通过；严格关键词扫描为空 |
+| 2026-04-25 | 完成 Step 4.5 nested wrapper 验证 | Codex | `OperationScopedAllocGuard` 下沉到 ext4_rs 并新增 nested scoped guard 单测，`cargo test -p ext4_rs --lib` 28/28 |

@@ -61,6 +61,19 @@
 
 ## 4. 当前建议的固定准备动作
 
+首次进入工作树或 toolchain component 缺失时，先跑一键环境准备：
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+./tools/setup_dev_env.sh
+```
+
+该脚本会安装 `rust-src`、`rustfmt`、`rustc-dev`、`llvm-tools-preview` 与内核 target，并准备 `.local/linux_vdso`。如果只想补 Rust 组件、不碰 VDSO：
+
+```bash
+./tools/setup_dev_env.sh --no-vdso
+```
+
 在重复跑 benchmark 前，先做下面这些：
 
 ```bash

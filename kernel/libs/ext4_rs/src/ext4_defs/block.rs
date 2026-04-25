@@ -19,6 +19,11 @@ pub trait BlockDevice: Send + Sync + Any {
 
 pub trait MetadataWriter: Send + Sync {
     fn write_metadata(&self, offset: usize, data: &[u8]);
+
+    fn write_metadata_for_jbd2_handle(&self, handle_id: Option<u64>, offset: usize, data: &[u8]) {
+        let _ = handle_id;
+        self.write_metadata(offset, data);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -2,4 +2,4 @@
 # The first two lines will be deleted when generating the user's toolchain file.
 [toolchain]
 channel = "nightly-2025-12-06"
-components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+components = ["rust-src", "rustfmt", "rustc-dev", "llvm-tools-preview"]
