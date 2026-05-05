@@ -98,12 +98,49 @@ struct DirectReadProfileStats {
     copy_ns: AtomicU64,
 }
 
+struct DirectWriteProfileStats {
+    write_calls: AtomicU64,
+    write_bytes: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    errors: AtomicU64,
+    plan_ns: AtomicU64,
+    prepare_ns: AtomicU64,
+    data_bio_ns: AtomicU64,
+    bio_alloc_ns: AtomicU64,
+    bio_copy_ns: AtomicU64,
+    bio_submit_ns: AtomicU64,
+    bio_wait_ns: AtomicU64,
+    touch_ns: AtomicU64,
+    total_ns: AtomicU64,
+    max_prepare_ns: AtomicU64,
+    max_data_bio_ns: AtomicU64,
+    max_touch_ns: AtomicU64,
+    max_total_ns: AtomicU64,
+}
+
 struct Ext4RsRuntimeLockStats {
     acquire_count: AtomicU64,
     total_wait_ns: AtomicU64,
     max_wait_ns: AtomicU64,
     total_hold_ns: AtomicU64,
     max_hold_ns: AtomicU64,
+}
+
+struct JournaledOpProfileStats {
+    op_count: AtomicU64,
+    mkdir_count: AtomicU64,
+    rmdir_count: AtomicU64,
+    write_count: AtomicU64,
+    start_handle_ns: AtomicU64,
+    apply_ns: AtomicU64,
+    finish_handle_ns: AtomicU64,
+    finish_alloc_ns: AtomicU64,
+    finish_io_ns: AtomicU64,
+    total_ns: AtomicU64,
+    max_apply_ns: AtomicU64,
+    max_finish_handle_ns: AtomicU64,
+    max_total_ns: AtomicU64,
 }
 
 static GENERIC014_WRITE_PROGRESS: AtomicU64 = AtomicU64::new(0);
@@ -243,6 +280,133 @@ impl Ext4RsRuntimeLockStats {
     }
 }
 
+impl DirectWriteProfileStats {
+    const LOG_INTERVAL_WRITES: u64 = 4_096;
+
+    const fn new() -> Self {
+        Self {
+            write_calls: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            plan_ns: AtomicU64::new(0),
+            prepare_ns: AtomicU64::new(0),
+            data_bio_ns: AtomicU64::new(0),
+            bio_alloc_ns: AtomicU64::new(0),
+            bio_copy_ns: AtomicU64::new(0),
+            bio_submit_ns: AtomicU64::new(0),
+            bio_wait_ns: AtomicU64::new(0),
+            touch_ns: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_prepare_ns: AtomicU64::new(0),
+            max_data_bio_ns: AtomicU64::new(0),
+            max_touch_ns: AtomicU64::new(0),
+            max_total_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_write(
+        &self,
+        bytes: usize,
+        cache_hit: bool,
+        success: bool,
+        plan_ns: u64,
+        prepare_ns: u64,
+        data_bio_ns: u64,
+        bio_alloc_ns: u64,
+        bio_copy_ns: u64,
+        bio_submit_ns: u64,
+        bio_wait_ns: u64,
+        touch_ns: u64,
+        total_ns: u64,
+    ) -> u64 {
+        let writes = self.write_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if cache_hit {
+            self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        if !success {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+        self.plan_ns.fetch_add(plan_ns, Ordering::Relaxed);
+        self.prepare_ns.fetch_add(prepare_ns, Ordering::Relaxed);
+        self.data_bio_ns.fetch_add(data_bio_ns, Ordering::Relaxed);
+        self.bio_alloc_ns.fetch_add(bio_alloc_ns, Ordering::Relaxed);
+        self.bio_copy_ns.fetch_add(bio_copy_ns, Ordering::Relaxed);
+        self.bio_submit_ns
+            .fetch_add(bio_submit_ns, Ordering::Relaxed);
+        self.bio_wait_ns.fetch_add(bio_wait_ns, Ordering::Relaxed);
+        self.touch_ns.fetch_add(touch_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(total_ns, Ordering::Relaxed);
+        Ext4RsRuntimeLockStats::update_max(&self.max_prepare_ns, prepare_ns);
+        Ext4RsRuntimeLockStats::update_max(&self.max_data_bio_ns, data_bio_ns);
+        Ext4RsRuntimeLockStats::update_max(&self.max_touch_ns, touch_ns);
+        Ext4RsRuntimeLockStats::update_max(&self.max_total_ns, total_ns);
+        writes
+    }
+}
+
+impl JournaledOpProfileStats {
+    const fn new() -> Self {
+        Self {
+            op_count: AtomicU64::new(0),
+            mkdir_count: AtomicU64::new(0),
+            rmdir_count: AtomicU64::new(0),
+            write_count: AtomicU64::new(0),
+            start_handle_ns: AtomicU64::new(0),
+            apply_ns: AtomicU64::new(0),
+            finish_handle_ns: AtomicU64::new(0),
+            finish_alloc_ns: AtomicU64::new(0),
+            finish_io_ns: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            max_apply_ns: AtomicU64::new(0),
+            max_finish_handle_ns: AtomicU64::new(0),
+            max_total_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record(
+        &self,
+        op: Option<&JournaledOp>,
+        start_handle_ns: u64,
+        apply_ns: u64,
+        finish_handle_ns: u64,
+        finish_alloc_ns: u64,
+        finish_io_ns: u64,
+        total_ns: u64,
+    ) {
+        self.op_count.fetch_add(1, Ordering::Relaxed);
+        match op {
+            Some(JournaledOp::Mkdir) => {
+                self.mkdir_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(JournaledOp::Rmdir) => {
+                self.rmdir_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Some(JournaledOp::Write { .. }) => {
+                self.write_count.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.start_handle_ns
+            .fetch_add(start_handle_ns, Ordering::Relaxed);
+        self.apply_ns.fetch_add(apply_ns, Ordering::Relaxed);
+        self.finish_handle_ns
+            .fetch_add(finish_handle_ns, Ordering::Relaxed);
+        self.finish_alloc_ns
+            .fetch_add(finish_alloc_ns, Ordering::Relaxed);
+        self.finish_io_ns.fetch_add(finish_io_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(total_ns, Ordering::Relaxed);
+        Ext4RsRuntimeLockStats::update_max(&self.max_apply_ns, apply_ns);
+        Ext4RsRuntimeLockStats::update_max(&self.max_finish_handle_ns, finish_handle_ns);
+        Ext4RsRuntimeLockStats::update_max(&self.max_total_ns, total_ns);
+    }
+}
+
 impl JournaledOp {
     fn for_small_write(_ino: u32, _offset: usize, data: &[u8]) -> Option<Self> {
         if data.is_empty() || data.len() > JOURNALED_SMALL_WRITE_MAX_BYTES {
@@ -257,13 +421,20 @@ struct DirEntryCache {
     loaded: bool,
     /// Maps entry name → (child_ino, dir_byte_offset).
     /// `dir_byte_offset == u64::MAX` means the offset is unknown (fallback path).
-    entries: BTreeMap<String, (u32, u64)>,
+    entries: BTreeMap<String, DirEntryCacheEntry>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DirEntryCacheEntry {
+    ino: u32,
+    offset: u64,
+    de_type: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirLookupCacheResult {
-    /// (child_ino, dir_byte_offset); offset is u64::MAX when unknown.
-    Hit(u32, u64),
+    /// (child_ino, dir_byte_offset, de_type); offset is u64::MAX when unknown.
+    Hit(u32, u64, u8),
     Miss,
     Unknown,
 }
@@ -297,14 +468,14 @@ struct DirectReadCache {
 #[derive(Debug)]
 struct KernelBlockDeviceAdapter {
     inner: Arc<dyn BlockDevice>,
-    io_failed: AtomicBool,
+    io_failure_epoch: AtomicU64,
 }
 
 impl KernelBlockDeviceAdapter {
     fn new(inner: Arc<dyn BlockDevice>) -> Self {
         Self {
             inner,
-            io_failed: AtomicBool::new(false),
+            io_failure_epoch: AtomicU64::new(0),
         }
     }
 
@@ -320,15 +491,15 @@ impl KernelBlockDeviceAdapter {
 
     #[inline]
     fn mark_io_failure(&self) {
-        self.io_failed.store(true, Ordering::Release);
+        self.io_failure_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn clear_io_failure(&self) {
-        self.io_failed.store(false, Ordering::Release);
+    fn begin_io_operation(&self) -> u64 {
+        self.io_failure_epoch.load(Ordering::Acquire)
     }
 
-    fn consume_io_failure(&self) -> bool {
-        self.io_failed.swap(false, Ordering::AcqRel)
+    fn io_failed_since(&self, epoch: u64) -> bool {
+        self.io_failure_epoch.load(Ordering::Acquire) != epoch
     }
 
     fn device_size_bytes(&self) -> usize {
@@ -556,14 +727,19 @@ pub(super) struct Ext4Fs {
     alloc_guard: Arc<LocalOperationAllocGuard>,
     next_alloc_operation_id: AtomicU64,
     jbd2_checkpoint_lock: Mutex<()>,
+    inode_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
+    dir_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    phase2_profile_enabled: bool,
     direct_read_profile_started: AtomicBool,
     direct_read_profile: DirectReadProfileStats,
+    direct_write_profile: DirectWriteProfileStats,
     runtime_lock_stats: Ext4RsRuntimeLockStats,
+    journaled_op_profile: JournaledOpProfileStats,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Self>,
 }
@@ -590,14 +766,19 @@ impl Ext4Fs {
             alloc_guard: alloc_guard.clone(),
             next_alloc_operation_id: AtomicU64::new(1),
             jbd2_checkpoint_lock: Mutex::new(()),
+            inode_correctness_locks: Mutex::new(BTreeMap::new()),
+            dir_correctness_locks: Mutex::new(BTreeMap::new()),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
+            phase2_profile_enabled: Self::phase2_profile_enabled_from_kcmdline(),
             direct_read_profile_started: AtomicBool::new(false),
             direct_read_profile: DirectReadProfileStats::new(),
+            direct_write_profile: DirectWriteProfileStats::new(),
             runtime_lock_stats: Ext4RsRuntimeLockStats::new(),
+            journaled_op_profile: JournaledOpProfileStats::new(),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak_ref.clone(),
         });
@@ -605,6 +786,84 @@ impl Ext4Fs {
         fs.initialize_jbd2_journal();
         fs.replay_mount_jbd2_journal();
         fs
+    }
+
+    fn phase2_profile_enabled_from_kcmdline() -> bool {
+        let Some(kcmd) = KCMDLINE.get() else {
+            return false;
+        };
+        let Some(args) = kcmd.get_module_args("ext4fs") else {
+            return false;
+        };
+
+        for arg in args {
+            match arg {
+                ModuleArg::Arg(key) => {
+                    if key.as_c_str().to_bytes() == b"phase2_profile" {
+                        return true;
+                    }
+                }
+                ModuleArg::KeyVal(key, value) => {
+                    if key.as_c_str().to_bytes() != b"phase2_profile" {
+                        continue;
+                    }
+                    return matches!(value.as_c_str().to_bytes(), b"1" | b"true" | b"yes");
+                }
+            }
+        }
+        false
+    }
+
+    fn correctness_lock_for(
+        table: &Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
+        ino: u32,
+    ) -> Arc<Mutex<()>> {
+        table
+            .lock()
+            .entry(ino)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn sorted_unique_inos(inos: &[u32]) -> Vec<u32> {
+        let mut sorted = Vec::new();
+        for &ino in inos {
+            if !sorted.contains(&ino) {
+                sorted.push(ino);
+            }
+        }
+        sorted.sort_unstable();
+        sorted
+    }
+
+    fn with_inode_locks<T>(&self, inos: &[u32], f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let sorted = Self::sorted_unique_inos(inos);
+        let locks: Vec<_> = sorted
+            .iter()
+            .map(|&ino| Self::correctness_lock_for(&self.inode_correctness_locks, ino))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            guards.push(lock.lock());
+        }
+        f()
+    }
+
+    fn with_inode_lock<T>(&self, ino: u32, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.with_inode_locks(&[ino], f)
+    }
+
+    fn with_dir_locks<T>(&self, inos: &[u32], f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let sorted = Self::sorted_unique_inos(inos);
+        let locks: Vec<_> = sorted
+            .iter()
+            .map(|&ino| Self::correctness_lock_for(&self.dir_correctness_locks, ino))
+            .collect();
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in &locks {
+            guards.push(lock.lock());
+        }
+        f()
     }
 
     pub(super) fn lock_inner(&self) -> MutexGuard<'_, Ext4> {
@@ -706,7 +965,7 @@ impl Ext4Fs {
             .sync()
             .map_err(|_| Error::with_message(Errno::EIO, "failed to sync recovered JBD2 blocks"))?;
 
-        self.prepare_ext4_io();
+        let io_epoch = self.prepare_ext4_io();
         let superblock_result = {
             let runtime_wait_start_ns = Self::monotonic_nanos();
             let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
@@ -725,7 +984,7 @@ impl Ext4Fs {
             );
             Ok::<(), Error>(())
         };
-        let io_result = self.finish_ext4_io();
+        let io_result = self.finish_ext4_io(io_epoch);
         superblock_result?;
         io_result?;
 
@@ -1315,12 +1574,12 @@ impl Ext4Fs {
         }
     }
 
-    fn prepare_ext4_io(&self) {
-        self.adapter.clear_io_failure();
+    fn prepare_ext4_io(&self) -> u64 {
+        self.adapter.begin_io_operation()
     }
 
-    fn finish_ext4_io(&self) -> Result<()> {
-        if self.adapter.consume_io_failure() {
+    fn finish_ext4_io(&self, io_epoch: u64) -> Result<()> {
+        if self.adapter.io_failed_since(io_epoch) {
             return_errno_with_message!(Errno::EIO, "ext4 block I/O failure");
         }
         Ok(())
@@ -1353,13 +1612,15 @@ impl Ext4Fs {
             .runtime_lock_stats
             .acquire_count
             .load(Ordering::Relaxed);
-        if acquire_count % Ext4RsRuntimeLockStats::LOG_INTERVAL_ACQUIRES == 0 {
+        if self.phase2_profile_enabled
+            && acquire_count % Ext4RsRuntimeLockStats::LOG_INTERVAL_ACQUIRES == 0
+        {
             self.maybe_log_phase2_debug_stats(acquire_count);
         }
     }
 
     fn maybe_log_phase2_debug_stats(&self, runtime_lock_acquires: u64) {
-        if runtime_lock_acquires == 0 {
+        if !self.phase2_profile_enabled || runtime_lock_acquires == 0 {
             return;
         }
         let total_wait_ns = self
@@ -1379,6 +1640,14 @@ impl Ext4Fs {
             .map(|runtime| runtime.debug_stats())
             .unwrap_or_default();
         let alloc_guard_stats = self.alloc_guard.debug_stats();
+        let journaled_ops = self.journaled_op_profile.op_count.load(Ordering::Relaxed);
+        let avg_journaled_stage_us = |stage: &AtomicU64| {
+            if journaled_ops == 0 {
+                0
+            } else {
+                stage.load(Ordering::Relaxed) / journaled_ops / 1_000
+            }
+        };
         let avg_active_x100 = if jbd2_stats.active_handle_samples == 0 {
             0
         } else {
@@ -1388,13 +1657,41 @@ impl Ext4Fs {
                 / jbd2_stats.active_handle_samples
         };
 
-        debug!(
-            "[ext4-phase2] runtime_lock_acquires={} avg_wait_us={} max_wait_us={} avg_hold_us={} max_hold_us={} jbd2_handles_started={} finished={} max_active={} avg_active_x100={} max_running_handles={} max_running_reserved={} max_running_metadata={} rotations={} commits_prepared={} commits_finished={} checkpoints={} overlay_reads={} overlay_hits={} metadata_writes={} alloc_clear_calls={} alloc_reserve_calls={} alloc_reserved_blocks={} alloc_contains_checks={} alloc_max_operation_blocks={}",
+        warn!(
+            "[ext4-phase2] runtime_lock_acquires={} avg_wait_us={} max_wait_us={} avg_hold_us={} max_hold_us={} journaled_ops={} mkdir_ops={} rmdir_ops={} write_ops={} avg_start_handle_us={} avg_apply_us={} avg_finish_handle_us={} avg_finish_alloc_us={} avg_finish_io_us={} avg_total_us={} max_apply_ms={} max_finish_handle_ms={} max_total_ms={} jbd2_handles_started={} finished={} max_active={} avg_active_x100={} max_running_handles={} max_running_reserved={} max_running_metadata={} rotations={} commits_prepared={} commits_finished={} checkpoints={} overlay_reads={} overlay_hits={} metadata_writes={} alloc_clear_calls={} alloc_reserve_calls={} alloc_reserved_blocks={} alloc_contains_checks={} alloc_max_operation_blocks={}",
             runtime_lock_acquires,
             total_wait_ns / runtime_lock_acquires / 1_000,
             max_wait_ns / 1_000,
             total_hold_ns / runtime_lock_acquires / 1_000,
             max_hold_ns / 1_000,
+            journaled_ops,
+            self.journaled_op_profile
+                .mkdir_count
+                .load(Ordering::Relaxed),
+            self.journaled_op_profile
+                .rmdir_count
+                .load(Ordering::Relaxed),
+            self.journaled_op_profile
+                .write_count
+                .load(Ordering::Relaxed),
+            avg_journaled_stage_us(&self.journaled_op_profile.start_handle_ns),
+            avg_journaled_stage_us(&self.journaled_op_profile.apply_ns),
+            avg_journaled_stage_us(&self.journaled_op_profile.finish_handle_ns),
+            avg_journaled_stage_us(&self.journaled_op_profile.finish_alloc_ns),
+            avg_journaled_stage_us(&self.journaled_op_profile.finish_io_ns),
+            avg_journaled_stage_us(&self.journaled_op_profile.total_ns),
+            self.journaled_op_profile
+                .max_apply_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+            self.journaled_op_profile
+                .max_finish_handle_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+            self.journaled_op_profile
+                .max_total_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
             jbd2_stats.started_handles,
             jbd2_stats.finished_handles,
             jbd2_stats.max_active_handles,
@@ -1472,6 +1769,80 @@ impl Ext4Fs {
         );
     }
 
+    fn maybe_log_direct_write_profile(&self, writes: u64) {
+        if !self.phase2_profile_enabled || writes == 0 {
+            return;
+        }
+        if writes != 1 && writes % DirectWriteProfileStats::LOG_INTERVAL_WRITES != 0 {
+            return;
+        }
+
+        let total_bytes = self
+            .direct_write_profile
+            .write_bytes
+            .load(Ordering::Relaxed);
+        let cache_hits = self.direct_write_profile.cache_hits.load(Ordering::Relaxed);
+        let cache_misses = self
+            .direct_write_profile
+            .cache_misses
+            .load(Ordering::Relaxed);
+        let errors = self.direct_write_profile.errors.load(Ordering::Relaxed);
+        let plan_ns = self.direct_write_profile.plan_ns.load(Ordering::Relaxed);
+        let prepare_ns = self.direct_write_profile.prepare_ns.load(Ordering::Relaxed);
+        let data_bio_ns = self
+            .direct_write_profile
+            .data_bio_ns
+            .load(Ordering::Relaxed);
+        let bio_alloc_ns = self
+            .direct_write_profile
+            .bio_alloc_ns
+            .load(Ordering::Relaxed);
+        let bio_copy_ns = self.direct_write_profile.bio_copy_ns.load(Ordering::Relaxed);
+        let bio_submit_ns = self
+            .direct_write_profile
+            .bio_submit_ns
+            .load(Ordering::Relaxed);
+        let bio_wait_ns = self.direct_write_profile.bio_wait_ns.load(Ordering::Relaxed);
+        let touch_ns = self.direct_write_profile.touch_ns.load(Ordering::Relaxed);
+        let total_ns = self.direct_write_profile.total_ns.load(Ordering::Relaxed);
+
+        warn!(
+            "[ext4-direct-write] writes={} bytes={} avg_bytes={} cache_hits={} cache_misses={} cache_hit_pct_x100={} errors={} avg_plan_us={} avg_prepare_us={} avg_data_bio_us={} avg_bio_alloc_us={} avg_bio_copy_us={} avg_bio_submit_us={} avg_bio_wait_us={} avg_touch_us={} avg_total_us={} max_prepare_ms={} max_data_bio_ms={} max_touch_ms={} max_total_ms={}",
+            writes,
+            total_bytes,
+            total_bytes / writes,
+            cache_hits,
+            cache_misses,
+            cache_hits.saturating_mul(10_000) / writes,
+            errors,
+            plan_ns / writes / 1_000,
+            prepare_ns / writes / 1_000,
+            data_bio_ns / writes / 1_000,
+            bio_alloc_ns / writes / 1_000,
+            bio_copy_ns / writes / 1_000,
+            bio_submit_ns / writes / 1_000,
+            bio_wait_ns / writes / 1_000,
+            touch_ns / writes / 1_000,
+            total_ns / writes / 1_000,
+            self.direct_write_profile
+                .max_prepare_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+            self.direct_write_profile
+                .max_data_bio_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+            self.direct_write_profile
+                .max_touch_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+            self.direct_write_profile
+                .max_total_ns
+                .load(Ordering::Relaxed)
+                / 1_000_000,
+        );
+    }
+
     fn maybe_start_direct_read_profile(&self) {
         if self
             .direct_read_profile_started
@@ -1529,7 +1900,7 @@ impl Ext4Fs {
     ) -> Result<u32> {
         let ino = self.create_at(parent, name, mode)?;
         if let Some(rdev) = rdev {
-            self.set_inode_rdev(ino, rdev)?;
+            self.with_inode_lock(ino, || self.set_inode_rdev(ino, rdev))?;
         }
         Ok(ino)
     }
@@ -1747,8 +2118,9 @@ impl Ext4Fs {
         }
 
         self.direct_read_profile.record_cache_miss();
-        let (cached_len, cached_mappings) =
-            self.run_ext4(|ext4| ext4.ext4_plan_direct_read(ino, offset, next_plan_window))?;
+        let (cached_len, cached_mappings) = self.run_ext4_file_read_only(|ext4| {
+            ext4.ext4_plan_direct_read(ino, offset, next_plan_window)
+        })?;
         if cached_len == 0 {
             return Ok((0, Vec::new()));
         }
@@ -1817,14 +2189,83 @@ impl Ext4Fs {
         Ok(Some(mappings))
     }
 
-    fn clear_pending_direct_read(&self, ino: u32) {
-        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
-            entry.pending = None;
+    fn submit_direct_write_mappings(
+        &self,
+        mappings: &[SimpleBlockRange],
+        reader: &mut VmReader,
+        profile_enabled: bool,
+        bio_alloc_ns: &mut u64,
+        bio_copy_ns: &mut u64,
+        bio_submit_ns: &mut u64,
+        bio_wait_ns: &mut u64,
+    ) -> Result<()> {
+        let mut bio_waiter = BioWaiter::new();
+        for mapping in mappings {
+            let alloc_start_ns = if profile_enabled {
+                Self::monotonic_nanos()
+            } else {
+                0
+            };
+            let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::ToDevice);
+            if profile_enabled {
+                *bio_alloc_ns = bio_alloc_ns
+                    .saturating_add(Self::monotonic_nanos().saturating_sub(alloc_start_ns));
+            }
+
+            let copy_start_ns = if profile_enabled {
+                Self::monotonic_nanos()
+            } else {
+                0
+            };
+            bio_segment
+                .writer()
+                .map_err(Self::vm_io_error)?
+                .write_fallible(reader)
+                .map_err(|(e, _)| Error::from(e))?;
+            if profile_enabled {
+                *bio_copy_ns = bio_copy_ns
+                    .saturating_add(Self::monotonic_nanos().saturating_sub(copy_start_ns));
+            }
+
+            let submit_start_ns = if profile_enabled {
+                Self::monotonic_nanos()
+            } else {
+                0
+            };
+            let waiter = self
+                .block_device
+                .write_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
+            if profile_enabled {
+                *bio_submit_ns = bio_submit_ns
+                    .saturating_add(Self::monotonic_nanos().saturating_sub(submit_start_ns));
+            }
+            bio_waiter.concat(waiter);
         }
+
+        let wait_start_ns = if profile_enabled {
+            Self::monotonic_nanos()
+        } else {
+            0
+        };
+        let status = bio_waiter.wait();
+        if profile_enabled {
+            *bio_wait_ns =
+                bio_wait_ns.saturating_add(Self::monotonic_nanos().saturating_sub(wait_start_ns));
+        }
+        if Some(BioStatus::Complete) != status {
+            return_errno!(Errno::EIO);
+        }
+        Ok(())
     }
 
     fn invalidate_direct_read_cache(&self, ino: u32) {
         self.inode_direct_read_cache.lock().remove(&ino);
+    }
+
+    fn clear_pending_direct_read(&self, ino: u32) {
+        if let Some(entry) = self.inode_direct_read_cache.lock().get_mut(&ino) {
+            entry.pending = None;
+        }
     }
 
     fn take_matching_pending_direct_read(
@@ -2028,7 +2469,7 @@ impl Ext4Fs {
         &self,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
     ) -> Result<T> {
-        self.prepare_ext4_io();
+        let io_epoch = self.prepare_ext4_io();
         let runtime_wait_start_ns = Self::monotonic_nanos();
         let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
         self.record_ext4_rs_runtime_lock_wait(
@@ -2051,8 +2492,75 @@ impl Ext4Fs {
         self.record_ext4_rs_runtime_lock_hold(
             Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
         );
-        self.finish_ext4_io()?;
+        self.finish_ext4_io(io_epoch)?;
         result
+    }
+
+    fn run_ext4_read_only<T>(
+        &self,
+        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let result = {
+            let inner = self.lock_inner();
+            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
+            f(&scoped_ext4).map_err(map_ext4_error)
+        };
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    fn run_ext4_file_read_only<T>(
+        &self,
+        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let result = {
+            let inner = self.lock_inner();
+            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
+            f(&scoped_ext4).map_err(map_ext4_error)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    fn run_ext4_dir_read_only<T>(
+        &self,
+        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let result = {
+            let inner = self.lock_inner();
+            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
+            f(&scoped_ext4).map_err(map_ext4_error)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    fn run_ext4_dir_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let result = {
+            let inner = self.lock_inner();
+            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
+            f(&scoped_ext4)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        Ok(result)
     }
 
     fn run_inode_metadata_update<T>(
@@ -2064,38 +2572,32 @@ impl Ext4Fs {
             .read()
             .as_ref()
             .is_some_and(|runtime| runtime.enabled());
-        if journal_enabled && !self.has_active_jbd2_handle() {
+        if journal_enabled {
             self.run_journaled_ext4(None, |ext4| f(ext4).map_err(map_ext4_error))
         } else {
             self.run_ext4(f)
         }
     }
 
-    pub(super) fn run_ext4_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
-        self.prepare_ext4_io();
+    fn run_ext4_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
         let runtime_wait_start_ns = Self::monotonic_nanos();
         let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
         self.record_ext4_rs_runtime_lock_wait(
             Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
         );
         let runtime_hold_start_ns = Self::monotonic_nanos();
-        let preserve_alloc_guard = self.has_active_jbd2_handle();
-        let alloc_operation_id = if preserve_alloc_guard {
-            None
-        } else {
-            Some(self.begin_alloc_operation(None))
-        };
         let result = {
             let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, alloc_operation_id);
+            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
             f(&scoped_ext4)
         };
-        self.finish_alloc_operation(alloc_operation_id);
         drop(runtime_guard);
         self.record_ext4_rs_runtime_lock_hold(
             Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
         );
-        self.finish_ext4_io()?;
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
         Ok(result)
     }
 
@@ -2202,55 +2704,67 @@ impl Ext4Fs {
             op.as_ref(),
             Some(JournaledOp::Write { len }) if *len == 512
         );
-        self.prepare_ext4_io();
-        let finish_io_start_ns = Self::monotonic_nanos();
-        let (result, apply_elapsed_ns, finish_handle_elapsed_ns) = {
-            let runtime_wait_start_ns = Self::monotonic_nanos();
-            let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-            self.record_ext4_rs_runtime_lock_wait(
-                Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
-            );
-            let runtime_hold_start_ns = Self::monotonic_nanos();
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let profile_start_ns = Self::monotonic_nanos();
+        let op_name = Self::jbd2_handle_op_name(op.as_ref());
 
-            let op_name = Self::jbd2_handle_op_name(op.as_ref());
-            let jbd2_handle = self.start_jbd2_handle(op.as_ref());
-            let handle_id = jbd2_handle.as_ref().map(|handle| handle.handle_id());
-            let alloc_operation_id =
-                self.begin_alloc_operation(handle_id);
+        let start_handle_start_ns = Self::monotonic_nanos();
+        let jbd2_handle = self.start_jbd2_handle(op.as_ref());
+        let start_handle_elapsed_ns =
+            Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
+        let handle_id = jbd2_handle.as_ref().map(|handle| handle.handle_id());
+        let alloc_operation_id = self.begin_alloc_operation(handle_id);
 
-            let apply_start_ns = Self::monotonic_nanos();
-            let result = {
-                let inner = self.lock_inner();
-                let scoped_ext4 =
-                    self.ext4_with_operation_context(&inner, handle_id, Some(alloc_operation_id));
-                apply(&scoped_ext4)
-            };
-            let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
-
-            let finish_handle_start_ns = Self::monotonic_nanos();
-            self.finish_jbd2_handle(jbd2_handle, op_name, result.is_ok());
-            let finish_handle_elapsed_ns =
-                Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
-            self.finish_alloc_operation(Some(alloc_operation_id));
-            drop(runtime_guard);
-            self.record_ext4_rs_runtime_lock_hold(
-                Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
-            );
-            (result, apply_elapsed_ns, finish_handle_elapsed_ns)
+        let apply_start_ns = Self::monotonic_nanos();
+        let result = {
+            let inner = self.lock_inner();
+            let scoped_ext4 =
+                self.ext4_with_operation_context(&inner, handle_id, Some(alloc_operation_id));
+            apply(&scoped_ext4)
         };
+        let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
 
-        let io_result = self.finish_ext4_io();
+        let finish_handle_start_ns = Self::monotonic_nanos();
+        self.finish_jbd2_handle(jbd2_handle, op_name, result.is_ok());
+        let finish_handle_elapsed_ns =
+            Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
+        let finish_alloc_start_ns = Self::monotonic_nanos();
+        self.finish_alloc_operation(Some(alloc_operation_id));
+        let finish_alloc_elapsed_ns =
+            Self::monotonic_nanos().saturating_sub(finish_alloc_start_ns);
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+
+        let finish_io_start_ns = Self::monotonic_nanos();
+        let io_result = self.finish_ext4_io(io_epoch);
         let finish_io_elapsed_ns = Self::monotonic_nanos().saturating_sub(finish_io_start_ns);
-        if generic014_like_write && finish_io_elapsed_ns >= GENERIC014_SLOW_OP_LOG_THRESHOLD_NS {
+        let total_elapsed_ns = Self::monotonic_nanos().saturating_sub(profile_start_ns);
+        if self.phase2_profile_enabled {
+            self.journaled_op_profile.record(
+                op.as_ref(),
+                start_handle_elapsed_ns,
+                apply_elapsed_ns,
+                finish_handle_elapsed_ns,
+                finish_alloc_elapsed_ns,
+                finish_io_elapsed_ns,
+                total_elapsed_ns,
+            );
+        }
+        if generic014_like_write && total_elapsed_ns >= GENERIC014_SLOW_OP_LOG_THRESHOLD_NS {
             debug!(
-                "ext4: generic014-like journaled profile apply_ms={} finish_handle_ms={} finish_io_ms={} post_io_ms={}",
+                "ext4: generic014-like journaled profile apply_ms={} finish_handle_ms={} finish_io_ms={} total_ms={}",
                 apply_elapsed_ns / 1_000_000,
                 finish_handle_elapsed_ns / 1_000_000,
                 finish_io_elapsed_ns / 1_000_000,
-                finish_io_elapsed_ns
-                    .saturating_sub(apply_elapsed_ns)
-                    .saturating_sub(finish_handle_elapsed_ns)
-                    / 1_000_000
+                total_elapsed_ns / 1_000_000
             );
         }
         match (result, io_result) {
@@ -2261,7 +2775,7 @@ impl Ext4Fs {
     }
 
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
-        self.run_ext4_noerr(|ext4| ext4.ext4_stat(ino))
+        self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))
     }
 
     fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
@@ -2269,8 +2783,8 @@ impl Ext4Fs {
         let Some(cache) = caches.get(&parent) else {
             return DirLookupCacheResult::Unknown;
         };
-        if let Some(&(ino, offset)) = cache.entries.get(name) {
-            return DirLookupCacheResult::Hit(ino, offset);
+        if let Some(entry) = cache.entries.get(name) {
+            return DirLookupCacheResult::Hit(entry.ino, entry.offset, entry.de_type);
         }
         if cache.loaded {
             return DirLookupCacheResult::Miss;
@@ -2278,7 +2792,7 @@ impl Ext4Fs {
         DirLookupCacheResult::Unknown
     }
 
-    fn load_dir_cache_if_needed(&self, parent: u32) -> Result<()> {
+    fn load_dir_cache_if_needed_locked(&self, parent: u32) -> Result<()> {
         {
             let caches = self.dir_entry_cache.lock();
             if let Some(cache) = caches.get(&parent) {
@@ -2288,18 +2802,29 @@ impl Ext4Fs {
             }
         }
 
-        let meta = self.stat(parent)?;
-        if meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+        let (is_dir, entries_with_offsets) = self.run_ext4_dir_read_only_noerr(|ext4| {
+            let meta = ext4.ext4_stat(parent);
+            if meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+                return (false, Vec::new());
+            }
+            // Use ext4_readdir_with_offsets so we capture each entry's byte offset,
+            // enabling O(1) rmdir via ext4_rmdir_at_fast later.
+            (true, ext4.ext4_readdir_with_offsets(parent))
+        })?;
+        if !is_dir {
             return_errno_with_message!(Errno::ENOTDIR, "parent inode is not a directory");
         }
 
-        // Use ext4_readdir_with_offsets so we capture each entry's byte offset,
-        // enabling O(1) rmdir via ext4_rmdir_at_fast later.
-        let entries_with_offsets =
-            self.run_ext4_noerr(|ext4| ext4.ext4_readdir_with_offsets(parent))?;
         let mut entry_map = BTreeMap::new();
-        for (name, ino, entry_offset) in entries_with_offsets {
-            entry_map.insert(name, (ino, entry_offset));
+        for (name, ino, entry_offset, de_type) in entries_with_offsets {
+            entry_map.insert(
+                name,
+                DirEntryCacheEntry {
+                    ino,
+                    offset: entry_offset,
+                    de_type,
+                },
+            );
         }
 
         let mut caches = self.dir_entry_cache.lock();
@@ -2312,15 +2837,29 @@ impl Ext4Fs {
     }
 
     /// Insert a cache entry with a known byte offset in the parent directory stream.
-    fn cache_insert_entry_with_offset(&self, parent: u32, name: &str, child: u32, offset: u64) {
+    fn cache_insert_entry_with_offset(
+        &self,
+        parent: u32,
+        name: &str,
+        child: u32,
+        offset: u64,
+        de_type: u8,
+    ) {
         let mut caches = self.dir_entry_cache.lock();
         let cache = caches.entry(parent).or_default();
-        cache.entries.insert(name.to_string(), (child, offset));
+        cache.entries.insert(
+            name.to_string(),
+            DirEntryCacheEntry {
+                ino: child,
+                offset,
+                de_type,
+            },
+        );
     }
 
     /// Insert a cache entry when the byte offset is unknown (fallback paths).
-    fn cache_insert_entry(&self, parent: u32, name: &str, child: u32) {
-        self.cache_insert_entry_with_offset(parent, name, child, u64::MAX);
+    fn cache_insert_entry(&self, parent: u32, name: &str, child: u32, de_type: u8) {
+        self.cache_insert_entry_with_offset(parent, name, child, u64::MAX, de_type);
     }
 
     fn cache_remove_entry(&self, parent: u32, name: &str) {
@@ -2342,18 +2881,77 @@ impl Ext4Fs {
         self.inode_mtime_ctime_cache.lock().remove(&ino);
     }
 
-    pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
+    fn dirent_type_from_inode_mode(mode: u16) -> u8 {
+        let file_type = mode & 0xF000;
+        if file_type == ext4_rs::InodeFileType::S_IFREG.bits() {
+            1
+        } else if file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
+            2
+        } else if file_type == ext4_rs::InodeFileType::S_IFCHR.bits() {
+            3
+        } else if file_type == ext4_rs::InodeFileType::S_IFBLK.bits() {
+            4
+        } else if file_type == ext4_rs::InodeFileType::S_IFIFO.bits() {
+            5
+        } else if file_type == ext4_rs::InodeFileType::S_IFSOCK.bits() {
+            6
+        } else if file_type == ext4_rs::InodeFileType::S_IFLNK.bits() {
+            7
+        } else {
+            0
+        }
+    }
+
+    fn loaded_dir_cache_entries(&self, ino: u32) -> Option<Vec<SimpleDirEntry>> {
+        let caches = self.dir_entry_cache.lock();
+        let cache = caches.get(&ino)?;
+        if !cache.loaded {
+            return None;
+        }
+        if cache.entries.values().any(|entry| entry.offset == u64::MAX) {
+            return None;
+        }
+
+        let mut entries: Vec<_> = cache
+            .entries
+            .iter()
+            .map(|(name, entry)| (entry.offset, name.clone(), *entry))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        Some(
+            entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (_, name, entry))| SimpleDirEntry {
+                    inode: entry.ino,
+                    de_type: entry.de_type,
+                    name,
+                    // The VFS layer only requires a stable, monotonically
+                    // increasing cookie for repeated readdir_at calls.
+                    next_offset: index.saturating_add(1),
+                })
+                .collect(),
+        )
+    }
+
+    fn lookup_at_locked(&self, parent: u32, name: &str) -> Result<u32> {
+        self.lookup_at_locked_with_type(parent, name)
+            .map(|(ino, _)| ino)
+    }
+
+    fn lookup_at_locked_with_type(&self, parent: u32, name: &str) -> Result<(u32, u8)> {
         match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(ino, _) => return Ok(ino),
+            DirLookupCacheResult::Hit(ino, _, de_type) => return Ok((ino, de_type)),
             DirLookupCacheResult::Miss => {
                 return_errno_with_message!(Errno::ENOENT, "entry not found in directory cache");
             }
             DirLookupCacheResult::Unknown => {}
         }
 
-        if self.load_dir_cache_if_needed(parent).is_ok() {
+        if self.load_dir_cache_if_needed_locked(parent).is_ok() {
             match self.lookup_cache(parent, name) {
-                DirLookupCacheResult::Hit(ino, _) => return Ok(ino),
+                DirLookupCacheResult::Hit(ino, _, de_type) => return Ok((ino, de_type)),
                 DirLookupCacheResult::Miss => {
                     return_errno_with_message!(Errno::ENOENT, "entry not found in directory cache");
                 }
@@ -2361,22 +2959,32 @@ impl Ext4Fs {
             }
         }
 
-        let ino = self.run_ext4(|ext4| ext4.ext4_lookup_at(parent, name))?;
-        self.cache_insert_entry(parent, name, ino);
-        Ok(ino)
+        let ino = self.run_ext4_dir_read_only(|ext4| ext4.ext4_lookup_at(parent, name))?;
+        self.cache_insert_entry(parent, name, ino, 0);
+        Ok((ino, 0))
+    }
+
+    pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
+        let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
+        let _parent_guard = parent_lock.lock();
+        self.lookup_at_locked(parent, name)
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
-        self.run_ext4(|ext4| ext4.ext4_dir_open(path))
+        self.run_ext4_read_only(|ext4| ext4.ext4_dir_open(path))
     }
 
     pub(super) fn create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
+        let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
+        let _parent_guard = parent_lock.lock();
         let op = JournaledOp::Create;
         let ino = self.run_journaled_ext4(Some(op), |ext4| {
             ext4.ext4_create_at(parent, name, mode)
                 .map_err(map_ext4_error)
         })?;
-        self.cache_insert_entry(parent, name, ino);
+        let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _child_guard = child_lock.lock();
+        self.cache_insert_entry(parent, name, ino, Self::dirent_type_from_inode_mode(mode));
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
         self.touch_mtime_ctime(parent)?;
@@ -2384,14 +2992,16 @@ impl Ext4Fs {
     }
 
     pub(super) fn mkdir_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
+        let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
+        let _parent_guard = parent_lock.lock();
         // Ensure the parent directory cache is fully loaded so subsequent existence
         // checks (lookup_cache → Miss) can bypass the O(n) dir_find_entry disk scan.
         // The first call reads the directory once; subsequent calls return immediately.
-        let cache_loaded = self.load_dir_cache_if_needed(parent).is_ok();
+        let cache_loaded = self.load_dir_cache_if_needed_locked(parent).is_ok();
 
         if cache_loaded {
             match self.lookup_cache(parent, name) {
-                DirLookupCacheResult::Hit(_, _) => return_errno!(Errno::EEXIST),
+                DirLookupCacheResult::Hit(_, _, _) => return_errno!(Errno::EEXIST),
                 DirLookupCacheResult::Miss => {
                     // Cache is complete and confirms the name is absent — skip disk scan.
                     let op = JournaledOp::Mkdir;
@@ -2399,7 +3009,10 @@ impl Ext4Fs {
                         ext4.ext4_mkdir_unchecked_at(parent, name, mode)
                             .map_err(map_ext4_error)
                     })?;
-                    self.cache_insert_entry_with_offset(parent, name, ino, dir_byte_offset);
+                    let child_lock =
+                        Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+                    let _child_guard = child_lock.lock();
+                    self.cache_insert_entry_with_offset(parent, name, ino, dir_byte_offset, 2);
                     self.cache_remove_dir(ino);
                     self.touch_birth_times(ino)?;
                     self.touch_mtime_ctime(parent)?;
@@ -2415,7 +3028,9 @@ impl Ext4Fs {
             ext4.ext4_mkdir_at(parent, name, mode)
                 .map_err(map_ext4_error)
         })?;
-        self.cache_insert_entry(parent, name, ino);
+        let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _child_guard = child_lock.lock();
+        self.cache_insert_entry(parent, name, ino, 2);
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
         self.touch_mtime_ctime(parent)?;
@@ -2423,11 +3038,15 @@ impl Ext4Fs {
     }
 
     pub(super) fn unlink_at(&self, parent: u32, name: &str) -> Result<()> {
-        let target_ino = self.lookup_at(parent, name)?;
+        let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
+        let _parent_guard = parent_lock.lock();
+        let target_ino = self.lookup_at_locked(parent, name)?;
         let target_meta = self.stat(target_ino)?;
         if target_meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
             return_errno!(Errno::EISDIR);
         }
+        let target_lock = Self::correctness_lock_for(&self.inode_correctness_locks, target_ino);
+        let _target_guard = target_lock.lock();
 
         let op = JournaledOp::Unlink;
         self.run_journaled_ext4(Some(op), |ext4| {
@@ -2440,13 +3059,17 @@ impl Ext4Fs {
     }
 
     pub(super) fn rmdir_at(&self, parent: u32, name: &str) -> Result<()> {
-        let child_ino = self.lookup_at(parent, name)?;
+        let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
+        let _parent_guard = parent_lock.lock();
+        let child_ino = self.lookup_at_locked(parent, name)?;
         let child_meta = self.stat(child_ino)?;
         if child_meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
             return_errno!(Errno::ENOTDIR);
         }
+        let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, child_ino);
+        let _child_guard = child_lock.lock();
 
-        let entries = self.readdir(child_ino)?;
+        let entries = self.readdir_locked(child_ino)?;
         let has_real_child = entries
             .iter()
             .any(|entry| entry.name != "." && entry.name != "..");
@@ -2456,7 +3079,7 @@ impl Ext4Fs {
 
         // Retrieve cached byte offset for O(1) parent-dir entry removal.
         let dir_byte_offset = match self.lookup_cache(parent, name) {
-            DirLookupCacheResult::Hit(_, offset) => offset,
+            DirLookupCacheResult::Hit(_, offset, _) => offset,
             _ => u64::MAX,
         };
 
@@ -2485,43 +3108,55 @@ impl Ext4Fs {
         new_parent: u32,
         new_name: &str,
     ) -> Result<()> {
-        if old_parent == new_parent && old_name == new_name {
-            return Ok(());
-        }
-
-        let old_ino = self.lookup_at(old_parent, old_name)?;
-        let overwritten_ino = self.lookup_at(new_parent, new_name).ok();
-        let overwritten_is_dir = overwritten_ino
-            .and_then(|ino| self.stat(ino).ok().map(|meta| (ino, meta)))
-            .map(|(ino, meta)| (ino, meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits()));
-
-        let op = JournaledOp::Rename;
-        self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_rename_at(old_parent, old_name, new_parent, new_name)
-                .map_err(map_ext4_error)
-        })?;
-
-        self.cache_remove_entry(old_parent, old_name);
-        self.cache_insert_entry(new_parent, new_name, old_ino);
-
-        if let Some((ino, true)) = overwritten_is_dir {
-            self.cache_remove_dir(ino);
-        }
-        if let Some(ino) = overwritten_ino {
-            if ino != old_ino {
-                self.cache_remove_entry(new_parent, new_name);
-                self.cache_insert_entry(new_parent, new_name, old_ino);
-                self.clear_inode_touch_cache(ino);
+        self.with_dir_locks(&[old_parent, new_parent], || {
+            if old_parent == new_parent && old_name == new_name {
+                return Ok(());
             }
-        }
 
-        self.touch_mtime_ctime(old_parent)?;
-        if new_parent != old_parent {
-            self.touch_mtime_ctime(new_parent)?;
-        }
-        self.touch_ctime(old_ino)?;
+            let (old_ino, old_de_type) = self.lookup_at_locked_with_type(old_parent, old_name)?;
+            let overwritten_ino = self.lookup_at_locked(new_parent, new_name).ok();
+            let overwritten_is_dir = overwritten_ino
+                .and_then(|ino| self.stat(ino).ok().map(|meta| (ino, meta)))
+                .map(|(ino, meta)| {
+                    (ino, meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits())
+                });
 
-        Ok(())
+            let mut affected_inodes = Vec::new();
+            affected_inodes.push(old_ino);
+            if let Some(ino) = overwritten_ino {
+                affected_inodes.push(ino);
+            }
+
+            self.with_inode_locks(&affected_inodes, || {
+                let op = JournaledOp::Rename;
+                self.run_journaled_ext4(Some(op), |ext4| {
+                    ext4.ext4_rename_at(old_parent, old_name, new_parent, new_name)
+                        .map_err(map_ext4_error)
+                })?;
+
+                self.cache_remove_entry(old_parent, old_name);
+                self.cache_insert_entry(new_parent, new_name, old_ino, old_de_type);
+
+                if let Some((ino, true)) = overwritten_is_dir {
+                    self.cache_remove_dir(ino);
+                }
+                if let Some(ino) = overwritten_ino {
+                    if ino != old_ino {
+                        self.cache_remove_entry(new_parent, new_name);
+                        self.cache_insert_entry(new_parent, new_name, old_ino, old_de_type);
+                        self.clear_inode_touch_cache(ino);
+                    }
+                }
+
+                self.touch_mtime_ctime(old_parent)?;
+                if new_parent != old_parent {
+                    self.touch_mtime_ctime(new_parent)?;
+                }
+                self.touch_ctime(old_ino)?;
+
+                Ok(())
+            })
+        })
     }
 
     pub(super) fn read_at(
@@ -2531,7 +3166,9 @@ impl Ext4Fs {
         data: &mut [u8],
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        let read_len = self.run_ext4(|ext4| ext4.ext4_read_at(ino, offset, data))?;
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+        let read_len = self.run_ext4_file_read_only(|ext4| ext4.ext4_read_at(ino, offset, data))?;
         if read_len > 0 {
             self.touch_atime(ino, status_flags)?;
         }
@@ -2545,6 +3182,8 @@ impl Ext4Fs {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
         self.maybe_start_direct_read_profile();
 
         let mut plan_ns = 0u64;
@@ -2556,7 +3195,8 @@ impl Ext4Fs {
             (pending.len, pending.mappings, pending.waiter)
         } else {
             let plan_start = Self::monotonic_nanos();
-            let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, writer.avail())?;
+            let (direct_len, mappings) =
+                self.plan_direct_read_cached(ino, offset, writer.avail())?;
             plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
             if direct_len == 0 {
                 return Ok(0);
@@ -2601,6 +3241,8 @@ impl Ext4Fs {
     }
 
     pub(super) fn write_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
         let generic014_like_write = data.len() == 512;
         let mut generic014_write_seq = 0;
         let mut generic014_write_start_ns = 0;
@@ -2618,7 +3260,7 @@ impl Ext4Fs {
         let op = JournaledOp::for_small_write(ino, offset, data);
         let mut ext4_write_elapsed_ns = 0u64;
         let mut inode_time_elapsed_ns = 0u64;
-        let written = self
+        let write_result = self
             .run_journaled_ext4(op, |ext4| {
                 let ext4_write_start_ns = Self::monotonic_nanos();
                 let written = ext4
@@ -2653,9 +3295,10 @@ impl Ext4Fs {
                     );
                 }
                 err
-            })?;
+            });
+        self.invalidate_direct_read_cache(ino);
+        let written = write_result?;
         if written > 0 {
-            self.invalidate_direct_read_cache(ino);
             self.inode_mtime_ctime_cache.lock().insert(ino, now);
         }
         if generic014_like_write {
@@ -2686,76 +3329,152 @@ impl Ext4Fs {
         offset: usize,
         reader: &mut VmReader,
     ) -> Result<usize> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
         let write_len = reader.remain();
         if write_len == 0 {
             return Ok(0);
         }
 
-        let mut reused_read_mapping_cache = false;
-        let mappings = if let Some(cached_mappings) =
-            self.plan_direct_write_overwrite_cached(ino, offset, write_len)?
-        {
-            reused_read_mapping_cache = true;
-            cached_mappings
+        let profile_enabled = self.phase2_profile_enabled;
+        let profile_start_ns = if profile_enabled {
+            Self::monotonic_nanos()
         } else {
-            self.run_journaled_ext4(Some(JournaledOp::Write { len: write_len }), |ext4| {
-                let mappings = ext4
-                    .ext4_prepare_write_at(ino, offset, write_len)
-                    .map_err(map_ext4_error)?;
-
-                let mut bio_waiter = BioWaiter::new();
-                for mapping in &mappings {
-                    let bio_segment =
-                        BioSegment::alloc(mapping.len as usize, BioDirection::ToDevice);
-                    bio_segment
-                        .writer()
-                        .map_err(Self::vm_io_error)?
-                        .write_fallible(reader)
-                        .map_err(|(e, _)| Error::from(e))?;
-                    let waiter = self
-                        .block_device
-                        .write_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
-                    bio_waiter.concat(waiter);
-                }
-
-                if Some(BioStatus::Complete) != bio_waiter.wait() {
-                    return_errno!(Errno::EIO);
-                }
-
-                Ok(mappings)
-            })?
+            0
         };
+        let mut plan_elapsed_ns = 0u64;
+        let mut prepare_elapsed_ns = 0u64;
+        let mut data_bio_elapsed_ns = 0u64;
+        let mut bio_alloc_elapsed_ns = 0u64;
+        let mut bio_copy_elapsed_ns = 0u64;
+        let mut bio_submit_elapsed_ns = 0u64;
+        let mut bio_wait_elapsed_ns = 0u64;
+        let mut touch_elapsed_ns = 0u64;
+        let mut reused_read_mapping_cache = false;
+        let write_result = (|| -> Result<usize> {
+            let plan_start_ns = if profile_enabled {
+                Self::monotonic_nanos()
+            } else {
+                0
+            };
+            let mappings = if let Some(cached_mappings) =
+                self.plan_direct_write_overwrite_cached(ino, offset, write_len)?
+            {
+                reused_read_mapping_cache = true;
+                cached_mappings
+            } else {
+                if profile_enabled {
+                    plan_elapsed_ns =
+                        Self::monotonic_nanos().saturating_sub(plan_start_ns);
+                }
+                self.run_journaled_ext4(Some(JournaledOp::Write { len: write_len }), |ext4| {
+                    let prepare_start_ns = if profile_enabled {
+                        Self::monotonic_nanos()
+                    } else {
+                        0
+                    };
+                    let mappings = ext4
+                        .ext4_prepare_write_at(ino, offset, write_len)
+                        .map_err(map_ext4_error)?;
+                    if profile_enabled {
+                        prepare_elapsed_ns =
+                            Self::monotonic_nanos().saturating_sub(prepare_start_ns);
+                    }
 
-        if reused_read_mapping_cache {
-            let mut bio_waiter = BioWaiter::new();
+                    let data_bio_start_ns = if profile_enabled {
+                        Self::monotonic_nanos()
+                    } else {
+                        0
+                    };
+                    self.submit_direct_write_mappings(
+                        &mappings,
+                        reader,
+                        profile_enabled,
+                        &mut bio_alloc_elapsed_ns,
+                        &mut bio_copy_elapsed_ns,
+                        &mut bio_submit_elapsed_ns,
+                        &mut bio_wait_elapsed_ns,
+                    )?;
+                    if profile_enabled {
+                        data_bio_elapsed_ns =
+                            Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
+                    }
 
-            for mapping in &mappings {
-                let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::ToDevice);
-                bio_segment
-                    .writer()
-                    .map_err(Self::vm_io_error)?
-                    .write_fallible(reader)
-                    .map_err(|(e, _)| Error::from(e))?;
-                let waiter = self
-                    .block_device
-                    .write_blocks_async(Bid::new(mapping.pblock), bio_segment)?;
-                bio_waiter.concat(waiter);
+                    Ok(mappings)
+                })?
+            };
+            if profile_enabled && reused_read_mapping_cache {
+                plan_elapsed_ns = Self::monotonic_nanos().saturating_sub(plan_start_ns);
             }
 
-            if Some(BioStatus::Complete) != bio_waiter.wait() {
-                return_errno!(Errno::EIO);
+            if reused_read_mapping_cache {
+                let data_bio_start_ns = if profile_enabled {
+                    Self::monotonic_nanos()
+                } else {
+                    0
+                };
+                self.submit_direct_write_mappings(
+                    &mappings,
+                    reader,
+                    profile_enabled,
+                    &mut bio_alloc_elapsed_ns,
+                    &mut bio_copy_elapsed_ns,
+                    &mut bio_submit_elapsed_ns,
+                    &mut bio_wait_elapsed_ns,
+                )?;
+                if profile_enabled {
+                    data_bio_elapsed_ns =
+                        Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
+                }
             }
-        }
 
-        self.clear_pending_direct_read(ino);
-        if !reused_read_mapping_cache {
+            Ok(write_len)
+        })();
+
+        if reused_read_mapping_cache && write_result.is_ok() {
+            self.clear_pending_direct_read(ino);
+        } else {
             self.invalidate_direct_read_cache(ino);
         }
-        self.touch_mtime_ctime(ino)?;
-        Ok(write_len)
+        let result = match write_result {
+            Ok(written) => {
+                let touch_start_ns = if profile_enabled {
+                    Self::monotonic_nanos()
+                } else {
+                    0
+                };
+                let touch_result = self.touch_mtime_ctime(ino);
+                if profile_enabled {
+                    touch_elapsed_ns =
+                        Self::monotonic_nanos().saturating_sub(touch_start_ns);
+                }
+                touch_result.map(|_| written)
+            }
+            Err(err) => Err(err),
+        };
+        if profile_enabled {
+            let writes = self.direct_write_profile.record_write(
+                write_len,
+                reused_read_mapping_cache,
+                result.is_ok(),
+                plan_elapsed_ns,
+                prepare_elapsed_ns,
+                data_bio_elapsed_ns,
+                bio_alloc_elapsed_ns,
+                bio_copy_elapsed_ns,
+                bio_submit_elapsed_ns,
+                bio_wait_elapsed_ns,
+                touch_elapsed_ns,
+                Self::monotonic_nanos().saturating_sub(profile_start_ns),
+            );
+            self.maybe_log_direct_write_profile(writes);
+        }
+        result
     }
 
     pub(super) fn truncate(&self, ino: u32, new_size: u64) -> Result<()> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
         let seq = GENERIC014_TRUNCATE_PROGRESS.fetch_add(1, Ordering::Relaxed) + 1;
         if seq <= 8 || seq % GENERIC014_PROGRESS_LOG_INTERVAL == 0 {
             debug!(
@@ -2765,7 +3484,7 @@ impl Ext4Fs {
         }
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Truncate;
-        self.run_journaled_ext4(Some(op), |ext4| {
+        let truncate_result = self.run_journaled_ext4(Some(op), |ext4| {
             ext4.ext4_truncate(ino, new_size).map_err(map_ext4_error)?;
             ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
                 .map_err(map_ext4_error)?;
@@ -2777,21 +3496,40 @@ impl Ext4Fs {
                     ino, new_size, err
                 );
                 err
-            })?;
+            });
         self.invalidate_direct_read_cache(ino);
+        truncate_result?;
         self.inode_mtime_ctime_cache.lock().insert(ino, now);
         Ok(())
     }
 
+    fn readdir_locked(&self, ino: u32) -> Result<Vec<SimpleDirEntry>> {
+        if let Some(entries) = self.loaded_dir_cache_entries(ino) {
+            return Ok(entries);
+        }
+
+        if self.load_dir_cache_if_needed_locked(ino).is_ok() {
+            if let Some(entries) = self.loaded_dir_cache_entries(ino) {
+                return Ok(entries);
+            }
+        }
+
+        self.run_ext4_dir_read_only_noerr(|ext4| ext4.ext4_readdir(ino))
+    }
+
     pub(super) fn readdir(&self, ino: u32) -> Result<Vec<SimpleDirEntry>> {
-        self.run_ext4_noerr(|ext4| ext4.ext4_readdir(ino))
+        let dir_lock = Self::correctness_lock_for(&self.dir_correctness_locks, ino);
+        let _dir_guard = dir_lock.lock();
+        self.readdir_locked(ino)
     }
 
     pub(super) fn dev_id(&self) -> u64 {
         self.block_device.id().as_encoded_u64()
     }
 
-    pub(super) fn fsync_regular_file(&self) -> Result<()> {
+    pub(super) fn fsync_regular_file(&self, ino: u32) -> Result<()> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
         // Regular-file fsync/fdatasync should not force a full filesystem
         // checkpoint sweep. On the current virtio-blk stack, journal writes are
         // already synchronous DMA to the host, and the JBD2 commit path relies

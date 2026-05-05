@@ -11,6 +11,36 @@ impl Ext4 {
         self.metadata_writer.write_metadata(offset, data);
     }
 
+    pub(crate) fn subtract_superblock_free_blocks(&self, blocks: u64) -> Ext4Superblock {
+        let mut super_block = self.allocator_locks.lock_superblock_counter();
+        let free_blocks = super_block.free_blocks_count();
+        super_block.set_free_blocks_count(free_blocks - blocks);
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
+        *super_block
+    }
+
+    pub(crate) fn add_superblock_free_blocks(&self, blocks: u64) -> Ext4Superblock {
+        let mut super_block = self.allocator_locks.lock_superblock_counter();
+        let free_blocks = super_block.free_blocks_count();
+        super_block.set_free_blocks_count(free_blocks + blocks);
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
+        *super_block
+    }
+
+    pub(crate) fn decrease_superblock_free_inodes(&self) -> Ext4Superblock {
+        let mut super_block = self.allocator_locks.lock_superblock_counter();
+        super_block.decrease_free_inodes_count();
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
+        *super_block
+    }
+
+    pub(crate) fn increase_superblock_free_inodes(&self) -> Ext4Superblock {
+        let mut super_block = self.allocator_locks.lock_superblock_counter();
+        super_block.increase_free_inodes_count();
+        super_block.sync_to_disk_with_csum(&self.metadata_writer);
+        *super_block
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();
@@ -78,6 +108,10 @@ impl Ext4 {
         let ext4_tmp = Ext4 {
             metadata_writer: Arc::new(PassthroughMetadataWriter::new(block_device.clone())),
             alloc_guard: Arc::new(LocalOperationAllocGuard::new()),
+            allocator_locks: Arc::new(AllocatorBlockGroupLocks::new(
+                super_block.block_group_count(),
+                super_block,
+            )),
             block_device,
             super_block,
             system_zone_cache: None,

@@ -454,7 +454,7 @@ impl Inode for Ext4Inode {
     fn sync_all(&self) -> Result<()> {
         let fs = self.ext4_fs()?;
         if self.type_() == InodeType::File {
-            fs.fsync_regular_file()
+            fs.fsync_regular_file(self.ino)
         } else {
             fs.sync()
         }
@@ -463,7 +463,7 @@ impl Inode for Ext4Inode {
     fn sync_data(&self) -> Result<()> {
         let fs = self.ext4_fs()?;
         if self.type_() == InodeType::File {
-            fs.fsync_regular_file()
+            fs.fsync_regular_file(self.ino)
         } else {
             fs.sync()
         }

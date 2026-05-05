@@ -25,7 +25,7 @@ CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
 CRASH_HOLD_STAGE=${CRASH_HOLD_STAGE:-after_commit}
 CRASH_SCENARIOS=${CRASH_SCENARIOS:-}
 CRASH_EXPECT=${CRASH_EXPECT:-committed}
-EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync"}
+EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync,unlink_while_open,allocator_churn"}
 EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
 EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
 EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED:-1}
@@ -70,6 +70,7 @@ NETDEV=${NETDEV:-user}
 VHOST=${VHOST:-off}
 CONSOLE=${CONSOLE:-ttyS0}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
+EXT4_PHASE2_PROFILE=${EXT4_PHASE2_PROFILE:-0}
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Error: docker not found." >&2
@@ -121,6 +122,7 @@ DOCKER_ENV_ARGS=(
   -e VHOST="${VHOST}"
   -e CONSOLE="${CONSOLE}"
   -e KLOG_LEVEL="${KLOG_LEVEL}"
+  -e EXT4_PHASE2_PROFILE="${EXT4_PHASE2_PROFILE}"
 )
 
 for key in http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY; do

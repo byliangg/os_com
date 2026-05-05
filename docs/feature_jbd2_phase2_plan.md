@@ -110,7 +110,7 @@
 
 ## Step 2：显式化 ext4_rs `runtime_block_size`
 
-**状态：** 待开始
+**状态：** 已完成
 **目标：** 移除全局 block size 变量的语义风险，但暂不删除 `EXT4_RS_RUNTIME_LOCK`，不改变并发模型。
 
 ### 方案
@@ -133,7 +133,7 @@
 
 ## Step 3：JBD2 handle-local operation context
 
-**状态：** 待开始
+**状态：** 已完成
 **目标：** 让并发 metadata write 归属正确 handle/transaction。
 
 ### 方案
@@ -163,7 +163,7 @@
 
 ## Step 4：operation allocated block guard 本地化
 
-**状态：** 待开始
+**状态：** 已完成
 **目标：** 修复 allocator guard 的全局共享风险。
 
 ### 方案
@@ -235,7 +235,7 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 5：per-inode / per-directory correctness 锁
 
-**状态：** 待开始
+**状态：** 已完成（Step 5A correctness）
 **目标：** 先以保守锁保护同 inode 与目录变更正确性。
 **前置条件：** Step 4.5 已验收通过。
 
@@ -269,7 +269,7 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 6：allocator 与 block group 并发协议
 
-**状态：** 待开始
+**状态：** 已完成（Step 6A correctness；真实绕开全局串行 fence 留到 Step 7）
 **目标：** 支持不同 inode 同时分配块而不重复、不漏计。
 
 ### 方案
@@ -288,21 +288,22 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 7：逐步缩小 `EXT4_RS_RUNTIME_LOCK`、`inner: Mutex<Ext4>` 与全局串行路径
 
-**状态：** 待开始
+**状态：** 进行中（Step 7A' 文件读路径已完成；Step 7B/7C 尝试后因 `generic/011` 回退）
 **目标：** 在 Step 3/4/5/6 的 correctness 保护全部通过后，从“同 fs 串行”推进到“不同 inode/目录/allocator 分区并发”。
 
 ### 方案
 
 1. 先确认 Step 2 已替换所有 `sync_runtime_block_size()` / `set_runtime_block_size()` 真实调用点，包括 `fs.rs` 中 mount/recovery/run_ext4/run_journaled_ext4 等路径；否则不得放开 `inner` 并发。
-2. 再把只读路径从 `inner` 中拆出可并发部分，例如 extent mapping 查询、stat 读取、direct read plan。
-3. 只有在 handle-local context、alloc guard 本地化、per-inode/per-dir 锁、per-block-group allocator 协议都通过验收后，才能缩小或删除 `EXT4_RS_RUNTIME_LOCK`。
-4. 对写路径按资源加锁：
+2. 再把只读路径从全局 runtime fence 中拆出可并发部分，例如普通文件 `read_at` 与 direct read plan；Step 7A' 仅允许已经持同 inode correctness 锁的文件读绕开 `EXT4_RS_RUNTIME_LOCK`，目录/metadata 读继续保守串行。
+3. Step 7A/7B/7C 的宽拆锁尝试被 `phase6_good` `generic/011` 挡住：全只读绕开 runtime fence、只读锁外 snapshot、journaled 写绕开 runtime fence 均会暴露目录 cleanup mismatch；后续重新打开前必须先补齐目录/metadata read-vs-mutation 与 JBD2 checkpoint/home-block-vs-apply 协议。
+4. 只有在 handle-local context、alloc guard 本地化、per-inode/per-dir 锁、per-block-group allocator 协议、目录读写同步与 checkpoint/home-block 协议都通过验收后，才能继续缩小或删除 `EXT4_RS_RUNTIME_LOCK`。
+5. 对写路径按资源加锁：
    - inode extent/size；
    - parent dir；
    - block group allocator；
    - journal runtime。
-5. 对仍依赖 `inner` 的路径保守保留锁，并在 milestone 标注剩余原因。
-6. 每拆一个路径就跑 Phase 2 并发测试与 Phase 1 固定回归；若出现死锁或数据错误，回退到上一层保守锁范围。
+6. 对仍依赖 `inner` / `EXT4_RS_RUNTIME_LOCK` 的路径保守保留锁，并在 milestone 标注剩余原因。
+7. 每拆一个路径就跑 Phase 2 并发测试与 Phase 1 固定回归；若出现死锁或数据错误，回退到上一层保守锁范围。
 
 ### 验收
 
@@ -319,16 +320,21 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 8：性能恢复与优化
 
-**状态：** 待开始
+**状态：** 进行中
 **目标：** correctness 稳定后，恢复 write ratio 到 90% 级别并提升并发吞吐。
 
 ### 方案
 
-1. 对 commit/checkpoint 做批量化与延迟策略复核，避免 correctness 阶段的保守锁导致 per-op flush 回归。
-2. direct read cache 引入 generation，减少过度失效。
-3. allocator 按 block group 并行，减少热点 group 争用。
-4. 评估后台 commit/checkpoint 线程；若引入，必须先补 crash ordering 测试。
-5. fio、lmbench、并发 workload 分别记录，避免只优化单一指标。
+1. 先用 `EXT4_PHASE2_PROFILE=1 KLOG_LEVEL=warn` 做目标 workload profile，再决定拆锁顺序；不要盲拆目录/metadata 或 journaled write fence。
+2. `ext4/045` profile 已确认主因是目录 metadata read/遍历仍受 `EXT4_RS_RUNTIME_LOCK` fence 保护：长名目录阶段 timeout 前 `journaled_ops` 停在 131317、`mkdir_ops` 停在 65538，但 `runtime_lock_acquires` 与 `overlay_reads` 持续增长。
+3. 已完成 cache-backed directory read 第一刀：目录 cache 条目记录 `(ino, offset, de_type)`，完整 cache 可直接服务 readdir；lookup/readdir/cache load 在 dir correctness lock 下绕开全局 runtime fence。`ext4/045` 1200s 已从 timeout 变为 PASS。
+4. 已恢复 direct overwrite 写路径的 mapping cache 保留策略：纯覆盖写成功时只清 pending speculative read，不清完整 mapping cache；扩展写、重新分配或失败仍全量失效。Asterinas-only fio write 暂为 `2071 MiB/s`，说明 fio write 仍需继续 profile。
+5. direct write profile 已定位：fio overwrite 稳态 mapping cache hit > 99%，`prepare`/`touch` 已不是主耗时；主要成本在每 1MiB data bio 的 wait（约 455us）与 user->bio copy（约 125us）。write-side fast-submit 试验只带来小幅 profile 改善且正式双边 fio write 仍为 `63.44%`，不作为保留优化；Step 8 write 仍未达标。
+6. Step 8 下一优先级：围绕 data bio 路径做更大设计，优先评估 multi-segment/scatter-gather bio 或安全 zero-copy direct write；不要在未解决 user page fragmentation、DMA lifetime 与 fallback 语义前直接套用之前被否掉的 read zero-copy 方案。
+7. checkpoint/home-block-vs-apply 协议继续作为 journaled write 拆 runtime fence 前置；当前代码已有 batch checkpoint，且 direct write profile 未指向 checkpoint，因此除非 profile 再变化，不引入后台 commit/checkpoint 线程。
+8. 继续完善目录 read-vs-mutation 协议：评估是否把 `dir_open(path)`、`stat` 中可归属到目录/子 inode 的读路径也纳入更细粒度锁，而不是依赖 runtime fence。
+9. allocator 热点 group 并行与 fio write >= 90% 复测在 data bio 路径优化后继续推进。
+10. fio、lmbench、并发 workload 分别记录，避免只优化单一指标。
 
 ### 验收
 
@@ -371,6 +377,17 @@ ENABLE_KVM=1 \
 RELEASE_LTO=0 \
 XFSTESTS_CASE_TIMEOUT_SEC=1200 \
 XFSTESTS_RUN_TIMEOUT_SEC=3600 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase1 \
+ENABLE_KVM=1 \
+KLOG_LEVEL=warn \
+EXT4_PHASE2_PROFILE=1 \
+XFSTESTS_SINGLE_TEST=ext4/045 \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+XFSTESTS_RUN_TIMEOUT_SEC=1500 \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 

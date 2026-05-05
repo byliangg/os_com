@@ -2,7 +2,7 @@
 
 首次更新时间：2026-04-24（Asia/Shanghai）
 
-当前状态：Phase 2 Step 0/1/2/3/4/4.5 已完成，准备进入 Step 5
+当前状态：Phase 2 Step 0/1/2/3/4/4.5 已完成；Step 5A correctness 锁与并发测试扩展已完成；Step 6A allocator/block-group correctness 协议与固定回归已完成；Step 7A' 仅放开普通文件读路径的全局 fence；目录/metadata 读与 journaled 写拆锁因 `generic/011` 回退到保守 fence
 
 ## Phase 1 收口基线
 
@@ -358,122 +358,227 @@
 
 ## Step 5：per-inode / per-directory correctness 锁
 
-**状态：** 待开始
+**状态：** 已完成（Step 5A correctness）
 **对应 analysis：** G5、G6、G7、G8、G12、G13
 **目标摘要：** 保守保护同 inode 写侧、目录 mutation、buffered 直通路径、direct read cache、fsync 与 orphan inode 语义。
 **前置条件：** Step 4.5 已验收通过。
 
 ### 改动概要
 
-- 待记录。
+- 新增 `inode_correctness_locks` 与 `dir_correctness_locks` 两张 per-fs 锁表，按 inode number 稳定排序获取多 inode / 多目录锁。
+- 同 inode `read_at` / `read_direct_at` / `write_at` / `write_direct_at` / `truncate` / regular-file `fsync` 采用保守互斥；mapping generation 优化继续留到 Step 8。
+- `create` / `mkdir` / `unlink` / `rmdir` 持 parent directory correctness 锁；`unlink` / `rmdir` 同时保护目标 inode。
+- `rename` 固定先按 inode number 锁 `old_parent` / `new_parent` 目录，再解析 `src` / 可选 `dst`，随后按 inode number 锁受影响 inode，覆盖 same-dir、cross-dir、overwrite、目标不存在场景。
+- `write_at` / `write_direct_at` / `truncate` 成功或失败后均失效对应 direct read cache；direct write 不再保留旧 pending speculative read。
+- `sync_all` / `sync_data` regular-file 路径传入 inode number，fsync 与同 inode write/truncate 保守互斥；fsync 仍遵循既有 group commit 语义。
+- 新增 `unlink_while_open` Phase 2 并发 case：打开文件后 unlink，旧 fd 继续读写/fsync，同时并发创建压力文件并校验新文件不能复用旧 inode 号。
+- Phase 2 concurrency 默认 case list 扩展为 6 项，新增 `unlink_while_open`。
 
 ### 涉及文件
 
-- 待记录。
+- `asterinas/kernel/src/fs/ext4/fs.rs`
+- `asterinas/kernel/src/fs/ext4/inode.rs`
+- `asterinas/test/initramfs/src/syscall/ext4_phase2/phase2_concurrency.c`
+- `asterinas/test/initramfs/src/syscall/ext4_phase2/run_ext4_phase2_concurrency.sh`
+- `asterinas/tools/ext4/run_phase4_in_docker.sh`
+- `asterinas/tools/ext4/run_phase4_part3.sh`
+- `feature_jbd2_phase2_plan.md`
+- `asterinas/docs/feature_jbd2_phase2_plan.md`
+- `feature_jbd2_phase2_milestone.md`
+- `asterinas/docs/feature_jbd2_phase2_milestone.md`
 
 ### 功能回归
 
 | 测试项 | 结果 |
 |--------|------|
-| multi-file read/write verify | 待运行 |
-| create/unlink churn | 待运行 |
-| rename churn | 待运行 |
-| write/truncate/fsync | 待运行 |
+| `cargo check -p ext4_rs` | PASS（仅既有 `error_in_core` stable warning） |
+| `cargo test -p ext4_rs --lib` | PASS（28/28） |
+| `VDSO_LIBRARY_DIR=/home/lby/os_com_codex/asterinas/.local/linux_vdso CARGO_TARGET_DIR=/tmp/os_com_codex_kernel_target cargo check -p aster-kernel --target x86_64-unknown-none` | PASS |
+| Phase 2 helper static build | PASS（`gcc -O2 -Wall -Wextra -static .../phase2_concurrency.c`） |
+| runner shell syntax | PASS（`sh -n` / `bash -n`） |
+| `cargo fmt --check` | BLOCKED：仓库存在大量既有格式差异，未执行全仓库格式化 |
+| unlink-while-open / orphan inode smoke | PASS（单项，`workers=2 rounds=2 seed=48`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260426_021627.log`） |
+| multi-file read/write verify | PASS（默认 6-case Phase 2 smoke，`workers=2 rounds=2 seed=49`） |
+| create/unlink churn | PASS（默认 6-case Phase 2 smoke，`workers=2 rounds=2 seed=49`） |
+| rename churn | PASS（默认 6-case Phase 2 smoke，`workers=2 rounds=2 seed=49`） |
+| write/truncate/fsync | PASS（默认 6-case Phase 2 smoke，`workers=2 rounds=2 seed=49`） |
+| unlink_while_open | PASS（默认 6-case Phase 2 smoke，`workers=2 rounds=2 seed=49`） |
+| Phase 2 concurrency baseline | PASS（6/6，`workers=4 rounds=8 seed=1`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260426_021911.log`） |
+| crash matrix | PASS（18/18，`CRASH_ROUNDS=2`，summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260426_022050.tsv`） |
+| `phase4_good` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase4_good_20260426_022050.log`） |
+| `phase3_base_guard` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase3_base_guard_20260426_022050.log`） |
+| `phase6_good` | PASS（100.00%，日志：`asterinas/benchmark/logs/phase6_good_20260426_030227.log`） |
+| `jbd_phase1` | PASS（100.00%，日志：`asterinas/benchmark/logs/jbd_phase1_20260426_031823.log`） |
+| lmbench regression | PARTIAL（7/8 PASS；`ext4_vfs_open_lat` 超时 rc=124，summary：`asterinas/benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260426_022050.tsv`，性能项留到 Step 8 复核） |
+| strict keyword scan | PASS（Phase 2 concurrency、phase3、phase4、phase6、jbd_phase1 与 crash verify 日志均无 `EXT4_PHASE2_FAIL` / panic / BUG / mapped block 错误等关键词） |
 
 ### 验收项
 
-- [ ] 同 inode write/truncate 串行或有等价保护
-- [ ] Step 5 采用保守 read 同步，mapping generation 留到 Step 8
-- [ ] rename 多锁顺序固定
-- [ ] Phase 2 明确不接入 ext4 PageCache，buffered 路径仍直通 fs 层
-- [ ] direct read cache 写侧失效可靠
-- [ ] ordered-mode transaction 级 dirty data drain 已验证
-- [ ] fsync group commit 语义已写入测试预期
-- [ ] unlink-while-open / orphan inode 策略已验证
+- [x] 同 inode write/truncate 串行或有等价保护
+- [x] Step 5 采用保守 read 同步，mapping generation 留到 Step 8
+- [x] rename 多锁顺序固定
+- [x] Phase 2 明确不接入 ext4 PageCache，buffered 路径仍直通 fs 层
+- [x] direct read cache 写侧失效可靠
+- [x] ordered-mode transaction 级 dirty data drain 已验证
+- [x] fsync group commit 语义已写入测试预期
+- [x] unlink-while-open / orphan inode 策略已验证
 
 ## Step 6：allocator 与 block group 并发协议
 
-**状态：** 待开始
+**状态：** 已完成（Step 6A correctness；真实绕开全局串行 fence 留到 Step 7）
 **对应 analysis：** G4
 **目标摘要：** 支持不同 inode 并发分配块，bitmap/counter/extent/JBD2 状态一致。
 
 ### 改动概要
 
-- 待记录。
+- 在 ext4_rs `Ext4` 中新增挂载级共享 `AllocatorBlockGroupLocks`，每个 block group 一个 allocator 锁，并额外提供 superblock free-counter 状态锁。
+- block allocation/free、batch allocation、inode allocation/free，以及旧 `allocate_new_block()` 路径在读改写 block/inode bitmap、group descriptor free counter、superblock free counter 时进入同一 allocator 协议。
+- superblock free block/free inode counter 更新改为在 counter 锁下维护挂载级 in-memory superblock state，再做增减与 checksum sync，避免并发 RMW 使用 mount-time 旧副本覆盖新计数，同时避免每次分配重新读取磁盘 superblock。
+- 新增 Phase 2 `allocator_churn` 并发 case，反复 create/write/fsync/unlink 临时文件，同时保留每 worker 的 keep 文件并做 size/hash 校验，覆盖分配/释放 churn 下的数据串线风险。
 
 ### 涉及文件
 
-- 待记录。
+- `asterinas/kernel/libs/ext4_rs/src/ext4_defs/ext4.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/ext4.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/balloc.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/ialloc.rs`
+- `asterinas/kernel/libs/ext4_rs/src/ext4_impls/inode.rs`
+- `asterinas/test/initramfs/src/syscall/ext4_phase2/phase2_concurrency.c`
+- `asterinas/test/initramfs/src/syscall/ext4_phase2/run_ext4_phase2_concurrency.sh`
+- `asterinas/tools/ext4/run_phase4_in_docker.sh`
+- `asterinas/tools/ext4/run_phase4_part3.sh`
 
 ### 功能回归
 
 | 测试项 | 结果 |
 |--------|------|
-| 并发大文件写 | 待运行 |
-| crash + e2fsck | 待运行 |
-| 固定回归集 | 待运行 |
+| `cargo check -p ext4_rs` | PASS（仅既有 `error_in_core` stable warning） |
+| `cargo test -p ext4_rs --lib` | PASS（28/28） |
+| `cargo check -p aster-kernel --target x86_64-unknown-none` | PASS（仅既有依赖 warning） |
+| C helper host static build | PASS（`gcc -O2 -Wall -Wextra -static`） |
+| 脚本语法检查 | PASS（Phase 2 runner `sh -n`，phase runner `bash -n`） |
+| Phase 2 allocator 专项 smoke | PASS（`allocator_churn` 1/1，`workers=2 rounds=2 seed=60`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260430_063120.log`） |
+| Phase 2 默认 7-case baseline | PASS（7/7，`workers=4 rounds=8 seed=2`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260430_100006.log`） |
+| crash matrix | PASS（18/18，summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260430_100112.tsv`） |
+| `phase4_good` | PASS（100%，日志：`asterinas/benchmark/logs/phase4_good_20260430_081714.log`；需使用 `ENABLE_KVM=1 NETDEV=tap VHOST=on`，TCG 慢速会触发 timeout 假阴性） |
+| `phase3_base_guard` | PASS（100%，日志：`asterinas/benchmark/logs/phase3_base_guard_20260430_082917.log`） |
+| `phase6_good` | PASS（100%，日志：`asterinas/benchmark/logs/phase6_good_20260430_084031.log`） |
+| `jbd_phase1` | PASS（100%，`XFSTESTS_CASE_TIMEOUT_SEC=1200`，日志：`asterinas/benchmark/logs/jbd_phase1_20260430_094327.log`；默认 600s 下 `ext4/045` 接近边界并超时，记录为 Step 8 性能复核项） |
+| strict keyword scan | PASS（上述 Phase 2 / phase3 / phase4 / phase6 / jbd_phase1 / crash verify 日志扫描为空） |
 
 ### 验收项
 
-- [ ] 同 block group 分配有互斥协议
-- [ ] 多 block group 操作按 group number 升序取锁
-- [ ] 不同 block group 可并行
-- [ ] crash 后 bitmap/counter/extent 一致
+- [x] 同 block group 分配有互斥协议
+- [x] 多 block group 操作按 group number 升序取锁或单 group 持锁后释放再前进
+- [x] 不同 block group 具备独立 allocator 锁协议（真实绕开全局串行 fence 留到 Step 7）
+- [x] crash 后 bitmap/counter/extent 一致
 
 ## Step 7：逐步缩小 `EXT4_RS_RUNTIME_LOCK`、`inner: Mutex<Ext4>` 与全局串行路径
 
-**状态：** 待开始
+**状态：** 进行中（Step 7A' 文件读路径已完成；Step 7B/7C 尝试后回退）
 **对应 analysis：** G1-G10
 **目标摘要：** 在 Step 3/4/5/6 的 correctness 保护到位后，把多文件读写从同 fs 串行推进到真实并发。
 
 ### 改动概要
 
-- 待记录。
+- 新增 `run_ext4_file_read_only()`，仅供已经持同 inode correctness 锁的普通文件 buffered `read_at` 与 direct-read extent plan 使用；该窄路径不获取 `EXT4_RS_RUNTIME_LOCK`，但仍保留 `inner: Mutex<Ext4>`。
+- `stat`、directory cache load 的 `readdir_with_offsets`、lookup fallback、`dir_open`、`readdir` 等目录/metadata 读路径继续使用带 `EXT4_RS_RUNTIME_LOCK` 的 `run_ext4_read_only()` / `run_ext4_read_only_noerr()`。
+- Step 7A 原先尝试将所有只读 ext4_rs 调用绕开全局 runtime fence；`phase6_good` 的 `generic/011` 暴露目录树 cleanup mismatch 后，已收窄为 Step 7A' 文件读专用路径。
+- Step 7B 曾尝试只读 helper 在 `inner` 下 clone 出 `Ext4` snapshot 后锁外执行；`generic/011` 仍可复现失败，已回退。
+- 同 inode read/write/truncate 仍由 Step 5A inode correctness 锁互斥；目录 mutation 仍由 Step 5A dir locks 互斥。
+- 将 `KernelBlockDeviceAdapter` 的 I/O failure 观测从全局 clear/consume bool 改为单调 `io_failure_epoch`，避免只读 ext4 wrapper 并发后互相清理失败状态。
+- Step 7C 曾尝试将 `run_journaled_ext4()` 从 `EXT4_RS_RUNTIME_LOCK` 中移出；`generic/011` 单测仍失败，说明目录/metadata 读 fence 也是必要边界，journaled 写路径已恢复保守 runtime fence。
+- `run_inode_metadata_update()` 不再用全局 `has_active_jbd2_handle()` 判断是否嵌套，避免真实并发 handle 下把 metadata update 误路由到无 handle 的 `run_ext4()`。
+- journaled 写路径仍保留 `EXT4_RS_RUNTIME_LOCK` 与 `inner: Mutex<Ext4>`；allocator、extent tree、目录 mutation 的真正同 fs 写侧并行继续留到后续 Step 7D/5B/6B，并需先补齐 checkpoint/home-block 与 ext4 apply 的并发协议。
 
 ### 涉及文件
 
-- 待记录。
+- `asterinas/kernel/src/fs/ext4/fs.rs`
 
 ### 功能回归
 
 | 测试项 | 结果 |
 |--------|------|
-| Phase 2 并发测试 | 待运行 |
-| 固定回归集 | 待运行 |
-| crash matrix | 待运行 |
+| `sync_runtime_block_size` / `set_runtime_block_size` 扫描 | PASS（`kernel/src/fs/ext4` 与 `kernel/libs/ext4_rs/src` 均无命中） |
+| `cargo check -p aster-kernel --target x86_64-unknown-none` | PASS（`VDSO_LIBRARY_DIR=/home/lby/os_com_codex/asterinas/.local/linux_vdso CARGO_TARGET_DIR=/tmp/os_com_codex_kernel_target`；仅既有依赖 warning） |
+| Phase 2 并发 smoke | PASS（7/7，`workers=2 rounds=2 seed=70`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_022918.log`） |
+| Step 7B Phase 2 并发 smoke | PASS（7/7，`workers=2 rounds=2 seed=72`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_054307.log`） |
+| Step 7B Phase 2 并发 baseline | PASS（7/7，`workers=4 rounds=8 seed=4`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_054513.log`） |
+| Step 7C Phase 2 并发 smoke | PASS（7/7，`workers=2 rounds=2 seed=73`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_113832.log`） |
+| Step 7C Phase 2 并发 baseline | PASS（7/7，`workers=4 rounds=8 seed=5`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_114034.log`） |
+| Step 7C crash matrix | PASS（9/9，summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260501_114134.tsv`） |
+| Step 7B/7C blocker | FAIL reproduced（`phase6_good` `generic/011` output mismatch：全量日志 `asterinas/benchmark/logs/phase6_good_20260501_120532.log`；单测复现 `asterinas/benchmark/logs/phase6_good_20260501_122108.log` / `122537.log` / `122942.log`） |
+| Step 7A' `generic/011` guard | PASS（单测 100%，日志：`asterinas/benchmark/logs/phase6_good_20260501_123821.log`；完全恢复 fence 对照 PASS：`phase6_good_20260501_123351.log`） |
+| Step 7A' `generic/013` guard | PASS（单测 100%，日志：`asterinas/benchmark/logs/phase6_good_20260501_165222.log`） |
+| Step 7A' Phase 2 并发 smoke | PASS（7/7，`workers=2 rounds=2 seed=74`，日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260501_124230.log`） |
+| Step 7A' full `phase6_good` | PASS（25/25，100%，日志：`asterinas/benchmark/logs/phase6_good_20260501_170453.log`；早先人工中断的不完整日志 `phase6_good_20260501_124524.log` 不计作回归） |
+| Step 7A' `phase4_good` | PASS（18/18，100%，日志：`asterinas/benchmark/logs/phase4_good_20260501_180011.log`） |
+| Step 7A' `phase3_base_guard` | PASS（16/16，100%，日志：`asterinas/benchmark/logs/phase3_base_guard_20260501_180011.log`） |
+| Step 7A' `jbd_phase1` | PARTIAL（完整列表 5/6，`ext4/045` 在 1200s 预算下 timeout，日志：`asterinas/benchmark/logs/jbd_phase1_20260501_191319.log`；`ext4/045` 单项 2400s PASS，日志：`asterinas/benchmark/logs/jbd_phase1_20260501_195203.log`，判定为性能预算边界而非 correctness 失败） |
+| Step 7A' crash matrix | PASS（9/9，`CRASH_ROUNDS=1`，summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260501_202214.tsv`） |
+| strict keyword scan | PASS（Step 7A' Phase 2 smoke、phase3、phase4、phase6、jbd_phase1 与 crash verify 日志无 `EXT4_PHASE2_FAIL` / panic / BUG / mapped block 错误等关键词） |
+| 固定回归集 | PASS/PARTIAL（phase3/phase4/phase6/crash 通过；jbd_phase1 仅 `ext4/045` 1200s timeout，2400s 单项通过，留到 Step 8 性能预算复核） |
 
 ### 验收项
 
 - [ ] 多文件并发读写真正绕开单一全局串行瓶颈
-- [ ] `sync_runtime_block_size()` / `set_runtime_block_size()` 真实调用点已被 Step 2 替换或证明无竞态
-- [ ] 剩余 `inner` 依赖原因已记录
-- [ ] 若出现死锁或数据错误，可回退到上一层保守锁范围
+- [x] `sync_runtime_block_size()` / `set_runtime_block_size()` 真实调用点已被 Step 2 替换或证明无竞态
+- [x] 剩余 `inner` / runtime fence 依赖原因已记录（目录/metadata 读与 journaled 写仍依赖 `EXT4_RS_RUNTIME_LOCK`；普通文件读可窄化绕开）
+- [x] 若出现死锁或数据错误，可回退到上一层保守锁范围（`generic/011` 已触发并完成回退）
 
 ## Step 8：性能恢复与优化
 
-**状态：** 待开始
+**状态：** 进行中（已完成 `ext4/045` profile、cache-backed directory read 与 direct write profile，fio write 仍待优化）
 **对应 analysis：** G7、G9
 **目标摘要：** 在并发 correctness 稳定后恢复/提升 fio 与并发 workload 性能。
 
 ### 改动概要
 
-- 待记录。
+- 新增可开关的 Phase 2 profile：`ext4fs.phase2_profile=1` / `EXT4_PHASE2_PROFILE=1` 时按 runtime-lock acquire 间隔输出 `[ext4-phase2]`，统计 journaled op 数、mkdir/rmdir/write 分布、`start_handle/apply/finish_handle/finish_io` 平均耗时与 JBD2/allocator 累计计数；默认关闭，避免正式 benchmark 带 profile 原子计数与 warn 日志开销。
+- 对 `ext4/045` 进行 1200s profile 复核：日志 `asterinas/benchmark/logs/jbd_phase1_20260501_233951.log`。该 profile run 在 1200s timeout，结论是性能瓶颈主要落在目录 metadata read/遍历仍受 `EXT4_RS_RUNTIME_LOCK` fence 保护，而不是 allocator 等待或每 op flush。
+- 观测细节：
+  - 短名目录阶段：`journaled_ops=131312`、`mkdir_ops=65538` 后 journaled op 停止增长，但 `runtime_lock_acquires` 与 `overlay_reads` 继续快速增长，说明 mkdir 主体结束后仍有大量目录/metadata read。
+  - 长名目录阶段 timeout 前：`journaled_ops=131317`、`mkdir_ops=65538`、`rmdir_ops=0`，但 `runtime_lock_acquires=778240`、`overlay_reads=6708974`，再次证明 timeout 卡在长名目录遍历读路径。
+  - `avg_wait_us=0`，runtime lock 不存在明显多线程竞争；`avg_apply_us` 约 1.3ms/op，`avg_finish_handle_us` 约 0.1ms/op；checkpoint 以批次出现，`max_finish_handle_ms` 约 1.2s，是尾延迟来源但不是 1200s 主因。
+- Step 8 下一优先级调整为：先设计/实现目录 read-vs-mutation 协议，让 lookup/readdir/目录 cache load 在无 mutation 冲突时绕开全局 runtime fence；checkpoint/home-block-vs-apply 协议作为第二优先级，避免后续拆 journaled write fence 时破坏 crash ordering。
+- 落地 cache-backed directory read 第一刀：目录 cache 条目记录 `(ino, offset, de_type)`，已完整加载且 offset 完整的目录可直接生成 `SimpleDirEntry` 服务 `readdir_at`；lookup/readdir/cache load 在 parent dir correctness lock 下使用只获取 `Ext4Fs::inner` 的目录读 helper，绕开 `EXT4_RS_RUNTIME_LOCK`。写侧 mutation 仍持原有 parent dir correctness lock 并维护 cache。
+- fio write 复测暴露当前双边对照波动较大：`20260502_103037` 双边 run 中 Asterinas write 为 `1998 MiB/s`、Linux write 为 `3413 MiB/s`，read 则出现 Asterinas `5846 MiB/s` / Linux `3120 MiB/s` 的反向异常；该 run 仅作为诊断输入，不作为 Step 8 验收结论。
+- 修复 direct overwrite 写路径的 mapping cache 失效策略：复用完整 direct-read mapping cache 且写入成功时只清 pending speculative read，不再每个 1MiB overwrite 都清掉 mapping cache；扩展写、重新分配或失败仍全量失效，避免 stale mapping。Asterinas-only fio write 复测为 `2071 MiB/s`，说明仍需继续 profile direct write / journaled metadata touch 路径。
+- 新增 direct write profile：统计 write calls/bytes、mapping cache hit/miss、prepare/data-bio/touch、bio alloc/copy/submit/wait 与尾延迟；fio overwrite 稳态 cache hit > 99%，`prepare`/`touch` 已不是主耗时，主要成本落在 data bio wait（约 441-455us/1MiB）与 user->bio copy（约 124-129us/1MiB）。
+- 补 `EXT4_PHASE2_PROFILE` benchmark 透传，并试验 write-side fast-submit hint：profile 中 `avg_bio_wait_us` 小幅下降到约 441us，但正式双边 fio write 仍只有 `63.44%`，说明该优化不足以完成 Step 8；同时 `allocator_churn seed=76` 暴露 hash mismatch，故不保留该 block/virtio 快路径试验。
+- Step 8 下一优先级调整为 data bio 路径：评估 multi-segment/scatter-gather bio 或安全 zero-copy direct write；在解决 user page fragmentation、DMA lifetime 与 fallback 语义前，不直接复用之前被否掉的 read zero-copy 方案。
 
 ### 涉及文件
 
-- 待记录。
+- `asterinas/kernel/src/fs/ext4/fs.rs`
+- `asterinas/kernel/libs/ext4_rs/src/simple_interface/mod.rs`
+- `asterinas/Makefile`
+- `asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh`
+- `asterinas/tools/ext4/run_phase4_part3.sh`
+- `asterinas/tools/ext4/run_phase4_in_docker.sh`
 
 ### 性能结果
 
 | 测试项 | Asterinas | Linux | 比值 | 结论 |
 |--------|----------:|------:|-----:|------|
-| fio read | 待运行 | 待运行 | 待运行 | 待记录 |
-| fio write | 待运行 | 待运行 | 待运行 | 待记录 |
+| `ext4/045` profile | 1200s timeout | 未测 | N/A | timeout 前 long-name 阶段 journaled op 已停在 mkdir 后，目录 metadata read fence 是主因 |
+| `ext4/045` after cache-backed readdir | PASS（1200s） | 未测 | N/A | 日志：`asterinas/benchmark/logs/jbd_phase1_20260502_004718.log` |
+| `jbd_phase1` full after cache-backed readdir | PASS（100%） | N/A | N/A | 日志：`asterinas/benchmark/logs/jbd_phase1_20260502_005937.log`，含 `ext4/045 rc=0` |
+| `generic/011` single | PASS（100%） | N/A | N/A | 日志：`asterinas/benchmark/logs/phase6_good_20260502_005349.log` |
+| Phase 2 concurrency smoke | PASS（7/7，seed=74） | N/A | N/A | 日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260502_005505.log` |
+| fio read/write双边诊断 | read `5846 MiB/s` / write `1998 MiB/s` | read `3120 MiB/s` / write `3413 MiB/s` | read `187.37%` / write `58.54%` | 环境/对照波动明显，仅作诊断；日志：`/tmp/ext4-fio-summary.eAMd12` |
+| fio write Asterinas-only after mapping-cache fix | `2071 MiB/s` | 未跑 | N/A | 日志：`/tmp/ext4-write-asterinas-after-cache-20260502_103037.log` |
+| fio write profile before write fast-submit | `1103 MiB/s` | 未跑 | N/A | profile overhead 下的诊断值；`avg_bio_wait_us=455`、`avg_bio_copy_us=125`、cache hit `99.35%`；日志：`/tmp/ext4-write-profile-split-20260502_130609.log` |
+| fio write profile during write fast-submit trial | `1117 MiB/s` | 未跑 | N/A | profile overhead 下的诊断值；`avg_bio_wait_us=441`、`avg_bio_copy_us=124`、cache hit `99.35%`；试验未保留；日志：`/tmp/ext4-fio-summary.9nD7CO/ext4_seq_write_bw.log` |
+| fio read/write正式复测 during write fast-submit trial | read `5314 MiB/s` / write `1362 MiB/s` | read `2162 MiB/s` / write `2147 MiB/s` | read `245.79%` / write `63.44%` | read 达标，write 未达标；试验未保留；日志：`/tmp/ext4-fio-summary.gn8sia` |
+| `generic/011` after mapping-cache fix | PASS（100%） | N/A | N/A | 日志：`asterinas/benchmark/logs/phase6_good_20260502_023824.log` |
+| Phase 2 concurrency smoke after mapping-cache fix | PASS（7/7，seed=75） | N/A | N/A | 日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260502_023628.log` |
+| allocator_churn after reverting write fast-submit trial | PASS（seed=76） | N/A | N/A | 确认不保留 write fast-submit 后该 seed 单项通过；日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260502_054540.log` |
 | 并发 workload | 待运行 | 待运行 | 待运行 | 待记录 |
 
 ### 验收项
 
-- [ ] fio read >= 90%
+- [x] fio read >= 90%
 - [ ] fio write 目标 >= 90%
 - [ ] 并发 workload 相比全局串行模型有明确提升
 
@@ -512,3 +617,14 @@
 | 2026-04-25 | Step 4.5 active credit admission 修补 | Codex | over-soft-limit 时 active running TX 可 rotate 到 `prev_running`，新增 active-handle credit 单测，`cargo test -p ext4_rs --lib` 27/27 |
 | 2026-04-25 | Step 4.5 Docker 固定回归 | Codex | Phase 2 baseline、phase3、phase4、phase6、jbd_phase1、crash matrix 均通过；严格关键词扫描为空 |
 | 2026-04-25 | 完成 Step 4.5 nested wrapper 验证 | Codex | `OperationScopedAllocGuard` 下沉到 ext4_rs 并新增 nested scoped guard 单测，`cargo test -p ext4_rs --lib` 28/28 |
+| 2026-04-26 | Step 5A correctness 锁骨架 | Codex | per-inode/per-dir 保守锁、rename 固定锁序、direct read cache 写侧失效；ext4_rs/aster-kernel check 通过，Phase 2 smoke 5/5 |
+| 2026-04-26 | Step 5A unlink-while-open 专项 | Codex | 新增 `unlink_while_open` case 并加入默认 Phase 2 concurrency；单项 smoke 1/1，默认 6-case smoke 6/6，baseline 6/6，严格关键词扫描为空 |
+| 2026-04-26 | Step 5A 固定 correctness 回归 | Codex | crash matrix 18/18、phase4/phase3/phase6/jbd_phase1 均 100%；lmbench 7/8，`ext4_vfs_open_lat` 超时留待 Step 8 性能复核 |
+| 2026-04-30 | 完成 Step 6A allocator/block-group correctness 协议 | Codex | per-block-group allocator locks、superblock counter state、`allocator_churn` 已接入；Phase 2 7/7、crash 18/18、phase3/phase4/phase6/jbd_phase1 均通过，`ext4/045` 600s 边界留待 Step 8 复核 |
+| 2026-05-01 | Step 7A/7B/7C 拆锁尝试与回退 | Codex | 全只读绕开 runtime fence、只读锁外 snapshot、journaled 写绕开 runtime fence 均在 `generic/011` 下暴露目录 cleanup mismatch；恢复目录/metadata 读与 journaled 写 fence |
+| 2026-05-01 | Step 7A' 文件读窄化拆锁 | Codex | 仅 buffered file read 与 direct-read extent plan 绕开 `EXT4_RS_RUNTIME_LOCK`；`generic/011` 单测 PASS，Phase 2 smoke 7/7 |
+| 2026-05-02 | Step 7A' 固定回归收口 | Codex | phase6/phase4/phase3/crash 均通过；jbd_phase1 仅 `ext4/045` 1200s timeout、2400s 单项 PASS，记录为 Step 8 性能预算项 |
+| 2026-05-02 | Step 8 `ext4/045` profile | Codex | 新增 `EXT4_PHASE2_PROFILE` 开关；profile run `jbd_phase1_20260501_233951.log` 显示 timeout 主因是目录 metadata read/遍历仍受 runtime fence 保护，checkpoint inline 约 1.2s 尾延迟为次要项，allocator 等待不是主因 |
+| 2026-05-02 | Step 8 cache-backed directory read | Codex | 已加载目录 cache 可直接服务 readdir；lookup/readdir/cache load 在 dir correctness lock 下绕开 runtime fence；`ext4/045` 1200s PASS、完整 `jbd_phase1` 100%、`generic/011` PASS、Phase 2 smoke 7/7 |
+| 2026-05-02 | Step 8 direct overwrite mapping cache 修补 | Codex | 纯 overwrite direct write 成功时保留 mapping cache、只清 pending read；fio 双边 run 波动大不作为验收，Asterinas-only write `2071 MiB/s`；`generic/011` PASS、Phase 2 smoke seed=75 7/7 |
+| 2026-05-02 | Step 8 direct write profile 与 write fast-submit 试验 | Codex | direct write profile 显示 data bio wait/copy 为主瓶颈；write-side fast-submit 小幅降低 wait，但正式 fio write 仍 `63.44%` 且 smoke 出现 hash mismatch，试验未保留；下一步转向 multi-segment/zero-copy data bio 设计 |

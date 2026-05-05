@@ -541,10 +541,10 @@ impl Ext4 {
         simple_entries
     }
 
-    /// Like `ext4_readdir` but also returns each entry's absolute byte offset in the
-    /// directory stream, as `(name, ino, entry_byte_offset)`. Used to populate the
-    /// kernel-layer directory cache with offsets for O(1) rmdir.
-    pub fn ext4_readdir_with_offsets(&self, inode: u32) -> Vec<(String, u32, u64)> {
+    /// Like `ext4_readdir` but also returns each entry's absolute byte offset and
+    /// directory entry type, as `(name, ino, entry_byte_offset, de_type)`. Used to
+    /// populate the kernel-layer directory cache with offsets for O(1) rmdir.
+    pub fn ext4_readdir_with_offsets(&self, inode: u32) -> Vec<(String, u32, u64, u8)> {
         // Iterate directory blocks directly to avoid building a fat Vec<(Ext4DirEntry, usize)>.
         // Ext4DirEntry is 264 bytes; for 65537 entries the intermediate Vec would require a
         // single 34 MB contiguous allocation (capacity doubles to 131072 × 272 bytes = 0x2200000).
@@ -578,7 +578,7 @@ impl Ext4 {
                     }
                     if !de.unused() {
                         let entry_offset = (iblock as usize * block_size + offset) as u64;
-                        result.push((de.get_name(), de.inode, entry_offset));
+                        result.push((de.get_name(), de.inode, entry_offset, de.get_de_type()));
                     }
                     offset += rec_len;
                 }

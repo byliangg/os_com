@@ -11,7 +11,7 @@ Phase 2 会逐步把 Phase 1 依赖的全局串行化拆成显式同步。本文
 1. 不持有 spin lock 做阻塞操作、磁盘 I/O、等待 QEMU/block device、等待其他进程或可能睡眠的操作。
 2. cache map 锁只保护内存 map 的短临界区，不在持锁状态下进入 ext4_rs、JBD2 或块设备 I/O。
 3. 多资源锁按稳定 key 排序获取；需要补锁时，如果新 key 可能排在已持锁之前，必须释放后按完整顺序重取。
-4. `EXT4_RS_RUNTIME_LOCK` 在 Step 7 前仍是 safety fence，不能在 Step 2 后提前缩空或删除。
+4. `EXT4_RS_RUNTIME_LOCK` 在 Step 7 前仍是 safety fence，不能在 Step 2 后提前缩空或删除；Step 7A' 起，只有已经持同 inode correctness 锁的普通文件读路径可跳过该全局 fence，并且必须保留 `Ext4Fs::inner`。
 5. Step 4.5 通过前，Step 3/4 的 handle-local / operation-local 结论只视为全局串行 fence 下成立；不得据此进入 Step 5 的实现阶段或 Step 7 的拆锁阶段。
 
 ## 全局锁顺序
@@ -28,7 +28,13 @@ Phase 2 会逐步把 Phase 1 依赖的全局串行化拆成显式同步。本文
    - `inode_mtime_ctime_cache`
 4. ext4_rs coordination
    - Phase 2 前半段：`EXT4_RS_RUNTIME_LOCK`、`Ext4Fs::inner`
-   - Step 7 后：per-inode/per-dir/per-block-group 等更细粒度锁
+   - Step 7A'：普通文件 buffered read 与 direct-read extent plan 可直接获取 `Ext4Fs::inner`，不获取 `EXT4_RS_RUNTIME_LOCK`
+   - Step 8 起，lookup / `readdir` / directory cache load 在对应 dir correctness lock 下可直接获取 `Ext4Fs::inner`，不获取 `EXT4_RS_RUNTIME_LOCK`；已加载且 offset 完整的 directory cache 可直接服务 `readdir`
+   - 其他 metadata 读（`stat` / `dir_open` 等尚未纳入 dir read-vs-mutation 协议的路径）继续获取 `EXT4_RS_RUNTIME_LOCK -> Ext4Fs::inner`
+   - journaled 写路径继续获取 `EXT4_RS_RUNTIME_LOCK -> Ext4Fs::inner`
+   - Step 7B/7C 宽拆锁尝试已因 `generic/011` 回退，重新打开前必须补齐目录读写同步与 checkpoint/home-block-vs-apply 协议
+   - Step 7D 后：per-inode/per-dir/per-block-group 等更细粒度锁逐步接管写侧路径
+   - Step 8 `ext4/045` profile 证明：目录 metadata read/遍历长期持有 runtime fence 是 1200s timeout 主因；重新拆目录读 fence 前必须先落地 read-vs-mutation 协议，不能再采用 Step 7B 的无协议宽拆锁
 5. allocator block group locks
 6. `jbd2_runtime`
 7. `jbd2_journal`

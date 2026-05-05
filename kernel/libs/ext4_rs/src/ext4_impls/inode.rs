@@ -340,6 +340,7 @@ impl Ext4 {
         let inodes_per_group = super_block.inodes_per_group();
         let bgid = (inode_ref.inode_num - 1) / inodes_per_group;
         let index = (inode_ref.inode_num - 1) % inodes_per_group;
+        let _allocator_bg_guard = self.allocator_locks.lock_block_group(bgid);
 
         // load block group
         let mut block_group =
@@ -360,10 +361,7 @@ impl Ext4 {
         self.write_metadata(block_bitmap_block as usize * block_size, data);
 
         /* Update superblock free blocks count */
-        let mut super_blk_free_blocks = super_block.free_blocks_count();
-        super_blk_free_blocks -= 1;
-        super_block.set_free_blocks_count(super_blk_free_blocks);
-        super_block.sync_to_disk_with_csum(&self.metadata_writer);
+        let super_block = self.subtract_superblock_free_blocks(1);
 
         /* Update inode blocks (different block size!) count */
         let mut inode_blocks = inode_ref.inode.blocks_count();

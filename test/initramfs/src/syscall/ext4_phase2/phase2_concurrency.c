@@ -145,6 +145,31 @@ static void write_all(int fd, const void *buf, size_t len, const char *path)
     }
 }
 
+static void read_all_at(int fd, void *buf, size_t len, off_t offset, const char *path)
+{
+    unsigned char *cursor = buf;
+    size_t remaining = len;
+
+    if (lseek(fd, offset, SEEK_SET) < 0) {
+        failf("lseek for read failed path=%s offset=%lld errno=%d",
+              path, (long long)offset, errno);
+    }
+
+    while (remaining != 0) {
+        ssize_t nread = read(fd, cursor, remaining);
+        if (nread < 0) {
+            failf("read_at failed path=%s offset=%lld errno=%d",
+                  path, (long long)offset, errno);
+        }
+        if (nread == 0) {
+            failf("short read path=%s offset=%lld remaining=%zu",
+                  path, (long long)offset, remaining);
+        }
+        cursor += nread;
+        remaining -= (size_t)nread;
+    }
+}
+
 static void path_join(char *out, size_t out_len, const char *a, const char *b)
 {
     int n = snprintf(out, out_len, "%s/%s", a, b);
@@ -457,6 +482,180 @@ static void case_write_truncate_fsync(void)
     }
 }
 
+static void worker_unlink_while_open(const char *case_dir, unsigned int worker)
+{
+    unsigned char expected[IO_BLOCK];
+    unsigned char actual[IO_BLOCK];
+    unsigned char small[SMALL_BLOCK];
+    char victim[PATH_MAX];
+    char pressure[PATH_MAX];
+    char name[96];
+    struct stat victim_st;
+    int fd;
+
+    snprintf(name, sizeof(name), "open_unlink_%02u.dat", worker);
+    path_join(victim, sizeof(victim), case_dir, name);
+    fd = open(victim, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    if (fd < 0) {
+        failf("open unlink victim failed worker=%u errno=%d", worker, errno);
+    }
+
+    make_pattern(expected, sizeof(expected), worker, 0, 0x66);
+    write_all(fd, expected, sizeof(expected), victim);
+    if (fsync(fd) != 0) {
+        failf("fsync unlink victim failed worker=%u errno=%d", worker, errno);
+    }
+    if (fstat(fd, &victim_st) != 0) {
+        failf("fstat unlink victim failed worker=%u errno=%d", worker, errno);
+    }
+    if (unlink(victim) != 0) {
+        failf("unlink open victim failed worker=%u errno=%d", worker, errno);
+    }
+    int check_fd = open(victim, O_RDONLY);
+    if (check_fd >= 0) {
+        close(check_fd);
+        failf("unlinked victim is still reachable worker=%u", worker);
+    }
+    if (errno != ENOENT) {
+        failf("unexpected open errno for unlinked victim worker=%u errno=%d", worker, errno);
+    }
+
+    for (unsigned int round = 0; round < g_rounds; round++) {
+        snprintf(name, sizeof(name), "pressure_%02u_%04u.dat", worker, round);
+        path_join(pressure, sizeof(pressure), case_dir, name);
+        int pressure_fd = open(pressure, O_CREAT | O_TRUNC | O_RDWR, 0666);
+        if (pressure_fd < 0) {
+            failf("open pressure file failed worker=%u round=%u errno=%d", worker, round, errno);
+        }
+        struct stat pressure_st;
+        if (fstat(pressure_fd, &pressure_st) != 0) {
+            failf("fstat pressure file failed worker=%u round=%u errno=%d", worker, round, errno);
+        }
+        if (pressure_st.st_ino == victim_st.st_ino) {
+            failf("inode reused while old fd open worker=%u round=%u ino=%llu",
+                  worker, round, (unsigned long long)victim_st.st_ino);
+        }
+        make_pattern(small, sizeof(small), worker, round, 0x67);
+        write_all(pressure_fd, small, sizeof(small), pressure);
+        if (fsync(pressure_fd) != 0 || close(pressure_fd) != 0) {
+            failf("sync pressure file failed worker=%u round=%u errno=%d", worker, round, errno);
+        }
+
+        read_all_at(fd, actual, sizeof(actual), 0, victim);
+        if (memcmp(actual, expected, sizeof(expected)) != 0) {
+            failf("unlinked open fd content changed worker=%u round=%u", worker, round);
+        }
+
+        make_pattern(small, sizeof(small), worker, round, 0x68);
+        if (lseek(fd, 0, SEEK_END) < 0) {
+            failf("seek old fd end failed worker=%u round=%u errno=%d", worker, round, errno);
+        }
+        write_all(fd, small, sizeof(small), victim);
+        if (fsync(fd) != 0) {
+            failf("fsync old fd append failed worker=%u round=%u errno=%d", worker, round, errno);
+        }
+        memset(actual, 0, sizeof(small));
+        read_all_at(fd, actual, sizeof(small),
+                    (off_t)IO_BLOCK + (off_t)round * SMALL_BLOCK, victim);
+        if (memcmp(actual, small, sizeof(small)) != 0) {
+            failf("unlinked old fd append verify failed worker=%u round=%u", worker, round);
+        }
+    }
+
+    if (close(fd) != 0) {
+        failf("close unlinked victim fd failed worker=%u errno=%d", worker, errno);
+    }
+}
+
+static void case_unlink_while_open(void)
+{
+    char case_dir[PATH_MAX];
+
+    ensure_case_dir(case_dir, sizeof(case_dir));
+    spawn_workers(worker_unlink_while_open, case_dir, "unlink_while_open");
+}
+
+static uint64_t expected_allocator_hash(unsigned int worker)
+{
+    unsigned char buf[IO_BLOCK];
+    uint64_t hash = FNV_OFFSET;
+
+    for (unsigned int round = 0; round < g_rounds; round++) {
+        for (unsigned int chunk = 0; chunk < 4; chunk++) {
+            make_pattern(buf, sizeof(buf), worker, round, 0x70 + chunk);
+            hash = fnv_update(hash, buf, sizeof(buf));
+        }
+    }
+    return hash;
+}
+
+static void worker_allocator_churn(const char *case_dir, unsigned int worker)
+{
+    unsigned char buf[IO_BLOCK];
+    char keep[PATH_MAX];
+    char tmp[PATH_MAX];
+    char name[96];
+    int keep_fd;
+
+    snprintf(name, sizeof(name), "alloc_keep_%02u.dat", worker);
+    path_join(keep, sizeof(keep), case_dir, name);
+    keep_fd = open(keep, O_CREAT | O_TRUNC | O_RDWR, 0666);
+    if (keep_fd < 0) {
+        failf("open allocator keep failed worker=%u errno=%d", worker, errno);
+    }
+
+    for (unsigned int round = 0; round < g_rounds; round++) {
+        for (unsigned int chunk = 0; chunk < 4; chunk++) {
+            make_pattern(buf, sizeof(buf), worker, round, 0x70 + chunk);
+            write_all(keep_fd, buf, sizeof(buf), keep);
+        }
+        if (fsync(keep_fd) != 0) {
+            failf("fsync allocator keep failed worker=%u round=%u errno=%d",
+                  worker, round, errno);
+        }
+
+        snprintf(name, sizeof(name), "alloc_tmp_%02u_%04u.dat", worker, round);
+        path_join(tmp, sizeof(tmp), case_dir, name);
+        int tmp_fd = open(tmp, O_CREAT | O_TRUNC | O_RDWR, 0666);
+        if (tmp_fd < 0) {
+            failf("open allocator tmp failed worker=%u round=%u errno=%d",
+                  worker, round, errno);
+        }
+        for (unsigned int chunk = 0; chunk < 4; chunk++) {
+            make_pattern(buf, sizeof(buf), worker, round, 0x80 + chunk);
+            write_all(tmp_fd, buf, sizeof(buf), tmp);
+        }
+        if (fsync(tmp_fd) != 0 || close(tmp_fd) != 0) {
+            failf("sync allocator tmp failed worker=%u round=%u errno=%d",
+                  worker, round, errno);
+        }
+        if (unlink(tmp) != 0) {
+            failf("unlink allocator tmp failed worker=%u round=%u errno=%d",
+                  worker, round, errno);
+        }
+    }
+
+    if (close(keep_fd) != 0) {
+        failf("close allocator keep failed worker=%u errno=%d", worker, errno);
+    }
+}
+
+static void case_allocator_churn(void)
+{
+    char case_dir[PATH_MAX];
+
+    ensure_case_dir(case_dir, sizeof(case_dir));
+    spawn_workers(worker_allocator_churn, case_dir, "allocator_churn");
+
+    for (unsigned int worker = 0; worker < g_workers; worker++) {
+        char path[PATH_MAX];
+        char name[64];
+        snprintf(name, sizeof(name), "alloc_keep_%02u.dat", worker);
+        path_join(path, sizeof(path), case_dir, name);
+        verify_file_hash(path, expected_allocator_hash(worker), (off_t)g_rounds * 4 * IO_BLOCK);
+    }
+}
+
 static void parse_args(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -496,6 +695,10 @@ int main(int argc, char **argv)
         case_rename_churn();
     } else if (strcmp(g_case_name, "write_truncate_fsync") == 0) {
         case_write_truncate_fsync();
+    } else if (strcmp(g_case_name, "unlink_while_open") == 0) {
+        case_unlink_while_open();
+    } else if (strcmp(g_case_name, "allocator_churn") == 0) {
+        case_allocator_churn();
     } else {
         failf("unknown case");
     }

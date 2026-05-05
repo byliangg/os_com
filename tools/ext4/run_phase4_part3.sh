@@ -46,8 +46,9 @@ RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
 RUN_PHASE2_CONCURRENCY=${RUN_PHASE2_CONCURRENCY:-0}
 RUN_LMBENCH=${RUN_LMBENCH:-1}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
+EXT4_PHASE2_PROFILE=${EXT4_PHASE2_PROFILE:-0}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
-EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync"}
+EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync,unlink_while_open,allocator_churn"}
 EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
 EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
 EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED:-1}
@@ -201,6 +202,7 @@ run_xfstests_mode() {
   timeout "${XFSTESTS_RUN_TIMEOUT_SEC}s" bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
     --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
     --kcmd-args='console=${CONSOLE}' \
+    --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
     --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \
     --kcmd-args='SYSCALL_TEST_WORKDIR=/ext4' \
     --kcmd-args='EXTRA_BLOCKLISTS_DIRS=' \
@@ -252,6 +254,7 @@ run_phase2_concurrency_suite() {
   timeout "${EXT4_PHASE2_TIMEOUT_SEC}s" bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
     --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
     --kcmd-args='console=${CONSOLE}' \
+    --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
     --kcmd-args='SYSCALL_TEST_SUITE=ext4_phase2' \
     --kcmd-args='EXT4_PHASE2_TEST_DEV=/dev/vda' \
     --kcmd-args='EXT4_PHASE2_MNT=/ext4_phase2' \
@@ -328,6 +331,7 @@ run_lmbench_regression() {
     timeout "${timeout_s}s" bash -lc "cd '${ROOT_DIR}/kernel' && cargo osdk run \
       --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
       --kcmd-args='console=${CONSOLE}' \
+      --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
       --init-args='/benchmark/common/bench_runner.sh ${bench} asterinas' \
       --target-arch=x86_64 \
       --profile release-lto \
