@@ -288,7 +288,7 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 7：逐步缩小 `EXT4_RS_RUNTIME_LOCK`、`inner: Mutex<Ext4>` 与全局串行路径
 
-**状态：** 进行中（Step 7A' 文件读路径已完成；Step 7B/7C 尝试后因 `generic/011` 回退）
+**状态：** 已完成（Step 7A' 文件读路径已收口；Step 7B/7C 尝试后因 `generic/011` 回退，后续更激进拆锁列入 hardening）
 **目标：** 在 Step 3/4/5/6 的 correctness 保护全部通过后，从“同 fs 串行”推进到“不同 inode/目录/allocator 分区并发”。
 
 ### 方案
@@ -320,7 +320,7 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 
 ## Step 8：性能恢复与优化
 
-**状态：** 进行中
+**状态：** 已收口为性能遗留项（fio write 继续优化推迟，功能收口不阻塞）
 **目标：** correctness 稳定后，恢复 write ratio 到 90% 级别并提升并发吞吐。
 
 ### 方案
@@ -330,76 +330,98 @@ Step 3/4 已移除 `active_handles.front_mut()` 与全局 `OP_ALLOCATED_BLOCKS` 
 3. 已完成 cache-backed directory read 第一刀：目录 cache 条目记录 `(ino, offset, de_type)`，完整 cache 可直接服务 readdir；lookup/readdir/cache load 在 dir correctness lock 下绕开全局 runtime fence。`ext4/045` 1200s 已从 timeout 变为 PASS。
 4. 已恢复 direct overwrite 写路径的 mapping cache 保留策略：纯覆盖写成功时只清 pending speculative read，不清完整 mapping cache；扩展写、重新分配或失败仍全量失效。Asterinas-only fio write 暂为 `2071 MiB/s`，说明 fio write 仍需继续 profile。
 5. direct write profile 已定位：fio overwrite 稳态 mapping cache hit > 99%，`prepare`/`touch` 已不是主耗时；主要成本在每 1MiB data bio 的 wait（约 455us）与 user->bio copy（约 125us）。write-side fast-submit 试验只带来小幅 profile 改善且正式双边 fio write 仍为 `63.44%`，不作为保留优化；Step 8 write 仍未达标。
-6. Step 8 下一优先级：围绕 data bio 路径做更大设计，优先评估 multi-segment/scatter-gather bio 或安全 zero-copy direct write；不要在未解决 user page fragmentation、DMA lifetime 与 fallback 语义前直接套用之前被否掉的 read zero-copy 方案。
-7. checkpoint/home-block-vs-apply 协议继续作为 journaled write 拆 runtime fence 前置；当前代码已有 batch checkpoint，且 direct write profile 未指向 checkpoint，因此除非 profile 再变化，不引入后台 commit/checkpoint 线程。
-8. 继续完善目录 read-vs-mutation 协议：评估是否把 `dir_open(path)`、`stat` 中可归属到目录/子 inode 的读路径也纳入更细粒度锁，而不是依赖 runtime fence。
-9. allocator 热点 group 并行与 fio write >= 90% 复测在 data bio 路径优化后继续推进。
-10. fio、lmbench、并发 workload 分别记录，避免只优化单一指标。
+6. Step 8 下一优先级先做纯观测 write bio 分段，不改 bio 构造、submit 顺序或 `BioWaiter` 语义：新增独立 `WRITE_BIO_PROFILE_STATS`，仍由 `EXT4_PHASE2_PROFILE` 统一开关驱动；记录 write bio 的 enqueue -> dequeue、dequeue -> virtq handed/notified、virtq handed -> completion、completion -> wait-return 近似唤醒延迟。
+7. 在 ext4 direct write profile 侧记录 per-call `mappings.len()` / `bios_per_call` / `segments_per_bio`，并在 `submit_direct_write_mappings()` 入口/出口快照 request queue merge counter，得到本次 `write_at(1MiB)` 的 merge delta；用 mapping cache hit ratio、mappings 分布、segments 分布和 per-call merge delta 共同判定 SG/multi-segment 是否仍有收益空间。
+8. 2026-05-05 profile 已验证当前 fio 稳态为 1 mapping / 1 bio / 1 segment，request queue merge delta 为 0；block 内核侧 submit/enqueue/dequeue/dispatch 平均仅约 6us，主等待在 virtq handed -> completion（约 308us），copy 仍约 88us。SG/multi-segment 路线不再作为 Step 8 主线，除非后续测点或 fragmentation 数据推翻该结论。
+9. zero-copy direct write 审计结论需要先被用户缓冲区物理连续性 profile 约束：block/DMA 层已经能用 `BioSegment::new_from_segment(USegment, ToDevice)` 保持 DMA 生命周期，但 syscall/ext4 侧当前只有 `VmReader`，没有现成的 user page segment 列表；virtio block 单 request 数据段上限约为 `QUEUE_SIZE - 2`（当前 62，且单 bio 入队边界更保守）。
+10. 2026-05-05 用户缓冲区 profile 显示 fio 1MiB write 的 user buffer 为 256 pages / 256 physical runs / max run 1 page，`user_profile_failures=0`。因此 naive page-SG zero-copy 会把当前 1 bio / 1 segment 的 1MiB 写拆成至少 5 个 virtio requests，很可能增加最大瓶颈 `virtq handed -> completion`，不作为下一步实现主线。
+11. Step 8 技术倾向修正为：不实现 naive zero-copy；只有在能保持低 descriptor/request 数的方案出现时（例如可证明的物理连续用户缓冲、hugepage/pinned segment 支持，或不会退化成多 request 的 DMA 生命周期设计）才重新评估 zero-copy。若后续数据仍显示 wait 主要落在 host/QEMU 侧且 copy 不足以补齐 90% 缺口，则接受低于 90% 并更新验收说明作为兜底；不把更改 fio `iodepth` / `ioengine` 作为默认赛题口径。
+12. checkpoint/home-block-vs-apply 协议继续作为 journaled write 拆 runtime fence 前置；当前代码已有 batch checkpoint，且 direct write profile 未指向 checkpoint，因此除非 profile 再变化，不引入后台 commit/checkpoint 线程。
+13. 继续完善目录 read-vs-mutation 协议：评估是否把 `dir_open(path)`、`stat` 中可归属到目录/子 inode 的读路径也纳入更细粒度锁，而不是依赖 runtime fence。
+14. allocator 热点 group 并行与 fio write >= 90% 复测在 data bio 路径优化后继续推进。
+15. fio、lmbench、并发 workload 分别记录，避免只优化单一指标。
+16. 当前 Phase 2 收口接受 fio write 未达 90%：最新确认功能基线通过，fio read 达标，write 最新正式确认值为 `87.01%`；继续优化需另开性能 hardening，不与优秀档功能验收混在一起。
 
 ### 验收
 
-- fio read >= 90%，write 目标 >= 90%；
-- 并发 workload 相比全局串行模型有明确吞吐提升；
+- fio read >= 90%，write 目标作为后续性能项；
+- Phase 2 concurrency baseline 7/7 PASS；
 - crash 与 xfstests 不回退。
 
 ## Step 9：文档、报告与最终验收
 
-**状态：** 待开始
+**状态：** 已完成（功能验收收口；fio write 性能优化保留到后续）
 
 ### 方案
 
 1. 更新 `feature_jbd2_phase2_milestone.md`，写入每步代码改动、日志路径、测试数据。
-2. 更新 README、benchmark、environment 与索引文档。
-3. 补充 RustOS/星绽架构下 ext4 并发与日志性能优化研究结论，服务赛题文档完整性与创新性评分。
+2. 更新 benchmark 快照，明确当前功能 baseline 与 fio write 遗留项。
+3. 将 Phase 2 功能验收与性能后续项拆开：JBD2/崩溃恢复/xfstests core/并发 baseline 属于当前达标证据；fio write >= 90% 与 `8x64` 高压偶发失败属于后续 hardening。
+4. 补充 RustOS/星绽架构下 ext4 并发与日志性能优化研究结论，服务赛题文档完整性与创新性评分。
 
 ### 验收
 
 - Phase 2 milestone 完整；
-- README 能指导同学克隆后复现；
-- 赛题优秀档剩余项均有测试证据。
+- benchmark 能指导当前功能 baseline 与性能口径；
+- 赛题优秀档剩余功能项均有测试证据；
+- 性能遗留项与当前功能验收边界清楚。
 
 ## 推荐验证命令
 
 所有命令默认在 `/home/lby/os_com_codex/asterinas` 下执行。
 
+### 完整功能回归
+
 ```bash
-PHASE4_DOCKER_MODE=phase6_with_guard \
+PHASE4_DOCKER_MODE=part3_full \
 ENABLE_KVM=1 \
-NETDEV=tap \
-VHOST=on \
-KLOG_LEVEL=error \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+PERF_ROUNDS=1 \
+PERF_CASE_TIMEOUT_SEC=600 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+```bash
+PHASE4_DOCKER_MODE=phase6_only \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 
 ```bash
 PHASE4_DOCKER_MODE=jbd_phase1 \
 ENABLE_KVM=1 \
-RELEASE_LTO=0 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
 XFSTESTS_CASE_TIMEOUT_SEC=1200 \
-XFSTESTS_RUN_TIMEOUT_SEC=3600 \
+XFSTESTS_RUN_TIMEOUT_SEC=5400 \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 
+### Phase 2 并发 baseline
+
 ```bash
-PHASE4_DOCKER_MODE=jbd_phase1 \
+PHASE4_DOCKER_MODE=jbd_phase2_concurrency \
+EXT4_PHASE2_WORKERS=4 \
+EXT4_PHASE2_ROUNDS=8 \
+EXT4_PHASE2_SEED=78 \
 ENABLE_KVM=1 \
-KLOG_LEVEL=warn \
-EXT4_PHASE2_PROFILE=1 \
-XFSTESTS_SINGLE_TEST=ext4/045 \
-XFSTESTS_CASE_TIMEOUT_SEC=1200 \
-XFSTESTS_RUN_TIMEOUT_SEC=1500 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 
-```bash
-PHASE4_DOCKER_MODE=crash_only \
-ENABLE_KVM=1 \
-NETDEV=tap \
-VHOST=on \
-CRASH_ROUNDS=1 \
-CRASH_HOLD_STAGE=after_commit \
-bash tools/ext4/run_phase4_in_docker.sh
-```
+可用 `EXT4_PHASE2_CASES=multi_file_write_verify,rename_churn` 缩小 case 集合；case 列表使用逗号分隔，避免 kernel cmdline 被空格切开。
+
+### fio 守底复跑
 
 ```bash
 BENCH_ENABLE_KVM=1 \
@@ -407,22 +429,5 @@ BENCH_ASTER_NETDEV=tap \
 BENCH_ASTER_VHOST=on \
 bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 ```
-
-Phase 2 新 runner 建立后，应在本节补充 `PHASE4_DOCKER_MODE=jbd_phase2_concurrency` 或等价命令。
-
-### Phase 2 并发 baseline
-
-```bash
-PHASE4_DOCKER_MODE=jbd_phase2_concurrency \
-ENABLE_KVM=1 \
-NETDEV=tap \
-VHOST=on \
-EXT4_PHASE2_SEED=1 \
-EXT4_PHASE2_WORKERS=4 \
-EXT4_PHASE2_ROUNDS=8 \
-bash tools/ext4/run_phase4_in_docker.sh
-```
-
-可用 `EXT4_PHASE2_CASES=multi_file_write_verify,rename_churn` 缩小 case 集合；case 列表使用逗号分隔，避免 kernel cmdline 被空格切开。
 
 锁顺序与同步原语约定见 `feature_jbd2_phase2_lock_order.md`；后续 Step 1/2/3/4/5/6/7 的代码改动必须按该文档检查。

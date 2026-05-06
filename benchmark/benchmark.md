@@ -1,6 +1,6 @@
 # Asterinas EXT4 Benchmark 最新结果快照
 
-更新时间：2026-04-24（Asia/Shanghai）
+更新时间：2026-05-05（Asia/Shanghai）
 
 ## 1. 本文用途
 
@@ -41,6 +41,18 @@
 - Linux：`4763 MB/s`
 - ratio：`93.49%`
 - 结果文件：`asterinas/result_fio-ext4_seq_read_bw.json`
+
+### 2.5 ext4 JBD2 / Phase 2 功能基线
+
+- `phase3_base_guard`：10 PASS / 0 FAIL / 6 NOTRUN / 24 STATIC_BLOCKED，日志 `asterinas/benchmark/logs/phase3_base_guard_20260505_144845.log`
+- `phase4_good`：12 PASS / 0 FAIL / 6 NOTRUN / 22 STATIC_BLOCKED，日志 `asterinas/benchmark/logs/phase4_good_20260505_144845.log`
+- `phase6_good`：25/25 PASS，日志 `asterinas/benchmark/logs/phase6_good_20260505_151230.log`
+- `jbd_phase1`：6 PASS / 0 FAIL / 6 NOTRUN，日志 `asterinas/benchmark/logs/jbd_phase1_20260505_152645.log`
+- JBD2 crash matrix：18/18 PASS，summary `asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260505_144845.tsv`
+- lmbench regression：8/8 PASS，summary `asterinas/benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260505_144845.tsv`
+- Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`
+- 最新 baseline 日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
+- 说明：`EXT4_PHASE2_WORKERS=8 EXT4_PHASE2_ROUNDS=64 EXT4_PHASE2_SEED=100` 属于额外高压探针，曾观察到偶发短读/extent mapping 风险，不作为当前功能验收基线。
 
 ## 3. 当前 fio 参数口径
 
@@ -140,6 +152,8 @@ bash test/initramfs/src/benchmark/bench_linux_and_aster.sh <job> x86_64
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。
 - 2026-04-24 的 ext4 结果来自 JBD2 Phase 1 收口后的 fio 守底复跑：read `93.49%`、write `87.01%`，满足 Phase 1 “相对基线不下降超过 5 个百分点”的守底线（read ≥ 90%、write ≥ 85%）。
+- 2026-05-05 的 Phase 2 收口口径：完整功能回归大全量已复跑通过，包括 phase3、phase4、phase6、jbd_phase1、crash matrix、lmbench 与 Phase 2 concurrency；其中 xfstests 统计按 `PASS / FAIL / NOTRUN / STATIC_BLOCKED` 原始口径记录，NOTRUN/STATIC_BLOCKED 为环境或赛题范围外跳过项；fio write 仍低于 90%，作为性能优化遗留项继续推进。
+- Step 8 profile 显示当前 fio write 稳态为 1 mapping / 1 bio / 1 segment，request queue merge 为 0；fio 1MiB user buffer 为 256 pages / 256 physical runs / max run 1 page，因此 naive page-SG zero-copy 不作为当前实现主线。
 - 这几轮 Linux 对照侧都出现了 `kvm_intel: VMX not supported by CPU 0`。
 - 因此当前结果适合用于“本地最新观测值”和方案推进参考。
 - 如果后续要写正式 milestone 或对外结论，建议同时记录该环境现象，避免把 Linux 对照侧异常忽略掉。

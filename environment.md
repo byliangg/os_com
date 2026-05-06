@@ -1,21 +1,33 @@
-# Asterinas EXT4 Phase4 Environment (Clean)
+# Asterinas EXT4 Environment（Current, Phase 2 收口）
 
-更新时间：2026-04-07（Asia/Shanghai）
+更新时间：2026-05-05（Asia/Shanghai）
 
 ## 1. 目标与范围
 
-这份文档只覆盖 `stage4` 的 **本机直跑环境**（非 Docker）。
-目标是让别人拿到仓库后，按本文命令可直接复现当前阶段结论。
+这份文档记录当前 ext4 Phase 2 收口的推荐环境。
+当前优先使用 Docker runner 复现功能回归；宿主机直跑只作为排障辅助。
 
-## 2. 当前结论（截至 2026-04-07）
+当前结论：
 
-1. 当前工作分支：`stage4`
-2. 当前最好结果：
-   - `generic/013` 单测可通过（`rc=0`）
-   - 日志：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_single_generic013_afterbounds_20260407_114356.log`
-3. 当前未打通项：
-   - `phase4_good` 全量仍失败（`2 pass / 18 fail`）
-   - 关键日志：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10/phase4_good_full_afterbounds_20260407_115151.log`
+1. Phase 2 correctness baseline 已收口。
+2. Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`。
+3. 最新 baseline 日志：`benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`。
+4. fio read 已达标，fio write 最新正式确认值为 `87.01%`，作为后续性能优化项。
+
+## 2. 当前结论（截至 2026-05-05）
+
+1. 当前有效工作树：`/home/lby/os_com_codex/asterinas`
+2. 当前功能 baseline：
+   - `phase3_base_guard`：10 PASS / 0 FAIL / 6 NOTRUN / 24 STATIC_BLOCKED
+   - `phase4_good`：12 PASS / 0 FAIL / 6 NOTRUN / 22 STATIC_BLOCKED
+   - `phase6_good`：25/25 PASS
+   - `jbd_phase1`：6 PASS / 0 FAIL / 6 NOTRUN
+   - JBD2 crash matrix：18/18 PASS
+   - lmbench regression：8/8 PASS
+   - Phase 2 concurrency：7/7 PASS，日志 `benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
+3. 当前遗留项：
+   - fio write 最新正式确认值为 `87.01%`，低于 90%，继续作为性能优化项。
+   - `8 workers / 64 rounds` 高压混合并发探针曾观察到偶发短读/extent mapping 风险，不作为当前功能验收基线。
 
 补充：
 
@@ -42,16 +54,14 @@
 保留并使用：
 
 1. 构建目录：`/home/lby/os_com_codex/asterinas/target_lby`
-2. 日志目录：`/home/lby/os_com_codex/asterinas/stage4_ext4_logs_restore_runp3_v10`
-3. 基础 initramfs：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase3.cpio.gz`
-4. 当前推荐 initramfs：
-   - 实体：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3_stage4fix_v19.cpio.gz`
-   - 入口（符号链接）：`/home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3.cpio.gz`
+2. 日志目录：`/home/lby/os_com_codex/asterinas/benchmark/logs`
+3. 基础 initramfs：`/home/lby/os_com_codex/asterinas/benchmark/assets/initramfs/initramfs_phase3.cpio.gz`
+4. 当前推荐 initramfs：`/home/lby/os_com_codex/asterinas/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz`
 5. VDSO：`/home/lby/os_com_codex/asterinas/.local/linux_vdso`
 6. xfstests 预构建目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-prebuilt`
 7. xfstests 源目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-src`
 
-说明：已经清理历史 `target_*` 和旧 `stage4/5/6` 日志，只保留上述最小集合。
+说明：Docker runner 会按需重打包 phase4_part3 initramfs；如只做功能回归，优先使用 `tools/ext4/run_phase4_in_docker.sh`。
 
 ## 5. 环境变量（统一口径）
 

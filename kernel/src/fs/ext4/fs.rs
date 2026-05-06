@@ -4,23 +4,31 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_block::{
-    bio::{BioDirection, BioSegment, BioStatus, BioWaiter, reset_read_bio_profile},
-    id::Bid,
     BlockDevice, SECTOR_SIZE,
+    bio::{
+        BioDirection, BioSegment, BioStatus, BioWaiter, reset_read_bio_profile,
+        reset_write_bio_profile, set_write_bio_profile_enabled,
+    },
+    id::Bid,
+    request_queue::bio_request_merge_count,
 };
-use aster_time::read_monotonic_time;
 use aster_cmdline::{KCMDLINE, ModuleArg};
+use aster_time::read_monotonic_time;
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
     Jbd2Journal, JournalCommitWriteStage, JournalHandle, JournalRecoveryResult, JournalRuntime,
     LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter,
-    OperationAllocGuard as Ext4OperationAllocGuard, OperationScopedAllocGuard,
-    SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
+    OperationAllocGuard as Ext4OperationAllocGuard, OperationScopedAllocGuard, SimpleBlockRange,
+    SimpleDirEntry, SimpleInodeMeta,
 };
 use ostd::{
-    mm::{VmIo, VmWriter, io_util::HasVmReaderWriter},
-    sync::RwMutex,
     Error as OstdError,
+    mm::{
+        HasPaddr, PAGE_SIZE, PageFlags, Vaddr, VmIo, VmWriter, io_util::HasVmReaderWriter,
+        vm_space::VmQueriedItem,
+    },
+    sync::RwMutex,
+    task::disable_preempt,
 };
 
 use crate::{
@@ -28,10 +36,11 @@ use crate::{
         path::PerMountFlags,
         registry::{FsProperties, FsType},
         utils::{
-            FileSystem, FsEventSubscriberStats, FsFlags, Inode, StatusFlags, SuperBlock, NAME_MAX,
+            FileSystem, FsEventSubscriberStats, FsFlags, Inode, NAME_MAX, StatusFlags, SuperBlock,
         },
     },
     prelude::*,
+    vm::vmar::{VMAR_CAP_ADDR, VMAR_LOWEST_ADDR},
 };
 
 const EXT4_MAGIC: u64 = 0xEF53;
@@ -101,6 +110,14 @@ struct DirectReadProfileStats {
 struct DirectWriteProfileStats {
     write_calls: AtomicU64,
     write_bytes: AtomicU64,
+    total_mappings: AtomicU64,
+    total_bios: AtomicU64,
+    total_segments: AtomicU64,
+    total_blocks: AtomicU64,
+    merge_hits: AtomicU64,
+    user_buffer_pages: AtomicU64,
+    user_buffer_phys_runs: AtomicU64,
+    user_buffer_profile_failures: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     errors: AtomicU64,
@@ -111,12 +128,36 @@ struct DirectWriteProfileStats {
     bio_copy_ns: AtomicU64,
     bio_submit_ns: AtomicU64,
     bio_wait_ns: AtomicU64,
+    bio_wait_return_after_complete_ns: AtomicU64,
     touch_ns: AtomicU64,
     total_ns: AtomicU64,
+    max_mappings: AtomicU64,
+    max_bios_per_call: AtomicU64,
+    max_segments_per_bio: AtomicU64,
+    max_blocks_per_bio: AtomicU64,
+    max_user_buffer_phys_runs: AtomicU64,
+    max_user_buffer_phys_run_pages: AtomicU64,
     max_prepare_ns: AtomicU64,
     max_data_bio_ns: AtomicU64,
+    max_bio_wait_return_after_complete_ns: AtomicU64,
     max_touch_ns: AtomicU64,
     max_total_ns: AtomicU64,
+}
+
+#[derive(Default)]
+struct DirectWriteBioCallProfile {
+    mappings: u64,
+    bios: u64,
+    segments: u64,
+    blocks: u64,
+    merge_hits: u64,
+    user_buffer_pages: u64,
+    user_buffer_phys_runs: u64,
+    user_buffer_profile_failures: u64,
+    max_segments_per_bio: u64,
+    max_blocks_per_bio: u64,
+    max_user_buffer_phys_run_pages: u64,
+    wait_return_after_complete_ns: u64,
 }
 
 struct Ext4RsRuntimeLockStats {
@@ -267,12 +308,8 @@ impl Ext4RsRuntimeLockStats {
     fn update_max(target: &AtomicU64, value: u64) {
         let mut current = target.load(Ordering::Relaxed);
         while value > current {
-            match target.compare_exchange_weak(
-                current,
-                value,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(observed) => current = observed,
             }
@@ -287,6 +324,14 @@ impl DirectWriteProfileStats {
         Self {
             write_calls: AtomicU64::new(0),
             write_bytes: AtomicU64::new(0),
+            total_mappings: AtomicU64::new(0),
+            total_bios: AtomicU64::new(0),
+            total_segments: AtomicU64::new(0),
+            total_blocks: AtomicU64::new(0),
+            merge_hits: AtomicU64::new(0),
+            user_buffer_pages: AtomicU64::new(0),
+            user_buffer_phys_runs: AtomicU64::new(0),
+            user_buffer_profile_failures: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             errors: AtomicU64::new(0),
@@ -297,10 +342,18 @@ impl DirectWriteProfileStats {
             bio_copy_ns: AtomicU64::new(0),
             bio_submit_ns: AtomicU64::new(0),
             bio_wait_ns: AtomicU64::new(0),
+            bio_wait_return_after_complete_ns: AtomicU64::new(0),
             touch_ns: AtomicU64::new(0),
             total_ns: AtomicU64::new(0),
+            max_mappings: AtomicU64::new(0),
+            max_bios_per_call: AtomicU64::new(0),
+            max_segments_per_bio: AtomicU64::new(0),
+            max_blocks_per_bio: AtomicU64::new(0),
+            max_user_buffer_phys_runs: AtomicU64::new(0),
+            max_user_buffer_phys_run_pages: AtomicU64::new(0),
             max_prepare_ns: AtomicU64::new(0),
             max_data_bio_ns: AtomicU64::new(0),
+            max_bio_wait_return_after_complete_ns: AtomicU64::new(0),
             max_touch_ns: AtomicU64::new(0),
             max_total_ns: AtomicU64::new(0),
         }
@@ -311,6 +364,7 @@ impl DirectWriteProfileStats {
         bytes: usize,
         cache_hit: bool,
         success: bool,
+        bio_profile: &DirectWriteBioCallProfile,
         plan_ns: u64,
         prepare_ns: u64,
         data_bio_ns: u64,
@@ -324,6 +378,22 @@ impl DirectWriteProfileStats {
         let writes = self.write_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.total_mappings
+            .fetch_add(bio_profile.mappings, Ordering::Relaxed);
+        self.total_bios
+            .fetch_add(bio_profile.bios, Ordering::Relaxed);
+        self.total_segments
+            .fetch_add(bio_profile.segments, Ordering::Relaxed);
+        self.total_blocks
+            .fetch_add(bio_profile.blocks, Ordering::Relaxed);
+        self.merge_hits
+            .fetch_add(bio_profile.merge_hits, Ordering::Relaxed);
+        self.user_buffer_pages
+            .fetch_add(bio_profile.user_buffer_pages, Ordering::Relaxed);
+        self.user_buffer_phys_runs
+            .fetch_add(bio_profile.user_buffer_phys_runs, Ordering::Relaxed);
+        self.user_buffer_profile_failures
+            .fetch_add(bio_profile.user_buffer_profile_failures, Ordering::Relaxed);
         if cache_hit {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -340,10 +410,34 @@ impl DirectWriteProfileStats {
         self.bio_submit_ns
             .fetch_add(bio_submit_ns, Ordering::Relaxed);
         self.bio_wait_ns.fetch_add(bio_wait_ns, Ordering::Relaxed);
+        self.bio_wait_return_after_complete_ns
+            .fetch_add(bio_profile.wait_return_after_complete_ns, Ordering::Relaxed);
         self.touch_ns.fetch_add(touch_ns, Ordering::Relaxed);
         self.total_ns.fetch_add(total_ns, Ordering::Relaxed);
+        Ext4RsRuntimeLockStats::update_max(&self.max_mappings, bio_profile.mappings);
+        Ext4RsRuntimeLockStats::update_max(&self.max_bios_per_call, bio_profile.bios);
+        Ext4RsRuntimeLockStats::update_max(
+            &self.max_segments_per_bio,
+            bio_profile.max_segments_per_bio,
+        );
+        Ext4RsRuntimeLockStats::update_max(
+            &self.max_blocks_per_bio,
+            bio_profile.max_blocks_per_bio,
+        );
+        Ext4RsRuntimeLockStats::update_max(
+            &self.max_user_buffer_phys_runs,
+            bio_profile.user_buffer_phys_runs,
+        );
+        Ext4RsRuntimeLockStats::update_max(
+            &self.max_user_buffer_phys_run_pages,
+            bio_profile.max_user_buffer_phys_run_pages,
+        );
         Ext4RsRuntimeLockStats::update_max(&self.max_prepare_ns, prepare_ns);
         Ext4RsRuntimeLockStats::update_max(&self.max_data_bio_ns, data_bio_ns);
+        Ext4RsRuntimeLockStats::update_max(
+            &self.max_bio_wait_return_after_complete_ns,
+            bio_profile.wait_return_after_complete_ns,
+        );
         Ext4RsRuntimeLockStats::update_max(&self.max_touch_ns, touch_ns);
         Ext4RsRuntimeLockStats::update_max(&self.max_total_ns, total_ns);
         writes
@@ -572,14 +666,20 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         let dev_size = self.device_size_bytes();
         let Some(write_end) = offset.checked_add(data.len()) else {
             self.mark_io_failure();
-            error!("ext4 block write overflow at offset {} len={}", offset, data.len());
+            error!(
+                "ext4 block write overflow at offset {} len={}",
+                offset,
+                data.len()
+            );
             return;
         };
         if write_end > dev_size {
             self.mark_io_failure();
             error!(
                 "ext4 block write out of range: offset={} len={} device_size={}",
-                offset, data.len(), dev_size
+                offset,
+                data.len(),
+                dev_size
             );
             return;
         }
@@ -736,6 +836,7 @@ pub(super) struct Ext4Fs {
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     phase2_profile_enabled: bool,
     direct_read_profile_started: AtomicBool,
+    direct_write_profile_started: AtomicBool,
     direct_read_profile: DirectReadProfileStats,
     direct_write_profile: DirectWriteProfileStats,
     runtime_lock_stats: Ext4RsRuntimeLockStats,
@@ -775,6 +876,7 @@ impl Ext4Fs {
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
             phase2_profile_enabled: Self::phase2_profile_enabled_from_kcmdline(),
             direct_read_profile_started: AtomicBool::new(false),
+            direct_write_profile_started: AtomicBool::new(false),
             direct_read_profile: DirectReadProfileStats::new(),
             direct_write_profile: DirectWriteProfileStats::new(),
             runtime_lock_stats: Ext4RsRuntimeLockStats::new(),
@@ -783,6 +885,7 @@ impl Ext4Fs {
             self_ref: weak_ref.clone(),
         });
 
+        set_write_bio_profile_enabled(fs.phase2_profile_enabled);
         fs.initialize_jbd2_journal();
         fs.replay_mount_jbd2_journal();
         fs
@@ -1140,13 +1243,12 @@ impl Ext4Fs {
                 let Some(runtime) = rt.as_mut() else {
                     return;
                 };
-                let rotated_tid = if runtime
-                    .should_rotate_running_transaction(JOURNAL_COMMIT_BATCH_BLOCKS)
-                {
-                    runtime.rotate_running_transaction()
-                } else {
-                    None
-                };
+                let rotated_tid =
+                    if runtime.should_rotate_running_transaction(JOURNAL_COMMIT_BATCH_BLOCKS) {
+                        runtime.rotate_running_transaction()
+                    } else {
+                        None
+                    };
                 let batch_commit_ready = runtime.batch_commit_ready(JOURNAL_COMMIT_BATCH_BLOCKS);
                 (rotated_tid, batch_commit_ready)
             };
@@ -1163,7 +1265,6 @@ impl Ext4Fs {
                 let _ = self.try_commit_ready_jbd2_transaction();
             }
         }
-
     }
 
     fn has_active_jbd2_handle(&self) -> bool {
@@ -1259,14 +1360,16 @@ impl Ext4Fs {
         };
         for plan in &plans {
             for metadata in &plan.metadata_blocks {
-                let Some(block_offset) = (metadata.block_nr as usize).checked_mul(block_size) else {
+                let Some(block_offset) = (metadata.block_nr as usize).checked_mul(block_size)
+                else {
                     warn!(
                         "ext4: batch checkpoint block offset overflow block_nr={} block_size={}",
                         metadata.block_nr, block_size
                     );
                     continue;
                 };
-                self.adapter.write_offset(block_offset, &metadata.block_data);
+                self.adapter
+                    .write_offset(block_offset, &metadata.block_data);
             }
         }
 
@@ -1432,13 +1535,9 @@ impl Ext4Fs {
 
         match write_result {
             Ok(commit) => {
-                let _ = self
-                    .jbd2_runtime
-                    .write()
-                    .as_mut()
-                    .map(|runtime| {
-                        runtime.finish_commit(plan.tid, commit.start_block, commit.next_head)
-                    });
+                let _ = self.jbd2_runtime.write().as_mut().map(|runtime| {
+                    runtime.finish_commit(plan.tid, commit.start_block, commit.next_head)
+                });
                 warn!(
                     "ext4: jbd2 committed tid={} sequence={} start={} commit={} next_head={} metadata_blocks={} data_sync_required={} free_blocks={}",
                     plan.tid,
@@ -1493,7 +1592,9 @@ impl Ext4Fs {
         };
 
         for metadata in &checkpoint_plan.metadata_blocks {
-            let Some(block_offset) = (metadata.block_nr as usize).checked_mul(metadata.block_data.len()) else {
+            let Some(block_offset) =
+                (metadata.block_nr as usize).checked_mul(metadata.block_data.len())
+            else {
                 warn!(
                     "ext4: checkpoint metadata block offset overflow tid={} block_nr={} block_size={}",
                     checkpoint_plan.tid,
@@ -1502,14 +1603,14 @@ impl Ext4Fs {
                 );
                 return false;
             };
-            self.adapter.write_offset(block_offset, &metadata.block_data);
+            self.adapter
+                .write_offset(block_offset, &metadata.block_data);
         }
 
         if let Err(err) = self.block_device.sync() {
             warn!(
                 "ext4: failed to sync metadata blocks before JBD2 checkpoint tid={}: {:?}",
-                checkpoint_plan.tid,
-                err
+                checkpoint_plan.tid, err
             );
             return false;
         }
@@ -1556,18 +1657,14 @@ impl Ext4Fs {
                     .and_then(|runtime| runtime.finish_checkpoint(checkpoint_plan.tid));
                 debug!(
                     "ext4: jbd2 checkpointed tid={} start={} next_head={} next_start={:?}",
-                    checkpoint_plan.tid,
-                    result.start_block,
-                    result.next_head,
-                    result.next_start,
+                    checkpoint_plan.tid, result.start_block, result.next_head, result.next_start,
                 );
                 true
             }
             Err(err) => {
                 warn!(
                     "ext4: failed to checkpoint JBD2 transaction tid={}: {:?}",
-                    checkpoint_plan.tid,
-                    err
+                    checkpoint_plan.tid, err
                 );
                 false
             }
@@ -1651,9 +1748,7 @@ impl Ext4Fs {
         let avg_active_x100 = if jbd2_stats.active_handle_samples == 0 {
             0
         } else {
-            jbd2_stats
-                .active_handle_sample_sum
-                .saturating_mul(100)
+            jbd2_stats.active_handle_sample_sum.saturating_mul(100)
                 / jbd2_stats.active_handle_samples
         };
 
@@ -1728,13 +1823,19 @@ impl Ext4Fs {
             .direct_read_profile
             .total_mappings
             .load(Ordering::Relaxed);
-        let mapped_bytes = self.direct_read_profile.mapped_bytes.load(Ordering::Relaxed);
+        let mapped_bytes = self
+            .direct_read_profile
+            .mapped_bytes
+            .load(Ordering::Relaxed);
         let zero_fill_bytes = self
             .direct_read_profile
             .zero_fill_bytes
             .load(Ordering::Relaxed);
         let cache_hits = self.direct_read_profile.cache_hits.load(Ordering::Relaxed);
-        let cache_misses = self.direct_read_profile.cache_misses.load(Ordering::Relaxed);
+        let cache_misses = self
+            .direct_read_profile
+            .cache_misses
+            .load(Ordering::Relaxed);
         let max_mappings = self
             .direct_read_profile
             .max_mappings
@@ -1781,6 +1882,32 @@ impl Ext4Fs {
             .direct_write_profile
             .write_bytes
             .load(Ordering::Relaxed);
+        let total_mappings = self
+            .direct_write_profile
+            .total_mappings
+            .load(Ordering::Relaxed);
+        let total_bios = self.direct_write_profile.total_bios.load(Ordering::Relaxed);
+        let total_segments = self
+            .direct_write_profile
+            .total_segments
+            .load(Ordering::Relaxed);
+        let total_blocks = self
+            .direct_write_profile
+            .total_blocks
+            .load(Ordering::Relaxed);
+        let merge_hits = self.direct_write_profile.merge_hits.load(Ordering::Relaxed);
+        let user_buffer_pages = self
+            .direct_write_profile
+            .user_buffer_pages
+            .load(Ordering::Relaxed);
+        let user_buffer_phys_runs = self
+            .direct_write_profile
+            .user_buffer_phys_runs
+            .load(Ordering::Relaxed);
+        let user_buffer_profile_failures = self
+            .direct_write_profile
+            .user_buffer_profile_failures
+            .load(Ordering::Relaxed);
         let cache_hits = self.direct_write_profile.cache_hits.load(Ordering::Relaxed);
         let cache_misses = self
             .direct_write_profile
@@ -1797,17 +1924,27 @@ impl Ext4Fs {
             .direct_write_profile
             .bio_alloc_ns
             .load(Ordering::Relaxed);
-        let bio_copy_ns = self.direct_write_profile.bio_copy_ns.load(Ordering::Relaxed);
+        let bio_copy_ns = self
+            .direct_write_profile
+            .bio_copy_ns
+            .load(Ordering::Relaxed);
         let bio_submit_ns = self
             .direct_write_profile
             .bio_submit_ns
             .load(Ordering::Relaxed);
-        let bio_wait_ns = self.direct_write_profile.bio_wait_ns.load(Ordering::Relaxed);
+        let bio_wait_ns = self
+            .direct_write_profile
+            .bio_wait_ns
+            .load(Ordering::Relaxed);
+        let bio_wait_return_after_complete_ns = self
+            .direct_write_profile
+            .bio_wait_return_after_complete_ns
+            .load(Ordering::Relaxed);
         let touch_ns = self.direct_write_profile.touch_ns.load(Ordering::Relaxed);
         let total_ns = self.direct_write_profile.total_ns.load(Ordering::Relaxed);
 
         warn!(
-            "[ext4-direct-write] writes={} bytes={} avg_bytes={} cache_hits={} cache_misses={} cache_hit_pct_x100={} errors={} avg_plan_us={} avg_prepare_us={} avg_data_bio_us={} avg_bio_alloc_us={} avg_bio_copy_us={} avg_bio_submit_us={} avg_bio_wait_us={} avg_touch_us={} avg_total_us={} max_prepare_ms={} max_data_bio_ms={} max_touch_ms={} max_total_ms={}",
+            "[ext4-direct-write] writes={} bytes={} avg_bytes={} cache_hits={} cache_misses={} cache_hit_pct_x100={} errors={} avg_mappings_x100={} max_mappings={} avg_bios_x100={} max_bios_per_call={} avg_segments_per_bio_x100={} max_segments_per_bio={} avg_blocks_per_bio={} max_blocks_per_bio={} merge_hits={} avg_merge_hits_x100={} avg_user_pages_x100={} avg_user_phys_runs_x100={} max_user_phys_runs={} avg_user_phys_run_pages_x100={} max_user_phys_run_pages={} user_profile_failures={} avg_plan_us={} avg_prepare_us={} avg_data_bio_us={} avg_bio_alloc_us={} avg_bio_copy_us={} avg_bio_submit_us={} avg_bio_wait_us={} avg_bio_wait_return_after_complete_us={} avg_touch_us={} avg_total_us={} max_prepare_ms={} max_data_bio_ms={} max_bio_wait_return_after_complete_us={} max_touch_ms={} max_total_ms={}",
             writes,
             total_bytes,
             total_bytes / writes,
@@ -1815,6 +1952,46 @@ impl Ext4Fs {
             cache_misses,
             cache_hits.saturating_mul(10_000) / writes,
             errors,
+            total_mappings.saturating_mul(100) / writes,
+            self.direct_write_profile
+                .max_mappings
+                .load(Ordering::Relaxed),
+            total_bios.saturating_mul(100) / writes,
+            self.direct_write_profile
+                .max_bios_per_call
+                .load(Ordering::Relaxed),
+            if total_bios == 0 {
+                0
+            } else {
+                total_segments.saturating_mul(100) / total_bios
+            },
+            self.direct_write_profile
+                .max_segments_per_bio
+                .load(Ordering::Relaxed),
+            if total_bios == 0 {
+                0
+            } else {
+                total_blocks / total_bios
+            },
+            self.direct_write_profile
+                .max_blocks_per_bio
+                .load(Ordering::Relaxed),
+            merge_hits,
+            merge_hits.saturating_mul(100) / writes,
+            user_buffer_pages.saturating_mul(100) / writes,
+            user_buffer_phys_runs.saturating_mul(100) / writes,
+            self.direct_write_profile
+                .max_user_buffer_phys_runs
+                .load(Ordering::Relaxed),
+            if user_buffer_phys_runs == 0 {
+                0
+            } else {
+                user_buffer_pages.saturating_mul(100) / user_buffer_phys_runs
+            },
+            self.direct_write_profile
+                .max_user_buffer_phys_run_pages
+                .load(Ordering::Relaxed),
+            user_buffer_profile_failures,
             plan_ns / writes / 1_000,
             prepare_ns / writes / 1_000,
             data_bio_ns / writes / 1_000,
@@ -1822,6 +1999,7 @@ impl Ext4Fs {
             bio_copy_ns / writes / 1_000,
             bio_submit_ns / writes / 1_000,
             bio_wait_ns / writes / 1_000,
+            bio_wait_return_after_complete_ns / writes / 1_000,
             touch_ns / writes / 1_000,
             total_ns / writes / 1_000,
             self.direct_write_profile
@@ -1832,6 +2010,10 @@ impl Ext4Fs {
                 .max_data_bio_ns
                 .load(Ordering::Relaxed)
                 / 1_000_000,
+            self.direct_write_profile
+                .max_bio_wait_return_after_complete_ns
+                .load(Ordering::Relaxed)
+                / 1_000,
             self.direct_write_profile
                 .max_touch_ns
                 .load(Ordering::Relaxed)
@@ -1853,6 +2035,90 @@ impl Ext4Fs {
         }
     }
 
+    fn maybe_start_direct_write_profile(&self) {
+        if self
+            .direct_write_profile_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            reset_write_bio_profile();
+        }
+    }
+
+    fn profile_direct_write_user_buffer(
+        user_start: Vaddr,
+        len: usize,
+        bio_profile: &mut DirectWriteBioCallProfile,
+    ) {
+        if len == 0 {
+            return;
+        }
+        if user_start < VMAR_LOWEST_ADDR
+            || VMAR_CAP_ADDR
+                .checked_sub(user_start)
+                .is_none_or(|gap| gap < len)
+        {
+            bio_profile.user_buffer_profile_failures =
+                bio_profile.user_buffer_profile_failures.saturating_add(1);
+            return;
+        }
+
+        let aligned_start = user_start / PAGE_SIZE * PAGE_SIZE;
+        let Some(user_end) = user_start.checked_add(len) else {
+            bio_profile.user_buffer_profile_failures =
+                bio_profile.user_buffer_profile_failures.saturating_add(1);
+            return;
+        };
+        let aligned_end = user_end.saturating_add(PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+        let current_task = ostd::task::Task::current().unwrap();
+        let thread_local =
+            crate::process::posix_thread::AsThreadLocal::as_thread_local(&current_task).unwrap();
+        let user_space = crate::context::CurrentUserSpace::new(thread_local);
+        let vm_space = user_space.vmar().vm_space();
+
+        let mut current = aligned_start;
+        let mut previous_paddr = None;
+        let mut current_run_pages = 0u64;
+        while current < aligned_end {
+            let paddr = {
+                let preempt_guard = disable_preempt();
+                let cursor_result =
+                    vm_space.cursor(&preempt_guard, &(current..current + PAGE_SIZE));
+                let Ok(mut cursor) = cursor_result else {
+                    bio_profile.user_buffer_profile_failures =
+                        bio_profile.user_buffer_profile_failures.saturating_add(1);
+                    return;
+                };
+                match cursor.query() {
+                    Ok((_, Some(VmQueriedItem::MappedRam { frame, prop })))
+                        if prop.flags.contains(PageFlags::R) =>
+                    {
+                        frame.paddr()
+                    }
+                    _ => {
+                        bio_profile.user_buffer_profile_failures =
+                            bio_profile.user_buffer_profile_failures.saturating_add(1);
+                        return;
+                    }
+                }
+            };
+
+            bio_profile.user_buffer_pages = bio_profile.user_buffer_pages.saturating_add(1);
+            if previous_paddr.is_some_and(|prev| prev + PAGE_SIZE == paddr) {
+                current_run_pages = current_run_pages.saturating_add(1);
+            } else {
+                bio_profile.user_buffer_phys_runs =
+                    bio_profile.user_buffer_phys_runs.saturating_add(1);
+                current_run_pages = 1;
+            }
+            bio_profile.max_user_buffer_phys_run_pages = bio_profile
+                .max_user_buffer_phys_run_pages
+                .max(current_run_pages);
+            previous_paddr = Some(paddr);
+            current = current.saturating_add(PAGE_SIZE);
+        }
+    }
+
     pub(super) fn set_inode_times(
         &self,
         ino: u32,
@@ -1861,7 +2127,8 @@ impl Ext4Fs {
         ctime: Option<u32>,
     ) -> Result<()> {
         self.run_inode_metadata_update(|ext4| {
-            ext4.ext4_set_inode_times(ino, atime, mtime, ctime).map(|_| ())
+            ext4.ext4_set_inode_times(ino, atime, mtime, ctime)
+                .map(|_| ())
         })
     }
 
@@ -1915,7 +2182,8 @@ impl Ext4Fs {
         }
 
         let mount_flags = self.mount_flags();
-        if mount_flags.contains(PerMountFlags::RDONLY) || mount_flags.contains(PerMountFlags::NOATIME)
+        if mount_flags.contains(PerMountFlags::RDONLY)
+            || mount_flags.contains(PerMountFlags::NOATIME)
         {
             return None;
         }
@@ -1940,7 +2208,10 @@ impl Ext4Fs {
                 Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => return Ok(()),
                 Ok(_) => {}
                 Err(err) => {
-                    warn!("ext4: failed to stat inode {} for atime policy: {:?}", ino, err);
+                    warn!(
+                        "ext4: failed to stat inode {} for atime policy: {:?}",
+                        ino, err
+                    );
                     return Ok(());
                 }
             }
@@ -2095,8 +2366,11 @@ impl Ext4Fs {
                 let request_end = offset.saturating_add(requested_direct_len);
                 if offset >= entry.file_offset && request_end <= cache_end {
                     self.direct_read_profile.record_cache_hit();
-                    let mappings =
-                        Self::slice_mappings_for_range(offset, requested_direct_len, &entry.mappings)?;
+                    let mappings = Self::slice_mappings_for_range(
+                        offset,
+                        requested_direct_len,
+                        &entry.mappings,
+                    )?;
                     return Ok((requested_direct_len, mappings));
                 }
 
@@ -2198,8 +2472,17 @@ impl Ext4Fs {
         bio_copy_ns: &mut u64,
         bio_submit_ns: &mut u64,
         bio_wait_ns: &mut u64,
+        bio_profile: &mut DirectWriteBioCallProfile,
     ) -> Result<()> {
         let mut bio_waiter = BioWaiter::new();
+        let merge_start = if profile_enabled {
+            bio_profile.mappings = bio_profile
+                .mappings
+                .saturating_add(u64::try_from(mappings.len()).unwrap_or(u64::MAX));
+            bio_request_merge_count()
+        } else {
+            0
+        };
         for mapping in mappings {
             let alloc_start_ns = if profile_enabled {
                 Self::monotonic_nanos()
@@ -2207,6 +2490,14 @@ impl Ext4Fs {
                 0
             };
             let bio_segment = BioSegment::alloc(mapping.len as usize, BioDirection::ToDevice);
+            if profile_enabled {
+                bio_profile.bios = bio_profile.bios.saturating_add(1);
+                bio_profile.segments = bio_profile.segments.saturating_add(1);
+                bio_profile.blocks = bio_profile.blocks.saturating_add(u64::from(mapping.len));
+                bio_profile.max_segments_per_bio = bio_profile.max_segments_per_bio.max(1);
+                bio_profile.max_blocks_per_bio =
+                    bio_profile.max_blocks_per_bio.max(u64::from(mapping.len));
+            }
             if profile_enabled {
                 *bio_alloc_ns = bio_alloc_ns
                     .saturating_add(Self::monotonic_nanos().saturating_sub(alloc_start_ns));
@@ -2249,8 +2540,17 @@ impl Ext4Fs {
         };
         let status = bio_waiter.wait();
         if profile_enabled {
-            *bio_wait_ns =
-                bio_wait_ns.saturating_add(Self::monotonic_nanos().saturating_sub(wait_start_ns));
+            let wait_return_ns = Self::monotonic_nanos();
+            *bio_wait_ns = bio_wait_ns.saturating_add(wait_return_ns.saturating_sub(wait_start_ns));
+            let max_complete_ns = bio_waiter.max_complete_ns();
+            if max_complete_ns != 0 {
+                bio_profile.wait_return_after_complete_ns = bio_profile
+                    .wait_return_after_complete_ns
+                    .saturating_add(wait_return_ns.saturating_sub(max_complete_ns));
+            }
+            bio_profile.merge_hits = bio_profile
+                .merge_hits
+                .saturating_add(bio_request_merge_count().saturating_sub(merge_start));
         }
         if Some(BioStatus::Complete) != status {
             return_errno!(Errno::EIO);
@@ -2402,7 +2702,8 @@ impl Ext4Fs {
         }
 
         let plan_start = Self::monotonic_nanos();
-        let (next_len, next_mappings) = self.plan_direct_read_cached(ino, next_offset, direct_len)?;
+        let (next_len, next_mappings) =
+            self.plan_direct_read_cached(ino, next_offset, direct_len)?;
         let plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
         if next_len < SPECULATIVE_DIRECT_READ_MIN_BYTES {
             return Ok((None, plan_ns));
@@ -2680,11 +2981,7 @@ impl Ext4Fs {
             Some(filter_op) => filter_op == op_name,
             None => true,
         };
-        if op_matches {
-            Some(stage)
-        } else {
-            None
-        }
+        if op_matches { Some(stage) } else { None }
     }
 
     fn should_force_commit_for_injected_crash(op_name: &str) -> bool {
@@ -2716,8 +3013,7 @@ impl Ext4Fs {
 
         let start_handle_start_ns = Self::monotonic_nanos();
         let jbd2_handle = self.start_jbd2_handle(op.as_ref());
-        let start_handle_elapsed_ns =
-            Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
+        let start_handle_elapsed_ns = Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
         let handle_id = jbd2_handle.as_ref().map(|handle| handle.handle_id());
         let alloc_operation_id = self.begin_alloc_operation(handle_id);
 
@@ -2736,8 +3032,7 @@ impl Ext4Fs {
             Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
         let finish_alloc_start_ns = Self::monotonic_nanos();
         self.finish_alloc_operation(Some(alloc_operation_id));
-        let finish_alloc_elapsed_ns =
-            Self::monotonic_nanos().saturating_sub(finish_alloc_start_ns);
+        let finish_alloc_elapsed_ns = Self::monotonic_nanos().saturating_sub(finish_alloc_start_ns);
         drop(runtime_guard);
         self.record_ext4_rs_runtime_lock_hold(
             Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
@@ -3009,8 +3304,7 @@ impl Ext4Fs {
                         ext4.ext4_mkdir_unchecked_at(parent, name, mode)
                             .map_err(map_ext4_error)
                     })?;
-                    let child_lock =
-                        Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+                    let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
                     let _child_guard = child_lock.lock();
                     self.cache_insert_entry_with_offset(parent, name, ino, dir_byte_offset, 2);
                     self.cache_remove_dir(ino);
@@ -3118,7 +3412,10 @@ impl Ext4Fs {
             let overwritten_is_dir = overwritten_ino
                 .and_then(|ino| self.stat(ino).ok().map(|meta| (ino, meta)))
                 .map(|(ino, meta)| {
-                    (ino, meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits())
+                    (
+                        ino,
+                        meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits(),
+                    )
                 });
 
             let mut affected_inodes = Vec::new();
@@ -3249,10 +3546,15 @@ impl Ext4Fs {
         if generic014_like_write {
             generic014_write_seq = GENERIC014_WRITE_PROGRESS.fetch_add(1, Ordering::Relaxed) + 1;
             generic014_write_start_ns = Self::monotonic_nanos();
-            if generic014_write_seq <= 8 || generic014_write_seq % GENERIC014_PROGRESS_LOG_INTERVAL == 0 {
+            if generic014_write_seq <= 8
+                || generic014_write_seq % GENERIC014_PROGRESS_LOG_INTERVAL == 0
+            {
                 debug!(
                     "ext4: generic014-like write progress seq={} ino={} offset={} len={}",
-                    generic014_write_seq, ino, offset, data.len()
+                    generic014_write_seq,
+                    ino,
+                    offset,
+                    data.len()
                 );
             }
         }
@@ -3266,8 +3568,7 @@ impl Ext4Fs {
                 let written = ext4
                     .ext4_write_at(ino, offset, data)
                     .map_err(map_ext4_error)?;
-                ext4_write_elapsed_ns =
-                    Self::monotonic_nanos().saturating_sub(ext4_write_start_ns);
+                ext4_write_elapsed_ns = Self::monotonic_nanos().saturating_sub(ext4_write_start_ns);
                 if written > 0 {
                     let inode_time_start_ns = Self::monotonic_nanos();
                     ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
@@ -3350,7 +3651,12 @@ impl Ext4Fs {
         let mut bio_submit_elapsed_ns = 0u64;
         let mut bio_wait_elapsed_ns = 0u64;
         let mut touch_elapsed_ns = 0u64;
+        let mut bio_call_profile = DirectWriteBioCallProfile::default();
+        let user_buffer_start = reader.cursor() as Vaddr;
         let mut reused_read_mapping_cache = false;
+        if profile_enabled {
+            self.maybe_start_direct_write_profile();
+        }
         let write_result = (|| -> Result<usize> {
             let plan_start_ns = if profile_enabled {
                 Self::monotonic_nanos()
@@ -3364,8 +3670,7 @@ impl Ext4Fs {
                 cached_mappings
             } else {
                 if profile_enabled {
-                    plan_elapsed_ns =
-                        Self::monotonic_nanos().saturating_sub(plan_start_ns);
+                    plan_elapsed_ns = Self::monotonic_nanos().saturating_sub(plan_start_ns);
                 }
                 self.run_journaled_ext4(Some(JournaledOp::Write { len: write_len }), |ext4| {
                     let prepare_start_ns = if profile_enabled {
@@ -3394,6 +3699,7 @@ impl Ext4Fs {
                         &mut bio_copy_elapsed_ns,
                         &mut bio_submit_elapsed_ns,
                         &mut bio_wait_elapsed_ns,
+                        &mut bio_call_profile,
                     )?;
                     if profile_enabled {
                         data_bio_elapsed_ns =
@@ -3421,16 +3727,23 @@ impl Ext4Fs {
                     &mut bio_copy_elapsed_ns,
                     &mut bio_submit_elapsed_ns,
                     &mut bio_wait_elapsed_ns,
+                    &mut bio_call_profile,
                 )?;
                 if profile_enabled {
-                    data_bio_elapsed_ns =
-                        Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
+                    data_bio_elapsed_ns = Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
                 }
             }
 
             Ok(write_len)
         })();
 
+        if profile_enabled && write_result.is_ok() {
+            Self::profile_direct_write_user_buffer(
+                user_buffer_start,
+                write_len,
+                &mut bio_call_profile,
+            );
+        }
         if reused_read_mapping_cache && write_result.is_ok() {
             self.clear_pending_direct_read(ino);
         } else {
@@ -3445,8 +3758,7 @@ impl Ext4Fs {
                 };
                 let touch_result = self.touch_mtime_ctime(ino);
                 if profile_enabled {
-                    touch_elapsed_ns =
-                        Self::monotonic_nanos().saturating_sub(touch_start_ns);
+                    touch_elapsed_ns = Self::monotonic_nanos().saturating_sub(touch_start_ns);
                 }
                 touch_result.map(|_| written)
             }
@@ -3457,6 +3769,7 @@ impl Ext4Fs {
                 write_len,
                 reused_read_mapping_cache,
                 result.is_ok(),
+                &bio_call_profile,
                 plan_elapsed_ns,
                 prepare_elapsed_ns,
                 data_bio_elapsed_ns,
@@ -3484,12 +3797,13 @@ impl Ext4Fs {
         }
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Truncate;
-        let truncate_result = self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_truncate(ino, new_size).map_err(map_ext4_error)?;
-            ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                .map_err(map_ext4_error)?;
-            Ok(())
-        })
+        let truncate_result = self
+            .run_journaled_ext4(Some(op), |ext4| {
+                ext4.ext4_truncate(ino, new_size).map_err(map_ext4_error)?;
+                ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
+                    .map_err(map_ext4_error)?;
+                Ok(())
+            })
             .map_err(|err| {
                 error!(
                     "ext4 truncate failed: ino={} new_size={} err={:?}",
@@ -3549,7 +3863,11 @@ impl Ext4Fs {
     }
 
     pub(super) fn make_inode(self: &Arc<Self>, ino: u32, path: String) -> Arc<dyn Inode> {
-        Arc::new(super::inode::Ext4Inode::new(Arc::downgrade(self), ino, path))
+        Arc::new(super::inode::Ext4Inode::new(
+            Arc::downgrade(self),
+            ino,
+            path,
+        ))
     }
 }
 
@@ -3573,9 +3891,7 @@ impl FileSystem for Ext4Fs {
         let ext4_sb = self.lock_inner().super_block;
         let block_size = ext4_sb.block_size() as usize;
         let blocks = ext4_sb.blocks_count() as usize;
-        let bfree = ext4_sb
-            .free_blocks_count()
-            .min(usize::MAX as u64) as usize;
+        let bfree = ext4_sb.free_blocks_count().min(usize::MAX as u64) as usize;
         let files = ext4_sb.total_inodes() as usize;
         let ffree = ext4_sb.free_inodes_count() as usize;
         let fsid = u64::from_le_bytes(ext4_sb.uuid[..8].try_into().unwrap_or([0u8; 8]));

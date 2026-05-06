@@ -1,163 +1,207 @@
-# Asterinas EXT4 Environment（Current, stage-8）
+# Asterinas EXT4 Environment（Current, Phase 2 收口）
 
-更新时间：2026-04-11（Asia/Shanghai）
+更新时间：2026-05-05（Asia/Shanghai）
 
-## 1. 当前工作目录
+## 1. 目标与范围
 
-1. 主工作树：`/home/lby/os_com_codex/asterinas`
-2. 顶层文档目录：`/home/lby/os_com_codex`
-3. 当前目标：继续推进 ext4 P1，主看 `fio/ext4_seq_read_bw`
-4. 当前推荐执行位置：Docker 容器
+这份文档记录当前 ext4 Phase 2 收口的推荐环境。
+当前优先使用 Docker runner 复现功能回归；宿主机直跑只作为排障辅助。
 
-## 2. 当前 benchmark 口径
+当前结论：
 
-1. fio 常用参数指纹：
-   - `BENCH_ENABLE_KVM=1`
-   - `BENCH_ASTER_NETDEV=tap`
-   - `BENCH_ASTER_VHOST=on`
-2. lmbench 对比常用参数指纹：
-   - `PERF_ROUNDS=1`
-   - `PERF_CASE_TIMEOUT_SEC=600`
-   - `BENCH_ENABLE_KVM=1`
-   - `BENCH_ASTER_NETDEV=tap`
-   - `BENCH_ASTER_VHOST=on`
-3. P1 排障允许临时单边跑：
-   - `BENCH_RUN_ONLY=asterinas`
-   - `BENCH_RUN_ONLY=linux`
-   - 默认仍应是 `BENCH_RUN_ONLY=both`
-4. 正式写入 milestone 的结果仍应使用双边对照。
+1. Phase 2 correctness baseline 已收口。
+2. Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`。
+3. 最新 baseline 日志：`benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`。
+4. fio read 已达标，fio write 最新正式确认值为 `87.01%`，作为后续性能优化项。
 
-## 3. 当前已确认的环境坑
+## 2. 当前结论（截至 2026-05-05）
 
-### 3.1 宿主机 benchmark 不稳定，优先不用
+1. 当前有效工作树：`/home/lby/os_com_codex/asterinas`
+2. 当前功能 baseline：
+   - `phase3_base_guard`：10 PASS / 0 FAIL / 6 NOTRUN / 24 STATIC_BLOCKED
+   - `phase4_good`：12 PASS / 0 FAIL / 6 NOTRUN / 22 STATIC_BLOCKED
+   - `phase6_good`：25/25 PASS
+   - `jbd_phase1`：6 PASS / 0 FAIL / 6 NOTRUN
+   - JBD2 crash matrix：18/18 PASS
+   - lmbench regression：8/8 PASS
+   - Phase 2 concurrency：7/7 PASS，日志 `benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
+3. 当前遗留项：
+   - fio write 最新正式确认值为 `87.01%`，低于 90%，继续作为性能优化项。
+   - `8 workers / 64 rounds` 高压混合并发探针曾观察到偶发短读/extent mapping 风险，不作为当前功能验收基线。
 
-1. `prepare_host.sh` 默认会写 `/opt/linux_binary_cache`，当前宿主无权限。
-   - 需要显式设置：
-   - `LINUX_DEPENDENCIES_DIR=/home/lby/os_com_codex/asterinas/.cache/linux_binary_cache`
-2. `make run_kernel` 必须显式带：
-   - `VDSO_LIBRARY_DIR=/home/lby/os_com_codex/asterinas/.local/linux_vdso`
-3. 宿主历史 target 中存在 root-owned 产物，会导致 `cargo-osdk` 报 `Permission denied`。
-   - 典型位置：
-   - `asterinas/target/osdk/`
-   - `asterinas/target/release-lto/` 下部分文件
-   - 规避方式：
-   - `CARGO_TARGET_DIR=/home/lby/os_com_codex/asterinas/.target_bench`
-4. 宿主机 `~/.local/bin/qemu-system-x86_64` 是旧 wrapper。
-   - 当前内容仍指向 `/home/lby/os_com/asterinas/.local/qemu-root2/...`
-   - 该真实 QEMU bundle 已不存在
-   - 结论：宿主 benchmark 入口当前不可信，优先走 Docker
-5. 迁目录后，`cargo-osdk` 如果不是从当前树重新安装，会混入旧路径 `/home/lby/os_com/asterinas/...`。
-   - 必须重装为当前树版本
-   - 而且要在**安装 cargo-osdk 时**带 `OSDK_LOCAL_DEV=1`
-   - 否则 run-base 会把 `ostd/osdk-frame-allocator/osdk-heap-allocator` 写成 crates.io 版本，出现双份 `ostd` 冲突
+补充：
 
-### 3.2 Docker benchmark 更稳，但也有两个固定坑
+1. 当前 ext4 fio 双项摘要复跑脚本是 `test/initramfs/src/benchmark/fio/run_ext4_summary.sh`。
+2. 该脚本会顺序执行 `ext4_seq_write_bw` 与 `ext4_seq_read_bw`。
+3. 默认不输出 benchmark 过程日志，只在最后打印 `Asterinas`、`Linux`、`ratio` 摘要。
 
-1. `test/initramfs/build/initramfs` 和 `initramfs.cpio.gz` 可能残留为旧目录/旧 symlink。
-   - 每次重跑前建议先清：
-   - `rm -rf /root/asterinas/test/initramfs/build/initramfs /root/asterinas/test/initramfs/build/initramfs.cpio.gz`
-2. 由于当前机器代理环境和 `/etc/resolv.conf` 口径，容器里会看到 DNS fallback 警告。
-   - 目前不影响 benchmark 继续执行
+## 3. 机器与工具版本（实际检测值）
 
-## 4. 当前建议的固定准备动作
+1. OS：Ubuntu 24.04.1 LTS
+2. Kernel：`6.8.0-41-generic`
+3. Rust：`rustc 1.94.0-nightly (2025-12-05)`
+4. Cargo：`cargo 1.94.0-nightly`
+5. cargo-osdk：`0.17.0`
+6. QEMU：`8.2.2`
+7. e2fsprogs（mke2fs/mkfs.ext4）：`1.47.0`
+8. bash：`5.2.21`
+9. ripgrep：`15.1.0`
 
-首次进入工作树或 toolchain component 缺失时，先跑一键环境准备：
+## 4. 干净环境目录（当前保留）
+
+仓库根：`/home/lby/os_com_codex/asterinas`
+
+保留并使用：
+
+1. 构建目录：`/home/lby/os_com_codex/asterinas/target_lby`
+2. 日志目录：`/home/lby/os_com_codex/asterinas/benchmark/logs`
+3. 基础 initramfs：`/home/lby/os_com_codex/asterinas/benchmark/assets/initramfs/initramfs_phase3.cpio.gz`
+4. 当前推荐 initramfs：`/home/lby/os_com_codex/asterinas/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz`
+5. VDSO：`/home/lby/os_com_codex/asterinas/.local/linux_vdso`
+6. xfstests 预构建目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-prebuilt`
+7. xfstests 源目录：`/home/lby/os_com_codex/asterinas/.local/xfstests-src`
+
+说明：Docker runner 会按需重打包 phase4_part3 initramfs；如只做功能回归，优先使用 `tools/ext4/run_phase4_in_docker.sh`。
+
+## 5. 环境变量（统一口径）
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+
+export PATH=/home/lby/.local/bin:$PATH
+export CARGO_TARGET_DIR=$(pwd)/target_lby
+export VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso
+export BOOT_METHOD=qemu-direct
+export OVMF=off
+export RELEASE_LTO=1
+export ENABLE_KVM=0
+export NETDEV=user
+export VHOST=off
+export CONSOLE=ttyS0
+```
+
+首次进入工作树或 toolchain component 缺失时，可先跑仓库自带的一键准备脚本：
 
 ```bash
 cd /home/lby/os_com_codex/asterinas
 ./tools/setup_dev_env.sh
 ```
 
-该脚本会安装 `rust-src`、`rustfmt`、`rustc-dev`、`llvm-tools-preview` 与内核 target，并准备 `.local/linux_vdso`。如果只想补 Rust 组件、不碰 VDSO：
+该脚本会安装 `rust-src`、`rustfmt`、`rustc-dev`、`llvm-tools-preview` 与内核 target，并准备 `.local/linux_vdso`。如果只想补 Rust 组件、不碰 VDSO，可使用：
 
 ```bash
 ./tools/setup_dev_env.sh --no-vdso
 ```
 
-在重复跑 benchmark 前，先做下面这些：
+可选代理（仅下载超时时打开，Clash 7890）：
+
+```bash
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export all_proxy=socks5://127.0.0.1:7890
+```
+
+## 6. 依赖准备与校验
+
+### 6.1 校验基础命令
+
+```bash
+command -v qemu-system-x86_64
+command -v mkfs.ext4
+command -v cargo
+command -v rg
+```
+
+### 6.2 需要重建 xfstests 预构建时
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+tools/ext4/prepare_xfstests_prebuilt.sh \
+  /home/lby/os_com_codex/asterinas/.local/xfstests-prebuilt \
+  /home/lby/os_com_codex/asterinas/.local/xfstests-src
+```
+
+### 6.3 需要重建 part3 initramfs 时
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+tools/ext4/prepare_phase4_part3_initramfs.sh \
+  /home/lby/os_com_codex/asterinas/.local/initramfs_phase3.cpio.gz \
+  /home/lby/os_com_codex/asterinas/.local/initramfs_phase4_part3.cpio.gz
+```
+
+## 7. 运行命令（phase4）
+
+### 7.1 全流程（part3 脚本）
 
 ```bash
 cd /home/lby/os_com_codex/asterinas
 
-mkdir -p .cache/linux_binary_cache .target_bench
-
-OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path ./osdk --force
+env VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso PATH=/home/lby/.local/bin:$PATH \
+    CARGO_TARGET_DIR=$(pwd)/target_lby BOOT_METHOD=qemu-direct OVMF=off \
+    RELEASE_LTO=1 ENABLE_KVM=0 NETDEV=user VHOST=off CONSOLE=ttyS0 \
+    timeout 10800s tools/ext4/run_phase4_part3.sh
 ```
 
-如果只做本地编译检查：
+### 7.2 只跑 `generic/013`（定位）
 
 ```bash
 cd /home/lby/os_com_codex/asterinas/kernel
-VDSO_LIBRARY_DIR=/home/lby/os_com_codex/asterinas/.local/linux_vdso cargo osdk check
+
+timeout 1800s cargo osdk run \
+  --kcmd-args='ostd.log_level=error' \
+  --kcmd-args='console=ttyS0' \
+  --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \
+  --kcmd-args='SYSCALL_TEST_WORKDIR=/ext4' \
+  --kcmd-args='EXTRA_BLOCKLISTS_DIRS=' \
+  --kcmd-args='XFSTESTS_MODE=phase4_good' \
+  --kcmd-args='XFSTESTS_THRESHOLD_PERCENT=90' \
+  --kcmd-args='XFSTESTS_RESULTS_DIR=' \
+  --kcmd-args='XFSTESTS_TEST_DEV=/dev/vda' \
+  --kcmd-args='XFSTESTS_SCRATCH_DEV=/dev/vdb' \
+  --kcmd-args='XFSTESTS_TEST_DIR=/ext4_test' \
+  --kcmd-args='XFSTESTS_SCRATCH_MNT=/ext4_scratch' \
+  --kcmd-args='XFSTESTS_SKIP_MKFS=1' \
+  --kcmd-args='XFSTESTS_SINGLE_TEST=generic/013' \
+  --kcmd-args='XFSTESTS_CASE_TIMEOUT_SEC=600' \
+  --init-args='/opt/syscall_test/run_syscall_test.sh' \
+  --target-arch=x86_64 \
+  --profile release-lto \
+  --boot-method='qemu-direct' \
+  --grub-boot-protocol=multiboot2 \
+  --initramfs='../.local/initramfs_phase4_part3.cpio.gz'
 ```
 
-## 5. 当前推荐的 Docker fio 复跑命令
+## 8. 判定口径
 
-单边 Asterinas read：
+1. 看 case 结果：日志出现 `xfstests case done: generic/013 rc=0`
+2. 看总结果：日志出现 `All syscall tests passed.`
+3. 全量 `phase4_good` 看统计行：`phase4_good\tpass\tfail...`
+
+## 9. 已知问题与规避
+
+1. 本环境当前不是 Docker 封装链路，按仓库脚本 + QEMU 直跑。
+2. 曾出现“历史 root 权限污染目录”问题，已从仓库移出：
+   - `/home/lby/os_com_codex/garbage/asterinas_target_root_polluted_20260407`
+   - `/home/lby/os_com_codex/garbage/asterinas_osdk_target_root_polluted_20260407`
+   - `/home/lby/os_com_codex/garbage/asterinas_target_lby_root_backup_20260407`
+3. 如需彻底删掉上述垃圾隔离目录，需要 root 权限：
+
+```bash
+sudo rm -rf /home/lby/os_com_codex/garbage/asterinas_target_root_polluted_20260407 \
+            /home/lby/os_com_codex/garbage/asterinas_osdk_target_root_polluted_20260407 \
+            /home/lby/os_com_codex/garbage/asterinas_target_lby_root_backup_20260407
+```
+
+## 10. 一次性快速复现（最短路径）
 
 ```bash
 cd /home/lby/os_com_codex/asterinas
+export PATH=/home/lby/.local/bin:$PATH
+export CARGO_TARGET_DIR=$(pwd)/target_lby
+export VDSO_LIBRARY_DIR=$(pwd)/.local/linux_vdso
 
-docker run --rm --privileged --network=host --device=/dev/kvm \
-  -v /dev:/dev \
-  -v /home/lby/os_com_codex/asterinas:/root/asterinas \
-  -w /root/asterinas \
-  -e http_proxy=http://127.0.0.1:7890 \
-  -e https_proxy=http://127.0.0.1:7890 \
-  -e all_proxy=socks5://127.0.0.1:7890 \
-  -e BENCH_RUN_ONLY=asterinas \
-  -e BENCH_ENABLE_KVM=1 \
-  -e BENCH_ASTER_NETDEV=tap \
-  -e BENCH_ASTER_VHOST=on \
-  -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
-  -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
-  -e LINUX_DEPENDENCIES_DIR=/root/asterinas/.cache/linux_binary_cache \
-  asterinas/asterinas:0.17.0-20260227 \
-  bash -lc '
-    rm -rf /root/asterinas/.target_bench/osdk \
-           /root/asterinas/test/initramfs/build/initramfs \
-           /root/asterinas/test/initramfs/build/initramfs.cpio.gz
-    OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path /root/asterinas/osdk --force
-    bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_read_bw
-  '
+timeout 10800s tools/ext4/run_phase4_part3.sh
 ```
 
-如果要正式双边对照，把 `BENCH_RUN_ONLY=asterinas` 去掉或改回 `both`。
-
-快速双项复跑（ext4 write + read，默认静默）：
-
-```bash
-cd /home/lby/os_com_codex
-./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
-```
-
-说明：
-
-1. 该脚本会顺序执行 `fio/ext4_seq_write_bw` 和 `fio/ext4_seq_read_bw`。
-2. 默认不向终端输出 benchmark 过程日志，只在结束后打印 `Asterinas`、`Linux` 和 `ratio` 摘要。
-3. 如需保留临时日志用于排障，可执行：
-
-```bash
-cd /home/lby/os_com_codex
-KEEP_LOGS=1 ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
-```
-
-## 6. 当前现场状态（2026-04-11）
-
-1. `asterinas/test/initramfs/build/` 当前状态：
-   - `initramfs -> /nix/store/...-initramfs`
-   - `initramfs.cpio.gz -> /nix/store/...-initramfs-image`
-2. 可写 benchmark target：
-   - `asterinas/.target_bench`
-3. 历史 target 仍保留，但不建议 benchmark 继续复用：
-   - `asterinas/target/osdk`
-   - `asterinas/target_lby`
-4. 当前只保留了一个长期容器：
-   - `asterinas/asterinas:0.17.0-20260227`
-   - `sleep infinity`
-   - 这是历史常驻容器，不是本轮 benchmark 残留
-
-## 7. 后续约定
-
-1. 后续凡是 benchmark 入口、代理、`cargo-osdk`、QEMU、target 目录有变化，都优先更新本文件。
-2. 提交前如果不再需要单边 benchmark，加回默认双边口径使用方式。
+如果只做最小确认，先跑第 7.2 节单测 `generic/013`。
