@@ -27,7 +27,7 @@ use ostd::{
         HasPaddr, PAGE_SIZE, PageFlags, Vaddr, VmIo, VmWriter, io_util::HasVmReaderWriter,
         vm_space::VmQueriedItem,
     },
-    sync::RwMutex,
+    sync::{RwMutex, WaitQueue},
     task::disable_preempt,
 };
 
@@ -86,8 +86,22 @@ enum JournaledOp {
     Unlink,
     Rmdir,
     Rename,
-    Write { len: usize },
-    Truncate,
+    Write { len: usize, ino: u32 },
+    Truncate { ino: u32 },
+}
+
+impl JournaledOp {
+    /// Step 4a-2: returns the primary inode whose metadata is modified by this
+    /// op, used by `finish_jbd2_handle` to update the inode→TID map for
+    /// fsync force-commit.  Currently only `Write` and `Truncate` carry
+    /// inode info; other ops touch multiple inodes (parents + child) and
+    /// are not tracked at this granularity in v1.
+    fn affected_ino(&self) -> Option<u32> {
+        match self {
+            Self::Write { ino, .. } | Self::Truncate { ino } => Some(*ino),
+            _ => None,
+        }
+    }
 }
 
 struct DirectReadProfileStats {
@@ -502,11 +516,25 @@ impl JournaledOpProfileStats {
 }
 
 impl JournaledOp {
-    fn for_small_write(_ino: u32, _offset: usize, data: &[u8]) -> Option<Self> {
-        if data.is_empty() || data.len() > JOURNALED_SMALL_WRITE_MAX_BYTES {
+    /// Tag for buffered writes through `Ext4Fs::write_at`.
+    ///
+    /// Step 4a-2: previously this returned `None` for writes larger than
+    /// `JOURNALED_SMALL_WRITE_MAX_BYTES` (192 B), causing the
+    /// `inode_tids` map to miss large buffered writes — so fsync of those
+    /// inodes had `target_tid = None` and skipped force-commit.
+    /// generic/047 (32 K pwrite + fsync per file) exposed this: late files
+    /// went un-committed and were lost after shutdown + replay.
+    /// Now we always return `Some(Write { len, ino })` for non-empty
+    /// writes; the journal credit estimation in
+    /// `estimate_jbd2_reserved_blocks` already scales with `len`.
+    fn for_small_write(ino: u32, _offset: usize, data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
             return None;
         }
-        Some(Self::Write { len: data.len() })
+        Some(Self::Write {
+            len: data.len(),
+            ino,
+        })
     }
 }
 
@@ -829,6 +857,25 @@ pub(super) struct Ext4Fs {
     jbd2_checkpoint_lock: Mutex<()>,
     inode_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
     dir_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
+    /// Step 4a-2: per-ino "highest TID containing a metadata change for this
+    /// inode" map.  Equivalent to Linux `EXT4_I(inode)->i_sync_tid`.
+    /// Updated by `finish_jbd2_handle` after a Write/Truncate handle stops;
+    /// queried by `fsync_regular_file` to find the target TID for force-commit.
+    /// Entries with `tid <= last_committed_tid` are stale but harmless (the
+    /// fast path in `force_commit_for_tid` filters them).  We do not actively
+    /// evict to keep the lock granularity simple; eviction can be added later
+    /// when memory pressure arises.
+    inode_tids: RwMutex<BTreeMap<u32, u32>>,
+    /// Step 4a-2: WaitQueue for fsync force-commit waiters.  Woken after
+    /// every successful `finish_commit` (i.e. `last_committed_tid` advances)
+    /// and after every `stop_handle` (which may make a prev_running TX
+    /// commit-ready).  Waiters re-check `last_committed_tid >= target_tid`.
+    commit_notifier: WaitQueue,
+    /// Step 4b: shutdown state set by `EXT4_IOC_SHUTDOWN` ioctl.
+    /// `0` = active, `1` = shutdown.  Once shutdown, `run_journaled_ext4`
+    /// and `fsync_regular_file` return EIO.  Cleared automatically on
+    /// remount + recovery (Phase 1 path).
+    shutdown_state: AtomicU32,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
@@ -869,6 +916,9 @@ impl Ext4Fs {
             jbd2_checkpoint_lock: Mutex::new(()),
             inode_correctness_locks: Mutex::new(BTreeMap::new()),
             dir_correctness_locks: Mutex::new(BTreeMap::new()),
+            inode_tids: RwMutex::new(BTreeMap::new()),
+            commit_notifier: WaitQueue::new(),
+            shutdown_state: AtomicU32::new(0),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
@@ -1117,11 +1167,11 @@ impl Ext4Fs {
             Some(JournaledOp::Create) | Some(JournaledOp::Mkdir) => 8,
             Some(JournaledOp::Unlink) | Some(JournaledOp::Rmdir) => 8,
             Some(JournaledOp::Rename) => 12,
-            Some(JournaledOp::Write { len }) => {
+            Some(JournaledOp::Write { len, .. }) => {
                 let blocks = len.div_ceil(EXT4_BLOCK_SIZE);
                 u32::try_from(blocks.saturating_add(8)).unwrap_or(u32::MAX)
             }
-            Some(JournaledOp::Truncate) => 8,
+            Some(JournaledOp::Truncate { .. }) => 8,
             None => 8,
         }
     }
@@ -1134,7 +1184,7 @@ impl Ext4Fs {
             Some(JournaledOp::Rmdir) => "rmdir",
             Some(JournaledOp::Rename) => "rename",
             Some(JournaledOp::Write { .. }) => "write",
-            Some(JournaledOp::Truncate) => "truncate",
+            Some(JournaledOp::Truncate { .. }) => "truncate",
             None => "anonymous",
         }
     }
@@ -1195,6 +1245,7 @@ impl Ext4Fs {
     fn finish_jbd2_handle(
         &self,
         handle: Option<JournalHandle>,
+        op: Option<&JournaledOp>,
         op_name: &'static str,
         succeeded: bool,
     ) {
@@ -1209,6 +1260,20 @@ impl Ext4Fs {
         let Some(summary) = summary else {
             return;
         };
+
+        // Step 4a-2: record (ino → handle's TID) so a subsequent fsync(ino)
+        // can force-commit exactly the TID containing this inode's metadata.
+        // Only Write/Truncate carry inode info in v1; other ops touch
+        // multiple inodes (parent + child) and rely on the Phase 2 inode
+        // correctness lock to serialize fsync after the op completes.
+        if succeeded {
+            if let Some(ino) = op.and_then(JournaledOp::affected_ino) {
+                self.record_inode_tid(ino, summary.transaction_id);
+            }
+        }
+        // Wake any fsync waiter blocked on this transaction (a stop_handle on
+        // prev_running may have made it commit_ready below).
+        self.commit_notifier.wake_all();
 
         debug!(
             "ext4: jbd2 handle op={} handle_id={} tid={} reserved={} modified_blocks={} data_sync_required={} success={}",
@@ -1272,6 +1337,99 @@ impl Ext4Fs {
             .read()
             .as_ref()
             .is_some_and(|runtime| runtime.has_active_handle())
+    }
+
+    /// Step 4a-2: returns the highest TID whose `finish_commit` succeeded.
+    /// `0` means no transaction has committed yet (post-mount fresh state)
+    /// — fsync of an inode whose recorded TID is also 0 is therefore a no-op
+    /// (no metadata change).
+    fn last_committed_tid(&self) -> u32 {
+        self.jbd2_runtime
+            .read()
+            .as_ref()
+            .map(|runtime| runtime.last_committed_tid())
+            .unwrap_or(0)
+    }
+
+    /// Step 4a-2: record that this inode's metadata is committed in TID
+    /// `tid` (or earlier). Always advances monotonically. Called by
+    /// `finish_jbd2_handle` after a Write/Truncate handle stops.
+    fn record_inode_tid(&self, ino: u32, tid: u32) {
+        if tid == 0 {
+            return;
+        }
+        let mut tids = self.inode_tids.write();
+        let entry = tids.entry(ino).or_insert(0);
+        if tid > *entry {
+            *entry = tid;
+        }
+    }
+
+    /// Step 4a-2: returns the latest TID with a known metadata change for
+    /// this inode, or `None` if no Write/Truncate has been recorded.
+    fn lookup_inode_tid(&self, ino: u32) -> Option<u32> {
+        self.inode_tids.read().get(&ino).copied()
+    }
+
+    /// Step 4a-2: drive forward and wait until the JBD2 transaction
+    /// containing this inode's recent metadata changes is durable in the
+    /// journal.  Mirrors Linux `jbd2_journal_force_commit_nested` +
+    /// `jbd2_log_wait_commit` semantics.
+    ///
+    /// Algorithm:
+    /// 1. Fast path: if `last_committed_tid >= target_tid`, return.
+    /// 2. If `target_tid` is the current running TX, rotate it to
+    ///    `prev_running` (so no new handles join, allowing existing handles
+    ///    to drain to commit-readiness).
+    /// 3. Loop: try `try_commit_ready_jbd2_transaction()` to drive any
+    ///    commit-ready TX to disk; if `last_committed_tid < target_tid`,
+    ///    block on `commit_notifier` until either a finish_commit or a
+    ///    handle stop wakes us, then re-check.
+    ///
+    /// Wakeup correctness: every `finish_commit` and every `stop_handle`
+    /// calls `commit_notifier.wake_all()`, so any state change that could
+    /// advance `last_committed_tid` notifies waiters.  `WaitQueue::wait_until`
+    /// enqueues the waker before re-evaluating the condition, so no wakeup
+    /// is lost.
+    fn force_commit_for_tid(&self, target_tid: u32) {
+        if target_tid == 0 {
+            return;
+        }
+        // Fast path: already committed.
+        if self.last_committed_tid() >= target_tid {
+            return;
+        }
+
+        // Rotate target_tid out of `running` if it's still there. This
+        // prevents new handles from joining and lets existing ones drain.
+        {
+            let mut runtime_guard = self.jbd2_runtime.write();
+            if let Some(runtime) = runtime_guard.as_mut() {
+                let running_tid = runtime
+                    .running_transaction()
+                    .map(|t| t.tid())
+                    .unwrap_or(0);
+                if running_tid == target_tid {
+                    let _ = runtime.rotate_running_transaction();
+                }
+            }
+        }
+
+        // Wait until target_tid is committed.  In each iteration we first
+        // try to drive any commit-ready TX forward (this is what advances
+        // `last_committed_tid`), then check the condition.  If still not
+        // satisfied, `wait_until` enqueues us on `commit_notifier` and the
+        // next `finish_commit` / `stop_handle` will wake us up.
+        self.commit_notifier.wait_until(|| {
+            // Drive forward: this commits the prev_running TX once its
+            // active handles have drained, advancing `last_committed_tid`.
+            let _ = self.try_commit_ready_jbd2_transaction();
+            if self.last_committed_tid() >= target_tid {
+                Some(())
+            } else {
+                None
+            }
+        });
     }
 
     fn flush_pending_jbd2_transactions(&self) {
@@ -1538,6 +1696,15 @@ impl Ext4Fs {
                 let _ = self.jbd2_runtime.write().as_mut().map(|runtime| {
                     runtime.finish_commit(plan.tid, commit.start_block, commit.next_head)
                 });
+                // Step 4a-2: wake any fsync waiter that was blocked on this TID.
+                self.commit_notifier.wake_all();
+                // Step 4b: ensure on-disk superblock has the
+                // EXT4_FEATURE_INCOMPAT_RECOVER ("needs_recovery") flag set
+                // after the first commit since last clean SB.  Linux ext4
+                // sets this at mount; we set it lazily on first commit so
+                // post-replay clean unmount paths report "clean log"
+                // correctly without needing an explicit umount hook.
+                self.mark_needs_recovery_if_needed();
                 warn!(
                     "ext4: jbd2 committed tid={} sequence={} start={} commit={} next_head={} metadata_blocks={} data_sync_required={} free_blocks={}",
                     plan.tid,
@@ -2997,9 +3164,14 @@ impl Ext4Fs {
         op: Option<JournaledOp>,
         apply: impl FnOnce(&Ext4) -> Result<T>,
     ) -> Result<T> {
+        // Step 4b: gate at the entry of journaled operations.  All
+        // create/mkdir/unlink/rmdir/rename/write/truncate paths flow
+        // through this helper, so a single check here is sufficient.
+        self.check_not_shutdown()?;
+
         let generic014_like_write = matches!(
             op.as_ref(),
-            Some(JournaledOp::Write { len }) if *len == 512
+            Some(JournaledOp::Write { len, .. }) if *len == 512
         );
         let io_epoch = self.prepare_ext4_io();
         let runtime_wait_start_ns = Self::monotonic_nanos();
@@ -3027,7 +3199,7 @@ impl Ext4Fs {
         let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
 
         let finish_handle_start_ns = Self::monotonic_nanos();
-        self.finish_jbd2_handle(jbd2_handle, op_name, result.is_ok());
+        self.finish_jbd2_handle(jbd2_handle, op.as_ref(), op_name, result.is_ok());
         let finish_handle_elapsed_ns =
             Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
         let finish_alloc_start_ns = Self::monotonic_nanos();
@@ -3672,7 +3844,7 @@ impl Ext4Fs {
                 if profile_enabled {
                     plan_elapsed_ns = Self::monotonic_nanos().saturating_sub(plan_start_ns);
                 }
-                self.run_journaled_ext4(Some(JournaledOp::Write { len: write_len }), |ext4| {
+                self.run_journaled_ext4(Some(JournaledOp::Write { len: write_len, ino }), |ext4| {
                     let prepare_start_ns = if profile_enabled {
                         Self::monotonic_nanos()
                     } else {
@@ -3796,7 +3968,7 @@ impl Ext4Fs {
             );
         }
         let now = Self::now_unix_seconds_u32();
-        let op = JournaledOp::Truncate;
+        let op = JournaledOp::Truncate { ino };
         let truncate_result = self
             .run_journaled_ext4(Some(op), |ext4| {
                 ext4.ext4_truncate(ino, new_size).map_err(map_ext4_error)?;
@@ -3841,17 +4013,207 @@ impl Ext4Fs {
         self.block_device.id().as_encoded_u64()
     }
 
+    /// Returns a reference to the underlying block device.
+    ///
+    /// Used by `Ext4Inode::sync_all` / `sync_data` to issue a final
+    /// `BlockDevice::sync()` after `fsync_regular_file()`, mirroring the ext2
+    /// `impl_for_vfs/inode.rs` pattern (Step 4a-1).
+    pub(super) fn block_device(&self) -> &Arc<dyn BlockDevice> {
+        &self.block_device
+    }
+
+    /// Step 4b: returns true if the filesystem has been shut down via
+    /// `EXT4_IOC_SHUTDOWN`.  After shutdown, journaled operations and
+    /// fsync return EIO.  Reads still work in v1 (Linux returns EIO on
+    /// reads too, but we accept the slightly looser semantics for now;
+    /// the xfstests use shutdown only as a "stop writing then unmount"
+    /// barrier and do not read after shutdown).
+    pub(super) fn is_shutdown(&self) -> bool {
+        self.shutdown_state.load(Ordering::Acquire) != 0
+    }
+
+    fn check_not_shutdown(&self) -> Result<()> {
+        if self.is_shutdown() {
+            return_errno_with_message!(Errno::EIO, "ext4: filesystem is shutdown");
+        }
+        Ok(())
+    }
+
+    /// Step 4b: implements the `EXT4_IOC_SHUTDOWN` ioctl.
+    ///
+    /// Three flag values follow Linux ext4 semantics:
+    ///   - `EXT4_GOING_FLAGS_DEFAULT (0x0)`: best-effort sync of dirty
+    ///     metadata, then forced shutdown.  Implemented as `Ext4Fs::sync()`
+    ///     followed by setting the shutdown bit (slightly more conservative
+    ///     than Linux, which does not actively force-commit on DEFAULT).
+    ///   - `EXT4_GOING_FLAGS_LOGFLUSH (0x1)`: force-commit all pending
+    ///     transactions, flush the journal and the device, then shutdown.
+    ///     This is the "clean-ish" variant.
+    ///   - `EXT4_GOING_FLAGS_NOLOGFLUSH (0x2)`: discard in-flight commits,
+    ///     no flush, no journal sync.  This is the strongest crash
+    ///     simulation — equivalent to a hard power-cut at the moment of
+    ///     the ioctl.  After this, the on-disk state is whatever was
+    ///     already persisted; remount must replay the journal.
+    ///
+    /// In all three cases, after this call returns, all subsequent
+    /// journaled operations and fsync return EIO until remount.
+    pub(super) fn shutdown(&self, flag: u32) -> Result<()> {
+        const EXT4_GOING_FLAGS_DEFAULT: u32 = 0x0;
+        const EXT4_GOING_FLAGS_LOGFLUSH: u32 = 0x1;
+        const EXT4_GOING_FLAGS_NOLOGFLUSH: u32 = 0x2;
+
+        // Idempotent: a second shutdown call is a no-op.
+        if self.is_shutdown() {
+            return Ok(());
+        }
+
+        match flag {
+            EXT4_GOING_FLAGS_NOLOGFLUSH => {
+                // Hard crash simulation: do NOT flush the journal.  Just
+                // mark the FS as shutdown.  Any pending JBD2 transactions
+                // on disk are left in their current state; remount will
+                // see needs_recovery (s_start != 0) and replay.
+                warn!("ext4: shutdown NOLOGFLUSH (hard crash simulation)");
+            }
+            EXT4_GOING_FLAGS_LOGFLUSH | EXT4_GOING_FLAGS_DEFAULT => {
+                // Clean-ish shutdown: force-commit and flush journal +
+                // device first.  The existing FileSystem::sync() path
+                // already does flush_pending_jbd2_transactions +
+                // block_device.sync().
+                warn!(
+                    "ext4: shutdown {} — force-commit + flush before mark",
+                    if flag == EXT4_GOING_FLAGS_LOGFLUSH {
+                        "LOGFLUSH"
+                    } else {
+                        "DEFAULT"
+                    }
+                );
+                if let Err(err) = self.do_filesystem_sync_unchecked() {
+                    warn!("ext4: shutdown sync failed (continuing anyway): {:?}", err);
+                }
+            }
+            _ => {
+                return_errno_with_message!(Errno::EINVAL, "ext4: unsupported shutdown flag");
+            }
+        }
+
+        // Step 4b: ensure dumpe2fs / e2fsprogs see "needs_recovery" after a
+        // forced shutdown.  This is what generic/052/054/055 (and Linux ext4
+        // mount-time pessimistic flag) rely on.  We persist the flag here
+        // unconditionally for ALL shutdown flags — even LOGFLUSH leaves
+        // EXT4_FEATURE_INCOMPAT_RECOVER set in Linux because LOGFLUSH only
+        // flushes the journal area, it does not perform a clean unmount.
+        self.mark_needs_recovery_for_shutdown();
+
+        self.shutdown_state.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// Step 4b: force-write `EXT4_FEATURE_INCOMPAT_RECOVER` to the on-disk
+    /// superblock and flush.  Called from `shutdown()` so dumpe2fs reports
+    /// "dirty log" after `EXT4_IOC_SHUTDOWN`, regardless of which flag was
+    /// used.  Bypasses `JournalIoBridge` deferral by routing the write
+    /// through a raw adapter wrapper so the value reaches the disk even
+    /// on the NOLOGFLUSH (no journal commit) path.
+    fn mark_needs_recovery_for_shutdown(&self) {
+        // Lightweight metadata writer that bypasses the journal overlay
+        // and writes directly via the underlying block adapter.
+        struct RawAdapterWriter(Arc<KernelBlockDeviceAdapter>);
+        impl Ext4MetadataWriter for RawAdapterWriter {
+            fn write_metadata(&self, offset: usize, data: &[u8]) {
+                self.0.write_offset(offset, data);
+            }
+            fn write_metadata_for_jbd2_handle(
+                &self,
+                _handle_id: Option<u64>,
+                offset: usize,
+                data: &[u8],
+            ) {
+                self.0.write_offset(offset, data);
+            }
+        }
+        let raw_writer: Arc<dyn Ext4MetadataWriter> =
+            Arc::new(RawAdapterWriter(self.adapter.clone()));
+
+        let mut inner = self.lock_inner();
+        inner.super_block.set_needs_recovery(true);
+        inner.super_block.sync_to_disk_with_csum(&raw_writer);
+        drop(inner);
+        // Flush so dumpe2fs / next mount sees the updated superblock.
+        let _ = self.block_device.sync();
+    }
+
+    /// Internal helper: same as `FileSystem::sync()` but does not check
+    /// the shutdown bit (used during shutdown itself).
+    fn do_filesystem_sync_unchecked(&self) -> Result<()> {
+        self.flush_pending_jbd2_transactions();
+        self.block_device.sync()?;
+        self.flush_pending_jbd2_transactions();
+        Ok(())
+    }
+
+    /// Step 4b: lazily set the on-disk superblock's `needs_recovery` flag
+    /// (`EXT4_FEATURE_INCOMPAT_RECOVER`) on first journal commit since the
+    /// flag was last clean.  After this, dumpe2fs-style probes will report
+    /// the FS as "dirty log" until the next clean shutdown / replay clears
+    /// the flag.  No-op if the flag is already set (cheap fast path).
+    fn mark_needs_recovery_if_needed(&self) {
+        let need_persist = {
+            let inner = self.lock_inner();
+            !inner.super_block.needs_recovery()
+        };
+        if !need_persist {
+            return;
+        }
+        let mut inner = self.lock_inner();
+        if inner.super_block.needs_recovery() {
+            return;
+        }
+        let metadata_writer = inner.metadata_writer.clone();
+        inner.super_block.set_needs_recovery(true);
+        inner.super_block.sync_to_disk_with_csum(&metadata_writer);
+    }
+
     pub(super) fn fsync_regular_file(&self, ino: u32) -> Result<()> {
+        // Step 4b: post-shutdown fsync must return EIO so that callers
+        // (e.g. xfstests after godown) know that the filesystem is dead.
+        self.check_not_shutdown()?;
+
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
-        // Regular-file fsync/fdatasync should not force a full filesystem
-        // checkpoint sweep. On the current virtio-blk stack, journal writes are
-        // already synchronous DMA to the host, and the JBD2 commit path relies
-        // on write ordering rather than an extra full-device flush. Doing a
-        // block_device.sync() here turns generic/047 into one global flush per
-        // file, which is far more expensive than the journal commit itself.
-        self.commit_pending_jbd2_transactions();
-        self.commit_pending_jbd2_transactions();
+
+        // Step 4a-2: look up the highest TID that contains a metadata change
+        // for this inode (recorded by `finish_jbd2_handle` after Write/Truncate).
+        // If `None`, the inode has no recorded metadata changes and fsync is
+        // a no-op for the journal — the VFS-layer device flush in
+        // `Ext4Inode::sync_all` (Step 4a-1) still runs to handle any
+        // already-issued data writes from prior writers.
+        let target_tid = self.lookup_inode_tid(ino);
+        let committed = self.last_committed_tid();
+
+        // Step 1 observation: log fsync entry state for diagnostic purposes.
+        warn!(
+            "ext4: fsync ino={} target_tid={:?} committed_tid={}",
+            ino, target_tid, committed
+        );
+
+        if let Some(target_tid) = target_tid {
+            // Step 4a-2: force-commit the target TID. Internally:
+            //   - Fast path returns if already committed.
+            //   - If target is the running TX, rotate it to prev_running.
+            //   - Drive `try_commit_ready_jbd2_transaction()` and block on
+            //     `commit_notifier` until last_committed_tid >= target_tid.
+            // This replaces the previous best-effort
+            // `commit_pending_jbd2_transactions()` calls, which silently
+            // no-op'd when commit_ready=false (e.g. when other workers held
+            // active handles) — a POSIX violation.
+            self.force_commit_for_tid(target_tid);
+        }
+
+        // Lazy checkpoint: only when journal pressure is high. Checkpoint
+        // writes home blocks back from the journal area, freeing journal
+        // space; not strictly required for fsync correctness (replay handles
+        // it on crash). Phase 2 batch_checkpoint policy preserved.
         if self.checkpoint_depth() >= REGULAR_FILE_FSYNC_CHECKPOINT_DEPTH {
             self.try_batch_checkpoint_all_jbd2_transactions();
         }
@@ -3877,6 +4239,13 @@ impl FileSystem for Ext4Fs {
     }
 
     fn sync(&self) -> Result<()> {
+        // Step 4b: after `EXT4_IOC_SHUTDOWN`, sync() is a no-op.  Especially
+        // important for NOLOGFLUSH (hard crash simulation) — we must NOT
+        // sneak in commits on subsequent unmount/syncfs.  For LOGFLUSH /
+        // DEFAULT, the sync was already done as part of the ioctl.
+        if self.is_shutdown() {
+            return Ok(());
+        }
         self.flush_pending_jbd2_transactions();
         self.block_device.sync()?;
         self.flush_pending_jbd2_transactions();

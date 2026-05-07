@@ -1,11 +1,11 @@
-# Asterinas EXT4 Environment（Current, Phase 2 收口）
+# Asterinas EXT4 Environment（Current, Phase 3 规划）
 
-更新时间：2026-05-05（Asia/Shanghai）
+更新时间：2026-05-06（Asia/Shanghai）
 
 ## 1. 目标与范围
 
-这份文档记录当前 ext4 Phase 2 收口的推荐环境。
-当前优先使用 Docker runner 复现功能回归；宿主机直跑只作为排障辅助。
+这份文档记录当前 ext4 Phase 3 规划阶段的推荐环境。
+当前优先使用 Docker runner 复现功能回归与 fsync/flush 预研测试；宿主机直跑只作为排障辅助。
 
 当前结论：
 
@@ -13,8 +13,9 @@
 2. Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`。
 3. 最新 baseline 日志：`benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`。
 4. fio read 已达标，fio write 最新正式确认值为 `87.01%`，作为后续性能优化项。
+5. Phase 3 已启动规划，优先固化 clone-ready Docker 测试入口，并收口 `fsync` / `fdatasync` / block flush / Linux 持久化语义。
 
-## 2. 当前结论（截至 2026-05-05）
+## 2. 当前结论（截至 2026-05-06）
 
 1. 当前有效工作树：`/home/lby/os_com_codex/asterinas`
 2. 当前功能 baseline：
@@ -172,13 +173,43 @@ timeout 1800s cargo osdk run \
   --initramfs='../.local/initramfs_phase4_part3.cpio.gz'
 ```
 
-## 8. 判定口径
+## 8. Phase 3 fsync/flush 测试入口
+
+### 8.1 Phase 3 专项（jbd_phase3_fsync_flush Docker mode）
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+
+PHASE4_DOCKER_MODE=jbd_phase3_fsync_flush \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+XFSTESTS_RUN_TIMEOUT_SEC=5400 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+说明：
+- Tier 1 shutdown 用例（generic/043-049/052/054/055/388/392）在 `EXT4_IOC_SHUTDOWN` 实现前（Step 4）全部 NOTRUN，是预期结果。
+- 全部 NOTRUN 不算失败，milestone 记录即可。
+
+### 8.2 fsync-heavy fio 预研（独立于 xfstests）
+
+```bash
+cd /home/lby/os_com_codex
+KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_write_16k_fsync4_summary.sh
+```
+
+用于暴露持久化语义，不作为普通吞吐宣传。
+
+## 9. 判定口径
 
 1. 看 case 结果：日志出现 `xfstests case done: generic/013 rc=0`
 2. 看总结果：日志出现 `All syscall tests passed.`
 3. 全量 `phase4_good` 看统计行：`phase4_good\tpass\tfail...`
 
-## 9. 已知问题与规避
+## 10. 已知问题与规避
 
 1. 本环境当前不是 Docker 封装链路，按仓库脚本 + QEMU 直跑。
 2. 曾出现“历史 root 权限污染目录”问题，已从仓库移出：
@@ -193,7 +224,7 @@ sudo rm -rf /home/lby/os_com_codex/garbage/asterinas_target_root_polluted_202604
             /home/lby/os_com_codex/garbage/asterinas_target_lby_root_backup_20260407
 ```
 
-## 10. 一次性快速复现（最短路径）
+## 11. 一次性快速复现（最短路径）
 
 ```bash
 cd /home/lby/os_com_codex/asterinas

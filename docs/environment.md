@@ -1,11 +1,11 @@
-# Asterinas EXT4 Environment（Current, Phase 2 收口）
+# Asterinas EXT4 Environment（Current, Phase 3 规划）
 
-更新时间：2026-05-05（Asia/Shanghai）
+更新时间：2026-05-06（Asia/Shanghai）
 
 ## 1. 目标与范围
 
-这份文档记录当前 ext4 Phase 2 收口的推荐环境。
-当前优先使用 Docker runner 复现功能回归；宿主机直跑只作为排障辅助。
+这份文档记录当前 ext4 Phase 3 规划阶段的推荐环境。
+当前优先使用 Docker runner 复现功能回归与 fsync/flush 预研测试；宿主机直跑只作为排障辅助。
 
 当前结论：
 
@@ -13,8 +13,9 @@
 2. Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`。
 3. 最新 baseline 日志：`benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`。
 4. fio read 已达标，fio write 最新正式确认值为 `87.01%`，作为后续性能优化项。
+5. Phase 3 已启动规划，优先固化 clone-ready Docker 测试入口，并收口 `fsync` / `fdatasync` / block flush / Linux 持久化语义。
 
-## 2. 当前结论（截至 2026-05-05）
+## 2. 当前结论（截至 2026-05-06）
 
 1. 当前有效工作树：`/home/lby/os_com_codex/asterinas`
 2. 当前功能 baseline：

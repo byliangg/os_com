@@ -1,6 +1,6 @@
 # Asterinas EXT4 + JBD2 赛题版本
 
-本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 2 收口状态**：在 Asterinas 上实现 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery，并完成多文件并发读写 correctness baseline、核心 xfstests 回归、crash matrix、lmbench 与 fio 守底验证。
+本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 3 规划状态**：Phase 2 已完成 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery、多文件并发读写 correctness baseline、核心 xfstests 回归、crash matrix、lmbench 与 fio 守底验证；Phase 3 聚焦 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐。
 
 当前日期口径：2026-05-06（Asia/Shanghai）；最新功能验证基线为 2026-05-05。
 
@@ -13,6 +13,7 @@
 - fio O_DIRECT 性能 Phase 1：顺序读写已达到守底目标，最新 JBD2 收口后结果为 read `93.49%`、write `87.01%`（对比 Linux ext4）。
 - JBD2 Phase 1：已完成完整事务管理、日志写盘、checkpoint、dirty journal recovery、crash 注入与旧 CrashJournal 移除。
 - JBD2 Phase 2：多文件并发读写 correctness baseline 已收口；完成锁顺序文档化、`runtime_block_size` 显式化、handle-local context、operation-local allocator guard、allocator/block-group correctness 协议、目录 cache-backed readdir，以及 Step 8 fio write profile。
+- JBD2 Phase 3：已完成预研测试与计划模板，当前准备从环境/测试资产固化开始，后续收口 raw block fd、virtio-blk 与 ext4 regular-file 的 fsync/flush 持久化语义。
 
 ### Phase 2 收口结论
 
@@ -242,6 +243,9 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | `docs/feature_jbd2_phase2_plan.md` | JBD2 Phase 2 实现计划（先 correctness，再性能） |
 | `docs/feature_jbd2_phase2_lock_order.md` | JBD2 Phase 2 锁顺序、同步原语与回退约定 |
 | `docs/feature_jbd2_phase2_milestone.md` | JBD2 Phase 2 进度跟踪模板 |
+| `docs/feature_jbd2_phase3_pretest.md` | JBD2 Phase 3 预研测试，记录 fsync/flush 语义风险与 fsync-heavy fio 现象 |
+| `docs/feature_jbd2_phase3_plan.md` | JBD2 Phase 3 实现计划，覆盖环境固化、raw/virtio/ext4 fsync/flush 语义收口 |
+| `docs/feature_jbd2_phase3_milestone.md` | JBD2 Phase 3 进度跟踪模板 |
 | `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
 | `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
 | `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |
@@ -256,6 +260,7 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 - `rename_across_dir` crash 场景函数已保留，但 marker 触发不稳定，未纳入默认 crash matrix；默认矩阵每轮 9 个场景，最新收口复跑两轮共 18/18 PASS。
 - `STATIC_BLOCKED` 用例主要来自当前阶段未覆盖的 Linux ext4 语义或环境能力，例如 hardlink/symlink、AIO、xattr/chacl、renameat2、部分 fallocate/fiemap/collapse-range、device-mapper crash tests。
 - 多文件并发基本读写 correctness 已完成；更激进拆锁、更高并发吞吐、PageCache 深度优化与 fio write >= 90% 属于后续性能 hardening。
+- Phase 3 开始前确认：`bs=16K fsync=4` 预研中 Asterinas sync latency 远低于 Linux，说明现有 fsync/flush 语义仍需收口；该结果在修复前不能作为性能宣传。
 
 ## 来源说明
 

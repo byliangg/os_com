@@ -1,0 +1,35 @@
+# Phase 3 fsync/flush durability list
+# Goal: validate fsync/fdatasync持久化语义、EXT4_IOC_SHUTDOWN + journal replay。
+#
+# Tier 1: 仅依赖 _require_scratch_shutdown (src/godown + EXT4_IOC_SHUTDOWN)。
+# 当前 EXT4_IOC_SHUTDOWN 尚未实现 (Step 4)，所有用例将 NOTRUN——这是预期结果。
+# Step 4 接入真实 ioctl 后，本 list 作为 Phase 3 主要 xfstests 证据。
+#
+# 关键用例：
+#   generic/047 — force-commit 后 inode size/extent 持久性（最小 fsync durability 验证）
+#   generic/392 — fsync 与 fdatasync 恢复后 metadata 边界区分（唯一直接验证两者差异的 case）
+#   generic/388 — recovery 后立刻再 shutdown，验证 replay idempotency
+#   generic/052/054/055 — log replay 基础 + logstate 探测（需 dumpe2fs）
+#
+# Tier 2 (dm-flakey 依赖，blocked): 见 blocked/jbd_phase3_excluded.tsv
+# Tier 3 (dm-log-writes 等，推迟): 见 blocked/jbd_phase3_excluded.tsv
+
+# --- generic: NULL files / inode size after fsync/sync/fdatasync ---
+generic/043
+generic/044
+generic/045
+generic/046
+generic/047
+generic/048
+generic/049
+
+# --- generic: log replay via shutdown + logstate probe ---
+generic/052
+generic/054
+generic/055
+
+# --- generic: recovery idempotency (repeated shutdown after replay) ---
+generic/388
+
+# --- generic: fsync vs fdatasync metadata distinction (CRITICAL) ---
+generic/392

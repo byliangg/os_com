@@ -1,6 +1,6 @@
 # Asterinas EXT4 Benchmark 最新结果快照
 
-更新时间：2026-05-05（Asia/Shanghai）
+更新时间：2026-05-06（Asia/Shanghai）
 
 ## 1. 本文用途
 
@@ -53,6 +53,13 @@
 - Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`
 - 最新 baseline 日志：`asterinas/benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
 - 说明：`EXT4_PHASE2_WORKERS=8 EXT4_PHASE2_ROUNDS=64 EXT4_PHASE2_SEED=100` 属于额外高压探针，曾观察到偶发短读/extent mapping 风险，不作为当前功能验收基线。
+
+### 2.6 JBD2 Phase 3 fsync/flush 预研基线
+
+- Phase 3 当前进入规划阶段，目标是收口 `fsync` / `fdatasync` / block flush / Linux 持久化语义，不把 fsync-heavy 结果混入普通顺序吞吐指标。
+- 预研记录见 `feature_jbd2_phase3_pretest.md`。
+- `bs=16K + fsync=4` 预研显示 Asterinas sync latency 远低于 Linux：raw `302 ns` vs Linux `1913.51 us`，ext4 journaled `50.13 us` vs Linux `3337.87 us`。
+- 初步判断：raw block fd `fsync` 可能没有触达底层 flush；ext4 regular-file `fsync` 当前不是 Linux 等价持久化屏障；该组结果在语义收口前不能作为性能宣传。
 
 ## 3. 当前 fio 参数口径
 
@@ -148,7 +155,77 @@ bash test/initramfs/src/benchmark/bench_linux_and_aster.sh <job> x86_64
 - `fio/ext4_seq_write_bw`
 - `fio/ext4_seq_read_bw`
 
-## 5. 当前观察与说明
+## 5. 整体综合测试（按需运行）
+
+> **注意**：本节测试耗时约 30 分钟，仅在需要诊断各层开销时运行，日常评审和功能验收不需要跑。
+
+### 5.1 测试目的
+
+通过对比 raw 裸设备、ext4 有日志、ext4 无日志三种配置的顺序读写带宽，完成以下开销分解：
+
+- **raw vs ext4 nojournal**：文件系统层（extent 查找、inode 更新）本身的开销
+- **ext4 nojournal vs ext4 journaled**：JBD2 日志层的写开销
+- **Asterinas raw vs Linux raw**：virtio-blk / 块设备驱动层的差距
+
+### 5.2 6 个测试项
+
+| # | job | filename | rw | 说明 |
+|---|-----|----------|----|------|
+| 1 | `fio/raw_seq_read_bw` | `/dev/vda` | read | 裸块设备，理论读上限 |
+| 2 | `fio/raw_seq_write_bw` | `/dev/vda` | write | 裸块设备，理论写上限 |
+| 3 | `fio/ext4_seq_read_bw` | `/ext4/fio-test` | read | 有日志 ext4，与官方评审口径相同 |
+| 4 | `fio/ext4_seq_write_bw` | `/ext4/fio-test` | write | 有日志 ext4，与官方评审口径相同 |
+| 5 | `fio/ext4_nojournal_seq_read_bw` | `/ext4/fio-test` | read | 无日志 ext4（`^has_journal`） |
+| 6 | `fio/ext4_nojournal_seq_write_bw` | `/ext4/fio-test` | write | 无日志 ext4（`^has_journal`） |
+
+6 个测试共用相同 fio 参数，与官方评审口径完全对齐：
+
+```bash
+-size=1G -bs=1M
+-ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1
+-time_based=1 -ramp_time=60 -runtime=100
+```
+
+### 5.3 入口与运行方法
+
+```bash
+cd /home/lby/os_com_codex
+./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+```
+
+- 脚本：`asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh`
+- 行为：顺序执行 6 个 job，每个都跑 Asterinas 和 Linux 两侧，最后打印汇总
+- 日志：默认执行完自动清理；如需保留日志排查问题，加 `KEEP_LOGS=1`：
+
+```bash
+KEEP_LOGS=1 ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+```
+
+- 仅跑 Asterinas 侧（跳过 Linux，节省一半时间）：
+
+```bash
+BENCH_RUN_ONLY=aster ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+```
+
+### 5.4 最新结果（2026-05-06）
+
+| 测试 | Asterinas | Linux | Aster/Linux |
+|------|----------:|------:|:-----------:|
+| raw read | 2849 MB/s | 7039 MB/s | 40.47% |
+| raw write | 2163 MB/s | 3719 MB/s | 58.16% |
+| ext4 journaled read | 5735 MB/s | 3798 MB/s | 151.00% |
+| ext4 journaled write | 2081 MB/s | 3323 MB/s | 62.62% |
+| ext4 nojournal read | 5696 MB/s | 3419 MB/s | 166.60% |
+| ext4 nojournal write | 2124 MB/s | 3671 MB/s | 57.86% |
+
+关键结论：
+
+- Asterinas ext4 read（5735 MB/s）> raw read（2849 MB/s）：Phase 1 speculative readahead 的效果，ext4 路径有预读加速，裸设备访问没有。
+- JBD2 写开销极小：nojournal（2124）vs journaled（2081）差 ~43 MB/s（约 2%），符合"JBD2 只记录 metadata，不记录数据"的设计。
+- 写瓶颈在 virtio-blk / sync 路径，不在 FS 层或日志层。
+- 本轮 Linux 侧出现 `kvm_intel: VMX not supported by CPU 0`，Linux 绝对值仅供参考，以 Asterinas 绝对值为主。
+
+## 7. 当前观察与说明
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。
 - 2026-04-24 的 ext4 结果来自 JBD2 Phase 1 收口后的 fio 守底复跑：read `93.49%`、write `87.01%`，满足 Phase 1 “相对基线不下降超过 5 个百分点”的守底线（read ≥ 90%、write ≥ 85%）。
@@ -158,7 +235,7 @@ bash test/initramfs/src/benchmark/bench_linux_and_aster.sh <job> x86_64
 - 因此当前结果适合用于“本地最新观测值”和方案推进参考。
 - 如果后续要写正式 milestone 或对外结论，建议同时记录该环境现象，避免把 Linux 对照侧异常忽略掉。
 
-## 6. 对应仓库内文档
+## 8. 对应仓库内文档
 
 - 根目录：`benchmark.md`
 - 仓库内同步副本：`asterinas/benchmark/benchmark.md`

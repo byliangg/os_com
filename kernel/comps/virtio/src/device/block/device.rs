@@ -602,12 +602,19 @@ impl DeviceInner {
     /// Flushes any cached data from the guest to the persistent storage on the host.
     /// This will be ignored if the device doesn't support the `VIRTIO_BLK_F_FLUSH` feature.
     fn flush(&self, bio_request: BioRequest) {
-        if self.features.support_flush {
+        if !self.features.support_flush {
+            // Device does not advertise VIRTIO_BLK_F_FLUSH: complete the bio
+            // without issuing a flush request to avoid errors on such devices.
+            log::warn!("virtio-blk: flush() support_flush=false → device has no flush, marking complete");
             bio_request.bios().for_each(|bio| {
                 bio.complete(BioStatus::Complete);
             });
             return;
         }
+
+        // Device advertises VIRTIO_BLK_F_FLUSH: send a real ReqType::Flush request.
+        // Step 1/3 observation: this is the path executed when support_flush=true.
+        log::warn!("virtio-blk: flush() support_flush=true → sending ReqType::Flush to device");
 
         let id = self.id_allocator.alloc();
         let req_slice = {

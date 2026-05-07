@@ -1,0 +1,19 @@
+test	reason
+# Static exclusions for Phase 3 fsync/flush durability scope.
+# Tier 2: dm-flakey 依赖，当前 Asterinas 无 device-mapper 支持，由自研 host-crash 场景补位。
+# Tier 3: dm-log-writes / thin-pool / reflink / dm-error，推迟到后续 phase。
+
+# --- Tier 2: requires dm-flakey ---
+generic/311	requires dm-flakey; self-developed host_crash_fsync_size_durability補位 (对标 generic/047+311)
+generic/321	requires dm-flakey; directory fsync corner cases; host_crash_dir_fsync 補位
+generic/322	requires dm-flakey; rename+fsync crash replay; host_crash_rename_fsync_dst 補位
+generic/335	requires dm-flakey; cross-dir rename+fsync(parent); host_crash_rename_fsync_dst parent variant 補位
+generic/341	requires dm-flakey; rename dir+new entry fsync; host_crash_rename_fsync_dst dir variant 補位
+generic/342	requires dm-flakey; rename file+old-name recreate fsync; host_crash_rename_fsync_dst old-name variant 補位
+generic/376	requires dm-flakey; same-dir rename+recreate fsync; host_crash_rename_fsync_dst same-dir variant 補位
+
+# --- Tier 3: requires dm-log-writes / thin-pool / reflink / dm-error ---
+generic/455	requires dm-log-writes+dm-thin-pool; fsx power-fail safeness; deferred
+generic/457	requires dm-log-writes+dm-thin-pool+reflink; cloned files power-fail; deferred
+generic/482	requires dm-log-writes+dm-thin-pool; per-FUA consistency check; deferred
+generic/648	requires dm-error+reflink+nested recovery; deferred

@@ -40,11 +40,15 @@ prepare_libs() {
 
 # Prepare fs for Linux
 prepare_fs() {
-    if [[ "${benchmark:-}" == */ext4_* || "${benchmark:-}" == ext4_* ]]; then
+    if [[ "${benchmark:-}" == */ext4_nojournal_* || "${benchmark:-}" == ext4_nojournal_* ]]; then
+        # No-journal ext4 benchmark: format without journal feature.
+        mke2fs -t ext4 -F -q -O ^has_journal "${BENCHMARK_ROOT}/../../build/ext2.img"
+        e2fsck -f -y "${BENCHMARK_ROOT}/../../build/ext2.img" || true
+    elif [[ "${benchmark:-}" == */ext4_* || "${benchmark:-}" == ext4_* ]]; then
         # Ext4 benchmark: keep Linux side media as ext4.
         mkfs.ext4 -F "${BENCHMARK_ROOT}/../../build/ext2.img"
     else
-        # Ext2/non-ext4 benchmark: keep historical ext2 compatibility profile.
+        # Ext2/non-ext4 benchmark (including raw): keep historical ext2 compatibility profile.
         mke2fs -F -O ^ext_attr -O ^resize_inode -O ^dir_index "${BENCHMARK_ROOT}/../../build/ext2.img"
     fi
     make initramfs BENCHMARK=${benchmark}

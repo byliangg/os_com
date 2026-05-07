@@ -1,0 +1,11 @@
+alert:
+  bigger_is_better: true
+  threshold: 125%
+chart:
+  description: fio -filename=/dev/vda -size=1G -bs=16K -direct=1 -fsync=4
+  legend: Average file write bandwidth on {system}
+  title: '[Raw device] The bandwidth of sequential writes (bs=16K, fsync=4)'
+  unit: MB/s
+result_extraction:
+  result_index: 2
+  search_pattern: bw=[0-9]+

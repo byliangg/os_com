@@ -39,6 +39,9 @@ else
     phase6_only|phase6_with_guard)
       XFSTESTS_CASE_TIMEOUT_SEC=1200
       ;;
+    jbd_phase3_fsync_flush)
+      XFSTESTS_CASE_TIMEOUT_SEC=1200
+      ;;
     *)
       XFSTESTS_CASE_TIMEOUT_SEC=600
       ;;
@@ -54,6 +57,9 @@ if [ -n "${XFSTESTS_RUN_TIMEOUT_SEC+x}" ]; then
 else
   case "${MODE}" in
     phase6_only|phase6_with_guard)
+      XFSTESTS_RUN_TIMEOUT_SEC=5400
+      ;;
+    jbd_phase3_fsync_flush)
       XFSTESTS_RUN_TIMEOUT_SEC=5400
       ;;
     *)
@@ -114,6 +120,7 @@ DOCKER_ENV_ARGS=(
   -e XFSTESTS_XFS_IO_DEBUG="${XFSTESTS_XFS_IO_DEBUG}"
   -e XFSTESTS_SPARSE_PROBE_LOG="${XFSTESTS_SPARSE_PROBE_LOG}"
   -e RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}"
+  -e RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}"
   -e BOOT_METHOD="${BOOT_METHOD}"
   -e OVMF="${OVMF}"
   -e RELEASE_LTO="${RELEASE_LTO}"
@@ -201,6 +208,7 @@ run_part3_with_flags() {
     RUN_CRASH_SUITE="${RUN_CRASH_SUITE}" RUN_PHASE4_GOOD="${RUN_PHASE4_GOOD}" \
     RUN_PHASE3_BASE="${RUN_PHASE3_BASE}" RUN_PHASE6_GOOD="${RUN_PHASE6_GOOD}" RUN_LMBENCH="${RUN_LMBENCH}" \
     RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}" RUN_PHASE2_CONCURRENCY="${RUN_PHASE2_CONCURRENCY:-0}" \
+    RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}" \
     tools/ext4/run_phase4_part3.sh
 }
 
@@ -243,11 +251,16 @@ case "${PHASE4_DOCKER_MODE}" in
     ;;
   jbd_phase2_concurrency)
     echo "[INFO] mode=jbd_phase2_concurrency (only ext4 Phase 2 concurrency baseline)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=1 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=1 RUN_JBD_PHASE3=0 run_part3_with_flags
+    ;;
+  jbd_phase3_fsync_flush)
+    echo "[INFO] mode=jbd_phase3_fsync_flush (Phase 3 fsync/flush durability xfstests)"
+    echo "[INFO] Tier 1 tests will NOTRUN until EXT4_IOC_SHUTDOWN is implemented (Step 4)."
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=1 run_part3_with_flags
     ;;
   *)
     echo "Error: unsupported PHASE4_DOCKER_MODE=${PHASE4_DOCKER_MODE}" >&2
-    echo "Supported: phase4_good | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency" >&2
+    echo "Supported: phase4_good | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush" >&2
     exit 3
     ;;
 esac

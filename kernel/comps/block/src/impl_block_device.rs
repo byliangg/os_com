@@ -97,6 +97,10 @@ impl dyn BlockDevice {
 
     /// Issues a sync request
     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+        // Step 1 observation: confirm whether this is actually reached.
+        // With current ext4 regular-file fsync path this should NOT be called
+        // (fsync_regular_file() skips block_device.sync()). Remove after Step 1.
+        log::warn!("block: BlockDevice::sync() called — BioType::Flush will be submitted");
         let bio = Bio::new(
             BioType::Flush,
             Sid::from(Bid::from_offset(0)),

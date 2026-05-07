@@ -5,9 +5,11 @@ use core::time::Duration;
 
 use device_id::DeviceId;
 use ext4_rs::{EXT4_ROOT_INODE, InodeFileType, SimpleInodeMeta};
+use ostd::mm::VmIo;
 
 use super::fs::Ext4Fs;
 use crate::{
+    current_userspace,
     device,
     fs::{
         inode_handle::FileIo,
@@ -18,7 +20,17 @@ use crate::{
     },
     prelude::*,
     process::{Gid, Uid},
+    util::ioctl::RawIoctl,
 };
+
+// Step 4b: `FS_IOC_GOINGDOWN = _IOR('X', 125, __u32)` from Linux
+// `include/uapi/linux/fs.h`.  ext4 implements this as `EXT4_IOC_SHUTDOWN`.
+// We match the raw cmd value rather than going through `dispatch_ioctl!`
+// because Linux declares this ioctl with direction `_IOR` (kernel→user) for
+// historical reasons even though the actual usage is "user passes a flag
+// pointer that the kernel reads from".  Asterinas's typed ioctl framework
+// would reject this direction/data mismatch.  See xfstests `src/godown.c`.
+const EXT4_IOC_SHUTDOWN: u32 = 0x8004_587d;
 
 #[derive(Debug)]
 pub(super) struct Ext4Inode {
@@ -454,8 +466,17 @@ impl Inode for Ext4Inode {
     fn sync_all(&self) -> Result<()> {
         let fs = self.ext4_fs()?;
         if self.type_() == InodeType::File {
-            fs.fsync_regular_file(self.ino)
+            // Step 4a-1: mirror ext2 `impl_for_vfs/inode.rs:224-234` pattern —
+            // fs-internal fsync (JBD2 commit) + VFS-layer device flush.
+            // The trailing block_device().sync() ensures the journal commit
+            // block (and any in-flight metadata writes) reach durable storage,
+            // making this fsync host-crash safe (was missing prior to 4a-1).
+            fs.fsync_regular_file(self.ino)?;
+            fs.block_device().sync().map_err(|_| Error::new(Errno::EIO))?;
+            Ok(())
         } else {
+            // Directory / other types: fall back to fs-wide sync (already
+            // includes block_device.sync() inside).
             fs.sync()
         }
     }
@@ -463,7 +484,11 @@ impl Inode for Ext4Inode {
     fn sync_data(&self) -> Result<()> {
         let fs = self.ext4_fs()?;
         if self.type_() == InodeType::File {
-            fs.fsync_regular_file(self.ino)
+            // Step 4a-1: same pattern as sync_all. fdatasync semantics are
+            // currently equivalent to fsync (conservative); see plan §4.6.
+            fs.fsync_regular_file(self.ino)?;
+            fs.block_device().sync().map_err(|_| Error::new(Errno::EIO))?;
+            Ok(())
         } else {
             fs.sync()
         }
@@ -471,6 +496,26 @@ impl Inode for Ext4Inode {
 
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.ext4_fs().unwrap()
+    }
+
+    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+        // Step 4b: handle `EXT4_IOC_SHUTDOWN` (== `FS_IOC_GOINGDOWN`) so
+        // xfstests `src/godown` can simulate forced shutdown via the real
+        // kernel ioctl path (not the legacy `sync + needs_recovery marker`
+        // shim, which has been retired in jbd_phase3_fsync_durability mode).
+        if raw_ioctl.cmd() == EXT4_IOC_SHUTDOWN {
+            // The argument is a `*const u32` flag; read it from userspace.
+            // See Linux `EXT4_GOING_FLAGS_*` constants:
+            //   0x0 = DEFAULT, 0x1 = LOGFLUSH, 0x2 = NOLOGFLUSH.
+            // Use the inline chain form (mirrors `syscall/futex.rs`) — the
+            // intermediate `current_userspace!()` value is a temporary that
+            // cannot outlive the call.
+            let flag: u32 = current_userspace!().read_val(raw_ioctl.arg())?;
+            let fs = self.ext4_fs()?;
+            fs.shutdown(flag)?;
+            return Ok(0);
+        }
+        return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported on this ext4 inode");
     }
 
     fn is_dentry_cacheable(&self) -> bool {

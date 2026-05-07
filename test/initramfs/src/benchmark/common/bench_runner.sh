@@ -23,6 +23,17 @@ is_ext4_benchmark() {
     esac
 }
 
+is_raw_benchmark() {
+    case "${BENCHMARK_NAME}" in
+        */raw_*|raw_*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_mountpoint_present() {
     local mp="$1"
     awk -v p="${mp}" '$2==p { found=1; exit 0 } END { exit(found ? 0 : 1) }' /proc/mounts
@@ -68,6 +79,8 @@ prepare_system() {
         if is_ext4_benchmark; then
             mount -t ext4 /dev/vda /ext4
             echo "Mounted ext4 benchmark fs on /dev/vda -> /ext4"
+        elif is_raw_benchmark; then
+            echo "Raw benchmark: skipping /dev/vda mount"
         else
             mount -t ext2 /dev/vda /ext2
             echo "Mounted ext2 benchmark fs on /dev/vda -> /ext2"

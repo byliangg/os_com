@@ -1,15 +1,18 @@
+[Info] [normal] Forwarded QEMU guest port: 42138->22; 2862->8080 55900->6379 64185->5201 31461->31234 54256->31236 38259->11211
+[Info] [test] Forwarded QEMU guest port: 48901->22; 39546->8080 11817->6379 60739->5201 32442->31234 17870->31236 60063->11211
 warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
   |
   = note: this feature is not stably supported; its behavior can change in the future
 
-warning: `linux-boot-params` (lib) generated 1 warning
-warning: `align_ext` (lib) generated 1 warning (1 duplicate)
-warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
-warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
-warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
-warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning
 warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
 warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
 warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
  --> /root/asterinas/third_party/core2/src/lib.rs:1:42
   |
@@ -20,24 +23,14 @@ warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no long
 
 warning: `ostd` (lib) generated 1 warning (1 duplicate)
 warning: `core2` (lib) generated 2 warnings (1 duplicate)
-warning: `jhash` (lib) generated 1 warning (1 duplicate)
 warning: `component` (lib) generated 1 warning (1 duplicate)
 warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
 warning: `aster-util` (lib) generated 1 warning (1 duplicate)
 warning: `aster-console` (lib) generated 1 warning (1 duplicate)
 warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
 warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
 warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
-warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
-warning: `device-id` (lib) generated 1 warning (1 duplicate)
-warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
-warning: `aster-time` (lib) generated 1 warning (1 duplicate)
-warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
-warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
-warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
-warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
-warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
-warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
 warning: `xarray` (lib) generated 1 warning (1 duplicate)
 warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
 warning: unexpected `cfg` condition name: `fuzzing`
@@ -115,18 +108,44 @@ warning: the feature `error_in_core` has been stable since 1.81.0 and no longer 
   |
   = note: `#[warn(stable_features)]` on by default
 
-warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
-warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
 warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
 warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
 warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
 warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
 warning: `aster-network` (lib) generated 1 warning (1 duplicate)
 warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
 warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
-warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:75:7
+   |
+75 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1450:8
+     |
+ 895 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1450 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
 warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
-    Finished `release-lto` profile [optimized] target(s) in 0.11s
+    Finished `release-lto` profile [optimized] target(s) in 0.10s
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
@@ -151,8 +170,8 @@ Press Ctrl-B to configure iPXE (PCI 00:02.0)...
 
 Booting from ROM..WARN: IOMMU initialization error:NoIommu
 [kernel] OSTD initialized. Preparing components.
-[32m[     0.539][0m [93mWARN [0m: [39mFramebuffer not found[0m
-[32m[     0.540][0m [93mWARN [0m: [39mFramebuffer not initialized[0m
+[32m[     0.552][0m [93mWARN [0m: [39mFramebuffer not found[0m
+[32m[     0.553][0m [93mWARN [0m: [39mFramebuffer not initialized[0m
 [kernel] Spawn the first kernel thread
 [kernel] unpacking the initramfs.cpio.gz to rootfs ...
 [kernel] rootfs is ready
@@ -199,7 +218,7 @@ Running ext4 crash-recovery tests...
 [32m[     1.126][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
 [32m[     1.127][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
 [32m[     1.130][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.133][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.136][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.138][0m [93mWARN [0m: [39mext4: replay hold point reached for op=rename stage=after_commit (kill VM now to simulate power loss)[0m
-qemu-system-x86_64: terminating on signal 15 from pid 1110 ()
+[32m[     1.132][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.135][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.137][0m [93mWARN [0m: [39mext4: replay hold point reached for op=rename stage=after_commit (kill VM now to simulate power loss)[0m
+qemu-system-x86_64: terminating on signal 15 from pid 1104 ()

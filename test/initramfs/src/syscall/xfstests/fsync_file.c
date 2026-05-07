@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -85,15 +86,50 @@ static int do_pwrite_op(int fd, const char *offset_str, const char *length_str, 
     return 0;
 }
 
+static int do_truncate_op(int fd, const char *size_str) {
+    char *end = NULL;
+    unsigned long long size;
+
+    errno = 0;
+    size = strtoull(size_str, &end, 0);
+    if (errno != 0 || end == size_str || *end != '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    return ftruncate(fd, (off_t)size);
+}
+
+static int do_fpunch_op(int fd, const char *offset_str, const char *len_str) {
+    char *end = NULL;
+    unsigned long long offset, len;
+
+    errno = 0;
+    offset = strtoull(offset_str, &end, 0);
+    if (errno != 0 || end == offset_str || *end != '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    errno = 0;
+    len = strtoull(len_str, &end, 0);
+    if (errno != 0 || end == len_str || *end != '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                     (off_t)offset, (off_t)len);
+}
+
 int main(int argc, char *argv[]) {
     int fd;
     int rc;
     const char *op;
     const char *path;
 
-    if (argc != 3 && argc != 6) {
+    if (argc < 3) {
         fprintf(stderr, "usage: %s <fsync|fdatasync|syncfs> <path>\n", argv[0]);
         fprintf(stderr, "   or: %s pwrite <path> <offset> <length> <fill_byte>\n", argv[0]);
+        fprintf(stderr, "   or: %s truncate <path> <size>\n", argv[0]);
+        fprintf(stderr, "   or: %s fpunch <path> <offset> <length>\n", argv[0]);
         return 2;
     }
 
@@ -102,6 +138,10 @@ int main(int argc, char *argv[]) {
 
     if (strcmp(op, "pwrite") == 0) {
         fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    } else if (strcmp(op, "truncate") == 0) {
+        fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+    } else if (strcmp(op, "fpunch") == 0) {
+        fd = open(path, O_RDWR | O_CLOEXEC);
     } else {
         fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -120,6 +160,20 @@ int main(int argc, char *argv[]) {
             return 2;
         }
         rc = do_pwrite_op(fd, argv[3], argv[4], argv[5]);
+    } else if (strcmp(op, "truncate") == 0) {
+        if (argc != 4) {
+            fprintf(stderr, "%s: truncate requires <path> <size>\n", argv[0]);
+            close(fd);
+            return 2;
+        }
+        rc = do_truncate_op(fd, argv[3]);
+    } else if (strcmp(op, "fpunch") == 0) {
+        if (argc != 5) {
+            fprintf(stderr, "%s: fpunch requires <path> <offset> <length>\n", argv[0]);
+            close(fd);
+            return 2;
+        }
+        rc = do_fpunch_op(fd, argv[3], argv[4]);
     } else {
         rc = do_sync_op(op, fd);
     }

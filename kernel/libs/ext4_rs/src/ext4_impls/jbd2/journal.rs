@@ -61,6 +61,11 @@ pub struct JournalRuntime {
     committing: Option<JournalTransaction>,
     checkpoint_list: VecDeque<JournalTransaction>,
     active_handles: VecDeque<JournalHandle>,
+    /// Highest TID whose `finish_commit` has succeeded.  Used by the host's
+    /// fsync force-commit fast path: if `last_committed_tid >= target_tid`,
+    /// the inode's metadata is already on disk and no further commit work
+    /// is needed.  Step 4a-2.
+    last_committed_tid: u32,
     debug_stats: JournalRuntimeDebugStats,
     overlay_reads: AtomicU64,
     overlay_hits: AtomicU64,
@@ -78,6 +83,7 @@ impl JournalRuntime {
             committing: None,
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
+            last_committed_tid: 0,
             debug_stats: JournalRuntimeDebugStats::default(),
             overlay_reads: AtomicU64::new(0),
             overlay_hits: AtomicU64::new(0),
@@ -95,6 +101,7 @@ impl JournalRuntime {
             committing: None,
             checkpoint_list: VecDeque::new(),
             active_handles: VecDeque::new(),
+            last_committed_tid: 0,
             debug_stats: JournalRuntimeDebugStats::default(),
             overlay_reads: AtomicU64::new(0),
             overlay_hits: AtomicU64::new(0),
@@ -123,6 +130,12 @@ impl JournalRuntime {
 
     pub fn checkpoint_depth(&self) -> usize {
         self.checkpoint_list.len()
+    }
+
+    /// Returns the highest TID whose `finish_commit` has succeeded.
+    /// Step 4a-2: used by `Ext4Fs::force_commit_for_tid` fast path.
+    pub fn last_committed_tid(&self) -> u32 {
+        self.last_committed_tid
     }
 
     pub fn active_handle(&self) -> Option<&JournalHandle> {
@@ -582,6 +595,10 @@ impl JournalRuntime {
         transaction.set_state(JournalTransactionState::Checkpoint);
         transaction.set_checkpoint_range(start_block, next_head);
         self.checkpoint_list.push_back(transaction);
+        // Step 4a-2: advance last_committed_tid monotonically.
+        if tid > self.last_committed_tid {
+            self.last_committed_tid = tid;
+        }
         self.debug_stats.finished_commits = self.debug_stats.finished_commits.saturating_add(1);
         true
     }

@@ -34,6 +34,8 @@ PHASE6_GOOD_LIST=${SCRIPT_DIR}/testcases/phase6_good.list
 PHASE6_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase6_excluded.tsv
 JBD_PHASE1_LIST=${SCRIPT_DIR}/testcases/jbd_phase1.list
 JBD_PHASE1_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/jbd_phase1_excluded.tsv
+JBD_PHASE3_LIST=${SCRIPT_DIR}/testcases/jbd_phase3_fsync_durability.list
+JBD_PHASE3_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/jbd_phase3_excluded.tsv
 
 BASE_LIST=""
 STATIC_EXCLUDED=""
@@ -845,6 +847,14 @@ emulate_one() {
             echo "fiemap [offset [len]]"
             return 0
             ;;
+        help\ fpunch*)
+            echo "fpunch offset len"
+            return 0
+            ;;
+        help\ truncate*)
+            echo "truncate offset"
+            return 0
+            ;;
         pwrite*)
             emulate_pwrite "${cmd}"
             return $?
@@ -861,6 +871,32 @@ emulate_one() {
         fiemap*)
             emulate_fiemap
             return 0
+            ;;
+        truncate*)
+            # xfs_io truncate N  →  ftruncate(fd, N)
+            # N may have a size suffix (k/K/m/M/g/G); use parse_size to expand.
+            local sz_raw sz
+            sz_raw=$(echo "${cmd}" | awk '{print $2}')
+            sz=$(parse_size "${sz_raw}")
+            if [ -n "${target}" ] && [ -x /opt/xfstests/fsync_file ]; then
+                /opt/xfstests/fsync_file truncate "${target}" "${sz}" >/dev/null 2>&1
+                return $?
+            fi
+            return 1
+            ;;
+        fpunch*)
+            # xfs_io fpunch OFFSET LEN  →  fallocate(PUNCH_HOLE|KEEP_SIZE)
+            # Both OFFSET and LEN may have size suffixes.
+            local off_raw len_raw off len
+            off_raw=$(echo "${cmd}" | awk '{print $2}')
+            len_raw=$(echo "${cmd}" | awk '{print $3}')
+            off=$(parse_size "${off_raw}")
+            len=$(parse_size "${len_raw}")
+            if [ -n "${target}" ] && [ -x /opt/xfstests/fsync_file ]; then
+                /opt/xfstests/fsync_file fpunch "${target}" "${off}" "${len}" >/dev/null 2>&1
+                return $?
+            fi
+            return 1
             ;;
         *)
             return 1
@@ -1080,8 +1116,19 @@ else
 fi
 
 if [ "${FSTYP:-}" = "ext4" ]; then
+    if [ "${XFSTESTS_MODE:-}" = "jbd_phase3_fsync_durability" ]; then
+        # Phase 3: godown must use the real EXT4_IOC_SHUTDOWN ioctl.
+        # Do NOT fake-pass with a sync marker — that would produce false PASS
+        # evidence for fsync durability cases. Let _require_scratch_shutdown
+        # see the failure and NOTRUN the test until Step 4 implements the ioctl.
+        if [ -f /tmp/xfstests_godown_real.log ]; then
+            cat /tmp/xfstests_godown_real.log >&2 || true
+        fi
+        exit "${rc}"
+    fi
     sync || true
-    # Ext4 fallback: emulate "forced shutdown" as a sync barrier.
+    # Legacy ext4 fallback: emulate "forced shutdown" as a sync barrier.
+    # Not used in jbd_phase3_fsync_durability mode (see above).
     touch /tmp/xfstests_ext4_needs_recovery >/dev/null 2>&1 || true
     exit 0
 fi
@@ -1351,6 +1398,10 @@ case "${MODE}" in
     jbd_phase1)
         BASE_LIST=${JBD_PHASE1_LIST}
         STATIC_EXCLUDED=${JBD_PHASE1_STATIC_EXCLUDED}
+        ;;
+    jbd_phase3_fsync_durability)
+        BASE_LIST=${JBD_PHASE3_LIST}
+        STATIC_EXCLUDED=${JBD_PHASE3_STATIC_EXCLUDED}
         ;;
     *)
         echo "Error: unsupported XFSTESTS_MODE=${MODE}" >&2

@@ -23,6 +23,7 @@ use crate::{
     prelude::*,
     process::{Gid, Uid, credentials::capabilities::CapSet, posix_thread::AsPosixThread},
     time::clocks::RealTimeCoarseClock,
+    util::ioctl::RawIoctl,
     vm::vmo::Vmo,
 };
 
@@ -354,6 +355,16 @@ pub trait Inode: Any + InodeIo + Send + Sync {
 
     fn sync_data(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Inode-level ioctl handler.
+    ///
+    /// Default implementation returns `ENOTTY`. Filesystem-specific inodes
+    /// (e.g. ext4) override this to support FS-level ioctls such as
+    /// `EXT4_IOC_SHUTDOWN` (Step 4b).  When `InodeHandle::ioctl` finds the
+    /// file has no `file_io` handler, it falls through to this method.
+    fn ioctl(&self, _raw_ioctl: RawIoctl) -> Result<i32> {
+        return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported on this inode");
     }
 
     /// Manipulates a range of space of the file according to the specified allocate mode,

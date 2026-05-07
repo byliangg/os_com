@@ -331,7 +331,12 @@ impl FileLike for InodeHandle {
             return file_io.ioctl(raw_ioctl);
         }
 
-        return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported");
+        // Step 4b: fall back to the inode-level ioctl handler so filesystems
+        // (notably ext4) can serve FS-specific ioctls such as
+        // `EXT4_IOC_SHUTDOWN` opened via `open(mountpoint, O_RDONLY)`.
+        // The default `Inode::ioctl` still returns `ENOTTY`, preserving
+        // existing behavior for filesystems that do not override it.
+        self.path.inode().ioctl(raw_ioctl)
     }
 
     fn mappable(&self) -> Result<Mappable> {
