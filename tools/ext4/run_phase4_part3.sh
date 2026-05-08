@@ -65,6 +65,10 @@ run_crash_prepare_once() {
   local hold_stage="$3"
   local round="$4"
   local log_file="$5"
+  local replay_hold_enabled=1
+  if [ "${hold_op}" = "prepare_done" ]; then
+    replay_hold_enabled=0
+  fi
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
@@ -77,7 +81,7 @@ run_crash_prepare_once() {
     --kcmd-args='EXT4_CRASH_PHASE=prepare' \
     --kcmd-args='EXT4_CRASH_SCENARIO=${scenario}' \
     --kcmd-args='EXT4_CRASH_SKIP_MKFS=1' \
-    --kcmd-args='ext4fs.replay_hold=1' \
+    --kcmd-args='ext4fs.replay_hold=${replay_hold_enabled}' \
     --kcmd-args='ext4fs.replay_hold_op=${hold_op}' \
     --kcmd-args='ext4fs.replay_hold_stage=${hold_stage}' \
     --init-args='/opt/syscall_test/run_syscall_test.sh' \
@@ -89,6 +93,9 @@ run_crash_prepare_once() {
   local run_pid=$!
 
   local marker="replay hold point reached for op=${hold_op} stage=${hold_stage}"
+  if [ "${hold_op}" = "prepare_done" ]; then
+    marker="EXT4_CRASH_PREPARE_DONE scenario=${scenario}"
+  fi
   marker_seen_in_log() {
     grep -aF -q "${marker}" "${log_file}" 2>/dev/null
   }

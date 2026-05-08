@@ -188,6 +188,9 @@ impl Jbd2Journal {
 
         let commit = self.build_commit_block(sequence);
         hook(JournalCommitWriteStage::BeforeCommitBlock);
+        // Ordered-mode barrier: descriptor and journal payload must be durable
+        // before the commit block makes the transaction replayable.
+        block_device.sync()?;
         self.device.write_block(block_device, commit_block, &commit)?;
         hook(JournalCommitWriteStage::AfterCommitBlock);
 

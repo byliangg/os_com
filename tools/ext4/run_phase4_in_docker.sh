@@ -51,6 +51,8 @@ XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN:-0}
 XFSTESTS_CHILD_XTRACE=${XFSTESTS_CHILD_XTRACE:-0}
 XFSTESTS_XFS_IO_DEBUG=${XFSTESTS_XFS_IO_DEBUG:-0}
 XFSTESTS_SPARSE_PROBE_LOG=${XFSTESTS_SPARSE_PROBE_LOG:-0}
+XFSTESTS_TEST_IMG_SIZE=${XFSTESTS_TEST_IMG_SIZE:-2G}
+XFSTESTS_SCRATCH_IMG_SIZE=${XFSTESTS_SCRATCH_IMG_SIZE:-2G}
 
 if [ -n "${XFSTESTS_RUN_TIMEOUT_SEC+x}" ]; then
   XFSTESTS_RUN_TIMEOUT_SEC="${XFSTESTS_RUN_TIMEOUT_SEC}"
@@ -119,6 +121,8 @@ DOCKER_ENV_ARGS=(
   -e XFSTESTS_RUN_TIMEOUT_SEC="${XFSTESTS_RUN_TIMEOUT_SEC}"
   -e XFSTESTS_XFS_IO_DEBUG="${XFSTESTS_XFS_IO_DEBUG}"
   -e XFSTESTS_SPARSE_PROBE_LOG="${XFSTESTS_SPARSE_PROBE_LOG}"
+  -e XFSTESTS_TEST_IMG_SIZE="${XFSTESTS_TEST_IMG_SIZE}"
+  -e XFSTESTS_SCRATCH_IMG_SIZE="${XFSTESTS_SCRATCH_IMG_SIZE}"
   -e RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}"
   -e RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}"
   -e BOOT_METHOD="${BOOT_METHOD}"
@@ -202,6 +206,7 @@ run_part3_with_flags() {
     XFSTESTS_TRACE_RUN="${XFSTESTS_TRACE_RUN}" XFSTESTS_CHILD_XTRACE="${XFSTESTS_CHILD_XTRACE}" \
     XFSTESTS_RUN_TIMEOUT_SEC="${XFSTESTS_RUN_TIMEOUT_SEC}" XFSTESTS_XFS_IO_DEBUG="${XFSTESTS_XFS_IO_DEBUG}" \
     XFSTESTS_SPARSE_PROBE_LOG="${XFSTESTS_SPARSE_PROBE_LOG}" \
+    XFSTESTS_TEST_IMG_SIZE="${XFSTESTS_TEST_IMG_SIZE}" XFSTESTS_SCRATCH_IMG_SIZE="${XFSTESTS_SCRATCH_IMG_SIZE}" \
     EXT4_PHASE2_CASES="${EXT4_PHASE2_CASES}" EXT4_PHASE2_WORKERS="${EXT4_PHASE2_WORKERS}" \
     EXT4_PHASE2_ROUNDS="${EXT4_PHASE2_ROUNDS}" EXT4_PHASE2_SEED="${EXT4_PHASE2_SEED}" \
     EXT4_PHASE2_TIMEOUT_SEC="${EXT4_PHASE2_TIMEOUT_SEC}" \
@@ -258,9 +263,16 @@ case "${PHASE4_DOCKER_MODE}" in
     echo "[INFO] Tier 1 tests will NOTRUN until EXT4_IOC_SHUTDOWN is implemented (Step 4)."
     RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=1 run_part3_with_flags
     ;;
+  jbd_phase3_host_crash)
+    echo "[INFO] mode=jbd_phase3_host_crash (Phase 3 fsync host-crash substitutes)"
+    CRASH_ROUNDS=1 \
+    CRASH_HOLD_STAGE=prepare_done \
+    CRASH_SCENARIOS="${CRASH_SCENARIOS:-host_crash_fsync_size_durability:prepare_done host_crash_fdatasync_metadata:prepare_done host_crash_rename_fsync_dst:prepare_done host_crash_concurrent_fsync:prepare_done}" \
+    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 run_part3_with_flags
+    ;;
   *)
     echo "Error: unsupported PHASE4_DOCKER_MODE=${PHASE4_DOCKER_MODE}" >&2
-    echo "Supported: phase4_good | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush" >&2
+    echo "Supported: phase4_good | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
     exit 3
     ;;
 esac

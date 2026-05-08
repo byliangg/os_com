@@ -1,10 +1,10 @@
-# Asterinas EXT4 Environment（Current, Phase 3 规划）
+# Asterinas EXT4 Environment（Current, Phase 3）
 
-更新时间：2026-05-06（Asia/Shanghai）
+更新时间：2026-05-08（Asia/Shanghai）
 
 ## 1. 目标与范围
 
-这份文档记录当前 ext4 Phase 3 规划阶段的推荐环境。
+这份文档记录当前 ext4 Phase 3 的推荐环境。
 当前优先使用 Docker runner 复现功能回归与 fsync/flush 预研测试；宿主机直跑只作为排障辅助。
 
 当前结论：
@@ -12,10 +12,10 @@
 1. Phase 2 correctness baseline 已收口。
 2. Phase 2 concurrency final baseline：7/7 PASS，`EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78`。
 3. 最新 baseline 日志：`benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`。
-4. fio read 已达标，fio write 最新正式确认值为 `87.01%`，作为后续性能优化项。
-5. Phase 3 已启动规划，优先固化 clone-ready Docker 测试入口，并收口 `fsync` / `fdatasync` / block flush / Linux 持久化语义。
+4. Phase 2/JBD2 守底 fio 为 read `93.49%`、write `87.01%`；Phase 3 Step 6 普通 fio 复跑为 read `127.06%`、write `39.18%`。
+5. Phase 3 fsync/flush 语义主线已收口；普通 fio write 当前低于 `75%` hardening 红线，是退场前性能 blocker。
 
-## 2. 当前结论（截至 2026-05-06）
+## 2. 当前结论（截至 2026-05-08）
 
 1. 当前有效工作树：`/home/lby/os_com_codex/asterinas`
 2. 当前功能 baseline：
@@ -27,7 +27,8 @@
    - lmbench regression：8/8 PASS
    - Phase 2 concurrency：7/7 PASS，日志 `benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
 3. 当前遗留项：
-   - fio write 最新正式确认值为 `87.01%`，低于 90%，继续作为性能优化项。
+   - Phase 3 Step 6 普通 fio write 最新复跑值为 `39.18%`（1189 MB/s vs Linux 3035 MB/s），低于 `75%` hardening 红线，继续作为性能 blocker。
+   - Phase 3 Step 6 普通 fio read 最新复跑值为 `127.06%`（5179 MB/s vs Linux 4076 MB/s），已通过。
    - `8 workers / 64 rounds` 高压混合并发探针曾观察到偶发短读/extent mapping 风险，不作为当前功能验收基线。
 
 补充：
@@ -191,10 +192,29 @@ bash tools/ext4/run_phase4_in_docker.sh
 ```
 
 说明：
-- Tier 1 shutdown 用例（generic/043-049/052/054/055/388/392）在 `EXT4_IOC_SHUTDOWN` 实现前（Step 4）全部 NOTRUN，是预期结果。
-- 全部 NOTRUN 不算失败，milestone 记录即可。
+- Tier 1 shutdown 用例（generic/043-049/052/054/055/388/392）现在用于验证真实 `EXT4_IOC_SHUTDOWN` + fsync/flush durability。
+- 当前已知 `generic/049` / `generic/392` 仍可能 FAIL，按 milestone 记录根因；不得把 NOTRUN/FAIL 写成 PASS。
 
-### 8.2 fsync-heavy fio 预研（独立于 xfstests）
+### 8.2 Phase 3 host-crash 替代验证（jbd_phase3_host_crash Docker mode）
+
+```bash
+cd /home/lby/os_com_codex/asterinas
+
+PHASE4_DOCKER_MODE=jbd_phase3_host_crash \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+KLOG_LEVEL=warn \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+说明：
+- 该 mode 跑 4 个自研场景：`host_crash_fsync_size_durability`、`host_crash_fdatasync_metadata`、`host_crash_rename_fsync_dst`、`host_crash_concurrent_fsync`。
+- runner 在 guest 内完成真实 `fsync` / `fdatasync` / 目录 `fsync` 后，等待 `EXT4_CRASH_PREPARE_DONE`，再杀 QEMU 并重挂载校验。
+- 该证据覆盖 guest powercut + journal replay；host page cache 丢失 / dm-log-writes 级别证据需单独记录，不能混算。
+
+### 8.3 fsync-heavy fio 预研（独立于 xfstests）
 
 ```bash
 cd /home/lby/os_com_codex
@@ -202,6 +222,15 @@ KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_write_16k_fsyn
 ```
 
 用于暴露持久化语义，不作为普通吞吐宣传。
+
+### 8.4 普通 ext4 fio 复跑
+
+```bash
+cd /home/lby/os_com_codex
+KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+2026-05-08 Step 6 结果：read `5179/4076=127.06%`，write `1189/3035=39.18%`。read 通过；write 低于 75% hardening 红线，需在 Phase 3 退场前继续处理。
 
 ## 9. 判定口径
 

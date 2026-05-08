@@ -5,13 +5,13 @@
 当前状态（2026-05-08）：
 
 - Step 0 / 1 / 2 / 3 全部 ✅
-- Step 4：4a-1 / 4a-2 / 4b / 4d 已 ✅；**4c（commit block 前 PREFLUSH 严格 ordered-mode）待执行**
-- **Step 5（dm 依赖 xfstests 的自研 host-crash 4 case 替代验证）待执行**
-- **Step 6（fsync-heavy fio benchmark 写入 milestone + technical_report 更新）待执行**
+- Step 4：4a-1 / 4a-2 / 4b / 4c / 4d 已 ✅
+- Step 5：自研 host-crash 4 case 替代验证 ✅
+- **Step 6（Tier 1 fsync/flush 全绿 + fsync-heavy fio benchmark + 普通 fio 复跑 + technical_report 更新）部分完成；普通 fio write 已跌破 75% 红线，转入性能 hardening blocker**
 
-阶段性产出：Tier 1 xfstests **9 PASS / 1 NOTRUN / 2 FAIL**；phase3/phase4/phase6/jbd_phase1/jbd_phase2_concurrency 回归套件 100% PASS（与 Phase 2 baseline 一致）；ext4 fsync latency 从 50us no-op 升到 2374us 真实 device flush，与 Linux 1884us 同量级。
+阶段性产出：Tier 1 xfstests 默认 2G scratch 全套 **11 PASS / 1 NOTRUN / 0 FAIL**；扩容 12G scratch 后 `generic/048` 单点 **PASS**；phase3/phase4/phase6/jbd_phase1/jbd_phase2_concurrency 回归套件 100% PASS（与 Phase 2 baseline 一致）；ext4 fsync latency 从 50us no-op 升到 2374us 真实 device flush，与 Linux 1884us 同量级；普通 fio O_DIRECT 复跑 read **127.06%** PASS，write **39.18%** FAIL（低于 75% 红线）。
 
-Phase 3 尚未退场——退场前需补完 Step 4c / Step 5 / Step 6，或显式裁剪范围并写入 plan。
+Phase 3 fsync/flush 语义主线已收口；退场前需要先处理普通 fio O_DIRECT write 性能回归，并整理 AGENTS/CLAUDE/README 索引。
 
 ## Phase 2 收口基线
 
@@ -366,7 +366,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 
 ## Step 4：ext4 regular-file `fsync` / `fdatasync` 持久化语义收口
 
-**状态：** 进行中（拆为 4a-1 / 4a-2 / 4b / 4c / 4d 顺序推进）
+**状态：** ✅ 已完成（2026-05-08，拆为 4a-1 / 4a-2 / 4b / 4c / 4d 顺序推进）
 **目标摘要：** 对普通文件提供 JBD2 commit + device flush/barrier 语义。
 
 ### 子步进度
@@ -376,7 +376,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | 4a-1 | `Ext4Inode::sync_all/sync_data` 末尾加 `block_device.sync()`（VFS 层 flush） | ✅ 已完成（ext4 fsync 49us→2374us）|
 | 4a-2 | inode→TID 表 + `force_commit_for_tid` + `WaitQueue` 等待原语 | ✅ 已完成（单线程 fsync 不回退）|
 | 4b | `EXT4_IOC_SHUTDOWN` ioctl（NOLOGFLUSH/LOGFLUSH/DEFAULT） + needs_recovery SB | ✅ 已完成（Tier 1: 9 PASS / 11，含关键 047/052/054/055）|
-| 4c | commit block 前一次 PREFLUSH 等价 flush（journal commit 内序列调整） | 待执行 |
+| 4c | commit block 前一次 PREFLUSH 等价 flush（journal commit 内序列调整） | ✅ 已完成（2026-05-08）|
 | 4d | Tier 1 xfstests + 回归套件 + 文档收口 | ✅ 已完成（2026-05-07）|
 
 每子步要求"独立可回退"：完成后即跑 16K fsync4 + phase4_good/phase6_good smoke 确认不回退，再进入下一子步。
@@ -414,7 +414,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 
 - ext4 journaled fsync latency 从 49 us 跃升到 2374 us（48×），跨过 us → ms 量级，**与 Linux 1884 us 同量级**，证明 device flush 真正下到设备。语义修复成功。
 - ext4 nojournal 也升到 ms 级（2192 us）。注意：nojournal 仍走 ramfs 设备节点 sync 路径，4a-1 改动覆盖到了。
-- ratio 48% / 32%：Asterinas 比 Linux 慢约 2×，主要是 QEMU virtio-blk flush RTT 比 Linux 真实物理 flush 高，加上 Asterinas JBD2 commit 路径单线程串行写。这部分留给 4a-2（force-commit 减少冗余）和 4c（PREFLUSH 合并）继续优化。
+- ratio 48% / 32%：Asterinas 比 Linux 慢约 2×，主要是 QEMU virtio-blk flush RTT 比 Linux 真实物理 flush 高，加上 Asterinas JBD2 commit 路径单线程串行写。4a-2 已收口 force-commit 冗余，4c 已补 commit-block-pre PREFLUSH；剩余属于后续 batching / hardening。
 - raw 路径（Step 2 已修）这次 ratio 167% 是 Linux 侧 variance（27 MB/s 比上次 51 MB/s 慢一半），不是 Asterinas 退步——Asterinas raw 实际从 27→46 MB/s 反而提升。
 
 **仍未解决（留给 4a-2）：**
@@ -535,7 +535,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | `kernel/src/fs/inode_handle.rs` | `InodeHandle::ioctl` 在 `file_io.is_none()` 时 fallback 到 `inode.ioctl()` |
 | `kernel/src/fs/ext4/inode.rs` | 加 `EXT4_IOC_SHUTDOWN` 常量 + `Ext4Inode::ioctl` 实现 |
 | `kernel/src/fs/ext4/fs.rs` | `Ext4Fs::shutdown_state` 字段 + `shutdown` / `is_shutdown` / `check_not_shutdown` / `do_filesystem_sync_unchecked` 方法；`run_journaled_ext4` / `fsync_regular_file` / `FileSystem::sync` gate；`for_small_write` 去阈值 |
-| `test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | xfs_io shim 的 truncate/fpunch 用 `parse_size` 展开 size 后缀 |
+| `test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | xfs_io shim 的 truncate/fpunch 用 `parse_size` 展开 size 后缀；Step 6 追加 `-rxc "syncfs"` 组合参数解析 |
 
 **实测效果（jbd_phase3_fsync_durability mode, 2026-05-07，最终）：**
 
@@ -546,7 +546,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | `generic/045` | NOTRUN | ✅ PASS | pwrite + truncate + sync（suffix fix）|
 | `generic/046` | NOTRUN | ✅ PASS | 全 FS sync + replay（suffix fix）|
 | **`generic/047`** | NOTRUN | ✅ **PASS** | **critical: pwrite + fsync 每文件持久性（for_small_write 修复）** |
-| `generic/048` | NOTRUN | NOTRUN | 需 10G scratch（环境限制，不在 v1 范围）|
+| `generic/048` | NOTRUN | ✅ PASS（12G scratch 单点） | 默认 2G scratch 全套 NOTRUN；扩容后单独运行通过 |
 | `generic/049` | NOTRUN | ❌ FAIL | 无 fsync 的 999 文件批量写 + sync；尾 9 文件丢失（journal 空间压力 / batch checkpoint hole） |
 | **`generic/052`** | NOTRUN | ✅ **PASS** | **shutdown 路径直写 SB needs_recovery 修复** |
 | **`generic/054`** | NOTRUN | ✅ **PASS** | **同 052（logstate dumpe2fs 现读到 dirty）** |
@@ -554,19 +554,16 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | `generic/388` | NOTRUN | ✅ PASS | 反复 shutdown+recovery idempotency |
 | `generic/392` | NOTRUN | ❌ FAIL | fsync vs fdatasync 后 mtime/ctime 持久；v1 fdatasync 完全等价 fsync 的保守实现仍有 1 秒级差异 |
 
-**9 PASS / 1 NOTRUN / 2 FAIL（82% 有效跑过率）**。从 12 NOTRUN → 9 PASS。
+**Step 4b 原始结果：9 PASS / 1 NOTRUN / 2 FAIL（82% 有效跑过率）**。从 12 NOTRUN → 9 PASS。
 
-剩余 2 个 FAIL（049/392）已知根因：
+**Step 6 补修后结果（2026-05-08）：默认 2G scratch 全套 11 PASS / 1 NOTRUN / 0 FAIL**，完整日志 `asterinas/benchmark/logs/jbd_phase3_fsync_durability_20260508_023301.log`。
 
-- **049**：批量无 fsync 写入 + 单次 syncfs 路径上，journal 满 → checkpoint → 部分 TX abort，尾 9 文件丢失。需要更激进的 batch_commit / 调高 JOURNAL_LOW_WATER_MARK / 在 syncfs 路径加 force checkpoint。留给 4c 或后续性能 hardening。
-- **392**：fdatasync 与 fsync 当前完全相同。Linux 上 fdatasync 在仅 atime/ctime 修改时不触发 force-commit，时间戳行为不同。需要 fdatasync 路径与 sync_tid 区分（plan §4.6 已记录为保守等价实现）。留给后续。
+**generic/048 扩容验证（2026-05-08）：12G scratch 单点 PASS**，完整日志 `asterinas/benchmark/logs/jbd_phase3_fsync_durability_20260508_025646.log`。第一次扩容尝试日志 `asterinas/benchmark/logs/jbd_phase3_fsync_durability_20260508_025357.log` 仍 NOTRUN，根因是外层 Docker wrapper 未向容器传递 `XFSTESTS_SCRATCH_IMG_SIZE`，实际仍按默认 2G 创建 scratch；已在 `tools/ext4/run_phase4_in_docker.sh` 补齐 `XFSTESTS_TEST_IMG_SIZE` / `XFSTESTS_SCRATCH_IMG_SIZE` 透传后重跑通过。
 
-剩余失败已知根因，留给 4c/4d/后续：
+Step 6 已修根因：
 
-- **049**：批量无 fsync 写入 + 单次 syncfs 路径上，journal 满 → checkpoint → 部分 TX abort。需要更激进的 batch_commit / 调高 JOURNAL_LOW_WATER_MARK。
-- **052/054/055**：godown NOLOGFLUSH 后，on-disk superblock 的 `needs_recovery` flag 期望 set。当前我们只设了内存 shutdown_state，没改 superblock 标志。需在 `shutdown()` NOLOGFLUSH 路径中追加一次"只写 superblock 的 needs_recovery flag 到 disk"的动作。
-- **055** 还需要 `xfs_logprint` 不存在的 NOTRUN 处理（exclusion 已在 blocked.tsv 之外，需要补 NOTRUN 短路）。
-- **392**：fdatasync 与 fsync 当前完全相同。Linux 上 fdatasync 在仅 atime/ctime 修改时不触发 force-commit。v1 conservative 实现与 Linux 略不同——若需对齐 392，需要把 atime/ctime-only 操作排除在 inode_tids 推进之外。
+- **049（已修）**：根因不是 journal 空间算法，而是 xfs_io shim 没解析组合参数 `-rxc "syncfs"`，导致 `_scratch_sync` 没执行真实 syncfs。Step 6 修复 shim 后 `generic/049` PASS。
+- **392（已修）**：根因是 inode 时间戳/metadata 更新使用匿名 journal op，没有推进 inode→TID 映射，`fsync` 找不到目标 TID。Step 6 新增 `JournaledOp::InodeMetadata { ino }` 后 `generic/392` PASS。
 
 **4b 验收项：**
 
@@ -580,8 +577,85 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 - [x] generic/047（critical）通过：fsync force-commit + device flush 全链路对路
 - [x] generic/043/044/045/046/388 通过
 - [x] generic/052/054/055 通过：shutdown 路径直写 SB `needs_recovery` 标志
-- [ ] generic/049（journal space 边缘）— 留给 4c/性能 hardening
-- [ ] generic/392（fdatasync 区分 atime-only）— 留给后续
+- [x] generic/049（syncfs 批量写持久化）— Step 6 已修
+- [x] generic/392（fsync inode metadata 持久化）— Step 6 已修
+- [x] generic/048（10GB scratch 大文件 sync/shutdown）— Step 6 扩容 12G scratch 单点 PASS
+
+### 4c：commit block 前 PREFLUSH 等价 flush
+
+**状态：** ✅ 已完成（2026-05-08）
+
+**改动概要：**
+
+1. `ext4_rs::BlockDevice` 新增必选 `sync() -> Result<()>`，不提供默认 no-op，避免任何 backend 静默绕过持久化语义。
+2. `KernelBlockDeviceAdapter::sync()` 调用真实 `aster_block::BlockDevice::sync()`，并要求返回 `BioStatus::Complete`；非 complete 或底层错误均转换为 ext4 `EIO`。
+3. `JournalIoBridge::sync()` 委托到底层 adapter，让 journal commit 路径可以发出真实 flush。
+4. `Jbd2Journal::write_commit_plan_with_hook()` 在 descriptor block 与 journal payload 写完后、commit block 写入前调用 `block_device.sync()?`。
+5. file-backed probe / unit disk backend 用 `File::sync_all()` 实现 `sync()`，保持测试工具也走真实 flush 语义。
+
+**涉及文件：**
+
+| 文件 | 改动 |
+|------|------|
+| `kernel/libs/ext4_rs/src/ext4_defs/block.rs` | `BlockDevice` trait 新增必选 `sync()` |
+| `kernel/libs/ext4_rs/src/ext4_impls/jbd2/mod.rs` | commit block 前插入 `block_device.sync()?` |
+| `kernel/src/fs/ext4/fs.rs` | `KernelBlockDeviceAdapter` / `JournalIoBridge` 实现真实 `sync()` |
+| `kernel/libs/ext4_rs/src/main.rs` | 测试 `Disk` backend 用 `File::sync_all()` 实现 flush |
+| `kernel/libs/ext4_rs/src/bin/jbd2_probe.rs` | probe 的 file-backed backend 用 `File::sync_all()` 实现 flush |
+
+**语义说明：**
+
+ordered-mode commit 顺序现在变为：
+
+1. 写 descriptor block；
+2. 写 journal payload；
+3. **commit block 前 flush**，保证 descriptor + payload 先于 commit block 持久化；
+4. 写 commit block，使 transaction 可 replay；
+5. VFS `fsync` 末尾继续执行 `block_device.sync()`，负责 commit block 与后续设备缓存落盘。
+
+这样避免了 host/device crash 下"commit block 先持久化、payload 尚未持久化"的危险窗口；若 commit 前 flush 失败，commit block 不会写入，错误向上传播为 fsync 失败。
+
+**验证结果：**
+
+| 项目 | 结果 |
+|------|------|
+| `cargo check -p ext4_rs` | ✅ PASS |
+| `cargo check -p aster-kernel --target x86_64-unknown-none` | ✅ PASS |
+| Docker `jbd_phase3_fsync_flush` | ✅ Step 4c 当时 9 PASS / 1 NOTRUN / 2 FAIL；Step 6 补修后默认全套 11 PASS / 1 NOTRUN / 0 FAIL，12G scratch `generic/048` 单点 PASS |
+
+Docker 命令按 `environment.md` 口径执行：
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase3_fsync_flush \
+ENABLE_KVM=1 BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+XFSTESTS_RUN_TIMEOUT_SEC=5400 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+日志：`asterinas/benchmark/logs/jbd_phase3_fsync_durability_20260507_170016.log`
+
+Step 4c 当时已知结果如下；均已在 Step 6 补修：
+
+- `generic/049` FAIL：后续确认是 xfs_io shim 未解析 `-rxc "syncfs"`，不是 journal space 本体问题。
+- `generic/392` FAIL：后续确认是 inode metadata 更新未推进 inode→TID 映射。
+- `generic/048`：默认 2G scratch NOTRUN；Step 6 补齐 image size 透传后，12G scratch 单点 PASS。
+
+**环境备注：**
+
+- 裸机 host 路径按 `environment.md` 先尝试，但旧 `target_lby/osdk` 存在 root-owned 产物导致 `PermissionDenied`，未作为最终验收口径。
+- 本机 `cargo-osdk` 曾指向旧 `/root/asterinas/osdk` 构建路径，已用当前 `/home/lby/os_com_codex/asterinas/osdk` 重新安装。
+- 本机 QEMU wrapper 仍指向旧 `/home/lby/os_com/asterinas/.local/qemu-root2/...`，因此 Phase 3 验证最终采用 Docker runner。
+
+**4c 验收项：**
+
+- [x] `BlockDevice::sync()` 是必选 trait 方法，不存在默认空实现
+- [x] ext4 kernel backend 发出真实 block device flush，并检查 `BioStatus::Complete`
+- [x] journal descriptor + payload 写完后、commit block 写入前执行 flush
+- [x] commit 前 flush 失败时不写 commit block，错误上传
+- [x] probe/test backend 使用 `File::sync_all()`，不是空函数
+- [x] Docker `jbd_phase3_fsync_flush` 结果与 4b 基线一致，无新增未知失败；Step 6 补修后全有效样本 PASS
 
 ### 4d：回归验证 + 文档收口
 
@@ -596,7 +670,7 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | `phase6_good`（单独跑） | ✅ **25 PASS / 0 FAIL / 0 NOTRUN / 26 STATIC_BLOCKED** | 100% pass rate，与 Phase 2 baseline 一致 |
 | `jbd_phase1` | ✅ **6 PASS / 0 FAIL / 6 NOTRUN** | 100% effective pass rate，与 Phase 2 baseline 一致 |
 | `jbd_phase2_concurrency` | ✅ **7 PASS / 0 FAIL**（workers=4 rounds=8 seed=78）| 与 Phase 2 baseline 完全一致 |
-| `jbd_phase3_fsync_durability` | ✅ **9 PASS / 1 NOTRUN / 2 FAIL** | 4b 主成果；从 12 NOTRUN → 9 PASS |
+| `jbd_phase3_fsync_durability` | ✅ **默认 11 PASS / 1 NOTRUN / 0 FAIL；12G scratch `generic/048` 单点 PASS** | Step 6 补修后结果；默认全套仍保留 2G scratch 口径 |
 | `crash_only` | ⚠️ **2 PASS / 1 FAIL（truncate_append）** | 见下方分析；不阻 Phase 3 退场 |
 
 **phase6_with_guard（phase3+phase4+phase6 同 VM 串跑）观察到 flake：**
@@ -618,26 +692,26 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 - [x] phase6_good 不回退（100%，单独跑）
 - [x] jbd_phase1 不回退（100%）
 - [x] jbd_phase2_concurrency 不回退（7/7 PASS, seed=78）
-- [x] jbd_phase3_fsync_durability 9 PASS / 1 NOTRUN / 2 FAIL（Phase 3 主成果）
+- [x] jbd_phase3_fsync_durability 默认 11 PASS / 1 NOTRUN / 0 FAIL；12G scratch `generic/048` 单点 PASS（Phase 3 主成果）
 - [ ] crash_only 全 PASS — 留 1 个 truncate_append fail 待后续分析
 - [x] phase6_with_guard 同 VM 串跑的 flake 已识别并验证为环境噪声
 
-## Phase 3 阶段性总结（Step 0~4 子线，Step 5/6 待执行）
+## Phase 3 阶段性总结（Step 0~5 子线，Step 6 待执行）
 
-> 注：Phase 3 尚未整体退场。本节仅总结到目前 Step 4 主线为止的产出。Step 4c（commit-block-pre PREFLUSH）、Step 5（自研 host-crash 4 case）、Step 6（benchmark + technical_report 更新）见下方专门章节，状态均为"待执行"。
+> 注：本节原本总结到 Step 5；Step 6 已补修 `generic/049/392` 并把 Tier 1 有效样本收口到 100%，最新状态以 Step 6 为准。
 
 ### Step 0~4 主线达成目标
 
 1. **fsync/fdatasync 持久化语义对齐**：从"假 fsync"（49us 内存 commit + 无 device flush）变为"真 fsync"（2.3ms 真实 device flush + 与 Linux 同量级），通过 4 个独立 step 完成。
-2. **Tier 1 xfstests shutdown 测试集 9 PASS / 11**（含 critical 用例 047/052/054/055/392→[只剩 392] 中的 4 个）：
-   - generic/043/044/045/046/047/052/054/055/388 全 PASS
-   - generic/048 NOTRUN（10G 限制）
-   - generic/049/392 FAIL（已知根因，留作后续）
+2. **Tier 1 xfstests shutdown 测试集默认全套 11 PASS / 11 有效样本，扩容后 `generic/048` 单点 PASS**：
+   - generic/043/044/045/046/047/049/052/054/055/388/392 全 PASS
+   - generic/048 默认 2G scratch NOTRUN；12G scratch 单点 PASS（`jbd_phase3_fsync_durability_20260508_025646.log`）
 3. **EXT4_IOC_SHUTDOWN 三种 flag 完整实现**（NOLOGFLUSH / LOGFLUSH / DEFAULT）+ shutdown 状态机 + 后置 I/O 返回 EIO + 重 mount 自恢复
 4. **JBD2 force-commit + WaitQueue 等待原语**：替换历史的"两次 commit_pending hack"，并发 active handle 下 fsync 不再静默 no-op
 5. **inode → TID 追踪**：per-ino map，覆盖 buffered write 全量（去掉了原 192B 阈值）
 6. **VFS 层 device flush 镜像 ext2 模式**
 7. **回归套件全 PASS**：phase3/phase4/phase6/jbd_phase1/jbd_phase2_concurrency 与 Phase 2 baseline 完全一致
+8. **自研 host-crash 替代验证 4/4 PASS**：fsync size、fdatasync i_size/data、rename+dst dir fsync、concurrent fsync 均完成 prepare-kill-verify 闭环
 
 ### Phase 3 涉及的代码改动总览
 
@@ -653,14 +727,14 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | `kernel/comps/virtio/src/device/block/{mod,device}.rs` | FLUSH bit 判断 `& != 0` + `flush()` 分支取反（Step 3）|
 | `test/initramfs/src/syscall/xfstests/fsync_file.c` | 加 `truncate` + `fpunch` 操作 |
 | `test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | xfs_io shim 加 `truncate/fpunch + size suffix`；godown shim Phase 3 mode-aware fail-fast；`jbd_phase3_fsync_durability` xfstests mode |
-| `tools/ext4/{prepare,run}_phase4_*.sh` + `run_phase4_in_docker.sh` | `jbd_phase3_fsync_flush` Docker mode + 测试 list 注入 |
+| `tools/ext4/{prepare,run}_phase4_*.sh` + `run_phase4_in_docker.sh` | `jbd_phase3_fsync_flush` Docker mode + 测试 list 注入；Step 6 补齐 xfstests image size 环境变量透传 |
 
 ### 留作后续的工作
 
-- **generic/049**（journal 空间满）：syncfs 路径下批量无 fsync 写入，journal 满 → checkpoint → 部分 TX abort 导致尾文件丢失。需调阈值或更激进 batch_commit。
-- **generic/392**（fdatasync vs fsync）：fdatasync v1 完全等价 fsync 的保守实现仍有 mtime/ctime 1 秒级差异，需细化 atime-only 写不触发 force-commit。
+- **generic/049**：已修。xfs_io shim 现在识别 `-rxc "syncfs"`，`_scratch_sync` 会触发真实 syncfs。
+- **generic/392**：已修。inode metadata 更新现在推进 inode→TID 映射，`fsync` 会 force-commit 时间戳/metadata 事务。
 - **crash matrix truncate_append**：依赖隐式 commit 触发的场景在 4b 之后不再 commit，需研究 Phase 2 → Phase 3 的语义差。
-- **Step 4c**（commit block 前 PREFLUSH）：当前只在 VFS 层最后一次 flush，严格 ordered-mode barrier 仍未实现。host crash 场景下足够，但宣传"完全等价 Linux ext4 ordered mode"还差这一步。
+- **Step 4c**（commit block 前 PREFLUSH）：已实现严格 ordered-mode barrier；descriptor + journal payload 会在 commit block 前 flush，VFS 层末尾仍保留最终 device flush。
 - **fio O_DIRECT write ratio 恢复 90%**：当前 87.01% 仍未达赛题优秀档。Phase 3 引入的额外 flush 轻微影响 fsync-heavy 场景，但常规 O_DIRECT 写不变。属于性能 hardening Phase。
 
 ### 052/054/055 修复后续记
@@ -673,11 +747,15 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 
 ### 4a-2 / 4b / 4c / 4d
 
-待执行，每子步进入时新增本节子条目。
+已按上方各子节记录。Phase 3 Step 4 主线已经完成，剩余工作转入 Step 5 / Step 6；Step 5 现已完成，最终剩 Step 6。
 
 ### 整体改动概要
 
-- 待 4a-1 ~ 4d 全部完成后汇总。
+- 4a-1：VFS 层 final flush。
+- 4a-2：inode→TID 追踪、force-commit、WaitQueue 等待。
+- 4b：`EXT4_IOC_SHUTDOWN` 三 flag 与 Tier 1 xfstests 打通。
+- 4c：commit block 前 PREFLUSH 等价 barrier。
+- 4d：回归套件与文档收口。
 
 ### 整体涉及文件
 
@@ -687,13 +765,13 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 
 | 测试项 | 结果 | 日志 |
 |--------|------|------|
-| `generic/047` | 待运行（依赖 4b 的 ioctl）| 待记录 |
-| Tier 1 shutdown ioctl xfstests | 待运行（依赖 4b）| 待记录 |
-| `jbd_phase1` | 待运行 | 待记录 |
-| crash matrix fsync durability | 待运行 | 待记录 |
-| ext4 journaled `bs=16K fsync=4` | 4a-1 后跑 | 待记录 |
-| Phase 2 concurrency baseline | 待运行 | 待记录 |
-| concurrent fsync with active foreign handle | 待运行（依赖 4a-2）| 待记录 |
+| `generic/047` | ✅ PASS | Docker `jbd_phase3_fsync_flush` |
+| Tier 1 shutdown ioctl xfstests | ✅ 默认 11 PASS / 1 NOTRUN / 0 FAIL；12G scratch `generic/048` 单点 PASS | `jbd_phase3_fsync_durability_20260508_023301.log` + `jbd_phase3_fsync_durability_20260508_025646.log` |
+| `jbd_phase1` | ✅ PASS（4d 已记录） | 不回退 |
+| crash matrix fsync durability | ⚠️ 2 PASS / 1 FAIL | `truncate_append` 已知差异 |
+| ext4 journaled `bs=16K fsync=4` | ✅ ms 级真实 flush | 4a-1/4a-2 已记录 |
+| Phase 2 concurrency baseline | ✅ 7/7 PASS | 4d 已记录 |
+| concurrent fsync with active foreign handle | ✅ 间接覆盖 | 4a-2 force-commit + Tier 1 |
 | atime/fdatasync audit case | 待运行 | 待记录 |
 
 ### 性能结果
@@ -717,38 +795,54 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 - [ ] `JournaledOp` / handle finish 上下文能明确影响的 inode 集合，不靠 raw metadata block offset 反推 inode
 - [ ] running TX 可 force rotate 到 `prev_running`
 - [ ] fsync 通过 `WaitQueue` / `Condvar` 风格 notifier 等待目标 TID active handles 退出并完成 commit，不使用 spin/yield 轮询
-- [ ] ordered mode 至少两次 flush：commit block 前 fs-internal flush + VFS inode sync 末尾 block-device flush
-- [ ] `Ext4Inode::sync_all()` / `sync_data()` mirror ext2：fs-internal fsync 后末尾调用 `fs.block_device().sync()`
+- [x] ordered mode 至少两次 flush：commit block 前 fs-internal flush + VFS inode sync 末尾 block-device flush
+- [x] `Ext4Inode::sync_all()` / `sync_data()` mirror ext2：fs-internal fsync 后末尾调用 `fs.block_device().sync()`
 - [ ] 不退化为每次全 FS checkpoint sweep；除 journal 空间压力外，不提交/检查点非目标 TID
 - [ ] `fdatasync` 与 `fsync` 当前边界已记录，且不照抄 ext2 仅 evict page cache 的 fdatasync 反例
-- [ ] `commit_pending_jbd2_transactions()` 连续调用两次的历史 hack 已删除或保留理由已记录
+- [x] `commit_pending_jbd2_transactions()` 连续调用两次的历史 hack 已删除或保留理由已记录
 - [ ] `generic/047` 与 `generic/392` 作为 critical 用例通过或有明确 blocker
 - [ ] fixed regression 不回退
 
 ## Step 5：dm 依赖 xfstests 的替代验证与 blocked 策略
 
-**状态：** 待执行
+**状态：** ✅ 已完成（2026-05-08）
 **目标摘要：** 对 Linux fsync crash replay case 给出 blocked 或替代验证闭环。
 
 ### 改动概要
 
-- 待记录。
+1. 扩展 `ext4_crash` suite，新增 4 个 Phase 3 自研 host-crash 场景：
+   - `host_crash_fsync_size_durability`
+   - `host_crash_fdatasync_metadata`
+   - `host_crash_rename_fsync_dst`
+   - `host_crash_concurrent_fsync`
+2. 新增 `prepare_done` crash marker 模式：guest 内先完成真实 `fsync` / `fdatasync` / 目录 `fsync`，打印 `EXT4_CRASH_PREPARE_DONE` 后由 host runner kill QEMU，再重启挂载验证。
+3. 修正 runner：`prepare_done` 模式不启用 `ext4fs.replay_hold` 内核注入，避免未知 op filter 退化为"匹配任意 op"。
+4. `fsync_file` helper 改为优先静态编译，避免极小 initramfs 中动态 loader/权限路径导致 `Permission denied`。
+5. 新增 Docker mode `jbd_phase3_host_crash`，一键运行 4 个替代场景。
+6. 同步 `environment.md`、`asterinas/environment.md`、`asterinas/benchmark/environment.md` 的 Step 5 运行入口。
 
 ### 涉及文件
 
-- 待记录。
+| 文件 | 改动 |
+|------|------|
+| `test/initramfs/src/syscall/ext4_crash/run_ext4_crash_test.sh` | 新增 4 个 host-crash 场景和 byte-level 校验 |
+| `tools/ext4/run_phase4_part3.sh` | `prepare_done` marker 支持；该模式关闭 replay_hold |
+| `tools/ext4/run_phase4_in_docker.sh` | 新增 `jbd_phase3_host_crash` Docker mode |
+| `tools/ext4/prepare_phase4_part3_initramfs.sh` | `fsync_file` 优先静态编译 |
+| `environment.md` / `asterinas/environment.md` | 新增 Phase 3 host-crash 入口 |
+| `asterinas/benchmark/environment.md` | 新增复现命令 |
 
 ### blocked / 替代验证矩阵
 
 | xfstests case | blocked 原因 | 替代验证 | 状态 |
 |---------------|--------------|----------|------|
-| `generic/311` | `dm-flakey` | `host_crash_fsync_size_durability` | 待执行 |
-| `generic/321` | `dm-flakey`，目录 fsync crash | `host_crash_rename_fsync_dst` / dir fsync variant | 待执行 |
-| `generic/322` | `dm-flakey`，rename fsync crash | `host_crash_rename_fsync_dst` | 待执行 |
-| `generic/335` | `dm-flakey`，跨目录 rename parent fsync | `host_crash_rename_fsync_dst` parent variant | 待执行 |
-| `generic/341` | `dm-flakey`，rename dir + new entry | rename dir 自研扩展，若未做则 blocked | 待执行 |
-| `generic/342` | `dm-flakey`，rename file + old name recreate | `host_crash_rename_fsync_dst` old-name variant | 待执行 |
-| `generic/376` | `dm-flakey`，same-dir rename + recreate | `host_crash_rename_fsync_dst` same-dir variant | 待执行 |
+| `generic/311` | `dm-flakey` | `host_crash_fsync_size_durability` | ✅ 替代验证 PASS |
+| `generic/321` | `dm-flakey`，目录 fsync crash | `host_crash_rename_fsync_dst` / dir fsync variant | ✅ 替代验证 PASS（rename 后 fsync dst dir） |
+| `generic/322` | `dm-flakey`，rename fsync crash | `host_crash_rename_fsync_dst` | ✅ 替代验证 PASS |
+| `generic/335` | `dm-flakey`，跨目录 rename parent fsync | `host_crash_rename_fsync_dst` parent variant | ⚠️ 部分覆盖（dst dir fsync；跨父目录扩展留后续） |
+| `generic/341` | `dm-flakey`，rename dir + new entry | rename dir 自研扩展，若未做则 blocked | ⚠️ blocked（需 dir rename 扩展） |
+| `generic/342` | `dm-flakey`，rename file + old name recreate | `host_crash_rename_fsync_dst` old-name variant | ⚠️ 部分覆盖（plain rename；old-name recreate 留后续） |
+| `generic/376` | `dm-flakey`，same-dir rename + recreate | `host_crash_rename_fsync_dst` same-dir variant | ⚠️ 部分覆盖（rename+dir fsync；recreate 留后续） |
 | `generic/455` | `dm-log-writes` + thin-pool | 暂不在 Phase 3 范围 | blocked |
 | `generic/457` | `dm-log-writes` + thin-pool + reflink | 暂不在 Phase 3 范围 | blocked |
 | `generic/482` | `dm-log-writes` + thin-pool prefix replay | 暂不在 Phase 3 范围 | blocked |
@@ -758,85 +852,153 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 
 | case | 对标 | repro 摘要 | 状态 |
 |------|------|-----------|------|
-| `host_crash_fsync_size_durability` | `generic/047/311` | write + fsync + guest powercut / fault backend + remount + size/md5 verify | 待设计 |
-| `host_crash_fdatasync_metadata` | `generic/392` | fsync/fdatasync 两组对比，至少验证 fdatasync 后 i_size，fsync 后更完整 metadata | 待设计 |
-| `host_crash_rename_fsync_dst` | `generic/322/335/376` | rename + fsync(dst or parent) + crash + remount + dentry/content verify | 待设计 |
-| `host_crash_concurrent_fsync` | Phase 2 concurrency + fsync | 多 worker 写入/截断/fsync，force-commit active handle 场景下 crash verify | 待设计 |
+| `host_crash_fsync_size_durability` | `generic/047/311` | `pwrite 64K` + `fsync(file)` + `fsync(parent)` + kill QEMU + remount + size/all-byte verify | ✅ PASS |
+| `host_crash_fdatasync_metadata` | `generic/392` | `fdatasync(file)` 后校验 i_size/data；另跑 `fsync(file)` 对照文件 | ✅ PASS（不宣称完全覆盖 392 时间戳差异） |
+| `host_crash_rename_fsync_dst` | `generic/322/335/376` | write + fsync(src file) + rename 到 dst + `fsync(dst dir)` + kill QEMU + dentry/content verify | ✅ PASS |
+| `host_crash_concurrent_fsync` | Phase 2 concurrency + fsync | 4 worker 并发 pwrite+fsync，目录 fsync 后 kill QEMU，逐文件 size/all-byte verify | ✅ PASS |
+
+### 验证结果
+
+命令（按 `environment.md` Docker 口径）：
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase3_host_crash \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+KLOG_LEVEL=warn \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+结果：**4 PASS / 0 FAIL**。
+
+日志：
+
+- summary：`asterinas/benchmark/logs/crash/phase4_part3_crash_summary_20260507_173023.tsv`
+- prepare/verify 日志：`asterinas/benchmark/logs/crash/host_crash_*_{prepare,verify}_r1.log`
+
+summary 摘要：
+
+| scenario | result |
+|----------|--------|
+| `host_crash_fsync_size_durability` | PASS |
+| `host_crash_fdatasync_metadata` | PASS |
+| `host_crash_rename_fsync_dst` | PASS |
+| `host_crash_concurrent_fsync` | PASS |
 
 ### host/device persistence 方法学
 
 | 项目 | 状态 | 说明 |
 |------|------|------|
-| QEMU `-drive` cache 参数审计 | 待记录 | 当前脚本若未显式设置 cache，不能直接当作稳定介质证明 |
-| guest powercut / kill QEMU replay | 待设计 | 只证明 guest crash + journal replay，不证明宿主 page cache 丢失 |
-| host-side dm-log-writes / fault backend | 待设计 | 用于证明 flush/barrier 对未 flush 写入的保护 |
-| 修复前负向证据 | 待运行 | 目标：观察 fsync 返回但未发 flush / 目标 TID 未 commit |
-| 修复后正向证据 | 待运行 | 同流程下数据与 metadata 持久化校验通过 |
+| QEMU `-drive` cache 参数审计 | ⚠️ 待 Step 6 | 当前 Step 5 不宣称 host page cache 丢失语义 |
+| guest powercut / kill QEMU replay | ✅ 已覆盖 | 4 个场景均在 prepare 完成后 kill QEMU，重启 replay 后校验 |
+| host-side dm-log-writes / fault backend | blocked | Asterinas guest 当前无 dm-flakey/dm-log-writes；保留 blocked |
+| 修复前负向证据 | ⚠️ 间接 | Phase 3 pretest 已有 fsync latency no-op 证据；未在本 Step 复跑旧代码 |
+| 修复后正向证据 | ✅ 已覆盖 | prepare 日志可见 `BlockDevice::sync()` / virtio flush；verify 4/4 PASS |
 
 ### 验收项
 
-- [ ] blocked case 原因清楚
-- [ ] 自研 crash 替代场景覆盖核心 fsync/rename/dir 风险
-- [ ] 4 个 host-crash 最小集有命令、日志、校验口径
-- [ ] host/device persistence 与 guest crash replay 证据分开
-- [ ] blocked case 不计入 pass rate
-- [ ] 若解除 blocked，记录环境与日志
+- [x] blocked case 原因清楚
+- [x] 自研 crash 替代场景覆盖核心 fsync/rename/dir 风险
+- [x] 4 个 host-crash 最小集有命令、日志、校验口径
+- [x] host/device persistence 与 guest crash replay 证据分开
+- [x] blocked case 不计入 pass rate
+- [x] 若解除 blocked，记录环境与日志
 
 ## Step 6：Phase 3 全量回归、benchmark 与报告更新
 
-**状态：** 待执行
+**状态：** 部分完成（fsync/flush 语义收口；普通 fio write 红线未过）
 **目标摘要：** 完成持久化语义修复后的全量证据链与文档收口。
 
 ### 改动概要
 
-- 待记录。
+- 修正 `run_write_16k_fsync4_summary.sh` 的结果解析：不再信任 `bench_linux_and_aster.sh` 生成的裸数字 JSON，而是直接解析 fio 最终 `WRITE: bw=...` 行，按 `KiB/MiB/GiB` 与 `KB/MB/GB` 归一化到十进制 `MB/s`。
+- 用 Step 4c 后的保存日志重新换算 `bs=16K fsync=4` 三组结果；`ext4_journaled` 原 JSON 中 `5288 MB/s` 实际为 `5288 KiB/s = 5.415 MB/s`，不得作为性能宣传。
+- 修复 `generic/392`：新增 `JournaledOp::InodeMetadata { ino }`，让时间戳/chmod/chown/rdev 等单 inode metadata 更新推进 inode→TID 映射，`fsync` 能 force-commit 对应事务。
+- 修复 `generic/049`：xfs_io shim 支持 `-rxc "syncfs"` 组合短选项，确保 `_scratch_sync` 执行真实 `syncfs`。
+- 复跑普通 ext4 fio O_DIRECT：read 达到 127.06%，write 只有 39.18%，已低于 75% hardening 红线；本 Step 追加性能回归分析。
+- 更新 `benchmark.md`、`technical_report.md` 与仓库内 benchmark/milestone 副本，明确 fsync-heavy 是语义压力测试，和普通 O_DIRECT 吞吐分栏记录。
 
 ### 涉及文件
 
-- 待记录。
+| 文件 | 说明 |
+|------|------|
+| `asterinas/test/initramfs/src/benchmark/fio/run_write_16k_fsync4_summary.sh` | fsync-heavy summary 改为解析 fio bandwidth 单位并归一化 |
+| `asterinas/kernel/src/fs/ext4/fs.rs` | `InodeMetadata` journal op + inode metadata TID 追踪 |
+| `asterinas/test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | xfs_io shim 支持 `-rxc "syncfs"` |
+| `feature_jbd2_phase3_milestone.md` | Step 6 记录真实 benchmark 结果与遗留项 |
+| `benchmark.md` / `asterinas/benchmark/benchmark.md` | 同步 Phase 3 fsync-heavy 结果口径 |
+| `technical_report.md` | 补充 Phase 3 fsync/flush 语义结论 |
 
 ### 功能回归
 
 | 测试项 | 结果 | 日志 |
 |--------|------|------|
-| `phase3_base_guard` | 待运行 | 待记录 |
-| `phase4_good` | 待运行 | 待记录 |
-| `phase6_good` | 待运行 | 待记录 |
-| `jbd_phase1` | 待运行 | 待记录 |
-| crash matrix | 待运行 | 待记录 |
-| Phase 2 concurrency baseline | 待运行 | 待记录 |
-| `jbd_phase3_fsync_flush` | 待运行 | 待记录 |
-| Tier 1 shutdown ioctl xfstests | 待运行 | 待记录 |
-| host-crash fsync matrix | 待运行 | 待记录 |
+| `phase3_base_guard` | Step 4 主线已回归通过；Step 6 未单独复跑 | 见 Step 4 记录 |
+| `phase4_good` | Step 4 主线已回归通过；Step 6 未单独复跑 | 见 Step 4 记录 |
+| `phase6_good` | Step 4 主线已回归通过；Step 6 未单独复跑 | 见 Step 4 记录 |
+| `jbd_phase1` | Step 4 主线已回归通过；Step 6 未单独复跑 | 见 Step 4 记录 |
+| crash matrix | Phase 2 crash matrix 曾有 18/18；Phase 3 host-crash 补位另列 | 见 Step 4/5 记录 |
+| Phase 2 concurrency baseline | Step 4 主线已回归通过；Step 6 未单独复跑 | 见 Step 4 记录 |
+| `jbd_phase3_fsync_flush` | ✅ 默认 11 PASS / 1 NOTRUN / 0 FAIL | `benchmark/logs/jbd_phase3_fsync_durability_20260508_023301.log` |
+| Tier 1 shutdown ioctl xfstests | ✅ 默认 11 PASS / 1 NOTRUN / 0 FAIL；12G scratch `generic/048` 单点 PASS | `benchmark/logs/jbd_phase3_fsync_durability_20260508_025646.log` |
+| host-crash fsync matrix | ✅ 4/4 PASS | `benchmark/logs/crash/phase4_part3_crash_summary_20260507_173023.tsv` |
 
 ### Phase 3 覆盖统计
 
 | 维度 | 覆盖项 | 结果 | 说明 |
 |------|--------|------|------|
-| guest crash + journal replay | Phase 1 crash matrix + Tier 1 shutdown xfstests | 待运行 | 证明 replay 与 force-commit 元数据持久性 |
-| host/device persistence | 4 个 host-crash 自研场景 + flush 计数/故障注入证据 | 待运行 | 不与 guest crash 混算 |
-| fdatasync vs fsync | `generic/045` + `generic/392` + `host_crash_fdatasync_metadata` | 待运行 | 记录保守等价或细化差异 |
-| dm 依赖 blocked | Tier 2 7 条 + Tier 3 4 条 | 待记录 | 每条必须有补位或范围说明 |
+| guest crash + journal replay | Phase 1 crash matrix + Tier 1 shutdown xfstests | ✅ 默认全套 11/11 有效 PASS；扩容后 Tier 1 12 case 均有 PASS 证据 | `generic/048` 需 12G scratch 单跑 |
+| host/device persistence | 4 个 host-crash 自研场景 + flush 计数/故障注入证据 | ⚠️ 自研场景 4/4 PASS；host fault injection 仍 blocked | 不与 guest crash 混算 |
+| fdatasync vs fsync | `generic/045` + `generic/392` + `host_crash_fdatasync_metadata` | ✅ `generic/045` PASS，`generic/392` PASS，host-crash metadata PASS | fdatasync 至少恢复 i_size；fsync 恢复 inode metadata |
+| dm 依赖 blocked | Tier 2 7 条 + Tier 3 4 条 | ⚠️ Step 5 给出 4 个 host-crash 替代场景 | dm-log-writes / dm-error / thin-pool 类仍不在 Phase 3 已验证范围 |
 
 ### 性能结果
 
 | 测试项 | Asterinas | Linux | ratio | 结论 |
 |--------|----------:|------:|------:|------|
-| ext4 read fio | 待运行 | 待运行 | 待运行 | 待记录 |
-| ext4 write fio | 待运行 | 待运行 | 待运行 | 待记录 |
-| raw `bs=16K fsync=4` | 待运行 | 待运行 | 待运行 | 待记录 |
-| ext4 journaled `bs=16K fsync=4` | 待运行 | 待运行 | 待运行 | 待记录 |
+| ext4 read fio | 5179 MB/s | 4076 MB/s | 127.06% | Step 6 普通 O_DIRECT 复跑，通过 |
+| ext4 write fio | 1189 MB/s | 3035 MB/s | 39.18% | Step 6 普通 O_DIRECT 复跑，低于 75% hardening 红线；同代码首轮观察 1625/3192=50.91%，仍低于红线 |
+| raw `bs=16K fsync=4` | 33.240 MB/s | 47.186 MB/s | 70.44% | raw block fd `fsync` 已触发真实 flush，和 Linux 同量级 |
+| ext4 journaled `bs=16K fsync=4` | 5.415 MB/s | 22.649 MB/s | 23.91% | commit block 前 PREFLUSH + VFS final flush 后的真实持久化成本；旧 JSON 的 `5288` 是 KiB/s |
+| ext4 nojournal `bs=16K fsync=4` | 11.010 MB/s | 37.958 MB/s | 29.01% | nojournal 仍需 device flush，低于 Linux |
 
-性能红线：普通 ext4 write fio 低于 `75%` 时，必须在本 step 记录 group commit / commit batching / flush 合并分析；fsync-heavy 下降不直接视为普通吞吐回退。
+fsync-heavy 本轮命令：
+
+```bash
+KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_write_16k_fsync4_summary.sh
+```
+
+保存日志：`/tmp/write-16k-fsync4.SumaYX/`。
+
+普通 fio 本轮命令：
+
+```bash
+KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
+保存日志：write 最终复跑 `/tmp/ext4-fio-summary.final/ext4_seq_write_bw.log`，read 复跑 `/tmp/ext4-fio-summary.iqspHK/ext4_seq_read_bw.log`。`run_ext4_summary.sh` 外层在 write 低于阈值后打印 failed，但 Docker 内 job 已完成；read 使用等价 Docker job 单独补跑。
+
+普通 fio write 红线分析：
+
+1. Phase 3 为修复 `generic/047`，`JournaledOp::for_small_write` 改为所有非空 write 都记录 `Write { len, ino }`，确保 inode TID 能被后续 `fsync` 追踪到。
+2. 当前 `estimate_jbd2_reserved_blocks()` 对 `Write` 按 `len.div_ceil(EXT4_BLOCK_SIZE) + 8` 估算 journal credit；1MiB O_DIRECT write 会预留约 264 个 block，导致 transaction 更频繁 rotate/commit。
+3. Step 4c 在 JBD2 commit block 前加入 PREFLUSH 等价屏障后，频繁 commit 的成本被放大，普通 write 稳态跌破红线。
+4. 已试验把 write metadata credit 固定为 32 blocks，结果进一步降到 1101/2873=38.32%，说明简单压低 credit 不是有效修复；该实验改动已回退。
+5. 后续 hardening 方向：拆分“inode TID 追踪”和“transaction admission credit”；区分纯 overwrite/no-allocation direct write 与会分配/改 extent 的 write；减少稳态 O_DIRECT overwrite 走 `ext4_prepare_write_at` 与全局路径的次数；合并 commit/flush。
+
+性能红线：普通 ext4 write fio 已低于 `75%`，不得作为 Phase 3 退场性能结论；fsync-heavy 下降不直接视为普通吞吐回退。
 
 ### 验收项
 
-- [ ] milestone 每个 step 均有命令、日志、结果
-- [ ] benchmark 区分普通吞吐与 fsync-heavy 语义测试
-- [ ] technical report 更新 Phase 3 语义结论
-- [ ] guest crash 与 host/device persistence 统计不混算
+- [x] milestone 每个已执行 step 均有命令、日志、结果
+- [x] benchmark 区分普通吞吐与 fsync-heavy 语义测试
+- [x] technical report 更新 Phase 3 语义结论
+- [x] guest crash 与 host/device persistence 统计不混算
+- [x] 普通 fio O_DIRECT 已复跑，并记录 write 低于 75% 红线
 - [ ] AGENTS/CLAUDE/README 索引指向 Phase 3
-- [ ] 后续性能 hardening 边界清楚
+- [x] 后续性能 hardening 边界清楚
 
 ## 变更日志
 
@@ -846,3 +1008,9 @@ Step 1 观测点日志也同步更新为修后的正确描述。
 | 2026-05-06 | Plan review | Codex | 按代码审计补强 force commit/TID 追踪、ordered flush 顺序、virtio flush 等待闭环、host/device persistence 方法学与普通 fio 性能红线 |
 | 2026-05-06 | Plan review | Codex | 将 xfstests 按 Tier 1/2/3 对齐 Phase 3 两条线；补入 `EXT4_IOC_SHUTDOWN` 前置、godown shim 口径更正、4 个自研 host-crash 补位与 Step 6 分栏统计 |
 | 2026-05-06 | Plan review | Codex | 按 ext2 代码参考收口 VFS final flush、两次 flush 屏障、per-ino TID 状态位置、非 PageCache 现状与 ext2 fdatasync 反例 |
+| 2026-05-08 | 4c | Codex | `BlockDevice::sync()` 改为必选真实实现，JBD2 commit block 前新增 PREFLUSH 等价 barrier，并按 `environment.md` 用 Docker `jbd_phase3_fsync_flush` 回归 |
+| 2026-05-08 | 5 | Codex | 新增 `jbd_phase3_host_crash` Docker mode 与 4 个自研 fsync/fdatasync/rename/concurrent crash 场景，Docker 验证 4/4 PASS |
+| 2026-05-08 | 6 | Codex | 修正 `bs=16K fsync=4` summary 单位解析，记录 Step 4c 后真实 fsync-heavy 结果与 Phase 3 报告口径 |
+| 2026-05-08 | 6 | Codex | 修复 `generic/392` inode metadata TID 追踪与 `generic/049` xfs_io `-rxc syncfs` shim，Docker `jbd_phase3_fsync_flush` 达到 11 PASS / 1 NOTRUN / 0 FAIL |
+| 2026-05-08 | 6 | Codex | 补齐 Docker wrapper 对 `XFSTESTS_*_IMG_SIZE` 的透传，12G scratch 单跑 `generic/048` PASS |
+| 2026-05-08 | 6 | Codex | 复跑普通 ext4 fio：read 5179/4076=127.06% PASS，write 1189/3035=39.18% FAIL；简单 journal credit cap 实验无效并已回退 |

@@ -701,6 +701,13 @@ while [ $# -gt 0 ]; do
             cmds+=("${2:-}")
             shift 2
             ;;
+        -*c*)
+            # xfs_io accepts combined short options such as `-rxc "syncfs"`.
+            # Treat any option group containing `c` as consuming the next
+            # argument as a command.
+            cmds+=("${2:-}")
+            shift 2
+            ;;
         --)
             shift
             break

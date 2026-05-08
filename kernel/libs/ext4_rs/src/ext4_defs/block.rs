@@ -15,6 +15,7 @@ pub trait BlockDevice: Send + Sync + Any {
         }
     }
     fn write_offset(&self, offset: usize, data: &[u8]);
+    fn sync(&self) -> Result<()>;
 }
 
 pub trait MetadataWriter: Send + Sync {

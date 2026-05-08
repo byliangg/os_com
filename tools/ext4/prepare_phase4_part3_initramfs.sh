@@ -97,7 +97,10 @@ install_host_tool_with_libs /usr/sbin/e2fsck /usr/sbin/e2fsck
 
 echo "[INFO] Building xfstests file I/O helper ..."
 XFSTESTS_FSYNC_HELPER="${WORK_DIR}/fsync_file"
-${CC:-gcc} -O2 test/initramfs/src/syscall/xfstests/fsync_file.c -o "${XFSTESTS_FSYNC_HELPER}"
+if ! ${CC:-gcc} -O2 -Wall -Wextra -static test/initramfs/src/syscall/xfstests/fsync_file.c -o "${XFSTESTS_FSYNC_HELPER}"; then
+  echo "[WARN] static xfstests file I/O helper build failed; falling back to dynamic build" >&2
+  ${CC:-gcc} -O2 -Wall -Wextra test/initramfs/src/syscall/xfstests/fsync_file.c -o "${XFSTESTS_FSYNC_HELPER}"
+fi
 install_host_tool_with_libs "${XFSTESTS_FSYNC_HELPER}" /opt/xfstests/fsync_file
 
 echo "[INFO] Building ext4 Phase 2 concurrency helper ..."

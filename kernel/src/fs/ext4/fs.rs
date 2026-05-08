@@ -88,17 +88,20 @@ enum JournaledOp {
     Rename,
     Write { len: usize, ino: u32 },
     Truncate { ino: u32 },
+    InodeMetadata { ino: u32 },
 }
 
 impl JournaledOp {
     /// Step 4a-2: returns the primary inode whose metadata is modified by this
     /// op, used by `finish_jbd2_handle` to update the inode→TID map for
-    /// fsync force-commit.  Currently only `Write` and `Truncate` carry
-    /// inode info; other ops touch multiple inodes (parents + child) and
-    /// are not tracked at this granularity in v1.
+    /// fsync force-commit.  Single-inode metadata ops carry inode info;
+    /// directory ops touch multiple inodes (parents + child) and are not
+    /// tracked at this granularity in v1.
     fn affected_ino(&self) -> Option<u32> {
         match self {
-            Self::Write { ino, .. } | Self::Truncate { ino } => Some(*ino),
+            Self::Write { ino, .. } | Self::Truncate { ino } | Self::InodeMetadata { ino } => {
+                Some(*ino)
+            }
             _ => None,
         }
     }
@@ -749,6 +752,28 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
             error!("ext4 block write failed at offset {}: {:?}", offset, err);
         }
     }
+
+    fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
+        match self.inner.sync() {
+            Ok(BioStatus::Complete) => Ok(()),
+            Ok(status) => {
+                self.mark_io_failure();
+                error!("ext4 block sync completed with status {:?}", status);
+                Err(ext4_rs::Ext4Error::with_message(
+                    ext4_rs::Errno::EIO,
+                    "block device sync did not complete",
+                ))
+            }
+            Err(err) => {
+                self.mark_io_failure();
+                error!("ext4 block sync failed: {:?}", err);
+                Err(ext4_rs::Ext4Error::with_message(
+                    ext4_rs::Errno::EIO,
+                    "block device sync failed",
+                ))
+            }
+        }
+    }
 }
 
 struct JournalIoBridge {
@@ -813,6 +838,10 @@ impl Ext4BlockDevice for JournalIoBridge {
 
     fn write_offset(&self, offset: usize, data: &[u8]) {
         self.adapter.write_offset(offset, data);
+    }
+
+    fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
+        self.adapter.sync()
     }
 }
 
@@ -1171,7 +1200,7 @@ impl Ext4Fs {
                 let blocks = len.div_ceil(EXT4_BLOCK_SIZE);
                 u32::try_from(blocks.saturating_add(8)).unwrap_or(u32::MAX)
             }
-            Some(JournaledOp::Truncate { .. }) => 8,
+            Some(JournaledOp::Truncate { .. }) | Some(JournaledOp::InodeMetadata { .. }) => 8,
             None => 8,
         }
     }
@@ -1185,6 +1214,7 @@ impl Ext4Fs {
             Some(JournaledOp::Rename) => "rename",
             Some(JournaledOp::Write { .. }) => "write",
             Some(JournaledOp::Truncate { .. }) => "truncate",
+            Some(JournaledOp::InodeMetadata { .. }) => "inode_metadata",
             None => "anonymous",
         }
     }
@@ -1263,7 +1293,7 @@ impl Ext4Fs {
 
         // Step 4a-2: record (ino → handle's TID) so a subsequent fsync(ino)
         // can force-commit exactly the TID containing this inode's metadata.
-        // Only Write/Truncate carry inode info in v1; other ops touch
+        // Only single-inode ops carry inode info in v1; directory ops touch
         // multiple inodes (parent + child) and rely on the Phase 2 inode
         // correctness lock to serialize fsync after the op completes.
         if succeeded {
@@ -2293,35 +2323,43 @@ impl Ext4Fs {
         mtime: Option<u32>,
         ctime: Option<u32>,
     ) -> Result<()> {
-        self.run_inode_metadata_update(|ext4| {
+        self.run_inode_metadata_update(ino, |ext4| {
             ext4.ext4_set_inode_times(ino, atime, mtime, ctime)
                 .map(|_| ())
         })
     }
 
     pub(super) fn set_inode_mode(&self, ino: u32, mode: u16) -> Result<()> {
-        self.run_inode_metadata_update(|ext4| ext4.ext4_set_inode_mode(ino, mode).map(|_| ()))?;
+        self.run_inode_metadata_update(ino, |ext4| {
+            ext4.ext4_set_inode_mode(ino, mode).map(|_| ())
+        })?;
         self.touch_ctime(ino)
     }
 
     pub(super) fn set_inode_uid(&self, ino: u32, uid: u32) -> Result<()> {
         let uid = u16::try_from(uid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "uid exceeds ext4 uid width"))?;
-        self.run_inode_metadata_update(|ext4| ext4.ext4_set_inode_uid(ino, uid).map(|_| ()))?;
+        self.run_inode_metadata_update(ino, |ext4| {
+            ext4.ext4_set_inode_uid(ino, uid).map(|_| ())
+        })?;
         self.touch_ctime(ino)
     }
 
     pub(super) fn set_inode_gid(&self, ino: u32, gid: u32) -> Result<()> {
         let gid = u16::try_from(gid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "gid exceeds ext4 gid width"))?;
-        self.run_inode_metadata_update(|ext4| ext4.ext4_set_inode_gid(ino, gid).map(|_| ()))?;
+        self.run_inode_metadata_update(ino, |ext4| {
+            ext4.ext4_set_inode_gid(ino, gid).map(|_| ())
+        })?;
         self.touch_ctime(ino)
     }
 
     pub(super) fn set_inode_rdev(&self, ino: u32, rdev: u64) -> Result<()> {
         let rdev = u32::try_from(rdev)
             .map_err(|_| Error::with_message(Errno::EINVAL, "rdev exceeds ext4 rdev width"))?;
-        self.run_inode_metadata_update(|ext4| ext4.ext4_set_inode_rdev(ino, rdev).map(|_| ()))?;
+        self.run_inode_metadata_update(ino, |ext4| {
+            ext4.ext4_set_inode_rdev(ino, rdev).map(|_| ())
+        })?;
         self.touch_ctime(ino)
     }
 
@@ -3033,6 +3071,15 @@ impl Ext4Fs {
 
     fn run_inode_metadata_update<T>(
         &self,
+        ino: u32,
+        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
+    ) -> Result<T> {
+        self.run_inode_metadata_update_with_op(Some(JournaledOp::InodeMetadata { ino }), f)
+    }
+
+    fn run_inode_metadata_update_with_op<T>(
+        &self,
+        op: Option<JournaledOp>,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
     ) -> Result<T> {
         let journal_enabled = self
@@ -3041,7 +3088,7 @@ impl Ext4Fs {
             .as_ref()
             .is_some_and(|runtime| runtime.enabled());
         if journal_enabled {
-            self.run_journaled_ext4(None, |ext4| f(ext4).map_err(map_ext4_error))
+            self.run_journaled_ext4(op, |ext4| f(ext4).map_err(map_ext4_error))
         } else {
             self.run_ext4(f)
         }

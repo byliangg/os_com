@@ -11,6 +11,7 @@ TEST_DEV=${EXT4_CRASH_TEST_DEV:-/dev/vda}
 MNT_DIR=${EXT4_CRASH_MNT:-/ext4_crash_test}
 CASE_DIR_NAME=${EXT4_CRASH_CASE_DIR:-phase4_crash}
 CASE_DIR=${MNT_DIR}/${CASE_DIR_NAME}
+FSYNC_HELPER=${EXT4_CRASH_FSYNC_HELPER:-/opt/xfstests/fsync_file}
 
 fail() {
     echo "EXT4_CRASH_FAIL scenario=${SCENARIO} phase=${PHASE} reason=$1" >&2
@@ -38,6 +39,20 @@ require_file_contains() {
     needle="$2"
     [ -f "${file}" ] || fail "missing file ${file}"
     grep -F -q "${needle}" "${file}" 2>/dev/null || fail "file ${file} does not contain ${needle}"
+}
+
+require_file_filled_with_byte() {
+    file="$1"
+    byte="$2"
+    char=$(printf "\\$(printf '%03o' "${byte}")")
+    [ -f "${file}" ] || fail "missing file ${file}"
+    remaining=$(LC_ALL=C tr -d "${char}" < "${file}" | wc -c | tr -d '[:space:]')
+    [ "${remaining}" = "0" ] || fail "file ${file} contains ${remaining} bytes other than ${byte}"
+}
+
+fsync_helper() {
+    [ -x "${FSYNC_HELPER}" ] || fail "missing fsync helper ${FSYNC_HELPER}"
+    "${FSYNC_HELPER}" "$@" || fail "fsync helper failed: $*"
 }
 
 ensure_mountpoint_unmounted() {
@@ -229,6 +244,68 @@ verify_append_concurrent() {
     require_file_contains "${CASE_DIR}/append_concurrent.txt" "append-final"
 }
 
+prepare_host_crash_fsync_size_durability() {
+    mkdir -p "${CASE_DIR}/fsync_size"
+    fsync_helper pwrite "${CASE_DIR}/fsync_size/data.bin" 0 65536 65
+    fsync_helper fsync "${CASE_DIR}/fsync_size/data.bin"
+    fsync_helper fsync "${CASE_DIR}/fsync_size"
+}
+
+verify_host_crash_fsync_size_durability() {
+    require_file_size "${CASE_DIR}/fsync_size/data.bin" 65536
+    require_file_filled_with_byte "${CASE_DIR}/fsync_size/data.bin" 65
+}
+
+prepare_host_crash_fdatasync_metadata() {
+    mkdir -p "${CASE_DIR}/fdatasync_meta"
+    fsync_helper pwrite "${CASE_DIR}/fdatasync_meta/data.bin" 0 32768 66
+    fsync_helper fdatasync "${CASE_DIR}/fdatasync_meta/data.bin"
+    fsync_helper pwrite "${CASE_DIR}/fdatasync_meta/fsync_data.bin" 0 4096 67
+    fsync_helper fsync "${CASE_DIR}/fdatasync_meta/fsync_data.bin"
+    fsync_helper fsync "${CASE_DIR}/fdatasync_meta"
+}
+
+verify_host_crash_fdatasync_metadata() {
+    require_file_size "${CASE_DIR}/fdatasync_meta/data.bin" 32768
+    require_file_filled_with_byte "${CASE_DIR}/fdatasync_meta/data.bin" 66
+    require_file_size "${CASE_DIR}/fdatasync_meta/fsync_data.bin" 4096
+    require_file_filled_with_byte "${CASE_DIR}/fdatasync_meta/fsync_data.bin" 67
+}
+
+prepare_host_crash_rename_fsync_dst() {
+    mkdir -p "${CASE_DIR}/rename_fsync/src" "${CASE_DIR}/rename_fsync/dst"
+    printf "rename-fsync-dst-payload" > "${CASE_DIR}/rename_fsync/src/item.tmp"
+    fsync_helper fsync "${CASE_DIR}/rename_fsync/src/item.tmp"
+    mv "${CASE_DIR}/rename_fsync/src/item.tmp" "${CASE_DIR}/rename_fsync/dst/item.txt"
+    fsync_helper fsync "${CASE_DIR}/rename_fsync/dst"
+}
+
+verify_host_crash_rename_fsync_dst() {
+    [ ! -e "${CASE_DIR}/rename_fsync/src/item.tmp" ] || fail "rename source still exists"
+    require_file_content "${CASE_DIR}/rename_fsync/dst/item.txt" "rename-fsync-dst-payload"
+}
+
+prepare_host_crash_concurrent_fsync() {
+    mkdir -p "${CASE_DIR}/concurrent_fsync"
+    for i in 1 2 3 4; do
+        (
+            byte=$((70 + i))
+            fsync_helper pwrite "${CASE_DIR}/concurrent_fsync/worker_${i}.bin" 0 8192 "${byte}"
+            fsync_helper fsync "${CASE_DIR}/concurrent_fsync/worker_${i}.bin"
+        ) &
+    done
+    wait
+    fsync_helper fsync "${CASE_DIR}/concurrent_fsync"
+}
+
+verify_host_crash_concurrent_fsync() {
+    for i in 1 2 3 4; do
+        byte=$((70 + i))
+        require_file_size "${CASE_DIR}/concurrent_fsync/worker_${i}.bin" 8192
+        require_file_filled_with_byte "${CASE_DIR}/concurrent_fsync/worker_${i}.bin" "${byte}"
+    done
+}
+
 prepare_scenario() {
     case "$1" in
         create_write) prepare_create_write ;;
@@ -241,6 +318,10 @@ prepare_scenario() {
         rename_across_dir) prepare_rename_across_dir ;;
         truncate_shrink) prepare_truncate_shrink ;;
         append_concurrent) prepare_append_concurrent ;;
+        host_crash_fsync_size_durability) prepare_host_crash_fsync_size_durability ;;
+        host_crash_fdatasync_metadata) prepare_host_crash_fdatasync_metadata ;;
+        host_crash_rename_fsync_dst) prepare_host_crash_rename_fsync_dst ;;
+        host_crash_concurrent_fsync) prepare_host_crash_concurrent_fsync ;;
         *) fail "unknown scenario $1" ;;
     esac
 }
@@ -257,6 +338,10 @@ verify_scenario() {
         rename_across_dir) verify_rename_across_dir ;;
         truncate_shrink) verify_truncate_shrink ;;
         append_concurrent) verify_append_concurrent ;;
+        host_crash_fsync_size_durability) verify_host_crash_fsync_size_durability ;;
+        host_crash_fdatasync_metadata) verify_host_crash_fdatasync_metadata ;;
+        host_crash_rename_fsync_dst) verify_host_crash_rename_fsync_dst ;;
+        host_crash_concurrent_fsync) verify_host_crash_concurrent_fsync ;;
         *) fail "unknown scenario $1" ;;
     esac
 }

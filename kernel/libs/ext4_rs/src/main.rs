@@ -97,6 +97,18 @@ impl BlockDevice for Disk {
         let _r = file.seek(std::io::SeekFrom::Start(offset as u64));
         let _r = file.write_all(&data);
     }
+
+    fn sync(&self) -> Result<()> {
+        use std::fs::OpenOptions;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("ex4.img")
+            .unwrap();
+        file.sync_all()
+            .map_err(|_| Ext4Error::with_message(Errno::EIO, "file sync failed"))?;
+        Ok(())
+    }
 }
 
 fn test_raw_block_device_write(block_device: Arc<dyn BlockDevice>, size_mb: usize) {

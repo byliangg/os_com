@@ -44,6 +44,14 @@ impl BlockDevice for FileBackedDisk {
         file.write_all(data).unwrap();
         file.flush().unwrap();
     }
+
+    fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
+        let file = self.file.lock().unwrap();
+        file.sync_all().map_err(|_| {
+            ext4_rs::Ext4Error::with_message(ext4_rs::Errno::EIO, "file sync failed")
+        })?;
+        Ok(())
+    }
 }
 
 fn usage() -> ! {
