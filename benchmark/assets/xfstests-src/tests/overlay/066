@@ -1,0 +1,157 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Chengguang Xu <cgxu519@mykernel.net>
+# All Rights Reserved.
+#
+# FS QA Test 066
+#
+# Test overlayfs copy-up function for variant sparse files.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup fiemap
+
+# Import common functions..
+. ./common/filter
+
+# real QA test starts here.
+
+# Modify as appropriate.
+_require_test
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# We have totally 16 test files in this test.
+# The detail as below:
+# 1 small empty file 4K
+# 1 big empty file 4M
+# 1 small random hole file 10M
+# 1 big random hole file 100M
+#
+# 12 files with variant iosize aligned holes.
+# 2^0(K)..2^11(K) hole size files(file size = 10 * iosize)
+#
+# Considering both upper and lower fs will fill zero when copy-up
+# hole area in the file, this test at least requires double disk
+# space of the sum of above test files' size.
+
+_require_fs_space $OVL_BASE_SCRATCH_MNT $((((4) + (4096) + (10 * 1024) \
+		 + (100 * 1024) + (10 * (1 + 2048) * 12 / 2)) * 2))
+
+do_cmd()
+{
+	echo $@ >>$seqres.full
+	eval $@ >>$seqres.full
+}
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+testfile="copyup_sparse_test"
+
+# Create a small completely empty hole file(4K).
+file_size=4
+do_cmd $XFS_IO_PROG -fc "\"truncate ${file_size}K\"" \
+			"${lowerdir}/${testfile}_empty_small"
+
+# Create a big completely empty hole file(4M).
+file_size=4096
+do_cmd $XFS_IO_PROG -fc "\"truncate ${file_size}K\"" \
+			"${lowerdir}/${testfile}_empty_big"
+
+# Create 2^0(K)..2^11(K) hole size test files(file size = 10 * iosize).
+#
+# The pattern is like below, both hole and data are equal to
+# iosize except last hole.
+#
+# |-- hole --|-- data --| ... |-- data --|-- hole --|
+
+min_iosize=1
+max_iosize=2048
+iosize=$min_iosize
+
+while [ $iosize -le $max_iosize ]; do
+	file_size=$(($iosize * 10))
+	max_pos=$(($file_size - $iosize))
+	pos=$iosize
+	do_cmd $XFS_IO_PROG -fc "\"truncate ${file_size}K\"" \
+				"${lowerdir}/${testfile}_iosize${iosize}K"
+	echo -e "\niosize=${iosize}K hole test write scenarios ---\n" >>$seqres.full
+	while [ $pos -lt $max_pos ]; do
+		do_cmd $XFS_IO_PROG -fc "\"pwrite ${pos}K ${iosize}K\"" \
+					"${lowerdir}/${testfile}_iosize${iosize}K"
+		pos=$(($pos + $iosize * 2))
+	done
+	iosize=$(($iosize * 2))
+done
+echo >>$seqres.full
+
+# Create test file with many random small holes(hole size is between 4K and 512K),
+# total file size is 10M.
+
+file_size=10240
+min_hole=4
+max_hole=512
+pos=$min_hole
+max_pos=$(($file_size - 2*$max_hole))
+
+do_cmd $XFS_IO_PROG -fc "\"truncate ${file_size}K\"" \
+			"${lowerdir}/${testfile}_random_small"
+
+echo -e "\nSmall random hole test write scenarios ---\n" >>$seqres.full
+while [ $pos -le $max_pos ]; do
+	iosize=$(($RANDOM % ($max_hole - $min_hole) + $min_hole))
+	do_cmd $XFS_IO_PROG -fc "\"pwrite ${pos}K ${iosize}K\"" \
+		"${lowerdir}/${testfile}_random_small"
+	pos=$(($pos + $iosize * 2))
+done
+echo >>$seqres.full
+
+# Create test file with many random holes(hole size is between 1M and 5M),
+# total file size is 100M.
+
+file_size=102400
+min_hole=1024
+max_hole=5120
+pos=$min_hole
+max_pos=$(($file_size - 2*$max_hole))
+
+do_cmd $XFS_IO_PROG -fc "\"truncate ${file_size}K\"" \
+			"${lowerdir}/${testfile}_random_big"
+
+echo -e "\nBig random hole test write scenarios ---\n" >>$seqres.full
+while [ $pos -le $max_pos ]; do
+	iosize=$(($RANDOM % ($max_hole - $min_hole) + $min_hole))
+	do_cmd $XFS_IO_PROG -fc "\"pwrite ${pos}K ${iosize}K\"" \
+				"${lowerdir}/${testfile}_random_big"
+	pos=$(($pos + $iosize * 2))
+done
+echo >>$seqres.full
+
+_scratch_mount
+
+# Open the test files, no errors are expected.
+echo -e "\nDoing copy-up...\n" >>$seqres.full
+for f in $SCRATCH_MNT/*; do
+	do_cmd $XFS_IO_PROG -c "open" $f
+done
+
+echo "Silence is golden"
+
+# Check all copy-up files in upper layer.
+diff -qr ${upperdir} ${lowerdir} | tee -a $seqres.full
+if [ $? -ne 0 ]; then
+	echo "Copy-up failed!!!"
+
+	echo "\n----------------------------------------" >>$seqres.full
+	echo -e "The layout of files in lowerdir\n" >>$seqres.full
+	do_cmd $FILEFRAG_PROG -k -e $lowerdir/*
+	echo "\n----------------------------------------" >>$seqres.full
+	echo -e "The layer of files in upperdir\n" >>$seqres.full
+	do_cmd $FILEFRAG_PROG -k -e $upperdir/*
+
+fi
+
+# success, all done
+status=0
+exit

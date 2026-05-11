@@ -1,0 +1,87 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 SUSE Linux Products GmbH.  All Rights Reserved.
+#
+# FS QA Test 677
+#
+# Test that after a full fsync of a file with preallocated extents beyond the
+# file's size, if a power failure happens, the preallocated extents still exist
+# after we mount the filesystem.
+#
+. ./common/preamble
+_begin_fstest auto quick log prealloc fiemap
+
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -r -f $tmp.*
+}
+
+. ./common/filter
+. ./common/dmflakey
+. ./common/punch
+
+
+_require_scratch
+_require_dm_target flakey
+_require_xfs_io_command "falloc" "-k"
+_require_xfs_io_command "fiemap"
+_require_odirect
+
+rm -f $seqres.full
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# The fiemap results in the golden output requires file allocations to align to
+# 1MB boundaries.
+_require_congruent_file_oplen $SCRATCH_MNT 1048576
+
+# Create our test file with many extents.
+# On btrfs this results in having multiple leaves of metadata full of file
+# extent items, a condition necessary to trigger the original bug.
+#
+# We use direct IO here because:
+#
+# 1) It's faster then doing fsync after each buffered write;
+#
+# 2) For btrfs, the first fsync would clear the inode's full sync runtime flag,
+#    and we want the fsync below to trigger the full fsync code path of btrfs.
+$XFS_IO_PROG -f -d -c "pwrite -b 4K 0 16M" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Now add two preallocated extents to our file without extending the file's size.
+# One right at i_size, and another further beyond, leaving a gap between the two
+# prealloc extents.
+$XFS_IO_PROG -c "falloc -k 16M 1M" $SCRATCH_MNT/foo
+$XFS_IO_PROG -c "falloc -k 20M 1M" $SCRATCH_MNT/foo
+
+# Make sure everything is durably persisted.
+# On btrfs this commits the current transaction and it makes all the created
+# extents to have a generation lower than the generation of the transaction used
+# by the next write and fsync.
+_scratch_sync
+
+# Now overwrite only the first extent.
+# On btrfs, due to COW (both data and metadata), that results in modifying only
+# the first leaf of metadata for our inode (we replace a file extent item and
+# update the inode item). Then fsync it. On btrfs this fsync will use the slow
+# code path because it's the first fsync since the inode was created/loaded.
+$XFS_IO_PROG -c "pwrite 0 4K" -c "fsync" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Simulate a power failure and then mount again the filesystem to replay the log
+# tree.
+_flakey_drop_and_remount
+
+# After the power failure we expect that the preallocated extents, beyond the
+# inode's i_size, still exist.
+echo "List of extents after power failure:"
+$XFS_IO_PROG -c "fiemap -v" $SCRATCH_MNT/foo | _filter_fiemap
+
+_scratch_unmount
+
+# success, all done
+status=0
+exit

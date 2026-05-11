@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 Oracle. All Rights Reserved.
+#
+# FSQA Test No. 481
+#
+# Reproduce a regression of btrfs that leads to -EEXIST on creating new files
+# after log replay.
+#
+# The kernel fix is
+#   Btrfs: fix unexpected -EEXIST when creating new inode
+#
+. ./common/preamble
+_begin_fstest auto quick log metadata
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# create a file and keep it in write ahead log
+$XFS_IO_PROG -f -c "fsync" $SCRATCH_MNT/foo
+
+# fail this filesystem so that remount can replay the write ahead log
+_flakey_drop_and_remount
+
+# see if we can create a new file successfully
+touch $SCRATCH_MNT/bar
+
+_scratch_unmount
+
+echo "Silence is golden"
+
+status=0
+exit

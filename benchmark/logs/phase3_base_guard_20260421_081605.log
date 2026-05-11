@@ -1,0 +1,524 @@
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+ Downloading crates ...
+  Downloaded aead v0.4.3
+  Downloaded bitflags v1.3.2
+  Downloaded bittle v0.5.7
+  Downloaded bit_field v0.10.3
+  Downloaded adler32 v1.2.0
+  Downloaded cipher v0.3.0
+  Downloaded autocfg v1.5.0
+  Downloaded thiserror-impl v2.0.18
+  Downloaded defmt v0.3.100
+  Downloaded darling_macro v0.13.4
+  Downloaded universal-hash v0.4.1
+  Downloaded getset v0.1.6
+  Downloaded nougat v0.2.4
+  Downloaded hash32 v0.2.1
+  Downloaded cobs v0.3.0
+  Downloaded ext-trait v1.0.1
+  Downloaded never-say-never v6.6.666
+  Downloaded funty v2.0.0
+  Downloaded extension-traits v1.0.1
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded hash32 v0.3.1
+  Downloaded managed v0.8.0
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded subtle v2.4.1
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded ghash v0.4.4
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded defmt-parser v1.0.0
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded serde_spanned v0.6.9
+  Downloaded radium v0.7.0
+  Downloaded takeable v0.2.2
+  Downloaded time-core v0.1.8
+  Downloaded ptr_meta v0.3.1
+  Downloaded powerfmt v0.2.0
+  Downloaded dary_heap v0.3.9
+  Downloaded darling v0.13.4
+  Downloaded zero v0.1.3
+  Downloaded volatile v0.4.6
+  Downloaded ctr v0.8.0
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ghost v0.1.20
+  Downloaded foldhash v0.2.0
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded xmas-elf v0.10.0
+  Downloaded bitflags v2.11.1
+  Downloaded acpi v5.2.0
+  Downloaded memoffset v0.9.1
+  Downloaded tdx-guest v0.2.4
+  Downloaded rustversion v1.0.22
+  Downloaded thiserror v2.0.18
+  Downloaded num-conv v0.2.1
+  Downloaded deranged v0.5.8
+  Downloaded lru v0.16.4
+  Downloaded defmt v1.0.1
+  Downloaded toml_datetime v0.6.11
+  Downloaded quote v1.0.45
+  Downloaded tap v1.0.1
+  Downloaded byteorder v1.5.0
+  Downloaded allocator-api2 v0.2.21
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded font8x8 v0.2.7
+  Downloaded paste v1.0.15
+  Downloaded owo-colors v4.3.0
+  Downloaded lending-iterator v0.1.7
+  Downloaded generic-array v0.14.9
+  Downloaded crc32fast v1.5.0
+  Downloaded polyval v0.5.3
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded wyz v0.5.1
+  Downloaded unwinding v0.2.8
+  Downloaded spin v0.9.8
+  Downloaded uguid v2.2.1
+  Downloaded defmt-macros v1.0.1
+  Downloaded darling_core v0.13.4
+  Downloaded semver v1.0.28
+  Downloaded rand_core v0.9.5
+  Downloaded once_cell v1.21.4
+  Downloaded log v0.4.29
+  Downloaded volatile v0.6.1
+  Downloaded multiboot2 v0.24.1
+  Downloaded rle-decode-fast v1.0.3
+  Downloaded intrusive-collections v0.9.7
+  Downloaded postcard v1.1.3
+  Downloaded proc-macro2 v1.0.106
+  Downloaded unicode-ident v1.0.24
+  Downloaded num-traits v0.2.19
+  Downloaded opaque-debug v0.3.1
+  Downloaded aes v0.7.5
+  Downloaded toml v0.7.8
+  Downloaded memchr v2.8.0
+  Downloaded const_format v0.2.36
+  Downloaded aes-gcm v0.9.4
+  Downloaded heapless v0.8.0
+  Downloaded typenum v1.20.0
+  Downloaded uefi-raw v0.12.0
+  Downloaded toml_edit v0.19.15
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded x86_64 v0.14.13
+  Downloaded bitvec v1.0.1
+  Downloaded gimli v0.28.1
+  Downloaded winnow v0.5.40
+  Downloaded zerocopy v0.8.48
+  Downloaded x86 v0.52.0
+  Downloaded multiboot2-common v0.3.0
+  Downloaded iced-x86 v1.21.0
+  Downloaded konst v0.2.20
+  Downloaded heapless v0.7.17
+  Downloaded rand v0.9.4
+  Downloaded raw-cpuid v10.7.0
+  Downloaded json v0.12.4
+  Downloaded hashbrown v0.14.5
+  Downloaded itertools v0.10.5
+  Downloaded indexmap v2.14.0
+  Downloaded hashbrown v0.17.0
+  Downloaded gimli v0.32.3
+  Downloaded syn v2.0.117
+  Downloaded libc v0.2.185
+  Downloaded time v0.3.47
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded getopts v0.2.24
+  Downloaded rustc-literal-escaper v0.0.5
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-kernel v0.1.0 (/root/asterinas/kernel)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/target_lby/osdk/aster-kernel-run-base)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 1m 35s
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19D0+7EF319D0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..[kernel] OSTD initialized. Preparing components.
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running xfstests...
+xfstests probe: is_block TEST_DEV=1 SCRATCH_DEV=1
+brw-rw-rw-    1 root     root      254,   0 Apr 21 08:17 [1;35m/dev/vda[m
+brw-rw-rw-    1 root     root      254,  16 Apr 21 08:17 [1;35m/dev/vdb[m
+xfstests probe: lstat64 raw TEST_DEV=Device type: shim shim shim shim shim shim fe:0
+xfstests probe: lstat64 raw SCRATCH_DEV=Device type: shim shim shim shim shim shim fe:10
+xfstests probe: lstat64 TEST_DEV_TYPE=fe:0 SCRATCH_DEV_TYPE=fe:10
+xfstests probe: CHECK_SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash
+xfstests probe: grep=/opt/xfstests/shims/bin/grep readlink=/opt/xfstests/shims/bin/readlink
+xfstests probe: HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+xfstests probe: single_test=generic/013 trace_run=0
+xfstests probe: ignore_static_excluded_for_single=0
+xfstests probe: TEST_DEV=/dev/vda TEST_DIR=/ext4_test SCRATCH_DEV=/dev/vdb SCRATCH_MNT=/ext4_scratch
+xfstests probe: local.config
+EMAIL=root@localhost
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+xfstests probe: fill rc=1
+fill: cannot create "(null)": Bad address
+xfstests probe: shim grep rc=1 shim readlink rc=0 shim findmnt rc=1
+xfstests env: MKFS_PROG=/usr/bin/mke2fs FSCK_PROG=unset
+xfstests fsstate: pre:generic/013 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr 21 08:17 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 21 08:17 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/013 timeout=600s trace=0
+Killed
+xfstests case done: generic/013 rc=124
+xfstests fsstate: post:generic/013 TEST_DIR='drwxr-xr-x    5 root     root          4096 Apr 21 08:16 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 21 08:17 /ext4_scratch ' TEST_DEV_MOUNTS='/dev/vda /ext4_test ext4 rw,relatime | ' SCRATCH_MOUNTS='<none>'
+===== FAIL LOG: generic/013 =====
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/013        
+----- TIMEOUT FULL LOG TAIL: generic/013 -----
+6/474: creat add id=73,parent=42
+6/475: dwrite - xfsctl(XFS_IOC_DIOINFO) d1cX/f20XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[930 1 0 0 2048 768600] return 25, fallback to stat()
+6/475: dwrite d1cX/f20XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[930 1 0 0 2048 768600] [548864,12288] 0
+6/476: dread - xfsctl(XFS_IOC_DIOINFO) d1cX/d1fXX/f28XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[989 1 0 0 3264 1093632] return 25, fallback to stat()
+6/476: dread d1cX/d1fXX/f28XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[989 1 0 0 3264 1093632] [954368,4096] 0
+6/477: rmdir d1cX/d1fXX/d3eXXX/d43XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+6/477: rmdir del entry: id=67,parent=62
+6/478: bulkstat nent 559 total 0
+6/479: rename(WHITEOUT) c14X to d1cX/d2d/c4aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 22
+6/480: do_mmap - mmap failed d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f31XXXXXXXXXXXXXXXXXXXXXXXX[1066 1 0 0 896 1292733] [823296,4261,SHARED] 19
+6/481: deduperange from f1aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[848 1 0 0 10688 1242471] [933888,40960] error 25
+6/482: chown d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f2bXXXXXXXX 0/0 0
+6/483: do_mmap - mmap failed f1aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[848 1 0 0 10688 1242471] [86016,6787,SHARED] 19
+6/484: fallocate(KEEP_SIZE|INSERT_RANGE) d1cX/d1fXX/f24X[968 1 0 0 1088 933888] [466037,449211] 22
+6/485: chown d1cX/f35 25/12 0
+6/486: read dontcache d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f2bXXXXXXXX[991 1 0 0 4480 1896448] [83649,45080] 22
+6/487: mkdir d1cX/d2d/d30XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d4bXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+6/487: mkdir add id=75,parent=48
+6/488: writev d1cX/d2d/d30XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f39XX[1070 1 0 0 2752 1143048] [612165,83,904] 0
+6/489: read d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f2bXXXXXXXX[991 1 0 0 4480 1896448] [1486633,16690] 0
+6/490: rename() d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX to d1cX/d2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d4cX 22
+6/491: setfattr file d1cX/d2d name user.x1 flag create value length 28: 95
+19/749: write dontcache f2[179 1 3 1 4992 1662713] [521868,5031] 22
+19/750: fallocate(PUNCH_HOLE) dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d40XXXXXXX/f5b[688 1 0 0 1024 973482] [1754227,841826] 95
+19/752: read dontcache dfXXXXXXXX/d10XXXXXXXXXXX/f16X[253 1 0 0 5696 1557565] [458787,80619] 22
+6/492: syncfs 0
+19/753: fallocate(KEEP_SIZE|ZERO_RANGE) dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f38XXXXXXXXXXXXX[518 1 0 0 3840 1107419] [1360673,559016] 95
+19/754: write dontcache dfXXXXXXXX/f53[581 1 0 0 5696 1016629] [1116389,55432] 22
+19/755: setfattr file dfXXXXXXXX/d10XXXXXXXXXXX/f15XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX name user.x1 flag none value length 15: 95
+19/756: fallocate(PUNCH_HOLE) f1XXXXX[178 1 1 1 11904 2394237] [722885,915649] 95
+19/757: write f4XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[199 1 0 0 4544 380928] [1352606,41149] 0
+19/758: unlink dfXXXXXXXX/d10XXXXXXXXXXX/f16X 0
+19/758: unlink del entry: id=22,parent=16
+19/759: link f4XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d3cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d63/f78XXXXXXX 20
+19/759: link add id=120,parent=99
+19/760: deduperange from f1XXXXX[178 1 1 1 11904 2394237] [2117632,28672] error 25
+19/761: copyrange dfXXXXXXXX/d10XXXXXXXXXXX/f22X[289 1 0 0 4672 2613248] [1608223,43253] -> feXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[220 1 0 0 5504 1736704] [3429339,43253] asked for 43253, copied -1??
+
+19/762: fallocate(KEEP_SIZE) dfXXXXXXXX/d10XXXXXXXXXXX/f22X[289 1 0 0 4672 2613248] [1629327,1027167] 95
+19/763: do_mmap - mmap failed dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d40XXXXXXX/f5b[688 1 0 0 1024 973482] [847872,25971,SHARED] 19
+19/764: writev dfXXXXXXXX/d10XXXXXXXXXXX/f33[401 1 2 3 5504 2302703] [624443,1380,36] 0
+19/765: rename(WHITEOUT) c6X to dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d5eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/c79 22
+19/766: link dfXXXXXXXX/f53 dfXXXXXXXX/d3aX/f7aX 20
+19/766: link add id=122,parent=58
+19/767: getdents dfXXXXXXXX/d3aX 0
+19/768: do_mmap - mmap failed dfXXXXXXXX/f53[581 1 0 0 5696 1016629] [843776,111762,PRIVATE] 19
+19/769: writev dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2dXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f31XXXX[400 1 0 0 0 0] [745448,29,831] 0
+19/770: fallocate(INSERT_RANGE) dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f60XXX[752 1 3 1 2240 856064] [440426,277410] 95
+19/771: write dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f2cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[397 1 0 0 8960 4284416] [2494185,125401] 0
+19/772: fallocate() dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f50XXXXX[569 1 0 0 0 0] [610542,307192] 95
+19/773: bulkstat nent 130 total 0
+19/774: write dontcache fcXXXXXXXXXXXXXXXXXXXXXXXXX[203 1 0 0 2624 1087538] [1565022,130020] 22
+19/775: removefattr file dfXXXXXXXX/f53 name user.x0 95
+19/776: truncate dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f57XXXXXX[582 1 2 5 1600 143852] 327894 0
+19/777: chown dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f38XXXXXXXXXXXXX 79/69 0
+19/778: splice dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2fXXXXXXXX/f46XXXXXXXXXXXXXXXXXXX[555 1 0 20 1728 1478656] [1042826,117269] -> dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f57XXXXXX[582 1 2 5 1600 327894] [4228362,117269] 38 asked for 117269, spliced 0??
+
+19/779: copyrange f1XXXXX[178 1 1 1 11904 2394237] [1641752,51319] -> dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2dXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f31XXXX[400 1 0 0 448 769547] [619246,51319] asked for 51319, copied -1??
+
+19/780: fallocate(KEEP_SIZE) dfXXXXXXXX/f65XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[886 1 11 22 640 45321] [247134,783131] 95
+19/781: write dontcache f4XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[199 1 0 0 5248 1393755] [2005289,4747] 22
+19/782: truncate dfXXXXXXXX/d3aX/f70X[1256 1 0 0 1344 611743] 661725 0
+19/783: writev dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f2cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[397 1 0 0 11008 4284416] [535068,192,586] 0
+19/784: getattr dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/c5cXXXXXXXXXXXXX 0 -1
+19/786: getfattr file dfXXXXXXXX/d3aX/f58XXXXXXXXXXX name user.x0 failed 95
+19/787: fallocate(KEEP_SIZE|UNSHARE_RANGE) dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f60XXX[752 1 3 1 2240 856064] [578360,805682] 95
+19/788: copyrange dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f23[333 1 1 3 2944 1060864] [67873,53765] -> dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f60XXX[752 1 3 1 2240 856064] [2651989,53765] asked for 53765, copied -1??
+
+19/789: rename(NOREPLACE) dfXXXXXXXX/f53 to dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d3cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f7b 22
+19/790: fallocate(KEEP_SIZE|UNSHARE_RANGE) dfXXXXXXXX/d10XXXXXXXXXXX/f5fXXXXXXXXXXXXXXXXXXXXXXXXXXXX[751 1 0 0 0 0] [82375,94933] 95
+19/791: copyrange dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f73[1258 1 0 0 0 0] [0,0] -> dfXXXXXXXX/f65XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[886 1 11 22 640 45321] [3397024,0]
+19/792: stat dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d5eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+19/793: mknod dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/c7cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+19/793: mknod add id=124,parent=26
+19/794: copyrange dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f5dXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[690 1 0 0 3136 739771] [538384,99129] -> dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d44XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f60XXX[752 1 3 1 2240 856064] [4604169,99129] asked for 99129, copied -1??
+
+19/795: writev dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f38XXXXXXXXXXXXX[518 1 79 69 3840 1107419] [559682,39,921] 0
+19/796: creat dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2dXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f7dXXXXXXXXXX x:0 0 0
+19/796: creat add id=125,parent=45
+19/797: do_mmap - dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f50XXXXX[569 1 0 0 0 0] zero size
+19/798: clonerange dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f2cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[397 1 0 0 12864 4284416] [1581056,32768] -> dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d40XXXXXXX/f5b[688 1 0 0 1024 973482] [4751360,32768] error 25
+19/799: removefattr file dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d3cXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d63 name user.x0 95
+19/800: mkdir dfXXXXXXXX/d1eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2fXXXXXXXX/d7eXXXXXXXXXXXXXXXXXXXXXXXXX 0
+19/800: mkdir add id=126,parent=47
+19/801: splice dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/d25XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2dXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f31XXXX[400 1 0 0 448 769547] [246740,42522] -> dfXXXXXXXX/d10XXXXXXXXXXX/d1aX/f73[1258 1 0 0 0 0] [341341,42522] 38 asked for 42522, spliced 0??
+
+5/680: clonerange d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f3eX[1149 1 1 1 1408 697496] [413696,94208] -> d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/d4aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f4cXXX[1176 1 0 0 1920 400150] [4509696,94208] error 25
+5/681: rename(EXCHANGE) d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d17/c51XXXXXXXXXXXXXXXXXXXXXXXXXXXX to d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d24XXXXXXXXXXX/c25XX 22
+5/682: rename(WHITEOUT) d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/c39XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX to d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/d55/c66X 22
+19/802: syncfs 0
+5/683: writev d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d17/f28XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[956 1 0 0 4096 638976] [337022,124,1012] 0
+5/684: rename(WHITEOUT) cf to d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/d55/c67 22
+5/685: chown d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f23XXXXXXXXXX 1/0 0
+5/686: clonerange d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f3eX[1149 1 1 1 1408 697496] [655360,32768] -> d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f29XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[957 1 0 0 4288 2281755] [544768,32768] error 25
+5/687: mknod d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/c68XXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+5/687: mknod add id=104,parent=17
+5/688: listfattr d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d17/f1bXXXXXX failed 95
+5/689: dread - xfsctl(XFS_IOC_DIOINFO) d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f3eX[1149 1 1 1 1408 697496] return 25, fallback to stat()
+5/689: dread d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f3eX[1149 1 1 1 1408 697496] [512000,20480] 0
+5/690: dwrite - xfsctl(XFS_IOC_DIOINFO) d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f29XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[957 1 0 0 4288 2281755] return 25, fallback to stat()
+5/690: dwrite d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX/f29XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[957 1 0 0 4288 2281755] [2109440,4096] 0
+5/691: writev d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f35[1014 1 0 0 3328 1898990] [888941,847,122] 0
+5/692: listfattr d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d1dXXXX failed 95
+9/770: symlink d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2f/d62XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/l96X 95
+9/770: symlink add id=150,parent=98
+9/771: read d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f71XXXXXXXXXXXXXX[1024 1 0 0 1024 946651] [388914,99389] 0
+9/772: xfsctl(XFS_IOC_UNRESVSP64) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f5cXXXXXXXXXXXXX[901 1 0 0 1088 711203] [1433233,208803] 25
+9/773: mkdir d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d97 0
+9/773: mkdir add id=151,parent=9
+9/774: exchangerange - files are too small
+9/775: chown d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d5d 1/1 0
+9/776: chown d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d3f 38/9 0
+9/777: fallocate(KEEP_SIZE|PUNCH_HOLE) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2f/f90XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[1273 1 0 0 0 0] [779240,124130] 95
+9/778: rename(EXCHANGE) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/f51XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX to d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d5d/d63XXXXXXXXXXXXXXXXXXXXXXXXXXXX/f7dXX 22
+9/779: do_mmap - mmap failed d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f5cXXXXXXXXXXXXX[901 1 0 0 1088 711203] [532480,47528,PRIVATE] 19
+9/780: dwrite - xfsctl(XFS_IOC_DIOINFO) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d5d/d63XXXXXXXXXXXXXXXXXXXXXXXXXXXX/f83XXXXXXXXXXXXXX[1182 1 0 0 0 0] return 25, fallback to stat()
+5/693: fsync d11XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d17 0
+9/780: dwrite d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d31XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d5d/d63XXXXXXXXXXXXXXXXXXXXXXXXXXXX/f83XXXXXXXXXXXXXX[1182 1 0 0 0 0] [815104,57344] 0
+9/781: link d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/f85 d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d97/f98XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 20
+9/781: link add id=152,parent=151
+9/782: fallocate(ZERO_RANGE) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2f/d62XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f67[1021 1 0 0 0 0] [52640,159744] 95
+9/783: do_mmap - mmap failed d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/f5bXX[900 1 0 0 896 455483] [352256,95122,SHARED] 19
+9/784: rmdir d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d3f 39
+9/785: dwrite - xfsctl(XFS_IOC_DIOINFO) d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d2aXXXXXXXXXXXXXXXXXXXXX/d76X/f93XXXXXXXXXXXXXXXXXXXXXXXXXXXX[1275 1 0 0 0 0] return 25, fallback to stat()
+9/785: dwrite d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d2aXXXXXXXXXXXXXXXXXXXXX/d76X/f93XXXXXXXXXXXXXXXXXXXXXXXXXXXX[1275 1 0 0 0 0] [483328,12288] 0
+9/786: creat d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/d2f/d62XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f99XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX x:0 0 0
+9/786: creat add id=153,parent=98
+16/664: clonerange d0XX/d1/ddXXXXXX/f21[414 1 0 0 3392 1490944] [720896,77824] -> d0XX/d1/f6aX[1185 1 0 0 0 0] [90112,77824] error 25
+9/787: fsync d3XXXXXXXXXXXXXXXXXXXXXXXXXXX/d9XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+13/664: dread d6X/d7/f39XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[747 1 0 0 3008 1682777] [643072,61440] 0
+16/665: fdatasync d0XX/d5XXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f3eXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0
+13/665: write d6X/d7/d1bXX/f53XXXXXXXXXXXXXXXXXXXX[1002 1 0 0 0 0] [958959,119924] 0
+13/667: rename() f3XXXXXXXXXXXXXXXX to d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f60XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 18
+13/668: fallocate(ZERO_RANGE) d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f3dXX[748 1 0 0 6912 1626112] [2124152,191669] 95
+13/669: chown d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f48XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 0/0 0
+13/670: fallocate(UNSHARE_RANGE) d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f4d[998 1 0 0 0 0] [126919,929272] 95
+13/671: write dontcache d6X/d7/d1bXX/f58XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[1016 1 30 25 896 1085440] [965803,108296] 22
+13/672: rename(NOREPLACE) d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/c34XXXXXXXXXXX to d6X/d7/c61XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 22
+13/673: writev d6X/d7/f50XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[1000 1 0 0 0 0] [644774,27,826] 0
+13/674: getdents d6X/d7 0
+13/675: clonerange d6X/d7/f4bXXXXXXXXXXXXXX[918 1 0 0 832 178825] [73728,57344] -> d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f3dXX[748 1 0 0 6912 1626112] [1216512,57344] error 25
+13/676: splice d6X/d7/f4bXXXXXXXXXXXXXX[918 1 0 0 832 178825] [14050,71842] -> d6X/d7/d1bXX/f58XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[1016 1 30 25 896 1085440] [325663,71842] 38 asked for 71842, spliced 0??
+
+13/677: rename(WHITEOUT) d6X/c24XXXXXXXXXXXXX to d6X/d7/c62XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX 22
+13/678: deduperange from d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f48XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[788 1 0 0 0 0] [0,0] error 25
+13/680: write dontcache d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f48XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[788 1 0 0 0 0] [572439,14029] 22
+13/681: do_mmap - mmap failed d6X/d7/d1bXX/f58XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[1016 1 30 25 896 1085440] [782336,31616,PRIVATE] 19
+13/682: rmdir d6X/d7/d1bXX/d3eX 39
+13/683: write d6X/d7/f25XXXX[508 1 0 0 3264 2088960] [2497928,48642] 0
+13/684: do_mmap - d6X/d7/d2bXXXXXXXXXXXXXXXXXXXX/f48XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[788 1 0 0 0 0] zero size
+13/685: dread - xfsctl(XFS_IOC_DIOINFO) f1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[195 1 29 57 6528 358263] return 25, fallback to stat()
+13/685: dread f1XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[195 1 29 57 6528 358263] [286720,106496] 0
+13/686: write d6X/d7/f5aXXXXXXX[1017 1 1 0 0 0] [419381,85181] 0
+13/687: write d6X/d7/f4bXXXXXXXXXXXXXX[918 1 0 0 832 178825] [1087280,59280] 0
+13/688: write d6X/d7/fcXX[342 1 17 86 6144 1937408] [2904200,102005] 0
+13/689: clonerange d6X/d7/f2aXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX[521 1 4 1 1792 442714] [315392,98304] -> f3XXXXXXXXXXXXXXXX[268 1 0 0 9984 1105920] [266240,98304] error 25
+10/617: rename() d0XX/d5bX/f62 to d0XX/dbX/f69XXXXXXXXX 18
+11/680: dwrite - xfsctl(XFS_IOC_DIOINFO) d5X/d25X/d1bXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX/f36XX[391 1 0 0 5376 1690613] return 25, fallback to stat()
+10/618: fsync d0XX/d3bX/d46XXXXXXXXXXXXXXXXXX 0
+13/690: fdatasync d6X/f13XXXXXXXXXXXXXXXXXXXXXXXX 0
+----- END TIMEOUT FULL LOG TAIL -----
+===== END FAIL LOG: generic/013 =====
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+phase3_base\t0\t1\t0\t0\t1\t0.00\t90
+===== phase3_base detailed results =====
+test	status	rc	reason
+generic/013	FAIL	124	timeout 600s
+xfstests phase3_base failed: pass_rate=0.00% < threshold=90%
+See summary: /tmp/xfstests_results/phase3_base_summary.tsv
+Error: xfstests failed.

@@ -1,0 +1,195 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# Make a new test
+#
+
+# generic initialization
+iam=new
+. ./common/test_names
+
+tmpfile="/tmp/$$."
+trap "rm -f $tmpfile; exit" 0 1 2 3 15
+
+_cleanup()
+{
+    :
+}
+
+SRC_GROUPS=`find tests -not -path tests -type d -printf "%f "`
+usage()
+{
+    echo "Usage $0 test_dir|test_dir_and_name"
+    echo "Available dirs are: $SRC_GROUPS"
+    exit
+}
+
+[ $# -eq 0 ] && usage
+
+if echo "$1" | grep -q '/'; then
+	if [ -e "tests/$1" ]; then
+		echo "$1: test already exists."
+		exit 1
+	fi
+	tdir="tests/$(echo "$1" | cut -d '/' -f 1)"
+	id="$(echo "$1" | cut -d '/' -f 2)"
+else
+	tdir=tests/$1
+	id="$(basename "$(./tools/nextid "$1")")"
+fi
+
+i=0
+line=0
+eof=1
+[ -d "$tdir/" ] || usage
+
+export AWK_PROG="$(type -P awk)"
+[ "$AWK_PROG" = "" ] && { echo "awk not found"; exit; }
+
+echo "Next test id is $id"
+shift
+
+read -p "Append a name to the ID? Test name will be $id-\$name. y,[n]: " -r
+if [[ $REPLY = [Yy] ]]; then
+	# get the new name from user
+	name=""
+	while [ "$name" = "" ]; do
+		read -p "Enter the name: "
+		if [ "$REPLY" = "" ]; then
+			echo "For canceling, use ctrl+c."
+		elif echo "$id-$REPLY" | grep -q "^$VALID_TEST_NAME$"; then
+			if [ -e "$tdir/$id-$REPLY" ]; then
+				echo "File '$id-$REPLY' already exists, use another one."
+				echo
+			else
+				name="$REPLY"
+			fi
+		else
+			echo "A name can contain only alphanumeric symbols and dash!"
+			echo
+		fi
+	done
+
+	id="$id-$name"
+fi
+
+echo "Creating test file '$id'"
+
+if [ -f $tdir/$id ]
+then
+    echo "Error: test $id already exists!"
+    _cleanup
+    exit 1
+fi
+
+# Extract group names from the documentation.
+group_names() {
+	awk '/^[[:lower:][:digit:]_]/ {
+		if ($1 != "" && $1 != "Group" && $2 != "Name:" && $1 != "all")
+			printf("%s\n", $1);
+	}' doc/group-names.txt
+}
+
+# Make sure that the new test's groups fit the correct format and are listed
+# in the group documentation file.
+check_groups() {
+	for g in "$@"; do
+		local inval="$(echo "${g}" | tr -d '[:lower:][:space:][:digit:]_')"
+		if [ -n "${inval}" ]; then
+			echo "Invalid characters in group(s): ${inval}"
+			echo "Only lower cases, digits and underscore are allowed in groups, separated by space"
+			return 1
+		elif [ "${g}" = "other" ]; then
+			echo "Do not add more tests to group \"other\""
+			return 1
+		elif ! group_names | grep -q -w "${g}"; then
+			echo "Warning: group \"${g}\" not defined in documentation"
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+if [ $# -eq 0 ]; then
+	# interactive mode
+	prompt="Add to group(s) [auto] (separate by space, ? for list): "
+	while true; do
+		read -p "${prompt}" -a new_groups || exit 1
+		case "${#new_groups[@]}" in
+		0)
+			new_groups=("auto")
+			;;
+		1)
+			if [ "${new_groups[0]}" = "?" ]; then
+				echo $(group_names | grep -v -w 'other')
+				continue
+			fi
+			;;
+		esac
+		check_groups "${new_groups[@]}" && break
+	done
+else
+	# expert mode, groups are on the command line
+	new_groups=("$@")
+	check_groups "${new_groups[@]}" || exit 1
+fi
+
+read -p "Enter <copyright owner>: " -r
+copyright_owner="${REPLY:=YOUR NAME HERE}"
+
+echo -n "Creating skeletal script for you to edit ..."
+
+year=`date +%Y`
+
+cat <<End-of-File >$tdir/$id
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) $year $copyright_owner.  All Rights Reserved.
+#
+# FS QA Test $id
+#
+# what am I here for?
+#
+. ./common/preamble
+_begin_fstest ${new_groups[@]}
+
+# Override the default cleanup function.
+# _cleanup()
+# {
+# 	cd /
+# 	rm -r -f \$tmp.*
+# }
+
+# Import common functions.
+# . ./common/filter
+
+# Modify as appropriate.
+_require_test
+
+# if error
+exit
+
+# optional stuff if your test has verbose output to help resolve problems
+#echo
+#echo "If failure, check \$seqres.full (this) and \$seqres.full.ok (reference)"
+
+# success, all done
+_exit 0
+End-of-File
+
+sleep 2		# latency to read messages to this point
+echo ""
+
+chmod 755 $tdir/$id
+${EDITOR-vi} $tdir/$id
+
+# Create default .out file
+cat <<End-of-File >$tdir/$id.out
+QA output created by $id
+Silence is golden
+End-of-File
+
+echo " done."
+exit 0

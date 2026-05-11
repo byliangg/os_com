@@ -1,0 +1,142 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 021
+#
+# xfs_db type attr test (pv 797508 linux-xfs & IRIX)
+#
+. ./common/preamble
+_begin_fstest db attr auto quick
+
+status=0	# success is the default!
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+	echo "*** unmount"
+	_scratch_unmount 2>/dev/null
+	rm -f $tmp.*
+}
+
+_attr()
+{
+	${ATTR_PROG} $* 2>$tmp.err >$tmp.out
+	exit=$?
+	sed \
+	    -e "s#$SCRATCH_MNT[^ .:]*#<TESTFILE>#g" \
+	    -e "s#$tmp[^ :]*#<TMPFILE>#g;" \
+		$tmp.out
+	sed \
+	    -e "s#$SCRATCH_MNT[^ .:]*#<TESTFILE>#g" \
+	    -e "s#$tmp[^ :]*#<TMPFILE>#g;" \
+		$tmp.err 1>&2
+	return $exit
+}
+
+do_getfattr()
+{
+	_getfattr $* 2>$tmp.err >$tmp.out
+	exit=$?
+	sed \
+	    -e "s#$SCRATCH_MNT[^ .:]*#<TESTFILE>#g" \
+	    -e "s#$tmp[^ :]*#<TMPFILE>#g;" \
+		$tmp.out
+	sed \
+	    -e "s#$SCRATCH_MNT[^ .:]*#<TESTFILE>#g" \
+	    -e "s#$tmp[^ :]*#<TMPFILE>#g;" \
+		$tmp.err 1>&2
+	return $exit
+}
+
+
+_require_scratch
+_require_attrs
+
+_scratch_unmount >/dev/null 2>&1
+
+echo "*** mkfs"
+_scratch_mkfs_xfs >/dev/null
+
+echo "*** mount FS"
+_scratch_mount
+
+seqfull=$0
+if _xfs_has_feature $SCRATCH_MNT parent; then
+	_link_out_file "parent"
+else
+	_link_out_file ""
+fi
+
+testfile=$SCRATCH_MNT/testfile
+echo "*** make test file 1"
+
+touch $testfile.1
+echo "v1" | _attr -s "a1" $testfile.1 >/dev/null
+echo "v2--" | _attr -s "a2--" $testfile.1 >/dev/null
+do_getfattr --absolute-names $testfile.1
+inum_1=`ls -li $testfile.1 | $AWK_PROG '{ print $1 }'`
+
+echo "*** make test file 2"
+
+touch $testfile.2
+echo "value_1" | _attr -s "a1" $testfile.2 >/dev/null
+echo "value_2" | _attr -s "a2-----" $testfile.2 >/dev/null
+( echo start; POSIXLY_CORRECT=yes dd if=/dev/zero bs=65525 count=1; echo end )\
+	| _attr -s "a3" $testfile.2 >/dev/null
+do_getfattr --absolute-names $testfile.2
+
+# print name and size from 1st line of output
+_attr -g "a3" $testfile.2 > $tmp.hahahahaplonk
+head -1 $tmp.hahahahaplonk
+# NOTE:
+# Above goo works around some truly bizzaro sh/sed/head interaction
+# for some versions of these tools (fails on Redhat 7+, 6.2 worked)
+
+# print out the rest of the data apart from the header
+# the size is +1 for an extra \n at the end
+echo -n "size of attr value = "
+# wc inserts different amounts of whitespace in front...
+_attr -g "a3" $testfile.2 | tail -3 | wc -c | sed -e "s/^ *//"
+echo ""
+
+inum_2=`ls -li $testfile.2 | $AWK_PROG '{ print $1 }'`
+
+echo "*** unmount FS"
+_scratch_unmount >>$seqres.full 2>&1 \
+	|| _fail "umount failed"
+
+echo "*** dump attributes (1)"
+
+_scratch_xfs_db -r -c "inode $inum_1" -c "print a.sfattr"  | \
+	perl -ne '
+/\.secure/ && next;
+/\.parent/ && next;
+	print unless /^\d+:\[.*/;'
+
+echo "*** dump attributes (2)"
+
+# There is a fair bit of filtering here to convert v5 filesystem output
+# into the v4 format that holds the meaningful information for the test.
+_scratch_xfs_db -r -c "inode $inum_2" -c "a a.bmx[0].startblock" -c print  \
+	| perl -ne '
+s/,secure//;
+s/,parent//;
+s/info.hdr/info/;
+/hdr.info.crc/ && next;
+/hdr.info.bno/ && next;
+/hdr.info.uuid/ && next;
+/hdr.info.lsn/ && next;
+/hdr.info.owner/ && next;
+/\.parent/ && next;
+s/^(hdr.info.magic =) 0x3bee/\1 0xfbee/;
+s/^(hdr.firstused =) (\d+)/\1 FIRSTUSED/;
+s/^(hdr.freemap\[0-2] = \[base,size]).*/\1 [FREEMAP..]/;
+s/^(entries\[0-[23]] = \[hashval,nameidx,incomplete,root,local]).*/\1 [ENTRIES..]/;
+	print unless /^\d+:\[.*/;'
+
+echo "*** done"
+exit

@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/024
+#
+# btrfs wrong compression type regression test. This test is used to check
+# the oops will happen when the users write some data into the files whose
+# compress flag is set but the compression of the fs is disabled.
+#
+. ./common/preamble
+_begin_fstest auto quick compress
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_no_nodatacow
+
+__workout()
+{
+	work_file="$SCRATCH_MNT/tmpfile"
+
+	touch $work_file
+	$CHATTR_PROG =c $work_file
+	$XFS_IO_PROG -f -c "pwrite 0 1M" -c "fsync" $work_file | _filter_xfs_io
+}
+
+echo "*** test compress=no"
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount "-o compress=no"
+__workout
+_scratch_unmount
+_check_scratch_fs
+
+echo "*** test compress-force=no"
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount "-o compress-force=no"
+__workout
+_scratch_unmount
+
+echo "*** done"
+status=0 ; exit

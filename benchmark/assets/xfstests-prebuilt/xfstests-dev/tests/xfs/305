@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 305
+#
+# Test to verify that turn group/project quotas off while fsstress and
+# user quotas are left on.
+#
+. ./common/preamble
+_begin_fstest auto quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+# Modify as appropriate.
+
+_require_scratch
+_require_xfs_quota
+
+_scratch_mkfs_xfs -m crc=1 >/dev/null 2>&1
+
+_qmount_option "uquota,gquota,pquota"
+
+QUOTA_DIR=$SCRATCH_MNT/quota_dir
+
+_exercise()
+{
+	type=$1
+
+	_qmount
+	mkdir -p $QUOTA_DIR
+
+	_run_fsstress_bg -d $QUOTA_DIR -n 1000000 -p 100
+	sleep 10
+	$XFS_QUOTA_PROG -x -c "disable -$type" $SCRATCH_DEV
+	sleep 5
+	_kill_fsstress
+}
+
+echo "*** turn off group quotas"
+_exercise g
+echo "*** done"
+
+echo "*** turn off project quotas"
+_exercise p
+echo "*** done"
+
+echo "*** turn off group/project quotas"
+_exercise gp
+echo "*** done"
+
+# success, all done
+status=0
+exit

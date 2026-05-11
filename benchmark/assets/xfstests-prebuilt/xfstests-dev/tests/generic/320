@@ -1,0 +1,86 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011-2012 Fujitsu, Inc.  All Rights Reserved.
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/320
+#
+# heavy rm workload
+#
+# Regression test for commit:
+# 9a3a5da xfs: check for stale inode before acquiring iflock on push
+#
+# Based on generic/273
+#
+. ./common/preamble
+_begin_fstest auto rw
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+threads=100
+count=2
+fs_size=$((2 * 1024 * 1024 * 1024))
+ORIGIN=$SCRATCH_MNT/origin
+
+threads_set()
+{
+	threads=$((LOAD_FACTOR * 100))
+	if [ $threads -gt 200 ]
+	then
+		threads=200
+	fi
+}
+
+file_create()
+{
+	i=0
+	mkdir $ORIGIN
+
+	disksize=$(($fs_size / 3))
+	num=$(($disksize / $count / $threads / 4096))
+	while [ $i -lt $num ]; do
+		$XFS_IO_PROG -f -c "pwrite 0 $((4096*count))" \
+			$ORIGIN/file_$i >>$seqres.full 2>&1
+		i=$(($i + 1))
+	done
+}
+
+worker()
+{
+	suffix=$1
+
+	mkdir $SCRATCH_MNT/sub_$suffix
+
+	cp -r $ORIGIN/* $SCRATCH_MNT/sub_$suffix >>$seqres.full 2>&1
+	rm -rf $SCRATCH_MNT/sub_$suffix
+}
+
+do_workload()
+{
+	pids=""
+	loop=1
+
+	threads_set
+	file_create
+
+	while [ $loop -lt $threads ]; do
+		worker $loop &
+		pids="$pids $!"
+		loop=$(($loop + 1))
+	done
+
+	wait $pids
+}
+
+echo "Silence is golden"
+
+_scratch_mkfs_sized $fs_size >>$seqres.full 2>&1
+_scratch_mount >>$seqres.full 2>&1
+
+do_workload
+
+status=0
+exit

@@ -1,0 +1,115 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test generic/398
+#
+# Filesystem encryption is designed to enforce that a consistent encryption
+# policy is used within a given encrypted directory tree and that an encrypted
+# directory tree does not contain any unencrypted files.  This test verifies
+# that filesystem operations that would violate this constraint fail.  This does
+# not test enforcement of this constraint on lookup, which is still needed to
+# detect offline changes.
+#
+. ./common/preamble
+_begin_fstest auto quick encrypt
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+. ./common/renameat2
+
+_require_scratch_encryption
+_require_renameat2 exchange
+
+_init_session_keyring
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+
+# Set up two encrypted directories, with different encryption policies,
+# and one unencrypted directory.
+edir1=$SCRATCH_MNT/edir1
+edir2=$SCRATCH_MNT/edir2
+udir=$SCRATCH_MNT/udir
+mkdir $edir1 $edir2 $udir
+keydesc1=$(_generate_session_encryption_key)
+keydesc2=$(_generate_session_encryption_key)
+_set_encpolicy $edir1 $keydesc1
+_set_encpolicy $edir2 $keydesc2
+touch $edir1/efile1
+touch $edir2/efile2
+touch $udir/ufile
+
+# Test linking and renaming an encrypted file into an encrypted directory with a
+# different encryption policy.  Should fail with EXDEV.
+
+echo -e "\n*** Link encrypted <= encrypted ***"
+ln $edir1/efile1 $edir2/efile1 |& _filter_scratch
+
+echo -e "\n*** Rename encrypted => encrypted ***"
+$here/src/renameat2 $edir1/efile1 $edir2/efile1
+
+# Test linking and renaming an unencrypted file into an encrypted directory.
+# Should fail with EXDEV.
+
+echo -e "\n\n*** Link unencrypted <= encrypted ***"
+ln $udir/ufile $edir1/ufile |& _filter_scratch
+
+echo -e "\n*** Rename unencrypted => encrypted ***"
+$here/src/renameat2 $udir/ufile $edir1/ufile
+
+# Test linking and renaming an encrypted file into an unencrypted directory.
+# Should succeed.
+
+echo -e "\n\n*** Link encrypted <= unencrypted ***"
+ln -v $edir1/efile1 $udir/efile1 |& _filter_scratch
+rm $udir/efile1 # undo
+
+echo -e "\n*** Rename encrypted => unencrypted ***"
+$here/src/renameat2 $edir1/efile1 $udir/efile1
+$here/src/renameat2 $udir/efile1 $edir1/efile1 # undo
+
+# Test renaming a forbidden (unencrypted, or encrypted with a different
+# encryption policy) file into an encrypted directory via an exchange (cross
+# rename) operation.  Should fail with EXDEV.
+
+echo -e "\n\n*** Exchange encrypted <=> encrypted ***"
+$here/src/renameat2 -x $edir1/efile1 $edir2/efile2
+
+echo -e "\n*** Exchange unencrypted <=> encrypted ***"
+$here/src/renameat2 -x $udir/ufile $edir1/efile1
+
+echo -e "\n*** Exchange encrypted <=> unencrypted ***"
+$here/src/renameat2 -x $edir1/efile1 $udir/ufile
+
+# Test a file with a special type, i.e. not regular, directory, or symlink.
+# Since such files are not subject to encryption, there should be no
+# restrictions on linking or renaming them into encrypted directories.
+
+echo -e "\n\n*** Special file tests ***"
+mkfifo $edir1/fifo
+$here/src/renameat2 $edir1/fifo $edir2/fifo
+$here/src/renameat2 $edir2/fifo $udir/fifo
+$here/src/renameat2 $udir/fifo $edir1/fifo
+mkfifo $udir/fifo
+$here/src/renameat2 -x $udir/fifo $edir1/fifo
+ln -v $edir1/fifo $edir2/fifo | _filter_scratch
+rm $edir1/fifo $edir2/fifo $udir/fifo
+
+# Now test that *without* access to the encrypted key, we cannot use an exchange
+# (cross rename) operation to move a forbidden file into an encrypted directory.
+
+_unlink_session_encryption_key $keydesc1
+_unlink_session_encryption_key $keydesc2
+_scratch_cycle_mount
+efile1=$(find $edir1 -type f)
+efile2=$(find $edir2 -type f)
+
+echo -e "\n\n*** Exchange encrypted <=> encrypted without key ***"
+$here/src/renameat2 -x $efile1 $efile2
+echo -e "\n*** Exchange encrypted <=> unencrypted without key ***"
+$here/src/renameat2 -x $efile1 $udir/ufile
+
+# success, all done
+status=0
+exit

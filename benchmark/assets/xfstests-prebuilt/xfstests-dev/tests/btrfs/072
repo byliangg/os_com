@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 Red Hat Inc. All rights reserved.
+#
+# FSQA Test No. btrfs/072
+#
+# Run btrfs scrub and defrag operations simultaneously with fsstress
+# running in background.
+#
+. ./common/preamble
+_begin_fstest auto scrub defrag compress raid
+
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	if [ ! -z "$defrag_pid" ]; then
+		_btrfs_kill_stress_defrag_pid $defrag_pid
+	fi
+	if [ ! -z "$scrub_pid" ]; then
+		_btrfs_kill_stress_scrub_pid $scrub_pid
+	fi
+	_kill_fsstress
+}
+
+. ./common/filter
+
+# we check scratch dev after each loop
+_require_scratch_nocheck
+_require_scratch_dev_pool 4
+_btrfs_get_profile_configs
+
+run_test()
+{
+	local mkfs_opts=$1
+	local with_compress=$2
+
+	echo "Test $mkfs_opts with $with_compress" >>$seqres.full
+
+	_scratch_pool_mkfs $mkfs_opts >>$seqres.full 2>&1
+	# make sure we created btrfs with desired options
+	if [ $? -ne 0 ]; then
+		echo "mkfs $mkfs_opts failed"
+		return
+	fi
+	_scratch_mount >>$seqres.full 2>&1
+
+	args=`_scale_fsstress_args -p 20 -n 100 -d $SCRATCH_MNT/stressdir`
+	echo "Run fsstress $args" >>$seqres.full
+	_run_fsstress_bg $args
+
+	echo -n "Start scrub worker: " >>$seqres.full
+	_btrfs_stress_scrub $SCRATCH_MNT >/dev/null 2>&1 &
+	scrub_pid=$!
+	echo "$scrub_pid" >>$seqres.full
+
+	echo -n "Start defrag worker: " >>$seqres.full
+	_btrfs_stress_defrag $SCRATCH_MNT $with_compress >/dev/null 2>&1 &
+	defrag_pid=$!
+	echo "$defrag_pid" >>$seqres.full
+
+	echo "Wait for fsstress to exit and kill all background workers" >>$seqres.full
+	_wait_for_fsstress
+	_btrfs_kill_stress_defrag_pid $defrag_pid
+	unset defrag_pid
+	_btrfs_kill_stress_scrub_pid $scrub_pid
+	unset scrub_pid
+
+	echo "Scrub the filesystem" >>$seqres.full
+	$BTRFS_UTIL_PROG scrub start -B $SCRATCH_MNT >>$seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		echo "Scrub find errors in \"$mkfs_opts\" test" | tee -a $seqres.full
+	fi
+
+	_scratch_unmount
+	# we called _require_scratch_nocheck instead of _require_scratch
+	# do check after test for each profile config
+	_check_scratch_fs
+}
+
+echo "Silence is golden"
+for t in "${_btrfs_profile_configs[@]}"; do
+	run_test "$t" nocompress
+	run_test "$t" compress
+done
+
+status=0
+exit

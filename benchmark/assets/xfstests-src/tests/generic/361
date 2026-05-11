@@ -1,0 +1,64 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 361
+#
+# Test remount on I/O errors.
+#
+# XFS had a bug to hang on remount in this case, this kernel commit fix
+# the issue.
+# 5cb13dc cancel the setfilesize transation when io error happen
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_unmount $fs_mnt &>> /dev/null
+	[ -n "$loop_dev" ] && _destroy_loop_device $loop_dev
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_block_device $SCRATCH_DEV
+_require_loop
+_require_sparse_files
+
+# create a small filesystem to hold another filesystem image
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+# create the sparse fs image and mount point
+fs_img=$SCRATCH_MNT/fs.img
+fs_mnt=$SCRATCH_MNT/mnt
+$XFS_IO_PROG -fc "truncate 1g" $fs_img >>$seqres.full 2>&1
+mkdir -p $fs_mnt
+
+# mount loop device and create a larger file to hit I/O errors on loop device
+loop_dev=$(_create_loop_device $fs_img)
+_mkfs_dev $loop_dev
+_mount -t $FSTYP $loop_dev $fs_mnt
+if [ "$FSTYP" = "xfs" ]; then
+	# Turn off all XFS metadata IO error retries
+	dname=$(_short_dev $loop_dev)
+	echo 0 | tee /sys/fs/xfs/$dname/error/*/*/* > /dev/null
+fi
+$XFS_IO_PROG -fc "pwrite 0 520m" $fs_mnt/testfile >>$seqres.full 2>&1
+
+# remount should not hang
+$MOUNT_PROG -o remount,ro $fs_mnt >>$seqres.full 2>&1
+
+_unmount $fs_mnt &>/dev/null
+_destroy_loop_device $loop_dev
+unset loop_dev
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

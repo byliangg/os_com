@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 011
+#
+# test overlay private xattr on overlayfs with multiple lower dirs, all the
+# lower layers except the lowest one should honor overlay private xattr
+# "trusted.overlay", which means it should not be visible to user.
+#
+# Commit b581755b1c56 ("ovl: xattr filter fix") fixed this issue.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_scratch
+_require_attrs trusted
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create test dir on upper and make it opaque by setting proper xattr
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $lowerdir/testdir
+mkdir -p $upperdir/testdir
+$SETFATTR_PROG -n "trusted.overlay.opaque" -v "y" $upperdir/testdir
+
+# mount overlay with multiple lowerdirs, with $lowerdir as the lowest dir and
+# $upperdir overlaid on top of $lowerdir, so that "trusted.overlay.opaque"
+# xattr should be honored and should not be listed
+# mount readonly, because there's no upper and workdir
+_overlay_scratch_mount_opts -o ro -o lowerdir=$upperdir:$lowerdir
+
+# Dump trusted.overlay xattr, we should not see the "opaque" xattr
+_getfattr -d -m overlay $SCRATCH_MNT/testdir
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

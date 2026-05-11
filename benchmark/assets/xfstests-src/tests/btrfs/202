@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+#
+# FS QA Test 201
+#
+# Regression test for fix "btrfs: fix invalid removal of root ref"
+#
+. ./common/preamble
+_begin_fstest auto quick subvol snapshot
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+# Create a subvol b under a and then snapshot a into c.  This create's a stub
+# entry in c for b because c doesn't have a reference for b.
+#
+# But when we rename b c/foo it creates a ref for b in c.  However if we go to
+# remove c/b btrfs used to depend on not finding the root ref to handle the
+# unlink properly, but we now have a ref for that root.  We also had a bug that
+# would allow us to remove mis-matched refs if the keys matched, so we'd end up
+# removing too many entries which would cause a transaction abort.
+
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/a | _filter_scratch
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/a/b | _filter_scratch
+_btrfs subvolume snapshot $SCRATCH_MNT/a $SCRATCH_MNT/c
+
+# Need the dummy entry created so that we get the invalid removal when we rmdir
+ls $SCRATCH_MNT/c/b
+
+mkdir $SCRATCH_MNT/c/foo
+mv $SCRATCH_MNT/a/b $SCRATCH_MNT/c/foo
+rm -rf $SCRATCH_MNT/*
+touch $SCRATCH_MNT/blah
+
+status=0
+exit

@@ -1,0 +1,26 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 529
+#
+# Regression test for a bug where XFS corrupts memory if the listxattr buffer
+# is a particularly well crafted size on a filesystem that supports posix acls.
+#
+. ./common/preamble
+_begin_fstest auto quick acl attr
+
+# Import common functions.
+. ./common/attr
+
+_require_acls
+_require_scratch
+_require_test_program "t_attr_corruption"
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+$here/src/t_attr_corruption $SCRATCH_MNT
+
+status=0
+exit

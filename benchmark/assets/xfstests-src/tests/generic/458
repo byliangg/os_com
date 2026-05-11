@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test No. 458
+#
+# Regression test for xfs leftover CoW extents after truncate
+# and umount
+#
+# Fixed by commit 3af423b03435 ("xfs: evict CoW fork extents when performing
+# finsert/fcollapse")
+#
+. ./common/preamble
+_begin_fstest auto quick clone collapse insert zero
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "fzero"
+_require_xfs_io_command "fcollapse"
+_require_xfs_io_command "finsert"
+_require_xfs_io_command "truncate"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -f -c "pwrite 0 0x40000" \
+	$SCRATCH_MNT/foo > /dev/null 2>&1
+
+_cp_reflink $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+
+$XFS_IO_PROG -f -c "fzero -k 0x169f 0x387c" \
+		-c "fcollapse 0x29000 0xd000" \
+		-c "finsert 0 0x8000" \
+		-c "truncate 0x8000" \
+	$SCRATCH_MNT/foo > /dev/null 2>&1
+
+echo "Silence is golden"
+status=0
+exit

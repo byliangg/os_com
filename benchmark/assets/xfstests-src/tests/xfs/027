@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 027
+#
+# Test out "xfsdump | xfsrestore"
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_fill
+_do_dump_restore
+_diff_compare_sub
+
+# success, all done
+exit

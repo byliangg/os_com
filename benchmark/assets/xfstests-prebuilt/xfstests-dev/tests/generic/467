@@ -1,0 +1,86 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test No. 467
+#
+# Check open by file handle.
+# This is a variant of test generic/426 that tests with less
+# files and more use cases:
+# - open directory by file handle
+# - verify content integrity of file after opening by file handle
+# - open by file handle of unlinked open files
+# - open by file handle of renamed files
+#
+. ./common/preamble
+_begin_fstest auto quick exportfs
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+# _require_exportfs already requires open_by_handle, but let's not count on it
+_require_test_program "open_by_handle"
+_require_exportfs
+
+NUMFILES=10
+testdir=$TEST_DIR/$seq-dir
+
+# Create test dir and non-empty test files
+create_test_files()
+{
+	local dir=$1
+	local opt=$2
+
+	rm -rf $dir
+	$here/src/open_by_handle -cwp $dir $NUMFILES
+}
+
+# Test encode/decode file handles
+test_file_handles()
+{
+	local dir=$1
+	local opt=$2
+
+	echo test_file_handles $* | _filter_test_dir
+	$here/src/open_by_handle $opt $dir $NUMFILES
+}
+
+# Check stale handles to deleted files/dir
+create_test_files $testdir
+test_file_handles $testdir -dp
+
+# Check non-stale handles to linked files/dir
+create_test_files $testdir
+test_file_handles $testdir -rp
+
+# Check non-stale handles to unlinked open files
+create_test_files $testdir
+test_file_handles $testdir -dkr
+
+# Check non-stale handles to files that were hardlinked and original deleted
+create_test_files $testdir
+test_file_handles $testdir -lr
+test_file_handles $testdir -ur
+
+# Check non-stale file handles of renamed files
+create_test_files $testdir
+test_file_handles $testdir -mr
+
+# Check non-stale file handles after rename of parent
+create_test_files $testdir
+rm -rf $testdir.renamed
+mv $testdir $testdir.renamed/
+test_file_handles $testdir.renamed -rp
+
+# Check non-stale file handles after move to new parent
+create_test_files $testdir
+rm -rf $testdir.new
+mkdir -p $testdir.new
+mv $testdir/* $testdir.new/
+test_file_handles $testdir.new -rp
+
+status=0
+exit

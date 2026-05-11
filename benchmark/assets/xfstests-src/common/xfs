@@ -1,0 +1,2303 @@
+#
+# XFS specific common functions.
+#
+
+__generate_xfs_report_vars() {
+	__generate_blockdev_report_vars TEST_RTDEV
+	__generate_blockdev_report_vars TEST_LOGDEV
+	__generate_blockdev_report_vars SCRATCH_RTDEV
+	__generate_blockdev_report_vars SCRATCH_LOGDEV
+
+	REPORT_VARS["XFS_ALWAYS_COW"]="$(cat /sys/fs/xfs/debug/always_cow 2>/dev/null)"
+	REPORT_VARS["XFS_LARP"]="$(cat /sys/fs/xfs/debug/larp 2>/dev/null)"
+	REPORT_ENV_LIST_OPT+=("TEST_XFS_REPAIR_REBUILD" "TEST_XFS_SCRUB_REBUILD")
+}
+
+_setup_large_xfs_fs()
+{
+	fs_size=$1
+	local tmp_dir=/tmp/
+
+	[ "$LARGE_SCRATCH_DEV" != yes ] && return 0
+	[ -z "$SCRATCH_DEV_EMPTY_SPACE" ] && SCRATCH_DEV_EMPTY_SPACE=0
+	[ $SCRATCH_DEV_EMPTY_SPACE -ge $fs_size ] && return 0
+
+	# calculate the size of the file we need to allocate.
+	# Default free space in the FS is 50GB, but you can specify more via
+	# SCRATCH_DEV_EMPTY_SPACE
+	file_size=$(($fs_size - 50*1024*1024*1024))
+	file_size=$(($file_size - $SCRATCH_DEV_EMPTY_SPACE))
+
+	# mount the filesystem, create the file, unmount it
+	_try_scratch_mount 2>&1 >$tmp_dir/mnt.err
+	local status=$?
+	if [ $status -ne 0 ]; then
+		echo "mount failed"
+		cat $tmp_dir/mnt.err >&2
+		rm -f $tmp_dir/mnt.err
+		return $status
+	fi
+	rm -f $tmp_dir/mnt.err
+
+	xfs_io -F -f \
+		-c "truncate $file_size" \
+		-c "falloc -k 0 $file_size" \
+		-c "chattr +d" \
+		$SCRATCH_MNT/.use_space 2>&1 > /dev/null
+	export NUM_SPACE_FILES=1
+	status=$?
+	_scratch_unmount
+	if [ $status -ne 0 ]; then
+		echo "large file prealloc failed"
+		cat $tmp_dir/mnt.err >&2
+		return $status
+	fi
+	return 0
+}
+
+_scratch_mkfs_xfs_opts()
+{
+	mkfs_opts=$*
+
+	_scratch_options mkfs
+
+	echo "$MKFS_XFS_PROG $SCRATCH_OPTIONS $mkfs_opts"
+}
+
+
+_scratch_mkfs_xfs_supported()
+{
+	local mkfs_opts=$*
+
+	_scratch_options mkfs
+
+	$MKFS_XFS_PROG -N $MKFS_OPTIONS $SCRATCH_OPTIONS $mkfs_opts $SCRATCH_DEV
+	local mkfs_status=$?
+
+	# a mkfs failure may be caused by conflicts between $MKFS_OPTIONS and
+	# $mkfs_opts, try again without $MKFS_OPTIONS
+	if [ $mkfs_status -ne 0 -a -n "$mkfs_opts" ]; then
+		$MKFS_XFS_PROG -N $SCRATCH_OPTIONS $mkfs_opts $SCRATCH_DEV
+		mkfs_status=$?
+	fi
+	return $mkfs_status
+}
+
+# Returns the minimum XFS log size, in units of log blocks.
+_scratch_find_xfs_min_logblocks()
+{
+	local mkfs_cmd="`_scratch_mkfs_xfs_opts`"
+
+	# The smallest log size we can specify is 2M (XFS_MIN_LOG_BYTES) so
+	# pass that in and see if mkfs succeeds or tells us what is the
+	# minimum log size.
+	local XFS_MIN_LOG_BYTES=2097152
+
+	# Try formatting the filesystem with all the options given and the
+	# minimum log size.  We hope either that this succeeds or that mkfs
+	# tells us the required minimum log size for the feature set.
+	#
+	# We cannot use _scratch_do_mkfs because it will retry /any/ failed
+	# mkfs with MKFS_OPTIONS removed even if the only "failure" was that
+	# the log was too small.
+	local extra_mkfs_options="$* -N -l size=$XFS_MIN_LOG_BYTES"
+	eval "$mkfs_cmd $MKFS_OPTIONS $extra_mkfs_options $SCRATCH_DEV" \
+		2>$tmp.mkfserr 1>$tmp.mkfsstd
+	local mkfs_status=$?
+
+	# If the format fails for a reason other than the log being too small,
+	# try again without MKFS_OPTIONS because that's what _scratch_do_mkfs
+	# will do if we pass in the log size option.
+	if [ $mkfs_status -ne 0 ] &&
+	   ! grep -E -q '(log size.*too small, minimum|external log device.*too small, must be)' $tmp.mkfserr; then
+		eval "$mkfs_cmd $extra_mkfs_options $SCRATCH_DEV" \
+			2>$tmp.mkfserr 1>$tmp.mkfsstd
+		mkfs_status=$?
+	fi
+
+	# mkfs suceeded, so we must pick out the log block size to do the
+	# unit conversion
+	if [ $mkfs_status -eq 0 ]; then
+		blksz="$(grep '^log.*bsize' $tmp.mkfsstd | \
+			sed -e 's/log.*bsize=\([0-9]*\).*$/\1/g')"
+		echo $((XFS_MIN_LOG_BYTES / blksz))
+		rm -f $tmp.mkfsstd $tmp.mkfserr
+		return
+	fi
+
+	# Usually mkfs will tell us the minimum log size...
+	if grep -q 'minimum size is' $tmp.mkfserr; then
+		grep 'minimum size is' $tmp.mkfserr | \
+			sed -e 's/^.*minimum size is \([0-9]*\) blocks/\1/g'
+		rm -f $tmp.mkfsstd $tmp.mkfserr
+		return
+	fi
+	if grep -q 'external log device.*too small, must be' $tmp.mkfserr; then
+		grep 'external log device.*too small, must be' $tmp.mkfserr | \
+			sed -e 's/^.*must be at least \([0-9]*\) blocks/\1/g'
+		rm -f $tmp.mkfsstd $tmp.mkfserr
+		return
+	fi
+
+	# Don't know what to do, so fail
+	echo "Cannot determine minimum log size" >&2
+	cat $tmp.mkfsstd >> $seqres.full
+	cat $tmp.mkfserr >> $seqres.full
+	rm -f $tmp.mkfsstd $tmp.mkfserr
+}
+
+_try_scratch_mkfs_xfs()
+{
+	local mkfs_cmd="`_scratch_mkfs_xfs_opts`"
+	local mkfs_filter="sed -e '/less than device physical sector/d' \
+			       -e '/switching to logical sector/d' \
+			       -e '/Default configuration/d'"
+	local tmp=`mktemp -u`
+	local mkfs_status
+
+	_scratch_do_mkfs "$mkfs_cmd" "$mkfs_filter" $* 2>$tmp.mkfserr 1>$tmp.mkfsstd
+	mkfs_status=$?
+
+	grep -q crc=0 $tmp.mkfsstd && _force_xfsv4_mount_options
+
+	grep -q "zoned file systems do not support" $tmp.mkfserr && \
+		_notrun "Not supported on zoned file systems"
+	grep -q "must be greater than the minimum zone count" $tmp.mkfserr && \
+		_notrun "Zone count too small"
+
+	if [ $mkfs_status -eq 0 -a "$LARGE_SCRATCH_DEV" = yes ]; then
+		# manually parse the mkfs output to get the fs size in bytes
+		local fs_size
+		fs_size=`cat $tmp.mkfsstd | perl -ne '
+			if (/^data\s+=\s+bsize=(\d+)\s+blocks=(\d+)/) {
+				my $size = $1 * $2;
+				print STDOUT "$size\n";
+			}'`
+		_setup_large_xfs_fs $fs_size
+		mkfs_status=$?
+	fi
+
+	if [ $mkfs_status -ne 0 ] && grep -q '^block size [0-9]* cannot be smaller than sector size' "$tmp.mkfserr"; then
+		errormsg="$(grep '^block size [0-9]* cannot be smaller than sector size' "$tmp.mkfserr" | head -n 1)"
+		_notrun "_scratch_mkfs_xfs: $errormsg"
+	fi
+
+	# output mkfs stdout and stderr
+	cat $tmp.mkfsstd
+	cat $tmp.mkfserr >&2
+	rm -f $tmp.mkfserr $tmp.mkfsstd
+
+	return $mkfs_status
+}
+
+_scratch_mkfs_xfs()
+{
+	_try_scratch_mkfs_xfs $* || _notrun "_scratch_mkfs_xfs failed with ($*)"
+}
+
+# Get the number of realtime extents of a mounted filesystem.
+_xfs_get_rtextents()
+{
+	local path="$1"
+
+	$XFS_INFO_PROG "$path" | sed -n "s/^.*rtextents=\([[:digit:]]*\).*/\1/p"
+}
+
+# Get the realtime extent size of a mounted filesystem.
+_xfs_get_rtextsize()
+{
+	local path="$1"
+
+	$XFS_INFO_PROG "$path" | sed -n "s/^.*realtime.*extsz=\([[:digit:]]*\).*/\1/p"
+}
+
+# Get the size of an allocation unit of a file.  Normally this is just the
+# block size of the file, but for realtime files, this is the realtime extent
+# size.
+_xfs_get_file_block_size()
+{
+	local path="$1"
+
+	# If rtinherit or realtime are not set on the path, then all files
+	# will be created on the data device.
+	if ! ($XFS_IO_PROG -c "stat -v" "$path" 2>&1 | grep -E -q '(rt-inherit|realtime)'); then
+		_get_block_size "$path"
+		return
+	fi
+
+	# Otherwise, call xfs_info until we find a mount point or the root.
+	path="$(readlink -m "$path")"
+	while ! $XFS_INFO_PROG "$path" &>/dev/null && [ "$path" != "/" ]; do
+		path="$(dirname "$path")"
+	done
+
+	# If there's no realtime section, the rtinherit and rextsize settings
+	# are irrelevant -- all files are created on the data device.
+	if $XFS_INFO_PROG "$path" | grep -q 'realtime =none'; then
+		_get_block_size "$path"
+		return
+	fi
+
+	# Otherwise, report the rt extent size.
+	_xfs_get_rtextsize "$path"
+}
+
+# Get the directory block size of a mounted filesystem.
+_xfs_get_dir_blocksize()
+{
+	local fs="$1"
+
+	$XFS_INFO_PROG "$fs" | sed -n "s/^naming.*bsize=\([[:digit:]]*\).*/\1/p"
+}
+
+# Decide if this path is a file on the realtime device
+_xfs_is_realtime_file()
+{
+	local mntpt="$(findmnt --target "$1" --noheadings --output TARGET)"
+
+	_xfs_has_feature $mntpt realtime || return 1
+	$XFS_IO_PROG -c 'stat -v' "$1" | grep -q -w realtime
+}
+
+# Set or clear the realtime status of every supplied path.  The first argument
+# is either 'data' or 'realtime'.  All other arguments should be paths to
+# existing directories or empty regular files.
+#
+# For each directory, each file subsequently created will target the given
+# device for file data allocations.  For each empty regular file, each
+# subsequent file data allocation will be on the given device.
+#
+# NOTE: If you call this on $TEST_DIR, you must reset the rtinherit flag state
+# before the end of the test to avoid polluting subsequent tests.
+_xfs_force_bdev()
+{
+	local device="$1"
+	shift
+	local chattr_arg=""
+
+	case "$device" in
+	"data")		chattr_arg="-t";;
+	"realtime")	chattr_arg="+t";;
+	*)
+		echo "${device}: Don't know what device this is?"
+		return 1
+		;;
+	esac
+
+	$XFS_IO_PROG -c "chattr $chattr_arg" "$@"
+}
+
+_xfs_get_fsxattr()
+{
+	local field="$1"
+	local path="$2"
+
+	local value=$($XFS_IO_PROG -c "stat" "$path" | grep -w "$field")
+	echo ${value##fsxattr.${field} = }
+}
+
+_scratch_xfs_options()
+{
+    local type=$1
+    local rt_opt=""
+    local log_opt=""
+
+    case $type in
+    mkfs)
+	SCRATCH_OPTIONS="$SCRATCH_OPTIONS -f"
+	rt_opt="-r"
+        log_opt="-l"
+	;;
+    mount)
+	rt_opt="-o"
+        log_opt="-o"
+	;;
+    esac
+    [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+	SCRATCH_OPTIONS="$SCRATCH_OPTIONS ${rt_opt}rtdev=$SCRATCH_RTDEV"
+    [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+	SCRATCH_OPTIONS="$SCRATCH_OPTIONS ${log_opt}logdev=$SCRATCH_LOGDEV"
+}
+
+_scratch_xfs_db_options()
+{
+	SCRATCH_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		SCRATCH_OPTIONS="-l$SCRATCH_LOGDEV"
+	if [ "$USE_EXTERNAL" = yes ] && [ ! -z "$SCRATCH_RTDEV" ]; then
+		$XFS_DB_PROG --help 2>&1 | grep -q -- '-R rtdev' && \
+			SCRATCH_OPTIONS="$SCRATCH_OPTIONS -R$SCRATCH_RTDEV"
+	fi
+	echo $SCRATCH_OPTIONS $* $SCRATCH_DEV
+}
+
+_scratch_xfs_db()
+{
+	$XFS_DB_PROG "$@" $(_scratch_xfs_db_options)
+}
+
+_test_xfs_db_options()
+{
+	TEST_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_LOGDEV" ] && \
+		TEST_OPTIONS="-l$TEST_LOGDEV"
+	echo $TEST_OPTIONS $* $TEST_DEV
+}
+
+_test_xfs_db()
+{
+	$XFS_DB_PROG "$@" $(_test_xfs_db_options)
+}
+
+_scratch_xfs_admin()
+{
+	local options=("$SCRATCH_DEV")
+	local rt_opts=()
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		options+=("$SCRATCH_LOGDEV")
+	if [ "$USE_EXTERNAL" = yes ] && [ -n "$SCRATCH_RTDEV" ]; then
+		$XFS_ADMIN_PROG --help 2>&1 | grep -q 'rtdev' || \
+			_notrun 'xfs_admin does not support rt devices'
+		rt_opts+=(-r "$SCRATCH_RTDEV")
+	fi
+
+	# xfs_admin in xfsprogs 5.11 has a bug where an external log device
+	# forces xfs_db to be invoked, potentially with zero command arguments.
+	# When this happens, xfs_db will wait for input on stdin, which causes
+	# fstests to hang.  Since xfs_admin is not an interactive tool, we
+	# can redirect stdin from /dev/null to prevent this issue.
+	$XFS_ADMIN_PROG "${rt_opts[@]}" "$@" "${options[@]}" < /dev/null
+}
+
+_scratch_xfs_logprint()
+{
+	SCRATCH_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		SCRATCH_OPTIONS="-l$SCRATCH_LOGDEV"
+	$XFS_LOGPRINT_PROG $SCRATCH_OPTIONS $* $SCRATCH_DEV
+}
+
+_test_xfs_logprint()
+{
+	TEST_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_LOGDEV" ] && \
+		TEST_OPTIONS="-l$TEST_LOGDEV"
+	$XFS_LOGPRINT_PROG $TEST_OPTIONS $* $TEST_DEV
+}
+
+# Check for secret debugging hooks in xfs_repair
+_require_libxfs_debug_flag() {
+	local hook="$1"
+
+	grep -q "$hook" "$(type -P xfs_repair)" || \
+		_notrun "libxfs debug hook $hook not detected?"
+}
+
+_scratch_xfs_repair()
+{
+	SCRATCH_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		SCRATCH_OPTIONS="-l$SCRATCH_LOGDEV"
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+		SCRATCH_OPTIONS=$SCRATCH_OPTIONS" -r$SCRATCH_RTDEV"
+	$XFS_REPAIR_PROG $SCRATCH_OPTIONS $* $SCRATCH_DEV
+}
+
+# this test requires the projid32bit feature to be available in mkfs.xfs.
+#
+_require_projid32bit()
+{
+       _scratch_mkfs_xfs_supported -i projid32bit=1 >/dev/null 2>&1 \
+	   || _notrun "mkfs.xfs doesn't have projid32bit feature"
+}
+
+_require_projid16bit()
+{
+	_scratch_mkfs_xfs_supported -i projid32bit=0 >/dev/null 2>&1 \
+	   || _notrun "16 bit project IDs not supported on $SCRATCH_DEV"
+}
+
+# If the xfs_info output for the given XFS filesystem mount mentions the given
+# feature.  If so, return 0 for success.  If not, return 1 for failure.  If the
+# third option is -v, echo 1 for success and 0 for not.
+#
+# Starting with xfsprogs 4.17, this also works for unmounted filesystems.
+# The feature 'realtime' looks for rtextents > 0.
+_xfs_has_feature()
+{
+	local fs="$1"
+	local feat="$2"
+	local verbose="$3"
+	local feat_regex="1"
+
+	case "$feat" in
+	"realtime")
+		feat="rtextents"
+		feat_regex="[1-9][0-9]*"
+		;;
+	"rtgroups")
+		# any fs with rtgroups enabled will have a nonzero rt group
+		# size, even if there is no rt device (and hence zero actual
+		# groups)
+		feat="rgsize"
+		feat_regex="[1-9][0-9]*"
+		;;
+	esac
+
+	local answer="$($XFS_INFO_PROG "$fs" 2>&1 | grep -E -w -c "$feat=$feat_regex")"
+	if [ "$answer" -ne 0 ]; then
+		test "$verbose" = "-v" && echo 1
+		return 0
+	fi
+
+	test "$verbose" = "-v" && echo 0
+	return 1
+}
+
+# Require that the xfs_info output for the given XFS filesystem mount mentions
+# the given feature flag.  If the third argument is -u (or is empty and the
+# second argument is $SCRATCH_MNT), unmount the fs on failure.  If a fourth
+# argument is supplied, it will be used as the _notrun message.
+_require_xfs_has_feature()
+{
+	local fs="$1"
+	local feat="$2"
+	local umount="$3"
+	local message="$4"
+
+	if [ -z "$umount" ] && [ "$fs" = "$SCRATCH_MNT" ]; then
+		umount="-u"
+	fi
+
+	_xfs_has_feature "$1" "$2" && return 0
+
+	test "$umount" = "-u" && umount "$fs" &>/dev/null
+
+	test -n "$message" && _notrun "$message"
+
+	case "$fs" in
+	"$TEST_DIR"|"$TEST_DEV")	fsname="test";;
+	"$SCRATCH_MNT"|"$SCRATCH_DEV")	fsname="scratch";;
+	*)				fsname="$fs";;
+	esac
+	_notrun "$2 not supported by $fsname filesystem type: $FSTYP"
+}
+
+# this test requires the xfs kernel support crc feature on scratch device
+#
+_require_scratch_xfs_crc()
+{
+	_try_scratch_mkfs_xfs >/dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 \
+	   || _notrun "Kernel doesn't support crc feature"
+	_require_xfs_has_feature $SCRATCH_MNT crc -u \
+		"crc feature not supported by this filesystem"
+	_scratch_unmount
+}
+
+# this test requires the finobt feature to be available in mkfs.xfs
+#
+_require_xfs_mkfs_finobt()
+{
+	_scratch_mkfs_xfs_supported -m crc=1,finobt=1 >/dev/null 2>&1 \
+	   || _notrun "mkfs.xfs doesn't have finobt feature"
+}
+
+# this test requires the xfs kernel support finobt feature
+#
+_require_xfs_finobt()
+{
+	_try_scratch_mkfs_xfs -m crc=1,finobt=1 >/dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 \
+	   || _notrun "Kernel doesn't support finobt feature"
+	_scratch_unmount
+}
+
+# this test requires xfs sysfs attribute support
+#
+_require_xfs_sysfs()
+{
+	attr=$1
+	sysfsdir=/sys/fs/xfs
+
+	if [ ! -e $sysfsdir ]; then
+		_notrun "no kernel support for XFS sysfs attributes"
+	fi
+
+	if [ ! -z $1 ] && [ ! -e $sysfsdir/$attr ]; then
+		_notrun "sysfs attribute '$attr' is not supported"
+	fi
+}
+
+# this test requires the xfs sparse inode feature
+#
+_require_xfs_sparse_inodes()
+{
+	_scratch_mkfs_xfs_supported -m crc=1 -i sparse > /dev/null 2>&1 \
+		|| _notrun "mkfs.xfs does not support sparse inodes"
+	_try_scratch_mkfs_xfs -m crc=1 -i sparse > /dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 \
+		|| _notrun "kernel does not support sparse inodes"
+	_scratch_unmount
+}
+
+# this test requires the xfs large extent counter feature
+#
+_require_xfs_nrext64()
+{
+	_scratch_mkfs_xfs_supported -m crc=1 -i nrext64 > /dev/null 2>&1 \
+		|| _notrun "mkfs.xfs does not support nrext64"
+	_try_scratch_mkfs_xfs -m crc=1 -i nrext64 > /dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 \
+		|| _notrun "kernel does not support nrext64"
+	_scratch_unmount
+}
+
+# check that xfs_db supports a specific command
+_require_xfs_db_command()
+{
+	if [ $# -ne 1 ]; then
+		echo "Usage: _require_xfs_db_command command" 1>&2
+		_exit 1
+	fi
+	command=$1
+
+	_try_scratch_mkfs_xfs >/dev/null 2>&1
+	_scratch_xfs_db -x -c "help" | grep $command > /dev/null || \
+		_notrun "xfs_db $command support is missing"
+}
+
+# Check the health of a mounted XFS filesystem.  Callers probably want to
+# ensure that xfs_scrub has been run first.  Returns 1 if unhealthy metadata
+# are found or 0 otherwise.
+_check_xfs_health() {
+	local mntpt="$1"
+	local ret=0
+	local t="$tmp.health_helper"
+
+	test -x "$XFS_SPACEMAN_PROG" || return 0
+
+	$XFS_SPACEMAN_PROG -c 'health -c -q' $mntpt > $t.out 2> $t.err
+	test $? -ne 0 && ret=1
+
+	# Don't return error if userspace or kernel don't support health
+	# reporting.
+	grep -q 'command.*health.*not found' $t.err && return 0
+	grep -q 'Inappropriate ioctl for device' $t.err && return 0
+
+	# Filter out the "please run scrub" message if nothing's been checked.
+	sed -e '/Health status has not been/d' -e '/Please run xfs_scrub/d' -i \
+			$t.err
+
+	grep -q unhealthy $t.out && ret=1
+	test $(wc -l < $t.err) -gt 0 && ret=1
+	cat $t.out
+	cat $t.err 1>&2
+	rm -f $t.out $t.err
+
+	return $ret
+}
+
+# Does the filesystem mounted from a particular device support scrub?
+_supports_xfs_scrub()
+{
+	local mountpoint="$1"
+	local device="$2"
+
+	if [ -z "$device" ] || [ -z "$mountpoint" ]; then
+		echo "Usage: _supports_xfs_scrub mountpoint device"
+		return 1
+	fi
+
+	if [ ! -b "$device" ] || [ ! -e "$mountpoint" ]; then
+		return 1
+	fi
+
+	test "$FSTYP" = "xfs" || return 1
+	test -x "$XFS_SCRUB_PROG" || return 1
+
+	mountpoint $mountpoint >/dev/null || \
+		_fail "$mountpoint is not mounted"
+
+	# Probe for kernel support...
+	$XFS_IO_PROG -c 'help scrub' 2>&1 | grep -q 'types are:.*probe' || return 1
+	$XFS_IO_PROG -c "scrub probe" "$mountpoint" 2>&1 | grep -q "Inappropriate ioctl" && return 1
+
+	# Scrub can't run on norecovery mounts
+	_fs_options "$device" | grep -q "norecovery" && return 1
+
+	return 0
+}
+
+# Does the scratch file system support scrub?
+_require_scratch_xfs_scrub()
+{
+	_supports_xfs_scrub $SCRATCH_MNT $SCRATCH_DEV || \
+		_notrun "Scrub not supported"
+}
+
+# Save a snapshot of a corrupt xfs filesystem for later debugging.
+_xfs_metadump() {
+	local metadump="$1"
+	local device="$2"
+	local logdev="$3"
+	local rtdev="$4"
+	local compressopt="$5"
+	shift; shift; shift; shift; shift
+	local options="$@"
+
+	if [ "$logdev" != "none" ]; then
+		options="$options -l $logdev"
+	fi
+
+	if [ "$rtdev" != "none" ] && _xfs_metadump_supports_rt; then
+		options="$options -r $rtdev"
+	fi
+
+	$XFS_METADUMP_PROG $options "$device" "$metadump"
+	res=$?
+	[ "$compressopt" = "compress" ] && [ -n "$DUMP_COMPRESSOR" ] &&
+		$DUMP_COMPRESSOR -f "$metadump" &> /dev/null
+	return $res
+}
+
+# What is the version of this metadump file?
+_xfs_metadumpfile_version() {
+	local file="$1"
+	local magic
+
+	magic="$($XFS_IO_PROG -c 'pread -q -v 0 4' "$file")"
+	case "$magic" in
+	"00000000:  58 4d 44 32  XMD2") echo 2;;
+	"00000000:  58 46 53 4d  XFSM") echo 1;;
+	esac
+}
+
+_xfs_mdrestore() {
+	local metadump="$1"
+	local device="$2"
+	local logdev="$3"
+	local rtdev="$4"
+	shift; shift; shift; shift
+	local options="$@"
+	local dumpfile_ver
+
+	# If we're configured for compressed dumps and there isn't already an
+	# uncompressed dump, see if we can use DUMP_COMPRESSOR to decompress
+	# something.
+	if [ ! -e "$metadump" ] && [ -n "$DUMP_COMPRESSOR" ]; then
+		for compr in "$metadump".*; do
+			[ -e "$compr" ] && $DUMP_COMPRESSOR -d -f -k "$compr" && break
+		done
+	fi
+	test -r "$metadump" || return 1
+	dumpfile_ver="$(_xfs_metadumpfile_version "$metadump")"
+
+	if [ "$logdev" != "none" ] && [[ $dumpfile_ver > 1 ]]; then
+		# metadump and mdrestore began capturing and restoring the
+		# contents of external log devices with the addition of the
+		# metadump v2 format.  Hence it only makes sense to specify -l
+		# here if the dump file itself is in v2 format.
+		#
+		# With a v1 metadump, the log device is not changed by the dump
+		# and restore process.  Historically, fstests either didn't
+		# notice or _notrun themselves when external logs were in use.
+		# Don't break that for people testing with xfsprogs < 6.5.
+		options="$options -l $logdev"
+	fi
+
+	if [ "$rtdev" != "none" ] && [[ $dumpfile_ver > 1 ]] && _xfs_metadump_supports_rt; then
+		# metadump and mdrestore capture and restore metadata on the
+		# realtime volume by turning on metadump v2 format.  This is
+		# only done if the realtime volume contains metadata such as
+		# rtgroup superblocks.  The -r option to mdrestore wasn't added
+		# until the creation of rtgroups.
+		#
+		# Hence it only makes sense to specify -r here if the dump file
+		# itself is in v2 format.
+		options="$options -r $rtdev"
+	fi
+
+	$XFS_MDRESTORE_PROG $options "${metadump}" "${device}"
+}
+
+# What is the maximum metadump file format supported by xfs_metadump?
+_xfs_metadump_max_version()
+{
+	if $XFS_METADUMP_PROG --help 2>&1 | grep -q -- '-v version'; then
+		echo 2
+	else
+		echo 1
+	fi
+}
+
+# Do xfs_metadump/mdrestore support the -r switch for realtime devices?
+_xfs_metadump_supports_rt()
+{
+	$XFS_METADUMP_PROG --help 2>&1 | grep -q -- '-r rtdev'
+}
+
+# Snapshot the metadata on the scratch device
+_scratch_xfs_metadump()
+{
+	local metadump=$1
+	shift
+	local logdev=none
+	local rtdev=none
+
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+		logdev=$SCRATCH_LOGDEV
+
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+		rtdev=$SCRATCH_RTDEV
+
+	_xfs_metadump "$metadump" "$SCRATCH_DEV" "$logdev" "$rtdev" nocompress "$@"
+}
+
+# Restore snapshotted metadata on the scratch device
+_scratch_xfs_mdrestore()
+{
+	local metadump=$1
+	shift
+	local logdev=none
+	local rtdev=none
+	local options="$@"
+
+	# $SCRATCH_LOGDEV should have a non-zero length value only when all of
+	# the following conditions are met.
+	# 1. Metadump is in v2 format.
+	# 2. Metadump has contents dumped from an external log device.
+	if [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ]; then
+		logdev=$SCRATCH_LOGDEV
+	fi
+
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+		rtdev=$SCRATCH_RTDEV
+
+	_xfs_mdrestore "$metadump" "$SCRATCH_DEV" "$logdev" "$rtdev" "$@"
+}
+
+# Check if mdrestore to the scratch device is supported
+_require_scratch_xfs_mdrestore() {
+	_require_command "$XFS_MDRESTORE_PROG" "xfs_mdrestore"
+
+	# mdrestore can't restore to zoned devices
+        _require_non_zoned_device $SCRATCH_DEV
+	if [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ]; then
+		_require_non_zoned_device $SCRATCH_LOGDEV
+	fi
+	if [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ]; then
+		_require_non_zoned_device $SCRATCH_RTDEV
+	fi
+}
+
+# Do not use xfs_repair (offline fsck) to rebuild the filesystem
+_xfs_skip_offline_rebuild() {
+	touch "$RESULT_DIR/.skip_rebuild"
+}
+
+# Do not use xfs_scrub (online fsck) to rebuild the filesystem
+_xfs_skip_online_rebuild() {
+	touch "$RESULT_DIR/.skip_orebuild"
+}
+
+# run xfs_repair and xfs_scrub on a FS.
+_check_xfs_filesystem()
+{
+	local can_scrub=
+
+	if [ $# -ne 3 ]; then
+		echo "Usage: _check_xfs_filesystem device <logdev>|none <rtdev>|none" 1>&2
+		_exit 1
+	fi
+
+	extra_mount_options=""
+	extra_log_options=""
+	extra_options=""
+	device=$1
+	if [ -f $device ]; then
+		extra_options="-f"
+	fi
+
+	local logdev="$2"
+	if [ "$logdev" != "none" ]; then
+		extra_log_options="-l$logdev"
+		extra_mount_options="-ologdev=$logdev"
+	fi
+
+	local rtdev="$3"
+	if [ "$rtdev" != "none" ]; then
+		extra_rt_options="-r$rtdev"
+		extra_mount_options=$extra_mount_options" -ortdev=$rtdev"
+	fi
+	extra_mount_options=$extra_mount_options" $MOUNT_OPTIONS"
+
+	[ "$FSTYP" != xfs ] && return 0
+
+	type=`_fs_type $device`
+	ok=1
+
+	# Run online scrub if we can.
+	mntpt="$(_is_dev_mounted $device)"
+	if [ -n "$mntpt" ] && _supports_xfs_scrub "$mntpt" "$device"; then
+		can_scrub=1
+
+		# Tests can create a scenario in which a call to syncfs() issued
+		# at the end of the execution of the test script would return an
+		# error code. xfs_scrub internally calls syncfs() before
+		# starting the actual online consistency check operation. Since
+		# such a call to syncfs() fails, xfs_scrub ends up returning
+		# without performing consistency checks on the test
+		# filesystem. This can mask a possible on-disk data structure
+		# corruption. Hence consume such a possible syncfs() failure
+		# before executing a scrub operation.
+		$XFS_IO_PROG -c syncfs $mntpt >> $seqres.full 2>&1
+
+		"$XFS_SCRUB_PROG" -v -d -n $mntpt > $tmp.scrub 2>&1
+		if [ $? -ne 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device failed scrub"
+			echo "*** xfs_scrub -v -d -n output ***" >> $seqres.full
+			cat $tmp.scrub >> $seqres.full
+			echo "*** end xfs_scrub output" >> $seqres.full
+			ok=0
+		fi
+		rm -f $tmp.scrub
+
+		# Does the health reporting notice anything?
+		_check_xfs_health $mntpt > $tmp.health 2>&1
+		res=$?
+		if [ $((res ^ ok)) -eq 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device failed health check"
+			echo "*** xfs_spaceman -c 'health -c -q' output ***" >> $seqres.full
+			cat $tmp.health >> $seqres.full
+			echo "*** end xfs_spaceman output" >> $seqres.full
+			ok=0
+		fi
+		rm -f $tmp.health
+	fi
+
+	if [ "$type" = "xfs" ]; then
+		# mounted ...
+		mountpoint=`_umount_or_remount_ro $device`
+	fi
+
+	$XFS_LOGPRINT_PROG -t $extra_log_options $device 2>&1 \
+		| tee $tmp.logprint | grep -q "<CLEAN>"
+	if [ $? -ne 0 ]; then
+		_log_err "_check_xfs_filesystem: filesystem on $device has dirty log"
+		echo "*** xfs_logprint -t output ***"	>>$seqres.full
+		cat $tmp.logprint			>>$seqres.full
+		echo "*** end xfs_logprint output"	>>$seqres.full
+
+		ok=0
+	fi
+
+	# xfs_check used to run here, but was removed as of July 2024 because
+	# xfs_repair can detect more corruptions than xfs_check ever did.
+
+	$XFS_REPAIR_PROG -n $extra_options $extra_log_options $extra_rt_options $device >$tmp.repair 2>&1
+	if [ $? -ne 0 ]; then
+		_log_err "_check_xfs_filesystem: filesystem on $device is inconsistent (r)"
+		echo "*** xfs_repair -n output ***"	>>$seqres.full
+		cat $tmp.repair				>>$seqres.full
+		echo "*** end xfs_repair output"	>>$seqres.full
+
+		ok=0
+	fi
+	rm -f $tmp.fs_check $tmp.logprint $tmp.repair
+
+	if [ "$ok" -ne 1 ] && [ "$DUMP_CORRUPT_FS" = "1" ]; then
+		local flatdev="$(basename "$device")"
+		_xfs_metadump "$seqres.$flatdev.check.md" "$device" "$logdev" \
+			"$rtdev" compress -a -o >> $seqres.full
+	fi
+
+	# Optionally test the index rebuilding behavior.
+	if [ -n "$TEST_XFS_REPAIR_REBUILD" ] && [ ! -e "$RESULT_DIR/.skip_rebuild" ]; then
+		rebuild_ok=1
+		$XFS_REPAIR_PROG $extra_options $extra_log_options $extra_rt_options $device >$tmp.repair 2>&1
+		if [ $? -ne 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device is inconsistent (rebuild)"
+			echo "*** xfs_repair output ***"	>>$seqres.full
+			cat $tmp.repair				>>$seqres.full
+			echo "*** end xfs_repair output"	>>$seqres.full
+
+			ok=0
+			rebuild_ok=0
+		fi
+		rm -f $tmp.repair
+
+		$XFS_REPAIR_PROG -n $extra_options $extra_log_options $extra_rt_options $device >$tmp.repair 2>&1
+		if [ $? -ne 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device is inconsistent (rebuild-reverify)"
+			echo "*** xfs_repair -n output ***"	>>$seqres.full
+			cat $tmp.repair				>>$seqres.full
+			echo "*** end xfs_repair output"	>>$seqres.full
+
+			ok=0
+			rebuild_ok=0
+		fi
+		rm -f $tmp.repair
+
+		if [ "$rebuild_ok" -ne 1 ] && [ "$DUMP_CORRUPT_FS" = "1" ]; then
+			local flatdev="$(basename "$device")"
+			_xfs_metadump "$seqres.$flatdev.rebuild.md" "$device" \
+				"$logdev" "$rtdev" compress -a -o >> $seqres.full
+		fi
+	fi
+
+	if [ $ok -eq 0 ]; then
+		echo "*** mount output ***"		>>$seqres.full
+		_mount					>>$seqres.full
+		echo "*** end mount output"		>>$seqres.full
+	elif [ "$type" = "xfs" ]; then
+		_mount_or_remount_rw "$extra_mount_options" $device $mountpoint
+	fi
+
+	# If desired, test the online metadata rebuilding behavior if the
+	# filesystem was mounted when this function was called.
+	if [ -n "$TEST_XFS_SCRUB_REBUILD" ] && [ -n "$can_scrub" ] && [ ! -e "$RESULT_DIR/.skip_orebuild" ]; then
+		orebuild_ok=1
+
+		# Walk the entire directory tree to load directory blocks into
+		# memory and populate the dentry cache, which can speed up the
+		# repairs considerably when the directory tree is very large.
+		find $mntpt &>/dev/null &
+
+		XFS_SCRUB_FORCE_REPAIR=1 "$XFS_SCRUB_PROG" -v -d $mntpt 2>&1 | gzip > $tmp.scrub.gz
+		ret=$?
+		if [ $ret -ne 0 ]; then
+			if zgrep -q 'No space left on device' $tmp.scrub.gz; then
+				# It's not an error if the fs does not have
+				# enough space to complete a repair.  We will
+				# check everything, though.
+				echo "*** XFS_SCRUB_FORCE_REPAIR=1 xfs_scrub -v -d ran out of space ret=$ret ***" >> $seqres.full
+				echo "See $seqres.scrubout.gz for details." >> $seqres.full
+				mv $tmp.scrub.gz $seqres.scrubout.gz
+				echo "*** end xfs_scrub output" >> $seqres.full
+			else
+				_log_err "_check_xfs_filesystem: filesystem on $device failed scrub orebuild"
+				echo "*** XFS_SCRUB_FORCE_REPAIR=1 xfs_scrub -v -d output ret=$ret ***" >> $seqres.full
+				echo "See $seqres.scrubout.gz for details." >> $seqres.full
+				mv $tmp.scrub.gz $seqres.scrubout.gz
+				echo "*** end xfs_scrub output" >> $seqres.full
+				ok=0
+				orebuild_ok=0
+			fi
+		fi
+		rm -f $tmp.scrub.gz
+
+		# Clear force_repair because xfs_scrub could have set it
+		$XFS_IO_PROG -x -c 'inject noerror' "$mntpt" >> $seqres.full
+
+		"$XFS_SCRUB_PROG" -v -d -n $mntpt > $tmp.scrub 2>&1
+		if [ $? -ne 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device failed scrub orebuild recheck"
+			echo "*** xfs_scrub -v -d -n output ***" >> $seqres.full
+			cat $tmp.scrub >> $seqres.full
+			echo "*** end xfs_scrub output" >> $seqres.full
+			ok=0
+			orebuild_ok=0
+		fi
+		rm -f $tmp.scrub
+
+		mountpoint=`_umount_or_remount_ro $device`
+
+		$XFS_REPAIR_PROG -n $extra_options $extra_log_options $extra_rt_options $device >$tmp.repair 2>&1
+		if [ $? -ne 0 ]; then
+			_log_err "_check_xfs_filesystem: filesystem on $device is inconsistent (orebuild-reverify)"
+			echo "*** xfs_repair -n output ***"	>>$seqres.full
+			cat $tmp.repair				>>$seqres.full
+			echo "*** end xfs_repair output"	>>$seqres.full
+
+			ok=0
+			orebuild_ok=0
+		fi
+		rm -f $tmp.repair
+
+		if [ $ok -eq 0 ]; then
+			echo "*** mount output ***"		>>$seqres.full
+			_mount					>>$seqres.full
+			echo "*** end mount output"		>>$seqres.full
+		elif [ "$type" = "xfs" ]; then
+			_mount_or_remount_rw "$extra_mount_options" $device $mountpoint
+		fi
+
+		if [ "$orebuild_ok" -ne 1 ] && [ "$DUMP_CORRUPT_FS" = "1" ]; then
+			local flatdev="$(basename "$device")"
+			_xfs_metadump "$seqres.$flatdev.orebuild.md" "$device" \
+				"$logdev" "$rtdev" compress -a -o >> $seqres.full
+		fi
+	fi
+
+	if [ $ok -eq 0 ]; then
+		status=1
+		if [ "$iam" != "check" ]; then
+			_exit 1
+		fi
+		return 1
+	fi
+
+	return 0
+}
+
+_check_xfs_test_fs()
+{
+	TEST_LOG="none"
+	TEST_RT="none"
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_LOGDEV" ] && \
+		TEST_LOG="$TEST_LOGDEV"
+
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_RTDEV" ] && \
+		TEST_RT="$TEST_RTDEV"
+
+	_check_xfs_filesystem $TEST_DEV $TEST_LOG $TEST_RT
+	return $?
+}
+
+_check_xfs_scratch_fs()
+{
+	local device="${1:-$SCRATCH_DEV}"
+	local scratch_log="none"
+	local scratch_rt="none"
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_LOGDEV" ] && \
+	    scratch_log="$SCRATCH_LOGDEV"
+
+	[ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ] && \
+	    scratch_rt="$SCRATCH_RTDEV"
+
+	_check_xfs_filesystem $device $scratch_log $scratch_rt
+}
+
+# modeled after _scratch_xfs_repair
+_test_xfs_repair()
+{
+	TEST_OPTIONS=""
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_LOGDEV" ] && \
+		TEST_OPTIONS="-l$TEST_LOGDEV"
+	[ "$USE_EXTERNAL" = yes -a ! -z "$TEST_RTDEV" ] && \
+		TEST_OPTIONS=$TEST_OPTIONS" -r$TEST_RTDEV"
+	[ "$LARGE_TEST_DEV" = yes ] && TEST_OPTIONS=$TEST_OPTIONS" -t"
+	$XFS_REPAIR_PROG $TEST_OPTIONS $* $TEST_DEV
+}
+
+_require_xfs_test_rmapbt()
+{
+	_require_test
+	_require_xfs_has_feature "$TEST_DIR" rmapbt
+}
+
+_require_xfs_scratch_rmapbt()
+{
+	_require_scratch
+
+	_scratch_mkfs > /dev/null
+	_scratch_mount
+	_require_xfs_has_feature "$SCRATCH_MNT" rmapbt
+	_scratch_unmount
+}
+
+_xfs_bmapx_find()
+{
+	case "$1" in
+	"attr")
+		param="a"
+		;;
+	"cow")
+		param="c"
+		;;
+	*)
+		param="e"
+		;;
+	esac
+	shift
+	file="$1"
+	shift
+
+	$XFS_IO_PROG -c "bmap -${param}lpv" "$file" | grep -c "$@"
+}
+
+# Reset all xfs error handling attributes, set them to original
+# status.
+#
+# Only one argument, and it's mandatory:
+#  - dev: device name, e.g. $SCRATCH_DEV
+#
+# Note: this function only works for XFS
+_reset_xfs_sysfs_error_handling()
+{
+	local dev=$1
+
+	if [ ! -b "$dev" -o "$FSTYP" != "xfs" ]; then
+		_fail "Usage: reset_xfs_sysfs_error_handling <device>"
+	fi
+
+	_set_fs_sysfs_attr $dev error/fail_at_unmount 1
+	echo -n "error/fail_at_unmount="
+	_get_fs_sysfs_attr $dev error/fail_at_unmount
+
+	# Make sure all will be configured to retry forever by default, except
+	# for ENODEV, which is an unrecoverable error, so it will be configured
+	# to not retry on error by default.
+	for e in default EIO ENOSPC; do
+		_set_fs_sysfs_attr $dev \
+				   error/metadata/${e}/max_retries -1
+		echo -n "error/metadata/${e}/max_retries="
+		_get_fs_sysfs_attr $dev error/metadata/${e}/max_retries
+
+		_set_fs_sysfs_attr $dev \
+				   error/metadata/${e}/retry_timeout_seconds -1
+		echo -n "error/metadata/${e}/retry_timeout_seconds="
+		_get_fs_sysfs_attr $dev \
+				   error/metadata/${e}/retry_timeout_seconds
+	done
+}
+
+# Unmount an XFS with a dirty log
+_scratch_xfs_unmount_dirty()
+{
+	local f="$SCRATCH_MNT/.dirty_umount"
+
+	rm -f "$f"
+	echo "test" > "$f"
+	_scratch_sync
+	_scratch_shutdown
+	_scratch_unmount
+}
+
+# Prepare a mounted filesystem for an IO error shutdown test by disabling retry
+# for metadata writes.  This prevents a (rare) log livelock when:
+#
+# - The log has given out all available grant space, preventing any new
+#   writers from tripping over IO errors (and shutting down the fs/log),
+# - All log buffers were written to disk, and
+# - The log tail is pinned because the AIL keeps hitting EIO trying to write
+#   committed changes back into the filesystem.
+#
+# Real users might want the default behavior of the AIL retrying writes forever
+# but for testing purposes we don't want to wait.
+#
+# The sole parameter should be the filesystem data device, e.g. $SCRATCH_DEV.
+_xfs_prepare_for_eio_shutdown()
+{
+	local dev="$1"
+	local ctlfile="error/fail_at_unmount"
+
+	# Once we enable IO errors, it's possible that a writer thread will
+	# trip over EIO, cancel the transaction, and shut down the system.
+	# This is expected behavior, so we need to remove the "Internal error"
+	# message from the list of things that can cause the test to be marked
+	# as failed.
+	_add_dmesg_filter "Internal error"
+
+	# Don't retry any writes during the (presumably) post-shutdown unmount
+	_has_fs_sysfs "$ctlfile" && _set_fs_sysfs_attr $dev "$ctlfile" 1
+
+	# Disable retry of metadata writes that fail with EIO
+	for ctl in max_retries retry_timeout_seconds; do
+		ctlfile="error/metadata/EIO/$ctl"
+
+		_has_fs_sysfs "$ctlfile" && _set_fs_sysfs_attr $dev "$ctlfile" 0
+	done
+}
+
+# Skip if we are running an older binary without the stricter input checks.
+# Make multiple checks to be sure that there is no regression on the one
+# selected feature check, which would skew the result.
+#
+# At first, make a common function that runs the tests and returns
+# number of failed cases.
+_xfs_mkfs_validation_check()
+{
+	local tmpfile=`mktemp`
+	local cmd="$MKFS_XFS_PROG -f -N -d file,name=$tmpfile,size=1g"
+
+	$cmd -s size=8s >/dev/null 2>&1
+	local sum=$?
+
+	$cmd -l version=2,su=260k >/dev/null 2>&1
+	sum=`expr $sum + $?`
+
+	rm -f $tmpfile
+	return $sum
+}
+
+# Skip the test if all calls passed - mkfs accepts invalid input
+_require_xfs_mkfs_validation()
+{
+	_xfs_mkfs_validation_check
+	if [ "$?" -eq 0 ]; then
+		_notrun "Requires newer mkfs with stricter input checks: the oldest supported version of xfsprogs is 4.7."
+	fi
+}
+
+_require_scratch_xfs_shrink()
+{
+	_require_scratch
+	_require_command "$XFS_GROWFS_PROG" xfs_growfs
+
+	_try_scratch_mkfs_xfs | _filter_mkfs 2>$tmp.mkfs >/dev/null
+	. $tmp.mkfs
+	_scratch_mount
+	# here just to check if kernel supports, no need do more extra work
+	local errmsg
+	errmsg=$($XFS_GROWFS_PROG -D$((dblocks-1)) "$SCRATCH_MNT" 2>&1)
+	if [ "$?" -ne 0 ]; then
+		echo "$errmsg" | grep 'XFS_IOC_FSGROWFSDATA xfsctl failed: Invalid argument' > /dev/null && \
+			_notrun "kernel does not support shrinking"
+		echo "$errmsg" | grep 'data size .* too small, old size is ' > /dev/null && \
+			_notrun "xfsprogs does not support shrinking"
+		_fail "$XFS_GROWFS_PROG failed unexpectedly: $errmsg"
+	fi
+	_scratch_unmount
+}
+
+# this test requires mkfs.xfs have case-insensitive naming support
+_require_xfs_mkfs_ciname()
+{
+	_scratch_mkfs_xfs_supported -n version=ci >/dev/null 2>&1 \
+		|| _notrun "need case-insensitive naming support in mkfs.xfs"
+}
+
+# this test requires the xfs kernel support ascii-ci feature
+#
+_require_xfs_ciname()
+{
+	_try_scratch_mkfs_xfs -n version=ci >/dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 || \
+		_notrun "XFS doesn't support ascii-ci feature"
+	_scratch_unmount
+}
+
+# this test requires mkfs.xfs have configuration file support
+_require_xfs_mkfs_cfgfile()
+{
+	echo > /tmp/a
+	_scratch_mkfs_xfs_supported -c options=/tmp/a >/dev/null 2>&1
+	res=$?
+	rm -rf /tmp/a
+	test $res -eq 0 || _notrun "need configuration file support in mkfs.xfs"
+}
+
+# XFS_DEBUG requirements
+_require_xfs_debug()
+{
+	if grep -q "debug 0" /proc/fs/xfs/stat; then
+		_notrun "Require XFS built with CONFIG_XFS_DEBUG"
+	fi
+}
+_require_no_xfs_debug()
+{
+	if grep -q "debug 1" /proc/fs/xfs/stat; then
+		_notrun "Require XFS built without CONFIG_XFS_DEBUG"
+	fi
+}
+
+# Require that assertions will not crash the system.
+#
+# Assertions would always crash the system if XFS assert fatal was enabled
+# (CONFIG_XFS_ASSERT_FATAL=y).  If a test is designed to trigger an assertion,
+# skip the test on a CONFIG_XFS_ASSERT_FATAL built XFS by default.  Note:
+# CONFIG_XFS_ASSERT_FATAL can be disabled by setting bug_on_assert to zero if
+# we want test to run.
+_require_no_xfs_bug_on_assert()
+{
+	if [ -f /sys/fs/xfs/debug/bug_on_assert ]; then
+		grep -q "1" /sys/fs/xfs/debug/bug_on_assert && \
+		   _notrun "test requires XFS bug_on_assert to be off, turn it off to run the test"
+	else
+		# Note: Prior to the creation of CONFIG_XFS_ASSERT_FATAL (and
+		# the sysfs knob bug_on_assert), assertions would always crash
+		# the system if XFS debug was enabled (CONFIG_XFS_DEBUG=y).  If
+		# a test is designed to trigger an assertion and the test
+		# designer does not want to hang fstests, skip the test.
+		_require_no_xfs_debug
+	fi
+}
+
+# Require that XFS is not configured in always_cow mode.
+_require_no_xfs_always_cow()
+{
+	if [ -f /sys/fs/xfs/debug/always_cow ]; then
+		grep -q "1" /sys/fs/xfs/debug/always_cow && \
+		   _notrun "test requires XFS always_cow to be off, turn it off to run the test"
+	fi
+}
+
+# Get a metadata field
+# The first arg is the field name
+# The rest of the arguments are xfs_db commands to find the metadata.
+_scratch_xfs_get_metadata_field()
+{
+	local key="$1"
+	shift
+
+	local grep_key="$(echo "${key}" | tr '[]()' '....')"
+	local cmds=()
+	local arg
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+	_scratch_xfs_db "${cmds[@]}" -c "print ${key}" | grep "^${grep_key}" | \
+		sed -e 's/^.* = //g'
+}
+
+# Set a metadata field
+# The first arg is the field name
+# The second arg is the new value
+# The rest of the arguments are xfs_db commands to find the metadata.
+_scratch_xfs_set_metadata_field()
+{
+	local key="$1"
+	local value="$2"
+	shift; shift
+
+	local cmds=()
+	local arg
+	for arg in "$@"; do
+		cmds+=("-c" "${arg}")
+	done
+
+	local wr_cmd="write"
+	_scratch_xfs_db -x -c "help write" | grep -E -q "(-c|-d)" && value="-- ${value}"
+	_scratch_xfs_db -x -c "help write" | grep -E -q "(-d)" && wr_cmd="${wr_cmd} -d"
+	_scratch_xfs_db -x "${cmds[@]}" -c "${wr_cmd} ${key} ${value}"
+}
+
+_scratch_xfs_get_sb_field()
+{
+	_scratch_xfs_get_metadata_field "$1" "sb 0"
+}
+
+_scratch_xfs_set_sb_field()
+{
+	_scratch_xfs_set_metadata_field "$1" "$2" "sb 0"
+}
+
+# Before xfsprogs commit 4222d000ed("db: write via array indexing doesn't
+# work"), xfs_db command to write a specific AGFL index doesn't work. It's a
+# bug in a diagnostic tool that is only used by XFS developers as a test
+# infrastructure, so it's fine to treat it as a infrastructure dependency as
+# all other _require rules.
+_require_xfs_db_write_array()
+{
+	local supported=0
+
+	_require_test
+	touch $TEST_DIR/$seq.img
+	$MKFS_XFS_PROG -d file,name=$TEST_DIR/$seq.img,size=512m >/dev/null 2>&1
+	$XFS_DB_PROG -x -c "agfl 0" -c "write bno[32] 78" $TEST_DIR/$seq.img \
+		>/dev/null 2>&1
+	$XFS_DB_PROG -x -c "agfl 0" -c "print bno[32]" $TEST_DIR/$seq.img \
+		| grep -q "bno\[32\] = 78" && supported=1
+	rm -f $TEST_DIR/$seq.img
+	[ $supported -eq 0 ] && _notrun "xfs_db write can't support array"
+}
+
+_require_xfs_spaceman_command()
+{
+	if [ -z "$1" ]; then
+		echo "Usage: _require_xfs_spaceman_command command [switch]" 1>&2
+		_exit 1
+	fi
+	local command=$1
+	shift
+	local param="$*"
+	local param_checked=0
+	local opts=""
+
+	_require_command "$XFS_SPACEMAN_PROG" "xfs_spaceman"
+
+	testfile=$TEST_DIR/$$.xfs_spaceman
+	touch $testfile
+	case $command in
+	"health"|"listfsprops")
+		testio=`$XFS_SPACEMAN_PROG -c "$command $param" $TEST_DIR 2>&1`
+		param_checked=1
+		;;
+	*)
+		testio=`$XFS_SPACEMAN_PROG -c "help $command" $TEST_DIR 2>&1`
+	esac
+
+	rm -f $testfile 2>&1 > /dev/null
+	echo $testio | grep -q "not found" && \
+		_notrun "xfs_spaceman $command support is missing"
+	echo $testio | grep -q "Operation not supported" && \
+		_notrun "xfs_spaceman $command failed (old kernel/wrong fs?)"
+	echo $testio | grep -q "Invalid" && \
+		_notrun "xfs_spaceman $command failed (old kernel/wrong fs/bad args?)"
+	echo $testio | grep -q "foreign file active" && \
+		_notrun "xfs_spaceman $command not supported on $FSTYP"
+	echo $testio | grep -q "Inappropriate ioctl for device" && \
+		_notrun "xfs_spaceman $command support is missing (missing ioctl?)"
+	echo $testio | grep -q "Function not implemented" && \
+		_notrun "xfs_spaceman $command support is missing (missing syscall?)"
+
+	[ -n "$param" ] || return
+
+	if [ $param_checked -eq 0 ]; then
+		$XFS_SPACEMAN_PROG -c "help $command" | grep -q "^ $param --" || \
+			_notrun "xfs_spaceman $command doesn't support $param"
+	fi
+}
+
+_scratch_get_sfdir_prefix() {
+	local dir_ino="$1"
+
+	for prefix in "u.sfdir3" "u.sfdir2" "u3.sfdir3"; do
+		if [ -n "$(_scratch_xfs_get_metadata_field \
+				"${prefix}.hdr.parent.i4" \
+				"inode ${dir_ino}")" ]; then
+			echo "${prefix}"
+			return 0
+		fi
+	done
+	_scratch_xfs_db -c "inode ${dir_ino}" -c 'p' >> $seqres.full
+	return 1
+}
+
+_scratch_get_bmx_prefix() {
+	local ino="$1"
+
+	for prefix in "u3.bmx" "u.bmx"; do
+		if [ -n "$(_scratch_xfs_get_metadata_field \
+				"${prefix}[0].startblock" \
+				"inode ${ino}")" ]; then
+			echo "${prefix}"
+			return 0
+		fi
+	done
+	_scratch_xfs_db -c "inode ${ino}" -c 'p' >> $seqres.full
+	return 1
+}
+
+_scratch_get_iext_count()
+{
+	local selector=$1
+	local whichfork=$2
+	local field=""
+
+	case $whichfork in
+		"attr")
+			field=core.naextents
+			;;
+		"data")
+			field=core.nextents
+			;;
+		*)
+			return 1
+	esac
+
+	_scratch_xfs_get_metadata_field $field "$selector"
+}
+
+#
+# Ensures that we don't pass any mount options incompatible with XFS v4
+#
+_force_xfsv4_mount_options()
+{
+	local gquota=0
+	local pquota=0
+
+	# Can't have group and project quotas in XFS v4
+	echo "$MOUNT_OPTIONS" | grep -E -q "(gquota|grpquota|grpjquota=|gqnoenforce)" && gquota=1
+	echo "$MOUNT_OPTIONS" | grep -E -q "(\bpquota|prjquota|pqnoenforce)" && pquota=1
+
+	if [ $gquota -gt 0 ] && [ $pquota -gt 0 ]; then
+		export MOUNT_OPTIONS=$(echo $MOUNT_OPTIONS \
+			| sed   -e 's/gquota/QUOTA/g'      \
+				-e 's/grpquota/QUOTA/g'    \
+				-e 's/grpjquota=[^, ]/QUOTA/g' \
+				-e 's/gqnoenforce/QUOTA/g' \
+				-e "s/QUOTA/defaults/g")
+	fi
+	echo "MOUNT_OPTIONS = $MOUNT_OPTIONS" >>$seqres.full
+}
+
+# Find AG count of mounted filesystem
+_xfs_mount_agcount()
+{
+	$XFS_INFO_PROG "$1" | sed -n "s/^.*agcount=\([[:digit:]]*\).*/\1/p"
+}
+
+# Find rtgroup count of mounted filesystem
+_xfs_mount_rgcount()
+{
+	local rtgroups="$($XFS_INFO_PROG "$1" | grep rgcount= | sed -e 's/^.*rgcount=\([0-9]*\).*$/\1/g')"
+
+	test -z "$rtgroups" && rtgroups=0
+	echo "$rtgroups"
+}
+
+# Wipe the superblock of each XFS AGs
+_try_wipe_scratch_xfs()
+{
+	local num='^[0-9]+$'
+	local agcount
+	local agsize
+	local dbsize
+
+	# Try to wipe each SB if there's an existed XFS
+	agcount=`_scratch_xfs_get_sb_field agcount 2>/dev/null`
+	agsize=`_scratch_xfs_get_sb_field agblocks 2>/dev/null`
+	dbsize=`_scratch_xfs_get_sb_field blocksize 2>/dev/null`
+	if [[ $agcount =~ $num && $agsize =~ $num && $dbsize =~ $num ]];then
+		for ((i = 0; i < agcount; i++)); do
+			$XFS_IO_PROG -c "pwrite $((i * dbsize * agsize)) $dbsize" \
+				$SCRATCH_DEV >/dev/null;
+		done
+	fi
+
+	# Try to wipe each SB by default mkfs.xfs geometry
+	local tmp=`mktemp -u`
+	unset agcount agsize dbsize
+	_try_scratch_mkfs_xfs -N 2>/dev/null | perl -ne '
+		if (/^meta-data=.*\s+agcount=(\d+), agsize=(\d+) blks/) {
+			print STDOUT "agcount=$1\nagsize=$2\n";
+		}
+		if (/^data\s+=\s+bsize=(\d+)\s/) {
+			print STDOUT "dbsize=$1\n";
+		}' > $tmp.mkfs
+
+	. $tmp.mkfs
+	if [[ $agcount =~ $num && $agsize =~ $num && $dbsize =~ $num ]];then
+		for ((i = 0; i < agcount; i++)); do
+			$XFS_IO_PROG -c "pwrite $((i * dbsize * agsize)) $dbsize" \
+				$SCRATCH_DEV >/dev/null;
+		done
+	fi
+	rm -f $tmp.mkfs
+}
+
+_require_xfs_copy()
+{
+	[ -n "$XFS_COPY_PROG" ] || _notrun "xfs_copy binary not yet installed"
+	[ "$USE_EXTERNAL" = yes ] && \
+		_notrun "Cannot xfs_copy with external devices"
+
+	$XFS_INFO_PROG "$TEST_DIR" | grep -q 'realtime.*internal' &&
+		_notrun "Cannot xfs_copy with internal rt device"
+
+	# xfs_copy on v5 filesystems do not require the "-d" option if xfs_db
+	# can change the UUID on v5 filesystems
+	touch /tmp/$$.img
+	$MKFS_XFS_PROG -d file,name=/tmp/$$.img,size=64m >/dev/null 2>&1
+
+	# xfs_db will return 0 even if it can't generate a new uuid, so
+	# check the output to make sure if it can change UUID of V5 xfs
+	$XFS_DB_PROG -x -c "uuid generate" /tmp/$$.img \
+		| grep -q "invalid UUID\|supported on V5 fs" \
+		&& export XFS_COPY_PROG="$XFS_COPY_PROG -d"
+	rm -f /tmp/$$.img
+}
+
+__xfs_cowgc_interval_knob1="/proc/sys/fs/xfs/speculative_cow_prealloc_lifetime"
+__xfs_cowgc_interval_knob2="/proc/sys/fs/xfs/speculative_prealloc_lifetime"
+
+_xfs_set_cowgc_interval() {
+	if [ -w $__xfs_cowgc_interval_knob1 ]; then
+		echo "$@" > $__xfs_cowgc_interval_knob1
+	elif [ -w $__xfs_cowgc_interval_knob2 ]; then
+		echo "$@" > $__xfs_cowgc_interval_knob2
+	else
+		_fail "Can't find cowgc interval procfs knob?"
+	fi
+}
+
+_xfs_get_cowgc_interval() {
+	if [ -w $__xfs_cowgc_interval_knob1 ]; then
+		cat $__xfs_cowgc_interval_knob1
+	elif [ -w $__xfs_cowgc_interval_knob2 ]; then
+		cat $__xfs_cowgc_interval_knob2
+	else
+		_fail "Can't find cowgc interval procfs knob?"
+	fi
+}
+
+# Print the status of the given features on the scratch filesystem.
+# Returns 0 if all features are found, 1 otherwise.
+_check_scratch_xfs_features()
+{
+	local features="$(_scratch_xfs_db -c 'version')"
+	local output=("FEATURES:")
+	local found=0
+
+	for feature in "$@"; do
+		local status="NO"
+		if echo "${features}" | grep -q -w "${feature}"; then
+			status="YES"
+			found=$((found + 1))
+		fi
+		output+=("${feature}:${status}")
+	done
+
+	echo "${output[@]}"
+	test "${found}" -eq "$#"
+}
+
+# Skip a test if any of the given fs features aren't present on the scratch
+# filesystem.  The scratch fs must have been formatted already.
+_require_scratch_xfs_features()
+{
+	local features="$(_scratch_xfs_db -c 'version' 2>/dev/null)"
+
+	for feature in "$@"; do
+		echo "${features}" | grep -q -w "${feature}" ||
+			_notrun "Missing scratch feature: ${feature}"
+	done
+}
+
+# Decide if xfs_repair knows how to set (or clear) a filesystem feature.
+_require_xfs_repair_upgrade()
+{
+	local type="$1"
+
+	$XFS_REPAIR_PROG -c "$type=garbagevalue" 2>&1 | \
+		grep -q 'unknown option' && \
+		_notrun "xfs_repair does not support upgrading fs with $type"
+}
+
+# Require that the scratch device exists, that mkfs can format with inobtcount
+# enabled, and that the kernel can mount such a filesystem.
+_require_scratch_xfs_inobtcount()
+{
+	_require_scratch
+
+	_scratch_mkfs -m inobtcount=1 &> /dev/null || \
+		_notrun "mkfs.xfs doesn't support inobtcount feature"
+	_try_scratch_mount || \
+		_notrun "kernel doesn't support xfs inobtcount feature"
+	_scratch_unmount
+}
+
+_xfs_timestamp_range()
+{
+	local device="$1"
+	local use_db=0
+	local dbprog="$XFS_DB_PROG $device"
+	test "$device" = "$SCRATCH_DEV" && dbprog=_scratch_xfs_db
+
+	$dbprog -f -c 'help timelimit' | grep -v -q 'not found' && use_db=1
+	if [ $use_db -eq 0 ]; then
+		# The "timelimit" command was added to xfs_db at the same time
+		# that bigtime was added to xfsprogs.  Therefore, we can assume
+		# the old timestamp range if the command isn't present.
+		echo "-$((1<<31)) $(((1<<31)-1))"
+	else
+		$dbprog -f -c 'timelimit --compact' | \
+			awk '{printf("%s %s", $1, $2);}'
+	fi
+}
+
+# Require that the scratch device exists, that mkfs can format with bigtime
+# enabled, that the kernel can mount such a filesystem, and that xfs_info
+# advertises the presence of that feature.
+_require_scratch_xfs_bigtime()
+{
+	_require_scratch
+
+	_scratch_mkfs -m bigtime=1 &>/dev/null || \
+		_notrun "mkfs.xfs doesn't support bigtime feature"
+	_try_scratch_mount || \
+		_notrun "kernel doesn't support xfs bigtime feature"
+	_require_xfs_has_feature $SCRATCH_MNT bigtime -u \
+		"crc feature not supported by this filesystem"
+	_scratch_unmount
+}
+
+_xfs_filter_mkfs()
+{
+	echo "_fs_has_crcs=0" >&2
+	set -
+	perl -ne '
+	if (/^meta-data=([\w,|\/.-]+)\s+isize=(\d+)\s+agcount=(\d+), agsize=(\d+) blks/) {
+		print STDERR "ddev=$1\nisize=$2\nagcount=$3\nagsize=$4\n";
+		print STDOUT "meta-data=DDEV isize=XXX agcount=N, agsize=XXX blks\n";
+	}
+	if (/^\s+=\s+sectsz=(\d+)\s+attr=(\d+)/) {
+		print STDERR "sectsz=$1\nattr=$2\n";
+	}
+	if (/^\s+=\s+crc=(\d)/) {
+		print STDERR "_fs_has_crcs=$1\n";
+	}
+	if (/^data\s+=\s+bsize=(\d+)\s+blocks=(\d+), imaxpct=(\d+)/) {
+		print STDERR "dbsize=$1\ndblocks=$2\nimaxpct=$3\n";
+		print STDOUT "data     = bsize=XXX blocks=XXX, imaxpct=PCT\n";
+	}
+	if (/^\s+=\s+sunit=(\d+)\s+swidth=(\d+) blks/) {
+		print STDERR "sunit=$1\nswidth=$2\nunwritten=1\n";
+		print STDOUT "         = sunit=XXX swidth=XXX, unwritten=X\n";
+	}
+	if (/^naming\s+=version\s+(\d+)\s+bsize=(\d+)/) {
+		print STDERR "dirversion=$1\ndirbsize=$2\n";
+		print STDOUT "naming   =VERN bsize=XXX\n";
+	}
+	if (/^naming\s+=.*parent=(\d+)/) {
+		print STDERR "parent=$1\n";
+	}
+	if (/^log\s+=(internal log|[\w|\/.-]+)\s+bsize=(\d+)\s+blocks=(\d+),\s+version=(\d+)/ ||
+		/^log\s+=(internal log|[\w|\/.-]+)\s+bsize=(\d+)\s+blocks=(\d+)/) {
+		print STDERR "ldev=\"$1\"\nlbsize=$2\nlblocks=$3\nlversion=$4\n";
+		print STDOUT "log      =LDEV bsize=XXX blocks=XXX\n";
+	}
+	if (/^\s+=\s+exchange=(\d+)\s+metadir=(\d+)/) {
+		print STDERR "exchange=$1\nmetadir=$2\n\n";
+	}
+	if (/^\s+=\s+sectsz=(\d+)\s+sunit=(\d+) blks/) {
+		print STDERR "logsectsz=$1\nlogsunit=$2\n\n";
+	}
+	if (/^realtime\s+=([\w|\/.-]+)\s+extsz=(\d+)\s+blocks=(\d+), rtextents=(\d+)/) {
+		print STDERR "rtdev=$1\nrtextsz=$2\nrtblocks=$3\nrtextents=$4\n";
+		print STDOUT "realtime =RDEV extsz=XXX blocks=XXX, rtextents=XXX\n";
+	}
+	if (/^\s+=\s+rgcount=(\d+)\s+rgsize=(\d+) extents/) {
+		print STDERR "rgcount=$1\nrgextents=$2\n";
+	}'
+}
+
+_require_xfsrestore_xflag()
+{
+	$XFSRESTORE_PROG -h 2>&1 | grep -q -w -e '-x' || \
+			_notrun 'xfsrestore does not support -x flag.'
+}
+
+# Number of bytes reserved for a full inode record, which includes the
+# immediate fork areas.
+_xfs_get_inode_size()
+{
+	local mntpoint="$1"
+
+	$XFS_INFO_PROG "$mntpoint" | sed -n '/meta-data=.*isize/s/^.*isize=\([0-9]*\).*$/\1/p'
+}
+
+# Number of bytes reserved for only the inode record, excluding the
+# immediate fork areas.
+_xfs_get_inode_core_bytes()
+{
+	local dir="$1"
+
+	if _xfs_has_feature "$dir" crc; then
+		# v5 filesystems
+		echo 176
+	else
+		# v4 filesystems
+		echo 96
+	fi
+}
+
+# Create a file with a lower inode number than the root inode number. For this
+# creation, this function runs mkfs and mount on the scratch device with
+# options. This function prints the root inode number and the created inode
+# number.
+_scratch_xfs_create_fake_root()
+{
+	local root_inum
+	local inum
+
+	# A large stripe unit will put the root inode out quite far
+	# due to alignment, leaving free blocks ahead of it.
+	_try_scratch_mkfs_xfs -d sunit=1024,swidth=1024 > $seqres.full 2>&1 || \
+		_fail "mkfs failed"
+
+	# Mounting /without/ a stripe should allow inodes to be allocated
+	# in lower free blocks, without the stripe alignment.
+	_scratch_mount -o sunit=0,swidth=0
+
+	local root_inum=$(stat -c %i $SCRATCH_MNT)
+
+	# Consume space after the root inode so that the blocks before
+	# root look "close" for the next inode chunk allocation
+	$XFS_IO_PROG -f -c "falloc 0 16m" $SCRATCH_MNT/fillfile
+
+	# And make a bunch of inodes until we (hopefully) get one lower
+	# than root, in a new inode chunk.
+	echo "root_inum: $root_inum" >> $seqres.full
+	for i in $(seq 0 4096) ; do
+		fname=$SCRATCH_MNT/$(printf "FILE_%03d" $i)
+		touch $fname
+		inum=$(stat -c "%i" $fname)
+		[[ $inum -lt $root_inum ]] && break
+	done
+
+	echo "created: $inum" >> $seqres.full
+
+	[[ $inum -lt $root_inum ]] || _notrun "Could not set up test"
+
+	echo "$root_inum $inum"
+}
+
+# Find us the path to the AG header containing a per-AG btree with a specific
+# height.
+_scratch_xfs_find_agbtree_height() {
+	local bt_type="$1"
+	local bt_height="$2"
+	local agcount=$(_xfs_mount_agcount $SCRATCH_DEV)
+
+	case "${bt_type}" in
+	"bno"|"cnt"|"rmap"|"refcnt")
+		hdr="agf"
+		bt_prefix="${bt_type}"
+		;;
+	"ino")
+		hdr="agi"
+		bt_prefix=""
+		;;
+	"fino")
+		hdr="agi"
+		bt_prefix="free_"
+		;;
+	*)
+		_fail "Don't know about AG btree ${bt_type}"
+		;;
+	esac
+
+	for ((agno = 0; agno < agcount; agno++)); do
+		bt_level=$(_scratch_xfs_db -c "${hdr} ${agno}" -c "p ${bt_prefix}level" | awk '{print $3}')
+		# "level" is really the btree height
+		if [ "${bt_level}" -eq "${bt_height}" ]; then
+			echo "${hdr} ${agno}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+# Find us the path to the inode containing a realtime btree with a specific
+# height.
+_scratch_xfs_find_rgbtree_height() {
+	local bt_type="$1"
+	local bt_height="$2"
+	local rgcount=$(_xfs_mount_rgcount $SCRATCH_DEV)
+	local path
+	local path_format
+	local bt_prefix
+
+	case "${bt_type}" in
+	"rmap")
+		path_format="/rtgroups/%u.rmap"
+		bt_prefix="u3.rtrmapbt"
+		;;
+	"refcnt")
+		path_format="/rtgroups/%u.refcount"
+		bt_prefix="u3.rtrefcbt"
+		;;
+	*)
+		_fail "Don't know about rt btree ${bt_type}"
+		;;
+	esac
+
+	for ((rgno = 0; rgno < rgcount; rgno++)); do
+		path="$(printf "${path_format}" "${rgno}")"
+		bt_level=$(_scratch_xfs_db -c "path -m ${path}" -c "p ${bt_prefix}.level" | awk '{print $3}')
+		# "level" is the actual level within the btree
+		if [ "${bt_level}" -eq "$((bt_height - 1))" ]; then
+			echo "${path}"
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+_require_xfs_mkfs_atomicswap()
+{
+	# atomicswap can be activated on rmap or reflink filesystems.
+	# reflink is newer (4.9 for reflink vs. 4.8 for rmap) so test that.
+	_scratch_mkfs_xfs_supported -m reflink=1 >/dev/null 2>&1 || \
+		_notrun "mkfs.xfs doesn't have atomicswap dependent features"
+}
+
+_require_xfs_scratch_atomicswap()
+{
+	_require_xfs_mkfs_atomicswap
+	_require_scratch
+	_require_xfs_io_command exchangerange
+	_scratch_mkfs -m reflink=1 > /dev/null
+	_try_scratch_mount || \
+		_notrun "atomicswap dependencies not supported by scratch filesystem type: $FSTYP"
+	_scratch_unmount
+}
+
+# Return the maximum start offset that the FITRIM command will accept, in units
+# of 1024 byte blocks.
+_xfs_discard_max_offset_kb()
+{
+	local statfs
+
+	# Use awk to read the statfs output for the XFS filesystem, compute
+	# the two possible FITRIM offset maximums, and then use some horrid
+	# bash magic to import the five numbers as an indexed array.  There's
+	# no better way to do this in bash since you can't readarray to build
+	# an associative array.  Elements are as follows:
+	#
+	# 0: fsblock size in bytes
+	# 1: Data volume size in fsblocks.
+	# 2: Realtime volume size in fsblocks.
+	# 3: Max FITRIM offset if we can only trim the data volume
+	# 4: Max FITRIM offset if we can trim the data and rt volumes
+	readarray -t statfs < <($XFS_IO_PROG -c 'statfs' "$1" | \
+		awk '{g[$1] = $3} END {printf("%d\n%d\n%d\n%d\n%d\n",
+			g["geom.bsize"],
+			g["geom.datablocks"],
+			g["geom.rtblocks"],
+			g["geom.bsize"] * g["geom.datablocks"] / 1024,
+			g["geom.bsize"] * (g["geom.datablocks"] + g["geom.rtblocks"]) / 1024);}')
+
+	# If the kernel supports discarding the realtime volume, then it will
+	# not reject a FITRIM for fsblock dblks+1, even if the len/minlen
+	# arguments are absurd.
+	if [ "${statfs[2]}" -gt 0 ]; then
+		if $FSTRIM_PROG -o "$((statfs[0] * statfs[1]))" \
+				-l "${statfs[0]}" \
+				-m "$((statfs[0] * 2))" "$1" &>/dev/null; then
+			# The kernel supports discarding the rt volume, so
+			# print out the second answer from above.
+			echo "${statfs[4]}"
+			return
+		fi
+	fi
+
+	# The kernel does not support discarding the rt volume or there is no
+	# rt volume.  Print out the first answer from above.
+	echo "${statfs[3]}"
+}
+
+# check if mkfs and the kernel support nocrc (v4) file systems
+_require_xfs_nocrc()
+{
+	_try_scratch_mkfs_xfs -m crc=0 > /dev/null 2>&1 || \
+		_notrun "v4 file systems not supported"
+	_try_scratch_mount > /dev/null 2>&1 || \
+		_notrun "v4 file systems not supported"
+	_scratch_unmount
+}
+
+# Adjust MKFS_OPTIONS as necessary to avoid having parent pointers formatted
+# onto the filesystem
+_xfs_force_no_pptrs()
+{
+	# Nothing to do if parent pointers aren't supported by mkfs
+	$MKFS_XFS_PROG 2>&1 | grep -q parent=0 || return
+
+	if echo "$MKFS_OPTIONS" | grep -q 'parent='; then
+		MKFS_OPTIONS="$(echo "$MKFS_OPTIONS" | \
+				sed -e 's/parent=[01]/parent=0/g')"
+		return
+	fi
+
+	MKFS_OPTIONS="$MKFS_OPTIONS -n parent=0"
+}
+
+# this test requires the xfs parent pointers feature
+#
+_require_xfs_parent()
+{
+	_scratch_mkfs_xfs_supported -n parent > /dev/null 2>&1 \
+		|| _notrun "mkfs.xfs does not support parent pointers"
+	_try_scratch_mkfs_xfs -n parent > /dev/null 2>&1
+	_try_scratch_mount >/dev/null 2>&1 \
+		|| _notrun "kernel does not support parent pointers"
+	_scratch_unmount
+}
+
+# Extract a statfs attribute of the given mounted XFS filesystem.
+_xfs_statfs_field()
+{
+	$XFS_IO_PROG -c 'statfs' "$1" | grep -E "$2" | cut -d ' ' -f 3
+}
+
+# Wipe all filesystem properties from an xfs filesystem.  The sole argument
+# must be the root directory of a filesystem.
+_wipe_xfs_properties()
+{
+	getfattr --match="^trusted.xfs:" --absolute-names --dump --encoding=hex "$1" | \
+			grep '=' | sed -e 's/=.*$//g' | while read name; do
+		setfattr --remove="$name" "$1"
+	done
+}
+
+# Return the xfs_db selector for a superblock-rooted metadata file on the
+# scratch filesystem.  The sole argument is the name of the field within the
+# superblock.  This helper cannot be used to find files under the metadata
+# directory tree.
+_scratch_xfs_find_metafile()
+{
+	local metafile="$1"
+	local sb_field
+
+	# With metadir=1, the realtime volume is sharded into allocation
+	# groups.  Each rtgroup has its own bitmap and summary file.  Tests
+	# should pick a particular file, but this compatibility shim still
+	# exists to keep old tests working.
+	case "$metafile" in
+	"rbmino")
+		if _xfs_has_feature "$SCRATCH_DEV" rtgroups; then
+			echo "path -m /rtgroups/0.bitmap"
+			return 0
+		fi
+		;;
+	"rsumino")
+		if _xfs_has_feature "$SCRATCH_DEV" rtgroups; then
+			echo "path -m /rtgroups/0.summary"
+			return 0
+		fi
+		;;
+	"uquotino")
+		if _xfs_has_feature "$SCRATCH_DEV" metadir; then
+			echo "path -m /quota/user"
+			return 0
+		fi
+		;;
+	"gquotino")
+		if _xfs_has_feature "$SCRATCH_DEV" metadir; then
+			echo "path -m /quota/group"
+			return 0
+		fi
+		;;
+	"pquotino")
+		if _xfs_has_feature "$SCRATCH_DEV" metadir; then
+			echo "path -m /quota/project"
+			return 0
+		fi
+		;;
+	esac
+
+	sb_field="$(_scratch_xfs_get_sb_field "$metafile")"
+	if echo "$sb_field" | grep -q -w 'not found'; then
+		return 1
+	fi
+	echo "inode $sb_field"
+	return 0
+}
+
+# Force metadata directories off.
+_scratch_xfs_force_no_metadir()
+{
+	_require_non_zoned_device $SCRATCH_DEV
+	# metadir is required for when the rt device is on a zoned device
+	if [ "$USE_EXTERNAL" = yes -a ! -z "$SCRATCH_RTDEV" ]; then
+		_require_non_zoned_device $SCRATCH_RTDEV
+	fi
+
+	# Remove any mkfs-time quota options because those are only supported
+	# with metadir=1
+	for opt in uquota gquota pquota; do
+		echo "$MKFS_OPTIONS" | grep -q -w "$opt" || continue
+
+		MKFS_OPTIONS="$(echo "$MKFS_OPTIONS" | sed -e "s/,$opt//g" -e "s/ $opt/ /g")"
+		MOUNT_OPTIONS="$MOUNT_OPTIONS -o $opt"
+	done
+
+	# Replace any explicit metadir option with metadir=0
+	if echo "$MKFS_OPTIONS" | grep -q 'metadir='; then
+		MKFS_OPTIONS="$(echo "$MKFS_OPTIONS" | sed -e 's/metadir=[0-9]*/metadir=0/g' -e 's/metadir\([, ]\)/metadir=0\1/g')"
+		return
+	fi
+
+	# Inject metadir=0 if there isn't one in MKFS_OPTIONS and mkfs supports
+	# that option.
+	if grep -q 'metadir=' $MKFS_XFS_PROG; then
+		MKFS_OPTIONS="-m metadir=0 $MKFS_OPTIONS"
+	fi
+
+	# Replace any explicit zonedr option with zoned=0
+	if echo "$MKFS_OPTIONS" | grep -q 'zoned='; then
+		MKFS_OPTIONS="$(echo "$MKFS_OPTIONS" | sed -e 's/zoned=[0-9]*/zoned=0/g' -e 's/zoned\([, ]\)/zoned=0\1/g')"
+		return
+	fi
+}
+
+# do not run on zoned file systems
+_require_xfs_scratch_non_zoned()
+{
+	if _has_fs_sysfs_attr $SCRATCH_DEV "zoned/max_open_zones"; then
+		_notrun "Not supported on zoned file systems"
+	fi
+}
+
+# only run on zoned file systems
+_require_xfs_scratch_zoned()
+{
+	local attr="zoned/max_open_zones"
+	local min_open_zones=$1
+
+	if ! _has_fs_sysfs_attr $SCRATCH_DEV $attr; then
+		_notrun "Requires zoned file system"
+	fi
+
+	if [ -n "${min_open_zones}" ]; then
+		local has_open_zones=`_get_fs_sysfs_attr $SCRATCH_DEV $attr`
+
+		if [ "${min_open_zones}" -gt "${has_open_zones}" ]; then
+			_notrun "Requires at least ${min_open_zones} open zones"
+		fi
+	fi
+}
+
+# Decide if a mount filesystem has metadata directory trees.
+_xfs_mount_has_metadir() {
+	local mount="$1"
+
+	# spaceman (and its info command) predate metadir
+	test ! -e "$XFS_SPACEMAN_PROG" && return 1
+	$XFS_SPACEMAN_PROG -c "info" "$mount" | grep -q 'metadir=1'
+}
+
+# Compute the number of files that are not counted in quotas.
+_xfs_calc_hidden_quota_files() {
+	local mount="$1"
+
+	if _xfs_mount_has_metadir "$mount"; then
+		# Prior to the metadir feature, the realtime bitmap and summary
+		# file were "owned" by root and hence accounted to the root
+		# dquots.  The metadata directory feature stopped accounting
+		# metadata files to quotas, so we must subtract 2 inodes from
+		# the repquota golden outputs to keep the tests going.
+		#
+		# We needn't adjust the block counts because the kernel doesn't
+		# support rt quota and hence the rt metadata files will always
+		# be zero length.
+		echo -2
+	else
+		echo 0
+	fi
+}
+
+_require_xfs_mkfs_metadir()
+{
+	_scratch_mkfs_xfs_supported -m metadir=1 >/dev/null 2>&1 || \
+		_notrun "mkfs.xfs doesn't have metadir features"
+}
+
+_require_xfs_scratch_metadir()
+{
+	_require_xfs_mkfs_metadir
+	_require_scratch
+
+	_scratch_mkfs -m metadir=1 &> /dev/null
+	_require_scratch_xfs_features METADIR
+	_try_scratch_mount
+	res=$?
+	if [ $res -ne 0 ]; then
+		_notrun "mounting with metadir not supported by filesystem type: $FSTYP"
+	else
+		_scratch_unmount
+	fi
+}
+
+# Does the xfs kernel module support realtime quota?
+_xfs_kmod_supports_rtquota() {
+	local xqmfile="/proc/fs/xfs/xqm"
+
+	test -e "$xqmfile" || modprobe xfs
+	test -e "$xqmfile" || return 1
+
+	grep -q -w rtquota "$xqmfile"
+}
+
+# Does this mounted filesystem support realtime quota?  This is the only way
+# to check that the fs really supports it because the kernel ignores quota
+# mount options for pre-rtgroups realtime filesystems.
+_xfs_fs_supports_rtquota() {
+	local mntpt="$1"
+	local dev="$2"
+	local rtdev="$3"
+
+	test -d "$mntpt" || \
+		echo "_xfs_fs_supports_rtquota needs a mountpoint"
+	test "$USE_EXTERNAL" == "yes" || \
+		echo "_xfs_fs_supports_rtquota needs USE_EXTERNAL=yes"
+	test -n "$rtdev" || \
+		echo "_xfs_fs_supports_rtquota needs an rtdev"
+
+	$here/src/feature -U $dev || \
+		$here/src/feature -G $dev || \
+		$here/src/feature -P $dev
+}
+
+# Do we support realtime quotas on the (mounted) test filesystem?
+_xfs_test_supports_rtquota() {
+	_xfs_fs_supports_rtquota "$TEST_DIR" "$TEST_DEV" "$TEST_RTDEV"
+}
+
+# Do we support realtime quotas on the (mounted) scratch filesystem?
+_xfs_scratch_supports_rtquota() {
+	_xfs_fs_supports_rtquota "$SCRATCH_MNT" "$SCRATCH_DEV" "$SCRATCH_RTDEV"
+}
+
+# Make sure that we're set up for realtime quotas if external rt devices are
+# configured.  The test filesystem has to be mounted before each test, so we
+# can check that quickly, and we make the bold assumption that the same will
+# apply to any scratch fs that might be created.
+_require_xfs_rtquota_if_rtdev() {
+	if [ "$USE_EXTERNAL" != "yes" ]; then
+		$XFS_INFO_PROG "$TEST_DIR" | grep -q 'realtime.*internal' &&
+			_notrun "Quota on internal rt device not supported"
+	fi
+
+	if [ -n "$TEST_RTDEV$SCRATCH_RTDEV" ]; then
+		_xfs_kmod_supports_rtquota || \
+			_notrun "Kernel driver does not support rt quota"
+	fi
+
+	if [ -n "$TEST_RTDEV" ]; then
+		_xfs_test_supports_rtquota || \
+			_notrun "Quotas not supported on realtime device"
+	fi
+
+	if [ -n "$SCRATCH_RTDEV" ] && [ -z "$TEST_RTDEV" ]; then
+		_notrun "Quotas probably not supported on realtime scratch device; set TEST_RTDEV"
+	fi
+}
+
+# Resolve a metadata directory tree path and return the inode number.
+_scratch_metadir_lookup() {
+	local res="$(_scratch_xfs_db -c "ls -i -m $1")"
+	test "${PIPESTATUS[0]}" -eq 0 && echo "$res"
+}
+
+# Figure out which directory entry we have to change to update the rtrmap
+# inode pointer.  The last line of output is inumber field within a metadata
+# object; any previous lines are the accessor commands that must be fed to
+# xfs_db to get to the correct directory block.
+_scratch_find_rt_metadir_entry() {
+	local sfkey="$(_scratch_xfs_db -c 'path -m /rtgroups' -c print | \
+		grep "\"$1\"" | \
+		sed -e 's/.name.*$//g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' )"
+	if [ -n "$sfkey" ]; then
+		echo 'path -m /rtgroups'
+		_scratch_xfs_db -c 'path -m /rtgroups' -c print | \
+			grep "${sfkey}.inumber" | awk '{print $1}'
+		return 0
+	fi
+
+	local size=$(_scratch_xfs_db -c 'path -m /rtgroups' -c 'print core.size' | awk '{print $3}')
+	local blksz=$(_scratch_xfs_db -c 'sb 0' -c 'print blocksize' | awk '{print $3}')
+	local dirblklog=$(_scratch_xfs_db -c 'sb 0' -c 'print dirblklog' | awk '{print $3}')
+	local dirblksz=$((blksz << dirblklog ))
+	for ((fileoff = 0; fileoff < (size / dirblksz); fileoff++)); do
+		local dbkey="$(_scratch_xfs_db -c 'path -m /rtgroups' -c "dblock $fileoff" -c 'print' | \
+			grep "\"$1\"" | \
+			sed -e 's/.name.*$//g' -e 's/\[/\\[/g' -e 's/\]/\\]/g' )"
+		if [ -n "$dbkey" ]; then
+			echo 'path -m /rtgroups'
+			echo "dblock $fileoff"
+			_scratch_xfs_db -c 'path -m /rtgroups' -c "dblock $fileoff" -c print | \
+				grep "${dbkey}.inumber" | awk '{print $1}'
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+# extract the AG/RTG number from xfs_bmap output
+_filter_bmap_gno()
+{
+	# The AG/RG number is in column 4 of xfs_bmap output
+        perl -ne '
+                $ag = (split /\s+/)[4] ;
+		if ($ag =~ /\d+/) {print "$ag "} ;
+        '
+}

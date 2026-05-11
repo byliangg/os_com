@@ -1,0 +1,23 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.
+#
+# FS QA Test No. 446
+#
+# checkbashisms on all /bin/sh scripts.  This is a maintainer script.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# get standard environment
+
+_require_command "$CHECKBASHISMS_PROG" checkbashisms
+
+test -z "$WORKAREA" && _notrun "Can't find xfsprogs source"
+
+echo "Silence is golden"
+find $WORKAREA -type f -name 'xfs*.sh' -print0 | xargs -0 grep '^#!.*/bin/sh' | sed -e 's/:.*$//g' | while read f; do
+	$CHECKBASHISMS_PROG $f
+done
+
+status=0

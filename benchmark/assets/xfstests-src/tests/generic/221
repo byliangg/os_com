@@ -1,0 +1,24 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Christoph Hellwig.  All Rights Reserved.
+#
+# FS QA Test No. 221
+#
+# Check ctime updates when calling futimens without UTIME_OMIT for the
+# mtime entry.
+#
+# Based on a bug report and testcase from Eric Blake <ebb9@byu.net>.
+#
+. ./common/preamble
+_begin_fstest auto metadata quick
+
+# Import common functions.
+
+_require_test
+
+echo "Silence is golden."
+
+(cd $TEST_DIR && $here/src/t_futimens)
+
+status=0
+exit $status

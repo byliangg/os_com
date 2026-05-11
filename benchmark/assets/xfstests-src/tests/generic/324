@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/324
+#
+# Sanity check for defrag utility.
+#
+. ./common/preamble
+_begin_fstest auto fsr quick defrag prealloc
+
+PIDS=""
+
+# Import common functions.
+. ./common/filter
+. ./common/defrag
+
+_require_scratch
+_require_defrag
+_require_xfs_io_command "falloc"
+
+_workout()
+{
+	nr=$1
+	echo "Defragment file with $nr * 2 fragments"
+	# Create sparse file
+	for ((i=0;i<nr;i++))
+	do
+		$XFS_IO_PROG -f -c "falloc $((409600*i)) 4k"  \
+			$SCRATCH_MNT/test.$nr >> $seqres.full 2>&1
+	done
+	# Fill holes for half of range , as result file will contain nr*1.5 fragments
+	$XFS_IO_PROG -c "falloc 0 $((204800*nr))"  \
+	    $SCRATCH_MNT/test.$nr | _filter_xfs_io
+	# Data wrilte will convert extetns to inialized ones
+	for ((i=0;i<nr;i++))
+	do
+		patt=`printf "0x%x" $i`
+		$XFS_IO_PROG -c "pwrite -S $patt $((i*123400)) 1234" \
+			$SCRATCH_MNT/test.$nr | _filter_xfs_io
+	done
+	_defrag --min_before $nr --max_before $((nr*4)) \
+		--min_after 1 $SCRATCH_MNT/test.$nr
+}
+
+# Actual testing starting from here
+_scratch_mkfs  >> $seqres.full 2>&1
+_scratch_mount
+_workout 10
+_workout 250
+_workout 1000
+status=0

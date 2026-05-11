@@ -1,0 +1,1075 @@
+#
+# Common btrfs specific functions
+#
+
+. common/module
+
+# The recommended way to execute simple "btrfs" command.
+_btrfs()
+{
+	run_check $BTRFS_UTIL_PROG $*
+}
+
+_btrfs_get_subvolid()
+{
+	local mnt=$1
+	local name=$2
+
+	$BTRFS_UTIL_PROG subvolume list $mnt | grep -E "\s$name$" | $AWK_PROG '{ print $2 }'
+}
+
+# _require_btrfs_command <command> [<subcommand>|<option>]
+# We check for btrfs and (optionally) features of the btrfs command
+# This function support both subfunction like "inspect-internal dump-tree" and
+# options like "check --qgroup-report", and also subfunction options like
+# "subvolume delete --subvolid"
+_require_btrfs_command()
+{
+	local cmd=$1
+	local param=$2
+	local param_arg=$3
+	local safe_param
+
+	_require_command "$BTRFS_UTIL_PROG" btrfs
+	if [ -z "$1" ]; then
+		return 1;
+	fi
+	$BTRFS_UTIL_PROG $cmd --help &> /dev/null
+	[ $? -eq 0 ] || _notrun "$BTRFS_UTIL_PROG too old (must support $cmd)"
+
+	test -z "$param" && return
+
+	# If $param is an option, replace leading "-"s for grep
+	if [ ${param:0:1} == "-" ]; then
+		safe_param=$(echo $param | sed 's/^-*//')
+		$BTRFS_UTIL_PROG $cmd --help | grep -wq $safe_param || \
+			_notrun "$BTRFS_UTIL_PROG too old (must support $cmd $param)"
+		return
+	fi
+
+	$BTRFS_UTIL_PROG $cmd $param --help &> /dev/null
+	[ $? -eq 0 ] || _notrun "$BTRFS_UTIL_PROG too old (must support $cmd $param)"
+
+	test -z "$param_arg" && return
+
+	# replace leading "-"s for grep
+	safe_param=$(echo $param_arg | sed 's/^-*//')
+	$BTRFS_UTIL_PROG $cmd $param --help | grep -wq $safe_param || \
+		_notrun "$BTRFS_UTIL_PROG too old (must support $cmd $param $param_arg)"
+}
+
+# Require extra check on btrfs qgroup numbers
+_require_btrfs_qgroup_report()
+{
+	_require_btrfs_command check --qgroup-report
+	touch ${RESULT_DIR}/require_scratch.require_qgroup_report
+}
+
+_require_btrfs_dump_super()
+{
+	if [ ! -x "$BTRFS_SHOW_SUPER_PROG" ]; then
+		_require_command "$BTRFS_UTIL_PROG" btrfs
+		if ! $BTRFS_UTIL_PROG inspect-internal dump-super --help >& /dev/null; then
+			_notrun "Missing btrfs-show-super or inspect-internal dump-super"
+		fi
+		BTRFS_SHOW_SUPER_PROG="$BTRFS_UTIL_PROG inspect-internal dump-super"
+	fi
+}
+
+_require_btrfs_mkfs_feature()
+{
+	if [ -z $1 ]; then
+		echo "Missing feature name argument for _require_btrfs_mkfs_feature"
+		_exit 1
+	fi
+	feat=$1
+	$MKFS_BTRFS_PROG -O list-all 2>&1 | \
+		grep '^[ \t]*'"$feat"'\b' > /dev/null 2>&1
+	[ $? -eq 0 ] || \
+		_notrun "Feature $feat not supported in the available version of mkfs.btrfs"
+}
+
+_require_btrfs_mkfs_uuid_option()
+{
+	local cnt
+
+	cnt=$($MKFS_BTRFS_PROG --help 2>&1 | \
+				grep -E --count -- "--uuid|--device-uuid")
+	if [ $cnt != 2 ]; then
+		_notrun "Require $MKFS_BTRFS_PROG with --uuid and --device-uuid options"
+	fi
+}
+
+_require_btrfs_fs_feature()
+{
+	if [ -z $1 ]; then
+		echo "Missing feature name argument for _require_btrfs_fs_feature"
+		_exit 1
+	fi
+	feat=$1
+	modprobe btrfs > /dev/null 2>&1
+	[ -e /sys/fs/btrfs/features/$feat ] || \
+		_notrun "Feature $feat not supported by the available btrfs version"
+}
+
+_require_btrfs_fs_sysfs()
+{
+	modprobe btrfs > /dev/null 2>&1
+	[ -e /sys/fs/btrfs/features ] || \
+		_notrun "Sysfs not supported by the available btrfs version"
+
+}
+
+_require_btrfs_no_compress()
+{
+	if _normalize_mount_options "$MOUNT_OPTIONS" | grep -q "compress"; then
+		_notrun "This test requires no compression enabled"
+	fi
+}
+
+_require_btrfs_no_nodatacow()
+{
+	if _normalize_mount_options "$MOUNT_OPTIONS" | grep -q "nodatacow"; then
+		_notrun "This test requires no nodatacow enabled"
+	fi
+}
+
+_require_btrfs_no_nodatasum()
+{
+	if _normalize_mount_options "$MOUNT_OPTIONS" | grep -q "nodatasum"; then
+		_notrun "This test requires no nodatasum enabled"
+	fi
+}
+
+_require_btrfs_free_space_tree()
+{
+	_scratch_mkfs > /dev/null 2>&1
+	if ! $BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV | \
+		grep -q "FREE_SPACE_TREE"
+	then
+		_notrun "This test requires a free-space-tree"
+	fi
+}
+
+_require_btrfs_no_block_group_tree()
+{
+	_scratch_mkfs > /dev/null 2>&1
+	if $BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV | \
+		grep -q "BLOCK_GROUP_TREE"
+	then
+		_notrun "This test requires no block-group-tree"
+	fi
+}
+
+_check_btrfs_filesystem()
+{
+	device=$1
+
+	# If type is set, we're mounted
+	type=`_fs_type $device`
+	ok=1
+
+	if [ "$type" = "$FSTYP" ]; then
+		# mounted ...
+		mountpoint=`_umount_or_remount_ro $device`
+	fi
+
+	if [ -f ${RESULT_DIR}/require_scratch.require_qgroup_report ]; then
+		$BTRFS_UTIL_PROG check $device --qgroup-report > $tmp.qgroup_report 2>&1
+		if grep -qE "Counts for qgroup.*are different" $tmp.qgroup_report ; then
+			_log_err "_check_btrfs_filesystem: filesystem on $device has wrong qgroup numbers"
+			echo "*** qgroup_report.$FSTYP output ***"	>>$seqres.full
+			cat $tmp.qgroup_report				>>$seqres.full
+			echo "*** qgroup_report.$FSTYP output ***"	>>$seqres.full
+		fi
+		rm -f $tmp.qgroup_report
+	fi
+
+	$BTRFS_UTIL_PROG check $device >$tmp.fsck 2>&1
+	if [ $? -ne 0 ]; then
+		_log_err "_check_btrfs_filesystem: filesystem on $device is inconsistent"
+		echo "*** fsck.$FSTYP output ***"	>>$seqres.full
+		cat $tmp.fsck				>>$seqres.full
+		echo "*** end fsck.$FSTYP output"	>>$seqres.full
+
+		ok=0
+	fi
+	rm -f $tmp.fsck
+
+	if [ $ok -eq 0 ] && [ "$DUMP_CORRUPT_FS" = "1" ]; then
+		local flatdev="$(basename "$device")"
+		_btrfs_metadump "$device" "$seqres.$flatdev.check.md" >>$seqres.full
+	fi
+
+	if [ $ok -eq 0 ]; then
+		echo "*** mount output ***"		>>$seqres.full
+		_mount					>>$seqres.full
+		echo "*** end mount output"		>>$seqres.full
+	elif [ "$type" = "$FSTYP" ]; then
+		# was mounted ...
+		_mount_or_remount_rw "$MOUNT_OPTIONS" $device $mountpoint
+		ok=$?
+	fi
+
+	if [ $ok -eq 0 ]; then
+		status=1
+		if [ "$iam" != "check" ]; then
+			_exit 1
+		fi
+		return 1
+	fi
+
+	return 0
+}
+
+_require_btrfs_dev_del_by_devid()
+{
+	$BTRFS_UTIL_PROG device delete --help | grep -E devid > /dev/null 2>&1
+	[ $? -eq 0 ] || _notrun "$BTRFS_UTIL_PROG too old "\
+			"(must support 'btrfs device delete <devid> /<mnt>')"
+}
+
+# get btrfs profile configs being tested
+#
+# A set of pre-set profile configs are exported via _btrfs_profile_configs
+# array. Default configs can be overridden by setting BTRFS_PROFILE_CONFIGS
+# var in the format "metadata_profile:data_profile", multiple configs can be
+# seperated by space, e.g.
+# export BTRFS_PROFILE_CONFIGS="raid0:raid0 raid1:raid1 dup:single"
+_btrfs_get_profile_configs()
+{
+	if [ "$FSTYP" != "btrfs" ]; then
+		return
+	fi
+
+	modprobe btrfs > /dev/null 2>&1
+
+	local unsupported=()
+	if [ "$1" == "replace" ]; then
+		# We can't do replace with these profiles because they
+		# imply only one device ($SCRATCH_DEV), and we need to
+		# keep $SCRATCH_DEV around for _scratch_mount
+		# and _check_scratch_fs.
+		unsupported+=(
+			"dup"
+		)
+	elif [ "$1" == "replace-missing" ]; then
+		# We can't replace missing devices with these profiles
+		# because there isn't enough redundancy.
+		unsupported+=(
+			"single"
+			"dup"
+			"raid0"
+		)
+	fi
+
+	if [ ! -e /sys/fs/btrfs/features/raid56 ]; then
+		# We don't have raid56 compiled in, remove them
+		unsupported+=(
+			"raid5"
+			"raid6"
+		)
+	fi
+
+	if _scratch_btrfs_is_zoned; then
+		# Zoned btrfs only supports SINGLE profile
+		unsupported+=(
+			"dup"
+			"raid0"
+			"raid1"
+			"raid1c3"
+			"raid1c4"
+			"raid10"
+			"raid5"
+			"raid6"
+		)
+	fi
+
+	if [ -z "$BTRFS_PROFILE_CONFIGS" ]; then
+		# Default configurations to test.
+		local configs=(
+			"single:single"
+			"dup:single"
+			"raid0:raid0"
+			"raid1:raid0"
+			"raid1:raid1"
+			"raid10:raid10"
+			"raid5:raid5"
+			"raid6:raid6"
+		)
+		if [ "$1" == "dup" ]; then
+			configs+=("dup:dup")
+		fi
+	else
+		# User-provided configurations.
+		local configs=(${BTRFS_PROFILE_CONFIGS[@]})
+	fi
+
+	_btrfs_profile_configs=()
+	for cfg in "${configs[@]}"; do
+		local supported=true
+		local profiles=(${cfg/:/ })
+
+		for unsupp in "${unsupported[@]}"; do
+			if [ "${profiles[0]}" == "$unsupp" -o "${profiles[1]}" == "$unsupp" ]; then
+				supported=false
+			fi
+		done
+		if "$supported"; then
+			_btrfs_profile_configs+=("-m ${profiles[0]} -d ${profiles[1]}")
+		fi
+	done
+	export _btrfs_profile_configs
+}
+
+# stress btrfs by running balance operation in a loop
+_btrfs_stress_balance()
+{
+	local options=$@
+	while true; do
+		_run_btrfs_balance_start $options >> $seqres.full
+	done
+}
+
+# Kill a background process running _btrfs_stress_balance()
+_btrfs_kill_stress_balance_pid()
+{
+	local balance_pid=$1
+
+	# Ignore if process already died.
+	kill $balance_pid &> /dev/null
+	wait $balance_pid &> /dev/null
+	# Wait for the balance operation to finish.
+	while pgrep -f "btrfs balance start" > /dev/null; do
+		sleep 1
+	done
+}
+
+# stress btrfs by creating/mounting/umounting/deleting subvolume in a loop
+_btrfs_stress_subvolume()
+{
+	local btrfs_dev=$1
+	local btrfs_mnt=$2
+	local subvol_name=$3
+	local subvol_mnt=$4
+	local stop_file=$5
+
+	rm -f $stop_file
+	mkdir -p $subvol_mnt
+	while [ ! -e $stop_file ]; do
+		$BTRFS_UTIL_PROG subvolume create $btrfs_mnt/$subvol_name
+		$MOUNT_PROG -o subvol=$subvol_name $btrfs_dev $subvol_mnt
+		_unmount $subvol_mnt
+		$BTRFS_UTIL_PROG subvolume delete $btrfs_mnt/$subvol_name
+	done
+}
+
+# Kill a background process running _btrfs_stress_subvolume()
+_btrfs_kill_stress_subvolume_pid()
+{
+	local subvol_pid=$1
+	local stop_file=$2
+	local subvol_mnt=$3
+
+	touch $stop_file
+	# Ignore if process already died.
+	wait $subvol_pid &> /dev/null
+	rm -f $stop_file
+	_unmount $subvol_mnt &> /dev/null
+}
+
+# stress btrfs by running scrub in a loop
+_btrfs_stress_scrub()
+{
+	local btrfs_mnt=$1
+	while true; do
+		$BTRFS_UTIL_PROG scrub start -B $btrfs_mnt
+	done
+}
+
+# Kill a background process running _btrfs_stress_scrub()
+_btrfs_kill_stress_scrub_pid()
+{
+       local scrub_pid=$1
+
+       # Ignore if process already died.
+       kill $scrub_pid &> /dev/null
+       wait $scrub_pid &> /dev/null
+       # Wait for the scrub operation to finish.
+       while pgrep -f "btrfs scrub start" > /dev/null; do
+               sleep 1
+       done
+}
+
+# stress btrfs by defragmenting every file/dir in a loop and compress file
+# contents while defragmenting if second argument is not "nocompress"
+_btrfs_stress_defrag()
+{
+	local btrfs_mnt=$1
+	local compress=$2
+
+	while true; do
+		if [ "$compress" == "nocompress" ]; then
+			find $btrfs_mnt \( -type f -o -type d \) -exec \
+			$BTRFS_UTIL_PROG filesystem defrag {} \;
+		else
+			find $btrfs_mnt \( -type f -o -type d \) -exec \
+			$BTRFS_UTIL_PROG filesystem defrag -clzo {} \;
+			find $btrfs_mnt \( -type f -o -type d \) -exec \
+			$BTRFS_UTIL_PROG filesystem defrag -czlib {} \;
+		fi
+	done
+}
+
+# Kill a background process running _btrfs_stress_defrag()
+_btrfs_kill_stress_defrag_pid()
+{
+       local defrag_pid=$1
+
+       # Ignore if process already died.
+       kill $defrag_pid &> /dev/null
+       wait $defrag_pid &> /dev/null
+       # Wait for the defrag operation to finish.
+       while pgrep -f "btrfs filesystem defrag" > /dev/null; do
+               sleep 1
+       done
+}
+
+# stress btrfs by remounting it with different compression algorithms in a loop
+# run this with fsstress running at background could exercise the compression
+# code path and ensure no race when switching compression algorithm with constant
+# I/O activity.
+_btrfs_stress_remount_compress()
+{
+	local btrfs_mnt=$1
+	while true; do
+		for algo in no zlib lzo; do
+			$MOUNT_PROG -o remount,compress=$algo $btrfs_mnt
+		done
+	done
+}
+
+# Kill a background process running _btrfs_stress_remount_compress()
+_btrfs_kill_stress_remount_compress_pid()
+{
+	local remount_pid=$1
+	local btrfs_mnt=$2
+
+	# Ignore if process already died.
+	kill $remount_pid &> /dev/null
+	wait $remount_pid &> /dev/null
+	# Wait for the remount loop to finish.
+	while pgrep -f "mount.*${btrfs_mnt}" > /dev/null; do
+		sleep 1
+	done
+}
+
+# stress btrfs by replacing devices in a loop
+# Note that at least 3 devices are needed in SCRATCH_DEV_POOL and the last
+# device should be free(not used by btrfs)
+_btrfs_stress_replace()
+{
+	local btrfs_mnt=$1
+
+	# The device number in SCRATCH_DEV_POOL should be at least 3,
+	# one is SCRATCH_DEV, one is to be replaced, one is free device
+	# we won't replace SCRATCH_DEV, see below for reason
+	if [ "`echo $SCRATCH_DEV_POOL | wc -w`" -lt 3 ]; then
+		echo "_btrfs_stress_replace requires at least 3 devices in SCRATCH_DEV_POOL"
+		return
+	fi
+
+	# take the last device as the first free_dev
+	local free_dev="`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $NF}'`"
+
+	# free_dev should be really free
+	if $BTRFS_UTIL_PROG filesystem show $btrfs_mnt | grep -q "$free_dev"; then
+		echo "_btrfs_stress_replace: $free_dev is used by btrfs"
+		return
+	fi
+
+	# dev_pool is device list being currently used by btrfs (excluding SCRATCH_DEV)
+	# and can be replaced. We don't replace SCRATCH_DEV because it will be used in
+	# _scratch_mount and _check_scratch_fs etc.
+	local dev_pool=`echo $SCRATCH_DEV_POOL | sed -e "s# *$SCRATCH_DEV *##" \
+			-e "s# *$free_dev *##"`
+
+	# set the first device in dev_pool as the first src_dev to be replaced
+	local src_dev=`echo $dev_pool | $AWK_PROG '{print $1}'`
+
+	echo "dev_pool=$dev_pool"
+	echo "free_dev=$free_dev, src_dev=$src_dev"
+	while true; do
+		echo "Replacing $src_dev with $free_dev"
+		$BTRFS_UTIL_PROG replace start -fB $src_dev $free_dev $btrfs_mnt
+		if [ $? -ne 0 ]; then
+			# don't update src_dev and free_dev if replace failed
+			continue
+		fi
+		dev_pool="$dev_pool $free_dev"
+		dev_pool=`echo $dev_pool | sed -e "s# *$src_dev *##"`
+		free_dev=$src_dev
+		src_dev=`echo $dev_pool | $AWK_PROG '{print $1}'`
+	done
+}
+
+# Kill a background process running _btrfs_stress_replace()
+_btrfs_kill_stress_replace_pid()
+{
+       local replace_pid=$1
+
+       # Ignore if process already died.
+       kill $replace_pid &> /dev/null
+       wait $replace_pid &> /dev/null
+       # Wait for the replace operation to finish.
+       while pgrep -f "btrfs replace start" > /dev/null; do
+               sleep 1
+       done
+}
+
+# find the right option to force output in bytes, older versions of btrfs-progs
+# print that by default, newer print human readable numbers with unit suffix
+_btrfs_qgroup_units()
+{
+	$BTRFS_UTIL_PROG qgroup show --help 2>&1 | grep -q -- --raw && echo "--raw"
+}
+
+_btrfs_compression_algos()
+{
+	echo zlib
+	for feature in /sys/fs/btrfs/features/compress_*; do
+		echo "${feature#/sys/fs/btrfs/features/compress_}"
+	done
+}
+
+# run btrfs balance start with required --full-balance if available.
+_run_btrfs_balance_start()
+{
+	local bal_opt=""
+
+	$BTRFS_UTIL_PROG balance start --help | grep -q "full-balance"
+	(( $? == 0 )) && bal_opt="--full-balance"
+
+	$BTRFS_UTIL_PROG balance start $bal_opt $*
+}
+
+#return the sector size of the btrfs scratch fs
+_scratch_btrfs_sectorsize()
+{
+	$BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV |\
+		grep sectorsize | $AWK_PROG '{print $2}'
+}
+
+_btrfs_supports_forget()
+{
+	$BTRFS_UTIL_PROG device scan --help | grep -wq forget && \
+		$BTRFS_UTIL_PROG device scan --forget > /dev/null 2>&1
+}
+
+_require_btrfs_forget_or_module_loadable()
+{
+	_btrfs_supports_forget && return
+
+	_require_loadable_fs_module "btrfs"
+}
+
+_btrfs_forget_or_module_reload()
+{
+	_btrfs_supports_forget && return
+
+	_reload_fs_module "btrfs"
+}
+
+# Test cases which utilized _btrfs_forget_or_module_reload() must call this
+# to make sure TEST_DEV can still be mounted. As TEST_DEV can be part of a
+# multi-device btrfs.
+_btrfs_rescan_devices()
+{
+	$BTRFS_UTIL_PROG device scan &> /dev/null
+}
+
+_scratch_btrfs_is_zoned()
+{
+	[ `_zone_type ${SCRATCH_DEV}` != "none" ] && return 0
+	return 1
+}
+
+_btrfs_get_fsid()
+{
+	local fsid
+	local mnt=$1
+
+	fsid=$($BTRFS_UTIL_PROG filesystem show $mnt |grep uuid: |\
+	       $AWK_PROG '{print $NF}')
+
+	echo $fsid
+}
+
+_require_btrfs_sysfs_fsid()
+{
+	local fsid
+
+	fsid=$(_btrfs_get_fsid $TEST_DIR)
+
+	# Check if the kernel has sysfs fsid support.
+	# Following kernel patch adds it:
+	#   btrfs: sysfs add devinfo/fsid to retrieve fsid from the device
+	test -f /sys/fs/btrfs/$fsid/devinfo/1/fsid ||\
+		_notrun "Need btrfs sysfs fsid support"
+}
+
+# If test doesn't want v1 cache to take up data space, there's no longer need
+# the "nospace_cache" mount option if the filesystem is already using v2 cache.
+# Since v2 cache is using metadata space, it will no longer take up data space.
+_btrfs_no_v1_cache_opt()
+{
+	if $BTRFS_UTIL_PROG inspect-internal dump-tree $SCRATCH_DEV |\
+	   grep -q "FREE_SPACE_TREE"; then
+		return
+	fi
+	echo -n "-onospace_cache"
+}
+
+# v1 space cache is already deprecated and will be removed soon. Furthermore
+# the soon-to-be-default block-group-tree has dependency on v2 space cache, and
+# will reject v1 cache mount option.
+# Make sure v1 space cache is still supported for test cases still utilizing
+# v1 space cache.
+_require_btrfs_v1_cache()
+{
+	_scratch_mkfs &> /dev/null
+	_try_scratch_mount -o clear_cache,space_cache=v1 || _notrun "v1 space cache is not supported"
+	_scratch_unmount
+
+	# Make sure no FREE_SPACE_TREE enabled.
+	if $BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV |\
+	   grep -q "FREE_SPACE_TREE"; then
+		_notrun "v1 space cache is not supported"
+	fi
+
+	# Make sure the cache generation is not 0 nor -1.
+	local cache_gen=$($BTRFS_UTIL_PROG inspect-internal dump-super $SCRATCH_DEV |\
+			  grep "cache_generation" | $AWK_PROG '{ print $2 }' )
+	if [ "$cache_gen" -eq 0 -o $(( $test_num + 1 )) -eq 0 ]; then
+		_notrun "v1 space cache is not supported"
+	fi
+}
+
+# Require certain sectorsize support
+_require_btrfs_support_sectorsize()
+{
+	local sectorsize=$1
+
+	# PAGE_SIZE as sectorsize is always supported
+	if [ $sectorsize -eq $(_get_page_size) ]; then
+		return
+	fi
+
+	test -f /sys/fs/btrfs/features/supported_sectorsizes || \
+		_notrun "no subpage support found"
+	grep -wq $sectorsize /sys/fs/btrfs/features/supported_sectorsizes || \
+		_notrun "sectorsize $sectorsize is not supported"
+}
+
+_require_btrfs_inline_extents_creation()
+{
+	local ino
+
+	_require_xfs_io_command fiemap
+	_require_scratch
+
+	_scratch_mkfs &> /dev/null
+	_scratch_mount -o max_inline=2048,compress=none
+	_pwrite_byte 0x00 0 1024 $SCRATCH_MNT/inline &> /dev/null
+	sync
+	$XFS_IO_PROG -c "fiemap -v" $SCRATCH_MNT/inline | tail -n 1 > $tmp.fiemap
+	_scratch_unmount
+	# 0x200 means inlined, 0x100 means not block aligned, 0x1 means
+	# the last extent.
+	if ! grep -q "0x301" $tmp.fiemap; then
+		rm -f -- $tmp.fiemap
+		_notrun "No inline extent creation support, maybe subpage?"
+	fi
+	rm -f -- $tmp.fiemap
+}
+
+_btrfs_metadump()
+{
+	local device="$1"
+	local dumpfile="$2"
+
+	test -n "$BTRFS_IMAGE_PROG" || _fail "btrfs-image not installed"
+	$BTRFS_IMAGE_PROG "$device" "$dumpfile"
+	[ -n "$DUMP_COMPRESSOR" ] && $DUMP_COMPRESSOR -f "$dumpfile" &> /dev/null
+}
+
+# Return the btrfs logical address for the first block in a file
+_btrfs_get_first_logical()
+{
+	local file=$1
+	_require_command "$FILEFRAG_PROG" filefrag
+
+	${FILEFRAG_PROG} -v $file >> $seqres.full
+	${FILEFRAG_PROG} -v $file | _filter_filefrag | cut -d '#' -f 1
+}
+
+# Find the device path for a btrfs logical offset
+_btrfs_get_device_path()
+{
+	local logical=$1
+	local stripe=$2
+
+	_require_command "$BTRFS_MAP_LOGICAL_PROG" btrfs-map-logical
+
+	$BTRFS_MAP_LOGICAL_PROG -l $logical $SCRATCH_DEV | \
+		$AWK_PROG "(\$1 ~ /mirror/ && \$2 ~ /$stripe/) { print \$8 }"
+}
+
+
+# Find the device physical sector for a btrfs logical offset
+_btrfs_get_physical()
+{
+	local logical=$1
+	local stripe=$2
+
+	_require_command "$BTRFS_MAP_LOGICAL_PROG" btrfs-map-logical
+
+	$BTRFS_MAP_LOGICAL_PROG -l $logical $SCRATCH_DEV >> $seqres.full 2>&1
+	$BTRFS_MAP_LOGICAL_PROG -l $logical $SCRATCH_DEV | \
+		$AWK_PROG "(\$1 ~ /mirror/ && \$2 ~ /$stripe/) { print \$6 }"
+}
+
+# Read from a specific stripe to test read recovery that corrupted a specific
+# stripe.  Btrfs uses the PID to select the mirror, so keep reading until the
+# xfs_io process that performed the read was executed with a PID that ends up
+# on the intended mirror.
+_btrfs_direct_read_on_mirror()
+{
+	local mirror=$1
+	local nr_mirrors=$2
+	local file=$3
+	local offset=$4
+	local size=$5
+
+	while [[ -z $( (( BASHPID % nr_mirrors == mirror )) &&
+		exec $XFS_IO_PROG -d \
+			-c "pread -b $size $offset $size" $file) ]]; do
+		:
+	done
+}
+
+# Read from a specific stripe to test read recovery that corrupted a specific
+# stripe.  Btrfs uses the PID to select the mirror, so keep reading until the
+# xfs_io process that performed the read was executed with a PID that ends up
+# on the intended mirror.
+_btrfs_buffered_read_on_mirror()
+{
+	local mirror=$1
+	local nr_mirrors=$2
+	local file=$3
+	local offset=$4
+	local size=$5
+
+	# The drop_caches doesn't seem to drop every pages on aarch64 with
+	# 64K page size.
+	# So here as another workaround, cycle mount the SCRATCH_MNT to ensure
+	# the cache are dropped, but we can not use _scratch_cycle_mount, as
+	# we may mount whatever dm device at SCRATCH_MNT.
+	# So here we grab the mounted block device and its mount options, then
+	# unmount and re-mount with the same device and options.
+	local dev=$(findmnt -n -T $SCRATCH_MNT -o SOURCE)
+	local opts=$(findmnt -n -T $SCRATCH_MNT -o OPTIONS)
+	if [ -z "$dev" -o -z "$opts" ]; then
+		_fail "failed to grab mount info of $SCRATCH_MNT"
+	fi
+	_scratch_unmount
+	_mount $dev -o $opts $SCRATCH_MNT
+	while [[ -z $( (( BASHPID % nr_mirrors == mirror )) &&
+		exec $XFS_IO_PROG \
+			-c "pread -b $size $offset $size" $file) ]]; do
+		:
+	done
+}
+
+_require_btrfs_corrupt_block()
+{
+	# An optional arg1 argument to also check the option.
+	local opt=$1
+
+	_require_command "$BTRFS_CORRUPT_BLOCK_PROG" btrfs-corrupt-block
+
+	if [ -z "$opt" ]; then
+		return
+	fi
+
+	$BTRFS_CORRUPT_BLOCK_PROG -h 2>&1 | grep -wq -- "--$opt"
+	if [ $? != 0 ]; then
+		_notrun "Require $BTRFS_CORRUPT_BLOCK_PROG option --$opt"
+	fi
+}
+
+_require_btrfs_send_version()
+{
+	local version=$1
+	local ret
+
+	# Check the kernel support. If send_stream_version does not exists,
+	# then it's a kernel that only supports v1.
+	[ -f /sys/fs/btrfs/features/send_stream_version ] || \
+		_notrun "kernel does not support send stream $version"
+
+	[ $(cat /sys/fs/btrfs/features/send_stream_version) -ge $version ] || \
+		_notrun "kernel does not support send stream $version"
+
+	# Now check that btrfs-progs supports the requested stream version.
+	_scratch_mkfs &> /dev/null || \
+		_fail "mkfs failed at _require_btrfs_send_version"
+	_scratch_mount
+	$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+			 $SCRATCH_MNT/snap &> /dev/null
+	$BTRFS_UTIL_PROG send --proto $version $SCRATCH_MNT/snap &> /dev/null
+	ret=$?
+	_scratch_unmount
+
+	if [ $ret -ne 0 ]; then
+		_notrun "btrfs-progs does not support send stream version $version"
+	fi
+}
+
+# Get the bytenr associated to a file extent item at a given file offset.
+#
+# NOTE: At the moment this only works if the file is on a filesystem on top of
+#       the scratch device and the file is in the default subvolume (tree id 5).
+_btrfs_get_file_extent_item_bytenr()
+{
+	local file="$1"
+	local offset="$2"
+	local ino=$(stat -c "%i" "$file")
+	local file_extent_key="($ino EXTENT_DATA $offset)"
+
+	_require_btrfs_command inspect-internal dump-tree
+
+	# The tree dump command below works on committed roots, by reading from
+	# a device directly, so we have to sync the filesystem to commit any
+	# open transaction.
+	$BTRFS_UTIL_PROG filesystem sync $SCRATCH_MNT
+
+	$BTRFS_UTIL_PROG inspect-internal dump-tree -t 5 $SCRATCH_DEV | \
+		grep -A4 "$file_extent_key" | grep "disk byte" | \
+		$AWK_PROG '{ print $5 }'
+}
+
+# Check that btrfs-progs has support for the logical-resolve command, with the
+# -o option, and that the kernel supports the logical to ino ioctl v2 (which
+# adds the ignore offset parameter).
+_require_btrfs_scratch_logical_resolve_v2()
+{
+	local bytenr
+
+	# First check if we have support for calling the v2 logical resolve
+	# ioctl in btrfs-progs. Check if the -o options exists, which makes
+	# btrfs-progs call v2 of the ioctl (because the flag
+	# BTRFS_LOGICAL_INO_ARGS_IGNORE_OFFSET is only supported in v2).
+	_require_btrfs_command inspect-internal logical-resolve -o
+	_require_scratch
+
+	_scratch_mkfs > /dev/null || \
+		_fail "_require_btrfs_scratch_logical_resolve_v2: mkfs failed"
+	_scratch_mount
+
+	$XFS_IO_PROG -f -c "pwrite -q 0 128K" "$SCRATCH_MNT/file1"
+	bytenr=$(_btrfs_get_file_extent_item_bytenr "$SCRATCH_MNT/file1" 0)
+	$BTRFS_UTIL_PROG inspect-internal logical-resolve -o $bytenr \
+			 $SCRATCH_MNT > /dev/null
+	if [ $? -ne 0 ]; then
+		_scratch_unmount
+		_notrun "Logical resolve ioctl v2 not supported in the kernel"
+	fi
+	_scratch_unmount
+}
+
+_qgroup_mode()
+{
+	local dev=$1
+
+	if [ ! -b "$dev" ]; then
+		_fail "Usage: _qgroup_mode <mounted_device>"
+	fi
+
+	if _has_fs_sysfs_attr $dev /qgroups/mode; then
+		_get_fs_sysfs_attr $dev qgroups/mode
+	else
+		echo "qgroup"
+	fi
+}
+
+_check_regular_qgroup()
+{
+	_qgroup_mode "$@" | grep -q 'qgroup'
+}
+
+_qgroup_rescan()
+{
+	local mnt=$1
+	local dev=$(findmnt -n -o SOURCE $mnt)
+
+	_check_regular_qgroup $dev || return 1
+	_btrfs quota rescan -w $mnt
+}
+
+_require_qgroup_rescan()
+{
+	_scratch_mkfs >>$seqres.full 2>&1
+	_scratch_mount
+	_btrfs quota enable $SCRATCH_MNT
+	# Wait for the first rescan.
+	$BTRFS_UTIL_PROG quota rescan -W $SCRATCH_MNT || \
+				_notrun "not able to wait on a quota rescan"
+	# Make sure we can start a rescan.
+	$BTRFS_UTIL_PROG quota rescan -w $SCRATCH_MNT >> $seqres.full || \
+					_notrun "not able to run quota rescan"
+	_scratch_unmount
+}
+
+_require_scratch_qgroup()
+{
+	_scratch_mkfs >>$seqres.full 2>&1
+	_scratch_mount
+	$BTRFS_UTIL_PROG quota enable $SCRATCH_MNT
+	_check_regular_qgroup $SCRATCH_DEV || \
+					_notrun "not running normal qgroups"
+	_scratch_unmount
+}
+
+_require_scratch_enable_simple_quota()
+{
+	_scratch_mkfs >>$seqres.full 2>&1
+	_scratch_mount
+	_qgroup_mode $SCRATCH_DEV | grep 'squota' && \
+			_notrun "cannot enable simple quota; on by default"
+	$BTRFS_UTIL_PROG quota enable --simple $SCRATCH_MNT || \
+					_notrun "simple quotas not available"
+	_scratch_unmount
+}
+
+_has_btrfs_sysfs_feature_attr()
+{
+	local feature_attr=$1
+
+	[ -z $feature_attr ] && \
+		_fail "Missing feature name argument for _has_btrfs_sysfs_attr"
+
+	modprobe btrfs &> /dev/null
+
+	test -e /sys/fs/btrfs/features/$feature_attr
+}
+
+# Print the fsid and metadata uuid replaced with constant strings FSID and
+# METADATA_UUID. Compare temp_fsid with fsid and metadata_uuid, then echo what
+# it matches to or TEMP_FSID. This helps in comparing with the golden output.
+_check_temp_fsid()
+{
+	local dev1=$1
+	local fsid
+	local metadata_uuid
+
+	_require_btrfs_fs_sysfs
+	_require_btrfs_fs_feature temp_fsid
+	_require_btrfs_fs_feature metadata_uuid
+	_require_btrfs_command inspect-internal dump-super
+
+	# on disk fsid
+	fsid=$($BTRFS_UTIL_PROG inspect-internal dump-super $dev1 | \
+				grep ^fsid | $AWK_PROG -d" " '{print $2}')
+	echo -e "On disk fsid:\t\t$fsid" | sed -e "s/$fsid/FSID/g"
+
+	# Print FSID even if it is not the same as metadata_uuid because it has
+	# to match in the golden output.
+	metadata_uuid=$(cat /sys/fs/btrfs/$fsid/metadata_uuid)
+	echo -e "Metadata uuid:\t\tFSID"
+
+	# This returns the temp_fsid if set
+	tempfsid=$(_btrfs_get_fsid $dev1)
+	if [[ $tempfsid == $fsid ]]; then
+		echo -e "Temp fsid:\t\tFSID"
+	elif [[ $tempfsid == $metadata_uuid ]]; then
+		# If we are here, it means there is a bug; let it not match with
+		# the golden output.
+		echo -e "Temp fsid:\t\t$metadata_uuid"
+	else
+		echo -e "Temp fsid:\t\tTEMPFSID"
+	fi
+
+	echo -e -n "Tempfsid status:\t"
+	cat /sys/fs/btrfs/$tempfsid/temp_fsid
+}
+
+_btrfs_mkfs_clone()
+{
+	local fsid
+	local uuid
+	local dev1=$1
+	local dev2=$2
+
+	_require_btrfs_command inspect-internal dump-super
+	_require_btrfs_mkfs_uuid_option
+
+	[[ -z $dev1 || -z $dev2 ]] && \
+		_fail "_btrfs_mkfs_clone requires two devices as arguments"
+
+	_mkfs_dev -fq $dev1
+
+	fsid=$($BTRFS_UTIL_PROG inspect-internal dump-super $dev1 | \
+					grep -E ^fsid | $AWK_PROG '{print $2}')
+	uuid=$($BTRFS_UTIL_PROG inspect-internal dump-super $dev1 | \
+				grep -E ^dev_item.uuid | $AWK_PROG '{print $2}')
+
+	_mkfs_dev -fq --uuid $fsid --device-uuid $uuid $dev2
+}
+
+_check_btrfs_raid_type()
+{
+	_btrfs_get_profile_configs
+	if [[ ! "${_btrfs_profile_configs[@]}" =~ "$1" ]]; then
+		return 1
+	fi
+	return 0
+}
+
+_require_btrfs_raid_type()
+{
+	_check_btrfs_raid_type $1 || \
+		_notrun "$1 isn't supported by the profile config or scratch device"
+}
+
+_require_btrfs_iouring_encoded_read()
+{
+	local fn
+	local tmpfile
+	local ret
+
+	_require_command src/btrfs_encoded_read
+
+	_scratch_mkfs &> /dev/null
+	_scratch_mount
+
+	fn=`mktemp -p $SCRATCH_MNT`
+	tmpfile=`mktemp`
+
+	src/btrfs_encoded_read io_uring $fn 0 > $tmpfile
+	ret=$?
+
+	_scratch_unmount
+
+	if [[ $ret -ne 0 ]]; then
+		rm $tmpfile
+		_fail "btrfs_encoded_read failed" >>$seqres.full
+	fi
+
+	read ret < $tmpfile
+	rm $tmpfile
+
+	if [[ $ret == -95 ]]; then
+		_notrun "btrfs io_uring encoded read failed with -EOPNOTSUPP"
+	fi
+}

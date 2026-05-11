@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 447
+#
+# Exercise mount vs superblock shrinker races.
+#
+. ./common/preamble
+_begin_fstest auto mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	echo 0 > /sys/fs/xfs/debug/mount_delay
+}
+
+# Import common functions.
+. ./common/filter
+
+
+
+_require_scratch
+_require_xfs_sysfs debug/mount_delay
+
+echo "Silence is golden"
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -fxc "pwrite 0 4k" -c fsync \
+		-c "shutdown" $SCRATCH_MNT/foo 2>&1 > /dev/null
+
+_scratch_unmount
+
+echo 30 > /sys/fs/xfs/debug/mount_delay
+_scratch_mount
+echo 0 > /sys/fs/xfs/debug/mount_delay
+_scratch_unmount
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 001
+#
+# Test the xfs_db write of the XFS BMBT entries. For each XFS BMBT field,
+# write the value 0, each bit and finally the entry beyond the maximum legal
+# value. Also makes sure a core write and hex input still work.
+#
+. ./common/preamble
+_begin_fstest db auto quick
+
+_do_bit_test()
+{
+	field="$1"
+	bits="$2"
+
+	echo "testing $field with $bits bits"
+	_scratch_xfs_db -x -c "inode $FILE_INO" -c "write $field 0"
+	num=1
+	for n in `seq 0 1 $bits`; do
+		_scratch_xfs_db -x -c "inode $FILE_INO" \
+			  -c "write $field $num"
+		let num=$num*2
+	done
+	echo
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch_nocheck
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# create the test file
+echo "make a file with data so it has an extent" > $SCRATCH_MNT/file
+
+# find the inode for the test file
+FILE_INO=`ls -i $SCRATCH_MNT |awk '{print $1}'`
+
+_scratch_unmount
+
+# test bit length constants
+BMBT_EXNTFLAG_BITLEN=1
+BMBT_STARTOFF_BITLEN=54
+BMBT_STARTBLOCK_BITLEN=52
+BMBT_BLOCKCOUNT_BITLEN=21
+
+prefix=$(_scratch_get_bmx_prefix $FILE_INO)
+test -n "$prefix" || _fail "could not find bmx prefix from inode $FILE_INO"
+
+filter_output() {
+	sed -e "s/${prefix}/u.bmx/g"
+}
+
+# test setting the BMBT entries from 0 to past the valid number.
+_do_bit_test "${prefix}[0].extentflag" $BMBT_EXNTFLAG_BITLEN | filter_output
+_do_bit_test "${prefix}[0].startoff" $BMBT_STARTOFF_BITLEN | filter_output
+_do_bit_test "${prefix}[0].startblock" $BMBT_STARTBLOCK_BITLEN | filter_output
+_do_bit_test "${prefix}[0].blockcount" $BMBT_BLOCKCOUNT_BITLEN | filter_output
+# test setting the 32 bit generation number
+_scratch_xfs_db -x -c "inode $FILE_INO" -c "write core.gen 0x5a"
+_scratch_xfs_db -x -c "inode $FILE_INO" -c "write core.gen 0xa5"
+_scratch_xfs_db -x -c "inode $FILE_INO" -c "write core.gen 0"
+_scratch_xfs_db -x -c "inode $FILE_INO" -c "write core.gen #5a5a"
+_scratch_xfs_db -x -c "inode $FILE_INO" -c "write core.gen #a5a5"
+status=0
+exit

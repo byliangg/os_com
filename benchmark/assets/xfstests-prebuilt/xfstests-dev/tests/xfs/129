@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 129
+#
+# Ensure that we can create enough distinct reflink entries to force creation
+# of a multi-level refcount btree, and that metadump will successfully copy
+# said block.
+#
+. ./common/preamble
+_begin_fstest auto quick clone metadump
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    _scratch_unmount > /dev/null 2>&1
+    _xfs_cleanup_verify_metadump
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/metadump
+
+_require_command "$XFS_MDRESTORE_PROG" "xfs_mdrestore"
+_require_loop
+_require_scratch_reflink
+_xfs_setup_verify_metadump
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_file_block_size $testdir)"
+nr_blks=$((4 * blksz / 12))
+_pwrite_byte 0x61 0 $((blksz * nr_blks)) $testdir/file1 >> $seqres.full
+
+echo "Reflink every other block"
+seq 1 2 $((nr_blks - 1)) | while read nr; do
+	_reflink_range  $testdir/file1 $((nr * blksz)) \
+			$testdir/file2 $((nr * blksz)) $blksz >> $seqres.full
+done
+
+_scratch_unmount
+
+echo "Create metadump file, restore it and check restored fs"
+_xfs_verify_metadumps
+
+# success, all done
+status=0
+exit

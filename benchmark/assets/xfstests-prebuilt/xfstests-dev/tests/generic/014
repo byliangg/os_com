@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 014
+#
+# truncfile
+#
+. ./common/preamble
+_begin_fstest rw udf auto quick
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    rm -rf $TEST_DIR/truncfile.$$.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_sparse_files
+
+# ensure EOF preallocation doesn't massively extend the runtime of this test
+# by limiting the amount of preallocation and therefore the amount of blocks
+# zeroed during the truncfile test run.
+if [ "$FSTYP" == "xfs" ]; then
+	_test_unmount
+	_test_mount -o allocsize=64k
+fi
+
+echo "brevity is wit..."
+
+echo "------"
+echo "test 1"
+echo "------"
+$here/src/truncfile -c 10000 $TEST_DIR/truncfile.$$.0 >$tmp.out 2>&1
+ret=$?
+if [ "$ret" -ne 0 ]; then
+	out=`cat $tmp.out`
+	echo "truncfile returned $ret : \"$out\""
+else
+	echo "OK"
+fi
+
+exit

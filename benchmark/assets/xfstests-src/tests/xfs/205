@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Dave Chinner
+#
+# FS QA Test No. 205
+#
+# Test out ENOSPC flushing on small filesystems.
+#
+. ./common/preamble
+_begin_fstest metadata rw auto
+
+# Import common functions.
+. ./common/filter
+
+
+# single AG will cause xfs_repair to fail checks.
+_require_scratch_nocheck
+
+# Disable the scratch rt device to avoid test failures relating to the rt
+# bitmap consuming all the free space in our small data device.
+unset SCRATCH_RTDEV
+
+fsblksz=1024
+_scratch_mkfs_xfs -d size=$((32768*fsblksz)) -b size=$fsblksz >> $seqres.full 2>&1
+_scratch_mount
+
+# fix the reserve block pool to a known size so that the enospc calculations
+# work out correctly.
+_scratch_resvblks 1024 >> $seqres.full 2>&1
+
+# on a 16MB filesystem, there's 32768x$fsblkszbyte blocks. used is:
+#	- 4944 in the log,
+#	- 32+1 for the root inode cluster
+#	- 4 for the AG header
+#	- 2 for free space btrees
+#	- 4 for the AGFL
+#	- min(%5, 1024) = 1024 blocks for the reserve pool
+#	- about 15 blocks I can't account for right now.
+# That leaves ~26,745 blocks free to use.
+#
+# Writing the following three files fill the fs almost exactly.
+#
+# $ df -k /mnt/scratch
+# Filesystem           1K-blocks      Used Available Use% Mounted on
+# /dev/ubdc                13912     13908         4 100% /mnt/scratch
+#
+blks=$(( ($(_get_available_space $SCRATCH_MNT) / $fsblksz) - 15 ))
+test $blks -gt 1100 || _notrun "not enough space"
+b1=$(echo $blks | sed -e 's/[0-9][0-9][0-9]$/000/g')
+# in case b2 begins with '0' as '098' and being treated as octal number, force
+# it to be 10 based
+b2=$((10#$(echo $blks | sed -e 's/^[0-9][0-9]//g')))
+echo "blks: $blks b1: $b1 b2: $b2" >> $seqres.full
+dd if=/dev/zero of=$SCRATCH_MNT/fred bs=$fsblksz count=$((b1 - 1000)) 2>&1 | _filter_dd
+dd if=/dev/zero of=$SCRATCH_MNT/fred2 bs=$fsblksz count=$b2 2>&1 | _filter_dd
+dd if=/dev/zero of=$SCRATCH_MNT/fred3 bs=$fsblksz count=$((blks - (b1 + b2))) 2>&1 | _filter_dd
+rm -f $SCRATCH_MNT/fred*
+
+echo "*** one file"
+# now try a single file of that size
+dd if=/dev/zero of=$SCRATCH_MNT/fred bs=$fsblksz count=$blks 2>&1 | _filter_dd
+#rm -f $SCRATCH_MNT/fred*
+
+echo "*** one file, a few bytes at a time"
+# now try a single file of that size
+dd if=/dev/zero of=$SCRATCH_MNT/fred bs=15 count=$[blks/15*$fsblksz] 2>&1 | _filter_dd
+echo space: $(_get_available_space $SCRATCH_MNT) >> $seqres.full
+
+# success, all done
+echo "*** done"
+status=0

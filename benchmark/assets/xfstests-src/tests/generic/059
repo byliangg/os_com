@@ -1,0 +1,105 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 059
+#
+# This test is motivated by an fsync issue discovered in btrfs.
+# The issue was that after punching a hole for a small range, which affected
+# only a partial page, an fsync operation would have no effect at all. This was
+# because for this particular case the btrfs hole punching implementation did
+# not update some btrfs specific inode metadata that is required to determine
+# if an fsync operation needs to update the fsync log. For this to happen, it
+# was also necessary that in the transaction where the hole punching was
+# performed, and before the fsync operation, no other operation that modified
+# the file (or its metadata) was performed.
+#
+# The btrfs issue was fixed by the following linux kernel patch:
+#
+#  Btrfs: add missing inode update when punching hole
+#
+# Also test the mtime and ctime properties of the file change after punching
+# holes with ranges that operate only on a single block of the file.
+#
+. ./common/preamble
+_begin_fstest metadata auto quick punch log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+_require_xfs_io_command "fpunch"
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test file.
+$XFS_IO_PROG -f -c "pwrite -S 0x22 -b 16K 0 16K" \
+	$SCRATCH_MNT/foo | _filter_xfs_io
+
+# Fsync the file, this makes btrfs update some btrfs inode specific fields
+# that are used to track if the inode needs to be written/updated to the fsync
+# log or not. After this fsync, the new values for those fields indicate that
+# a subsequent fsync does not need to touch the fsync log.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+# Force a commit of the current transaction. After this point, any operation
+# that modifies the data or metadata of our file, should update those fields in
+# the btrfs inode with values that make the next fsync operation write to the
+# fsync log.
+_scratch_sync
+
+# Sleep for 1 second, because we want to check that the next punch operations we
+# do update the file's mtime and ctime.
+sleep 1
+
+mtime_before=$(stat -c %Y $SCRATCH_MNT/foo)
+ctime_before=$(stat -c %Z $SCRATCH_MNT/foo)
+
+# Punch a hole in our file. This small range affects only 1 page.
+# This made the btrfs hole punching implementation write only some zeroes in
+# one page, but it did not update the btrfs inode fields used to determine if
+# the next fsync needs to write to the fsync log.
+$XFS_IO_PROG -c "fpunch 8000 4K" $SCRATCH_MNT/foo
+
+# Another variation of the previously mentioned case.
+$XFS_IO_PROG -c "fpunch 15000 100" $SCRATCH_MNT/foo
+
+# Now fsync the file. This was a no-operation because the previous hole punch
+# operation didn't update the inode's fields mentioned before, so they remained
+# with the values they had after the first fsync - that is, they indicate that
+# it is not needed to write to fsync log.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+echo "File content before:"
+od -t x1 $SCRATCH_MNT/foo
+
+_flakey_drop_and_remount
+
+# Because the last fsync didn't do anything, here the file content matched what
+# it was after the first fsync, before the holes were punched, and not what it
+# was after the holes were punched.
+echo "File content after:"
+od -t x1 $SCRATCH_MNT/foo
+
+mtime_after=$(stat -c %Y $SCRATCH_MNT/foo)
+ctime_after=$(stat -c %Z $SCRATCH_MNT/foo)
+
+[ $mtime_after -gt $mtime_before ] || \
+	echo "mtime did not increase (before: $mtime_before after: $mtime_after"
+[ $ctime_after -gt $ctime_before ] || \
+	echo "ctime did not increase (before: $ctime_before after: $ctime_after"
+
+status=0
+exit

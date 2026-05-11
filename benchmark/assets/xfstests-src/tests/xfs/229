@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Christoph Hellwig.  All Rights Reserved.
+# Copyright (c) 2010 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 221
+#
+# Check for file corruption when using the extent size hint on
+# the normal data subvolume.
+#
+# http://oss.sgi.com/bugzilla/show_bug.cgi?id=874
+#
+# Based on a bug report and testcase from Geoffrey Wehrman <gwehrman@sgi.com>.
+#
+. ./common/preamble
+_begin_fstest auto rw
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -rf ${TDIR}
+}
+
+# Import common functions.
+
+_require_test
+
+TDIR="${TEST_DIR}/t_holes"
+NFILES="10"
+EXTSIZE="256k"
+
+# Create the test directory
+mkdir ${TDIR}
+
+# Per-directory extent size hints aren't particularly useful for files that
+# are created on the realtime section.  Force the test file to be created on
+# the data directory.  Do not change the rtinherit flag on $TEST_DIR because
+# that will affect other tests.
+_xfs_force_bdev data $TDIR
+
+# check for free space on the data volume even if rthinherit is set
+_require_fs_space $TDIR 3200000
+
+# Set the test directory extsize
+$XFS_IO_PROG -c "extsize ${EXTSIZE}" ${TDIR}
+
+# Create a set of holey files
+echo "generating ${NFILES} files"
+
+for i in $(seq 0 ${NFILES}); do
+  $here/src/t_holes ${TDIR}/${i}
+done
+
+# Compare the files
+echo "comparing files"
+errcnt=0
+j=0
+for i in $(seq 0 ${NFILES}); do
+    let j=$i+1
+    while [ ${j} -lt ${NFILES} ] ; do
+	if ! cmp ${TDIR}/${i} ${TDIR}/${j} ; then
+	    let errcnt=$errcnt+1
+	fi
+	let j=$j+1
+    done
+done
+
+echo "got ${errcnt} errors"
+
+status=$errcnt
+exit $status

@@ -1,0 +1,1234 @@
+[Info] [normal] Forwarded QEMU guest port: 27087->22; 11326->8080 2869->6379 26066->5201 60340->31234 2312->31236 49797->11211
+[Info] [test] Forwarded QEMU guest port: 12562->22; 35455->8080 16676->6379 40040->5201 52934->31234 61216->31236 22245->11211
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+ Downloading crates ...
+  Downloaded cipher v0.3.0
+  Downloaded funty v2.0.0
+  Downloaded ctr v0.8.0
+  Downloaded hash32 v0.3.1
+  Downloaded bit_field v0.10.3
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded darling_macro v0.13.4
+  Downloaded darling_core v0.13.4
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded bittle v0.5.7
+  Downloaded adler32 v1.2.0
+  Downloaded defmt v0.3.100
+  Downloaded extension-traits v1.0.1
+  Downloaded ext-trait v1.0.1
+  Downloaded serde_spanned v0.6.9
+  Downloaded ghash v0.4.4
+  Downloaded universal-hash v0.4.1
+  Downloaded aead v0.4.3
+  Downloaded hash32 v0.2.1
+  Downloaded getset v0.1.6
+  Downloaded unwinding v0.2.8
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded toml v0.7.8
+  Downloaded opaque-debug v0.3.1
+  Downloaded cobs v0.3.0
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded tap v1.0.1
+  Downloaded num-conv v0.2.1
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded zero v0.1.3
+  Downloaded radium v0.7.0
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded wyz v0.5.1
+  Downloaded subtle v2.4.1
+  Downloaded nougat v0.2.4
+  Downloaded ghost v0.1.20
+  Downloaded unicode-ident v1.0.24
+  Downloaded defmt v1.0.1
+  Downloaded generic-array v0.14.9
+  Downloaded bitflags v1.3.2
+  Downloaded libflate_lz77 v2.2.0
+  Downloaded managed v0.8.0
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded takeable v0.2.2
+  Downloaded ptr_meta v0.3.1
+  Downloaded never-say-never v6.6.666
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded toml_datetime v0.6.11
+  Downloaded powerfmt v0.2.0
+  Downloaded byteorder v1.5.0
+  Downloaded deranged v0.5.8
+  Downloaded dary_heap v0.3.8
+  Downloaded darling v0.13.4
+  Downloaded defmt-macros v1.0.1
+  Downloaded thiserror v2.0.18
+  Downloaded xmas-elf v0.10.0
+  Downloaded foldhash v0.2.0
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded rand_core v0.9.5
+  Downloaded polyval v0.5.3
+  Downloaded memoffset v0.9.1
+  Downloaded thiserror-impl v2.0.18
+  Downloaded tdx-guest v0.2.4
+  Downloaded paste v1.0.15
+  Downloaded defmt-parser v1.0.0
+  Downloaded volatile v0.6.1
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded rustversion v1.0.22
+  Downloaded autocfg v1.5.0
+  Downloaded owo-colors v4.3.0
+  Downloaded core2 v0.4.0
+  Downloaded acpi v5.2.0
+  Downloaded bitflags v2.11.0
+  Downloaded postcard v1.1.3
+  Downloaded quote v1.0.45
+  Downloaded semver v1.0.28
+  Downloaded spin v0.9.8
+  Downloaded lending-iterator v0.1.7
+  Downloaded num-traits v0.2.19
+  Downloaded libflate v2.2.1
+  Downloaded volatile v0.4.6
+  Downloaded intrusive-collections v0.9.7
+  Downloaded allocator-api2 v0.2.21
+  Downloaded crc32fast v1.5.0
+  Downloaded font8x8 v0.2.7
+  Downloaded uguid v2.2.1
+  Downloaded rle-decode-fast v1.0.3
+  Downloaded multiboot2 v0.24.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded log v0.4.29
+  Downloaded once_cell v1.21.4
+  Downloaded lru v0.16.3
+  Downloaded aes-gcm v0.9.4
+  Downloaded time-core v0.1.8
+  Downloaded gimli v0.32.3
+  Downloaded heapless v0.8.0
+  Downloaded indexmap v2.13.1
+  Downloaded hashbrown v0.14.5
+  Downloaded memchr v2.8.0
+  Downloaded json v0.12.4
+  Downloaded heapless v0.7.17
+  Downloaded const_format v0.2.35
+  Downloaded aes v0.7.5
+  Downloaded bitvec v1.0.1
+  Downloaded gimli v0.28.1
+  Downloaded syn v2.0.117
+  Downloaded time v0.3.47
+  Downloaded toml_edit v0.19.15
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded uefi-raw v0.12.0
+  Downloaded x86_64 v0.14.13
+  Downloaded iced-x86 v1.21.0
+  Downloaded raw-cpuid v10.7.0
+  Downloaded itertools v0.10.5
+  Downloaded zerocopy v0.8.48
+  Downloaded libc v0.2.184
+  Downloaded multiboot2-common v0.3.0
+  Downloaded winnow v0.5.40
+  Downloaded x86 v0.52.0
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded rustc-literal-escaper v0.0.5
+  Downloaded getopts v0.2.24
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `linux-boot-params` (lib) generated 1 warning
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+   Compiling ext4_rs v1.3.3 (/root/asterinas/kernel/libs/ext4_rs)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+   Compiling aster-kernel v0.1.0 (/root/asterinas/kernel)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: field `loaded` is never read
+   --> /root/asterinas/kernel/src/fs/ext4/fs.rs:265:5
+    |
+264 | struct DirEntryCache {
+    |        ------------- field in this struct
+265 |     loaded: bool,
+    |     ^^^^^^
+    |
+    = note: `DirEntryCache` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: enum `DirLookupCacheResult` is never used
+   --> /root/asterinas/kernel/src/fs/ext4/fs.rs:270:6
+    |
+270 | enum DirLookupCacheResult {
+    |      ^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `lookup_cache` and `load_dir_cache_if_needed` are never used
+   --> /root/asterinas/kernel/src/fs/ext4/fs.rs:911:8
+    |
+411 | impl Ext4Fs {
+    | ----------- methods in this implementation
+...
+911 |     fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
+    |        ^^^^^^^^^^^^
+...
+925 |     fn load_dir_cache_if_needed(&self, parent: u32) -> Result<()> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 4 warnings (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/target_lby/osdk/aster-kernel-run-base)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 1m 21s
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19D0+7EF319D0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..[kernel] OSTD initialized. Preparing components.
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running xfstests...
+xfstests probe: is_block TEST_DEV=1 SCRATCH_DEV=1
+brw-rw-rw-    1 root     root      254,   0 Apr  7 16:44 [1;35m/dev/vda[m
+brw-rw-rw-    1 root     root      254,  16 Apr  7 16:44 [1;35m/dev/vdb[m
+xfstests probe: lstat64 raw TEST_DEV=Device type: shim shim shim shim shim shim fe:0
+xfstests probe: lstat64 raw SCRATCH_DEV=Device type: shim shim shim shim shim shim fe:10
+xfstests probe: lstat64 TEST_DEV_TYPE=fe:0 SCRATCH_DEV_TYPE=fe:10
+xfstests probe: CHECK_SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash
+xfstests probe: grep=/opt/xfstests/shims/bin/grep readlink=/opt/xfstests/shims/bin/readlink
+xfstests probe: HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+xfstests probe: single_test=generic/014 trace_run=0
+xfstests probe: TEST_DEV=/dev/vda TEST_DIR=/ext4_test SCRATCH_DEV=/dev/vdb SCRATCH_MNT=/ext4_scratch
+xfstests probe: local.config
+EMAIL=root@localhost
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+xfstests probe: fill rc=1
+fill: cannot create "(null)": Bad address
+xfstests probe: shim grep rc=1 shim readlink rc=0 shim findmnt rc=1
+xfstests sparse probe: rc=0 size_bytes=1689600 blocks_512b=3304 du_kb=1652 file=/ext4_test/10{RANDOM}.sparseprobe
+xfstests sparse method: dd_seek_write rc=0 size_bytes=1689600 blocks_512b=3304 du_kb=1652
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+xfstests sparse method: dd_seek_zero_count rc=0 size_bytes=0 blocks_512b=0 du_kb=0
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+xfstests sparse method: truncate_only rc=0 size_bytes=1689600 blocks_512b=3304 du_kb=1652
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+xfstests sparse method: dd_small_seek rc=0 size_bytes=11 blocks_512b=8 du_kb=4
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+xfstests env: MKFS_PROG=/usr/bin/mke2fs FSCK_PROG=unset
+xfstests fsstate: pre:generic/014 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 16:44 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 16:44 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/014 timeout=900s trace=0
+[32m[     1.482][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=2 name='470.sparsefiletest' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[     1.486][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=2 name='470.sparsefiletest' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[     1.526][0m [31mERROR[0m: [39mext4_lookup_at failed: parent=2 name='truncfile.470.0' err=Ext4Error { errno: ENOENT, msg: Some("dir search fail") }[0m
+[32m[     1.535][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=256799452 len=512 file_size=0 block_size=4096 iblock_start=62695[0m
+[32m[     1.536][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62695 end_lblock=62696 run_start=62695 cursor=62823 run_len=128[0m
+[32m[     1.546][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196296671 len=512 file_size=55978444 block_size=4096 iblock_start=47923[0m
+[32m[     1.547][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47923 end_lblock=47924 run_start=47923 cursor=48051 run_len=128[0m
+[32m[     1.557][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=20696761 len=512 file_size=27473180 block_size=4096 iblock_start=5052[0m
+[32m[     1.558][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5052 end_lblock=5053 run_start=5052 cursor=5180 run_len=128[0m
+[32m[     1.567][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=194122372 len=512 file_size=155077034 block_size=4096 iblock_start=47393[0m
+[32m[     1.568][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47393 end_lblock=47394 run_start=47393 cursor=47521 run_len=128[0m
+[32m[     1.577][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=44501400 len=512 file_size=77883012 block_size=4096 iblock_start=10864[0m
+[32m[     1.578][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=10864 end_lblock=10865 run_start=10864 cursor=10992 run_len=128[0m
+[32m[     1.588][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=11351995 len=512 file_size=158112161 block_size=4096 iblock_start=2771[0m
+[32m[     1.594][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=2771 end_lblock=2772 run_start=2771 cursor=2899 run_len=128[0m
+[32m[     1.604][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=26681398 len=512 file_size=257055420 block_size=4096 iblock_start=6514[0m
+[32m[     1.609][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6514 end_lblock=6515 run_start=6514 cursor=6642 run_len=128[0m
+[32m[     1.618][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=247945146 len=512 file_size=80970595 block_size=4096 iblock_start=60533[0m
+[32m[     1.623][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60533 end_lblock=60534 run_start=60533 cursor=60661 run_len=128[0m
+[32m[     1.632][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=113582641 len=512 file_size=106746366 block_size=4096 iblock_start=27730[0m
+[32m[     1.637][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27730 end_lblock=27731 run_start=27730 cursor=27858 run_len=128[0m
+[32m[     1.647][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=252672595 len=512 file_size=249029579 block_size=4096 iblock_start=61687[0m
+[32m[     1.652][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=61687 end_lblock=61688 run_start=61687 cursor=61815 run_len=128[0m
+[32m[     1.662][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=82783772 len=512 file_size=255221334 block_size=4096 iblock_start=20210[0m
+[32m[     1.667][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=20210 end_lblock=20211 run_start=20210 cursor=20338 run_len=128[0m
+[32m[     1.677][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=200258747 len=512 file_size=259432070 block_size=4096 iblock_start=48891[0m
+[32m[     1.684][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48891 end_lblock=48892 run_start=48891 cursor=49019 run_len=128[0m
+[32m[     1.694][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=214677280 len=512 file_size=35741179 block_size=4096 iblock_start=52411[0m
+[32m[     1.702][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52411 end_lblock=52412 run_start=52411 cursor=52539 run_len=128[0m
+[32m[     1.712][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=41711128 len=512 file_size=3887652 block_size=4096 iblock_start=10183[0m
+[32m[     1.718][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=10183 end_lblock=10184 run_start=10183 cursor=10311 run_len=128[0m
+[32m[     1.728][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=267541125 len=512 file_size=74505986 block_size=4096 iblock_start=65317[0m
+[32m[     1.734][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=65317 end_lblock=65318 run_start=65317 cursor=65445 run_len=128[0m
+[32m[     1.744][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196136794 len=512 file_size=10030521 block_size=4096 iblock_start=47884[0m
+[32m[     1.746][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47884 end_lblock=47885 run_start=47884 cursor=47923 run_len=39[0m
+[32m[     1.757][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196849282 len=512 file_size=31155105 block_size=4096 iblock_start=48058[0m
+[32m[     1.762][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48058 end_lblock=48059 run_start=48058 cursor=48186 run_len=128[0m
+[32m[     1.772][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=6577027 len=512 file_size=105178922 block_size=4096 iblock_start=1605[0m
+[32m[     1.778][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=1605 end_lblock=1606 run_start=1605 cursor=1733 run_len=128[0m
+[32m[     1.787][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=176505475 len=512 file_size=143363697 block_size=4096 iblock_start=43092[0m
+[32m[     1.792][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43092 end_lblock=43093 run_start=43092 cursor=43220 run_len=128[0m
+[32m[     1.801][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=191411704 len=512 file_size=71491043 block_size=4096 iblock_start=46731[0m
+[32m[     1.806][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=46731 end_lblock=46732 run_start=46731 cursor=46859 run_len=128[0m
+[32m[     1.816][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=44715751 len=512 file_size=86350195 block_size=4096 iblock_start=10916[0m
+[32m[     1.825][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=20113802 len=512 file_size=107762426 block_size=4096 iblock_start=4910[0m
+[32m[     1.830][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4910 end_lblock=4911 run_start=4910 cursor=5038 run_len=128[0m
+[32m[     1.839][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=158102399 len=512 file_size=180371233 block_size=4096 iblock_start=38599[0m
+[32m[     1.844][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38599 end_lblock=38600 run_start=38599 cursor=38727 run_len=128[0m
+[32m[     1.853][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=67350082 len=512 file_size=167532822 block_size=4096 iblock_start=16442[0m
+[32m[     1.858][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=16442 end_lblock=16443 run_start=16442 cursor=16570 run_len=128[0m
+[32m[     1.868][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=242727148 len=512 file_size=198638604 block_size=4096 iblock_start=59259[0m
+[32m[     1.873][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59259 end_lblock=59260 run_start=59259 cursor=59387 run_len=128[0m
+[32m[     1.882][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=195388908 len=512 file_size=92562850 block_size=4096 iblock_start=47702[0m
+[32m[     1.887][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47702 end_lblock=47703 run_start=47702 cursor=47830 run_len=128[0m
+[32m[     1.896][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=215371856 len=512 file_size=66735573 block_size=4096 iblock_start=52581[0m
+[32m[     1.900][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52581 end_lblock=52582 run_start=52581 cursor=52709 run_len=128[0m
+[32m[     1.909][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=80600661 len=512 file_size=268417310 block_size=4096 iblock_start=19677[0m
+[32m[     1.913][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19677 end_lblock=19678 run_start=19677 cursor=19805 run_len=128[0m
+[32m[     1.923][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=76509657 len=512 file_size=244924459 block_size=4096 iblock_start=18679[0m
+[32m[     1.928][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=18679 end_lblock=18680 run_start=18679 cursor=18807 run_len=128[0m
+[32m[     1.937][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=121293995 len=512 file_size=77697268 block_size=4096 iblock_start=29612[0m
+[32m[     1.942][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=29612 end_lblock=29613 run_start=29612 cursor=29740 run_len=128[0m
+[32m[     1.952][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=67172932 len=512 file_size=141542607 block_size=4096 iblock_start=16399[0m
+[32m[     1.954][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=16399 end_lblock=16400 run_start=16399 cursor=16442 run_len=43[0m
+[32m[     1.964][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=95968364 len=512 file_size=92697943 block_size=4096 iblock_start=23429[0m
+[32m[     1.970][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23429 end_lblock=23430 run_start=23429 cursor=23557 run_len=128[0m
+[32m[     1.980][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=74551851 len=512 file_size=15987032 block_size=4096 iblock_start=18201[0m
+[32m[     1.986][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=18201 end_lblock=18202 run_start=18201 cursor=18329 run_len=128[0m
+[32m[     1.996][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=256249430 len=512 file_size=237394977 block_size=4096 iblock_start=62560[0m
+[32m[     2.002][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62560 end_lblock=62561 run_start=62560 cursor=62688 run_len=128[0m
+[32m[     2.012][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=114723679 len=512 file_size=126196385 block_size=4096 iblock_start=28008[0m
+[32m[     2.017][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28008 end_lblock=28009 run_start=28008 cursor=28136 run_len=128[0m
+[32m[     2.026][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=136749000 len=512 file_size=30307077 block_size=4096 iblock_start=33385[0m
+[32m[     2.031][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=33385 end_lblock=33386 run_start=33385 cursor=33513 run_len=128[0m
+[32m[     2.040][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=134497787 len=512 file_size=235325719 block_size=4096 iblock_start=32836[0m
+[32m[     2.046][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=32836 end_lblock=32837 run_start=32836 cursor=32964 run_len=128[0m
+[32m[     2.056][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=91676621 len=512 file_size=50523215 block_size=4096 iblock_start=22381[0m
+[32m[     2.064][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=22381 end_lblock=22382 run_start=22381 cursor=22509 run_len=128[0m
+[32m[     2.074][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=246259115 len=512 file_size=105739266 block_size=4096 iblock_start=60121[0m
+[32m[     2.080][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60121 end_lblock=60122 run_start=60121 cursor=60249 run_len=128[0m
+[32m[     2.091][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=141788144 len=512 file_size=202873917 block_size=4096 iblock_start=34616[0m
+[32m[     2.097][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=34616 end_lblock=34617 run_start=34616 cursor=34744 run_len=128[0m
+[32m[     2.107][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=237457707 len=512 file_size=111587437 block_size=4096 iblock_start=57973[0m
+[32m[     2.114][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=57973 end_lblock=57974 run_start=57973 cursor=58101 run_len=128[0m
+[32m[     2.124][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=129909653 len=512 file_size=141216162 block_size=4096 iblock_start=31716[0m
+[32m[     2.129][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31716 end_lblock=31717 run_start=31716 cursor=31844 run_len=128[0m
+[32m[     2.138][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=94609437 len=512 file_size=181288540 block_size=4096 iblock_start=23098[0m
+[32m[     2.144][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23098 end_lblock=23099 run_start=23098 cursor=23226 run_len=128[0m
+[32m[     2.154][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=213733937 len=512 file_size=112933106 block_size=4096 iblock_start=52181[0m
+[32m[     2.161][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52181 end_lblock=52182 run_start=52181 cursor=52309 run_len=128[0m
+[32m[     2.171][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=19494809 len=512 file_size=72082881 block_size=4096 iblock_start=4759[0m
+[32m[     2.177][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4759 end_lblock=4760 run_start=4759 cursor=4887 run_len=128[0m
+[32m[     2.187][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=216173170 len=512 file_size=100400883 block_size=4096 iblock_start=52776[0m
+[32m[     2.193][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52776 end_lblock=52777 run_start=52776 cursor=52904 run_len=128[0m
+[32m[     2.203][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=175422598 len=512 file_size=170561127 block_size=4096 iblock_start=42827[0m
+[32m[     2.209][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=42827 end_lblock=42828 run_start=42827 cursor=42955 run_len=128[0m
+[32m[     2.219][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=200758625 len=512 file_size=259506374 block_size=4096 iblock_start=49013[0m
+[32m[     2.228][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=185876847 len=512 file_size=70718422 block_size=4096 iblock_start=45380[0m
+[32m[     2.235][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45380 end_lblock=45381 run_start=45380 cursor=45508 run_len=128[0m
+[32m[     2.247][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=89964315 len=512 file_size=100850696 block_size=4096 iblock_start=21963[0m
+[32m[     2.259][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21963 end_lblock=21964 run_start=21963 cursor=22091 run_len=128[0m
+[32m[     2.270][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=84229734 len=512 file_size=121840329 block_size=4096 iblock_start=20563[0m
+[32m[     2.278][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=20563 end_lblock=20564 run_start=20563 cursor=20691 run_len=128[0m
+[32m[     2.289][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=157632294 len=512 file_size=32627807 block_size=4096 iblock_start=38484[0m
+[32m[     2.294][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38484 end_lblock=38485 run_start=38484 cursor=38599 run_len=115[0m
+[32m[     2.303][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=97374782 len=512 file_size=57688075 block_size=4096 iblock_start=23773[0m
+[32m[     2.308][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23773 end_lblock=23774 run_start=23773 cursor=23901 run_len=128[0m
+[32m[     2.318][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107509404 len=512 file_size=220172444 block_size=4096 iblock_start=26247[0m
+[32m[     2.323][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26247 end_lblock=26248 run_start=26247 cursor=26375 run_len=128[0m
+[32m[     2.333][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=100287948 len=512 file_size=235468303 block_size=4096 iblock_start=24484[0m
+[32m[     2.338][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24484 end_lblock=24485 run_start=24484 cursor=24612 run_len=128[0m
+[32m[     2.347][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=58372597 len=512 file_size=101304062 block_size=4096 iblock_start=14251[0m
+[32m[     2.352][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14251 end_lblock=14252 run_start=14251 cursor=14379 run_len=128[0m
+[32m[     2.363][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143151292 len=512 file_size=226633132 block_size=4096 iblock_start=34949[0m
+[32m[     2.370][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=34949 end_lblock=34950 run_start=34949 cursor=35077 run_len=128[0m
+[32m[     2.379][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=104884044 len=512 file_size=160162201 block_size=4096 iblock_start=25606[0m
+[32m[     2.384][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25606 end_lblock=25607 run_start=25606 cursor=25734 run_len=128[0m
+[32m[     2.394][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=90520175 len=512 file_size=93907917 block_size=4096 iblock_start=22099[0m
+[32m[     2.402][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=22099 end_lblock=22100 run_start=22099 cursor=22227 run_len=128[0m
+[32m[     2.412][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=95981340 len=512 file_size=219002328 block_size=4096 iblock_start=23432[0m
+[32m[     2.421][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=49635364 len=512 file_size=145275064 block_size=4096 iblock_start=12118[0m
+[32m[     2.426][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=12118 end_lblock=12119 run_start=12118 cursor=12246 run_len=128[0m
+[32m[     2.436][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=102534601 len=512 file_size=169611023 block_size=4096 iblock_start=25032[0m
+[32m[     2.442][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25032 end_lblock=25033 run_start=25032 cursor=25160 run_len=128[0m
+[32m[     2.453][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=94476512 len=512 file_size=211147623 block_size=4096 iblock_start=23065[0m
+[32m[     2.455][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23065 end_lblock=23066 run_start=23065 cursor=23098 run_len=33[0m
+[32m[     2.465][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=99088661 len=512 file_size=71818653 block_size=4096 iblock_start=24191[0m
+[32m[     2.470][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24191 end_lblock=24192 run_start=24191 cursor=24319 run_len=128[0m
+[32m[     2.480][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=35567228 len=512 file_size=105962074 block_size=4096 iblock_start=8683[0m
+[32m[     2.485][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=8683 end_lblock=8684 run_start=8683 cursor=8811 run_len=128[0m
+[32m[     2.494][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=41231075 len=512 file_size=198494190 block_size=4096 iblock_start=10066[0m
+[32m[     2.499][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=10066 end_lblock=10067 run_start=10066 cursor=10183 run_len=117[0m
+[32m[     2.509][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=18150286 len=512 file_size=239715851 block_size=4096 iblock_start=4431[0m
+[32m[     2.515][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4431 end_lblock=4432 run_start=4431 cursor=4559 run_len=128[0m
+[32m[     2.524][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=115918247 len=512 file_size=69256878 block_size=4096 iblock_start=28300[0m
+[32m[     2.529][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28300 end_lblock=28301 run_start=28300 cursor=28428 run_len=128[0m
+[32m[     2.538][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=113088642 len=512 file_size=23434225 block_size=4096 iblock_start=27609[0m
+[32m[     2.543][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27609 end_lblock=27610 run_start=27609 cursor=27730 run_len=121[0m
+[32m[     2.552][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=155538588 len=512 file_size=156745643 block_size=4096 iblock_start=37973[0m
+[32m[     2.557][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37973 end_lblock=37974 run_start=37973 cursor=38101 run_len=128[0m
+[32m[     2.566][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=50153539 len=512 file_size=66528864 block_size=4096 iblock_start=12244[0m
+[32m[     2.575][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=234865825 len=512 file_size=34411046 block_size=4096 iblock_start=57340[0m
+[32m[     2.580][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=57340 end_lblock=57341 run_start=57340 cursor=57468 run_len=128[0m
+[32m[     2.589][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=2336978 len=512 file_size=123001962 block_size=4096 iblock_start=570[0m
+[32m[     2.603][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=22887193 len=512 file_size=52137668 block_size=4096 iblock_start=5587[0m
+[32m[     2.610][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5587 end_lblock=5588 run_start=5587 cursor=5715 run_len=128[0m
+[32m[     2.620][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=53764113 len=512 file_size=253663904 block_size=4096 iblock_start=13126[0m
+[32m[     2.626][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13126 end_lblock=13127 run_start=13126 cursor=13254 run_len=128[0m
+[32m[     2.636][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=180474970 len=512 file_size=69426441 block_size=4096 iblock_start=44061[0m
+[32m[     2.641][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=44061 end_lblock=44062 run_start=44061 cursor=44189 run_len=128[0m
+[32m[     2.649][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=166463309 len=512 file_size=231163124 block_size=4096 iblock_start=40640[0m
+[32m[     2.654][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=40640 end_lblock=40641 run_start=40640 cursor=40768 run_len=128[0m
+[32m[     2.662][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=217796520 len=512 file_size=78280960 block_size=4096 iblock_start=53172[0m
+[32m[     2.667][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=53172 end_lblock=53173 run_start=53172 cursor=53300 run_len=128[0m
+[32m[     2.675][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=212816741 len=512 file_size=79844396 block_size=4096 iblock_start=51957[0m
+[32m[     2.680][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=51957 end_lblock=51958 run_start=51957 cursor=52085 run_len=128[0m
+[32m[     2.688][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=213596349 len=512 file_size=208474916 block_size=4096 iblock_start=52147[0m
+[32m[     2.690][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52147 end_lblock=52148 run_start=52147 cursor=52181 run_len=34[0m
+[32m[     2.698][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=111145689 len=512 file_size=75551512 block_size=4096 iblock_start=27135[0m
+[32m[     2.703][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27135 end_lblock=27136 run_start=27135 cursor=27263 run_len=128[0m
+[32m[     2.722][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=210219564 len=512 file_size=245178799 block_size=4096 iblock_start=51323[0m
+[32m[     2.728][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=51323 end_lblock=51324 run_start=51323 cursor=51451 run_len=128[0m
+[32m[     2.737][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=31689903 len=512 file_size=216157205 block_size=4096 iblock_start=7736[0m
+[32m[     2.744][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7736 end_lblock=7737 run_start=7736 cursor=7864 run_len=128[0m
+[32m[     2.752][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=225196709 len=512 file_size=118430079 block_size=4096 iblock_start=54979[0m
+[32m[     2.757][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=54979 end_lblock=54980 run_start=54979 cursor=55107 run_len=128[0m
+[32m[     2.765][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=192861521 len=512 file_size=148174394 block_size=4096 iblock_start=47085[0m
+[32m[     2.770][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47085 end_lblock=47086 run_start=47085 cursor=47213 run_len=128[0m
+[32m[     2.779][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=226953579 len=512 file_size=21179914 block_size=4096 iblock_start=55408[0m
+[32m[     2.784][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=55408 end_lblock=55409 run_start=55408 cursor=55536 run_len=128[0m
+[32m[     2.794][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=160150753 len=512 file_size=80354709 block_size=4096 iblock_start=39099[0m
+[32m[     2.799][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39099 end_lblock=39100 run_start=39099 cursor=39227 run_len=128[0m
+[32m[     2.809][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=175206690 len=512 file_size=251755400 block_size=4096 iblock_start=42775[0m
+[32m[     2.811][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=42775 end_lblock=42776 run_start=42775 cursor=42827 run_len=52[0m
+[32m[     2.821][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=253222788 len=512 file_size=70978635 block_size=4096 iblock_start=61821[0m
+[32m[     2.826][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=61821 end_lblock=61822 run_start=61821 cursor=61949 run_len=128[0m
+[32m[     2.835][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=55968497 len=512 file_size=24542905 block_size=4096 iblock_start=13664[0m
+[32m[     2.840][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13664 end_lblock=13665 run_start=13664 cursor=13792 run_len=128[0m
+[32m[     2.849][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=244063473 len=512 file_size=210672422 block_size=4096 iblock_start=59585[0m
+[32m[     2.854][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59585 end_lblock=59586 run_start=59585 cursor=59713 run_len=128[0m
+[32m[     2.863][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=69877916 len=512 file_size=66538020 block_size=4096 iblock_start=17060[0m
+[32m[     2.868][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=17060 end_lblock=17061 run_start=17060 cursor=17188 run_len=128[0m
+[32m[     2.877][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=79074957 len=512 file_size=40635313 block_size=4096 iblock_start=19305[0m
+[32m[     2.882][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19305 end_lblock=19306 run_start=19305 cursor=19433 run_len=128[0m
+[32m[     2.891][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=113057979 len=512 file_size=107799237 block_size=4096 iblock_start=27602[0m
+[32m[     2.892][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27602 end_lblock=27603 run_start=27602 cursor=27609 run_len=7[0m
+[32m[     2.901][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=126458817 len=512 file_size=83446795 block_size=4096 iblock_start=30873[0m
+[32m[     2.906][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=30873 end_lblock=30874 run_start=30873 cursor=31001 run_len=128[0m
+[32m[     2.915][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=201760882 len=512 file_size=99006676 block_size=4096 iblock_start=49258[0m
+[32m[     2.922][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=49258 end_lblock=49259 run_start=49258 cursor=49386 run_len=128[0m
+[32m[     2.932][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=234705570 len=512 file_size=234506413 block_size=4096 iblock_start=57301[0m
+[32m[     2.934][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=57301 end_lblock=57302 run_start=57301 cursor=57340 run_len=39[0m
+[32m[     2.943][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=34521835 len=512 file_size=109874212 block_size=4096 iblock_start=8428[0m
+[32m[     2.948][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=8428 end_lblock=8429 run_start=8428 cursor=8556 run_len=128[0m
+[32m[     2.957][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=64260491 len=512 file_size=211386554 block_size=4096 iblock_start=15688[0m
+[32m[     2.962][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=15688 end_lblock=15689 run_start=15688 cursor=15816 run_len=128[0m
+[32m[     2.972][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=41749878 len=512 file_size=222978539 block_size=4096 iblock_start=10192[0m
+[32m[     2.982][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=186517034 len=512 file_size=133586174 block_size=4096 iblock_start=45536[0m
+[32m[     2.988][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45536 end_lblock=45537 run_start=45536 cursor=45664 run_len=128[0m
+[32m[     2.998][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=50162273 len=512 file_size=180591809 block_size=4096 iblock_start=12246[0m
+[32m[     3.003][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=12246 end_lblock=12247 run_start=12246 cursor=12374 run_len=128[0m
+[32m[     3.013][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=79068723 len=512 file_size=247424025 block_size=4096 iblock_start=19303[0m
+[32m[     3.014][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19303 end_lblock=19304 run_start=19303 cursor=19305 run_len=2[0m
+[32m[     3.025][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=57151562 len=512 file_size=14564274 block_size=4096 iblock_start=13953[0m
+[32m[     3.033][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13953 end_lblock=13954 run_start=13953 cursor=14081 run_len=128[0m
+[32m[     3.044][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=231453232 len=512 file_size=194845041 block_size=4096 iblock_start=56507[0m
+[32m[     3.052][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56507 end_lblock=56508 run_start=56507 cursor=56635 run_len=128[0m
+[32m[     3.062][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=51858194 len=512 file_size=218456070 block_size=4096 iblock_start=12660[0m
+[32m[     3.068][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=12660 end_lblock=12661 run_start=12660 cursor=12788 run_len=128[0m
+[32m[     3.077][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=133663292 len=512 file_size=138660003 block_size=4096 iblock_start=32632[0m
+[32m[     3.082][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=32632 end_lblock=32633 run_start=32632 cursor=32760 run_len=128[0m
+[32m[     3.091][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257341830 len=512 file_size=144526063 block_size=4096 iblock_start=62827[0m
+[32m[     3.098][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62827 end_lblock=62828 run_start=62827 cursor=62955 run_len=128[0m
+[32m[     3.108][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=25384016 len=512 file_size=80921559 block_size=4096 iblock_start=6197[0m
+[32m[     3.113][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6197 end_lblock=6198 run_start=6197 cursor=6325 run_len=128[0m
+[32m[     3.123][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=45713622 len=512 file_size=204075442 block_size=4096 iblock_start=11160[0m
+[32m[     3.129][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11160 end_lblock=11161 run_start=11160 cursor=11288 run_len=128[0m
+[32m[     3.139][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=163794037 len=512 file_size=34265876 block_size=4096 iblock_start=39988[0m
+[32m[     3.145][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39988 end_lblock=39989 run_start=39988 cursor=40116 run_len=128[0m
+[32m[     3.154][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=45497838 len=512 file_size=224354303 block_size=4096 iblock_start=11107[0m
+[32m[     3.156][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11107 end_lblock=11108 run_start=11107 cursor=11160 run_len=53[0m
+[32m[     3.164][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=145808507 len=512 file_size=128258213 block_size=4096 iblock_start=35597[0m
+[32m[     3.168][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35597 end_lblock=35598 run_start=35597 cursor=35725 run_len=128[0m
+[32m[     3.176][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=185948679 len=512 file_size=89197604 block_size=4096 iblock_start=45397[0m
+[32m[     3.183][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=211236669 len=512 file_size=186273291 block_size=4096 iblock_start=51571[0m
+[32m[     3.188][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=51571 end_lblock=51572 run_start=51571 cursor=51699 run_len=128[0m
+[32m[     3.196][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=245178888 len=512 file_size=182311447 block_size=4096 iblock_start=59858[0m
+[32m[     3.201][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59858 end_lblock=59859 run_start=59858 cursor=59986 run_len=128[0m
+[32m[     3.209][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=159672974 len=512 file_size=200284300 block_size=4096 iblock_start=38982[0m
+[32m[     3.216][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38982 end_lblock=38983 run_start=38982 cursor=39099 run_len=117[0m
+[32m[     3.224][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=95167868 len=512 file_size=129936484 block_size=4096 iblock_start=23234[0m
+[32m[     3.229][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23234 end_lblock=23235 run_start=23234 cursor=23362 run_len=128[0m
+[32m[     3.237][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=164646979 len=512 file_size=62116575 block_size=4096 iblock_start=40197[0m
+[32m[     3.242][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=40197 end_lblock=40198 run_start=40197 cursor=40325 run_len=128[0m
+[32m[     3.250][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196116996 len=512 file_size=186860186 block_size=4096 iblock_start=47880[0m
+[32m[     3.251][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47880 end_lblock=47881 run_start=47880 cursor=47884 run_len=4[0m
+[32m[     3.259][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=57108782 len=512 file_size=45899364 block_size=4096 iblock_start=13942[0m
+[32m[     3.260][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13942 end_lblock=13943 run_start=13942 cursor=13953 run_len=11[0m
+[32m[     3.268][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196920591 len=512 file_size=80558986 block_size=4096 iblock_start=48076[0m
+[32m[     3.276][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=32375773 len=512 file_size=89960623 block_size=4096 iblock_start=7904[0m
+[32m[     3.281][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7904 end_lblock=7905 run_start=7904 cursor=8032 run_len=128[0m
+[32m[     3.289][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=44571227 len=512 file_size=79158073 block_size=4096 iblock_start=10881[0m
+[32m[     3.296][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=138836687 len=512 file_size=108466149 block_size=4096 iblock_start=33895[0m
+[32m[     3.303][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=33895 end_lblock=33896 run_start=33895 cursor=34023 run_len=128[0m
+[32m[     3.311][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=157674005 len=512 file_size=184942494 block_size=4096 iblock_start=38494[0m
+[32m[     3.320][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=81807103 len=512 file_size=56584237 block_size=4096 iblock_start=19972[0m
+[32m[     3.326][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19972 end_lblock=19973 run_start=19972 cursor=20100 run_len=128[0m
+[32m[     3.335][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=38120477 len=512 file_size=153769391 block_size=4096 iblock_start=9306[0m
+[32m[     3.341][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9306 end_lblock=9307 run_start=9306 cursor=9434 run_len=128[0m
+[32m[     3.349][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=251729457 len=512 file_size=213155377 block_size=4096 iblock_start=61457[0m
+[32m[     3.354][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=61457 end_lblock=61458 run_start=61457 cursor=61585 run_len=128[0m
+[32m[     3.362][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=185479855 len=512 file_size=162067960 block_size=4096 iblock_start=45283[0m
+[32m[     3.366][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45283 end_lblock=45284 run_start=45283 cursor=45380 run_len=97[0m
+[32m[     3.374][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=52803896 len=512 file_size=227353987 block_size=4096 iblock_start=12891[0m
+[32m[     3.379][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=12891 end_lblock=12892 run_start=12891 cursor=13019 run_len=128[0m
+[32m[     3.387][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=36725086 len=512 file_size=46614676 block_size=4096 iblock_start=8966[0m
+[32m[     3.392][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=8966 end_lblock=8967 run_start=8966 cursor=9094 run_len=128[0m
+[32m[     3.402][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=16629349 len=512 file_size=153720845 block_size=4096 iblock_start=4059[0m
+[32m[     3.408][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4059 end_lblock=4060 run_start=4059 cursor=4187 run_len=128[0m
+[32m[     3.416][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=208784444 len=512 file_size=58554907 block_size=4096 iblock_start=50972[0m
+[32m[     3.421][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=50972 end_lblock=50973 run_start=50972 cursor=51100 run_len=128[0m
+[32m[     3.429][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=161901660 len=512 file_size=205213096 block_size=4096 iblock_start=39526[0m
+[32m[     3.434][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39526 end_lblock=39527 run_start=39526 cursor=39654 run_len=128[0m
+[32m[     3.442][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=24279125 len=512 file_size=62327863 block_size=4096 iblock_start=5927[0m
+[32m[     3.448][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5927 end_lblock=5928 run_start=5927 cursor=6055 run_len=128[0m
+[32m[     3.456][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124632252 len=512 file_size=7990586 block_size=4096 iblock_start=30427[0m
+[32m[     3.461][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=30427 end_lblock=30428 run_start=30427 cursor=30555 run_len=128[0m
+[32m[     3.469][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=198515944 len=512 file_size=180001285 block_size=4096 iblock_start=48465[0m
+[32m[     3.474][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48465 end_lblock=48466 run_start=48465 cursor=48593 run_len=128[0m
+[32m[     3.482][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=141393182 len=512 file_size=139964368 block_size=4096 iblock_start=34519[0m
+[32m[     3.487][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=34519 end_lblock=34520 run_start=34519 cursor=34616 run_len=97[0m
+[32m[     3.495][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=201171355 len=512 file_size=163112491 block_size=4096 iblock_start=49114[0m
+[32m[     3.501][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=49114 end_lblock=49115 run_start=49114 cursor=49242 run_len=128[0m
+[32m[     3.509][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=105232325 len=512 file_size=93355031 block_size=4096 iblock_start=25691[0m
+[32m[     3.517][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=84875766 len=512 file_size=6503975 block_size=4096 iblock_start=20721[0m
+[32m[     3.522][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=20721 end_lblock=20722 run_start=20721 cursor=20849 run_len=128[0m
+[32m[     3.530][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=32078976 len=512 file_size=200596821 block_size=4096 iblock_start=7831[0m
+[32m[     3.538][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=12841902 len=512 file_size=165074102 block_size=4096 iblock_start=3135[0m
+[32m[     3.543][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3135 end_lblock=3136 run_start=3135 cursor=3263 run_len=128[0m
+[32m[     3.551][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=219556337 len=512 file_size=265758120 block_size=4096 iblock_start=53602[0m
+[32m[     3.556][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=53602 end_lblock=53603 run_start=53602 cursor=53730 run_len=128[0m
+[32m[     3.564][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=37827117 len=512 file_size=110362058 block_size=4096 iblock_start=9235[0m
+[32m[     3.568][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9235 end_lblock=9236 run_start=9235 cursor=9306 run_len=71[0m
+[32m[     3.576][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=21407444 len=512 file_size=111025468 block_size=4096 iblock_start=5226[0m
+[32m[     3.582][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5226 end_lblock=5227 run_start=5226 cursor=5354 run_len=128[0m
+[32m[     3.590][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=178619604 len=512 file_size=123807400 block_size=4096 iblock_start=43608[0m
+[32m[     3.595][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43608 end_lblock=43609 run_start=43608 cursor=43736 run_len=128[0m
+[32m[     3.603][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=160127890 len=512 file_size=218060929 block_size=4096 iblock_start=39093[0m
+[32m[     3.611][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=152060883 len=512 file_size=39265747 block_size=4096 iblock_start=37124[0m
+[32m[     3.617][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37124 end_lblock=37125 run_start=37124 cursor=37252 run_len=128[0m
+[32m[     3.625][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=149869144 len=512 file_size=166515490 block_size=4096 iblock_start=36589[0m
+[32m[     3.631][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=36589 end_lblock=36590 run_start=36589 cursor=36717 run_len=128[0m
+[32m[     3.639][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=164204818 len=512 file_size=67398215 block_size=4096 iblock_start=40089[0m
+[32m[     3.647][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=199178649 len=512 file_size=33272434 block_size=4096 iblock_start=48627[0m
+[32m[     3.652][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48627 end_lblock=48628 run_start=48627 cursor=48755 run_len=128[0m
+[32m[     3.662][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=87472094 len=512 file_size=195442791 block_size=4096 iblock_start=21355[0m
+[32m[     3.667][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21355 end_lblock=21356 run_start=21355 cursor=21483 run_len=128[0m
+[32m[     3.677][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=161262308 len=512 file_size=213031853 block_size=4096 iblock_start=39370[0m
+[32m[     3.682][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39370 end_lblock=39371 run_start=39370 cursor=39498 run_len=128[0m
+[32m[     3.692][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=57531920 len=512 file_size=65949779 block_size=4096 iblock_start=14045[0m
+[32m[     3.701][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=139052402 len=512 file_size=131246786 block_size=4096 iblock_start=33948[0m
+[32m[     3.710][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=28131421 len=512 file_size=71417862 block_size=4096 iblock_start=6868[0m
+[32m[     3.715][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6868 end_lblock=6869 run_start=6868 cursor=6996 run_len=128[0m
+[32m[     3.725][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=104736730 len=512 file_size=213586798 block_size=4096 iblock_start=25570[0m
+[32m[     3.727][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25570 end_lblock=25571 run_start=25570 cursor=25606 run_len=36[0m
+[32m[     3.736][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=145643781 len=512 file_size=122308452 block_size=4096 iblock_start=35557[0m
+[32m[     3.738][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35557 end_lblock=35558 run_start=35557 cursor=35597 run_len=40[0m
+[32m[     3.747][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=45732679 len=512 file_size=86225201 block_size=4096 iblock_start=11165[0m
+[32m[     3.755][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=187882975 len=512 file_size=159733810 block_size=4096 iblock_start=45869[0m
+[32m[     3.760][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45869 end_lblock=45870 run_start=45869 cursor=45997 run_len=128[0m
+[32m[     3.769][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=267251915 len=512 file_size=127417696 block_size=4096 iblock_start=65247[0m
+[32m[     3.772][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=65247 end_lblock=65248 run_start=65247 cursor=65317 run_len=70[0m
+[32m[     3.783][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=263704540 len=512 file_size=167055046 block_size=4096 iblock_start=64380[0m
+[32m[     3.791][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64380 end_lblock=64381 run_start=64380 cursor=64508 run_len=128[0m
+[32m[     3.802][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=86951192 len=512 file_size=245765387 block_size=4096 iblock_start=21228[0m
+[32m[     3.809][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21228 end_lblock=21229 run_start=21228 cursor=21355 run_len=127[0m
+[32m[     3.819][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=249434607 len=512 file_size=19819198 block_size=4096 iblock_start=60897[0m
+[32m[     3.825][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60897 end_lblock=60898 run_start=60897 cursor=61025 run_len=128[0m
+[32m[     3.836][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=18254172 len=512 file_size=123612686 block_size=4096 iblock_start=4456[0m
+[32m[     3.845][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=208852337 len=512 file_size=23070538 block_size=4096 iblock_start=50989[0m
+[32m[     3.854][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=230382971 len=512 file_size=238889406 block_size=4096 iblock_start=56245[0m
+[32m[     3.861][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56245 end_lblock=56246 run_start=56245 cursor=56373 run_len=128[0m
+[32m[     3.870][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=241935005 len=512 file_size=264142453 block_size=4096 iblock_start=59066[0m
+[32m[     3.876][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59066 end_lblock=59067 run_start=59066 cursor=59194 run_len=128[0m
+[32m[     3.887][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=23860642 len=512 file_size=19722585 block_size=4096 iblock_start=5825[0m
+[32m[     3.893][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5825 end_lblock=5826 run_start=5825 cursor=5927 run_len=102[0m
+[32m[     3.903][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=102574901 len=512 file_size=183783075 block_size=4096 iblock_start=25042[0m
+[32m[     3.912][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=234656373 len=512 file_size=213668583 block_size=4096 iblock_start=57289[0m
+[32m[     3.913][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=57289 end_lblock=57290 run_start=57289 cursor=57301 run_len=12[0m
+[32m[     3.922][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=62963843 len=512 file_size=244046140 block_size=4096 iblock_start=15372[0m
+[32m[     3.928][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=15372 end_lblock=15373 run_start=15372 cursor=15500 run_len=128[0m
+[32m[     3.938][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=28310406 len=512 file_size=31283137 block_size=4096 iblock_start=6911[0m
+[32m[     3.948][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=46639033 len=512 file_size=257861554 block_size=4096 iblock_start=11386[0m
+[32m[     3.953][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11386 end_lblock=11387 run_start=11386 cursor=11514 run_len=128[0m
+[32m[     3.963][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=267601213 len=512 file_size=257089397 block_size=4096 iblock_start=65332[0m
+[32m[     3.972][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=190444655 len=512 file_size=54739181 block_size=4096 iblock_start=46495[0m
+[32m[     3.979][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=46495 end_lblock=46496 run_start=46495 cursor=46623 run_len=128[0m
+[32m[     3.989][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=136090030 len=512 file_size=7935849 block_size=4096 iblock_start=33225[0m
+[32m[     3.994][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=33225 end_lblock=33226 run_start=33225 cursor=33353 run_len=128[0m
+[32m[     4.004][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=219953249 len=512 file_size=48396136 block_size=4096 iblock_start=53699[0m
+[32m[     4.013][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=110834756 len=512 file_size=125664370 block_size=4096 iblock_start=27059[0m
+[32m[     4.016][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27059 end_lblock=27060 run_start=27059 cursor=27135 run_len=76[0m
+[32m[     4.025][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=176969329 len=512 file_size=8459108 block_size=4096 iblock_start=43205[0m
+[32m[     4.034][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=142382042 len=512 file_size=104812923 block_size=4096 iblock_start=34761[0m
+[32m[     4.039][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=34761 end_lblock=34762 run_start=34761 cursor=34889 run_len=128[0m
+[32m[     4.049][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=204298692 len=512 file_size=102741718 block_size=4096 iblock_start=49877[0m
+[32m[     4.056][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=49877 end_lblock=49878 run_start=49877 cursor=50005 run_len=128[0m
+[32m[     4.066][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=193031998 len=512 file_size=126925139 block_size=4096 iblock_start=47126[0m
+[32m[     4.076][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=147384067 len=512 file_size=190081277 block_size=4096 iblock_start=35982[0m
+[32m[     4.082][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35982 end_lblock=35983 run_start=35982 cursor=36110 run_len=128[0m
+[32m[     4.092][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257102511 len=512 file_size=3079363 block_size=4096 iblock_start=62769[0m
+[32m[     4.101][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=71922954 len=512 file_size=15040947 block_size=4096 iblock_start=17559[0m
+[32m[     4.106][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=17559 end_lblock=17560 run_start=17559 cursor=17687 run_len=128[0m
+[32m[     4.117][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=71067348 len=512 file_size=130280747 block_size=4096 iblock_start=17350[0m
+[32m[     4.123][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=17350 end_lblock=17351 run_start=17350 cursor=17478 run_len=128[0m
+[32m[     4.132][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=266934405 len=512 file_size=205395585 block_size=4096 iblock_start=65169[0m
+[32m[     4.136][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=65169 end_lblock=65170 run_start=65169 cursor=65247 run_len=78[0m
+[32m[     4.145][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=129668457 len=512 file_size=220529600 block_size=4096 iblock_start=31657[0m
+[32m[     4.148][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31657 end_lblock=31658 run_start=31657 cursor=31716 run_len=59[0m
+[32m[     4.158][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=70787565 len=512 file_size=31418033 block_size=4096 iblock_start=17282[0m
+[32m[     4.162][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=17282 end_lblock=17283 run_start=17282 cursor=17350 run_len=68[0m
+[32m[     4.172][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124681088 len=512 file_size=108596302 block_size=4096 iblock_start=30439[0m
+[32m[     4.182][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=53629661 len=512 file_size=66189558 block_size=4096 iblock_start=13093[0m
+[32m[     4.184][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13093 end_lblock=13094 run_start=13093 cursor=13126 run_len=33[0m
+[32m[     4.193][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=132989883 len=512 file_size=257754906 block_size=4096 iblock_start=32468[0m
+[32m[     4.198][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=32468 end_lblock=32469 run_start=32468 cursor=32596 run_len=128[0m
+[32m[     4.208][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=75378561 len=512 file_size=35382091 block_size=4096 iblock_start=18402[0m
+[32m[     4.215][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=18402 end_lblock=18403 run_start=18402 cursor=18530 run_len=128[0m
+[32m[     4.225][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=236670984 len=512 file_size=159924993 block_size=4096 iblock_start=57781[0m
+[32m[     4.231][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=57781 end_lblock=57782 run_start=57781 cursor=57909 run_len=128[0m
+[32m[     4.241][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=266289121 len=512 file_size=167193422 block_size=4096 iblock_start=65011[0m
+[32m[     4.246][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=65011 end_lblock=65012 run_start=65011 cursor=65139 run_len=128[0m
+[32m[     4.256][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=112795287 len=512 file_size=125335865 block_size=4096 iblock_start=27537[0m
+[32m[     4.259][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27537 end_lblock=27538 run_start=27537 cursor=27602 run_len=65[0m
+[32m[     4.269][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=188322335 len=512 file_size=28735058 block_size=4096 iblock_start=45977[0m
+[32m[     4.278][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=187167132 len=512 file_size=11610112 block_size=4096 iblock_start=45695[0m
+[32m[     4.285][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45695 end_lblock=45696 run_start=45695 cursor=45823 run_len=128[0m
+[32m[     4.295][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=54904276 len=512 file_size=48082104 block_size=4096 iblock_start=13404[0m
+[32m[     4.300][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13404 end_lblock=13405 run_start=13404 cursor=13532 run_len=128[0m
+[32m[     4.310][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=17792364 len=512 file_size=167166646 block_size=4096 iblock_start=4343[0m
+[32m[     4.314][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4343 end_lblock=4344 run_start=4343 cursor=4431 run_len=88[0m
+[32m[     4.324][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=266206213 len=512 file_size=105333060 block_size=4096 iblock_start=64991[0m
+[32m[     4.325][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64991 end_lblock=64992 run_start=64991 cursor=65011 run_len=20[0m
+[32m[     4.336][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=164308717 len=512 file_size=159598251 block_size=4096 iblock_start=40114[0m
+[32m[     4.346][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=222407966 len=512 file_size=40711365 block_size=4096 iblock_start=54298[0m
+[32m[     4.352][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=54298 end_lblock=54299 run_start=54298 cursor=54426 run_len=128[0m
+[32m[     4.362][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=91601974 len=512 file_size=59502112 block_size=4096 iblock_start=22363[0m
+[32m[     4.363][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=22363 end_lblock=22364 run_start=22363 cursor=22381 run_len=18[0m
+[32m[     4.373][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=224107219 len=512 file_size=89812314 block_size=4096 iblock_start=54713[0m
+[32m[     4.377][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=54713 end_lblock=54714 run_start=54713 cursor=54841 run_len=128[0m
+[32m[     4.387][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=74418424 len=512 file_size=266497827 block_size=4096 iblock_start=18168[0m
+[32m[     4.389][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=18168 end_lblock=18169 run_start=18168 cursor=18201 run_len=33[0m
+[32m[     4.398][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=32885045 len=512 file_size=164632653 block_size=4096 iblock_start=8028[0m
+[32m[     4.407][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=56626492 len=512 file_size=80312869 block_size=4096 iblock_start=13824[0m
+[32m[     4.413][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13824 end_lblock=13825 run_start=13824 cursor=13942 run_len=118[0m
+[32m[     4.423][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=180508768 len=512 file_size=44824300 block_size=4096 iblock_start=44069[0m
+[32m[     4.432][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=154642181 len=512 file_size=221830812 block_size=4096 iblock_start=37754[0m
+[32m[     4.437][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37754 end_lblock=37755 run_start=37754 cursor=37882 run_len=128[0m
+[32m[     4.447][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=136331024 len=512 file_size=210042976 block_size=4096 iblock_start=33283[0m
+[32m[     4.457][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=128782304 len=512 file_size=252716108 block_size=4096 iblock_start=31440[0m
+[32m[     4.462][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31440 end_lblock=31441 run_start=31440 cursor=31568 run_len=128[0m
+[32m[     4.473][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143597279 len=512 file_size=163519867 block_size=4096 iblock_start=35057[0m
+[32m[     4.484][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=72760694 len=512 file_size=245071532 block_size=4096 iblock_start=17763[0m
+[32m[     4.494][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=17763 end_lblock=17764 run_start=17763 cursor=17891 run_len=128[0m
+[32m[     4.507][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=30454443 len=512 file_size=56747386 block_size=4096 iblock_start=7435[0m
+[32m[     4.515][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7435 end_lblock=7436 run_start=7435 cursor=7563 run_len=128[0m
+[32m[     4.526][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=10376404 len=512 file_size=224694598 block_size=4096 iblock_start=2533[0m
+[32m[     4.532][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=2533 end_lblock=2534 run_start=2533 cursor=2661 run_len=128[0m
+[32m[     4.543][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=184647798 len=512 file_size=70891363 block_size=4096 iblock_start=45080[0m
+[32m[     4.548][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45080 end_lblock=45081 run_start=45080 cursor=45208 run_len=128[0m
+[32m[     4.558][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=27533370 len=512 file_size=253135203 block_size=4096 iblock_start=6722[0m
+[32m[     4.563][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6722 end_lblock=6723 run_start=6722 cursor=6850 run_len=128[0m
+[32m[     4.573][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=134970821 len=512 file_size=74759781 block_size=4096 iblock_start=32951[0m
+[32m[     4.582][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=178095495 len=512 file_size=196736810 block_size=4096 iblock_start=43480[0m
+[32m[     4.587][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43480 end_lblock=43481 run_start=43480 cursor=43608 run_len=128[0m
+[32m[     4.596][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=178088741 len=512 file_size=259963352 block_size=4096 iblock_start=43478[0m
+[32m[     4.597][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43478 end_lblock=43479 run_start=43478 cursor=43480 run_len=2[0m
+[32m[     4.607][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=3374008 len=512 file_size=264865471 block_size=4096 iblock_start=823[0m
+[32m[     4.621][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143446549 len=512 file_size=74085084 block_size=4096 iblock_start=35021[0m
+[32m[     4.630][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=46189099 len=512 file_size=99294827 block_size=4096 iblock_start=11276[0m
+[32m[     4.639][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=132519579 len=512 file_size=56938750 block_size=4096 iblock_start=32353[0m
+[32m[     4.644][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=32353 end_lblock=32354 run_start=32353 cursor=32468 run_len=115[0m
+[32m[     4.653][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=203652352 len=512 file_size=25037411 block_size=4096 iblock_start=49719[0m
+[32m[     4.659][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=49719 end_lblock=49720 run_start=49719 cursor=49847 run_len=128[0m
+[32m[     4.669][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=190737992 len=512 file_size=262377756 block_size=4096 iblock_start=46566[0m
+[32m[     4.679][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=63843771 len=512 file_size=93605185 block_size=4096 iblock_start=15586[0m
+[32m[     4.683][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=15586 end_lblock=15587 run_start=15586 cursor=15688 run_len=102[0m
+[32m[     4.692][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=198481063 len=512 file_size=153645428 block_size=4096 iblock_start=48457[0m
+[32m[     4.693][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48457 end_lblock=48458 run_start=48457 cursor=48465 run_len=8[0m
+[32m[     4.702][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=208451941 len=512 file_size=196638122 block_size=4096 iblock_start=50891[0m
+[32m[     4.705][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=50891 end_lblock=50892 run_start=50891 cursor=50972 run_len=81[0m
+[32m[     4.714][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=72302666 len=512 file_size=235488977 block_size=4096 iblock_start=17652[0m
+[32m[     4.723][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=213317506 len=512 file_size=196182678 block_size=4096 iblock_start=52079[0m
+[32m[     4.733][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=128141770 len=512 file_size=99093475 block_size=4096 iblock_start=31284[0m
+[32m[     4.738][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31284 end_lblock=31285 run_start=31284 cursor=31412 run_len=128[0m
+[32m[     4.747][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=85190948 len=512 file_size=23506409 block_size=4096 iblock_start=20798[0m
+[32m[     4.756][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=88412585 len=512 file_size=35830412 block_size=4096 iblock_start=21585[0m
+[32m[     4.761][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21585 end_lblock=21586 run_start=21585 cursor=21713 run_len=128[0m
+[32m[     4.770][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=238091974 len=512 file_size=99332188 block_size=4096 iblock_start=58127[0m
+[32m[     4.775][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=58127 end_lblock=58128 run_start=58127 cursor=58255 run_len=128[0m
+[32m[     4.785][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=113814727 len=512 file_size=175770543 block_size=4096 iblock_start=27786[0m
+[32m[     4.795][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=252801438 len=512 file_size=249129610 block_size=4096 iblock_start=61719[0m
+[32m[     4.805][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=229957592 len=512 file_size=116171840 block_size=4096 iblock_start=56141[0m
+[32m[     4.810][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56141 end_lblock=56142 run_start=56141 cursor=56245 run_len=104[0m
+[32m[     4.820][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=37161350 len=512 file_size=200682963 block_size=4096 iblock_start=9072[0m
+[32m[     4.829][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=126726491 len=512 file_size=230976010 block_size=4096 iblock_start=30939[0m
+[32m[     4.838][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=173499448 len=512 file_size=199996452 block_size=4096 iblock_start=42358[0m
+[32m[     4.846][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=42358 end_lblock=42359 run_start=42358 cursor=42486 run_len=128[0m
+[32m[     4.856][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=246911327 len=512 file_size=12808372 block_size=4096 iblock_start=60281[0m
+[32m[     4.862][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60281 end_lblock=60282 run_start=60281 cursor=60409 run_len=128[0m
+[32m[     4.873][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=249116743 len=512 file_size=8927660 block_size=4096 iblock_start=60819[0m
+[32m[     4.877][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60819 end_lblock=60820 run_start=60819 cursor=60897 run_len=78[0m
+[32m[     4.887][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=114170413 len=512 file_size=232040452 block_size=4096 iblock_start=27873[0m
+[32m[     4.892][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27873 end_lblock=27874 run_start=27873 cursor=28001 run_len=128[0m
+[32m[     4.902][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=36263191 len=512 file_size=258278328 block_size=4096 iblock_start=8853[0m
+[32m[     4.906][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=8853 end_lblock=8854 run_start=8853 cursor=8966 run_len=113[0m
+[32m[     4.916][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107895888 len=512 file_size=40187300 block_size=4096 iblock_start=26341[0m
+[32m[     4.925][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=137038592 len=512 file_size=149668013 block_size=4096 iblock_start=33456[0m
+[32m[     4.934][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=75670445 len=512 file_size=204775726 block_size=4096 iblock_start=18474[0m
+[32m[     4.945][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=263855076 len=512 file_size=25083131 block_size=4096 iblock_start=64417[0m
+[32m[     4.955][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=163515012 len=512 file_size=135093105 block_size=4096 iblock_start=39920[0m
+[32m[     4.959][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39920 end_lblock=39921 run_start=39920 cursor=39988 run_len=68[0m
+[32m[     4.970][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143577897 len=512 file_size=264896037 block_size=4096 iblock_start=35053[0m
+[32m[     4.979][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=157092367 len=512 file_size=29087447 block_size=4096 iblock_start=38352[0m
+[32m[     4.984][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38352 end_lblock=38353 run_start=38352 cursor=38480 run_len=128[0m
+[32m[     4.993][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=49697870 len=512 file_size=264740916 block_size=4096 iblock_start=12133[0m
+[32m[     5.002][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=158606670 len=512 file_size=77632998 block_size=4096 iblock_start=38722[0m
+[32m[     5.011][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124730698 len=512 file_size=75994256 block_size=4096 iblock_start=30451[0m
+[32m[     5.020][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=27158341 len=512 file_size=85854195 block_size=4096 iblock_start=6630[0m
+[32m[     5.029][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=253010457 len=512 file_size=139294018 block_size=4096 iblock_start=61770[0m
+[32m[     5.038][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=265256702 len=512 file_size=47510712 block_size=4096 iblock_start=64759[0m
+[32m[     5.044][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64759 end_lblock=64760 run_start=64759 cursor=64887 run_len=128[0m
+[32m[     5.053][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=112038315 len=512 file_size=136975148 block_size=4096 iblock_start=27353[0m
+[32m[     5.059][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27353 end_lblock=27354 run_start=27353 cursor=27481 run_len=128[0m
+[32m[     5.068][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=4166596 len=512 file_size=213113845 block_size=4096 iblock_start=1017[0m
+[32m[     5.084][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=84404053 len=512 file_size=52507773 block_size=4096 iblock_start=20606[0m
+[32m[     5.093][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=134019125 len=512 file_size=47843726 block_size=4096 iblock_start=32719[0m
+[32m[     5.103][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=30535181 len=512 file_size=257728491 block_size=4096 iblock_start=7454[0m
+[32m[     5.112][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107481602 len=512 file_size=193432192 block_size=4096 iblock_start=26240[0m
+[32m[     5.113][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26240 end_lblock=26241 run_start=26240 cursor=26247 run_len=7[0m
+[32m[     5.123][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=117808653 len=512 file_size=2973604 block_size=4096 iblock_start=28761[0m
+[32m[     5.128][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28761 end_lblock=28762 run_start=28761 cursor=28889 run_len=128[0m
+[32m[     5.139][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=254766217 len=512 file_size=210340023 block_size=4096 iblock_start=62198[0m
+[32m[     5.145][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62198 end_lblock=62199 run_start=62198 cursor=62326 run_len=128[0m
+[32m[     5.155][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=114476515 len=512 file_size=88040299 block_size=4096 iblock_start=27948[0m
+[32m[     5.164][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=112056963 len=512 file_size=244174687 block_size=4096 iblock_start=27357[0m
+[32m[     5.173][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=90620736 len=512 file_size=171321690 block_size=4096 iblock_start=22124[0m
+[32m[     5.182][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=129919530 len=512 file_size=147782096 block_size=4096 iblock_start=31718[0m
+[32m[     5.191][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=193580787 len=512 file_size=190546698 block_size=4096 iblock_start=47260[0m
+[32m[     5.196][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=47260 end_lblock=47261 run_start=47260 cursor=47388 run_len=128[0m
+[32m[     5.205][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=4486909 len=512 file_size=217251277 block_size=4096 iblock_start=1095[0m
+[32m[     5.213][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=241756948 len=512 file_size=221973933 block_size=4096 iblock_start=59022[0m
+[32m[     5.215][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59022 end_lblock=59023 run_start=59022 cursor=59066 run_len=44[0m
+[32m[     5.224][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=81844472 len=512 file_size=70658683 block_size=4096 iblock_start=19981[0m
+[32m[     5.234][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=109751677 len=512 file_size=197536692 block_size=4096 iblock_start=26794[0m
+[32m[     5.241][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26794 end_lblock=26795 run_start=26794 cursor=26922 run_len=128[0m
+[32m[     5.252][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=238561395 len=512 file_size=9117244 block_size=4096 iblock_start=58242[0m
+[32m[     5.261][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=80423794 len=512 file_size=7826286 block_size=4096 iblock_start=19634[0m
+[32m[     5.263][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19634 end_lblock=19635 run_start=19634 cursor=19677 run_len=43[0m
+[32m[     5.273][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=117520659 len=512 file_size=44610604 block_size=4096 iblock_start=28691[0m
+[32m[     5.276][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28691 end_lblock=28692 run_start=28691 cursor=28761 run_len=70[0m
+[32m[     5.286][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107249708 len=512 file_size=88005661 block_size=4096 iblock_start=26184[0m
+[32m[     5.289][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26184 end_lblock=26185 run_start=26184 cursor=26240 run_len=56[0m
+[32m[     5.298][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=57786386 len=512 file_size=212335253 block_size=4096 iblock_start=14108[0m
+[32m[     5.303][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14108 end_lblock=14109 run_start=14108 cursor=14236 run_len=128[0m
+[32m[     5.313][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=99434589 len=512 file_size=189435819 block_size=4096 iblock_start=24276[0m
+[32m[     5.322][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=29392013 len=512 file_size=261839120 block_size=4096 iblock_start=7175[0m
+[32m[     5.330][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7175 end_lblock=7176 run_start=7175 cursor=7303 run_len=128[0m
+[32m[     5.339][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=220695152 len=512 file_size=154038576 block_size=4096 iblock_start=53880[0m
+[32m[     5.345][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=53880 end_lblock=53881 run_start=53880 cursor=54008 run_len=128[0m
+[32m[     5.355][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=158600330 len=512 file_size=124760554 block_size=4096 iblock_start=38720[0m
+[32m[     5.364][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=79864781 len=512 file_size=216854003 block_size=4096 iblock_start=19498[0m
+[32m[     5.369][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19498 end_lblock=19499 run_start=19498 cursor=19626 run_len=128[0m
+[32m[     5.378][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=81589665 len=512 file_size=27778813 block_size=4096 iblock_start=19919[0m
+[32m[     5.380][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19919 end_lblock=19920 run_start=19919 cursor=19972 run_len=53[0m
+[32m[     5.390][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=47182582 len=512 file_size=83821969 block_size=4096 iblock_start=11519[0m
+[32m[     5.396][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11519 end_lblock=11520 run_start=11519 cursor=11647 run_len=128[0m
+[32m[     5.405][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=99820727 len=512 file_size=100157551 block_size=4096 iblock_start=24370[0m
+[32m[     5.409][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24370 end_lblock=24371 run_start=24370 cursor=24484 run_len=114[0m
+[32m[     5.419][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=28822583 len=512 file_size=138401243 block_size=4096 iblock_start=7036[0m
+[32m[     5.426][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7036 end_lblock=7037 run_start=7036 cursor=7164 run_len=128[0m
+[32m[     5.436][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=46559306 len=512 file_size=141721490 block_size=4096 iblock_start=11367[0m
+[32m[     5.437][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11367 end_lblock=11368 run_start=11367 cursor=11386 run_len=19[0m
+[32m[     5.447][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=200258986 len=512 file_size=244980374 block_size=4096 iblock_start=48891[0m
+[32m[     5.454][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=26747501 len=512 file_size=72966530 block_size=4096 iblock_start=6530[0m
+[32m[     5.464][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=184155524 len=512 file_size=138480844 block_size=4096 iblock_start=44959[0m
+[32m[     5.471][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=44959 end_lblock=44960 run_start=44959 cursor=45080 run_len=121[0m
+[32m[     5.481][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=242866484 len=512 file_size=255672399 block_size=4096 iblock_start=59293[0m
+[32m[     5.490][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107744345 len=512 file_size=160802902 block_size=4096 iblock_start=26304[0m
+[32m[     5.499][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=138063382 len=512 file_size=129145413 block_size=4096 iblock_start=33706[0m
+[32m[     5.505][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=33706 end_lblock=33707 run_start=33706 cursor=33834 run_len=128[0m
+[32m[     5.516][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=120800700 len=512 file_size=211164962 block_size=4096 iblock_start=29492[0m
+[32m[     5.522][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=29492 end_lblock=29493 run_start=29492 cursor=29612 run_len=120[0m
+[32m[     5.532][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=43633865 len=512 file_size=134257877 block_size=4096 iblock_start=10652[0m
+[32m[     5.538][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=10652 end_lblock=10653 run_start=10652 cursor=10780 run_len=128[0m
+[32m[     5.548][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=123553712 len=512 file_size=93319016 block_size=4096 iblock_start=30164[0m
+[32m[     5.553][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=30164 end_lblock=30165 run_start=30164 cursor=30292 run_len=128[0m
+[32m[     5.563][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=105063695 len=512 file_size=66037059 block_size=4096 iblock_start=25650[0m
+[32m[     5.572][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=45514407 len=512 file_size=233170091 block_size=4096 iblock_start=11111[0m
+[32m[     5.581][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=54264232 len=512 file_size=36379427 block_size=4096 iblock_start=13248[0m
+[32m[     5.590][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=246175921 len=512 file_size=215327172 block_size=4096 iblock_start=60101[0m
+[32m[     5.591][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60101 end_lblock=60102 run_start=60101 cursor=60121 run_len=20[0m
+[32m[     5.601][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=230888714 len=512 file_size=110033213 block_size=4096 iblock_start=56369[0m
+[32m[     5.611][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=62580435 len=512 file_size=152392491 block_size=4096 iblock_start=15278[0m
+[32m[     5.615][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=15278 end_lblock=15279 run_start=15278 cursor=15372 run_len=94[0m
+[32m[     5.625][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=206389149 len=512 file_size=257544048 block_size=4096 iblock_start=50387[0m
+[32m[     5.630][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=50387 end_lblock=50388 run_start=50387 cursor=50515 run_len=128[0m
+[32m[     5.640][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=66569433 len=512 file_size=177250925 block_size=4096 iblock_start=16252[0m
+[32m[     5.645][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=16252 end_lblock=16253 run_start=16252 cursor=16380 run_len=128[0m
+[32m[     5.655][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=243640209 len=512 file_size=28621976 block_size=4096 iblock_start=59482[0m
+[32m[     5.660][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=59482 end_lblock=59483 run_start=59482 cursor=59585 run_len=103[0m
+[32m[     5.670][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=178125638 len=512 file_size=112646238 block_size=4096 iblock_start=43487[0m
+[32m[     5.679][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=51968923 len=512 file_size=27638385 block_size=4096 iblock_start=12687[0m
+[32m[     5.688][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=222932511 len=512 file_size=110492362 block_size=4096 iblock_start=54426[0m
+[32m[     5.694][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=54426 end_lblock=54427 run_start=54426 cursor=54554 run_len=128[0m
+[32m[     5.704][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=44460220 len=512 file_size=239116257 block_size=4096 iblock_start=10854[0m
+[32m[     5.705][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=10854 end_lblock=10855 run_start=10854 cursor=10864 run_len=10[0m
+[32m[     5.715][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=83059994 len=512 file_size=203616315 block_size=4096 iblock_start=20278[0m
+[32m[     5.724][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=161409919 len=512 file_size=145654287 block_size=4096 iblock_start=39406[0m
+[32m[     5.733][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=23174423 len=512 file_size=159877146 block_size=4096 iblock_start=5657[0m
+[32m[     5.742][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=9137723 len=512 file_size=118575673 block_size=4096 iblock_start=2230[0m
+[32m[     5.748][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=2230 end_lblock=2231 run_start=2230 cursor=2358 run_len=128[0m
+[32m[     5.758][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=213586028 len=512 file_size=183195854 block_size=4096 iblock_start=52145[0m
+[32m[     5.759][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52145 end_lblock=52146 run_start=52145 cursor=52147 run_len=2[0m
+[32m[     5.769][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=159788193 len=512 file_size=238808443 block_size=4096 iblock_start=39010[0m
+[32m[     5.778][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=227619528 len=512 file_size=167799294 block_size=4096 iblock_start=55571[0m
+[32m[     5.785][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=55571 end_lblock=55572 run_start=55571 cursor=55699 run_len=128[0m
+[32m[     5.796][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=195398514 len=512 file_size=211499870 block_size=4096 iblock_start=47704[0m
+[32m[     5.806][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=112957832 len=512 file_size=21254072 block_size=4096 iblock_start=27577[0m
+[32m[     5.817][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=165702813 len=512 file_size=43438981 block_size=4096 iblock_start=40454[0m
+[32m[     5.825][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=40454 end_lblock=40455 run_start=40454 cursor=40582 run_len=128[0m
+[32m[     5.836][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=106003489 len=512 file_size=260038001 block_size=4096 iblock_start=25879[0m
+[32m[     5.841][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25879 end_lblock=25880 run_start=25879 cursor=26007 run_len=128[0m
+[32m[     5.850][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=132840736 len=512 file_size=83597702 block_size=4096 iblock_start=32431[0m
+[32m[     5.858][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=21712796 len=512 file_size=4720759 block_size=4096 iblock_start=5300[0m
+[32m[     5.867][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=184002442 len=512 file_size=247964958 block_size=4096 iblock_start=44922[0m
+[32m[     5.869][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=44922 end_lblock=44923 run_start=44922 cursor=44959 run_len=37[0m
+[32m[     5.878][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=265863897 len=512 file_size=18841839 block_size=4096 iblock_start=64908[0m
+[32m[     5.882][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64908 end_lblock=64909 run_start=64908 cursor=64991 run_len=83[0m
+[32m[     5.891][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=6521378 len=512 file_size=187868321 block_size=4096 iblock_start=1592[0m
+[32m[     5.892][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=1592 end_lblock=1593 run_start=1592 cursor=1605 run_len=13[0m
+[32m[     5.901][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=95177410 len=512 file_size=222334284 block_size=4096 iblock_start=23236[0m
+[32m[     5.908][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=68995618 len=512 file_size=94524109 block_size=4096 iblock_start=16844[0m
+[32m[     5.915][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=16844 end_lblock=16845 run_start=16844 cursor=16972 run_len=128[0m
+[32m[     5.923][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=254980006 len=512 file_size=179671524 block_size=4096 iblock_start=62250[0m
+[32m[     5.933][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=53566225 len=512 file_size=130019039 block_size=4096 iblock_start=13077[0m
+[32m[     5.934][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13077 end_lblock=13078 run_start=13077 cursor=13093 run_len=16[0m
+[32m[     5.945][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=147663733 len=512 file_size=170513756 block_size=4096 iblock_start=36050[0m
+[32m[     5.955][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=12941258 len=512 file_size=176942602 block_size=4096 iblock_start=3159[0m
+[32m[     5.965][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=37671348 len=512 file_size=64735834 block_size=4096 iblock_start=9197[0m
+[32m[     5.967][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9197 end_lblock=9198 run_start=9197 cursor=9235 run_len=38[0m
+[32m[     5.976][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=155649712 len=512 file_size=27166547 block_size=4096 iblock_start=38000[0m
+[32m[     5.987][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=197835503 len=512 file_size=99753693 block_size=4096 iblock_start=48299[0m
+[32m[     5.993][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=48299 end_lblock=48300 run_start=48299 cursor=48427 run_len=128[0m
+[32m[     6.003][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=19688762 len=512 file_size=237753425 block_size=4096 iblock_start=4806[0m
+[32m[     6.013][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=106850192 len=512 file_size=154814589 block_size=4096 iblock_start=26086[0m
+[32m[     6.020][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26086 end_lblock=26087 run_start=26086 cursor=26184 run_len=98[0m
+[32m[     6.032][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196589233 len=512 file_size=117865462 block_size=4096 iblock_start=47995[0m
+[32m[     6.042][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=20977326 len=512 file_size=126995255 block_size=4096 iblock_start=5121[0m
+[32m[     6.051][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257884043 len=512 file_size=153751637 block_size=4096 iblock_start=62959[0m
+[32m[     6.057][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62959 end_lblock=62960 run_start=62959 cursor=63087 run_len=128[0m
+[32m[     6.067][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=225433323 len=512 file_size=19330617 block_size=4096 iblock_start=55037[0m
+[32m[     6.077][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=19289640 len=512 file_size=236103132 block_size=4096 iblock_start=4709[0m
+[32m[     6.080][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4709 end_lblock=4710 run_start=4709 cursor=4759 run_len=50[0m
+[32m[     6.090][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=48004446 len=512 file_size=56518850 block_size=4096 iblock_start=11719[0m
+[32m[     6.097][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=11719 end_lblock=11720 run_start=11719 cursor=11847 run_len=128[0m
+[32m[     6.107][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=130578551 len=512 file_size=146825697 block_size=4096 iblock_start=31879[0m
+[32m[     6.114][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31879 end_lblock=31880 run_start=31879 cursor=32007 run_len=128[0m
+[32m[     6.124][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=29722058 len=512 file_size=31377951 block_size=4096 iblock_start=7256[0m
+[32m[     6.133][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=165581964 len=512 file_size=232278709 block_size=4096 iblock_start=40425[0m
+[32m[     6.135][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=40425 end_lblock=40426 run_start=40425 cursor=40454 run_len=29[0m
+[32m[     6.145][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=79275113 len=512 file_size=175897394 block_size=4096 iblock_start=19354[0m
+[32m[     6.154][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=58365760 len=512 file_size=34827830 block_size=4096 iblock_start=14249[0m
+[32m[     6.155][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14249 end_lblock=14250 run_start=14249 cursor=14251 run_len=2[0m
+[32m[     6.165][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=260227716 len=512 file_size=123736487 block_size=4096 iblock_start=63532[0m
+[32m[     6.172][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=63532 end_lblock=63533 run_start=63532 cursor=63660 run_len=128[0m
+[32m[     6.182][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=61111853 len=512 file_size=128202991 block_size=4096 iblock_start=14919[0m
+[32m[     6.187][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14919 end_lblock=14920 run_start=14919 cursor=15047 run_len=128[0m
+[32m[     6.197][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=212680841 len=512 file_size=252189661 block_size=4096 iblock_start=51924[0m
+[32m[     6.199][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=51924 end_lblock=51925 run_start=51924 cursor=51957 run_len=33[0m
+[32m[     6.208][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=216128222 len=512 file_size=184293495 block_size=4096 iblock_start=52765[0m
+[32m[     6.209][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52765 end_lblock=52766 run_start=52765 cursor=52776 run_len=11[0m
+[32m[     6.220][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=60206037 len=512 file_size=122178766 block_size=4096 iblock_start=14698[0m
+[32m[     6.225][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14698 end_lblock=14699 run_start=14698 cursor=14826 run_len=128[0m
+[32m[     6.235][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=14521089 len=512 file_size=168456801 block_size=4096 iblock_start=3545[0m
+[32m[     6.241][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3545 end_lblock=3546 run_start=3545 cursor=3673 run_len=128[0m
+[32m[     6.251][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=262412682 len=512 file_size=117433968 block_size=4096 iblock_start=64065[0m
+[32m[     6.257][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64065 end_lblock=64066 run_start=64065 cursor=64193 run_len=128[0m
+[32m[     6.267][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=182724152 len=512 file_size=261817959 block_size=4096 iblock_start=44610[0m
+[32m[     6.273][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=44610 end_lblock=44611 run_start=44610 cursor=44738 run_len=128[0m
+[32m[     6.284][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=126910752 len=512 file_size=24073387 block_size=4096 iblock_start=30984[0m
+[32m[     6.294][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=162011888 len=512 file_size=107854882 block_size=4096 iblock_start=39553[0m
+[32m[     6.303][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124696209 len=512 file_size=146054350 block_size=4096 iblock_start=30443[0m
+[32m[     6.313][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=18776269 len=512 file_size=155100842 block_size=4096 iblock_start=4584[0m
+[32m[     6.319][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=4584 end_lblock=4585 run_start=4584 cursor=4709 run_len=125[0m
+[32m[     6.329][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=162513468 len=512 file_size=188859197 block_size=4096 iblock_start=39676[0m
+[32m[     6.334][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39676 end_lblock=39677 run_start=39676 cursor=39804 run_len=128[0m
+[32m[     6.343][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=100891296 len=512 file_size=129554548 block_size=4096 iblock_start=24631[0m
+[32m[     6.348][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24631 end_lblock=24632 run_start=24631 cursor=24759 run_len=128[0m
+[32m[     6.357][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=154344056 len=512 file_size=23246203 block_size=4096 iblock_start=37681[0m
+[32m[     6.360][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37681 end_lblock=37682 run_start=37681 cursor=37754 run_len=73[0m
+[32m[     6.369][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=129375623 len=512 file_size=243814557 block_size=4096 iblock_start=31585[0m
+[32m[     6.372][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=31585 end_lblock=31586 run_start=31585 cursor=31657 run_len=72[0m
+[32m[     6.382][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=266625086 len=512 file_size=66234320 block_size=4096 iblock_start=65094[0m
+[32m[     6.391][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=117563457 len=512 file_size=36788703 block_size=4096 iblock_start=28702[0m
+[32m[     6.400][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=39608437 len=512 file_size=113416806 block_size=4096 iblock_start=9670[0m
+[32m[     6.405][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9670 end_lblock=9671 run_start=9670 cursor=9798 run_len=128[0m
+[32m[     6.415][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=121370797 len=512 file_size=190251641 block_size=4096 iblock_start=29631[0m
+[32m[     6.424][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=57812181 len=512 file_size=19675009 block_size=4096 iblock_start=14114[0m
+[32m[     6.433][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257762872 len=512 file_size=8012566 block_size=4096 iblock_start=62930[0m
+[32m[     6.442][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=158703884 len=512 file_size=84162017 block_size=4096 iblock_start=38746[0m
+[32m[     6.447][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38746 end_lblock=38747 run_start=38746 cursor=38874 run_len=128[0m
+[32m[     6.456][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124642858 len=512 file_size=107200436 block_size=4096 iblock_start=30430[0m
+[32m[     6.465][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=45927709 len=512 file_size=183859236 block_size=4096 iblock_start=11212[0m
+[32m[     6.474][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=64767366 len=512 file_size=183528376 block_size=4096 iblock_start=15812[0m
+[32m[     6.483][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=43785262 len=512 file_size=163522395 block_size=4096 iblock_start=10689[0m
+[32m[     6.493][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=39464243 len=512 file_size=141346739 block_size=4096 iblock_start=9634[0m
+[32m[     6.495][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9634 end_lblock=9635 run_start=9634 cursor=9670 run_len=36[0m
+[32m[     6.505][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=67217667 len=512 file_size=189236968 block_size=4096 iblock_start=16410[0m
+[32m[     6.514][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=185247925 len=512 file_size=157620200 block_size=4096 iblock_start=45226[0m
+[32m[     6.517][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=45226 end_lblock=45227 run_start=45226 cursor=45283 run_len=57[0m
+[32m[     6.527][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=204426286 len=512 file_size=40679973 block_size=4096 iblock_start=49908[0m
+[32m[     6.536][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=167463833 len=512 file_size=191913456 block_size=4096 iblock_start=40884[0m
+[32m[     6.541][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=40884 end_lblock=40885 run_start=40884 cursor=41012 run_len=128[0m
+[32m[     6.551][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=124613601 len=512 file_size=122916436 block_size=4096 iblock_start=30423[0m
+[32m[     6.552][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=30423 end_lblock=30424 run_start=30423 cursor=30427 run_len=4[0m
+[32m[     6.562][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=201678310 len=512 file_size=77681528 block_size=4096 iblock_start=49237[0m
+[32m[     6.571][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=59010125 len=512 file_size=89582404 block_size=4096 iblock_start=14406[0m
+[32m[     6.576][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14406 end_lblock=14407 run_start=14406 cursor=14534 run_len=128[0m
+[32m[     6.586][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196668270 len=512 file_size=197643725 block_size=4096 iblock_start=48014[0m
+[32m[     6.595][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=110829734 len=512 file_size=103705885 block_size=4096 iblock_start=27058[0m
+[32m[     6.596][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=27058 end_lblock=27059 run_start=27058 cursor=27059 run_len=1[0m
+[32m[     6.606][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=89047357 len=512 file_size=201126965 block_size=4096 iblock_start=21740[0m
+[32m[     6.611][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21740 end_lblock=21741 run_start=21740 cursor=21868 run_len=128[0m
+[32m[     6.621][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=135282148 len=512 file_size=207935403 block_size=4096 iblock_start=33027[0m
+[32m[     6.627][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=33027 end_lblock=33028 run_start=33027 cursor=33155 run_len=128[0m
+[32m[     6.637][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=46804052 len=512 file_size=131577368 block_size=4096 iblock_start=11426[0m
+[32m[     6.648][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=232787848 len=512 file_size=47118237 block_size=4096 iblock_start=56832[0m
+[32m[     6.655][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56832 end_lblock=56833 run_start=56832 cursor=56960 run_len=128[0m
+[32m[     6.666][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=89562491 len=512 file_size=19574727 block_size=4096 iblock_start=21865[0m
+[32m[     6.676][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=137150188 len=512 file_size=261111817 block_size=4096 iblock_start=33483[0m
+[32m[     6.686][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=248779406 len=512 file_size=148459733 block_size=4096 iblock_start=60737[0m
+[32m[     6.690][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=60737 end_lblock=60738 run_start=60737 cursor=60819 run_len=82[0m
+[32m[     6.700][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=178202308 len=512 file_size=187937281 block_size=4096 iblock_start=43506[0m
+[32m[     6.710][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=152641373 len=512 file_size=113495349 block_size=4096 iblock_start=37265[0m
+[32m[     6.716][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37265 end_lblock=37266 run_start=37265 cursor=37393 run_len=128[0m
+[32m[     6.727][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143642669 len=512 file_size=218020059 block_size=4096 iblock_start=35069[0m
+[32m[     6.736][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=190004648 len=512 file_size=152333759 block_size=4096 iblock_start=46387[0m
+[32m[     6.740][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=46387 end_lblock=46388 run_start=46387 cursor=46495 run_len=108[0m
+[32m[     6.750][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=114810023 len=512 file_size=82094361 block_size=4096 iblock_start=28029[0m
+[32m[     6.759][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=245186849 len=512 file_size=143050185 block_size=4096 iblock_start=59860[0m
+[32m[     6.781][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=118779069 len=512 file_size=103413605 block_size=4096 iblock_start=28998[0m
+[32m[     6.786][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28998 end_lblock=28999 run_start=28998 cursor=29126 run_len=128[0m
+[32m[     6.794][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=190411859 len=512 file_size=222803411 block_size=4096 iblock_start=46487[0m
+[32m[     6.802][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=60945916 len=512 file_size=16867766 block_size=4096 iblock_start=14879[0m
+[32m[     6.805][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14879 end_lblock=14880 run_start=14879 cursor=14919 run_len=40[0m
+[32m[     6.814][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=92993953 len=512 file_size=190360485 block_size=4096 iblock_start=22703[0m
+[32m[     6.820][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=22703 end_lblock=22704 run_start=22703 cursor=22831 run_len=128[0m
+[32m[     6.828][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=151811133 len=512 file_size=156624040 block_size=4096 iblock_start=37063[0m
+[32m[     6.831][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37063 end_lblock=37064 run_start=37063 cursor=37124 run_len=61[0m
+[32m[     6.840][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=136185872 len=512 file_size=259093936 block_size=4096 iblock_start=33248[0m
+[32m[     6.848][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=15959872 len=512 file_size=152446483 block_size=4096 iblock_start=3896[0m
+[32m[     6.853][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3896 end_lblock=3897 run_start=3896 cursor=4024 run_len=128[0m
+[32m[     6.861][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=267665174 len=512 file_size=194659466 block_size=4096 iblock_start=65347[0m
+[32m[     6.869][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=69920252 len=512 file_size=105007878 block_size=4096 iblock_start=17070[0m
+[32m[     6.878][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=19234017 len=512 file_size=24846404 block_size=4096 iblock_start=4695[0m
+[32m[     6.887][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=146489468 len=512 file_size=25746746 block_size=4096 iblock_start=35764[0m
+[32m[     6.894][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35764 end_lblock=35765 run_start=35764 cursor=35892 run_len=128[0m
+[32m[     6.904][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=36158615 len=512 file_size=250760339 block_size=4096 iblock_start=8827[0m
+[32m[     6.906][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=8827 end_lblock=8828 run_start=8827 cursor=8853 run_len=26[0m
+[32m[     6.916][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=196411706 len=512 file_size=126448349 block_size=4096 iblock_start=47952[0m
+[32m[     6.925][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=104836102 len=512 file_size=220289337 block_size=4096 iblock_start=25594[0m
+[32m[     6.935][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=109279527 len=512 file_size=80810625 block_size=4096 iblock_start=26679[0m
+[32m[     6.941][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26679 end_lblock=26680 run_start=26679 cursor=26794 run_len=115[0m
+[32m[     6.950][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=177271740 len=512 file_size=29724816 block_size=4096 iblock_start=43279[0m
+[32m[     6.957][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43279 end_lblock=43280 run_start=43279 cursor=43407 run_len=128[0m
+[32m[     6.967][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=184617995 len=512 file_size=98956977 block_size=4096 iblock_start=45072[0m
+[32m[     6.976][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=48199314 len=512 file_size=153983602 block_size=4096 iblock_start=11767[0m
+[32m[     6.985][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=137250622 len=512 file_size=151835022 block_size=4096 iblock_start=33508[0m
+[32m[     6.994][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257398643 len=512 file_size=132180454 block_size=4096 iblock_start=62841[0m
+[32m[     7.004][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=140210712 len=512 file_size=108709874 block_size=4096 iblock_start=34231[0m
+[32m[     7.010][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=34231 end_lblock=34232 run_start=34231 cursor=34359 run_len=128[0m
+[32m[     7.020][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=232307578 len=512 file_size=237683513 block_size=4096 iblock_start=56715[0m
+[32m[     7.026][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56715 end_lblock=56716 run_start=56715 cursor=56832 run_len=117[0m
+[32m[     7.036][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=119763019 len=512 file_size=192208211 block_size=4096 iblock_start=29239[0m
+[32m[     7.042][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=29239 end_lblock=29240 run_start=29239 cursor=29367 run_len=128[0m
+[32m[     7.051][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=97575467 len=512 file_size=70891368 block_size=4096 iblock_start=23822[0m
+[32m[     7.058][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=101190637 len=512 file_size=166602241 block_size=4096 iblock_start=24704[0m
+[32m[     7.065][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=101043047 len=512 file_size=252356229 block_size=4096 iblock_start=24668[0m
+[32m[     7.073][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=8864041 len=512 file_size=146371838 block_size=4096 iblock_start=2164[0m
+[32m[     7.077][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=2164 end_lblock=2165 run_start=2164 cursor=2230 run_len=66[0m
+[32m[     7.086][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=147217990 len=512 file_size=234823647 block_size=4096 iblock_start=35941[0m
+[32m[     7.088][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35941 end_lblock=35942 run_start=35941 cursor=35982 run_len=41[0m
+[32m[     7.096][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=3486578 len=512 file_size=86547241 block_size=4096 iblock_start=851[0m
+[32m[     7.104][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=164222314 len=512 file_size=203045606 block_size=4096 iblock_start=40093[0m
+[32m[     7.112][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=29028561 len=512 file_size=125643569 block_size=4096 iblock_start=7087[0m
+[32m[     7.119][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=7595235 len=512 file_size=146225961 block_size=4096 iblock_start=1854[0m
+[32m[     7.126][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=1854 end_lblock=1855 run_start=1854 cursor=1982 run_len=128[0m
+[32m[     7.135][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=179273957 len=512 file_size=245139837 block_size=4096 iblock_start=43768[0m
+[32m[     7.140][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=43768 end_lblock=43769 run_start=43768 cursor=43896 run_len=128[0m
+[32m[     7.148][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=91624997 len=512 file_size=243354529 block_size=4096 iblock_start=22369[0m
+[32m[     7.155][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=239592658 len=512 file_size=203206553 block_size=4096 iblock_start=58494[0m
+[32m[     7.160][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=58494 end_lblock=58495 run_start=58494 cursor=58622 run_len=128[0m
+[32m[     7.169][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=229863183 len=512 file_size=256506945 block_size=4096 iblock_start=56118[0m
+[32m[     7.170][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56118 end_lblock=56119 run_start=56118 cursor=56141 run_len=23[0m
+[32m[     7.178][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=104666037 len=512 file_size=213552569 block_size=4096 iblock_start=25553[0m
+[32m[     7.179][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25553 end_lblock=25554 run_start=25553 cursor=25570 run_len=17[0m
+[32m[     7.187][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=158631542 len=512 file_size=116284799 block_size=4096 iblock_start=38728[0m
+[32m[     7.188][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=38728 end_lblock=38729 run_start=38728 cursor=38746 run_len=18[0m
+[32m[     7.196][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=153191602 len=512 file_size=115774052 block_size=4096 iblock_start=37400[0m
+[32m[     7.201][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37400 end_lblock=37401 run_start=37400 cursor=37528 run_len=128[0m
+[32m[     7.209][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=2101785 len=512 file_size=171666745 block_size=4096 iblock_start=513[0m
+[32m[     7.219][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=136337668 len=512 file_size=93094012 block_size=4096 iblock_start=33285[0m
+[32m[     7.226][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=152316394 len=512 file_size=941366 block_size=4096 iblock_start=37186[0m
+[32m[     7.234][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=223023753 len=512 file_size=181785380 block_size=4096 iblock_start=54449[0m
+[32m[     7.242][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=214398849 len=512 file_size=203289359 block_size=4096 iblock_start=52343[0m
+[32m[     7.245][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52343 end_lblock=52344 run_start=52343 cursor=52411 run_len=68[0m
+[32m[     7.253][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=222851258 len=512 file_size=229863411 block_size=4096 iblock_start=54407[0m
+[32m[     7.261][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=104705242 len=512 file_size=181292090 block_size=4096 iblock_start=25562[0m
+[32m[     7.269][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=228342003 len=512 file_size=225304291 block_size=4096 iblock_start=55747[0m
+[32m[     7.275][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=55747 end_lblock=55748 run_start=55747 cursor=55875 run_len=128[0m
+[32m[     7.283][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=181154409 len=512 file_size=20291328 block_size=4096 iblock_start=44227[0m
+[32m[     7.288][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=44227 end_lblock=44228 run_start=44227 cursor=44355 run_len=128[0m
+[32m[     7.296][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=40678496 len=512 file_size=148010200 block_size=4096 iblock_start=9931[0m
+[32m[     7.301][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9931 end_lblock=9932 run_start=9931 cursor=10059 run_len=128[0m
+[32m[     7.310][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=59638037 len=512 file_size=239188834 block_size=4096 iblock_start=14560[0m
+[32m[     7.318][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=14560 end_lblock=14561 run_start=14560 cursor=14688 run_len=128[0m
+[32m[     7.329][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=135414698 len=512 file_size=82019418 block_size=4096 iblock_start=33060[0m
+[32m[     7.339][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=211571992 len=512 file_size=234463416 block_size=4096 iblock_start=51653[0m
+[32m[     7.347][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=4587801 len=512 file_size=93155242 block_size=4096 iblock_start=1120[0m
+[32m[     7.356][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=107026156 len=512 file_size=28491497 block_size=4096 iblock_start=26129[0m
+[32m[     7.366][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=191570855 len=512 file_size=252110194 block_size=4096 iblock_start=46770[0m
+[32m[     7.376][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=1991621 len=512 file_size=52847609 block_size=4096 iblock_start=486[0m
+[32m[     7.387][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=106835060 len=512 file_size=71971987 block_size=4096 iblock_start=26082[0m
+[32m[     7.388][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26082 end_lblock=26083 run_start=26082 cursor=26086 run_len=4[0m
+[32m[     7.399][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=166533221 len=512 file_size=245907368 block_size=4096 iblock_start=40657[0m
+[32m[     7.408][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=83205843 len=512 file_size=124731978 block_size=4096 iblock_start=20313[0m
+[32m[     7.417][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=87198776 len=512 file_size=61951029 block_size=4096 iblock_start=21288[0m
+[32m[     7.426][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=236703203 len=512 file_size=191666773 block_size=4096 iblock_start=57788[0m
+[32m[     7.436][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=85568525 len=512 file_size=50446890 block_size=4096 iblock_start=20890[0m
+[32m[     7.441][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=20890 end_lblock=20891 run_start=20890 cursor=21018 run_len=128[0m
+[32m[     7.451][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=66384301 len=512 file_size=209896470 block_size=4096 iblock_start=16207[0m
+[32m[     7.454][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=16207 end_lblock=16208 run_start=16207 cursor=16252 run_len=45[0m
+[32m[     7.465][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=75677642 len=512 file_size=103102241 block_size=4096 iblock_start=18475[0m
+[32m[     7.474][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=212547637 len=512 file_size=203963723 block_size=4096 iblock_start=51891[0m
+[32m[     7.476][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=51891 end_lblock=51892 run_start=51891 cursor=51924 run_len=33[0m
+[32m[     7.485][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=263023510 len=512 file_size=109263749 block_size=4096 iblock_start=64214[0m
+[32m[     7.490][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=64214 end_lblock=64215 run_start=64214 cursor=64342 run_len=128[0m
+[32m[     7.500][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=266966632 len=512 file_size=268126505 block_size=4096 iblock_start=65177[0m
+[32m[     7.509][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=232046399 len=512 file_size=191323506 block_size=4096 iblock_start=56651[0m
+[32m[     7.512][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=56651 end_lblock=56652 run_start=56651 cursor=56715 run_len=64[0m
+[32m[     7.524][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=201024788 len=512 file_size=166180991 block_size=4096 iblock_start=49078[0m
+[32m[     7.527][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=49078 end_lblock=49079 run_start=49078 cursor=49114 run_len=36[0m
+[32m[     7.537][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=44687522 len=512 file_size=149642382 block_size=4096 iblock_start=10910[0m
+[32m[     7.546][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=114631036 len=512 file_size=146422524 block_size=4096 iblock_start=27986[0m
+[32m[     7.555][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=40292535 len=512 file_size=166412397 block_size=4096 iblock_start=9837[0m
+[32m[     7.559][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9837 end_lblock=9838 run_start=9837 cursor=9931 run_len=94[0m
+[32m[     7.569][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=99635988 len=512 file_size=229395815 block_size=4096 iblock_start=24325[0m
+[32m[     7.572][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24325 end_lblock=24326 run_start=24325 cursor=24370 run_len=45[0m
+[32m[     7.582][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=163318924 len=512 file_size=158491479 block_size=4096 iblock_start=39872[0m
+[32m[     7.585][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39872 end_lblock=39873 run_start=39872 cursor=39920 run_len=48[0m
+[32m[     7.595][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=171890869 len=512 file_size=184145999 block_size=4096 iblock_start=41965[0m
+[32m[     7.601][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=41965 end_lblock=41966 run_start=41965 cursor=42093 run_len=128[0m
+[32m[     7.611][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=2118317 len=512 file_size=184418592 block_size=4096 iblock_start=517[0m
+[32m[     7.620][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=265554288 len=512 file_size=74006640 block_size=4096 iblock_start=64832[0m
+[32m[     7.629][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=101857182 len=512 file_size=227590436 block_size=4096 iblock_start=24867[0m
+[32m[     7.636][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=24867 end_lblock=24868 run_start=24867 cursor=24995 run_len=128[0m
+[32m[     7.646][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=80473978 len=512 file_size=1215661 block_size=4096 iblock_start=19646[0m
+[32m[     7.655][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=228510819 len=512 file_size=143685188 block_size=4096 iblock_start=55788[0m
+[32m[     7.664][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=190612914 len=512 file_size=55056063 block_size=4096 iblock_start=46536[0m
+[32m[     7.673][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=63225937 len=512 file_size=265315775 block_size=4096 iblock_start=15436[0m
+[32m[     7.682][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=85655303 len=512 file_size=150796205 block_size=4096 iblock_start=20911[0m
+[32m[     7.692][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=188895093 len=512 file_size=84281096 block_size=4096 iblock_start=46116[0m
+[32m[     7.697][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=46116 end_lblock=46117 run_start=46116 cursor=46244 run_len=128[0m
+[32m[     7.707][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=54340915 len=512 file_size=148989438 block_size=4096 iblock_start=13266[0m
+[32m[     7.713][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=13266 end_lblock=13267 run_start=13266 cursor=13394 run_len=128[0m
+[32m[     7.723][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=214480606 len=512 file_size=228585636 block_size=4096 iblock_start=52363[0m
+[32m[     7.732][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=169840668 len=512 file_size=235989156 block_size=4096 iblock_start=41465[0m
+[32m[     7.738][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=41465 end_lblock=41466 run_start=41465 cursor=41593 run_len=128[0m
+[32m[     7.748][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=10920152 len=512 file_size=107638141 block_size=4096 iblock_start=2666[0m
+[32m[     7.752][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=2666 end_lblock=2667 run_start=2666 cursor=2771 run_len=105[0m
+[32m[     7.762][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=262105572 len=512 file_size=184589591 block_size=4096 iblock_start=63990[0m
+[32m[     7.766][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=63990 end_lblock=63991 run_start=63990 cursor=64065 run_len=75[0m
+[32m[     7.776][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=22586012 len=512 file_size=161966968 block_size=4096 iblock_start=5514[0m
+[32m[     7.779][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=5514 end_lblock=5515 run_start=5514 cursor=5587 run_len=73[0m
+[32m[     7.789][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=110273604 len=512 file_size=107791447 block_size=4096 iblock_start=26922[0m
+[32m[     7.794][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=26922 end_lblock=26923 run_start=26922 cursor=27050 run_len=128[0m
+[32m[     7.804][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=116498300 len=512 file_size=199885113 block_size=4096 iblock_start=28441[0m
+[32m[     7.809][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28441 end_lblock=28442 run_start=28441 cursor=28569 run_len=128[0m
+[32m[     7.819][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=251336891 len=512 file_size=64193478 block_size=4096 iblock_start=61361[0m
+[32m[     7.823][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=61361 end_lblock=61362 run_start=61361 cursor=61457 run_len=96[0m
+[32m[     7.833][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=25236487 len=512 file_size=110850931 block_size=4096 iblock_start=6161[0m
+[32m[     7.835][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6161 end_lblock=6162 run_start=6161 cursor=6197 run_len=36[0m
+[32m[     7.845][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=81262007 len=512 file_size=241591853 block_size=4096 iblock_start=19839[0m
+[32m[     7.848][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19839 end_lblock=19840 run_start=19839 cursor=19919 run_len=80[0m
+[32m[     7.858][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=115205700 len=512 file_size=203083039 block_size=4096 iblock_start=28126[0m
+[32m[     7.863][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=28126 end_lblock=28127 run_start=28126 cursor=28254 run_len=128[0m
+[32m[     7.872][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=143824380 len=512 file_size=244523106 block_size=4096 iblock_start=35113[0m
+[32m[     7.877][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35113 end_lblock=35114 run_start=35113 cursor=35241 run_len=128[0m
+[32m[     7.886][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=14595822 len=512 file_size=250606195 block_size=4096 iblock_start=3563[0m
+[32m[     7.895][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=32222803 len=512 file_size=190934770 block_size=4096 iblock_start=7866[0m
+[32m[     7.897][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=7866 end_lblock=7867 run_start=7866 cursor=7904 run_len=38[0m
+[32m[     7.907][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=24867968 len=512 file_size=110180243 block_size=4096 iblock_start=6071[0m
+[32m[     7.911][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=6071 end_lblock=6072 run_start=6071 cursor=6161 run_len=90[0m
+[32m[     7.921][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=94221079 len=512 file_size=157474428 block_size=4096 iblock_start=23003[0m
+[32m[     7.926][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=23003 end_lblock=23004 run_start=23003 cursor=23131 run_len=128[0m
+[32m[     7.936][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=170311120 len=512 file_size=234875105 block_size=4096 iblock_start=41579[0m
+[32m[     7.941][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=41579 end_lblock=41580 run_start=41579 cursor=41707 run_len=128[0m
+[32m[     7.951][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=257498677 len=512 file_size=120025847 block_size=4096 iblock_start=62865[0m
+[32m[     7.956][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=62865 end_lblock=62866 run_start=62865 cursor=62993 run_len=128[0m
+[32m[     7.966][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=88374701 len=512 file_size=31347538 block_size=4096 iblock_start=21575[0m
+[32m[     7.971][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21575 end_lblock=21576 run_start=21575 cursor=21703 run_len=128[0m
+[32m[     7.980][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=94589199 len=512 file_size=109973906 block_size=4096 iblock_start=23093[0m
+[32m[     7.989][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=144369412 len=512 file_size=254630454 block_size=4096 iblock_start=35246[0m
+[32m[     7.994][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=35246 end_lblock=35247 run_start=35246 cursor=35374 run_len=128[0m
+[32m[     8.003][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=153307016 len=512 file_size=90723082 block_size=4096 iblock_start=37428[0m
+[32m[     8.008][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=37428 end_lblock=37429 run_start=37428 cursor=37556 run_len=128[0m
+[32m[     8.019][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=40274099 len=512 file_size=235397381 block_size=4096 iblock_start=9832[0m
+[32m[     8.024][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=9832 end_lblock=9833 run_start=9832 cursor=9960 run_len=128[0m
+[32m[     8.035][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=78378662 len=512 file_size=255653164 block_size=4096 iblock_start=19135[0m
+[32m[     8.042][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=19135 end_lblock=19136 run_start=19135 cursor=19263 run_len=128[0m
+[32m[     8.052][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=25050740 len=512 file_size=150104626 block_size=4096 iblock_start=6115[0m
+[32m[     8.061][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=161367583 len=512 file_size=3918443 block_size=4096 iblock_start=39396[0m
+[32m[     8.068][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=39396 end_lblock=39397 run_start=39396 cursor=39524 run_len=128[0m
+[32m[     8.078][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=213168480 len=512 file_size=10357269 block_size=4096 iblock_start=52043[0m
+[32m[     8.086][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=52043 end_lblock=52044 run_start=52043 cursor=52171 run_len=128[0m
+[32m[     8.098][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=170516086 len=512 file_size=177625735 block_size=4096 iblock_start=41629[0m
+[32m[     8.108][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=240486127 len=512 file_size=255408072 block_size=4096 iblock_start=58712[0m
+[32m[     8.115][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=58712 end_lblock=58713 run_start=58712 cursor=58840 run_len=128[0m
+[32m[     8.125][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=106409434 len=512 file_size=196226605 block_size=4096 iblock_start=25978[0m
+[32m[     8.132][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=25978 end_lblock=25979 run_start=25978 cursor=26106 run_len=128[0m
+[32m[     8.143][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=252769734 len=512 file_size=217618617 block_size=4096 iblock_start=61711[0m
+[32m[     8.150][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=61711 end_lblock=61712 run_start=61711 cursor=61839 run_len=128[0m
+[32m[     8.161][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=89299348 len=512 file_size=109664193 block_size=4096 iblock_start=21801[0m
+[32m[     8.168][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=21801 end_lblock=21802 run_start=21801 cursor=21929 run_len=128[0m
+[32m[     8.178][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=259729953 len=512 file_size=205881132 block_size=4096 iblock_start=63410[0m
+[32m[     8.185][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=63410 end_lblock=63411 run_start=63410 cursor=63538 run_len=128[0m
+[32m[     8.195][0m [31mERROR[0m: [39m[sparse-debug] write_at inode=13 offset=15570997 len=512 file_size=168616866 block_size=4096 iblock_start=3801[0m
+[32m[     8.200][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3801 end_lblock=3802 run_start=3801 cursor=3896 run_len=95[0m
+[32m[     8.207][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3801 end_lblock=3802 run_start=3801 cursor=3929 run_len=128[0m
+[32m[     8.212][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3801 end_lblock=3802 run_start=3801 cursor=3929 run_len=128[0m
+[32m[     8.217][0m [31mERROR[0m: [39m[sparse-debug] map_range inode=13 start_lblock=3801 end_lblock=3802 run_start=3801 cursor=3929 run_len=128[0m
+[32m[     8.218][0m [31mERROR[0m: [39mext4 write_at failed: ino=13 offset=15570997 len=512 err=Error { errno: ENOENT, msg: None }[0m
+xfstests case done: generic/014 rc=1
+xfstests fsstate: post:generic/014 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr  7 16:44 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr  7 16:44 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+===== FAIL LOG: generic/014 =====
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/014        - output mismatch (see /opt/xfstests/xfstests-dev/results//generic/014.out.bad)
+    --- tests/generic/014.out
+    +++ /opt/xfstests/xfstests-dev/results//generic/014.out.bad
+    @@ -3,4 +3,5 @@
+     ------
+     test 1
+     ------
+    -OK
+    +truncfile returned 1 : "write: No such file or directory
+    +Seed = 1775580293 (use "-s 1775580293" to re-execute this test)"
+    ...
+    (Run 'diff -u /opt/xfstests/xfstests-dev/tests/generic/014.out /opt/xfstests/xfstests-dev/results//generic/014.out.bad'  to see the entire diff)
+Ran: generic/014
+Failures: generic/014
+Failed 1 of 1 tests
+----- FULL LOG TAIL: generic/014 -----
+umount: can't unmount /dev/vdb: Invalid argument
+----- END FULL LOG TAIL -----
+----- BAD OUT: generic/014 -----
+QA output created by 014
+brevity is wit...
+------
+test 1
+------
+truncfile returned 1 : "write: No such file or directory
+Seed = 1775580293 (use "-s 1775580293" to re-execute this test)"
+===== END FAIL LOG: generic/014 =====
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+phase6_good\t0\t1\t0\t0\t1\t0.00\t90
+===== phase6_good detailed results =====
+test	status	rc	reason
+generic/014	FAIL	1	generic/014        - output mismatch (see /opt/xfstests/xfstests-dev/results//generic/014.out.bad)
+xfstests phase6_good failed: pass_rate=0.00% < threshold=90%
+See summary: /tmp/xfstests_results/phase6_good_summary.tsv
+Error: xfstests failed.
+[

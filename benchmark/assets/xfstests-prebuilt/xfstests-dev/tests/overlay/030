@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test No. 030
+#
+# Run the t_immutable test program for immutable/append-only files
+# and directories in an overlayfs upper directory.
+#
+# This test is similar and was derived from generic/079, but
+# the original test is _notrun with FSTYP=overlay on kernel < v5.10
+# because prior to commit 61536bed2149 ("ovl: support [S|G]ETFLAGS
+# and FS[S|G]ETXATTR ioctls for directories"), t_immutable -c would
+# fail to prepare immutable/append-only directories on the overlay
+# mount path.
+#
+. ./common/preamble
+_begin_fstest auto quick perms
+
+timmutable=$here/src/t_immutable
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+
+# Override the default cleanup function.
+_cleanup()
+{
+	$timmutable -r $upperdir/t_immutable &> /dev/null
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_chattr ia
+_require_test_program "t_immutable"
+_require_scratch
+
+_scratch_mkfs
+
+# Preparing immutable files in uppper dir
+mkdir -p $upperdir
+$timmutable -C $upperdir/t_immutable >$tmp.out 2>&1
+if grep -q -e 'Operation not supported' -e "Inappropriate ioctl" $tmp.out; then
+	_notrun "Setting immutable/append flag not supported"
+fi
+
+_scratch_mount
+
+# Test immutability of files in overlay
+$timmutable $SCRATCH_MNT/t_immutable 2>&1
+status=$?
+exit

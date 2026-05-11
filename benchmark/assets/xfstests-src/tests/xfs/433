@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 433
+#
+# Regression test for an XFS NULL xattr buffer problem during unlink. XFS had a
+# bug where the attr fork walk during file removal could go off the rails due to
+# a stale reference to content of a released buffer. Memory pressure could cause
+# this reference to point to free or reused memory and cause subsequent
+# attribute fork lookups to fail, return a NULL buffer and possibly crash.
+#
+# This test emulates this behavior using an error injection knob to explicitly
+# disable buffer LRU caching. This forces the attr walk to execute under
+# conditions where each buffer is immediately freed on release.
+#
+# Commit f35c5e10c6ed ("xfs: reinit btree pointer on attr tree inactivation
+# walk") fixed the bug.
+#
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Import common functions.
+. ./common/attr
+. ./common/inject
+
+
+# Modify as appropriate.
+_require_xfs_io_error_injection buf_lru_ref
+_require_scratch
+_require_attrs
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+file=$SCRATCH_MNT/testfile
+
+# create a bunch of xattrs to form a multi-level attr tree
+touch $file
+for i in $(seq 0 499); do
+	$SETFATTR_PROG -n trusted.user.$i -v 0 $file
+done
+
+# cycle the mount to clear any buffer references
+_scratch_cycle_mount || _fail "cycle mount failure"
+
+# disable the lru cache and unlink the file
+_scratch_inject_error buf_lru_ref 1
+rm -f $file
+_scratch_inject_error buf_lru_ref 0
+
+echo Silence is golden
+
+# success, all done
+status=0
+exit

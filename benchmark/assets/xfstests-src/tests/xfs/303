@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle Inc.  All Rights Reserved.
+#
+# FS QA Test No. 303
+#
+# Test to verify xfs_quota(8) administrator commands can deal with invalid
+# storage mount point without NULL pointer dereference problem.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+
+
+echo "Silence is golden"
+
+# To run this sanity check we don't need to enable quota function
+# nor need a scratch device as quota tool will get the mount path
+# at first.
+# An non-existent xfs mount point
+INVALID_PATH="/INVALID_XFS_MOUNT_POINT"
+
+$XFS_QUOTA_PROG -x -c 'report -a' $INVALID_PATH	2>/dev/null
+$XFS_QUOTA_PROG -x -c 'state -a' $INVALID_PATH	2>/dev/null
+$XFS_QUOTA_PROG -x -c 'free -h' $INVALID_PATH		2>/dev/null
+$XFS_QUOTA_PROG -x -c 'quot -v' $INVALID_PATH		2>/dev/null
+$XFS_QUOTA_PROG -x -c 'remove' $INALID_PATH		2>/dev/null
+$XFS_QUOTA_PROG -x -c 'disable' $INVALID_PATH		2>/dev/null
+$XFS_QUOTA_PROG -x -c 'enable' $INVALID_PATH		2>/dev/null
+
+# success, all done
+status=0
+exit

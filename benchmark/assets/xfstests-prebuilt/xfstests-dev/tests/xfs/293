@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 293
+#
+# Ensure all xfs_io commands are documented
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+
+_require_command "$MAN_PROG" man
+
+echo "Silence is golden"
+
+MANPAGE=`$MAN_PROG --path xfs_io`
+
+case "$MANPAGE" in
+*.gz|*.z\|*.Z)	CAT=zcat;;
+*.bz2)		CAT=bzcat;;
+*.xz)		CAT=xzcat;;
+*)		CAT=cat;;
+esac
+
+_require_command "$(type -P $CAT)" $CAT
+
+for COMMAND in `$XFS_IO_PROG -c help | awk '{print $1}' | grep -v "^Use"`; do
+  $CAT "$MANPAGE" | grep -E -q "^\.B.*$COMMAND" || \
+	echo "$COMMAND not documented in the xfs_io manpage"
+done
+
+# success, all done
+status=0
+exit

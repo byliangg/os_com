@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Facebook.  All Rights Reserved.
+#
+# FS QA Test 173
+#
+# Test swap file activation restrictions specific to Btrfs, swap file can't be
+# CoW file nor compressed file.
+#
+. ./common/preamble
+_begin_fstest auto quick swap compress
+
+. ./common/filter
+
+_require_scratch_swapfile
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+echo "COW file"
+# We can't use _format_swapfile because we don't want chattr +C, and we can't
+# unset it after the swap file has been created.
+rm -f "$SCRATCH_MNT/swap"
+touch "$SCRATCH_MNT/swap"
+# Make sure we have a COW file if we were mounted with "-o nodatacow".
+if _normalize_mount_options "$MOUNT_OPTIONS" | grep -q "nodatacow"; then
+	_require_chattr C
+	$CHATTR_PROG -C "$SCRATCH_MNT/swap"
+fi
+chmod 0600 "$SCRATCH_MNT/swap"
+_pwrite_byte 0x61 0 $(($(_get_page_size) * 10)) "$SCRATCH_MNT/swap" >> $seqres.full
+$MKSWAP_PROG "$SCRATCH_MNT/swap" >> $seqres.full
+swapon "$SCRATCH_MNT/swap" 2>&1 | _filter_scratch
+swapoff "$SCRATCH_MNT/swap" >/dev/null 2>&1
+
+echo "Compressed file"
+rm -f "$SCRATCH_MNT/swap"
+_format_swapfile "$SCRATCH_MNT/swap" $(($(_get_page_size) * 10)) > /dev/null
+$CHATTR_PROG +c "$SCRATCH_MNT/swap" 2>&1 | grep -o "Invalid argument while setting flags"
+
+status=0
+exit

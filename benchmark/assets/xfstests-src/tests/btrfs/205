@@ -1,0 +1,176 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 205
+#
+# Test several scenarios of cloning operations where the source range includes
+# inline extents. They used to not be supported on btrfs because their
+# implementation was not straightforward, and therefore these operations used
+# to fail with errno EOPNOTSUPP on older kernels.
+#
+# Support for this was added by a patch with the following subject:
+#
+#   "Btrfs: implement full reflink support for inline extents"
+#
+. ./common/preamble
+_begin_fstest auto quick clone compress prealloc
+
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_xfs_io_command "falloc" "-k"
+_require_command "$CHATTR_PROG" chattr
+_require_btrfs_fs_feature "no_holes"
+_require_btrfs_mkfs_feature "no-holes"
+# We want to create a compressed inline extent representing 4K of data for file
+# foo1 and then clone it into a file without compression, and since compression
+# implies datasum, cloning fails if the destination file has nodatasum. So skip
+# the test if nodatasum is present in MOUNT_OPTIONS.
+_require_btrfs_no_nodatasum
+
+run_tests()
+{
+    rm -f $SCRATCH_MNT/foo* $SCRATCH_MNT/bar*
+
+    # File foo1 has an inline extent encoding 4K of data followed by a regular
+    # extent. It has a file size of 128K.
+    echo "Creating file foo1"
+    touch $SCRATCH_MNT/foo1
+    $CHATTR_PROG +c $SCRATCH_MNT/foo1 > /dev/null 2>&1
+    $XFS_IO_PROG -c "pwrite -S 0xab 0 4K" \
+		 -c "fsync" \
+		 -c "pwrite -S 0xab 4K 124K" \
+		 $SCRATCH_MNT/foo1 | _filter_xfs_io
+
+    # File bar1 has a single 128K extent, and a file size of 128K.
+    echo "Creating file bar1"
+    $XFS_IO_PROG -f -c "pwrite -S 0xcd 0 128K" $SCRATCH_MNT/bar1 | _filter_xfs_io
+
+    echo "Cloning foo1 into the end of bar1"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo1 0 128K 128K" $SCRATCH_MNT/bar1 \
+        | _filter_xfs_io
+
+    echo "File bar1 digest = $(_md5_checksum $SCRATCH_MNT/bar1)"
+
+    # File foo2 has an inline extent with 1000 bytes of data and it's followed
+    # by a regular extent of 60K. It has a file size of 64K.
+    echo "Creating file foo2"
+    $XFS_IO_PROG -f -c "pwrite -S 0xab 0 1000" \
+		 -c "fsync" \
+		 -c "falloc 0 4K" \
+		 -c "pwrite -S 0xab 4K 60K" \
+		 $SCRATCH_MNT/foo2 | _filter_xfs_io
+
+    # File bar2 has a regular extent of 64K and a file size of 64K too.
+    echo "Creating file bar2"
+    $XFS_IO_PROG -f -c "pwrite -S 0xcd 0 64K" $SCRATCH_MNT/bar2 | _filter_xfs_io
+
+    echo "Cloning foo2 into the end of bar2"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo2 0 64K 64K" $SCRATCH_MNT/bar2 \
+        | _filter_xfs_io
+
+    echo "File bar2 digest = $(_md5_checksum $SCRATCH_MNT/bar2)"
+
+    # File bar3 has a regular extent of 128K and a file size of 128K too.
+    echo "Creating file bar3"
+    $XFS_IO_PROG -f -c "pwrite -S 0xcd 0 128K" $SCRATCH_MNT/bar3 \
+        | _filter_xfs_io
+
+    echo "Cloning foo2 into the middle of bar3"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo2 0 64K 64K" $SCRATCH_MNT/bar3 \
+        | _filter_xfs_io
+
+    echo "File bar3 digest = $(_md5_checksum $SCRATCH_MNT/bar3)"
+
+    # File bar4 has a 64K hole at offset 0 followed by a 64K regular extent, and
+    # a file size of 128K.
+    echo "Creating file bar4"
+    $XFS_IO_PROG -f -c "pwrite -S 0xcd 64K 64K" $SCRATCH_MNT/bar4 | _filter_xfs_io
+
+    echo "Cloning foo1 into bar4"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo1 0 0 128K" $SCRATCH_MNT/bar4 \
+        | _filter_xfs_io
+
+    echo "File bar4 digest = $(_md5_checksum $SCRATCH_MNT/bar4)"
+
+    # File bar5 has a 1Mb prealloc extent at file offset 0 and a file size of 0.
+    echo "Creating file bar5"
+    $XFS_IO_PROG -f -c "falloc -k 0 1M" $SCRATCH_MNT/bar5
+
+    echo "Cloning foo1 into bar5"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo1 0 0 128K" $SCRATCH_MNT/bar5 \
+        | _filter_xfs_io
+
+    echo "File bar5 digest = $(_md5_checksum $SCRATCH_MNT/bar5)"
+
+    # File bar6 has an inline extent encoding 500 bytes of data followed by a
+    # prealloc extent of 1Mb at file offset 4K. The file size is 500 bytes.
+    echo "Creating file bar6"
+    $XFS_IO_PROG -f -c "pwrite -S 0xef 0 500" \
+		 -c "falloc -k 4K 1M" \
+		 $SCRATCH_MNT/bar6 | _filter_xfs_io
+
+    echo "Cloning foo1 into bar6"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo1 0 0 128K" $SCRATCH_MNT/bar6 \
+        | _filter_xfs_io
+
+    echo "File bar6 digest = $(_md5_checksum $SCRATCH_MNT/bar6)"
+
+    # File foo3 a single inline extent of 500 bytes.
+    echo "Creating file foo3"
+    $XFS_IO_PROG -f -c "pwrite -S 0xbf 0 500" $SCRATCH_MNT/foo3 | _filter_xfs_io
+
+    # File bar7 is an empty file, has no extents.
+    touch $SCRATCH_MNT/bar7
+
+    echo "Cloning foo3 into bar7"
+    $XFS_IO_PROG -c "reflink $SCRATCH_MNT/foo3" $SCRATCH_MNT/bar7 | _filter_xfs_io
+
+    echo "File bar7 digest = $(_md5_checksum $SCRATCH_MNT/bar7)"
+
+    # Unmount and mount again the filesystem. We want to verify the reflink
+    # operations were durably persisted.
+    _scratch_cycle_mount
+
+    echo "File digests after mounting again the filesystem:"
+    echo "File bar1 digest = $(_md5_checksum $SCRATCH_MNT/bar1)"
+    echo "File bar2 digest = $(_md5_checksum $SCRATCH_MNT/bar2)"
+    echo "File bar3 digest = $(_md5_checksum $SCRATCH_MNT/bar3)"
+    echo "File bar4 digest = $(_md5_checksum $SCRATCH_MNT/bar4)"
+    echo "File bar5 digest = $(_md5_checksum $SCRATCH_MNT/bar5)"
+    echo "File bar6 digest = $(_md5_checksum $SCRATCH_MNT/bar6)"
+    echo "File bar7 digest = $(_md5_checksum $SCRATCH_MNT/bar7)"
+}
+
+_scratch_mkfs "-O ^no-holes" >>$seqres.full 2>&1
+_scratch_mount
+
+echo
+echo "Testing with defaults"
+echo
+run_tests
+
+echo
+echo "Testing with -o compress"
+echo
+_scratch_cycle_mount "compress"
+run_tests
+
+echo
+echo "Testing with -o nodatacow"
+echo
+_scratch_cycle_mount "nodatacow"
+run_tests
+
+echo
+echo "Testing with -O no-holes"
+echo
+_scratch_unmount
+_scratch_mkfs "-O no-holes" >>$seqres.full 2>&1
+_scratch_mount
+run_tests
+
+status=0
+exit

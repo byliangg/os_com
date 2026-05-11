@@ -1,0 +1,90 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Facebook.  All Rights Reserved.
+#
+# FS QA Test 027
+#
+# Test replace of a missing device on various data and metadata profiles.
+#
+. ./common/preamble
+_begin_fstest auto replace volume scrub raid
+
+. ./common/filter
+
+# we check scratch dev after each loop
+_require_scratch_nocheck
+_require_scratch_dev_pool 5
+_require_scratch_dev_pool_equal_size
+_btrfs_get_profile_configs replace-missing
+_require_command "$WIPEFS_PROG" wipefs
+
+run_test()
+{
+	local mkfs_opts=$1
+	local ndevs=`echo $SCRATCH_DEV_POOL | wc -w`
+
+	# reserve one for replace target
+	((ndevs--))
+
+	_scratch_dev_pool_get $ndevs
+	_spare_dev_get
+
+	echo "Test $mkfs_opts" >>$seqres.full
+
+	_scratch_pool_mkfs $mkfs_opts >>$seqres.full 2>&1
+	# make sure we created btrfs with desired options
+	if [ $? -ne 0 ]; then
+		echo "mkfs $mkfs_opts failed"
+		_spare_dev_put
+		_scratch_dev_pool_put
+		return
+	fi
+	_scratch_mount >>$seqres.full 2>&1
+
+	local missing_dev=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}'`
+	local missing_dev_id=`$BTRFS_UTIL_PROG filesystem show $SCRATCH_MNT | grep $missing_dev | $AWK_PROG '{print $2}'`
+
+	# get some data on the filesystem so there's something to replace
+	_ddt of="$SCRATCH_MNT"/file1 bs=1M count=1 >> $seqres.full 2>&1
+	_ddt of="$SCRATCH_MNT"/file2 bs=1M count=2 >> $seqres.full 2>&1
+	_ddt of="$SCRATCH_MNT"/file3 bs=1M count=4 >> $seqres.full 2>&1
+
+	# nuke a device and remount in degraded mode
+	_scratch_unmount
+	$WIPEFS_PROG -a "$missing_dev" >>$seqres.full 2>&1
+	_scratch_mount -o degraded >>$seqres.full 2>&1
+
+	# replace $missing_dev with $replace_dev and scrub it to double-check
+	$BTRFS_UTIL_PROG replace start -B -f -r $missing_dev_id $SPARE_DEV \
+		$SCRATCH_MNT >>$seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		echo "btrfs replace failed"
+		_scratch_unmount
+		_spare_dev_put
+		_scratch_dev_pool_put
+		return
+	fi
+	$BTRFS_UTIL_PROG scrub start -B $SCRATCH_MNT >>$seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		echo "btrfs scrub failed"
+		_scratch_unmount
+		_spare_dev_put
+		_scratch_dev_pool_put
+		return
+	fi
+
+	_scratch_unmount
+	# we called _require_scratch_nocheck instead of _require_scratch
+	# do check after test for each profile config
+	_check_scratch_fs
+	_spare_dev_put
+	_scratch_dev_pool_put
+}
+
+echo "Silence is golden"
+for t in "${_btrfs_profile_configs[@]}"; do
+	run_test "$t"
+done
+
+status=0
+exit

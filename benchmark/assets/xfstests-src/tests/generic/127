@@ -1,0 +1,112 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 127
+#
+# fsx tests modified from CXFSQA tests
+#   - fsx_00_lite
+#   - fsx_05_lite_mmap
+#   - fsx_10_std,
+#   - fsx_15_std_mmap
+#
+. ./common/preamble
+_begin_fstest rw auto mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	[ -n "$fsx_pids" ] && kill $fsx_pids 2> /dev/null
+	wait
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+FSX_FILE_SIZE=262144
+FSX_ARGS="-q -l $FSX_FILE_SIZE -o 65536 -S 191110531 -N 100000"
+
+_fsx_lite_nommap()
+{
+    dd if=/dev/zero of=$TEST_DIR/fsx_lite_nommap bs=${FSX_FILE_SIZE} count=1 > /dev/null 2>&1
+    if ! $FSX_PROG $FSX_ARGS -L -R -W $FSX_AVOID $TEST_DIR/fsx_lite_nommap > $tmp.output 2>&1
+    then
+        echo "$FSX_PROG $FSX_ARGS -L -R -W $TEST_DIR/fsx_lite_nommap"
+        cat $tmp.output
+        return 1
+    fi
+    cat $tmp.output
+    return 0
+}
+
+_fsx_lite_mmap()
+{
+    dd if=/dev/zero of=$TEST_DIR/fsx_lite_mmap bs=${FSX_FILE_SIZE} count=1 > /dev/null 2>&1
+    if ! $FSX_PROG $FSX_ARGS -L $FSX_AVOID $TEST_DIR/fsx_lite_mmap > $tmp.output 2>&1
+    then
+	echo "$FSX_PROG $FSX_ARGS -L fsx_lite_mmap"
+	cat $tmp.output
+	return 1
+    fi
+    cat $tmp.output
+    return 0
+}
+
+_fsx_std_nommap()
+{
+	local fname="$TEST_DIR/$1"
+
+	if ! $FSX_PROG $FSX_ARGS -R -W $FSX_AVOID $fname > $tmp.output 2>&1
+	then
+		echo "$FSX_PROG $FSX_ARGS -R -W fsx_std_nommap"
+		cat $tmp.output
+		return 1
+	fi
+	cat $tmp.output
+	return 0
+}
+
+_fsx_std_mmap()
+{
+	local fname="$TEST_DIR/$1"
+
+	if ! $FSX_PROG $FSX_ARGS $FSX_AVOID $fname > $tmp.output 2>&1
+	then
+		echo "$FSX_PROG $FSX_ARGS fsx_std_mmap"
+		cat $tmp.output
+		return 1
+	fi
+	cat $tmp.output
+	return 0
+}
+
+_require_test
+
+_fsx_lite_nommap &
+fsx_pids=$!
+
+_fsx_lite_mmap &
+fsx_pids="$! $fsx_pids"
+
+_fsx_std_nommap fsx_std_nommap &
+fsx_pids="$! $fsx_pids"
+
+_fsx_std_mmap fsx_std_mmap &
+fsx_pids="$! $fsx_pids"
+
+#flush cache after write
+FSX_ARGS="-f $FSX_ARGS"
+_fsx_std_nommap fsx_std_nommap_flush &
+fsx_pids="$! $fsx_pids"
+
+_fsx_std_mmap fsx_std_mmap_flush &
+fsx_pids="$! $fsx_pids"
+
+wait $fsx_pids
+unset fsx_pids
+
+status=0
+_cleanup
+exit

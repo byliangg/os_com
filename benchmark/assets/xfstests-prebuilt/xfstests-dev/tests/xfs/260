@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Red Hat, Inc.. All Rights Reserved.
+#
+# FS QA Test 260
+#
+# Verify that an attempt to create a too-small device with stripe geometry,
+# is handled gracefully instead of hitting an assert in align_ag_geometry()
+#
+# This test verifies the problem fixed in xfsprogs with commit
+# (mkfs.xfs: fix ASSERT on too-small device with stripe geometry)
+#
+
+. ./common/preamble
+_begin_fstest auto quick mkfs
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $localfile
+}
+
+# Import common functions.
+
+echo 'Silence is golden'
+
+_require_test
+
+localfile=$TEST_DIR/$seq.$$
+
+$XFS_IO_PROG -f -c "truncate 10444800" $localfile
+
+$MKFS_XFS_PROG -dsu=65536,sw=1 $localfile >> $seqres.full 2>&1
+
+[ $? -ne 1 ] && echo "${MKFS_XFS_PROG} should fail gracefully"
+
+# success, all done
+status=0
+exit

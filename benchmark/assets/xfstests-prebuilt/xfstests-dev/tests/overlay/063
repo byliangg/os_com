@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 063
+#
+# Create dir over cached negative dentry, but whiteout removed from upper
+#
+# The following kernel commit fixed the kernel crash: 5e1275808630 ("ovl: check
+# whiteout in ovl_create_over_whiteout()")
+#
+. ./common/preamble
+_begin_fstest auto quick whiteout
+
+# Import common functions.
+. ./common/filter
+
+_fixed_by_kernel_commit 5e1275808630 \
+	"ovl: check whiteout in ovl_create_over_whiteout()"
+
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create test file
+lowerdir=${OVL_BASE_SCRATCH_MNT}/${OVL_LOWER}
+upperdir=${OVL_BASE_SCRATCH_MNT}/${OVL_UPPER}
+mkdir -p $lowerdir
+touch ${lowerdir}/file
+
+_scratch_mount
+
+# Create whiteout and populate dcache with negative dentry
+rm ${SCRATCH_MNT}/file
+ls -l ${SCRATCH_MNT}/file > /dev/null 2>&1
+
+# Remove whiteout and try to create dir over negative dentry
+rm ${upperdir}/file
+mkdir ${SCRATCH_MNT}/file > /dev/null 2>&1
+
+# unmount overlayfs
+$UMOUNT_PROG $SCRATCH_MNT
+
+echo "Silence is golden"
+# success, all done
+status=0
+exit

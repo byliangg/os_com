@@ -1,0 +1,252 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 009
+#
+# XFS allocator test (preallocation - allocp, resvsp ,etc)
+#
+. ./common/preamble
+_begin_fstest rw ioctl auto prealloc quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    echo "*** unmount"
+    _scratch_unmount
+}
+
+_init()
+{
+    echo "*** mkfs"
+    if ! _try_scratch_mkfs_xfs >$tmp.out 2>&1
+    then
+	cat $tmp.out
+        echo "failed to mkfs $SCRATCH_DEV"
+        exit 1
+    fi
+
+    echo "*** mount"
+    if ! _try_scratch_mount
+    then
+        echo "failed to mount $SCRATCH_DEV"
+        exit 1
+    fi
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_filesize()
+{
+    ls -l $1 | $AWK_PROG -v bsize="$bsize" '{print "filesize = " $5 / bsize}'
+}
+
+_block_filter()
+{
+	$AWK_PROG -v bsize="$bsize" '
+	BEGIN {
+		br_pos = 0
+		br_len = 0
+	}
+	function dump_blockrange() {
+		if (br_len == 0)
+			return
+		printf("        [%d,%d]: BLOCKRANGE\n", br_pos, br_len)
+		br_pos = 0
+		br_len = 0
+	}
+	/blocksize/ {
+		dump_blockrange()
+		printf("    blocksize BSIZE\n")
+
+		next
+	}
+
+	/CMD/ {
+		dump_blockrange()
+		split($3, off, "=")
+		offset = strtonum(off[2])
+		if (offset != -1)
+			offset = offset / bsize
+
+		split($4, len, "=")
+		nr_blocks = strtonum(len[2])
+		if (nr_blocks != -1)
+			nr_blocks = nr_blocks / bsize
+
+		printf("    %s %s off=%s, len=%d\n", $1, $2, offset, nr_blocks)
+
+		next
+	}
+
+	/MAP/ {
+		dump_blockrange()
+		split($2, off, "=")
+		offset = strtonum(off[2])
+		if (offset != -1)
+			offset = offset / bsize
+
+		split($3, len, "=")
+
+		nr_blocks = strtonum(len[2])
+
+		if (nr_blocks != -1)
+			nr_blocks = nr_blocks / bsize
+
+		printf("    %s off=%s, len=%d %s\n", $1, offset, nr_blocks, $4)
+
+		next
+	}
+
+	/TRUNCATE/ {
+		dump_blockrange()
+		split($2, off, "=")
+		offset = strtonum(off[2]) / bsize
+
+		printf("    %s off=%s\n", $1, offset)
+
+		next
+	}
+
+	/\[[0-9]+,[0-9]+\]:/ {
+		rangestr = gensub(/\[([0-9]+),([0-9]+)\]:/, "\\1,\\2", "g", $1);
+		split(rangestr, off, ",")
+		if (br_pos + br_len == off[1]) {
+			br_len += off[2];
+		} else {
+			dump_blockrange()
+			br_pos = off[1];
+			br_len = off[2];
+		}
+
+		next
+	}
+
+	{
+		dump_blockrange()
+		print
+
+		next
+	}
+	END {
+		dump_blockrange()
+	}
+	'
+}
+
+_init
+out=$SCRATCH_MNT/$$.tmp
+
+# This isn't really related to fs block size, it's just what
+# alloc uses for the "block" unit in it's input parameters...
+# However, xfs_alloc_file_space() rounds up allocation
+# request by the filesystem's block size.
+bsize=$(_get_file_block_size $SCRATCH_MNT)
+
+# since we're using a clean FS here, we make some assumptions
+# about availability of contiguous blocks
+
+# also interesting to note is that ALLOC == FREE. seriously.
+# the _length is ignored_ in irix. the file is allocated up
+# to the specified offset, and zero filled if previously
+# unallocated. the file is truncated at the specified point.
+
+echo "*** test 1 - reservations cleared on O_TRUNC"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+r 0 1000b
+m
+EOF
+_filesize $out
+
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out -t | _block_filter
+m
+EOF
+_filesize $out
+
+echo "*** test 2 - reserve & filesize"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+r 0 1000b
+EOF
+
+_filesize $out
+
+echo "*** test 3 - alloc & filesize"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+a 1000b
+EOF
+
+_filesize $out
+
+echo "*** test 4 - allocations cleared on O_TRUNC"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+a 1000b
+EOF
+_filesize $out
+
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out -t | _block_filter
+m
+EOF
+_filesize $out
+
+echo "*** test 5 - reserve / unreserve"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+r 0 100b
+u 100b 500b
+m
+u 900b 200b
+m
+EOF
+
+echo "*** test 6 - reserve adjacent"
+rm -f $out
+cat <<EOF | $here/src/alloc -t -n -b $bsize -f $out | _block_filter
+r 0 100b
+r 100b 100b
+m
+EOF
+
+echo "*** test 7 - alloc"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+a 1000b
+m
+a 2000b
+m
+EOF
+
+_filesize $out
+
+echo "*** test 8 - alloc & truncate"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+a 1000b
+m
+t 500b
+m
+EOF
+
+_filesize $out
+
+echo "*** test 9 - reserve & truncate"
+rm -f $out
+cat <<EOF | $here/src/alloc -n -b $bsize -f $out | _block_filter
+r 0 1000b
+m
+t 500b
+m
+EOF
+
+_filesize $out
+
+status=0
+exit

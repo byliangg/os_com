@@ -1,0 +1,136 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003,2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 078
+#
+# Check several growfs corner cases
+#
+. ./common/preamble
+_begin_fstest growfs auto quick
+
+_register_cleanup "_cleanup; rm -f $tmp.*"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_unmount $LOOP_MNT 2>/dev/null
+	[ -n "$loop_dev" ] && _destroy_loop_device $loop_dev 2>/dev/null
+	# try to keep the image file if test fails
+	[ $status -eq 0 ] && rm -f $LOOP_IMG
+	rmdir $LOOP_MNT
+}
+
+# Import common functions.
+. ./common/filter
+
+# loop devices are available in Linux only
+
+_require_test
+# Must have loop device
+_require_loop
+_require_xfs_io_command "truncate"
+
+LOOP_IMG=$TEST_DIR/$seq.fs
+LOOP_MNT=$TEST_DIR/$seq.mnt
+
+_filter_io()
+{
+	sed -e '/.* ops; /d'
+}
+
+
+echo "*** create loop mount point"
+rmdir $LOOP_MNT 2>/dev/null
+mkdir -p $LOOP_MNT || _fail "cannot create loopback mount point"
+
+_grow_loop()
+{
+	original=$1
+	new_size=$2
+	bsize=$3
+	check=$4
+	agsize=$5
+
+	$XFS_IO_PROG -f -c "truncate $original" $LOOP_IMG
+	loop_dev=`_create_loop_device $LOOP_IMG $bsize`
+
+	dparam=""
+	if [ -n "$agsize" ]; then
+		dparam="-d agsize=$agsize"
+	fi
+
+	echo
+	echo "=== GROWFS (from $original to $new_size, $bsize blocksize)"
+	echo
+
+	echo "*** mkfs loop file (size=$original)"
+	$MKFS_XFS_PROG -b size=$bsize $dparam $loop_dev | \
+		_filter_mkfs 2>/dev/null
+
+	echo "*** extend loop file"
+	_destroy_loop_device $loop_dev
+	$XFS_IO_PROG -c "pwrite $new_size $bsize" $LOOP_IMG | _filter_io
+	loop_dev=`_create_loop_device $LOOP_IMG $bsize`
+	echo "*** mount loop filesystem"
+	_mount $loop_dev $LOOP_MNT
+
+	echo "*** grow loop filesystem"
+	$XFS_GROWFS_PROG $LOOP_MNT 2>&1 |  _filter_growfs 2>&1
+
+	echo "*** unmount"
+	_unmount $LOOP_MNT
+
+	# Large grows takes forever to check..
+	if [ "$check" -gt "0" ]
+	then
+		echo "*** check"
+		_check_xfs_filesystem $loop_dev none none
+	fi
+
+	_destroy_loop_device $loop_dev
+	unset loop_dev
+	rm -f $LOOP_IMG
+}
+
+# Wes' problem sizes...
+_grow_loop $((168024*4096)) 1376452608 4096 1
+
+# Some other blocksize cases...
+_grow_loop $((168024*2048)) 1376452608 2048 1
+_grow_loop $((168024*1024)) 688230400 1024 1
+
+# Other corner cases suggested by dgc
+# also the following doesn't check if the filesystem is consistent.
+#  - grow 1TB by 1.5TB (control)
+_grow_loop 1t 2500g 4096 0
+
+#  - grow 1TB by 2.5TB (grow by > 2TB)
+_grow_loop 1t 3500g 4096 0
+
+#  - grow 1TB by 3.5TB (grow past 4TB)
+_grow_loop 1t 4500g 4096 0
+
+#  - grow 1TB by 4.5TB (grow by > 4TB)
+_grow_loop 1t 5500g 4096 0
+
+#  - grow 1TB by 7.5TB (grow past 8TB)
+_grow_loop 1t 8500g 4096 0
+
+#  - grow 1TB by 8.5TB (grow by > 8TB)
+_grow_loop 1t 9500g 4096 0
+
+#  - grow 1TB by 14.5TB (grow by > 8TB)
+_grow_loop 1t 15500g 4096 0
+
+#  - grow 1TB by 15TB (grow to 16TB)
+_grow_loop 1t 16000g 4096 0
+
+# It would be nice to go on, but this would require a totally new test in order
+# to take care of 64-bit machines.
+
+echo "*** all done"
+status=0
+exit

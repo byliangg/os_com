@@ -1,0 +1,31 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+#
+# Copyright (c) 2021 Christian Brauner <christian.brauner@ubuntu.com>
+# All Rights Reserved.
+#
+# FS QA Test No. 632
+#
+# Regression test to verify that creating a series of detached mounts,
+# attaching them to the filesystem, and unmounting them does not trigger an
+# integer overflow in ns->mounts causing the kernel to block any new mounts in
+# count_mounts() and returning ENOSPC because it falsely assumes that the
+# maximum number of mounts in the mount namespace has been reached, i.e. it
+# thinks it can't fit the new mounts into the mount namespace anymore.
+#
+# Kernel commit ee2e3f50629f ("mount: fix mounting of detached mounts onto
+# targets that reside on shared mounts") fixed the bug.
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+_require_test
+_require_test_program "detached_mounts_propagation"
+
+_mount --make-shared $TEST_DIR
+$here/src/detached_mounts_propagation $TEST_DIR >> $seqres.full
+status=$?
+_mount --make-private $TEST_DIR
+
+echo silence is golden
+exit

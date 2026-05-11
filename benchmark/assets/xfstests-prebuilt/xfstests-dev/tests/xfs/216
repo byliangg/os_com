@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 216
+#
+# log size mkfs test - ensure the log size scaling works for small filesystems
+#
+. ./common/preamble
+_begin_fstest log metadata auto quick
+
+# Import common functions.
+. ./common/filter
+
+_cleanup()
+{
+	_unmount $LOOP_MNT > /dev/null 2>&1
+	[ -n "$loop_dev" ] && _destroy_loop_device $loop_dev
+	cd /
+	rm -f $tmp.*
+}
+
+_require_scratch
+_scratch_mkfs_xfs >/dev/null 2>&1
+_scratch_mount
+
+_require_loop
+LOOP_IMG=$SCRATCH_MNT/test_fs
+LOOP_MNT=$SCRATCH_MNT/test_fs_dir
+
+loop_mkfs_opts=
+$MKFS_XFS_PROG 2>&1 | grep -q rmapbt && \
+	loop_mkfs_opts="$loop_mkfs_opts -m rmapbt=0"
+$MKFS_XFS_PROG 2>&1 | grep -q reflink && \
+	loop_mkfs_opts="$loop_mkfs_opts -m reflink=0"
+
+# Decide which golden output file we're using.  Starting with mkfs.xfs 5.15,
+# the default minimum log size was raised to 64MB for all cases, so we detect
+# that by test-formatting with a 512M filesystem.  This is a little handwavy,
+# but it's the best we can do.
+choose_golden_output() {
+	local seqfull=$1
+	local file=$2
+
+	if $MKFS_XFS_PROG -f -b size=4096 -l version=2 \
+			-d name=$file,size=512m $loop_mkfs_opts | \
+			grep -q 'log.*blocks=16384'; then
+		_link_out_file_named $seqfull.out "64mblog"
+	else
+		_link_out_file_named $seqfull.out "classic"
+	fi
+}
+
+_do_mkfs()
+{
+	for i in $*; do
+		echo -n "fssize=${i}g "
+		$MKFS_XFS_PROG -f -b size=4096 -l version=2 \
+			-d size=${i}g $loop_mkfs_opts $loop_dev |grep log
+		_mount $loop_dev $LOOP_MNT
+		echo "test write" > $LOOP_MNT/test
+		_unmount $LOOP_MNT > /dev/null 2>&1
+	done
+}
+# make large holey file
+$XFS_IO_PROG -f -c "truncate 256g" $LOOP_IMG
+
+choose_golden_output $0 $LOOP_IMG
+
+#make loopback mount dir
+mkdir $LOOP_MNT
+
+loop_dev=$(_create_loop_device $LOOP_IMG)
+
+# walk over standard sizes (up to 256GB)
+_do_mkfs 1 2 4 8 16 32 64 128 256
+
+_destroy_loop_device $loop_dev
+unset loop_dev
+status=0
+exit

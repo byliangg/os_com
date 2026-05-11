@@ -1,0 +1,113 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 429
+#
+# Test that no-key dentries are revalidated after adding a key.  Regression test
+# for:
+#	28b4c263961c ("ext4 crypto: revalidate dentry after adding or removing the key")
+#
+# Furthermore, test that no-key dentries are *not* revalidated after "revoking"
+# a key.  This used to be done, but it was broken and was removed by:
+#	1b53cf9815bb ("fscrypt: remove broken support for detecting keyring key revocation")
+#
+# Also test for a race condition bug in 28b4c263961c, fixed by:
+#	03a8bb0e53d9 ("ext4/fscrypto: avoid RCU lookup in d_revalidate")
+#
+# Note: the following fix for another race in 28b4c263961c should be applied as
+# well, though we don't test for it because it's very difficult to reproduce:
+#	3d43bcfef5f0 ("ext4 crypto: use dget_parent() in ext4_d_revalidate()")
+#
+. ./common/preamble
+_begin_fstest auto encrypt
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+
+_require_scratch_encryption
+_require_command "$KEYCTL_PROG" keyctl
+_require_test_program "t_encrypted_d_revalidate"
+
+# Set up an encrypted directory
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+_init_session_keyring
+keydesc=$(_generate_key_descriptor)
+raw_key=$(_generate_raw_encryption_key)
+mkdir $SCRATCH_MNT/edir
+_add_session_encryption_key $keydesc $raw_key
+_set_encpolicy $SCRATCH_MNT/edir $keydesc
+
+# Create two files in the directory: one whose name is valid in the base64
+# format used in no-key filenames, and one whose name is not.  The exact
+# filenames *should* be irrelevant, but due to yet another bug, ->lookup() in an
+# encrypted directory without the key returned ERR_PTR(-ENOENT) rather than NULL
+# if the name was not a valid no-key name, causing a negative dentry to not be
+# created.  For the purpose of this test, we want at least one negative dentry
+# to be created, so just create both types of name.
+echo contents_@@@ > $SCRATCH_MNT/edir/@@@ # not valid base64
+echo contents_abcd > $SCRATCH_MNT/edir/abcd # valid base64
+
+show_file_contents()
+{
+	echo "--- Contents of files using plaintext names:"
+	cat $SCRATCH_MNT/edir/@@@ |& _filter_scratch
+	cat $SCRATCH_MNT/edir/abcd |& _filter_scratch
+	echo "--- Contents of files using no-key names:"
+	cat ${nokey_names[@]} |& _filter_scratch | _filter_nokey_filenames edir
+}
+
+show_directory_with_key()
+{
+	echo "--- Directory listing:"
+	find $SCRATCH_MNT/edir -mindepth 1 | sort | _filter_scratch
+	show_file_contents
+}
+
+# View the directory without the encryption key.  The plaintext names shouldn't
+# exist, but 'cat' each to verify this, which also should create negative
+# dentries.  The no-key names are unpredictable by design, but verify that the
+# correct number of them are listed by readdir, and save them for later.
+echo
+echo "***** Without encryption key *****"
+_unlink_session_encryption_key $keydesc
+_scratch_cycle_mount
+echo "--- Directory listing:"
+nokey_names=( $(find $SCRATCH_MNT/edir -mindepth 1 | sort) )
+printf '%s\n' "${nokey_names[@]}" | \
+	_filter_scratch | _filter_nokey_filenames edir
+show_file_contents
+
+# Without remounting or dropping caches, add the encryption key and view the
+# directory again.  Now the plaintext names should all be there, and the no-key
+# names should be gone.  Make sure to 'cat' all the names to test for stale
+# dentries.
+echo
+echo "***** With encryption key *****"
+_add_session_encryption_key $keydesc $raw_key
+show_directory_with_key
+
+# Test for ->d_revalidate() race conditions.
+echo
+echo "***** Race conditions *****"
+$here/src/t_encrypted_d_revalidate $SCRATCH_MNT/edir
+rm -rf $SCRATCH_MNT/edir/dir
+
+# Now open the files to pin them in the inode cache (needed to make the test
+# reliable), then revoke the encryption key.  This should no longer cause the
+# files to be presented in no-key form immediately.
+echo
+echo "***** After key revocation *****"
+(
+	exec 3<$SCRATCH_MNT/edir
+	exec 4<$SCRATCH_MNT/edir/@@@
+	exec 5<$SCRATCH_MNT/edir/abcd
+	_revoke_session_encryption_key $keydesc
+	show_directory_with_key
+)
+
+# success, all done
+status=0
+exit

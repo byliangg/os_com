@@ -1,0 +1,132 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011-2012 Fujitsu, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 273
+#
+# reservation test with heavy cp workload
+#
+#creator
+
+. ./common/preamble
+_begin_fstest auto rw
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	_scratch_unmount
+}
+
+. ./common/filter
+
+threads=50
+count=2
+
+_threads_set()
+{
+	_cpu_num=`$here/src/feature -o`
+	threads=$(($_cpu_num * 50))
+	if [ $threads -gt 200 ]
+	then
+		threads=200
+	fi
+}
+
+_file_create()
+{
+	block_size=$1
+	_i=0
+
+	if ! mkdir $SCRATCH_MNT/origin
+	then
+		echo "mkdir origin err"
+		status=1
+		exit
+	fi
+
+	cd $SCRATCH_MNT/origin
+
+	_disksize=$(_get_available_space $SCRATCH_MNT)
+	_free_inodes=$(_get_free_inode $SCRATCH_MNT)
+	# Some filesystems do not limit number of inodes and return 0
+	if [ $_free_inodes -eq 0 ]; then
+		# Guess one block per inode
+		_free_inodes=$(($_disksize / $block_size))
+	fi
+	# Leave some slack for directories etc.
+	_free_inodes=$(($_free_inodes - $_free_inodes/8))
+	_disksize=$(($_disksize / 3))
+	_num=$(($_disksize / $count / $block_size))
+	if [ $_num -gt $_free_inodes ]; then
+		_num=$_free_inodes
+	fi
+	_num=$(($_num/$threads))
+	_count=$count
+	while [ $_i -lt $_num ]
+	do
+		dd if=/dev/zero of=file_$_i bs=$block_size count=$_count >/dev/null 2>&1
+		_i=$(($_i + 1))
+	done
+
+	cd $here
+}
+
+_porter()
+{
+	_suffix=$1
+
+	if ! mkdir $SCRATCH_MNT/sub_$_suffix
+	then
+		echo "mkdir sub_xxx err"
+		status=1
+		exit
+	fi
+
+	cp -r $SCRATCH_MNT/origin $SCRATCH_MNT/sub_$_suffix >>$seqres.full 2>&1
+	if [ $? -ne 0 ]
+	then
+		echo "_porter $_suffix not complete"
+	fi
+	
+	_scratch_sync
+}
+
+_do_workload()
+{
+	_pids=""
+	_pid=1
+	block_size=$(_get_file_block_size $SCRATCH_MNT)
+
+	_threads_set
+	_file_create $block_size
+
+	_threads=$threads
+
+	while [ $_pid -lt $_threads ]
+	do
+		_porter $_pid &
+		_pids="$_pids $!"
+		_pid=$(($_pid + 1))
+	done
+
+	wait $_pids
+}
+
+_require_scratch
+
+echo "------------------------------"
+echo "start the workload"
+echo "------------------------------"
+
+_scratch_unmount 2>/dev/null
+_scratch_mkfs_sized $((2 * 1024 * 1024 * 1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+_do_workload
+
+status=0
+exit

@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat.  All Rights Reserved.
+#
+# FS QA Test 462
+#
+# This is a regression test for kernel commit
+#  ef947b2 x86, mm: fix gup_pte_range() vs DAX mappings
+# created by Jeffrey Moyer <jmoyer@redhat.com>
+#
+# This is reproducible only when testing on pmem device
+# which is configured in "memory mode", not in "raw mode".
+#
+. ./common/preamble
+_begin_fstest auto quick dax mmap
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_test
+_require_scratch_dax_mountopt "dax"
+_require_test_program "t_mmap_write_ro"
+# running by unpriviliged user is not necessary to reproduce
+# this bug, just trying to test more.
+_require_user
+
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount "-o dax"
+
+# remount TEST_DEV wo/ dax
+export TEST_FS_MOUNT_OPTS=""
+_test_cycle_mount
+
+# prepare a 4k read-only DAX file, save its md5sum
+$XFS_IO_PROG -f -c "pwrite -S 0xFF 0 4096" \
+	$SCRATCH_MNT/readonlyfile >> $seqres.full 2>&1
+chmod 0644  $SCRATCH_MNT/readonlyfile
+md5_1="$(_md5_checksum $SCRATCH_MNT/readonlyfile)"
+
+# prepare another 4k non-DAX file
+$XFS_IO_PROG -f -c "pwrite -S 0x00 0 4096" \
+	$TEST_DIR/${seq}.file >> $seqres.full 2>&1
+
+# allow qa_user access
+chown $qa_user $TEST_DIR/${seq}.file
+
+# run test programme, read another file writing into
+# the read-only file with mmap, which should fail.
+#
+# don't use $here/src/t_mmap_write_ro, as we're running it as a regular user,
+# and $here may contain path component that a regular user doesn't have search
+# permission
+_user_do "src/t_mmap_write_ro $TEST_DIR/${seq}.file \
+	$SCRATCH_MNT/readonlyfile"
+
+# read-only file should not get updated, md5sum again.
+md5_2="$(_md5_checksum $SCRATCH_MNT/readonlyfile)"
+
+[ "$md5_1" != "$md5_2" ] && echo "read only file changed"
+
+# success, all done
+status=0
+exit

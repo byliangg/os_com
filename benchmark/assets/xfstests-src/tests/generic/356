@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 356
+#
+# Check that we can't reflink a swapfile.
+#
+. ./common/preamble
+_begin_fstest auto quick clone swap
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_swapfile
+_require_scratch_reflink
+_require_cp_reflink
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+blocks=160
+blksz=65536
+
+echo "Initialize file"
+_format_swapfile "$testdir/file1" $((blocks * blksz)) > /dev/null
+swapon $testdir/file1
+
+touch "$testdir/file2"
+$CHATTR_PROG +C "$testdir/file2" >/dev/null 2>&1
+
+echo "Try to reflink"
+_cp_reflink $testdir/file1 $testdir/file2 2>&1 | _filter_scratch
+
+echo "Tear it down"
+swapoff $testdir/file1
+
+# success, all done
+status=0
+exit

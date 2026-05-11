@@ -1,0 +1,34 @@
+# xfstests Syscall Suite (Phase3/Phase4)
+
+This suite integrates `xfstests` into Asterinas `AUTO_TEST=syscall` pipeline.
+
+## Required host input
+
+Set `XFSTESTS_PREBUILT_DIR` before building initramfs. The directory must contain:
+
+1. `xfstests-dev/` (with executable `check` script)
+2. Optional `tools/bin/` helper binaries used by xfstests scripts
+
+## Runtime modes
+
+1. `XFSTESTS_MODE=phase3_base` (default): blocking mode, computes pass-rate with phase3 rules.
+2. `XFSTESTS_MODE=phase4_good`: blocking mode, computes pass-rate with phase4-part1 candidate set.
+3. `XFSTESTS_MODE=phase6_good`: blocking mode, stage6 "good" candidate set.
+4. `XFSTESTS_MODE=jbd_phase1`: blocking mode, JBD2 Phase 1 candidate set (journal replay, orphan recovery, ext4 journal-specific tests). Target threshold: 95%.
+5. `XFSTESTS_MODE=generic_quick`: observation-only mode, always exits success and records log.
+
+## Pass-rate rules (phase3_base / phase4_good / phase6_good / jbd_phase1)
+
+1. Denominator = `PASS + FAIL`
+2. Numerator = `PASS`
+3. `NOTRUN`/`STATIC_BLOCKED` do not count in denominator and are written with reasons
+4. Threshold = `XFSTESTS_THRESHOLD_PERCENT` (default: `90`)
+
+## Output files
+
+Under `XFSTESTS_RESULTS_DIR` (default: `/tmp/xfstests_results`):
+
+1. `<mode>_results.tsv`
+2. `<mode>_summary.tsv`
+3. `<mode>_excluded.tsv`
+4. Per-test logs (`generic_001.log`, ...)

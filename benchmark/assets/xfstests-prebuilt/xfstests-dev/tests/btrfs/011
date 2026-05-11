@@ -1,0 +1,268 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2013 STRATO.  All rights reserved.
+#
+# FSQA Test No. btrfs/011
+#
+# Test of the btrfs replace operation.
+#
+# The amount of tests done depends on the number of devices in the
+# SCRATCH_DEV_POOL. For full test coverage, at least 5 devices should
+# be available (e.g. 5 partitions).
+#
+# The source and target devices for the replace operation are
+# arbitrarily chosen out of SCRATCH_DEV_POOl. Since the target device
+# mustn't be smaller than the source device, the requirement for this
+# test is that all devices have _exactly_ the same size. If this is
+# not the case, this test is not run.
+#
+# To check the filesystems after replacing a device, a scrub run is
+# performed, a btrfsck run, and finally the filesystem is remounted.
+#
+. ./common/preamble
+_begin_fstest auto replace volume scrub raid
+
+noise_pid=0
+
+# Override the default cleanup function.
+_cleanup()
+{
+	if [ $noise_pid -ne 0 ] && ps -p $noise_pid | grep -q $noise_pid; then
+		kill -TERM $noise_pid
+	fi
+	wait
+	rm -f $tmp.*
+	# we need this umount and couldn't rely on _require_scratch to umount
+	# it from next test, because we would replace SCRATCH_DEV, which is
+	# needed by _require_scratch, and make it umounted.
+	_scratch_unmount > /dev/null 2>&1
+}
+
+. ./common/filter
+
+_require_scratch_nocheck
+_require_scratch_dev_pool 5
+_require_scratch_dev_pool_equal_size
+_require_scratch_size $((10 * 1024 * 1024)) #kB
+_require_command "$WIPEFS_PROG" wipefs
+_btrfs_get_profile_configs dup
+
+rm -f $tmp.*
+
+echo "*** test btrfs replace"
+
+# In seconds
+wait_time=1
+
+fill_scratch()
+{
+	local fssize=$1
+	local with_cancel=$2
+	local filler_pid
+
+	# Fill inline extents.
+	for i in `seq 1 500`; do
+		_ddt of=$SCRATCH_MNT/s$i bs=3800 count=1
+	done > /dev/null 2>&1
+
+	# Fill data extents.
+	for i in `seq 1 500`; do
+		_ddt of=$SCRATCH_MNT/l$i bs=16385 count=1
+	done > /dev/null 2>&1
+	_ddt of=$SCRATCH_MNT/t0 bs=1M count=1 > /dev/null 2>&1
+	for i in `seq $fssize`; do
+		cp $SCRATCH_MNT/t0 $SCRATCH_MNT/t$i || _fail "cp failed"
+	done > /dev/null 2>> $seqres.full
+
+	# Ensure we have enough data so that dev-replace would take at least
+	# 2 * $wait_time, allowing we cancel the running replace.
+	# Some extra points:
+	# - Use XFS_IO_PROG instead of dd
+	#   fstests wraps dd, making it pretty hard to kill the real dd pid
+	# - Use 64K block size with Direct IO
+	#   64K is the same stripe size used in replace/scrub. Using Direct IO
+	#   ensure the IO speed is near device limit and comparable to replace
+	#   speed.
+	$XFS_IO_PROG -f -d -c "pwrite -b 64k 0 1E" "$SCRATCH_MNT/t_filler" &>\
+		$tmp.filler_result &
+	filler_pid=$!
+	if [ "${with_cancel}" = "cancel" ]; then
+		sleep $((10 * $wait_time))
+	else
+		sleep $((2 * $wait_time))
+	fi
+	kill -KILL $filler_pid &> /dev/null
+	wait $filler_pid &> /dev/null
+
+	# If the system is too fast and the fs is too small, then skip the test
+	if grep -q "No space left" $tmp.filler_result; then
+		ls -alh $SCRATCH_MNT >> $seqres.full
+		cat $tmp.filler_result >> $seqres.full
+		_notrun "fs too small for this test"
+	fi
+	cat $tmp.filler_result
+	sync; sync
+}
+
+workout()
+{
+	local mkfs_options="$1"
+	local num_devs4raid="$2"
+	local with_cancel="$3"
+	local fssize="$4"
+	local source_dev="`echo ${SCRATCH_DEV_POOL} | $AWK_PROG '{print $1}'`"
+	local quick="quick"
+
+	[[ $fssize != 64 ]] && quick="thorough"
+
+	echo -e "\\n---------workout \"$1\" $2 $3 $4-----------" >> $seqres.full
+
+	$WIPEFS_PROG -a $SCRATCH_DEV_POOL > /dev/null 2>&1
+	_scratch_dev_pool_get $num_devs4raid
+	_spare_dev_get
+
+	_scratch_pool_mkfs $mkfs_options >> $seqres.full 2>&1 ||\
+		_fail "mkfs failed"
+
+	_scratch_mount
+	_require_fs_space $SCRATCH_MNT $((2 * 512 * 1024)) #2.5G
+
+	fill_scratch $fssize $with_cancel
+	_btrfs filesystem show -m $SCRATCH_MNT
+
+	echo -e "Replace from $source_dev to $SPARE_DEV\\n" >> $seqres.full
+	btrfs_replace_test $source_dev $SPARE_DEV "" $with_cancel $quick
+
+	_btrfs filesystem show -m $SCRATCH_MNT
+
+	# Skip -r test for configs without mirror OR replace cancel
+	if echo $mkfs_options | grep -E -qv "raid1|raid5|raid6|raid10" || \
+	   [ "${with_cancel}Q" = "cancelQ" ]; then
+		_scratch_unmount > /dev/null 2>&1
+		_scratch_dev_pool_put
+		_spare_dev_put
+		return 0
+	fi
+
+	# Due to above replace, now SPARE_DEV is part of the FS, check that.
+	$BTRFS_UTIL_PROG filesystem show -m $SCRATCH_MNT |\
+		grep -qs $SPARE_DEV$ ||\
+		_fail "$SPARE_DEV is not part of SCRATCH_FS"
+
+	btrfs_replace_test $SPARE_DEV $source_dev "-r" $with_cancel $quick
+
+	_scratch_unmount > /dev/null 2>&1
+	_scratch_dev_pool_put
+	_spare_dev_put
+}
+
+btrfs_replace_test()
+{
+	local source_dev="$1"
+	local target_dev="$2"
+	local replace_options="$3"
+	local with_cancel="$4"
+	local quick="$5"
+
+	# generate some (slow) background traffic in parallel to the
+	# replace operation. It is not a problem if cat fails early
+	# with ENOSPC.
+	cat /dev/urandom | od > $SCRATCH_MNT/noise 2>> $seqres.full &
+	noise_pid=$!
+
+	if [ "${with_cancel}Q" = "cancelQ" ]; then
+		# background the replace operation (no '-B' option given)
+		_btrfs replace start -f $replace_options $source_dev $target_dev $SCRATCH_MNT
+		sleep $wait_time
+		$BTRFS_UTIL_PROG replace cancel $SCRATCH_MNT 2>&1 >> $seqres.full
+
+		# 'replace status' waits for the replace operation to finish
+		# before the status is printed
+		$BTRFS_UTIL_PROG replace status $SCRATCH_MNT > $tmp.tmp 2>&1
+		cat $tmp.tmp >> $seqres.full
+
+		# If the replace is finished, we need to replace $source_dev
+		# back with $target_dev, or later fsck will fail and abort
+		# the test, reducing the coverage.
+		if grep -q finished $tmp.tmp ; then
+			$BTRFS_UTIL_PROG replace start -Bf $target_dev \
+				$source_dev $SCRATCH_MNT > /dev/null
+		fi
+
+		# For above finished case, we still output the error message
+		# but continue the test, or later profiles won't get tested
+		# at all.
+		grep -q canceled $tmp.tmp || echo "btrfs replace status (canceled) failed"
+	else
+		if [ "${quick}Q" = "thoroughQ" ]; then
+			# The thorough test runs around 2 * $wait_time seconds.
+			# This is a chance to force a sync in the middle of the
+			# replace operation.
+			(sleep $wait_time; sync) > /dev/null 2>&1 &
+		fi
+		_btrfs replace start -Bf $replace_options $source_dev $target_dev $SCRATCH_MNT
+
+		$BTRFS_UTIL_PROG replace status $SCRATCH_MNT > $tmp.tmp 2>&1
+		cat $tmp.tmp >> $seqres.full
+		grep -q finished $tmp.tmp || _fail "btrfs replace status (finished) failed"
+	fi
+
+	if ps -p $noise_pid | grep -q $noise_pid; then
+		kill -TERM $noise_pid 2> /dev/null
+	fi
+	noise_pid=0
+	wait
+
+	# scrub tests on-disk data, that's the reason for the sync.
+	# With the '-B' option (don't background), any type of error causes
+	# exit values != 0, including detected correctable and uncorrectable
+	# errors on the device.
+	sync; sync
+	_btrfs scrub start -B $SCRATCH_MNT
+
+	# Two tests are performed, the 1st is to btrfsck the filesystem,
+	# and the 2nd test is to mount the filesystem.
+	# Usually _check_btrfs_filesystem would perform the mount test,
+	# but it gets confused by the mount output that shows SCRATCH_MNT
+	# mounted but not being mounted to SCRATCH_DEV. This happens
+	# because in /proc/mounts the 2nd device of the filesystem is
+	# shown after the replace operation. Let's just do the mount
+	# test manually after _check_btrfs_filesystem is finished.
+	_scratch_unmount > /dev/null 2>&1
+	if [ "${with_cancel}Q" != "cancelQ" ]; then
+		# after the replace operation, use the target_dev for everything
+		echo "_check_btrfs_filesystem $target_dev" >> $seqres.full
+		_check_btrfs_filesystem $target_dev
+		_mount -t $FSTYP `_scratch_mount_options | sed "s&${SCRATCH_DEV}&${target_dev}&"`
+	else
+		_check_btrfs_filesystem $source_dev
+		_scratch_mount
+	fi
+}
+
+for t in "-m single -d single:1 no 64" \
+	"-m dup -d single:1 no 64" \
+	"-m dup -d single:1 cancel 1024" \
+	"-m raid0 -d raid0:2 no 64" \
+	"-m raid1 -d raid1:2 no 2048" \
+	"-m raid10 -d raid10:4 no 64" \
+	"-m single -d single -M:1 no 64" \
+	"-m dup -d dup -M:1 no 64" \
+	"-m raid5 -d raid5:2 no 64" \
+	"-m raid6 -d raid6:3 no 64"; do
+	mkfs_option=${t%:*}
+	workout_option=${t#*:}
+	if [[ "${_btrfs_profile_configs[@]}" =~ "${mkfs_option/ -M}"( |$) ]]; then
+		workout "$mkfs_option" $workout_option
+	else
+		# If we have limited the profile configs we could leave
+		# $SCRATCH_DEV in an inconsistent state (because it was
+		# replaced), so mkfs the scratch device to make sure we don't
+		# trip the fs check at the end.
+		_scratch_mkfs > /dev/null 2>&1
+	fi
+done
+
+echo "*** done"
+status=0
+exit

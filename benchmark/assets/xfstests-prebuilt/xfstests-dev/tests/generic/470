@@ -1,0 +1,64 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Intel Corporation.  All Rights Reserved.
+#
+# FS QA Test No. 470
+#
+# Use dm-log-writes to verify that MAP_SYNC actually syncs metadata during
+# page faults.
+#
+. ./common/preamble
+_begin_fstest auto quick dax mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_log_writes_cleanup
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmlogwrites
+
+_require_scratch
+_require_no_logdev
+_require_log_writes_dax_mountopt "dax"
+_require_xfs_io_command "mmap" "-S"
+_require_xfs_io_command "log_writes"
+_require_command "$BLKDISCARD_PROG" blkdiscard
+
+MAPPED_LEN=$((512 * 1024 * 1024)) # 512 MiB
+LEN=$((1024 * 1024)) # 1 MiB
+
+_log_writes_init $SCRATCH_DEV $MAPPED_LEN
+_log_writes_mkfs >> $seqres.full 2>&1
+_log_writes_mount -o dax
+
+$XFS_IO_PROG -t -c "truncate $LEN" -c "mmap -S 0 $LEN" -c "mwrite 0 $LEN" \
+	-c "log_writes -d $LOGWRITES_NAME -m preunmap" \
+	-f $SCRATCH_MNT/test
+
+# Unmount the scratch dir and tear down the log writes target
+_log_writes_unmount
+_log_writes_remove
+_check_scratch_fs
+
+# Forcibly zero the mapped range of scratch device and destroy
+# previous filesystem so we can be sure our rebuild works.
+# Note that blkdiscard -z will fall back to writing buffers of zeroes
+# if scratch device doesn't support write zeroes operation(i.e.
+# REQ_OP_WRITE_ZEROES).
+$BLKDISCARD_PROG -fzl $MAPPED_LEN $SCRATCH_DEV >> $seqres.full 2>&1
+_scratch_mkfs >> $seqres.full 2>&1
+
+# check pre-unmap state
+_log_writes_replay_log preunmap $SCRATCH_DEV
+_scratch_mount
+
+# We should see $SCRATCH_MNT/test as having 1 MiB in block allocations
+du -sh $SCRATCH_MNT/test | _filter_scratch | _filter_spaces
+
+status=0
+exit

@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. xfs/020
+#
+# Test segfault issue when repairing large xfs.
+#
+# Regression test for xfsprogs commit
+# 7f2d6b8 xfs_repair: avoid segfault if reporting progress early in repair
+#
+. ./common/preamble
+_begin_fstest auto repair
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    rm -f $fsfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+# Writing a 60t fs requires about 2GB of space, so make sure
+# we have plenty of space to do that.
+_require_fs_space $TEST_DIR 2500000
+
+echo "Silence is golden"
+
+fsfile=$TEST_DIR/fsfile.$seq
+rm -f $fsfile
+# The actual truncate command is required here (and not xfs_io) because it
+# returns nonzero if the operation fails.
+truncate -s 60t $fsfile || _notrun "Cannot create 60T sparse file for test."
+rm -f $fsfile
+
+$MKFS_PROG -t xfs -d size=60t,file,name=$fsfile >/dev/null
+$XFS_REPAIR_PROG -f -o ag_stride=32 -t 1 $fsfile >/dev/null 2>&1
+
+status=$?
+exit

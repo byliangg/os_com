@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 029
+#
+# There are dirs/files in lower dir and upper dir before
+# mounting overlayfs. After mounting, use dir in overlayfs
+# mountpoint as lowerdir to mount another overlayfs, then
+# access old files through the second overlayfs. It was
+# not working, kernel commit below fixed it.
+#
+# c4fcfc1619ea ovl: fix d_real() for stacked fs
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick nested
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $tmp/mnt
+	rm -rf $tmp
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_fixed_by_kernel_commit c4fcfc1619ea "ovl: fix d_real() for stacked fs"
+
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Preparing files
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $upperdir/up
+echo foo > $upperdir/up/foo
+mkdir -p $lowerdir/low
+echo bar > $lowerdir/low/bar
+
+# mount overlay in SCRATCH_MNT
+_scratch_mount
+
+mkdir -p $tmp/{upper,mnt,work}
+# mount overlay again using upper dir from SCRATCH_MNT dir
+_overlay_mount_dirs $SCRATCH_MNT/up $tmp/{upper,work} \
+  overlay $tmp/mnt
+# accessing file in the second mount
+cat $tmp/mnt/foo
+$UMOUNT_PROG $tmp/mnt
+
+# re-create upper/work to avoid ovl_verify_origin() mount failure
+# when index is enabled
+rm -rf $tmp/{upper,work}
+mkdir -p $tmp/{upper,work}
+# mount overlay again using lower dir from SCRATCH_MNT dir
+_overlay_mount_dirs $SCRATCH_MNT/low $tmp/{upper,work} \
+  overlay $tmp/mnt
+cat $tmp/mnt/bar
+$UMOUNT_PROG $tmp/mnt
+
+rm -rf $tmp/{upper,work}
+mkdir -p $tmp/{upper,work}
+# mount overlay again using SCRATCH_MNT dir
+_overlay_mount_dirs $SCRATCH_MNT/ $tmp/{upper,work} \
+  overlay $tmp/mnt
+cat $tmp/mnt/up/foo
+cat $tmp/mnt/low/bar
+
+# success, all done
+status=0
+exit

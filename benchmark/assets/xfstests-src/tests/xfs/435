@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 435
+#
+# Ensure that we don't leak dquots when CoW recovery fails.
+#
+# Corrupt the refcount btree to ensure that the CoW garbage collection
+# (and therefore the mount) fail.
+#
+# On a subsequent mount attempt, we should be able to release the quota
+# inodes when we're aborting the mount.  We also should not leak dquots.
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+. ./common/quota
+. ./common/module
+
+_require_quota
+_require_scratch_reflink
+_require_cp_reflink
+_disable_dmesg_check
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount -o quota >> "$seqres.full" 2>&1
+
+testdir="$SCRATCH_MNT/test-$seq"
+blksz=65536
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+blks=3
+mkdir "$testdir"
+
+echo "Create a many-block file"
+_pwrite_byte 0x62 0 $((blksz * blks)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x63 0 $blksz $testdir/file2 >> $seqres.full
+_reflink_range $testdir/file2 0 $testdir/file1 $blksz $blksz >> $seqres.full
+
+echo "Remount to check recovery" | _tee_kernlog
+_scratch_unmount
+_scratch_xfs_db -x -c 'agf 0' -c 'addr refcntroot' -c 'fuzz -d recs[1].startblock ones' >> $seqres.full
+_scratch_xfs_db -x -c 'agf 0' -c 'addr refcntroot' -c p >> $seqres.full
+_try_scratch_mount -o quota >> $seqres.full 2>&1
+_scratch_unmount 2> /dev/null
+rm -f ${RESULT_DIR}/require_scratch
+
+echo "See if we leak"
+_optional_reload_fs_module "xfs"
+
+# success, all done
+status=0
+exit

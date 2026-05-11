@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 020
+#
+# Reproducer from kernel commit 3fe6e52
+#    ovl: override creds with the ones from the superblock mounter
+# Testing ovl copyup/namespace/cred issue.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup perms
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_fixed_by_kernel_commit 3fe6e52f0626 \
+	"ovl: override creds with the ones from the superblock mounter"
+
+_require_scratch
+_require_unshare
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir/dir
+
+_scratch_mount
+
+unshare -m -p -f -U -r bash -c \
+	"touch $SCRATCH_MNT/dir/{1,2,3}; rm -fR $SCRATCH_MNT/*"
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

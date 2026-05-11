@@ -1,0 +1,16 @@
+QA output created by 556
+SCRATCH_MNT/basic Casefold
+SCRATCH_MNT/basic
+SCRATCH_MNT/casefold_flag_removal Casefold
+SCRATCH_MNT/casefold_flag_removal Casefold
+SCRATCH_MNT/flag_inheritance/d1/d2/d3 Casefold
+SCRATCH_MNT/symlink/ind1/TARGET
+mv: 'SCRATCH_MNT/rename/rename' and 'SCRATCH_MNT/rename/RENAME' are the same file
+# file: SCRATCH_MNT/xattrs/x
+user.foo="bar"
+
+# file: SCRATCH_MNT/xattrs/x/f1
+user.foo="bar"
+
+touch: 'SCRATCH_MNT/strict/corac'$'\314\247\303': Invalid argument
+touch: 'SCRATCH_MNT/strict/cora'$'\303\247\303': Invalid argument

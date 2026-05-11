@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 530
+#
+# Stress test creating a lot of unlinked O_TMPFILE files and recovering them
+# after a crash, checking that we don't blow up the filesystem.  This is sort
+# of a performance test for the xfs unlinked inode backref patchset, but it
+# applies to most other filesystems.
+#
+# Use only a single CPU to test the single threaded situation.
+#
+. ./common/preamble
+_begin_fstest auto quick shutdown unlink
+testfile=$TEST_DIR/$seq.txt
+
+# Import common functions.
+
+_require_scratch
+_require_scratch_shutdown
+_require_metadata_journaling
+_require_test_program "t_open_tmpfiles"
+
+# For XFS, pushing 50000 unlinked inode inactivations through a small xfs log
+# can result in bottlenecks on the log grant heads, so try to make the log
+# larger to reduce runtime.
+_scratch_mkfs $(_scratch_mkfs_concurrency_options) >> $seqres.full 2>&1
+_scratch_mount
+
+# Set ULIMIT_NOFILE to min(file-max / 2, 50000 files per LOAD_FACTOR)
+# so that this test doesn't take forever or OOM the box
+max_files=$((50000 * LOAD_FACTOR))
+max_allowable_files=$(( $(cat /proc/sys/fs/file-max) / 2 ))
+test $max_allowable_files -gt 0 && test $max_files -gt $max_allowable_files && \
+	max_files=$max_allowable_files
+ulimit -n $max_files
+
+# Open a lot of unlinked files
+echo create >> $seqres.full
+$here/src/t_open_tmpfiles $SCRATCH_MNT $(_scratch_shutdown_handle) >> $seqres.full
+
+# Unmount to prove that we can clean it all
+echo umount >> $seqres.full
+before=$(date +%s)
+_scratch_unmount
+after=$(date +%s)
+echo "Unmount took $((after - before))s." >> $seqres.full
+
+# Mount so that we can run the usual checks
+echo silence is golden
+_scratch_mount
+status=0
+exit

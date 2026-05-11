@@ -1,0 +1,74 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test 132
+#
+# Check if false ENOSPC will happen when parallel buffer write happens
+# The problem is caused by incorrect metadata reservation for any buffered
+# write whose max extent size is not 128M (including compression and in-band
+# dedupe).
+#
+. ./common/preamble
+_begin_fstest auto enospc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	kill $pids &> /dev/null
+	wait
+}
+
+. ./common/filter
+
+_require_scratch
+
+# Use small filesystem to trigger the bug more easily
+# It's highly recommened to run this test case with MKFS_OPTIONS="-n 64k"
+# to further increase the possibility
+# Since the false ENOSPC happens due to incorrect metadata reservation,
+# larger nodesize and small fs will make it much easier to reproduce
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >> $seqres.full 2>&1
+
+# Recommended to use MOUNT_OPTIONS="-o compress" to trigger the bug
+_scratch_mount
+
+sleep_time=$(($TIME_FACTOR * 30))
+loop_writer()
+{
+	offset=$1
+	len=$2
+	file=$3
+
+	while true; do
+		# Only need stderr, and we need to specify small block size
+		# but still large enough trigger compression
+		$XFS_IO_PROG -c "pwrite -b 8K $offset $len" $file > /dev/null
+	done
+}
+
+touch $SCRATCH_MNT/testfile
+
+# Start 2 writter writting into the same file
+# The file is 142M, which is smaller than 1/2 of the filesystem,
+# so no other cause can lead to ENOSPC.
+loop_writer 0 128M $SCRATCH_MNT/testfile &
+pids=$!
+loop_writer 128M 16M $SCRATCH_MNT/testfile &
+pids="$pids $!"
+
+sleep $sleep_time
+
+kill $pids
+wait
+
+# Wait all writers really exits
+while pgrep -f "$SCRATCH_MNT" > /dev/null; do
+	sleep 1
+done
+
+echo "Silence is golden"
+status=0
+exit

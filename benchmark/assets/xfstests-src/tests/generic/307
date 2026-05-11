@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 307
+#
+# Check if ctime is updated and written to disk after setfacl
+#
+# Regression test for the following extN commits
+# c6ac12a ext4: update ctime when changing the file's permission by setfacl
+# 30e2bab ext3: update ctime when changing the file's permission by setfacl
+# 523825b ext2: update ctime when changing the file's permission by setfacl
+#
+# Based on test 277
+#
+. ./common/preamble
+_begin_fstest auto quick acl
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+testfile=$SCRATCH_MNT/testfile.$seq
+
+_require_scratch
+_require_acls
+
+echo "Silence is golden"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount >/dev/null 2>&1
+
+touch $testfile
+_scratch_cycle_mount
+ctime1=`stat -c %Z $testfile`
+
+sleep 1
+setfacl -m 'u::x,g::x,o::x' $testfile
+ctime2=`stat -c %Z $testfile`
+
+_scratch_cycle_mount
+ctime3=`stat -c %Z $testfile`
+
+if [ "$ctime1" == "$ctime2" ]; then
+	echo "error: ctime not updated after setfacl"
+elif [ "$ctime1" == "$ctime3" ]; then
+	echo "error: on disk ctime not updated"
+else
+	status=0
+fi
+
+exit

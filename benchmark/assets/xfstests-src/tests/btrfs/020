@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/020
+#
+# btrfs device replace test on RO fs
+#
+# Regression test for commit:
+# bbb651e Btrfs: don't allow the replace procedure on read only filesystems
+#
+. ./common/preamble
+_begin_fstest auto quick replace volume raid
+
+. ./common/filter
+
+_require_scratch_dev_pool 3
+
+_fixed_by_kernel_commit bbb651e469d9 \
+	"Btrfs: don't allow the replace procedure on read only filesystems"
+
+_scratch_dev_pool_get 2
+_spare_dev_get
+
+_scratch_pool_mkfs -m raid1 -d raid1 >> $seqres.full 2>&1
+_scratch_mount -o ro
+
+# The replace is expected to fail.
+#
+# There is an unexpected newline at the middle of the error message, filter it out
+# to handle older progs (unexpected new line) and newer ones (new line removed).
+$BTRFS_UTIL_PROG replace start -B 2 $SPARE_DEV $SCRATCH_MNT 2>&1 >> $seqres.full | \
+	sed -e "/^$/d" | _filter_scratch
+
+_scratch_unmount
+_spare_dev_put
+_scratch_dev_pool_put
+
+status=0
+exit

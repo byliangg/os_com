@@ -1,0 +1,107 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 291
+#
+# Test xfs_repair on fragmented multi-block dir2 fs
+#
+. ./common/preamble
+_begin_fstest auto repair metadump
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -r -f $tmp.*
+	_xfs_cleanup_verify_metadump
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/metadump
+
+_require_command "$XFS_MDRESTORE_PROG" "xfs_mdrestore"
+_xfs_setup_verify_metadump
+
+_require_scratch
+logblks=$(_scratch_find_xfs_min_logblocks -n size=16k -d size=133m)
+_scratch_mkfs_sized $((133 * 1048576)) '' -n size=16k -l size=${logblks}b >> $seqres.full 2>&1
+_scratch_mount
+
+# First we cause very badly fragmented freespace, then
+# make some multiblock directories in the filesystem, which
+# should come out very fragmented as a result
+
+# Step 1: Cause badly fragmented free space
+# 
+# XXX: this needs to be factored to match what generic/204 does to support
+# different inode sizes without ENOSPC
+mkdir $SCRATCH_MNT/fragdir
+for I in `seq 0 26200`; do
+        (echo data > $SCRATCH_MNT/fragdir/f$I) >> $seqres.full 2>&1
+done
+_scratch_sync
+
+for I in `seq 0 2 26200`; do
+        rm -f $SCRATCH_MNT/fragdir/f$I >> $seqres.full 2>&1
+done
+_scratch_sync
+
+# Soak up any remaining freespace
+$XFS_IO_PROG -f -c "pwrite 0 16m" -c "fsync" $SCRATCH_MNT/space_file.large >> $seqres.full 2>&1
+
+# Take a look at freespace for any post-mortem on the test
+_scratch_unmount
+_scratch_xfs_db -r -c freesp  >> $seqres.full 2>&1
+_scratch_mount
+
+# Step 2: Make a bunch of (hopefully fragmented) multiblock
+# dir2 directories
+
+# - FMT_LOCAL
+mkdir $SCRATCH_MNT/S_IFDIR.FMT_LOCAL
+touch $SCRATCH_MNT/S_IFDIR.FMT_LOCAL/localdirfile
+
+# - FMT_EXTENTS
+mkdir $SCRATCH_MNT/S_IFDIR.FMT_EXTENTS
+for I in `seq 1 100`; do
+	touch $SCRATCH_MNT/S_IFDIR.FMT_EXTENTS/extent_dir_file_$I
+done
+# With a few missing
+for I in `seq 10 2 20` 100; do
+	rm -f $SCRATCH_MNT/S_IFDIR.FMT_EXTENTS/extent_dir_file_$I
+done
+
+# - FMT_BTREE
+mkdir $SCRATCH_MNT/S_IFDIR.FMT_BTREE
+for I in `seq 1 1000`; do
+	touch $SCRATCH_MNT/S_IFDIR.FMT_BTREE/btree_dir_file_$I
+done
+# With a few missing
+for I in `seq 10 2 20` 1000; do
+	rm -f $SCRATCH_MNT/S_IFDIR.FMT_BTREE/btree_dir_file_$I
+done
+
+# Dave's special hack - grow freespace tree
+mkdir $SCRATCH_MNT/S_IFDIR.FMT_BTREE2
+for I in `seq 1 5000`; do
+	touch $SCRATCH_MNT/S_IFDIR.FMT_BTREE2/btree2_dir_file_$I
+done
+# Remove every other (odds)
+for I in `seq 1 2 5000`; do
+	rm -f $SCRATCH_MNT/S_IFDIR.FMT_BTREE2/btree2_dir_file_$I
+done
+
+_scratch_unmount
+# Can xfs_repair cope with this monster?
+_scratch_xfs_repair >> $seqres.full 2>&1 || _fail "xfs_repair failed"
+
+# Yes they can!  Now...
+# Can xfs_metadump cope with this monster?
+_xfs_verify_metadumps '-a -o'
+
+# Yes it can; success, all done
+status=0
+exit
+

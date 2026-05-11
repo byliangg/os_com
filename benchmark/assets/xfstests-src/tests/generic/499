@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 499
+#
+# Test a specific sequence of fsx operations that causes an mmap read past
+# eof to return nonzero contents.
+#
+. ./common/preamble
+_begin_fstest auto quick rw collapse zero prealloc mmap
+
+# Import common functions.
+. ./common/punch
+
+_require_scratch
+_require_xfs_io_command "falloc" "-k"
+_require_xfs_io_command "fcollapse"
+_require_xfs_io_command "fzero"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+cat >> $tmp.fsxops << ENDL
+fallocate 0x77e2 0x5f06 0x269a2 keep_size
+mapwrite 0x2e7fc 0x42ba 0x3f989
+write 0x67a9 0x714e 0x3f989
+write 0x39f96 0x185a 0x3f989
+collapse_range 0x36000 0x8000 0x3f989
+mapread 0x74c0 0x1bb3 0x3e2d0
+truncate 0x0 0x8aa2 0x3e2d0
+zero_range 0x1265 0x783d 0x8aa2
+mapread 0x7bd8 0xeca 0x8aa2
+ENDL
+
+victim=$SCRATCH_MNT/a
+touch $victim
+$FSX_PROG --replay-ops $tmp.fsxops $victim > $tmp.output 2>&1 || cat $tmp.output
+
+echo "Silence is golden"
+status=0
+exit

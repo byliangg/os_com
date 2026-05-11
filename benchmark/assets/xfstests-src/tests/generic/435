@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 435
+#
+# Test that without the encryption key for a directory, long filenames are
+# presented in a way which avoids collisions, even though they are abbreviated
+# in order to support names up to NAME_MAX bytes.
+#
+# Regression test for:
+#	6332cd32c829 ("f2fs: check entire encrypted bigname when finding a dentry")
+#	6b06cdee81d6 ("fscrypt: avoid collisions when presenting long encrypted filenames")
+#
+# Even with these two fixes it's still possible to create intentional
+# collisions.  For now this test covers "accidental" collisions only.
+#
+. ./common/preamble
+_begin_fstest auto encrypt
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+
+_require_scratch_encryption
+_require_command "$KEYCTL_PROG" keyctl
+
+# set up an encrypted directory
+
+_init_session_keyring
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+mkdir $SCRATCH_MNT/edir
+keydesc=$(_generate_session_encryption_key)
+# -f 0x2: zero-pad to 16-byte boundary (i.e. encryption block boundary)
+_set_encpolicy $SCRATCH_MNT/edir $keydesc -f 0x2
+
+# Create files with long names (> 32 bytes, long enough to trigger the use of
+# "digested" names) in the encrypted directory.
+#
+# Use 100,000 files so that we have a good chance of detecting buggy filesystems
+# that solely use a 32-bit hash to distinguish files, which f2fs was doing.
+#
+# Furthermore, make the filenames differ only in the last 16-byte encryption
+# block.  This reproduces the bug where it was not accounted for that ciphertext
+# stealing (CTS) causes the last two blocks to appear "flipped".
+seq -f "$SCRATCH_MNT/edir/abcdefghijklmnopqrstuvwxyz012345%.0f" 100000 | xargs touch
+find $SCRATCH_MNT/edir/ -type f | xargs stat -c %i | sort | uniq | wc -l
+
+_unlink_session_encryption_key $keydesc
+_scratch_cycle_mount
+
+# Verify that every file has a unique inode number and can be removed without
+# error.  With the bug(s), some filenames incorrectly pointed to the same inode,
+# and ext4 reported a "Structure needs cleaning" error when removing files.
+find $SCRATCH_MNT/edir/ -type f | xargs stat -c %i | sort | uniq | wc -l
+rm -rf $SCRATCH_MNT/edir |& head -n 10
+stat $SCRATCH_MNT/edir |& _filter_stat |& _filter_scratch
+
+# success, all done
+status=0
+exit

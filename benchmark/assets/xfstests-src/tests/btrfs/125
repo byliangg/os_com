@@ -1,0 +1,153 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle.  All Rights Reserved.
+#
+# FS QA Test 125
+#
+# This test verify if the reconstructed data on the RAID5 is good.
+# Steps:
+# Initialize RAID5 with some data
+#
+# Re-mount RAID5 degraded with dev3 missing and write data
+# Save md5sum checkpoint1
+#
+# Re-mount healthy RAID5
+#
+# Let balance fix the RAID5.
+# Save md5sum checkpoint2
+#
+# Re-mount RAID5 degraded with dev1 as missing.
+# Save md5sum checkpoint3
+#
+# Verify if all three checkpoints match
+#
+. ./common/preamble
+_begin_fstest replace volume balance auto quick raid
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	_btrfs_rescan_devices
+}
+
+. ./common/filter
+
+_require_scratch_dev_pool 3
+_test_unmount
+_require_btrfs_forget_or_module_loadable
+_require_btrfs_raid_type raid5
+
+_scratch_dev_pool_get 3
+
+dev1=${SCRATCH_DEV_NAME[0]}
+dev2=${SCRATCH_DEV_NAME[1]}
+dev3=${SCRATCH_DEV_NAME[2]}
+
+echo dev1=$dev1 >> $seqres.full
+echo dev2=$dev2 >> $seqres.full
+echo dev3=$dev3 >> $seqres.full
+
+# Balance won't be successful if filled too much
+dev1_sz=`blockdev --getsize64 $dev1`
+dev2_sz=`blockdev --getsize64 $dev2`
+dev3_sz=`blockdev --getsize64 $dev3`
+
+# get min of both.
+max_fs_sz=`echo -e "$dev1_sz\n$dev2_sz\n$dev3_sz" | sort -n | head -1`
+# Need disks with more than 2G
+if [ $max_fs_sz -lt 2000000000 ]; then
+	_scratch_dev_pool_put
+	_test_mount
+	_notrun "Smallest dev size $max_fs_sz, Need at least 2G"
+fi
+max_fs_sz=100000000
+bs="1M"
+count=$(($max_fs_sz / 1000000))
+
+#-------------normal init-------------------
+echo >> $seqres.full
+echo "max_fs_sz=$max_fs_sz count=$count" >> $seqres.full
+echo "-----Initialize -----" >> $seqres.full
+_scratch_pool_mkfs "-mraid1 -draid5" >> $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+dd if=/dev/zero of="$SCRATCH_MNT"/tf1 bs=$bs count=1 \
+					>>$seqres.full 2>&1
+_btrfs filesystem show
+_btrfs filesystem df $SCRATCH_MNT
+
+#-------------degraded-init-------------------
+echo >> $seqres.full
+echo "-----Write degraded mount fill upto $max_fs_sz bytes-----" >> $seqres.full
+echo
+echo "Write data with degraded mount"
+
+echo "unmount" >> $seqres.full
+_scratch_unmount
+echo "clean btrfs ko" >> $seqres.full
+# un-scan the btrfs devices
+_btrfs_forget_or_module_reload
+_mount -o degraded,device=$dev2 $dev1 $SCRATCH_MNT >>$seqres.full 2>&1
+dd if=/dev/zero of="$SCRATCH_MNT"/tf2 bs=$bs count=$count \
+					>>$seqres.full 2>&1
+_btrfs filesystem show
+_btrfs filesystem df $SCRATCH_MNT
+checkpoint1=`md5sum $SCRATCH_MNT/tf2`
+echo $checkpoint1 >> $seqres.full 2>&1
+
+#-------------balance-------------------
+echo >> $seqres.full
+echo "-----Mount normal-----" >> $seqres.full
+echo
+echo "Mount normal and balance"
+
+_scratch_unmount
+_btrfs device scan
+_scratch_mount >> $seqres.full 2>&1
+
+echo >> $seqres.full
+_run_btrfs_balance_start $SCRATCH_MNT >> $seqres.full
+
+_btrfs filesystem show
+_btrfs filesystem df ${SCRATCH_MNT}
+
+checkpoint2=`md5sum $SCRATCH_MNT/tf2`
+echo $checkpoint2 >> $seqres.full 2>&1
+
+#-------------degraded-mount-------------------
+echo >> $seqres.full
+echo "-----Mount degraded with dev1 missing-----" >> $seqres.full
+echo
+echo "Mount degraded but with other dev"
+
+_scratch_unmount
+# un-scan the btrfs devices
+_btrfs_forget_or_module_reload
+
+_mount -o degraded,device=${dev2} $dev3 $SCRATCH_MNT >>$seqres.full 2>&1
+
+_btrfs filesystem show
+_btrfs filesystem df $SCRATCH_MNT
+checkpoint3=`md5sum $SCRATCH_MNT/tf2`
+echo $checkpoint3 >> $seqres.full 2>&1
+
+if [ "$checkpoint1" != "$checkpoint2" ]; then
+	echo $checkpoint1
+	echo $checkpoint2
+	echo "Inital sum does not match with after balance"
+fi
+
+if [ "$checkpoint1" != "$checkpoint3" ]; then
+	echo $checkpoint1
+	echo $checkpoint3
+	echo "Inital sum does not match with data on dev2 written by balance"
+fi
+
+$UMOUNT_PROG $dev2
+_scratch_dev_pool_put
+_btrfs_rescan_devices
+_test_mount
+
+status=0
+exit

@@ -1,0 +1,51 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Netapp, Inc. All rights reserved.
+#
+# FS QA Test No. 431
+#
+# Tests vfs_copy_file_range():
+#   - Copy a small file
+#   - Small copies from various points in the original file
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+# get standard environment
+. common/filter
+
+
+_require_xfs_io_command "copy_range"
+_require_test
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file and then copy"
+echo -n "abcde" > $testdir/file
+$XFS_IO_PROG -f -c "copy_range $testdir/file" "$testdir/copy"
+echo -n "abcde" | cmp $testdir/copy
+echo "Original md5sums:"
+md5sum $testdir/{file,copy} | _filter_test_dir
+
+echo "Small copies from various points in the original file"
+$XFS_IO_PROG -f -c "copy_range -s 0 -l 1      $testdir/file" "$testdir/a"
+$XFS_IO_PROG -f -c "copy_range -s 1 -l 1      $testdir/file" "$testdir/b"
+$XFS_IO_PROG -f -c "copy_range -s 2 -l 1      $testdir/file" "$testdir/c"
+$XFS_IO_PROG -f -c "copy_range -s 3 -l 1      $testdir/file" "$testdir/d"
+$XFS_IO_PROG -f -c "copy_range -s 4 -l 1      $testdir/file" "$testdir/e"
+$XFS_IO_PROG -f -c "copy_range -s 4 -l 1 -d 1 $testdir/file" "$testdir/f"
+$XFS_IO_PROG -f -c "copy_range -s 5 -l 1      $testdir/file" "$testdir/g"
+echo -n "a"    | cmp $testdir/a
+echo -n "b"    | cmp $testdir/b
+echo -n "c"    | cmp $testdir/c
+echo -n "d"    | cmp $testdir/d
+echo -n "e"    | cmp $testdir/e
+echo -en "\0e" | cmp $testdir/f
+echo -n ""     | cmp $testdir/g
+echo "md5sums after small copies"
+md5sum $testdir/{file,a,b,c,d,e,f,g} | _filter_test_dir
+
+#success, all done
+status=0
+exit

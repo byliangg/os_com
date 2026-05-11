@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2021 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 145
+#
+# Regression test for failing to undo delalloc quota reservations when changing
+# project id but we fail some other part of FSSETXATTR validation.  If we fail
+# the test, we trip debugging assertions in dmesg.  This is a regression test
+# for commit 1aecf3734a95 ("xfs: fix chown leaking delalloc quota blocks when
+# fssetxattr fails").
+
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/quota
+
+_fixed_by_kernel_commit 1aecf3734a95 \
+	"xfs: fix chown leaking delalloc quota blocks when fssetxattr fails"
+
+_require_command "$FILEFRAG_PROG" filefrag
+_require_test_program "chprojid_fail"
+_require_quota
+_require_scratch
+
+echo "Format filesystem" | tee -a $seqres.full
+_scratch_mkfs > $seqres.full
+_qmount_option 'prjquota'
+_qmount
+_require_prjquota $SCRATCH_DEV
+
+# Make sure that a regular buffered write produces delalloc reservations.
+$XFS_IO_PROG -f -c 'pwrite 0 64k' $SCRATCH_MNT/testy &> /dev/null
+$FILEFRAG_PROG -v $SCRATCH_MNT/testy 2>&1 | grep -q delalloc || \
+	_notrun "test requires delayed allocation writes"
+rm -f $SCRATCH_MNT/testy
+
+echo "Run test program"
+$XFS_QUOTA_PROG -x -c 'report -ap' $SCRATCH_MNT >> $seqres.full
+$here/src/chprojid_fail $SCRATCH_MNT/blah
+
+# The regression we're testing for is an accounting bug involving delalloc
+# reservations.  FSSETXATTR does not itself cause dirty data writeback, so we
+# assume that if the file still has delalloc extents, then it must have had
+# them when chprojid_fail was running, and therefore the test was set up
+# correctly.  There's a slight chance that background writeback can sneak in
+# and flush the file, but this should be a small enough gap.
+$FILEFRAG_PROG -v $SCRATCH_MNT/blah 2>&1 | grep -q delalloc || \
+	echo "file didn't get delalloc extents, test invalid?"
+
+# Make a note of current quota status for diagnostic purposes
+$XFS_QUOTA_PROG -x -c 'report -ap' $SCRATCH_MNT >> $seqres.full
+
+# success, all done
+status=0
+exit

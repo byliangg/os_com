@@ -1,0 +1,79 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 335
+#
+# Test that if we move one file between directories, fsync the parent directory
+# of the old directory, power fail and remount the filesystem, the file is not
+# lost and it's located at the destination directory.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test directories and the file we will later check if it has
+# disappeared.
+mkdir -p $SCRATCH_MNT/a/b
+mkdir $SCRATCH_MNT/c
+touch $SCRATCH_MNT/a/b/foo
+
+# Make sure everything is durably persisted.
+_scratch_sync
+
+# Now move our test file into a new parent directory.
+mv $SCRATCH_MNT/a/b/foo $SCRATCH_MNT/c/
+
+# Create a new file inside the parent directory of the directory where our test
+# file foo was previously at. This is just to ensure the fsync we do next
+# against that parent directory actually does something and it's not a noop.
+touch $SCRATCH_MNT/a/bar
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/a
+
+# btrfs can not guarantee that when we fsync a directory all its subdirectories
+# created on past transactions are fsynced as well. It may do it sometimes, but
+# it's not guaranteed, giving such guarantees would be too expensive for large
+# directories and posix does not require that recursive behaviour. So if we want
+# the rename of "foo" to be persisted, explicitly fsync "foo".
+if [ $FSTYP == "btrfs" ]; then
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/c/foo
+fi
+
+echo "Filesystem content before power failure:"
+ls -R $SCRATCH_MNT/a $SCRATCH_MNT/c | _filter_scratch
+
+# Simulate a power failure / crash and remount the filesystem, so that the
+# journal/log is replayed.
+_flakey_drop_and_remount
+
+# We expect our file foo to exist, have an entry in the new parent
+# directory (c/) and not have anymore an entry in the old parent directory
+# (a/b/).
+# The new file named bar should also exist.
+echo "Filesystem content after power failure:"
+# Must match what we had before the power failure.
+ls -R $SCRATCH_MNT/a $SCRATCH_MNT/c | _filter_scratch
+
+_scratch_unmount
+
+status=0
+exit

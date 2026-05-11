@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 425
+#
+# Check that FIEMAP produces some output when we require an external
+# block to hold extended attributes.
+#
+. ./common/preamble
+_begin_fstest auto quick attr fiemap
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+[ $FSTYP = bcachefs ] && _notrun "bcachefs does not store xattrs in blocks"
+
+_require_scratch
+_require_attrs
+_require_xfs_io_command "fiemap" "-a"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original files"
+testfile=$testdir/attrfile
+touch $testfile
+blk_sz=$(_get_file_block_size $SCRATCH_MNT)
+
+# Assume each attr eats at least 20 bytes.  Try to fill 2 fs blocks.
+max_attrs=$((2 * blk_sz / 20))
+
+i=0
+while [ $i -lt $max_attrs ]; do
+	n="$(printf "%010d" $i)"
+	$SETFATTR_PROG -n "user.$n" -v "$n" $testfile > $seqres.full 2>&1 || break
+	i=$((i + 1))
+done
+_scratch_sync
+
+echo "Check attr extent counts"
+f1=$(_count_attr_extents $testfile)
+echo "$f1 xattr extents" >> $seqres.full
+$XFS_IO_PROG -c 'fiemap -a -v' $testfile >> $seqres.full
+test $f1 -gt 0 || echo "Expected at least one xattr extent."
+
+_scratch_cycle_mount
+
+echo "Check attr extent counts after remount"
+f1=$(_count_attr_extents $testfile)
+echo "$f1 xattr extents" >> $seqres.full
+$XFS_IO_PROG -c 'fiemap -a -v' $testfile >> $seqres.full
+test $f1 -gt 0 || echo "Expected at least one xattr extent."
+
+# success, all done
+status=0
+exit

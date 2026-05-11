@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Fujitsu. All Rights Reserved.
+#
+# FS QA Test No. 091
+#
+# Test for incorrect exclusive reference count after cloning file
+# between subvolumes.
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup
+
+. ./common/filter
+. ./common/reflink
+
+_require_scratch
+_require_cp_reflink
+_require_scratch_qgroup
+
+# use largest node/leaf size (64K) to allow the test to be run on arch with
+# page size > 4k.
+NODESIZE=65536
+
+run_check _scratch_mkfs "--nodesize $NODESIZE"
+
+# discard error output since we will check return value manually.
+# also disable all compression, or output will mismatch with golden output
+_try_scratch_mount "-o compress=no,compress-force=no" 2> /dev/null
+
+_btrfs subvolume create $SCRATCH_MNT/subv1
+_btrfs subvolume create $SCRATCH_MNT/subv2
+_btrfs subvolume create $SCRATCH_MNT/subv3
+
+_btrfs quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT
+
+$XFS_IO_PROG -f -c "pwrite 0 256K" $SCRATCH_MNT/subv1/file1 | _filter_xfs_io
+cp --reflink $SCRATCH_MNT/subv1/file1 $SCRATCH_MNT/subv2/file1
+cp --reflink $SCRATCH_MNT/subv1/file1 $SCRATCH_MNT/subv3/file1
+
+# Current btrfs use tree search ioctl to show quota, which will only show info
+# in commit tree. So need to sync to update the qgroup commit tree.
+sync
+
+units=`_btrfs_qgroup_units`
+$BTRFS_UTIL_PROG qgroup show $units $SCRATCH_MNT | $SED_PROG -n '/[0-9]/p' | \
+	$AWK_PROG '{print $2" "$3}'
+
+# success, all done
+status=0
+exit

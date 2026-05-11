@@ -1,0 +1,63 @@
+QA output created by 137
+wrote 65536/65536 bytes at offset 0
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 65536/65536 bytes at offset 0
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 65536/65536 bytes at offset 1114112
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 65536/65536 bytes at offset 1114112
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 65536/65536 bytes at offset 1114112
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+
+File digests in the original filesystem:
+9802287a6faa01a1fd0e01732b732fca  SCRATCH_MNT/snap1/foo
+fe93f68ad1d8d5e47feba666ee6d3c47  SCRATCH_MNT/snap1/bar
+fe93f68ad1d8d5e47feba666ee6d3c47  SCRATCH_MNT/snap2/foo
+8d06f9b5841190b586a7526d0dd356f3  SCRATCH_MNT/snap2/bar
+
+File snap1/foo fiemap results in the original filesystem:
+0: [0..127]: data
+
+File snap1/bar fiemap results in the original filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data
+
+File snap2/foo fiemap results in the original filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data
+
+File snap2/bar fiemap results in the original filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data
+
+At subvol SCRATCH_MNT/snap1
+At subvol SCRATCH_MNT/snap2
+At subvol snap1
+
+File digests in the new filesystem:
+9802287a6faa01a1fd0e01732b732fca  SCRATCH_MNT/snap1/foo
+fe93f68ad1d8d5e47feba666ee6d3c47  SCRATCH_MNT/snap1/bar
+fe93f68ad1d8d5e47feba666ee6d3c47  SCRATCH_MNT/snap2/foo
+8d06f9b5841190b586a7526d0dd356f3  SCRATCH_MNT/snap2/bar
+
+File snap1/foo fiemap results in the new filesystem:
+0: [0..127]: data
+
+File snap1/bar fiemap results in the new filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data
+
+File snap2/foo fiemap results in the new filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data
+
+File snap2/bar fiemap results in the new filesystem:
+0: [0..127]: data
+1: [128..2175]: hole
+2: [2176..2303]: data

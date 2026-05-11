@@ -2,5 +2,5 @@
 # when updating this
 [toolchain]
 channel = "nightly-2025-12-06"
-components = ["rust-src", "rustc-dev", "llvm-tools-preview"]
+components = ["rust-src", "rustfmt", "rustc-dev", "llvm-tools-preview"]
 targets = ["x86_64-unknown-none", "riscv64imac-unknown-none-elf", "loongarch64-unknown-none-softfloat"]

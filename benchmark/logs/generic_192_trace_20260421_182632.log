@@ -1,0 +1,3227 @@
+[Info] [normal] Forwarded QEMU guest port: 21377->22; 34017->8080 35526->6379 59298->5201 38719->31234 21303->31236 26558->11211
+[Info] [test] Forwarded QEMU guest port: 17660->22; 19643->8080 31574->6379 7251->5201 54728->31234 51413->31236 47663->11211
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 0.17s
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=01h].ECX.tsc-deadline [bit 24]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.invpcid [bit 10]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.gfni [bit 8]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.vpclmulqdq [bit 10]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EDX.spec-ctrl [bit 26]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=07h,ecx=00h].EDX.ssbd [bit 31]
+qemu-system-x86_64: warning: TCG doesn't support requested feature: CPUID[eax=0Dh,ecx=01h].EAX.xsavec [bit 1]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD1A00+7EF31A00 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..[kernel] OSTD initialized. Preparing components.
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running xfstests...
+xfstests probe: is_block TEST_DEV=1 SCRATCH_DEV=1
+brw-rw-rw-    1 root     root      254,   0 Apr 21 10:26 [1;35m/dev/vda[m
+brw-rw-rw-    1 root     root      254,  16 Apr 21 10:26 [1;35m/dev/vdb[m
+xfstests probe: lstat64 raw TEST_DEV=Device type: shim shim shim shim shim shim fe:0
+xfstests probe: lstat64 raw SCRATCH_DEV=Device type: shim shim shim shim shim shim fe:10
+xfstests probe: lstat64 TEST_DEV_TYPE=fe:0 SCRATCH_DEV_TYPE=fe:10
+xfstests probe: CHECK_SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash
+xfstests probe: grep=/opt/xfstests/shims/bin/grep readlink=/opt/xfstests/shims/bin/readlink
+xfstests probe: HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+xfstests probe: single_test=generic/192 trace_run=1
+xfstests probe: ignore_static_excluded_for_single=0
+xfstests probe: TEST_DEV=/dev/vda TEST_DIR=/ext4_test SCRATCH_DEV=/dev/vdb SCRATCH_MNT=/ext4_scratch
+xfstests probe: local.config
+EMAIL=root@localhost
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+xfstests probe: fill rc=1
+fill: cannot create "(null)": Bad address
+xfstests probe: shim grep rc=1 shim readlink rc=0 shim findmnt rc=1
+xfstests env: MKFS_PROG=/usr/sbin/mkfs.ext4 FSCK_PROG=/usr/sbin/e2fsck
+xfstests fsstate: pre:generic/192 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr 21 10:26 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 21 10:26 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/192 timeout=600s trace=1
+xfstests case done: generic/192 rc=1
+xfstests fsstate: post:generic/192 TEST_DIR='drwxr-xr-x    2 root     root             2 Apr 21 10:26 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Apr 21 10:26 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+===== FAIL LOG: generic/192 =====
++ unset CONFIG_INCLUDED
++ export FSTYP=ext4
++ FSTYP=ext4
++ export TEST_DEV=/dev/vda
++ TEST_DEV=/dev/vda
++ export SCRATCH_DEV=/dev/vdb
++ SCRATCH_DEV=/dev/vdb
++ export TEST_DIR=/ext4_test
++ TEST_DIR=/ext4_test
++ export SCRATCH_MNT=/ext4_scratch
++ SCRATCH_MNT=/ext4_scratch
++ export HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++ HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++ '[' 1 = 1 ']'
++ '[' 1 = 1 ']'
++ case "${0:-}" in
++ tmp=/tmp/145
++ status=0
++ needwrap=true
++ needsum=true
++ try=()
++ sum_bad=0
++ bad=()
++ notrun=()
++ interrupt=true
++ diff='diff -u'
++ showme=false
++ have_test_arg=false
++ randomize=false
++ exact_order=false
+++ pwd
++ export here=/opt/xfstests/xfstests-dev
++ here=/opt/xfstests/xfstests-dev
++ xfile=
++ subdir_xfile=
++ brief_test_summary=false
++ do_report=false
++ DUMP_OUTPUT=false
++ iterations=1
++ istop=false
++ loop_on_fail=0
++ exclude_tests=()
++ _err_msg=
++ iam=check
++ export MSGVERB=text:action
++ MSGVERB=text:action
++ export QA_CHECK_FS=true
++ QA_CHECK_FS=true
++ export DIFF_LENGTH=10
++ DIFF_LENGTH=10
++ timestamp=false
++ . common/exit
++ . common/test_names
+++ VALID_TEST_ID='[0-9]\{3\}'
+++ VALID_TEST_NAME='[0-9]\{3\}-\?[[:alnum:]-]*'
++ rm -f /tmp/145.list /tmp/145.tmp /tmp/145.grep /opt/xfstests/xfstests-dev/check.out '/tmp/145.report.*' /tmp/145.arglist
++ SRC_GROUPS=generic
++ export SRC_DIR=tests
++ SRC_DIR=tests
++ '[' 1 -gt 0 ']'
++ case "$1" in
++ have_test_arg=true
++ true
++ break
++ . ./common/rc
+++ . common/config
++++ export LANG=C
++++ LANG=C
++++ export LC_ALL=C
++++ LC_ALL=C
++++ PATH=.:/opt/xfstests/shims/bin:/bin:/usr/bin:/sbin:/usr/sbin:/opt/xfstests/tools/bin:/bin:/benchmark
+++++ hostname -s
++++ export 'HOST=(none)'
++++ HOST='(none)'
+++++ uname -s
++++ test Linux = Linux
++++ export MODULAR=0
++++ MODULAR=0
++++ export BOOT=/boot
++++ BOOT=/boot
++++ export EXTRA=xfs-qa
++++ EXTRA=xfs-qa
++++ export SOAK_PROC=3
++++ SOAK_PROC=3
++++ export SOAK_STRESS=10000
++++ SOAK_STRESS=10000
++++ export SOAK_PASSES=-1
++++ SOAK_PASSES=-1
++++ export EMAIL=root@localhost
++++ EMAIL=root@localhost
++++ export HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++++ HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++++ export 'CHECK_OPTIONS=-g auto'
++++ CHECK_OPTIONS='-g auto'
++++ export BENCH_PASSES=5
++++ BENCH_PASSES=5
++++ export TIME_FACTOR=1
++++ TIME_FACTOR=1
++++ export LOAD_FACTOR=1
++++ LOAD_FACTOR=1
++++ export SOAK_DURATION=
++++ SOAK_DURATION=
++++ export DEBUGFS_MNT=/sys/kernel/debug
++++ DEBUGFS_MNT=/sys/kernel/debug
++++ export OVL_UPPER=ovl-upper
++++ OVL_UPPER=ovl-upper
++++ export OVL_LOWER=ovl-lower
++++ OVL_LOWER=ovl-lower
++++ export OVL_WORK=ovl-work
++++ OVL_WORK=ovl-work
++++ export OVL_MNT=ovl-mnt
++++ OVL_MNT=ovl-mnt
++++ export UNIONMOUNT_TESTSUITE=/opt/xfstests/xfstests-dev/src/unionmount-testsuite
++++ UNIONMOUNT_TESTSUITE=/opt/xfstests/xfstests-dev/src/unionmount-testsuite
++++ export FSCK_OK=0
++++ FSCK_OK=0
++++ export FSCK_NONDESTRUCT=1
++++ FSCK_NONDESTRUCT=1
++++ export FSCK_REBOOT=2
++++ FSCK_REBOOT=2
++++ export FSCK_UNCORRECTED=4
++++ FSCK_UNCORRECTED=4
++++ export FSCK_ERROR=8
++++ FSCK_ERROR=8
++++ export FSCK_USAGE=16
++++ FSCK_USAGE=16
++++ export FSCK_CANCELED=32
++++ FSCK_CANCELED=32
++++ export FSCK_LIBRARY=128
++++ FSCK_LIBRARY=128
+++++ pwd
++++ export PWD=/opt/xfstests/xfstests-dev
++++ PWD=/opt/xfstests/xfstests-dev
++++ export MALLOCLIB=/usr/lib/libefence.a
++++ MALLOCLIB=/usr/lib/libefence.a
++++ export LOCAL_CONFIGURE_OPTIONS=--enable-readline=yes
++++ LOCAL_CONFIGURE_OPTIONS=--enable-readline=yes
++++ export RECREATE_TEST_DEV=false
++++ RECREATE_TEST_DEV=false
+++++ type -P mkfs
++++ export MKFS_PROG=/opt/xfstests/shims/bin/mkfs
++++ MKFS_PROG=/opt/xfstests/shims/bin/mkfs
++++ '[' /opt/xfstests/shims/bin/mkfs = '' ']'
+++++ type -P mount
++++ export MOUNT_PROG=/bin/mount
++++ MOUNT_PROG=/bin/mount
++++ '[' /bin/mount = '' ']'
+++++ type -P umount
++++ export UMOUNT_PROG=/opt/xfstests/shims/bin/umount
++++ UMOUNT_PROG=/opt/xfstests/shims/bin/umount
++++ '[' /opt/xfstests/shims/bin/umount = '' ']'
++++ export FSSTRESS_PROG=/opt/xfstests/xfstests-dev/ltp/fsstress
++++ FSSTRESS_PROG=/opt/xfstests/xfstests-dev/ltp/fsstress
++++ '[' '!' -x /opt/xfstests/xfstests-dev/ltp/fsstress ']'
++++ export FSX_PROG=/opt/xfstests/xfstests-dev/ltp/fsx
++++ FSX_PROG=/opt/xfstests/xfstests-dev/ltp/fsx
++++ '[' '!' -x /opt/xfstests/xfstests-dev/ltp/fsx ']'
+++++ type -P perl
++++ export PERL_PROG=/opt/xfstests/shims/bin/perl
++++ PERL_PROG=/opt/xfstests/shims/bin/perl
++++ '[' /opt/xfstests/shims/bin/perl = '' ']'
+++++ type -P awk
++++ export AWK_PROG=/bin/awk
++++ AWK_PROG=/bin/awk
++++ '[' /bin/awk = '' ']'
+++++ type -P sed
++++ export SED_PROG=/bin/sed
++++ SED_PROG=/bin/sed
++++ '[' /bin/sed = '' ']'
+++++ type -P bc
++++ export BC_PROG=/bin/bc
++++ BC_PROG=/bin/bc
++++ '[' /bin/bc = '' ']'
++++ export PS_ALL_FLAGS=-ef
++++ PS_ALL_FLAGS=-ef
+++++ type -P df
++++ export DF_PROG=/bin/df
++++ DF_PROG=/bin/df
++++ '[' /bin/df = '' ']'
++++ export 'DF_PROG=/bin/df -T -P'
++++ DF_PROG='/bin/df -T -P'
+++++ type -P xfs_io
++++ export XFS_IO_PROG=/opt/xfstests/shims/bin/xfs_io
++++ XFS_IO_PROG=/opt/xfstests/shims/bin/xfs_io
++++ '[' /opt/xfstests/shims/bin/xfs_io = '' ']'
+++++ type -P mkswap
++++ export MKSWAP_PROG=/bin/mkswap
++++ MKSWAP_PROG=/bin/mkswap
++++ MKSWAP_PROG='/bin/mkswap -f'
+++++ type -P xfs_logprint
++++ export XFS_LOGPRINT_PROG=
++++ XFS_LOGPRINT_PROG=
+++++ type -P xfs_protofile
++++ export XFS_PROTOFILE_PROG=
++++ XFS_PROTOFILE_PROG=
+++++ type -P xfs_repair
++++ export XFS_REPAIR_PROG=
++++ XFS_REPAIR_PROG=
+++++ type -P xfs_db
++++ export XFS_DB_PROG=
++++ XFS_DB_PROG=
+++++ type -P xfs_metadump
++++ export XFS_METADUMP_PROG=
++++ XFS_METADUMP_PROG=
+++++ type -P xfs_mdrestore
++++ export XFS_MDRESTORE_PROG=
++++ XFS_MDRESTORE_PROG=
+++++ type -P xfs_admin
++++ export XFS_ADMIN_PROG=
++++ XFS_ADMIN_PROG=
+++++ type -P xfs_growfs
++++ export XFS_GROWFS_PROG=
++++ XFS_GROWFS_PROG=
+++++ type -P xfs_spaceman
++++ export XFS_SPACEMAN_PROG=
++++ XFS_SPACEMAN_PROG=
+++++ type -P xfs_scrub
++++ export XFS_SCRUB_PROG=
++++ XFS_SCRUB_PROG=
+++++ type -P xfs_prepair
++++ export XFS_PARALLEL_REPAIR_PROG=
++++ XFS_PARALLEL_REPAIR_PROG=
+++++ type -P xfs_prepair64
++++ export XFS_PARALLEL_REPAIR64_PROG=
++++ XFS_PARALLEL_REPAIR64_PROG=
+++++ type -P xfsdump
++++ export __XFSDUMP_PROG=
++++ __XFSDUMP_PROG=
++++ '[' -n '' ']'
++++ export XFSDUMP_PROG=
++++ XFSDUMP_PROG=
+++++ type -P xfsrestore
++++ export XFSRESTORE_PROG=
++++ XFSRESTORE_PROG=
+++++ type -P xfsinvutil
++++ export XFSINVUTIL_PROG=
++++ XFSINVUTIL_PROG=
+++++ type -P getfattr
++++ export GETFATTR_PROG=
++++ GETFATTR_PROG=
+++++ type -P setfattr
++++ export SETFATTR_PROG=/bin/setfattr
++++ SETFATTR_PROG=/bin/setfattr
+++++ type -P chacl
++++ export CHACL_PROG=
++++ CHACL_PROG=
+++++ type -P attr
++++ export ATTR_PROG=
++++ ATTR_PROG=
+++++ type -P quota
++++ export QUOTA_PROG=
++++ QUOTA_PROG=
+++++ type -P xfs_quota
++++ export XFS_QUOTA_PROG=
++++ XFS_QUOTA_PROG=
+++++ type -P indent
++++ export INDENT_PROG=
++++ INDENT_PROG=
+++++ type -P xfs_copy
++++ export XFS_COPY_PROG=
++++ XFS_COPY_PROG=
+++++ type -P fstrim
++++ export FSTRIM_PROG=/bin/fstrim
++++ FSTRIM_PROG=/bin/fstrim
+++++ type -P dumpe2fs
++++ export DUMPE2FS_PROG=/opt/xfstests/shims/bin/dumpe2fs
++++ DUMPE2FS_PROG=/opt/xfstests/shims/bin/dumpe2fs
+++++ type -P resize2fs
++++ export RESIZE2FS_PROG=
++++ RESIZE2FS_PROG=
+++++ type -P fio
++++ export FIO_PROG=
++++ FIO_PROG=
+++++ type -P filefrag
++++ export FILEFRAG_PROG=
++++ FILEFRAG_PROG=
+++++ type -P e4defrag
++++ export E4DEFRAG_PROG=
++++ E4DEFRAG_PROG=
+++++ type -P logger
++++ export LOGGER_PROG=/bin/logger
++++ LOGGER_PROG=/bin/logger
+++++ type -P dbench
++++ export DBENCH_PROG=
++++ DBENCH_PROG=
+++++ type -P dmsetup
++++ export DMSETUP_PROG=
++++ DMSETUP_PROG=
+++++ type -P wipefs
++++ export WIPEFS_PROG=
++++ WIPEFS_PROG=
+++++ type -P blkdiscard
++++ export BLKDISCARD_PROG=/bin/blkdiscard
++++ BLKDISCARD_PROG=/bin/blkdiscard
+++++ type -P dump
++++ export DUMP_PROG=
++++ DUMP_PROG=
+++++ type -P restore
++++ export RESTORE_PROG=
++++ RESTORE_PROG=
+++++ type -P lvm
++++ export LVM_PROG=
++++ LVM_PROG=
+++++ type -P lsattr
++++ export LSATTR_PROG=/bin/lsattr
++++ LSATTR_PROG=/bin/lsattr
+++++ type -P chattr
++++ export CHATTR_PROG=/bin/chattr
++++ CHATTR_PROG=/bin/chattr
+++++ type -P debugfs
++++ export DEBUGFS_PROG=
++++ DEBUGFS_PROG=
+++++ type -P uuidgen
++++ export UUIDGEN_PROG=
++++ UUIDGEN_PROG=
+++++ type -P keyctl
++++ export KEYCTL_PROG=
++++ KEYCTL_PROG=
+++++ type -P xz
++++ export XZ_PROG=/bin/xz
++++ XZ_PROG=/bin/xz
+++++ type -P lz4
++++ export LZ4_PROG=
++++ LZ4_PROG=
+++++ type -P flock
++++ export FLOCK_PROG=/bin/flock
++++ FLOCK_PROG=/bin/flock
+++++ type -P ldd
++++ export LDD_PROG=
++++ LDD_PROG=
+++++ type -P timeout
++++ export TIMEOUT_PROG=/bin/timeout
++++ TIMEOUT_PROG=/bin/timeout
+++++ type -P man
++++ export MAN_PROG=/bin/man
++++ MAN_PROG=/bin/man
+++++ type -P nfs4_setfacl
++++ export NFS4_SETFACL_PROG=
++++ NFS4_SETFACL_PROG=
+++++ type -P nfs4_getfacl
++++ export NFS4_GETFACL_PROG=
++++ NFS4_GETFACL_PROG=
+++++ type -P ubiupdatevol
++++ export UBIUPDATEVOL_PROG=/bin/ubiupdatevol
++++ UBIUPDATEVOL_PROG=/bin/ubiupdatevol
+++++ type -P thin_check
++++ export THIN_CHECK_PROG=
++++ THIN_CHECK_PROG=
+++++ type -P python3
++++ export PYTHON3_PROG=
++++ PYTHON3_PROG=
+++++ type -P sqlite3
++++ export SQLITE3_PROG=
++++ SQLITE3_PROG=
+++++ type -P setcap
++++ export SETCAP_PROG=
++++ SETCAP_PROG=
+++++ type -P getcap
++++ export GETCAP_PROG=
++++ GETCAP_PROG=
+++++ type -P capsh
++++ export CAPSH_PROG=
++++ CAPSH_PROG=
+++++ type -P checkbashisms
++++ export CHECKBASHISMS_PROG=
++++ CHECKBASHISMS_PROG=
+++++ type -P xfs_info
++++ export XFS_INFO_PROG=
++++ XFS_INFO_PROG=
+++++ type -P duperemove
++++ export DUPEREMOVE_PROG=
++++ DUPEREMOVE_PROG=
+++++ type -P cc
++++ export CC_PROG=
++++ CC_PROG=
+++++ type -P fsverity
++++ export FSVERITY_PROG=
++++ FSVERITY_PROG=
+++++ type -P openssl
++++ export OPENSSL_PROG=
++++ OPENSSL_PROG=
+++++ type -P accton
++++ export ACCTON_PROG=
++++ ACCTON_PROG=
+++++ type -P e2image
++++ export E2IMAGE_PROG=
++++ E2IMAGE_PROG=
+++++ type -P blkzone
++++ export BLKZONE_PROG=
++++ BLKZONE_PROG=
+++++ type -P gzip
++++ export GZIP_PROG=/bin/gzip
++++ GZIP_PROG=/bin/gzip
+++++ type -P btrfs-image
++++ export BTRFS_IMAGE_PROG=
++++ BTRFS_IMAGE_PROG=
+++++ type -P btrfs-map-logical
++++ export BTRFS_MAP_LOGICAL_PROG=
++++ BTRFS_MAP_LOGICAL_PROG=
+++++ type -P parted
++++ export PARTED_PROG=
++++ PARTED_PROG=
+++++ type -P xfs_property
++++ export XFS_PROPERTY_PROG=
++++ XFS_PROPERTY_PROG=
+++++ type -P fscryptctl
++++ export FSCRYPTCTL_PROG=
++++ FSCRYPTCTL_PROG=
+++++ type -P udevadm
++++ UDEVADM_PROG=
++++ '[' -z '' ']'
+++++ type -P udevsettle
++++ UDEV_SETTLE_PROG=
++++ [[ '' == '' ]]
++++ UDEV_SETTLE_PROG='sleep 1'
++++ unset UDEV_WAIT_PROG
++++ export UDEV_SETTLE_PROG
++++ export UDEVADM_PROG
++++ export UDEV_WAIT_PROG
++++ MODPROBE_REMOVE_PATIENT=
++++ modprobe --help
++++ grep -q -1 remove-patiently
++++ modprobe --help
++++ [[ 1 -ne 0 ]]
++++ [[ -z '' ]]
++++ export MODPROBE_PATIENT_RM_TIMEOUT_SECONDS=50
++++ MODPROBE_PATIENT_RM_TIMEOUT_SECONDS=50
++++ export MODPROBE_REMOVE_PATIENT
+++++ type -P mkfs.xfs
++++ export MKFS_XFS_PROG=
++++ MKFS_XFS_PROG=
+++++ type -P mkfs.ext4
++++ export MKFS_EXT4_PROG=/opt/xfstests/shims/bin/mkfs.ext4
++++ MKFS_EXT4_PROG=/opt/xfstests/shims/bin/mkfs.ext4
+++++ type -P mkudffs
++++ export MKFS_UDF_PROG=
++++ MKFS_UDF_PROG=
+++++ set_mkfs_prog_path_with_opts btrfs
+++++ local fstyp=btrfs
++++++ type -P mkfs.btrfs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_BTRFS_PROG=
++++ MKFS_BTRFS_PROG=
+++++ set_mkfs_prog_path_with_opts f2fs
+++++ local fstyp=f2fs
++++++ type -P mkfs.f2fs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_F2FS_PROG=
++++ MKFS_F2FS_PROG=
+++++ type -P dump.f2fs
++++ export DUMP_F2FS_PROG=
++++ DUMP_F2FS_PROG=
+++++ type -P f2fs_io
++++ export F2FS_IO_PROG=
++++ F2FS_IO_PROG=
+++++ type -P inject.f2fs
++++ export F2FS_INJECT_PROG=
++++ F2FS_INJECT_PROG=
+++++ type -P fsck.f2fs
++++ export F2FS_FSCK_PROG=
++++ F2FS_FSCK_PROG=
+++++ type -P btrfs
++++ export BTRFS_UTIL_PROG=
++++ BTRFS_UTIL_PROG=
+++++ type -P btrfs-show-super
++++ export BTRFS_SHOW_SUPER_PROG=
++++ BTRFS_SHOW_SUPER_PROG=
+++++ type -P btrfs-convert
++++ export BTRFS_CONVERT_PROG=
++++ BTRFS_CONVERT_PROG=
+++++ type -P btrfstune
++++ export BTRFS_TUNE_PROG=
++++ BTRFS_TUNE_PROG=
+++++ type -P btrfs-corrupt-block
++++ export BTRFS_CORRUPT_BLOCK_PROG=
++++ BTRFS_CORRUPT_BLOCK_PROG=
+++++ type -P xfs_fsr
++++ export XFS_FSR_PROG=
++++ XFS_FSR_PROG=
++++ export MKFS_NFS_PROG=false
++++ MKFS_NFS_PROG=false
++++ export MKFS_AFS_PROG=false
++++ MKFS_AFS_PROG=false
++++ export MKFS_CIFS_PROG=false
++++ MKFS_CIFS_PROG=false
++++ export MKFS_OVERLAY_PROG=false
++++ MKFS_OVERLAY_PROG=false
+++++ type -P mkfs.reiser4
++++ export MKFS_REISER4_PROG=
++++ MKFS_REISER4_PROG=
+++++ type -P e2fsck
++++ export E2FSCK_PROG=/sbin/e2fsck
++++ E2FSCK_PROG=/sbin/e2fsck
+++++ type -P tune2fs
++++ export TUNE2FS_PROG=
++++ TUNE2FS_PROG=
+++++ type -P fsck.overlay
++++ export FSCK_OVERLAY_PROG=
++++ FSCK_OVERLAY_PROG=
+++++ set_mkfs_prog_path_with_opts bcachefs
+++++ local fstyp=bcachefs
++++++ type -P mkfs.bcachefs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_BCACHEFS_PROG=
++++ MKFS_BCACHEFS_PROG=
++++ '[' -x /usr/sbin/selinuxenabled ']'
++++ '[' '!' -f /opt/xfstests/xfstests-dev/local.config ']'
++++ export HOST_OPTIONS_SECTIONS=-no-sections-
++++ HOST_OPTIONS_SECTIONS=-no-sections-
++++ export OPTIONS_HAVE_SECTIONS=false
++++ OPTIONS_HAVE_SECTIONS=false
++++ '[' -f /opt/xfstests/xfstests-dev/local.config ']'
+++++ get_config_sections /opt/xfstests/xfstests-dev/local.config
+++++ sed -n -e 's/^\[\([[:alnum:]_-]*\)\]/\1/p'
++++ export HOST_OPTIONS_SECTIONS=
++++ HOST_OPTIONS_SECTIONS=
++++ '[' -z '' ']'
++++ . /opt/xfstests/xfstests-dev/local.config
+++++ EMAIL=root@localhost
+++++ FSTYP=ext4
+++++ TEST_DEV=/dev/vda
+++++ TEST_DIR=/ext4_test
+++++ SCRATCH_DEV=/dev/vdb
+++++ SCRATCH_MNT=/ext4_scratch
++++ export HOST_OPTIONS_SECTIONS=-no-sections-
++++ HOST_OPTIONS_SECTIONS=-no-sections-
++++ '[' -z '' ']'
+++++ cut -f1 '-d '
+++++ echo -no-sections-
++++ get_next_config -no-sections-
++++ '[' '!' -z '' ']'
++++ '[' ext4 == overlay ']'
++++ local OLD_FSTYP=ext4
++++ local OLD_MOUNT_OPTIONS=
++++ local OLD_TEST_FS_MOUNT_OPTS=
++++ local OLD_MKFS_OPTIONS=
++++ local OLD_FSCK_OPTIONS=
++++ local OLD_USE_EXTERNAL=
++++ unset MOUNT_OPTIONS
++++ unset TEST_FS_MOUNT_OPTS
++++ unset MKFS_OPTIONS
++++ unset FSCK_OPTIONS
++++ unset USE_EXTERNAL
++++ '[' '' == true ']'
++++ parse_config_section -no-sections-
++++ SECTION=-no-sections-
++++ false
++++ return 0
++++ '[' '!' -z ext4 ']'
++++ '[' ext4 '!=' ext4 ']'
++++ '[' -z '' ']'
++++ export MOUNT_OPTIONS=
++++ MOUNT_OPTIONS=
++++ '[' -z '' ']'
++++ export TEST_FS_MOUNT_OPTS=
++++ TEST_FS_MOUNT_OPTS=
++++ '[' -z '' ']'
++++ export MKFS_OPTIONS=
++++ MKFS_OPTIONS=
++++ '[' -z '' ']'
++++ export FSCK_OPTIONS=
++++ FSCK_OPTIONS=
++++ '[' -z '' ']'
++++ export USE_EXTERNAL=
++++ USE_EXTERNAL=
++++ '[' -z '' ']'
++++ export RESULT_BASE=/opt/xfstests/xfstests-dev/results/
++++ RESULT_BASE=/opt/xfstests/xfstests-dev/results/
++++ '[' ext4 == tmpfs ']'
++++ MC=
++++ '[' -z root@localhost ']'
++++ '[' -z /ext4_test ']'
++++ '[' -z /dev/vda ']'
++++ '[' -n '' ']'
++++ _check_device TEST_DEV required /dev/vda
++++ local name=TEST_DEV
++++ local dev_needed=required
++++ local dev=/dev/vda
++++ '[' -z /dev/vda ']'
++++ '[' -b /dev/vda ']'
++++ return 0
+++++ _canonicalize_mountpoint TEST_DIR /ext4_test
+++++ local name=TEST_DIR
+++++ local dir=/ext4_test
+++++ '[' -d /ext4_test ']'
+++++ readlink -e /ext4_test
+++++ return 0
++++ export TEST_DIR=/ext4_test
++++ TEST_DIR=/ext4_test
++++ '[' '!' -z '' ']'
++++ _check_device SCRATCH_DEV optional /dev/vdb
++++ local name=SCRATCH_DEV
++++ local dev_needed=optional
++++ local dev=/dev/vdb
++++ '[' -z /dev/vdb ']'
++++ '[' -b /dev/vdb ']'
++++ return 0
+++++ _canonicalize_mountpoint SCRATCH_MNT /ext4_scratch
+++++ local name=SCRATCH_MNT
+++++ local dir=/ext4_scratch
+++++ '[' -d /ext4_scratch ']'
+++++ readlink -e /ext4_scratch
+++++ return 0
++++ export SCRATCH_MNT=/ext4_scratch
++++ SCRATCH_MNT=/ext4_scratch
++++ '[' -n '' ']'
++++ '[' '' == true -o ext4 == overlay ']'
++++ export CONFIG_INCLUDED=true
++++ CONFIG_INCLUDED=true
++++ '[' -z ext4 ']'
++++ FSTYP=ext4
++++ export FSTYP
++++ '[' -z '' ']'
++++ _mount_opts
+++++ _common_mount_opts
+++++ case $FSTYP in
+++++ echo '-o acl,user_xattr '
++++ export 'MOUNT_OPTIONS=-o acl,user_xattr '
++++ MOUNT_OPTIONS='-o acl,user_xattr '
++++ '[' -z '' ']'
++++ _test_mount_opts
+++++ _common_mount_opts
+++++ case $FSTYP in
+++++ echo '-o acl,user_xattr '
++++ export 'TEST_FS_MOUNT_OPTS=-o acl,user_xattr '
++++ TEST_FS_MOUNT_OPTS='-o acl,user_xattr '
++++ '[' -z '' ']'
++++ _mkfs_opts
++++ case $FSTYP in
++++ '[' -z '' ']'
++++ _fsck_opts
++++ case $FSTYP in
++++ export FSCK_OPTIONS=-nf
++++ FSCK_OPTIONS=-nf
++++ _canonicalize_devices
++++ '[' '' '!=' yes ']'
++++ return
++++ export TEST_DEV
++++ /bin/true
++++ type -P bc
+++ BC=/bin/bc
+++ _FSSTRESS_PID=
+++ umask 022
+++ _source_specific_fs ext4
+++ local fs=ext4
+++ '[' -z ext4 ']'
+++ case "$fs" in
+++ '[' /opt/xfstests/shims/bin/mkfs.ext4 = '' ']'
+++ . ./common/ext4
+++ '[' '!' -z '' ']'
+++ USE_REMOUNT=0
+++ /bin/true
++ init_rc
++ '[' /dev/vda = '' ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -z '' ']'
++ _test_mount
++ local mount_ret
++ '[' ext4 == ceph-fuse ']'
++ '[' ext4 == overlay ']'
++ _test_options mount
++ local type=mount
++ local rt_opt=
++ local log_opt=
++ TEST_OPTIONS=
++ '[' ext4 '!=' xfs ']'
++ return
++ _mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ /bin/mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ mount_ret=0
++ '[' 0 -ne 0 ']'
++ _idmapped_mount /dev/vda /ext4_test
++ '[' '' = true ']'
++ return 0
++ _prepare_for_eio_shutdown /dev/vda
++ local dev=/dev/vda
++ case "$FSTYP" in
++ return 0
++ _check_mounted_on TEST_DEV /dev/vda TEST_DIR /ext4_test ext4
++ local devname=TEST_DEV
++ local dev=/dev/vda
++ local mntname=TEST_DIR
++ local mnt=/ext4_test
++ local type=ext4
++ '[' /dev/vda '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vda /ext4_test
++ local dev=/dev/vda
++ local mnt=/ext4_test
+++ findmnt -rncv -S /dev/vda -o SOURCE,TARGET
++ local 'mount_rec=/dev/vda /ext4_test'
++ '[' -n '/dev/vda /ext4_test' ']'
++ '[' '/dev/vda /ext4_test' '!=' '/dev/vda /ext4_test' ']'
++ dev_already_mounted=0
++ '[' 0 -ne 0 ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ _df_device /dev/vda
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -n ext4 -a ext4 '!=' ext4 ']'
++ return 0
++ '[' -n /dev/vdb ']'
++ _check_mounted_on SCRATCH_DEV /dev/vdb SCRATCH_MNT /ext4_scratch
++ local devname=SCRATCH_DEV
++ local dev=/dev/vdb
++ local mntname=SCRATCH_MNT
++ local mnt=/ext4_scratch
++ local type=
++ '[' /dev/vdb '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vdb /ext4_scratch
++ local dev=/dev/vdb
++ local mnt=/ext4_scratch
+++ findmnt -rncv -S /dev/vdb -o SOURCE,TARGET
++ local mount_rec=
++ '[' -n '' ']'
++ return 1
++ dev_already_mounted=1
++ '[' 1 -ne 0 ']'
++ return 1
++ '[' 1 -le 1 ']'
++ /opt/xfstests/shims/bin/xfs_io -c stat /ext4_test
++ grep -q 'is not on an XFS filesystem'
++ /opt/xfstests/shims/bin/xfs_io -i -c quit
++ '[' -n '' ']'
++ '[' -n '' ']'
++ '[' -n '' ']'
++ true
++ '[' 1 -gt 0 ']'
++ case "$1" in
+++ cd tests
+++ echo generic/192
++ list=generic/192
++ for t in $list
++ t=generic/192
++ test_dir=generic
++ test_name=192
++ group_file=tests/generic/group.list
++ grep -Eq '^192' tests/generic/group.list
++ echo tests/generic/192
++ shift
++ '[' 0 -gt 0 ']'
+++ id -u
++ '[' 0 -ne 0 ']'
++ '[' -n '' ']'
+++ awk 'BEGIN {x = 0} /\/[0-9]*$/ {l = length($0) - 6; if (l > x) x = l;} END {print x}'
+++ ls tests/btrfs/001 tests/btrfs/001.out tests/btrfs/002 tests/btrfs/002.out tests/btrfs/003 tests/btrfs/003.out tests/btrfs/004 tests/btrfs/004.out tests/btrfs/005 tests/btrfs/005.out tests/btrfs/006 tests/btrfs/006.out tests/btrfs/007 tests/btrfs/007.out tests/btrfs/008 tests/btrfs/008.out tests/btrfs/009 tests/btrfs/009.out tests/btrfs/010 tests/btrfs/010.out tests/btrfs/011 tests/btrfs/011.out tests/btrfs/012 tests/btrfs/012.out tests/btrfs/013 tests/btrfs/013.out tests/btrfs/014 tests/btrfs/014.out tests/btrfs/015 tests/btrfs/015.out tests/btrfs/016 tests/btrfs/016.out tests/btrfs/017 tests/btrfs/017.out tests/btrfs/018 tests/btrfs/018.out tests/btrfs/019 tests/btrfs/019.out tests/btrfs/020 tests/btrfs/020.out tests/btrfs/021 tests/btrfs/021.out tests/btrfs/022 tests/btrfs/022.out tests/btrfs/023 tests/btrfs/023.out tests/btrfs/024 tests/btrfs/024.out tests/btrfs/025 tests/btrfs/025.out tests/btrfs/026 tests/btrfs/026.out tests/btrfs/027 tests/btrfs/027.out tests/btrfs/028 tests/btrfs/028.out tests/btrfs/029 tests/btrfs/029.out tests/btrfs/030 tests/btrfs/030.out tests/btrfs/031 tests/btrfs/031.out tests/btrfs/032 tests/btrfs/032.out tests/btrfs/033 tests/btrfs/033.out tests/btrfs/034 tests/btrfs/034.out tests/btrfs/035 tests/btrfs/035.out tests/btrfs/036 tests/btrfs/036.out tests/btrfs/037 tests/btrfs/037.out tests/btrfs/038 tests/btrfs/038.out tests/btrfs/039 tests/btrfs/039.out tests/btrfs/040 tests/btrfs/040.out tests/btrfs/041 tests/btrfs/041.out tests/btrfs/042 tests/btrfs/042.out tests/btrfs/043 tests/btrfs/043.out tests/btrfs/044 tests/btrfs/044.out tests/btrfs/045 tests/btrfs/045.out tests/btrfs/046 tests/btrfs/046.out tests/btrfs/047 tests/btrfs/047.out tests/btrfs/048 tests/btrfs/048.out tests/btrfs/049 tests/btrfs/049.out tests/btrfs/050 tests/btrfs/050.out tests/btrfs/051 tests/btrfs/051.out tests/btrfs/052 tests/btrfs/052.out tests/btrfs/053 tests/btrfs/053.out tests/btrfs/054 tests/btrfs/054.out tests/btrfs/055 tests/btrfs/055.out tests/btrfs/056 tests/btrfs/056.out tests/btrfs/057 tests/btrfs/057.out tests/btrfs/058 tests/btrfs/058.out tests/btrfs/059 tests/btrfs/059.out tests/btrfs/060 tests/btrfs/060.out tests/btrfs/061 tests/btrfs/061.out tests/btrfs/062 tests/btrfs/062.out tests/btrfs/063 tests/btrfs/063.out tests/btrfs/064 tests/btrfs/064.out tests/btrfs/065 tests/btrfs/065.out tests/btrfs/066 tests/btrfs/066.out tests/btrfs/067 tests/btrfs/067.out tests/btrfs/068 tests/btrfs/068.out tests/btrfs/069 tests/btrfs/069.out tests/btrfs/070 tests/btrfs/070.out tests/btrfs/071 tests/btrfs/071.out tests/btrfs/072 tests/btrfs/072.out tests/btrfs/073 tests/btrfs/073.out tests/btrfs/074 tests/btrfs/074.out tests/btrfs/075 tests/btrfs/075.out tests/btrfs/076 tests/btrfs/076.out tests/btrfs/077 tests/btrfs/077.out tests/btrfs/078 tests/btrfs/078.out tests/btrfs/079 tests/btrfs/079.out tests/btrfs/080 tests/btrfs/080.out tests/btrfs/081 tests/btrfs/081.out tests/btrfs/082 tests/btrfs/082.out tests/btrfs/083 tests/btrfs/083.out tests/btrfs/084 tests/btrfs/084.out tests/btrfs/085 tests/btrfs/085.out tests/btrfs/086 tests/btrfs/086.out tests/btrfs/087 tests/btrfs/087.out tests/btrfs/088 tests/btrfs/088.out tests/btrfs/089 tests/btrfs/089.out tests/btrfs/090 tests/btrfs/090.out tests/btrfs/091 tests/btrfs/091.out tests/btrfs/092 tests/btrfs/092.out tests/btrfs/093 tests/btrfs/093.out tests/btrfs/094 tests/btrfs/094.out tests/btrfs/095 tests/btrfs/095.out tests/btrfs/096 tests/btrfs/096.out tests/btrfs/097 tests/btrfs/097.out tests/btrfs/098 tests/btrfs/098.out tests/btrfs/099 tests/btrfs/099.out tests/btrfs/100 tests/btrfs/100.out tests/btrfs/101 tests/btrfs/101.out tests/btrfs/102 tests/btrfs/102.out tests/btrfs/103 tests/btrfs/103.out tests/btrfs/104 tests/btrfs/104.out tests/btrfs/105 tests/btrfs/105.out tests/btrfs/106 tests/btrfs/106.out tests/btrfs/107 tests/btrfs/107.out tests/btrfs/108 tests/btrfs/108.out tests/btrfs/109 tests/btrfs/109.out tests/btrfs/110 tests/btrfs/110.out tests/btrfs/111 tests/btrfs/111.out tests/btrfs/112 tests/btrfs/112.out tests/btrfs/113 tests/btrfs/113.out tests/btrfs/114 tests/btrfs/114.out tests/btrfs/115 tests/btrfs/115.out tests/btrfs/116 tests/btrfs/116.out tests/btrfs/117 tests/btrfs/117.out tests/btrfs/118 tests/btrfs/118.out tests/btrfs/119 tests/btrfs/119.out tests/btrfs/120 tests/btrfs/120.out tests/btrfs/121 tests/btrfs/121.out tests/btrfs/122 tests/btrfs/122.out tests/btrfs/123 tests/btrfs/123.out tests/btrfs/124 tests/btrfs/124.out tests/btrfs/125 tests/btrfs/125.out tests/btrfs/126 tests/btrfs/126.out tests/btrfs/127 tests/btrfs/127.out tests/btrfs/128 tests/btrfs/128.out tests/btrfs/129 tests/btrfs/129.out tests/btrfs/130 tests/btrfs/130.out tests/btrfs/131 tests/btrfs/131.out tests/btrfs/132 tests/btrfs/132.out tests/btrfs/133 tests/btrfs/133.out tests/btrfs/134 tests/btrfs/134.out tests/btrfs/135 tests/btrfs/135.out tests/btrfs/136 tests/btrfs/136.out tests/btrfs/137 tests/btrfs/137.out tests/btrfs/138 tests/btrfs/138.out tests/btrfs/139 tests/btrfs/139.out tests/btrfs/140 tests/btrfs/140.out tests/btrfs/141 tests/btrfs/141.out tests/btrfs/142 tests/btrfs/142.out tests/btrfs/143 tests/btrfs/143.out tests/btrfs/144 tests/btrfs/144.out tests/btrfs/145 tests/btrfs/145.out tests/btrfs/146 tests/btrfs/146.out tests/btrfs/147 tests/btrfs/147.out tests/btrfs/148 tests/btrfs/148.out tests/btrfs/149 tests/btrfs/149.out tests/btrfs/150 tests/btrfs/150.out tests/btrfs/151 tests/btrfs/151.out tests/btrfs/152 tests/btrfs/152.out tests/btrfs/153 tests/btrfs/153.out tests/btrfs/154 tests/btrfs/154.out tests/btrfs/155 tests/btrfs/155.out tests/btrfs/156 tests/btrfs/156.out tests/btrfs/157 tests/btrfs/157.out tests/btrfs/158 tests/btrfs/158.out tests/btrfs/159 tests/btrfs/159.out tests/btrfs/160 tests/btrfs/160.out tests/btrfs/161 tests/btrfs/161.out tests/btrfs/162 tests/btrfs/162.out tests/btrfs/163 tests/btrfs/163.out tests/btrfs/164 tests/btrfs/164.out tests/btrfs/165 tests/btrfs/165.out tests/btrfs/166 tests/btrfs/166.out tests/btrfs/167 tests/btrfs/167.out tests/btrfs/168 tests/btrfs/168.out tests/btrfs/169 tests/btrfs/169.out tests/btrfs/170 tests/btrfs/170.out tests/btrfs/171 tests/btrfs/171.out tests/btrfs/172 tests/btrfs/172.out tests/btrfs/173 tests/btrfs/173.out tests/btrfs/174 tests/btrfs/174.out tests/btrfs/175 tests/btrfs/175.out tests/btrfs/176 tests/btrfs/176.out tests/btrfs/177 tests/btrfs/177.out tests/btrfs/178 tests/btrfs/178.out tests/btrfs/179 tests/btrfs/179.out tests/btrfs/180 tests/btrfs/180.out tests/btrfs/181 tests/btrfs/181.out tests/btrfs/182 tests/btrfs/182.out tests/btrfs/183 tests/btrfs/183.out tests/btrfs/184 tests/btrfs/184.out tests/btrfs/185 tests/btrfs/185.out tests/btrfs/186 tests/btrfs/186.out tests/btrfs/187 tests/btrfs/187.out tests/btrfs/188 tests/btrfs/188.out tests/btrfs/189 tests/btrfs/189.out tests/btrfs/190 tests/btrfs/190.out tests/btrfs/191 tests/btrfs/191.out tests/btrfs/192 tests/btrfs/192.out tests/btrfs/193 tests/btrfs/193.out tests/btrfs/194 tests/btrfs/194.out tests/btrfs/195 tests/btrfs/195.out tests/btrfs/196 tests/btrfs/196.out tests/btrfs/197 tests/btrfs/197.out tests/btrfs/198 tests/btrfs/198.out tests/btrfs/199 tests/btrfs/199.out tests/btrfs/200 tests/btrfs/200.out tests/btrfs/201 tests/btrfs/201.out tests/btrfs/202 tests/btrfs/202.out tests/btrfs/203 tests/btrfs/203.out tests/btrfs/204 tests/btrfs/204.out tests/btrfs/205 tests/btrfs/205.out tests/btrfs/206 tests/btrfs/206.out tests/btrfs/207 tests/btrfs/207.out tests/btrfs/208 tests/btrfs/208.out tests/btrfs/209 tests/btrfs/209.out tests/btrfs/210 tests/btrfs/210.out tests/btrfs/211 tests/btrfs/211.out tests/btrfs/212 tests/btrfs/212.out tests/btrfs/213 tests/btrfs/213.out tests/btrfs/214 tests/btrfs/214.out tests/btrfs/215 tests/btrfs/215.out tests/btrfs/216 tests/btrfs/216.out tests/btrfs/217 tests/btrfs/217.out tests/btrfs/218 tests/btrfs/218.out tests/btrfs/219 tests/btrfs/219.out tests/btrfs/220 tests/btrfs/220.out tests/btrfs/221 tests/btrfs/221.out tests/btrfs/222 tests/btrfs/222.out tests/btrfs/223 tests/btrfs/223.out tests/btrfs/224 tests/btrfs/224.out tests/btrfs/225 tests/btrfs/225.out tests/btrfs/226 tests/btrfs/226.out tests/btrfs/227 tests/btrfs/227.out tests/btrfs/228 tests/btrfs/228.out tests/btrfs/229 tests/btrfs/229.out tests/btrfs/230 tests/btrfs/230.out tests/btrfs/231 tests/btrfs/231.out tests/btrfs/232 tests/btrfs/232.out tests/btrfs/233 tests/btrfs/233.out tests/btrfs/234 tests/btrfs/234.out tests/btrfs/235 tests/btrfs/235.out tests/btrfs/236 tests/btrfs/236.out tests/btrfs/237 tests/btrfs/237.out tests/btrfs/238 tests/btrfs/238.out tests/btrfs/239 tests/btrfs/239.out tests/btrfs/240 tests/btrfs/240.out tests/btrfs/241 tests/btrfs/241.out tests/btrfs/242 tests/btrfs/242.out tests/btrfs/243 tests/btrfs/243.out tests/btrfs/244 tests/btrfs/244.out tests/btrfs/245 tests/btrfs/245.out tests/btrfs/246 tests/btrfs/246.out tests/btrfs/247 tests/btrfs/247.out tests/btrfs/248 tests/btrfs/248.out tests/btrfs/249 tests/btrfs/249.out tests/btrfs/250 tests/btrfs/250.out tests/btrfs/251 tests/btrfs/251.out tests/btrfs/252 tests/btrfs/252.out tests/btrfs/253 tests/btrfs/253.out tests/btrfs/254 tests/btrfs/254.out tests/btrfs/255 tests/btrfs/255.out tests/btrfs/256 tests/btrfs/256.out tests/btrfs/257 tests/btrfs/257.out tests/btrfs/258 tests/btrfs/258.out tests/btrfs/259 tests/btrfs/259.out tests/btrfs/260 tests/btrfs/260.out tests/btrfs/261 tests/btrfs/261.out tests/btrfs/262 tests/btrfs/262.out tests/btrfs/263 tests/btrfs/263.out tests/btrfs/264 tests/btrfs/264.out tests/btrfs/265 tests/btrfs/265.out tests/btrfs/266 tests/btrfs/266.out tests/btrfs/267 tests/btrfs/267.out tests/btrfs/268 tests/btrfs/268.out tests/btrfs/269 tests/btrfs/269.out tests/btrfs/270 tests/btrfs/270.out tests/btrfs/271 tests/btrfs/271.out tests/btrfs/272 tests/btrfs/272.out tests/btrfs/273 tests/btrfs/273.out tests/btrfs/274 tests/btrfs/274.out tests/btrfs/275 tests/btrfs/275.out tests/btrfs/276 tests/btrfs/276.out tests/btrfs/277 tests/btrfs/277.out tests/btrfs/278 tests/btrfs/278.out tests/btrfs/279 tests/btrfs/279.out tests/btrfs/280 tests/btrfs/280.out tests/btrfs/281 tests/btrfs/281.out tests/btrfs/282 tests/btrfs/282.out tests/btrfs/283 tests/btrfs/283.out tests/btrfs/284 tests/btrfs/284.out tests/btrfs/285 tests/btrfs/285.out tests/btrfs/286 tests/btrfs/286.out tests/btrfs/287 tests/btrfs/287.out tests/btrfs/288 tests/btrfs/288.out tests/btrfs/289 tests/btrfs/289.out tests/btrfs/290 tests/btrfs/290.out tests/btrfs/291 tests/btrfs/291.out tests/btrfs/292 tests/btrfs/292.out tests/btrfs/293 tests/btrfs/293.out tests/btrfs/294 tests/btrfs/294.out tests/btrfs/295 tests/btrfs/295.out tests/btrfs/296 tests/btrfs/296.out tests/btrfs/297 tests/btrfs/297.out tests/btrfs/298 tests/btrfs/298.out tests/btrfs/299 tests/btrfs/299.out tests/btrfs/300 tests/btrfs/300.out tests/btrfs/301 tests/btrfs/301.out tests/btrfs/302 tests/btrfs/302.out tests/btrfs/303 tests/btrfs/303.out tests/btrfs/304 tests/btrfs/304.out tests/btrfs/305 tests/btrfs/305.out tests/btrfs/306 tests/btrfs/306.out tests/btrfs/307 tests/btrfs/307.out tests/btrfs/308 tests/btrfs/308.out tests/btrfs/309 tests/btrfs/309.out tests/btrfs/310 tests/btrfs/310.out tests/btrfs/311 tests/btrfs/311.out tests/btrfs/312 tests/btrfs/312.out tests/btrfs/313 tests/btrfs/313.out tests/btrfs/314 tests/btrfs/314.out tests/btrfs/315 tests/btrfs/315.out tests/btrfs/316 tests/btrfs/316.out tests/btrfs/317 tests/btrfs/317.out tests/btrfs/318 tests/btrfs/318.out tests/btrfs/319 tests/btrfs/319.out tests/btrfs/320 tests/btrfs/320.out tests/btrfs/321 tests/btrfs/321.out tests/btrfs/322 tests/btrfs/322.out tests/btrfs/323 tests/btrfs/323.out tests/btrfs/324 tests/btrfs/324.out tests/btrfs/325 tests/btrfs/325.out tests/btrfs/326 tests/btrfs/326.out tests/btrfs/327 tests/btrfs/327.out tests/btrfs/328 tests/btrfs/328.out tests/btrfs/329 tests/btrfs/329.out tests/btrfs/330 tests/btrfs/330.out tests/btrfs/331 tests/btrfs/331.out tests/btrfs/332 tests/btrfs/332.out tests/btrfs/333 tests/btrfs/333.out tests/btrfs/334 tests/btrfs/334.out tests/btrfs/335 tests/btrfs/335.out tests/btrfs/336 tests/btrfs/336.out tests/btrfs/337 tests/btrfs/337.out tests/btrfs/338 tests/btrfs/338.out tests/btrfs/339 tests/btrfs/339.out tests/btrfs/340 tests/btrfs/340.out tests/btrfs/341 tests/btrfs/341.out tests/btrfs/342 tests/btrfs/342.out tests/btrfs/343 tests/btrfs/343.out tests/btrfs/344 tests/btrfs/344.out tests/btrfs/Makefile tests/btrfs/group.list tests/ceph/001 tests/ceph/001.out tests/ceph/002 tests/ceph/002.out tests/ceph/003 tests/ceph/003.out tests/ceph/004 tests/ceph/004.out tests/ceph/005 tests/ceph/005.out tests/ceph/006 tests/ceph/006.out tests/ceph/Makefile tests/ceph/group.list tests/cifs/001 tests/cifs/001.out tests/cifs/Makefile tests/cifs/group.list tests/ext4/001 tests/ext4/001.cfg tests/ext4/001.out.default tests/ext4/001.out.nodelalloc tests/ext4/001.out.nozero tests/ext4/003 tests/ext4/003.out tests/ext4/004 tests/ext4/004.out tests/ext4/005 tests/ext4/005.out tests/ext4/006 tests/ext4/006.out tests/ext4/007 tests/ext4/007.out tests/ext4/008 tests/ext4/008.out tests/ext4/009 tests/ext4/009.out tests/ext4/010 tests/ext4/010.out tests/ext4/011 tests/ext4/011.out tests/ext4/012 tests/ext4/012.out tests/ext4/013 tests/ext4/013.out tests/ext4/014 tests/ext4/014.out tests/ext4/015 tests/ext4/015.out tests/ext4/016 tests/ext4/016.out tests/ext4/017 tests/ext4/017.out tests/ext4/018 tests/ext4/018.out tests/ext4/019 tests/ext4/019.out tests/ext4/020 tests/ext4/020.out tests/ext4/021 tests/ext4/021.out tests/ext4/022 tests/ext4/022.out tests/ext4/023 tests/ext4/023.out tests/ext4/024 tests/ext4/024.out tests/ext4/025 tests/ext4/025.out tests/ext4/026 tests/ext4/026.out tests/ext4/027 tests/ext4/027.out tests/ext4/028 tests/ext4/028.out tests/ext4/029 tests/ext4/029.out tests/ext4/030 tests/ext4/030.out tests/ext4/031 tests/ext4/031.out tests/ext4/032 tests/ext4/032.out tests/ext4/033 tests/ext4/033.out tests/ext4/034 tests/ext4/034.out tests/ext4/035 tests/ext4/035.out tests/ext4/036 tests/ext4/036.out tests/ext4/037 tests/ext4/037.out tests/ext4/038 tests/ext4/038.out tests/ext4/039 tests/ext4/039.out tests/ext4/040 tests/ext4/040.out tests/ext4/041 tests/ext4/041.out tests/ext4/042 tests/ext4/042.out tests/ext4/043 tests/ext4/043.out tests/ext4/044 tests/ext4/044.out tests/ext4/045 tests/ext4/045.out tests/ext4/046 tests/ext4/046.out tests/ext4/047 tests/ext4/047.out tests/ext4/048 tests/ext4/048.out tests/ext4/049 tests/ext4/049.out tests/ext4/050 tests/ext4/050.out tests/ext4/051 tests/ext4/051.out tests/ext4/052 tests/ext4/052.out tests/ext4/053 tests/ext4/053.out tests/ext4/054 tests/ext4/054.out tests/ext4/055 tests/ext4/055.out tests/ext4/056 tests/ext4/056.out tests/ext4/057 tests/ext4/057.out tests/ext4/058 tests/ext4/058.out tests/ext4/059 tests/ext4/059.out tests/ext4/060 tests/ext4/060.out tests/ext4/061 tests/ext4/061.out tests/ext4/062 tests/ext4/062.out tests/ext4/063 tests/ext4/063.out tests/ext4/271 tests/ext4/271.out tests/ext4/301 tests/ext4/301.out tests/ext4/302 tests/ext4/302.out tests/ext4/303 tests/ext4/303.out tests/ext4/304 tests/ext4/304.out tests/ext4/305 tests/ext4/305.out tests/ext4/306 tests/ext4/306.out tests/ext4/307 tests/ext4/307.out tests/ext4/308 tests/ext4/308.out tests/ext4/Makefile tests/ext4/group.list tests/f2fs/001 tests/f2fs/001.out tests/f2fs/002 tests/f2fs/002.out tests/f2fs/003 tests/f2fs/003.out tests/f2fs/004 tests/f2fs/004.out tests/f2fs/005 tests/f2fs/005.out tests/f2fs/006 tests/f2fs/006.out tests/f2fs/007 tests/f2fs/007.out tests/f2fs/008 tests/f2fs/008.out tests/f2fs/009 tests/f2fs/009.out tests/f2fs/010 tests/f2fs/010.out tests/f2fs/011 tests/f2fs/011.out tests/f2fs/012 tests/f2fs/012.out tests/f2fs/013 tests/f2fs/013.out tests/f2fs/014 tests/f2fs/014.out tests/f2fs/015 tests/f2fs/015.out tests/f2fs/016 tests/f2fs/016.out tests/f2fs/017 tests/f2fs/017.out tests/f2fs/018 tests/f2fs/018.out tests/f2fs/019 tests/f2fs/019.out tests/f2fs/020 tests/f2fs/020.out tests/f2fs/021 tests/f2fs/021.out tests/f2fs/022 tests/f2fs/022.out tests/f2fs/023 tests/f2fs/023.out tests/f2fs/Makefile tests/f2fs/group.list tests/generic/001 tests/generic/001.out tests/generic/002 tests/generic/002.out tests/generic/003 tests/generic/003.out tests/generic/004 tests/generic/004.out tests/generic/005 tests/generic/005.out tests/generic/006 tests/generic/006.out tests/generic/007 tests/generic/007.out tests/generic/008 tests/generic/008.out tests/generic/009 tests/generic/009.out tests/generic/010 tests/generic/010.out tests/generic/011 tests/generic/011.out tests/generic/012 tests/generic/012.out tests/generic/013 tests/generic/013.out tests/generic/014 tests/generic/014.out tests/generic/015 tests/generic/015.out tests/generic/016 tests/generic/016.out tests/generic/017 tests/generic/017.out tests/generic/018 tests/generic/018.out tests/generic/019 tests/generic/019.out tests/generic/020 tests/generic/020.out tests/generic/021 tests/generic/021.out tests/generic/022 tests/generic/022.out tests/generic/023 tests/generic/023.out tests/generic/024 tests/generic/024.out tests/generic/025 tests/generic/025.out tests/generic/026 tests/generic/026.out tests/generic/027 tests/generic/027.out tests/generic/028 tests/generic/028.out tests/generic/029 tests/generic/029.out tests/generic/030 tests/generic/030.out tests/generic/031 tests/generic/031.out tests/generic/032 tests/generic/032.out tests/generic/033 tests/generic/033.out tests/generic/034 tests/generic/034.out tests/generic/035 tests/generic/035.cfg tests/generic/035.out.default tests/generic/035.out.nfs tests/generic/036 tests/generic/036.out tests/generic/037 tests/generic/037.out tests/generic/038 tests/generic/038.out tests/generic/039 tests/generic/039.out tests/generic/040 tests/generic/040.out tests/generic/041 tests/generic/041.out tests/generic/042 tests/generic/042.out tests/generic/043 tests/generic/043.out tests/generic/044 tests/generic/044.out tests/generic/045 tests/generic/045.out tests/generic/046 tests/generic/046.out tests/generic/047 tests/generic/047.out tests/generic/048 tests/generic/048.out tests/generic/049 tests/generic/049.out tests/generic/050 tests/generic/050.cfg tests/generic/050.out.default tests/generic/050.out.nojournal tests/generic/050.out.xfsquota tests/generic/051 tests/generic/051.out tests/generic/052 tests/generic/052.out tests/generic/053 tests/generic/053.out tests/generic/054 tests/generic/054.out tests/generic/055 tests/generic/055.out tests/generic/056 tests/generic/056.out tests/generic/057 tests/generic/057.out tests/generic/058 tests/generic/058.out tests/generic/059 tests/generic/059.out tests/generic/060 tests/generic/060.out tests/generic/061 tests/generic/061.out tests/generic/062 tests/generic/062.out tests/generic/063 tests/generic/063.out tests/generic/064 tests/generic/064.out tests/generic/065 tests/generic/065.out tests/generic/066 tests/generic/066.out tests/generic/067 tests/generic/067.out tests/generic/068 tests/generic/068.out tests/generic/069 tests/generic/069.out tests/generic/070 tests/generic/070.out tests/generic/071 tests/generic/071.out tests/generic/072 tests/generic/072.out tests/generic/073 tests/generic/073.out tests/generic/074 tests/generic/074.out tests/generic/075 tests/generic/075.out tests/generic/076 tests/generic/076.out tests/generic/077 tests/generic/077.out tests/generic/078 tests/generic/078.out tests/generic/079 tests/generic/079.out tests/generic/080 tests/generic/080.out tests/generic/081 tests/generic/081.out tests/generic/082 tests/generic/082.out tests/generic/083 tests/generic/083.out tests/generic/084 tests/generic/084.out tests/generic/085 tests/generic/085.out tests/generic/086 tests/generic/086.out tests/generic/087 tests/generic/087.out tests/generic/088 tests/generic/088.out tests/generic/089 tests/generic/089.out tests/generic/090 tests/generic/090.out tests/generic/091 tests/generic/091.out tests/generic/092 tests/generic/092.out tests/generic/093 tests/generic/093.out tests/generic/094 tests/generic/094.out tests/generic/095 tests/generic/095.out tests/generic/096 tests/generic/096.out tests/generic/097 tests/generic/097.out tests/generic/098 tests/generic/098.out tests/generic/099 tests/generic/099.out tests/generic/100 tests/generic/100.out tests/generic/101 tests/generic/101.out tests/generic/102 tests/generic/102.out tests/generic/103 tests/generic/103.out tests/generic/104 tests/generic/104.out tests/generic/105 tests/generic/105.out tests/generic/106 tests/generic/106.out tests/generic/107 tests/generic/107.out tests/generic/108 tests/generic/108.out tests/generic/109 tests/generic/109.out tests/generic/110 tests/generic/110.out tests/generic/111 tests/generic/111.out tests/generic/112 tests/generic/112.out tests/generic/113 tests/generic/113.out tests/generic/114 tests/generic/114.out tests/generic/115 tests/generic/115.out tests/generic/116 tests/generic/116.out tests/generic/117 tests/generic/117.out tests/generic/118 tests/generic/118.out tests/generic/119 tests/generic/119.out tests/generic/120 tests/generic/120.out tests/generic/121 tests/generic/121.out tests/generic/122 tests/generic/122.out tests/generic/123 tests/generic/123.out tests/generic/124 tests/generic/124.out tests/generic/125 tests/generic/125.out tests/generic/126 tests/generic/126.out tests/generic/127 tests/generic/127.out tests/generic/128 tests/generic/128.out tests/generic/129 tests/generic/129.out tests/generic/130 tests/generic/130.out tests/generic/131 tests/generic/131.out tests/generic/132 tests/generic/132.out tests/generic/133 tests/generic/133.out tests/generic/134 tests/generic/134.out tests/generic/135 tests/generic/135.out tests/generic/136 tests/generic/136.out tests/generic/137 tests/generic/137.out tests/generic/138 tests/generic/138.out tests/generic/139 tests/generic/139.out tests/generic/140 tests/generic/140.out tests/generic/141 tests/generic/141.out tests/generic/142 tests/generic/142.out tests/generic/143 tests/generic/143.out tests/generic/144 tests/generic/144.out tests/generic/145 tests/generic/145.out tests/generic/146 tests/generic/146.out tests/generic/147 tests/generic/147.out tests/generic/148 tests/generic/148.out tests/generic/149 tests/generic/149.out tests/generic/150 tests/generic/150.out tests/generic/151 tests/generic/151.out tests/generic/152 tests/generic/152.out tests/generic/153 tests/generic/153.out tests/generic/154 tests/generic/154.out tests/generic/155 tests/generic/155.out tests/generic/156 tests/generic/156.out tests/generic/157 tests/generic/157.out tests/generic/158 tests/generic/158.out tests/generic/159 tests/generic/159.out tests/generic/160 tests/generic/160.out tests/generic/161 tests/generic/161.out tests/generic/162 tests/generic/162.out tests/generic/163 tests/generic/163.out tests/generic/164 tests/generic/164.out tests/generic/165 tests/generic/165.out tests/generic/166 tests/generic/166.out tests/generic/167 tests/generic/167.out tests/generic/168 tests/generic/168.out tests/generic/169 tests/generic/169.out tests/generic/170 tests/generic/170.out tests/generic/171 tests/generic/171.out tests/generic/172 tests/generic/172.out tests/generic/173 tests/generic/173.out tests/generic/174 tests/generic/174.out tests/generic/175 tests/generic/175.out tests/generic/176 tests/generic/176.out tests/generic/177 tests/generic/177.out tests/generic/178 tests/generic/178.out tests/generic/179 tests/generic/179.out tests/generic/180 tests/generic/180.out tests/generic/181 tests/generic/181.out tests/generic/182 tests/generic/182.out tests/generic/183 tests/generic/183.out tests/generic/184 tests/generic/184.out tests/generic/185 tests/generic/185.out tests/generic/186 tests/generic/186.out tests/generic/187 tests/generic/187.out tests/generic/188 tests/generic/188.out tests/generic/189 tests/generic/189.out tests/generic/190 tests/generic/190.out tests/generic/191 tests/generic/191.out tests/generic/192 tests/generic/192.out tests/generic/193 tests/generic/193.out tests/generic/194 tests/generic/194.out tests/generic/195 tests/generic/195.out tests/generic/196 tests/generic/196.out tests/generic/197 tests/generic/197.out tests/generic/198 tests/generic/198.out tests/generic/199 tests/generic/199.out tests/generic/200 tests/generic/200.out tests/generic/201 tests/generic/201.out tests/generic/202 tests/generic/202.out tests/generic/203 tests/generic/203.out tests/generic/204 tests/generic/204.out tests/generic/205 tests/generic/205.out tests/generic/206 tests/generic/206.out tests/generic/207 tests/generic/207.out tests/generic/208 tests/generic/208.out tests/generic/209 tests/generic/209.out tests/generic/210 tests/generic/210.out tests/generic/211 tests/generic/211.out tests/generic/212 tests/generic/212.out tests/generic/213 tests/generic/213.out tests/generic/214 tests/generic/214.out tests/generic/215 tests/generic/215.out tests/generic/216 tests/generic/216.out tests/generic/217 tests/generic/217.out tests/generic/218 tests/generic/218.out tests/generic/219 tests/generic/219.out tests/generic/220 tests/generic/220.out tests/generic/221 tests/generic/221.out tests/generic/222 tests/generic/222.out tests/generic/223 tests/generic/223.out tests/generic/224 tests/generic/224.out tests/generic/225 tests/generic/225.out tests/generic/226 tests/generic/226.out tests/generic/227 tests/generic/227.out tests/generic/228 tests/generic/228.out tests/generic/229 tests/generic/229.out tests/generic/230 tests/generic/230.out tests/generic/231 tests/generic/231.out tests/generic/232 tests/generic/232.out tests/generic/233 tests/generic/233.out tests/generic/234 tests/generic/234.out tests/generic/235 tests/generic/235.out tests/generic/236 tests/generic/236.out tests/generic/237 tests/generic/237.out tests/generic/238 tests/generic/238.out tests/generic/239 tests/generic/239.out tests/generic/240 tests/generic/240.out tests/generic/241 tests/generic/241.out tests/generic/242 tests/generic/242.out tests/generic/243 tests/generic/243.out tests/generic/244 tests/generic/244.out tests/generic/245 tests/generic/245.out tests/generic/246 tests/generic/246.out tests/generic/247 tests/generic/247.out tests/generic/248 tests/generic/248.out tests/generic/249 tests/generic/249.out tests/generic/250 tests/generic/250.out tests/generic/251 tests/generic/251.out tests/generic/252 tests/generic/252.out tests/generic/253 tests/generic/253.out tests/generic/254 tests/generic/254.out tests/generic/255 tests/generic/255.out tests/generic/256 tests/generic/256.out tests/generic/257 tests/generic/257.out tests/generic/258 tests/generic/258.out tests/generic/259 tests/generic/259.out tests/generic/260 tests/generic/260.out tests/generic/261 tests/generic/261.out tests/generic/262 tests/generic/262.out tests/generic/263 tests/generic/263.out tests/generic/264 tests/generic/264.out tests/generic/265 tests/generic/265.out tests/generic/266 tests/generic/266.out tests/generic/267 tests/generic/267.out tests/generic/268 tests/generic/268.out tests/generic/269 tests/generic/269.out tests/generic/270 tests/generic/270.out tests/generic/271 tests/generic/271.out tests/generic/272 tests/generic/272.out tests/generic/273 tests/generic/273.out tests/generic/274 tests/generic/274.out tests/generic/275 tests/generic/275.out tests/generic/276 tests/generic/276.out tests/generic/277 tests/generic/277.out tests/generic/278 tests/generic/278.out tests/generic/279 tests/generic/279.out tests/generic/280 tests/generic/280.out tests/generic/281 tests/generic/281.out tests/generic/282 tests/generic/282.out tests/generic/283 tests/generic/283.out tests/generic/284 tests/generic/284.out tests/generic/285 tests/generic/285.out tests/generic/286 tests/generic/286.out tests/generic/287 tests/generic/287.out tests/generic/288 tests/generic/288.out tests/generic/289 tests/generic/289.out tests/generic/290 tests/generic/290.out tests/generic/291 tests/generic/291.out tests/generic/292 tests/generic/292.out tests/generic/293 tests/generic/293.out tests/generic/294 tests/generic/294.out tests/generic/295 tests/generic/295.out tests/generic/296 tests/generic/296.out tests/generic/297 tests/generic/297.out tests/generic/298 tests/generic/298.out tests/generic/299 tests/generic/299.out tests/generic/300 tests/generic/300.out tests/generic/301 tests/generic/301.out tests/generic/302 tests/generic/302.out tests/generic/303 tests/generic/303.out tests/generic/304 tests/generic/304.out tests/generic/305 tests/generic/305.out tests/generic/306 tests/generic/306.out tests/generic/307 tests/generic/307.out tests/generic/308 tests/generic/308.out tests/generic/309 tests/generic/309.out tests/generic/310 tests/generic/310.out tests/generic/311 tests/generic/311.out tests/generic/312 tests/generic/312.out tests/generic/313 tests/generic/313.out tests/generic/314 tests/generic/314.out tests/generic/315 tests/generic/315.out tests/generic/316 tests/generic/316.out tests/generic/317 tests/generic/317.out tests/generic/318 tests/generic/318.out tests/generic/319 tests/generic/319.out tests/generic/320 tests/generic/320.out tests/generic/321 tests/generic/321.out tests/generic/322 tests/generic/322.out tests/generic/323 tests/generic/323.out tests/generic/324 tests/generic/324.out tests/generic/325 tests/generic/325.out tests/generic/326 tests/generic/326.out tests/generic/327 tests/generic/327.out tests/generic/328 tests/generic/328.out tests/generic/329 tests/generic/329.out tests/generic/330 tests/generic/330.out tests/generic/331 tests/generic/331.out tests/generic/332 tests/generic/332.out tests/generic/333 tests/generic/333.out tests/generic/334 tests/generic/334.out tests/generic/335 tests/generic/335.out tests/generic/336 tests/generic/336.out tests/generic/337 tests/generic/337.out tests/generic/338 tests/generic/338.out tests/generic/339 tests/generic/339.out tests/generic/340 tests/generic/340.out tests/generic/341 tests/generic/341.out tests/generic/342 tests/generic/342.out tests/generic/343 tests/generic/343.out tests/generic/344 tests/generic/344.out tests/generic/345 tests/generic/345.out tests/generic/346 tests/generic/346.out tests/generic/347 tests/generic/347.out tests/generic/348 tests/generic/348.out tests/generic/349 tests/generic/349.out tests/generic/350 tests/generic/350.out tests/generic/351 tests/generic/351.out tests/generic/352 tests/generic/352.out tests/generic/353 tests/generic/353.out tests/generic/354 tests/generic/354.out tests/generic/355 tests/generic/355.out tests/generic/356 tests/generic/356.out tests/generic/357 tests/generic/357.out tests/generic/358 tests/generic/358.out tests/generic/359 tests/generic/359.out tests/generic/360 tests/generic/360.out tests/generic/361 tests/generic/361.out tests/generic/362 tests/generic/362.out tests/generic/363 tests/generic/363.out tests/generic/364 tests/generic/364.out tests/generic/365 tests/generic/365.out tests/generic/366 tests/generic/366.out tests/generic/367 tests/generic/367.out tests/generic/368 tests/generic/368.out tests/generic/369 tests/generic/369.out tests/generic/370 tests/generic/370.out tests/generic/371 tests/generic/371.out tests/generic/372 tests/generic/372.out tests/generic/373 tests/generic/373.out tests/generic/374 tests/generic/374.out tests/generic/375 tests/generic/375.out tests/generic/376 tests/generic/376.out tests/generic/377 tests/generic/377.out tests/generic/378 tests/generic/378.out tests/generic/379 tests/generic/379.out tests/generic/380 tests/generic/380.out tests/generic/381 tests/generic/381.out tests/generic/382 tests/generic/382.out tests/generic/383 tests/generic/383.out tests/generic/384 tests/generic/384.out tests/generic/385 tests/generic/385.out tests/generic/386 tests/generic/386.out tests/generic/387 tests/generic/387.out tests/generic/388 tests/generic/388.out tests/generic/389 tests/generic/389.out tests/generic/390 tests/generic/390.out tests/generic/391 tests/generic/391.out tests/generic/392 tests/generic/392.out tests/generic/393 tests/generic/393.out tests/generic/394 tests/generic/394.out tests/generic/395 tests/generic/395.out tests/generic/396 tests/generic/396.out tests/generic/397 tests/generic/397.out tests/generic/398 tests/generic/398.out tests/generic/399 tests/generic/399.out tests/generic/400 tests/generic/400.out tests/generic/401 tests/generic/401.out tests/generic/402 tests/generic/402.out tests/generic/403 tests/generic/403.out tests/generic/404 tests/generic/404.out tests/generic/405 tests/generic/405.out tests/generic/406 tests/generic/406.out tests/generic/407 tests/generic/407.out tests/generic/408 tests/generic/408.out tests/generic/409 tests/generic/409.out tests/generic/410 tests/generic/410.out tests/generic/411 tests/generic/411.out tests/generic/412 tests/generic/412.out tests/generic/413 tests/generic/413.out tests/generic/414 tests/generic/414.out tests/generic/415 tests/generic/415.out tests/generic/416 tests/generic/416.out tests/generic/417 tests/generic/417.out tests/generic/418 tests/generic/418.out tests/generic/419 tests/generic/419.out tests/generic/420 tests/generic/420.out tests/generic/421 tests/generic/421.out tests/generic/422 tests/generic/422.out tests/generic/423 tests/generic/423.out tests/generic/424 tests/generic/424.out tests/generic/425 tests/generic/425.out tests/generic/426 tests/generic/426.out tests/generic/427 tests/generic/427.out tests/generic/428 tests/generic/428.out tests/generic/429 tests/generic/429.out tests/generic/430 tests/generic/430.out tests/generic/431 tests/generic/431.out tests/generic/432 tests/generic/432.out tests/generic/433 tests/generic/433.out tests/generic/434 tests/generic/434.out tests/generic/435 tests/generic/435.out tests/generic/436 tests/generic/436.out tests/generic/437 tests/generic/437.out tests/generic/438 tests/generic/438.out tests/generic/439 tests/generic/439.out tests/generic/440 tests/generic/440.out tests/generic/441 tests/generic/441.out tests/generic/442 tests/generic/442.out tests/generic/443 tests/generic/443.out tests/generic/444 tests/generic/444.out tests/generic/445 tests/generic/445.out tests/generic/446 tests/generic/446.out tests/generic/447 tests/generic/447.out tests/generic/448 tests/generic/448.out tests/generic/449 tests/generic/449.out tests/generic/450 tests/generic/450.out tests/generic/451 tests/generic/451.out tests/generic/452 tests/generic/452.out tests/generic/453 tests/generic/453.out tests/generic/454 tests/generic/454.out tests/generic/455 tests/generic/455.out tests/generic/456 tests/generic/456.out tests/generic/457 tests/generic/457.out tests/generic/458 tests/generic/458.out tests/generic/459 tests/generic/459.out tests/generic/460 tests/generic/460.out tests/generic/461 tests/generic/461.out tests/generic/462 tests/generic/462.out tests/generic/463 tests/generic/463.out tests/generic/464 tests/generic/464.out tests/generic/465 tests/generic/465.out tests/generic/466 tests/generic/466.out tests/generic/467 tests/generic/467.out tests/generic/468 tests/generic/468.out tests/generic/469 tests/generic/469.out tests/generic/470 tests/generic/470.out tests/generic/471 tests/generic/471.out tests/generic/472 tests/generic/472.out tests/generic/473 tests/generic/473.out tests/generic/474 tests/generic/474.out tests/generic/475 tests/generic/475.out tests/generic/476 tests/generic/476.out tests/generic/477 tests/generic/477.out tests/generic/478 tests/generic/478.out tests/generic/479 tests/generic/479.out tests/generic/480 tests/generic/480.out tests/generic/481 tests/generic/481.out tests/generic/482 tests/generic/482.out tests/generic/483 tests/generic/483.out tests/generic/484 tests/generic/484.out tests/generic/485 tests/generic/485.out tests/generic/486 tests/generic/486.out tests/generic/487 tests/generic/487.out tests/generic/488 tests/generic/488.out tests/generic/489 tests/generic/489.out tests/generic/490 tests/generic/490.out tests/generic/491 tests/generic/491.out tests/generic/492 tests/generic/492.out tests/generic/493 tests/generic/493.out tests/generic/494 tests/generic/494.out tests/generic/495 tests/generic/495.out tests/generic/496 tests/generic/496.out tests/generic/497 tests/generic/497.out tests/generic/498 tests/generic/498.out tests/generic/499 tests/generic/499.out tests/generic/500 tests/generic/500.out tests/generic/501 tests/generic/501.out tests/generic/502 tests/generic/502.out tests/generic/503 tests/generic/503.out tests/generic/504 tests/generic/504.out tests/generic/505 tests/generic/505.out tests/generic/506 tests/generic/506.out tests/generic/507 tests/generic/507.out tests/generic/508 tests/generic/508.out tests/generic/509 tests/generic/509.out tests/generic/510 tests/generic/510.out tests/generic/511 tests/generic/511.out tests/generic/512 tests/generic/512.out tests/generic/513 tests/generic/513.out tests/generic/514 tests/generic/514.out tests/generic/515 tests/generic/515.out tests/generic/516 tests/generic/516.out tests/generic/517 tests/generic/517.out tests/generic/518 tests/generic/518.out tests/generic/519 tests/generic/519.out tests/generic/520 tests/generic/520.out tests/generic/521 tests/generic/521.out tests/generic/522 tests/generic/522.out tests/generic/523 tests/generic/523.out tests/generic/524 tests/generic/524.out tests/generic/525 tests/generic/525.out tests/generic/526 tests/generic/526.out tests/generic/527 tests/generic/527.out tests/generic/528 tests/generic/528.out tests/generic/529 tests/generic/529.out tests/generic/530 tests/generic/530.out tests/generic/531 tests/generic/531.out tests/generic/532 tests/generic/532.out tests/generic/533 tests/generic/533.out tests/generic/534 tests/generic/534.out tests/generic/535 tests/generic/535.out tests/generic/536 tests/generic/536.out tests/generic/537 tests/generic/537.out tests/generic/538 tests/generic/538.out tests/generic/539 tests/generic/539.out tests/generic/540 tests/generic/540.out tests/generic/541 tests/generic/541.out tests/generic/542 tests/generic/542.out tests/generic/543 tests/generic/543.out tests/generic/544 tests/generic/544.out tests/generic/545 tests/generic/545.out tests/generic/546 tests/generic/546.out tests/generic/547 tests/generic/547.out tests/generic/548 tests/generic/548.out tests/generic/549 tests/generic/549.out tests/generic/550 tests/generic/550.out tests/generic/551 tests/generic/551.out tests/generic/552 tests/generic/552.out tests/generic/553 tests/generic/553.out tests/generic/554 tests/generic/554.out tests/generic/555 tests/generic/555.out tests/generic/556 tests/generic/556.out tests/generic/557 tests/generic/557.out tests/generic/558 tests/generic/558.out tests/generic/559 tests/generic/559.out tests/generic/560 tests/generic/560.out tests/generic/561 tests/generic/561.out tests/generic/562 tests/generic/562.out tests/generic/563 tests/generic/563.out tests/generic/564 tests/generic/564.out tests/generic/565 tests/generic/565.out tests/generic/566 tests/generic/566.out tests/generic/567 tests/generic/567.out tests/generic/568 tests/generic/568.out tests/generic/569 tests/generic/569.out tests/generic/570 tests/generic/570.out tests/generic/571 tests/generic/571.out tests/generic/572 tests/generic/572.out tests/generic/573 tests/generic/573.out tests/generic/574 tests/generic/574.out tests/generic/575 tests/generic/575.out tests/generic/576 tests/generic/576.out tests/generic/577 tests/generic/577.out tests/generic/578 tests/generic/578.out tests/generic/579 tests/generic/579.out tests/generic/580 tests/generic/580.out tests/generic/581 tests/generic/581.out tests/generic/582 tests/generic/582.out tests/generic/583 tests/generic/583.out tests/generic/584 tests/generic/584.out tests/generic/585 tests/generic/585.out tests/generic/586 tests/generic/586.out tests/generic/587 tests/generic/587.out tests/generic/588 tests/generic/588.out tests/generic/589 tests/generic/589.out tests/generic/590 tests/generic/590.out tests/generic/591 tests/generic/591.out tests/generic/592 tests/generic/592.out tests/generic/593 tests/generic/593.out tests/generic/594 tests/generic/594.out tests/generic/595 tests/generic/595.out tests/generic/596 tests/generic/596.out tests/generic/597 tests/generic/597.out tests/generic/598 tests/generic/598.out tests/generic/599 tests/generic/599.out tests/generic/600 tests/generic/600.out tests/generic/601 tests/generic/601.out tests/generic/602 tests/generic/602.out tests/generic/603 tests/generic/603.out tests/generic/604 tests/generic/604.out tests/generic/605 tests/generic/605.out tests/generic/606 tests/generic/606.out tests/generic/607 tests/generic/607.out tests/generic/608 tests/generic/608.out tests/generic/609 tests/generic/609.out tests/generic/610 tests/generic/610.out tests/generic/611 tests/generic/611.out tests/generic/612 tests/generic/612.out tests/generic/613 tests/generic/613.out tests/generic/614 tests/generic/614.out tests/generic/615 tests/generic/615.out tests/generic/616 tests/generic/616.out tests/generic/617 tests/generic/617.out tests/generic/618 tests/generic/618.out tests/generic/619 tests/generic/619.out tests/generic/620 tests/generic/620.out tests/generic/621 tests/generic/621.out tests/generic/622 tests/generic/622.out tests/generic/623 tests/generic/623.out tests/generic/624 tests/generic/624.out tests/generic/625 tests/generic/625.out tests/generic/626 tests/generic/626.out tests/generic/627 tests/generic/627.out tests/generic/628 tests/generic/628.out tests/generic/629 tests/generic/629.out tests/generic/630 tests/generic/630.out tests/generic/631 tests/generic/631.out tests/generic/632 tests/generic/632.out tests/generic/633 tests/generic/633.out tests/generic/634 tests/generic/634.out tests/generic/635 tests/generic/635.out tests/generic/636 tests/generic/636.out tests/generic/637 tests/generic/637.out tests/generic/638 tests/generic/638.out tests/generic/639 tests/generic/639.out tests/generic/640 tests/generic/640.out tests/generic/641 tests/generic/641.out tests/generic/642 tests/generic/642.out tests/generic/643 tests/generic/643.out tests/generic/644 tests/generic/644.out tests/generic/645 tests/generic/645.out tests/generic/646 tests/generic/646.out tests/generic/647 tests/generic/647.out tests/generic/648 tests/generic/648.out tests/generic/649 tests/generic/649.out tests/generic/650 tests/generic/650.out tests/generic/651 tests/generic/651.out tests/generic/652 tests/generic/652.out tests/generic/653 tests/generic/653.out tests/generic/654 tests/generic/654.out tests/generic/655 tests/generic/655.out tests/generic/656 tests/generic/656.out tests/generic/657 tests/generic/657.out tests/generic/658 tests/generic/658.out tests/generic/659 tests/generic/659.out tests/generic/660 tests/generic/660.out tests/generic/661 tests/generic/661.out tests/generic/662 tests/generic/662.out tests/generic/663 tests/generic/663.out tests/generic/664 tests/generic/664.out tests/generic/665 tests/generic/665.out tests/generic/666 tests/generic/666.out tests/generic/667 tests/generic/667.out tests/generic/668 tests/generic/668.out tests/generic/669 tests/generic/669.out tests/generic/670 tests/generic/670.out tests/generic/671 tests/generic/671.out tests/generic/672 tests/generic/672.out tests/generic/673 tests/generic/673.out tests/generic/674 tests/generic/674.out tests/generic/675 tests/generic/675.out tests/generic/676 tests/generic/676.out tests/generic/677 tests/generic/677.out tests/generic/678 tests/generic/678.out tests/generic/679 tests/generic/679.out tests/generic/680 tests/generic/680.out tests/generic/681 tests/generic/681.out tests/generic/682 tests/generic/682.out tests/generic/683 tests/generic/683.out tests/generic/684 tests/generic/684.out tests/generic/685 tests/generic/685.out tests/generic/686 tests/generic/686.out tests/generic/687 tests/generic/687.out tests/generic/688 tests/generic/688.out tests/generic/689 tests/generic/689.out tests/generic/690 tests/generic/690.out tests/generic/691 tests/generic/691.out tests/generic/692 tests/generic/692.out tests/generic/693 tests/generic/693.out tests/generic/694 tests/generic/694.out tests/generic/695 tests/generic/695.out tests/generic/696 tests/generic/696.out tests/generic/697 tests/generic/697.out tests/generic/698 tests/generic/698.out tests/generic/699 tests/generic/699.out tests/generic/700 tests/generic/700.out tests/generic/701 tests/generic/701.out tests/generic/702 tests/generic/702.out tests/generic/703 tests/generic/703.out tests/generic/704 tests/generic/704.out tests/generic/705 tests/generic/705.out tests/generic/706 tests/generic/706.out tests/generic/707 tests/generic/707.out tests/generic/708 tests/generic/708.out tests/generic/709 tests/generic/709.out tests/generic/710 tests/generic/710.out tests/generic/711 tests/generic/711.out tests/generic/712 tests/generic/712.out tests/generic/713 tests/generic/713.out tests/generic/714 tests/generic/714.out tests/generic/715 tests/generic/715.out tests/generic/716 tests/generic/716.out tests/generic/717 tests/generic/717.out tests/generic/718 tests/generic/718.out tests/generic/719 tests/generic/719.out tests/generic/720 tests/generic/720.out tests/generic/721 tests/generic/721.out tests/generic/722 tests/generic/722.out tests/generic/723 tests/generic/723.out tests/generic/724 tests/generic/724.out tests/generic/725 tests/generic/725.out tests/generic/726 tests/generic/726.out tests/generic/727 tests/generic/727.out tests/generic/728 tests/generic/728.out tests/generic/729 tests/generic/729.out tests/generic/730 tests/generic/730.out tests/generic/731 tests/generic/731.out tests/generic/732 tests/generic/732.out tests/generic/733 tests/generic/733.out tests/generic/734 tests/generic/734.out tests/generic/735 tests/generic/735.out tests/generic/736 tests/generic/736.out tests/generic/737 tests/generic/737.out tests/generic/738 tests/generic/738.out tests/generic/739 tests/generic/739.out tests/generic/740 tests/generic/740.out tests/generic/741 tests/generic/741.out tests/generic/742 tests/generic/742.out tests/generic/743 tests/generic/743.out tests/generic/744 tests/generic/744.out tests/generic/745 tests/generic/745.out tests/generic/746 tests/generic/746.out tests/generic/747 tests/generic/747.out tests/generic/748 tests/generic/748.out tests/generic/749 tests/generic/749.out tests/generic/750 tests/generic/750.out tests/generic/751 tests/generic/751.out tests/generic/752 tests/generic/752.out tests/generic/753 tests/generic/753.out tests/generic/754 tests/generic/754.out tests/generic/755 tests/generic/755.out tests/generic/756 tests/generic/756.out tests/generic/757 tests/generic/757.out tests/generic/758 tests/generic/758.out tests/generic/759 tests/generic/759.out tests/generic/760 tests/generic/760.out tests/generic/761 tests/generic/761.out tests/generic/762 tests/generic/762.out tests/generic/763 tests/generic/763.out tests/generic/764 tests/generic/764.out tests/generic/765 tests/generic/765.out tests/generic/766 tests/generic/766.out tests/generic/767 tests/generic/767.out tests/generic/768 tests/generic/768.out tests/generic/769 tests/generic/769.out tests/generic/770 tests/generic/770.out tests/generic/771 tests/generic/771.out tests/generic/772 tests/generic/772.out tests/generic/773 tests/generic/773.out tests/generic/774 tests/generic/774.out tests/generic/775 tests/generic/775.out tests/generic/776 tests/generic/776.out tests/generic/777 tests/generic/777.out tests/generic/778 tests/generic/778.out tests/generic/779 tests/generic/779.out tests/generic/780 tests/generic/780.out tests/generic/781 tests/generic/781.out tests/generic/782 tests/generic/782.out tests/generic/783 tests/generic/783.out tests/generic/784 tests/generic/784.out tests/generic/785 tests/generic/785.out tests/generic/786 tests/generic/786.out tests/generic/787 tests/generic/787.out tests/generic/788 tests/generic/788.out tests/generic/789 tests/generic/789.out tests/generic/Makefile tests/generic/group.list tests/nfs/001 tests/nfs/001.out tests/nfs/Makefile tests/nfs/group.list tests/ocfs2/001 tests/ocfs2/001.out tests/ocfs2/Makefile tests/ocfs2/group.list tests/overlay/001 tests/overlay/001.out tests/overlay/002 tests/overlay/002.out tests/overlay/003 tests/overlay/003.out tests/overlay/004 tests/overlay/004.out tests/overlay/005 tests/overlay/005.out tests/overlay/006 tests/overlay/006.out tests/overlay/007 tests/overlay/007.out tests/overlay/008 tests/overlay/008.out tests/overlay/009 tests/overlay/009.out tests/overlay/010 tests/overlay/010.out tests/overlay/011 tests/overlay/011.out tests/overlay/012 tests/overlay/012.out tests/overlay/014 tests/overlay/014.out tests/overlay/015 tests/overlay/015.out tests/overlay/016 tests/overlay/016.out tests/overlay/017 tests/overlay/017.out tests/overlay/018 tests/overlay/018.out tests/overlay/019 tests/overlay/019.out tests/overlay/020 tests/overlay/020.out tests/overlay/021 tests/overlay/021.out tests/overlay/022 tests/overlay/022.out tests/overlay/023 tests/overlay/023.out tests/overlay/024 tests/overlay/024.out tests/overlay/025 tests/overlay/025.out tests/overlay/026 tests/overlay/026.out tests/overlay/027 tests/overlay/027.out tests/overlay/028 tests/overlay/028.out tests/overlay/029 tests/overlay/029.out tests/overlay/030 tests/overlay/030.out tests/overlay/031 tests/overlay/031.out tests/overlay/032 tests/overlay/032.out tests/overlay/033 tests/overlay/033.out tests/overlay/034 tests/overlay/034.out tests/overlay/035 tests/overlay/035.out tests/overlay/036 tests/overlay/036.out tests/overlay/037 tests/overlay/037.out tests/overlay/038 tests/overlay/038.out tests/overlay/039 tests/overlay/039.out tests/overlay/040 tests/overlay/040.out tests/overlay/041 tests/overlay/041.out tests/overlay/042 tests/overlay/042.out tests/overlay/043 tests/overlay/043.out tests/overlay/044 tests/overlay/044.out tests/overlay/045 tests/overlay/045.out tests/overlay/046 tests/overlay/046.out tests/overlay/047 tests/overlay/047.out tests/overlay/048 tests/overlay/048.out tests/overlay/049 tests/overlay/049.out tests/overlay/050 tests/overlay/050.out tests/overlay/051 tests/overlay/051.out tests/overlay/052 tests/overlay/052.out tests/overlay/053 tests/overlay/053.out tests/overlay/054 tests/overlay/054.out tests/overlay/055 tests/overlay/055.out tests/overlay/056 tests/overlay/056.out tests/overlay/057 tests/overlay/057.out tests/overlay/058 tests/overlay/058.out tests/overlay/059 tests/overlay/059.out tests/overlay/060 tests/overlay/060.out tests/overlay/061 tests/overlay/061.out tests/overlay/062 tests/overlay/062.out tests/overlay/063 tests/overlay/063.out tests/overlay/064 tests/overlay/064.out tests/overlay/065 tests/overlay/065.out tests/overlay/066 tests/overlay/066.out tests/overlay/067 tests/overlay/067.out tests/overlay/068 tests/overlay/068.out tests/overlay/069 tests/overlay/069.out tests/overlay/070 tests/overlay/070.out tests/overlay/071 tests/overlay/071.out tests/overlay/072 tests/overlay/072.out tests/overlay/073 tests/overlay/073.out tests/overlay/074 tests/overlay/074.out tests/overlay/075 tests/overlay/075.out tests/overlay/076 tests/overlay/076.out tests/overlay/077 tests/overlay/077.out tests/overlay/078 tests/overlay/078.out tests/overlay/079 tests/overlay/079.out tests/overlay/080 tests/overlay/080.out tests/overlay/081 tests/overlay/081.out tests/overlay/082 tests/overlay/082.out tests/overlay/083 tests/overlay/083.out tests/overlay/084 tests/overlay/084.out tests/overlay/085 tests/overlay/085.out tests/overlay/086 tests/overlay/086.out tests/overlay/087 tests/overlay/087.out tests/overlay/088 tests/overlay/088.out tests/overlay/089 tests/overlay/089.out tests/overlay/100 tests/overlay/100.out tests/overlay/101 tests/overlay/101.out tests/overlay/102 tests/overlay/102.out tests/overlay/103 tests/overlay/103.out tests/overlay/104 tests/overlay/104.out tests/overlay/105 tests/overlay/105.out tests/overlay/106 tests/overlay/106.out tests/overlay/107 tests/overlay/107.out tests/overlay/108 tests/overlay/108.out tests/overlay/109 tests/overlay/109.out tests/overlay/110 tests/overlay/110.out tests/overlay/111 tests/overlay/111.out tests/overlay/112 tests/overlay/112.out tests/overlay/113 tests/overlay/113.out tests/overlay/114 tests/overlay/114.out tests/overlay/115 tests/overlay/115.out tests/overlay/116 tests/overlay/116.out tests/overlay/117 tests/overlay/117.out tests/overlay/Makefile tests/overlay/group.list tests/perf/001 tests/perf/001.out tests/perf/Makefile tests/perf/group.list tests/selftest/001 tests/selftest/001.out tests/selftest/002 tests/selftest/002.out tests/selftest/003 tests/selftest/003.out tests/selftest/004 tests/selftest/004.out tests/selftest/005 tests/selftest/005.out tests/selftest/006 tests/selftest/006.out tests/selftest/007 tests/selftest/007.out tests/selftest/Makefile tests/selftest/group.list tests/tmpfs/001 tests/tmpfs/001.out tests/tmpfs/Makefile tests/tmpfs/group.list tests/udf/102 tests/udf/102.out tests/udf/Makefile tests/udf/group.list tests/xfs/001 tests/xfs/001.out tests/xfs/002 tests/xfs/002.out tests/xfs/003 tests/xfs/003.out tests/xfs/004 tests/xfs/004.out tests/xfs/005 tests/xfs/005.out tests/xfs/006 tests/xfs/006.out tests/xfs/007 tests/xfs/007.out tests/xfs/008 tests/xfs/008.out tests/xfs/009 tests/xfs/009.out tests/xfs/010 tests/xfs/010.out tests/xfs/011 tests/xfs/011.out tests/xfs/012 tests/xfs/012.out tests/xfs/013 tests/xfs/013.out tests/xfs/014 tests/xfs/014.out tests/xfs/015 tests/xfs/015.out tests/xfs/016 tests/xfs/016.out tests/xfs/017 tests/xfs/017.out tests/xfs/018 tests/xfs/018.out tests/xfs/019 tests/xfs/019.out tests/xfs/020 tests/xfs/020.out tests/xfs/021 tests/xfs/021.cfg tests/xfs/021.out.default tests/xfs/021.out.parent tests/xfs/022 tests/xfs/022.out tests/xfs/023 tests/xfs/023.out tests/xfs/024 tests/xfs/024.out tests/xfs/025 tests/xfs/025.out tests/xfs/026 tests/xfs/026.out tests/xfs/027 tests/xfs/027.out tests/xfs/028 tests/xfs/028.out tests/xfs/029 tests/xfs/029.out tests/xfs/030 tests/xfs/030.out tests/xfs/031 tests/xfs/031.out tests/xfs/032 tests/xfs/032.out tests/xfs/033 tests/xfs/033.cfg tests/xfs/033.out.crc tests/xfs/033.out.default tests/xfs/034 tests/xfs/034.out tests/xfs/035 tests/xfs/035.out tests/xfs/036 tests/xfs/036.out tests/xfs/037 tests/xfs/037.out tests/xfs/038 tests/xfs/038.out tests/xfs/039 tests/xfs/039.out tests/xfs/040 tests/xfs/040.out tests/xfs/041 tests/xfs/041.out tests/xfs/042 tests/xfs/042.out tests/xfs/043 tests/xfs/043.out tests/xfs/044 tests/xfs/044.out tests/xfs/045 tests/xfs/045.out tests/xfs/046 tests/xfs/046.out tests/xfs/047 tests/xfs/047.out tests/xfs/048 tests/xfs/048.out tests/xfs/049 tests/xfs/049.out tests/xfs/050 tests/xfs/050.out tests/xfs/051 tests/xfs/051.out tests/xfs/052 tests/xfs/052.out tests/xfs/053 tests/xfs/053.out tests/xfs/054 tests/xfs/054.out tests/xfs/055 tests/xfs/055.out tests/xfs/056 tests/xfs/056.out tests/xfs/057 tests/xfs/057.out tests/xfs/058 tests/xfs/058.out tests/xfs/059 tests/xfs/059.out tests/xfs/060 tests/xfs/060.out tests/xfs/061 tests/xfs/061.out tests/xfs/062 tests/xfs/062.out tests/xfs/063 tests/xfs/063.out tests/xfs/064 tests/xfs/064.out tests/xfs/065 tests/xfs/065.out tests/xfs/066 tests/xfs/066.out tests/xfs/067 tests/xfs/067.out tests/xfs/068 tests/xfs/068.out tests/xfs/069 tests/xfs/069.out tests/xfs/070 tests/xfs/070.out tests/xfs/071 tests/xfs/071.out.32 tests/xfs/071.out.64 tests/xfs/072 tests/xfs/072.out tests/xfs/073 tests/xfs/073.out tests/xfs/074 tests/xfs/074.out tests/xfs/075 tests/xfs/075.out tests/xfs/076 tests/xfs/076.out tests/xfs/077 tests/xfs/077.out tests/xfs/078 tests/xfs/078.out tests/xfs/079 tests/xfs/079.out tests/xfs/080 tests/xfs/080.out tests/xfs/081 tests/xfs/081.out tests/xfs/082 tests/xfs/082.out tests/xfs/083 tests/xfs/083.out tests/xfs/084 tests/xfs/084.out tests/xfs/085 tests/xfs/085.out tests/xfs/086 tests/xfs/086.out tests/xfs/087 tests/xfs/087.out tests/xfs/088 tests/xfs/088.out tests/xfs/089 tests/xfs/089.out tests/xfs/090 tests/xfs/090.out tests/xfs/091 tests/xfs/091.out tests/xfs/092 tests/xfs/092.out tests/xfs/093 tests/xfs/093.out tests/xfs/094 tests/xfs/094.out tests/xfs/095 tests/xfs/095.out tests/xfs/096 tests/xfs/096.out tests/xfs/097 tests/xfs/097.out tests/xfs/098 tests/xfs/098.out tests/xfs/099 tests/xfs/099.out tests/xfs/100 tests/xfs/100.out tests/xfs/101 tests/xfs/101.out tests/xfs/102 tests/xfs/102.out tests/xfs/103 tests/xfs/103.out tests/xfs/104 tests/xfs/104.out tests/xfs/105 tests/xfs/105.out tests/xfs/106 tests/xfs/106.out tests/xfs/107 tests/xfs/107.out tests/xfs/108 tests/xfs/108.out tests/xfs/109 tests/xfs/109.out tests/xfs/110 tests/xfs/110.out tests/xfs/111 tests/xfs/111.out tests/xfs/112 tests/xfs/112.out tests/xfs/113 tests/xfs/113.out tests/xfs/114 tests/xfs/114.out tests/xfs/115 tests/xfs/115.out tests/xfs/116 tests/xfs/116.cfg tests/xfs/116.out.default tests/xfs/116.out.metadir tests/xfs/117 tests/xfs/117.out tests/xfs/118 tests/xfs/118.out tests/xfs/119 tests/xfs/119.out tests/xfs/120 tests/xfs/120.out tests/xfs/121 tests/xfs/121.out tests/xfs/122 tests/xfs/122.out tests/xfs/123 tests/xfs/123.out tests/xfs/124 tests/xfs/124.out tests/xfs/125 tests/xfs/125.out tests/xfs/126 tests/xfs/126.out tests/xfs/127 tests/xfs/127.out tests/xfs/128 tests/xfs/128.out tests/xfs/129 tests/xfs/129.out tests/xfs/130 tests/xfs/130.out tests/xfs/131 tests/xfs/131.out tests/xfs/132 tests/xfs/132.out tests/xfs/133 tests/xfs/133.out tests/xfs/134 tests/xfs/134.out tests/xfs/135 tests/xfs/135.out tests/xfs/136 tests/xfs/136.out tests/xfs/137 tests/xfs/137.out tests/xfs/138 tests/xfs/138.out tests/xfs/139 tests/xfs/139.out tests/xfs/140 tests/xfs/140.out tests/xfs/141 tests/xfs/141.out tests/xfs/142 tests/xfs/142.out tests/xfs/143 tests/xfs/143.out tests/xfs/144 tests/xfs/144.out tests/xfs/145 tests/xfs/145.out tests/xfs/146 tests/xfs/146.out tests/xfs/147 tests/xfs/147.out tests/xfs/148 tests/xfs/148.out tests/xfs/149 tests/xfs/149.out tests/xfs/150 tests/xfs/150.out tests/xfs/151 tests/xfs/151.out tests/xfs/152 tests/xfs/152.out tests/xfs/153 tests/xfs/153.out tests/xfs/154 tests/xfs/154.out tests/xfs/155 tests/xfs/155.out tests/xfs/156 tests/xfs/156.out tests/xfs/157 tests/xfs/157.out tests/xfs/158 tests/xfs/158.out tests/xfs/159 tests/xfs/159.out tests/xfs/160 tests/xfs/160.out tests/xfs/161 tests/xfs/161.out tests/xfs/162 tests/xfs/162.out tests/xfs/163 tests/xfs/163.out tests/xfs/164 tests/xfs/164.out tests/xfs/165 tests/xfs/165.out tests/xfs/166 tests/xfs/166.out tests/xfs/167 tests/xfs/167.out tests/xfs/168 tests/xfs/168.out tests/xfs/169 tests/xfs/169.out tests/xfs/170 tests/xfs/170.out tests/xfs/171 tests/xfs/171.out tests/xfs/172 tests/xfs/172.out tests/xfs/173 tests/xfs/173.out tests/xfs/174 tests/xfs/174.out tests/xfs/175 tests/xfs/175.out tests/xfs/176 tests/xfs/176.out tests/xfs/177 tests/xfs/177.out tests/xfs/178 tests/xfs/178.out tests/xfs/179 tests/xfs/179.out tests/xfs/180 tests/xfs/180.out tests/xfs/181 tests/xfs/181.out tests/xfs/182 tests/xfs/182.out tests/xfs/183 tests/xfs/183.out tests/xfs/184 tests/xfs/184.out tests/xfs/185 tests/xfs/185.out tests/xfs/186 tests/xfs/186.out tests/xfs/187 tests/xfs/187.out tests/xfs/188 tests/xfs/188.out tests/xfs/189 tests/xfs/189.out tests/xfs/190 tests/xfs/190.out tests/xfs/191 tests/xfs/191.out tests/xfs/192 tests/xfs/192.out tests/xfs/193 tests/xfs/193.out tests/xfs/194 tests/xfs/194.out tests/xfs/195 tests/xfs/195.out tests/xfs/196 tests/xfs/196.out tests/xfs/197 tests/xfs/197.out tests/xfs/198 tests/xfs/198.out tests/xfs/199 tests/xfs/199.out tests/xfs/200 tests/xfs/200.out tests/xfs/201 tests/xfs/201.out tests/xfs/202 tests/xfs/202.out tests/xfs/203 tests/xfs/203.out tests/xfs/204 tests/xfs/204.out tests/xfs/205 tests/xfs/205.out tests/xfs/206 tests/xfs/206.out tests/xfs/207 tests/xfs/207.out tests/xfs/208 tests/xfs/208.out tests/xfs/209 tests/xfs/209.out tests/xfs/210 tests/xfs/210.out tests/xfs/211 tests/xfs/211.out tests/xfs/212 tests/xfs/212.out tests/xfs/213 tests/xfs/213.out tests/xfs/214 tests/xfs/214.out tests/xfs/215 tests/xfs/215.out tests/xfs/216 tests/xfs/216.cfg tests/xfs/216.out.64mblog tests/xfs/216.out.classic tests/xfs/217 tests/xfs/217.out tests/xfs/218 tests/xfs/218.out tests/xfs/219 tests/xfs/219.out tests/xfs/220 tests/xfs/220.out tests/xfs/221 tests/xfs/221.out tests/xfs/222 tests/xfs/222.out tests/xfs/223 tests/xfs/223.out tests/xfs/224 tests/xfs/224.out tests/xfs/225 tests/xfs/225.out tests/xfs/226 tests/xfs/226.out tests/xfs/227 tests/xfs/227.out tests/xfs/228 tests/xfs/228.out tests/xfs/229 tests/xfs/229.out tests/xfs/230 tests/xfs/230.out tests/xfs/231 tests/xfs/231.out tests/xfs/232 tests/xfs/232.out tests/xfs/233 tests/xfs/233.out tests/xfs/234 tests/xfs/234.out tests/xfs/235 tests/xfs/235.out tests/xfs/236 tests/xfs/236.out tests/xfs/237 tests/xfs/237.out tests/xfs/238 tests/xfs/238.out tests/xfs/239 tests/xfs/239.out tests/xfs/240 tests/xfs/240.out tests/xfs/241 tests/xfs/241.out tests/xfs/242 tests/xfs/242.out tests/xfs/243 tests/xfs/243.out tests/xfs/244 tests/xfs/244.out tests/xfs/245 tests/xfs/245.out tests/xfs/246 tests/xfs/246.out tests/xfs/247 tests/xfs/247.out tests/xfs/248 tests/xfs/248.out tests/xfs/249 tests/xfs/249.out tests/xfs/250 tests/xfs/250.out tests/xfs/251 tests/xfs/251.out tests/xfs/252 tests/xfs/252.out tests/xfs/253 tests/xfs/253.out tests/xfs/254 tests/xfs/254.out tests/xfs/255 tests/xfs/255.out tests/xfs/256 tests/xfs/256.out tests/xfs/257 tests/xfs/257.out tests/xfs/258 tests/xfs/258.out tests/xfs/259 tests/xfs/259.out tests/xfs/260 tests/xfs/260.out tests/xfs/261 tests/xfs/261.out tests/xfs/262 tests/xfs/262.out tests/xfs/263 tests/xfs/263.out tests/xfs/264 tests/xfs/264.out tests/xfs/265 tests/xfs/265.out tests/xfs/266 tests/xfs/266.out tests/xfs/267 tests/xfs/267.out tests/xfs/268 tests/xfs/268.out tests/xfs/269 tests/xfs/269.out tests/xfs/270 tests/xfs/270.out tests/xfs/271 tests/xfs/271.out tests/xfs/272 tests/xfs/272.out tests/xfs/273 tests/xfs/273.out tests/xfs/274 tests/xfs/274.out tests/xfs/275 tests/xfs/275.out tests/xfs/276 tests/xfs/276.out tests/xfs/277 tests/xfs/277.out tests/xfs/278 tests/xfs/278.out tests/xfs/279 tests/xfs/279.out tests/xfs/280 tests/xfs/280.out tests/xfs/281 tests/xfs/281.out tests/xfs/282 tests/xfs/282.out tests/xfs/283 tests/xfs/283.out tests/xfs/284 tests/xfs/284.out tests/xfs/285 tests/xfs/285.out tests/xfs/286 tests/xfs/286.out tests/xfs/287 tests/xfs/287.out tests/xfs/288 tests/xfs/288.out tests/xfs/289 tests/xfs/289.out tests/xfs/290 tests/xfs/290.out tests/xfs/291 tests/xfs/291.out tests/xfs/292 tests/xfs/292.out tests/xfs/293 tests/xfs/293.out tests/xfs/294 tests/xfs/294.out tests/xfs/295 tests/xfs/295.out tests/xfs/296 tests/xfs/296.out tests/xfs/297 tests/xfs/297.out tests/xfs/298 tests/xfs/298.out tests/xfs/299 tests/xfs/299.out tests/xfs/300 tests/xfs/300.out tests/xfs/301 tests/xfs/301.out tests/xfs/302 tests/xfs/302.out tests/xfs/303 tests/xfs/303.out tests/xfs/304 tests/xfs/304.out tests/xfs/305 tests/xfs/305.out tests/xfs/306 tests/xfs/306.out tests/xfs/307 tests/xfs/307.out tests/xfs/308 tests/xfs/308.out tests/xfs/309 tests/xfs/309.out tests/xfs/310 tests/xfs/310.out tests/xfs/311 tests/xfs/311.out tests/xfs/312 tests/xfs/312.out tests/xfs/313 tests/xfs/313.out tests/xfs/314 tests/xfs/314.out tests/xfs/315 tests/xfs/315.out tests/xfs/316 tests/xfs/316.out tests/xfs/317 tests/xfs/317.out tests/xfs/318 tests/xfs/318.out tests/xfs/319 tests/xfs/319.out tests/xfs/320 tests/xfs/320.out tests/xfs/321 tests/xfs/321.out tests/xfs/322 tests/xfs/322.out tests/xfs/323 tests/xfs/323.out tests/xfs/324 tests/xfs/324.out tests/xfs/325 tests/xfs/325.out tests/xfs/326 tests/xfs/326.out tests/xfs/327 tests/xfs/327.out tests/xfs/328 tests/xfs/328.out tests/xfs/329 tests/xfs/329.out tests/xfs/330 tests/xfs/330.out tests/xfs/331 tests/xfs/331.out tests/xfs/332 tests/xfs/332.out tests/xfs/334 tests/xfs/334.out tests/xfs/335 tests/xfs/335.out tests/xfs/336 tests/xfs/336.out tests/xfs/337 tests/xfs/337.out tests/xfs/338 tests/xfs/338.out tests/xfs/339 tests/xfs/339.out tests/xfs/340 tests/xfs/340.out tests/xfs/341 tests/xfs/341.out tests/xfs/342 tests/xfs/342.out tests/xfs/343 tests/xfs/343.out tests/xfs/344 tests/xfs/344.out tests/xfs/345 tests/xfs/345.out tests/xfs/346 tests/xfs/346.out tests/xfs/347 tests/xfs/347.out tests/xfs/348 tests/xfs/348.out tests/xfs/349 tests/xfs/349.out tests/xfs/350 tests/xfs/350.out tests/xfs/351 tests/xfs/351.out tests/xfs/352 tests/xfs/352.out tests/xfs/353 tests/xfs/353.out tests/xfs/354 tests/xfs/354.out tests/xfs/355 tests/xfs/355.out tests/xfs/356 tests/xfs/356.out tests/xfs/357 tests/xfs/357.out tests/xfs/358 tests/xfs/358.out tests/xfs/359 tests/xfs/359.out tests/xfs/360 tests/xfs/360.out tests/xfs/361 tests/xfs/361.out tests/xfs/362 tests/xfs/362.out tests/xfs/363 tests/xfs/363.out tests/xfs/364 tests/xfs/364.out tests/xfs/365 tests/xfs/365.out tests/xfs/366 tests/xfs/366.out tests/xfs/367 tests/xfs/367.out tests/xfs/368 tests/xfs/368.out tests/xfs/369 tests/xfs/369.out tests/xfs/370 tests/xfs/370.out tests/xfs/371 tests/xfs/371.out tests/xfs/372 tests/xfs/372.out tests/xfs/373 tests/xfs/373.out tests/xfs/374 tests/xfs/374.out tests/xfs/375 tests/xfs/375.out tests/xfs/376 tests/xfs/376.out tests/xfs/377 tests/xfs/377.out tests/xfs/378 tests/xfs/378.out tests/xfs/379 tests/xfs/379.out tests/xfs/380 tests/xfs/380.out tests/xfs/381 tests/xfs/381.out tests/xfs/382 tests/xfs/382.out tests/xfs/383 tests/xfs/383.out tests/xfs/384 tests/xfs/384.out tests/xfs/385 tests/xfs/385.out tests/xfs/386 tests/xfs/386.out tests/xfs/387 tests/xfs/387.out tests/xfs/388 tests/xfs/388.out tests/xfs/389 tests/xfs/389.out tests/xfs/390 tests/xfs/390.out tests/xfs/391 tests/xfs/391.out tests/xfs/392 tests/xfs/392.out tests/xfs/393 tests/xfs/393.out tests/xfs/394 tests/xfs/394.out tests/xfs/395 tests/xfs/395.out tests/xfs/396 tests/xfs/396.out tests/xfs/397 tests/xfs/397.out tests/xfs/398 tests/xfs/398.out tests/xfs/399 tests/xfs/399.out tests/xfs/400 tests/xfs/400.out tests/xfs/401 tests/xfs/401.out tests/xfs/402 tests/xfs/402.out tests/xfs/403 tests/xfs/403.out tests/xfs/404 tests/xfs/404.out tests/xfs/405 tests/xfs/405.out tests/xfs/406 tests/xfs/406.out tests/xfs/407 tests/xfs/407.out tests/xfs/408 tests/xfs/408.out tests/xfs/409 tests/xfs/409.out tests/xfs/410 tests/xfs/410.out tests/xfs/411 tests/xfs/411.out tests/xfs/412 tests/xfs/412.out tests/xfs/413 tests/xfs/413.out tests/xfs/414 tests/xfs/414.out tests/xfs/415 tests/xfs/415.out tests/xfs/416 tests/xfs/416.out tests/xfs/417 tests/xfs/417.out tests/xfs/418 tests/xfs/418.out tests/xfs/419 tests/xfs/419.out tests/xfs/420 tests/xfs/420.out tests/xfs/421 tests/xfs/421.out tests/xfs/422 tests/xfs/422.out tests/xfs/423 tests/xfs/423.out tests/xfs/424 tests/xfs/424.out tests/xfs/425 tests/xfs/425.out tests/xfs/426 tests/xfs/426.out tests/xfs/427 tests/xfs/427.out tests/xfs/428 tests/xfs/428.out tests/xfs/429 tests/xfs/429.out tests/xfs/430 tests/xfs/430.out tests/xfs/431 tests/xfs/431.out tests/xfs/432 tests/xfs/432.out tests/xfs/433 tests/xfs/433.out tests/xfs/434 tests/xfs/434.out tests/xfs/435 tests/xfs/435.out tests/xfs/436 tests/xfs/436.out tests/xfs/437 tests/xfs/437.out tests/xfs/438 tests/xfs/438.out tests/xfs/439 tests/xfs/439.out tests/xfs/440 tests/xfs/440.out tests/xfs/441 tests/xfs/441.out tests/xfs/442 tests/xfs/442.out tests/xfs/443 tests/xfs/443.out tests/xfs/444 tests/xfs/444.out tests/xfs/445 tests/xfs/445.out tests/xfs/446 tests/xfs/446.out tests/xfs/447 tests/xfs/447.out tests/xfs/448 tests/xfs/448.out tests/xfs/449 tests/xfs/449.out tests/xfs/450 tests/xfs/450.out tests/xfs/451 tests/xfs/451.out tests/xfs/452 tests/xfs/452.out tests/xfs/453 tests/xfs/453.out tests/xfs/454 tests/xfs/454.out tests/xfs/455 tests/xfs/455.out tests/xfs/456 tests/xfs/456.out tests/xfs/457 tests/xfs/457.out tests/xfs/458 tests/xfs/458.out tests/xfs/459 tests/xfs/459.out tests/xfs/460 tests/xfs/460.out tests/xfs/461 tests/xfs/461.out tests/xfs/462 tests/xfs/462.out tests/xfs/463 tests/xfs/463.out tests/xfs/464 tests/xfs/464.out tests/xfs/465 tests/xfs/465.out tests/xfs/466 tests/xfs/466.out tests/xfs/467 tests/xfs/467.out tests/xfs/468 tests/xfs/468.out tests/xfs/469 tests/xfs/469.out tests/xfs/470 tests/xfs/470.out tests/xfs/471 tests/xfs/471.out tests/xfs/472 tests/xfs/472.out tests/xfs/473 tests/xfs/473.out tests/xfs/474 tests/xfs/474.out tests/xfs/475 tests/xfs/475.out tests/xfs/476 tests/xfs/476.out tests/xfs/477 tests/xfs/477.out tests/xfs/478 tests/xfs/478.out tests/xfs/479 tests/xfs/479.out tests/xfs/480 tests/xfs/480.out tests/xfs/481 tests/xfs/481.out tests/xfs/482 tests/xfs/482.out tests/xfs/483 tests/xfs/483.out tests/xfs/484 tests/xfs/484.out tests/xfs/485 tests/xfs/485.out tests/xfs/486 tests/xfs/486.out tests/xfs/487 tests/xfs/487.out tests/xfs/488 tests/xfs/488.out tests/xfs/489 tests/xfs/489.out tests/xfs/490 tests/xfs/490.out tests/xfs/491 tests/xfs/491.out tests/xfs/492 tests/xfs/492.out tests/xfs/493 tests/xfs/493.out tests/xfs/494 tests/xfs/494.out tests/xfs/495 tests/xfs/495.out tests/xfs/496 tests/xfs/496.out tests/xfs/497 tests/xfs/497.out tests/xfs/498 tests/xfs/498.out tests/xfs/499 tests/xfs/499.out tests/xfs/500 tests/xfs/500.out tests/xfs/501 tests/xfs/501.out tests/xfs/502 tests/xfs/502.out tests/xfs/503 tests/xfs/503.out tests/xfs/504 tests/xfs/504.out tests/xfs/505 tests/xfs/505.out tests/xfs/506 tests/xfs/506.out tests/xfs/507 tests/xfs/507.out tests/xfs/508 tests/xfs/508.out tests/xfs/509 tests/xfs/509.out tests/xfs/510 tests/xfs/510.out tests/xfs/511 tests/xfs/511.out tests/xfs/512 tests/xfs/512.out tests/xfs/513 tests/xfs/513.out tests/xfs/514 tests/xfs/514.out tests/xfs/515 tests/xfs/515.out tests/xfs/516 tests/xfs/516.out tests/xfs/517 tests/xfs/517.out tests/xfs/518 tests/xfs/518.out tests/xfs/519 tests/xfs/519.out tests/xfs/520 tests/xfs/520.out tests/xfs/521 tests/xfs/521.out tests/xfs/522 tests/xfs/522.out tests/xfs/523 tests/xfs/523.out tests/xfs/524 tests/xfs/524.out tests/xfs/525 tests/xfs/525.out tests/xfs/526 tests/xfs/526.out tests/xfs/527 tests/xfs/527.out tests/xfs/528 tests/xfs/528.out tests/xfs/529 tests/xfs/529.out tests/xfs/530 tests/xfs/530.out tests/xfs/531 tests/xfs/531.out tests/xfs/532 tests/xfs/532.out tests/xfs/533 tests/xfs/533.out tests/xfs/534 tests/xfs/534.out tests/xfs/535 tests/xfs/535.out tests/xfs/536 tests/xfs/536.out tests/xfs/537 tests/xfs/537.out tests/xfs/538 tests/xfs/538.out tests/xfs/540 tests/xfs/540.out tests/xfs/541 tests/xfs/541.out tests/xfs/542 tests/xfs/542.out tests/xfs/543 tests/xfs/543.out tests/xfs/544 tests/xfs/544.out tests/xfs/545 tests/xfs/545.out tests/xfs/546 tests/xfs/546.out tests/xfs/547 tests/xfs/547.out tests/xfs/548 tests/xfs/548.out tests/xfs/549 tests/xfs/549.out tests/xfs/550 tests/xfs/550.out tests/xfs/551 tests/xfs/551.out tests/xfs/552 tests/xfs/552.out tests/xfs/553 tests/xfs/553.out tests/xfs/554 tests/xfs/554.out tests/xfs/555 tests/xfs/555.out tests/xfs/556 tests/xfs/556.out tests/xfs/557 tests/xfs/557.out tests/xfs/558 tests/xfs/558.out tests/xfs/559 tests/xfs/559.out tests/xfs/560 tests/xfs/560.out tests/xfs/561 tests/xfs/561.out tests/xfs/562 tests/xfs/562.out tests/xfs/563 tests/xfs/563.out tests/xfs/564 tests/xfs/564.out tests/xfs/565 tests/xfs/565.out tests/xfs/566 tests/xfs/566.out tests/xfs/567 tests/xfs/567.out tests/xfs/568 tests/xfs/568.out tests/xfs/569 tests/xfs/569.out tests/xfs/570 tests/xfs/570.out tests/xfs/571 tests/xfs/571.out tests/xfs/572 tests/xfs/572.out tests/xfs/573 tests/xfs/573.out tests/xfs/574 tests/xfs/574.out tests/xfs/575 tests/xfs/575.out tests/xfs/576 tests/xfs/576.out tests/xfs/577 tests/xfs/577.out tests/xfs/578 tests/xfs/578.out tests/xfs/579 tests/xfs/579.out tests/xfs/580 tests/xfs/580.out tests/xfs/581 tests/xfs/581.out tests/xfs/582 tests/xfs/582.out tests/xfs/583 tests/xfs/583.out tests/xfs/584 tests/xfs/584.out tests/xfs/585 tests/xfs/585.out tests/xfs/586 tests/xfs/586.out tests/xfs/587 tests/xfs/587.out tests/xfs/588 tests/xfs/588.out tests/xfs/589 tests/xfs/589.out tests/xfs/590 tests/xfs/590.out tests/xfs/591 tests/xfs/591.out tests/xfs/592 tests/xfs/592.out tests/xfs/593 tests/xfs/593.out tests/xfs/594 tests/xfs/594.out tests/xfs/595 tests/xfs/595.out tests/xfs/596 tests/xfs/596.out tests/xfs/597 tests/xfs/597.out tests/xfs/598 tests/xfs/598.out tests/xfs/599 tests/xfs/599.out tests/xfs/600 tests/xfs/600.out tests/xfs/601 tests/xfs/601.out tests/xfs/602 tests/xfs/602.out tests/xfs/603 tests/xfs/603.out tests/xfs/604 tests/xfs/604.out tests/xfs/605 tests/xfs/605.out tests/xfs/606 tests/xfs/606.out tests/xfs/607 tests/xfs/607.out tests/xfs/608 tests/xfs/608.out tests/xfs/609 tests/xfs/609.out tests/xfs/610 tests/xfs/610.out tests/xfs/612 tests/xfs/612.out tests/xfs/613 tests/xfs/613.out tests/xfs/614 tests/xfs/614.cfg tests/xfs/614.out.lba1024 tests/xfs/614.out.lba1024_parent tests/xfs/614.out.lba2048 tests/xfs/614.out.lba2048_parent tests/xfs/614.out.lba4096 tests/xfs/614.out.lba4096_parent tests/xfs/614.out.lba512 tests/xfs/614.out.lba512_parent tests/xfs/615 tests/xfs/615.out tests/xfs/616 tests/xfs/616.out tests/xfs/617 tests/xfs/617.out tests/xfs/618 tests/xfs/618.out tests/xfs/619 tests/xfs/619.out tests/xfs/620 tests/xfs/620.out tests/xfs/621 tests/xfs/621.out tests/xfs/622 tests/xfs/622.out tests/xfs/623 tests/xfs/623.out tests/xfs/624 tests/xfs/624.out tests/xfs/625 tests/xfs/625.out tests/xfs/626 tests/xfs/626.out tests/xfs/627 tests/xfs/627.out tests/xfs/628 tests/xfs/628.out tests/xfs/629 tests/xfs/629.out tests/xfs/630 tests/xfs/630.out tests/xfs/631 tests/xfs/631.out tests/xfs/632 tests/xfs/632.out tests/xfs/633 tests/xfs/633.out tests/xfs/634 tests/xfs/634.out tests/xfs/635 tests/xfs/635.out tests/xfs/636 tests/xfs/636.out tests/xfs/637 tests/xfs/637.out tests/xfs/638 tests/xfs/638.out tests/xfs/639 tests/xfs/639.out tests/xfs/640 tests/xfs/640.out tests/xfs/641 tests/xfs/641.out tests/xfs/642 tests/xfs/642.out tests/xfs/643 tests/xfs/643.out tests/xfs/644 tests/xfs/644.out tests/xfs/645 tests/xfs/645.out tests/xfs/646 tests/xfs/646.out tests/xfs/647 tests/xfs/647.out tests/xfs/648 tests/xfs/648.out tests/xfs/649 tests/xfs/649.out tests/xfs/650 tests/xfs/650.out tests/xfs/651 tests/xfs/651.out tests/xfs/652 tests/xfs/652.out tests/xfs/653 tests/xfs/653.out tests/xfs/708 tests/xfs/708.out tests/xfs/709 tests/xfs/709.out tests/xfs/710 tests/xfs/710.out tests/xfs/711 tests/xfs/711.out tests/xfs/712 tests/xfs/712.out tests/xfs/713 tests/xfs/713.out tests/xfs/714 tests/xfs/714.out tests/xfs/715 tests/xfs/715.out tests/xfs/716 tests/xfs/716.out tests/xfs/717 tests/xfs/717.out tests/xfs/718 tests/xfs/718.out tests/xfs/719 tests/xfs/719.out tests/xfs/720 tests/xfs/720.out tests/xfs/721 tests/xfs/721.out tests/xfs/722 tests/xfs/722.out tests/xfs/723 tests/xfs/723.out tests/xfs/724 tests/xfs/724.out tests/xfs/725 tests/xfs/725.out tests/xfs/726 tests/xfs/726.out tests/xfs/727 tests/xfs/727.out tests/xfs/728 tests/xfs/728.out tests/xfs/729 tests/xfs/729.out tests/xfs/730 tests/xfs/730.out tests/xfs/731 tests/xfs/731.out tests/xfs/732 tests/xfs/732.out tests/xfs/733 tests/xfs/733.out tests/xfs/734 tests/xfs/734.out tests/xfs/735 tests/xfs/735.out tests/xfs/736 tests/xfs/736.out tests/xfs/737 tests/xfs/737.out tests/xfs/738 tests/xfs/738.out tests/xfs/739 tests/xfs/739.out tests/xfs/740 tests/xfs/740.out tests/xfs/741 tests/xfs/741.out tests/xfs/742 tests/xfs/742.out tests/xfs/743 tests/xfs/743.out tests/xfs/744 tests/xfs/744.out tests/xfs/745 tests/xfs/745.out tests/xfs/746 tests/xfs/746.out tests/xfs/747 tests/xfs/747.out tests/xfs/748 tests/xfs/748.out tests/xfs/749 tests/xfs/749.out tests/xfs/750 tests/xfs/750.out tests/xfs/751 tests/xfs/751.out tests/xfs/752 tests/xfs/752.out tests/xfs/753 tests/xfs/753.out tests/xfs/754 tests/xfs/754.out tests/xfs/755 tests/xfs/755.out tests/xfs/756 tests/xfs/756.out tests/xfs/757 tests/xfs/757.out tests/xfs/758 tests/xfs/758.out tests/xfs/759 tests/xfs/759.out tests/xfs/760 tests/xfs/760.out tests/xfs/761 tests/xfs/761.out tests/xfs/762 tests/xfs/762.out tests/xfs/763 tests/xfs/763.out tests/xfs/764 tests/xfs/764.out tests/xfs/765 tests/xfs/765.out tests/xfs/766 tests/xfs/766.out tests/xfs/767 tests/xfs/767.out tests/xfs/768 tests/xfs/768.out tests/xfs/769 tests/xfs/769.out tests/xfs/770 tests/xfs/770.out tests/xfs/771 tests/xfs/771.out tests/xfs/772 tests/xfs/772.out tests/xfs/773 tests/xfs/773.out tests/xfs/774 tests/xfs/774.out tests/xfs/775 tests/xfs/775.out tests/xfs/776 tests/xfs/776.out tests/xfs/777 tests/xfs/777.out tests/xfs/778 tests/xfs/778.out tests/xfs/779 tests/xfs/779.out tests/xfs/780 tests/xfs/780.out tests/xfs/781 tests/xfs/781.out tests/xfs/782 tests/xfs/782.out tests/xfs/783 tests/xfs/783.out tests/xfs/784 tests/xfs/784.out tests/xfs/785 tests/xfs/785.out tests/xfs/786 tests/xfs/786.out tests/xfs/787 tests/xfs/787.out tests/xfs/788 tests/xfs/788.out tests/xfs/789 tests/xfs/789.out tests/xfs/790 tests/xfs/790.out tests/xfs/791 tests/xfs/791.out tests/xfs/792 tests/xfs/792.out tests/xfs/793 tests/xfs/793.out tests/xfs/794 tests/xfs/794.out tests/xfs/795 tests/xfs/795.out tests/xfs/796 tests/xfs/796.out tests/xfs/797 tests/xfs/797.out tests/xfs/798 tests/xfs/798.out tests/xfs/799 tests/xfs/799.out tests/xfs/800 tests/xfs/800.out tests/xfs/801 tests/xfs/801.out tests/xfs/802 tests/xfs/802.out tests/xfs/803 tests/xfs/803.out tests/xfs/804 tests/xfs/804.out tests/xfs/805 tests/xfs/805.out tests/xfs/806 tests/xfs/806.out tests/xfs/807 tests/xfs/807.out tests/xfs/808 tests/xfs/808.out tests/xfs/809 tests/xfs/809.out tests/xfs/810 tests/xfs/810.out tests/xfs/811 tests/xfs/811.out tests/xfs/812 tests/xfs/812.out tests/xfs/813 tests/xfs/813.out tests/xfs/814 tests/xfs/814.out tests/xfs/815 tests/xfs/815.out tests/xfs/816 tests/xfs/816.out tests/xfs/817 tests/xfs/817.out tests/xfs/818 tests/xfs/818.out tests/xfs/819 tests/xfs/819.out tests/xfs/820 tests/xfs/820.out tests/xfs/821 tests/xfs/821.out tests/xfs/822 tests/xfs/822.out tests/xfs/823 tests/xfs/823.out tests/xfs/824 tests/xfs/824.out tests/xfs/825 tests/xfs/825.out tests/xfs/826 tests/xfs/826.out tests/xfs/827 tests/xfs/827.out tests/xfs/828 tests/xfs/828.out tests/xfs/829 tests/xfs/829.out tests/xfs/830 tests/xfs/830.out tests/xfs/831 tests/xfs/831.out tests/xfs/832 tests/xfs/832.out tests/xfs/833 tests/xfs/833.out tests/xfs/834 tests/xfs/834.out tests/xfs/835 tests/xfs/835.out tests/xfs/836 tests/xfs/836.out tests/xfs/837 tests/xfs/837.cfg tests/xfs/837.out.default tests/xfs/837.out.oldquota tests/xfs/838 tests/xfs/838.out tests/xfs/839 tests/xfs/839.out tests/xfs/840 tests/xfs/840.out tests/xfs/841 tests/xfs/841.out tests/xfs/Makefile tests/xfs/group.list
++ max_test_namelen=12
++ HAVE_SYSTEMD_SCOPES=
++ systemctl reset-failed fstests-check
++ systemd-run --quiet --unit fstests-check --scope bash -c 'exit 77'
++ test 127 -eq 77
++ OOM_SCORE_ADJ=/proc/self/oom_score_adj
++ _adjust_oom_score -500
++ test -w /proc/self/oom_score_adj
++ echo -500
++ _detect_kmemleak
++ local kern_knob=/sys/kernel/debug/kmemleak
++ KMEMLEAK_CHECK_FILE=/tmp/check_kmemleak
++ rm -f /tmp/check_kmemleak
++ '[' '!' -w /sys/kernel/debug/kmemleak ']'
++ return 0
++ _prepare_test_list
++ unset list
++ '[' -s /tmp/145.arglist ']'
++ cat /tmp/145.arglist
++ true
++ false
++ false
++ sorter=cat
+++ uniq
+++ cat
+++ sort -n /tmp/145.list
++ list=tests/generic/192
++ rm -f /tmp/145.list
+++ date '+%F %T'
++ fstests_start_time='2026-04-21 10:26:33'
++ false
++ trap '_wrapup; exit $status' 0 1 2 3 15
++ (( iters = 0 ))
++ (( iters < 1 ))
++ for section in $HOST_OPTIONS_SECTIONS
++ run_section -no-sections-
++ local section=-no-sections- skip
++ OLD_FSTYP=ext4
++ OLD_TEST_FS_MOUNT_OPTS='-o acl,user_xattr '
++ '[' '!' -z '' ']'
++ '[' '!' -z '' ']'
++ get_next_config -no-sections-
++ '[' '!' -z true ']'
++ false
++ return 0
++ _canonicalize_devices
++ '[' '' '!=' yes ']'
++ return
++ mkdir -p /opt/xfstests/xfstests-dev/results/
++ '[' '!' -d /opt/xfstests/xfstests-dev/results/ ']'
++ false
+++ _wallclock
+++ date +%s
++ sect_start=1776767193
++ false
++ '[' ext4 '!=' ext4 ']'
++ '[' '-o acl,user_xattr ' '!=' '-o acl,user_xattr ' ']'
++ init_rc
++ '[' /dev/vda = '' ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -z ext4 ']'
++ _check_mounted_on TEST_DEV /dev/vda TEST_DIR /ext4_test ext4
++ local devname=TEST_DEV
++ local dev=/dev/vda
++ local mntname=TEST_DIR
++ local mnt=/ext4_test
++ local type=ext4
++ '[' /dev/vda '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vda /ext4_test
++ local dev=/dev/vda
++ local mnt=/ext4_test
+++ findmnt -rncv -S /dev/vda -o SOURCE,TARGET
++ local 'mount_rec=/dev/vda /ext4_test'
++ '[' -n '/dev/vda /ext4_test' ']'
++ '[' '/dev/vda /ext4_test' '!=' '/dev/vda /ext4_test' ']'
++ dev_already_mounted=0
++ '[' 0 -ne 0 ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ /bin/df -T -P
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -n ext4 -a ext4 '!=' ext4 ']'
++ return 0
++ '[' -n /dev/vdb ']'
++ _check_mounted_on SCRATCH_DEV /dev/vdb SCRATCH_MNT /ext4_scratch
++ local devname=SCRATCH_DEV
++ local dev=/dev/vdb
++ local mntname=SCRATCH_MNT
++ local mnt=/ext4_scratch
++ local type=
++ '[' /dev/vdb '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vdb /ext4_scratch
++ local dev=/dev/vdb
++ local mnt=/ext4_scratch
+++ findmnt -rncv -S /dev/vdb -o SOURCE,TARGET
++ local mount_rec=
++ '[' -n '' ']'
++ return 1
++ dev_already_mounted=1
++ '[' 1 -ne 0 ']'
++ return 1
++ '[' 1 -le 1 ']'
++ /opt/xfstests/shims/bin/xfs_io -c stat /ext4_test
++ grep -q 'is not on an XFS filesystem'
++ /opt/xfstests/shims/bin/xfs_io -i -c quit
++ seq=check.145
++ check=/opt/xfstests/xfstests-dev/results//check
++ seqres=/opt/xfstests/xfstests-dev/results//check
++ rm -f /opt/xfstests/xfstests-dev/results//check.full
++ '[' -f /opt/xfstests/xfstests-dev/results//check.time ']'
++ touch /opt/xfstests/xfstests-dev/results//check.time
+++ _full_fstyp_details
+++ '[' -z ext4 ']'
+++ '[' ext4 = xfs ']'
+++ echo ext4
++ echo 'FSTYP         -- ext4'
+FSTYP         -- ext4
+++ _full_platform_details
++++ uname -s
+++ local os=Linux
++++ hostname -s
+++ local 'host=(none)'
++++ uname -rv
+++ local 'kernel=5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970'
++++ uname -m
+++ local platform=x86_64
+++ echo 'Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970'
++ echo 'PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970'
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
++ '[' '!' -z /dev/vdb ']'
+++ _scratch_mkfs_options
+++ _scratch_options mkfs
+++ SCRATCH_OPTIONS=
+++ case "$FSTYP" in
+++ _scratch_ext4_options mkfs
+++ local type=mkfs
+++ local log_opt=
+++ case $type in
+++ SCRATCH_OPTIONS=' -F'
+++ log_opt='-J device='
+++ '[' '' = yes -a '!' -z '' ']'
+++ echo -F /dev/vdb
++ echo 'MKFS_OPTIONS  -- -F /dev/vdb'
+MKFS_OPTIONS  -- -F /dev/vdb
+++ _scratch_mount_options
+++ _scratch_options mount
+++ SCRATCH_OPTIONS=
+++ case "$FSTYP" in
+++ _scratch_ext4_options mount
+++ local type=mount
+++ local log_opt=
+++ case $type in
++++ realpath -q ''
+++ log_opt='-o journal_path='
+++ '[' '' = yes -a '!' -z '' ']'
++++ _common_dev_mount_options
++++ echo -o acl,user_xattr
+++ echo -o acl,user_xattr /dev/vdb /ext4_scratch
++ echo 'MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch'
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
++ echo
+
++ test -n ''
++ needwrap=true
++ '[' '!' -z /dev/vdb ']'
++ _scratch_unmount
++ _scratch_mkfs
++ _try_scratch_mount
++ _scratch_unmount
++ case "$FSTYP" in
++ _unmount /dev/vdb
++ local outlog=/tmp/145.145.umount
++ local errlog=/tmp/145.145.umount.err
++ rm -f /tmp/145.145.umount /tmp/145.145.umount.err
++ /opt/xfstests/shims/bin/umount /dev/vdb
++ local res=0
++ '[' -s /tmp/145.145.umount ']'
++ '[' -s /tmp/145.145.umount.err ']'
++ rm -f /tmp/145.145.umount /tmp/145.145.umount.err
++ return 0
++ _check_test_fs
++ case $FSTYP in
++ _check_generic_filesystem /dev/vda
++ local device=/dev/vda
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ local type=ext4
++ local ok=1
++ '[' ext4 = ext4 ']'
+++ _umount_or_remount_ro /dev/vda
+++ '[' 1 -ne 1 ']'
+++ local device=/dev/vda
++++ _is_dev_mounted /dev/vda
++++ local dev=/dev/vda
++++ local fstype=ext4
++++ '[' 1 -lt 1 ']'
++++ findmnt -rncv -S /dev/vda -t ext4 -o TARGET
++++ head -1
+++ local mountpoint=/ext4_test
+++ '[' 0 -eq 0 ']'
+++ _unmount /dev/vda
+++ local outlog=/tmp/145.389.umount
+++ local errlog=/tmp/145.389.umount.err
+++ rm -f /tmp/145.389.umount /tmp/145.389.umount.err
+++ /opt/xfstests/shims/bin/umount /dev/vda
+++ local res=0
+++ '[' -s /tmp/145.389.umount ']'
+++ '[' -s /tmp/145.389.umount.err ']'
+++ rm -f /tmp/145.389.umount /tmp/145.389.umount.err
+++ return 0
+++ echo /ext4_test
++ local mountpoint=/ext4_test
++ fsck -t ext4 -nf /dev/vda
++ '[' 0 -ne 0 ']'
++ rm -f /tmp/145.fsck
++ '[' 1 -eq 0 ']'
++ '[' 1 -eq 0 ']'
++ '[' ext4 = ext4 ']'
++ _mount_or_remount_rw '-o acl,user_xattr ' /dev/vda /ext4_test
++ '[' 3 -ne 3 ']'
++ local 'mount_opts=-o acl,user_xattr '
++ local device=/dev/vda
++ local mountpoint=/ext4_test
++ '[' 0 -eq 0 ']'
++ '[' ext4 '!=' overlay ']'
++ _mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ /bin/mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ _idmapped_mount /dev/vda /ext4_test
++ '[' '' = true ']'
++ return 0
++ '[' 0 -ne 0 ']'
++ return 1
++ ok=1
++ '[' 1 -eq 0 ']'
++ return 0
++ loop_status=()
++ local tc_status ix
++ _list=('tests/generic/192')
++ local -a _list
++ (( ix = 0 ))
++ (( ix < 1 ))
++ seq=tests/generic/192
++ '[' '!' -f tests/generic/192 ']'
++ export seqnum=generic/192
++ seqnum=generic/192
++ group=generic
++ false
++ REPORT_DIR=/opt/xfstests/xfstests-dev/results/
++ export RESULT_DIR=/opt/xfstests/xfstests-dev/results//generic
++ RESULT_DIR=/opt/xfstests/xfstests-dev/results//generic
++ seqres=/opt/xfstests/xfstests-dev/results//generic/192
++ false
++ printf '%-*s' 12 generic/192
+generic/192 + false
++ tc_status=pass
++ '[' '!' -f tests/generic/192 ']'
++ mkdir -p /opt/xfstests/xfstests-dev/results//generic
++ rm -f '/opt/xfstests/xfstests-dev/results//generic/require_scratch*'
++ rm -f '/opt/xfstests/xfstests-dev/results//generic/require_test*'
++ rm -f /opt/xfstests/xfstests-dev/results//generic/192.out.bad /opt/xfstests/xfstests-dev/results//generic/192.hints
++ _expunge_test generic/192
++ local TEST_ID=generic/192
++ return 1
++ (( !0 ))
++ try+=("$seqnum")
++ awk 'BEGIN {lasttime="       "} \
+		     $1 == "generic/192" {lasttime=" " $2 "s ... "; exit} \
+		     END {printf "%s", lasttime}' /opt/xfstests/xfstests-dev/results//check.time
+       + rm -f core /opt/xfstests/xfstests-dev/results//generic/192.notrun
++ _start_coredumpctl_collection
++ command -v coredumpctl
++ return
+++ _wallclock
+++ date +%s
++ start=1776767193
++ false
++ '[' '!' -x tests/generic/192 ']'
++ /bin/logger 'run xfstest generic/192'
++ '[' -w /dev/kmsg ']'
++ _try_wipe_scratch_devs
+++ date '+%F %T'
++ test_start_time='2026-04-21 10:26:33'
++ '[' false = true ']'
++ _run_seq
++ sts=0
++ local cores=0
++ _finish_coredumpctl_collection
++ test -n ''
++ return
++ for i in core core.*
++ test -f core
++ continue
++ for i in core core.*
++ test -f 'core.*'
++ continue
++ '[' -f /opt/xfstests/xfstests-dev/results//generic/192.notrun ']'
++ '[' 0 -ne 0 ']'
++ _adjust_oom_score 250
++ test -w /proc/self/oom_score_adj
++ echo 250
++ _check_filesystems
++ local ret=0
++ '[' -f /opt/xfstests/xfstests-dev/results//generic/require_test ']'
++ _check_test_fs
++ case $FSTYP in
++ _check_generic_filesystem /dev/vda
++ local device=/dev/vda
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ _df_device /dev/vda
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ local type=ext4
++ local ok=1
++ '[' ext4 = ext4 ']'
+++ _umount_or_remount_ro /dev/vda
+++ '[' 1 -ne 1 ']'
+++ local device=/dev/vda
++++ _is_dev_mounted /dev/vda
++++ local dev=/dev/vda
++++ local fstype=ext4
++++ '[' 1 -lt 1 ']'
++++ findmnt -rncv -S /dev/vda -t ext4 -o TARGET
++++ head -1
+++ local mountpoint=/ext4_test
+++ '[' 0 -eq 0 ']'
+++ _unmount /dev/vda
+++ local outlog=/tmp/145.690.umount
+++ local errlog=/tmp/145.690.umount.err
+++ rm -f /tmp/145.690.umount /tmp/145.690.umount.err
+++ /opt/xfstests/shims/bin/umount /dev/vda
+++ local res=0
+++ '[' -s /tmp/145.690.umount ']'
+++ '[' -s /tmp/145.690.umount.err ']'
+++ rm -f /tmp/145.690.umount /tmp/145.690.umount.err
+++ return 0
+++ echo /ext4_test
++ local mountpoint=/ext4_test
++ fsck -t ext4 -nf /dev/vda
++ '[' 0 -ne 0 ']'
++ rm -f /tmp/145.fsck
++ '[' 1 -eq 0 ']'
++ '[' 1 -eq 0 ']'
++ '[' ext4 = ext4 ']'
++ _mount_or_remount_rw '-o acl,user_xattr ' /dev/vda /ext4_test
++ '[' 3 -ne 3 ']'
++ local 'mount_opts=-o acl,user_xattr '
++ local device=/dev/vda
++ local mountpoint=/ext4_test
++ '[' 0 -eq 0 ']'
++ '[' ext4 '!=' overlay ']'
++ _mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ /bin/mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ _idmapped_mount /dev/vda /ext4_test
++ '[' '' = true ']'
++ return 0
++ '[' 0 -ne 0 ']'
++ return 1
++ ok=1
++ '[' 1 -eq 0 ']'
++ return 0
++ rm -f /opt/xfstests/xfstests-dev/results//generic/require_test
++ '[' -f /opt/xfstests/xfstests-dev/results//generic/require_scratch ']'
++ _scratch_unmount
++ return 0
++ _check_dmesg
++ '[' '!' -f /opt/xfstests/xfstests-dev/results//generic/check_dmesg ']'
++ return 0
++ for i in core core.*
++ test -f core
++ continue
++ for i in core core.*
++ test -f 'core.*'
++ continue
++ '[' -n '' ']'
++ _check_kmemleak
++ local kern_knob=/sys/kernel/debug/kmemleak
++ local leak_file=/opt/xfstests/xfstests-dev/results//generic/192.kmemleak
++ '[' '!' -f /tmp/check_kmemleak ']'
++ return 0
++ false
+++ _wallclock
+++ date +%s
++ stop=1776767193
++ '[' '!' -f tests/generic/192.out ']'
++ sed -i 's/`/\'\''/g' /tmp/145.out
++ diff tests/generic/192.out /tmp/145.out
++ _dump_err '- output mismatch (see /opt/xfstests/xfstests-dev/results//generic/192.out.bad)'
++ _err_msg='- output mismatch (see /opt/xfstests/xfstests-dev/results//generic/192.out.bad)'
++ echo '- output mismatch (see /opt/xfstests/xfstests-dev/results//generic/192.out.bad)'
+- output mismatch (see /opt/xfstests/xfstests-dev/results//generic/192.out.bad)
++ mv /tmp/145.out /opt/xfstests/xfstests-dev/results//generic/192.out.bad
++ diff -u tests/generic/192.out /opt/xfstests/xfstests-dev/results//generic/192.out.bad
++ test 10 -le 0
++ head -n 10
++ sed -e 's/^\(.\)/    \1/'
++ echo ...
++ echo '(Run '\''diff -u /opt/xfstests/xfstests-dev/tests/generic/192.out /opt/xfstests/xfstests-dev/results//generic/192.out.bad'\''' ' to see the entire diff)'
+    --- tests/generic/192.out
+    +++ /opt/xfstests/xfstests-dev/results//generic/192.out.bad
+    @@ -1,5 +1,13 @@
+    ++ cmd=('bash' '-c' 'test -w /proc/self/oom_score_adj && echo 250 > /proc/self/oom_score_adj; exec ./tests/generic/192')
+    ++ local cmd
+    ++ local res
+    ++ '[' -n '' ']'
+    ++ bash -c 'test -w /proc/self/oom_score_adj && echo 250 > /proc/self/oom_score_adj; exec ./tests/generic/192'
+     QA output created by 192
+     sleep for 5 seconds
+    ...
+    (Run 'diff -u /opt/xfstests/xfstests-dev/tests/generic/192.out /opt/xfstests/xfstests-dev/results//generic/192.out.bad'  to see the entire diff)
++ tc_status=fail
++ '[' -f /opt/xfstests/xfstests-dev/results//generic/192.hints ']'
++ _stash_test_status generic/192 fail
++ local test_seq=generic/192
++ local test_status=fail
++ false
++ (( 0 > 0 ))
++ case "$test_status" in
++ (( loop_on_fail > 0 ))
++ bad+=("$test_seq")
++ (( !0 && ix++ ))
++ (( ix < 1 ))
++ seq=check.145
++ check=/opt/xfstests/xfstests-dev/results//check
++ seqres=/opt/xfstests/xfstests-dev/results//check
+++ _wallclock
+++ date +%s
++ sect_stop=1776767193
++ interrupt=false
++ _wrapup
++ seq=check.145
++ check=/opt/xfstests/xfstests-dev/results//check
++ false
++ false
++ true
++ '[' -f /opt/xfstests/xfstests-dev/results//check.time -a -f /tmp/145.time ']'
++ _global_log ''
++ echo ''
++ false
+++ uname -r
++ _global_log 'Kernel version: 5.13.0'
++ echo 'Kernel version: 5.13.0'
++ false
+++ date
++ _global_log 'Tue Apr 21 10:26:33 UTC 2026'
++ echo 'Tue Apr 21 10:26:33 UTC 2026'
++ false
++ echo 'SECTION       -- -no-sections-'
++ echo =========================
++ (( 1 > 0 ))
++ '[' false == false ']'
++ echo 'Ran: generic/192'
+Ran: generic/192
++ echo 'Ran: generic/192'
++ _global_log 'Ran: generic/192'
++ echo 'Ran: generic/192'
++ false
++ false
++ false
++ (( 0 > 0 ))
++ (( 1 > 0 ))
++ echo 'Failures: generic/192'
+Failures: generic/192
++ echo 'Failed 1 of 1 tests'
+Failed 1 of 1 tests
++ _global_log 'Failures: generic/192'
++ echo 'Failures: generic/192'
++ false
++ _global_log 'Failed 1 of 1 tests'
++ echo 'Failed 1 of 1 tests'
++ false
++ echo 'Failures: generic/192'
++ echo 'Failed 1 of 1 tests'
++ echo ''
++ false
++ '[' -n '' ']'
++ needwrap=false
+++ expr 0 + 1
++ sum_bad=1
++ _wipe_counters
++ try=()
++ notrun=()
++ bad=()
++ false
++ rm -f /tmp/145.arglist /tmp/145.err /tmp/145.summary
++ interrupt=true
++ echo
+
++ _test_unmount
++ _scratch_unmount
++ '[' 1 '!=' 0 ']'
++ '[' false = true ']'
++ (( iters++ ))
++ (( iters < 1 ))
++ interrupt=false
+++ expr 1 '!=' 0
++ _exit 1
++ test -n 1
++ status=1
++ exit 1
++ _wrapup
++ seq=check.145
++ check=/opt/xfstests/xfstests-dev/results//check
++ false
++ false
++ false
+++ expr 1 + 0
++ sum_bad=1
++ _wipe_counters
++ try=()
++ notrun=()
++ bad=()
++ false
++ rm -f '/tmp/145.*'
++ exit 1
+----- BASH_ENV TRACE -----
+pid=123 ppid=10 argv0=/opt/xfstests/shims/bin/grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=124 ppid=10 argv0=/opt/xfstests/shims/bin/readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=125 ppid=10 argv0=/opt/xfstests/shims/bin/findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=145 ppid=10 argv0=./check
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=238 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=268 ppid=267 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=270 ppid=269 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=283 ppid=145 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=291 ppid=145 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=293 ppid=145 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=294 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=295 ppid=145 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=297 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=320 ppid=145 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=328 ppid=145 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=330 ppid=145 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=331 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=332 ppid=145 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=343 ppid=342 argv0=realpath
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=346 ppid=145 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=351 ppid=350 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=353 ppid=352 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=360 ppid=145 argv0=/opt/xfstests/shims/bin/mkfs.ext4
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=363 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=364 ppid=145 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=370 ppid=369 argv0=realpath
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=374 ppid=145 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=379 ppid=378 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=381 ppid=380 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=391 ppid=390 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=395 ppid=389 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=400 ppid=399 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=402 ppid=401 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=418 ppid=145 argv0=bash
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=418 ppid=145 argv0=./tests/generic/192
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=510 ppid=418 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=540 ppid=539 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=542 ppid=541 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=552 ppid=418 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=560 ppid=418 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=562 ppid=418 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=563 ppid=418 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=564 ppid=418 argv0=/opt/xfstests/shims/bin/xfs_io
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=568 ppid=567 argv0=/opt/xfstests/xfstests-dev/src/lstat64
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=574 ppid=573 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=576 ppid=575 argv0=/opt/xfstests/xfstests-dev/src/lstat64
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=582 ppid=581 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=584 ppid=583 argv0=/opt/xfstests/xfstests-dev/src/lstat64
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=590 ppid=589 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=591 ppid=418 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=605 ppid=418 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=607 ppid=418 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=609 ppid=418 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=612 ppid=418 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=615 ppid=418 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=617 ppid=418 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=622 ppid=621 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=624 ppid=623 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=627 ppid=418 argv0=stat
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=692 ppid=691 argv0=findmnt
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=696 ppid=690 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=701 ppid=700 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=703 ppid=702 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=711 ppid=683 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=716 ppid=715 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=718 ppid=717 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=736 ppid=145 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=741 ppid=740 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=743 ppid=742 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=746 ppid=145 argv0=/opt/xfstests/shims/bin/umount
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=751 ppid=750 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=753 ppid=752 argv0=readlink
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=772 ppid=771 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+pid=774 ppid=773 argv0=grep
+CONFIG_INCLUDED=<unset>
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+---
+----- END BASH_ENV TRACE -----
+----- CHILD XTRACE -----
++ . ./common/preamble
++ _begin_fstest atime auto
++ . common/exit
++ . common/test_names
+++ VALID_TEST_ID='[0-9]\{3\}'
+++ VALID_TEST_NAME='[0-9]\{3\}-\?[[:alnum:]-]*'
++ '[' -n '' ']'
+++ basename ./tests/generic/192
++ seq=192
++ seqres=/opt/xfstests/xfstests-dev/results//generic/192
++ echo 'QA output created by 192'
+++ pwd
++ here=/opt/xfstests/xfstests-dev
++ tmp=/tmp/418
++ status=1
++ _register_cleanup _cleanup
++ local cleanup=_cleanup
++ shift
++ test -n _cleanup
++ cleanup='_cleanup; '
++ trap '_cleanup; exit $status' EXIT HUP INT QUIT TERM
++ . ./common/rc
+++ . common/config
++++ export LANG=C
++++ LANG=C
++++ export LC_ALL=C
++++ LC_ALL=C
++++ PATH=.:.:/opt/xfstests/shims/bin:/bin:/usr/bin:/sbin:/usr/sbin:/opt/xfstests/tools/bin:/bin:/benchmark
+++++ hostname -s
++++ export 'HOST=(none)'
++++ HOST='(none)'
+++++ uname -s
++++ test Linux = Linux
++++ export MODULAR=0
++++ MODULAR=0
++++ export BOOT=/boot
++++ BOOT=/boot
++++ export EXTRA=xfs-qa
++++ EXTRA=xfs-qa
++++ export SOAK_PROC=3
++++ SOAK_PROC=3
++++ export SOAK_STRESS=10000
++++ SOAK_STRESS=10000
++++ export SOAK_PASSES=-1
++++ SOAK_PASSES=-1
++++ export EMAIL=root@localhost
++++ EMAIL=root@localhost
++++ export HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++++ HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
++++ export 'CHECK_OPTIONS=-g auto'
++++ CHECK_OPTIONS='-g auto'
++++ export BENCH_PASSES=5
++++ BENCH_PASSES=5
++++ export TIME_FACTOR=1
++++ TIME_FACTOR=1
++++ export LOAD_FACTOR=1
++++ LOAD_FACTOR=1
++++ export SOAK_DURATION=
++++ SOAK_DURATION=
++++ export DEBUGFS_MNT=/sys/kernel/debug
++++ DEBUGFS_MNT=/sys/kernel/debug
++++ export OVL_UPPER=ovl-upper
++++ OVL_UPPER=ovl-upper
++++ export OVL_LOWER=ovl-lower
++++ OVL_LOWER=ovl-lower
++++ export OVL_WORK=ovl-work
++++ OVL_WORK=ovl-work
++++ export OVL_MNT=ovl-mnt
++++ OVL_MNT=ovl-mnt
++++ export UNIONMOUNT_TESTSUITE=/opt/xfstests/xfstests-dev/src/unionmount-testsuite
++++ UNIONMOUNT_TESTSUITE=/opt/xfstests/xfstests-dev/src/unionmount-testsuite
++++ export FSCK_OK=0
++++ FSCK_OK=0
++++ export FSCK_NONDESTRUCT=1
++++ FSCK_NONDESTRUCT=1
++++ export FSCK_REBOOT=2
++++ FSCK_REBOOT=2
++++ export FSCK_UNCORRECTED=4
++++ FSCK_UNCORRECTED=4
++++ export FSCK_ERROR=8
++++ FSCK_ERROR=8
++++ export FSCK_USAGE=16
++++ FSCK_USAGE=16
++++ export FSCK_CANCELED=32
++++ FSCK_CANCELED=32
++++ export FSCK_LIBRARY=128
++++ FSCK_LIBRARY=128
+++++ pwd
++++ export PWD=/opt/xfstests/xfstests-dev
++++ PWD=/opt/xfstests/xfstests-dev
++++ export MALLOCLIB=/usr/lib/libefence.a
++++ MALLOCLIB=/usr/lib/libefence.a
++++ export LOCAL_CONFIGURE_OPTIONS=--enable-readline=yes
++++ LOCAL_CONFIGURE_OPTIONS=--enable-readline=yes
++++ export RECREATE_TEST_DEV=false
++++ RECREATE_TEST_DEV=false
+++++ type -P mkfs
++++ export MKFS_PROG=/opt/xfstests/shims/bin/mkfs
++++ MKFS_PROG=/opt/xfstests/shims/bin/mkfs
++++ '[' /opt/xfstests/shims/bin/mkfs = '' ']'
+++++ type -P mount
++++ export MOUNT_PROG=/bin/mount
++++ MOUNT_PROG=/bin/mount
++++ '[' /bin/mount = '' ']'
+++++ type -P umount
++++ export UMOUNT_PROG=/opt/xfstests/shims/bin/umount
++++ UMOUNT_PROG=/opt/xfstests/shims/bin/umount
++++ '[' /opt/xfstests/shims/bin/umount = '' ']'
++++ export FSSTRESS_PROG=/opt/xfstests/xfstests-dev/ltp/fsstress
++++ FSSTRESS_PROG=/opt/xfstests/xfstests-dev/ltp/fsstress
++++ '[' '!' -x /opt/xfstests/xfstests-dev/ltp/fsstress ']'
++++ export FSX_PROG=/opt/xfstests/xfstests-dev/ltp/fsx
++++ FSX_PROG=/opt/xfstests/xfstests-dev/ltp/fsx
++++ '[' '!' -x /opt/xfstests/xfstests-dev/ltp/fsx ']'
+++++ type -P perl
++++ export PERL_PROG=/opt/xfstests/shims/bin/perl
++++ PERL_PROG=/opt/xfstests/shims/bin/perl
++++ '[' /opt/xfstests/shims/bin/perl = '' ']'
+++++ type -P awk
++++ export AWK_PROG=/bin/awk
++++ AWK_PROG=/bin/awk
++++ '[' /bin/awk = '' ']'
+++++ type -P sed
++++ export SED_PROG=/bin/sed
++++ SED_PROG=/bin/sed
++++ '[' /bin/sed = '' ']'
+++++ type -P bc
++++ export BC_PROG=/bin/bc
++++ BC_PROG=/bin/bc
++++ '[' /bin/bc = '' ']'
++++ export PS_ALL_FLAGS=-ef
++++ PS_ALL_FLAGS=-ef
+++++ type -P df
++++ export DF_PROG=/bin/df
++++ DF_PROG=/bin/df
++++ '[' /bin/df = '' ']'
++++ export 'DF_PROG=/bin/df -T -P'
++++ DF_PROG='/bin/df -T -P'
+++++ type -P xfs_io
++++ export XFS_IO_PROG=/opt/xfstests/shims/bin/xfs_io
++++ XFS_IO_PROG=/opt/xfstests/shims/bin/xfs_io
++++ '[' /opt/xfstests/shims/bin/xfs_io = '' ']'
+++++ type -P mkswap
++++ export MKSWAP_PROG=/bin/mkswap
++++ MKSWAP_PROG=/bin/mkswap
++++ MKSWAP_PROG='/bin/mkswap -f'
+++++ type -P xfs_logprint
++++ export XFS_LOGPRINT_PROG=
++++ XFS_LOGPRINT_PROG=
+++++ type -P xfs_protofile
++++ export XFS_PROTOFILE_PROG=
++++ XFS_PROTOFILE_PROG=
+++++ type -P xfs_repair
++++ export XFS_REPAIR_PROG=
++++ XFS_REPAIR_PROG=
+++++ type -P xfs_db
++++ export XFS_DB_PROG=
++++ XFS_DB_PROG=
+++++ type -P xfs_metadump
++++ export XFS_METADUMP_PROG=
++++ XFS_METADUMP_PROG=
+++++ type -P xfs_mdrestore
++++ export XFS_MDRESTORE_PROG=
++++ XFS_MDRESTORE_PROG=
+++++ type -P xfs_admin
++++ export XFS_ADMIN_PROG=
++++ XFS_ADMIN_PROG=
+++++ type -P xfs_growfs
++++ export XFS_GROWFS_PROG=
++++ XFS_GROWFS_PROG=
+++++ type -P xfs_spaceman
++++ export XFS_SPACEMAN_PROG=
++++ XFS_SPACEMAN_PROG=
+++++ type -P xfs_scrub
++++ export XFS_SCRUB_PROG=
++++ XFS_SCRUB_PROG=
+++++ type -P xfs_prepair
++++ export XFS_PARALLEL_REPAIR_PROG=
++++ XFS_PARALLEL_REPAIR_PROG=
+++++ type -P xfs_prepair64
++++ export XFS_PARALLEL_REPAIR64_PROG=
++++ XFS_PARALLEL_REPAIR64_PROG=
+++++ type -P xfsdump
++++ export __XFSDUMP_PROG=
++++ __XFSDUMP_PROG=
++++ '[' -n '' ']'
++++ export XFSDUMP_PROG=
++++ XFSDUMP_PROG=
+++++ type -P xfsrestore
++++ export XFSRESTORE_PROG=
++++ XFSRESTORE_PROG=
+++++ type -P xfsinvutil
++++ export XFSINVUTIL_PROG=
++++ XFSINVUTIL_PROG=
+++++ type -P getfattr
++++ export GETFATTR_PROG=
++++ GETFATTR_PROG=
+++++ type -P setfattr
++++ export SETFATTR_PROG=/bin/setfattr
++++ SETFATTR_PROG=/bin/setfattr
+++++ type -P chacl
++++ export CHACL_PROG=
++++ CHACL_PROG=
+++++ type -P attr
++++ export ATTR_PROG=
++++ ATTR_PROG=
+++++ type -P quota
++++ export QUOTA_PROG=
++++ QUOTA_PROG=
+++++ type -P xfs_quota
++++ export XFS_QUOTA_PROG=
++++ XFS_QUOTA_PROG=
+++++ type -P indent
++++ export INDENT_PROG=
++++ INDENT_PROG=
+++++ type -P xfs_copy
++++ export XFS_COPY_PROG=
++++ XFS_COPY_PROG=
+++++ type -P fstrim
++++ export FSTRIM_PROG=/bin/fstrim
++++ FSTRIM_PROG=/bin/fstrim
+++++ type -P dumpe2fs
++++ export DUMPE2FS_PROG=/opt/xfstests/shims/bin/dumpe2fs
++++ DUMPE2FS_PROG=/opt/xfstests/shims/bin/dumpe2fs
+++++ type -P resize2fs
++++ export RESIZE2FS_PROG=
++++ RESIZE2FS_PROG=
+++++ type -P fio
++++ export FIO_PROG=
++++ FIO_PROG=
+++++ type -P filefrag
++++ export FILEFRAG_PROG=
++++ FILEFRAG_PROG=
+++++ type -P e4defrag
++++ export E4DEFRAG_PROG=
++++ E4DEFRAG_PROG=
+++++ type -P logger
++++ export LOGGER_PROG=/bin/logger
++++ LOGGER_PROG=/bin/logger
+++++ type -P dbench
++++ export DBENCH_PROG=
++++ DBENCH_PROG=
+++++ type -P dmsetup
++++ export DMSETUP_PROG=
++++ DMSETUP_PROG=
+++++ type -P wipefs
++++ export WIPEFS_PROG=
++++ WIPEFS_PROG=
+++++ type -P blkdiscard
++++ export BLKDISCARD_PROG=/bin/blkdiscard
++++ BLKDISCARD_PROG=/bin/blkdiscard
+++++ type -P dump
++++ export DUMP_PROG=
++++ DUMP_PROG=
+++++ type -P restore
++++ export RESTORE_PROG=
++++ RESTORE_PROG=
+++++ type -P lvm
++++ export LVM_PROG=
++++ LVM_PROG=
+++++ type -P lsattr
++++ export LSATTR_PROG=/bin/lsattr
++++ LSATTR_PROG=/bin/lsattr
+++++ type -P chattr
++++ export CHATTR_PROG=/bin/chattr
++++ CHATTR_PROG=/bin/chattr
+++++ type -P debugfs
++++ export DEBUGFS_PROG=
++++ DEBUGFS_PROG=
+++++ type -P uuidgen
++++ export UUIDGEN_PROG=
++++ UUIDGEN_PROG=
+++++ type -P keyctl
++++ export KEYCTL_PROG=
++++ KEYCTL_PROG=
+++++ type -P xz
++++ export XZ_PROG=/bin/xz
++++ XZ_PROG=/bin/xz
+++++ type -P lz4
++++ export LZ4_PROG=
++++ LZ4_PROG=
+++++ type -P flock
++++ export FLOCK_PROG=/bin/flock
++++ FLOCK_PROG=/bin/flock
+++++ type -P ldd
++++ export LDD_PROG=
++++ LDD_PROG=
+++++ type -P timeout
++++ export TIMEOUT_PROG=/bin/timeout
++++ TIMEOUT_PROG=/bin/timeout
+++++ type -P man
++++ export MAN_PROG=/bin/man
++++ MAN_PROG=/bin/man
+++++ type -P nfs4_setfacl
++++ export NFS4_SETFACL_PROG=
++++ NFS4_SETFACL_PROG=
+++++ type -P nfs4_getfacl
++++ export NFS4_GETFACL_PROG=
++++ NFS4_GETFACL_PROG=
+++++ type -P ubiupdatevol
++++ export UBIUPDATEVOL_PROG=/bin/ubiupdatevol
++++ UBIUPDATEVOL_PROG=/bin/ubiupdatevol
+++++ type -P thin_check
++++ export THIN_CHECK_PROG=
++++ THIN_CHECK_PROG=
+++++ type -P python3
++++ export PYTHON3_PROG=
++++ PYTHON3_PROG=
+++++ type -P sqlite3
++++ export SQLITE3_PROG=
++++ SQLITE3_PROG=
+++++ type -P setcap
++++ export SETCAP_PROG=
++++ SETCAP_PROG=
+++++ type -P getcap
++++ export GETCAP_PROG=
++++ GETCAP_PROG=
+++++ type -P capsh
++++ export CAPSH_PROG=
++++ CAPSH_PROG=
+++++ type -P checkbashisms
++++ export CHECKBASHISMS_PROG=
++++ CHECKBASHISMS_PROG=
+++++ type -P xfs_info
++++ export XFS_INFO_PROG=
++++ XFS_INFO_PROG=
+++++ type -P duperemove
++++ export DUPEREMOVE_PROG=
++++ DUPEREMOVE_PROG=
+++++ type -P cc
++++ export CC_PROG=
++++ CC_PROG=
+++++ type -P fsverity
++++ export FSVERITY_PROG=
++++ FSVERITY_PROG=
+++++ type -P openssl
++++ export OPENSSL_PROG=
++++ OPENSSL_PROG=
+++++ type -P accton
++++ export ACCTON_PROG=
++++ ACCTON_PROG=
+++++ type -P e2image
++++ export E2IMAGE_PROG=
++++ E2IMAGE_PROG=
+++++ type -P blkzone
++++ export BLKZONE_PROG=
++++ BLKZONE_PROG=
+++++ type -P gzip
++++ export GZIP_PROG=/bin/gzip
++++ GZIP_PROG=/bin/gzip
+++++ type -P btrfs-image
++++ export BTRFS_IMAGE_PROG=
++++ BTRFS_IMAGE_PROG=
+++++ type -P btrfs-map-logical
++++ export BTRFS_MAP_LOGICAL_PROG=
++++ BTRFS_MAP_LOGICAL_PROG=
+++++ type -P parted
++++ export PARTED_PROG=
++++ PARTED_PROG=
+++++ type -P xfs_property
++++ export XFS_PROPERTY_PROG=
++++ XFS_PROPERTY_PROG=
+++++ type -P fscryptctl
++++ export FSCRYPTCTL_PROG=
++++ FSCRYPTCTL_PROG=
+++++ type -P udevadm
++++ UDEVADM_PROG=
++++ '[' -z '' ']'
+++++ type -P udevsettle
++++ UDEV_SETTLE_PROG=
++++ [[ '' == '' ]]
++++ UDEV_SETTLE_PROG='sleep 1'
++++ unset UDEV_WAIT_PROG
++++ export UDEV_SETTLE_PROG
++++ export UDEVADM_PROG
++++ export UDEV_WAIT_PROG
++++ MODPROBE_REMOVE_PATIENT=
++++ modprobe --help
++++ grep -q -1 remove-patiently
++++ modprobe --help
++++ [[ 1 -ne 0 ]]
++++ [[ -z 50 ]]
++++ export MODPROBE_REMOVE_PATIENT
+++++ type -P mkfs.xfs
++++ export MKFS_XFS_PROG=
++++ MKFS_XFS_PROG=
+++++ type -P mkfs.ext4
++++ export MKFS_EXT4_PROG=/opt/xfstests/shims/bin/mkfs.ext4
++++ MKFS_EXT4_PROG=/opt/xfstests/shims/bin/mkfs.ext4
+++++ type -P mkudffs
++++ export MKFS_UDF_PROG=
++++ MKFS_UDF_PROG=
+++++ set_mkfs_prog_path_with_opts btrfs
+++++ local fstyp=btrfs
++++++ type -P mkfs.btrfs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_BTRFS_PROG=
++++ MKFS_BTRFS_PROG=
+++++ set_mkfs_prog_path_with_opts f2fs
+++++ local fstyp=f2fs
++++++ type -P mkfs.f2fs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_F2FS_PROG=
++++ MKFS_F2FS_PROG=
+++++ type -P dump.f2fs
++++ export DUMP_F2FS_PROG=
++++ DUMP_F2FS_PROG=
+++++ type -P f2fs_io
++++ export F2FS_IO_PROG=
++++ F2FS_IO_PROG=
+++++ type -P inject.f2fs
++++ export F2FS_INJECT_PROG=
++++ F2FS_INJECT_PROG=
+++++ type -P fsck.f2fs
++++ export F2FS_FSCK_PROG=
++++ F2FS_FSCK_PROG=
+++++ type -P btrfs
++++ export BTRFS_UTIL_PROG=
++++ BTRFS_UTIL_PROG=
+++++ type -P btrfs-show-super
++++ export BTRFS_SHOW_SUPER_PROG=
++++ BTRFS_SHOW_SUPER_PROG=
+++++ type -P btrfs-convert
++++ export BTRFS_CONVERT_PROG=
++++ BTRFS_CONVERT_PROG=
+++++ type -P btrfstune
++++ export BTRFS_TUNE_PROG=
++++ BTRFS_TUNE_PROG=
+++++ type -P btrfs-corrupt-block
++++ export BTRFS_CORRUPT_BLOCK_PROG=
++++ BTRFS_CORRUPT_BLOCK_PROG=
+++++ type -P xfs_fsr
++++ export XFS_FSR_PROG=
++++ XFS_FSR_PROG=
++++ export MKFS_NFS_PROG=false
++++ MKFS_NFS_PROG=false
++++ export MKFS_AFS_PROG=false
++++ MKFS_AFS_PROG=false
++++ export MKFS_CIFS_PROG=false
++++ MKFS_CIFS_PROG=false
++++ export MKFS_OVERLAY_PROG=false
++++ MKFS_OVERLAY_PROG=false
+++++ type -P mkfs.reiser4
++++ export MKFS_REISER4_PROG=
++++ MKFS_REISER4_PROG=
+++++ type -P e2fsck
++++ export E2FSCK_PROG=/sbin/e2fsck
++++ E2FSCK_PROG=/sbin/e2fsck
+++++ type -P tune2fs
++++ export TUNE2FS_PROG=
++++ TUNE2FS_PROG=
+++++ type -P fsck.overlay
++++ export FSCK_OVERLAY_PROG=
++++ FSCK_OVERLAY_PROG=
+++++ set_mkfs_prog_path_with_opts bcachefs
+++++ local fstyp=bcachefs
++++++ type -P mkfs.bcachefs
+++++ local p=
+++++ '[' '' '!=' '' ']'
+++++ echo
++++ export MKFS_BCACHEFS_PROG=
++++ MKFS_BCACHEFS_PROG=
++++ '[' -x /usr/sbin/selinuxenabled ']'
++++ '[' '!' -f /opt/xfstests/xfstests-dev/local.config ']'
++++ export HOST_OPTIONS_SECTIONS=-no-sections-
++++ HOST_OPTIONS_SECTIONS=-no-sections-
++++ export OPTIONS_HAVE_SECTIONS=false
++++ OPTIONS_HAVE_SECTIONS=false
++++ '[' -f /opt/xfstests/xfstests-dev/local.config ']'
+++++ get_config_sections /opt/xfstests/xfstests-dev/local.config
+++++ sed -n -e 's/^\[\([[:alnum:]_-]*\)\]/\1/p'
++++ export HOST_OPTIONS_SECTIONS=
++++ HOST_OPTIONS_SECTIONS=
++++ '[' -z '' ']'
++++ . /opt/xfstests/xfstests-dev/local.config
+++++ EMAIL=root@localhost
+++++ FSTYP=ext4
+++++ TEST_DEV=/dev/vda
+++++ TEST_DIR=/ext4_test
+++++ SCRATCH_DEV=/dev/vdb
+++++ SCRATCH_MNT=/ext4_scratch
++++ export HOST_OPTIONS_SECTIONS=-no-sections-
++++ HOST_OPTIONS_SECTIONS=-no-sections-
++++ '[' -z '' ']'
+++++ cut -f1 '-d '
+++++ echo -no-sections-
++++ get_next_config -no-sections-
++++ '[' '!' -z '' ']'
++++ '[' ext4 == overlay ']'
++++ local OLD_FSTYP=ext4
++++ local 'OLD_MOUNT_OPTIONS=-o acl,user_xattr '
++++ local 'OLD_TEST_FS_MOUNT_OPTS=-o acl,user_xattr '
++++ local OLD_MKFS_OPTIONS=
++++ local OLD_FSCK_OPTIONS=-nf
++++ local OLD_USE_EXTERNAL=
++++ unset MOUNT_OPTIONS
++++ unset TEST_FS_MOUNT_OPTS
++++ unset MKFS_OPTIONS
++++ unset FSCK_OPTIONS
++++ unset USE_EXTERNAL
++++ '[' '' == true ']'
++++ parse_config_section -no-sections-
++++ SECTION=-no-sections-
++++ false
++++ return 0
++++ '[' '!' -z ext4 ']'
++++ '[' ext4 '!=' ext4 ']'
++++ '[' -z '' ']'
++++ export 'MOUNT_OPTIONS=-o acl,user_xattr '
++++ MOUNT_OPTIONS='-o acl,user_xattr '
++++ '[' -z '' ']'
++++ export 'TEST_FS_MOUNT_OPTS=-o acl,user_xattr '
++++ TEST_FS_MOUNT_OPTS='-o acl,user_xattr '
++++ '[' -z '' ']'
++++ export MKFS_OPTIONS=
++++ MKFS_OPTIONS=
++++ '[' -z '' ']'
++++ export FSCK_OPTIONS=-nf
++++ FSCK_OPTIONS=-nf
++++ '[' -z '' ']'
++++ export USE_EXTERNAL=
++++ USE_EXTERNAL=
++++ '[' -z /opt/xfstests/xfstests-dev/results/ ']'
++++ '[' ext4 == tmpfs ']'
++++ MC=
++++ '[' -z root@localhost ']'
++++ '[' -z /ext4_test ']'
++++ '[' -z /dev/vda ']'
++++ '[' -n '' ']'
++++ _check_device TEST_DEV required /dev/vda
++++ local name=TEST_DEV
++++ local dev_needed=required
++++ local dev=/dev/vda
++++ '[' -z /dev/vda ']'
++++ '[' -b /dev/vda ']'
++++ return 0
+++++ _canonicalize_mountpoint TEST_DIR /ext4_test
+++++ local name=TEST_DIR
+++++ local dir=/ext4_test
+++++ '[' -d /ext4_test ']'
+++++ readlink -e /ext4_test
+++++ return 0
++++ export TEST_DIR=/ext4_test
++++ TEST_DIR=/ext4_test
++++ '[' '!' -z '' ']'
++++ _check_device SCRATCH_DEV optional /dev/vdb
++++ local name=SCRATCH_DEV
++++ local dev_needed=optional
++++ local dev=/dev/vdb
++++ '[' -z /dev/vdb ']'
++++ '[' -b /dev/vdb ']'
++++ return 0
+++++ _canonicalize_mountpoint SCRATCH_MNT /ext4_scratch
+++++ local name=SCRATCH_MNT
+++++ local dir=/ext4_scratch
+++++ '[' -d /ext4_scratch ']'
+++++ readlink -e /ext4_scratch
+++++ return 0
++++ export SCRATCH_MNT=/ext4_scratch
++++ SCRATCH_MNT=/ext4_scratch
++++ '[' -n '' ']'
++++ '[' '' == true -o ext4 == overlay ']'
++++ export CONFIG_INCLUDED=true
++++ CONFIG_INCLUDED=true
++++ '[' -z ext4 ']'
++++ FSTYP=ext4
++++ export FSTYP
++++ '[' -z '-o acl,user_xattr ' ']'
++++ '[' -z '-o acl,user_xattr ' ']'
++++ '[' -z '' ']'
++++ _mkfs_opts
++++ case $FSTYP in
++++ '[' -z -nf ']'
++++ _canonicalize_devices
++++ '[' '' '!=' yes ']'
++++ return
++++ export TEST_DEV
++++ /bin/true
++++ type -P bc
+++ BC=/bin/bc
+++ _FSSTRESS_PID=
+++ umask 022
+++ _source_specific_fs ext4
+++ local fs=ext4
+++ '[' -z ext4 ']'
+++ case "$fs" in
+++ '[' /opt/xfstests/shims/bin/mkfs.ext4 = '' ']'
+++ . ./common/ext4
+++ '[' '!' -z '' ']'
+++ USE_REMOUNT=0
+++ /bin/true
++ init_rc
++ '[' /dev/vda = '' ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -z ext4 ']'
++ _check_mounted_on TEST_DEV /dev/vda TEST_DIR /ext4_test ext4
++ local devname=TEST_DEV
++ local dev=/dev/vda
++ local mntname=TEST_DIR
++ local mnt=/ext4_test
++ local type=ext4
++ '[' /dev/vda '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vda /ext4_test
++ local dev=/dev/vda
++ local mnt=/ext4_test
+++ findmnt -rncv -S /dev/vda -o SOURCE,TARGET
++ local 'mount_rec=/dev/vda /ext4_test'
++ '[' -n '/dev/vda /ext4_test' ']'
++ '[' '/dev/vda /ext4_test' '!=' '/dev/vda /ext4_test' ']'
++ dev_already_mounted=0
++ '[' 0 -ne 0 ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/df -T -P
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -n ext4 -a ext4 '!=' ext4 ']'
++ return 0
++ '[' -n /dev/vdb ']'
++ _check_mounted_on SCRATCH_DEV /dev/vdb SCRATCH_MNT /ext4_scratch
++ local devname=SCRATCH_DEV
++ local dev=/dev/vdb
++ local mntname=SCRATCH_MNT
++ local mnt=/ext4_scratch
++ local type=
++ '[' /dev/vdb '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vdb /ext4_scratch
++ local dev=/dev/vdb
++ local mnt=/ext4_scratch
+++ findmnt -rncv -S /dev/vdb -o SOURCE,TARGET
++ local mount_rec=
++ '[' -n '' ']'
++ return 1
++ dev_already_mounted=1
++ '[' 1 -ne 0 ']'
++ return 1
++ '[' 1 -le 1 ']'
++ /opt/xfstests/shims/bin/xfs_io -c stat /ext4_test
++ grep -q 'is not on an XFS filesystem'
++ /opt/xfstests/shims/bin/xfs_io -i -c quit
++ rm -f /opt/xfstests/xfstests-dev/results//generic/192.full /opt/xfstests/xfstests-dev/results//generic/192.hints
++ . ./common/filter
+++ /bin/true
++ _require_test
++ case "$FSTYP" in
++ '[' -z /dev/vda ']'
+++ _is_block_dev /dev/vda
+++ '[' 1 -ne 1 ']'
+++ local dev=/dev/vda
+++ '[' -L /dev/vda ']'
+++ '[' -b /dev/vda ']'
+++ /opt/xfstests/xfstests-dev/src/lstat64 /dev/vda
+++ /bin/awk '/Device type:/ { print $9 }'
++ '[' fe:0 = '' ']'
+++ _is_block_dev /dev/vdb
+++ '[' 1 -ne 1 ']'
+++ local dev=/dev/vdb
+++ '[' -L /dev/vdb ']'
+++ '[' -b /dev/vdb ']'
+++ /opt/xfstests/xfstests-dev/src/lstat64 /dev/vdb
+++ /bin/awk '/Device type:/ { print $9 }'
+++ _is_block_dev /dev/vda
+++ '[' 1 -ne 1 ']'
+++ local dev=/dev/vda
+++ '[' -L /dev/vda ']'
+++ '[' -b /dev/vda ']'
+++ /bin/awk '/Device type:/ { print $9 }'
+++ /opt/xfstests/xfstests-dev/src/lstat64 /dev/vda
++ '[' fe:10 = fe:0 ']'
++ '[' '!' -d /ext4_test ']'
++ _check_mounted_on TEST_DEV /dev/vda TEST_DIR /ext4_test
++ local devname=TEST_DEV
++ local dev=/dev/vda
++ local mntname=TEST_DIR
++ local mnt=/ext4_test
++ local type=
++ '[' /dev/vda '!=' ceph-fuse ']'
++ _check_if_dev_already_mounted /dev/vda /ext4_test
++ local dev=/dev/vda
++ local mnt=/ext4_test
+++ findmnt -rncv -S /dev/vda -o SOURCE,TARGET
++ local 'mount_rec=/dev/vda /ext4_test'
++ '[' -n '/dev/vda /ext4_test' ']'
++ '[' '/dev/vda /ext4_test' '!=' '/dev/vda /ext4_test' ']'
++ dev_already_mounted=0
++ '[' 0 -ne 0 ']'
+++ _fs_type /dev/vda
+++ '[' 1 -ne 1 ']'
+++ _df_device /dev/vda
+++ '[' 1 -ne 1 ']'
+++ /bin/awk '{ print $2 }'
+++ /bin/df -T -P
+++ sed -e s/nfs4/nfs/ -e s/fuse.glusterfs/glusterfs/ -e s/fuse.ceph-fuse/ceph-fuse/
+++ /bin/awk -v what=/dev/vda '
+        ($1==what) && (NF==1) {
+            v=$1
+            getline
+            print v, $0
+            exit
+        }
+        ($1==what) {
+            print
+            exit
+        }
+    '
++ '[' -n '' -a ext4 '!=' '' ']'
++ return 0
++ local err=0
++ '[' 0 -le 1 ']'
++ '[' 0 -ne 0 ']'
++ touch /opt/xfstests/xfstests-dev/results//generic/require_test
++ _require_atime
++ _exclude_scratch_mount_option noatime
++ _exclude_mount_option '-o acl,user_xattr ' noatime
+++ _normalize_mount_options '-o acl,user_xattr '
+++ echo '-o acl,user_xattr '
+++ sed -n 's/-o\s*\(\S*\)/\1/gp'
+++ sed 's/,/ /g'
++ local 'mnt_opts=acl user_xattr '
++ shift
++ '[' 1 -gt 0 ']'
++ local pattern=noatime
++ echo noatime
++ grep -E -q 'dax(=always|$)'
++ grep -E -q noatime
++ echo acl user_xattr
++ shift
++ '[' 0 -gt 0 ']'
++ case $FSTYP in
++ delay=5
++ testfile=/ext4_test/testfile
++ rm -f /ext4_test/testfile
++ for i in echo stat sleep cat
++ echo --help
++ for i in echo stat sleep cat
++ stat --help
++ for i in echo stat sleep cat
++ sleep --help
++ for i in echo stat sleep cat
++ cat --help
++ echo test
+++ _access_time /ext4_test/testfile
+++ stat -c %X /ext4_test/testfile
++ time1=0
++ echo 0
++ echo 'sleep for 5 seconds'
++ sleep 5
++ cat /ext4_test/testfile
+++ _access_time /ext4_test/testfile
+++ stat -c %X /ext4_test/testfile
++ time2=0
++ echo 0
++ cd /
++ _test_cycle_mount
++ local unmounted
++ case "$FSTYP" in
++ '[' '' = true ']'
++ _test_unmount
++ '[' ext4 == overlay ']'
++ _unmount /dev/vda
++ local outlog=/tmp/418.418.umount
++ local errlog=/tmp/418.418.umount.err
++ rm -f /tmp/418.418.umount /tmp/418.418.umount.err
++ /opt/xfstests/shims/bin/umount /dev/vda
++ local res=0
++ '[' -s /tmp/418.418.umount ']'
++ '[' -s /tmp/418.418.umount.err ']'
++ rm -f /tmp/418.418.umount /tmp/418.418.umount.err
++ return 0
++ _test_mount
++ local mount_ret
++ '[' ext4 == ceph-fuse ']'
++ '[' ext4 == overlay ']'
++ _test_options mount
++ local type=mount
++ local rt_opt=
++ local log_opt=
++ TEST_OPTIONS=
++ '[' ext4 '!=' xfs ']'
++ return
++ _mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ /bin/mount -t ext4 -o acl,user_xattr /dev/vda /ext4_test
++ mount_ret=0
++ '[' 0 -ne 0 ']'
++ _idmapped_mount /dev/vda /ext4_test
++ '[' '' = true ']'
++ return 0
++ _prepare_for_eio_shutdown /dev/vda
++ local dev=/dev/vda
++ case "$FSTYP" in
++ return 0
+++ _access_time /ext4_test/testfile
+++ stat -c %X /ext4_test/testfile
++ time3=
++ echo
+++ expr 0 - 0
++ delta1=0
+++ expr - 0
++ delta2=
++ min_tol=0
++ '[' ext4 = exfat ']'
++ _within_tolerance delta1 0 5 0 2 -v
++ _name=delta1
++ _given_val=0
++ _correct_val=5
++ _mintol=0
++ _maxtol=0
++ _verbose=0
++ _debug=false
++ '[' 6 -ge 5 ']'
++ '[' 2 = -v ']'
++ _maxtol=2
++ '[' 6 -ge 6 ']'
++ '[' -v = -v ']'
++ _verbose=1
+++ echo 0
+++ sed -e s/%//
++ _mintolerance=0
++ '[' 0 = 0 ']'
+++ echo 'scale=5; 5-0'
+++ bc
++ _min=5
+++ echo 2
+++ sed -e s/%//
++ _maxtolerance=2
++ '[' 2 = 2 ']'
+++ echo 'scale=5; 5+2'
+++ bc
++ _max=7
++ false
++ false
++ cat
++ cat
+++ bc
++ _above_min=0
+++ bc
++ _below_max=1
++ rm -f /tmp/418.bc.1 /tmp/418.bc.2
+++ expr 0 '&' 1
++ _in_range=0
+++ sed -e '/\./s/0*$//' -e 's/\.$//'
+++ echo 5
++ _min=5
+++ sed -e '/\./s/0*$//' -e 's/\.$//'
+++ echo 7
++ _max=7
++ '[' 0 -eq 1 ']'
++ '[' 1 -eq 1 ']'
++ echo delta1 has value of 0
++ '[' 1 -eq 1 ']'
++ echo delta1 is NOT in range 5 .. 7
++ return 1
++ _within_tolerance delta2 0 0 0 -v
++ _name=delta2
++ _given_val=0
++ _correct_val=0
++ _mintol=0
++ _maxtol=0
++ _verbose=0
++ _debug=false
++ '[' 5 -ge 5 ']'
++ '[' -v = -v ']'
++ _verbose=1
++ '[' 5 -ge 6 ']'
+++ sed -e s/%//
+++ echo 0
++ _mintolerance=0
++ '[' 0 = 0 ']'
+++ echo 'scale=5; 0-0'
+++ bc
++ _min=0
+++ sed -e s/%//
+++ echo 0
++ _maxtolerance=0
++ '[' 0 = 0 ']'
+++ bc
+++ echo 'scale=5; 0+0'
++ _max=0
++ false
++ false
++ cat
++ cat
+++ bc
++ _above_min=1
+++ bc
++ _below_max=1
++ rm -f /tmp/418.bc.1 /tmp/418.bc.2
+++ expr 1 '&' 1
++ _in_range=1
+++ echo 0
+++ sed -e '/\./s/0*$//' -e 's/\.$//'
++ _min=0
+++ echo 0
+++ sed -e '/\./s/0*$//' -e 's/\.$//'
++ _max=0
++ '[' 1 -eq 1 ']'
++ '[' 1 -eq 1 ']'
++ echo delta2 is in range
++ return 0
++ status=0
++ exit
++ _cleanup
++ command -v _kill_fsstress
++ _kill_fsstress
++ '[' -n '' ']'
++ cd /
++ rm -r -f '/tmp/418.*'
++ exit 0
+----- END CHILD XTRACE -----
+----- FULL LOG TAIL: generic/192 -----
+0
+0
+
+umount: can't unmount /dev/vdb: Invalid argument
+----- END FULL LOG TAIL -----
+----- BAD OUT: generic/192 -----
++ cmd=('bash' '-c' 'test -w /proc/self/oom_score_adj && echo 250 > /proc/self/oom_score_adj; exec ./tests/generic/192')
++ local cmd
++ local res
++ '[' -n '' ']'
++ bash -c 'test -w /proc/self/oom_score_adj && echo 250 > /proc/self/oom_score_adj; exec ./tests/generic/192'
+QA output created by 192
+sleep for 5 seconds
+test
+stat: can't stat '/ext4_test/testfile': No such file or directory
+expr: syntax error
+delta1 has value of 0
+delta1 is NOT in range 5 .. 7
+delta2 is in range
+===== END FAIL LOG: generic/192 =====
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+jbd_phase1\t0\t1\t0\t0\t1\t0.00\t0
+===== jbd_phase1 detailed results =====
+test	status	rc	reason
+generic/192	FAIL	1	+++ export FSCK_ERROR=8
+xfstests jbd_phase1 passed: pass_rate=0.00% >= 0%
+summary=/tmp/xfstests_results/jbd_phase1_summary.tsv
+results=/tmp/xfstests_results/jbd_phase1_results.tsv
+excluded=/tmp/xfstests_results/jbd_phase1_excluded.tsv
+All syscall tests passed.

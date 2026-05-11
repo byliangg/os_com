@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 553
+#
+# Check that we cannot copy_file_range() to an immutable file
+#
+# This is a regression test for kernel commit:
+#   96e6e8f4a68d ("vfs: add missing checks to copy_file_range")
+#
+. ./common/preamble
+_begin_fstest auto quick copy_range
+
+_register_cleanup "_cleanup" BUS
+
+workdir="$TEST_DIR/test-$seq"
+# Override the default cleanup function.
+_cleanup()
+{
+	$XFS_IO_PROG -f -r -c "chattr -i" $workdir/immutable >/dev/null 2>&1
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_xfs_io_command "copy_range"
+_require_xfs_io_command "chattr" "i"
+
+rm -rf $workdir
+mkdir $workdir
+
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 128k" $workdir/file >> $seqres.full 2>&1
+
+# we have to open the file to be immutable rw and hold it open over the
+# chattr command to set it immutable, otherwise we won't be able to open it for
+# writing after it's been made immutable. (i.e. would exercise file mode checks,
+# not immutable inode flag checks).
+echo immutable file returns EPERM
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 64k" -c fsync $workdir/immutable | _filter_xfs_io
+$XFS_IO_PROG -f -c "chattr +i" -c "copy_range -l 32k $workdir/file" $workdir/immutable
+$XFS_IO_PROG -f -r -c "chattr -i" $workdir/immutable
+
+# success, all done
+status=0
+exit

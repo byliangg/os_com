@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Eric Sandeen.  All Rights Reserved.
+#
+# FS QA Test No. 225
+#
+# Run the fiemap (file extent mapping) tester
+#
+. ./common/preamble
+_begin_fstest auto quick fiemap
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_odirect
+_require_xfs_io_command "fiemap"
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount > /dev/null 2>&1
+
+fiemapfile=$SCRATCH_MNT/$seq.fiemap
+fiemaplog=$SCRATCH_MNT/$seq.log
+
+_require_test_program "fiemap-tester"
+
+seed=`date +%s`
+
+echo "using seed $seed" >> $fiemaplog
+
+echo "fiemap run without preallocation, with sync"
+$here/src/fiemap-tester -q -S -s $seed -p 0 -r 200 $fiemapfile 2>&1 | tee -a $fiemaplog
+
+if [ $? -ne 0 ]; then
+	if grep -q "Operation not supported" $fiemaplog; then
+	      _notrun "FIEMAP not supported by this filesystem type: $FSTYP"
+	fi
+	status=$?
+	exit
+fi
+
+echo "fiemap run without preallocation or sync"
+$here/src/fiemap-tester -q -s $seed -p 0 -r 200 $fiemapfile 2>&1 | tee -a $fiemaplog
+
+status=0
+exit

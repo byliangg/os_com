@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 052
+#
+# To test log replay by shutdown of file system
+# This is the first simple initial test to ensure that
+# the goingdown ioctl is working and recovery of
+# create transactions is working.
+#
+. ./common/preamble
+_begin_fstest shutdown log auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+
+
+rm -f $tmp.log
+
+_require_scratch
+_require_scratch_shutdown
+_require_logstate
+
+echo "mkfs"
+_scratch_mkfs >>$seqres.full 2>&1 \
+    || _fail "mkfs scratch failed"
+_require_metadata_journaling $SCRATCH_DEV
+
+echo "mount"
+_scratch_mount
+
+echo "touch files"
+touch $SCRATCH_MNT/{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}
+
+echo "godown"
+_scratch_shutdown -v -f >> $seqres.full
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after going down..."
+_print_logstate
+
+# curious if FS consistent at start
+if false; then
+    if _check_scratch_fs; then
+       echo "*** checked ok ***"
+    fi
+fi
+
+echo "mount with replay"
+_try_scratch_mount $mnt >>$seqres.full 2>&1 \
+    || _fail "mount failed: $mnt $MOUNT_OPTIONS"
+
+echo "ls SCRATCH_MNT"
+ls $SCRATCH_MNT | _filter_lostfound
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after mount and replay..."
+_print_logstate
+
+# success, all done
+status=0
+exit

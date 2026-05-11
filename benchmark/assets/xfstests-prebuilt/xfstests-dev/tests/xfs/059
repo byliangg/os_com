@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001, 2011 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 059
+#
+# Test multi-stream xfsdump/xfsrestore.
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+
+_require_multi_stream
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_fill_multi
+_do_dump_multi_file --multi 4
+_do_restore_multi_file --multi 4
+_ls_compare_sub
+_diff_compare
+
+# success, all done
+exit

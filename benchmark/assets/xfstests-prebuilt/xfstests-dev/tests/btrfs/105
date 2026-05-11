@@ -1,0 +1,85 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+# Copyright (C) 2015 Martin Raiber <martin@urbackup.org>
+#
+# FS QA Test No. btrfs/105
+#
+# Test that an incremental send works after a file from the parent snapshot
+# gets replaced in the send snapshot by another one at the same exact location,
+# with the same name and with the same inode number.
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_scratch
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create our test file with a single extent of 64K.
+mkdir -p $SCRATCH_MNT/foo
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 64K" $SCRATCH_MNT/foo/bar | _filter_xfs_io
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+_btrfs subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+echo "File digest before being replaced:"
+md5sum $SCRATCH_MNT/mysnap1/foo/bar | _filter_scratch
+
+# Remove the file and then create a new one in the same location with the same
+# name but with different content. This new file ends up getting the same inode
+# number as the previous one, because that inode number was the highest inode
+# number used by the snapshot's root and therefore when attempting to find the
+# a new inode number for the new file, we end up reusing the same inode number.
+# This happens because currently btrfs uses the highest inode number summed by 1
+# for the first inode created once a snapshot's root is loaded (done at
+# fs/btrfs/inode-map.c:btrfs_find_free_objectid in the linux kernel tree).
+# Having these two different files in the snapshots with the same inode number
+# (but different generation numbers) caused the btrfs send code to emit an
+# incorrect path for the file when issuing an unlink operation because it failed
+# to realize they were different files.
+rm -f $SCRATCH_MNT/mysnap2/foo/bar
+$XFS_IO_PROG -f -c "pwrite -S 0xbb 0 96K" \
+	$SCRATCH_MNT/mysnap2/foo/bar | _filter_xfs_io
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT/mysnap2 \
+	$SCRATCH_MNT/mysnap2_ro
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/mysnap2_ro
+
+echo "File digest in the original filesystem after being replaced:"
+md5sum $SCRATCH_MNT/mysnap2_ro/foo/bar | _filter_scratch
+
+# Now recreate the filesystem by receiving both send streams and verify we get
+# the same file contents that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+
+echo "File digest in the new filesystem:"
+# Must match the digest from the new file.
+md5sum $SCRATCH_MNT/mysnap2_ro/foo/bar | _filter_scratch
+
+status=0
+exit

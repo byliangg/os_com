@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 297
+#
+# Test freeze/unfreeze file system randomly under fsstress
+# Regression test for commit:
+# 437a255 xfs: fix direct IO nested transaction deadlock.
+#
+. ./common/preamble
+_begin_fstest auto freeze
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	_kill_fsstress
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_freeze
+
+logblks=$(_scratch_find_xfs_min_logblocks -d agcount=16,su=256k,sw=12 -l su=256k)
+_scratch_mkfs_xfs -d agcount=16,su=256k,sw=12 -l su=256k,size=${logblks}b >/dev/null 2>&1
+_scratch_mount
+
+STRESS_DIR="$SCRATCH_MNT/testdir"
+mkdir -p $STRESS_DIR
+
+# turn off sync as this can lead to near deadlock conditions due to every
+# fsstress process lockstepping against freeze on large CPU count machines
+_run_fsstress_bg -d $STRESS_DIR -f sync=0 -n 1000 -p 1000 $FSSTRESS_AVOID
+
+# Freeze/unfreeze file system randomly
+echo "Start freeze/unfreeze randomly" | tee -a $seqres.full
+LOOP=10
+while [ $LOOP -gt 0 ];do
+	TIMEOUT=`expr $RANDOM % 5`
+	sleep $TIMEOUT
+	echo "* Freeze file system after sleeping $TIMEOUT seconds" >>$seqres.full
+	xfs_freeze -f $SCRATCH_MNT
+	if [ $? -ne 0 ];then
+		echo " - Error: freeze filesystem failed" | tee -a $seqres.full
+	fi
+	TIMEOUT=`expr $RANDOM % 3`
+	sleep $TIMEOUT
+	echo "* Unfreeze file system after sleeping $TIMEOUT seconds" >>$seqres.full
+	xfs_freeze -u $SCRATCH_MNT
+	if [ $? -ne 0 ];then
+		echo " - Error: unfreeze filesystem failed" | tee -a $seqres.full
+	fi
+	let LOOP=$LOOP-1
+done
+echo "Test done" | tee -a $seqres.full
+_kill_fsstress
+
+status=0
+exit

@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 294
+#
+# Tests for EEXIST (not EROFS) for inode creations, if
+# we ask to create an already-existing entity on an RO filesystem
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# NFS will optimize away the on-the-wire lookup before attempting to
+# create a new file (since that means an extra round trip).
+_exclude_fs nfs
+
+_require_scratch
+_require_symlinks
+_require_mknod
+
+_scratch_mkfs > $seqres.full 2>&1 || _fail "Could not mkfs scratch device"
+
+THIS_TEST_DIR=$SCRATCH_MNT/$seq.test
+
+_create_files()
+{
+	mknod $THIS_TEST_DIR/testnode c 1 3 2>&1 | _filter_mknod
+	mkdir $THIS_TEST_DIR/testdir
+	touch $THIS_TEST_DIR/testtarget
+	ln -s $THIS_TEST_DIR/testtarget $THIS_TEST_DIR/testlink 2>&1 | _filter_ln
+}
+
+_scratch_mount
+
+rm -rf $THIS_TEST_DIR
+mkdir $THIS_TEST_DIR || _fail "Could not create dir for test"
+
+_create_files 2>&1 | _filter_scratch
+_try_scratch_mount -o remount,ro || _fail "Could not remount scratch readonly"
+_create_files 2>&1 | _filter_scratch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 119
+#
+# Leaking reservation space in the GRH
+# Test out pv#942130
+# This can hang when things aren't working
+#
+. ./common/preamble
+_begin_fstest log v2log auto freeze
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+
+_require_scratch
+_require_freeze
+
+# this may hang
+_scratch_sync
+
+export MKFS_OPTIONS="-l version=2,su=64k"
+logblks=$(_scratch_find_xfs_min_logblocks)
+export MKFS_OPTIONS="-l version=2,size=${logblks}b,su=64k"
+export MOUNT_OPTIONS="-o logbsize=64k"
+_scratch_mkfs_xfs >/dev/null
+
+_scratch_mount
+
+max=99
+i=0
+echo "start freezing and unfreezing"
+while [ $i -lt $max ]; do
+	xfs_freeze -f $SCRATCH_MNT
+	xfs_freeze -u $SCRATCH_MNT
+	echo -n .
+	let i=$i+1
+done
+echo "done"
+
+# success, all done
+status=0
+exit

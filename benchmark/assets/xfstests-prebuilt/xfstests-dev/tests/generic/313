@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 313
+#
+# Check ctime and mtime are updated on truncate(2) and ftruncate(2)
+#
+# Regression test for commit:
+# 3972f26 btrfs: update timestamps on truncate()
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+testfile=$TEST_DIR/testfile.$seq
+
+echo "Silence is golden"
+
+$here/src/t_truncate_cmtime $testfile 2>&1
+
+status=0
+exit

@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 001
+#
+# Test copy up files from lower dir that are <, =, > 4G in size.
+#
+# Kernel commit 0480334fa604 ("ovl: use O_LARGEFILE in ovl_copy_up()")
+# fixed bug when copying up large file from lower dir.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# overlay copy_up doesn't deal with sparse file well, holes will be filled by
+# zeros, so at least (4G + 4G + 8k) free space is needed on scratch base fs
+_require_fs_space $OVL_BASE_SCRATCH_MNT $((4*1024*1024*2 + 8))
+
+# Create test files with different sizes in lower dir
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+touch $lowerdir/zero_size
+$XFS_IO_PROG -fc "pwrite 0 4k" $lowerdir/less_than_4g >>$seqres.full
+$XFS_IO_PROG -fc "pwrite 4294963200 4k" $lowerdir/4gfile >>$seqres.full
+$XFS_IO_PROG -fc "pwrite 4g 4k" $lowerdir/larger_than_4g >>$seqres.full
+
+_scratch_mount
+
+echo "Silence is golden"
+
+# Open the files should succeed, no errors are expected (e.g. EFBIG)
+for f in $SCRATCH_MNT/*; do
+	$XFS_IO_PROG -c "open" $f >>$seqres.full
+done
+
+# success, all done
+status=0
+exit

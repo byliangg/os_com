@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 440
+#
+# Regression test for a quota accounting bug when changing the owner of
+# a file that has CoW reservations and no dirty pages.  The reservations
+# should shift over to the new owner, but they do not.
+#
+
+# unreliable_in_parallel: external sync(1) and/or drop caches can reclaim inodes
+# and free post-eof space, resulting in lower than expected block counts.
+
+. ./common/preamble
+_begin_fstest auto quick clone quota unreliable_in_parallel
+
+# Import common functions.
+. ./common/reflink
+. ./common/quota
+. ./common/filter
+
+# Modify as appropriate.
+
+_require_quota
+_require_scratch_delalloc
+_require_scratch_reflink
+_require_cp_reflink
+_require_user
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount "-o usrquota,grpquota" >> "$seqres.full" 2>&1
+
+# Make sure all our files are on the data device
+_xfs_force_bdev data $SCRATCH_MNT
+
+echo "Create files"
+$XFS_IO_PROG -c "cowextsize 1m" $SCRATCH_MNT
+touch $SCRATCH_MNT/a $SCRATCH_MNT/force_fsgqa
+chown $qa_user $SCRATCH_MNT/a $SCRATCH_MNT/force_fsgqa
+_pwrite_byte 0x58 0 64k $SCRATCH_MNT/a >> $seqres.full
+$XFS_IO_PROG -c 'stat -r' $SCRATCH_MNT/a | grep stat.size >> $seqres.full
+_report_quota_blocks "-u $SCRATCH_MNT"
+
+echo "Reflink and CoW"
+_cp_reflink $SCRATCH_MNT/a $SCRATCH_MNT/b
+_pwrite_byte 0x59 0 64k $SCRATCH_MNT/a >> $seqres.full
+$XFS_IO_PROG -c 'stat -r' $SCRATCH_MNT/a | grep stat.size >> $seqres.full
+_report_quota_blocks "-u $SCRATCH_MNT"
+
+echo "Sync"
+_scratch_sync
+_report_quota_blocks "-u $SCRATCH_MNT"
+
+echo "Chown and check quota"
+chown root $SCRATCH_MNT/a
+$XFS_IO_PROG -c 'stat -r' $SCRATCH_MNT/a | grep stat.size >> $seqres.full
+_report_quota_blocks "-u $SCRATCH_MNT"
+
+echo "Remount"
+_scratch_unmount
+_scratch_mount "-o usrquota,grpquota" >> "$seqres.full" 2>&1
+$XFS_IO_PROG -c 'stat -r' $SCRATCH_MNT/a | grep stat.size >> $seqres.full
+_report_quota_blocks "-u $SCRATCH_MNT"
+
+# success, all done
+status=0
+exit

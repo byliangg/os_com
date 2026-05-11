@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 209
+#
+# Make sure setting cowextsz on a directory propagates it to subfiles.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "cowextsize"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+_require_congruent_file_oplen $SCRATCH_MNT 1048576
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Set extsz and cowextsz on directory"
+$XFS_IO_PROG -c "cowextsize 1048576" $testdir >> $seqres.full
+
+echo "Create a fake tree structure"
+seq 1 2 | while read nr; do
+	mkdir "$testdir/dir-$nr"
+	seq 1 4 | while read nnr; do
+		touch "$testdir/dir-$nr/file-$nnr"
+	done
+done
+_scratch_cycle_mount
+
+echo "Check cowextsize settings"
+seq 1 2 | while read nr; do
+	seq 1 4 | while read nnr; do
+		file="$testdir/dir-$nr/file-$nnr"
+		$XFS_IO_PROG -c "cowextsize" $file | _filter_scratch
+	done
+done
+
+# success, all done
+status=0
+exit

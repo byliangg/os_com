@@ -1,0 +1,82 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 304
+#
+# Check that high-offset dedupes work.
+#
+. ./common/preamble
+_begin_fstest auto quick clone dedupe
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_test_dedupe
+_require_cp_reflink
+
+echo "Format and mount"
+testdir=$TEST_DIR/test-$seq
+mkdir $testdir
+
+echo "Create the original files"
+bigoff=9223372036854775806
+len=9223372036854775807
+bigoff_64k=9223372036854710272	# bigoff rounded down to 64k
+$XFS_IO_PROG -f -c "truncate $len" $testdir/file0 >> $seqres.full
+test -s $testdir/file0 || _notrun "High offset ftruncate failed"
+_pwrite_byte 0x61 $bigoff 1 $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 $bigoff 1 $testdir/file3 >> $seqres.full
+_pwrite_byte 0x61 1048575 1 $testdir/file2 >> $seqres.full
+
+echo "Dedupe large single byte file"
+_dedupe_range $testdir/file1 $bigoff_64k $testdir/file3 $bigoff_64k 65536 \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe large empty file"
+_dedupe_range $testdir/file0 0 $testdir/file4 0 $len \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe past maximum file size in dest file (should fail)"
+_dedupe_range $testdir/file1 0 $testdir/file5 4611686018427322368 $len \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe high offset to low offset"
+_dedupe_range $testdir/file1 $bigoff_64k $testdir/file6 1048576 65535 \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe past source file EOF (should fail)"
+_dedupe_range $testdir/file2 524288 $testdir/file7 0 1048576 \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe max size at nonzero offset (should fail)"
+_dedupe_range $testdir/file2 524288 $testdir/file8 0 $len \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Dedupe with huge off/len (should fail)"
+_dedupe_range $testdir/file2 $bigoff_64k $testdir/file9 0 $bigoff_64k \
+	2>&1 >> $seqres.full | _filter_dedupe_error
+
+echo "Check file creation"
+_test_cycle_mount
+echo "file3"
+$XFS_IO_PROG -c "pread -v -q $bigoff 1" $testdir/file3
+echo "file4"
+$XFS_IO_PROG -c "pread -v -q $bigoff 1" $testdir/file4
+# file5 should fail above
+echo "file6"
+$XFS_IO_PROG -c "pread -v -q 1114110 1" $testdir/file6
+# file7 should fail above
+
+# success, all done
+status=0
+exit

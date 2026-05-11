@@ -1,0 +1,115 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/137
+#
+# Test that both incremental and full send operations preserve file holes.
+#
+. ./common/preamble
+_begin_fstest auto quick send fiemap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+. ./common/punch
+
+_require_test
+_require_scratch
+_require_xfs_io_command "fiemap"
+_require_btrfs_no_compress
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create the first test file.
+$XFS_IO_PROG -f -c "pwrite -S 0xaa -b 64k 0 64K" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Create a second test file with a 1Mb hole.
+$XFS_IO_PROG -f \
+     -c "pwrite -S 0xaa -b 64k 0 64K" \
+     -c "pwrite -S 0xbb -b 64k 1088K 64K" \
+     $SCRATCH_MNT/bar | _filter_xfs_io
+
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+	$SCRATCH_MNT/snap1 >/dev/null
+
+# Now add one new extent to our first test file, increasing its size and leaving
+# a 1Mb hole between the first extent and this new extent.
+$XFS_IO_PROG -c "pwrite -S 0xbb -b 64k 1088K 64K" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Now overwrite the last extent of our second test file.
+$XFS_IO_PROG -c "pwrite -S 0xcc -b 64k 1088K 64K" $SCRATCH_MNT/bar | _filter_xfs_io
+
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+		 $SCRATCH_MNT/snap2 >/dev/null
+
+echo
+echo "File digests in the original filesystem:"
+md5sum $SCRATCH_MNT/snap1/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap1/bar | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/bar | _filter_scratch
+
+echo
+echo "File snap1/foo fiemap results in the original filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap1/foo | _filter_fiemap
+echo
+echo "File snap1/bar fiemap results in the original filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap1/bar | _filter_fiemap
+echo
+echo "File snap2/foo fiemap results in the original filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap2/foo | _filter_fiemap
+echo
+echo "File snap2/bar fiemap results in the original filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap2/bar | _filter_fiemap
+echo
+
+# Create the send streams to apply later on a new filesystem.
+$BTRFS_UTIL_PROG send -f $send_files_dir/1.snap $SCRATCH_MNT/snap1 2>&1 \
+	| _filter_scratch
+$BTRFS_UTIL_PROG send -p $SCRATCH_MNT/snap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/snap2 2>&1 | _filter_scratch
+
+# Create a new filesystem, receive the send streams and verify that the file
+# contents are the same as in the original filesystem and that the file holes
+# exists in both snapshots.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+$BTRFS_UTIL_PROG receive -f $send_files_dir/1.snap $SCRATCH_MNT >/dev/null
+$BTRFS_UTIL_PROG receive -f $send_files_dir/2.snap $SCRATCH_MNT >/dev/null
+
+echo
+echo "File digests in the new filesystem:"
+md5sum $SCRATCH_MNT/snap1/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap1/bar | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/foo | _filter_scratch
+md5sum $SCRATCH_MNT/snap2/bar | _filter_scratch
+
+echo
+echo "File snap1/foo fiemap results in the new filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap1/foo | _filter_fiemap
+echo
+echo "File snap1/bar fiemap results in the new filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap1/bar | _filter_fiemap
+echo
+echo "File snap2/foo fiemap results in the new filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap2/foo | _filter_fiemap
+echo
+echo "File snap2/bar fiemap results in the new filesystem:"
+$XFS_IO_PROG -r -c "fiemap -v" $SCRATCH_MNT/snap2/bar | _filter_fiemap
+
+status=0
+exit

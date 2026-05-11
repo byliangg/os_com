@@ -1,0 +1,117 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/104
+#
+# Test btrfs quota group consistency operations during snapshot
+# delete. Btrfs has had long standing issues with drop snapshot
+# failing to properly account for quota groups. This test crafts
+# several snapshot trees with shared and exclusive elements. One of
+# the trees is removed and then quota group consistency is checked.
+#
+# This issue is fixed by the following linux kernel patches:
+#
+#    Btrfs: use btrfs_get_fs_root in resolve_indirect_ref
+#    Btrfs: keep dropped roots in cache until transaciton commit
+#    btrfs: qgroup: account shared subtree during snapshot delete
+#
+. ./common/preamble
+_begin_fstest auto qgroup
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+
+# Create an fs tree of a given height at a target location. This is
+# done by agressively creating inline extents to expand the number of
+# nodes required. We also add an traditional extent so that
+# drop_snapshot is forced to walk at least one extent that is not
+# stored in metadata.
+#
+# NOTE: The ability to vary tree height for this test is very useful
+# for debugging problems with drop_snapshot(). As a result we retain
+# that parameter even though the test below always does level 2 trees.
+_explode_fs_tree () {
+	local level=$1;
+	local loc="$2";
+	local n;
+
+	if [ -z $loc ]; then
+		echo "specify location for fileset"
+		exit 1;
+	fi
+
+	case $level in
+	1)# this always reproduces level 1 trees
+		n=10;
+		;;
+	2)# this always reproduces level 2 trees
+		n=1500
+		;;
+	3)# this always reproduces level 3 trees
+		n=1000000;
+		;;
+	*)
+		echo "Can't make level $level trees";
+		exit 1;
+		;;
+	esac
+
+	mkdir -p $loc
+	for i in `seq -w 1 $n`; do
+		$XFS_IO_PROG -f -c "pwrite 0 4095" $loc/file$i > /dev/null 2>&1
+	done
+
+	$XFS_IO_PROG -f -c "pwrite 0 128k" $loc/extentfile > /dev/null 2>&1
+}
+
+# Force the default leaf size as the calculations for making our btree
+# heights are based on that.
+_scratch_mkfs "--nodesize 16384" >> $seqres.full 2>&1
+_scratch_mount
+
+# populate the default subvolume and create a snapshot ('snap1')
+_explode_fs_tree 1 $SCRATCH_MNT/files
+_btrfs subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/snap1
+
+# create new btree nodes in this snapshot. They will become shared
+# with the next snapshot we create.
+_explode_fs_tree 1 $SCRATCH_MNT/snap1/files-snap1
+
+# create our final snapshot ('snap2'), populate it with
+# exclusively owned nodes.
+#
+# As a result of this action, snap2 will get an implied ref to the
+# 128K extent created in the default subvolume.
+_btrfs subvolume snapshot $SCRATCH_MNT/snap1 $SCRATCH_MNT/snap2
+_explode_fs_tree 1 $SCRATCH_MNT/snap2/files-snap2
+
+# Enable qgroups now that we have our filesystem prepared. This
+# will kick off a scan which we will have to wait for.
+_btrfs quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT
+
+# Remount to clear cache, force everything to disk
+_scratch_cycle_mount
+
+# Finally, delete snap1 to trigger btrfs_drop_snapshot(). This
+# snapshot is most interesting to delete because it will cause some
+# nodes to go exclusively owned for snap2, while some will stay shared
+# with the default subvolume. That exercises a maximum of the drop
+# snapshot/qgroup interactions.
+#
+# snap2s imlied ref from to the 128K extent in files/ can be lost by
+# the root finding code in qgroup accounting due to snap1 no longer
+# providing a path to it. This was fixed by the first two patches
+# referenced above.
+_btrfs subvolume delete $SCRATCH_MNT/snap1
+
+# "btrfs filesystem sync" will trigger subvolume deletion
+_btrfs filesystem sync $SCRATCH_MNT
+
+# Qgroup will be checked by fstest at _check_scratch_fs()
+
+status=0
+exit

@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 597
+#
+# Test protected_symlink and protected_hardlink sysctls
+#
+. ./common/preamble
+_begin_fstest auto quick perms
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -rf $TEST_DIR/$seq
+	[ ! -z "$SYMLINK_PROTECTION" ] \
+		&& sysctl -qw fs.protected_symlinks=$SYMLINK_PROTECTION
+	[ ! -z "$HARDLINK_PROTECTION" ] \
+		&& sysctl -qw fs.protected_hardlinks=$HARDLINK_PROTECTION
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_sysctl_variable fs.protected_symlinks
+_require_sysctl_variable fs.protected_hardlinks
+_require_user fsgqa2
+_require_group fsgqa2
+# Do this SECOND so that qa_user is fsgqa, and _user_do uses that account
+_require_user fsgqa
+_require_group fsgqa
+_require_symlinks
+
+OWNER=fsgqa2
+OTHER=fsgqa
+
+# Save current system state to reset when done
+SYMLINK_PROTECTION=`sysctl -n fs.protected_symlinks`
+HARDLINK_PROTECTION=`sysctl -n fs.protected_hardlinks`
+
+test_symlink()
+{
+	ln -s $TEST_DIR/$seq/target $TEST_DIR/$seq/sticky_dir/symlink
+	chown $OTHER:$OTHER $TEST_DIR/$seq/sticky_dir
+	chown $OWNER:$OWNER $TEST_DIR/$seq/sticky_dir/symlink
+	# If we can read the target, we followed the link
+	_user_do "cat $TEST_DIR/$seq/sticky_dir/symlink" | _filter_test_dir
+	rm -f $TEST_DIR/$seq/sticky_dir/symlink
+}
+
+test_hardlink()
+{
+	chown $OWNER:$OWNER $TEST_DIR/$seq/target
+	chmod go-rw $TEST_DIR/$seq/target
+	_user_do "ln $TEST_DIR/$seq/target $TEST_DIR/$seq/sticky_dir/hardlink" \
+		| _filter_test_dir
+	test -f $TEST_DIR/$seq/sticky_dir/hardlink \
+		&& echo "successfully created hardlink"
+	rm -f $TEST_DIR/$seq/sticky_dir/hardlink
+}
+
+setup_tree()
+{
+	# Create world-writable sticky dir
+	mkdir -p $TEST_DIR/$seq/sticky_dir
+	chmod 1777 $TEST_DIR/$seq/sticky_dir
+	# And a file elsewhere that will be linked to from that sticky dir
+	mkdir -p $TEST_DIR/$seq
+	# If we can read it, we followed the link.
+	echo "successfully followed symlink" > $TEST_DIR/$seq/target
+}
+
+setup_tree
+
+# First test fs.protected_symlinks
+# With protection on, symlink follows should fail if the
+# link owner != the sticky directory owner, and the process
+# is not the link owner.
+echo "== Test symlink follow protection when"
+echo "== process != link owner and dir owner != link owner"
+sysctl -w fs.protected_symlinks=0
+test_symlink
+sysctl -w fs.protected_symlinks=1
+test_symlink
+
+echo
+
+# Now test fs.protected_hardlinks
+# With protection on, hardlink creation should fail if the
+# process does not own the target file, and the process does not have
+# read-write access to the target
+echo "== Test hardlink create protection when"
+echo "== process != target owner and process cannot read target"
+sysctl -w fs.protected_hardlinks=0
+test_hardlink
+sysctl -w fs.protected_hardlinks=1
+test_hardlink
+
+# success, all done
+status=0
+exit

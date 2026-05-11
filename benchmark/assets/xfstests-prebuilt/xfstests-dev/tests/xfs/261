@@ -1,0 +1,95 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 261
+#
+# This test exercises an issue in libxcmd where a problem with any
+# mount point or project quota directory causes the program to exit
+# complete.  The effect of this is that one cannot operate on any
+# directory, even if the problem directory is completely unrelated
+# to the directory one wants to operate on.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+my_mtab=${tmp}.mtab
+
+mtab=/proc/self/mounts
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f ${tmp}.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+echo "Silence is golden."
+
+
+# Modify as appropriate.
+
+_require_quota
+_require_scratch
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+# Just use the current mount table as an example mtab file.  Odds
+# are good there's nothing wrong with it.
+_setup_my_mtab() {
+	cp "${mtab}" "${my_mtab}"
+}
+
+# Any bogus entry in the mtab file is enough to trigger the problem.
+# So just append a bogus entry at the end of the private mtab file.
+# This matches an actually-observed entry in a mount table (with a
+# few characters in the paths changed to protect the innocent).
+_perturb_my_mtab() {
+	cat <<-! >> "${my_mtab}"
+		/dev/disk/by-id/scsi-3600508e000000000c329ba1d8b0c391b-part3 /tmp/autoY8qcJ9\040(deleted) xfs rw 0 0
+	!
+}
+
+_check() {
+	if [ $# -eq 0 ]; then
+		export MOUNT_OPTIONS=""
+	elif [ $# -eq 1 ]; then
+		[ $1 = u -o $1 = g -o $1 = p ] || exit
+		export MOUNT_OPTIONS="-o${1}quota"
+	else
+		exit
+	fi
+
+	_qmount
+
+	# Set up a private mount table file, then try out a simple quota
+	# command to show mounts
+	_setup_my_mtab
+	echo print | $XFS_QUOTA_PROG -t "${my_mtab}" > /dev/null || exit
+
+	# Do the same simple quota command after adding a bogus entry to the
+	# mount table.  Old code will bail on this because it has trouble
+	# with the bogus entry.
+	_perturb_my_mtab
+	echo print | $XFS_QUOTA_PROG -t "${my_mtab}" > /dev/null || exit
+}
+
+#########
+
+# Mount SCRATCH with no quota options
+_check
+
+# user quota enabled
+_check u
+
+# group quota enabled
+_check g
+
+# user quota enabled
+_check p
+
+status=0	# success, all done

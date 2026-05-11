@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 109
+#
+# Test rename for various sizes of directories. This is motivated by a bug
+# in XFS where directory entry file type was not updated properly on rename.
+#
+. ./common/preamble
+_begin_fstest auto metadata dir
+
+# Import common functions.
+
+_require_scratch
+_require_symlinks
+
+echo "Silence is golden"
+
+filldir()
+{
+	for (( i = 0; i < $1; i++ )); do
+		echo -n > "fname$i"
+	done
+}
+
+# Test renaming of file, symlink over file, symlink, non-existent
+# name
+renamedir()
+{
+	touch fs1
+	touch fs2
+	touch fs3
+	touch fd1
+	touch fd2
+	ln -s foo ss1
+	ln -s foo ss2
+	ln -s foo ss3
+	ln -s foo sd1
+	ln -s foo sd2
+
+	mv -T fs1 fd1
+	mv -T fs2 sd1
+	mv -T fs3 ed1
+
+	mv -T ss1 fd2
+	mv -T ss2 sd2
+	mv -T ss3 ed2
+}
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+# Test different directory sizes to test various directory formats
+for f in 1 2 3 4 5 8 12 18 27 40 60 90 135 202 303 454 681 1020 1530 2295; do
+	mkdir $SCRATCH_MNT/dir$f
+	( cd $SCRATCH_MNT/dir$f ; filldir $f ; renamedir )
+done
+
+status=0
+exit

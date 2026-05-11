@@ -7,6 +7,7 @@ use ostd::{
     sync::{RoArc, RwMutexReadGuard, Waker},
     task::Task,
 };
+use spin::Once;
 
 use super::{
     Credentials, Process,
@@ -45,7 +46,7 @@ pub use thread_local::{AsThreadLocal, FileTableRefMut, ThreadLocal};
 pub struct PosixThread {
     // Immutable part
     process: Weak<Process>,
-    task: Weak<Task>,
+    task: Once<Weak<Task>>,
 
     // Mutable part
     tid: AtomicU32,
@@ -93,6 +94,10 @@ pub struct PosixThread {
 }
 
 impl PosixThread {
+    pub(in crate::process) fn bind_task(&self, task: &Arc<Task>) {
+        self.task.call_once(|| Arc::downgrade(task));
+    }
+
     pub fn process(&self) -> Arc<Process> {
         self.process.upgrade().unwrap()
     }
@@ -221,7 +226,12 @@ impl PosixThread {
         // does not fully resolve it and has some drawbacks. For more details, see
         // <https://github.com/asterinas/asterinas/pull/2491#issuecomment-3527958970>.
         let signalled_waker = self.signalled_waker.lock();
-        let task = self.task.upgrade().unwrap();
+        let task = self
+            .task
+            .get()
+            .expect("posix thread task is not bound yet")
+            .upgrade()
+            .unwrap();
         match (
             signalled_waker.as_ref(),
             task.schedule_info().cpu.get().is_none(),

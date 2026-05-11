@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 027
+#
+# Check that getfsmap reports the BG metadata we're expecting.
+#
+. ./common/preamble
+_begin_fstest auto quick fsmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f "$tmp".* $TEST_DIR/fsmap $TEST_DIR/testout
+}
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_xfs_io_command "fsmap"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+
+echo "Get fsmap" | tee -a $seqres.full
+$XFS_IO_PROG -c 'fsmap' $SCRATCH_MNT > $TEST_DIR/fsmap
+cat $TEST_DIR/fsmap >> $seqres.full
+
+echo "Check fs metadata" | tee -a $seqres.full
+x=$(grep -c 'static fs metadata' $TEST_DIR/fsmap)
+test $x -gt 0 || echo "No fs metadata?"
+
+echo "Check block bitmap" | tee -a $seqres.full
+x=$(grep -c 'special 102:3' $TEST_DIR/fsmap)
+test $x -gt 0 || echo "No block bitmaps?"
+
+echo "Check inode bitmap" | tee -a $seqres.full
+x=$(grep -c 'special 102:4' $TEST_DIR/fsmap)
+test $x -gt 0 || echo "No inode bitmaps?"
+
+echo "Check inodes" | tee -a $seqres.full
+x=$(grep -c 'inodes' $TEST_DIR/fsmap)
+test $x -gt 0 || echo "No inodes?"
+
+# success, all done
+status=0
+exit

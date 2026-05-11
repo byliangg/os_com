@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 080
+#
+# rwtest (iogen|doio)
+#
+. ./common/preamble
+_begin_fstest rw ioctl auto quick
+
+# Import common functions.
+. ./common/filter
+
+# Override the default cleanup function.
+_cleanup()
+{ 
+    cd /
+    rm -f $tmp.*
+}
+
+_require_test
+_require_xfs_io_command falloc	# iogen requires falloc
+
+quiet=-q
+clean=-c
+
+export here
+cd $TEST_DIR
+echo
+
+
+$here/ltp/rwtest.sh $quiet $clean -i 2000 -f direct,buffered,sync
+status=$?
+[ $status -ne 0 ] && exit
+echo Completed rwtest pass 1 successfully.
+
+#$here/ltp/rwtest.sh $quiet $clean -Dv -i 1000 -n 10 -f direct,buffered,sync
+#[ $status -ne 0 ] && exit
+#echo Completed rwtest pass 2 successfully.
+
+exit

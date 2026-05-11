@@ -1,0 +1,99 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/129
+#
+# Test that an incremental send operation does not prematurely issues rmdir
+# operations under a particular scenario (the rmdir operation is sent before
+# the target directory is empty).
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -fr $send_files_dir
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/a
+mkdir $SCRATCH_MNT/tmp
+mkdir $SCRATCH_MNT/del
+mv $SCRATCH_MNT/tmp $SCRATCH_MNT/del
+mkdir $SCRATCH_MNT/a/c
+mkdir $SCRATCH_MNT/del/x
+
+# Filesystem looks like:
+#
+# .                                                             (ino 256)
+# |--- a/                                                       (ino 257)
+# |    |--- c/                                                  (ino 260)
+# |
+# |--- del/                                                     (ino 259)
+#       |--- tmp/                                               (ino 258)
+#       |--- x/                                                 (ino 261)
+#
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+# When inode 260 was processed, rename operations for it and for inode 258 were
+# issued (the rename for inode 260 must happen before the rename for inode 258).
+# Then immediately after issuing the rename operation for inode 258, and before
+# inode 261 was processed, the send stream issued a rmdir operation for inode
+# 260, which would make the receiver fail with the error ENOTEMPTY because inode
+# 261 was not yet renamed, it was still a child of inode 260 at that time.
+#
+mv $SCRATCH_MNT/a/c $SCRATCH_MNT
+mv $SCRATCH_MNT/del/x $SCRATCH_MNT/a
+mv $SCRATCH_MNT/del/tmp $SCRATCH_MNT/c
+rmdir $SCRATCH_MNT/del
+
+# Filesystem now looks like:
+#
+# .                                                             (ino 256)
+# |--- a/                                                       (ino 257)
+# |    |--- x/                                                  (ino 261)
+# |
+# |--- c/                                                       (ino 260)
+#      |--- tmp/                                                (ino 258)
+#
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+run_check $FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $send_files_dir/2.fssum \
+	-x $SCRATCH_MNT/mysnap2/mysnap1 $SCRATCH_MNT/mysnap2
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+# Now recreate the filesystem by receiving both send streams and verify we get
+# the same content that the original filesystem had.
+_scratch_unmount
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/2.fssum $SCRATCH_MNT/mysnap2
+
+echo "Silence is golden"
+status=0
+exit

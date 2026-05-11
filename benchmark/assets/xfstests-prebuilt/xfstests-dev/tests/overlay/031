@@ -1,0 +1,115 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Huawei.  All Rights Reserved.
+#
+# FS QA Test 031
+#
+# The unmerged and origined directories may contain invalid
+# whiteouts when we change underlaying dir (e.g. clean up lowerdir)
+# and remount overlay. This may lead to whiteouts exposure and
+# rmdir failure.
+#
+. ./common/preamble
+_begin_fstest auto quick whiteout
+
+# create test directory and test file, mount overlayfs and remove
+# testfile to create a whiteout in upper dir.
+create_whiteout()
+{
+	local lower=$1
+	local upper=$2
+	local work=$3
+	local file=$4
+
+	mkdir -p $lower/testdir
+	touch $lower/testdir/$file
+
+	_overlay_scratch_mount_dirs $lower $upper $work
+
+	rm -f $SCRATCH_MNT/testdir/$file
+
+	$UMOUNT_PROG $SCRATCH_MNT
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+
+# remove all files from previous runs
+_scratch_mkfs
+
+# create test directorys and whiteout
+lowerdir1=$OVL_BASE_SCRATCH_MNT/lower1
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+# When overlay inode index feature is enabled, a workdir cannot be reused
+# with a different upperdir. workdir1 in this test is used as the workdir
+# when lowerdir1 is used as the upperdir.
+workdir1=$OVL_BASE_SCRATCH_MNT/workdir1
+testfile1=a
+testfile2=b
+mkdir -p $lowerdir1 $lowerdir2 $upperdir $workdir $workdir1
+
+create_whiteout $lowerdir1 $upperdir $workdir $testfile1
+
+# clean up the lower directory and mount overlay again,
+# whiteout will expose.
+rm -rf $lowerdir1/testdir
+
+_overlay_scratch_mount_dirs $lowerdir1 $upperdir $workdir
+
+ls $SCRATCH_MNT/testdir
+
+# try to remove test dir from overlay dir, trigger ovl_remove_upper,
+# it will not clean up the dir and lead to rmdir failure.
+rm -rf $SCRATCH_MNT/testdir 2>&1 | _filter_scratch
+
+# umount overlay again, create a new file with the same name and
+# mount overlay again.
+$UMOUNT_PROG $SCRATCH_MNT
+touch $lowerdir1/testdir
+
+_overlay_scratch_mount_dirs $lowerdir1 $upperdir $workdir
+
+# try to remove test dir from overlay dir, trigger ovl_remove_and_whiteout,
+# it will not clean up the dir and lead to residue.
+rm -rf $SCRATCH_MNT/testdir 2>&1 | _filter_scratch
+
+$UMOUNT_PROG $SCRATCH_MNT
+
+# let lower dir have invalid whiteouts, repeat ls and rmdir test again.
+rm -rf $lowerdir1/testdir
+rm -rf $upperdir/testdir
+
+create_whiteout $lowerdir2 $lowerdir1 $workdir1 $testfile1
+
+rm -rf $lowerdir2/testdir
+
+_overlay_scratch_mount_dirs "$lowerdir1:$lowerdir2" $upperdir $workdir
+
+ls $SCRATCH_MNT/testdir
+rm -rf $SCRATCH_MNT/testdir 2>&1 | _filter_scratch
+
+$UMOUNT_PROG $SCRATCH_MNT
+
+# let lower dir and upper dir both have invalid whiteouts, repeat ls and rmdir again.
+rm -rf $lowerdir1/testdir
+rm -rf $upperdir/testdir
+
+create_whiteout $lowerdir1 $upperdir $workdir $testfile1
+
+rm -rf $lowerdir1/testdir/$testfile1
+
+create_whiteout $lowerdir2 $lowerdir1 $workdir1 $testfile2
+
+_overlay_scratch_mount_dirs $lowerdir1 $upperdir $workdir
+
+ls $SCRATCH_MNT/testdir
+rm -rf $SCRATCH_MNT/testdir 2>&1 | _filter_scratch
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,145 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 080
+#
+# Regression test for a btrfs issue where if right after the snapshot creation
+# ioctl started, a file write followed by a file truncate happened, with both
+# operations increasing the file's size, the created snapshot would capture an
+# inconsistent state of the file system tree. That state reflected the file
+# truncation but it didn't reflect the write operation, and left a gap between
+# two file extent items (and that gap corresponded to the total or a partial
+# area of the write operation's range).
+#
+# This issue was fixed by the following linux kernel patch:
+#
+#     Btrfs: fix snapshot inconsistency after a file write followed by truncate
+#
+. ./common/preamble
+_begin_fstest auto snapshot
+
+# Override the default cleanup function.
+_cleanup()
+{
+	for p in ${cpu_stress_pids[*]}; do
+		kill $p &> /dev/null
+	done
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_scratch_nocheck
+
+truncate_offset=90123
+
+create_snapshot()
+{
+	local ts=`date +'%H_%M_%S_%N'`
+
+	_btrfs subvolume snapshot -r \
+		$SCRATCH_MNT $SCRATCH_MNT/"${ts}_snap"
+}
+
+create_file()
+{
+	local name=$1
+
+	run_check $XFS_IO_PROG -f \
+		-c "pwrite -S 0xaa -b 32K 0 32K" \
+		-c "fsync" \
+		-c "pwrite -S 0xbb -b 32770 16K 32770" \
+		-c "truncate $truncate_offset" \
+		$SCRATCH_MNT/$name
+}
+
+workout()
+{
+	local name=$1
+
+	create_file $name &
+	fpid=$!
+	create_snapshot &
+	spid=$!
+	wait $fpid
+	create_ret=$?
+	wait $spid
+	snap_ret=$?
+	if [ $create_ret != 0 -o $snap_ret != 0 ]; then
+		_fail "Failure creating file or snapshot, check $seqres.full for details"
+	fi
+}
+
+# If the installed btrfs mkfs supports the no-holes feature, make sure the
+# created fs doesn't get that feature enabled. With it enabled, the below fsck
+# call wouldn't fail. This feature hasn't been enabled by default since it was
+# introduced, but be safe and explicitly disable it.
+_scratch_mkfs -O list-all 2>&1 | grep -q '\bno-holes\b'
+if [ $? -eq 0 ]; then
+	mkfs_options="-O ^no-holes"
+fi
+_scratch_mkfs "$mkfs_options" >>$seqres.full 2>&1
+
+_scratch_mount
+
+# Create a file while no snapshotting is in progress so that we get the expected
+# digest for every file in a snapshot that caught the truncate operation (which
+# sets the file's size to $truncate_offset).
+create_file "gold_file"
+expected_digest=`_md5_checksum "$SCRATCH_MNT/gold_file"`
+
+# Run some background load in order to make the issue easier to trigger.
+# Specially needed when testing with non-debug kernels and there isn't
+# any other significant load on the test machine other than this test.
+num_cpus=`$here/src/feature -o`
+num_procs=$(($num_cpus * 20))
+for ((i = 0; i < $num_procs; i++)); do
+	while true; do
+		true
+	done &
+	cpu_stress_pids[$i]=$!
+done
+
+for ((i = 1; i <= 100; i++)); do
+	workout "foobar_$i"
+done
+
+for ((i = 0; i < $num_procs; i++)); do
+	kill ${cpu_stress_pids[$i]} &> /dev/null
+	unset cpu_stress_pids[$i]
+done
+
+for f in $(find $SCRATCH_MNT -type f -name 'foobar_*'); do
+	file_size=$(stat -c%s "$f")
+	# We want to verify that if the file has the size set by the truncate
+	# operation, then both delalloc writes were flushed, and every version
+	# of the file in each snapshot has its range [0, 16K) full of bytes with
+	# a value of 0xaa and the range [16K, 49154) is full of bytes with a
+	# value of 0xbb.
+	if [ "$file_size" -eq "$truncate_offset" ]; then
+		digest=`_md5_checksum "$f"`
+		if [ "$digest" != "$expected_digest" ]; then
+			echo -e "Unexpected content for file $f:\n"
+			_hexdump "$f"
+			_fail "Bad file content"
+		fi
+	fi
+done
+
+# Check the filesystem for inconsistencies.
+# Before the btrfs kernel fix mentioned above, we would very often get fsck
+# error messages like: "root 306 inode 338 errors 100, file extent discount".
+#
+# This was because if right after the snapshot creation ioctl started, a file
+# write followed by a file truncate, with both operations increasing the file's
+# size, we would get a snapshot that reflected a state where the file truncation
+# was visible but the previous file write was not visible, breaking expected
+# total ordering of operations and causing a gap between 2 file extents, where a
+# file extent item representing the range [32K .. ALIGN(16K + 32770, 4096)] was
+# missing in the snapshot's btree.
+_check_scratch_fs
+
+echo "Silence is golden"
+status=0
+exit

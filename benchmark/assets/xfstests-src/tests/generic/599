@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Chengguang Xu <cgxu519@mykernel.net>.
+# All Rights Reserved.
+#
+# FS QA Test 599
+#
+# Test data integrity for ro remount.
+#
+. ./common/preamble
+_begin_fstest auto quick remount shutdown
+
+status=0
+
+# Import common functions.
+. ./common/filter
+
+_require_fssum
+_require_scratch
+_require_scratch_shutdown
+
+_scratch_mkfs &>/dev/null
+_scratch_mount
+
+localdir=$SCRATCH_MNT/dir
+mkdir $localdir
+_scratch_sync
+
+# fssum used for comparing checksum of test file(data & metedata),
+# exclude checking about atime, block structure, open error.
+$FSSUM_PROG -ugomAcdES -f -w $tmp.fssum $localdir
+_scratch_remount ro
+_scratch_shutdown
+_scratch_cycle_mount
+$FSSUM_PROG -r $tmp.fssum $localdir
+
+exit

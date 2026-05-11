@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 023
+#
+# Test to verify if the group profile is created
+#
+# The test aims to create the raid and verify that its created
+#
+. ./common/preamble
+_begin_fstest auto quick raid
+
+. ./common/filter
+
+_require_scratch_dev_pool 4
+# Zoned btrfs only supports SINGLE profile
+_require_non_zoned_device "${SCRATCH_DEV}"
+
+create_group_profile()
+{
+	local mkfs_options="-d$1 -m$1"
+
+	_scratch_pool_mkfs $mkfs_options >> $seqres.full 2>&1 || _fail "mkfs failed"
+}
+
+check_group_profile()
+{
+	local test_raid="$1"
+
+	_scratch_mount
+	$BTRFS_UTIL_PROG filesystem df $SCRATCH_MNT > $tmp.tmp 2>&1
+	_scratch_unmount
+	cat $tmp.tmp >> $seqres.full
+	grep Data $tmp.tmp | grep -q "${test_raid}:"
+	[ $? -eq 0 ] || _fail "$test_raid not found for Data"
+	grep Metadata $tmp.tmp | grep -q "${test_raid}:"
+	[ $? -eq 0 ] || _fail "$test_raid not found for Metadata"
+}
+
+create_group_profile "raid0"
+check_group_profile "RAID0"
+
+create_group_profile "raid1"
+check_group_profile "RAID1"
+
+create_group_profile "raid10"
+check_group_profile "RAID10"
+
+if [ -e "/sys/fs/btrfs/features/raid56" ]; then
+	create_group_profile "raid5"
+	check_group_profile "RAID5"
+
+	create_group_profile "raid6"
+	check_group_profile "RAID6"
+fi
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,94 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 244
+#
+# test out "sparse" quota ids retrieved by Q_GETNEXTQUOTA
+#
+# Designed to use the new Q_GETNEXTQUOTA quotactl
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cat $tmp.IDs >> $seqres.full
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+_require_quota
+_require_scratch
+
+_scratch_mkfs >> $seqres.full 2>&1
+
+TYPES="u g"
+MOUNT_OPTIONS="-o usrquota,grpquota"
+_qmount
+_require_getnextquota
+
+echo "Launch all quotas"
+
+# Ideally we'd carefully test edge conditions of "sparse"
+# quota ids at beginnings and ends of otherwise empty disk
+# blocks, etc, but that's pretty fs-specific.
+# So just spray a bunch of random IDs into quota, and make
+# sure we get them all back.
+
+ITERATIONS=100
+
+# A few extra on the off chance we get dups
+for I in `seq 1 $(($ITERATIONS+10))`; do
+	ID=`od -N 4 -t uI -An /dev/urandom | tr -d " "`
+	echo $ID >> $tmp.1
+done
+
+# sort & uniq to remove dups & facilitate reading them back
+# On the off chance we got ID 0, remove it.
+sort -n $tmp.1 | uniq | head -n ${ITERATIONS} | grep -vw 0 > $tmp.IDs
+
+# Populate a bunch of random quotas on the filesystem:
+for TYPE in u g; do
+	for ID in `cat $tmp.IDs`; do
+		setquota -${TYPE} $ID $ID $ID $ID $ID $SCRATCH_MNT
+		touch ${SCRATCH_MNT}/${ID}
+		chown ${ID} ${SCRATCH_MNT}/${ID}
+	done
+done
+
+# remount just for kicks, make sure we get it off disk
+_scratch_unmount
+_qmount
+quotaon $SCRATCH_MNT 2>/dev/null
+
+# Read them back by iterating based on quotas returned.
+# This should match what we set, even if we don't directly
+# ask for each exact id, but just ask for "next" id after
+# each one we got back last.
+for TYPE in u g; do
+	# root is always there but not in our random IDs; start at 1
+	NEXT=1
+	for ID in `cat $tmp.IDs`; do
+		echo "Trying ID $NEXT expecting $ID" >> $seqres.full
+		Q=`$here/src/test-nextquota -i $NEXT -${TYPE} -d $SCRATCH_DEV` \
+			 || _fail "test-nextquota failed: $Q"
+		echo $Q >> $seqres.full
+		# ID and its inode limits should match
+		echo "$Q" | grep -qw ${ID} || _fail "Didn't get id $ID"
+		# Get the ID returned from the test
+		NEXT=`echo "$Q" | grep ^id | awk '{print $NF}' | head -n 1`
+		# Advance that ID by one, and ask for another search
+		let NEXT=NEXT+1
+	done
+done
+
+# success, all done
+status=0
+exit

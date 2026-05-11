@@ -1,0 +1,107 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 136
+#
+# Ensure that we can dedupe the last block of a file whose size isn't
+# block-aligned.
+#   - Create two 'a' files file whose size isn't block-aligned.
+#   - Create two 'b' files file whose size isn't block-aligned.
+#   - Dedupe the last block of file1 to the last block in file2 and file3.
+#   - Check that files 1-2 match, and that 3-4 match.
+#   - Check that the ends of 1-2 and 3-4 match, and that 1-3 don't match.
+#
+. ./common/preamble
+_begin_fstest auto quick clone dedupe
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_dedupe
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original files"
+blksz=65536
+_require_congruent_file_oplen $TEST_DIR $blksz
+_pwrite_byte 0x61 0 $((blksz + 37)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz + 37)) $testdir/file2 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz + 37)) $testdir/file3 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz + 37)) $testdir/file4 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file3 | _filter_test_dir
+md5sum $testdir/file4 | _filter_test_dir
+
+c1="$(_md5_checksum $testdir/file1)"
+c2="$(_md5_checksum $testdir/file2)"
+c3="$(_md5_checksum $testdir/file3)"
+c4="$(_md5_checksum $testdir/file4)"
+
+test ${c1} = ${c2} || echo "file1 and file2 should match"
+test ${c1} != ${c3} || echo "file1 and file3 should not match"
+test ${c1} != ${c4} || echo "file1 and file4 should not match"
+test ${c2} != ${c3} || echo "file2 and file3 should not match"
+test ${c2} != ${c4} || echo "file2 and file4 should not match"
+test ${c3} = ${c4} || echo "file3 and file4 should match"
+
+echo "Dedupe the last blocks together"
+echo "1->2"
+_dedupe_range $testdir/file1 $blksz $testdir/file2 $blksz 37 >> $seqres.full
+echo "1->3"
+_dedupe_range $testdir/file1 $blksz $testdir/file3 $blksz 37 2>&1 | _filter_dedupe_error
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file3 | _filter_test_dir
+md5sum $testdir/file4 | _filter_test_dir
+
+c1="$(_md5_checksum $testdir/file1)"
+c2="$(_md5_checksum $testdir/file2)"
+c3="$(_md5_checksum $testdir/file3)"
+c4="$(_md5_checksum $testdir/file4)"
+
+echo "Compare files"
+test ${c1} = ${c2} || echo "file1 and file2 should match"
+test ${c1} != ${c3} || echo "file1 and file3 should not match"
+test ${c1} != ${c4} || echo "file1 and file4 should not match"
+test ${c2} != ${c3} || echo "file2 and file3 should not match"
+test ${c2} != ${c4} || echo "file2 and file4 should not match"
+test ${c3} = ${c4} || echo "file3 and file4 should match"
+
+echo "Compare sections"
+_compare_range $testdir/file1 $blksz $testdir/file2 $blksz 37 \
+       || echo "End sections of files 1-2 do not match"
+
+_compare_range $testdir/file1 $blksz $testdir/file3 $blksz 37 \
+       || echo "End sections of files 1-3 do not match (intentional)"
+
+_compare_range $testdir/file1 $blksz $testdir/file4 $blksz 37 \
+       || echo "End sections of files 1-4 do not match (intentional)"
+
+_compare_range $testdir/file2 $blksz $testdir/file3 $blksz 37 \
+       || echo "End sections of files 2-3 do not match (intentional)"
+
+_compare_range $testdir/file2 $blksz $testdir/file4 $blksz 37 \
+       || echo "End sections of files 2-4 do not match (intentional)"
+
+_compare_range $testdir/file3 $blksz $testdir/file4 $blksz 37 \
+       || echo "End sections of files 3-4 do not match"
+
+# success, all done
+status=0
+exit

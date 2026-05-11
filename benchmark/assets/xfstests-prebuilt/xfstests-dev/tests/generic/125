@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 125
+#
+# ftruncate test, modified from CXFSQA tests cxfs_ftrunc and cxfs_trunc
+#
+. ./common/preamble
+_begin_fstest other pnfs auto
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_user
+_require_odirect
+_require_chmod
+
+TESTDIR=$TEST_DIR/ftrunc
+TESTFILE=$TESTDIR/ftrunc.tmp
+
+[ -d $TESTDIR ] && rm -r $TESTDIR
+mkdir $TESTDIR
+
+# ftrunc must be run as a mortal user.
+touch $TESTFILE
+
+chmod a+rw $TESTDIR
+chmod a+rw $TESTFILE
+
+# don't use $here/src/ftrunc, as we're running it as a regular user, and $here
+# may contain path component that a regular user doesn't have search permission
+_su $qa_user -c "./src/ftrunc -f $TESTFILE"
+
+if [ "$?" != "0" ];  then
+    echo src/ftrunc returned non 0 status!
+fi
+
+$here/src/trunc -f $TESTFILE
+if (test $? -eq 0 ) then
+    status=0
+fi
+
+exit

@@ -1,0 +1,117 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 232
+#
+# Test non-recovery of unused CoW reservations for dirty files:
+# - Create two reflinked files.  Set extsz hint on second file.
+# - Dirty a single byte on a number of CoW reservations in the second file.
+# - Fsync to flush out the dirty pages.
+# - Dirty a single byte anywhere in the second file.
+# - Wait for the reclaim to run.
+# - Write more and see how bad fragmentation is.
+#
+
+# unreliable_in_parallel: external sync operations affect what happens while
+# the test is waiting for COW expiration.
+
+. ./common/preamble
+_begin_fstest auto quick clone fiemap prealloc unreliable_in_parallel
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	test -n "$old_cowgc_interval" && \
+		_xfs_set_cowgc_interval $old_cowgc_interval
+	rm -rf $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch
+_require_scratch_delalloc
+_require_xfs_io_command "cowextsize"
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fiemap"
+
+old_cowgc_interval=$(_xfs_get_cowgc_interval)
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+blksz=65536
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+nr=64
+filesize=$((blksz * nr))
+bufnr=2
+bufsize=$((blksz * bufnr))
+
+_require_fs_space $SCRATCH_MNT $((filesize / 1024 * 3 * 5 / 4))
+real_blksz=$(_get_block_size $testdir)
+internal_blks=$((filesize / real_blksz))
+
+echo "Create the original files"
+$XFS_IO_PROG -c "cowextsize $bufsize" $testdir
+$XFS_IO_PROG -f -c "pwrite -S 0x61 -b $bufsize 0 $filesize" $testdir/file1 >> $seqres.full
+$XFS_IO_PROG -f -c "pwrite -S 0x61 -b $bufsize 0 $filesize" $testdir/file2.chk >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file2 >> $seqres.full
+_scratch_cycle_mount
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file2.chk | _filter_scratch
+
+echo "CoW and leave leftovers"
+_xfs_set_cowgc_interval 2
+seq 2 2 $((nr - 1)) | while read f; do
+	$XFS_IO_PROG -f -c "pwrite -S 0x63 $((blksz * f - 1)) 1" $testdir/file2 >> $seqres.full
+	$XFS_IO_PROG -f -c "pwrite -S 0x63 $((blksz * f - 1)) 1" $testdir/file2.chk >> $seqres.full
+done
+_scratch_sync
+
+echo "Wait for CoW expiration"
+$XFS_IO_PROG -f -c "pwrite -S 0x63 $((blksz * 2)) 1" $testdir/file2 >> $seqres.full
+sleep 3
+
+echo "Allocate free space"
+for i in $(seq 1 32); do
+	$XFS_IO_PROG -f -c "falloc 0 1" $testdir/junk.$i >> $seqres.full
+done
+$XFS_IO_PROG -f -c "falloc 0 $filesize" $testdir/junk >> $seqres.full
+
+echo "CoW and leave leftovers"
+_xfs_set_cowgc_interval $old_cowgc_interval
+seq 2 2 $((nr - 1)) | while read f; do
+	$XFS_IO_PROG -f -c "pwrite -S 0x63 $((blksz * f)) 1" $testdir/file2 >> $seqres.full
+	$XFS_IO_PROG -f -c "pwrite -S 0x63 $((blksz * f)) 1" $testdir/file2.chk >> $seqres.full
+done
+_scratch_sync
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file2.chk | _filter_scratch
+
+echo "Check extent counts"
+old_extents=$(_count_extents $testdir/file1)
+new_extents=$(_count_extents $testdir/file2)
+
+echo "old extents: $old_extents" >> $seqres.full
+echo "new extents: $new_extents" >> $seqres.full
+echo "maximum extents: $internal_blks" >> $seqres.full
+test $new_extents -le $((2 * nr / bufnr)) || echo "file2 more fragmented than expected"
+
+# success, all done
+status=0
+exit

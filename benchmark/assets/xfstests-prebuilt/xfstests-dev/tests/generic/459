@@ -1,0 +1,162 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test 459
+#
+# Test buffer filesystem error recovery during a full overcommited dm-thin device.
+#
+# When a dm-thin device reaches its full capacity, but the virtual device still
+# shows available space, the filesystem should be able to handle such cases
+# failing its operation without locking up.
+#
+# This test has been created first to cover a XFS problem where it loops
+# indefinitely in xfsaild due items still in AIL. The buffers containing such
+# items couldn't be resubmitted because the items were flush locked.
+# But, once this doesn't require any special filesystem feature to be executed,
+# this has been integrated as a generic test.
+#
+# This test might hang the filesystem when ran on an unpatched kernel
+#
+. ./common/preamble
+_begin_fstest auto freeze thin
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	cd /
+	rm -f $tmp.*
+	_unmount $SCRATCH_MNT >>$seqres.full 2>&1
+	$LVM_PROG vgremove -ff $vgname >>$seqres.full 2>&1
+	$LVM_PROG pvremove -ff $SCRATCH_DEV >>$seqres.full 2>&1
+	_udev_wait --removed /dev/mapper/$vgname-$lvname
+}
+
+# Import common functions.
+
+
+# This tests for filesystem lockup not consistency, so don't check for fs
+# consistency after test
+_require_scratch_nolvm
+_require_dm_target thin-pool
+_require_dm_target snapshot
+_require_command $LVM_PROG lvm
+_require_command "$THIN_CHECK_PROG" thin_check
+_require_freeze
+_require_odirect
+
+# Create all the LVM names with the hostname and pid so that we don't have any
+# collisions between VMs running from a shared pool of disks.  Hyphens become
+# underscores because LVM turns those into double hyphens, which messes with
+# accessing /dev/mapper/$vg-$lv (which you're not supposed to do but this test
+# does anyway).
+lvmsuffix="${seq}_$(hostname -s | tr '-' '_')_$$"
+
+vgname=vg_$lvmsuffix
+lvname=lv_$lvmsuffix
+poolname=pool_$lvmsuffix
+snapname=snap_$lvmsuffix
+origpsize=200
+virtsize=300
+newpsize=300
+
+# Check whether the filesystem has shutdown or remounted read-only. Shutdown
+# behavior can differ based on filesystem and configuration. Some fs' may not
+# have remounted without an additional write while others may have shutdown but
+# do not necessarily reflect read-only state in the mount options. Check both
+# here by first trying a simple write and following with an explicit ro check.
+is_shutdown_or_ro()
+{
+	ro=0
+
+	# if the fs has not shutdown, this may help trigger a remount-ro
+	touch $SCRATCH_MNT/newfile > /dev/null 2>&1 || ro=1
+
+	_fs_options /dev/mapper/$vgname-$snapname | grep -w "ro" > /dev/null
+	[ $? == 0 ] && ro=1
+
+	echo $ro
+}
+
+# Ensure we have enough disk space
+_scratch_mkfs_sized $((350 * 1024 * 1024)) >>$seqres.full 2>&1
+
+# Create a 200MB dm-thin POOL
+#
+# lvm has a hardcoded list of valid devices and fails with
+# "device type is unknown" for those not in the list like null_blk
+$LVM_PROG pvcreate -f $SCRATCH_DEV >>$seqres.full 2>&1 || \
+	_notrun "LVM is too stupid for this device"
+$LVM_PROG vgcreate -f $vgname $SCRATCH_DEV >>$seqres.full 2>&1
+
+$LVM_PROG lvcreate  --thinpool $poolname  --errorwhenfull y \
+		    --zero n -L $origpsize \
+		    --poolmetadatasize 4M $vgname >>$seqres.full 2>&1 || \
+	_notrun "Can't create thin pool"
+
+# Create a overprovisioned 300MB dm-thin virt. device
+$LVM_PROG lvcreate  --virtualsize $virtsize \
+		    -T $vgname/$poolname \
+		    -n $lvname >>$seqres.full 2>&1 || \
+	_notrun "Can't create thin volume"
+_udev_wait /dev/mapper/$vgname-$lvname
+_mkfs_dev /dev/mapper/$vgname-$lvname >>$seqres.full 2>&1
+
+# Running the test over the original volume doesn't reproduce the problem
+# reliably, while, running it over a snapshot, makes the problem 100%
+# reproducible, so, create a snapshot and run the test over it.
+$LVM_PROG lvcreate  -k n -s $vgname/$lvname \
+		    -n $snapname >>$seqres.full 2>&1
+_udev_wait /dev/mapper/$vgname-$snapname
+
+# Catch mount failure so we don't blindly go an freeze the root filesystem
+# instead of lvm volume.
+_mount /dev/mapper/$vgname-$snapname $SCRATCH_MNT || _fail "mount failed"
+
+# Consume all space available in the volume and freeze to ensure everything
+# required to make the fs consistent is flushed to disk.
+$XFS_IO_PROG -f -d -c 'pwrite -b 1m 0 220m' $SCRATCH_MNT/f1 >>$seqres.full 2>&1
+
+# In XFS, this freeze will never complete until the dm-thin POOL device is
+# extended. It is expected, and is only used so xfsaild is triggered to
+# flush AIL items, other filesystems usually get remounted as read-only during
+# the above write process.
+xfs_freeze -f $SCRATCH_MNT >>$seqres.full 2>&1 &
+freezeid=$!
+
+# Wait enough so xfsaild can run
+sleep 10
+
+# Make some extra space available so the freeze above can proceed
+$LVM_PROG lvextend -L $newpsize $vgname/$poolname >>$seqres.full 2>&1
+
+wait $freezeid
+ret=$?
+
+# Different filesystems will handle the lack of real space in different ways,
+# some will remount the filesystem in read-only mode, some will not. These tests
+# will check if:
+#	- The filesystem turns into Read-Only and reject further writes
+#	- The filesystem stays in Read-Write mode, but can be frozen/thawed
+#	  without getting stuck.
+if [ $ret -ne 0 ]; then
+	# freeze failed, filesystem should reject further writes
+	ISRO=`is_shutdown_or_ro`
+	if [ $ISRO == 1 ]; then
+		echo "Test OK"
+	else
+		echo "Freeze failed and FS isn't Read-Only. Test Failed"
+		status=1
+		exit
+	fi
+else
+	# Try to thaw the filesystem, and complete test if if succeed.
+	# NOTE: This will hang on affected XFS filesystems.
+	xfs_freeze -u $SCRATCH_MNT >>$seqres.full 2>&1
+	echo "Test OK"
+fi
+
+status=0
+exit

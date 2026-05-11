@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test ext4/024
+#
+# Regression test for 0d06863f903a ("ext4: don't BUG when truncating encrypted
+# inodes on the orphan list").
+#
+. ./common/preamble
+_begin_fstest auto quick encrypt dangerous
+
+# get standard environment and checks
+. ./common/encrypt
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch_encryption
+_require_command "$KEYCTL_PROG" keyctl
+
+_init_session_keyring
+
+#
+# Create an encrypted file whose size is not a multiple of the filesystem block
+# size, then add it to the orphan list.
+#
+# We create the encrypted file normally, rather than use debugfs to force the
+# inode flags to ENCRYPT|EXTENTS as done in the example listed in the commit
+# message of the kernel fix, because forcing the inode flags is incompatible
+# with some MKFS_OPTIONS such as inline_data or ^extents.
+#
+# This choice does, however, have the disadvantage that this test won't detect
+# the bug in as many situations, such as in kernels configured without
+# encryption support.
+#
+_scratch_mkfs_encrypted &>>$seqres.full
+_scratch_mount
+mkdir $SCRATCH_MNT/edir
+keydesc=$(_generate_session_encryption_key)
+_set_encpolicy $SCRATCH_MNT/edir $keydesc
+echo foo > $SCRATCH_MNT/edir/file
+inum=$(stat -c '%i' $SCRATCH_MNT/edir/file)
+_scratch_unmount
+debugfs -w -R "set_super_value s_last_orphan $inum" $SCRATCH_DEV &>>$seqres.full
+
+# Try to mount the filesystem.  This would hit a BUG() in fs/ext4/inode.c.
+_try_scratch_mount
+
+# success, all done
+echo "Didn't crash!"
+status=0
+exit

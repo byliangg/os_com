@@ -1,0 +1,77 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 042
+#
+# Test stale data exposure via writeback using various file allocation
+# modification commands. The presumption is that such commands result in partial
+# writeback and can convert a delayed allocation extent, that might be larger
+# than the ranged affected by fallocate, to a normal extent. If the fs happens
+# to crash sometime between when the extent modification is logged and writeback
+# occurs for dirty pages within the extent but outside of the fallocated range,
+# stale data exposure can occur.
+#
+. ./common/preamble
+_begin_fstest shutdown rw punch zero prealloc auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+
+_crashtest()
+{
+	cmd=$1
+	img=$SCRATCH_MNT/$seq.img
+	mnt=$SCRATCH_MNT/$seq.mnt
+	file=$mnt/file
+	size=$(_small_fs_size_mb 25)M
+
+	# Create an fs on a small, initialized image. The pattern is written to
+	# the image to detect stale data exposure.
+	$XFS_IO_PROG -f -c "truncate 0" -c "pwrite -S 0xCD 0 $size" $img \
+		>> $seqres.full 2>&1
+	_mkfs_dev $img >> $seqres.full 2>&1
+
+	mkdir -p $mnt
+	_mount $img $mnt
+
+	echo $cmd
+
+	# write, run the test command and shutdown the fs
+	$XFS_IO_PROG -f -c "pwrite -S 1 0 64k" -c "$cmd 60k 4k" $file | \
+		_filter_xfs_io
+	$here/src/godown -f $mnt
+
+	_unmount $mnt
+	_mount $img $mnt
+
+	# We should /never/ see 0xCD in the file, because we wrote that pattern
+	# to the filesystem image to expose stale data.
+	if od -An -tx1 $file | grep -q "CD"; then
+		echo "Saw stale data!!!"
+		_hexdump $file
+	fi
+
+	_unmount $mnt
+}
+
+# Modify as appropriate.
+_require_scratch
+_require_scratch_shutdown
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "fzero"
+
+_scratch_mkfs >/dev/null 2>&1
+_require_local_device $SCRATCH_DEV
+_require_metadata_journaling $SCRATCH_DEV
+_scratch_mount
+
+_crashtest "falloc -k"
+_crashtest "fpunch"
+_crashtest "fzero -k"
+
+status=0
+exit

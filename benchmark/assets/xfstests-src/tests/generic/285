@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Oracle Inc.  All Rights Reserved.
+# Copyright (c) 2011 Red Hat.  All Rights Reserved.
+#
+# FS QA Test No. 285
+#
+# SEEK_DATA/SEEK_HOLE sanity tests.
+#
+# Improved by Jeff.liu@oracle.com
+# Creater: josef@redhat.com
+#
+. ./common/preamble
+_begin_fstest auto rw seek
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_seek_data_hole
+
+BASE_TEST_FILE=$TEST_DIR/seek_sanity_testfile
+
+_require_test_program "seek_sanity_test"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $BASE_TEST_FILE*
+}
+
+_run_seek_sanity_test $BASE_TEST_FILE > $seqres.full 2>&1 ||
+	_fail "seek sanity check failed!"
+
+# success, all done
+status=0
+exit

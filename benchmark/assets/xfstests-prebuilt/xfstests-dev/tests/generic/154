@@ -1,0 +1,87 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 154
+#
+# Ensure that CoW on all copies of a file reflinked N times increases block count
+#   - Record fs block usage (0)
+#   - Create a file and some reflink copies
+#   - Record fs block usage (1)
+#   - CoW some blocks of the copies
+#   - Record fs block usage (2)
+#   - CoW all the rest of the blocks of the copies
+#   - Compare fs block usage to (2), (1), and (0)
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_block_size $testdir)"
+blks=2000
+margin='15%'
+free_blocks0=$(stat -f $testdir -c '%f')
+nr=4
+filesize=$((blksz * nr))
+sz=$((blks * blksz))
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+_test_cycle_mount
+
+echo "Create the reflink copies"
+for i in `seq 2 $nr`; do
+	_cp_reflink $testdir/file1 $testdir/file$i
+done
+_test_cycle_mount
+free_blocks1=$(stat -f $testdir -c '%f')
+
+echo "Rewrite some of the blocks"
+_pwrite_byte 0x62 0 $sz $testdir/file2 >> $seqres.full
+_pwrite_byte 0x63 0 $((sz / 2)) $testdir/file3 >> $seqres.full
+_pwrite_byte 0x64 $((sz / 2)) $((sz / 2)) $testdir/file4 >> $seqres.full
+_test_cycle_mount
+free_blocks2=$(stat -f $testdir -c '%f')
+
+echo "Rewrite all the files"
+_pwrite_byte 0x62 0 $sz $testdir/file2 >> $seqres.full
+_pwrite_byte 0x63 0 $sz $testdir/file3 >> $seqres.full
+_pwrite_byte 0x64 0 $sz $testdir/file4 >> $seqres.full
+_test_cycle_mount
+free_blocks3=$(stat -f $testdir -c '%f')
+
+echo "Rewrite the original file"
+_pwrite_byte 0x65 0 $sz $testdir/file1 >> $seqres.full
+_test_cycle_mount
+free_blocks4=$(stat -f $testdir -c '%f')
+#echo $free_blocks0 $free_blocks1 $free_blocks2 $free_blocks3 $free_blocks4
+
+_within_tolerance "free blocks after reflinking" $free_blocks1 $((free_blocks0 - blks)) $margin -v
+
+_within_tolerance "free blocks after partially CoWing some copies" $free_blocks2 $((free_blocks1 - (2 * blks))) $margin -v
+
+_within_tolerance "free blocks after CoWing all copies" $free_blocks3 $((free_blocks2 - blks)) $margin -v
+
+_within_tolerance "free blocks after overwriting original" $free_blocks4 $free_blocks3 $margin -v
+
+_within_tolerance "free blocks after all tests" $free_blocks4 $((free_blocks0 - (4 * blks))) $margin -v
+
+# success, all done
+status=0
+exit

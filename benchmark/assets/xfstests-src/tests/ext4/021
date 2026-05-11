@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test 021
+#
+# Regression test for commit:
+# 688f869 ext4: Initialize fsync transaction ids in ext4_new_inode()
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_dumpe2fs
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+blocksize=$(_get_block_size $SCRATCH_MNT)
+_scratch_unmount
+
+# With 4k block size, this amounts to 10M FS instance.
+fssize=$((2560 * $blocksize))
+_scratch_mkfs_sized $fssize >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+offset=0
+found=0
+# this is the jbd2 journal superblock magic number on disk, in big endian
+magic="c0 3b 39 98"
+
+while [ $offset -lt $fssize ]; do
+	if od -j $offset -N 4 -t x1 $SCRATCH_DEV | \
+	   grep -i "$magic" >/dev/null; then
+		echo "Found journal: $offset" >> $seqres.full
+		found=1
+		break
+	fi
+	offset=$((offset + blocksize))
+done
+if [ $found -ne 1 ]; then
+	echo "Found no journal"
+	exit
+fi
+
+# Overwrite journal.s_squence to 0x 81d1a480
+# 0x81d1a480 is hex form of 2178000000, and jbd2 journal is big endian on
+# disk, the s_squence offset to the beginning of journal superblock is 24
+# we do this to let jbd2 start to run with a initial big transaction id,
+# which will reduce the time taken to trigger this bug.
+$XFS_IO_PROG -c "pwrite -S 0x81 $((offset+24)) 1" \
+	-c "pwrite -S 0xd1 $((offset+25)) 1" \
+	-c "pwrite -S 0xa4 $((offset+26)) 1" \
+	-c "pwrite -S 0x80 $((offset+27)) 1" $SCRATCH_DEV >> $seqres.full 2>&1
+
+trans_id=`$DUMPE2FS_PROG $SCRATCH_DEV 2>/dev/null | grep "Journal sequence" | \
+	awk '{print $NF}'`
+echo "Initial transaction id is $trans_id"
+_scratch_mount
+
+do_fdatasync_work()
+{
+	# Wait for running subcommand before exitting so that
+	# mountpoint is not busy when we try to unmount it
+	trap "wait; exit" SIGTERM
+
+	while [ 1 ]; do
+		$XFS_IO_PROG -f -c "fdatasync" $SCRATCH_MNT/testfile
+	done
+}
+
+do_fdatasync_work &
+datasync_work_pid=$!
+sleep 10
+kill $datasync_work_pid >/dev/null 2>&1
+wait
+
+# success, all done
+status=0
+exit

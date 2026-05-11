@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 235
+#
+# Create and populate an XFS filesystem, corrupt the rmap btree,
+# then see how the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest auto fuzzers rmap
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_xfs_scratch_rmapbt
+test -n ${FORCE_FUZZ} || _require_scratch_xfs_crc
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+blksz=$(stat -f -c '%s' ${SCRATCH_MNT})
+agcount=$(_xfs_mount_agcount $SCRATCH_MNT)
+_xfs_force_bdev data $SCRATCH_MNT
+
+echo "+ make some files"
+_pwrite_byte 0x62 0 $((blksz * 64)) ${SCRATCH_MNT}/file0 >> $seqres.full
+_pwrite_byte 0x61 0 $((blksz * 64)) ${SCRATCH_MNT}/file1 >> $seqres.full
+cp -p ${SCRATCH_MNT}/file0 ${SCRATCH_MNT}/file2
+cp -p ${SCRATCH_MNT}/file1 ${SCRATCH_MNT}/file3
+umount ${SCRATCH_MNT}
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || \
+	_fail "xfs_repair should not fail"
+
+echo "+ corrupt image"
+seq 0 $((agcount - 1)) | while read ag; do
+	_scratch_xfs_db -x -c "agf ${ag}" -c "agf ${ag}" -c "addr rmaproot" \
+		-c "stack" -c "blocktrash -x 4096 -y 4096 -z -n 8 -3" \
+		>> $seqres.full 2>&1
+done
+
+echo "+ mount image && copy more"
+if _try_scratch_mount >> $seqres.full 2>&1; then
+
+	$XFS_IO_PROG -f -c "pwrite -S 0x63 0 $((blksz * 64))" -c "fsync" ${SCRATCH_MNT}/file4 >> $seqres.full 2>&1
+	test -s ${SCRATCH_MNT}/file4 && _fail "should not be able to copy with busted rmap btree"
+	umount ${SCRATCH_MNT}
+fi
+
+echo "+ repair fs"
+_disable_dmesg_check
+_repair_scratch_fs >> "$seqres.full" 2>&1
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i ${SCRATCH_MNT}/
+
+echo "+ copy more (2)"
+cp -p ${SCRATCH_MNT}/file1 ${SCRATCH_MNT}/file5 || \
+	_fail "modified rmap tree"
+umount ${SCRATCH_MNT}
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || \
+	_fail "xfs_repair should not fail"
+
+status=0
+exit

@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 181
+#
+# Test the convention that reflink with length == 0 means "to the end of fileA"
+#   - Create a file.
+#   - Try to reflink "zero" bytes.
+#   - Check that the reflink happened.
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+_require_cp_reflink
+
+testdir=$TEST_DIR/test-$seq
+rm -rf $testdir
+mkdir $testdir
+
+echo "Create the original files"
+blksz=65536
+_require_congruent_file_oplen $TEST_DIR $blksz
+_pwrite_byte 0x61 0 $((blksz * 256)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz * 256)) $testdir/file2 >> $seqres.full
+_pwrite_byte 0x62 0 $((blksz * 2)) $testdir/file2.chk >> $seqres.full
+_pwrite_byte 0x61 $((blksz * 2)) $((blksz * 255)) $testdir/file2.chk >> $seqres.full
+_reflink_range $testdir/file1 $blksz $testdir/file2 $((blksz * 2)) 0 >> $seqres.full
+_test_cycle_mount
+
+md5sum $testdir/file1 | _filter_test_dir
+md5sum $testdir/file2 | _filter_test_dir
+md5sum $testdir/file2.chk | _filter_test_dir
+
+c1=$(_md5_checksum $testdir/file1)
+c2=$(_md5_checksum $testdir/file2)
+
+test ${c1} != ${c2} || echo "file1 and file2 should not match"
+
+echo "Compare against check files"
+cmp -s $testdir/file2 $testdir/file2.chk || echo "file2 and file2.chk do not match"
+
+# success, all done
+status=0
+exit

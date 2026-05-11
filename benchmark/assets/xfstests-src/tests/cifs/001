@@ -1,0 +1,43 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. cifs/001
+#
+# Sanity test for server-side copies initiated via CIFS_IOC_COPYCHUNK_FILE
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $tmp.*
+	rm -rf $TEST_DIR/$$
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_cloner
+_require_test
+
+mkdir -p $TEST_DIR/$$/src || _fail "failed to create clone src dir"
+mkdir -p $TEST_DIR/$$/dest || _fail "failed to create clone dest dir"
+
+# populate 10 files, 1K-10K in size
+for i in `seq 1 10`; do
+	len=$(($i * 1024))
+	$XFS_IO_PROG -f -c "pwrite -S $i 0 $len" $TEST_DIR/$$/src/${i} \
+		| _filter_xfs_io
+done
+sync
+
+# clone each, then compare both versions
+for i in `seq 1 10`; do
+	$CLONER_PROG $TEST_DIR/$$/src/${i} $TEST_DIR/$$/dest/${i}
+	diff $TEST_DIR/$$/src/${i} $TEST_DIR/$$/dest/${i}
+done
+
+status=0
+exit

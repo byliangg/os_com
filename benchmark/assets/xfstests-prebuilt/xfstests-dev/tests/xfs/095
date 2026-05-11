@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 095
+#
+# Test upgrading the XFS log to v2
+#
+. ./common/preamble
+_begin_fstest log v2log auto
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+
+
+# Modify as appropriate.
+_require_scratch
+_require_v2log
+_require_xfs_nocrc
+
+if [ "$(blockdev --getss $SCRATCH_DEV)" != "512" ]; then
+	_notrun "need 512b sector size"
+fi
+
+export MOUNT_OPTIONS="-o logbsize=64k"
+
+# try and mount a v1 log with a v2 LRsize
+# expect failure
+_mkfs_log "-l version=1 -m crc=0 -d sectsize=512"
+_scratch_xfs_db -c 'version' | tr ',' '\n' | grep LOGV2
+_create_log
+
+# now make the fs a v2 fs and try to mount again
+# it should succeed this time
+_scratch_xfs_db -x -c 'version log2' | tr ',' '\n' | grep LOGV2
+_create_log
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,74 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/034
+#
+# Test for a btrfs incremental send data corruption issue due to
+# bad detection of file holes.
+#
+. ./common/preamble
+_begin_fstest auto quick send prealloc
+
+tmp=`mktemp -d`
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $tmp
+}
+
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# Create a file such that its file extent items span at least 3 btree leafs.
+# This is necessary to trigger a btrfs incremental send bug where file hole
+# detection was not correct, leading to data corruption by overriding latest
+# data regions of a file with zeroes.
+
+$XFS_IO_PROG -f -c "truncate 104857600" $SCRATCH_MNT/foo
+
+for ((i = 0; i < 940; i++))
+do
+	OFFSET=$((32768 + i * 8192))
+	LEN=$((OFFSET + 8192))
+	$XFS_IO_PROG -c "falloc -k $OFFSET $LEN" $SCRATCH_MNT/foo
+	$XFS_IO_PROG -c "pwrite -S 0xf0 $OFFSET 4096" \
+		$SCRATCH_MNT/foo | _filter_xfs_io
+done
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+$XFS_IO_PROG -c "truncate 3882008" $SCRATCH_MNT/foo
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+_btrfs send -f $tmp/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -f $tmp/2.snap -p $SCRATCH_MNT/mysnap1 \
+	$SCRATCH_MNT/mysnap2
+
+md5sum $SCRATCH_MNT/foo | _filter_scratch
+md5sum $SCRATCH_MNT/mysnap1/foo | _filter_scratch
+md5sum $SCRATCH_MNT/mysnap2/foo | _filter_scratch
+
+_scratch_unmount
+_check_btrfs_filesystem $SCRATCH_DEV
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+_btrfs receive -f $tmp/1.snap $SCRATCH_MNT
+md5sum $SCRATCH_MNT/mysnap1/foo | _filter_scratch
+
+_btrfs receive -f $tmp/2.snap $SCRATCH_MNT
+md5sum $SCRATCH_MNT/mysnap2/foo | _filter_scratch
+
+_scratch_unmount
+_check_btrfs_filesystem $SCRATCH_DEV
+
+status=0
+exit

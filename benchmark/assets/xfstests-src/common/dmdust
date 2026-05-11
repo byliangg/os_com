@@ -1,0 +1,37 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Facebook.  All Rights Reserved.
+#
+# common functions for setting up and tearing down a dmdust device
+
+export DUST_NAME="dust-test.$seq"
+
+_init_dust()
+{
+	local DEV_SIZE=`blockdev --getsz $SCRATCH_DEV`
+	DUST_DEV=/dev/mapper/$DUST_NAME
+	DUST_TABLE="0 $DEV_SIZE dust $SCRATCH_DEV 0 512"
+	_dmsetup_create $DUST_NAME --table "$DUST_TABLE" || \
+		_fatal "failed to create dust device"
+}
+
+_mount_dust()
+{
+	_scratch_options mount
+	_mount -t $FSTYP `_common_dev_mount_options $*` $SCRATCH_OPTIONS \
+		$DUST_DEV $SCRATCH_MNT
+}
+
+_unmount_dust()
+{
+	_unmount $SCRATCH_MNT
+}
+
+_cleanup_dust()
+{
+	# If dmsetup load fails then we need to make sure to do resume here
+	# otherwise the umount will hang
+	$DMSETUP_PROG resume $DUST_NAME > /dev/null 2>&1
+	_unmount $SCRATCH_MNT > /dev/null 2>&1
+	_dmsetup_remove $DUST_NAME
+}

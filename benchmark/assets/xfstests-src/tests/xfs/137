@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 137
+#
+# XFS v5 supers carry an LSN in various on-disk structures to track when
+# associated metadata was last written to disk. These metadata LSNs must always
+# be behind the current LSN as dictated by the log to ensure log recovery
+# correctness after a potential crash. This test uses xfs_db to intentionally
+# put the current LSN behind metadata LSNs and verifies that the kernel and
+# xfs_repair detect the problem.
+#
+. ./common/preamble
+_begin_fstest auto metadata v2log
+
+# Import common functions.
+
+
+# Modify as appropriate.
+_require_scratch
+_require_scratch_xfs_crc
+_require_xfs_db_command "logformat"
+
+_scratch_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+
+# push the log cycle ahead so we have room to move it backwards later
+_scratch_xfs_db -x -c "logformat -c 3" >> $seqres.full 2>&1
+
+# do some work on the fs to update metadata LSNs
+_scratch_mount
+_run_fsstress -d $SCRATCH_MNT -n 999 -p 4 -w
+_scratch_unmount
+
+# Reformat to the current cycle and try to mount. This fails in most cases
+# because the sb LSN is ahead of the current LSN. If it doesn't fail, push the
+# cycle back further and try again.
+_scratch_xfs_db -x -c "logformat" >> $seqres.full 2>&1
+_try_scratch_mount >> $seqres.full 2>&1
+if [ $? != 0 ]; then
+	echo mount failure detected
+else
+	_scratch_unmount
+	_scratch_xfs_db -x -c "logformat -c 2" >> $seqres.full 2>&1
+	_try_scratch_mount >> $seqres.full 2>&1 || echo mount failure detected
+fi
+
+# verify that repair detects invalid LSNs as well
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || \
+	echo repair failure detected
+
+# repair for real so the post-test check can verify repair fixed things up
+_scratch_xfs_repair >> $seqres.full 2>&1
+
+# success, all done
+status=0
+exit

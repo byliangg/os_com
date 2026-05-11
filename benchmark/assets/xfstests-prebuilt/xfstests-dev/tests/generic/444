@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 SUSE Linux.  All Rights Reserved.
+#
+# FS QA Test 444
+#
+# Check if SGID is inherited when creating a subdirectory when the owner is not
+# in the owning group and directory has default ACLs.
+#
+. ./common/preamble
+_begin_fstest auto quick acl perms
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_runas
+_require_acls
+
+cd $TEST_DIR
+
+TDIR=testdir.$seq
+
+# Create SGID directory with default ACLs
+rm -rf $TDIR
+mkdir $TDIR
+setfacl -d -m u:101:rwx $TDIR
+chown 100:100 $TDIR
+chmod 2755 $TDIR
+
+_runas -u 100 -g 100 -- mkdir $TDIR/testsub1
+stat -c %A $TDIR/testsub1
+_runas -u 100 -g 101 -- mkdir $TDIR/testsub2
+stat -c %A $TDIR/testsub2
+
+status=0
+exit

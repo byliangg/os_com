@@ -1,0 +1,28 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Miklos Szeredi.  All Rights Reserved.
+#
+# FS QA Test No. generic/024
+#
+# Check renameat2 syscall with RENAME_NOREPLACE flag
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/renameat2
+
+
+_require_test
+_require_renameat2 noreplace
+_require_symlinks
+
+
+rename_dir=$TEST_DIR/$$
+mkdir $rename_dir
+_rename_tests $rename_dir -n
+rmdir $rename_dir
+
+# success, all done
+status=0
+exit

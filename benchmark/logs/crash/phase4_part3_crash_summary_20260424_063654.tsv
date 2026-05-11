@@ -1,0 +1,10 @@
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	create_write	write	after_commit	/root/asterinas/benchmark/logs/crash/create_write_prepare_r1.log	/root/asterinas/benchmark/logs/crash/create_write_verify_r1.log	PASS
+1	rename	rename	after_commit	/root/asterinas/benchmark/logs/crash/rename_prepare_r1.log	/root/asterinas/benchmark/logs/crash/rename_verify_r1.log	PASS
+1	truncate_append	write	after_commit	/root/asterinas/benchmark/logs/crash/truncate_append_prepare_r1.log	/root/asterinas/benchmark/logs/crash/truncate_append_verify_r1.log	PASS
+1	large_write	rename	after_commit	/root/asterinas/benchmark/logs/crash/large_write_prepare_r1.log	/root/asterinas/benchmark/logs/crash/large_write_verify_r1.log	PASS
+1	fsync_durability	rename	after_commit	/root/asterinas/benchmark/logs/crash/fsync_durability_prepare_r1.log	/root/asterinas/benchmark/logs/crash/fsync_durability_verify_r1.log	PASS
+1	multi_file_create	rename	after_commit	/root/asterinas/benchmark/logs/crash/multi_file_create_prepare_r1.log	/root/asterinas/benchmark/logs/crash/multi_file_create_verify_r1.log	PASS
+1	dir_tree_churn	rmdir	after_commit	/root/asterinas/benchmark/logs/crash/dir_tree_churn_prepare_r1.log	/root/asterinas/benchmark/logs/crash/dir_tree_churn_verify_r1.log	PASS
+1	truncate_shrink	truncate	after_commit	/root/asterinas/benchmark/logs/crash/truncate_shrink_prepare_r1.log	/root/asterinas/benchmark/logs/crash/truncate_shrink_verify_r1.log	PASS
+1	append_concurrent	rename	after_commit	/root/asterinas/benchmark/logs/crash/append_concurrent_prepare_r1.log	/root/asterinas/benchmark/logs/crash/append_concurrent_verify_r1.log	PASS

@@ -1,0 +1,48 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. 277
+#
+# Check if ctime update caused by chattr is written to disk
+#
+. ./common/preamble
+_begin_fstest auto ioctl quick metadata
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -f $SCRATCH_MNT/tmp*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch
+_require_chattr A
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+touch $SCRATCH_MNT/tmp
+_scratch_cycle_mount
+ctime1=`stat -c %z $SCRATCH_MNT/tmp`
+
+sleep 1
+$CHATTR_PROG +A $SCRATCH_MNT/tmp
+$CHATTR_PROG -A $SCRATCH_MNT/tmp
+ctime2=`stat -c %z $SCRATCH_MNT/tmp`
+
+_scratch_cycle_mount
+ctime3=`stat -c %z $SCRATCH_MNT/tmp`
+
+if [ "$ctime1" == "$ctime2" ]; then
+	echo "error: ctime not updated after chattr"
+elif [ "$ctime1" == "$ctime3" ]; then
+	echo "error: on disk ctime not updated"
+else
+	status=0
+fi
+
+exit

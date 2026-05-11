@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 262
+#
+# Copy xfs_scrub to the scratch device, then run xfs_scrub in forced
+# repair mode (which will rebuild the data forks of the running scrub
+# executable and libraries!) to see what happens.
+#
+. ./common/preamble
+_begin_fstest fuzzers scrub online_repair
+
+_register_cleanup "_cleanup" BUS
+
+# Import common functions.
+. ./common/filter
+. ./common/fuzzy
+. ./common/inject
+
+_require_command "$LDD_PROG" ldd
+_require_scrub
+_require_scratch
+# xfs_scrub will turn on error injection itself
+_require_xfs_io_error_injection "force_repair"
+
+echo "Format and populate"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+
+_require_scratch_xfs_scrub
+
+cp $XFS_SCRUB_PROG $SCRATCH_MNT/xfs_scrub
+$LDD_PROG $XFS_SCRUB_PROG | sed -e '/\//!d;/linux-gate/d;/=>/ {s/.*=>[[:blank:]]*\([^[:blank:]]*\).*/\1/};s/[[:blank:]]*\([^[:blank:]]*\) (.*)/\1/' | while read lib; do
+	cp $lib $SCRATCH_MNT/
+done
+LD_LIBRARY_PATH=$SCRATCH_MNT $LDD_PROG $SCRATCH_MNT/xfs_scrub >> $seqres.full
+
+echo "Force online repairs"
+XFS_SCRUB_FORCE_REPAIR=1 LD_LIBRARY_PATH=$SCRATCH_MNT $SCRATCH_MNT/xfs_scrub -dTv $SCRATCH_MNT >> $seqres.full
+
+# success, all done
+status=0
+exit

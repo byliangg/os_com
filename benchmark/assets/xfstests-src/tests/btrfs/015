@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/015
+#
+# Regression test to make sure we can create a snapshot after mounting with
+# readonly and remounting rw.
+#
+. ./common/preamble
+_begin_fstest auto quick snapshot remount
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount -o ro
+_scratch_mount -o rw,remount
+
+$BTRFS_UTIL_PROG subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/snap >> $seqres.full 2>&1 \
+	|| _fail "couldn't create snapshot"
+
+echo "Silence is golden"
+status=0 ; exit

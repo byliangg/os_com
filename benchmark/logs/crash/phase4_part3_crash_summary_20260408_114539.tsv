@@ -1,0 +1,10 @@
+round	scenario	hold_op	prepare_log	verify_log	result
+1	create_write	write	/root/asterinas/benchmark/logs/crash/create_write_prepare_r1.log	/root/asterinas/benchmark/logs/crash/create_write_verify_r1.log	PASS
+1	rename	rename	/root/asterinas/benchmark/logs/crash/rename_prepare_r1.log	/root/asterinas/benchmark/logs/crash/rename_verify_r1.log	PASS
+1	truncate_append	write	/root/asterinas/benchmark/logs/crash/truncate_append_prepare_r1.log	/root/asterinas/benchmark/logs/crash/truncate_append_verify_r1.log	PASS
+2	create_write	write	/root/asterinas/benchmark/logs/crash/create_write_prepare_r2.log	/root/asterinas/benchmark/logs/crash/create_write_verify_r2.log	PASS
+2	rename	rename	/root/asterinas/benchmark/logs/crash/rename_prepare_r2.log	/root/asterinas/benchmark/logs/crash/rename_verify_r2.log	PASS
+2	truncate_append	write	/root/asterinas/benchmark/logs/crash/truncate_append_prepare_r2.log	/root/asterinas/benchmark/logs/crash/truncate_append_verify_r2.log	PASS
+3	create_write	write	/root/asterinas/benchmark/logs/crash/create_write_prepare_r3.log	/root/asterinas/benchmark/logs/crash/create_write_verify_r3.log	PASS
+3	rename	rename	/root/asterinas/benchmark/logs/crash/rename_prepare_r3.log	/root/asterinas/benchmark/logs/crash/rename_verify_r3.log	PASS
+3	truncate_append	write	/root/asterinas/benchmark/logs/crash/truncate_append_prepare_r3.log	/root/asterinas/benchmark/logs/crash/truncate_append_verify_r3.log	PASS

@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 424
+#
+# This case checks if setting type causes error.
+#
+# On crc filesystems, xfs_db doesn't take sector size into account
+# when setting type, and this can result in an errant crc.
+# This issue has been fixed in xfsprogs-dev:
+# '55f224b ("xfs_db: update buffer size when new type is set")'
+#
+# On crc filesystems, when setting the type to "inode" the verifier
+# validates multiple inodes in the current fs block, so setting the
+# buffer size to that of just one inode is not sufficient and it'll
+# emit spurious verifier errors for all but the first.
+# This issue has been fixed in xfsprogs-dev:
+# '533d1d2 ("xfs_db: properly set inode type")'
+. ./common/preamble
+_begin_fstest auto quick db
+
+filter_dbval()
+{
+	awk '{ print $4 }'
+}
+
+. ./common/filter
+
+# Since we have an open-coded mkfs call, don't let the post-check fsck run since
+# it would trip over us not using the external devices.
+_require_scratch_nocheck
+
+echo "Silence is golden."
+
+
+# for different sector sizes, ensure no CRC errors are falsely reported.
+
+# Supported types include: agf, agfl, agi, attr3, bmapbta,
+# bmapbtd, bnobt, cntbt, data, dir3, dqblk, inobt, inodata,
+# inode, log, rtbitmap, rtsummary, sb, symlink, text, finobt.
+# For various sector sizes, test some types that involve type size.
+#
+# NOTE: skip attr3, bmapbta, bmapbtd, dir3, dqblk, inodata, symlink
+# rtbitmap, rtsummary, log
+#
+sec_sz=`blockdev --getss $SCRATCH_DEV`
+while [ $sec_sz -le 4096 ]; do
+	sector_sizes="$sector_sizes $sec_sz"
+	sec_sz=$((sec_sz * 2))
+done
+
+for SECTOR_SIZE in $sector_sizes; do
+	finobt_enabled=0
+	$MKFS_XFS_PROG -f -s size=$SECTOR_SIZE $SCRATCH_DEV | \
+		grep -q 'finobt=1' && finobt_enabled=1
+
+	for TYPE in agf agi agfl sb; do
+		DADDR=`$XFS_DB_PROG -c "$TYPE" -c "daddr" $SCRATCH_DEV |
+			filter_dbval`
+		$XFS_DB_PROG -c "daddr $DADDR" -c "type $TYPE" $SCRATCH_DEV
+	done
+
+	DADDR=`$XFS_DB_PROG -c "sb" -c "addr rootino" -c "daddr" $SCRATCH_DEV |
+		filter_dbval`
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type inode" $SCRATCH_DEV
+	DADDR=`$XFS_DB_PROG -c "agf" -c "addr bnoroot" -c "daddr" $SCRATCH_DEV |
+		filter_dbval`
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type bnobt" $SCRATCH_DEV
+	DADDR=`$XFS_DB_PROG -c "agf" -c "addr cntroot" -c "daddr" $SCRATCH_DEV |
+		filter_dbval`
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type cntbt" $SCRATCH_DEV
+	DADDR=`$XFS_DB_PROG -c "agi" -c "addr root" -c "daddr" $SCRATCH_DEV |
+		filter_dbval`
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type inobt" $SCRATCH_DEV
+	if [ $finobt_enabled -eq 1 ]; then
+		DADDR=`$XFS_DB_PROG -c "agi" -c "addr free_root" -c "daddr" $SCRATCH_DEV |
+			 filter_dbval`
+		$XFS_DB_PROG -c "daddr $DADDR" -c "type finobt" $SCRATCH_DEV
+	fi
+
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type text" $SCRATCH_DEV
+	$XFS_DB_PROG -c "daddr $DADDR" -c "type data" $SCRATCH_DEV
+done
+
+# success, all done
+status=0
+exit

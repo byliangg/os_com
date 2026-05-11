@@ -294,6 +294,10 @@ impl Path {
             return_errno_with_message!(Errno::EINVAL, "the path is not in this mount namespace");
         }
 
+        // Match ordinary unmount semantics by flushing pending filesystem state
+        // before detaching the mount from the namespace.
+        self.mount.sync()?;
+
         let parent_mount = self.mount.parent().unwrap().upgrade().unwrap();
         let child_mount = parent_mount.do_unmount(&mountpoint)?;
 

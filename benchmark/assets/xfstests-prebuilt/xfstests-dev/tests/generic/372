@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 372
+#
+# Check that bmap/fiemap accurately report shared extents.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap prealloc
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fiemap"
+_require_scratch_explicit_shared_extents
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+blocks=5
+blksz=65536
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+sz=$((blocks * blksz))
+
+echo "Create the original files"
+$XFS_IO_PROG -f -c "falloc 0 $sz" $testdir/file1 >> $seqres.full
+_pwrite_byte 0x61 0 $sz $testdir/file1 >> $seqres.full
+_scratch_cycle_mount
+
+echo "file1 extents and holes"
+_count_extents $testdir/file1
+_count_holes $testdir/file1
+
+_reflink_range $testdir/file1 $blksz $testdir/file2 $((blksz * 3)) $blksz >> $seqres.full
+_reflink_range $testdir/file1 $((blksz * 3)) $testdir/file2 $blksz $blksz >> $seqres.full
+_scratch_cycle_mount
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+
+echo "file1 extents and holes"
+_count_extents $testdir/file1
+_count_holes $testdir/file1
+echo "file2 extents and holes"
+_count_extents $testdir/file2
+_count_holes $testdir/file2
+echo "file1 shared extents"
+$XFS_IO_PROG -c 'fiemap -v' $testdir/file1 | awk '{print $5}' | grep -c '0x.*[2367aAbBfF]...$'
+
+# success, all done
+status=0
+exit

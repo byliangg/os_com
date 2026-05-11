@@ -1,0 +1,134 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 421
+#
+# Test SEEK_HOLE/SEEK_DATA into a region that is marked CoW'd for
+# speculative preallocation in the CoW fork and isn't backed by
+# data fork extents.
+#
+# - Set a huge cowextsize hint.
+# - Create a file "DD      " (two data blocks, six hole blocks)
+# - Reflink copy this file to a second file.
+# - dio write to the first block of the second file to create a single
+#   large CoW reservation covering the whole file.
+# - dio write to block 3, which should be a hole in the data fork.
+# - Display the SEEK_HOLE/SEEK_DATA info for the second file to confirm
+#   that we see the data in blocks 0-1, the hole at block 2, the data
+#   at block 3, and the hole for the rest of the file.
+#
+# Basically we want to create a file with the following data/CoW forks:
+#
+# data: DD------
+#  cow: dddddddd
+#       ^--^---------- these blocks are dirty
+#
+# And then check that SEEK_HOLE and SEEK_DATA actually find that second
+# dirty block even though we've never had a data fork extent mapping the
+# second dirty block.  We need the huge cowextsize so that the hole
+# area receives preallocation in the CoW fork.
+#
+. ./common/preamble
+_begin_fstest auto quick clone punch seek
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "cowextsize"
+_require_xfs_io_command "fpunch"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+blksz=65536
+nr=8
+filesize=$((blksz * nr))
+
+echo "Create the original files"
+$XFS_IO_PROG -c "cowextsize" $testdir >> $seqres.full
+$XFS_IO_PROG -c "cowextsize $filesize" $testdir >> $seqres.full
+$XFS_IO_PROG -c "cowextsize" $testdir >> $seqres.full
+$XFS_IO_PROG -f -c "pwrite -S 0x61 0 $((blksz * 2))" -c "truncate $filesize" -c "fpunch $((blksz * 2)) $((blksz * (nr - 2) ))" $testdir/file1 >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file2 >> $seqres.full
+$XFS_IO_PROG -f -c "pwrite -S 0 0 $filesize" -c "pwrite -S 0x61 0 $((blksz * 2))" $testdir/file3 >> $seqres.full
+_scratch_cycle_mount
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+# drop caches to make sure the page cache for the unwritten extents is clean
+echo 1 > /proc/sys/vm/drop_caches
+
+echo "CoW the shared part then write into the empty part" | tee -a $seqres.full
+$XFS_IO_PROG -c "cowextsize" $testdir/file1 >> $seqres.full
+$XFS_IO_PROG -c "cowextsize" $testdir/file2 >> $seqres.full
+$XFS_IO_PROG -d -c "pwrite -S 0x63 0 $blksz" $testdir/file2 >> $seqres.full
+$XFS_IO_PROG -d -c "pwrite -S 0x63 $((blksz * 3)) $blksz" $testdir/file2 >> $seqres.full
+
+$XFS_IO_PROG -d -c "pwrite -S 0x63 0 $blksz" $testdir/file3 >> $seqres.full
+$XFS_IO_PROG -d -c "pwrite -S 0x63 $((blksz * 3)) $blksz" $testdir/file3 >> $seqres.full
+
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file1 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file2 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file3 >> $seqres.full 2>&1
+
+echo "Seek holes and data in file1"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file1
+echo "Seek holes and data in file2"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file2
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+# drop caches to make sure the page cache for the unwritten extents is clean
+echo 1 > /proc/sys/vm/drop_caches
+
+echo "sync filesystem" | tee -a $seqres.full
+_scratch_sync
+
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file1 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file2 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file3 >> $seqres.full 2>&1
+
+echo "Seek holes and data in file1"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file1
+echo "Seek holes and data in file2"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file2
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+# drop caches to make sure the page cache for the unwritten extents is clean
+echo 1 > /proc/sys/vm/drop_caches
+
+echo "Remount" | tee -a $seqres.full
+_scratch_cycle_mount
+
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file1 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file2 >> $seqres.full 2>&1
+$XFS_IO_PROG -c "bmap -ev" -c "bmap -cv" $testdir/file3 >> $seqres.full 2>&1
+
+echo "Seek holes and data in file1"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file1
+echo "Seek holes and data in file2"
+$XFS_IO_PROG -c "seek -a -r 0" $testdir/file2
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+md5sum $testdir/file3 | _filter_scratch
+
+# success, all done
+status=0
+exit

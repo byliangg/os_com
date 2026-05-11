@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 073
+#
+# Test file A fsync after moving one other unrelated file B between directories
+# and fsyncing B's old parent directory before fsyncing the file A. Check that
+# after a crash all the file A data we fsynced is available.
+#
+# This test is motivated by an issue discovered in btrfs which caused the file
+# data to be lost (despite fsync returning success to user space). That btrfs
+# bug was fixed by the following linux kernel patch:
+#
+#   Btrfs: fix data loss in the fast fsync path
+#
+. ./common/preamble
+_begin_fstest metadata auto quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our main test file 'foo', the one we check for data loss.
+# By doing an fsync against our file, it makes btrfs clear the 'needs_full_sync'
+# bit from its flags (btrfs inode specific flags).
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 8K" \
+		-c "fsync" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Now create one other file and 2 directories. We will move this second file
+# from one directory to the other later because it forces btrfs to commit its
+# currently open transaction if we fsync the old parent directory. This is
+# necessary to trigger the data loss bug that affected btrfs.
+mkdir $SCRATCH_MNT/testdir_1
+touch $SCRATCH_MNT/testdir_1/bar
+mkdir $SCRATCH_MNT/testdir_2
+
+# Make sure everything is durably persisted.
+_scratch_sync
+
+# Write more 8Kb of data to our file.
+$XFS_IO_PROG -c "pwrite -S 0xbb 8K 8K" $SCRATCH_MNT/foo | _filter_xfs_io
+
+# Move our 'bar' file into a new directory.
+mv $SCRATCH_MNT/testdir_1/bar $SCRATCH_MNT/testdir_2/bar
+
+# Fsync our first directory. Because it had a file moved into some other
+# directory, this made btrfs commit the currently open transaction. This is
+# a condition necessary to trigger the data loss bug.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir_1
+
+# Now fsync our main test file. If the fsync succeeds, we expect the 8Kb of
+# data we wrote previously to be persisted and available if a crash happens.
+# This did not happen with btrfs, because of the transaction commit that
+# happened when we fsynced the parent directory.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+
+_flakey_drop_and_remount
+
+# Now check that all data we wrote before are available.
+echo "File content after log replay:"
+od -t x1 $SCRATCH_MNT/foo
+
+status=0
+exit

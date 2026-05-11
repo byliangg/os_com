@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test 416
+#
+# Test fs behavior when large write request can't be met by one single extent
+#
+# Inspired by a bug in a btrfs fix, which doesn't get exposed by current test
+# cases
+#
+. ./common/preamble
+_begin_fstest auto enospc
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+
+fs_size=$((128 * 1024 * 1024))
+page_size=$(_get_page_size)
+
+# We will never reach this number though
+nr_files=$(($fs_size / $page_size))
+
+# Use small fs to make the fill more faster
+_scratch_mkfs_sized $fs_size >> $seqres.full 2>&1
+
+_scratch_mount
+
+fill_fs()
+{
+	dir=$1
+	for i in $(seq -w $nr_files); do
+		# xfs_io can't return correct value when it hit ENOSPC, use
+		# dd here to detect ENOSPC
+		dd if=/dev/zero of=$SCRATCH_MNT/$i bs=$page_size count=1 \
+			&> /dev/null
+		if [ $? -ne 0 ]; then
+			break
+		fi
+	done
+}
+
+fill_fs $SCRATCH_MNT
+
+# remount to sync every thing into fs, and drop all cache
+_scratch_remount
+
+# remove all files with odd file names, which should free near half
+# of the space
+rm $SCRATCH_MNT/*[13579]
+_scratch_sync
+
+# We should be able to write at least 1/8 of the whole fs size
+# The number 1/8 is for btrfs, which only has about 47M for data.
+# And half of the 47M is already taken up, so only 1/8 is safe here
+$XFS_IO_PROG -f -c "pwrite 0 $(($fs_size / 8))" $SCRATCH_MNT/large_file | \
+	_filter_xfs_io
+
+# success, all done
+status=0
+exit

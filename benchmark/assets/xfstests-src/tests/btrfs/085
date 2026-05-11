@@ -1,0 +1,129 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 SUSE.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/085
+#
+# Tests to ensure that orphan items are properly created and cleaned up
+# on next mount.
+#
+# There are three cases where orphan items may be cleaned up:
+# 1) Default subvolume is fs tree root (mkfs default)
+# 2) Default subvolume is explicitly created subvolume
+#    (i.e. btrfs subvol set-default)
+# 3) Non-default subvolume lookup
+#
+. ./common/preamble
+_begin_fstest auto quick metadata subvol
+
+# Override the default cleanup function.
+_cleanup()
+{
+    _cleanup_flakey
+    rm -f $tmp.*
+}
+
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_dm_target flakey
+_require_btrfs_command inspect-internal dump-tree
+
+has_orphan_item()
+{
+	INO=$1
+	if $BTRFS_UTIL_PROG inspect-internal dump-tree $SCRATCH_DEV | \
+		grep -q "key (ORPHAN ORPHAN_ITEM $INO)"; then
+		return 0
+	fi
+	return 1
+}
+
+test_orphan()
+{
+	PRECMD=$1
+	SUB=0
+
+	_scratch_mkfs >> $seqres.full 2>&1
+	_init_flakey
+
+	_scratch_mount
+
+	$PRECMD
+
+	TESTPATH=$SCRATCH_MNT/testdir/testfile
+	DIR=$(dirname $TESTPATH)
+
+	[ -d "$DIR" ] || mkdir -p $DIR
+
+	SIZE=$(( 1024 * 1024 ))
+	run_check dd if=/dev/zero of=$TESTPATH bs=$SIZE count=1
+
+	INO=$(stat -c %i $TESTPATH)
+
+	# Orphan item won't be created if the file doesn't make it to disk
+	sync
+
+	# Open and delete the file
+	exec 27<$TESTPATH
+	rm -f $TESTPATH
+
+	# Ensure the unlink (and orphan item creation) hits the disk
+	sync
+
+	# Turn off writes before closing so the orphan item will be left behind
+	_load_flakey_table $FLAKEY_DROP_WRITES
+
+	# Close the file so we can umount
+	exec 27>&-
+
+	# Orphan item should be on disk if operating correctly
+	_scratch_unmount
+	_load_flakey_table $FLAKEY_ALLOW_WRITES
+	if ! has_orphan_item $INO; then
+		echo "ERROR: No orphan item found after umount."
+		return
+	fi
+	_scratch_mount
+
+	# If $DIR is a subvolume, this will cause a lookup and orphan cleanup
+	(cd $DIR; true)
+
+	# Orphan item will be cleaned up during mount but won't be on
+	# disk until there's a sync.
+	sync
+
+	_scratch_unmount
+	if has_orphan_item $INO; then
+		echo "ERROR: Orphan item found after successful mount/sync."
+	fi
+	_cleanup_flakey
+}
+
+new_subvolume()
+{
+	_btrfs subvolume create $SCRATCH_MNT/testdir
+}
+
+new_default()
+{
+	new_subvolume
+	SUB=$($BTRFS_UTIL_PROG subvolume list $SCRATCH_MNT | $AWK_PROG '{print $2}')
+	_btrfs subvolume set-default $SUB $SCRATCH_MNT
+
+	_scratch_unmount
+	_scratch_mount
+}
+
+echo "Testing with fs root as default subvolume"
+test_orphan true
+
+echo "Testing with explicit default subvolume"
+test_orphan new_default
+
+echo "Testing with orphan on non-default subvolume"
+test_orphan new_subvolume
+
+status=0
+exit

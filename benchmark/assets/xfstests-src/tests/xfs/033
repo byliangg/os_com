@@ -1,0 +1,99 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 033
+#
+# exercise xfs_repair repairing broken filesystems (root inodes)
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest repair auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    _scratch_unmount 2>/dev/null
+    rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/repair
+. ./common/quota
+
+# nuke the root, rt bitmap, and rt summary inodes
+# 
+_check_root_inos()
+{
+	echo "Corrupting root inode - setting bits to $1"
+	_check_repair $1 "inode $rootino"
+	echo "Corrupting rt bitmap inode - setting bits to $1"
+	_check_repair $1 "inode $rbmino"
+	echo "Corrupting rt summary inode - setting bits to $1"
+	_check_repair $1 "inode $rsumino"
+}
+
+#
+# pv#909621
+# IRIX checks for valid user and group ids as we have a 
+# limit of MAXID
+# As it is unsigned on Linux, this test is not done
+# (i.e. -1 is a valid id on Linux but not on IRIX)
+# So we make the output the same for both OS's.
+#
+_filter_bad_ids()
+{
+	grep -E -v 'bad user id 0xffffffff|bad group id 0xffffffff'
+}
+
+
+_require_scratch
+_require_no_large_scratch_dev
+_scratch_xfs_force_no_metadir
+
+# devzero blows away 512byte blocks, so make 512byte inodes (at least)
+_scratch_mkfs_xfs | _filter_mkfs 2>$tmp.mkfs >/dev/null
+. $tmp.mkfs
+if [ $isize -lt 512 ]; then
+	_scratch_mkfs_xfs -isize=512 | _filter_mkfs 2>$tmp.mkfs >/dev/null
+	. $tmp.mkfs
+fi
+
+# link correct .out file
+FEATURES=
+if [ $_fs_has_crcs -eq 1 ]; then
+	FEATURES=crc
+fi
+_link_out_file_named $seqfull.out "$FEATURES"
+
+`_scratch_xfs_db -r -c sb -c p | grep 'ino = ' | \
+	sed -e 's/ //g' -e 's/^/export /'`
+
+# check we won't get any quota inodes setup on mount
+_qmount_option noquota
+_scratch_mount
+$here/src/feature -U $SCRATCH_DEV && \
+	_notrun "UQuota are enabled, test needs controlled sb recovery"
+$here/src/feature -G $SCRATCH_DEV && \
+	_notrun "GQuota are enabled, test needs controlled sb recovery"
+$here/src/feature -P $SCRATCH_DEV && \
+	_notrun "PQuota are enabled, test needs controlled sb recovery"
+_scratch_unmount
+
+# We fixed some bugs in xfs_repair that caused us to have to reset the inode
+# link counts on the root inode twice.  That wasn't related to what this test
+# is checking, so remove the nlink reset line from the golden output and filter
+# old xfsprogs to avoid introducing new regressions.
+filter_repair() {
+	sed -e '/resetting inode INO nlinks from 1 to 2/d'
+}
+
+# rootino, rbmino, and rsumino are now set (lets blow em away!)
+_check_root_inos 0 | filter_repair
+_check_root_inos -1 | filter_repair | _filter_bad_ids
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 046
+#
+# check on symlinks permissions
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_symlinks
+_do_dump_file
+_do_restore_file
+_ls_compare_sub
+
+# success, all done
+status=0
+exit

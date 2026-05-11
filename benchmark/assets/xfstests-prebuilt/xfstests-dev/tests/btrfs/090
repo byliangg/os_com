@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Fujitsu, Inc.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/090
+#
+# Check return value of "btrfs filesystem show" command executed on
+# umounted device.
+# It should return 0 if nothing wrong happens.
+#
+# Regression in v3.18 btrfs-progs and fixed by the following patch:
+#
+#    btrfs-progs: Fix wrong return value when executing 'fi show' on
+#    umounted device.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+. ./common/filter.btrfs
+
+_require_scratch
+_require_scratch_dev_pool
+
+FIRST_POOL_DEV=`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}'`
+TOTAL_DEVS=`echo $SCRATCH_DEV_POOL | wc -w`
+
+_scratch_pool_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+
+_btrfs filesystem show $FIRST_POOL_DEV | \
+	_filter_btrfs_filesystem_show $TOTAL_DEVS
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

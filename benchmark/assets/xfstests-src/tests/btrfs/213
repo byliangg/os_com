@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 213
+#
+# Test if canceling a running balance can lead to dead looping balance
+#
+. ./common/preamble
+_begin_fstest auto balance
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	kill $write_pid &> /dev/null
+	rm -f $tmp.*
+}
+
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command pwrite -D
+
+_fixed_by_kernel_commit 1dae7e0e58b4 \
+	"btrfs: reloc: clear DEAD_RELOC_TREE bit for orphan roots to prevent runaway balance"
+
+_scratch_mkfs >> $seqres.full
+_scratch_mount
+
+max_space=$(_get_total_space $SCRATCH_MNT)
+max_space=$(( max_space / 2 ))
+
+# Create enough IO so that we need around 8 seconds to relocate it.
+start_ts=$(_wallclock)
+$TIMEOUT_PROG 8s $XFS_IO_PROG -f -c "pwrite -D -b 1M 0 $max_space" \
+	"$SCRATCH_MNT/file" > /dev/null 2>&1
+stop_ts=$(_wallclock)
+
+runtime=$(( stop_ts - start_ts ))
+
+# Unmount and mount again the fs to clear any cached data and metadata, so that
+# it's less likely balance has already finished when we try to cancel it below.
+_scratch_cycle_mount
+
+# Now balance should take at least $runtime seconds, we can cancel it at
+# $runtime/4 to ensure a success cancel.
+_run_btrfs_balance_start -d --bg "$SCRATCH_MNT"
+sleep $(($runtime / 4))
+# It's possible that balance has already completed. It's unlikely but often
+# it may happen due to virtualization, caching and other factors, so ignore
+# any error about no balance currently running.
+$BTRFS_UTIL_PROG balance cancel "$SCRATCH_MNT" 2>&1 | grep -iq 'not in progress'
+if [ $? -eq 0 ]; then
+	_notrun "balance finished before we could cancel it"
+fi
+
+# Now check if we can finish relocating metadata, which should finish very
+# quickly.
+$BTRFS_UTIL_PROG balance start -m "$SCRATCH_MNT" >> $seqres.full
+
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

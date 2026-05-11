@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test 002
+#
+# Test that calling fsync against a file using the merged directory does not
+# result in a crash nor fails unexpectedly.
+#
+# This is motivated by a change in overlayfs that resulted in a crash (invalid
+# memory access) when the lower or upper directory belonged to a btrfs file
+# system.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create our test file.
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+touch $lowerdir/foobar
+
+_scratch_mount
+
+# Write some data to our file and fsync it, using the merged directory path.
+# This should work and not result in a crash.
+$XFS_IO_PROG -c "pwrite 0 64k" -c "fsync" $SCRATCH_MNT/foobar | _filter_xfs_io
+
+# success, all done
+status=0
+exit

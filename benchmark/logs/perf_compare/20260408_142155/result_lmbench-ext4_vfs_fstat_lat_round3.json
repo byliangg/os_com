@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Average fstat latency on Linux",
+    "unit": "µs",
+    "value": "0.1301",
+    "extra": "linux_result"
+  },
+  {
+    "name": "Average fstat latency on Asterinas",
+    "unit": "µs",
+    "value": "80.7778",
+    "extra": "aster_result"
+  }
+]

@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 115
+#
+# Moving and deleting cloned ("reflinked") files on btrfs:
+#   - Create a file and a reflink
+#   - Move both to a directory
+#   - Delete the original (moved) file, check that the copy still exists.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.* $testdir
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_test_reflink
+
+_require_xfs_io_command "fiemap"
+_require_cp_reflink
+_require_test
+
+testdir1=$TEST_DIR/test-$seq
+rm -rf $testdir1
+mkdir $testdir1
+
+echo "Create the original files and reflink dirs"
+$XFS_IO_PROG -f -c 'pwrite -S 0x61 0 9000' $testdir1/original \
+    >> $seqres.full
+cp --reflink $testdir1/original $testdir1/copy
+
+_verify_reflink $testdir1/original $testdir1/copy
+
+echo "Move orig & reflink copy to subdir and md5sum:"
+mkdir $testdir1/subdir
+mv $testdir1/original $testdir1/subdir/original_moved
+mv $testdir1/copy $testdir1/subdir/copy_moved
+_verify_reflink $testdir1/subdir/original_moved \
+    $testdir1/subdir/copy_moved
+
+md5sum $testdir1/subdir/original_moved | _filter_test_dir
+md5sum $testdir1/subdir/copy_moved | _filter_test_dir
+
+echo "remove orig from subdir and md5sum reflink copy:"
+rm $testdir1/subdir/original_moved
+md5sum $testdir1/subdir/copy_moved | _filter_test_dir
+rm -rf $testdir1/subdir
+
+# success, all done
+status=0
+exit

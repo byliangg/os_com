@@ -1,0 +1,289 @@
+#
+# Reports generator funcitons lives here
+#
+
+# List of xfstests's enviroment variables to include reports
+## TODO automate list population inside common/conf
+REPORT_ENV_LIST=("SECTION" "FSTYP" "PLATFORM" "MKFS_OPTIONS" "MOUNT_OPTIONS" \
+		 "HOST_OPTIONS" "CHECK_OPTIONS" "XFS_MKFS_OPTIONS" \
+		 "TIME_FACTOR" "LOAD_FACTOR" "TEST_DIR" "TEST_DEV" \
+		 "SCRATCH_DEV" "SCRATCH_MNT" "OVL_UPPER" "OVL_LOWER" "OVL_WORK")
+
+# Variables that are captured in the report /if/ they are set.
+REPORT_ENV_LIST_OPT=("TAPE_DEV" "RMT_TAPE_DEV" "FSSTRESS_AVOID" "FSX_AVOID"
+		     "KCONFIG_PATH" "PERF_CONFIGNAME" "MIN_FSSIZE"
+		     "IDMAPPED_MOUNTS")
+
+encode_xml()
+{
+	cat -v | \
+	    sed -e 's/&/\&amp;/g' \
+		-e 's/>/\&gt;/g' \
+		-e 's/</\&lt;/g' \
+		-e "s/'/\&apos;/g" \
+		-e 's/"/\&quot;/g'
+}
+
+encode_cdata()
+{
+	cat -v | sed -e 's/]]>/]]]]><![CDATA[>/g'
+}
+
+# Fill out REPORT_VARS with information about the block device referred to by
+# the passed-in bash variable.
+__generate_blockdev_report_vars() {
+	local bdev_var="$1"
+	local bdev="${!bdev_var}"
+
+	test -z "$bdev" && return
+	test -b "$bdev" || return
+	local sysfs_bdev="$(_sysfs_dev "$bdev")"
+
+	REPORT_VARS["${bdev_var}_SIZE_KB"]="$(( "$(blockdev --getsz "$bdev")" / 2 ))"
+	REPORT_VARS["${bdev_var}_ROTATIONAL"]="$(cat "$sysfs_bdev/queue/rotational" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_DAX"]="$(cat "$sysfs_bdev/queue/dax" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_DISCARD"]="$(sed -e 's/[1-9][0-9]*/1/g' "$sysfs_bdev/queue/discard_max_bytes" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_WRITE_ZEROES"]="$(sed -e 's/[1-9][0-9]*/1/g' "$sysfs_bdev/queue/write_zeroes_max_bytes" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_PHYS_BLOCK_BYTES"]="$(cat "$sysfs_bdev/queue/physical_block_size" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_LBA_BYTES"]="$(cat "$sysfs_bdev/queue/logical_block_size" 2>/dev/null)"
+	REPORT_VARS["${bdev_var}_ZONES"]="$(cat "$sysfs_bdev/queue/nr_zones" 2>/dev/null)"
+}
+
+__import_report_vars() {
+	local fname="$1"
+
+	while IFS=':' read key value; do
+		REPORT_VARS["${key%% }"]="${value## }"
+	done < "$1"
+}
+
+# Fill out REPORT_VARS with tidbits about our test runner configuration.
+# Caller is required to declare REPORT_VARS to be an associative array.
+__generate_report_vars() {
+	test "$REPORT_VARS_FILE" && __import_report_vars "$REPORT_VARS_FILE"
+
+	REPORT_VARS["ARCH"]="$(uname -m)"
+	REPORT_VARS["KERNEL"]="$(uname -r)"
+	REPORT_VARS["CPUS"]="$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
+	REPORT_VARS["MEM_KB"]="$(grep MemTotal: /proc/meminfo | awk '{print $2}')"
+	REPORT_VARS["SWAP_KB"]="$(grep SwapTotal: /proc/meminfo | awk '{print $2}')"
+	test -n "$SOAK_DURATION" && REPORT_VARS["SOAK_DURATION"]="$SOAK_DURATION"
+
+	test -e /sys/devices/system/node/possible && \
+		REPORT_VARS["NUMA_NODES"]="$(cat /sys/devices/system/node/possible 2>/dev/null)"
+
+	__generate_blockdev_report_vars "TEST_DEV"
+	__generate_blockdev_report_vars "SCRATCH_DEV"
+
+	# Add per-filesystem variables to the report variable list
+	test "$FSTYP" = "xfs" && __generate_xfs_report_vars
+	[[ "$FSTYP" == ext[0-9]* ]] && __generate_ext4_report_vars
+
+	# Optional environmental variables
+	for varname in "${REPORT_ENV_LIST_OPT[@]}"; do
+		test -n "${!varname}" && REPORT_VARS["${varname}"]="${!varname}"
+	done
+}
+
+#
+# Xunit format report functions
+_xunit_add_property()
+{
+	local name="$1"
+	local value="$2"
+
+	test -z "$value" && return
+
+	local xname="$(echo "$name" | encode_xml)"
+	local xvalue="$(echo "$value" | encode_xml)"
+
+	echo -e "\t\t<property name=\"$xname\" value=\"$xvalue\"/>"
+}
+
+_xunit_make_section_report()
+{
+	# xfstest:section ==> xunit:testsuite
+	local sect_name="$1"
+	local tests_count="$2"
+	local bad_count="$3"
+	local notrun_count="$4"
+	local sect_time="$5"
+	local timestamp
+	local tmp_fn="$REPORT_DIR/result.xml.new"
+	local out_fn="$REPORT_DIR/result.xml"
+
+	if [ $sect_name == '-no-sections-' ]; then
+		sect_name='global'
+	fi
+	local report=$tmp.report.xunit.$sect_name.xml
+	rm -f "$tmp_fn"
+	# Header
+	echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > "$tmp_fn"
+	if [ -n "$test_start_time" ]; then
+		timestamp="$(date -Iseconds --date="$test_start_time")"
+	else
+		timestamp="$(date -Iseconds)"
+	fi
+
+	local fstests_ns="https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git"
+	cat >> "$tmp_fn" << ENDL
+<testsuite
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+ xsi:schemaLocation="$fstests_ns $fstests_ns/tree/doc/xunit.xsd"
+
+ name="xfstests"
+ failures="$bad_count" skipped="$notrun_count" tests="$tests_count" time="$sect_time"
+ hostname="$HOST"
+  start_timestamp="$(date -Iseconds --date="$fstests_start_time")"
+        timestamp="$timestamp"
+ report_timestamp="$(date -Iseconds)"
+>
+ENDL
+
+	declare -A REPORT_VARS
+	__generate_report_vars
+
+	# Properties
+	echo -e "\t<properties>" >> "$tmp_fn"
+	(for key in "${!REPORT_VARS[@]}"; do
+		_xunit_add_property "$key" "${REPORT_VARS["$key"]}"
+	done;
+	for p in "${REPORT_ENV_LIST[@]}"; do
+		_xunit_add_property "$p" "${!p}"
+	done) | sort >> "$tmp_fn"
+	echo -e "\t</properties>" >> "$tmp_fn"
+	if [ -f $report ]; then
+		cat $report >> "$tmp_fn"
+	fi
+	echo "</testsuite>" >> "$tmp_fn"
+	_sync_fs "$tmp_fn" && mv "$tmp_fn" "$out_fn"
+	echo "Xunit report: $out_fn"
+}
+
+_xunit_make_testcase_report()
+{
+	local sect_name="$1"
+	local test_name="$2"
+	local test_status="$3"
+	local test_time="$4"
+	local report_format="$5"
+	local quiet
+
+	if [ "$report_format" = xunit-quiet ]; then
+		quiet=yes
+	fi
+
+	# TODO: other places may also win if no-section mode will be named like 'default/global'
+	if [ $sect_name == '-no-sections-' ]; then
+		sect_name='global'
+	fi
+	local report=$tmp.report.xunit.$sect_name.xml
+
+	echo -e "\t<testcase classname=\"xfstests.$sect_name\" name=\"$test_name\" time=\"$test_time\">" >> $report
+	case $test_status in
+	"pass")
+		;;
+	"notrun")
+		local notrun_file="${REPORT_DIR}/${test_name}.notrun"
+		if [ -f "$notrun_file" ]; then
+			local msg=`cat "$notrun_file" | encode_xml`
+			echo -e "\t\t<skipped message=\"$msg\" />" >> $report
+		else
+			echo -e "\t\t<skipped/>" >> $report
+		fi
+		;;
+	"list")
+		echo -e "\t\t<skipped/>" >> $report
+		;;
+	"fail")
+		local out_src="${SRC_DIR}/${test_name}.out"
+		local full_file="${REPORT_DIR}/${test_name}.full"
+		local dmesg_file="${REPORT_DIR}/${test_name}.dmesg"
+		local outbad_file="${REPORT_DIR}/${test_name}.out.bad"
+		if [ -z "$_err_msg" ]; then
+			_err_msg="Test $test_name failed, reason unknown"
+		fi
+		echo -e "\t\t<failure message=\"$_err_msg\" type=\"TestFail\" />" >> $report
+		if [ -z "$quiet" -a -s "$full_file" ]; then
+			echo -e "\t\t<system-out>" >> $report
+			printf	'<![CDATA[\n' >>$report
+			cat "$full_file" | tr -dc '[:print:][:space:]' | encode_cdata >>$report
+			printf ']]>\n'	>>$report
+			echo -e "\t\t</system-out>" >> $report
+		fi
+		if [ -z "$quiet" -a -f "$dmesg_file" ]; then
+			echo -e "\t\t<kernel-log>" >> $report
+			printf	'<![CDATA[\n' >>$report
+			cat "$dmesg_file" | tr -dc '[:print:][:space:]' | encode_cdata >>$report
+			printf ']]>\n'	>>$report
+			echo -e "\t\t</kernel-log>" >> $report
+		fi
+		if [ -z "$quiet" -a -s "$outbad_file" ]; then
+			echo -e "\t\t<system-err>" >> $report
+			printf	'<![CDATA[\n' >>$report
+			$diff "$out_src" "$outbad_file" | encode_cdata >>$report
+			printf ']]>\n'	>>$report
+			echo -e "\t\t</system-err>" >> $report
+		fi
+		;;
+	*)
+		echo -e "\t\t<failure message=\"Unknown test_status=$test_status\" type=\"TestFail\"/>" >> $report
+		;;
+	esac
+	echo -e "\t</testcase>" >> $report
+}
+
+
+#
+#  Common report generator entry points
+_make_section_report()
+{
+	local sect_name="$1"
+	local tests_count="$2"
+	local bad_count="$3"
+	local notrun_count="$4"
+	local sect_time="$5"
+	for report in $REPORT_LIST; do
+		case "$report" in
+		"xunit"|"xunit-quiet")
+			_xunit_make_section_report "$sect_name" "$tests_count" \
+						   "$bad_count" "$notrun_count" \
+						   "$sect_time"
+			;;
+		*)
+			_dump_err "format '$report' is not supported"
+			;;
+		esac
+	done
+}
+
+_make_testcase_report()
+{
+	local sect_name="$1"
+	local test_seq="$2"
+	local test_status="$3"
+	local test_time="$4"
+	for report in $REPORT_LIST; do
+		case "$report" in
+		"xunit"|"xunit-quiet")
+			_xunit_make_testcase_report "$sect_name" "$test_seq" \
+						    "$test_status" "$test_time" "$report"
+			;;
+		*)
+			_dump_err "report format '$report' is not supported"
+			;;
+		esac
+	done
+}
+
+_assert_report_list() {
+	for report in $REPORT_LIST; do
+		case "$report" in
+		"xunit"|"xunit-quiet")
+			;;
+		*)
+			_fatal "report format '$report' is not supported"
+			;;
+		esac
+	done
+}

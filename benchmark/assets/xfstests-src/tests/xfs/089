@@ -1,0 +1,124 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 089
+#
+# Create and populate an XFS filesystem, corrupt the bnobt, then see how
+# the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/populate
+
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_xfs_crc
+_require_attrs
+_require_populate_commands
+_require_xfs_db_blocktrash_z_command
+test -z "${FUZZ_ARGS}" && FUZZ_ARGS="-n 8 -3"
+
+TESTDIR="${SCRATCH_MNT}/scratchdir"
+TESTFILE="${TESTDIR}/testfile"
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+_xfs_force_bdev data $SCRATCH_MNT
+
+echo "+ make some files"
+mkdir -p "${TESTDIR}"
+for x in `seq 1 1024`; do
+	touch "${SCRATCH_MNT}/junk.${x}"
+	inode="$(stat -c '%i' "${SCRATCH_MNT}/junk.${x}")"
+	if [ "$x" -gt 512 ] && [ "$((inode % 64))" -eq 0 ]; then
+		mv "${SCRATCH_MNT}/junk.${x}" "${TESTFILE}.1"
+		break
+	fi
+done
+for x in `seq 2 64`; do
+	touch "${TESTFILE}.${x}"
+done
+inode="$(stat -c '%i' "${TESTFILE}.1")"
+agcount="$(_xfs_mount_agcount $SCRATCH_MNT)"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+echo "+ corrupt image"
+for ag in $(seq 1 $((agcount - 1))) 0; do
+	_scratch_xfs_db -x -c "agf ${ag}" -c "agf ${ag}" -c "addr bnoroot" -c "stack" -c "blocktrash -x 32 -y $((blksz * 8)) -z ${FUZZ_ARGS}" >> $seqres.full 2>&1
+done
+
+# Try to append to files; this should fail
+echo "+ mount image && modify files"
+if _try_scratch_mount >> $seqres.full 2>&1; then
+
+	for x in `seq 1 64`; do
+		$XFS_IO_PROG -f -c "pwrite -S 0x62 0 ${blksz}" "${TESTFILE}.${x}" >> $seqres.full 2>> $seqres.full
+	done
+	umount "${SCRATCH_MNT}"
+fi
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ check files"
+ls -la "${TESTDIR}" >> $seqres.full
+broken=0
+for x in `seq 1 64`; do
+	test -s "${TESTFILE}.${x}" || broken=1
+done
+echo "broken: ${broken}"
+
+# Try appending again, now that we've fixed the fs
+echo "+ modify files (2)"
+for x in `seq 1 64`; do
+	$XFS_IO_PROG -f -c "pwrite -S 0x62 ${blksz} ${blksz}" "${TESTFILE}.${x}" >> $seqres.full
+done
+umount "${SCRATCH_MNT}"
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ check files (2)"
+broken=0
+for x in `seq 1 64`; do
+	test -s "${TESTFILE}.${x}" || broken=1
+done
+echo "broken: ${broken}"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+status=0
+exit

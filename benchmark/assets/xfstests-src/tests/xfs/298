@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 298
+#
+# Test that inline symlinks are removed from the inode when an extended
+# attributes forces it into being remote symlink.
+# Warning: this test will ASSERT on unpatched DEBUG XFS.
+#
+. ./common/preamble
+_begin_fstest auto attr symlink quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate. This is a XFS specific bug. xfs_db also limits
+# this test to xfs
+
+_require_scratch
+
+_scratch_mkfs_xfs >/dev/null 2>&1
+
+SYMLINK_FILE="$SCRATCH_MNT/symlink"
+SYMLINK=""
+SYMLINK_ADD="0123456789ABCDEF01234567890ABCDEF"
+
+# test from 32 to MAXPATHLEN sized symlink. This should make sure that
+# 256-1024 byte version 2 and 3 inodes are covered.
+SIZE=32
+while [ $SIZE -lt 1024 ];do
+	_scratch_mount >/dev/null 2>&1
+	cd $SCRATCH_MNT
+	echo "Testing symlink size $SIZE"
+	SYMLINK="${SYMLINK}${SYMLINK_ADD}"
+	ln -s $SYMLINK $SYMLINK_FILE > /dev/null 2>&1
+
+	inode=`ls -li $SYMLINK_FILE | awk '{print $1}'`
+# add the extended attributes
+	attr  -Rs 1234567890ab $SYMLINK_FILE < /dev/null > /dev/null 2>&1
+	attr  -Rs 1234567890ac $SYMLINK_FILE < /dev/null > /dev/null 2>&1
+	attr  -Rs 1234567890ad $SYMLINK_FILE < /dev/null > /dev/null 2>&1
+# remove the extended attributes
+	attr  -Rr 1234567890ab $SYMLINK_FILE > /dev/null 2>&1
+	attr  -Rr 1234567890ac $SYMLINK_FILE > /dev/null 2>&1
+	attr  -Rr 1234567890ad $SYMLINK_FILE > /dev/null 2>&1
+# remove the symlink - make sure ifree removes the remote symlink.
+	rm $SYMLINK_FILE
+# umount and check the number of extents on the inode. Should be 0.
+	cd /
+	_scratch_unmount >/dev/null 2>&1
+	_scratch_xfs_db  -c "inode $inode" -c "p core.nextents"
+
+	let SIZE=$SIZE+32
+done
+
+status=0
+exit

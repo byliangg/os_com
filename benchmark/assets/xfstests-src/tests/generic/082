@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. 082
+#
+# Test quota handling on remount ro failure
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+filter_project_quota_line()
+{
+	grep -v "^project quota on"
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_test
+_require_scratch
+_require_quota
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount "-o usrquota,grpquota"
+
+# xfs doesn't need these setups and quotacheck even fails on xfs, so just
+# redirect the output to $seqres.full for debug purpose and ignore the results,
+# as we check the quota status later anyway.
+quotacheck -ug $SCRATCH_MNT >>$seqres.full 2>&1
+quotaon $SCRATCH_MNT >>$seqres.full 2>&1
+
+# first remount ro with a bad option, a failed remount ro should not disable
+# quota, but currently xfs doesn't fail in this case, the unknown option is
+# just ignored, but quota is still on. This may change in future, let's
+# re-consider the case then.
+_try_scratch_mount "-o remount,ro,nosuchopt" >>$seqres.full 2>&1
+quotaon -p $SCRATCH_MNT | _filter_scratch | filter_project_quota_line
+# second remount should succeed, no oops or hang expected
+_try_scratch_mount "-o remount,ro" || _fail "second remount,ro failed"
+
+# success, all done
+status=0
+exit

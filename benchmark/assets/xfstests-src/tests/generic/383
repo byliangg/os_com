@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 383
+#
+# Test xfs_quota when project names beginning with digits.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+qa_user=""
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_xfs_quota_foreign
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_enable_pquota
+
+do_project_test()
+{
+	local qa_project=123456-project
+	local dir=$SCRATCH_MNT/project
+
+	mkdir $dir 2>/dev/null
+
+	#project quota files
+	cat >$tmp.projects <<EOF
+10:$dir
+EOF
+
+	cat >$tmp.projid <<EOF
+$qa_project:10
+EOF
+
+	$XFS_QUOTA_PROG -D $tmp.projects -P $tmp.projid -x \
+		-c "project -s $qa_project" $SCRATCH_MNT > /dev/null
+
+	# We set & test inodes, because xfs vs ext4 consume differing
+	# amounts of space for an empty dir, but an inode is an inode...
+	$XFS_QUOTA_PROG -D $tmp.projects -P $tmp.projid -x \
+		-c "limit -p isoft=100 ihard=200 $qa_project" $SCRATCH_MNT
+
+	echo "=== quota command output ==="
+	$XFS_QUOTA_PROG -D $tmp.projects -P $tmp.projid \
+		-c "quota -p -v -i $qa_project" $SCRATCH_MNT | _filter_quota
+
+	echo "=== report command output ==="
+	$XFS_QUOTA_PROG -D $tmp.projects -P $tmp.projid -x \
+		-c "report -p -N -i" $SCRATCH_MNT | _filter_project_quota
+}
+
+# Test project
+_qmount_option "usrquota,prjquota"
+_qmount
+_require_prjquota $SCRATCH_DEV
+do_project_test
+
+# success, all done
+status=0
+exit

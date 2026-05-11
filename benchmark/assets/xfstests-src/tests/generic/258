@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 258
+#
+# Test timestamps prior to epoch
+# On 64-bit, ext2/3/4 was sign-extending when read from disk
+# See also commit 4d7bf11d649c72621ca31b8ea12b9c94af380e63
+#
+. ./common/preamble
+_begin_fstest auto quick bigtime
+
+# Import common functions.
+
+_require_test
+_require_negative_timestamps
+
+TESTFILE=$TEST_DIR/timestamp-test.txt
+
+# Create a file with a timestamp prior to the epoch
+echo "Creating file with timestamp of Jan 1, 1960"
+touch -t 196001010101 $TESTFILE
+# Should yield -315593940 (prior to epoch)
+echo "Testing for negative seconds since epoch"
+ts=`stat -c %X $TESTFILE`
+if [ "$ts" -ge 0 ]; then
+	echo "Timestamp wrapped: $ts"
+	_fail "Timestamp wrapped"
+fi
+
+# unmount, remount, and check the timestamp
+echo "Remounting to flush cache"
+_test_cycle_mount
+
+# Should yield -315593940 (prior to epoch)
+echo "Testing for negative seconds since epoch"
+ts=`stat -c %X $TESTFILE`
+if [ "$ts" -ge 0 ]; then
+	echo "Timestamp wrapped: $ts"
+	_fail "Timestamp wrapped"
+fi
+
+status=0 ; exit

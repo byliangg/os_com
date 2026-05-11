@@ -1,0 +1,66 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/036
+#
+# Regression test for running snapshots and send concurrently.
+#
+. ./common/preamble
+_begin_fstest auto quick send snapshot
+
+snapshots_pid=0
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# kill backgroud snapshots
+	if [ $snapshots_pid -ne 0 ] && ps -p $snapshots_pid | grep -q $snapshots_pid; then
+		kill -TERM $snapshots_pid 2> /dev/null
+		wait $snapshots_pid
+	fi
+	rm -f $tmp.*
+}
+
+do_snapshots()
+{
+	# Wait for any running 'btrfs subvolume snapshot' subcommand before
+	# exitting so that after the test kills the subshell running this
+	# function, it does not fail with EBUSY when unmounting the scratch
+	# device.
+	trap "wait; exit" SIGTERM
+
+	i=2
+	while [ 1 ]
+	do
+		$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT/snap_1 \
+			$SCRATCH_MNT/snap_$i >> $seqres.full 2>&1
+		let i=$i+1
+		sleep 1
+	done
+}
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+touch $SCRATCH_MNT/foo
+
+# get file with fragments by using backwards writes.
+for i in `seq 10240 -1 1`; do
+	$XFS_IO_PROG -f -d -c "pwrite $(($i * 4096)) 4096" \
+		$SCRATCH_MNT/foo > /dev/null | _filter_xfs_io
+done
+
+$BTRFS_UTIL_PROG subvolume snapshot -r $SCRATCH_MNT \
+	$SCRATCH_MNT/snap_1 >> $seqres.full 2>&1
+
+do_snapshots &
+snapshots_pid=$!
+
+$BTRFS_UTIL_PROG send -f /dev/null $SCRATCH_MNT/snap_1 2>&1 | _filter_scratch
+
+status=0 ; exit

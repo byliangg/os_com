@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 002
+#
+# Test that garbage in old v4 superblocks doesn't trip verifiers during growfs
+#
+# Older kernels sometimes left garbage in the unused portions
+# of the superblock during growfs; with the new verifiers this initially
+# caused failures during a subsequent growfs; see
+# 10e6e65 xfs: be more forgiving of a v4 secondary sb w/ junk in v5 fields
+# for further explanation.  (NB: while the commit log was good, the
+# patch had a bug which was subsequently fixed)
+#
+. ./common/preamble
+_begin_fstest auto quick growfs
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_scratch_nocheck
+_require_no_large_scratch_dev
+_require_xfs_nocrc
+
+_scratch_mkfs_xfs -m crc=0 -d size=128m >> $seqres.full 2>&1
+
+# Scribble past a couple V4 secondary superblocks to populate sb_crc
+# (We can't write to the structure member because it doesn't exist
+# on a v4 superblock, so we use the data type & "write fill")
+_scratch_xfs_db -x -c "sb 1" -c "type data" -c "write fill 0xff 224 4"
+_scratch_xfs_db -x -c "sb 2" -c "type data" -c "write fill 0xff 224 4"
+
+_scratch_mount
+
+# This should pass
+$XFS_GROWFS_PROG $SCRATCH_MNT >> $seqres.full 2>&1 || _fail "growfs failed"
+
+# success, all done
+status=0
+exit

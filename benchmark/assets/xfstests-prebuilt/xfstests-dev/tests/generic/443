@@ -1,0 +1,27 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 443
+#
+# Takes page fault while writev is iterating over the vectors in the IOV
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_test_program "writev_on_pagefault"
+
+# This program use several vectors for writev(), the kernel goes over them
+# one at a time, copying them from userspace, getting the user data ready
+# for IO. If it takes a page fault while iterating over the vectors in the
+# IOV, it stops, and sends what it got so far. We try to find a bug at this
+# moment.
+$here/src/writev_on_pagefault $TEST_DIR/testfile.$seq
+
+# success, all done
+status=0
+exit

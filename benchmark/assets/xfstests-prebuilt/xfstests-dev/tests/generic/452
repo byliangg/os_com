@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Intel Corporation.  All Rights Reserved.
+#
+# FS QA Test 452
+#
+# This is a regression test for kernel patch:
+#   commit fd96b8da68d3 ("ext4: fix fault handling when mounted with -o dax,ro")
+# created by Ross Zwisler <ross.zwisler@linux.intel.com>
+#
+. ./common/preamble
+_begin_fstest auto quick dax
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_scratch
+
+# we need to be able to execute binaries on scratch
+_exclude_scratch_mount_option "noexec"
+
+# format and mount
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+LS="$(type -P ls)"
+SCRATCH_LS=$SCRATCH_MNT/ls_on_scratch
+cp $LS $SCRATCH_LS
+
+$SCRATCH_LS $SCRATCH_LS | _filter_scratch
+
+_scratch_remount ro
+
+$SCRATCH_LS $SCRATCH_LS | _filter_scratch
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 107
+#
+# Regression test for commit:
+#
+# 983d8e60f508 ("xfs: map unwritten blocks in XFS_IOC_{ALLOC,FREE}SP just like fallocate")
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+_require_scratch
+_require_xfs_io_command allocsp		# detect presence of ALLOCSP ioctl
+_require_test_program allocstale
+
+# Create a 256MB filesystem to avoid running into mkfs problems with too-small
+# filesystems.
+size_mb=256
+
+# Write a known pattern to the disk so that we can detect stale disk blocks
+# being mapped into the file.  In the test author's experience, the bug will
+# reproduce within the first 500KB's worth of ALLOCSP calls, so running up
+# to 16MB should suffice.
+$XFS_IO_PROG -d -c "pwrite -S 0x58 -b 8m 0 ${size_mb}m" $SCRATCH_DEV > $seqres.full
+MKFS_OPTIONS="-K $MKFS_OPTIONS" _scratch_mkfs_sized $((size_mb * 1048576)) >> $seqres.full
+
+_scratch_mount
+
+# Force the file to be created on the data device, which we pre-initialized
+# with a known pattern.  The bug exists in the generic bmap code, so the choice
+# of backing device does not matter, and ignoring the rt device gets us out of
+# needing to detect things like rt extent size.
+_xfs_force_bdev data $SCRATCH_MNT
+testfile=$SCRATCH_MNT/a
+
+# Allow the test program to expand the file to 32MB.  If we can't find any
+# stale blocks at that point, the kernel has probably been patched.
+blksz=$(_get_file_block_size $SCRATCH_MNT)
+iterations=$(( (size_mb / 16) * 1048576 / blksz))
+echo "Setting up $iterations runs for block size $blksz" >> $seqres.full
+
+# Run reproducer program and dump file contents if we see stale data.  Full
+# details are in the source for the C program, but in a nutshell we run ALLOCSP
+# one block at a time to see if it'll give us blocks full of 'X'es.
+$here/src/allocstale $testfile $iterations
+res=$?
+test $res -eq 2 && od -tx1 -Ad -c $testfile
+
+# success, all done
+echo Silence is golden
+status=0
+exit

@@ -1,0 +1,93 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 032
+#
+# This test implements a data corruption scenario on XFS filesystems with
+# sub-page sized blocks and unwritten extents. Inode lock contention during
+# writeback of pages to unwritten extents leads to failure to convert those
+# extents on I/O completion. This causes data corruption as unwritten extents
+# are always read back as zeroes.
+#
+. ./common/preamble
+_begin_fstest auto quick rw fiemap prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	kill -9 $syncpid > /dev/null 2>&1
+	wait
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/punch
+
+
+_syncloop()
+{
+	# Wait for any running xfs_io command running syncfs before we exit so
+	# that unmount will not fail due to the mount being pinned by xfs_io.
+	trap "wait; exit" SIGTERM
+
+	while [ true ]; do
+		_scratch_sync
+	done
+}
+
+# Modify as appropriate.
+_require_scratch
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fiemap"
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# run background sync thread
+_syncloop &
+syncpid=$!
+
+for iters in $(seq 1 100)
+do
+	rm -f $SCRATCH_MNT/file
+
+	# create a delalloc block in each page of the first 64k of the file
+	for pgoff in $(seq 0 0x1000 0xf000); do
+		offset=$((pgoff + 0xc00))
+		$XFS_IO_PROG -f \
+			-c "pwrite $offset 0x1" \
+			$SCRATCH_MNT/file >> $seqres.full 2>&1
+	done
+
+	# preallocate the first 64k and overwite, writing past 64k to contend
+	# with writeback
+	file_len=0x100000
+	$XFS_IO_PROG \
+		-c "falloc 0 0x10000"	\
+		-c "pwrite 0 $file_len"	\
+		-c "fsync"		\
+		$SCRATCH_MNT/file >> $seqres.full 2>&1
+
+	# Check for unwritten extents. We should have none before EOF since we
+	# wrote over the entire preallocated region and ran fsync.
+	eof_sector=$(( file_len / 512 ))
+	$XFS_IO_PROG -c 'fiemap -v' $SCRATCH_MNT/file | \
+		_filter_fiemap | \
+		tr '[.]:' '    ' | \
+		awk "{if (\$2 < $eof_sector) {print \$0}}" | \
+		grep -q unwritten && _fail "Unwritten extents found!"
+done
+
+echo $iters iterations
+
+kill $syncpid
+wait
+
+# clear page cache and dump the file
+_scratch_cycle_mount
+_hexdump $SCRATCH_MNT/file
+
+status=0
+exit

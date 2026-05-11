@@ -1,0 +1,25 @@
+# JBD2 Phase 1 candidate list
+# Goal: validate block-level JBD2 (ordered mode) implementation on top of phase6 scope:
+# journal replay on clean/dirty umount, orphan recovery, metadata checksum,
+# ext4-specific journal recovery scripts.
+#
+# Tests that depend on dm-log-writes / dm-flakey are listed in
+# blocked/jbd_phase1_excluded.tsv with rationale — Asterinas currently has no
+# device-mapper support, and those tests will be reintroduced once dm infra lands
+# (or replaced with custom ext4_crash scenarios in run_ext4_crash_test.sh).
+
+# --- generic: journal replay via mount/umount cycles + metadata stress ---
+generic/068
+generic/076
+generic/083
+generic/192
+generic/530
+
+# --- ext4: JBD2 / journal commit & recovery specific tests ---
+ext4/021
+ext4/022
+ext4/030
+ext4/031
+ext4/032
+ext4/033
+ext4/045

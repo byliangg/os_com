@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Liu Bo.  All Rights Reserved.
+#
+# FS QA Test generic/406
+#
+# If a larger dio write (size >= 128M) got splitted, the assertion in endio
+# would complain (CONFIG_BTRFS_ASSERT is required).
+#
+# Regression test for
+#   Btrfs: adjust outstanding_extents counter properly when dio write is split
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_odirect
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+# 2G / 1K
+blocksize=$(( (128 + 1) * 2 * 1024 * 1024))
+fsblock=$(( (128 + 1) * 2 * 1024))
+_require_fs_space $SCRATCH_MNT $fsblock
+
+echo "Silence is golden"
+
+$XFS_IO_PROG -f -d -c "pwrite -b ${blocksize} 0 ${blocksize}" $SCRATCH_MNT/testfile.$seq >> $seqres.full 2>&1
+
+_scratch_unmount
+
+# success, all done
+status=0
+exit

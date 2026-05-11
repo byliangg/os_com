@@ -1,0 +1,182 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 IBM Corporation. All Rights Reserved.
+#
+# FSQA Test No. 038
+#
+# Test consistent d_ino numbers for samefs setup.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_fixed_in_kernel_version "v4.14"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_attrs trusted
+_require_test_program "t_dir_type"
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+# Create our test files.
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+
+mkdir -p $lowerdir/test_dir/pure_lower_dir/subdir
+
+touch $lowerdir/test_file
+
+_scratch_mount
+
+test_dir=$SCRATCH_MNT/test_dir/
+
+# Verify d_ino of '.' and '..' before and after dir becomes impure.
+impure_dir=$test_dir/impure_dir
+mkdir -p $impure_dir/subdir
+
+impure_dir_st_ino=$(stat -c '%i' $impure_dir)
+impure_dir_parent_st_ino=$(stat -c '%i' $test_dir)
+impure_subdir_st_ino=$(stat -c '%i' $impure_dir/subdir)
+
+# Before $impure_dir becomes impure
+parent_d=$($here/src/t_dir_type $impure_dir $impure_dir_parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $impure_dir $impure_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $impure_dir $impure_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for subdir"
+
+# Move a copied up file into pure dir to make it impure
+mv $SCRATCH_MNT/test_file $impure_dir
+test_file_st_ino=$(stat -c '%i' $impure_dir/test_file)
+
+impure=$(_getfattr --absolute-names --only-values -n 'trusted.overlay.impure' \
+			$upperdir/test_dir/impure_dir)
+[[ $impure == "y" ]] || echo "Impure directory missing impure xattr"
+
+# After $impure_dir becomes impure
+parent_d=$($here/src/t_dir_type $impure_dir $impure_dir_parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $impure_dir $impure_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $impure_dir $impure_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for subdir"
+
+# Verify copy up file's d_ino
+file_d=$($here/src/t_dir_type $impure_dir $test_file_st_ino)
+[[ $file_d == "test_file f" ]] || \
+	echo "Impure dir: Invalid d_ino reported for entry with copy-up origin"
+
+# Make $impure_dir pure
+rm -rf $impure_dir/test_file
+rm -rf $impure_dir/subdir
+
+# Verify invalidation of readdir cache
+$here/src/t_dir_type $impure_dir $test_file_st_ino
+[[ $? != 0 ]] || echo "Directory's readdir cache has stale file entries"
+$here/src/t_dir_type $impure_dir $impure_subdir_st_ino
+[[ $? != 0 ]] || echo "Directory's readdir cache has stale subdir entries"
+
+impure=$(_getfattr --absolute-names --only-values -n 'trusted.overlay.impure' \
+			$upperdir/test_dir/impure_dir 2>/dev/null)
+[[ -z $impure ]] || echo "Pure directory has impure xattr"
+
+# Verify d_ino values of subdir entries of a pure lower dir.
+parent_st_ino=$(stat -c '%i' $test_dir)
+pure_lower_dir=$SCRATCH_MNT/test_dir/pure_lower_dir
+pure_lower_dir_st_ino=$(stat -c '%i' $pure_lower_dir)
+pure_lower_subdir_st_ino=$(stat -c '%i' $pure_lower_dir/subdir)
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for subdir"
+
+# Create a file in pure lower dir to make it a merge dir
+touch $pure_lower_dir/newfile
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for subdir"
+
+_scratch_unmount
+
+# check overlayfs
+_check_scratch_fs
+
+# Verify pure lower residing in dir which has another lower layer
+_scratch_mkfs
+
+OVL_LOWER0=${OVL_LOWER}0
+OVL_LOWER1=${OVL_LOWER}1
+
+middir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER0
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER1
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+
+mkdir -p $middir
+mkdir -p $lowerdir
+mkdir -p $upperdir
+mkdir -p $workdir
+
+mkdir -p $lowerdir/test_dir/pure_lower_dir/subdir
+
+_overlay_scratch_mount_dirs "$middir:$lowerdir" $upperdir $workdir
+
+# Copy up test_dir
+touch $test_dir/test_file
+
+test_dir_st_ino=$(stat -c '%i' $test_dir)
+pure_lower_dir=$test_dir/pure_lower_dir
+pure_lower_dir_st_ino=$(stat -c '%i' $pure_lower_dir)
+pure_lower_subdir_st_ino=$(stat -c '%i' $pure_lower_dir/subdir)
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $test_dir_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for .."
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for subdir"
+
+# check overlayfs
+_overlay_check_scratch_dirs "$middir:$lowerdir" $upperdir $workdir
+
+echo "Silence is golden"
+status=0
+exit

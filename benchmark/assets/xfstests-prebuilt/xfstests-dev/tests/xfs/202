@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Christoph Hellwig.
+#
+# FS QA Test No. 202
+#
+# Test out the xfs_repair -o force_geometry option on single-AG filesystems.
+#
+. ./common/preamble
+_begin_fstest repair auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/repair
+
+
+# single AG will cause default xfs_repair to fail. This test is actually
+# testing the special corner case option needed to repair a single AG fs.
+_require_scratch_nocheck
+
+#
+# The AG size is limited to 1TB (or even less with historic xfsprogs),
+# so chose a small enough filesystem to make sure we can actually create
+# a single AG filesystem.
+#
+echo "== Creating single-AG filesystem =="
+_scratch_mkfs_xfs -d agcount=1 -d size=$((1024*1024*1024)) >/dev/null 2>&1
+
+echo "== Trying to repair it (should fail) =="
+_scratch_xfs_repair
+
+echo "== Trying to repair it with -o force_geometry =="
+_scratch_xfs_repair -o force_geometry 2>&1 | _filter_repair
+
+# success, all done
+echo "*** done"
+status=0

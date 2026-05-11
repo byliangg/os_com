@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 130
+#
+# Create and populate an XFS filesystem, corrupt the refcount btree,
+# then see how the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+test -n "${FORCE_FUZZ}" || _require_scratch_xfs_crc
+
+rm -f "$seqres.full"
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+agcount="$(_xfs_mount_agcount $SCRATCH_MNT)"
+_xfs_force_bdev data $SCRATCH_MNT
+
+echo "+ make some files"
+_pwrite_byte 0x62 0 $((blksz * 64)) "${SCRATCH_MNT}/file0" >> "$seqres.full"
+_pwrite_byte 0x61 0 $((blksz * 64)) "${SCRATCH_MNT}/file1" >> "$seqres.full"
+_cp_reflink "${SCRATCH_MNT}/file0" "${SCRATCH_MNT}/file2"
+_cp_reflink "${SCRATCH_MNT}/file1" "${SCRATCH_MNT}/file3"
+_scratch_unmount
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> "$seqres.full" 2>&1 || \
+	_fail "xfs_repair should not fail"
+
+echo "+ force log recovery"
+_scratch_mount
+_scratch_xfs_unmount_dirty
+
+echo "+ corrupt image"
+seq 0 $((agcount - 1)) | while read ag; do
+	_scratch_xfs_db -x -c "agf ${ag}" -c "agf ${ag}" -c "addr refcntroot" \
+		-c "stack" -c "blocktrash -x 4096 -y 4096 -z -n 8 -3" \
+		>> "$seqres.full" 2>&1
+done
+
+echo "+ mount image"
+_try_scratch_mount >> $seqres.full 2>&1 && \
+	echo "Should not be able to mount with broken refcountbt."
+_scratch_unmount >> $seqres.full 2>&1
+
+echo "+ repair fs"
+_disable_dmesg_check
+_repair_scratch_fs >> "$seqres.full" 2>&1
+_repair_scratch_fs >> "$seqres.full" 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ reflink more (2)"
+_cp_reflink "${SCRATCH_MNT}/file1" "${SCRATCH_MNT}/file5" || \
+	_fail "modified refcount tree"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> "$seqres.full" 2>&1 || \
+	_fail "xfs_repair should not fail"
+
+status=0
+exit

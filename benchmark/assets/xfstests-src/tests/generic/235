@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Jan Kara.  All Rights Reserved.
+# Copyright (c) 2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 235
+#
+# Test whether quota gets properly reenabled after remount read-write
+#
+. ./common/preamble
+_begin_fstest auto quota quick
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_user
+
+do_repquota()
+{
+	repquota -u -g $SCRATCH_MNT  | grep -v -E '^root|^$' | _filter_scratch
+}
+
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount "-o usrquota,grpquota"
+quotacheck -u -g $SCRATCH_MNT 2>/dev/null
+quotaon $SCRATCH_MNT 2>/dev/null
+
+touch $SCRATCH_MNT/testfile
+chown $qa_user:$qa_user $SCRATCH_MNT/testfile
+
+do_repquota
+
+# If remount fails with this problem:
+#
+# https://bugzilla.redhat.com/show_bug.cgi?id=563267
+#
+# then you need a more recent mount binary.
+_try_scratch_mount "-o remount,ro" 2>&1 | tee -a $seqres.full | _filter_scratch
+touch $SCRATCH_MNT/failed 2>&1 | tee -a $seqres.full | _filter_scratch
+_try_scratch_mount "-o remount,rw" 2>&1 | tee -a $seqres.full | _filter_scratch
+
+touch $SCRATCH_MNT/testfile2
+chown $qa_user:$qa_user $SCRATCH_MNT/testfile2
+
+do_repquota
+
+_scratch_unmount 2>/dev/null
+
+status=0
+exit

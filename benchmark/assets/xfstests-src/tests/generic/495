@@ -1,0 +1,38 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Facebook.  All Rights Reserved.
+#
+# FS QA Test 495
+#
+# Test invalid swap file (with holes)
+#
+. ./common/preamble
+_begin_fstest auto quick swap
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_swapfile
+_require_test_program mkswap
+_require_test_program swapon
+_require_sparse_files
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+blksize=$(_get_file_block_size $SCRATCH_MNT)
+test $blksize -eq $(getconf PAGE_SIZE) || \
+	_notrun "swap file allocation unit size must match page size"
+
+# We can't use _format_swapfile because we're using our custom mkswap and
+# swapon.
+touch "$SCRATCH_MNT/swap"
+$CHATTR_PROG +C "$SCRATCH_MNT/swap" >> $seqres.full 2>&1
+chmod 0600 "$SCRATCH_MNT/swap"
+$XFS_IO_PROG -c "truncate $(($(_get_page_size) * 10))" "$SCRATCH_MNT/swap"
+"$here/src/mkswap" "$SCRATCH_MNT/swap"
+"$here/src/swapon" "$SCRATCH_MNT/swap"
+swapoff "$SCRATCH_MNT/swap" >/dev/null 2>&1
+
+status=0
+exit

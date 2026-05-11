@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2019 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 562
+#
+# Test that if we clone a file with some large extents into a file that has
+# many small extents, when the fs is nearly full, the clone operation does
+# not fail and produces the correct result.
+#
+. ./common/preamble
+_begin_fstest auto clone punch
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+test "$FSTYP" = "xfs" && \
+	_fixed_by_kernel_commit 7ce31f20a077 "xfs: don't drop errno values when we fail to ficlone the entire range"
+
+_require_scratch_reflink
+_require_test_program "punch-alternating"
+_require_xfs_io_command "fpunch"
+
+_scratch_mkfs_sized $((590 * 1024 * 1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+file_size=$(( 200 * 1024 * 1024 )) # 200Mb
+
+# Create a file with many small extents.
+$XFS_IO_PROG -f -c "pwrite -S 0xe5 -b $file_size 0 $file_size" \
+	$SCRATCH_MNT/foo >>/dev/null
+$here/src/punch-alternating $SCRATCH_MNT/foo >> $seqres.full
+
+# Create file bar with the same size that file foo has but with large extents.
+$XFS_IO_PROG -f -c "pwrite -S 0xc7 -b $file_size 0 $file_size" \
+	$SCRATCH_MNT/bar >>/dev/null
+
+# Fill the fs (For btrfs we are interested in filling all unallocated space
+# and most of the existing metadata block group(s), so that after this there
+# will be no unallocated space and metadata space will be mostly full but with
+# more than enough free space for the clone operation below to succeed, we
+# create files with 2Kb because that results in extents inlined in the metadata
+# (btree leafs) and it's the fastest way to fill metadata space on btrfs, by
+# default btrfs inlines up to 2Kb of data).
+i=1
+while true; do
+	$XFS_IO_PROG -f -c "pwrite 0 2K" $SCRATCH_MNT/filler_$i &> /dev/null
+	[ $? -ne 0 ] && break
+	i=$(( i + 1 ))
+done
+
+# Now clone file bar into file foo. This is supposed to succeed and not fail
+# with ENOSPC for example.  However, XFS will sometimes run out of space.
+_reflink $SCRATCH_MNT/bar $SCRATCH_MNT/foo >>$seqres.full 2> $tmp.err
+cat $tmp.err
+test "$FSTYP" = "xfs" && grep -q 'No space left on device' $tmp.err && \
+	_notrun "ran out of space while cloning"
+
+# Unmount and mount the filesystem again to verify the operation was durably
+# persisted.
+_scratch_cycle_mount
+
+echo "File foo data after cloning and remount:"
+od -A d -t x1 $SCRATCH_MNT/foo
+
+status=0
+exit

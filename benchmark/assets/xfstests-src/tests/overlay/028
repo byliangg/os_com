@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 028
+#
+# When file in lower dir is locked and it's been copied up,
+# make sure the lock is working in overlayfs.
+#
+# Kernel commit below fixed it.
+# c568d68341be locks: fix file locking on overlayfs
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto copyup quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_command "$FLOCK_PROG" flock
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir
+touch $lowerdir/foo
+
+# Mounting overlay
+_scratch_mount
+
+# Testing copyup and flock
+flock $SCRATCH_MNT/foo sleep 3 &
+# flock in subshell should fail with no output
+(sleep 1; echo bar > $SCRATCH_MNT/foo; \
+  flock -n $SCRATCH_MNT/foo echo LOCKED)
+
+wait
+echo "Silence is golden"
+# success, all done
+status=0
+exit

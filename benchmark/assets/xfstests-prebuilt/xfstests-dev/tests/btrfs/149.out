@@ -1,0 +1,11 @@
+QA output created by 149
+wrote XXXX/XXXX bytes at offset XXXX
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+linked XXXX/XXXX bytes at offset XXXX
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+At subvol SCRATCH_MNT/mysnap1
+At subvol SCRATCH_MNT/mysnap2
+At subvol mysnap1
+File digests in the new filesystem:
+src and dest 'mysnap1' checksum matched
+src and dest 'mysnap2' checksum matched

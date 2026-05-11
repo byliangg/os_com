@@ -1,0 +1,80 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO. All Rights Reserved.
+#
+# FS QA Test No. 322
+#
+# Runs various rename fsync tests to cover some rename fsync corner cases.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch_nocheck
+_require_dm_target flakey
+
+_clean_working_dir()
+{
+	_scratch_mount
+	rm -rf $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+	_scratch_unmount
+}
+
+# Btrfs wasn't making sure the new file after rename survived the fsync
+_rename_test()
+{
+	echo "fsync rename test"
+	_scratch_mount
+	$XFS_IO_PROG -f -c "pwrite 0 1M" -c "fsync" $SCRATCH_MNT/foo \
+		>> $seqres.full 2>&1
+	mv $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+	md5sum $SCRATCH_MNT/bar | _filter_scratch
+
+	_flakey_drop_and_remount
+
+	md5sum $SCRATCH_MNT/bar | _filter_scratch
+	_scratch_unmount
+	_check_scratch_fs
+	[ $? -ne 0 ] && _fatal "fsck failed"
+}
+
+# Btrfs was dropping some of the modified extents in between fsyncs if we
+# renamed.
+_write_after_fsync_rename_test()
+{
+	echo "fsync rename test"
+	_scratch_mount
+	$XFS_IO_PROG -f -c "pwrite 0 1M" -c "fsync" -c "pwrite 2M 1M" \
+		-c "sync_range -b 2M 1M" $SCRATCH_MNT/foo >> $seqres.full 2>&1
+	mv $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+	md5sum $SCRATCH_MNT/bar | _filter_scratch
+
+	_flakey_drop_and_remount
+
+	md5sum $SCRATCH_MNT/bar | _filter_scratch
+	_scratch_unmount
+}
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+# Create a basic flakey device that will never error out
+_init_flakey
+
+_rename_test
+_clean_working_dir
+_write_after_fsync_rename_test
+
+status=0
+exit

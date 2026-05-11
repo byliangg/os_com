@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 326
+#
+# Ensure that quota charges us for reflinking a file and that we're not
+# charged for directio copy on write.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+. ./common/quota
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_xfs_io_command "fiemap"
+_require_quota
+_require_nobody
+_require_odirect
+_require_user
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+export MOUNT_OPTIONS="-o usrquota,grpquota $MOUNT_OPTIONS"
+_scratch_mount >> $seqres.full 2>&1
+_force_vfs_quota_testing $SCRATCH_MNT
+quotacheck -u -g $SCRATCH_MNT 2> /dev/null
+quotaon $SCRATCH_MNT 2> /dev/null
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+sz=4194304
+echo "Create the original files"
+$XFS_IO_PROG -f -c "pwrite -S 0x61 -b $sz 0 $sz" $testdir/file1 >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file2 >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file3 >> $seqres.full
+touch $testdir/urk
+chown nobody $testdir/urk
+touch $testdir/erk
+chown $qa_user $testdir/erk
+_report_quota_blocks $SCRATCH_MNT
+_scratch_cycle_mount
+
+echo "Change file ownership"
+chown $qa_user $testdir/file1
+chown $qa_user $testdir/file2
+chown $qa_user $testdir/file3
+_report_quota_blocks $SCRATCH_MNT
+
+echo "CoW one of the files"
+$XFS_IO_PROG -d -f -c "pwrite -S 0x63 -b $((sz/2)) 0 $((sz/2))" -c "fsync" $testdir/file2 >> $seqres.full
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Remount the FS to see if accounting changes"
+_scratch_cycle_mount
+_report_quota_blocks $SCRATCH_MNT
+
+echo "Chown one of the files"
+chown nobody $testdir/file3
+_report_quota_blocks $SCRATCH_MNT
+
+# success, all done
+status=0
+exit

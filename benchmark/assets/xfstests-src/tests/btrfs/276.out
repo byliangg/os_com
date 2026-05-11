@@ -1,0 +1,13 @@
+QA output created by 276
+Number of non-shared extents in the whole file: 2000
+Number of shared extents in the whole file: 2000
+wrote 65536/65536 bytes at offset 524288
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 65536/65536 bytes at offset 261095424
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+Number of non-shared extents in the whole file: 2
+Number of shared extents in the whole file: 1998
+Number of non-shared extents in range [512K, 512K + 64K): 1
+Number of non-shared extents in range [249M, 249M + 64K): 1
+Delete subvolume 'SCRATCH_MNT/snap'
+Number of non-shared extents in the whole file: 2000

@@ -1,0 +1,82 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test generic/395
+#
+# Test setting and getting encryption policies.
+#
+. ./common/preamble
+_begin_fstest auto quick encrypt
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+
+_require_scratch_encryption
+_require_xfs_io_command "get_encpolicy"
+_require_user
+
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+
+# Should be able to set an encryption policy on an empty directory
+empty_dir=$SCRATCH_MNT/empty_dir
+echo -e "\n*** Setting encryption policy on empty directory ***"
+mkdir $empty_dir
+_get_encpolicy $empty_dir |& _filter_scratch
+_set_encpolicy $empty_dir 0000111122223333
+_get_encpolicy $empty_dir | _filter_scratch
+
+# Should be able to set the same policy again, but not a different one.
+echo -e "\n*** Setting encryption policy again ***"
+_set_encpolicy $empty_dir 0000111122223333
+_get_encpolicy $empty_dir | _filter_scratch
+_set_encpolicy $empty_dir 4444555566667777 |& _filter_scratch
+_get_encpolicy $empty_dir | _filter_scratch
+
+# Should *not* be able to set an encryption policy on a nonempty directory
+nonempty_dir=$SCRATCH_MNT/nonempty_dir
+echo -e "\n*** Setting encryption policy on nonempty directory ***"
+mkdir $nonempty_dir
+touch $nonempty_dir/file
+_set_encpolicy $nonempty_dir |& _filter_scratch
+_get_encpolicy $nonempty_dir |& _filter_scratch
+
+# Should *not* be able to set an encryption policy on a nondirectory file, even
+# an empty one.  Regression test for 002ced4be642: "fscrypto: only allow setting
+# encryption policy on directories".
+nondirectory=$SCRATCH_MNT/nondirectory
+echo -e "\n*** Setting encryption policy on nondirectory ***"
+touch $nondirectory
+_set_encpolicy $nondirectory |& _filter_scratch
+_get_encpolicy $nondirectory |& _filter_scratch
+
+# Should *not* be able to set an encryption policy on another user's directory.
+# Regression test for 163ae1c6ad62: "fscrypto: add authorization check for
+# setting encryption policy".
+unauthorized_dir=$SCRATCH_MNT/unauthorized_dir
+echo -e "\n*** Setting encryption policy on another user's directory ***"
+mkdir $unauthorized_dir
+_user_do_set_encpolicy $unauthorized_dir |& _filter_scratch
+_get_encpolicy $unauthorized_dir |& _filter_scratch
+
+# Should *not* be able to set an encryption policy on a directory on a
+# filesystem mounted readonly.  Regression test for ba63f23d69a3: "fscrypto:
+# require write access to mount to set encryption policy".  Test both a regular
+# readonly filesystem and a readonly bind mount of a read-write filesystem.
+echo -e "\n*** Setting encryption policy on readonly filesystem ***"
+mkdir $SCRATCH_MNT/ro_dir $SCRATCH_MNT/ro_bind_mnt
+_scratch_remount ro
+_set_encpolicy $SCRATCH_MNT/ro_dir |& _filter_scratch
+_get_encpolicy $SCRATCH_MNT/ro_dir |& _filter_scratch
+_scratch_remount rw
+mount --bind $SCRATCH_MNT $SCRATCH_MNT/ro_bind_mnt
+mount -o remount,ro,bind $SCRATCH_MNT/ro_bind_mnt
+_set_encpolicy $SCRATCH_MNT/ro_bind_mnt/ro_dir |& _filter_scratch
+_get_encpolicy $SCRATCH_MNT/ro_bind_mnt/ro_dir |& _filter_scratch
+_unmount $SCRATCH_MNT/ro_bind_mnt
+
+# success, all done
+status=0
+exit

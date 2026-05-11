@@ -1,0 +1,67 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 104
+#
+# Test that if we add hard links (in the same directory) to two files and then
+# fsync only one of the files, after the fsync log/journal is replayed all the
+# links exist and the filesystem metadata (directory and file inodes) is in a
+# consistent state.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test directory and files.
+mkdir $SCRATCH_MNT/testdir
+touch $SCRATCH_MNT/testdir/foo
+touch $SCRATCH_MNT/testdir/bar
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Create one hard link for file foo and another one for file bar. After that
+# fsync only the file bar.
+ln $SCRATCH_MNT/testdir/bar $SCRATCH_MNT/testdir/bar_link
+ln $SCRATCH_MNT/testdir/foo $SCRATCH_MNT/testdir/foo_link
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir/bar
+
+_flakey_drop_and_remount
+
+# Now verify both our files have a link count of 2.
+echo "Link count for file foo: $(stat -c %h $SCRATCH_MNT/testdir/foo)"
+echo "Link count for file bar: $(stat -c %h $SCRATCH_MNT/testdir/bar)"
+
+# We should be able to remove all the links of our files in testdir, and after
+# that the parent directory should become empty and therefore possible to
+# remove it.
+rm -f $SCRATCH_MNT/testdir/*
+rmdir $SCRATCH_MNT/testdir
+
+_scratch_unmount
+
+# The fstests framework will call fsck against our filesystem which will verify
+# that all metadata is in a consistent state.
+
+status=0
+exit

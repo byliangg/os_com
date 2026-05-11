@@ -1,0 +1,96 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 306
+#
+# Regression test for an XFS multi-block buffer logging bug.
+#
+# The XFS bug results in a panic when a non-contiguous multi-block buffer is
+# mapped and logged in a particular manner, such that only regions beyond the
+# first fsb-sized mapping are logged. The crash occurs asynchronous to
+# transaction submission, when the associated buffer log item is pushed from the
+# CIL (i.e., when the log is subsequently flushed).
+#
+. ./common/preamble
+_begin_fstest auto quick punch
+
+# Import common functions.
+
+# Modify as appropriate.
+
+_require_scratch_nocheck	# check complains about single AG fs
+_require_xfs_io_command "fpunch"
+_require_command $UUIDGEN_PROG uuidgen
+_require_test_program "punch-alternating"
+
+# Disable the scratch rt device to avoid test failures relating to the rt
+# bitmap consuming all the free space in our small data device.
+unset SCRATCH_RTDEV
+
+# Create a small fs with a large directory block size. We want to fill up the fs
+# quickly and then create multi-fsb dirblocks over fragmented free space.
+_scratch_mkfs_xfs -d size=100m -n size=64k >> $seqres.full 2>&1
+_scratch_mount
+
+# When using the zone allocator, mkfs still creates an internal RT section by
+# default and the above unsetting SCRATCH_RTDEV of doesn't work.
+_require_xfs_scratch_non_zoned
+
+# Fill a source directory with many largish-named files. 1k uuid-named entries
+# sufficiently populates a 64k directory block.
+mkdir $SCRATCH_MNT/src
+for i in $(seq 0 1023); do
+	touch $SCRATCH_MNT/src/`$UUIDGEN_PROG`
+done
+
+# precreate target dirs while we still have free space for inodes
+for i in $(seq 0 3); do
+	mkdir $SCRATCH_MNT/$i
+done
+
+# consume and fragment free space
+$XFS_IO_PROG -xc "resblks 16" $SCRATCH_MNT >> $seqres.full 2>&1
+dd if=/dev/zero of=$SCRATCH_MNT/file bs=4k >> $seqres.full 2>&1
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/file >> $seqres.full 2>&1
+$here/src/punch-alternating $SCRATCH_MNT/file
+
+# Replicate the src dir several times into fragmented free space. After one or
+# two dirs, we should have nothing but non-contiguous directory blocks.
+for d in $(seq 0 3); do
+	for f in `ls -1 $SCRATCH_MNT/src`; do
+		ln $SCRATCH_MNT/src/$f $SCRATCH_MNT/$d/$f
+	done
+done
+
+# Fragment the target dirs a bit. Remove a handful of entries from each to
+# populate the best free space regions in the directory block headers. We want
+# to populate these now so the subsequent unlinks have no reason to log the
+# first block of the directory.
+for d in $(seq 0 3); do
+	i=0
+	for f in `ls -U $SCRATCH_MNT/$d`; do
+		if [ $i == 0 ]; then
+			unlink $SCRATCH_MNT/$d/$f
+		fi
+		i=$(((i + 1) % 128))
+	done
+done
+
+# remount to flush and ensure subsequent operations allocate a new log item
+_scratch_cycle_mount
+
+# Unlink an entry towards the end of each dir and fsync. The unlink should only
+# need to log the latter mappings of the 64k directory block. If the logging bug
+# is present, this will crash!
+for d in $(seq 0 3); do
+	f=`ls -U $SCRATCH_MNT/$d | tail -10 | head -n 1`
+	unlink $SCRATCH_MNT/$d/$f
+	$XFS_IO_PROG -c fsync $SCRATCH_MNT/$d
+done
+
+echo Silence is golden.
+
+# success, all done
+status=0
+exit

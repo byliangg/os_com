@@ -1,0 +1,98 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Jaegeuk Kim.  All Rights Reserved.
+#
+# FS QA Test No. generic/393
+#
+# Test some small truncations to check inline_data and its cached data are
+# truncated correctly at the same time.
+#
+# The inline_data feature was introduced in ext4 and f2fs as follows.
+#  ext4 : http://lwn.net/Articles/468678/
+#  f2fs : http://lwn.net/Articles/573408/
+#
+# The basic idea is embedding small-sized file's data into relatively large
+# inode space.
+# In ext4, up to 132 bytes of data can be stored in 256 bytes-sized inode.
+# In f2fs, up to 3.4KB of data can be embedded into 4KB-sized inode block.
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+testfile=$SCRATCH_MNT/testfile
+OD_CMD="od -A x -t x1z"
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+# 1. make a file containing inline_data.
+# 2. "truncated 0"  is to check cached page #0 was truncated entirely.
+# 3. "truncated 50" is to check inline_data was truncated within its inode.
+$XFS_IO_PROG -t -f \
+	-c "pwrite -S 0x58 0 40" `# write    |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+	-c "fsync"							 \
+	-c "truncate 0"          `# truncate |                        |` \
+	-c "truncate 50"         `# truncate |                        |` \
+$testfile | _filter_xfs_io
+
+echo "= truncate inline_data after #0 page was truncated entirely ="
+$OD_CMD $testfile
+_scratch_cycle_mount
+$OD_CMD $testfile
+rm $testfile
+
+# 1. make a file containing inline_data.
+# 2. "truncated 0"     is to check cached page #0 was truncated entirely.
+# 3. "truncated 4096"  is to check inline_data was dismissed and truncated.
+$XFS_IO_PROG -t -f \
+	-c "pwrite -S 0x58 0 40" `# write    |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+	-c "fsync"							 \
+	-c "truncate 0"          `# truncate |                        |` \
+	-c "truncate 4096"       `# truncate |                        |` \
+$testfile | _filter_xfs_io
+
+echo "= truncate dismissed inline_data after #0 page was truncated entirely ="
+$OD_CMD $testfile
+_scratch_cycle_mount
+$OD_CMD $testfile
+rm $testfile
+
+# 1. make a file containing inline_data.
+# 2. "truncated 4"   is to check cached page #0 was truncated partially.
+# 3. "truncated 50"  is to check inline_data was truncated within its inode.
+$XFS_IO_PROG -t -f \
+	-c "pwrite -S 0x58 0 40" `# write    |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+	-c "fsync"							 \
+	-c "truncate 4"          `# truncate |XXXX                    |` \
+	-c "truncate 50"         `# truncate |XXXX                    |` \
+$testfile | _filter_xfs_io
+
+echo "= truncate inline_data after #0 page was truncated partially ="
+$OD_CMD $testfile
+_scratch_cycle_mount
+$OD_CMD $testfile
+rm $testfile
+
+# 1. make a file containing inline_data.
+# 2. "truncated 4"     is to check cached page #0 was truncated partially.
+# 3. "truncated 4096"  is to check inline_data was dismissed and truncated.
+$XFS_IO_PROG -t -f \
+	-c "pwrite -S 0x58 0 40" `# write    |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+	-c "fsync"							 \
+	-c "truncate 4"          `# truncate |XXXX                    |` \
+	-c "truncate 4096"       `# truncate |XXXX                    |` \
+$testfile | _filter_xfs_io
+
+echo "= truncate dismissed inline_data after #0 page was truncated partially ="
+$OD_CMD $testfile
+_scratch_cycle_mount
+$OD_CMD $testfile
+rm $testfile
+
+status=0
+exit

@@ -1,0 +1,24 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 Christian Brauner.  All Rights Reserved.
+#
+# FS QA Test 633
+#
+# Test that idmapped mounts behave correctly.
+#
+. ./common/preamble
+_begin_fstest auto quick atime attr cap idmapped io_uring mount perms rw unlink
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_chown
+
+echo "Silence is golden"
+
+$here/src/vfs/vfstest --test-core --device "$TEST_DEV" \
+	--mount "$TEST_DIR" --fstype "$FSTYP"
+
+status=$?
+exit

@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 337
+#
+# Test that the filesystem's implementation of the listxattrs system call lists
+# all the xattrs an inode has.
+#
+. ./common/preamble
+_begin_fstest auto quick attr metadata
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch
+_require_attrs
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create our test file with a few xattrs. The first 3 xattrs have a name that
+# when given as input to a crc32c function result in the same checksum. This
+# made btrfs list only one of the xattrs through listxattrs system call (because
+# it packs xattrs with the same name checksum into the same btree item).
+touch $SCRATCH_MNT/testfile
+$SETFATTR_PROG -n user.foobar -v 123 $SCRATCH_MNT/testfile
+$SETFATTR_PROG -n user.WvG1c1Td -v qwerty $SCRATCH_MNT/testfile
+$SETFATTR_PROG -n user.J3__T_Km3dVsW_ -v hello $SCRATCH_MNT/testfile
+$SETFATTR_PROG -n user.something -v pizza $SCRATCH_MNT/testfile
+$SETFATTR_PROG -n user.ping -v pong $SCRATCH_MNT/testfile
+
+# Now call getfattr with --dump, which calls the listxattrs system call.
+# It should list all the xattrs we have set before.
+_getfattr --absolute-names --dump $SCRATCH_MNT/testfile | _filter_scratch
+
+status=0
+exit

@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 051
+#
+# Simulate a buffer use after free race in XFS log recovery. The race triggers
+# on I/O failures during log recovery. Note that this test is dangerous as it
+# causes BUG() errors or a panic.
+#
+. ./common/preamble
+_begin_fstest shutdown auto log metadata
+
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dmflakey
+
+# Modify as appropriate.
+
+_require_scratch
+_require_dm_target flakey
+_require_xfs_sysfs debug/log_recovery_delay
+
+echo "Silence is golden."
+
+_scratch_mkfs_xfs >/dev/null 2>&1
+_scratch_mount
+
+# Start a workload and shutdown the fs. The subsequent mount will require log
+# recovery.
+_run_fsstress_bg -n 9999 -p 2 -w -d $SCRATCH_MNT
+sleep 5
+_scratch_shutdown -f
+_kill_fsstress
+_scratch_unmount
+
+# Initialize a dm-flakey device that will pass I/Os for 5s and fail thereafter.
+BLK_DEV_SIZE=`blockdev --getsz $SCRATCH_DEV`
+FLAKEY_TABLE="0 $BLK_DEV_SIZE flakey $SCRATCH_DEV 0 5 180"
+_init_flakey
+_load_flakey_table $FLAKEY_ALLOW_WRITES
+
+# Set a 10s log recovery delay and mount the flakey device. This should allow
+# initial writes to proceed (e.g., stale log block reset) and then let the
+# flakey uptime timer expire such that I/Os will fail by the time log recovery
+# starts.
+echo 10 > /sys/fs/xfs/debug/log_recovery_delay
+
+# The mount should fail due to dm-flakey. Note that this is dangerous on kernels
+# without the xfs_buf log recovery race fixes.
+_scratch_mount > /dev/null 2>&1
+
+echo 0 > /sys/fs/xfs/debug/log_recovery_delay
+
+_cleanup_flakey
+
+# replay the log
+_scratch_mount
+_scratch_unmount
+
+# success, all done
+status=0
+exit

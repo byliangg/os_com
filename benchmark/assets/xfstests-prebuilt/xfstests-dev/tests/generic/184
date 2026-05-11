@@ -1,0 +1,24 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2007 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 184
+#
+# check mknod makes working nodes.
+#
+. ./common/preamble
+_begin_fstest metadata auto quick
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_mknod
+
+rm -f $TEST_DIR/null
+mknod $TEST_DIR/null c 1 3
+chmod 666 $TEST_DIR/null
+echo fred > $TEST_DIR/null
+
+status=$?
+exit

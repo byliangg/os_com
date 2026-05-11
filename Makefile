@@ -15,6 +15,8 @@ OVMF ?= on
 RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
+EXT4_PHASE2_PROFILE ?= 0
+EXT4_DIRECT_READ_CACHE ?= 1
 SCHEME ?= ""
 SMP ?= 1
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
@@ -89,6 +91,8 @@ CARGO_OSDK_COMMON_ARGS := --target-arch=$(OSDK_TARGET_ARCH)
 # The build arguments also apply to the `cargo osdk run` command.
 CARGO_OSDK_BUILD_ARGS := --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.phase2_profile=$(EXT4_PHASE2_PROFILE)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.direct_read_cache=$(EXT4_DIRECT_READ_CACHE)"
 CARGO_OSDK_TEST_ARGS :=
 
 ifeq ($(AUTO_TEST), syscall)
@@ -96,6 +100,15 @@ BUILD_SYSCALL_TEST := 1
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="SYSCALL_TEST_SUITE=$(SYSCALL_TEST_SUITE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="SYSCALL_TEST_WORKDIR=$(SYSCALL_TEST_WORKDIR)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="EXTRA_BLOCKLISTS_DIRS=$(EXTRA_BLOCKLISTS_DIRS)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_MODE=$(XFSTESTS_MODE)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_THRESHOLD_PERCENT=$(XFSTESTS_THRESHOLD_PERCENT)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_RESULTS_DIR=$(XFSTESTS_RESULTS_DIR)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_TEST_DEV=$(XFSTESTS_TEST_DEV)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_SCRATCH_DEV=$(XFSTESTS_SCRATCH_DEV)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_TEST_DIR=$(XFSTESTS_TEST_DIR)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_SCRATCH_MNT=$(XFSTESTS_SCRATCH_MNT)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_SINGLE_TEST=$(XFSTESTS_SINGLE_TEST)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_CASE_TIMEOUT_SEC=$(XFSTESTS_CASE_TIMEOUT_SEC)"
 CARGO_OSDK_BUILD_ARGS += --init-args="/opt/syscall_test/run_syscall_test.sh"
 else ifeq ($(AUTO_TEST), test)
 ENABLE_BASIC_TEST := true
@@ -126,7 +139,16 @@ endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
 ifneq ($(BENCHMARK), none)
-CARGO_OSDK_BUILD_ARGS += --init-args="/benchmark/common/bench_runner.sh $(BENCHMARK) asterinas"
+BENCHMARK_INIT_ARGS := /benchmark/common/bench_runner.sh $(BENCHMARK) asterinas
+ifneq ($(BENCH_FIO_BS),)
+BENCHMARK_INIT_ARGS += $(BENCH_FIO_BS)
+else ifneq ($(BENCH_FIO_FSYNC),)
+BENCHMARK_INIT_ARGS += 1M
+endif
+ifneq ($(BENCH_FIO_FSYNC),)
+BENCHMARK_INIT_ARGS += $(BENCH_FIO_FSYNC)
+endif
+CARGO_OSDK_BUILD_ARGS += --init-args="$(BENCHMARK_INIT_ARGS)"
 endif
 
 ifeq ($(INTEL_TDX), 1)
@@ -182,7 +204,7 @@ endif
 
 ifeq ($(ENABLE_KVM), 1)
 	ifeq ($(OSDK_TARGET_ARCH), x86_64)
-	CARGO_OSDK_COMMON_ARGS += --qemu-args="-accel kvm"
+	CARGO_OSDK_COMMON_ARGS += --qemu-args="-enable-kvm"
 	endif
 endif
 
@@ -265,7 +287,7 @@ install_osdk:
 	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
 	@# without the need to publish the changes of OSDK's self-hosted
 	@# dependencies to `crates.io`.
-	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+	@OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path osdk
 
 # This will install and update OSDK automatically
 $(CARGO_OSDK): $(OSDK_SRC_FILES)

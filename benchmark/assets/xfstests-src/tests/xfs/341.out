@@ -1,0 +1,6 @@
+QA output created by 341
+Format and mount
+Create some files
+Corrupt fs
+Repair fs
+Try to create more files (again)

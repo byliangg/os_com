@@ -1,0 +1,100 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 Red Hat Inc. All rights reserved.
+#
+# FSQA Test No. btrfs/065
+#
+# Run btrfs subvolume create/mount/umount/delete and device replace
+# operation simultaneously, with fsstress running in background.
+#
+. ./common/preamble
+_begin_fstest auto subvol replace volume scrub raid
+
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.*
+	if [ ! -z "$stop_file" ] && [ ! -z "$subvol_pid" ] && \
+		   [ ! -z "$subvol_mnt" ]; then
+		_btrfs_kill_stress_subvolume_pid $subvol_pid $stop_file $subvol_mnt
+	fi
+	if [ ! -z "$replace_pid" ]; then
+		_btrfs_kill_stress_replace_pid $replace_pid
+	fi
+	_kill_fsstress
+}
+
+. ./common/filter
+
+# we check scratch dev after each loop
+_require_scratch_nocheck
+_require_scratch_dev_pool 5
+_require_scratch_dev_pool_equal_size
+_btrfs_get_profile_configs replace
+
+stop_file=$TEST_DIR/$seq.stop.$$
+subvol_mnt=$TEST_DIR/$seq.mnt
+
+run_test()
+{
+	local mkfs_opts=$1
+	local saved_scratch_dev_pool=$SCRATCH_DEV_POOL
+
+	echo "Test $mkfs_opts" >>$seqres.full
+
+	# remove the last device from the SCRATCH_DEV_POOL list so
+	# _scratch_pool_mkfs won't use all devices in pool
+	local last_dev="`echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $NF}'`"
+	SCRATCH_DEV_POOL=`echo $SCRATCH_DEV_POOL | sed -e "s# *$last_dev *##"`
+	_scratch_pool_mkfs $mkfs_opts >>$seqres.full 2>&1
+	# make sure we created btrfs with desired options
+	if [ $? -ne 0 ]; then
+		echo "mkfs $mkfs_opts failed"
+		SCRATCH_DEV_POOL=$saved_scratch_dev_pool
+		return
+	fi
+	_scratch_mount >>$seqres.full 2>&1
+	SCRATCH_DEV_POOL=$saved_scratch_dev_pool
+
+	args=`_scale_fsstress_args -p 20 -n 100 -d $SCRATCH_MNT/stressdir`
+	echo "Run fsstress $args" >>$seqres.full
+	_run_fsstress_bg $args
+
+	echo -n "Start subvolume worker: " >>$seqres.full
+	_btrfs_stress_subvolume $SCRATCH_DEV $SCRATCH_MNT subvol_$$ $subvol_mnt $stop_file >/dev/null 2>&1 &
+	subvol_pid=$!
+	echo "$subvol_pid" >>$seqres.full
+
+	echo -n "Start replace worker: " >>$seqres.full
+	_btrfs_stress_replace $SCRATCH_MNT >>$seqres.full 2>&1 &
+	replace_pid=$!
+	echo "$replace_pid" >>$seqres.full
+
+	echo "Wait for fsstress to exit and kill all background workers" >>$seqres.full
+	_wait_for_fsstress
+	_btrfs_kill_stress_subvolume_pid $subvol_pid $stop_file $subvol_mnt
+	unset subvol_pid
+	_btrfs_kill_stress_replace_pid $replace_pid
+	unset replace_pid
+
+	echo "Scrub the filesystem" >>$seqres.full
+	$BTRFS_UTIL_PROG scrub start -B $SCRATCH_MNT >>$seqres.full 2>&1
+	if [ $? -ne 0 ]; then
+		echo "Scrub find errors in \"$mkfs_opts\" test" | tee -a $seqres.full
+	fi
+
+	# in case the subvolume is still mounted
+	$UMOUNT_PROG $subvol_mnt >/dev/null 2>&1
+	_scratch_unmount
+	# we called _require_scratch_nocheck instead of _require_scratch
+	# do check after test for each profile config
+	_check_scratch_fs
+}
+
+echo "Silence is golden"
+for t in "${_btrfs_profile_configs[@]}"; do
+	run_test "$t"
+done
+
+status=0
+exit

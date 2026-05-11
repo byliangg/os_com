@@ -1,0 +1,63 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 015
+#
+# SGID bit inheritance over whiteout.
+#
+. ./common/preamble
+_begin_fstest auto quick whiteout perms
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_user
+_require_group
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# set umask to make output deterministic
+umask 022
+
+# Create test dir in lower dir and set sgid bit
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+mkdir -p $lowerdir/dir
+chown $qa_user:$qa_group $lowerdir/dir
+chmod 2775 $lowerdir/dir
+touch $lowerdir/dir/testdir
+touch $lowerdir/dir/testfile
+touch $lowerdir/dir/hardlink
+
+# mount overlayfs, create new file and dir in parent dir with sgid bit set, new
+# files and dirs all should inherit the sgid bit and the group
+_scratch_mount
+
+# new dir
+mkdir $SCRATCH_MNT/dir/newdir
+stat -c "%A %G" $SCRATCH_MNT/dir/newdir
+
+# new file
+touch $SCRATCH_MNT/dir/newfile
+stat -c "%A %G" $SCRATCH_MNT/dir/newfile
+
+# new dir over whiteout
+rm -f $SCRATCH_MNT/dir/testdir
+mkdir $SCRATCH_MNT/dir/testdir
+stat -c "%A %G" $SCRATCH_MNT/dir/testdir
+
+# new file over whiteout
+rm -f $SCRATCH_MNT/dir/testfile
+touch $SCRATCH_MNT/dir/testfile
+stat -c "%A %G" $SCRATCH_MNT/dir/testfile
+
+# new hardlink over whiteout
+rm -f $SCRATCH_MNT/dir/hardlink
+ln $SCRATCH_MNT/dir/testfile $SCRATCH_MNT/dir/hardlink
+stat -c "%A %G" $SCRATCH_MNT/dir/hardlink
+
+# success, all done
+status=0
+exit

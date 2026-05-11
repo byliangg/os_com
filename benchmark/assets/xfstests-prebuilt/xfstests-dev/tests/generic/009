@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright 2014 (C) Red Hat, Inc., Lukas Czerner <lczerner@redhat.com>
+#
+# FS QA Test No. 009
+#
+# Test fallocate FALLOC_FL_ZERO_RANGE
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc zero fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+_require_xfs_io_command "fzero"
+_require_xfs_io_command "fiemap"
+_require_xfs_io_command "falloc"
+_require_test
+
+testfile=$TEST_DIR/009.$$
+
+# Disable extent zeroing for ext4 as that change where holes are created
+if [ "$FSTYP" = "ext4" ]; then
+	_ext4_disable_extent_zeroout
+fi
+if [ "$FSTYP" = "overlay" -a "$OVL_BASE_FSTYP" = "ext4" ]; then
+	_ext4_disable_extent_zeroout "$OVL_BASE_TEST_DEV"
+fi
+
+# Standard zero range tests
+_test_generic_punch falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Delayed allocation zero range tests
+_test_generic_punch -d falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Multi zero range tests
+_test_generic_punch -k falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Delayed allocation multi zero range tests
+_test_generic_punch -d -k falloc fzero fzero fiemap _filter_fiemap $testfile
+
+status=0 ; exit

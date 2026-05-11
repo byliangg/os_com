@@ -1,0 +1,5 @@
+QA output created by 432
+Format and mount
+Create huge dir
+Check for > 1000 block extent?
+Try to metadump, restore and check restored metadump image

@@ -47,6 +47,23 @@ impl dyn BlockDevice {
         bio.submit(self)
     }
 
+    /// Asynchronously reads contiguous blocks starting from the `bid` and hints
+    /// that the request is a speculative prefetch worth attempting on a fast submit path.
+    pub fn read_blocks_async_prefetch(
+        &self,
+        bid: Bid,
+        bio_segment: BioSegment,
+    ) -> Result<BioWaiter, BioEnqueueError> {
+        let bio = Bio::new(
+            BioType::Read,
+            Sid::from(bid),
+            vec![bio_segment],
+            Some(general_complete_fn),
+        );
+        bio.prefer_fast_submit();
+        bio.submit(self)
+    }
+
     /// Synchronously writes contiguous blocks starting from the `bid`.
     pub fn write_blocks(
         &self,
@@ -80,6 +97,10 @@ impl dyn BlockDevice {
 
     /// Issues a sync request
     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
+        // Step 1 observation: confirm whether this is actually reached.
+        // With current ext4 regular-file fsync path this should NOT be called
+        // (fsync_regular_file() skips block_device.sync()). Remove after Step 1.
+        log::warn!("block: BlockDevice::sync() called — BioType::Flush will be submitted");
         let bio = Bio::new(
             BioType::Flush,
             Sid::from(Bid::from_offset(0)),

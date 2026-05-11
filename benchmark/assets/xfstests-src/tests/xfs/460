@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.  All rights reserved.
+#
+# FS QA Test No. 460
+#
+# Populate a XFS filesystem and fuzz every inobt field.
+# Do not fix the filesystem, to test metadata verifiers.
+
+. ./common/preamble
+_begin_fstest dangerous_fuzzers fuzzers_norepair
+
+_register_cleanup "_cleanup" BUS
+
+# Import common functions.
+. ./common/filter
+. ./common/populate
+. ./common/fuzzy
+
+_require_scratch_xfs_fuzz_fields
+_disable_dmesg_check
+
+echo "Format and populate"
+_scratch_populate_cached nofill > $seqres.full 2>&1
+
+path="$(_scratch_xfs_find_agbtree_height 'ino' 2)" || \
+	_fail "could not find two-level inobt"
+
+echo "Fuzz inobt"
+_scratch_xfs_fuzz_metadata '' 'none'  "$path" 'addr root' 'addr ptrs[1]' >> $seqres.full
+echo "Done fuzzing inobt"
+
+# success, all done
+status=0
+exit

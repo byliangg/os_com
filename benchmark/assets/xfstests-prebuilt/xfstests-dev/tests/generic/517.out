@@ -1,0 +1,45 @@
+QA output created by 517
+wrote 524388/524388 bytes at offset 0
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 262144/262144 bytes at offset 524388
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+wrote 131172/131172 bytes at offset 0
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+File content before first deduplication:
+0000000 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b
+*
+0524384 6b 6b 6b 6b ae ae ae ae ae ae ae ae ae ae ae ae
+0524400 ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae
+*
+0786528 ae ae ae ae
+0786532
+deduped 131172/131172 bytes at offset 65536
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+File content after first deduplication and before unmounting:
+0000000 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b
+*
+0524384 6b 6b 6b 6b ae ae ae ae ae ae ae ae ae ae ae ae
+0524400 ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae
+*
+0786528 ae ae ae ae
+0786532
+File content after first unmount:
+0000000 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b
+*
+0524384 6b 6b 6b 6b ae ae ae ae ae ae ae ae ae ae ae ae
+0524400 ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae
+*
+0786528 ae ae ae ae
+0786532
+wrote 100/100 bytes at offset 0
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+deduped 100/100 bytes at offset 655360
+XXX Bytes, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
+File content after second deduplication:
+0000000 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b
+*
+0524384 6b 6b 6b 6b ae ae ae ae ae ae ae ae ae ae ae ae
+0524400 ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae ae
+*
+0786528 ae ae ae ae
+0786532

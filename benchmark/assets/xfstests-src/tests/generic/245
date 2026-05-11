@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Christoph Hellwig.  All Rights Reserved.
+#
+# FS QA Test No. 245
+#
+# Check that directory renames onto non-empty targets fail
+#
+# Based on a bug report and testcase from  Vlado Plaga <rechner@vlado-do.de>
+#
+. ./common/preamble
+_begin_fstest auto quick dir
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+dir=$TEST_DIR/test-mv
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -rf $dir
+}
+
+# According to the rename(2) manpage you can get either EEXIST or ENOTEMPTY as an
+# error for trying to rename a non-empty directory, so just catch the error for
+# ENOTMEMPTY and replace it with the EEXIST output so that either result passes
+# Also, mv v9.4+ modified error message when a nonempty destination directory fails
+# to be overwriteen
+_filter_directory_not_empty()
+{
+	sed -e "s,Directory not empty,File exists,g" \
+	    -e "s,cannot move .* to \(.*\):\(.*\),cannot overwrite \1:\2,g"
+}
+ 
+
+mkdir $dir
+
+mkdir $dir/aa
+mkdir $dir/ab
+touch $dir/aa/1
+mkdir $dir/ab/aa
+touch $dir/ab/aa/2
+
+mv $dir/ab/aa/ $dir 2>&1 | _filter_test_dir | _filter_directory_not_empty
+
+status=0
+exit $status

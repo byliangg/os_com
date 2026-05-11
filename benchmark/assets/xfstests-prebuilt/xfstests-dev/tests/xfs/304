@@ -1,0 +1,54 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 304
+#
+# Test to verify that turn group/project quotas off while user quotas
+# are left on.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+# Modify as appropriate.
+
+_require_scratch
+_require_xfs_quota
+
+_scratch_mkfs_xfs -m crc=1 >/dev/null 2>&1
+
+_qmount_option "uquota,gquota,pquota"
+_qmount
+
+QUOTA_DIR=$SCRATCH_MNT/quota_dir
+
+mkdir -p $QUOTA_DIR
+echo "*** turn off group quotas"
+$XFS_QUOTA_PROG -x -c 'disable -g' $SCRATCH_MNT
+rmdir $QUOTA_DIR
+echo "*** umount"
+_scratch_unmount
+
+_qmount
+mkdir -p $QUOTA_DIR
+echo "*** turn off project quotas"
+$XFS_QUOTA_PROG -x -c 'disable -p' $SCRATCH_MNT
+rmdir $QUOTA_DIR
+echo "*** umount"
+_scratch_unmount
+
+_qmount
+mkdir -p $QUOTA_DIR
+echo "*** turn off group/project quotas"
+$XFS_QUOTA_PROG -x -c 'disable -gp' $SCRATCH_MNT
+rmdir $QUOTA_DIR
+echo "*** umount"
+_scratch_unmount
+
+# success, all done
+status=0
+exit

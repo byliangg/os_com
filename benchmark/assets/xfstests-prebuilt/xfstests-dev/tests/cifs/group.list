@@ -1,0 +1,4 @@
+# QA groups control file, automatically generated.
+# See _begin_fstest in each test for details.
+
+001 auto quick

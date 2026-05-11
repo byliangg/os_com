@@ -1,0 +1,94 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 527
+#
+# Test that after a combination of file renames, deletions, linking and creating
+# new files with names that were previously deleted, if we fsync the new file,
+# after a power failure we are able to mount the filesystem and all file names
+# correspond to the correct inodes.
+#
+. ./common/preamble
+_begin_fstest auto quick log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+if [ $FSTYP = "f2fs" ]; then
+	export MOUNT_OPTIONS="-o fsync_mode=strict $MOUNT_OPTIONS"
+fi
+
+_init_flakey
+_scratch_mount
+
+mkdir $SCRATCH_MNT/testdir
+echo -n "foo" > $SCRATCH_MNT/testdir/fname1
+echo -n "hello" > $SCRATCH_MNT/testdir/fname2
+
+# For a different variant of the same test but when files have hardlinks too.
+mkdir $SCRATCH_MNT/testdir2
+echo -n "foo" > $SCRATCH_MNT/testdir2/zz
+ln $SCRATCH_MNT/testdir2/zz $SCRATCH_MNT/testdir2/zz_link
+echo -n "hello" > $SCRATCH_MNT/testdir2/a
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Rename, remove and link files such that one new name corresponds to the name
+# of a deleted file and one new file has the old name of the renamed file. Then
+# fsync only the new file.
+mv $SCRATCH_MNT/testdir/fname1 $SCRATCH_MNT/testdir/fname3
+rm -f $SCRATCH_MNT/testdir/fname2
+ln $SCRATCH_MNT/testdir/fname3 $SCRATCH_MNT/testdir/fname2
+echo -n "bar" > $SCRATCH_MNT/testdir/fname1
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir/fname1
+
+# A second variant, more complex, that involves files with hardlinks too.
+
+# The following 3 renames are equivalent to a rename exchange (zz_link to a), but
+# without the atomicity which isn't required here.
+mv $SCRATCH_MNT/testdir2/a $SCRATCH_MNT/testdir2/tmp
+mv $SCRATCH_MNT/testdir2/zz_link $SCRATCH_MNT/testdir2/a
+mv $SCRATCH_MNT/testdir2/tmp $SCRATCH_MNT/testdir2/zz_link
+
+# The following rename and file creation are equivalent to a rename whiteout.
+mv $SCRATCH_MNT/testdir2/zz $SCRATCH_MNT/testdir2/a2
+echo -n "bar" > $SCRATCH_MNT/testdir2/zz
+
+# Fsync of zz should work and produce correct results after a power failure.
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir2/zz
+
+# Simulate a power failure and mount the filesystem to check that all file names
+# exist and correspond to the correct inodes.
+_flakey_drop_and_remount
+
+echo "File fname1 data after power failure: $(cat $SCRATCH_MNT/testdir/fname1)"
+echo "File fname2 data after power failure: $(cat $SCRATCH_MNT/testdir/fname2)"
+echo "File fname3 data after power failure: $(cat $SCRATCH_MNT/testdir/fname3)"
+
+echo "File a data after power failure: $(cat $SCRATCH_MNT/testdir2/a)"
+echo "File a2 data after power failure: $(cat $SCRATCH_MNT/testdir2/a2)"
+echo "File zz data after power failure: $(cat $SCRATCH_MNT/testdir2/zz)"
+echo "File zz_link data after power failure: $(cat $SCRATCH_MNT/testdir2/zz_link)"
+
+_scratch_unmount
+
+status=0
+exit

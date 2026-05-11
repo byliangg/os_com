@@ -1,0 +1,190 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 IBM Corporation. All Rights Reserved.
+#
+# FSQA Test No. 041
+#
+# Test consistent d_ino numbers on non-samefs setup
+# This is a variant of overlay/038 to test consistent d_ino numbers
+# for non-samefs setup.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup nonsamefs
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_fixed_in_kernel_version "v4.17"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_test
+_require_attrs trusted
+_require_test_program "t_dir_type"
+
+lowerdir=$OVL_BASE_TEST_DIR/$seq-ovl-lower
+rm -rf $lowerdir
+mkdir $lowerdir
+
+# Create our test files.
+mkdir -p $lowerdir/test_dir/pure_lower_dir/subdir
+touch $lowerdir/test_file
+
+_scratch_mkfs
+
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+
+# Enabling xino in this test requires that base filesystem inode numbers will
+# not use bit 63 in inode number of the test files, because bit 63 is used by
+# overlayfs to indicate the layer. Let's just assume that this is true for all
+# tested filesystems and if we are wrong, the test may fail.
+_overlay_scratch_mount_dirs $lowerdir $upperdir $workdir -o xino=on || \
+	_notrun "cannot mount overlay with xino=on option"
+_fs_options $SCRATCH_DEV | grep -q "xino=on" || \
+	_notrun "cannot enable xino feature"
+
+test_dir=$SCRATCH_MNT/test_dir/
+
+# Verify d_ino of '.' and '..' before and after dir becomes impure.
+impure_dir=$test_dir/impure_dir
+mkdir -p $impure_dir/subdir
+
+impure_dir_st_ino=$(stat -c '%i' $impure_dir)
+impure_dir_parent_st_ino=$(stat -c '%i' $test_dir)
+impure_subdir_st_ino=$(stat -c '%i' $impure_dir/subdir)
+
+# Before $impure_dir becomes impure
+parent_d=$($here/src/t_dir_type $impure_dir $impure_dir_parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $impure_dir $impure_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $impure_dir $impure_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+    echo "Pure upper dir: Invalid d_ino reported for subdir"
+
+# Move a copied up file into pure dir to make it impure
+mv $SCRATCH_MNT/test_file $impure_dir
+test_file_st_ino=$(stat -c '%i' $impure_dir/test_file)
+
+impure=$(_getfattr --absolute-names --only-values -n 'trusted.overlay.impure' \
+			$upperdir/test_dir/impure_dir)
+[[ $impure == "y" ]] || echo "Impure directory missing impure xattr"
+
+# After $impure_dir becomes impure
+parent_d=$($here/src/t_dir_type $impure_dir $impure_dir_parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $impure_dir $impure_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $impure_dir $impure_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+    echo "Impure dir: Invalid d_ino reported for subdir"
+
+# Verify copy up file's d_ino
+file_d=$($here/src/t_dir_type $impure_dir $test_file_st_ino)
+[[ $file_d == "test_file f" ]] || \
+	echo "Impure dir: Invalid d_ino reported for entry with copy-up origin"
+
+# Make $impure_dir pure
+rm -rf $impure_dir/test_file
+rm -rf $impure_dir/subdir
+
+# Verify invalidation of readdir cache
+$here/src/t_dir_type $impure_dir $test_file_st_ino
+[[ $? != 0 ]] || echo "Directory's readdir cache has stale file entries"
+$here/src/t_dir_type $impure_dir $impure_subdir_st_ino
+[[ $? != 0 ]] || echo "Directory's readdir cache has stale subdir entries"
+
+impure=$(_getfattr --absolute-names --only-values -n 'trusted.overlay.impure' \
+			$upperdir/test_dir/impure_dir 2>/dev/null)
+[[ -z $impure ]] || echo "Pure directory has impure xattr"
+
+# Verify d_ino values of subdir entries of a pure lower dir.
+parent_st_ino=$(stat -c '%i' $test_dir)
+pure_lower_dir=$SCRATCH_MNT/test_dir/pure_lower_dir
+pure_lower_dir_st_ino=$(stat -c '%i' $pure_lower_dir)
+pure_lower_subdir_st_ino=$(stat -c '%i' $pure_lower_dir/subdir)
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Pure lower dir: Invalid d_ino reported for subdir"
+
+# Create a file in pure lower dir to make it a merge dir
+touch $pure_lower_dir/newfile
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $parent_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Merged dir: Invalid d_ino reported for subdir"
+
+$UMOUNT_PROG $SCRATCH_MNT
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir $upperdir $workdir -o xino=on
+
+# Verify pure lower residing in dir which has another lower layer
+middir=$OVL_BASE_TEST_DIR/$seq-ovl-mid
+lowerdir=$OVL_BASE_TEST_DIR/$seq-ovl-lower
+rm -rf $middir
+rm -rf $lowerdir
+mkdir $middir
+mkdir $lowerdir
+
+mkdir -p $middir/test_dir
+mkdir -p $lowerdir/test_dir/pure_lower_dir/subdir
+
+_scratch_mkfs
+
+_overlay_scratch_mount_dirs $middir:$lowerdir $upperdir $workdir -o xino=on
+
+# Copy up test_dir
+touch $test_dir/test_file
+
+test_dir_st_ino=$(stat -c '%i' $test_dir)
+pure_lower_dir=$test_dir/pure_lower_dir
+pure_lower_dir_st_ino=$(stat -c '%i' $pure_lower_dir)
+pure_lower_subdir_st_ino=$(stat -c '%i' $pure_lower_dir/subdir)
+
+parent_d=$($here/src/t_dir_type $pure_lower_dir $test_dir_st_ino)
+[[ $parent_d == ".. d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for .."
+
+current_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_dir_st_ino)
+[[ $current_d == ". d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for ."
+
+subdir_d=$($here/src/t_dir_type $pure_lower_dir $pure_lower_subdir_st_ino)
+[[ $subdir_d == "subdir d" ]] || \
+	echo "Pure lower in dir which has another lower layer: Invalid d_ino reported for subdir"
+
+# check overlayfs
+_overlay_check_scratch_dirs "$middir:$lowerdir" $upperdir $workdir -o xino=on
+
+echo "Silence is golden"
+status=0
+exit

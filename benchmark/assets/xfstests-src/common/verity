@@ -1,0 +1,434 @@
+# SPDX-License-Identifier: GPL-2.0
+# Copyright 2018 Google LLC
+#
+# Functions for setting up and testing fs-verity
+
+# btrfs will return IO errors on corrupted data with or without fs-verity.
+# to really test fs-verity, use nodatasum.
+if [ "$FSTYP" == "btrfs" ]; then
+        if [ -z "$MOUNT_OPTIONS" ]; then
+                export MOUNT_OPTIONS="-o nodatasum"
+        else
+                export MOUNT_OPTIONS+=" -o nodatasum"
+        fi
+fi
+
+# Require fs-verity support on the scratch filesystem.
+#
+# FSV_BLOCK_SIZE will be set to a Merkle tree block size that is supported by
+# the filesystem.  Other sizes may be supported too, but FSV_BLOCK_SIZE is the
+# only size that is guaranteed to work without any additional checks.
+_require_scratch_verity()
+{
+	_require_scratch
+	_require_command "$FSVERITY_PROG" fsverity
+
+	if ! _scratch_mkfs_verity &>>$seqres.full; then
+		# ext4: need e2fsprogs v1.44.5 or later (but actually v1.45.2+
+		#       is needed for some tests to pass, due to an e2fsck bug)
+		# f2fs: need f2fs-tools v1.11.0 or later
+		_notrun "$FSTYP userspace tools don't support fs-verity"
+	fi
+
+	# Try to mount the filesystem.  If this fails then either the kernel
+	# isn't aware of fs-verity, or the mkfs options were not compatible with
+	# verity (e.g. ext4 with block size != PAGE_SIZE on old kernels).
+	if ! _try_scratch_mount &>>$seqres.full; then
+		_notrun "kernel is unaware of $FSTYP verity feature," \
+			"or mkfs options are not compatible with verity"
+	fi
+
+	local fstyp=${1:-$FSTYP}
+	local scratch_mnt=${2:-$SCRATCH_MNT}
+
+	# The filesystem may be aware of fs-verity but have it disabled by
+	# CONFIG_FS_VERITY=n.  Detect support via sysfs.
+	if [ ! -e /sys/fs/$fstyp/features/verity ]; then
+		_notrun "kernel $fstyp isn't configured with verity support"
+	fi
+
+	# Select a default Merkle tree block size for when tests don't
+	# explicitly specify one.
+	#
+	# For consistency reasons, all 'fsverity' subcommands, including
+	# 'fsverity enable', default to 4K Merkle tree blocks.  That's generally
+	# not ideal for tests, since it's possible that the filesystem doesn't
+	# support 4K blocks but does support another size.  Specifically, the
+	# kernel originally supported only merkle_tree_block_size ==
+	# fs_block_size == page_size, and later it was updated to support
+	# merkle_tree_block_size <= min(fs_block_size, page_size).
+	#
+	# Therefore, we default to merkle_tree_block_size == min(fs_block_size,
+	# page_size).  That maximizes the chance of verity actually working.
+	local fs_block_size=$(_get_block_size $scratch_mnt)
+	local page_size=$(_get_page_size)
+	if (( fs_block_size <= page_size )); then
+		FSV_BLOCK_SIZE=$fs_block_size
+	else
+		FSV_BLOCK_SIZE=$page_size
+	fi
+
+	# The filesystem may have fs-verity enabled but not actually usable by
+	# default.  E.g., ext4 only supports verity on extent-based files, so it
+	# doesn't work on ext3-style filesystems.  So, try actually using it.
+	if ! _fsv_can_enable $scratch_mnt/tmpfile; then
+		_notrun "$fstyp verity isn't usable by default with these mkfs options"
+	fi
+
+	_scratch_unmount
+}
+
+# Check for CONFIG_FS_VERITY_BUILTIN_SIGNATURES=y, as well as the userspace
+# commands needed to generate certificates and add them to the kernel.
+_require_fsverity_builtin_signatures()
+{
+	if [ ! -e /proc/sys/fs/verity/require_signatures ]; then
+		_notrun "kernel doesn't support fs-verity builtin signatures"
+	fi
+	_require_command "$OPENSSL_PROG" openssl
+	_require_command "$KEYCTL_PROG" keyctl
+}
+
+# Use the openssl program to generate a private key and a X.509 certificate for
+# use with fs-verity built-in signature verification, and convert the
+# certificate to DER format.
+_fsv_generate_cert()
+{
+	local keyfile=$1
+	local certfile=$2
+	local certfileder=$3
+
+	if ! $OPENSSL_PROG req -newkey rsa:4096 -nodes -batch -x509 \
+			-keyout $keyfile -out $certfile &>> $seqres.full; then
+		_fail "Failed to generate certificate and private key (see $seqres.full)"
+	fi
+	$OPENSSL_PROG x509 -in $certfile -out $certfileder -outform der
+}
+
+# Clear the .fs-verity keyring.
+_fsv_clear_keyring()
+{
+	$KEYCTL_PROG clear %keyring:.fs-verity
+}
+
+# Load the given X.509 certificate in DER format into the .fs-verity keyring so
+# that the kernel can use it to verify built-in signatures.
+_fsv_load_cert()
+{
+	local certfileder=$1
+
+	$KEYCTL_PROG padd asymmetric '' %keyring:.fs-verity \
+		< $certfileder >> $seqres.full
+}
+
+# Disable mandatory signatures for fs-verity files, if they are supported.
+_disable_fsverity_signatures()
+{
+	if [ -e /proc/sys/fs/verity/require_signatures ]; then
+		_set_fsverity_require_signatures 0
+	fi
+}
+
+# Enable mandatory signatures for fs-verity files.
+# This assumes that _require_fsverity_builtin_signatures() was called.
+_enable_fsverity_signatures()
+{
+	_set_fsverity_require_signatures 1
+}
+
+# Restore the original value of fs.verity.require_signatures, i.e. the value it
+# had at the beginning of the test.
+_restore_fsverity_signatures()
+{
+	if [ -n "$FSVERITY_SIG_CTL_ORIG" ]; then
+		_set_fsverity_require_signatures "$FSVERITY_SIG_CTL_ORIG"
+	fi
+}
+
+# Restore the previous value of fs.verity.require_signatures, i.e. the value it
+# had just before it was last written to.
+_restore_prev_fsverity_signatures()
+{
+	if [ -n "$FSVERITY_SIG_CTL_PREV" ]; then
+		_set_fsverity_require_signatures "$FSVERITY_SIG_CTL_PREV"
+	fi
+}
+
+_set_fsverity_require_signatures()
+{
+	local newval=$1
+	local oldval=$(</proc/sys/fs/verity/require_signatures)
+	FSVERITY_SIG_CTL_PREV=$oldval
+	if [ -z "$FSVERITY_SIG_CTL_ORIG" ]; then
+		FSVERITY_SIG_CTL_ORIG=$oldval
+	fi
+	echo "$newval" > /proc/sys/fs/verity/require_signatures
+}
+
+# Require userspace and kernel support for 'fsverity dump_metadata'.
+# $1 must be a file with fs-verity enabled.
+_require_fsverity_dump_metadata()
+{
+	local verity_file=$1
+	local tmpfile=$tmp.require_fsverity_dump_metadata
+
+	if _fsv_dump_merkle_tree "$verity_file" 2>"$tmpfile" >/dev/null; then
+		return
+	fi
+	if grep -q "^ERROR: unrecognized command: 'dump_metadata'$" "$tmpfile"
+	then
+		_notrun "Missing 'fsverity dump_metadata' command"
+	fi
+	if grep -q "^ERROR: FS_IOC_READ_VERITY_METADATA failed on '.*': Inappropriate ioctl for device$" "$tmpfile"
+	then
+		_notrun "Kernel doesn't support FS_IOC_READ_VERITY_METADATA"
+	fi
+	_fail "Unexpected output from 'fsverity dump_metadata': $(<"$tmpfile")"
+}
+
+# Check for userspace tools needed to corrupt verity data or metadata.
+_require_fsverity_corruption()
+{
+	_require_xfs_io_command "fiemap"
+	if [ $FSTYP == "btrfs" ]; then
+		_require_btrfs_corrupt_block "value"
+	fi
+}
+
+_scratch_mkfs_verity()
+{
+	case $FSTYP in
+	ext4|f2fs)
+		_scratch_mkfs -O verity
+		;;
+	btrfs)
+		_scratch_mkfs
+		;;
+	overlay)
+		_scratch_mkfs # This relies on the scratch fs supporting verity
+                ;;
+	*)
+		_notrun "No verity support for $FSTYP"
+		;;
+	esac
+}
+
+_scratch_mkfs_encrypted_verity()
+{
+	case $FSTYP in
+	ext4)
+		_scratch_mkfs -O encrypt,verity
+		;;
+	f2fs)
+		# f2fs-tools as of v1.11.0 doesn't allow comma-separated
+		# features with -O.  Instead -O must be supplied multiple times.
+		_scratch_mkfs -O encrypt -O verity
+		;;
+	*)
+		_notrun "$FSTYP not supported in _scratch_mkfs_encrypted_verity"
+		;;
+	esac
+}
+
+_fsv_scratch_begin_subtest()
+{
+	local msg=$1
+
+	rm -rf "${SCRATCH_MNT:?}"/*
+	echo -e "\n# $msg"
+}
+
+_fsv_dump_merkle_tree()
+{
+	$FSVERITY_PROG dump_metadata merkle_tree "$@"
+}
+
+_fsv_dump_descriptor()
+{
+	$FSVERITY_PROG dump_metadata descriptor "$@"
+}
+
+_fsv_dump_signature()
+{
+	$FSVERITY_PROG dump_metadata signature "$@"
+}
+
+_fsv_enable()
+{
+	local args=("$@")
+	# If the caller didn't explicitly specify a Merkle tree block size, then
+	# use FSV_BLOCK_SIZE.
+	if ! [[ " $*" =~ " --block-size" ]]; then
+		args+=("--block-size=$FSV_BLOCK_SIZE")
+	fi
+	$FSVERITY_PROG enable "${args[@]}"
+}
+
+_fsv_measure()
+{
+        $FSVERITY_PROG measure "$@" | awk '{print $1}'
+}
+
+_fsv_digest()
+{
+	local args=("$@")
+	# If the caller didn't explicitly specify a Merkle tree block size, then
+	# use FSV_BLOCK_SIZE.
+	if ! [[ " $*" =~ " --block-size" ]]; then
+		args+=("--block-size=$FSV_BLOCK_SIZE")
+	fi
+	$FSVERITY_PROG digest "${args[@]}" | awk '{print $1}'
+}
+
+_fsv_sign()
+{
+	local args=("$@")
+	# If the caller didn't explicitly specify a Merkle tree block size, then
+	# use FSV_BLOCK_SIZE.
+	if ! [[ " $*" =~ " --block-size" ]]; then
+		args+=("--block-size=$FSV_BLOCK_SIZE")
+	fi
+	$FSVERITY_PROG sign "${args[@]}"
+}
+
+# Generate a file, then enable verity on it.
+_fsv_create_enable_file()
+{
+	local file=$1
+	shift
+
+	head -c $((FSV_BLOCK_SIZE * 2)) /dev/zero > "$file"
+	_fsv_enable "$file" "$@"
+}
+
+_fsv_can_enable()
+{
+	local test_file=$1
+	shift
+	local params=("$@")
+
+	_disable_fsverity_signatures
+	rm -f $test_file
+	head -c 4096 /dev/zero > $test_file
+	_fsv_enable $test_file "${params[@]}" &>> $seqres.full
+	local status=$?
+	_restore_prev_fsverity_signatures
+	rm -f $test_file
+	return $status
+}
+
+#
+# _fsv_scratch_corrupt_bytes - Write some bytes to a file, bypassing the filesystem
+#
+# Write the bytes sent on stdin to the given offset in the given file, but do so
+# by writing directly to the extents on the block device, with the filesystem
+# unmounted.  This can be used to corrupt a verity file for testing purposes,
+# bypassing the restrictions imposed by the filesystem.
+#
+# The file is assumed to be located on $SCRATCH_DEV.
+#
+_fsv_scratch_corrupt_bytes()
+{
+	local file=$1
+	local offset=$2
+	local lstart lend pstart pend
+	local dd_cmds=()
+	local cmd
+
+	_scratch_sync	# Sync to avoid unwritten extents
+
+	cat > $tmp.bytes
+	local end=$(( offset + $(_get_filesize $tmp.bytes ) ))
+
+	# For each extent that intersects the requested range in order, add a
+	# command that writes the next part of the data to that extent.
+	while read -r lstart lend pstart pend; do
+		lstart=$((lstart * 512))
+		lend=$(((lend + 1) * 512))
+		pstart=$((pstart * 512))
+		pend=$(((pend + 1) * 512))
+
+		if (( lend - lstart != pend - pstart )); then
+			_fail "Logical and physical extent lengths differ for file '$file'"
+		elif (( offset < lstart )); then
+			_fail "Hole in file '$file' at byte $offset.  Next extent begins at byte $lstart"
+		elif (( offset < lend )); then
+			local len=$((lend - offset))
+			local seek=$((pstart + (offset - lstart)))
+			dd_cmds+=("head -c $len | dd of=$SCRATCH_DEV oflag=seek_bytes seek=$seek status=none")
+			(( offset += len ))
+		fi
+	done < <($XFS_IO_PROG -r -c "fiemap $offset $((end - offset))" "$file" \
+		 | _filter_xfs_io_fiemap)
+
+	if (( offset < end )); then
+		_fail "Extents of file '$file' ended at byte $offset, but needed until $end"
+	fi
+
+	# Execute the commands to write the data
+	_scratch_unmount
+	for cmd in "${dd_cmds[@]}"; do
+		eval "$cmd"
+	done < $tmp.bytes
+	sync	# Sync to flush the block device's pagecache
+	_scratch_mount
+}
+
+#
+# _fsv_scratch_corrupt_merkle_tree - Corrupt a file's Merkle tree
+#
+# Like _fsv_scratch_corrupt_bytes(), but this corrupts the file's fs-verity
+# Merkle tree.  The offset is given as a byte offset into the Merkle tree.
+#
+_fsv_scratch_corrupt_merkle_tree()
+{
+	local file=$1
+	local offset=$2
+
+	case $FSTYP in
+	ext4|f2fs)
+		# ext4 and f2fs store the Merkle tree after the file contents
+		# itself, starting at the next 65536-byte aligned boundary.
+		(( offset += ($(_get_filesize $file) + 65535) & ~65535 ))
+		_fsv_scratch_corrupt_bytes $file $offset
+		;;
+	btrfs)
+		local ino=$(stat -c '%i' $file)
+		_scratch_unmount
+		local byte=""
+		while read -n 1 byte; do
+			local ascii=$(printf "%d" "'$byte'")
+			# This command will find a Merkle tree item for the inode (-I $ino,37,0)
+			# in the default filesystem tree (-r 5) and corrupt one byte (-b 1) at
+			# $offset (-o $offset) with the ascii representation of the byte we read
+			# (-v $ascii)
+			$BTRFS_CORRUPT_BLOCK_PROG -r 5 -I $ino,37,0 \
+			       --value $ascii --offset $offset -b 1 $SCRATCH_DEV
+			(( offset += 1 ))
+		done
+		_scratch_mount
+		;;
+	*)
+		_fail "_fsv_scratch_corrupt_merkle_tree() unimplemented on $FSTYP"
+		;;
+	esac
+}
+
+_require_fsverity_max_file_size_limit()
+{
+	case $FSTYP in
+	btrfs|ext4|f2fs)
+		;;
+	*)
+		_notrun "$FSTYP does not store verity data past EOF; no special file size limit"
+		;;
+	esac
+}
+
+# Replace fs-verity digests, as formatted by the 'fsverity' tool, with <digest>.
+# This function can be used by tests where fs-verity digests depend on the
+# default Merkle tree block size (FSV_BLOCK_SIZE).
+_filter_fsverity_digest()
+{
+	sed -E 's/\b(sha(256|512)):[a-f0-9]{64,}\b/\1:<digest>/'
+}

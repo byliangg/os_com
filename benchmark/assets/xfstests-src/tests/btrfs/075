@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2014 Red Hat Inc. All rights reserved.
+#
+# FSQA Test No. btrfs/075
+#
+# If one subvolume was mounted with selinux context, other subvolumes
+# should be able to be mounted with the same selinux context too.
+#
+. ./common/preamble
+_begin_fstest auto quick subvol
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	$UMOUNT_PROG $subvol_mnt >/dev/null 2>&1
+}
+
+. ./common/filter
+
+_require_scratch
+
+# SELINUX_MOUNT_OPTIONS will be set in common/config if selinux is enabled
+if [ "$SELINUX_MOUNT_OPTIONS" == "" ]; then
+	_notrun "Require selinux to be enabled"
+fi
+
+echo "Silence is golden"
+
+# first mount default subvolume with selinux context set
+_scratch_mkfs >$seqres.full 2>&1
+_scratch_mount
+
+# create a new subvolume and mount it with the same selinux context
+subvol_mnt=$TEST_DIR/$seq.mnt
+mkdir -p $subvol_mnt
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/subvol >>$seqres.full 2>&1
+$MOUNT_PROG -o subvol=subvol $SELINUX_MOUNT_OPTIONS $SCRATCH_DEV $subvol_mnt
+status=$?
+
+exit

@@ -1,0 +1,36 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. btrfs/121
+#
+# Test that an invalid parent qgroup does not cause snapshot create to
+# force the FS readonly.
+#
+# This issue is fixed by the following btrfs patch:
+#  [PATCH] btrfs: handle non-fatal errors in btrfs_qgroup_inherit()
+#  http://thread.gmane.org/gmane.comp.file-systems.btrfs/54755
+#
+. ./common/preamble
+_begin_fstest auto quick snapshot qgroup
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs >/dev/null
+_scratch_mount
+_btrfs quota enable $SCRATCH_MNT
+# The qgroup '1/10' does not exist. The kernel should either gives an error
+# (newer kernel with invalid qgroup detection) or ignore it (older kernel with
+# above fix).
+# Either way, we just ignore the output completely, and we will check if the fs
+# is still RW later.
+$BTRFS_UTIL_PROG subvolume snapshot -i 1/10 $SCRATCH_MNT $SCRATCH_MNT/snap1 >> $seqres.full 2>&1
+
+touch $SCRATCH_MNT/foobar
+
+echo "Silence is golden"
+
+status=0
+exit

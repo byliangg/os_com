@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Alibaba Group.  All Rights Reserved.
+# Copyright (c) 2017 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test No. 465
+#
+# Test i_size is updated properly under dio read/write
+#
+. ./common/preamble
+_begin_fstest auto rw quick aio
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $testfile.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs nfs
+
+_require_aiodio aio-dio-append-write-read-race
+_require_test_program "feature"
+
+testfile=$TEST_DIR/$seq.$$
+min_dio_align=`$here/src/min_dio_alignment $TEST_DIR $TEST_DEV`
+page_size=`$here/src/feature -s`
+
+echo "non-aio dio test"
+align=$min_dio_align
+while [ $align -le $page_size ]; do
+	echo "$AIO_TEST -a $align -d $testfile.$align" >> $seqres.full
+	$AIO_TEST -a $align -d $testfile.$align 2>&1 | tee -a $seqres.full
+	align=$((align * 2))
+done
+
+echo "aio-dio test"
+align=$min_dio_align
+while [ $align -le $page_size ]; do
+	echo "$AIO_TEST -a $align $testfile.$align" >> $seqres.full
+	$AIO_TEST -a $align $testfile.$align 2>&1 | tee -a $seqres.full
+	align=$((align * 2))
+done
+
+# success, all done
+status=0
+exit

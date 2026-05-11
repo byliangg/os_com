@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Fujitsu.  All Rights Reserved.
+#
+# FSQA Test No. 004
+#
+# Test "dump | restore"(as opposed to a tape)
+#
+. ./common/preamble
+_begin_fstest auto dump
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_kill_fsstress
+	cd /
+	rm -f $tmp.*
+	# remove the generated data, which is much and meaningless.
+	rm -rf $restore_dir
+}
+
+# Import common functions.
+. ./common/filter
+
+dump_dir=$SCRATCH_MNT/dump_restore_dir
+restore_dir=$TEST_DIR/dump_restore_dir
+
+workout()
+{
+	echo "Run fsstress" >> $seqres.full
+	args=`_scale_fsstress_args -z -f creat=5 -f write=20 -f mkdir=5 -n 100 -p 15 -d $dump_dir`
+	echo "fsstress $args" >> $seqres.full
+	_run_fsstress $args
+
+	echo "start Dump/Restore" >> $seqres.full
+	cd $TEST_DIR
+
+	$DUMP_PROG -0 -f - $dump_dir 2>/dev/null | $RESTORE_PROG -urvf - >> $seqres.full 2>&1
+	if [ $? -ne 0 ];then
+		_fail "Dump/Restore failed"
+	fi
+
+	rm -rf restoresymtable
+}
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_test
+_require_scratch
+
+_require_command "$DUMP_PROG" dump
+_require_command "$RESTORE_PROG" restore
+
+echo "Silence is golden"
+
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >> $seqres.full 2>&1
+_scratch_mount
+rm -rf $restore_dir $TEST_DIR/restoresymtable
+
+workout
+diff -r $dump_dir $restore_dir
+
+status=0
+exit

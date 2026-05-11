@@ -1,0 +1,74 @@
+# QA groups control file, automatically generated.
+# See _begin_fstest in each test for details.
+
+001 auto prealloc quick zero fiemap
+003 auto quick
+004 auto dump
+005 auto quick metadata ioctl rw
+006 dangerous_fuzzers
+007 fuzzers
+008 fuzzers
+009 fuzzers prealloc
+010 fuzzers
+011 fuzzers
+012 fuzzers
+013 fuzzers
+014 fuzzers
+015 fuzzers punch prealloc
+016 fuzzers
+017 fuzzers
+018 fuzzers
+019 fuzzers
+020 auto quick ioctl rw defrag
+021 auto quick
+022 auto quick attr dangerous
+023 auto quick scrub
+024 auto quick encrypt dangerous
+025 auto quick fuzzers dangerous
+026 auto quick attr
+027 auto quick fsmap
+028 auto quick fsmap
+029 auto quick fsmap
+030 auto quick dax
+031 auto quick dax
+032 auto quick ioctl resize
+033 auto ioctl resize
+034 auto quick quota fiemap prealloc
+035 auto quick resize
+036 auto quick
+037 auto quick
+038 auto quick
+039 auto enospc rw
+040 dangerous_fuzzers
+041 dangerous_fuzzers
+042 auto quick
+043 auto quick
+044 auto quick
+045 auto dir
+046 auto prealloc quick
+047 auto quick dax
+048 auto quick dir
+049 auto quick
+050 auto ioctl quick
+051 auto rw quick
+052 auto quick dir
+053 auto mount
+054 auto quick dangerous_fuzzers prealloc punch
+055 auto quota
+056 auto ioctl resize quick
+057 auto ioctl
+058 auto quick
+059 auto resize quick
+060 auto resize quick
+061 auto rw stress atomicwrites
+062 auto rw stress atomicwrites
+063 auto atomicwrites
+271 auto rw quick
+301 aio auto ioctl rw stress defrag
+302 aio auto ioctl rw stress defrag
+303 aio auto ioctl rw stress defrag
+304 aio auto ioctl rw stress defrag
+305 auto
+306 auto rw resize quick
+307 auto ioctl rw defrag prealloc
+308 auto ioctl rw prealloc quick defrag fiemap

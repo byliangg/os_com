@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 238
+#
+# Check stale handles pointing to unlinked files are detected correctly
+#
+. ./common/preamble
+_begin_fstest auto quick metadata ioctl
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+
+echo "Silence is golden"
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount > /dev/null 2>&1
+$here/src/stale_handle $SCRATCH_MNT
+status=$?
+exit

@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 161
+#
+# Test for race between delete a file while rewriting its reflinked twin
+#
+. ./common/preamble
+_begin_fstest auto quick clone
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.*
+    wait
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+loops=4096
+blksz=65536
+
+echo "Initialize files"
+echo >> $seqres.full
+_pwrite_byte 0x61 0 $((loops * blksz)) $testdir/file1 >> $seqres.full
+_cp_reflink $testdir/file1 $testdir/file2
+_scratch_cycle_mount
+
+echo "Delete while rewriting"
+rm -rf $testdir/file1 &
+_pwrite_byte 0x62 0 $((loops * blksz)) $testdir/file1 >> $seqres.full
+wait
+
+# success, all done
+status=0
+exit

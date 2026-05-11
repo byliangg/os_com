@@ -1,0 +1,63 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. 042
+#
+# Test the basic functionality of Quota groups
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup limit
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+
+run_check _scratch_mkfs
+_scratch_mount
+
+LIMIT_SIZE=$((10 * 1024 * 1024))
+
+_btrfs quota enable $SCRATCH_MNT
+_btrfs qgroup create 1/1 $SCRATCH_MNT
+_btrfs qgroup limit $LIMIT_SIZE 1/1 $SCRATCH_MNT
+
+for i in `seq 10 -1 1`; do
+	#add newly created subvolume qgroup to it's parent qgroup
+	_btrfs subvolume create -i 1/1 \
+		$SCRATCH_MNT/subv_$i
+done
+
+#try to write data into every subvolume
+for i in `seq 10 -1 1`; do
+	$XFS_IO_PROG -f -d -c 'pwrite -b 4k 0 10m' $SCRATCH_MNT/subv_$i/data \
+		>> /dev/null 2>&1 &
+done
+
+wait
+_btrfs filesystem sync $SCRATCH_MNT \
+	>>$seqres.full 2>&1
+
+total_written=0
+#calculate every subvolume's data.
+for i in `seq 10 -1 1`; do
+	#we may fail to create the file, skip this subvolume
+	test -f $SCRATCH_MNT/subv_$i || continue
+
+	filesize=`du -b $SCRATCH_MNT/subv_$i/data | $AWK_PROG '{print $1}'`
+	if [ $filesize -gt $LIMIT_SIZE ];then
+		_fail "subv_$i/data size should be less than $LIMIT_SIZE"
+	fi
+	total_written=$(($total_written+$filesize))
+done
+
+#check if total written exceeds limit
+if [ $total_written -gt $LIMIT_SIZE ];then
+	_fail "total written should be less than $LIMIT_SIZE"
+fi
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

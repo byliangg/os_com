@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 188
+#
+# drive the src/nametest program for CI mode
+# which does a heap of open(create)/unlink/stat
+# and checks that error codes make sense with its
+# memory of the files created.
+#
+# All filenames generated map to the same hash
+# value in XFS stressing leaf block traversal in
+# node form directories as well.
+#
+. ./common/preamble
+_begin_fstest ci dir auto
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    rm -rf $SCRATCH_MNT/$seq
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_mkfs_ciname
+_require_xfs_ciname
+
+_scratch_mkfs -n version=ci >/dev/null 2>&1
+_scratch_mount
+
+sourcefile=$tmp.ci_nametest
+seed=1
+
+# need to create an input file with a list of filenames on each line
+# do number of files for testing to try each directory format
+
+# start with small number of files and increase by 4x for each run
+max_files=6144
+num_files=6
+
+mkdir $SCRATCH_MNT/$seq
+while [ $num_files -le $max_files ]; do
+  iterations=`expr $num_files \* 10`
+  $here/src/genhashnames $SCRATCH_MNT/$seq/$num_files $num_files $seed >>$sourcefile
+  mkdir $SCRATCH_MNT/$seq/$num_files
+  $here/src/nametest -l $sourcefile -s $seed -i $iterations -z -c
+  num_files=`expr $num_files \* 4`
+done
+
+# success, all done
+status=0
+exit

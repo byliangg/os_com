@@ -35,6 +35,7 @@ controlled.workspace = true
 core2.workspace = true
 cpio-decoder.workspace = true
 device-id.workspace = true
+ext4_rs.workspace = true
 getset.workspace = true
 hashbrown.workspace = true
 id-alloc.workspace = true

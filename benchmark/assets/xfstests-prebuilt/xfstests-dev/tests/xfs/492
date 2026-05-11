@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 492
+#
+# Test detection & fixing of bad summary inode counts at mount time.
+#
+. ./common/preamble
+_begin_fstest auto quick fuzzers
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+
+# pre-lazysbcount filesystems blindly trust the primary sb fdblocks
+_require_scratch_xfs_features LAZYSBCOUNT
+
+_scratch_mount >> $seqres.full 2>&1
+echo "test file" > $SCRATCH_MNT/testfile
+
+echo "Fuzz ifree"
+_scratch_unmount
+icount=$(_scratch_xfs_get_metadata_field icount 'sb 0')
+_scratch_xfs_set_metadata_field ifree $((icount * 2)) 'sb 0' > $seqres.full 2>&1
+
+echo "Detection and Correction"
+_scratch_mount >> $seqres.full 2>&1
+avail=$(stat -c '%d' -f $SCRATCH_MNT)
+total=$(stat -c '%c' -f $SCRATCH_MNT)
+echo "avail: $avail" >> $seqres.full
+echo "total: $total" >> $seqres.full
+test "$avail" -gt "$total" && echo "free inodes bad: $avail > $total"
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 036
+#
+# Test xfsdump/restore minrmt to a remote IRIX tape 
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest dump ioctl remote tape
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+
+_require_tape $RMT_IRIXTAPE_DEV
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_fill
+_erase_soft
+_do_dump_min -o -F
+_do_restore_min
+_diff_compare
+
+# success, all done
+status=0
+exit

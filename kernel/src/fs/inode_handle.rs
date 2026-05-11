@@ -331,7 +331,12 @@ impl FileLike for InodeHandle {
             return file_io.ioctl(raw_ioctl);
         }
 
-        return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported");
+        // Step 4b: fall back to the inode-level ioctl handler so filesystems
+        // (notably ext4) can serve FS-specific ioctls such as
+        // `EXT4_IOC_SHUTDOWN` opened via `open(mountpoint, O_RDONLY)`.
+        // The default `Inode::ioctl` still returns `ENOTTY`, preserving
+        // existing behavior for filesystems that do not override it.
+        self.path.inode().ioctl(raw_ioctl)
     }
 
     fn mappable(&self) -> Result<Mappable> {
@@ -402,9 +407,7 @@ impl FileLike for InodeHandle {
         if let Some(ref file_io) = self.file_io {
             file_io.check_seekable()?;
             if file_io.is_offset_aware() {
-                // TODO: Figure out whether we need to add support for seeking from the end of
-                // special files.
-                return do_seek_util(&self.offset, pos, None);
+                return do_seek_util(&self.offset, pos, file_io.seek_end());
             } else {
                 return Ok(0);
             }
@@ -522,6 +525,13 @@ pub trait FileIo: Pollable + InodeIo + Any + Send + Sync + 'static {
     /// the offset in the `seek()` operation will be ignored.
     /// In that case, the `seek()` operation will do nothing but succeed.
     fn is_offset_aware(&self) -> bool;
+
+    /// Returns the end position for [`SeekFrom::End`] on special files.
+    ///
+    /// Implementors should return `None` when seeking from end is unsupported.
+    fn seek_end(&self) -> Option<usize> {
+        None
+    }
 
     // See `FileLike::mappable`.
     fn mappable(&self) -> Result<Mappable> {

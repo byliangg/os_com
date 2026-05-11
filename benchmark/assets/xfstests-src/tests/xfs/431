@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Facebook, Inc.  All Rights Reserved.
+#
+# FS QA Test 431
+#
+# Verify kernel doesn't panic when user attempts to set realtime flags
+# on non-realtime FS, using kernel compiled with CONFIG_XFS_RT.  Unpatched
+# kernels will panic during this test.  Kernels not compiled with
+# CONFIG_XFS_RT should pass test.
+#
+# See CVE-2017-14340 for more information.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_xfs_io_command "chattr" "t"
+_require_xfs_io_command "fsync"
+_require_xfs_io_command "pwrite"
+_require_scratch
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+# Set realtime inherit flag on scratch mount, suppress output
+# as this may simply error out on future kernels
+_xfs_force_bdev realtime $SCRATCH_MNT &> /dev/null
+
+# Check if 't' is actually set, as xfs_io returns 0 even when it fails to set
+# an attribute. And erroring out here is fine, this would be desired behavior
+# for FSes without realtime devices present.
+if $XFS_IO_PROG -c 'lsattr' $SCRATCH_MNT | grep -q 't'; then
+	# Attempt to write/fsync data to file
+	$XFS_IO_PROG -fc 'pwrite 0 1m' -c fsync $SCRATCH_MNT/testfile |
+		tee -a $seqres.full | _filter_xfs_io
+
+	# Remove the testfile and rt inherit flag after we are done or
+	# xfs_repair will fail.
+	rm -f $SCRATCH_MNT/testfile
+	_xfs_force_bdev data $SCRATCH_MNT | tee -a $seqres.full 2>&1
+fi
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,232 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Huawei.  All Rights Reserved.
+#
+# FS QA Test No. 046
+#
+# Test fsck.overlay how to deal with redirect xattr in overlayfs.
+#
+. ./common/preamble
+_begin_fstest auto quick fsck
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch_nocheck
+_require_attrs trusted
+_require_command "$FSCK_OVERLAY_PROG" fsck.overlay
+
+# remove all files from previous tests
+_scratch_mkfs
+
+OVL_XATTR_OPAQUE_VAL=y
+OVL_XATTR_IMPURE_VAL=y
+
+# Create impure directories
+make_impure_dir()
+{
+	for dir in $*; do
+		mkdir -p $dir
+		$SETFATTR_PROG -n $OVL_XATTR_IMPURE -v $OVL_XATTR_IMPURE_VAL $dir
+	done
+}
+
+# Create a redirect directory
+make_redirect_dir()
+{
+	local target=$1
+	local value=$2
+
+	mkdir -p $target
+	$SETFATTR_PROG -n $OVL_XATTR_REDIRECT -v $value $target
+}
+
+# Check redirect xattr
+check_redirect()
+{
+	local target=$1
+	local expect=$2
+
+	value=$(_getfattr --absolute-names --only-values -n \
+		$OVL_XATTR_REDIRECT $target)
+
+	[[ "$value" == "$expect" ]] || echo "Redirect xattr incorrect"
+}
+
+check_no_redirect()
+{
+	local target=$1
+
+	value=$(_getfattr --absolute-names -d -m \
+		$OVL_XATTR_REDIRECT $target)
+
+	[[ -z "$value" ]] || echo "Redirect xattr not empty"
+}
+
+# Check opaque xattr
+check_opaque()
+{
+	local target=$1
+
+	value=$(_getfattr --absolute-names --only-values -n \
+		$OVL_XATTR_OPAQUE $target)
+
+	[[ "$value" == "$OVL_XATTR_OPAQUE_VAL" ]] || \
+		echo "Opaque xattr incorrect"
+}
+
+# Create a whiteout
+make_whiteout()
+{
+	for arg in $*; do
+		mknod $arg c 0 0
+	done
+}
+
+# Check whiteout
+check_whiteout()
+{
+	for arg in $*; do
+		local ttype=`stat -c "%F:%t,%T" $arg`
+
+		[[ "$ttype" == "character special file:0,0" ]] || \
+			echo "Valid whiteout removed incorrectly"
+	done
+}
+
+# Create test directories
+lowerdir=$OVL_BASE_SCRATCH_MNT/lower
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+
+make_test_dirs()
+{
+	rm -rf $lowerdir $lowerdir2 $upperdir $workdir
+	mkdir -p $lowerdir $lowerdir2 $upperdir $workdir
+}
+
+# Test invalid redirect xattr point to a nonexistent origin, should remove
+echo "+ Invalid redirect"
+make_test_dirs
+make_redirect_dir $upperdir/testdir "invalid"
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_no_redirect $upperdir/testdir
+
+# Test invalid redirect xattr point to a file origin, should remove
+echo "+ Invalid redirect(2)"
+make_test_dirs
+touch $lowerdir/origin
+make_redirect_dir $upperdir/testdir "origin"
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_no_redirect $upperdir/testdir
+
+# Test valid redirect xattr point to a directory origin in the same directory,
+# should not remove
+echo "+ Valid redirect"
+make_test_dirs
+mkdir $lowerdir/origin
+make_whiteout $upperdir/origin
+make_redirect_dir $upperdir/testdir "origin"
+make_impure_dir $upperdir
+
+_overlay_fsck_expect $FSCK_OK $lowerdir $upperdir $workdir -p
+check_redirect $upperdir/testdir "origin"
+
+# Test valid redirect xattr point to a directory origin in different directories
+# should not remove
+echo "+ Valid redirect(2)"
+make_test_dirs
+mkdir $lowerdir/origin
+make_whiteout $upperdir/origin
+make_redirect_dir $upperdir/testdir1/testdir2 "/origin"
+make_impure_dir $upperdir/testdir1
+
+_overlay_fsck_expect $FSCK_OK $lowerdir $upperdir $workdir -p
+check_redirect $upperdir/testdir1/testdir2 "/origin"
+
+# Test valid redirect xattr but missing whiteout to cover lower target,
+# should fix whiteout
+echo "+ Missing whiteout"
+make_test_dirs
+mkdir $lowerdir/origin
+make_redirect_dir $upperdir/testdir "origin"
+
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -p
+check_redirect $upperdir/testdir "origin"
+check_whiteout $upperdir/origin
+
+# Test valid redirect xattrs exchanged by rename, should not remove
+echo "+ Valid redirect(3)"
+make_test_dirs
+mkdir $lowerdir/{testdir1,testdir2}
+make_redirect_dir $upperdir/testdir1 "testdir2"
+make_redirect_dir $upperdir/testdir2 "testdir1"
+make_impure_dir $upperdir
+
+_overlay_fsck_expect $FSCK_OK $lowerdir $upperdir $workdir -p
+check_redirect $upperdir/testdir1 "testdir2"
+check_redirect $upperdir/testdir2 "testdir1"
+
+# Test invalid redirect xattr with lower same name directory exists,
+# should remove invalid redirect xattr and set opaque in yes mode
+echo "+ Invalid redirect(3)"
+make_test_dirs
+mkdir $lowerdir/testdir
+make_redirect_dir $upperdir/testdir "invalid"
+
+# Question get yes answer: Should set opaque dir ?
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -y
+check_no_redirect $upperdir/testdir
+check_opaque $upperdir/testdir
+
+# Test duplicate redirect xattrs point to one origin, should fail in
+# auto mode, and should remove either of the duplicates in yes mode
+echo "+ Duplicate redirect"
+make_test_dirs
+mkdir $lowerdir2/origin
+make_redirect_dir $lowerdir/testdir1 "origin"
+make_redirect_dir $lowerdir/testdir2 "origin"
+make_redirect_dir $upperdir/testdir3 "origin"
+
+_overlay_fsck_expect $FSCK_UNCORRECTED "$lowerdir:$lowerdir2" $upperdir $workdir -p
+
+# Question get yes answer: Duplicate redirect directory, remove xattr ?
+_overlay_fsck_expect $FSCK_NONDESTRUCT "$lowerdir:$lowerdir2" $upperdir $workdir -y
+redirect_1=`check_redirect $lowerdir/testdir1 "origin" 2>/dev/null`
+redirect_2=`check_redirect $lowerdir/testdir2 "origin" 2>/dev/null`
+[[ $redirect_1 == $redirect_2 ]] && echo "Redirect xattr incorrect"
+check_no_redirect $upperdir/testdir3
+
+# Test duplicate redirect xattr duplicate with merge directory, should
+# fail in auto mode, and should remove the redirect xattr in yes mode
+echo "+ Duplicate redirect(2)"
+make_test_dirs
+mkdir $lowerdir/origin $upperdir/origin
+make_redirect_dir $upperdir/testdir "origin"
+
+_overlay_fsck_expect $FSCK_UNCORRECTED $lowerdir $upperdir $workdir -p
+
+# Question get yes answer: Duplicate redirect directory, remove xattr ?
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -y
+check_no_redirect $upperdir/testdir
+
+# Test duplicate redirect xattr with lower same name directory exists,
+# should remove the duplicate redirect xattr and set opaque in yes mode
+echo "+ Duplicate redirect(3)"
+make_test_dirs
+mkdir $lowerdir/{origin,testdir} $upperdir/origin
+make_redirect_dir $upperdir/testdir "invalid"
+
+# Question one get yes answer: Duplicate redirect directory, remove xattr?
+# Question two get yes answer: Should set opaque dir ?
+_overlay_fsck_expect $FSCK_NONDESTRUCT $lowerdir $upperdir $workdir -y
+check_no_redirect $upperdir/testdir
+check_opaque $upperdir/testdir
+
+# success, all done
+status=0
+exit

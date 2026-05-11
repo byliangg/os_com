@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2019 Oracle.  All Rights Reserved.
+#
+# FS QA Test 197
+#
+# Test stale and alien btrfs-device in the fs devices list.
+#  Bug fixed in the kernel patch:
+#   btrfs: include non-missing as a qualifier for the latest_bdev
+#   btrfs: remove identified alien btrfs device in open_fs_devices
+#
+. ./common/preamble
+_begin_fstest auto quick volume raid
+
+# Override the default cleanup function.
+_cleanup()
+{
+	$UMOUNT_PROG $TEST_DIR/$seq.mnt >/dev/null 2>&1
+	rm -rf $TEST_DIR/$seq.mnt
+	cd /
+	rm -f $tmp.*
+}
+
+. ./common/filter.btrfs
+
+_require_test
+_require_scratch
+_require_scratch_dev_pool 5
+# We require at least one raid setup, raid1 is the easiest, use this to gate on
+# wether or not we run this test
+_require_btrfs_raid_type raid1
+
+workout()
+{
+	raid=$1
+	device_nr=$2
+
+	if ! _check_btrfs_raid_type $raid; then
+		echo "$raid isn't supported, skipping" >> $seqres.full
+		return
+	fi
+
+	echo $raid >> $seqres.full
+	_scratch_dev_pool_get $device_nr
+	_spare_dev_get
+
+	_mkfs_dev $SPARE_DEV
+	mkdir -p $TEST_DIR/$seq.mnt
+	_mount $SPARE_DEV $TEST_DIR/$seq.mnt
+
+	_scratch_pool_mkfs "-d$raid -m$raid" >> $seqres.full 2>&1 || \
+							_fail "mkfs failed"
+
+	# Make device # 2 an alien btrfs device for the raid created above by
+	# adding it to the $TEST_DIR/$seq.mnt
+
+	# don't test with the first device as auto fs check (_check_scratch_fs)
+	# picks the first device
+	$BTRFS_UTIL_PROG device add -f "${SCRATCH_DEV_NAME[1]}" "$TEST_DIR/$seq.mnt" >> \
+		$seqres.full
+
+	_mount -o degraded ${SCRATCH_DEV_NAME[0]} $SCRATCH_MNT
+	# Check if missing device is reported as in the .out
+	$BTRFS_UTIL_PROG filesystem show -m $SCRATCH_MNT | \
+		_filter_btrfs_filesystem_show > $tmp.output 2>&1
+	cat $tmp.output >> $seqres.full
+	grep -q "${SCRATCH_DEV_NAME[1]}" $tmp.output && _fail "found stale device"
+
+	$BTRFS_UTIL_PROG device remove "${SCRATCH_DEV_NAME[1]}" "$TEST_DIR/$seq.mnt"
+	$UMOUNT_PROG $TEST_DIR/$seq.mnt
+	_scratch_unmount
+	_spare_dev_put
+	_scratch_dev_pool_put
+}
+
+workout "raid1" "2"
+workout "raid5" "3"
+workout "raid6" "4"
+workout "raid10" "4"
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

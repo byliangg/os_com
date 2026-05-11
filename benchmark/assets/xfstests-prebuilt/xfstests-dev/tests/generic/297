@@ -1,0 +1,74 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 297
+#
+# See how well reflink handles ^C in the middle of a slow reflink.
+#
+. ./common/preamble
+_begin_fstest auto clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -rf $tmp.* $TEST_DIR/before $TEST_DIR/after
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_command "$TIMEOUT_PROG" "timeout"
+
+test $FSTYP == "nfs"  && _notrun "NFS can't interrupt clone operations"
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create a one block file"
+blksz="$(_get_block_size $testdir)"
+_pwrite_byte 0x61 0 $blksz $testdir/file1 >> $seqres.full
+
+fnr=26		# 2^26 reflink extents should be enough to find a slow op?
+timeout=8	# guarantee a good long run...
+echo "Find a reflink size that takes a long time"
+for i in $(seq 0 $fnr); do
+	echo " ++ Reflink size $i, $((2 ** i)) blocks" >> $seqres.full
+	n=$(( (2 ** i) * blksz))
+	touch $TEST_DIR/before
+	$XFS_IO_PROG -f -c "reflink $testdir/file1 0 $n $n" $testdir/file1 >> $seqres.full 2>&1
+	touch $TEST_DIR/after
+	before=$(stat -c '%Y' $TEST_DIR/before)
+	after=$(stat -c '%Y' $TEST_DIR/after)
+	delta=$((after - before))
+	test $delta -gt $timeout && break
+done
+
+echo "Try to kill reflink after a shorter period of time"
+kill_after=2	# give us a shorter time to die
+n=$(_get_filesize $testdir/file1)
+echo "performing kill test on $n bytes..." >> $seqres.full
+touch $TEST_DIR/before
+$TIMEOUT_PROG -s INT ${kill_after}s $XFS_IO_PROG -f -c "reflink $testdir/file1 0 $n $n" $testdir/file1 >> $seqres.full 2>&1
+touch $TEST_DIR/after
+before=$(stat -c '%Y' $TEST_DIR/before)
+after=$(stat -c '%Y' $TEST_DIR/after)
+delta=$((after - before))
+echo "reflink of $n bytes took $delta seconds" >> $seqres.full
+test $delta -gt $timeout && _fail "reflink didn't stop in time, n=$n t=$delta"
+
+echo "Check scratch fs"
+sleep 2		# give it a few seconds to actually die...
+
+# success, all done
+status=0
+exit

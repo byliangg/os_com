@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test 618
+#
+# Verify that forkoff can be returned as 0 properly if it isn't
+# able to fit inline for XFS.
+# However, this test is fs-neutral and can be done quickly so
+# leave it in generic
+# This test verifies the problem fixed in kernel with commit
+# ada49d64fb35 ("xfs: fix forkoff miscalculation related to XFS_LITINO(mp)")
+
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+_require_scratch
+_require_attrs user
+
+if [ $FSTYP = "xfs" ]; then
+	# avoid crashing the system if possible
+	_require_no_xfs_bug_on_assert
+
+	# Use fixed inode size 512, so both v4 and v5 can be tested,
+	# and also make sure the issue can be triggered if the default
+	# inode size is changed later.
+	MKFS_OPTIONS="$MKFS_OPTIONS -i size=512"
+fi
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+localfile="${SCRATCH_MNT}/testfile"
+touch $localfile
+
+# value cannot exceed XFS_ATTR_SF_ENTSIZE_MAX (256) or it will turn into leaf
+# form directly; the following combination can trigger the issue for both v4
+# (XFS_LITINO = 412) & v5 (XFS_LITINO = 336) fses, in details the 2nd setattr
+# causes an integer underflow that is incorrectly typecast, leading to the
+# assert triggering.
+"${SETFATTR_PROG}" -n user.0 -v "`seq 0 80`" "${localfile}"
+"${SETFATTR_PROG}" -n user.1 -v "`seq 0 80`" "${localfile}"
+
+# Make sure that changes are written to disk
+_scratch_cycle_mount
+
+# getfattr won't succeed with the expected result if fails
+_getfattr --absolute-names -ebase64 -d $localfile | tail -n +2 | sort
+
+_scratch_unmount
+status=0
+exit

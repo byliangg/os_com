@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 069
+#
+# Test out writes with O_APPEND flag sets.
+#
+. ./common/preamble
+_begin_fstest rw udf auto quick
+
+status=0	# success is the default!
+_register_cleanup "rm -rf $tmp.*"
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+
+_scratch_unmount >/dev/null 2>&1
+
+echo "*** mkfs"
+_scratch_mkfs >/dev/null 2>&1 || _fail "mkfs failed"
+
+echo "*** mount FS"
+_scratch_mount
+
+cd $SCRATCH_MNT
+
+sizes="1 20 300 40000 3000000 12345"
+for size in $sizes ; do
+	$here/src/append_writer $size &
+	echo $! $size >> pids
+done
+
+cd $here
+
+wait
+ls -lh $SCRATCH_MNT >> $seqres.full
+echo "*** PIDs file" >> $seqres.full
+cat $SCRATCH_MNT/pids >> $seqres.full
+
+cat $SCRATCH_MNT/pids | while read pid size
+do
+	echo "*** checking file with $size integers"
+	echo checking pid=$pid size=$size >> $seqres.full
+	$here/src/append_reader $SCRATCH_MNT/testfile.$pid
+	status=$?
+	[ $status -ne 0 ] && \
+		echo "maybe corrupt O_APPEND to $SCRATCH_MOUNT/testfile.$pid!"
+	echo status: $status >> $seqres.full
+done
+
+# success, all done
+exit

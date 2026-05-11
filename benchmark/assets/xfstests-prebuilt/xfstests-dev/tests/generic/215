@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2009 Christoph Hellwig.
+#
+# FS QA Test No. 215
+#
+# Test out c/mtime updates after mapped writes.
+#
+# Based on the testcase in http://bugzilla.kernel.org/show_bug.cgi?id=2645
+#
+. ./common/preamble
+_begin_fstest auto metadata quick mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+testfile=$TEST_DIR/tst.mmap
+
+echo
+echo "creating test file"
+dd if=/dev/zero of=$testfile count=4096
+
+mtime1=`stat -c "%Y" $testfile`
+ctime1=`stat -c "%Z" $testfile`
+
+sleep 2
+
+echo
+echo "writing via mmap"
+$XFS_IO_PROG -f 		\
+	-c 'mmap 0 4096'	\
+	-c 'mwrite 0 4096'	\
+	$testfile | _filter_xfs_io_unique
+
+mtime2=`stat -c "%Y" $testfile`
+ctime2=`stat -c "%Z" $testfile`
+
+let mtime_diff=$mtime2-$mtime1
+let ctime_diff=$ctime2-$ctime1
+
+if [ "$mtime_diff" -eq "0" ]; then
+   echo "FAIL: mtime not update after mapped write"
+fi
+
+if [ "$ctime_diff" -eq "0" ]; then
+   echo "FAIL: ctime not update after mapped write"
+fi
+
+# success, all done
+echo "*** done"
+status=0

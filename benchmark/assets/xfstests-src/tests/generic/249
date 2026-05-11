@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 249
+#
+# simple splice(2) test.
+#
+. ./common/preamble
+_begin_fstest auto quick rw
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	rm -f $SRC $DST
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+echo "Feel the serenity."
+
+SRC=$TEST_DIR/$seq.src
+DST=$TEST_DIR/$seq.dst
+
+$XFS_IO_PROG -f -c "pwrite -S 0xa5a55a5a 0 32768k" -c fsync $SRC >> $seqres.full 2>&1
+[ $? -ne 0 ] && _fail "xfs_io pwrite failed"
+$XFS_IO_PROG -f -c "sendfile -i $SRC 0 32768k" -c fsync $DST >> $seqres.full 2>&1
+[ $? -ne 0 ] && _fail "xfs_io sendfile failed"
+
+diff -q $SRC $DST
+status=$?
+[ $status -ne 0 ] && _fail "$SRC and $DST differ"
+
+exit

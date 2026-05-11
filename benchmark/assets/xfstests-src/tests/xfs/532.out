@@ -1,0 +1,18 @@
+QA output created by 532
+Format and mount fs
+Consume free space
+Create fragmented filesystem
+Inject bmap_alloc_minlen_extent error tag
+* Set xattrs
+Create $testfile
+Inject reduce_max_iextents error tag
+Create xattrs
+Verify $testfile's naextent count
+Disable reduce_max_iextents error tag
+Remove $testfile
+* Remove xattrs
+Create $testfile
+Create initial xattr extents
+Inject reduce_max_iextents error tag
+Remove xattr to trigger -EFBIG
+Disable reduce_max_iextents error tag

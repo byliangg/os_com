@@ -1,0 +1,134 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Jan Kara.  All Rights Reserved.
+# Copyright (c) 2005 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 230
+#
+# Simple quota enforcement test.
+#
+. ./common/preamble
+_begin_fstest auto quota quick
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+_require_scratch
+_require_quota
+_require_user
+
+test_files()
+{
+	echo; echo "### create files, setting up ownership (type=$type)"
+	touch $SCRATCH_MNT/file{1,2} 2>/dev/null
+	chown $qa_user $SCRATCH_MNT/file{1,2} 2>/dev/null
+	chgrp $qa_user $SCRATCH_MNT/file{1,2} 2>/dev/null
+	chmod 777 $SCRATCH_MNT 2>/dev/null
+}
+
+test_enforcement()
+{
+	echo "### some buffered IO (type=$type)"
+	echo "--- initiating IO..." >>$seqres.full
+	# Firstly fit below block soft limit
+	echo "Write 225 blocks..."
+	_su $qa_user -c "$XFS_IO_PROG -c 'pwrite 0 $((225 * $BLOCK_SIZE))' -c fsync \
+		$SCRATCH_MNT/file1" 2>&1 >>$seqres.full | \
+		_filter_xfs_io_error | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# Secondly overcome block soft limit
+	echo "Rewrite 250 blocks plus 1 byte..."
+	_su $qa_user -c "$XFS_IO_PROG -c 'pwrite 0 $((250 * $BLOCK_SIZE + 1))' -c fsync \
+		$SCRATCH_MNT/file1" 2>&1 >>$seqres.full | \
+		_filter_xfs_io_error | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# Now try to overcome block hardlimit
+	# Reset grace time here due to the repquota will invoke Q_SYNC on
+	# old quota which may be time consuming on the low speed or busy
+	# scratch device that may leed to grace time exceed.
+	setquota -$type $qa_user -T $grace $grace $SCRATCH_MNT 2>/dev/null
+	echo "Write 250 blocks..."
+	_su $qa_user -c "$XFS_IO_PROG -c 'pwrite 0 $((250 * $BLOCK_SIZE))' -c fsync \
+		$SCRATCH_MNT/file2" 2>&1 >>$seqres.full | \
+		_filter_xfs_io_error | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# Now sleep for grace time and check that softlimit got enforced
+	sleep $((grace+1))
+	echo "Write 1 block..."
+	_su $qa_user -c "$XFS_IO_PROG -c 'truncate 0' -c 'pwrite 0 $BLOCK_SIZE' \
+		$SCRATCH_MNT/file2" 2>&1 >>$seqres.full | \
+		_filter_xfs_io_error | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# And now the softlimit test for inodes
+	# First reset space limits so that we don't have problems with
+	# space reservations on XFS
+	setquota -$type $qa_user 0 0 3 5 $SCRATCH_MNT
+	echo "Touch 3+4"
+	_su $qa_user -c "touch $SCRATCH_MNT/file3 $SCRATCH_MNT/file4" \
+		2>&1 >>$seqres.full | _filter_scratch | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# Try to exceed inode hardlimit
+	# Reset grace time here due to the repquota will invoke Q_SYNC on
+	# old quota which may be time consuming on the low speed or busy
+	# scratch device that may leed to grace time exceed.
+	setquota -$type $qa_user -T $grace $grace $SCRATCH_MNT 2>/dev/null
+	echo "Touch 5+6"
+	_su $qa_user -c "touch $SCRATCH_MNT/file5 $SCRATCH_MNT/file6" \
+		2>&1 >>$seqres.full | _filter_scratch | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	# Wait and check grace time enforcement
+	rm -f $SCRATCH_MNT/file5 >>$seqres.full 2>&1
+	sleep $((grace+1))
+	echo "Touch 5"
+	_su $qa_user -c "touch $SCRATCH_MNT/file5" 2>&1 >>$seqres.full |
+		_filter_scratch | tee -a $seqres.full
+	repquota -$type $SCRATCH_MNT  | grep -v "^root" >>$seqres.full 2>&1
+	echo "--- completed IO ($type)" >>$seqres.full
+}
+
+cleanup_files()
+{
+	rm -f $SCRATCH_MNT/file{1,2,3,4,5,6}
+}
+
+
+grace=2
+
+# Test only the quota type specified in each _scratch_mount clause below.
+_qmount_option 'defaults'
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount "-o usrquota,grpquota"
+_force_vfs_quota_testing $SCRATCH_MNT
+BLOCK_SIZE=$(_get_file_block_size $SCRATCH_MNT)
+quotacheck -u -g $SCRATCH_MNT 2>/dev/null
+quotaon $SCRATCH_MNT 2>/dev/null
+setquota -u $qa_user $((250 * $BLOCK_SIZE / 1024)) \
+	 $((500 * $BLOCK_SIZE / 1024)) 3 5 $SCRATCH_MNT
+setquota -u -t $grace $grace $SCRATCH_MNT
+setquota -g $qa_user $((250 * $BLOCK_SIZE / 1024)) \
+	 $((500 * $BLOCK_SIZE / 1024)) 3 5 $SCRATCH_MNT
+setquota -g -t $grace $grace $SCRATCH_MNT
+_scratch_unmount
+
+echo; echo "### test user limit enforcement"
+_scratch_mount "-o usrquota"
+quotaon $SCRATCH_MNT 2>/dev/null
+type=u
+test_files
+test_enforcement
+cleanup_files
+_scratch_unmount 2>/dev/null
+
+echo; echo "### test group limit enforcement"
+_scratch_mount "-o grpquota"
+quotaon $SCRATCH_MNT 2>/dev/null
+type=g
+test_files
+test_enforcement
+cleanup_files
+_scratch_unmount 2>/dev/null
+
+status=0
+exit

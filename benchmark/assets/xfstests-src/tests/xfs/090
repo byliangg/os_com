@@ -1,0 +1,101 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 090
+#
+# Exercise IO on the realtime device (direct, buffered, mmapd)
+#
+. ./common/preamble
+_begin_fstest rw auto realtime mmap
+
+# Import common functions.
+. ./common/filter
+
+_require_realtime
+_require_scratch
+
+_filter_io()
+{
+	sed -e '/.* ops; /d'
+}
+
+_create_scratch()
+{
+	echo "*** mkfs"
+	if ! _try_scratch_mkfs_xfs >$tmp.out 2>&1
+	then
+		cat $tmp.out
+		echo "failed to mkfs $SCRATCH_DEV"
+		exit 1
+	fi
+
+	echo "*** mount"
+	if ! _try_scratch_mount
+	then
+		echo "failed to mount $SCRATCH_DEV"
+		exit 1
+	fi
+}
+
+realtime_direct_aligned()
+{
+	echo direct realtime writes, 4 files, 2m each, increasing offsets.
+	for i in 0 1 2 3
+	do
+		$XFS_IO_PROG -fdxR $SCRATCH_MNT/rt-direct-$1-$i \
+			-c "extsize $1" -c "pwrite ${i}m 1m" \
+			| _filter_io
+	done
+	_check_scratch_fs
+}
+
+realtime_buffer_aligned()
+{
+	echo buffered realtime writes, 4 files, 2m each, increasing offsets.
+	for i in 0 1 2 3
+	do
+		$XFS_IO_PROG -fxR $SCRATCH_MNT/rt-buffera-$1-$i \
+			-c "extsize $1" -c "pwrite ${i}m 1m" \
+			| _filter_io
+	done
+	_check_scratch_fs
+}
+
+realtime_buffer_unaligned()
+{
+	echo buffered realtime writes, 4 files, unaligned byte offsets/sizes.
+	for i in 0 1 2 3
+	do
+		$XFS_IO_PROG -fxR $SCRATCH_MNT/rt-bufferu-$1-$i \
+			-c "extsize $1" -c "pwrite $i 1" \
+			| _filter_io
+	done
+	_check_scratch_fs
+}
+
+realtime_mmap_unaligned()
+{
+	# mmap realtime writes, 4 files, unaligned byte offsets/sizes.
+	for i in 0 1 2 3
+	do
+		$XFS_IO_PROG -fxR $SCRATCH_MNT/rt-mmap-$1-$i \
+			-c "extsize $1" -c "pwrite $i 1" \
+			| _filter_io
+	done
+	_check_scratch_fs
+}
+
+_create_scratch
+
+realtime_direct_aligned 0
+#realtime_direct_aligned 1m
+realtime_buffer_aligned 0
+#realtime_buffer_aligned 1m
+realtime_buffer_unaligned 0
+#realtime_buffer_unaligned 1m
+#realtime_mmap_unaligned 0
+#realtime_mmap_unaligned 1m
+
+status=0
+exit

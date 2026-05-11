@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 SGI.  All Rights Reserved.
+#
+# FS QA Test No. 283
+#
+# Test incremental dumps containing a mix of dump formats.
+# level 0 - current format
+# level 1 - format 2
+#
+. ./common/preamble
+_begin_fstest dump ioctl auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+_require_legacy_v2_format
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+
+_create_dumpdir_fill
+# ensure file/dir timestamps precede dump timestamp
+sleep 2
+$here/src/bstat $SCRATCH_MNT >>$seqres.full
+
+echo "*** Level 0 dump, current format"
+_do_dump_file -f $tmp.l0
+
+_append_dumpdir_fill
+$here/src/bstat $SCRATCH_MNT >>$seqres.full
+
+echo "*** Level 1 dump, format 2"
+_do_dump_file -l 1 -f $tmp.l1 -K
+
+# note the first restore has to be told to use format
+# 2 generation numbers due to the unusual case of
+# having a new-format dump followed by an old-format.
+echo "*** Restore using current format level 0"
+_prepare_restore_dir
+_do_restore_file_cum -f $tmp.l0 -K
+
+echo "*** Restore using format 2 level 1"
+_do_restore_file_cum -f $tmp.l1
+_diff_compare
+
+# success, all done
+status=0
+exit

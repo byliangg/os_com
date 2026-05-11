@@ -1,0 +1,140 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 IBM Corporation. All Rights Reserved.
+#
+# FSQA Test No. 043
+#
+# Test constant inode numbers on non-samefs setup
+# This is a variant of overlay/017 to test constant st_ino numbers for
+# non-samefs setup.
+#
+# This simple test demonstrates an issue with overlayfs on kernel < v4.17:
+# - stat file A shows inode number X
+# - modify A to trigger copy up
+# - stat file A shows inode number Y != X
+#
+# Also test if d_ino of readdir entries changes after copy up
+# and if inode numbers persist after rename, drop caches and
+# mount cycle.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup nonsamefs
+
+# Import common functions.
+. ./common/filter
+
+_fixed_in_kernel_version "v4.17"
+
+# Use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_test
+_require_test_program "af_unix"
+_require_test_program "t_dir_type"
+# Require redirect_dir for renaming a merge directory
+_require_scratch_feature redirect_dir
+
+lowerdir=$OVL_BASE_TEST_DIR/$seq-ovl-lower
+rm -rf $lowerdir
+mkdir $lowerdir
+
+# Create our test files.
+mkdir $lowerdir/dir
+touch $lowerdir/file
+ln -s $lowerdir/file $lowerdir/symlink
+mknod $lowerdir/chrdev c 1 1
+mknod $lowerdir/blkdev b 1 1
+mknod $lowerdir/fifo p
+$here/src/af_unix $lowerdir/socket
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+
+# Enable redirect_dir for renaming a merge directory.
+# Enabling xino in this test requires that base filesystem inode numbers will
+# not use bit 63 in inode number of the test files, because bit 63 is used by
+# overlayfs to indicate the layer. Let's just assume that this is true for all
+# tested filesystems and if we are wrong, the test may fail.
+_overlay_scratch_mount_dirs $lowerdir $upperdir $workdir -o redirect_dir=on,xino=on || \
+	_notrun "cannot mount overlay with xino=on option"
+_fs_options $SCRATCH_DEV | grep -q "xino=on" || \
+	_notrun "cannot enable xino feature"
+
+FILES="dir file symlink chrdev blkdev fifo socket"
+
+# Record inode numbers in format <ino> <basename>
+function record_inode_numbers()
+{
+	dir=$1
+	outfile=$2
+
+	for f in $FILES; do
+		ls -id $dir/$f
+	done | \
+	while read ino file; do
+		echo $ino `basename $file` >> $outfile
+	done
+}
+
+# Check inode numbers match recorder inode numbers
+function check_inode_numbers()
+{
+	dir=$1
+	before=$2
+	after=$3
+
+	record_inode_numbers $dir $after
+
+	# Test constant stat(2) st_ino -
+	# Compare before..after - expect silence
+	# We use diff -u so out.bad will tell us which stage failed
+	diff -u $before $after
+
+	# Test constant readdir(3)/getdents(2) d_ino -
+	# Expect to find file by inode number
+	cat $before | while read ino f; do
+		$here/src/t_dir_type $dir $ino | grep -q $f || \
+			echo "$f not found by ino $ino (from $before)"
+	done
+}
+
+rm -f $tmp.*
+testdir=$SCRATCH_MNT/test
+mkdir -p $testdir
+
+# Record inode numbers before copy up
+record_inode_numbers $SCRATCH_MNT $tmp.before
+
+for f in $FILES; do
+	# chown -h modifies all those file types
+	chown -h 100 $SCRATCH_MNT/$f
+done
+
+# Compare inode numbers before/after copy up
+check_inode_numbers $SCRATCH_MNT $tmp.before $tmp.after_copyup
+
+for f in $FILES; do
+	# move to another dir
+	mv $SCRATCH_MNT/$f $testdir/
+done
+
+echo 3 > /proc/sys/vm/drop_caches
+
+# Compare inode numbers before/after rename and drop caches
+check_inode_numbers $testdir $tmp.after_copyup $tmp.after_move
+
+# Verify that the inode numbers survive a mount cycle
+$UMOUNT_PROG $SCRATCH_MNT
+_overlay_scratch_mount_dirs $lowerdir $upperdir $workdir -o redirect_dir=on,xino=on
+
+# Compare inode numbers before/after mount cycle
+check_inode_numbers $testdir $tmp.after_move $tmp.after_cycle
+
+# check overlayfs
+_overlay_check_scratch_dirs $lowerdir $upperdir $workdir -o redirect_dir=on,xino=on
+
+echo "Silence is golden"
+status=0
+exit

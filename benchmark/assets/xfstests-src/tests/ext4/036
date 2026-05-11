@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test No. ext4/036
+#
+# Test truncate orphan inodes when mounting ext4
+# ext4 used to hit WARNING, this commit fixed the issue
+#
+# 721e3eb ext4: lock i_mutex when truncating orphan inodes
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+
+_require_scratch
+
+echo "Silence is golden"
+
+_scratch_mkfs_sized $((16*1024*1024)) >>$seqres.full 2>&1
+_scratch_mount
+
+# create a file and get its inode number, usually it's 12, but to be accurate
+testfile=$SCRATCH_MNT/testfile
+touch $testfile
+inode=`ls -i $testfile | awk '{print $1}'`
+
+# add the inode in orphan inode list
+_scratch_unmount
+debugfs -w -R "set_super_value last_orphan $inode" $SCRATCH_DEV \
+	>>$seqres.full 2>&1
+
+# mount again to truncate orphan inode, _check_dmesg will catch the WARNING
+_scratch_mount
+
+status=0
+exit

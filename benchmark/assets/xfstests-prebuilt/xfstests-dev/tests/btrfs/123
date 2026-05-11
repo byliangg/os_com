@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Fujitsu. All Rights Reserved.
+#
+# FS QA Test 123
+#
+# Test if btrfs leaks qgroup numbers for data extents
+#
+# Due to balance code is doing trick tree block swap, which doing
+# non-standard extent reference update, qgroup can't handle it correctly,
+# and leads to corrupted qgroup numbers.
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup balance
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_qgroup_report
+
+_scratch_mkfs >/dev/null
+# Need to use inline extents to fill metadata rapidly
+_scratch_mount "-o max_inline=2048"
+
+# create 64K inlined metadata, which will ensure there is a 2-level
+# metadata. Even for maximum nodesize(64K)
+for i in $(seq 32); do
+	_pwrite_byte 0xcdcdcdcd 0 2k $SCRATCH_MNT/small_$i | _filter_xfs_io
+done
+
+# then a large data write to make the quota corruption obvious enough
+_pwrite_byte 0xcdcdcdcd 0 32m $SCRATCH_MNT/large | _filter_xfs_io
+sync
+
+# enable quota and rescan to get correct number
+_btrfs quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT
+
+# now balance data block groups to corrupt qgroup
+_run_btrfs_balance_start -d $SCRATCH_MNT >> $seqres.full
+
+_scratch_unmount
+# qgroup will be check at _check_scratch_fs() by fstest
+
+# success, all done
+status=0
+exit

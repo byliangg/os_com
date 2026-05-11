@@ -1,0 +1,68 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 057
+#
+# Test absolute redirect is followed even if ancestor is opaque
+#
+# Typically, when following absolute redirect, if an opauqe dentry is
+# found, lookup in further lower directories is stopped. But if a
+# child dentry has another absolute redirect, then lookup in further
+# lower layers should continue.
+#
+# Say, following is example setup.
+# upper:  /redirect (redirect=/a/b/c)
+# lower1: /a/[b]/c       ([b] is opaque) (c has absolute redirect=/a/b/d/)
+# lower0: /a/b/d/foo
+#
+# "redirect" directory in upper should merge with lower1:/a/b/c/ and
+# lower0:/a/b/d/, despite lower1:/a/b/ being opaque.
+#
+. ./common/preamble
+_begin_fstest auto quick redirect
+
+# Import common functions.
+. ./common/filter
+
+# We use non-default scratch underlying overlay dirs, we need to check
+# them explicity after test.
+_require_scratch_nocheck
+_require_scratch_overlay_features redirect_dir
+
+# remove all files from previous tests
+_scratch_mkfs
+
+# Create test directories
+lowerdir=$OVL_BASE_SCRATCH_MNT/lower
+lowerdir2=$OVL_BASE_SCRATCH_MNT/lower2
+upperdir=$OVL_BASE_SCRATCH_MNT/upper
+workdir=$OVL_BASE_SCRATCH_MNT/workdir
+workdir2=$OVL_BASE_SCRATCH_MNT/workdir2
+
+mkdir -p $lowerdir $lowerdir2 $upperdir $workdir $workdir2
+mkdir -p $lowerdir/origin
+touch $lowerdir/origin/foo
+_overlay_scratch_mount_dirs $lowerdir $lowerdir2 $workdir2 -o redirect_dir=on
+
+# Create opaque parent with absolute redirect child in middle layer
+mkdir $SCRATCH_MNT/pure
+mv $SCRATCH_MNT/origin $SCRATCH_MNT/pure/redirect
+$UMOUNT_PROG $SCRATCH_MNT
+_overlay_scratch_mount_dirs $lowerdir2:$lowerdir $upperdir $workdir -o redirect_dir=on
+mv $SCRATCH_MNT/pure/redirect $SCRATCH_MNT/redirect
+# List content of renamed merge dir before mount cycle
+ls $SCRATCH_MNT/redirect/
+
+# Verify that redirects are followed by listing content of renamed merge dir
+# after mount cycle
+$UMOUNT_PROG $SCRATCH_MNT
+_overlay_scratch_mount_dirs $lowerdir2:$lowerdir $upperdir $workdir -o redirect_dir=on
+ls $SCRATCH_MNT/redirect/
+
+# check overlayfs
+_overlay_check_scratch_dirs "$lowerdir2:$lowerdir" $upperdir $workdir -o redirect_dir=on
+
+# success, all done
+status=0
+exit

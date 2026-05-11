@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 441
+#
+# Regression test for a quota accounting bug when reflinking across EOF
+# of a file in which we forgot dq_attach.
+#
+. ./common/preamble
+_begin_fstest auto quick clone quota
+
+# Import common functions.
+. ./common/reflink
+. ./common/quota
+. ./common/filter
+
+# Modify as appropriate.
+
+_require_quota
+_require_scratch_reflink
+_require_cp_reflink
+_require_user
+
+check_quota() {
+	du_total="$(du -ksc $SCRATCH_MNT/a $SCRATCH_MNT/b | tail -n 1 | awk '{print $1}')"
+	qu_total="$(_report_quota_blocks "-u $SCRATCH_MNT" | grep $qa_user | awk '{print $2}')"
+	echo "du: $du_total; quota: $qu_total"
+}
+
+echo "Format and mount (noquota)"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount "-o noquota" >> $seqres.full 2>&1
+_force_vfs_quota_testing $SCRATCH_MNT	 # _check_quota_usage uses repquota
+
+echo "Create files"
+_pwrite_byte 0x58 0 1m $SCRATCH_MNT/a >> $seqres.full
+_pwrite_byte 0x58 0 1m $SCRATCH_MNT/b >> $seqres.full
+chown $qa_user $SCRATCH_MNT/a $SCRATCH_MNT/b
+check_quota 2>&1 | _filter_scratch
+
+echo "Mount (usrquota) and check quota"
+_scratch_unmount
+_scratch_mount "-o usrquota,grpquota" >> "$seqres.full" 2>&1
+check_quota
+
+echo "Reflink and check quota again"
+_reflink_range $SCRATCH_MNT/a 256k $SCRATCH_MNT/b 384k 128k >> $seqres.full
+_reflink_range $SCRATCH_MNT/a 256k $SCRATCH_MNT/b 960k 128k >> $seqres.full
+check_quota
+
+echo "Force quotacheck"
+_check_quota_usage
+
+# success, all done
+status=0
+exit

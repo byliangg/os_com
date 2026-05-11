@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 190
+#
+# This test uses xfs_io to unreserve space in a file at various different
+# offsets and sizes. The script then verifies the holes are in the correct
+# location.
+#
+# PV 985792
+#
+
+. ./common/preamble
+_begin_fstest rw auto quick
+
+status=0    # success is the default!
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_scratch_mkfs_xfs >/dev/null 2>&1
+_scratch_mount
+
+fsblocksize=$(_get_file_block_size $SCRATCH_MNT)
+
+#This is the list of holes to punch in the file limited to $filesize
+#NOTE holes cannot overlap or this script will fail.
+holes="$fsblocksize:$fsblocksize \
+$(($fsblocksize * 74)):$fsblocksize \
+$(($fsblocksize * 256)):$(($fsblocksize / 8)) \
+$(echo scale=0\;$fsblocksize \* 256 \+ $fsblocksize \* 3 \/ 4 | bc):$(($fsblocksize * 2)) \
+$(echo scale=0\;$fsblocksize \* 260 \+ $fsblocksize \* 1 \/ 4 | bc):$(($fsblocksize * 2)) \
+$(($fsblocksize * 265)):$(echo scale=0\;$fsblocksize \+ $fsblocksize \* 3 \/ 4 | bc)"
+
+#filesize
+filesize=$(($fsblocksize * 2560))
+#Name of file to perform the test on
+filename=test-190
+
+$XFS_IO_PROG -f -c "pwrite 0 $(($fsblocksize * 2560))" $SCRATCH_MNT/$filename >> $seqres.full 2>&1
+
+# run DMAPI test using verbose output
+echo Punching holes in file
+echo Punching holes in file >> $seqres.full
+for i in $holes ; do
+	echo $XFS_IO_PROG -c "unresvsp `echo $i |$SED_PROG 's/:/ /g'`" $SCRATCH_MNT/$filename >> $seqres.full
+	$XFS_IO_PROG -c "unresvsp `echo $i |$SED_PROG 's/:/ /g'`" $SCRATCH_MNT/$filename ;
+done
+
+echo Verifying holes are in the correct spots:
+
+xfs_bmap=`xfs_bmap $SCRATCH_MNT/$filename`
+xfs_bmap $SCRATCH_MNT/$filename >> $seqres.full
+for i in $holes ; do
+	holeStart=$[`echo $i|$SED_PROG 's/:/ /g'|awk '{print $1}'`];
+	holeEnd=$[`echo $i|$SED_PROG 's/:/ /g'|awk '{print $2}'`];
+
+	#Round hole size down to a multiple of $fsblocksize
+	holeEnd=$[(($holeStart+$holeEnd)/$fsblocksize)*$fsblocksize]
+
+	#Round hole start up to a multiple of $fsblocksize
+	if [ $[$holeStart % $fsblocksize] -gt 0 ] ; then
+		holeStart=$[($holeStart/$fsblocksize +1) * $fsblocksize]
+	fi
+	#xfs_bmap prints holes in the following format
+	#                1: [8..15]: hole
+	bmap="\[$[$holeStart/512]..$[($holeEnd/512) -1]\]";
+	echo $bmap >> $seqres.full
+	if [ $holeEnd == $holeStart ] ; then
+		continue #there is no hole
+	fi
+	if ! echo $xfs_bmap|grep -q $bmap; then
+		echo Offset $holeStart to $holeEnd  basic blocks failed;
+		status=1;
+	fi
+done
+if [ $status == 0 ] ; then
+	echo Test $seq Passed.
+fi
+
+exit

@@ -1,0 +1,109 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 048
+#
+# Test nlink accounting of overlay hardlinks with offline modifications.
+#
+# nlink of overlay inode should account for the union of lower and upper
+# hardlinks. Orphan index inodes with union nlink 0 should be cleaned on
+# mount.
+#
+. ./common/preamble
+_begin_fstest auto quick copyup hardlink
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_scratch_feature index
+
+report_nlink()
+{
+	when=$1
+
+	# mount and check nlink after overlay offline modification
+	_scratch_mount -o index=on
+
+	# List <nlink> <name>
+	echo "== $when offline =="
+	for f in $HARDLINKS; do
+		_ls_l $SCRATCH_MNT/$f | awk '{ print $2, $9 }' | _filter_scratch
+	done
+
+	$UMOUNT_PROG $SCRATCH_MNT
+}
+
+# Create lower hardlinks
+create_hardlinks()
+{
+	mkdir -p $lowerdir
+	touch $lowerdir/0
+	ln $lowerdir/0 $lowerdir/1
+	ln $lowerdir/0 $lowerdir/2
+}
+
+test_hardlinks_offline()
+{
+	HARDLINKS=`seq 0 2`
+	report_nlink "all upper"
+
+	# Unlink copied up hardlink
+	rm $upperdir/0
+	HARDLINKS=`seq 1 2`
+	report_nlink "unlink upper"
+
+	# Link to copied up hardlink
+	ln $upperdir/2 $upperdir/3
+	HARDLINKS=`seq 1 3`
+	report_nlink "link upper"
+
+	# Rename over copied up hardlink
+	touch $upperdir/new
+	mv $upperdir/new $upperdir/1
+	HARDLINKS=`seq 2 3`
+	report_nlink "rename over upper"
+
+	# Unlink new upper hardlink
+	rm $upperdir/3
+	HARDLINKS=2
+	report_nlink "unlink new upper"
+
+	# Unlink last upper and drop union nlink to zero
+	rm $upperdir/2
+
+	HARDLINKS=
+	report_nlink "unlink last lower"
+
+	# Verify that orphan index is cleaned when dropping nlink to zero
+	# With nfs_export=on index will contain a whiteout index entry, so allow
+	# chardev entries in index dir.
+	find $workdir/index -mindepth 1 -type c -o -print
+}
+
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+workdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create lower hardlinks
+create_hardlinks
+
+# Enable overlay index feature to prevent breaking hardlinks on copy up
+_scratch_mount -o index=on
+
+# Copy up and index hardlinks
+touch $SCRATCH_MNT/0
+touch $SCRATCH_MNT/1
+touch $SCRATCH_MNT/2
+
+# Perform the rest of the changes offline
+$UMOUNT_PROG $SCRATCH_MNT
+
+test_hardlinks_offline
+
+status=0
+exit

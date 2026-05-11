@@ -1,0 +1,51 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/013
+#
+# Regression test for balance with prealloc extents.  This checks to make sure
+# we are balacing prealloc'ed extents properly by making sure we don't have any
+# csum errors.  Unfortunately this manifests itself with no csum which means
+# userspace doesn't get an error when reading the file back so we have to grok
+# dmesg to see if there was a csum error.
+#
+. ./common/preamble
+_begin_fstest auto quick balance prealloc
+
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+nr_csum_no_found=$(dmesg | grep -c "no csum found")
+nr_csum_failed=$(dmesg | grep -c "csum failed")
+
+_check_csum_error()
+{
+	new_csum_no_found=$(dmesg | grep -c "no csum found")
+	new_csum_failed=$(dmesg | grep -c "csum failed")
+
+	if [ $nr_csum_no_found -eq $new_csum_no_found -a \
+	     $nr_csum_failed -eq $new_csum_failed ]; then
+		return 0
+	fi
+	return 1
+}
+$XFS_IO_PROG -f -c "falloc 0 1M" -c "pwrite 16k 8k" -c "fsync" \
+	$SCRATCH_MNT/foo > $seqres.full 2>&1
+_run_btrfs_balance_start $SCRATCH_MNT >> $seqres.full
+_scratch_unmount
+_scratch_mount
+$XFS_IO_PROG -c "pread 0 1M" $SCRATCH_MNT/foo >> $seqres.full 2>&1 || \
+	_fail "pread failed"
+
+# This sucks but unfortunately it is the only way to be sure something didn't go
+# wrong.
+_check_csum_error || _fail "csum detected, please check dmesg"
+
+echo "Silence is golden"
+status=0 ; exit

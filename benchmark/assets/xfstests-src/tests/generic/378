@@ -1,0 +1,40 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 378
+#
+# Simple permission check on hard links.
+#
+# Overlayfs had a bug that hardlinks don't share inode, if chmod/chown/etc.
+# is performed on one of the links then the inode belonging to the other
+# one won't be updated. The following patch fixed this issue
+#
+# 51f7e52 ovl: share inode for hard link
+#
+. ./common/preamble
+_begin_fstest auto quick metadata
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_user
+_require_hardlinks
+
+# Setup testfile and its hardlink
+testfile=$TEST_DIR/testfile.$seq
+testlink=$testfile.hardlink
+rm -f $testfile $testlink
+echo "You should not see this" >$testfile
+ln $testfile $testlink
+
+# remove read permission from testfile and unprivileged user should have no
+# permission to read testfile and hardlink
+chmod -r $testfile
+_user_do "cat $testfile"
+_user_do "cat $testlink"
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/018
+#
+# Regression test to make sure we can move a subvol into another subvol
+#
+. ./common/preamble
+_begin_fstest auto quick subvol
+
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/test1 >> $seqres.full 2>&1 \
+	|| _fail "couldn't create test1"
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/test2 >> $seqres.full 2>&1 \
+	|| _fail "couldn't create test1"
+mv $SCRATCH_MNT/test1 $SCRATCH_MNT/test2 || _fail "Problem doing move"
+
+echo "Silence is golden"
+status=0 ; exit

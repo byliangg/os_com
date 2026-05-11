@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Huawei.  All Rights Reserved.
+#
+# FS QA Test 040
+#
+# chattr with [iap..] attributes open file for read-only and
+# invoke ioctl(). If we chattr a lower file in overlay, it
+# will get the lower file but not trigger copy-up, so ioctl()
+# lead to modification of that lower file.
+#
+# Upstream Commit 7c6893e3c9ab ("ovl: don't allow writing
+# ioctl on lower layer") return EPERM for this case to avoid
+# this issue.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$CHATTR_PROG -i $lowerdir/foo > /dev/null 2>&1
+	$CHATTR_PROG -i $upperdir/foo > /dev/null 2>&1
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_chattr i
+
+# remove all files from previous runs
+_scratch_mkfs
+
+# prepare lower test file
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $lowerdir
+touch $lowerdir/foo
+
+# mounting overlay
+_scratch_mount
+
+# Try to add immutable attributes in overlay, it will
+# open file for read-only and invoke ioctl(), it should not
+# modify lower origin file.
+$CHATTR_PROG +i $SCRATCH_MNT/foo > /dev/null 2>&1
+
+$UMOUNT_PROG $SCRATCH_MNT
+
+# touching origin file in lower, should succeed
+touch $lowerdir/foo
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

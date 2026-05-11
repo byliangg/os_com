@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 591
+#
+# Test using splice() to read from pipes.
+
+. ./common/preamble
+_begin_fstest auto quick rw pipe splice
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $TEST_DIR/a
+}
+
+# Import common functions.
+
+_require_test
+_require_odirect
+_require_test_program "splice-test"
+
+diosize=`$here/src/min_dio_alignment $TEST_DIR $TEST_DEV`
+
+$here/src/splice-test -s $diosize -r $TEST_DIR/a
+$here/src/splice-test -rd $TEST_DIR/a
+$here/src/splice-test -s $diosize $TEST_DIR/a
+$here/src/splice-test -d $TEST_DIR/a
+
+# success, all done
+status=0
+exit

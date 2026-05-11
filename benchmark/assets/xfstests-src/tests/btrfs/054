@@ -1,0 +1,82 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/054
+#
+# Regression test for a btrfs incremental send issue where the difference
+# between the snapshots used by the incremental send consists of one of
+# these cases:
+#
+# 1) First snapshot has a directory with name X and in the second snapshot
+#    that directory doesn't exist anymore but a subvolume/snapshot with
+#    the same name (X) exists;
+#
+# 2) First snapshot has a subvolume/snapshot with name X and in the second
+#    snapshot that subvolume/snapshot doesn't exist anymore (might have been
+#    replaced by a directory with the same name or not).
+#
+# This issue is fixed by the following linux kernel btrfs patches:
+#
+#    Btrfs: send, don't error in the presence of subvols/snapshots
+#    Btrfs: set dead flag on the right root when destroying snapshot
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $send_files_dir
+    rm -fr $tmp
+}
+
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_scratch
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+mkdir $SCRATCH_MNT/testdir
+_btrfs subvolume create $SCRATCH_MNT/first_subvol
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+# Replace the directory testdir with a subvolume that has the same name.
+rmdir $SCRATCH_MNT/testdir
+_btrfs subvolume create $SCRATCH_MNT/testdir
+
+# Delete the subvolume first_subvol and create a directory with the same name.
+_btrfs subvolume delete $SCRATCH_MNT/first_subvol
+mkdir $SCRATCH_MNT/first_subvol
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $send_files_dir/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+_scratch_unmount
+_check_scratch_fs
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+[ -e $SCRATCH_MNT/first_subvol ] && \
+	echo "Subvolume first_subvol was not supposed to be replicated by full send!"
+
+_btrfs receive -f $send_files_dir/2.snap $SCRATCH_MNT
+[ -e $SCRATCH_MNT/testdir ] && \
+	echo "Directory testdir was supposed to be deleted after incremental send!"
+
+status=0
+exit

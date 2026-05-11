@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 010
+#
+# dbtest
+#
+. ./common/preamble
+_begin_fstest other udf auto
+
+status=0	# success is the default!
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    rm -f $TEST_DIR/DBtest*.{pag,dir}
+}
+
+# filter random number output from dbtest
+#
+_filter_dbtest()
+{
+    sed \
+        -e '/were [0-9][0-9]* duplicate/s//were BLEEP duplicate/' \
+        -e '/using [0-9][0-9]* as seed/s//using BLEEP as seed/'
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test_program "dbtest"
+
+_require_test
+
+cd $TEST_DIR
+
+$here/src/dbtest -l 5 -n 1000 2>&1 | tee -a $seqres.full | _filter_dbtest
+
+# success, all done
+exit

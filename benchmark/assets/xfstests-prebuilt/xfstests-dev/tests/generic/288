@@ -1,0 +1,36 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright 2012 (C) Red Hat, Inc., Lukas Czerner <lczerner@redhat.com>
+#
+# FS QA Test No. 288
+#
+# This check the FITRIM argument handling in the corner case where length is
+# smaller than block size or zero.
+#
+. ./common/preamble
+_begin_fstest auto quick ioctl trim
+
+status=0
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+_require_batched_discard $SCRATCH_MNT
+
+echo "[+] Length is zero (should fail)"
+out=$("$FSTRIM_PROG" -v -o0 -l0 $SCRATCH_MNT 2>&1)
+[ $? -eq 0 ] && status=1
+echo $out | _filter_scratch
+
+echo "[+] Length is smaller than block size (should fail)"
+out=$("$FSTRIM_PROG" -v -o0 -l100 $SCRATCH_MNT 2>&1)
+[ $? -eq 0 ] && status=1
+echo $out | _filter_scratch
+
+echo "Test done"
+exit

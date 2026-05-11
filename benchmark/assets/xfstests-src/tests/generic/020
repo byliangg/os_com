@@ -1,0 +1,287 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 020
+#
+# extended attributes
+#
+. ./common/preamble
+_begin_fstest metadata attr udf auto quick
+
+status=0	# success is the default!
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_filter()
+{
+    sed "s#$TEST_DIR[^ :]*#<TESTFILE>#g; 
+            s#$tmp[^ :]*#<TMPFILE>#g" $1
+}
+
+_attr()
+{
+    $ATTR_PROG $* 2>$tmp.err >$tmp.out
+    exit=$?
+    _filter $tmp.out
+    _filter $tmp.err 1>&2
+    return $exit
+}
+
+do_getfattr()
+{
+    _getfattr $* 2>$tmp.err >$tmp.out
+    exit=$?
+    _filter $tmp.out
+    _filter $tmp.err 1>&2
+    return $exit
+}
+
+_attr_list()
+{
+    file=$1
+    
+    echo "   *** print attributes"
+    if ! do_getfattr -d -e text --absolute-names $file
+    then
+        echo "      !!! error return"
+        return 1
+    fi
+}
+
+# set fs-specific max_attrs
+_attr_get_max()
+{
+	# set maximum total attr space based on fs type
+	case "$FSTYP" in
+	xfs|udf|pvfs2|9p|ceph|fuse|nfs|ceph-fuse)
+		max_attrs=1000
+		;;
+	ext2|ext3|ext4)
+		# For 4k blocksizes, most of the attributes have an attr_name of
+		# "attribute_NN" which is 12, and "value_NN" which is 8.
+		# But for larger block sizes, we start having extended
+		# attributes of the
+		# form "attribute_NNN" or "attribute_NNNN", and "value_NNN" and
+		# "value_NNNN", which causes the round(len(..), 4) to jump up by
+		# 4 bytes.  So round_up(len(attr_name, 4)) becomes 16 instead of
+		# 12, and round_up(len(value, 4)) becomes 12 instead of 8.
+		#
+		# For 64K blocksize the calculation becomes
+		# 	max_attrs = (block_size - 32) / (16 + 12 + 16)
+		# or
+		# 	max_attrs = (block_size - 32) / 44
+		#
+		# For 4K blocksize:-
+		# 	max_attrs = (block_size - 32) / (16 + 8 + 12)
+		# or
+		# 	max_attrs = (block_size - 32) / 36
+		#
+		# Note (for 4K bs) above are exact calculations for attrs of
+		# type attribute_NN with values of type value_NN.
+		# With above calculations, for 4k blocksize max_attrs becomes
+		# 112.
+		# This means we can have few attrs of type attribute_NNN with
+		# values of
+		# type value_NNN. To avoid/handle this we need to add extra 4
+		# bytes of headroom.
+		#
+		# So for 4K, the calculations becomes:-
+		# 	max_attrs = (block_size - 32) / (16 + 8 + 12 + 4)
+		# or
+		# 	max_attrs = (block_size - 32) / 40
+		#
+		# Assume max ~1 block of attrs
+		BLOCK_SIZE=`_get_block_size $TEST_DIR`
+		if [ $BLOCK_SIZE -le 4096 ]; then
+			let max_attrs=$((($BLOCK_SIZE - 32) / (16 + 8 + 12 + 4)))
+		else
+			let max_attrs=$((($BLOCK_SIZE - 32) / (16 + 12 + 16 )))
+		fi
+		;;
+	ubifs)
+		LEB_SIZE=`_get_leb_size $TEST_DEV`
+		# On UBIFS, the number of xattrs has to be less than 50% LEB size
+		# divided by 160 (inode size)
+		let max_attrs=$((($LEB_SIZE / 2 / 160) - 1))
+		;;
+	*)
+		# Assume max ~1 block of attrs
+		BLOCK_SIZE=`_get_block_size $TEST_DIR`
+		# user.attribute_XXX="value.XXX" is about 32 bytes; leave some
+		# overhead
+		let max_attrs=$BLOCK_SIZE/40
+	esac
+}
+
+# set fs-specific max_attrval_size values. The parameter @max_attrval_namelen is
+# required for filesystems which take into account attr name lengths (including
+# namespace prefix) when determining limits; parameter @filename is required for
+# filesystems that need to take into account already existing attrs.
+_attr_get_maxval_size()
+{
+	local max_attrval_namelen="$1"
+	local filename="$2"
+
+	# Set max attr value size in bytes based on fs type
+	case "$FSTYP" in
+	btrfs)
+		_require_btrfs_command inspect-internal dump-super
+		local ns=$($BTRFS_UTIL_PROG inspect-internal dump-super \
+				$TEST_DEV | sed -n 's/nodesize\s*\(.*\)/\1/p')
+		[ -n "$ns" ] || _fail "failed to obtain nodesize"
+		# max == nodesize - sizeof(struct btrfs_header)
+		#		- sizeof(struct btrfs_item)
+		#		- sizeof(struct btrfs_dir_item) - name_len
+		max_attrval_size=$(( $ns - 156 - $max_attrval_namelen ))
+		;;
+	pvfs2)
+		max_attrval_size=8192
+		;;
+	xfs|udf|9p|fuse)
+		max_attrval_size=65536
+		;;
+	bcachefs)
+		max_attrval_size=1024
+		;;
+	nfs)
+		# NFS doesn't provide a way to find out the max_attrval_size for
+		# the underlying filesystem, so just use the lowest value above.
+		max_attrval_size=1024
+		;;
+	ceph)
+		# CephFS does not have a maximum value for attributes.  Instead,
+		# it imposes a maximum size for the full set of xattrs
+		# names+values, which by default is 64K.  Compute the maximum
+		# taking into account the already existing attributes
+		local size=$(getfattr --dump -e hex $filename 2>/dev/null | \
+			awk -F "=0x" '/^user/ {len += length($1) + length($2) / 2} END {print len}')
+		local selinux_size=$(getfattr -n 'security.selinux' --dump -e hex $filename 2>/dev/null | \
+			awk -F "=0x" '/^security/ {len += length($1) + length($2) / 2} END {print len}')
+		if [ -z $size ]; then
+			size=0
+		fi
+		if [ -z $selinux_size ]; then
+			selinux_size=0
+		fi
+		max_attrval_size=$((65536 - $size - $selinux_size - $max_attrval_namelen))
+		;;
+	hfsplus)
+		# HFS+ implementation supports only inline extended attributes.
+		# The size of value for inline xattr is limited by 3802 bytes.
+		max_attrval_size=3802
+		;;
+	*)
+		# Assume max ~1 block of attrs
+		BLOCK_SIZE=`_get_block_size $TEST_DIR`
+		# leave a little overhead
+		let max_attrval_size=$BLOCK_SIZE-256
+	esac
+}
+
+
+_require_test
+_require_attrs
+
+testfile=$TEST_DIR/attribute_$$
+
+echo "*** list non-existant file"
+_attr_list $testfile
+
+echo "*** list empty file"
+touch $testfile
+_attr_list $testfile
+
+echo "*** query non-existant attribute"
+_attr -g "nonexistant" $testfile 2>&1
+
+echo "*** one attribute"
+echo "fish" | _attr -s fish $testfile
+_attr_list $testfile
+
+echo "*** replace attribute"
+echo "fish3" | _attr -s fish $testfile
+_attr_list $testfile
+
+echo "*** add attribute"
+echo "fish2" | _attr -s snrub $testfile
+_attr_list $testfile
+
+echo "*** remove attribute"
+_attr -r fish $testfile
+_attr_list $testfile
+
+_attr_get_max
+
+echo "*** add lots of attributes"
+v=0
+
+while [ $v -lt $max_attrs ]
+do
+    echo -n "value_$v" | attr -s "attribute_$v" $testfile >>$seqres.full
+    if [ $? -ne 0 ]
+    then
+        echo "!!! failed to add \"attribute_$v\""
+        exit 1
+    fi
+    
+    let "v = v + 1"
+done
+
+echo "*** check"
+# don't print it all out...
+_getfattr --absolute-names $testfile \
+    | tee -a $seqres.full \
+    | $AWK_PROG '
+    	/^#/ { next }
+	/^[ 	]*$/ { next }
+        { l++ } 
+	END {print "   *** " (l - 1) " attribute(s)" }' \
+    | sed s/$max_attrs/MAX_ATTRS/
+
+echo "*** remove lots of attributes"
+v=0
+while [ $v -lt $max_attrs ]
+do
+    if ! $ATTR_PROG -r "attribute_$v" $testfile >>$seqres.full
+    then
+        echo "!!! failed to remove \"attribute_$v\""
+        exit 1
+    fi
+    
+    let "v = v + 1"
+done
+
+_attr_list $testfile
+
+echo "*** really long value"
+max_attrval_name="long_attr"	# add 5 for "user." prefix
+_attr_get_maxval_size "$(( 5 + ${#max_attrval_name} ))" "$testfile"
+
+dd if=/dev/zero bs=1 count=$max_attrval_size 2>/dev/null \
+    | _attr -s "$max_attrval_name" $testfile >/dev/null
+
+OCTAL_SIZE=`echo "obase=8; $max_attrval_size" | bc`
+_attr -q -g "$max_attrval_name" $testfile | od -w1 -t x1 \
+    | sed -e "s/^0*$OCTAL_SIZE$/ATTRSIZE/"
+_attr -r "$max_attrval_name" $testfile >/dev/null
+
+echo "*** set/get/remove really long names (expect failure)"
+short="XXXXXXXXXX"
+long="$short$short$short$short$short$short$short$short$short$short"
+vlong="$long$long$long"
+
+_attr -s $vlong -V fish $testfile 2>&1 >/dev/null
+_attr -g $vlong $testfile 2>&1 >/dev/null
+_attr -r $vlong $testfile 2>&1 >/dev/null
+
+echo "*** check final"
+
+_attr_list $testfile
+
+echo "*** delete"
+rm -f $testfile
+
+exit

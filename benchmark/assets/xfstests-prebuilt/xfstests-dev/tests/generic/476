@@ -1,0 +1,29 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 476
+#
+# Run an all-writes fsstress run with multiple threads to shake out
+# bugs in the write path.
+#
+. ./common/preamble
+_begin_fstest auto rw long_rw stress soak smoketest
+
+_require_scratch
+
+echo "Silence is golden."
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+nr_cpus=$((LOAD_FACTOR * 4))
+nr_ops=$((25000 * TIME_FACTOR))
+fsstress_args=(-w -d $SCRATCH_MNT -n $nr_ops -p $nr_cpus)
+test -n "$SOAK_DURATION" && fsstress_args+=(--duration="$SOAK_DURATION")
+
+_run_fsstress "${fsstress_args[@]}"
+
+# success, all done
+status=0
+exit

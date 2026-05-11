@@ -1,0 +1,95 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 104
+#
+# XFS online growfs-while-allocating tests (data subvol variant)
+#
+. ./common/preamble
+_begin_fstest growfs ioctl prealloc auto stress
+
+# Import common functions.
+. ./common/filter
+
+create_scratch_sized()
+{
+	echo "*** mkfs"
+	_scratch_mkfs_sized "$@" | tee -a $seqres.full | _filter_mkfs 2>$tmp.mkfs
+	. $tmp.mkfs
+
+	echo "*** mount"
+	if ! _try_scratch_mount 2>/dev/null
+	then
+		echo "failed to mount $SCRATCH_DEV"
+		exit 1
+	fi
+
+	# fix the reserve block pool to a known size so that the enospc
+	# calculations work out correctly.
+	_scratch_resvblks 1024 >  /dev/null 2>&1
+}
+
+_fill_scratch()
+{
+	$XFS_IO_PROG -f -c "resvsp 0 ${1}" $SCRATCH_MNT/resvfile
+}
+
+_stress_scratch()
+{
+	procs=3
+	nops=1000
+	# -w ensures that the only ops are ones which cause write I/O
+	args=`_scale_fsstress_args -d $SCRATCH_MNT -w -p $procs -n $nops`
+	_run_fsstress_bg $args
+}
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+_scratch_mkfs_xfs | tee -a $seqres.full | _filter_mkfs 2>$tmp.mkfs
+. $tmp.mkfs	# extract blocksize and data size for scratch device
+
+endsize=`expr 550 \* 1048576`	# stop after growing this big
+incsize=`expr  42 \* 1048576`	# grow in chunks of this size
+modsize=`expr   4 \* $incsize`	# pause after this many increments
+
+[ `expr $endsize / $dbsize` -lt $dblocks ] || _notrun "Scratch device too small"
+
+nags=4
+size=`expr 125 \* 1048576`	# 120 megabytes initially
+sizeb=`expr $size / $dbsize`	# in data blocks
+echo "*** creating scratch filesystem"
+logblks=$(_scratch_find_xfs_min_logblocks -dsize=${size} -dagcount=${nags})
+create_scratch_sized "${size}" '' -lsize=${logblks}b -dagcount=${nags}
+
+echo "*** using some initial space on scratch filesystem"
+for i in `seq 125 -1 90`; do
+	fillsize=`expr $i \* 1048576`
+	out="$(_fill_scratch $fillsize 2>&1)"
+	echo "$out" | grep -q 'No space left on device' && continue
+	test -n "${out}" && echo "$out"
+	break
+done
+
+# Grow the filesystem while actively stressing it...
+while [ $size -le $endsize ]; do
+	echo "*** stressing filesystem"
+	echo "*** stressing a ${sizeb} block filesystem" >> $seqres.full
+	_stress_scratch 
+	sleep 1
+	size=`expr $size + $incsize`
+	sizeb=`expr $size / $dbsize`	# in data blocks
+	echo "*** growing filesystem"
+	echo "*** growing to a ${sizeb} block filesystem" >> $seqres.full
+	xfs_growfs -D ${sizeb} $SCRATCH_MNT \
+		| tee -a $seqres.full | _filter_mkfs 2>$tmp.growfs
+	. $tmp.growfs
+	[ `expr $size % $modsize` -eq 0 ] && wait	# every 4th iteration
+	echo AGCOUNT=$agcount | tee -a $seqres.full
+	echo && echo >> $seqres.full
+	_wait_for_fsstress
+done
+
+status=0
+exit

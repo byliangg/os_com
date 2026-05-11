@@ -1,0 +1,131 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 055
+#
+# * like 054 but want to create more/different kinds of metadata
+#   and so will use fsstress
+# * also can interrupt metadata with godown
+#
+. ./common/preamble
+_begin_fstest shutdown log v2log auto quota stress
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+. ./common/quota
+
+_do_meta()
+{
+    out=$SCRATCH_MNT/fsstress
+    count=10000
+    param="-p 4 -z -f rmdir=10 -f link=10 -f creat=10 -f mkdir=10 \
+           -f rename=30 -f stat=30 -f unlink=30 -f truncate=20"
+    _echofull "calling fsstress $param -m8 -n $count"
+    FSSTRESS_ARGS=`_scale_fsstress_args $param -m 8 -n $count -d $out`
+    _run_fsstress $FSSTRESS_ARGS
+    if [ $? -ne 0 ]; then
+	_echofull "fsstress failed"
+    fi
+}
+
+_get_quota_option()
+{
+    case $FSTYP in
+    xfs)
+        _require_xfs_quota
+        echo "-o uquota"
+        ;;
+    *)
+        ;;
+    esac
+}
+
+
+_require_scratch
+_require_scratch_shutdown
+_require_logstate
+
+QUOTA_OPTION=`_get_quota_option`
+
+echo "*** init FS"
+_scratch_unmount >/dev/null 2>&1
+
+_scratch_mkfs >/dev/null 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+_get_log_configs > $tmp.seq.params
+
+cat $tmp.seq.params \
+| while read mkfs mnt restofline
+do
+    if [ "$mkfs" = "#" ]; then
+	continue
+    fi
+
+    echo "--- mkfs=$mkfs, mnt=$mnt ---" >> $seqres.full
+    export MKFS_OPTIONS="-l $mkfs"
+    export MOUNT_OPTIONS="-o $mnt"
+
+    # mkfs the FS
+    _echofull "mkfs"
+    _scratch_mkfs >>$seqres.full 2>&1
+    if [ $? -ne 0 ] ; then
+	_echofull "mkfs failed: $MKFS_OPTIONS"
+	continue
+    fi
+
+    # mount the FS
+    _echofull "mount"
+    if ! _try_scratch_mount $QUOTA_OPTION >>$seqres.full 2>&1; then
+	_echofull "mount failed: $MOUNT_OPTIONS"
+	continue
+    fi
+
+    # create the metadata
+    _do_meta
+
+    # check before on what FS should look like
+    _echofull "ls -RF SCRATCH_MNT"
+    ls -RF $SCRATCH_MNT >$tmp.ls1
+
+    _echofull "godown"
+    _scratch_shutdown -v -f >> $seqres.full
+
+    _echofull "unmount"
+    _scratch_unmount >>$seqres.full 2>&1 \
+	|| _fail "umount failed"
+
+    _echofull "logprint after going down..."
+    _print_logstate
+
+    _full "logprint headers"
+    _scratch_xfs_logprint -n >>$seqres.full 2>&1
+
+    _echofull "mount with replay"
+    _try_scratch_mount $QUOTA_OPTION >>$seqres.full 2>&1 \
+	|| _fail "mount failed: $MOUNT_OPTIONS"
+
+    # check on what FS looks like after log recovery
+    _echofull "ls -RF SCRATCH_MNT"
+    ls -RF $SCRATCH_MNT >$tmp.ls2
+
+    _echofull "diff ls before and after"
+    diff -us $tmp.ls1 $tmp.ls2 | sed "s#$tmp#TMP#g"
+
+    _echofull "unmount"
+    _scratch_unmount
+
+    _echofull "logprint after mount and replay..."
+    _print_logstate
+
+    if _check_scratch_fs; then
+	_echofull "filesystem is checked ok"
+    else
+	_echofull "filesystem is NOT ok"
+    fi
+done
+
+status=0
+exit

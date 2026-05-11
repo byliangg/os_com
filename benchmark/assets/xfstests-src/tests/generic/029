@@ -1,0 +1,92 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. generic/029
+#
+# Test mapped writes against truncate down/up to ensure we get the data
+# correctly written. This can expose data corruption bugs on filesystems where
+# the block size is smaller than the page size.
+#
+. ./common/preamble
+_begin_fstest auto quick rw mmap
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+
+testfile=$SCRATCH_MNT/testfile
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+# first case is just truncate down/truncate up to check that the mapped
+# write after the truncate up is correctly handled.
+$XFS_IO_PROG -t -f \
+-c "truncate 5120"              `# truncate     |                        |` \
+-c "pwrite -S 0x58 0 5120"      `# write        |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+-c "mmap -rw 0 5120"            `# mmap         |                        |` \
+-c "mwrite -S 0x5a 2048 3072"   `# mwrite       |          ZZZZZZZZZZZZZZ|` \
+-c "truncate 2048"              `# truncate dn  |         |` \
+-c "truncate 5120"              `# truncate up  |                        |` \
+-c "mwrite -S 0x59 2048 3072"   `# mwrite       |          YYYYYYYYYYYYYY|` \
+-c "close"      \
+$testfile | _filter_xfs_io
+
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+rm -f $testfile
+_scratch_sync
+
+# second case is to do a mwrite between the truncate to a block on the
+# same page we are truncating within the EOF. This checks that a mapped
+# write between truncate down and truncate up a further mapped
+# write to the same page into the new space doesn't result in data being lost.
+$XFS_IO_PROG -t -f \
+-c "truncate 5120"              `# truncate     |                        |` \
+-c "pwrite -S 0x58 0 5120"      `# write        |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+-c "mmap -rw 0 5120"            `# mmap         |                        |` \
+-c "mwrite -S 0x5a 2048 3072"   `# mwrite       |          ZZZZZZZZZZZZZZ|` \
+-c "truncate 2048"              `# truncate dn  |         |` \
+-c "mwrite -S 0x57 1024 1024"   `# mwrite       |     WWWWW              |` \
+-c "truncate 5120"              `# truncate up  |                        |` \
+-c "mwrite -S 0x59 2048 3072"   `# mwrite       |          YYYYYYYYYYYYYY|` \
+-c "close"      \
+$testfile | _filter_xfs_io
+ 
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+# third case is the same as second case, just with non-1k aligned offsets and
+# sizes.
+$XFS_IO_PROG -t -f \
+-c "truncate 5121"              `# truncate     |                        |` \
+-c "pwrite -S 0x58 0 5121"      `# write        |XXXXXXXXXXXXXXXXXXXXXXXX|` \
+-c "mmap -rw 0 5121"            `# mmap         |                        |` \
+-c "mwrite -S 0x5a 2047 3071"   `# mwrite       |          ZZZZZZZZZZZZZZ|` \
+-c "truncate 2047"              `# truncate dn  |         |` \
+-c "mwrite -S 0x57 513 1025"    `# mwrite       |  WWWWW                 |` \
+-c "truncate 5121"              `# truncate up  |                        |` \
+-c "mwrite -S 0x59 2047 3071"   `# mwrite       |          YYYYYYYYYYYYYY|` \
+-c "close"      \
+$testfile | _filter_xfs_io
+ 
+echo "==== Pre-Remount ==="
+_hexdump $testfile
+_scratch_cycle_mount
+echo "==== Post-Remount =="
+_hexdump $testfile
+
+status=0
+exit
+

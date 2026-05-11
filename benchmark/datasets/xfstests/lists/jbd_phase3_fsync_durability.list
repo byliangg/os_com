@@ -1,0 +1,18 @@
+# Phase 3 fsync/flush durability list (datasets mirror)
+# 与 test/initramfs/src/syscall/xfstests/testcases/jbd_phase3_fsync_durability.list 保持同步。
+#
+# Tier 1: 仅依赖 _require_scratch_shutdown / EXT4_IOC_SHUTDOWN。
+# 当前 EXT4_IOC_SHUTDOWN 尚未实现，Step 4 接入后作为 Phase 3 主要 xfstests 证据。
+
+generic/043
+generic/044
+generic/045
+generic/046
+generic/047
+generic/048
+generic/049
+generic/052
+generic/054
+generic/055
+generic/388
+generic/392

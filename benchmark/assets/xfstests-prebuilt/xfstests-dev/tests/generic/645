@@ -1,0 +1,28 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 Christian Brauner.  All Rights Reserved.
+#
+# FS QA Test 645
+#
+# Test that idmapped mounts behave correctly with complex user namespaces.
+#
+. ./common/preamble
+_begin_fstest auto quick idmapped mount
+
+# get standard environment, filters and checks
+. ./common/filter
+
+
+_require_idmapped_mounts
+_require_test
+_require_chown
+_wants_kernel_commit dacfd001eaf2 \
+	"fs/mnt_idmapping.c: Return -EINVAL when no map is written"
+
+echo "Silence is golden"
+
+$here/src/vfs/vfstest --test-nested-userns \
+	--device "$TEST_DEV" --mount "$TEST_DIR" --fstype "$FSTYP"
+
+status=$?
+exit

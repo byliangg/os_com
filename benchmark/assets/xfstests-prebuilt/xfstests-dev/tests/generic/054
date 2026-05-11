@@ -1,0 +1,116 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 054
+#
+# To test log replay with version 2 logs
+# Initially keep this simple with just creates.
+# In another qa test we can do more e.g. use fsstress.
+#
+. ./common/preamble
+_begin_fstest shutdown log v2log auto
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+
+
+_require_scratch
+_require_scratch_shutdown
+_require_logstate
+
+echo "*** init FS"
+_scratch_unmount >/dev/null 2>&1
+
+_scratch_mkfs >/dev/null 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+_get_log_configs > $tmp.seq.params
+
+# Do the work for various log params which
+# should not effect the data content of the log
+# Try with and without sync'ing - sync'ing will mean that
+# the log will be written out unfilled and thus the log
+# stripe can have an effect.
+#
+for s in sync nosync ; do
+    cat $tmp.seq.params \
+    | while read mkfs mnt restofline
+    do
+	if [ "$mkfs" = "#" ]; then
+	    continue
+	fi
+
+	echo "--- mkfs=$mkfs, mnt=$mnt, sync=$s ---" >>$seqres.full
+	export MKFS_OPTIONS="-l $mkfs"
+	export MOUNT_OPTIONS="-o $mnt"
+
+	# mkfs the FS
+	_echofull "mkfs"
+	_scratch_mkfs >>$seqres.full 2>&1
+	if [ $? -ne 0 ] ; then
+	    _echofull "mkfs failed: $MKFS_OPTIONS"
+	    continue
+	fi
+
+	# mount the FS
+	_echofull "mount"
+	if ! _try_scratch_mount >>$seqres.full 2>&1; then
+	    _echofull "mount failed: $MOUNT_OPTIONS"
+	    continue
+	fi
+
+	# create the metadata
+	if [ $s = "sync" ]; then
+	    # generate some log traffic - but not too much
+	    # add some syncs to get the log flushed to disk
+	    for file in $SCRATCH_MNT/{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}; do
+		touch $file
+		_scratch_sync
+	    done
+	else
+	    # generate some log traffic - but not too much - life gets a little
+	    # more complicated if the log wraps around. This traffic is
+	    # pretty much arbitary, but could probably be made better than this.
+	    touch $SCRATCH_MNT/{0,1,2,3,4,5,6,7,8,9}{0,1,2,3,4,5,6,7,8,9}
+	fi
+
+	# check before on what FS should look like
+	_echofull "ls SCRATCH_MNT"
+	ls $SCRATCH_MNT | _filter_lostfound
+
+	_echofull "godown"
+	_scratch_shutdown -v -f >> $seqres.full
+
+	_echofull "unmount"
+	_scratch_unmount >>$seqres.full 2>&1 \
+	    || _fail "umount failed"
+
+	_echofull "logprint after going down..."
+	_print_logstate
+
+	_echofull "mount with replay"
+	_try_scratch_mount >>$seqres.full 2>&1 \
+	    || _fail "mount failed: $MOUNT_OPTIONS"
+
+	# check on what FS looks like after log recovery
+	_echofull "ls SCRATCH_MNT"
+	ls $SCRATCH_MNT | _filter_lostfound
+
+	_echofull "unmount"
+	_scratch_unmount
+
+	_echofull "logprint after mount and replay..."
+	_print_logstate
+
+	if _check_scratch_fs; then
+	    _echofull "filesystem is checked ok"
+	else
+	    _echofull "filesystem is NOT ok"
+	fi
+    done
+done
+
+status=0
+exit

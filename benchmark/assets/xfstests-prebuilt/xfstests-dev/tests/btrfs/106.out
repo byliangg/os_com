@@ -1,0 +1,9 @@
+QA output created by 106
+
+Testing with zlib compression...
+Pages modified: [0 - 15]
+Hash matches after remount
+
+Testing with lzo compression...
+Pages modified: [0 - 15]
+Hash matches after remount

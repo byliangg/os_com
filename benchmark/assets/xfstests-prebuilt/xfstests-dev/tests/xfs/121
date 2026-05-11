@@ -1,0 +1,81 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 121
+#
+# To test log replay for the unlinked list.
+# So we create unlinked and still referenced inodes
+# and make sure that no clearing of the unlinked AGI buckets
+# are happening.
+# See pv#953263.
+#
+. ./common/preamble
+_begin_fstest shutdown log auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/log
+
+
+rm -f $tmp.log
+
+_require_scratch
+
+echo "mkfs"
+_scratch_mkfs_xfs >>$seqres.full 2>&1
+
+echo "mount"
+_scratch_mount
+
+# num_files must be greater than 64 (XFS_AGI_UNLINKED_BUCKETS)
+# so that there will be at least one linked list from one of
+# the 64 buckets, so that we can decode a di_next_unlinked field
+num_files=200
+delay=5
+echo "open and unlink $num_files files"
+$here/src/multi_open_unlink -f $SCRATCH_MNT/test_file -n $num_files -s $delay &
+
+# time to create and unlink all the files
+sleep 3
+
+echo "godown"
+_scratch_shutdown -v -f >> $seqres.full
+
+# time for multi_open_unlink to exit out after its delay
+# so we have no references and can unmount
+wait 2>/dev/null
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after going down..."
+_print_logstate
+
+echo "mount with replay"
+_try_scratch_mount $mnt >>$seqres.full 2>&1 \
+    || _fail "mount failed: $mnt $MOUNT_OPTIONS"
+
+echo "godown"
+_scratch_shutdown -v -f >> $seqres.full
+
+echo "unmount"
+_scratch_unmount
+
+echo "logprint after going down..."
+_print_logstate
+
+echo "logprint to check for CLEAR_AGI_BUCKET..."
+if _scratch_xfs_logprint -t | tee -a $seqres.full | grep CLEAR; then
+	echo 'CLEAR_AGI_BUCKET transactions found!!'
+	echo 'Are you running with an old xfs kernel - where the bug still exists?'
+else
+	echo 'No CLEAR_AGI_BUCKET found in transactions - great - test passed :)'
+fi
+
+# clean up dirty log with log recovery on mount
+_scratch_mount
+
+# success, all done
+status=0
+exit

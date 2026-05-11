@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 100. Modified from UDF QA test 030.
+#
+# Test whether a tarred directory structure can be untarred onto
+# a UDF file system.
+#
+. ./common/preamble
+_begin_fstest udf auto
+
+# Import common functions.
+. ./common/filter
+
+# Override the default cleanup function.
+_cleanup()
+{
+     rm -f $tmp.* $TEMP_DIR/$TAR_FILE
+}
+ 
+_require_test
+
+# Use _populate_fs() in common/rc to create a directory structure.
+TEMP_DIR=/tmp
+[ "$FSTYP" == "xfs" ] && TEMP_DIR=$TEST_DIR
+TAR_FILE=temp.tar
+NDIRS=3
+NFILES=6
+DEPTH=5
+POPULATED_DIR=$TEMP_DIR/populate_root
+SIZE=10
+
+# Clean up if file exist from prevous run
+rm -rf $POPULATED_DIR
+rm -f $TEMP_DIR/$TAR_FILE
+
+# Create the new directory structure
+_populate_fs -n $NDIRS -f $NFILES -d $DEPTH -r $POPULATED_DIR -s $SIZE >>$seqres.full 2>&1
+
+# Then tar up the directory structure
+tar -cvf $TEMP_DIR/$TAR_FILE $POPULATED_DIR >>$seqres.full 2>&1
+
+# untar on f/s
+cd $TEST_DIR
+tar -xvf $TEMP_DIR/$TAR_FILE >>$seqres.full 2>&1
+cd $here
+
+# use diff -qr to compare
+ls -R -l ${TEST_DIR}${POPULATED_DIR} >>$seqres.full 2>&1
+diff -qr $POPULATED_DIR ${TEST_DIR}${POPULATED_DIR}
+
+cd /
+
+status=0
+exit

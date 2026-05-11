@@ -1,0 +1,66 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc.,  All Rights Reserved.
+#
+# FS QA Test 355
+#
+# Test clear of suid/sgid on direct write.
+#
+. ./common/preamble
+_begin_fstest auto quick perms
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_user
+_require_odirect
+_require_chown
+
+testfile=$TEST_DIR/$seq.test
+rm -f $testfile
+
+do_io()
+{
+	_su $qa_user -c "$XFS_IO_PROG -d -c 'pwrite 0 4k' $testfile" \
+		>>$seqres.full
+}
+
+echo "Check that suid/sgid bits are cleared after direct write"
+
+# create testfile and set base ownership & permission
+echo "this is a test" >> $testfile
+chmod 644 $testfile
+chown $qa_user:$qa_user $testfile
+
+echo "== with no exec perm"
+chmod ug+s $testfile
+echo -n "before: "; stat -c '%A' $testfile
+do_io
+echo -n "after:  "; stat -c '%A' $testfile
+
+echo "== with user exec perm"
+chmod ug+s $testfile
+chmod u+x $testfile
+echo -n "before: "; stat -c '%A' $testfile
+do_io
+echo -n "after:  "; stat -c '%A' $testfile
+
+echo "== with group exec perm"
+chmod ug+s $testfile
+chmod g+x $testfile
+chmod u-x $testfile
+echo -n "before: "; stat -c '%A' $testfile
+do_io
+echo -n "after:  "; stat -c '%A' $testfile
+
+echo "== with user+group exec perm"
+chmod ug+s $testfile
+chmod u+x $testfile
+echo -n "before: "; stat -c '%A' $testfile
+do_io
+echo -n "after:  "; stat -c '%A' $testfile
+
+# success, all done
+status=0
+exit

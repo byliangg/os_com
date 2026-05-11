@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-newer
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 569
+#
+# Check that we can't modify a file that's an active swap file.
+
+. ./common/preamble
+_begin_fstest auto quick rw swap prealloc mmap
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	swapoff $testfile
+	rm -rf $tmp.* $testfile
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_xfs_io_command "falloc"
+_require_test_program swapon
+_require_scratch_swapfile
+_require_odirect
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testfile=$SCRATCH_MNT/$seq.swap
+
+_format_swapfile $testfile 20m > /dev/null
+
+# Can you modify the swapfile via previously open file descriptors?
+for verb in 1 2 3 4; do
+	echo "verb $verb"
+	"$here/src/swapon" -v $verb $testfile
+	swapoff $testfile
+done
+
+# Now try writing with a new file descriptor.
+swapon $testfile 2>&1 | _filter_scratch
+
+# Can we write to it?
+$XFS_IO_PROG -c 'pwrite -S 0x59 64k 64k' $testfile 2>&1 | _filter_xfs_io_error
+$XFS_IO_PROG -d -c 'pwrite -S 0x60 64k 64k' $testfile 2>&1 | _filter_xfs_io_error
+$XFS_IO_PROG -c 'mmap -rw 64k 64k' -c 'mwrite -S 0x61 64k 64k' $testfile
+
+# Can we change the file size?
+$XFS_IO_PROG -c 'truncate 18m' $testfile
+
+# Can you fallocate the file?
+$XFS_IO_PROG -c 'falloc 0 32m' $testfile
+
+# We test that you can't reflink, dedupe, or copy_file_range into a swapfile
+# in other tests.
+
+# success, all done
+status=0
+exit

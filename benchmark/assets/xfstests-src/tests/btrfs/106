@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 106
+#
+# Regression test for file read corruption when using compressed extents
+# that represent file ranges with a length that is a multiple of 16 pages
+# and that are shared by multiple consecutive ranges of the same file.
+#
+. ./common/preamble
+_begin_fstest auto quick clone compress
+
+. ./common/filter
+
+_require_scratch
+_require_cloner
+
+test_clone_and_read_compressed_extent()
+{
+	local mount_opts=$1
+
+	_scratch_mkfs >>$seqres.full 2>&1
+	_scratch_mount $mount_opts
+
+	PAGE_SIZE=$(_get_page_size)
+
+	# Create our test file with 16 pages worth of data in a single extent
+	# that is going to be compressed no matter which compression algorithm
+	# is used (zlib/lzo).
+	$XFS_IO_PROG -f -c "pwrite -S 0xaa 0K $((16 * $PAGE_SIZE))" \
+		     $SCRATCH_MNT/foo | _filter_xfs_io_pages_modified
+
+	# Now clone the compressed extent into an adjacent file offset.
+	$CLONER_PROG -s 0 -d $((16 * $PAGE_SIZE)) -l $((16 * $PAGE_SIZE)) \
+		$SCRATCH_MNT/foo $SCRATCH_MNT/foo
+
+	echo "Hash before unmount:" >> $seqres.full
+	old_md5=$(_md5_checksum "$SCRATCH_MNT/foo")
+	echo "$old_md5" >> $seqres.full
+
+	# Remount the fs or clear the page cache to trigger the bug in btrfs.
+	# Because the extent has an uncompressed length that is a multiple of 16
+	# pages, all the pages belonging to the second range of the file that is
+	# mapped by the page index range [16, 31], which points to the same
+	# extent as the first file range mapped by the page index range [0, 15],
+	# had their contents full of zeroes instead of the byte 0xaa. This was a
+	# bug exclusively in the read path of compressed extents, the correct
+	# data was stored on disk, btrfs just failed to fill in the pages
+	# correctly.
+	_scratch_cycle_mount
+
+	echo "Hash after remount:" >> $seqres.full
+	# Must match the digest we got before.
+	new_md5=$(_md5_checksum "$SCRATCH_MNT/foo")
+	echo "$new_md5" >> $seqres.full
+	if [ "$old_md5" != "$new_md5" ]; then
+		echo "Hash mismatches after remount"
+	else
+		echo "Hash matches after remount"
+	fi
+}
+
+echo -e "\nTesting with zlib compression..."
+test_clone_and_read_compressed_extent "-o compress=zlib"
+
+_scratch_unmount
+
+echo -e "\nTesting with lzo compression..."
+test_clone_and_read_compressed_extent "-o compress=lzo"
+
+status=0
+exit

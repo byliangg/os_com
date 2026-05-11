@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 011
+#
+# Create and populate an ext4 filesystem, corrupt the MMP block, then
+# see how the kernel and e2fsck deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_ext4_crc
+_require_attrs
+
+TESTDIR="${SCRATCH_MNT}/scratchdir"
+TESTFILE="${TESTDIR}/testfile"
+
+echo "+ create scratch fs"
+_scratch_mkfs_ext4 -O mmp -E mmp_update_interval=2 > /dev/null 2>&1
+
+echo "+ mount fs image"
+_scratch_mount
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+
+echo "+ make some files"
+echo moo > "${SCRATCH_MNT}/file0"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+e2fsck -fn "${SCRATCH_DEV}" >> $seqres.full 2>&1 || _fail "fsck should not fail"
+
+echo "+ corrupt image"
+blk="$(dumpe2fs "${SCRATCH_DEV}" 2> /dev/null | grep 'MMP block number' | sed -e 's/^MMP block number: *\([0-9]*\)$/\1/g')"
+$XFS_IO_PROG -f -c "pwrite -S 0x62 $((blk * blksz + 16)) 8" "${SCRATCH_DEV}" >> $seqres.full
+
+echo "+ mount image"
+_try_scratch_mount 2> /dev/null && _fail "mount should fail due to bad MMP"
+
+echo "+ repair fs"
+e2fsck -fy "${SCRATCH_DEV}" >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_try_scratch_mount || _fail "mount should not fail; MMP has been fixed"
+
+echo "+ check fs (2)"
+e2fsck -fn "${SCRATCH_DEV}" >> $seqres.full 2>&1 || _fail "fsck should not fail"
+
+status=0
+exit

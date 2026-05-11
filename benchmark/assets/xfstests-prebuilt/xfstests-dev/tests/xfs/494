@@ -1,0 +1,28 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 494
+#
+# Ensure that xfsprogs crc32 works correctly via xfs_io crc32cselftest command.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_require_xfs_io_command "crc32cselftest"
+
+rm -f "$seqres.full"
+
+filter_selftest() {
+	sed -e 's/bytes in [0-9]* usec/bytes in XXX usec/g'
+}
+
+$XFS_IO_PROG -c 'crc32cselftest' | filter_selftest
+
+echo "Silence is golden."
+# success, all done
+status=0
+exit

@@ -1,0 +1,58 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 332
+#
+# Make sure query_range returns -EINVAL if lowkey > highkey.
+#
+. ./common/preamble
+_begin_fstest auto quick rmap clone collapse punch insert zero prealloc
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_xfs_scratch_rmapbt
+_require_command "$XFS_DB_PROG" "xfs_db"
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fpunch"
+_require_xfs_io_command "fzero"
+_require_xfs_io_command "fcollapse"
+_require_xfs_io_command "finsert"
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+blksz=$(_get_file_block_size $SCRATCH_MNT) # 65536
+blocks=16
+len=$((blocks * blksz))
+
+echo "Create some files"
+$XFS_IO_PROG -f -c "falloc 0 $len" -c "pwrite -S 0x68 -b 1048576 0 $len" $SCRATCH_MNT/f1 >> $seqres.full
+
+echo "Manipulate file"
+$XFS_IO_PROG -c "fpunch $blksz $blksz" \
+	-c "fzero $((3 * blksz)) $blksz" \
+	-c "pwrite -S 0x69 $((5 * blksz)) $blksz" \
+	-c "fpunch $((7 * blksz)) $blksz" \
+	-c "fsync" \
+	-c "pwrite -S 0x70 $((7 * blksz)) $blksz" \
+	-c "fcollapse $((9 * blksz)) $blksz" \
+	-c "finsert $((10 * blksz)) $blksz" $SCRATCH_MNT/f1 >> $seqres.full
+
+echo "Unmount"
+_scratch_unmount
+
+echo "Try a regular fsmap"
+_scratch_xfs_db -c 'fsmap' >> $seqres.full
+_scratch_xfs_db -c 'fsmap 0 5' >> $seqres.full
+
+echo "Try a bad fsmap"
+_scratch_xfs_db -c 'fsmap 5 4'
+
+# success, all done
+status=0
+exit

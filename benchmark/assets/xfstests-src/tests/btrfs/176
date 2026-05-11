@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Facebook.  All Rights Reserved.
+#
+# FS QA Test 176
+#
+# Test device remove/replace with an active swap file.
+#
+. ./common/preamble
+_begin_fstest auto quick swap volume
+
+. ./common/filter
+
+_require_scratch_dev_pool 3
+_require_scratch_swapfile
+
+# We check the filesystem manually because we move devices around.
+rm -f "${RESULT_DIR}/require_scratch"
+
+scratch_dev1="$(echo "${SCRATCH_DEV_POOL}" | $AWK_PROG '{ print $1 }')"
+scratch_dev2="$(echo "${SCRATCH_DEV_POOL}" | $AWK_PROG '{ print $2 }')"
+scratch_dev3="$(echo "${SCRATCH_DEV_POOL}" | $AWK_PROG '{ print $3 }')"
+
+echo "Remove device"
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+_format_swapfile "$SCRATCH_MNT/swap" $(($(_get_page_size) * 10)) > /dev/null
+$BTRFS_UTIL_PROG device add -f "$scratch_dev2" "$SCRATCH_MNT" >> $seqres.full
+swapon "$SCRATCH_MNT/swap" 2>&1 | _filter_scratch
+# We know the swap file is on device 1 because we added device 2 after it was
+# already created.
+$BTRFS_UTIL_PROG device delete "$scratch_dev1" "$SCRATCH_MNT" 2>&1 | grep -o "Text file busy"
+# Deleting/readding device 2 should still work.
+$BTRFS_UTIL_PROG device delete "$scratch_dev2" "$SCRATCH_MNT"
+$BTRFS_UTIL_PROG device add -f "$scratch_dev2" "$SCRATCH_MNT" >> $seqres.full
+swapoff "$SCRATCH_MNT/swap" > /dev/null 2>&1
+# Deleting device 1 should work again after swapoff.
+$BTRFS_UTIL_PROG device delete "$scratch_dev1" "$SCRATCH_MNT"
+_scratch_unmount
+_check_dev_fs "$scratch_dev2"
+
+echo "Replace device"
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+_format_swapfile "$SCRATCH_MNT/swap" $(($(_get_page_size) * 10)) > /dev/null
+$BTRFS_UTIL_PROG device add -f "$scratch_dev2" "$SCRATCH_MNT" >> $seqres.full
+swapon "$SCRATCH_MNT/swap" 2>&1 | _filter_scratch
+# Again, we know the swap file is on device 1.
+$BTRFS_UTIL_PROG replace start -fB "$scratch_dev1" "$scratch_dev3" "$SCRATCH_MNT" 2>&1 | grep -o "Text file busy"
+# Replacing device 2 should still work.
+$BTRFS_UTIL_PROG replace start -fB "$scratch_dev2" "$scratch_dev3" "$SCRATCH_MNT" \
+	>> $seqres.full
+swapoff "$SCRATCH_MNT/swap" > /dev/null 2>&1
+# Replacing device 1 should work again after swapoff.
+$BTRFS_UTIL_PROG replace start -fB "$scratch_dev1" "$scratch_dev2" "$SCRATCH_MNT" \
+	>> $seqres.full
+_scratch_unmount
+_check_dev_fs "$scratch_dev2"
+
+# success, all done
+status=0
+exit

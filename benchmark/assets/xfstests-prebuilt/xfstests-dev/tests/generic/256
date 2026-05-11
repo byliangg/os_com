@@ -1,0 +1,98 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 IBM Corporation.  All Rights Reserved.
+#
+# FS QA Test No. 256
+#
+# Test Full File System Hole Punching
+#
+. ./common/preamble
+_begin_fstest auto quick punch
+
+# Import common functions.
+. ./common/populate
+. ./common/filter
+. ./common/punch
+
+
+_require_xfs_io_command "fpunch"
+_require_scratch
+_require_user
+_require_test
+
+testfile=$TEST_DIR/256.$$
+
+# _test_full_fs_punch()
+#
+# This function will test that a hole may be punched
+# even when the file system is full.  Reserved blocks
+# should be used to allow a punch hole to proceed even
+# when there is not enough blocks to further fragment the
+# file. To test this, this function will fragment the file
+# system by punching holes in regular intervals and filling
+# the file system between punches.
+#
+_test_full_fs_punch()
+{
+	local hole_len=$1      # The length of the holes to punch
+	local hole_interval=$2 # The interval between the holes
+	local iterations=$3    # The number of holes to punch
+	local file_name=$4     # File to punch holes in
+	local block_size=$5    # File system block size
+	local file_len=$(( $(( $hole_len + $hole_interval )) * $iterations ))
+	local path=`dirname $file_name`
+	local hole_offset=0
+	local start_time
+	local stop_time
+
+	if [ $# -ne 5 ]
+	then
+		echo "USAGE: _test_full_fs_punch hole_len hole_interval iterations file_name block_size"
+		exit 1
+	fi
+
+	rm -f $file_name &> /dev/null
+
+	$XFS_IO_PROG -f -c "pwrite 0 $file_len" \
+		-c "fsync" $file_name &> /dev/null
+	chmod 666 $file_name
+
+	start_time="$(date +%s)"
+	stop_time=$(( start_time + (30 * TIME_FACTOR) ))
+
+	# All files are created as a non root user to prevent reserved blocks
+	# from being consumed.
+	_fill_fs $(( 1024 * 1024 * 1024 )) $path/fill $block_size 1 \
+		> /dev/null 2>&1
+
+	for (( i=0; i<$iterations; i++ ))
+	do
+		test "$(date +%s)" -ge "$stop_time" && break
+
+		# This part must not be done as root in order to
+		# test that reserved blocks are used when needed
+		_user_do "$XFS_IO_PROG -f -c \"fpunch $hole_offset $hole_len\" $file_name"
+		rc=$?
+		if [ $? -ne 0 ] ; then
+			echo Punch hole failed
+			break
+		fi
+
+		hole_offset=$(( $hole_offset + $hole_len + $hole_interval ))
+
+		_fill_fs $hole_len $path/fill.$i $block_size 1 > /dev/null 2>&1
+
+	done
+}
+
+# Make a small file system to fill
+_scratch_unmount &> /dev/null
+_scratch_mkfs_sized $(( 1536 * 1024 * 1024 )) &> /dev/null
+_scratch_mount
+# Test must be able to write files with non-root permissions
+chmod 777 $SCRATCH_MNT
+
+block_size=`_get_block_size $SCRATCH_MNT`
+_test_full_fs_punch $(( $block_size * 2 )) $block_size 500 $SCRATCH_MNT/252.$$ $block_size
+
+status=0 ; exit

@@ -1,0 +1,91 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 100
+#
+# Create and populate an XFS filesystem, corrupt a leaf directory's data
+# extent, then see how the kernel and xfs_repair deal with it.
+#
+. ./common/preamble
+_begin_fstest fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    #rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/populate
+
+
+_require_scratch
+test -n "${FORCE_FUZZ}" || _require_scratch_xfs_crc
+_require_attrs
+_require_populate_commands
+_require_xfs_db_blocktrash_z_command
+test -z "${FUZZ_ARGS}" && FUZZ_ARGS="-n 8 -3"
+
+echo "+ create scratch fs"
+_scratch_mkfs_xfs > /dev/null
+
+echo "+ mount fs image"
+_scratch_mount
+dblksz=$(_xfs_get_dir_blocksize "$SCRATCH_MNT")
+nr="$((dblksz / 12))"
+blksz="$(stat -f -c '%s' "${SCRATCH_MNT}")"
+leaf_lblk="$((32 * 1073741824 / blksz))"
+node_lblk="$((64 * 1073741824 / blksz))"
+
+echo "+ make some files"
+__populate_create_dir "${SCRATCH_MNT}/blockdir" "${nr}"
+inode="$(stat -c '%i' "${SCRATCH_MNT}/blockdir")"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+echo "+ check dir"
+__populate_check_xfs_dir "${inode}" leaf
+
+echo "+ corrupt dir"
+loff=0
+while true; do
+	_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${loff}" -c "stack" | grep -q 'file data block is unmapped' && break
+	_scratch_xfs_db -x -c "inode ${inode}" -c "dblock ${loff}" -c "stack" -c "blocktrash -x 32 -y $((blksz * 8)) -z ${FUZZ_ARGS}" >> $seqres.full
+	loff="$((loff + 1))"
+done
+
+echo "+ mount image && modify dir"
+if _try_scratch_mount >> $seqres.full 2>&1; then
+
+	rm -rf "${SCRATCH_MNT}/blockdir/00000000" 2> /dev/null && _fail "modified corrupt directory"
+	mkdir "${SCRATCH_MNT}/blockdir/xxxxxxxx" 2> /dev/null && _fail "add to corrupt directory"
+	umount "${SCRATCH_MNT}"
+fi
+
+echo "+ repair fs"
+_repair_scratch_fs >> $seqres.full 2>&1
+_repair_scratch_fs >> $seqres.full 2>&1
+
+echo "+ mount image (2)"
+_scratch_mount
+
+echo "+ chattr -R -i"
+$CHATTR_PROG -R -f -i "${SCRATCH_MNT}/"
+
+echo "+ modify dir (2)"
+mkdir -p "${SCRATCH_MNT}/blockdir"
+rm -rf "${SCRATCH_MNT}/blockdir/00000000" || _fail "couldn't modify repaired directory"
+mkdir "${SCRATCH_MNT}/blockdir/xxxxxxxx" || _fail "add to repaired directory"
+umount "${SCRATCH_MNT}"
+
+echo "+ check fs (2)"
+_scratch_xfs_repair -n >> $seqres.full 2>&1 || _fail "xfs_repair should not fail"
+
+status=0
+exit

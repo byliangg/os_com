@@ -1,0 +1,96 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/040
+#
+# Regression test for btrfs incremental send issue where an rmdir
+# instruction was sent multiple times for the same target directory.
+# The number of times depended on the number of hardlinks against
+# the same inode inside the target directory. That inode must have
+# had the highest number of all the inodes that were children of the
+# directory. This made the btrfs receive command fail immediately once
+# it received the second rmdir instruction.
+#
+# This issue is fixed by the following linux kernel btrfs patch:
+#
+#   Btrfs: send, don't send rmdir for same target multiple times
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+tmp=`mktemp -d`
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $tmp
+}
+
+. ./common/filter
+
+_require_scratch
+_require_fssum
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+mkdir -p $SCRATCH_MNT/a/b/c
+echo 'hello world' > $SCRATCH_MNT/a/b/c/hel.txt
+echo 'ola mundo' > $SCRATCH_MNT/a/b/c/foo.txt
+ln $SCRATCH_MNT/a/b/c/foo.txt $SCRATCH_MNT/a/b/c/bar.txt
+ln $SCRATCH_MNT/a/b/c/foo.txt $SCRATCH_MNT/a/b/baz.txt
+
+# Filesystem looks like:
+#
+# .                        (ino 256)
+# |-- a/                   (ino 257)
+#     |-- b/               (ino 258)
+#         |-- c/           (ino 259)
+#         |   |-- hel.txt  (ino 260)
+#         |   |-- foo.txt  (ino 261)
+#         |   |-- bar.txt  (ino 261)
+#         |
+#         |-- baz.txt      (ino 261)
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+
+rm -f $SCRATCH_MNT/a/b/c/foo.txt
+rm -f $SCRATCH_MNT/a/b/c/bar.txt
+rm -f $SCRATCH_MNT/a/b/c/hel.txt
+rmdir $SCRATCH_MNT/a/b/c
+
+# Filesystem now looks like:
+#
+# .                        (ino 256)
+# |-- a/                   (ino 257)
+#     |-- b/               (ino 258)
+#         |-- baz.txt      (ino 261)
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap2
+
+run_check $FSSUM_PROG -A -f -w $tmp/1.fssum $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $tmp/2.fssum -x $SCRATCH_MNT/mysnap2/mysnap1 \
+	$SCRATCH_MNT/mysnap2
+
+_btrfs send -f $tmp/1.snap $SCRATCH_MNT/mysnap1
+_btrfs send -p $SCRATCH_MNT/mysnap1 -f $tmp/2.snap \
+	$SCRATCH_MNT/mysnap2
+
+_scratch_unmount
+_check_btrfs_filesystem $SCRATCH_DEV
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+_btrfs receive -f $tmp/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $tmp/1.fssum $SCRATCH_MNT/mysnap1
+
+_btrfs receive -f $tmp/2.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $tmp/2.fssum $SCRATCH_MNT/mysnap2
+
+_scratch_unmount
+_check_btrfs_filesystem $SCRATCH_DEV
+
+status=0
+exit

@@ -84,6 +84,7 @@ run_benchmark() {
     local benchmark="$1"
     local run_mode="$2"
     local runtime_configs_str="$3" # String with key=value pairs, one per line
+    local bench_run_only="${BENCH_RUN_ONLY:-both}"
 
     echo "Preparing libraries..."
     prepare_libs
@@ -118,20 +119,35 @@ run_benchmark() {
      done <<< "$runtime_configs_str"
 
     # Prepare commands for Asterinas and Linux using arrays
+    local bench_enable_kvm="${BENCH_ENABLE_KVM:-1}"
+    local bench_aster_netdev="${BENCH_ASTER_NETDEV:-tap}"
+    local bench_aster_vhost="${BENCH_ASTER_VHOST:-on}"
+    local bench_fio_bs="${BENCH_FIO_BS:-}"
+    local bench_fio_fsync="${BENCH_FIO_FSYNC:-}"
+    local ext4_direct_read_cache="${EXT4_DIRECT_READ_CACHE:-1}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
     asterinas_cmd_arr+=(
         "SMP=${smp_val}"
         "MEM=${mem_val}"
-        ENABLE_KVM=1
+        "ENABLE_KVM=${bench_enable_kvm}"
         RELEASE_LTO=1
-        NETDEV=tap
-        VHOST=on
+        "NETDEV=${bench_aster_netdev}"
+        "VHOST=${bench_aster_vhost}"
+        "EXT4_DIRECT_READ_CACHE=${ext4_direct_read_cache}"
     )
+    [[ -n "$bench_fio_bs" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=${bench_fio_bs}")
+    [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=1M")
+    [[ -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_FSYNC=${bench_fio_fsync}")
     if [[ "$platform" == "tdx" ]]; then
         asterinas_cmd_arr+=(INTEL_TDX=1)
     fi
+
+    local linux_init_args="/benchmark/common/bench_runner.sh ${benchmark} linux"
+    [[ -n "$bench_fio_bs" ]] && linux_init_args+=" ${bench_fio_bs}"
+    [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && linux_init_args+=" 1M"
+    [[ -n "$bench_fio_fsync" ]] && linux_init_args+=" ${bench_fio_fsync}"
 
     local linux_cmd_arr=(
         qemu-system-x86_64
@@ -145,7 +161,7 @@ run_benchmark() {
         -drive "if=none,format=raw,id=x0,file=${BENCHMARK_ROOT}/../../build/ext2.img"
         -device "virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
         -device "virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off,csum=off,guest_csum=off,ctrl_guest_offloads=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,mrg_rxbuf=off,ctrl_vq=off,ctrl_rx=off,ctrl_vlan=off,ctrl_rx_extra=off,guest_announce=off,ctrl_mac_addr=off,host_ufo=off,guest_uso4=off,guest_uso6=off,host_uso=off"
-        -append "console=ttyS0 rdinit=/benchmark/common/bench_runner.sh ${benchmark} linux mitigations=off hugepages=0 transparent_hugepage=never quiet"
+        -append "console=ttyS0 rdinit=${linux_init_args} mitigations=off hugepages=0 transparent_hugepage=never quiet"
         -netdev "tap,id=net01,script=${BENCHMARK_ROOT}/../../../../tools/net/qemu-ifup.sh,downscript=${BENCHMARK_ROOT}/../../../../tools/net/qemu-ifdown.sh,vhost=on"
         -nographic
     )
@@ -167,13 +183,20 @@ run_benchmark() {
     # Run the benchmark depending on the mode
     case "${run_mode}" in
         "guest_only")
-            echo "Running benchmark ${benchmark} on Asterinas..."
-            # Execute directly from array, redirect stderr to stdout, then tee
-            "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
-            prepare_fs
-            echo "Running benchmark ${benchmark} on Linux..."
-            # Execute directly from array, redirect stderr to stdout, then tee
-            "${linux_cmd_arr[@]}" 2>&1 | tee "${LINUX_OUTPUT}"
+            # Ensure Asterinas and Linux both run on a freshly prepared image.
+            if [[ "${bench_run_only}" != "linux" ]]; then
+                prepare_fs
+                echo "Running benchmark ${benchmark} on Asterinas..."
+                # Execute directly from array, redirect stderr to stdout, then tee
+                "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
+            fi
+
+            if [[ "${bench_run_only}" != "asterinas" ]]; then
+                prepare_fs
+                echo "Running benchmark ${benchmark} on Linux..."
+                # Execute directly from array, redirect stderr to stdout, then tee
+                "${linux_cmd_arr[@]}" 2>&1 | tee "${LINUX_OUTPUT}"
+            fi
             ;;
         "host_guest")
             # Note: host_guest_bench_runner.sh expects commands as single strings.
@@ -223,9 +246,14 @@ cleanup() {
 main() {
     local benchmark="$1"
     local platform="$2"
+    local bench_run_only="${BENCH_RUN_ONLY:-both}"
 
     if [[ -z "${BENCHMARK_ROOT}/${benchmark}" ]]; then
         echo "Error: No benchmark specified" >&2
+        exit 1
+    fi
+    if [[ "${bench_run_only}" != "both" && "${bench_run_only}" != "asterinas" && "${bench_run_only}" != "linux" ]]; then
+        echo "Error: BENCH_RUN_ONLY must be one of: both, asterinas, linux" >&2
         exit 1
     fi
     echo "Running benchmark $benchmark..."
@@ -259,13 +287,17 @@ main() {
     # Run the benchmark, passing the config string
     run_benchmark "$benchmark" "$run_mode" "$runtime_configs_str"
 
-    # Parse results if benchmark configuration exists
-    if [[ -f "$bench_result" ]]; then
-        parse_results "$bench_result"
+    if [[ "${bench_run_only}" == "both" ]]; then
+        # Parse results if benchmark configuration exists
+        if [[ -f "$bench_result" ]]; then
+            parse_results "$bench_result"
+        else
+            for job in "${BENCHMARK_ROOT}/${benchmark}"/bench_results/*; do
+                [[ -f "$job" ]] && parse_results "$job"
+            done
+        fi
     else
-        for job in "${BENCHMARK_ROOT}/${benchmark}"/bench_results/*; do
-            [[ -f "$job" ]] && parse_results "$job"
-        done
+        echo "Skipping result aggregation because BENCH_RUN_ONLY=${bench_run_only}."
     fi
 
     # Cleanup temporary files

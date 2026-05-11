@@ -1,0 +1,32 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test ext4/038
+#
+# Regression test for commit:
+# c9eb13a ext4: fix hang when processing corrupted orphaned inode list
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+_exclude_fs ext2
+
+_require_scratch
+_require_command "$DEBUGFS_PROG" debugfs
+
+echo "Silence is golden"
+
+# Although the bug only happens when last_orphan is set to 5
+# it is better to test all reserved inode numbers 1-10 here
+for i in {1..10}; do
+	# create smaller filesystems to save test time
+	_scratch_mkfs_sized $((16 * 1024 * 1024)) >>$seqres.full 2>&1
+	$DEBUGFS_PROG -w -R "ssv last_orphan $i" $SCRATCH_DEV >>$seqres.full 2>&1
+	_scratch_mount
+	_scratch_unmount
+done
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,30 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2020 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 117
+#
+# Run unionmount testsuite on a nested overlay filesystem
+# with multi lower layers, lowermost is an overlay layer,
+# whose layers are not on same fs
+# with xino enabled (expected xino overflows)
+#
+. ./common/preamble
+_begin_fstest auto union rotate nested nonsamefs xino
+
+_register_cleanup "_unionmount_testsuite_cleanup"
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_scratch
+_require_unionmount_testsuite
+
+_unionmount_testsuite_run --ovov=10 --xino --verify
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

@@ -1,0 +1,137 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-newer
+# Copyright (c) 2019, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 148
+#
+# See if we catch corrupt directory names or attr names with nulls or slashes
+# in them.
+
+. ./common/preamble
+_begin_fstest auto quick fuzzers
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_unmount $mntpt > /dev/null 2>&1
+	[ -n "$loop_dev" ] && _destroy_loop_device $loop_dev
+	rm -r -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_test
+_require_attrs
+_require_xfs_nocrc
+
+_disable_dmesg_check
+
+imgfile=$TEST_DIR/img-$seq
+mntpt=$TEST_DIR/mount-$seq
+testdir=$mntpt/testdir
+testfile=$mntpt/testfile
+nullstr="too_many_beans"
+slashstr="are_bad_for_you"
+test_names=("something" "$nullstr" "$slashstr" "another")
+
+rm -f $imgfile $imgfile.old
+
+# Format image file w/o crcs so we can sed the image file
+#
+# TODO: It might be possible to rewrite this using proper xfs_db
+# fs manipulation commands that would work with CRCs.
+#
+# We need to use 512 byte inodes to ensure the attr forks remain in short form
+# even when security xattrs are present so we are always doing name matches on
+# lookup and not name hash compares as leaf/node forms will do.
+$XFS_IO_PROG -f -c 'truncate 40m' $imgfile
+loop_dev=$(_create_loop_device $imgfile)
+MKFS_OPTIONS="-m crc=0 -i size=512" _mkfs_dev $loop_dev >> $seqres.full
+
+# Mount image file
+mkdir -p $mntpt
+_mount $loop_dev $mntpt
+
+echo "creating entries" >> $seqres.full
+
+# Create directory entries
+mkdir -p $testdir
+for name in "${test_names[@]}"; do
+	touch "$testdir/f_$name"
+done
+
+# Create attrs
+touch $testfile
+for name in "${test_names[@]}"; do
+	$ATTR_PROG -s "a_$name" -V heh $testfile >> $seqres.full
+done
+
+# Now put in the first part of the garbage names to make sure we can't
+# access those directly
+test_names+=("too_many" "are_bad/for_you")
+
+access_stuff() {
+	ls $testdir
+	$ATTR_PROG -l $testfile | grep 'a_' | sort
+
+	for name in "${test_names[@]}"; do
+		ls "$testdir/f_$name"
+		$ATTR_PROG -g "a_$name" $testfile
+	done
+}
+
+# Does it work?
+echo "++ ACCESSING GOOD METADATA" | tee -a $seqres.full
+access_stuff > $tmp.log 2>&1
+cat $tmp.log >> $seqres.full
+cat $tmp.log | _filter_test_dir
+
+# Corrupt the entries
+_unmount $mntpt
+_destroy_loop_device $loop_dev
+unset loop_dev
+cp $imgfile $imgfile.old
+sed -b \
+	-e "s/$nullstr/too_many\x00beans/g" \
+	-e "s/$slashstr/are_bad\/for_you/g" \
+	-i $imgfile
+test "$(md5sum < $imgfile)" != "$(md5sum < $imgfile.old)" ||
+	_fail "sed failed to change the image file?"
+
+loop_dev=$(_create_loop_device $imgfile)
+_mount $loop_dev $mntpt
+
+# Try to access the corrupt metadata
+echo "++ ACCESSING BAD METADATA" | tee -a $seqres.full
+access_stuff > $tmp.log 2>&1
+cat $tmp.log >> $seqres.full
+cat $tmp.log | _filter_test_dir | sed -e '/Could not list/d'
+
+echo "does scrub complain?" >> $seqres.full
+
+# Does scrub complain about this?
+if _supports_xfs_scrub $mntpt $loop_dev; then
+	$XFS_SCRUB_PROG -n $mntpt >> $seqres.full 2>&1
+	res=$?
+	test $((res & 1)) -eq 0 && \
+		echo "scrub failed to report corruption ($res)"
+fi
+
+echo "does repair complain?" >> $seqres.full
+
+# Does repair complain about this?
+_unmount $mntpt
+$XFS_REPAIR_PROG -n $loop_dev >> $seqres.full 2>&1
+res=$?
+test $res -eq 1 || \
+	echo "repair failed to report corruption ($res)"
+
+_destroy_loop_device $loop_dev
+unset loop_dev
+
+# success, all done
+status=0
+exit

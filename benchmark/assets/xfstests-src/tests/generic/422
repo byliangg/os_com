@@ -1,0 +1,98 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2017 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. generic/422
+#
+# Test that a filesystem's implementation of the stat(2) system call reports
+# correct values for the number of blocks allocated for a file when there are
+# delayed allocations.
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_xfs_io_command "falloc" "-k"
+_require_odirect
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -f -c "pwrite -S 0xaa 0 64K" $SCRATCH_MNT/foo1 | _filter_xfs_io
+$XFS_IO_PROG -f \
+     -c "pwrite -S 0xaa 0 64K" \
+     -c "truncate 128K" \
+     $SCRATCH_MNT/foo2 | _filter_xfs_io
+$XFS_IO_PROG -f \
+     -c "falloc -k 0 128K" \
+     -c "pwrite -S 0xaa 0 64K" \
+     $SCRATCH_MNT/foo3 | _filter_xfs_io
+touch $SCRATCH_MNT/foo4
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Now overwrite the extent of the first file.
+$XFS_IO_PROG -c "pwrite -S 0xff 0 64K" $SCRATCH_MNT/foo1 | _filter_xfs_io
+
+# Write to a hole of the second file.
+$XFS_IO_PROG -c "pwrite -S 0xff 64K 64K" $SCRATCH_MNT/foo2 | _filter_xfs_io
+# Write again to the same location, just to test that the fs will not account
+# the same write twice.
+$XFS_IO_PROG -c "pwrite -S 0x20 64K 64K" $SCRATCH_MNT/foo2 | _filter_xfs_io
+
+# Write beyond eof of the third file into the pre-allocated extent.
+$XFS_IO_PROG -c "pwrite -S 0xff 64K 64K" $SCRATCH_MNT/foo3 | _filter_xfs_io
+
+# Do a buffered write immediately followed by a direct IO write, without a
+# fsync in between, just to test that page invalidation does not lead to an
+# incorrect number of file blocks reported.
+$XFS_IO_PROG -c "pwrite -S 0xab 0 64K" $SCRATCH_MNT/foo4 | _filter_xfs_io
+$XFS_IO_PROG -d -c "pwrite -S 0xef 0 64K" $SCRATCH_MNT/foo4 | _filter_xfs_io
+
+space_used() {
+    echo "Space used by file foo1:"
+    du -h $SCRATCH_MNT/foo1 | _filter_scratch
+
+    echo "Space used by file foo2:"
+    du -h $SCRATCH_MNT/foo2 | _filter_scratch
+
+    echo "Space used by file foo3:"
+    du -h $SCRATCH_MNT/foo3 | _filter_scratch
+
+    echo "Space used by file foo4:"
+    du -h $SCRATCH_MNT/foo4 | _filter_scratch
+}
+
+space_used > $SCRATCH_MNT/$seq.before
+(
+    echo
+    echo "Before writeback"
+    echo
+
+    cat $SCRATCH_MNT/$seq.before
+) >> $seqres.full
+
+_scratch_sync
+
+# We expect the same file sizes reported by 'du' after writeback finishes.
+
+space_used > $SCRATCH_MNT/$seq.after
+(
+    echo
+    echo "After writeback"
+    echo
+
+    cat $SCRATCH_MNT/$seq.after
+) >> $seqres.full
+
+if diff -q $SCRATCH_MNT/$seq.before $SCRATCH_MNT/$seq.after; then
+	echo "Space used before and after writeback is equal"
+fi
+
+status=0
+exit

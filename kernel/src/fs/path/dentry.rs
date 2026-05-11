@@ -267,7 +267,26 @@ impl DirDentry<'_> {
             return_errno!(Errno::EEXIST);
         }
 
-        let new_inode = self.inode.create(name, type_, mode)?;
+        let new_inode = match self.inode.create(name, type_, mode) {
+            Ok(inode) => inode,
+            Err(err) if err.error() == Errno::EEXIST => {
+                // Another thread/process may have created this entry after we
+                // cached a negative dentry during path walk. Refresh cache to
+                // avoid stale ENOENT on immediate follow-up lookup/chdir.
+                if let Ok(existing_inode) = self.inode.lookup(name) {
+                    let existing_name = String::from(name);
+                    let existing_child = Dentry::new(
+                        existing_inode,
+                        DentryOptions::Leaf((existing_name.clone(), self.this())),
+                    );
+                    if existing_child.is_dentry_cacheable() {
+                        children.upgrade().insert(existing_name, existing_child);
+                    }
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let name = String::from(name);
         let new_child = Dentry::new(new_inode, DentryOptions::Leaf((name.clone(), self.this())));
 
@@ -312,7 +331,23 @@ impl DirDentry<'_> {
             return_errno!(Errno::EEXIST);
         }
 
-        let inode = self.inode.mknod(name, mode, type_)?;
+        let inode = match self.inode.mknod(name, mode, type_) {
+            Ok(inode) => inode,
+            Err(err) if err.error() == Errno::EEXIST => {
+                if let Ok(existing_inode) = self.inode.lookup(name) {
+                    let existing_name = String::from(name);
+                    let existing_child = Dentry::new(
+                        existing_inode,
+                        DentryOptions::Leaf((existing_name.clone(), self.this())),
+                    );
+                    if existing_child.is_dentry_cacheable() {
+                        children.upgrade().insert(existing_name, existing_child);
+                    }
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         let name = String::from(name);
         let new_child = Dentry::new(inode, DentryOptions::Leaf((name.clone(), self.this())));
 
@@ -350,11 +385,10 @@ impl DirDentry<'_> {
             return_errno_with_message!(Errno::EINVAL, "unlink on . or ..");
         }
 
-        let children = self.children.upread();
-        children.check_mountpoint(name)?;
-
-        let mut children = children.upgrade();
-        let cached_child = children.delete(name);
+        let cached_child = {
+            let children = self.children.read();
+            children.check_mountpoint_then_find(name)?
+        };
 
         let dir_inode = &self.inode;
         let child_inode = match cached_child {
@@ -363,13 +397,13 @@ impl DirDentry<'_> {
                 child.inode().clone()
             }
             None => {
-                // Cache miss: need to lookup from the underlying filesystem
-                drop(children);
+                // Cache miss: lookup from the underlying filesystem.
                 dir_inode.lookup(name)?
             }
         };
 
         dir_inode.unlink(name)?;
+        self.children.write().delete(name);
 
         let nlinks = child_inode.metadata().nlinks;
         fs::notify::on_link_count(&child_inode);
@@ -401,11 +435,10 @@ impl DirDentry<'_> {
             return_errno_with_message!(Errno::ENOTEMPTY, "rmdir on ..");
         }
 
-        let children = self.children.upread();
-        children.check_mountpoint(name)?;
-
-        let mut children = children.upgrade();
-        let cached_child = children.delete(name);
+        let cached_child = {
+            let children = self.children.read();
+            children.check_mountpoint_then_find(name)?
+        };
 
         let dir_inode = &self.inode;
         let child_inode = match cached_child {
@@ -414,13 +447,13 @@ impl DirDentry<'_> {
                 child.inode().clone()
             }
             None => {
-                // Cache miss: need to lookup from the underlying filesystem
-                drop(children);
+                // Cache miss: lookup from the underlying filesystem.
                 dir_inode.lookup(name)?
             }
         };
 
         dir_inode.rmdir(name)?;
+        self.children.write().delete(name);
 
         let nlinks = child_inode.metadata().nlinks;
         if nlinks == 0 {

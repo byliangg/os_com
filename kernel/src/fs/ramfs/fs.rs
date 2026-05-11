@@ -1187,6 +1187,27 @@ impl Inode for RamInode {
         }
     }
 
+    fn sync_all(&self) -> Result<()> {
+        // For block device nodes (e.g. /dev/vda), forward fsync to the
+        // underlying block device flush so the host persists pending writes.
+        // Regular files and other node types return Ok(()) (no persistent state).
+        if let Inner::BlockDevice(raw_id) = &self.inner {
+            if let Some(device_id) = DeviceId::from_encoded_u64(*raw_id) {
+                if let Some(block_device) = aster_block::lookup(device_id) {
+                    block_device
+                        .sync()
+                        .map_err(|_| Error::new(Errno::EIO))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_data(&self) -> Result<()> {
+        // Block device nodes: sync_data is equivalent to sync_all (drain all in-flight writes).
+        self.sync_all()
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem> {
         Weak::upgrade(&self.fs).unwrap()
     }

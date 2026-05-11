@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test generic/396
+#
+# Test that FS_IOC_SET_ENCRYPTION_POLICY correctly validates the fscrypt_policy
+# structure that userspace passes to it.
+#
+. ./common/preamble
+_begin_fstest auto quick encrypt
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+
+_require_scratch_encryption
+
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+dir=$SCRATCH_MNT/dir
+mkdir $dir
+
+echo -e "\n*** Invalid contents encryption mode ***"
+_set_encpolicy $dir -c 0xFF |& _filter_scratch
+
+echo -e "\n*** Invalid filenames encryption mode ***"
+_set_encpolicy $dir -n 0xFF |& _filter_scratch
+
+echo -e "\n*** Invalid flags ***"
+_set_encpolicy $dir -f 0xFF |& _filter_scratch
+
+echo -e "\n*** Invalid policy version ***"
+_set_encpolicy $dir -v 0xFF |& _filter_scratch
+
+# Currently, the only supported combination of modes is AES-256-XTS for contents
+# and AES-256-CTS for filenames.  Nothing else should be accepted.
+echo -e "\n*** Invalid combinations of modes ***"
+_set_encpolicy $dir -c AES-256-CTS -n AES-256-CTS |& _filter_scratch
+_set_encpolicy $dir -c AES-256-CTS -n AES-256-XTS |& _filter_scratch
+_set_encpolicy $dir -c AES-256-XTS -n AES-256-XTS |& _filter_scratch
+
+# success, all done
+status=0
+exit

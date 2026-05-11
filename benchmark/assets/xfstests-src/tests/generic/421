@@ -1,0 +1,73 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test generic/421
+#
+# Test revoking an encryption key during concurrent I/O.  Regression test for
+# 1b53cf9815bb ("fscrypt: remove broken support for detecting keyring key
+# revocation").
+#
+. ./common/preamble
+_begin_fstest auto quick encrypt dangerous
+
+# Import common functions.
+. ./common/filter
+. ./common/encrypt
+
+_require_scratch_encryption
+_require_command "$KEYCTL_PROG" keyctl
+
+_init_session_keyring
+_scratch_mkfs_encrypted &>> $seqres.full
+_scratch_mount
+
+dir=$SCRATCH_MNT/encrypted_dir
+file=$dir/file
+
+# 4 processes, 2 MB per process
+nproc=4
+slice=2
+
+# Create an encrypted file and sync its data to disk.
+rm -rf $dir
+mkdir $dir
+keydesc=$(_generate_session_encryption_key)
+_set_encpolicy $dir $keydesc
+$XFS_IO_PROG -f $file -c "pwrite 0 $((nproc*slice))M" -c "fsync" > /dev/null
+
+# Create processes to read from the encrypted file.  Use fadvise to wipe the
+# pagecache before each read, ensuring that each read actually does decryption.
+for ((proc = 0; proc < nproc; proc++)); do
+	(
+		range="$((proc * slice))M ${slice}M"
+		while [ ! -e $tmp.done ]; do
+			$XFS_IO_PROG $file -c "fadvise -d $range" \
+					   -c "pread $range" &> /dev/null
+		done
+	) &
+done
+
+# Wait a second for the readers to start up.
+sleep 1
+
+# Revoke the encryption key.
+keyid=$(_revoke_session_encryption_key $keydesc)
+
+# Now try to open the file again.  In buggy kernels this caused concurrent
+# readers to crash with a NULL pointer dereference during decryption.
+#
+# Note that the fix also made filenames stop "immediately" reverting to no-key
+# names on key revocation.  Therefore, the name of the file we're opening here
+# may be in either plaintext or no-key form depending on the kernel version, and
+# no-key names are unpredictable anyway, so just use 'find' to find it.
+cat "$(find $dir -type f)" > /dev/null
+
+# Wait for readers to exit
+touch $tmp.done
+wait
+
+# success, all done
+echo "Didn't crash!"
+status=0
+exit

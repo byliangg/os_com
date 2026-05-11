@@ -1,0 +1,70 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 390
+#
+# Multi-threads freeze/unfreeze testing. This's a stress test case,
+# it won't do functional check.
+#
+. ./common/preamble
+_begin_fstest auto freeze stress
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	# Kill freeze loops and make sure $SCRATCH_MNT is unfreezed
+	[ -n "$freeze_pids" ] && kill -9 $freeze_pids 2>/dev/null
+	wait $freeze_pids
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	_kill_fsstress
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+echo "Silence is golden"
+
+# Modify as appropriate.
+_require_scratch
+_require_freeze
+_require_test_program "feature"
+
+_scratch_mkfs >>$seqres.full 2>&1
+# We don't want to freeze/unfreeze root fs if mount scratch dev failed
+_scratch_mount
+
+num_cpus=`$here/src/feature -o`
+
+# Start fsstress in background
+procs=$num_cpus
+if [ $procs -gt 20 ]; then
+	procs=20
+elif [ $procs -le 1 ]; then
+	procs=2
+fi
+nops=1000
+stress_dir="$SCRATCH_MNT/fsstress_test_dir"
+mkdir "$stress_dir"
+fsstress_args=`_scale_fsstress_args -d $stress_dir -p $procs -n $nops`
+_run_fsstress_bg $fsstress_args
+
+# Start multi-threads freeze/unfreeze
+for ((i=0; i<$procs; i++)); do
+	while kill -0 $fsstress_pid 2>/dev/null; do
+		xfs_freeze -f $SCRATCH_MNT 2>/dev/null
+		xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	done &
+	freeze_pids="$! $freeze_pids"
+done
+
+_wait_for_fsstress
+result=$?
+wait $freeze_pids
+unset freeze_pids
+
+# Exit with fsstress return value
+status=$result
+exit

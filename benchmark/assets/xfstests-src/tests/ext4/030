@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017-2018 Intel Corporation.  All Rights Reserved.
+#
+# FS QA Test ext4/030
+#
+# This is a regression test for kernel patch:
+#   ext4: prevent data corruption with journaling + DAX
+# created by Ross Zwisler <ross.zwisler@linux.intel.com>
+#
+. ./common/preamble
+_begin_fstest auto quick dax
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch_dax_mountopt "dax"
+_require_test_program "t_ext4_dax_journal_corruption"
+_require_command "$CHATTR_PROG" chattr
+
+_scratch_mkfs > $seqres.full 2>&1
+
+# In order to get our failure condition consistently we need to turn off
+# delayed allocation.  With delayed allocation on this simple test will pass,
+# but we would almost certainly see data corruption down the road as the
+# contents of the journal would conflict with the DAX data.
+_scratch_mount "-o dax,nodelalloc" >> $seqres.full 2>&1
+
+$here/src/t_ext4_dax_journal_corruption $CHATTR_PROG $SCRATCH_MNT/testfile
+
+if [[ $? != 0 && $? != 77 ]]; then
+	echo "Test failed, status $?"
+	exit 1
+fi
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

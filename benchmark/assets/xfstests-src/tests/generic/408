@@ -1,0 +1,62 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Christoph Hellwig.  All Rights Reserved.
+#
+# FS QA Test No. 408
+#
+# Verify that mtime is not updated when deduping files.
+#
+. ./common/preamble
+_begin_fstest auto quick clone dedupe metadata
+
+status=0
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $sourcefile
+	rm -f $destfile
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+
+_require_test
+_require_test_dedupe
+
+echo "Silence is golden."
+
+# pattern the files.
+sourcefile=$TEST_DIR/dedup_mtime_sourcefile
+$XFS_IO_PROG -f -c "pwrite 0 4k" -c fsync $sourcefile >> $seqres.full
+
+destfile=$TEST_DIR/dedup_mtime_destfile
+$XFS_IO_PROG -f -c "pwrite 0 4k" -c fsync $destfile >> $seqres.full
+
+# sample timestamps.
+mtime1=`stat -c %Y $destfile`
+ctime1=`stat -c %Z $destfile`
+echo "before dedup: $mtime1 $ctime1" >> $seqres.full
+
+# dedup to trigger timestamp change
+sleep 1
+_dedupe_range $sourcefile 0 $destfile 0 "4k" >> $seqres.full
+
+# sample and verify that timestamps have changed.
+mtime2=`stat -c %Y $destfile`
+ctime2=`stat -c %Z $destfile`
+echo "after dedup : $mtime2 $ctime2" >> $seqres.full
+
+if [ "$mtime1" != "$mtime2" ]; then
+	echo "mtime updated"
+	let status=$status+1
+fi
+if [ "$ctime1" != "$ctime2" ]; then
+	echo "ctime updated"
+	let status=$status+1
+fi
+
+exit

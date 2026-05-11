@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 388
+#
+# Test XFS log recovery ordering on v5 superblock filesystems. XFS had a problem
+# where it would incorrectly replay older modifications from the log over more
+# recent versions of metadata due to failure to update metadata LSNs during log
+# recovery. This could result in false positive reports of corruption during log
+# recovery and permanent mount failure.
+#
+# To test this situation, run frequent shutdowns immediately after log recovery.
+# Ensure that log recovery does not recover stale modifications and cause
+# spurious corruption reports and/or mount failures.
+#
+. ./common/preamble
+_begin_fstest shutdown auto log metadata recoveryloop
+
+_require_scratch
+_require_local_device $SCRATCH_DEV
+_require_scratch_shutdown
+
+echo "Silence is golden."
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_scratch_mount
+
+while _soak_loop_running $((50 * TIME_FACTOR)); do
+	_run_fsstress_bg -d $SCRATCH_MNT -n 999999 -p 4
+
+	# purposely include 0 second sleeps to test shutdown immediately after
+	# recovery
+	sleep $((RANDOM % 3))
+	_scratch_shutdown
+
+	_kill_fsstress
+
+	# Toggle between rw and ro mounts for recovery. Quit if any mount
+	# attempt fails so we don't shutdown the host fs.
+	if [ $((RANDOM % 2)) -eq 0 ]; then
+		_scratch_cycle_mount || _fail "cycle mount failed"
+	else
+		_scratch_cycle_mount "ro" || _fail "cycle ro mount failed"
+		_scratch_cycle_mount || _fail "cycle rw mount failed"
+	fi
+done
+
+# success, all done
+status=0
+exit

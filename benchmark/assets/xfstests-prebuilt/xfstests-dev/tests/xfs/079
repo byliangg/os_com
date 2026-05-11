@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat, Inc. All Rights Reserved.
+#
+# FS QA Test No. 079
+#
+# Regression test for a bug in the log record checksum mechanism of XFS. Log
+# records are checksummed during recovery and a warning or mount failure occurs
+# on checksum verification failure. XFS had a bug where the checksum mechanism
+# verified different parts of a record depending on the current log buffer size.
+# This caused spurious checksum failures when a filesystem is recovered using a
+# different log buffer size from when the filesystem crashed.
+#
+# Test that log recovery succeeds with a different log buffer size from when the
+# filesystem crashed.
+#
+. ./common/preamble
+_begin_fstest shutdown auto log quick
+
+# Import common functions.
+. ./common/log
+
+# Modify as appropriate.
+_require_scratch
+_require_v2log
+
+echo "Silence is golden."
+
+dmesg -c > /dev/null
+
+_scratch_mkfs >> $seqres.full 2>&1 || _fail "mkfs failed"
+_scratch_mount "-o logbsize=32k"
+
+# Run a workload to dirty the log, wait a bit and shutdown the fs.
+_run_fsstress_bg -d $SCRATCH_MNT -p 4 -n 99999999
+sleep 10
+_scratch_shutdown -f
+_wait_for_fsstress
+
+# Remount with a different log buffer size. Going from 32k to 64k increases the
+# log record extended header count, as the log record header can only handle 32k
+# of space.
+_scratch_unmount
+_try_scratch_mount "-o logbsize=64k"
+
+# The mount may not fail on v4 filesystems. Check for CRC mismatch warning
+# messages to detect failure in this case.
+_dmesg_since_test_start | grep "XFS $(_short_dev $SCRATCH_DEV)" | grep CRC
+
+# success, all done
+status=0
+exit

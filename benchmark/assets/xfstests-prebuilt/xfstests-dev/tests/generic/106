@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2015 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FSQA Test No. 106
+#
+# Test that if we remove one hard link from an inode, evict the inode, fsync the
+# inode, power fail and then mount the filesystem, the hard link we removed does
+# not exists anymore and the filesystem metadata is in a consistent state.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_hardlinks
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+# Create our test file with 2 hard links.
+mkdir $SCRATCH_MNT/testdir
+touch $SCRATCH_MNT/testdir/foo
+ln $SCRATCH_MNT/testdir/foo $SCRATCH_MNT/testdir/bar
+
+# Make sure everything done so far is durably persisted.
+_scratch_sync
+
+# Now remove one of the links, trigger inode eviction and then fsync our
+# inode.
+unlink $SCRATCH_MNT/testdir/bar
+echo 2 > /proc/sys/vm/drop_caches
+$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/testdir/foo
+
+_flakey_drop_and_remount
+
+# Now verify our directory entries.
+echo "Entries in testdir:"
+ls -1 $SCRATCH_MNT/testdir
+
+# If we remove our inode, its parent should become empty and therefore we should
+# be able to remove the parent.
+rm -f $SCRATCH_MNT/testdir/*
+rmdir $SCRATCH_MNT/testdir
+
+_scratch_unmount
+
+# The fstests framework will call fsck against our filesystem which will verify
+# that all metadata is in a consistent state.
+
+status=0
+exit

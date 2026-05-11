@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 027
+#
+# If underlying upper file is immutable, it should stays
+# untouchable in the overlayfs mount.
+#
+# Kernel commit below fixed it.
+# f2b20f6ee842 vfs: move permission checking into ...
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick perms
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$CHATTR_PROG -i $upperdir/foo
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_chattr i
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Preparing immutable file
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $upperdir
+touch $upperdir/foo
+$CHATTR_PROG +i $upperdir/foo
+
+# Mounting overlay
+_scratch_mount
+
+# Touching immutable file in overlay, should fail.
+# Not filtering output here because of errno returned
+# varies among kernel versions:
+#   touch: setting times of 'foo': Operation not permitted
+#   touch: cannot touch 'foo': Permission denied
+if touch $SCRATCH_MNT/foo > /dev/null 2>&1 ; then
+	echo "Test Fail, you can't change an immutable file"
+else
+	echo "Silence is golden"
+fi
+
+# success, all done
+status=0
+exit

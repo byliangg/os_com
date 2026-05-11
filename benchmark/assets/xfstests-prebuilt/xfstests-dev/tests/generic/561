@@ -1,0 +1,89 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test generic/561
+#
+# Dedup & random I/O race test, do multi-threads fsstress and dedupe on
+# same directory/files
+#
+
+# unreliable_in_parallel: duperemove is buggy. It can get stuck in endless
+# fiemap mapping loops, and this seems to happen a *lot* when the system is
+# under heavy load. when they do this, they don't die when they are supposed to
+# and so have to be manually killed to end the test.
+
+. ./common/preamble
+_begin_fstest auto stress dedupe unreliable_in_parallel
+
+# Override the default cleanup function.
+_cleanup()
+{
+	end_test
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_duperemove
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+function end_test()
+{
+	_kill_fsstress
+
+	# stop duperemove running
+	if [ -e $dupe_run ]; then
+		rm -f $dupe_run
+		_pkill $dedup_bin >/dev/null 2>&1
+		wait $dedup_pids
+		rm -f $dedup_prog
+	fi
+}
+
+sleep_time=$((50 * TIME_FACTOR))
+
+# Start fsstress
+testdir="$SCRATCH_MNT/dir"
+mkdir $testdir
+fsstress_opts="-r -n 1000 -p $((5 * LOAD_FACTOR))"
+_run_fsstress_bg $fsstress_opts -d $testdir -l 0
+
+dedup_bin=${seq}.duperemove
+dedup_prog=$TEST_DIR/$dedup_bin
+cp -f $DUPEREMOVE_PROG $dedup_prog
+dedup_pids=""
+dupe_run=$TEST_DIR/${seq}-running
+# Start several dedupe processes on same directory
+touch $dupe_run
+for ((i = 0; i < $((2 * LOAD_FACTOR)); i++)); do
+	while [ -e $dupe_run ]; do
+		# Run cmd in a subshell so that the golden output does not
+		# capture assertions that trigger when killall shoots down
+		# dupremove processes in an arbitrary order, which leaves the
+		# memory in an inconsistent state long enough for the assert
+		# to trip.
+		cmd="$dedup_prog -dr --dedupe-options=same $testdir"
+		bash -c "$cmd" >> $seqres.full 2>&1
+	done 2>&1 | sed -e '/Terminated/d' &
+	dedup_pids="$! $dedup_pids"
+done
+
+# End the test after $sleep_time seconds
+sleep $sleep_time
+end_test
+
+# umount and mount again, verify pagecache contents don't mutate and a fresh
+# read from the disk also doesn't show mutations.
+find $testdir -type f -exec md5sum {} \; > ${tmp}.md5sum
+_scratch_cycle_mount
+md5sum -c --quiet ${tmp}.md5sum
+
+echo "Silence is golden"
+status=0
+exit

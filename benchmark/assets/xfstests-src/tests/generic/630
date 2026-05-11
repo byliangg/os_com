@@ -1,0 +1,35 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (c) 2021 Oracle.  All Rights Reserved.
+#
+# FS QA Test No. 630
+#
+# Make sure that mmap and file writers racing with FIDEDUPERANGE cannot write
+# to the file after the dedupe prep function has decided that the file contents
+# are identical and we can therefore go ahead with the remapping.
+
+. ./common/preamble
+_begin_fstest auto quick rw dedupe clone mmap
+
+# Import common functions.
+. ./common/reflink
+
+_require_scratch_dedupe
+_require_test_program "deduperace"
+
+nr_ops=$((TIME_FACTOR * 10000))
+
+# Format filesystem
+_scratch_mkfs > $seqres.full
+_scratch_mount
+
+# Test once with mmap writes
+$here/src/deduperace -c $SCRATCH_MNT -n $nr_ops
+
+# Test again with pwrites for the lulz
+$here/src/deduperace -c $SCRATCH_MNT -n $nr_ops -w
+
+echo Silence is golden.
+# success, all done
+status=0
+exit

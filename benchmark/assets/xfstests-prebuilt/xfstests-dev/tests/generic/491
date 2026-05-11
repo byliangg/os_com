@@ -1,0 +1,50 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test No. 491
+#
+# Test first read with freeze right after mount.
+#
+# With ext4, this leads to freeze proection bypass WARN_ON in
+# ext4_journal_check_start.
+#
+. ./common/preamble
+_begin_fstest auto quick freeze mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_freeze
+_require_command "$TIMEOUT_PROG" "timeout"
+
+testfile=$SCRATCH_MNT/foo
+
+# Create a filesystem with a file
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+echo "frozen" > $testfile
+
+# Mount filesystem "noatime" and freeze right after mount -
+# reads should not block
+_scratch_cycle_mount "noatime"
+xfs_freeze -f $SCRATCH_MNT
+
+# Read file while filesystem is frozen should succeed
+# without blocking
+$TIMEOUT_PROG -s KILL 5s cat $testfile
+
+xfs_freeze -u $SCRATCH_MNT
+
+status=0
+exit

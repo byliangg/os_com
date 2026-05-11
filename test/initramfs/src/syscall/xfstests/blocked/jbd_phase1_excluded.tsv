@@ -1,0 +1,44 @@
+# test	reason
+# Static exclusions for JBD2 Phase 1 scope.
+# Principle: include only tests that a correct ordered-mode JBD2 impl can run
+# today. Anything needing unavailable kernel features is parked here with a
+# specific reason so it can be revisited in Phase 2.
+
+# --- Requires dm-log-writes (device-mapper log-writes target, not in Asterinas) ---
+generic/311	requires dm-log-writes for fsync durability verification
+generic/321	requires dm-log-writes for fsync-on-dir crash verification
+generic/322	requires dm-log-writes for rename+fsync crash verification
+generic/335	requires dm-log-writes for log replay verification
+generic/336	requires dm-log-writes for log replay verification
+generic/337	requires dm-log-writes for log replay verification
+generic/341	requires dm-log-writes for multi-inode fsync replay
+generic/342	requires dm-log-writes for link+fsync replay
+generic/343	requires dm-log-writes for rename+fsync replay
+generic/348	requires dm-log-writes for directory-entry fsync replay
+generic/390	requires dm-log-writes for fsync rename atomicity
+generic/392	requires dm-log-writes for rename log replay
+generic/455	requires dm-log-writes crash injection framework
+generic/456	requires dm-log-writes crash injection framework
+generic/457	requires dm-log-writes crash injection framework
+generic/458	requires dm-log-writes crash injection framework
+generic/459	requires dm-log-writes crash injection framework
+generic/470	requires dm-log-writes for fsync crash replay
+generic/471	requires dm-log-writes for fsync crash patterns
+generic/475	requires dm-flakey for I/O error injection
+generic/482	requires dm-log-writes for fsync crash replay
+generic/483	requires dm-log-writes for fsync crash replay
+generic/500	requires dm-log-writes for append+fsync replay
+generic/501	requires dm-log-writes for rename+fsync replay
+generic/502	requires dm-log-writes for mknod+fsync replay
+generic/503	requires dm-log-writes for unlink+fsync replay
+generic/520	requires dm-log-writes for quota+fsync crash replay
+generic/521	requires dm-log-writes for log replay ordering
+generic/522	requires dm-log-writes for log replay ordering
+
+# --- Requires dm-flakey (IO failure injection, not in Asterinas) ---
+generic/041	requires dm-flakey + hardlink semantics
+generic/090	requires dm-flakey for dirty log replay
+
+# --- Out of Phase 1 scope (deferred to Phase 2 or rejected entirely) ---
+# Phase 1 does not remove EXT4_RS_RUNTIME_LOCK, so concurrent-heavy xfstests
+# will be admitted once Phase 2 delivers multi-handle concurrency.

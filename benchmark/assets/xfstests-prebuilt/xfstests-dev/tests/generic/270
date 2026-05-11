@@ -1,0 +1,86 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2006 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 270
+#
+# Run fsstress and ENOSPC hitters in parallel, check quota and
+# fs consistency at the end
+#
+. ./common/preamble
+_begin_fstest auto quota rw prealloc ioctl enospc stress
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+. ./common/attr
+
+# Disable all sync operations to get higher load
+FSSTRESS_AVOID="$FSSTRESS_AVOID -ffsync=0 -fsync=0 -ffdatasync=0"
+_workout()
+{
+	echo ""
+	echo "Run fsstress"
+	echo ""
+	num_iterations=10
+	enospc_time=2
+	out=$SCRATCH_MNT/fsstress.$$
+	args=`_scale_fsstress_args -p128 -n999999999 -f setattr=1 $FSSTRESS_AVOID -d $out`
+	echo "fsstress $args" >> $seqres.full
+	# Grant chown capability 
+	cp $FSSTRESS_PROG $tmp.fsstress.bin
+	$SETCAP_PROG cap_chown=epi $tmp.fsstress.bin
+
+	# io_uring accounts memory it needs under the rlimit memlocked option,
+	# which can be quite low on some setups (especially 64K pagesize). root
+	# isn't under this restriction, but regular users are. To avoid the
+	# io_uring_queue_init fail on ENOMEM, set max locked memory to unlimited
+	# temporarily.
+	ulimit -l unlimited
+	_su $qa_user -c "$tmp.fsstress.bin $args" > /dev/null 2>&1 &
+	_FSSTRESS_PID=$!
+
+	echo "Run dd writers in parallel"
+	for ((i=0; i < num_iterations; i++))
+	do
+		# File will be opened with O_TRUNC each time
+		_su $qa_user -c "dd if=/dev/zero \
+			of=$SCRATCH_MNT/SPACE_CONSUMER bs=1M " \
+			>> $seqres.full 2>&1
+		sleep $enospc_time
+	done
+
+	_pkill -PIPE -f fsstress
+	wait $_FSSTRESS_PID
+	return 0
+}
+
+_require_quota
+_require_user
+_require_scratch
+_require_command "$SETCAP_PROG" setcap
+_require_attrs security
+
+_scratch_mkfs_sized $((512 * 1024 * 1024)) >> $seqres.full 2>&1
+_qmount_option "usrquota,grpquota"
+_qmount
+
+if ! _workout; then
+	_scratch_unmount 2>/dev/null
+	exit
+fi
+
+if ! _check_quota_usage; then
+	_scratch_unmount 2>/dev/null
+	status=1
+	exit
+fi
+
+echo Comparing filesystem consistency
+if ! _scratch_unmount; then
+	echo "failed to umount"
+	status=1
+	exit
+fi
+status=0
+exit

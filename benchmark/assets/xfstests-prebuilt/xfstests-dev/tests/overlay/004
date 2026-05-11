@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 004
+#
+# Test file copy up on overlayfs by changing mode bits.
+#
+. ./common/preamble
+_begin_fstest attr auto copyup quick perms
+
+# Import common functions.
+. ./common/filter
+
+# Modify as appropriate.
+_require_scratch
+_require_user
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# Create test file in lower dir
+lowerdir=${OVL_BASE_SCRATCH_MNT}/${OVL_LOWER}
+upperdir=${OVL_BASE_SCRATCH_MNT}/${OVL_UPPER}
+mkdir -p $lowerdir
+touch ${lowerdir}/attr_file1
+chmod 000 ${lowerdir}/attr_file1
+touch ${lowerdir}/attr_file2
+chmod 000 ${lowerdir}/attr_file2
+
+_scratch_mount
+
+# copy up by change mode bits and check.
+chmod a+x ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod o-w ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod g+w ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod u-r ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod a+X ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod o-s ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod g+t ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+chmod u-X ${SCRATCH_MNT}/attr_file1 > /dev/null 2>&1
+stat -c %a ${SCRATCH_MNT}/attr_file1
+
+# unprivileged user can't do this.
+_user_do "chmod a+x ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod o-w ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod g+w ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod u-r ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod a+X ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod o-s ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod g+t ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+_user_do "chmod u-X ${SCRATCH_MNT}/attr_file2 > /dev/null 2>&1"
+stat -c %a ${SCRATCH_MNT}/attr_file2
+
+# unmount overlayfs but not base fs
+$UMOUNT_PROG $SCRATCH_MNT
+
+# check mode bits of the file that has been copied up, and
+# the file that should not have been copied up.
+stat -c %a ${upperdir}/attr_file1
+ls ${upperdir}/
+
+# success, all done
+status=0
+exit

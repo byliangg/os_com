@@ -1,0 +1,76 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Red Hat.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/001
+#
+# Test btrfs's subvolume and snapshot support
+#
+. ./common/preamble
+_begin_fstest auto quick subvol snapshot
+
+. ./common/filter
+. ./common/filter.btrfs
+
+_require_scratch
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+# First test basic snapshotting
+echo "Creating file foo in root dir"
+dd if=/dev/zero of=$SCRATCH_MNT/foo bs=1M count=1 &> /dev/null
+echo "List root dir"
+ls $SCRATCH_MNT
+echo "Creating snapshot of root dir"
+_btrfs subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/snap
+echo "List root dir after snapshot"
+ls $SCRATCH_MNT
+echo "List snapshot dir"
+ls $SCRATCH_MNT/snap
+rm -f $SCRATCH_MNT/foo
+echo "List root dir after rm of foo"
+ls $SCRATCH_MNT
+echo "List snapshot dir"
+ls $SCRATCH_MNT/snap
+
+# Test creating a normal subvolme
+$BTRFS_UTIL_PROG subvolume create $SCRATCH_MNT/subvol | _filter_scratch
+echo "Listing root dir"
+ls $SCRATCH_MNT
+echo "Listing subvol"
+ls $SCRATCH_MNT/subvol
+
+# Test setting a default mount
+echo "Creating file bar in subvol"
+dd if=/dev/zero of=$SCRATCH_MNT/subvol/bar bs=1M count=1 &> /dev/null
+echo "Setting subvol to the default"
+subvolid=$(_btrfs_get_subvolid $SCRATCH_MNT subvol)
+$BTRFS_UTIL_PROG subvolume set-default $subvolid $SCRATCH_MNT | _filter_scratch
+_scratch_cycle_mount
+echo "List root dir which is now subvol"
+ls $SCRATCH_MNT
+_scratch_unmount
+echo "Mounting sbuvolid=0 for the root dir"
+_scratch_mount "-o subvolid=0"
+echo "List root dir"
+ls $SCRATCH_MNT
+echo "Setting the root dir as the default again"
+$BTRFS_UTIL_PROG subvolume set-default 0 $SCRATCH_MNT | _filter_scratch
+_scratch_cycle_mount
+echo "List root dir"
+ls $SCRATCH_MNT
+
+# Test listing the subvolumes
+echo "Listing subvolumes"
+$BTRFS_UTIL_PROG subvolume list $SCRATCH_MNT | $AWK_PROG '{ print $NF }'
+
+# Delete the snapshot
+$BTRFS_UTIL_PROG subvolume delete $SCRATCH_MNT/snap | _filter_btrfs_subvol_delete
+echo "List root dir"
+ls $SCRATCH_MNT
+_scratch_cycle_mount
+echo "List root dir"
+ls $SCRATCH_MNT
+
+status=0 ; exit

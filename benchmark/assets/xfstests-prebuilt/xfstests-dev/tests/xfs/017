@@ -1,0 +1,59 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 017
+#
+# test remount ro - pv 795642
+#
+. ./common/preamble
+_begin_fstest mount auto quick stress
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+
+# xfs_db will OOM kill the machine if you don't have huge amounts of RAM, so
+# don't run this on large filesystems.
+_require_no_large_scratch_dev
+
+echo "*** init FS"
+
+_scratch_unmount >/dev/null 2>&1
+echo "*** MKFS ***"                         >>$seqres.full
+echo ""                                     >>$seqres.full
+_scratch_mkfs_xfs                           >>$seqres.full 2>&1
+_scratch_mount
+
+echo "*** test"
+
+for l in 0 1 2 3 4
+do
+        echo "    *** test $l"
+	FSSTRESS_ARGS=`_scale_fsstress_args -d $SCRATCH_MNT -n 1000`
+        _run_fsstress $FSSTRESS_ARGS
+
+        _try_scratch_mount -o remount,ro \
+            || _fail "remount ro failed"
+
+        echo ""                                 >>$seqres.full
+        echo "*** xfs_logprint ***"             >>$seqres.full
+        echo ""                                 >>$seqres.full
+        _scratch_xfs_logprint -tb               | tee -a $seqres.full \
+            | head | grep -q "<CLEAN>" || _fail "DIRTY LOG"
+
+        echo ""                             >>$seqres.full
+        echo "*** XFS_REPAIR ***"           >>$seqres.full
+        echo ""                             >>$seqres.full
+        _scratch_xfs_repair -n              >>$seqres.full 2>&1 \
+            || _fail "xfs_repair -n failed"
+        _try_scratch_mount -o remount,rw \
+            || _fail "remount rw failed"
+done
+
+echo "*** done"
+# happy exit
+status=0
+exit 0

@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Dave Chinner.  All Rights Reserved.
+#
+# FS QA Test No. 222
+#
+# xfs_fsr QA tests
+# run xfs_fsr over the test filesystem to give it a wide and varied set of
+# inodes to try to defragment. This is effectively a crash/assert failure
+# test looking for corruption induced by xfs_fsr runs.
+#
+. ./common/preamble
+_begin_fstest auto fsr ioctl quick
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+[ "$XFS_FSR_PROG" = "" ] && _notrun "xfs_fsr not found"
+
+xfs_fsr -d -v $TEST_DIR > $seqres.full 2>&1
+
+echo "--- silence is golden ---"
+status=0 ; exit

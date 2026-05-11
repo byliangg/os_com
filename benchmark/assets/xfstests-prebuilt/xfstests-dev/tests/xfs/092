@@ -1,0 +1,29 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 092
+#
+# Make sure that we can mount inode64 filesystems
+#
+. ./common/preamble
+_begin_fstest other auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+_require_no_large_scratch_dev
+
+MOUNT_OPTIONS="$MOUNT_OPTIONS -o inode64"
+_scratch_mkfs_xfs | _filter_mkfs 2>/dev/null
+echo Silence is golden
+
+_try_scratch_mount
+[ $? -eq 0 ] || echo "inode64 mount failed unexpectedly!"
+
+# success, all done
+status=0
+exit

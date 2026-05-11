@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test 022
+#
+# Regression test for kernel commit:
+#     76bc8e2 ovl: disallow overlayfs as upperdir
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick mount nested
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	$UMOUNT_PROG $tmp/mnt > /dev/null 2>&1
+	rm -rf $tmp
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_fixed_by_kernel_commit 76bc8e2843b6 "ovl: disallow overlayfs as upperdir"
+
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+mkdir -p $upperdir/upper
+mkdir -p $upperdir/work
+# mount overlay with dirs in upper
+_scratch_mount
+
+mkdir -p $tmp/{lower,mnt}
+# mount overlay using upper from another overlay upper
+# should fail
+_overlay_mount_dirs $tmp/lower $SCRATCH_MNT/upper \
+  $SCRATCH_MNT/work overlay $tmp/mnt > /dev/null 2>&1
+if [ $? -ne 0 ] ; then
+	echo "Silence is golden"
+else
+	echo "Test Fail"
+	echo "Overlay upperdir can't be another overlay upperdir"
+fi
+
+# success, all done
+status=0
+exit

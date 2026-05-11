@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2018 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 492
+#
+# Test the online filesystem label set/get ioctls
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_io_command "label"
+_require_label_get_max
+
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount
+
+# Make sure we can set & clear the label
+$XFS_IO_PROG -c "label -s label.$seq" $SCRATCH_MNT
+$XFS_IO_PROG -c "label" $SCRATCH_MNT
+
+$XFS_IO_PROG -c "label -c" $SCRATCH_MNT
+$XFS_IO_PROG -c "label" $SCRATCH_MNT
+
+# And that userspace can see it now, while mounted
+# NB: some blkid has trailing whitespace, filter it out here
+$XFS_IO_PROG -c "label -s label.$seq" $SCRATCH_MNT
+$XFS_IO_PROG -c "label" $SCRATCH_MNT
+blkid -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g"
+
+# And that the it is still there when it's unmounted
+_scratch_unmount
+blkid -s LABEL $SCRATCH_DEV | _filter_scratch | sed -e "s/ $//g"
+
+# And that it persists after a remount
+_scratch_mount
+$XFS_IO_PROG -c "label" $SCRATCH_MNT
+
+# And that a too-long label is rejected, beyond the interface max:
+fs_label=$(perl -e "print 'l' x 257;")
+$XFS_IO_PROG -c "label -s $fs_label" $SCRATCH_MNT
+
+# And it succeeds right at the filesystem max:
+max_label_len=$(_label_get_max)
+fs_label=$(perl -e "print 'o' x $max_label_len;")
+$XFS_IO_PROG -c "label -s $fs_label" $SCRATCH_MNT | sed -e 's/o\+/MAXLABEL/'
+
+# And that it fails past the filesystem max:
+let toolong_label_len=max_label_len+1
+fs_label=$(perl -e "print 'o' x $toolong_label_len;")
+$XFS_IO_PROG -c "label -s $fs_label " $SCRATCH_MNT
+
+# success, all done
+status=0
+exit

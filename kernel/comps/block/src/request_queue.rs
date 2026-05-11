@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::sync::atomic::AtomicU64;
+
 use ostd::sync::{Mutex, WaitQueue};
 
 use super::{
@@ -7,6 +9,12 @@ use super::{
     id::Sid,
 };
 use crate::prelude::*;
+
+static BIO_REQUEST_MERGE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+pub fn bio_request_merge_count() -> u64 {
+    BIO_REQUEST_MERGE_COUNT.load(Ordering::Relaxed)
+}
 
 /// A simple block I/O request queue backed by one internal FIFO queue.
 ///
@@ -61,12 +69,22 @@ impl BioRequestSingleQueue {
             return Err(BioEnqueueError::TooBig);
         }
 
+        if bio.should_record_enqueue_timestamp() {
+            let enqueue_time = aster_time::read_monotonic_time();
+            let enqueue_ns = enqueue_time
+                .as_secs()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::from(enqueue_time.subsec_nanos()));
+            bio.mark_enqueued(enqueue_ns);
+        }
+
         let mut queue = self.queue.lock();
         if let Some(request) = queue.front_mut()
             && request.can_merge(&bio)
             && request.num_segments() + bio.segments().len() <= self.max_nr_segments_per_bio
         {
             request.merge_bio(bio);
+            BIO_REQUEST_MERGE_COUNT.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
 
@@ -89,6 +107,12 @@ impl BioRequestSingleQueue {
             if num_requests > 0 {
                 let mut queue = self.queue.lock();
                 if let Some(request) = queue.pop_back() {
+                    let dequeue_time = aster_time::read_monotonic_time();
+                    let dequeue_ns = dequeue_time
+                        .as_secs()
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(u64::from(dequeue_time.subsec_nanos()));
+                    request.bios().for_each(|bio| bio.mark_dequeued(dequeue_ns));
                     self.dec_num_requests();
                     return request;
                 }

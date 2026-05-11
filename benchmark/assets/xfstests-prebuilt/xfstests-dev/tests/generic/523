@@ -1,0 +1,34 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 523
+#
+# Check that xattrs can have slashes in their name.
+#
+. ./common/preamble
+_begin_fstest auto quick attr
+
+# Import common functions.
+. ./common/attr
+. ./common/filter
+
+_require_scratch
+_require_attrs
+
+_scratch_mkfs >> $seqres.full 2>&1
+_scratch_mount
+
+echo "set attr"
+file=$SCRATCH_MNT/moofile
+touch $file
+$SETFATTR_PROG -n "user.boo/hoo" -v "woof" $file
+
+echo "check attr"
+_getfattr -d --absolute-names $file | _filter_scratch
+
+# Now we let the fsck tool check the filesystem, because xfs_repair had a
+# regression where it would flag and erase any xattr with a '/' in it.
+
+status=0
+exit

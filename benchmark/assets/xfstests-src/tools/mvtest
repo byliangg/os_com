@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Oracle.  All Rights Reserved.
+#
+# Move a test and update the golden output file.
+
+dir="$(dirname "$0")"
+
+if [ -z "$1" ] || [ "$1" = "--help" ]; then
+	echo "Usage: $0 path_to_test new_path_to_test"
+	exit 1
+fi
+
+src="$1"
+dest="$2"
+
+die() {
+	echo "$@"
+	exit 1
+}
+
+append() {
+	out="$1"
+	shift
+	echo "$@" >> "${out}"
+}
+
+test "${src}" != "${dest}" || die "Test \"${src}\" is the same as dest."
+test -e "tests/${src}" || die "Test \"${src}\" does not exist."
+test ! -e "tests/${dest}" || die "Test \"${src}\" already exists."
+
+sid="$(basename "${src}")"
+did="$(basename "${dest}")"
+
+git mv "tests/${src}" "tests/${dest}"
+git mv "tests/${src}.out" "tests/${dest}.out"
+# make sure testcase is executable
+chmod a+x "tests/${dest}"
+sed -e "s/^# FS[[:space:]]*QA.*Test.*[0-9]\+$/# FS QA Test No. ${did}/g" -i "tests/${dest}"
+sed -e "s/^QA output created by ${sid}$/QA output created by ${did}/g" -i "tests/${dest}.out"
+sed -e "s/test-${sid}/test-${did}/g" -i "tests/${dest}.out"
+
+echo "Moved \"${src}\" to \"${dest}\"."
+
+exit 0

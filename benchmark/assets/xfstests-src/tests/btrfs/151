@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle.  All Rights Reserved.
+#
+# FS QA Test 151
+#
+# Test if it's losing data chunk's raid profile after 'btrfs device
+# remove'.
+#
+# The fix is
+#	Btrfs: avoid losing data raid profile when deleting a device
+#
+. ./common/preamble
+_begin_fstest auto quick volume raid
+
+. ./common/filter
+
+_require_scratch
+_require_scratch_dev_pool 3
+_require_btrfs_dev_del_by_devid
+_check_minimal_fs_size $(( 1024 * 1024 * 1024 ))
+
+# We need exactly 3 disks to form a fixed stripe layout for this test.
+_scratch_dev_pool_get 3
+
+# create raid1 for data
+_scratch_pool_mkfs "-d raid1 -b 1G" >> $seqres.full 2>&1
+
+# we need an empty data chunk, so $(_btrfs_no_v1_cache_opt) is required.
+_scratch_mount $(_btrfs_no_v1_cache_opt)
+
+# if data chunk is empty, 'btrfs device remove' can change raid1 to
+# single.
+$BTRFS_UTIL_PROG device delete 2 $SCRATCH_MNT >> $seqres.full 2>&1
+
+# save btrfs filesystem df output for debug purpose
+$BTRFS_UTIL_PROG filesystem df $SCRATCH_MNT 2>&1 | \
+    tee -a $seqres.full | $AWK_PROG -F ':' '/Data,/ {print $1}'
+
+_scratch_dev_pool_put
+
+# success, all done
+status=0
+exit

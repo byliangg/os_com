@@ -1,0 +1,58 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Filipe Manana.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/051
+#
+# Regression test for btrfs send where long paths (exceeding 230 characters)
+# made send produce paths with random characters from a memory buffer returned
+# by kmalloc, as send forgot to populate the new buffer with the path string.
+#
+# This issue is fixed by the following linux kernel btrfs patch:
+#
+#   Btrfs: send, fix corrupted path strings for long paths
+#
+. ./common/preamble
+_begin_fstest auto quick send
+
+# Override the default cleanup function.
+_cleanup()
+{
+    rm -fr $send_files_dir
+    rm -fr $tmp
+}
+
+. ./common/filter
+
+_require_test
+_require_scratch
+_require_fssum
+
+send_files_dir=$TEST_DIR/btrfs-test-$seq
+
+rm -fr $send_files_dir
+mkdir $send_files_dir
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+TEST_PATH="$SCRATCH_MNT/fdmanana/.config/google-chrome-mysetup/Default/Pepper_Data/Shockwave_Flash/WritableRoot/#SharedObjects/JSHJ4ZKN/s.wsj.net/[[IMPORT]]/players.edgesuite.net/flash/plugins/osmf/advanced-streaming-plugin/v2.7/osmf1.6/Ak#"
+
+mkdir -p $TEST_PATH
+echo "hello world" > $TEST_PATH/amaiAdvancedStreamingPlugin.txt
+
+_btrfs subvolume snapshot -r $SCRATCH_MNT $SCRATCH_MNT/mysnap1
+run_check $FSSUM_PROG -A -f -w $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+_btrfs send -f $send_files_dir/1.snap $SCRATCH_MNT/mysnap1
+
+_scratch_unmount
+_check_scratch_fs
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+_btrfs receive -f $send_files_dir/1.snap $SCRATCH_MNT
+run_check $FSSUM_PROG -r $send_files_dir/1.fssum $SCRATCH_MNT/mysnap1
+
+status=0
+exit

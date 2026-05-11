@@ -1,0 +1,69 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 329
+#
+# Ensure that xfs_fsr handles errors correctly while defragging files.
+#
+. ./common/preamble
+_begin_fstest auto quick clone fsr
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+. ./common/reflink
+. ./common/inject
+
+_require_scratch_reflink
+_require_cp_reflink
+_require_command "$XFS_FSR_PROG" "xfs_fsr"
+_require_xfs_io_error_injection "bmap_finish_one"
+_require_xfs_scratch_rmapbt
+_require_xfs_io_command falloc	# fsr requires support for preallocation
+
+rm -f "$seqres.full"
+
+echo "Format and mount"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount >> "$seqres.full" 2>&1
+
+testdir="$SCRATCH_MNT/test-$seq"
+blksz=65536
+_require_congruent_file_oplen $SCRATCH_MNT $blksz
+blks=3
+mkdir "$testdir"
+
+echo "Create a many-block file"
+_pwrite_byte 0x62 0 $((blksz * blks)) $testdir/file1 >> $seqres.full
+_pwrite_byte 0x63 0 $blksz $testdir/file2 >> $seqres.full
+_reflink_range $testdir/file2 0 $testdir/file1 $blksz $blksz >> $seqres.full
+_scratch_cycle_mount
+$XFS_IO_PROG -c 'bmap -v' $testdir/file1 >> $seqres.full
+
+echo "Inject error"
+_scratch_inject_error "bmap_finish_one"
+
+echo "Defrag the file"
+old_nextents=$(_count_extents $testdir/file1)
+$XFS_FSR_PROG -v -d $testdir/file1 >> $seqres.full 2>&1
+
+echo "FS should be shut down, touch will fail"
+touch $SCRATCH_MNT/badfs 2>&1 | _filter_scratch
+
+echo "Remount to replay log" | _tee_kernlog
+_scratch_remount_dump_log >> $seqres.full
+new_nextents=$(_count_extents $testdir/file1)
+
+echo "Check extent count" | _tee_kernlog
+$XFS_IO_PROG -c 'stat -v' $testdir/file1 >> $seqres.full
+$XFS_IO_PROG -c 'stat -v' $testdir/file2 >> $seqres.full
+echo "extents: $old_nextents -> $new_nextents" >> $seqres.full
+
+echo "FS should be online, touch should succeed"
+touch $SCRATCH_MNT/goodfs
+$XFS_IO_PROG -c 'bmap -v' $testdir/file1 >> $seqres.full
+
+# success, all done
+status=0
+exit

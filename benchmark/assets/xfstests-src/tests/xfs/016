@@ -1,0 +1,260 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 016
+#
+# test end of log overwrite bug #796141
+#
+#
+# pv 796141
+#
+# create a new FS, mostly fill the log. Then wrap the log back to the
+# start bit by bit to force wiping of stale blocks near the end of the
+# log. Check the block after the log ends to check for corruption
+#
+# assumptions :
+#    - given we're only touching a single inode, the block after the
+#      log which is in the middle ag should never be touched.
+#      if it changes, we assume the log is writing over it
+#
+
+. ./common/preamble
+_begin_fstest rw auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    echo "*** unmount"
+    _scratch_unmount 2>/dev/null
+}
+
+_block_filter()
+{
+    sed -e 's/[0-9][0-9]*\.\.[0-9][0-9]*/BLOCKRANGE/g'
+}
+
+_init()
+{
+    echo "*** determine log size"
+    local sz_mb=50
+    local dsize="-d size=${sz_mb}m"
+    local lsize="-l size=$(_scratch_find_xfs_min_logblocks $dsize)b"
+    local force_opts="$dsize $lsize"
+    _scratch_mkfs_xfs $force_opts >> $seqres.full 2>&1
+
+    # set log_size and log_size_bb globally
+    log_size_bb=`_log_size`
+    log_size=$((log_size_bb * 512))
+    echo "log_size_bb = $log_size_bb log_size = $log_size" >> $seqres.full
+
+    echo "*** reset partition"
+    $here/src/devzero -b 2048 -n $sz_mb -v 198 $SCRATCH_DEV # write 0xc6
+    echo "*** mkfs"
+    #
+    # Do not discard blocks as we check for patterns in free space.
+    # 
+    # First, make sure that mkfs supports '-K' option by using its
+    # dry run (-N option) and then add it to the force_opts.
+    #
+    if _scratch_mkfs_xfs -N -K $force_opts >/dev/null 2>&1; then
+        force_opts="-K $force_opts"
+    fi
+    echo mkfs_xfs $force_opts $SCRATCH_DEV >>$seqres.full
+    _scratch_mkfs_xfs $force_opts >$tmp.mkfs0 2>&1
+    [ $? -ne 0 ] && \
+        _notrun "Cannot mkfs for this test using MKFS_OPTIONS specified"
+    _filter_mkfs <$tmp.mkfs0 >/dev/null 2>$tmp.mkfs
+    . $tmp.mkfs
+    [ $logsunit -ne 0 ] && \
+        _notrun "Cannot run this test using log MKFS_OPTIONS specified"
+
+    # quotas generate extra log traffic so force it off
+    _qmount_option noquota
+}
+
+_log_traffic()
+{
+    count=$1
+    echo "*** generate log traffic"
+
+    out=$SCRATCH_MNT/$$.tmp
+
+    echo "   *** mount"
+    if ! _try_scratch_mount
+    then
+        echo "failed to mount $SCRATCH_DEV"
+        exit 1
+    fi
+
+    # having any quota enabled (acct/enfd) means extra log traffic - evil!
+    $here/src/feature -U $SCRATCH_DEV && \
+		_notrun "UQuota are enabled, test needs controlled log traffic"
+    $here/src/feature -G $SCRATCH_DEV && \
+		_notrun "GQuota are enabled, test needs controlled log traffic"
+    $here/src/feature -P $SCRATCH_DEV && \
+		_notrun "PQuota are enabled, test needs controlled log traffic"
+
+    echo "   *** fiddle"
+    while [ $count -ge 0 ]
+    do
+	touch $out
+	_scratch_sync
+	rm $out
+	_scratch_sync
+	let "count = count - 1"
+    done
+
+    echo "   *** unmount"
+    if ! _scratch_unmount
+    then
+        echo "failed to unmount $SCRATCH_DEV"
+        exit 1
+    fi
+}
+
+_log_size()
+{
+    _scratch_xfs_logprint -tb | $AWK_PROG '
+        /log file: / || /log device: / { print $7}
+    '
+}
+
+_log_head()
+{
+    _scratch_xfs_logprint -tb | $AWK_PROG '
+        /head:/ { print $5 }
+    '
+}
+
+# Get log stripe unit for v2 logs; if none specified,
+# (or v1 log) just return "1" block
+
+_log_sunit()
+{
+    if [ ${lsunit:-0} -eq 0 ]; then
+        echo $dbsize
+    else
+        expr $lsunit \* $dbsize
+    fi
+}
+
+_after_log()
+{
+    _scratch_xfs_db -r -c "sb" -c "print" | $AWK_PROG '
+        /logstart/  { logstart = $3 }
+        /logblocks/ { logblocks = $3 }
+        END {
+            print logstart + logblocks
+        }
+    '
+}
+
+_check_corrupt()
+{
+    f="c6c6c6c6"
+    echo "*** check for corruption"
+    echo "expect $f..." >>$seqres.full
+    _scratch_xfs_db -r -c "fsblock $2" -c "print" | head | tee -a $seqres.full | \
+        grep -q -v "$f $f $f $f $f $f $f $f" && \
+            _fail "!!! block $2 corrupted!"
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+
+
+_require_scratch
+_init
+
+block=`_after_log $SCRATCH_DEV`
+echo "fsblock after log = $block"               >>$seqres.full
+_check_corrupt $SCRATCH_DEV $block
+
+actual_log_size=`_log_size`
+echo "log size = $actual_log_size BB"                      >>$seqres.full
+head=`_log_head`
+echo "log position = $head"                     >>$seqres.full
+lsunit=`_log_sunit`
+echo "log sunit = $lsunit"			>>$seqres.full
+
+# sanity checks
+[ $actual_log_size -eq $log_size_bb ] || \
+    _fail "!!! unexpected log size $size"
+[ $head -eq 2 -o $head -eq $((lsunit/512)) ] || \
+    _fail "!!! unexpected initial log position $head vs. $((lsunit/512))"
+
+# Step 1: Run 200 ops to estimate how how many log blocks are used for each op.
+# Ignore the fact that it will also include an unmount record; this should be
+# small overall.
+echo "    lots of traffic for sampling" >>$seqres.full
+sample_size_ops=200
+_log_traffic $sample_size_ops
+head1=`_log_head`
+num_blocks=`expr $head1 - $head`
+blocks_per_op=`echo "scale=3; $num_blocks / $sample_size_ops" | bc`
+echo "log position = $head1; old log position: $head" >> $seqres.full
+echo "blocks_per_op = $blocks_per_op" >>$seqres.full
+
+# Step 2: Quickly advance the log from wherever step 1 left us to the point
+# where the log is now 80% full on its first cycle.
+
+# Estimate the number of ops needed to get the log head close to but not past
+# near_end_min for a single mount.  We'd rather fall short and have to step our
+# way closer to the end than run past the end, so our target for this second
+# step is to fill 80% of the first cycle of the log.
+num_expected_ops=$(( 8 * $(echo "$log_size_bb / $blocks_per_op" | bc) / 10))
+echo "num_expected_ops = $num_expected_ops" >>$seqres.full
+
+# Compute the number of ops needed to get from wherever we are right now in
+# the log cycle to the 80% point.
+num_expected_to_go=`echo "$num_expected_ops - $sample_size_ops" | bc`
+echo "num_expected_to_go = $num_expected_to_go" >>$seqres.full
+
+echo "    lots more traffic" >>$seqres.full
+_log_traffic $num_expected_to_go
+head=`_log_head`
+echo "log position = $head"                     >>$seqres.full
+
+# Step 3: Gradually advance log traffic to get us from wherever step 2 left us
+# to the point where the log is within approximately 20 ops of wrapping into
+# the second cycle.
+
+# Since this is a log wrapping test, it's critical to push the log head to the
+# point where it will wrap around within twenty rounds of ops.  Compute the
+# expected value of the log head when we get to this point.  This "/ 1" piece
+# tricks bc into printing integer numbers.
+near_end_min=$(echo "$log_size_bb - (20 * $blocks_per_op / 1)" | bc)
+echo "near_end_min = $near_end_min" >>$seqres.full
+
+# Step us (in batches of 10 ops) to our goal.
+while [ $head -lt $near_end_min ]; do
+	echo "    bump traffic from $head towards $near_end_min" >> $seqres.full
+	_log_traffic 10 > /dev/null 2>&1
+	head=$(_log_head)
+done
+
+[ $head -ge $near_end_min -a $head -lt $log_size_bb ] || \
+    _fail "!!! unexpected near end log position $head"
+
+# Step 4: Try to wrap the log, checking for corruption with each advance.
+# This is the functionality that we're actually trying to test.  We will try
+# 40 ops (in batches of 2) to try to wrap the log.
+for c in `seq 0 20`
+do
+    echo "   little traffic"            >>$seqres.full
+    _log_traffic 2
+    head=`_log_head`
+    echo "log position = $head"         >>$seqres.full
+    _check_corrupt $SCRATCH_DEV $block
+done
+
+[ $head -lt 1000 ] || \
+    _fail "!!! unexpected wrapped log position $head"
+
+# success, all done
+status=0
+exit

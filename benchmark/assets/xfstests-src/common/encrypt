@@ -1,0 +1,1109 @@
+##/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Google, Inc.  All Rights Reserved.
+#
+# Functions for setting up and testing file encryption
+
+#
+# _require_scratch_encryption [-c CONTENTS_MODE] [-n FILENAMES_MODE]
+#			      [-f POLICY_FLAGS] [-v POLICY_VERSION]
+#			      [-s LOG2_DUSIZE]
+#
+# Require encryption support on the scratch device.
+#
+# This checks for support for the default type of encryption policy (v1 with
+# AES-256-XTS and AES-256-CTS).  Options can be specified to also require
+# support for a different type of encryption policy.
+#
+_require_scratch_encryption()
+{
+	local arg
+
+	_require_scratch
+	_require_xfs_io_command "set_encpolicy"
+
+	for arg; do
+		if [ "$arg" = "-s" ]; then
+			# -s option was added later.  Make sure it's available.
+			_require_xfs_io_command "set_encpolicy" "-s"
+		fi
+	done
+
+	# The 'test_dummy_encryption' mount option interferes with trying to use
+	# encryption for real, even if we are just trying to get/set policies
+	# and never put any keys in the keyring.  So skip the real encryption
+	# tests if the 'test_dummy_encryption' mount option was specified.
+	_exclude_scratch_mount_option "test_dummy_encryption"
+
+	# Make a filesystem on the scratch device with the encryption feature
+	# enabled.  If this fails then probably the userspace tools (e.g.
+	# e2fsprogs or f2fs-tools) are too old to understand encryption.
+	if ! _scratch_mkfs_encrypted &>>$seqres.full; then
+		_notrun "$FSTYP userspace tools do not support encryption"
+	fi
+
+	# Try to mount the filesystem.  If this fails then either the kernel
+	# isn't aware of encryption, or the mkfs options were not compatible
+	# with encryption (e.g. ext4 with block size != PAGE_SIZE).
+	if ! _try_scratch_mount &>>$seqres.full; then
+		_notrun "kernel is unaware of $FSTYP encryption feature," \
+			"or mkfs options are not compatible with encryption"
+	fi
+
+	# The kernel may be aware of encryption without supporting it.  For
+	# example, for ext4 this is the case with kernels configured with
+	# CONFIG_EXT4_FS_ENCRYPTION=n.  Detect support for encryption by trying
+	# to set an encryption policy.  (For ext4 we could instead check for the
+	# presence of /sys/fs/ext4/features/encryption, but this is broken on
+	# some older kernels and is ext4-specific anyway.)
+	mkdir $SCRATCH_MNT/tmpdir
+	if _set_encpolicy $SCRATCH_MNT/tmpdir 2>&1 >>$seqres.full | \
+		grep -Eq 'Inappropriate ioctl for device|Operation not supported'
+	then
+		_notrun "kernel does not support $FSTYP encryption"
+	fi
+	rmdir $SCRATCH_MNT/tmpdir
+
+	# If required, check for support for the specific type of encryption
+	# policy required by the test.
+	if [ $# -ne 0 ]; then
+		_require_encryption_policy_support $SCRATCH_MNT "$@"
+	fi
+
+	_scratch_unmount
+}
+
+_require_encryption_policy_support()
+{
+	local mnt=$1
+	local dir=$mnt/tmpdir
+	local set_encpolicy_args=""
+	local policy_flags=0
+	local policy_version=1
+	local c
+
+	OPTIND=2
+	while getopts "c:n:f:s:v:" c; do
+		case $c in
+		c|n|s)
+			set_encpolicy_args+=" -$c $OPTARG"
+			;;
+		f)
+			set_encpolicy_args+=" -$c $OPTARG"
+			policy_flags=$OPTARG
+			;;
+		v)
+			set_encpolicy_args+=" -$c $OPTARG"
+			policy_version=$OPTARG
+			;;
+		*)
+			_fail "${FUNCNAME[0]}: unrecognized option '$c'"
+			;;
+		esac
+	done
+	set_encpolicy_args=${set_encpolicy_args# }
+
+	echo "Checking whether kernel supports encryption policy: $set_encpolicy_args" \
+		>> $seqres.full
+
+	if (( policy_flags & (FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 |
+			      FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) )); then
+		_scratch_unmount
+		_scratch_mkfs_stable_inodes_encrypted &>> $seqres.full
+		_scratch_mount
+	fi
+
+	mkdir $dir
+	if (( policy_version > 1 )); then
+		_require_xfs_io_command "get_encpolicy" "-t"
+		local output=$(_get_encpolicy $dir -t)
+		if [ "$output" != "supported" ]; then
+			if [ "$output" = "unsupported" ]; then
+				_notrun "kernel does not support $FSTYP encryption v2 API"
+			fi
+			_fail "Unexpected output from 'get_encpolicy -t': $output"
+		fi
+		# Both the kernel and xfs_io support v2 encryption policies, and
+		# therefore also filesystem-level keys -- since that's the only
+		# way to provide keys for v2 policies.
+		local raw_key=$(_generate_raw_encryption_key)
+		local keyspec=$(_add_enckey $mnt "$raw_key" | awk '{print $NF}')
+	else
+		_require_command "$KEYCTL_PROG" keyctl
+		_init_session_keyring
+		local keyspec=$(_generate_session_encryption_key)
+	fi
+	if _set_encpolicy $dir $keyspec $set_encpolicy_args \
+		2>&1 >>$seqres.full | grep -Eq 'Invalid argument'; then
+		_notrun "kernel does not support encryption policy: '$set_encpolicy_args'"
+	fi
+	# fscrypt allows setting policies with modes it knows about, even
+	# without kernel crypto API support.  E.g. a policy using Adiantum
+	# encryption can be set on a kernel without CONFIG_CRYPTO_ADIANTUM.
+	# But actually trying to use such an encrypted directory will fail.
+	# To reliably check for availability of both the contents and filenames
+	# encryption modes, try creating a nonempty file.
+	if ! echo foo > $dir/file; then
+		_notrun "encryption policy '$set_encpolicy_args' is unusable; probably missing kernel crypto API support"
+	fi
+	if (( policy_version <= 1 )); then
+		$KEYCTL_PROG clear $TEST_KEYRING_ID
+	fi
+	rm -r $dir
+}
+
+# Require that the scratch filesystem accepts the "inlinecrypt" mount option.
+#
+# This does not check whether the scratch block device has any specific inline
+# encryption capabilities.
+_require_scratch_inlinecrypt()
+{
+	_require_scratch
+	_scratch_mkfs &>> $seqres.full
+	if ! _try_scratch_mount -o inlinecrypt &>> $seqres.full; then
+		_notrun "filesystem doesn't support -o inlinecrypt"
+	fi
+}
+
+# Require that the given block device supports hardware-wrapped inline
+# encryption keys, and require that a command-line tool that supports
+# importing/generating/preparing them is available.
+_require_hw_wrapped_key_support()
+{
+	local dev=$1
+
+	echo "Checking for HW-wrapped key support on $dev" >> $seqres.full
+	local sysfs_dir=$(_sysfs_dev $dev)
+	if [ ! -e $sysfs_dir/queue ]; then
+		sysfs_dir=$sysfs_dir/..
+	fi
+	if [ ! -e $sysfs_dir/queue/crypto/hw_wrapped_keys ]; then
+		_notrun "$dev doesn't support hardware-wrapped inline encryption keys"
+	fi
+
+	echo "Checking for fscryptctl support for HW-wrapped keys" >> $seqres.full
+	_require_command "$FSCRYPTCTL_PROG" fscryptctl
+	if ! "$FSCRYPTCTL_PROG" --help | grep -q "import_hw_wrapped_key"; then
+		_notrun "fscryptctl too old; doesn't support hardware-wrapped inline encryption keys"
+	fi
+}
+
+_scratch_mkfs_encrypted()
+{
+	case $FSTYP in
+	ext4|f2fs)
+		_scratch_mkfs -O encrypt
+		;;
+	ubifs)
+		# erase the UBI volume; reformated automatically on next mount
+		$UBIUPDATEVOL_PROG ${SCRATCH_DEV} -t
+		;;
+	ceph)
+		_scratch_cleanup_files
+		;;
+	*)
+		_notrun "No encryption support for $FSTYP"
+		;;
+	esac
+}
+
+_scratch_mkfs_sized_encrypted()
+{
+	case $FSTYP in
+	ext4|f2fs)
+		MKFS_OPTIONS="$MKFS_OPTIONS -O encrypt" _scratch_mkfs_sized $*
+		;;
+	*)
+		_notrun "Filesystem $FSTYP not supported in _scratch_mkfs_sized_encrypted"
+		;;
+	esac
+}
+
+# Like _scratch_mkfs_encrypted(), but add -O stable_inodes if applicable for the
+# filesystem type.  This is necessary for using encryption policies that include
+# the inode number in the IVs, e.g. policies with the IV_INO_LBLK_64 flag set.
+_scratch_mkfs_stable_inodes_encrypted()
+{
+	case $FSTYP in
+	ext4)
+		if ! _scratch_mkfs -O encrypt -O stable_inodes; then
+			_notrun "-O stable_inodes is not supported"
+		fi
+		;;
+	*)
+		_scratch_mkfs_encrypted
+		;;
+	esac
+}
+
+# For some tests it's helpful to always use the same key so that the test's
+# output is always the same.  For this purpose the following key can be used:
+TEST_RAW_KEY=
+for i in {1..64}; do
+	TEST_RAW_KEY+="\\x$(printf "%02x" $i)"
+done
+# Key descriptor: arbitrary value
+TEST_KEY_DESCRIPTOR="0000111122223333"
+# Key identifier: HKDF-SHA512(key=$TEST_RAW_KEY, salt="", info="fscrypt\0\x01")
+TEST_KEY_IDENTIFIER="69b2f6edeee720cce0577937eb8a6751"
+
+# This is the ID of the keyring that was created by _init_session_keyring().
+# You must call _init_session_keyring() before using this.
+TEST_KEYRING_ID=
+
+# Create a test keyring within the session keyring.  Keys added to this keyring
+# will be available within the test script and all its subprocesses.  If the
+# test keyring already exists, then it is replaced.
+#
+# This used to use 'keyctl new_session' to replace the session keyring itself.
+# However, that doesn't work if a non-root user owns the session keyring.
+_init_session_keyring()
+{
+	TEST_KEYRING_ID=$($KEYCTL_PROG newring xfstests @s)
+	if [ -z "$TEST_KEYRING_ID" ]; then
+		_fail "Failed to create test keyring in session keyring"
+	fi
+}
+
+# Check that _init_session_keyring() has been called.
+_check_session_keyring()
+{
+	if [ -z "$TEST_KEYRING_ID" ]; then
+		_fail "_init_session_keyring() must be called before using the test keyring"
+	fi
+}
+
+# Generate a key descriptor (16 character hex string)
+_generate_key_descriptor()
+{
+	local keydesc=""
+	local i
+	for ((i = 0; i < 8; i++)); do
+		keydesc="${keydesc}$(printf "%02x" $(( $RANDOM % 256 )))"
+	done
+	echo $keydesc
+}
+
+# Generate a raw encryption key, but don't add it to any keyring yet.
+_generate_raw_encryption_key()
+{
+	local size=${1:-64}
+	local raw=""
+	local i
+	for ((i = 0; i < $size; i++)); do
+		raw="${raw}\\x$(printf "%02x" $(( $RANDOM % 256 )))"
+	done
+	echo $raw
+}
+
+RAW_HW_KEY_SIZE=32
+
+# Serialize an integer into a CPU-endian bytestring of the given length, and
+# print it as a string where each byte is hex-escaped.  For example,
+# `_num_to_hex 1000 4` == "\xe8\x03\x00\x00" if the CPU is little endian.
+_num_to_hex()
+{
+	local value=$1
+	local nbytes=$2
+	local i
+	local big_endian=$(echo -ne '\x11' | od -tx2 | head -1 | \
+			   cut -f2 -d' ' | cut -c1)
+
+	if (( big_endian )); then
+		for (( i = 0; i < nbytes; i++ )); do
+			printf '\\x%02x' $(((value >> (8*(nbytes-1-i))) & 0xff))
+		done
+	else
+		for (( i = 0; i < nbytes; i++ )); do
+			printf '\\x%02x' $(((value >> (8*i)) & 0xff))
+		done
+	fi
+}
+
+# When fscrypt keys are added using the legacy mechanism (process-subscribed
+# keyrings rather than filesystem keyrings), they are normally named
+# "fscrypt:KEYDESC" where KEYDESC is the 16-character key descriptor hex string.
+# However, ext4 and f2fs didn't add support for the "fscrypt" prefix until
+# kernel v4.8 and v4.6, respectively.  Before that, they used "ext4" and "f2fs",
+# respectively.  To allow testing ext4 and f2fs encryption on kernels older than
+# this, we use these filesystem-specific prefixes for ext4 and f2fs.
+_get_fs_keyprefix()
+{
+	case $FSTYP in
+	ext4|f2fs)
+		echo $FSTYP
+		;;
+	*)
+		echo fscrypt
+		;;
+	esac
+}
+
+# Add the specified raw encryption key to the session keyring, using the
+# specified key descriptor.
+_add_session_encryption_key()
+{
+	local keydesc=$1
+	local raw=$2
+
+	_check_session_keyring
+
+	#
+	# Add the key to the session keyring.  The required structure is:
+	#
+	#	#define FSCRYPT_MAX_KEY_SIZE 64
+	#	struct fscrypt_key {
+	#		__u32 mode;
+	#		__u8 raw[FSCRYPT_MAX_KEY_SIZE];
+	#		__u32 size;
+	#	};
+	#
+	# The kernel ignores 'mode' but requires that 'size' be 64.
+	local mode=$(_num_to_hex 0 4)
+	local size=$(_num_to_hex 64 4)
+	local prefix=$(_get_fs_keyprefix)
+	echo -n -e "${mode}${raw}${size}" |
+		$KEYCTL_PROG padd logon $prefix:$keydesc $TEST_KEYRING_ID \
+			>>$seqres.full
+}
+
+#
+# Generate a random encryption key, add it to the session keyring, and print out
+# the resulting key descriptor (example: "8bf798e1a494e1ec").  Requires the
+# keyctl program and that _init_session_keyring() has been called.
+#
+_generate_session_encryption_key()
+{
+	local keydesc=$(_generate_key_descriptor)
+	local raw=$(_generate_raw_encryption_key)
+
+	_add_session_encryption_key $keydesc $raw
+
+	echo $keydesc
+}
+
+# Unlink an encryption key from the session keyring, given its key descriptor.
+_unlink_session_encryption_key()
+{
+	_check_session_keyring
+	local keydesc=$1
+	local prefix=$(_get_fs_keyprefix)
+	local keyid=$($KEYCTL_PROG search $TEST_KEYRING_ID logon $prefix:$keydesc)
+	$KEYCTL_PROG unlink $keyid >>$seqres.full
+}
+
+# Revoke an encryption key from the session keyring, given its key descriptor.
+_revoke_session_encryption_key()
+{
+	_check_session_keyring
+	local keydesc=$1
+	local prefix=$(_get_fs_keyprefix)
+	local keyid=$($KEYCTL_PROG search $TEST_KEYRING_ID logon $prefix:$keydesc)
+	$KEYCTL_PROG revoke $keyid >>$seqres.full
+}
+
+# Set an encryption policy on the specified directory.
+_set_encpolicy()
+{
+	local dir=$1
+	shift
+
+	$XFS_IO_PROG -c "set_encpolicy $*" "$dir"
+}
+
+_user_do_set_encpolicy()
+{
+	local dir=$1
+	shift
+
+	_user_do "$XFS_IO_PROG -c \"set_encpolicy $*\" \"$dir\""
+}
+
+# Display the specified file or directory's encryption policy.
+_get_encpolicy()
+{
+	local file=$1
+	shift
+
+	$XFS_IO_PROG -c "get_encpolicy $*" "$file"
+}
+
+_user_do_get_encpolicy()
+{
+	local file=$1
+	shift
+
+	_user_do "$XFS_IO_PROG -c \"get_encpolicy $*\" \"$file\""
+}
+
+# Add an encryption key to the given filesystem.
+_add_enckey()
+{
+	local mnt=$1
+	local raw_key=$2
+	shift 2
+
+	echo -ne "$raw_key" | $XFS_IO_PROG -c "add_enckey $*" "$mnt"
+}
+
+# Create a hardware-wrapped key from the given raw key using the given block
+# device, add it to the given filesystem, and print the resulting key
+# identifier.
+_add_hw_wrapped_key()
+{
+	local dev=$1
+	local mnt=$2
+	local raw_key=$3
+
+	echo -ne "$raw_key" | \
+		$FSCRYPTCTL_PROG import_hw_wrapped_key "$dev" | \
+		$FSCRYPTCTL_PROG prepare_hw_wrapped_key "$dev" | \
+		$FSCRYPTCTL_PROG add_key --hw-wrapped-key "$mnt"
+}
+
+_user_do_add_enckey()
+{
+	local mnt=$1
+	local raw_key=$2
+	shift 2
+
+	_user_do "echo -ne \"$raw_key\" | $XFS_IO_PROG -c \"add_enckey $*\" \"$mnt\""
+}
+
+# Remove the given encryption key from the given filesystem.
+_rm_enckey()
+{
+	local mnt=$1
+	local keyspec=$2
+	shift 2
+
+	$XFS_IO_PROG -c "rm_enckey $* $keyspec" "$mnt"
+}
+
+_user_do_rm_enckey()
+{
+	local mnt=$1
+	local keyspec=$2
+	shift 2
+
+	_user_do "$XFS_IO_PROG -c \"rm_enckey $* $keyspec\" \"$mnt\""
+}
+
+# Get the status of the given encryption key on the given filesystem.
+_enckey_status()
+{
+	local mnt=$1
+	local keyspec=$2
+	shift 2
+
+	$XFS_IO_PROG -c "enckey_status $* $keyspec" "$mnt"
+}
+
+_user_do_enckey_status()
+{
+	local mnt=$1
+	local keyspec=$2
+	shift 2
+
+	_user_do "$XFS_IO_PROG -c \"enckey_status $* $keyspec\" \"$mnt\""
+}
+
+# Require support for adding a key to a filesystem's fscrypt keyring via an
+# "fscrypt-provisioning" keyring key.
+_require_add_enckey_by_key_id()
+{
+	local mnt=$1
+
+	# Userspace support
+	_require_xfs_io_command "add_enckey" "-k"
+
+	# Kernel support
+	if $XFS_IO_PROG -c "add_enckey -k 12345" "$mnt" \
+		|& grep -q 'Invalid argument'; then
+		_notrun "Kernel doesn't support key_id parameter to FS_IOC_ADD_ENCRYPTION_KEY"
+	fi
+}
+
+# Add a key of type "fscrypt-provisioning" to the session keyring and print the
+# resulting key ID.
+_add_fscrypt_provisioning_key()
+{
+	local desc=$1
+	local type=$2
+	local raw=$3
+
+	_check_session_keyring
+
+	# The format of the key payload must be:
+	#
+	#	struct fscrypt_provisioning_key_payload {
+	#		__u32 type;
+	#		__u32 __reserved;
+	#		__u8 raw[];
+	#	};
+	#
+	local type_hex=$(_num_to_hex $type 4)
+	local reserved=$(_num_to_hex 0 4)
+	echo -n -e "${type_hex}${reserved}${raw}" |
+		$KEYCTL_PROG padd fscrypt-provisioning "$desc" $TEST_KEYRING_ID
+}
+
+# Retrieve the encryption nonce of the given inode as a hex string.  The nonce
+# was randomly generated by the filesystem and isn't exposed directly to
+# userspace.  But it can be read using the filesystem's debugging tools.
+_get_encryption_nonce()
+{
+	local device=$1
+	local inode=$2
+
+	case $FSTYP in
+	ext4)
+		# Use debugfs to dump the special xattr named "c", which is the
+		# file's fscrypt_context.  This produces a line like:
+		#
+		#	c (28) = 01 01 04 02 00 00 00 00 00 00 00 00 ef bd 18 76 5d f6 41 4e c0 a2 cd 5f 91 29 7e 12
+		#
+		# Then filter it to get just the 16-byte 'nonce' field at the end:
+		#
+		#	efbd18765df6414ec0a2cd5f91297e12
+		#
+		$DEBUGFS_PROG $device -R "ea_get <$inode> c" 2>>$seqres.full \
+			| grep '^c ' | sed 's/^.*=//' | tr -d ' \n' | tail -c 32
+		;;
+	f2fs)
+		# dump.f2fs prints the fscrypt_context like:
+		#
+		#	xattr: e_name_index:9 e_name:c e_name_len:1 e_value_size:28 e_value:
+		#	format: 1
+		#	contents_encryption_mode: 0x1
+		#	filenames_encryption_mode: 0x4
+		#	flags: 0x2
+		#	master_key_descriptor: 0000000000000000
+		#	nonce: EFBD18765DF6414EC0A2CD5F91297E12
+		#
+		# Also support the case where the whole xattr is printed as hex,
+		# as is the case for fscrypt_context_v2.
+		#
+		#	xattr: e_name_index:9 e_name:c e_name_len:1 e_value_size:40 e_value:
+		#	020104020000000033809BFEBE68A4AD264079B30861DD5E6B9E72D07523C58794ACF52534BAA756
+		#
+		$DUMP_F2FS_PROG -i $inode $device | awk '
+			/\<e_name:c\>/ { found = 1 }
+			(/^nonce:/ || /^[[:xdigit:]]+$/) && found {
+				print substr($0, length($0) - 31, 32);
+				found = 0;
+			}'
+		;;
+	*)
+		_fail "_get_encryption_nonce() isn't implemented on $FSTYP"
+		;;
+	esac
+}
+
+# Require support for _get_encryption_nonce()
+_require_get_encryption_nonce_support()
+{
+	echo "Checking for _get_encryption_nonce() support for $FSTYP" >> $seqres.full
+	case $FSTYP in
+	ext4)
+		_require_command "$DEBUGFS_PROG" debugfs
+		;;
+	f2fs)
+		_require_command "$DUMP_F2FS_PROG" dump.f2fs
+		# For fscrypt_context_v2, we actually need a f2fs-tools version
+		# that has the patch "f2fs-tools: improve xattr value printing"
+		# (https://sourceforge.net/p/linux-f2fs/mailman/message/36648640/).
+		# Otherwise the xattr is incorrectly parsed as v1.  But just let
+		# the test fail in that case, as it was an f2fs-tools bug...
+		;;
+	*)
+		_notrun "_get_encryption_nonce() isn't implemented on $FSTYP"
+		;;
+	esac
+}
+
+# Retrieve the encrypted filename stored on-disk for the given file.
+# The name is printed to stdout in binary.
+_get_ciphertext_filename()
+{
+	local device=$1
+	local inode=$2
+	local dir_inode=$3
+
+	case $FSTYP in
+	ext4)
+		# Extract the filename from the debugfs output line like:
+		#
+		#  131075  100644 (1)      0      0       0 22-Apr-2019 16:54 \xa2\x85\xb0z\x13\xe9\x09\x86R\xed\xdc\xce\xad\x14d\x19
+		#
+		# Bytes are shown either literally or as \xHH-style escape
+		# sequences; we have to decode the escaped bytes here.
+		#
+		$DEBUGFS_PROG $device -R "ls -l -r <$dir_inode>" \
+					2>>$seqres.full | perl -ne '
+			next if not /^\s*'$inode'\s+/;
+			s/.*?\d\d:\d\d //;
+			chomp;
+			s/\\x([[:xdigit:]]{2})/chr hex $1/eg;
+			print;'
+		;;
+	f2fs)
+		# Extract the filename from the dump.f2fs output line like:
+		#
+		#  i_name                        		[UpkzIPuts9by1oDmE+Ivfw]
+		#
+		# The name is shown base64-encoded; we have to decode it here.
+		#
+		$DUMP_F2FS_PROG $device -i $inode | perl -ne '
+			next if not /^i_name\s+\[([A-Za-z0-9+,]+)\]/;
+			chomp $1;
+			my @chars = split //, $1;
+			my $ac = 0;
+			my $bits = 0;
+			my $table = join "", (A..Z, a..z, 0..9, "+", ",");
+			foreach (@chars) {
+				$ac += index($table, $_) << $bits;
+				$bits += 6;
+				if ($bits >= 8) {
+					print chr($ac & 0xff);
+					$ac >>= 8;
+					$bits -= 8;
+				}
+			}
+			if ($ac != 0) {
+				print STDERR "Invalid base64-encoded string!\n";
+			}'
+		;;
+	*)
+		_fail "_get_ciphertext_filename() isn't implemented on $FSTYP"
+		;;
+	esac
+}
+
+# Require support for _get_ciphertext_filename().
+_require_get_ciphertext_filename_support()
+{
+	echo "Checking for _get_ciphertext_filename() support for $FSTYP" >> $seqres.full
+	case $FSTYP in
+	ext4)
+		# Verify that the "ls -l -r" debugfs command is supported and
+		# that it hex-encodes non-ASCII characters, rather than using an
+		# ambiguous escaping method.  This requires e2fsprogs v1.45.1 or
+		# later; or more specifically, a version that has the commit
+		# "debugfs: avoid ambiguity when printing filenames".
+		_require_command "$DEBUGFS_PROG" debugfs
+		_scratch_mount
+		touch $SCRATCH_MNT/$'\xc1'
+		_scratch_unmount
+		if ! $DEBUGFS_PROG $SCRATCH_DEV -R "ls -l -r /" 2>&1 \
+			| tee -a $seqres.full | grep -E -q '\s+\\xc1\s*$'; then
+			_notrun "debugfs (e2fsprogs) is too old; doesn't support showing unambiguous on-disk filenames"
+		fi
+		;;
+	f2fs)
+		# Verify that dump.f2fs shows encrypted filenames in full.  This
+		# requires f2fs-tools v1.13.0 or later; or more specifically, a
+		# version that has the commit
+		# "f2fs-tools: improve filename printing".
+
+		_require_command "$DUMP_F2FS_PROG" dump.f2fs
+		_require_command "$KEYCTL_PROG" keyctl
+		_scratch_mount
+		_init_session_keyring
+
+		local keydesc=$(_generate_session_encryption_key)
+		local dir=$SCRATCH_MNT/test.${FUNCNAME[0]}
+		local file=$dir/$(perl -e 'print "A" x 255')
+		mkdir $dir
+		_set_encpolicy $dir $keydesc
+		touch $file
+		local inode=$(stat -c %i $file)
+
+		_scratch_unmount
+		$KEYCTL_PROG clear $TEST_KEYRING_ID
+
+		# 255-character filename should result in 340 base64 characters.
+		if ! $DUMP_F2FS_PROG -i $inode $SCRATCH_DEV \
+			| grep -E -q '^i_name[[:space:]]+\[[A-Za-z0-9+,]{340}\]'; then
+			_notrun "dump.f2fs (f2fs-tools) is too old; doesn't support showing unambiguous on-disk filenames"
+		fi
+		;;
+	*)
+		_notrun "_get_ciphertext_filename() isn't implemented on $FSTYP"
+		;;
+	esac
+}
+
+# Get an encrypted file's list of on-disk blocks as a comma-separated list of
+# block offsets from the start of the device.  "Blocks" are 512 bytes each here.
+_get_ciphertext_block_list()
+{
+	local file=$1
+
+	_sync_fs $file
+	$XFS_IO_PROG -c fiemap $file | perl -ne '
+		next if not /^\s*\d+: \[\d+\.\.\d+\]: (\d+)\.\.(\d+)/;
+		print $_ . "," foreach $1..$2;' | sed 's/,$//'
+}
+
+# Dump a block list that was previously saved by _get_ciphertext_block_list().
+_dump_ciphertext_blocks()
+{
+	local device=$1
+	local blocklist=$2
+	local block
+
+	for block in $(tr ',' ' ' <<< $blocklist); do
+		dd if=$device bs=512 count=1 skip=$block status=none
+	done
+}
+
+_do_verify_ciphertext_for_encryption_policy()
+{
+	local contents_encryption_mode=$1
+	local filenames_encryption_mode=$2
+	local policy_flags=$3
+	local set_encpolicy_args=$4
+	local keyspec=$5
+	local raw_key_hex=$6
+	local crypt_contents_cmd="$here/src/fscrypt-crypt-util $7"
+	local crypt_filename_cmd="$here/src/fscrypt-crypt-util $8"
+
+	local blocksize=$(_get_block_size $SCRATCH_MNT)
+	local test_contents_files=()
+	local test_filenames_files=()
+	local i src dir dst inode blocklist \
+	      padding_flag padding dir_inode len name f nonce decrypted_name
+
+	# Create files whose encrypted contents we'll verify.  For each, save
+	# the information: (copy of original file, inode number of encrypted
+	# file, comma-separated block list) into test_contents_files[].
+	echo "Creating files for contents verification" >> $seqres.full
+	i=1
+	rm -f $tmp.testfile_*
+	for src in /dev/zero /dev/urandom; do
+		head -c $((4 * blocksize)) $src > $tmp.testfile_$i
+		(( i++ ))
+	done
+	dir=$SCRATCH_MNT/encdir
+	mkdir $dir
+	_set_encpolicy $dir $keyspec $set_encpolicy_args -f $policy_flags
+	for src in $tmp.testfile_*; do
+		dst=$dir/${src##*.}
+		# To make sure the test file is not compressed we create an empty one
+		# and disable compression first (F2FS won't allow resetting the
+		# compression flag if the file has data already in it).
+		touch $dst
+		if lsattr $dst | grep -qE ".+c.+ $dst" ; then
+			chattr -c +m $dst
+		fi
+		cp $src $dst
+		inode=$(stat -c %i $dst)
+		blocklist=$(_get_ciphertext_block_list $dst)
+		test_contents_files+=("$src $inode $blocklist")
+	done
+
+	# Create files whose encrypted names we'll verify.  For each, save the
+	# information: (original filename, inode number of encrypted file, inode
+	# of parent directory, padding amount) into test_filenames_files[].  Try
+	# each padding amount: 4, 8, 16, or 32 bytes.  Also try various filename
+	# lengths, including boundary cases.  Assume NAME_MAX == 255.
+	echo "Creating files for filenames verification" >> $seqres.full
+	for padding_flag in 0 1 2 3; do
+		padding=$((4 << padding_flag))
+		dir=$SCRATCH_MNT/encdir.pad$padding
+		mkdir $dir
+		dir_inode=$(stat -c %i $dir)
+		_set_encpolicy $dir $keyspec $set_encpolicy_args \
+			-f $((policy_flags | padding_flag))
+		for len in 1 3 15 16 17 32 100 254 255; do
+			name=$(tr -d -C a-zA-Z0-9 < /dev/urandom | head -c $len)
+			touch $dir/$name
+			inode=$(stat -c %i $dir/$name)
+			test_filenames_files+=("$name $inode $dir_inode $padding")
+		done
+	done
+
+	# Now unmount the filesystem and verify the ciphertext we just wrote.
+	_scratch_unmount
+
+	echo "Verifying encrypted file contents" >> $seqres.full
+	for f in "${test_contents_files[@]}"; do
+		read -r src inode blocklist <<< "$f"
+		nonce=$(_get_encryption_nonce $SCRATCH_DEV $inode)
+		_dump_ciphertext_blocks $SCRATCH_DEV $blocklist > $tmp.actual_contents
+		$crypt_contents_cmd $contents_encryption_mode $raw_key_hex \
+			--file-nonce=$nonce --inode-number=$inode \
+                        < $src > $tmp.expected_contents
+		if ! cmp $tmp.expected_contents $tmp.actual_contents; then
+			_fail "Expected encrypted contents != actual encrypted contents.  File: $f"
+		fi
+		$crypt_contents_cmd $contents_encryption_mode $raw_key_hex \
+			--decrypt --file-nonce=$nonce --inode-number=$inode \
+			< $tmp.actual_contents > $tmp.decrypted_contents
+		if ! cmp $src $tmp.decrypted_contents; then
+			_fail "Contents decryption sanity check failed.  File: $f"
+		fi
+	done
+
+	echo "Verifying encrypted file names" >> $seqres.full
+	for f in "${test_filenames_files[@]}"; do
+		read -r name inode dir_inode padding <<< "$f"
+		nonce=$(_get_encryption_nonce $SCRATCH_DEV $dir_inode)
+		_get_ciphertext_filename $SCRATCH_DEV $inode $dir_inode \
+			> $tmp.actual_name
+		echo -n "$name" | \
+			$crypt_filename_cmd $filenames_encryption_mode \
+			$raw_key_hex --file-nonce=$nonce --padding=$padding \
+			--data-unit-size=255 --inode-number=$dir_inode \
+			> $tmp.expected_name
+		if ! cmp $tmp.expected_name $tmp.actual_name; then
+			_fail "Expected encrypted filename != actual encrypted filename.  File: $f"
+		fi
+		$crypt_filename_cmd $filenames_encryption_mode $raw_key_hex \
+			--decrypt --file-nonce=$nonce --padding=$padding \
+			--data-unit-size=255 --inode-number=$dir_inode \
+			< $tmp.actual_name > $tmp.decrypted_name
+		decrypted_name=$(tr -d '\0' < $tmp.decrypted_name)
+		if [ "$name" != "$decrypted_name" ]; then
+			_fail "Filename decryption sanity check failed ($name != $decrypted_name).  File: $f"
+		fi
+	done
+}
+
+# fscrypt UAPI constants (see <linux/fscrypt.h>)
+
+FSCRYPT_MODE_AES_256_XTS=1
+FSCRYPT_MODE_AES_256_CTS=4
+FSCRYPT_MODE_AES_128_CBC=5
+FSCRYPT_MODE_AES_128_CTS=6
+FSCRYPT_MODE_ADIANTUM=9
+FSCRYPT_MODE_AES_256_HCTR2=10
+
+FSCRYPT_POLICY_FLAG_DIRECT_KEY=0x04
+FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64=0x08
+FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32=0x10
+
+FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR=1
+FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER=2
+
+_fscrypt_mode_name_to_num()
+{
+	local name=$1
+
+	case "$name" in
+	AES-256-XTS)		echo $FSCRYPT_MODE_AES_256_XTS ;;
+	AES-256-CTS-CBC)	echo $FSCRYPT_MODE_AES_256_CTS ;;
+	AES-128-CBC-ESSIV)	echo $FSCRYPT_MODE_AES_128_CBC ;;
+	AES-128-CTS-CBC)	echo $FSCRYPT_MODE_AES_128_CTS ;;
+	Adiantum)		echo $FSCRYPT_MODE_ADIANTUM ;;
+	AES-256-HCTR2)		echo $FSCRYPT_MODE_AES_256_HCTR2 ;;
+	*)			_fail "Unknown fscrypt mode: $name" ;;
+	esac
+}
+
+# Verify that file contents and names are encrypted correctly when an encryption
+# policy of the specified type is used.
+#
+# The first two parameters are the contents and filenames encryption modes to
+# test.  The following optional parameters are also accepted to further modify
+# the type of encryption policy that is tested:
+#
+#	'v2':			test a v2 encryption policy
+#	'direct':		test the DIRECT_KEY policy flag
+#	'iv_ino_lblk_64':	test the IV_INO_LBLK_64 policy flag
+#	'iv_ino_lblk_32':	test the IV_INO_LBLK_32 policy flag
+#	'log2_dusize=N':        test the log2_data_unit_size field
+#	'hw_wrapped_key':	use a hardware-wrapped inline encryption key
+#
+_verify_ciphertext_for_encryption_policy()
+{
+	local contents_encryption_mode=$1
+	local filenames_encryption_mode=$2
+	local opt
+	local policy_version=1
+	local policy_flags=0
+	local log2_dusize=0
+	local hw_wrapped_key=false
+	local set_encpolicy_args=""
+	local crypt_util_args=""
+	local crypt_util_contents_args=""
+	local crypt_util_filename_args=""
+	local expected_identifier
+
+	shift 2
+	for opt; do
+		case "$opt" in
+		v2)
+			policy_version=2
+			;;
+		direct)
+			if [ $contents_encryption_mode != \
+			     $filenames_encryption_mode ]; then
+				_fail "For direct key mode, contents and filenames modes must match"
+			fi
+			(( policy_flags |= FSCRYPT_POLICY_FLAG_DIRECT_KEY ))
+			;;
+		iv_ino_lblk_64)
+			(( policy_flags |= FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 ))
+			;;
+		iv_ino_lblk_32)
+			(( policy_flags |= FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32 ))
+			;;
+		log2_dusize=*)
+			log2_dusize=$(echo "$opt" | sed 's/^log2_dusize=//')
+			;;
+		hw_wrapped_key)
+			hw_wrapped_key=true
+			crypt_util_args+=" --enable-hw-kdf"
+			crypt_util_contents_args+=" --use-inlinecrypt-key"
+			;;
+		*)
+			_fail "Unknown option '$opt' passed to ${FUNCNAME[0]}"
+			;;
+		esac
+	done
+	local contents_mode_num=$(_fscrypt_mode_name_to_num $contents_encryption_mode)
+	local filenames_mode_num=$(_fscrypt_mode_name_to_num $filenames_encryption_mode)
+
+	set_encpolicy_args+=" -c $contents_mode_num"
+	set_encpolicy_args+=" -n $filenames_mode_num"
+	if (( log2_dusize != 0 )); then
+		set_encpolicy_args+=" -s $log2_dusize"
+	fi
+	crypt_util_contents_args+=" --mode-num=$contents_mode_num"
+	crypt_util_filename_args+=" --mode-num=$filenames_mode_num"
+
+	if (( policy_version > 1 )); then
+		set_encpolicy_args+=" -v 2"
+		crypt_util_args+=" --kdf=HKDF-SHA512"
+		if (( policy_flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY )); then
+			crypt_util_args+=" --direct-key"
+		elif (( policy_flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 )); then
+			crypt_util_args+=" --iv-ino-lblk-64"
+		elif (( policy_flags & FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32 )); then
+			crypt_util_args+=" --iv-ino-lblk-32"
+		fi
+	else
+		if (( policy_flags & ~FSCRYPT_POLICY_FLAG_DIRECT_KEY )); then
+			_fail "unsupported flags for v1 policy: $policy_flags"
+		fi
+		if (( policy_flags & FSCRYPT_POLICY_FLAG_DIRECT_KEY )); then
+			crypt_util_args+=" --direct-key --kdf=none"
+		else
+			crypt_util_args+=" --kdf=AES-128-ECB"
+		fi
+	fi
+	set_encpolicy_args=${set_encpolicy_args# }
+
+	_require_scratch_encryption $set_encpolicy_args -f $policy_flags
+	if $hw_wrapped_key; then
+		_require_hw_wrapped_key_support $SCRATCH_DEV
+	fi
+	_require_test_program "fscrypt-crypt-util"
+	_require_xfs_io_command "fiemap"
+	_require_get_encryption_nonce_support
+	_require_get_ciphertext_filename_support
+	if (( policy_version == 1 )); then
+		_require_command "$KEYCTL_PROG" keyctl
+	fi
+
+	echo "Creating encryption-capable filesystem" >> $seqres.full
+	if (( policy_flags & (FSCRYPT_POLICY_FLAG_IV_INO_LBLK_64 |
+			      FSCRYPT_POLICY_FLAG_IV_INO_LBLK_32) )); then
+		_scratch_mkfs_stable_inodes_encrypted &>> $seqres.full
+	else
+		_scratch_mkfs_encrypted &>> $seqres.full
+	fi
+	_scratch_mount
+
+	if (( log2_dusize != 0 )); then
+		crypt_util_contents_args+=" --data-unit-size=$((1 << log2_dusize))"
+	else
+		crypt_util_contents_args+=" --data-unit-size=$(_get_block_size $SCRATCH_MNT)"
+	fi
+
+	crypt_util_args+=" --fs-uuid=$(blkid -s UUID -o value $SCRATCH_DEV | tr -d -)"
+
+	crypt_util_contents_args+="$crypt_util_args"
+	crypt_util_filename_args+="$crypt_util_args"
+
+	echo "Generating encryption key" >> $seqres.full
+	if (( policy_version > 1 )); then
+		if $hw_wrapped_key; then
+			local raw_key=$(_generate_raw_encryption_key \
+					$RAW_HW_KEY_SIZE)
+			local keyspec=$(_add_hw_wrapped_key $SCRATCH_DEV \
+					$SCRATCH_MNT "$raw_key")
+		else
+			local raw_key=$(_generate_raw_encryption_key)
+			local keyspec=$(_add_enckey $SCRATCH_MNT "$raw_key" | \
+					awk '{print $NF}')
+		fi
+	else
+		local raw_key=$(_generate_raw_encryption_key)
+		local keyspec=$(_generate_key_descriptor)
+		_init_session_keyring
+		_add_session_encryption_key $keyspec $raw_key
+	fi
+	local raw_key_hex=$(echo "$raw_key" | tr -d '\\x')
+
+	if (( policy_version > 1 )); then
+		echo "Verifying key identifier" >> $seqres.full
+		expected_identifier=$($here/src/fscrypt-crypt-util  \
+				      --dump-key-identifier "$raw_key_hex" \
+				      $crypt_util_args)
+		if [ "$expected_identifier" != "$keyspec" ]; then
+			echo "KEY IDENTIFIER MISMATCH!"
+			echo "    Expected: $expected_identifier"
+			echo "    Actual: $keyspec"
+		fi
+	fi
+
+	echo
+	echo -e "Verifying ciphertext with parameters:"
+	echo -e "\tcontents_encryption_mode: $contents_encryption_mode"
+	echo -e "\tfilenames_encryption_mode: $filenames_encryption_mode"
+	[ $# -ne 0 ] && echo -e "\toptions: $*"
+
+	cat >> $seqres.full <<EOF
+Full ciphertext verification parameters:
+  contents_encryption_mode = $contents_encryption_mode
+  filenames_encryption_mode = $filenames_encryption_mode
+  policy_flags = $policy_flags
+  set_encpolicy_args = $set_encpolicy_args
+  keyspec = $keyspec
+  raw_key_hex = $raw_key_hex
+  crypt_util_contents_args = $crypt_util_contents_args
+  crypt_util_filename_args = $crypt_util_filename_args
+EOF
+	_do_verify_ciphertext_for_encryption_policy \
+		"$contents_encryption_mode" \
+		"$filenames_encryption_mode" \
+		"$policy_flags" \
+		"$set_encpolicy_args" \
+		"$keyspec" \
+		"$raw_key_hex" \
+		"$crypt_util_contents_args" \
+		"$crypt_util_filename_args"
+}
+
+# Replace no-key filenames in the given directory with "NOKEY_NAME".
+#
+# No-key filenames are the filenames that the filesystem shows when userspace
+# lists an encrypted directory without the directory's encryption key being
+# present.  These will differ on every run of the test, even when using the same
+# encryption key, hence the need for this filtering in some cases.
+#
+# Note, this may replace "regular" names too, as technically we can only tell
+# whether a name is definitely a regular name, or either a regular or no-key
+# name.  A directory will only contain one type of name at a time, though.
+_filter_nokey_filenames()
+{
+	local dir=$1
+
+	# The no-key name format is a filesystem implementation detail that has
+	# varied slightly over time.  Just look for names that consist entirely
+	# of characters that have ever been used in such names.
+	sed "s|${dir}${dir:+/}[A-Za-z0-9+,_-]\+|${dir}${dir:+/}NOKEY_NAME|g"
+}

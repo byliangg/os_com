@@ -1,0 +1,109 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fusion IO. All Rights Reserved.
+#
+# FS QA Test No. 321
+#
+# Runs various dir fsync tests to cover fsync'ing directory corner cases.
+#
+. ./common/preamble
+_begin_fstest auto quick metadata log
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch_nocheck
+_require_dm_target flakey
+
+_clean_working_dir()
+{
+	_scratch_mount
+	rm -rf $SCRATCH_MNT/foo $SCRATCH_MNT/bar
+	_scratch_unmount
+}
+
+# Btrfs wasn't making sure the directory survived fsync
+_directory_test()
+{
+	echo "fsync new directory"
+	_scratch_mount
+	mkdir $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+
+	_flakey_drop_and_remount
+
+	_ls_l $SCRATCH_MNT | tail -n +2 | awk '{ print $1, $9 }'
+	_scratch_unmount
+	_check_scratch_fs
+	[ $? -ne 0 ] && _fatal "fsck failed"
+}
+
+# Btrfs was losing a rename into a new directory
+_rename_test()
+{
+	echo "rename fsync test"
+	_scratch_mount
+	touch $SCRATCH_MNT/foo
+	mkdir $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+	mv $SCRATCH_MNT/foo $SCRATCH_MNT/bar/foo
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar/foo
+
+	_flakey_drop_and_remount
+
+	_ls_l $SCRATCH_MNT | tail -n +2 | awk '{ print $1, $9 }'
+	_ls_l $SCRATCH_MNT/bar | tail -n +2 | awk '{ print $1, $9 }'
+	_scratch_unmount
+	_check_scratch_fs
+	[ $? -ne 0 ] && _fatal "fsck failed"
+}
+
+# Btrfs was failing to replay a log when we had a inode with a smaller inode
+# number that is renamed into a directory with a higher inode number
+_replay_rename_test()
+{
+	echo "replay rename fsync test"
+	_scratch_mount
+	touch $SCRATCH_MNT/foo
+	mkdir $SCRATCH_MNT/bar
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/foo
+	mv $SCRATCH_MNT/foo $SCRATCH_MNT/bar/foo
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar
+
+	# This is to force btrfs to relog the entire inode including the ref so
+	# we are sure to try and replay the ref along with the dir_index item
+	setfattr -n user.foo -v blah $SCRATCH_MNT/bar/foo >> $seqres.full 2>&1
+
+	$XFS_IO_PROG -c "fsync" $SCRATCH_MNT/bar/foo
+
+	_flakey_drop_and_remount
+
+	_ls_l $SCRATCH_MNT | tail -n +2 | awk '{ print $1, $9 }'
+	_ls_l $SCRATCH_MNT/bar | tail -n +2 | awk '{ print $1, $9 }'
+	_scratch_unmount
+}
+
+_scratch_mkfs >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+
+# Create a basic flakey device that will never error out
+_init_flakey
+
+_directory_test
+_clean_working_dir
+_rename_test
+_clean_working_dir
+_replay_rename_test
+
+status=0
+exit

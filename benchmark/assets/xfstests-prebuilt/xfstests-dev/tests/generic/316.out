@@ -1,0 +1,181 @@
+QA output created by 316
+	1. into a hole
+1aca77e2188f52a62674fe8a873bdaba
+	2. into allocated space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	4. hole -> data
+0: [0..383]: hole
+1: [384..511]: extent
+2: [512..639]: hole
+286aad7ca07b2256f0f2bb8e608ff63d
+	6. data -> hole
+0: [0..127]: extent
+1: [128..639]: hole
+3976e5cc0b8a47c4cdc9e0211635f568
+	10. hole -> data -> hole
+1aca77e2188f52a62674fe8a873bdaba
+	11. data -> hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	14. data -> hole @ EOF
+0: [0..383]: extent
+1: [384..639]: hole
+eb591f549edabba2b21f80ce4deed8a9
+	15. data -> hole @ 0
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	16. data -> cache cold ->hole
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	17. data -> hole in single block file
+0: [0..7]: extent
+0000000 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+0000200 0000 0000 0000 0000 0000 0000 0000 0000
+*
+0000400 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+	1. into a hole
+1aca77e2188f52a62674fe8a873bdaba
+	2. into allocated space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	4. hole -> data
+0: [0..383]: hole
+1: [384..511]: extent
+2: [512..639]: hole
+286aad7ca07b2256f0f2bb8e608ff63d
+	6. data -> hole
+0: [0..127]: extent
+1: [128..639]: hole
+3976e5cc0b8a47c4cdc9e0211635f568
+	10. hole -> data -> hole
+1aca77e2188f52a62674fe8a873bdaba
+	11. data -> hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	14. data -> hole @ EOF
+0: [0..383]: extent
+1: [384..639]: hole
+eb591f549edabba2b21f80ce4deed8a9
+	15. data -> hole @ 0
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	16. data -> cache cold ->hole
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	17. data -> hole in single block file
+0: [0..7]: extent
+0000000 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+0000200 0000 0000 0000 0000 0000 0000 0000 0000
+*
+0000400 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+	1. into a hole
+1aca77e2188f52a62674fe8a873bdaba
+	2. into allocated space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	4. hole -> data
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	6. data -> hole
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	10. hole -> data -> hole
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	11. data -> hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	14. data -> hole @ EOF
+0: [0..383]: extent
+1: [384..639]: hole
+eb591f549edabba2b21f80ce4deed8a9
+	15. data -> hole @ 0
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	16. data -> cache cold ->hole
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	17. data -> hole in single block file
+0: [0..7]: extent
+0000000 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+0000200 0000 0000 0000 0000 0000 0000 0000 0000
+*
+0000400 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+	1. into a hole
+1aca77e2188f52a62674fe8a873bdaba
+	2. into allocated space
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	4. hole -> data
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	6. data -> hole
+0: [0..127]: extent
+1: [128..383]: hole
+2: [384..639]: extent
+2f7a72b9ca9923b610514a11a45a80c9
+	10. hole -> data -> hole
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	11. data -> hole -> data
+0: [0..127]: extent
+1: [128..511]: hole
+2: [512..639]: extent
+0bcfc7652751f8fe46381240ccadd9d7
+	14. data -> hole @ EOF
+0: [0..383]: extent
+1: [384..639]: hole
+eb591f549edabba2b21f80ce4deed8a9
+	15. data -> hole @ 0
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	16. data -> cache cold ->hole
+0: [0..255]: hole
+1: [256..639]: extent
+b0c249edb75ce5b52136864d879cde83
+	17. data -> hole in single block file
+0: [0..7]: extent
+0000000 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*
+0000200 0000 0000 0000 0000 0000 0000 0000 0000
+*
+0000400 cdcd cdcd cdcd cdcd cdcd cdcd cdcd cdcd
+*

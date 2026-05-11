@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Fujitsu. All Rights Reserved.
+#
+# FS QA Test 107
+#
+# Test that calling fallocate against a range which is already
+# allocated does not truncate beyond EOF
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc
+
+. ./common/filter
+. ./common/defrag
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+# Use 64K file size to match any sectorsize
+# And with a unaligned tailing range to ensure it will be at least 2 pages
+filesize=$(( 64 * 1024 + 1024 ))
+
+# Fallocate a range that will not cover the tailing page
+fallocrange=$(( 64 * 1024 ))
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+$XFS_IO_PROG -f -c "pwrite 0 $filesize" $SCRATCH_MNT/foo | _filter_xfs_io
+sync
+orig_extent_nr=`_extent_count $SCRATCH_MNT/foo`
+
+# As all space are allocated and even written to disk, this falloc
+# should do nothing with extent modification.
+$XFS_IO_PROG -f -c "falloc 0 $fallocrange" $SCRATCH_MNT/foo
+sync
+new_extent_nr=`_extent_count $SCRATCH_MNT/foo`
+
+echo "orig: $orig_extent_nr, new: $new_extent_nr" >> $seqres.full
+
+if [ "x$orig_extent_nr" != "x$new_extent_nr" ]; then
+	echo "Extent beyond EOF is re-truncated"
+	echo "orig_extent_nr: $orig_extent_nr new_extent_nr: $new_extent_nr"
+fi
+
+# success, all done
+status=0
+exit

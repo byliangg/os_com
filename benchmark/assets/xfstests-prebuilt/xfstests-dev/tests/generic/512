@@ -1,0 +1,52 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 SUSE Linux Products GmbH. All Rights Reserved.
+#
+# FS QA Test No. 512
+#
+# Test that if we have a very small file, with a size smaller than the block
+# size, then fallocate a very small range within the block size but past the
+# file's current size, fsync the file and then power fail, after mounting the
+# filesystem all the file data is there and the file size is correct.
+#
+. ./common/preamble
+_begin_fstest auto quick log prealloc
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_flakey
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/dmflakey
+
+_require_scratch
+_require_xfs_io_command "falloc"
+_require_dm_target flakey
+
+_scratch_mkfs >>$seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_init_flakey
+_scratch_mount
+
+$XFS_IO_PROG -f \
+	     -c "pwrite -S 0xb6 0 21" \
+	     -c "falloc 40 40" \
+	     -c "fsync" \
+	     $SCRATCH_MNT/foobar | _filter_xfs_io
+
+# Simulate a power failure and mount the filesystem. We expect no data loss
+# and a correct file size.
+_flakey_drop_and_remount
+
+echo "File content after power failure:"
+od -t x1 -A d $SCRATCH_MNT/foobar
+
+_scratch_unmount
+
+status=0
+exit

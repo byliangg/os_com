@@ -1,0 +1,64 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 067
+#
+# Test out acl/dacls which fit in shortform in the inode
+#
+. ./common/preamble
+_begin_fstest acl attr auto quick
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+_require_attrs
+_require_acls
+_require_scratch
+
+# set up fs for 1K inodes
+isize=0
+_scratch_mkfs_xfs | _filter_mkfs >$seqres.full 2>$tmp.mkfs
+[ $? -eq 0 ] && source $tmp.mkfs
+if [ "$isize" -lt 1024 ]; then
+    _scratch_mkfs_xfs -i size=1024 >>$seqres.full \
+	|| _notrun "Cannot mkfs for this test using MKFS_OPTIONS specified"
+fi
+_scratch_mount
+$XFS_INFO_PROG $SCRATCH_MNT >>$seqres.full
+cd $SCRATCH_MNT
+
+echo ""
+echo "=== Test out large ACLs  ==="
+
+mkdir largeacldir
+
+# John Trostel reported probs with going from 20 to 21 aces
+# 20 ace ACL = 20*12+4 = 244 bytes
+# 21 ace ACL = 21*12+4 = 256 bytes - too big for shortform
+# the 21 ace ACL can not be shortform
+#
+acl20=`_create_n_aces 20`
+acl21=`_create_n_aces 21`
+
+echo "try 20 aces for access acl"
+chacl $acl20 largeacldir
+getfacl --numeric largeacldir | _filter_aces
+
+echo "try 20 aces for default acl"
+chacl -d $acl20 largeacldir
+getfacl --numeric largeacldir | _filter_aces
+
+echo "try 21 aces for access acl"
+chacl $acl21 largeacldir
+getfacl --numeric largeacldir | _filter_aces
+
+echo "try 21 aces for default acl"
+chacl -d $acl21 largeacldir
+getfacl --numeric largeacldir | _filter_aces
+
+# success, all done
+status=0
+exit

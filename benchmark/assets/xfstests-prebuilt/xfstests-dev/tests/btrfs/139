@@ -1,0 +1,49 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 SUSE. All Rights Reserved.
+#
+# FS QA Test 139
+#
+# Check if btrfs quota limits are not reached when you constantly
+# create and delete files within the exclusive qgroup limits.
+#
+# Finally we create files to exceed the quota.
+#
+. ./common/preamble
+_begin_fstest auto qgroup limit
+
+. ./common/filter
+
+# We at least need 2GB of free space on $SCRATCH_DEV
+_require_scratch_size $((2 * 1024 * 1024))
+
+# This test requires specific data space usage, skip if we have compression
+# enabled.
+_require_no_compress
+
+_scratch_mkfs > /dev/null 2>&1
+_scratch_mount
+
+SUBVOL=$SCRATCH_MNT/subvol
+
+_btrfs subvolume create $SUBVOL
+_btrfs quota enable $SCRATCH_MNT
+_qgroup_rescan $SCRATCH_MNT
+_btrfs qgroup limit -e 1G $SUBVOL
+
+# Write and delete files within 1G limits, multiple times
+for i in $(seq 1 5); do
+	for j in $(seq 1 240); do
+		$XFS_IO_PROG -f -c "pwrite 0 4m" $SUBVOL/file_$j > /dev/null
+	done
+	rm -f $SUBVOL/file*
+done
+
+# Exceed the limits here
+for j in $(seq 1 8); do
+	$XFS_IO_PROG -f -c "pwrite 0 128m" $SUBVOL/file_$j 2>&1 | _filter_xfs_io | _filter_xfs_io_error
+done
+
+# success, all done
+status=0
+exit

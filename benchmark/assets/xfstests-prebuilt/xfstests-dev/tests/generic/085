@@ -1,0 +1,84 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2015 Red Hat Inc. All Rights Reserved.
+#
+# FS QA Test No. 085
+#
+# Exercise fs freeze/unfreeze and mount/umount race, which could lead to
+# use-after-free oops.
+#
+# This commit fixed the issue:
+# 1494583 fix get_active_super()/umount() race
+#
+. ./common/preamble
+_begin_fstest auto freeze mount
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cleanup_dmdev
+	cd /
+	rm -f $tmp.*
+}
+
+cleanup_dmdev()
+{
+	if [ -n "$pid" ]; then
+		kill -9 $pid 2>> $seqres.full
+		wait $pid 2>> $seqres.full
+	fi
+	# in case it's still suspended and/or mounted
+	$DMSETUP_PROG resume $lvdev >> $seqres.full 2>&1
+	_unmount -q $SCRATCH_MNT >/dev/null 2>&1
+	_dmsetup_remove $node
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_block_device $SCRATCH_DEV
+_require_dm_target linear
+_require_freeze
+
+setup_dmdev()
+{
+	table="0 $size_in_sector linear $SCRATCH_DEV 0"
+	_dmsetup_create $node --table "$table" || \
+		_fail "setup dm device failed"
+}
+
+echo "Silence is golden"
+
+size=$((256 * 1024 * 1024))
+size_in_sector=$((size / 512))
+_scratch_mkfs_sized $size >>$seqres.full 2>&1
+
+node=$seq-test
+lvdev=/dev/mapper/$node
+setup_dmdev
+
+# take use of dmsetup suspend to freeze the fs.
+# xfs_freeze/fsfreeze cannot be used in this test, because it can possibly
+# freeze the root fs of the host when SCRATCH_MNT is not mounted
+#
+# And the results of the racing commands (suspend/resume, mount/umount) are not
+# important, as long as they're racing with each other. So just throw away the
+# outputs and ignore the results.
+for ((i=0; i<100; i++)); do
+	$DMSETUP_PROG suspend $lvdev >> $seqres.full 2>&1
+	$DMSETUP_PROG resume $lvdev >> $seqres.full 2>&1
+done &
+pid=$!
+for ((i=0; i<100; i++)); do
+	_mount $lvdev $SCRATCH_MNT >> $seqres.full 2>&1
+	_unmount $lvdev >> $seqres.full 2>&1
+done &
+pid="$pid $!"
+
+wait $pid
+unset pid
+
+cleanup_dmdev
+status=0
+exit

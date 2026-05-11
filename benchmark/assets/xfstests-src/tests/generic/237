@@ -1,0 +1,47 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 FUJITSU LIMITED. All Rights Reserved.
+#
+# FS QA Test No. 237
+#
+# Check user B can setfacl a file which belongs to user A
+# See also http://marc.info/?l=linux-btrfs&m=127434445620298&w=2
+#
+. ./common/preamble
+_begin_fstest auto quick acl perms
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.*
+	[ -n "$TEST_DIR" ] && rm -rf $TEST_DIR/$seq.dir1
+}
+
+# only Linux supports fallocate
+_require_test
+_require_runas
+
+_acl_setup_ids
+_require_acls
+
+# get dir
+cd $TEST_DIR
+rm -rf $seq.dir1
+mkdir $seq.dir1
+cd $seq.dir1
+
+touch file1
+chown $acl1:$acl1 file1
+
+echo "Expect to FAIL"
+_runas -u $acl2 -g $acl2 -- setfacl -m u::rwx file1 2>&1 | sed 's/^setfacl: \/.*file1: Operation not permitted$/setfacl: file1: Operation not permitted/'
+
+echo "Test over."
+# success, all done
+status=0
+exit

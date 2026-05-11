@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2019 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 503
+#
+# Populate a XFS filesystem and ensure that metadump and mdrestore all work
+# properly.
+#
+. ./common/preamble
+_begin_fstest auto metadump
+
+_register_cleanup "_cleanup" BUS
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -rf $tmp.* $testdir
+	_xfs_cleanup_verify_metadump
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/populate
+. ./common/metadump
+
+testdir=$TEST_DIR/test-$seq
+
+
+_require_command "$XFS_MDRESTORE_PROG" "xfs_mdrestore"
+_require_loop
+_require_scratch_nocheck
+_require_populate_commands
+_xfs_skip_online_rebuild
+_xfs_skip_offline_rebuild
+_xfs_setup_verify_metadump
+
+echo "Format and populate"
+_scratch_populate_cached nofill > $seqres.full 2>&1
+
+mkdir -p $testdir
+metadump_file=$testdir/scratch.md
+copy_file=$testdir/copy.img
+
+echo "metadump and mdrestore"
+_xfs_verify_metadumps
+
+echo "metadump a and mdrestore"
+_xfs_verify_metadumps '-a'
+
+echo "metadump o and mdrestore"
+_xfs_verify_metadumps '-o'
+
+echo "metadump ao and mdrestore"
+_xfs_verify_metadumps '-a -o'
+
+# success, all done
+status=0
+exit

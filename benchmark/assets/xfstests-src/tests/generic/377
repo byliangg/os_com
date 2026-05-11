@@ -1,0 +1,56 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0+
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FSQA Test No. 377
+#
+# Test listxattr syscall behaviour with different buffer sizes.
+#
+. ./common/preamble
+_begin_fstest attr auto quick metadata
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+_require_scratch
+_require_attrs
+_require_test_program "listxattr"
+
+listxattr="$here/src/listxattr"
+
+_scratch_mkfs >>$seqres.full 2>&1
+_scratch_mount
+
+# Create a testfile with three xattrs such that the sum of namelengths of the
+# first two is bigger than the namelength of the third. This is needed for
+# the 5th testcase that tests one of the cornercases.
+testfile=${SCRATCH_MNT}/testfile
+touch $testfile
+$SETFATTR_PROG -n user.foo -v bar $testfile
+$SETFATTR_PROG -n user.ping -v pong $testfile
+$SETFATTR_PROG -n user.hello -v there $testfile
+
+# 1. Call listxattr without buffer length argument. This should succeed.
+$listxattr $testfile | grep '^xattr: user\.' | sort
+
+# 2. Calling listxattr on nonexistant file should fail with -ENOENT.
+$listxattr ""
+
+# 3. Calling listxattr with buffersize not suffecient for even one xattr
+# should fail with -ERANGE.
+$listxattr $testfile 1
+
+# 4. Calling listxattr with buffersize suffecient for one xattr, but not
+# sufficient for the whole list should still fail with -ERANGE.
+$listxattr $testfile 9
+
+# 5. Calling listxattr with buffersize suffecient for the last xattr, but not
+# sufficient for the sum of first two. Should fail with -ERANGE.
+$listxattr $testfile 11
+
+# 6. Calling listxattr with buffersize bigger than needed should succeed.
+$listxattr $testfile 500 | grep '^xattr: user\.' | sort
+
+status=0
+exit

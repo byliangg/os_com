@@ -1,0 +1,116 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. xfs/011
+#
+# Test the xfs log reservation mechanism for leaks. Run an fsstress workload to
+# include a variety of fs operations, freeze the filesystem and verify that
+# there are no oustanding reservations against the log.
+#
+. ./common/preamble
+_begin_fstest auto freeze log metadata quick
+
+_require_scratch
+_require_freeze
+_require_xfs_sysfs $(_short_dev $TEST_DEV)/log
+
+. ./common/filter
+
+devname=`_short_dev $SCRATCH_DEV`
+attrprefix="/sys/fs/xfs/$devname/log"
+
+# Override the default cleanup function.
+_cleanup()
+{
+	# Make sure $SCRATCH_MNT is unfreezed
+	xfs_freeze -u $SCRATCH_MNT 2>/dev/null
+	_kill_fsstress
+	cd /
+	rm -f $tmp.*
+}
+
+#
+# The grant heads record reservations in bytes.
+#
+# The value is not exactly zero for complex reason.  In short: we must always
+# have space for at least one minimum sized log write between ailp->ail_head_lsn
+# and log->l_tail_lsn, and that is what is showing up in the grant head
+# reservation values.  We don't need to explicitly reserve it for the first
+# iclog write after mount, but we always end up with it being present after the
+# first checkpoint commits and the AIL returns the checkpoint's unused space
+# back to the grant head.
+#
+# Hence just check the value is between 0 and the maximum iclog size (256kB).
+#
+_check_scratch_log_state_new()
+{
+	for attr in "reserve_grant_head_bytes" "write_grant_head_bytes"; do
+		space=`cat $attrprefix/$attr`
+		_within_tolerance $space 1024 0 $((256 * 1024))
+	done
+}
+
+#
+# The log head is exported in basic blocks and the log grant heads in bytes.
+# Convert the log head to bytes for precise comparison.
+#
+_check_scratch_log_state_old()
+{
+	log_head_cycle=`awk -F : '{ print $1 }' $attrprefix/log_head_lsn`
+	log_head_bytes=`awk -F : '{ print $2 }' $attrprefix/log_head_lsn`
+	log_head_bytes=$((log_head_bytes * 512))
+
+	for attr in "reserve_grant_head" "write_grant_head"; do
+		cycle=`cat $attrprefix/$attr | awk -F : '{ print $1 }'`
+		bytes=`cat $attrprefix/$attr | awk -F : '{ print $2 }'`
+
+		if [ $cycle != $log_head_cycle ] ||
+		   [ $bytes != $log_head_bytes ]
+		then
+			echo "$attr ($cycle:$bytes) does not match" \
+				"log_head_lsn ($log_head_cycle:$log_head_bytes)," \
+				"possible leak detected."
+		fi
+	done
+}
+
+# Use the information exported by XFS to sysfs to determine whether the log has
+# active reservations after a filesystem freeze.
+_check_scratch_log_state()
+{
+	# freeze the fs to ensure data is synced and the log is flushed. this
+	# means no outstanding transactions, and thus no outstanding log
+	# reservations, should exist
+	xfs_freeze -f $SCRATCH_MNT
+
+	if [ -f "${attrprefix}/reserve_grant_head_bytes" ]; then
+	    _check_scratch_log_state_new
+	else
+	    _check_scratch_log_state_old
+	fi
+
+	xfs_freeze -u $SCRATCH_MNT
+}
+
+echo "Silence is golden."
+
+_scratch_mkfs_xfs >> $seqres.full 2>&1
+_scratch_mount
+
+_check_scratch_log_state
+
+_run_fsstress_bg -d $SCRATCH_MNT/fsstress -n 9999999 -p 2 -S t
+
+iters=5
+while [ $iters -gt 0 ]; do
+	sleep 3
+	_check_scratch_log_state
+	iters=$((iters - 1))
+done
+
+_kill_fsstress
+_scratch_unmount
+
+status=0
+exit

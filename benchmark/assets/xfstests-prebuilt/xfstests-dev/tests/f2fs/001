@@ -1,0 +1,55 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Jaegeuk Kim.  All Rights Reserved.
+#
+# FS QA Test No. f2fs/001
+#
+# Test inline_data behaviors when filesystem is full.
+#
+# The inline_data feature was introduced in ext4 and f2fs as follows.
+#  ext4 : http://lwn.net/Articles/468678/
+#  f2fs : http://lwn.net/Articles/573408/
+#
+# The basic idea is embedding small-sized file's data into relatively large
+# inode space.
+# In ext4, up to 132 bytes of data can be stored in 256 bytes-sized inode.
+# In f2fs, up to 3.4KB of data can be embedded into 4KB-sized inode block.
+#
+. ./common/preamble
+_begin_fstest auto quick rw prealloc
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_xfs_io_command "falloc"
+
+testfile=$SCRATCH_MNT/testfile
+dummyfile=$SCRATCH_MNT/dummyfile
+
+# build 4GB filesystem
+_scratch_mkfs_sized $((4 * 1024 * 1024 * 1024)) > /dev/null 2>&1
+_scratch_mount
+
+echo "==== create small file ===="
+$XFS_IO_PROG -t -f -c "pwrite -S 0x58 0 40" $testfile | _filter_xfs_io
+
+# -ENOSPC should be triggered
+echo "==== Fullfill the partition ===="
+$XFS_IO_PROG -t -f -c "falloc 0 5g" $dummyfile | _filter_xfs_io
+
+# -ENOSPC should be triggered without any panic
+echo "==== change i_size & write data ===="
+$XFS_IO_PROG -c "truncate 96" -c "pwrite -S 0x58 8192 4096" $testfile 2>&1 \
+	| _filter_xfs_io_error
+
+echo "==== check data contents ===="
+_hexdump $testfile
+_scratch_cycle_mount
+_hexdump $testfile
+
+rm $testfile
+rm $dummyfile
+
+status=0
+exit

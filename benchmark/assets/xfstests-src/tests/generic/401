@@ -1,0 +1,61 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2016 CTERA Networks. All Rights Reserved.
+#
+# FSQA Test No. 401
+#
+# Test filetype feature
+#
+# This test does NOT require that file system support the d_type feature.
+# It verifies that file types are reported as either DT_UNKNOWN or as
+# the actual file type. For example, special dir entries . and .. MAY be
+# reported as DT_UNKNOWN IF filetype feature is disabled (ext4), but MAY
+# also be reported as DT_DIR in this case (xfs).
+#
+# For fs for which we know how to test the filetype feature (xfs|ext*)
+# verify getting DT_UNKNOWN IFF feature is disabled.
+#
+. ./common/preamble
+_begin_fstest auto quick
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+_require_symlinks
+_require_mknod
+_require_test_program "t_dir_type"
+
+_scratch_mkfs >>$seqres.full 2>&1
+
+_scratch_mount
+
+# Create our test files.
+testdir=$SCRATCH_MNT/find-by-type
+mkdir -p $testdir
+mkdir $testdir/d
+touch $testdir/f
+ln -s $testdir/f $testdir/l
+mknod $testdir/c c 1 1
+mknod $testdir/b b 1 1
+mknod $testdir/p p
+
+# Test d_type of test files - it must be the actual file type on fs
+# with filetype support and it could be either the actual file type
+# or DT_UNKNOWN on fs without filetype support
+ftype=
+_supports_filetype $SCRATCH_MNT && ftype=1
+$here/src/t_dir_type $testdir | \
+while read name type; do
+	if [ "$ftype" != 1 -a "$type" = u ]; then
+		if [ "$name" = "." -o "$name" = ".." ]; then
+			type=d
+		else
+			type=$name
+		fi
+	fi
+	echo $name $type
+done | sort
+
+status=0
+exit

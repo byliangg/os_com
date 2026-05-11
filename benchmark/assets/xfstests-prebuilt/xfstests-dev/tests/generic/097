@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2004 Silicon Graphics, Inc.  All Rights Reserved.
+# Copyright (c) 2017 Google, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 097. Modifed from UDFQA test 033.
+#
+# simple attr tests for EAs:
+#  - set
+#  - get
+#  - list
+#  - remove
+# Basic testing.
+#
+. ./common/preamble
+_begin_fstest attr auto quick
+
+file=$TEST_DIR/foo
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -f $tmp.* $file
+}
+
+getfattr()
+{
+	_getfattr --absolute-names "$@" |& _filter_test_dir
+}
+
+setfattr()
+{
+	$SETFATTR_PROG "$@" |& _filter_test_dir
+}
+
+# Import common functions.
+. ./common/attr
+. ./common/filter
+
+
+_require_test
+_require_attrs user trusted
+
+echo -e "\ncreate file foo"
+rm -f $file
+touch $file
+
+echo -e "\n*** Test out the trusted namespace ***"
+
+echo -e "\nset EA <trusted:colour,marone>:"
+setfattr -n trusted.colour -v marone $file
+
+echo -e "\nset EA <user:colour,beige>:"
+setfattr -n user.colour -v beige $file
+
+echo -e "\nset EA <user:vomit,pizza>:"
+setfattr -n user.vomit -v pizza $file
+
+echo -e "\nset EA <trusted:noise,whack>:"
+setfattr -n trusted.noise -v whack $file
+
+echo -e "\nlist trusted EAs: <trusted:colour,noise>:"
+getfattr -d -m '^trusted\.' $file
+
+echo -e "\nlist user EAs: <user:colour,vomit>:"
+getfattr -d $file
+
+echo -e "\nget trusted EA colour: marone"
+getfattr -n trusted.colour $file
+
+echo -e "\nget trusted EA noise: whack"
+getfattr -n trusted.noise $file
+
+echo -e "\nget trusted EA vomit which is a user EA => find nothing"
+getfattr -n trusted.vomit $file
+
+echo -e "\nunmount the FS and see if EAs are persistent"
+_test_cycle_mount
+
+echo -e "\nget trusted EA colour: marone"
+getfattr -n trusted.colour $file
+
+echo -e "\nget trusted EA noise: whack"
+getfattr -n trusted.noise $file
+
+echo -e "\nget user EA vomit: pizza"
+getfattr -n user.vomit $file
+
+echo -e "\nremove the trusted colour EA"
+setfattr -x trusted.colour $file
+
+echo -e "\nlist trusted EAs: <trusted:noise>:"
+getfattr -d -m '^trusted\.' $file
+
+echo -e "\nlist user EAs: <user:colour,vomit>:"
+getfattr -d $file
+
+echo -e "\nremove the final trusted EA noise"
+setfattr -x trusted.noise $file
+
+echo -e "\nlist trusted EAs: none"
+getfattr -d -m '^trusted\.' $file
+
+# success, all done
+status=0
+exit

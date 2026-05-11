@@ -1,0 +1,53 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Oracle, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 423
+#
+# Race scrubbing the inode record while appending to a file.
+# This exposes a bug in xfs_bmap_count_blocks where we count delalloc
+# extents for di_nblocks if the fork is in extents format, but we don't
+# count them if the fork is in btree format.
+#
+. ./common/preamble
+_begin_fstest scrub prealloc
+
+_register_cleanup "_cleanup" BUS
+
+# Import common functions.
+. ./common/filter
+. ./common/fuzzy
+. ./common/inject
+
+_require_test_program "punch-alternating"
+_require_xfs_io_command "scrub"
+_require_xfs_io_command "falloc"
+_require_scratch
+
+echo "Format and populate"
+_scratch_mkfs > "$seqres.full" 2>&1
+_scratch_mount
+
+$XFS_IO_PROG -f -c 'falloc 0 10m' $SCRATCH_MNT/a >> $seqres.full
+$XFS_IO_PROG -f -c 'falloc 0 10m' $SCRATCH_MNT/b >> $seqres.full
+$here/src/punch-alternating $SCRATCH_MNT/b
+_scratch_sync
+
+echo "Set up delalloc extents"
+$XFS_IO_PROG -c 'pwrite -S 0x66 10m 128k' $SCRATCH_MNT/a >> $seqres.full
+$XFS_IO_PROG -c 'pwrite -S 0x66 10m 128k' $SCRATCH_MNT/b >> $seqres.full
+$XFS_IO_PROG -c 'bmap -ev' $SCRATCH_MNT/a $SCRATCH_MNT/b > $SCRATCH_MNT/before
+cat $SCRATCH_MNT/before >> $seqres.full
+
+echo "Scrub a and b"
+$XFS_IO_PROG -x -c 'scrub inode' $SCRATCH_MNT/a >> $seqres.full
+$XFS_IO_PROG -x -c 'scrub inode' $SCRATCH_MNT/b >> $seqres.full
+$XFS_IO_PROG -c 'bmap -ev' $SCRATCH_MNT/a $SCRATCH_MNT/b > $SCRATCH_MNT/after
+cat $SCRATCH_MNT/after >> $seqres.full
+
+echo "Compare extent maps"
+diff -u $SCRATCH_MNT/before $SCRATCH_MNT/after
+
+echo "Test done"
+status=0
+exit

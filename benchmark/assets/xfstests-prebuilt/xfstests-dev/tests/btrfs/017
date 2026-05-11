@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Liu Bo.  All Rights Reserved.
+#
+# FS QA Test No. 017
+#
+# Verify that removing shared extents can end up incorrect qgroup accounting.
+#
+# Regression of 'commit fcebe4562dec ("Btrfs: rework qgroup accounting")',
+# this will throw a warning into dmesg.
+#
+# The issue is fixed by https://patchwork.kernel.org/patch/5499981/
+# "Btrfs: fix a warning of qgroup account on shared extents"
+#
+. ./common/preamble
+_begin_fstest auto quick qgroup
+
+. ./common/filter
+
+_require_scratch
+_require_scratch_qgroup
+_require_cloner
+
+# Currently in btrfs the node/leaf size can not be smaller than the page
+# size (but it can be greater than the page size). So use the largest
+# supported node/leaf size (64Kb) so that the test can run on any platform
+# that Linux supports.
+_scratch_mkfs "--nodesize 65536" >>$seqres.full 2>&1
+_scratch_mount
+
+BLOCK_SIZE=$(_get_block_size $SCRATCH_MNT)
+EXTENT_SIZE=$((2 * $BLOCK_SIZE))
+
+$XFS_IO_PROG -f -d -c "pwrite 0 $EXTENT_SIZE" $SCRATCH_MNT/foo \
+	| _filter_xfs_io_blocks_modified
+
+_btrfs subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/snap
+
+$CLONER_PROG -s 0 -d 0 -l $EXTENT_SIZE $SCRATCH_MNT/foo $SCRATCH_MNT/foo-reflink
+
+$CLONER_PROG -s 0 -d 0 -l $EXTENT_SIZE $SCRATCH_MNT/foo \
+	     $SCRATCH_MNT/snap/foo-reflink
+
+$CLONER_PROG -s 0 -d 0 -l $EXTENT_SIZE $SCRATCH_MNT/foo \
+	     $SCRATCH_MNT/snap/foo-reflink2
+
+_btrfs quota enable $SCRATCH_MNT
+_btrfs quota rescan -w $SCRATCH_MNT
+
+rm -fr $SCRATCH_MNT/foo*
+rm -fr $SCRATCH_MNT/snap/foo*
+
+sync
+
+units=`_btrfs_qgroup_units`
+$BTRFS_UTIL_PROG qgroup show $units $SCRATCH_MNT | $AWK_PROG '/[0-9]/ {print $2" "$3}'
+
+# success, all done
+status=0
+exit

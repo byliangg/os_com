@@ -1,0 +1,37 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 448
+#
+# Check what happens when SEEK_HOLE/SEEK_DATA are fed negative offsets.
+#
+. ./common/preamble
+_begin_fstest auto quick rw seek
+
+BASE_TEST_FILE=$TEST_DIR/seek_sanity_testfile_$seq
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	rm -f $tmp.* $BASE_TEST_FILE*
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_test
+_require_seek_data_hole
+
+_require_test_program "seek_sanity_test"
+
+_run_seek_sanity_test -s 18 -e 18 $BASE_TEST_FILE > $seqres.full 2>&1 ||
+	_fail "seek sanity check failed!"
+
+_check_dmesg
+# success, all done
+echo "Silence is golden"
+status=0
+exit

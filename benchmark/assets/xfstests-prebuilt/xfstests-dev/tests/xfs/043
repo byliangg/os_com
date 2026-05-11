@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 043
+#
+# Test out xfsdump/restore but rmv inventory prior to restore.
+# This checks that the on-disk inventory can be successfully
+# rebuilt from the on-tape inventory.
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest dump ioctl tape
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+
+_require_tape $TAPE_DEV
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_fill
+_erase_hard
+_do_dump_sub
+rm -rf /var/{,lib/}xfsdump/inventory # delete it - let cleanup fix it
+_do_restore
+_diff_compare_sub
+_ls_compare_sub
+
+# success, all done
+status=0
+exit

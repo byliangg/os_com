@@ -1,0 +1,46 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 024
+#
+# "work" directory under workdir should be cleaned up
+# well on overlayfs startup, or overlayfs will be mounted
+# read-only.
+# Kernel commit below fixes it.
+# eea2fb4851e9 ovl: proper cleanup of workdir
+#
+# This reproducer was originally written by
+#     Miklos Szeredi <mszeredi@redhat.com>
+#
+. ./common/preamble
+_begin_fstest auto quick mount
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_scratch
+
+# Remove all files from previous tests
+_scratch_mkfs
+
+# making workdir
+wkdir=$OVL_BASE_SCRATCH_MNT/$OVL_WORK
+mkdir -p $wkdir/work/foo
+
+_scratch_mount
+
+# try writing to mountpoint
+touch $SCRATCH_MNT/bar
+
+# checking work dir is clean
+if [ -e $wkdir/work/foo ] ; then
+	echo "work dir is not clean"
+else
+	echo "Silence is golden"
+fi
+# success, all done
+status=0
+exit

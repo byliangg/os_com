@@ -1,0 +1,78 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2014 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 062
+#
+# Use the bstat utility to verify bulkstat finds all inodes in a filesystem.
+# Test under various inode counts, inobt record layouts and bulkstat batch
+# sizes.
+#
+. ./common/preamble
+_begin_fstest auto ioctl quick
+
+# print the number of inodes counted by bulkstat
+_bstat_count()
+{
+	batchsize=$1
+	$here/src/bstat $SCRATCH_MNT $batchsize | grep ino | wc -l
+}
+
+# print bulkstat counts using varied batch sizes
+_bstat_test()
+{
+	expect=`find $SCRATCH_MNT -print | wc -l`
+	echo "expect $expect"
+
+	_bstat_count 4096
+	_bstat_count 32
+	_bstat_count 1
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+
+
+DIRCOUNT=8
+INOCOUNT=$((2048 / DIRCOUNT))
+
+_scratch_mkfs "-d agcount=$DIRCOUNT" >> $seqres.full 2>&1 || _fail "mkfs failed"
+_scratch_mount
+
+# create a set of directories and fill each with a fixed number of files
+for dir in $(seq 1 $DIRCOUNT); do
+	mkdir -p $SCRATCH_MNT/$dir
+	for i in $(seq 1 $INOCOUNT); do
+		touch $SCRATCH_MNT/$dir/$i
+	done
+done
+_bstat_test
+
+# remove every other file from each dir
+for dir in $(seq 1 $DIRCOUNT); do
+	for i in $(seq 2 2 $INOCOUNT); do
+		rm -f $SCRATCH_MNT/$dir/$i
+	done
+done
+_bstat_test
+
+# remove the entire second half of files
+for dir in $(seq 1 $DIRCOUNT); do
+	for i in $(seq $((INOCOUNT / 2)) $INOCOUNT); do
+		rm -f $SCRATCH_MNT/$dir/$i
+	done
+done
+_bstat_test
+
+# remove all regular files
+for dir in $(seq 1 $DIRCOUNT); do
+	rm -f $SCRATCH_MNT/$dir/*
+done
+_bstat_test
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,71 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Christoph Hellwig.
+#
+# FS QA Test No. 199
+#
+# Check that the features2 location fixups work correctly.  We check both
+# a regular read-write mount of a filesystem and the case where the
+# filesystem is first mounted read-only and then later remounted read-write,
+# which is the usual case for the root filesystem.
+#
+. ./common/preamble
+_begin_fstest mount auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	cd /
+	_scratch_unmount >/dev/null 2>&1
+}
+
+# Import common functions.
+. ./common/filter
+
+
+_require_scratch
+_require_xfs_nocrc
+
+# clear any mkfs options so that we can directly specify the options we need to
+# be able to test the features bitmask behaviour correctly.
+MKFS_OPTIONS=
+_scratch_mkfs_xfs -m crc=0 -l lazy-count=1 >/dev/null 2>&1
+
+# Grab the initial configuration. This checks mkfs sets the fields properly, and
+# gives us the values the resultant tests should be the same as for testing at
+# the end of the test. We don't hard code feature values, because that makes the
+# test break every time we change mkfs feature defaults.
+f2=`_scratch_xfs_get_sb_field features2`
+bf2=`_scratch_xfs_get_sb_field bad_features2`
+
+#
+# Now clear the normal flags
+#
+echo "Clearing features2:"
+_scratch_xfs_db -x  -c 'sb' -c 'write features2 0'
+
+_scratch_mount
+_scratch_unmount
+rwf2=`_scratch_xfs_get_sb_field features2`
+
+#
+# Clear the normal flags again for the second rount.
+#
+echo "Clearing features2:"
+_scratch_xfs_db -x  -c 'sb' -c 'write features2 0'
+
+#
+# And print the flags after a mount ro and remount rw
+#
+_scratch_mount -o ro
+_scratch_mount -o remount,rw
+_scratch_unmount
+rof2=`_scratch_xfs_get_sb_field features2`
+
+[ "$f2" != "$bf2" ] && echo "mkfs: features2 $f2 != bad_features2 $bf2"
+[ "$f2" != "$rwf2" ] && echo "mount rw: old features2 $f2 != new features2 $rwf2"
+[ "$f2" != "$rof2" ] && echo "ro->rw: old features2 $f2 != new features2 $rof2"
+
+# success, all done
+echo "*** done"
+status=0

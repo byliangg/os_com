@@ -1,0 +1,60 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2011 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 278
+#
+# Test xfs_repair to ensure it fixes the lost+found link count
+# at the first run. See also commit 198b747f255346bca64408875763b6ca0ed3d57d
+# from xfsprogs tree.
+#
+. ./common/preamble
+_begin_fstest repair auto
+
+status=0	# failure is the default!
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch
+
+_scratch_mkfs >$seqres.full 2>&1
+_scratch_mount
+
+mkdir -p $SCRATCH_MNT/dir/subdir
+
+#get inodes to be changed
+DIR_INO=`ls -i $SCRATCH_MNT |awk '{print $1}'`
+SUBDIR_INO=`ls -i $SCRATCH_MNT/dir |awk '{print $1}'`
+
+_scratch_unmount
+
+echo "Silence is goodness..."
+
+set_ifield() {
+	_scratch_xfs_set_metadata_field "$1" 0 "inode $2" >> $seqres.full
+}
+
+sfdir_prefix="$(_scratch_get_sfdir_prefix "$DIR_INO" || \
+	_fail "Cannot determine sfdir prefix")"
+
+# Corrupt DIR
+
+set_ifield "${sfdir_prefix}.list[0].inumber.i4" "$DIR_INO"
+set_ifield "${sfdir_prefix}.list[0].name" "$DIR_INO"
+set_ifield "${sfdir_prefix}.list[0].offset" "$DIR_INO"
+set_ifield "${sfdir_prefix}.list[0].namelen" "$DIR_INO"
+set_ifield "${sfdir_prefix}.hdr.parent.i4" "$DIR_INO"
+set_ifield "core.nlinkv2" "$DIR_INO"
+
+# Corrupt SUBDIR
+set_ifield "${sfdir_prefix}.hdr.parent.i4" "$SUBDIR_INO"
+set_ifield "core.nlinkv2" "$SUBDIR_INO"
+
+echo "===== BEGIN of xfs_repair =====" >> $seqres.full
+echo "" >>$seqres.full
+
+_scratch_xfs_repair >> $seqres.full 2>&1
+echo "===== END of xfs_repair =====" >> $seqres.full
+
+exit

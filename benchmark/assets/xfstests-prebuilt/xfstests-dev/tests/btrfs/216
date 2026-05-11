@@ -1,0 +1,43 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2020 Oracle.  All Rights Reserved.
+#
+# FS QA Test 216
+#
+# Test if the show_devname() returns sprout device instead of seed device.
+#
+
+. ./common/preamble
+_begin_fstest auto quick seed
+
+. ./common/filter
+
+_fixed_by_kernel_commit 4faf55b03823 \
+	"btrfs: don't traverse into the seed devices in show_devname"
+_require_scratch_dev_pool 2
+
+_scratch_dev_pool_get 2
+
+seed=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $1}')
+sprout=$(echo $SCRATCH_DEV_POOL | $AWK_PROG '{print $2}')
+
+_mkfs_dev $seed
+$BTRFS_TUNE_PROG -S 1 $seed
+_mount $seed $SCRATCH_MNT >> $seqres.full 2>&1
+cat /proc/self/mounts | grep $seed >> $seqres.full
+$BTRFS_UTIL_PROG device add -f $sprout $SCRATCH_MNT >> $seqres.full
+cat /proc/self/mounts | grep $sprout >> $seqres.full
+
+# check if the show_devname() returns the sprout device instead of seed device.
+dev=$(grep $SCRATCH_MNT /proc/self/mounts | $AWK_PROG '{print $1}')
+
+if [ "$sprout" != "$dev" ]; then
+	echo "Unexpected device: $dev, expected $sprout"
+fi
+echo "Silence is golden"
+
+_scratch_dev_pool_put
+
+# success, all done
+status=0
+exit

@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test 389
+#
+# Test if O_TMPFILE files inherit POSIX Default ACLs when they are linked into
+# the namespace.
+#
+. ./common/preamble
+_begin_fstest auto quick acl
+
+# Import common functions.
+. ./common/attr
+. ./common/filter
+
+
+_require_test
+_require_xfs_io_command "-T"
+_require_xfs_io_command "flink"
+_require_acls
+
+testdir="${TEST_DIR}/d.$seq"
+testfile="${testdir}/tst-tmpfile-flink"
+
+umask 022
+rm -rf ${testdir}
+mkdir -p ${testdir}
+setfacl -d -m u::rwx,g::rwx,o::rx ${testdir}
+$XFS_IO_PROG -T -m 0666 \
+	-c "pwrite 0 4096" \
+	-c "pread 0 4096" \
+	-c "flink ${testfile}" \
+	${testdir} | _filter_xfs_io
+stat -c '%a' ${testfile}
+
+# success, all done
+status=0
+exit

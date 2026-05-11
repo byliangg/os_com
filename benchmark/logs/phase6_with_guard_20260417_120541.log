@@ -1,0 +1,91 @@
+[2026年 04月 17日 星期五 12:19:13 CST] === START: phase6_with_guard ===
+[INFO] image=asterinas/asterinas:0.17.0-20260227
+[INFO] mode=phase6_with_guard
+[INFO] workdir=/home/lby/os_com_codex/asterinas -> /root/asterinas
+[INFO] cargo-osdk missing in container, creating workspace wrapper...
+[INFO] Extracting /root/asterinas/benchmark/assets/initramfs/initramfs_phase3.cpio.gz ...
+[INFO] Patching syscall/xfstests/ext4_crash scripts for phase4_part3 ...
+[INFO] Injecting xfstests prebuilt from /root/asterinas/benchmark/assets/xfstests-prebuilt ...
+[INFO] Repacking to /root/asterinas/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz ...
+[DONE] Prepared phase4_part3 initramfs: /root/asterinas/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz
+[INFO] mode=phase6_with_guard (phase6_good + phase4_good + phase3_base)
+[SKIP] crash suite disabled (RUN_CRASH_SUITE=0)
+[DONE] mode=phase4_good rc=0 log=/root/asterinas/benchmark/logs/phase4_good_20260417_041940.log
+425:xfstests case done: generic/001 rc=0
+504:xfstests case done: generic/006 rc=0
+945:xfstests case done: generic/013 rc=0
+949:xfstests case done: generic/028 rc=0
+954:xfstests case done: generic/035 rc=0
+958:xfstests case done: generic/036 rc=0
+974:xfstests case done: generic/041 rc=0
+1006:xfstests case done: generic/047 rc=0
+1199:xfstests case done: generic/051 rc=0
+1203:xfstests case done: generic/052 rc=0
+1216:xfstests case done: generic/054 rc=0
+1220:xfstests case done: generic/062 rc=0
+1516:xfstests case done: generic/068 rc=0
+1520:xfstests case done: generic/070 rc=0
+1536:xfstests case done: generic/083 rc=0
+1547:xfstests case done: generic/084 rc=0
+1551:xfstests case done: generic/090 rc=0
+1567:xfstests case done: generic/093 rc=0
+1583:===== phase4_good detailed results =====
+1625:xfstests phase4_good passed: pass_rate=100.00% >= 90%
+1629:All syscall tests passed.
+[DONE] mode=phase3_base rc=0 log=/root/asterinas/benchmark/logs/phase3_base_guard_20260417_041940.log
+285:xfstests case done: generic/006 rc=0
+716:xfstests case done: generic/013 rc=0
+721:xfstests case done: generic/028 rc=0
+725:xfstests case done: generic/036 rc=0
+741:xfstests case done: generic/041 rc=0
+774:xfstests case done: generic/047 rc=0
+965:xfstests case done: generic/051 rc=0
+970:xfstests case done: generic/052 rc=0
+982:xfstests case done: generic/054 rc=0
+986:xfstests case done: generic/062 rc=0
+1237:xfstests case done: generic/068 rc=0
+1241:xfstests case done: generic/070 rc=0
+1258:xfstests case done: generic/083 rc=0
+1268:xfstests case done: generic/084 rc=0
+1272:xfstests case done: generic/090 rc=0
+1288:xfstests case done: generic/093 rc=0
+1304:===== phase3_base detailed results =====
+1346:xfstests phase3_base passed: pass_rate=100.00% >= 90%
+1350:All syscall tests passed.
+[DONE] mode=phase6_good rc=0 log=/root/asterinas/benchmark/logs/phase6_good_20260417_041940.log
+266:xfstests case done: generic/001 rc=0
+270:xfstests case done: generic/003 rc=0
+349:xfstests case done: generic/006 rc=0
+484:xfstests case done: generic/007 rc=0
+901:xfstests case done: generic/011 rc=0
+1313:xfstests case done: generic/013 rc=0
+1366:xfstests case done: generic/014 rc=0
+1373:xfstests case done: generic/015 rc=0
+1395:xfstests case done: generic/027 rc=0
+1400:xfstests case done: generic/028 rc=0
+1404:xfstests case done: generic/035 rc=0
+1425:xfstests case done: generic/047 rc=0
+1617:xfstests case done: generic/051 rc=0
+1621:xfstests case done: generic/052 rc=0
+1633:xfstests case done: generic/054 rc=0
+1813:xfstests case done: generic/068 rc=0
+1960:xfstests case done: generic/076 rc=0
+1964:xfstests case done: generic/083 rc=0
+1974:xfstests case done: generic/084 rc=0
+1978:xfstests case done: generic/087 rc=0
+2161:xfstests case done: generic/100 rc=0
+2173:xfstests case done: generic/124 rc=0
+2177:xfstests case done: generic/126 rc=0
+2181:xfstests case done: generic/184 rc=0
+2185:xfstests case done: generic/192 rc=0
+2189:===== phase6_good detailed results =====
+2242:xfstests phase6_good passed: pass_rate=100.00% >= 90%
+2246:All syscall tests passed.
+[SKIP] lmbench disabled (RUN_LMBENCH=0)
+[DONE] phase4_part3 run finished
+crash_summary=<disabled>
+phase4_good_log=/root/asterinas/benchmark/logs/phase4_good_20260417_041940.log
+phase3_base_log=/root/asterinas/benchmark/logs/phase3_base_guard_20260417_041940.log
+phase6_good_log=/root/asterinas/benchmark/logs/phase6_good_20260417_041940.log
+lmbench_summary=<disabled>
+[2026年 04月 17日 星期五 12:43:46 CST] === DONE: phase6_with_guard ===

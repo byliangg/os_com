@@ -1,0 +1,39 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 292
+#
+# Ensure mkfs with stripe geometry goes into multidisk mode
+# which results in more AGs
+#
+. ./common/preamble
+_begin_fstest auto mkfs quick
+
+# Import common functions.
+. ./common/filter
+
+
+# Modify as appropriate.
+_require_test
+
+fsfile=$TEST_DIR/fsfile.$seq
+
+rm -f $fsfile
+$XFS_IO_PROG -f -c "truncate 256g" $fsfile
+
+echo "mkfs.xfs without geometry"
+mkfs.xfs -f $fsfile | _filter_mkfs 2> $tmp.mkfs > /dev/null
+grep -E 'ddev|agcount|agsize' $tmp.mkfs | \
+    sed -e "s:$fsfile:FILENAME:g"
+
+echo "mkfs.xfs with cmdline geometry"
+mkfs.xfs -f -d su=16k,sw=5 $fsfile | _filter_mkfs 2> $tmp.mkfs > /dev/null
+grep -E 'ddev|agcount|agsize' $tmp.mkfs | \
+    sed -e "s:$fsfile:FILENAME:g"
+
+rm -f $fsfile
+
+# success, all done
+status=0
+exit

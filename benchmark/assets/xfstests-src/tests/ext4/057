@@ -1,0 +1,57 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2022 Google, Inc. All Rights Reserved.
+#
+# Test the set/get UUID ioctl.
+#
+
+. ./common/preamble
+_begin_fstest auto ioctl
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_test_program uuid_ioctl
+_require_command $UUIDGEN_PROG uuidgen
+
+UUID_IOCTL=$here/src/uuid_ioctl
+
+# If the ioctl is not supported by the kernel, then skip test.
+current_uuid=$($UUID_IOCTL get $SCRATCH_MNT 2>&1)
+if [[ "$current_uuid" =~ ^Inappropriate[[:space:]]ioctl ]]; then
+        _notrun "UUID ioctls are not supported by kernel."
+fi
+
+# metadata_csum_seed must be set to decouple checksums from the uuid.
+# Otherwise, checksums need to be recomputed when the uuid changes, which
+# is not supported by the ioctl.
+_scratch_mkfs_ext4 -O metadata_csum_seed >> $seqres.full 2>&1
+_scratch_mount
+
+# Begin fsstress while modifying UUID
+fsstress_args=$(_scale_fsstress_args -d $SCRATCH_MNT -p 15 -n 999999)
+_run_fsstress_bg $fsstress_args
+
+for n in $(seq 1 20); do
+        new_uuid=$($UUIDGEN_PROG)
+
+        echo "Setting UUID to ${new_uuid}" >> $seqres.full 2>&1
+        $UUID_IOCTL set $SCRATCH_MNT $new_uuid
+
+        current_uuid=$($UUID_IOCTL get $SCRATCH_MNT)
+        echo "$UUID_IOCTL get $SCARTCH_MNT: $current_uuid" >> $seqres.full 2>&1
+        if [[ "$current_uuid" != "$new_uuid" ]]; then
+                echo "Current UUID ($current_uuid) does not equal what was sent with the ioctl ($new_uuid)"
+        fi
+done
+
+_kill_fsstress
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

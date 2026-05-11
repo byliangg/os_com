@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2003 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 079
+#
+# Run the t_immutable test program for immutable/append-only files.
+#
+. ./common/preamble
+_begin_fstest auto quick ioctl metadata
+
+timmutable=$here/src/t_immutable
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    echo "*** cleaning up"
+    $timmutable -r $SCRATCH_MNT/$seq
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/attr
+
+
+_require_chattr ia
+_require_user_exists "nobody"
+_require_user_exists "daemon"
+_require_test_program "t_immutable"
+_require_scratch
+
+_scratch_mkfs >/dev/null 2>&1 || _fail "mkfs failed"
+_scratch_mount
+
+echo "*** starting up"
+$timmutable -c $SCRATCH_MNT/$seq >$tmp.out 2>&1
+if grep -q -e 'Operation not supported' -e "Inappropriate ioctl" $tmp.out; then
+    rm -f $tmp.out
+    _notrun "Setting immutable/append flag not supported"
+fi
+cat $tmp.out
+rm -f $tmp.out
+status=$?
+exit

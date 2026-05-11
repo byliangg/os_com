@@ -1,0 +1,70 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 265
+#
+# Ensure that we can create enough distinct reflink entries to force creation
+# of a multi-level refcount btree by reflinking a file a number of times and
+# truncating the copies at successively lower sizes.  Delete and recreate a few
+# times to exercise the refcount btree grow/shrink functions.
+#
+. ./common/preamble
+_begin_fstest auto clone
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    umount $SCRATCH_MNT > /dev/null 2>&1
+    rm -rf $tmp.*
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_scratch_reflink
+_require_cp_reflink
+
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original file blocks"
+blksz="$(_get_block_size $testdir)"
+nr_blks=$((2 * blksz / 12))
+
+for i in 1 2 x; do
+	_pwrite_byte 0x61 0 $((blksz * nr_blks)) $testdir/file1 >> $seqres.full
+
+	echo "$i: Reflink a bunch of times"
+	seq 1 $nr_blks | while read nr; do
+		_cp_reflink $testdir/file1 $testdir/file1.$nr >> $seqres.full
+	done
+	_scratch_sync
+
+	echo "$i: Truncate files"
+	seq 1 $nr_blks | while read nr; do
+		truncate -s $((blksz * (nr_blks - nr))) $testdir/file1.$nr >> $seqres.full
+	done
+
+	umount $SCRATCH_MNT
+	_check_scratch_fs
+	_scratch_mount
+
+	test $i = "x" && break
+
+	echo "$i: Delete both files"
+	rm -rf $testdir
+	mkdir -p $testdir
+	umount $SCRATCH_MNT
+	_check_scratch_fs
+	_scratch_mount
+done
+
+# success, all done
+status=0
+exit

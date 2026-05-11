@@ -1,0 +1,42 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2008 Christoph Hellwig.
+#
+# FS QA Test No. 197
+#
+# Check that d_off can be represented in a 32 bit long type without
+# truncation.  Note that this test will always succeed on a 64 bit
+# systems where there is no smaller off_t.
+#
+# Based on a testcase from John Stanley <jpsinthemix@verizon.net>.
+#
+# http://oss.sgi.com/bugzilla/show_bug.cgi?id=808
+#
+. ./common/preamble
+_begin_fstest dir auto quick
+
+# Override the default cleanup function.
+_cleanup()
+{
+	rm -rf $TEST_DIR/ttt
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+
+bitsperlong=`$here/src/feature -w`
+if [ "$bitsperlong" -ne 32 ]; then
+	_notrun "This test is only valid on 32 bit machines"
+fi
+
+mkdir $TEST_DIR/ttt
+for n in {1..168}; do
+    touch $TEST_DIR/ttt/$n;
+done
+$here/src/t_dir_offset $TEST_DIR/ttt
+
+# success, all done
+echo "*** done"
+status=0

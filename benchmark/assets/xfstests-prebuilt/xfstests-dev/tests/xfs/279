@@ -1,0 +1,97 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2012 Red Hat, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 279
+#
+# Test mkfs.xfs against various types of devices with varying
+# logical & physical sector sizes and offsets.
+#
+. ./common/preamble
+_begin_fstest auto mkfs
+
+# Override the default cleanup function.
+_cleanup()
+{
+    cd /
+    rm -f $tmp.*
+    _put_scsi_debug_dev
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/scsi_debug
+
+
+_require_scsi_debug
+size=$(_small_fs_size_mb 128)
+
+# Remove xfs signature so -f isn't needed to re-mkfs
+_wipe_device()
+{
+	device=$1
+	dd if=/dev/zero of=$device bs=4k count=1 &>/dev/null
+}
+
+_check_mkfs()
+{
+	echo "===================" 
+	echo "mkfs with opts: $@" | sed -e "s,$SCSI_DEBUG_DEV,DEVICE,"
+	$MKFS_XFS_PROG $@ 2>/dev/null > $tmp.mkfs.full
+	if [ $? -ne 0 ]; then
+		echo "Failed."
+		return
+	fi
+	echo "Passed."
+	cat $tmp.mkfs.full | _filter_mkfs >> $seqres.full 2>$tmp.mkfs
+	. $tmp.mkfs
+	echo "Got sector size: $sectsz"
+	device=`echo $@ | awk '{print $NF}'`
+	_wipe_device $device
+}
+
+# === 4k physical 512b logical aligned
+(
+echo "==================="
+echo "4k physical 512b logical aligned"
+SCSI_DEBUG_DEV=`_get_scsi_debug_dev 4096 512 0 $size`
+test -b "$SCSI_DEBUG_DEV" || _notrun "Could not get scsi_debug device"
+# sector size should default to 4k
+_check_mkfs $SCSI_DEBUG_DEV
+# blocksize smaller than physical sectorsize should revert to logical sectorsize
+_check_mkfs -b size=2048 -f $SCSI_DEBUG_DEV
+) | tee -a $seqres.full
+_put_scsi_debug_dev
+
+# === 4k physical 512b logical unaligned
+(
+echo "==================="
+echo "4k physical 512b logical unaligned"
+SCSI_DEBUG_DEV=`_get_scsi_debug_dev 4096 512 1 $size`
+test -b "$SCSI_DEBUG_DEV" || _notrun "Could not get scsi_debug device"
+# should fail on misalignment
+_check_mkfs $SCSI_DEBUG_DEV
+# should fall back to logical sector size with force
+_check_mkfs -f $SCSI_DEBUG_DEV
+# with 4k sector specified should fail without force
+_check_mkfs -s size=4096 $SCSI_DEBUG_DEV
+# with 4k sector specified should fall back to logical sector size with force
+_check_mkfs -s size=4096 -f $SCSI_DEBUG_DEV
+) | tee -a $seqres.full
+_put_scsi_debug_dev
+
+# === hard 4k physical / 4k logical
+(
+echo "==================="
+echo "hard 4k physical / 4k logical"
+SCSI_DEBUG_DEV=`_get_scsi_debug_dev 4096 4096 0 $size`
+test -b "$SCSI_DEBUG_DEV" || _notrun "Could not get scsi_debug device"
+# block size smaller than sector size should fail 
+_check_mkfs -b size=2048 $SCSI_DEBUG_DEV
+# sector size smaller than physical sector size should fail
+_check_mkfs -s size=512 $SCSI_DEBUG_DEV
+) | tee -a $seqres.full
+_put_scsi_debug_dev
+
+status=0
+exit

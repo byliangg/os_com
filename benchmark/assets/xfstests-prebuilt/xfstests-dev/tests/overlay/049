@@ -1,0 +1,75 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (C) 2018 CTERA Networks. All Rights Reserved.
+#
+# FS QA Test 049
+#
+# Test multiple redirects to the same lower dir.
+#
+# Multiple redirects to the same lower dir will falsely return the same
+# st_ino/st_dev for two different upper dirs and will cause 'diff' to
+# falsely report that content of directories is the same when it is not.
+#
+# This test checks that overlayfs detects and fails lookup of a multiply
+# redirected dir.
+#
+# The check for multiply redirected dir was a by-product of kernel
+# commit 31747eda41ef ("ovl: hash directory inodes for fsnotify")
+#
+. ./common/preamble
+_begin_fstest auto quick copyup redirect
+
+# Rename lower dir to create a redirected upper dir and
+# touch lower file to create copy up with origin xattr
+create_redirect()
+{
+	local redirect=$1
+
+	mkdir -p $lowerdir/origin
+	touch $lowerdir/origin/file
+
+	_scratch_mount -o redirect_dir=on
+	touch $SCRATCH_MNT/origin/file
+	mv $SCRATCH_MNT/origin $SCRATCH_MNT/$redirect
+
+	$UMOUNT_PROG $SCRATCH_MNT
+}
+
+# Import common functions.
+. ./common/filter
+
+_require_scratch_nocheck
+_require_scratch_feature redirect_dir
+
+# remove all files from previous runs
+_scratch_mkfs
+
+upperdir=$OVL_BASE_SCRATCH_MNT/$OVL_UPPER
+lowerdir=$OVL_BASE_SCRATCH_MNT/$OVL_LOWER
+
+# Create redirected dir with copied up file
+create_redirect redirect1
+# Duplicate the redirected dir and copied up file
+cp -a $upperdir/redirect1 $upperdir/redirect2
+
+# Diverge the content of the two copies of file
+# and the content of two copies of redirected dir
+echo right >> $upperdir/redirect1/file
+touch $upperdir/redirect1/right
+echo wrong >> $upperdir/redirect2/file
+touch $upperdir/redirect2/wrong
+
+_scratch_mount -o redirect_dir=on
+
+# If both copies of file/dir use the same st_dev/st_ino in overlay
+# diff won't detect that their content differs
+diff -q $SCRATCH_MNT/redirect1/file $SCRATCH_MNT/redirect2/file &>/dev/null && \
+	echo "diff on files inside duplicate redirect parent doesn't know right from wrong!"
+
+diff -q $SCRATCH_MNT/redirect1 $SCRATCH_MNT/redirect2 &> /dev/null && \
+	echo "diff on duplicate redirect dirs doesn't know right from wrong!"
+
+# success, all done
+echo "Silence is golden"
+status=0
+exit

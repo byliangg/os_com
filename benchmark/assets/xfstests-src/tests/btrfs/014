@@ -1,0 +1,45 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2013 Fujitsu.  All Rights Reserved.
+#
+# FS QA Test No. btrfs/014
+#
+# Btrfs balance tests
+#
+. ./common/preamble
+_begin_fstest auto balance
+
+_create_snapshot()
+{
+	for i in $(seq 20)
+	do
+		$BTRFS_UTIL_PROG subvolume snapshot $SCRATCH_MNT $SCRATCH_MNT/snapshot0 >/dev/null
+		$BTRFS_UTIL_PROG subvolume delete $SCRATCH_MNT/snapshot0 >/dev/null
+	done
+}
+
+_balance()
+{
+	for i in $(seq 20)
+	do
+		_run_btrfs_balance_start $SCRATCH_MNT >> $seqres.full
+	done
+}
+
+. ./common/filter
+
+
+_require_scratch
+_scratch_mkfs >/dev/null 2>&1
+_scratch_mount
+
+echo "Tip: Run dmesg to see the error on failure"
+
+_create_snapshot &
+
+_balance &
+
+wait
+
+status=0
+exit

@@ -1,0 +1,44 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2001 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 035
+#
+# Test doing multiple dumps to tape and restoring the 2nd one
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest dump ioctl tape auto
+
+# Override the default cleanup function.
+_cleanup()
+{
+	_cleanup_dump
+	cd /
+	rm -f $tmp.*
+}
+
+# Import common functions.
+. ./common/dump
+
+
+_require_tape $TAPE_DEV
+_require_scratch
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_fill
+_erase_hard
+_do_dump -L $seq.1
+_rewind
+_scratch_unmount
+
+_scratch_mkfs_xfs >>$seqres.full
+_scratch_mount
+_create_dumpdir_fill2
+_do_dump -L $seq.2
+_do_restore -L $seq.2
+_diff_compare
+
+# success, all done
+status=0
+exit

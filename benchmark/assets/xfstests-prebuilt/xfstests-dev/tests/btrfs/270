@@ -1,0 +1,82 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Liu Bo.  All Rights Reserved.
+#
+# FS QA Test 270
+#
+# Regression test for btrfs buffered read repair of compressed data.
+#
+. ./common/preamble
+_begin_fstest auto quick read_repair compress raid
+
+. ./common/filter
+
+_require_scratch
+_require_btrfs_command inspect-internal dump-tree
+_require_non_zoned_device "${SCRATCH_DEV}" # no overwrites on zoned devices
+_require_scratch_dev_pool 2
+_scratch_dev_pool_get 2
+
+get_physical()
+{
+	local logical=$1
+	local stripe=$2
+	$BTRFS_UTIL_PROG inspect-internal dump-tree -t 3 $SCRATCH_DEV | \
+		grep $logical -A 6 | \
+		$AWK_PROG "(\$1 ~ /stripe/ && \$3 ~ /devid/ && \$2 ~ /$stripe/) { print \$6 }"
+}
+
+get_devid()
+{
+	local logical=$1
+	local stripe=$2
+	$BTRFS_UTIL_PROG inspect-internal dump-tree -t 3 $SCRATCH_DEV | \
+		grep $logical -A 6 | \
+		$AWK_PROG "(\$1 ~ /stripe/ && \$3 ~ /devid/ && \$2 ~ /$stripe/) { print \$4 }"
+}
+
+get_device_path()
+{
+	local devid=$1
+	echo "$SCRATCH_DEV_POOL" | $AWK_PROG "{print \$$devid}"
+}
+
+
+echo "step 1......mkfs.btrfs"
+_check_minimal_fs_size $(( 1024 * 1024 * 1024 ))
+_scratch_pool_mkfs "-d raid1 -b 1G" >>$seqres.full 2>&1
+_scratch_mount -ocompress
+
+# Create a file with all data being compressed
+$XFS_IO_PROG -f -c "pwrite -S 0xaa -W -b 128K 0 128K" \
+	"$SCRATCH_MNT/foobar" | _filter_xfs_io_offset
+
+logical_in_btrfs=$(_btrfs_get_first_logical $SCRATCH_MNT/foobar)
+physical=$(get_physical ${logical_in_btrfs} 1)
+devid=$(get_devid ${logical_in_btrfs} 1)
+devpath=$(get_device_path ${devid})
+
+_scratch_unmount
+echo "step 2......corrupt file extent"
+echo " corrupt stripe #1, devid $devid devpath $devpath physical $physical" \
+	>> $seqres.full
+dd if=$devpath of=$TEST_DIR/$seq.dump.good skip=$physical bs=1 count=4096 \
+	2>/dev/null
+$XFS_IO_PROG -c "pwrite -S 0xbb -b 4K $physical 4K" $devpath > /dev/null
+
+_scratch_mount
+
+echo "step 3......repair the bad copy"
+_btrfs_buffered_read_on_mirror 1 2 "$SCRATCH_MNT/foobar" 0 128K
+
+_scratch_unmount
+
+echo "step 4......check if the repair worked"
+dd if=$devpath of=$TEST_DIR/$seq.dump skip=$physical bs=1 count=4096 \
+	2>/dev/null
+cmp -bl $TEST_DIR/$seq.dump.good $TEST_DIR/$seq.dump
+
+_scratch_dev_pool_put
+# success, all done
+status=0
+exit

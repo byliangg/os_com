@@ -1,0 +1,41 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright 2014 (C) Red Hat, Inc., Lukas Czerner <lczerner@redhat.com>
+#
+# FS QA Test No. 001
+#
+# Test fallocate FALLOC_FL_ZERO_RANGE
+#
+seqfull=$0
+. ./common/preamble
+_begin_fstest auto prealloc quick zero fiemap
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "fzero"
+_require_test
+
+# Select appropriate golden output based on mount options
+_link_out_file
+
+testfile=$TEST_DIR/001.$$
+
+# Standard zero range tests
+_test_generic_punch falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Delayed allocation zero range tests
+_test_generic_punch -d falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Multi zero range tests
+_test_generic_punch -k falloc fzero fzero fiemap _filter_fiemap $testfile
+
+# Delayed allocation multi zero range tests
+_test_generic_punch -d -k falloc fzero fzero fiemap _filter_fiemap $testfile
+
+status=0 ; exit

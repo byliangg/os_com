@@ -1,0 +1,134 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2000-2002 Silicon Graphics, Inc.  All Rights Reserved.
+#
+# FS QA Test No. 044
+#
+# external log uuid/format tests (TODO - version 2 log format)
+#
+. ./common/preamble
+_begin_fstest other auto
+
+# Import common functions.
+. ./common/filter
+
+
+_require_logdev
+
+_check_mount()
+{
+    echo "    *** mount (expect success)"
+    if ! _try_scratch_mount
+    then
+        echo "        !!! mount failed (expecting success)"
+        status=1
+        exit
+    fi
+
+    echo "    *** umount"
+    if ! _scratch_unmount
+    then
+        echo "        !!! umount failed (expecting success)"
+        status=1
+        exit
+    fi
+}
+
+_check_no_mount()
+{
+    echo "    *** mount (expect failure)"
+    if _try_scratch_mount >$tmp.err 2>&1
+    then
+        cat $tmp.err
+        echo "        !!! mount succeeded (expecting failure)"
+        status=1
+        exit
+    fi
+}
+
+_check_require_logdev()
+{
+    echo "    *** mount without logdev (expect failure)"
+    if mount -t xfs $SCRATCH_DEV $SCRATCH_MNT >$tmp.err 2>&1
+    then
+        cat $tmp.err
+        echo "        !!! mount succeeded (expecting failure)"
+        status=1
+        exit
+    fi
+}
+
+_unexpected()
+{
+    echo "        !!! unexpected XFS command failure"
+    status=1
+    exit
+}
+
+# 
+_require_scratch
+
+echo "*** mkfs"
+
+# this test only works for version 1 logs currently
+lversion=1
+lsize=16777216
+_try_scratch_mkfs_xfs -lsize=$lsize,version=$lversion >$tmp.mkfs0 2>&1
+[ $? -ne 0 ] && \
+    _notrun "Cannot mkfs for this test using MKFS_OPTIONS specified"
+_filter_mkfs <$tmp.mkfs0 2>$tmp.mkfs1
+. $tmp.mkfs1
+[ $lversion -ne 1 ] && \
+    _notrun "Cannot run this test yet using MKFS_OPTIONS specified"
+
+_require_test_program "loggen"
+
+_check_mount
+_check_require_logdev
+
+echo "*** set uuid"
+_scratch_xfs_db -x  -l $SCRATCH_LOGDEV -c "uuid 02020202-0202-0202-0202-020202020202"
+[ $? -ne 0 ] && _unexpected
+_check_mount
+
+echo "*** zero log"
+$here/src/loggen -z 100 >$SCRATCH_LOGDEV
+_check_mount
+
+echo "*** write clean log"
+$here/src/loggen -u 2 -f 1 -m 1 -z 100 >$SCRATCH_LOGDEV
+_check_mount
+
+echo "*** write clean log (different format)"
+$here/src/loggen -u 2 -f 99 -m 1 -z 100 >$SCRATCH_LOGDEV
+_check_mount
+
+echo "*** write clean log (different uuid)"
+$here/src/loggen -u 7 -m 1 -z 100 >$SCRATCH_LOGDEV
+_check_no_mount
+
+echo "*** write clean log (different uuid & format)"
+$here/src/loggen -u 7 -f 99 -m 1 -z 100 >$SCRATCH_LOGDEV
+_check_no_mount
+
+echo "*** write dirty log"
+$here/src/loggen -u 2 -e 1 -z 100 >$SCRATCH_LOGDEV
+_check_mount
+
+echo "*** write dirty log (different format)"
+$here/src/loggen -u 2 -f 99 -e 1 -z 100 >$SCRATCH_LOGDEV
+_check_no_mount
+
+echo "*** write dirty log (irix style)"
+$here/src/loggen -u 0 -f 0 -e 1 -z 100 >$SCRATCH_LOGDEV
+_check_no_mount
+
+echo "*** write large dirty log"
+$here/src/loggen -u 2 -e 16000 -z 100 >$SCRATCH_LOGDEV
+_check_mount
+
+echo -e -n "\n\r*** XFS QA 044 - done\n\r\n\r" >/dev/console
+
+status=0
+# if error
+exit

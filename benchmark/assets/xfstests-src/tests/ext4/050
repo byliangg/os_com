@@ -1,0 +1,59 @@
+#!/bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 Google, Inc. All Rights Reserved.
+#
+# FS QA Test No. 050
+#
+# Test checkpoint and zeroout of journal via ioctl EXT4_IOC_CHECKPOINT
+#
+
+. ./common/preamble
+_begin_fstest auto ioctl quick
+
+# Import common functions.
+. ./common/filter
+
+_exclude_fs ext2
+_exclude_fs ext3
+
+_require_scratch
+_require_command "$DEBUGFS_PROG" debugfs
+
+checkpoint_journal=$here/src/checkpoint_journal
+_require_test_program "checkpoint_journal"
+
+testdir="${SCRATCH_MNT}/testdir"
+
+_scratch_mkfs_sized $((64 * 1024 * 1024)) >> $seqres.full 2>&1
+_require_metadata_journaling $SCRATCH_DEV
+_scratch_mount >> $seqres.full 2>&1
+blocksize=$(_get_block_size $SCRATCH_MNT)
+mkdir $testdir
+
+# check if ioctl present, skip test if not present
+$checkpoint_journal $SCRATCH_MNT --dry-run || _notrun "journal checkpoint ioctl not present on device"
+
+# create some files to add some entries to journal
+for i in {1..100}; do
+	echo > $testdir/$i
+done
+
+# make sure these files get to the journal
+sync --file-system $testdir/1
+
+# call ioctl to checkpoint and zero-fill journal blocks
+$checkpoint_journal $SCRATCH_MNT --erase=zeroout || _fail "ioctl returned error"
+
+# check journal blocks zeroed out
+$DEBUGFS_PROG $SCRATCH_DEV -R "cat <8>" 2> /dev/null | od >> $seqres.full
+check=$($DEBUGFS_PROG $SCRATCH_DEV -R "cat <8>" 2> /dev/null | \
+	    od --skip-bytes="$blocksize" -An -v | sed -e '/^[0 \t]*$/d')
+
+[ ! -z "$check" ] && _fail "Journal was not zeroed"
+
+_scratch_unmount >> $seqres.full 2>&1
+
+echo "Silence is golden"
+
+status=0
+exit

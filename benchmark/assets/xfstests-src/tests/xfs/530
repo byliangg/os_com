@@ -1,0 +1,107 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2021 Chandan Babu R.  All Rights Reserved.
+#
+# FS QA Test 530
+#
+# Verify that XFS does not cause bitmap/summary inode fork's extent count to
+# overflow when growing an the realtime volume of the filesystem.
+#
+. ./common/preamble
+_begin_fstest auto quick realtime growfs
+
+. ./common/filter
+. ./common/inject
+. ./common/populate
+
+_require_scratch
+_require_realtime
+_require_xfs_debug
+_require_test_program "punch-alternating"
+_require_xfs_io_error_injection "reduce_max_iextents"
+_require_xfs_io_error_injection "bmap_alloc_minlen_extent"
+
+echo "* Test extending rt inodes"
+
+_scratch_mkfs | _filter_mkfs >> $seqres.full 2> $tmp.mkfs
+. $tmp.mkfs
+
+nr_bitmap_blks=25
+nr_bits=$((nr_bitmap_blks * dbsize * 8))
+
+# Realtime extent size has to be atleast 4k in size.
+if (( $dbsize < 4096 )); then
+	rtextsz=4096
+else
+	rtextsz=$dbsize
+fi
+
+echo "Format and mount rt volume"
+_try_scratch_mkfs_xfs \
+	-d size=$((1024 * 1024 * 1024)) \
+	-r size=${rtextsz},extsize=${rtextsz} >> $seqres.full 2>&1 || \
+	_notrun "Couldn't created crafted fs (zoned?)"
+_try_scratch_mount || _notrun "Couldn't mount crafted fs"
+
+# If we didn't get the desired realtime volume and the same blocksize as the
+# first format (which we used to compute a specific rt geometry), skip the
+# test.  This can happen if the MKFS_OPTIONS conflict with the ones we passed
+# to _scratch_mkfs or do not result in a valid rt fs geometry.  In this case,
+# _scratch_mkfs will try to "succeed" at formatting by dropping MKFS_OPTIONS,
+# giving us the wrong geometry.
+formatted_blksz="$(_get_block_size $SCRATCH_MNT)"
+test "$formatted_blksz" -ne "$dbsize" && \
+	_notrun "Tried to format with $dbsize blocksize, got $formatted_blksz."
+_require_xfs_has_feature "$SCRATCH_MNT" realtime
+
+echo "Consume free space"
+fillerdir=$SCRATCH_MNT/fillerdir
+nr_free_blks=$(stat -f -c '%f' $SCRATCH_MNT)
+nr_free_blks=$((nr_free_blks * 90 / 100))
+
+_fill_fs $((dbsize * nr_free_blks)) $fillerdir $dbsize 0 >> $seqres.full 2>&1
+
+echo "Create fragmented filesystem"
+for dentry in $(ls -1 $fillerdir/); do
+	$here/src/punch-alternating $fillerdir/$dentry >> $seqres.full
+done
+
+echo "Inject reduce_max_iextents error tag"
+_scratch_inject_error reduce_max_iextents 1
+
+echo "Inject bmap_alloc_minlen_extent error tag"
+_scratch_inject_error bmap_alloc_minlen_extent 1
+
+echo "Grow realtime volume"
+# growfs expects sizes in FSB units
+fsbsize=$(_get_block_size $SCRATCH_MNT)
+rtdevsz=$((nr_bits * rtextsz))
+
+$XFS_GROWFS_PROG -R $((rtdevsize / fsbsize)) $SCRATCH_MNT \
+	>> $seqres.full 2>&1
+if [[ $? == 0 ]]; then
+	echo "Growfs succeeded; should have failed."
+	exit 1
+fi
+
+_scratch_unmount >> $seqres.full
+
+echo "Verify rbmino's and rsumino's extent count"
+for rtino in rbmino rsumino; do
+	selector="$(_scratch_xfs_find_metafile "$rtino")"
+	nextents=$(_scratch_get_iext_count "$selector" data || \
+			_fail "Unable to obtain inode fork's extent count")
+	if (( $nextents > 10 )); then
+		echo "Extent count overflow check failed: nextents = $nextents"
+		exit 1
+	fi
+done
+
+echo "Check filesystem"
+_check_scratch_fs
+
+_scratch_unmount &> /dev/null
+
+# success, all done
+status=0
+exit

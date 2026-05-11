@@ -1,0 +1,347 @@
+# QA groups control file, automatically generated.
+# See _begin_fstest in each test for details.
+
+001 auto quick subvol snapshot
+002 auto snapshot
+003 auto replace volume balance raid
+004 auto rw metadata fiemap logical_resolve compress
+005 auto defrag compress
+006 auto quick volume
+007 auto quick rw metadata send seek
+008 auto quick send
+009 auto quick subvol
+010 auto
+011 auto replace volume scrub raid
+012 auto convert
+013 auto quick balance prealloc
+014 auto balance
+015 auto quick snapshot remount
+016 auto quick send prealloc
+017 auto quick qgroup
+018 auto quick subvol
+019 auto quick send
+020 auto quick replace volume raid
+021 auto quick balance defrag
+022 auto qgroup limit
+023 auto quick raid
+024 auto quick compress
+025 auto quick send clone prealloc
+026 auto quick compress prealloc
+027 auto replace volume scrub raid
+028 auto qgroup balance
+029 auto quick clone
+030 auto quick send
+031 auto quick subvol clone
+032 auto quick remount
+033 auto quick send snapshot
+034 auto quick send prealloc
+035 auto quick clone
+036 auto quick send snapshot
+037 auto quick compress prealloc
+038 auto quick compress send
+039 auto quick send
+040 auto quick send
+041 auto quick compress
+042 auto quick qgroup limit
+043 auto quick send
+044 auto quick send
+045 auto quick send
+046 auto quick send preallocrw
+047 auto quick snapshot attr
+048 auto quick compress subvol snapshot send
+049 quick balance auto
+050 auto quick send
+051 auto quick send
+052 auto quick clone compress
+053 auto quick send
+054 auto quick send
+055 auto quick clone
+056 auto quick clone log compress
+057 auto quick
+058 auto quick send snapshot
+059 auto quick compress
+060 auto balance subvol scrub raid
+061 auto balance scrub raid
+062 auto balance defrag compress scrub raid
+063 auto balance remount compress scrub raid
+064 auto balance replace volume scrub raid
+065 auto subvol replace volume scrub raid
+066 auto subvol scrub raid
+067 auto subvol defrag compress scrub raid
+068 auto subvol remount compress scrub raid
+069 auto replace scrub volume raid
+070 auto replace defrag compress volume scrub raid
+071 auto replace remount compress volume scrub raid
+072 auto scrub defrag compress raid
+073 auto scrub remount compress raid
+074 auto defrag remount compress scrub raid
+075 auto quick subvol
+076 auto quick compress
+077 auto quick send snapshot
+078 auto snapshot
+079 auto rw metadata fiemap prealloc
+080 auto snapshot
+081 auto quick clone
+082 auto quick remount
+083 auto quick send
+084 auto quick send
+085 auto quick metadata subvol
+086 auto quick clone
+087 auto quick send
+088 auto quick metadata
+089 auto quick subvol
+090 auto quick metadata
+091 auto quick qgroup
+092 auto quick send
+093 auto quick clone
+094 auto quick send compress
+095 auto quick metadata log preallocrw
+096 auto quick clone
+097 auto quick send clone
+098 auto quick metadata clone log
+099 auto quick qgroup limit
+100 auto replace volume eio raid
+101 auto replace volume eio raid
+102 auto quick metadata enospc balance
+103 auto quick clone compress
+104 auto qgroup
+105 auto quick send
+106 auto quick clone compress
+107 auto quick prealloc
+108 auto quick send clone punch
+109 auto quick send clone compress
+110 auto quick send
+111 auto quick send
+112 auto quick clone prealloc compress
+113 auto quick compress clone
+114 auto qgroup
+115 auto qgroup
+116 auto quick metadata
+117 auto quick send clone
+118 auto quick snapshot metadata log
+119 auto quick snapshot metadata qgroup log
+120 auto quick snapshot metadata log
+121 auto quick snapshot qgroup
+122 auto quick snapshot qgroup
+123 auto quick qgroup balance
+124 auto replace volume balance raid
+125 replace volume balance auto quick raid
+126 auto quick qgroup limit
+127 auto quick send
+128 auto quick send
+129 auto quick send
+130 auto quick clone send
+131 auto quick
+132 auto enospc
+133 auto quick send
+134 auto quick send
+135 auto quick send
+136 auto convert
+137 auto quick send fiemap
+138 auto compress
+139 auto qgroup limit
+140 auto quick read_repair fiemap raid
+141 auto quick read_repair raid
+142 auto quick read_repair raid
+143 auto quick read_repair raid
+144 auto quick send
+145 auto quick send
+146 auto quick eio raid
+147 auto quick send
+148 auto quick rw scrub raid
+149 auto quick send compress
+150 auto quick dangerous read_repair compress raid
+151 auto quick volume raid
+152 auto quick metadata qgroup send
+153 auto quick qgroup limit preallocrw
+154 auto quick
+155 auto quick send
+156 auto quick trim balance
+157 auto quick raid read_repair
+158 auto quick raid scrub
+159 auto quick punch log
+160 auto quick eio raid
+161 auto quick volume seed
+162 auto quick volume seed
+163 auto quick volume seed remount
+164 auto quick volume remount
+165 auto quick subvol
+166 auto quick qgroup
+167 auto quick replace volume remount compress
+168 auto quick send
+169 auto quick send prealloc punch
+170 auto quick snapshot prealloc
+171 auto quick qgroup
+172 auto quick log replay recoveryloop
+173 auto quick swap compress
+174 auto quick swap compress
+175 auto quick swap volume raid
+176 auto quick swap volume
+177 auto quick swap balance
+178 auto quick send
+179 auto qgroup dangerous
+180 auto quick qgroup limit prealloc
+181 auto quick balance
+182 auto quick balance
+183 auto quick clone compress punch
+184 auto quick volume raid
+185 volume auto quick
+186 auto quick send volume
+187 auto send dedupe clone balance
+188 auto quick send prealloc punch
+189 auto quick send clone
+190 auto quick replay balance qgroup recoveryloop
+191 auto quick send dedupe
+192 auto replay snapshot stress recoveryloop
+193 auto quick qgroup enospc limit prealloc
+194 auto volume
+195 auto volume balance scrub raid
+196 auto metadata log volume
+197 auto quick volume raid
+198 auto quick volume raid
+199 auto quick trim fiemap
+200 auto quick send clone fiemap
+201 auto quick punch log
+202 auto quick subvol snapshot
+203 auto quick send clone
+204 auto quick punch
+205 auto quick clone compress prealloc
+206 auto quick log replay recoveryloop punch prealloc
+207 auto rw raid
+208 auto quick subvol
+209 auto quick log mmap
+210 auto quick qgroup snapshot
+211 auto quick log prealloc fiemap
+212 auto balance dangerous
+213 auto balance
+214 auto quick send snapshot
+215 auto quick read_repair
+216 auto quick seed
+217 auto quick trim dangerous
+218 auto quick volume
+219 auto quick volume
+220 auto quick remount
+221 auto quick send
+222 auto quick send
+223 auto quick replace trim raid
+224 auto quick qgroup
+225 auto quick volume seed
+226 auto quick rw snapshot clone prealloc punch
+227 auto quick send
+228 auto quick volume
+229 auto quick send clone
+230 auto quick qgroup limit
+231 auto quick clone log replay
+232 auto quick qgroup limit
+233 auto quick subvol remount
+234 auto quick compress rw
+235 auto quick send
+236 auto quick log
+237 auto quick zone balance
+238 auto quick seed trim
+239 auto quick log
+240 auto quick prealloc log
+241 auto quick send
+242 auto quick volume trim raid
+243 auto quick log
+244 auto quick volume dangerous
+245 auto quick idmapped subvol
+246 auto quick compress
+247 auto quick rename subvol
+248 auto quick seed volume
+249 auto quick seed volume raid
+250 auto quick enospc
+251 auto quick compress dangerous
+252 auto send balance stress
+253 auto
+254 auto quick volume raid
+255 auto qgroup balance
+256 auto quick defrag
+257 auto quick defrag prealloc fiemap
+258 auto defrag quick fiemap remount
+259 auto quick defrag fiemap compress
+260 auto quick defrag compress prealloc fiemap
+261 auto volume raid scrub
+262 auto quick qgroup
+263 auto quick defrag fiemap remount
+264 auto quick compress attr
+265 auto quick read_repair raid
+266 auto quick read_repair raid
+267 auto quick read_repair raid
+268 auto quick read_repair raid
+269 auto quick read_repair raid
+270 auto quick read_repair compress raid
+271 auto quick raid
+272 auto quick send
+273 auto quick snapshot zone
+274 auto quick swap subvol
+275 auto quick attr
+276 auto snapshot fiemap remount
+277 auto quick verity send
+278 auto quick send
+279 auto quick subvol fiemap clone
+280 auto quick compress snapshot fiemap defrag
+281 auto quick send compress clone fiemap
+282 auto scrub
+283 auto quick send clone fiemap
+284 auto quick send compress snapshot
+285 auto quick
+286 auto replace raid
+287 auto quick snapshot clone prealloc punch logical_resolve
+288 auto repair quick volume scrub
+289 auto quick scrub repair
+290 auto quick verity prealloc
+291 auto verity recoveryloop
+292 auto raid volume trim
+293 auto quick swap snapshot remount
+294 auto raid volume
+295 auto quick dangerous
+296 auto quick balance raid
+297 auto quick raid scrub
+298 auto quick seed
+299 auto quick preallocrw logical_resolve
+300 auto quick subvol snapshot
+301 auto quick qgroup clone subvol prealloc snapshot remount
+302 auto quick snapshot subvol
+303 auto quick snapshot send fiemap
+304 auto quick raid remount volume raid-stripe-tree
+305 auto quick raid remount volume raid-stripe-tree
+306 auto quick raid remount volume raid-stripe-tree
+307 auto quick raid remount volume raid-stripe-tree
+308 auto quick raid remount volume raid-stripe-tree
+309 auto quick snapshot subvol
+310 auto quick compress
+311 auto quick subvol tempfsid
+312 auto quick send compress
+313 auto quick clone tempfsid
+314 auto quick snapshot send tempfsid
+315 auto quick volume seed balance tempfsid
+316 auto quick qgroup
+317 auto volume raid convert
+318 auto quick volume scrub tempfsid
+319 auto quick send clone fiemap
+320 auto qgroup limit
+321 auto quick raid dangerous
+322 auto quick send clone fiemap
+323 auto quick seed remount volume
+324 auto quick mount remount compress
+325 auto quick preallocrw defrag
+326 auto quick mount remount
+327 auto quick compress
+328 auto quick qgroup
+329 auto quick
+330 auto quick subvol
+331 auto quick qgroup snapshot
+332 auto quick qgroup
+333 auto quick compress rw io_uring ioctl
+334 auto quick
+335 auto zone quick volume raid
+336 auto scrub quick
+337 auto quick compress clone
+338 auto quick send
+339 auto quick send snapshot
+340 auto quick qgroup
+341 auto quick subvol rename log
+342 auto quick
+343 auto quick compress
+344 auto quick compress

@@ -1,0 +1,25 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2010 Red Hat.  All Rights Reserved.
+#
+# FS QA Test No. 242
+#
+# Test XFS_IOC_ZERO_RANGE
+#
+. ./common/preamble
+_begin_fstest auto quick prealloc zero
+
+# Import common functions.
+. ./common/filter
+. ./common/punch
+
+_require_test
+
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "zero"
+
+testfile=$TEST_DIR/242.$$
+
+_test_generic_punch resvsp unresvsp zero 'bmap -p' _filter_bmap $testfile
+
+status=0 ; exit

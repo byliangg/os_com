@@ -1,0 +1,65 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2016, Oracle and/or its affiliates.  All Rights Reserved.
+#
+# FS QA Test No. 245
+#
+# Make sure that reflink deals with extents going beyond EOF.
+# - fallocate 256k in file1
+# - pwrite 252-257k to cause it to speculatively prealloc file1
+# - reflink file1 to file2
+# - compare file[12]
+#
+. ./common/preamble
+_begin_fstest auto quick clone prealloc
+
+# Import common functions.
+. ./common/filter
+. ./common/reflink
+
+_require_xfs_debug
+_require_scratch_reflink
+_require_xfs_io_command "falloc"
+_require_xfs_io_command "bmap" "-c"
+_require_cp_reflink
+
+echo "Format and mount"
+_scratch_mkfs > $seqres.full 2>&1
+_scratch_mount >> $seqres.full 2>&1
+
+testdir=$SCRATCH_MNT/test-$seq
+mkdir $testdir
+
+echo "Create the original files"
+$XFS_IO_PROG -f -c "falloc 0 256k" -c "pwrite 252k 6k" $testdir/file1 >> $seqres.full
+_scratch_cycle_mount
+_cp_reflink $testdir/file1 $testdir/file2 >> $seqres.full
+
+echo "Compare files"
+md5sum $testdir/file1 | _filter_scratch
+md5sum $testdir/file2 | _filter_scratch
+
+echo "Unwritten data extents"
+test $(_xfs_bmapx_find data $testdir/file1 -E '1[01]{4}$') -gt 0 || \
+	echo "Expected to find an unwritten file1 extent"
+echo "Shared data extents"
+test $(_xfs_bmapx_find data $testdir/file1 -E '10[01]{4}$') -gt 0 || \
+	echo "Expected to find a shared data extent"
+
+echo "Hole data extents"
+test $(_xfs_bmapx_find data $testdir/file2 'hole') -gt 0 || \
+	echo "Expected to find a hole data extent"
+echo "Shared data extents"
+test $(_xfs_bmapx_find data $testdir/file2 -E '10[01]{4}$') -gt 0 || \
+	echo "Expected to find a shared data extent"
+
+echo "Hole cow extents"
+test $(_xfs_bmapx_find cow $testdir/file1 'hole') -gt 0 || \
+	echo "Expected to find a hole cow extent"
+echo "Hole cow extents"
+test $(_xfs_bmapx_find cow $testdir/file2 'hole') -gt 0 || \
+	echo "Expected to find a hole cow extent"
+
+# success, all done
+status=0
+exit
