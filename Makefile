@@ -16,6 +16,7 @@ RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 EXT4_PHASE2_PROFILE ?= 0
+EXT4_DIRECT_READ_CACHE ?= 1
 SCHEME ?= ""
 SMP ?= 1
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
@@ -91,6 +92,7 @@ CARGO_OSDK_COMMON_ARGS := --target-arch=$(OSDK_TARGET_ARCH)
 CARGO_OSDK_BUILD_ARGS := --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.phase2_profile=$(EXT4_PHASE2_PROFILE)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.direct_read_cache=$(EXT4_DIRECT_READ_CACHE)"
 CARGO_OSDK_TEST_ARGS :=
 
 ifeq ($(AUTO_TEST), syscall)
@@ -137,7 +139,16 @@ endif
 
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
 ifneq ($(BENCHMARK), none)
-CARGO_OSDK_BUILD_ARGS += --init-args="/benchmark/common/bench_runner.sh $(BENCHMARK) asterinas"
+BENCHMARK_INIT_ARGS := /benchmark/common/bench_runner.sh $(BENCHMARK) asterinas
+ifneq ($(BENCH_FIO_BS),)
+BENCHMARK_INIT_ARGS += $(BENCH_FIO_BS)
+else ifneq ($(BENCH_FIO_FSYNC),)
+BENCHMARK_INIT_ARGS += 1M
+endif
+ifneq ($(BENCH_FIO_FSYNC),)
+BENCHMARK_INIT_ARGS += $(BENCH_FIO_FSYNC)
+endif
+CARGO_OSDK_BUILD_ARGS += --init-args="$(BENCHMARK_INIT_ARGS)"
 endif
 
 ifeq ($(INTEL_TDX), 1)

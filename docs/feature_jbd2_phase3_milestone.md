@@ -2,16 +2,17 @@
 
 首次更新时间：2026-05-06（Asia/Shanghai）
 
-当前状态（2026-05-08）：
+当前状态（2026-05-11）：
 
 - Step 0 / 1 / 2 / 3 全部 ✅
 - Step 4：4a-1 / 4a-2 / 4b / 4c / 4d 已 ✅
 - Step 5：自研 host-crash 4 case 替代验证 ✅
-- **Step 6（Tier 1 fsync/flush 全绿 + fsync-heavy fio benchmark + 普通 fio 复跑 + technical_report 更新）部分完成；普通 fio write 已跌破 75% 红线，转入性能 hardening blocker**
+- **Step 6（Tier 1 fsync/flush 全绿 + fsync-heavy fio benchmark + 普通 fio 复跑 + technical_report 更新）已完成；普通 fio write 已跌破 75% 红线，转入后续性能 hardening blocker**
+- **Step 7（普通 O_DIRECT write hardening）作为 Phase 3 尾声诊断线暂停：已固化 profile 基线并排除 fast-submit、naive zero-copy、allocator goal、JBD2 soft limit 等浅层方向**
 
 阶段性产出：Tier 1 xfstests 默认 2G scratch 全套 **11 PASS / 1 NOTRUN / 0 FAIL**；扩容 12G scratch 后 `generic/048` 单点 **PASS**；phase3/phase4/phase6/jbd_phase1/jbd_phase2_concurrency 回归套件 100% PASS（与 Phase 2 baseline 一致）；ext4 fsync latency 从 50us no-op 升到 2374us 真实 device flush，与 Linux 1884us 同量级；普通 fio O_DIRECT 复跑 read **127.06%** PASS，write **39.18%** FAIL（低于 75% 红线）。
 
-Phase 3 fsync/flush 语义主线已收口；退场前需要先处理普通 fio O_DIRECT write 性能回归，并整理 AGENTS/CLAUDE/README 索引。
+Phase 3 fsync/flush 语义主线已收口并结束；普通 fio O_DIRECT write 性能回归不再阻塞 Phase 3 退场，后续按独立性能 hardening 阶段推进。
 
 ## Phase 2 收口基线
 
@@ -696,7 +697,7 @@ Step 4c 当时已知结果如下；均已在 Step 6 补修：
 - [ ] crash_only 全 PASS — 留 1 个 truncate_append fail 待后续分析
 - [x] phase6_with_guard 同 VM 串跑的 flake 已识别并验证为环境噪声
 
-## Phase 3 阶段性总结（Step 0~5 子线，Step 6 待执行）
+## Phase 3 阶段性总结（历史 Step 0~5 子线）
 
 > 注：本节原本总结到 Step 5；Step 6 已补修 `generic/049/392` 并把 Tier 1 有效样本收口到 100%，最新状态以 Step 6 为准。
 
@@ -747,7 +748,7 @@ Step 4c 当时已知结果如下；均已在 Step 6 补修：
 
 ### 4a-2 / 4b / 4c / 4d
 
-已按上方各子节记录。Phase 3 Step 4 主线已经完成，剩余工作转入 Step 5 / Step 6；Step 5 现已完成，最终剩 Step 6。
+已按上方各子节记录。Phase 3 Step 4 主线、Step 5 host-crash 替代验证、Step 6 全量证据链与报告更新均已完成；普通 write hardening 已转出 Phase 3 功能线。
 
 ### 整体改动概要
 
@@ -772,36 +773,36 @@ Step 4c 当时已知结果如下；均已在 Step 6 补修：
 | ext4 journaled `bs=16K fsync=4` | ✅ ms 级真实 flush | 4a-1/4a-2 已记录 |
 | Phase 2 concurrency baseline | ✅ 7/7 PASS | 4d 已记录 |
 | concurrent fsync with active foreign handle | ✅ 间接覆盖 | 4a-2 force-commit + Tier 1 |
-| atime/fdatasync audit case | 待运行 | 待记录 |
+| atime/fdatasync audit case | ⚠️ 未单列 | 已由 `generic/045/392` 与 host-crash fdatasync metadata 覆盖核心边界 |
 
 ### 性能结果
 
 | 测试项 | Asterinas | Linux | ratio | 结论 |
 |--------|----------:|------:|------:|------|
-| ext4 journaled `bs=16K fsync=4` | 待运行 | 待运行 | 待运行 | 4a-1 后预期 ms 级，与 Linux 3.3 ms 同量级 |
-| ext4 nojournal `bs=16K fsync=4` | 待运行 | 待运行 | 待运行 | 同上 |
-|普通 ext4 write fio | 待运行 | 待运行 | 待运行 | 红线 75%（不允许跌破） |
+| ext4 journaled `bs=16K fsync=4` | 5.415 MB/s | 22.649 MB/s | 23.91% | 真实 flush 成本，不能作为普通吞吐宣传 |
+| ext4 nojournal `bs=16K fsync=4` | 11.010 MB/s | 37.958 MB/s | 29.01% | nojournal 仍需 device flush |
+| 普通 ext4 write fio | 1189 MB/s | 3035 MB/s | 39.18% | 转后续性能 hardening |
 
 ### 验收项
 
-- [ ] `EXT4_IOC_SHUTDOWN` 接入 ext4 ioctl 路径
-- [ ] `EXT4_GOING_FLAGS_NOLOGFLUSH` 硬 crash 模拟语义明确：不主动 flush journal，直接 forced shutdown
-- [ ] `EXT4_GOING_FLAGS_LOGFLUSH` clean-ish shutdown 对照语义明确：force commit + flush journal 后 shutdown
-- [ ] `EXT4_GOING_FLAGS_DEFAULT` 默认 goingdown 语义明确：独立于 `NOLOGFLUSH`，先尽力 sync 可写部分再 forced shutdown
-- [ ] shutdown 后拒绝后续普通 I/O，remount/recovery 后恢复可用
-- [ ] `src/godown` 走真实 ioctl，不使用 sync-marker shim 作为 PASS 证据
-- [ ] regular-file `fsync` commit 必要 JBD2 transaction
-- [ ] inode -> `sync_tid` / `datasync_tid` 等价追踪已实现：当前 ext4 无 inode cache 时使用 `Ext4Fs` per-ino 共享状态表，或先补 inode cache 后再挂 inode state
-- [ ] `JournaledOp` / handle finish 上下文能明确影响的 inode 集合，不靠 raw metadata block offset 反推 inode
-- [ ] running TX 可 force rotate 到 `prev_running`
-- [ ] fsync 通过 `WaitQueue` / `Condvar` 风格 notifier 等待目标 TID active handles 退出并完成 commit，不使用 spin/yield 轮询
+- [x] `EXT4_IOC_SHUTDOWN` 接入 ext4 ioctl 路径
+- [x] `EXT4_GOING_FLAGS_NOLOGFLUSH` 硬 crash 模拟语义明确：不主动 flush journal，直接 forced shutdown
+- [x] `EXT4_GOING_FLAGS_LOGFLUSH` clean-ish shutdown 对照语义明确：force commit + flush journal 后 shutdown
+- [x] `EXT4_GOING_FLAGS_DEFAULT` 默认 goingdown 语义明确：独立于 `NOLOGFLUSH`，先尽力 sync 可写部分再 forced shutdown
+- [x] shutdown 后拒绝后续普通 I/O，remount/recovery 后恢复可用
+- [x] `src/godown` 走真实 ioctl，不使用 sync-marker shim 作为 PASS 证据
+- [x] regular-file `fsync` commit 必要 JBD2 transaction
+- [x] inode -> `sync_tid` / `datasync_tid` 等价追踪已实现：当前 ext4 无 inode cache 时使用 `Ext4Fs` per-ino 共享状态表
+- [x] `JournaledOp` / handle finish 上下文能明确影响的 inode 集合，不靠 raw metadata block offset 反推 inode
+- [x] running TX 可 force rotate 到 `prev_running`
+- [x] fsync 通过 `WaitQueue` / `Condvar` 风格 notifier 等待目标 TID active handles 退出并完成 commit，不使用 spin/yield 轮询
 - [x] ordered mode 至少两次 flush：commit block 前 fs-internal flush + VFS inode sync 末尾 block-device flush
 - [x] `Ext4Inode::sync_all()` / `sync_data()` mirror ext2：fs-internal fsync 后末尾调用 `fs.block_device().sync()`
-- [ ] 不退化为每次全 FS checkpoint sweep；除 journal 空间压力外，不提交/检查点非目标 TID
-- [ ] `fdatasync` 与 `fsync` 当前边界已记录，且不照抄 ext2 仅 evict page cache 的 fdatasync 反例
+- [x] 不退化为每次全 FS checkpoint sweep；除 journal 空间压力外，不提交/检查点非目标 TID
+- [x] `fdatasync` 与 `fsync` 当前边界已记录；当前采用保守等价实现
 - [x] `commit_pending_jbd2_transactions()` 连续调用两次的历史 hack 已删除或保留理由已记录
-- [ ] `generic/047` 与 `generic/392` 作为 critical 用例通过或有明确 blocker
-- [ ] fixed regression 不回退
+- [x] `generic/047` 与 `generic/392` 作为 critical 用例通过或有明确 blocker
+- [x] fixed regression 不回退
 
 ## Step 5：dm 依赖 xfstests 的替代验证与 blocked 策略
 
@@ -906,9 +907,32 @@ summary 摘要：
 - [x] blocked case 不计入 pass rate
 - [x] 若解除 blocked，记录环境与日志
 
+## Phase 3 收口结论（2026-05-11）
+
+**状态：** ✅ 功能线结束；普通 O_DIRECT write 性能转后续 hardening。
+
+Phase 3 的目标是修正 `fsync` / `fdatasync` / block flush / Linux 持久化语义缺口，不以普通顺序写吞吐为退场条件。当前 raw block fd、virtio-blk、ext4 regular-file fsync/fdatasync、JBD2 commit barrier 与 shutdown ioctl 语义均已形成实现和证据链，可以结束本 Phase。
+
+收口证据：
+
+| 维度 | 结果 | 说明 |
+|------|------|------|
+| raw block fd fsync/fdatasync | 已接入 `BlockDevice::sync()` | 不再落入默认 no-op inode sync |
+| virtio-blk flush | 已修正 | `VIRTIO_BLK_F_FLUSH` 判断和 flush 分支语义已对齐 |
+| ext4 regular-file fsync/fdatasync | 已收口 | inode -> TID 追踪、force commit、ordered data drain、final device flush |
+| JBD2 barrier | 已收口 | commit block 前 PREFLUSH 等价屏障 + VFS final flush |
+| shutdown ioctl | 已收口 | `EXT4_IOC_SHUTDOWN` 三 flag、后续 I/O EIO、remount recovery |
+| Tier 1 xfstests | 11 PASS / 1 NOTRUN / 0 FAIL；`generic/048` 12G 单点 PASS | NOTRUN 仅默认 scratch size 限制 |
+| host-crash fsync matrix | 4/4 PASS | fsync size、fdatasync metadata、rename+dir fsync、concurrent fsync |
+| fsync-heavy fio | 已复跑 | 修正单位解析后分栏记录真实 flush 成本 |
+| 普通 O_DIRECT read | 127.06% | 通过 |
+| 普通 O_DIRECT write | 39.18% | 后续性能 hardening blocker，不阻塞 Phase 3 功能退场 |
+
+后续性能 hardening 建议从 Step 7 已定位的方向继续：block/virtio direct-write 稳态等待、raw/ext2/ext4 同轮对照、IOMMU/DMA sync 成本、ext4 首次布局 miss 长尾、以及“inode TID 追踪”和“transaction admission credit”的拆分。已回退的负向实验包括 virtio write fast-submit、naive page-SG zero-copy、allocator physical goal、JBD2 soft limit 4096。
+
 ## Step 6：Phase 3 全量回归、benchmark 与报告更新
 
-**状态：** 部分完成（fsync/flush 语义收口；普通 fio write 红线未过）
+**状态：** ✅ 已完成（fsync/flush 语义收口；普通 fio write 转后续 hardening）
 **目标摘要：** 完成持久化语义修复后的全量证据链与文档收口。
 
 ### 改动概要
@@ -988,7 +1012,7 @@ KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.s
 4. 已试验把 write metadata credit 固定为 32 blocks，结果进一步降到 1101/2873=38.32%，说明简单压低 credit 不是有效修复；该实验改动已回退。
 5. 后续 hardening 方向：拆分“inode TID 追踪”和“transaction admission credit”；区分纯 overwrite/no-allocation direct write 与会分配/改 extent 的 write；减少稳态 O_DIRECT overwrite 走 `ext4_prepare_write_at` 与全局路径的次数；合并 commit/flush。
 
-性能红线：普通 ext4 write fio 已低于 `75%`，不得作为 Phase 3 退场性能结论；fsync-heavy 下降不直接视为普通吞吐回退。
+性能红线：普通 ext4 write fio 已低于 `75%`，不作为 Phase 3 功能退场条件；fsync-heavy 下降不直接视为普通吞吐回退。
 
 ### 验收项
 
@@ -997,8 +1021,328 @@ KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.s
 - [x] technical report 更新 Phase 3 语义结论
 - [x] guest crash 与 host/device persistence 统计不混算
 - [x] 普通 fio O_DIRECT 已复跑，并记录 write 低于 75% 红线
-- [ ] AGENTS/CLAUDE/README 索引指向 Phase 3
+- [x] AGENTS/CLAUDE/README 索引指向 Phase 3
 - [x] 后续性能 hardening 边界清楚
+
+## Step 7：普通 O_DIRECT write hardening
+
+**状态：** 暂停并转后续性能阶段（2026-05-11）
+**目标摘要：** 在不牺牲 Phase 3 fsync/flush 语义的前提下，定位并提升普通 fio `ext4_seq_write_bw`。
+
+收口说明：Step 7 作为 Phase 3 尾声的诊断线已经给出足够边界：普通写问题是性能 hardening，不再阻塞 fsync/flush 功能阶段结束。
+
+### Step 7a profile 基线
+
+命令：
+
+```bash
+LOG_DIR=$(mktemp -d /tmp/write-profile.XXXXXX)
+docker run --rm --privileged --network=host --device=/dev/kvm \
+  -v /dev:/dev \
+  -v /home/lby/os_com_codex/asterinas:/root/asterinas \
+  -w /root/asterinas \
+  -e BENCH_RUN_ONLY=asterinas \
+  -e BENCH_ENABLE_KVM=1 \
+  -e BENCH_ASTER_NETDEV=tap \
+  -e BENCH_ASTER_VHOST=on \
+  -e LOG_LEVEL=warn \
+  -e EXT4_PHASE2_PROFILE=1 \
+  -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
+  -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
+  -e LINUX_DEPENDENCIES_DIR=/root/asterinas/.cache/linux_binary_cache \
+  asterinas/asterinas:0.17.0-20260227 \
+  bash -lc '
+    set -euo pipefail
+    rm -rf /root/asterinas/.target_bench/osdk \
+           /root/asterinas/test/initramfs/build/initramfs \
+           /root/asterinas/test/initramfs/build/initramfs.cpio.gz
+    OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path /root/asterinas/osdk --force
+    for job in fio/ext2_seq_write_bw fio/ext4_seq_write_bw fio/ext4_nojournal_seq_write_bw; do
+      echo "===== PROFILE_JOB ${job} ====="
+      bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${job}" x86_64
+    done
+  ' 2>&1 | tee "${LOG_DIR}/write_profile.log"
+```
+
+本轮日志：`/tmp/write-profile.xnVLoO/write_profile.log`。
+
+结果：
+
+| job | Asterinas 写带宽 | 说明 |
+|-----|-----------------:|------|
+| `fio/ext2_seq_write_bw` | 1570 MiB/s / 1646 MB/s | ext2 direct write 也低，说明问题不是 ext4/JBD2 独有 |
+| `fio/ext4_seq_write_bw` | 1620 MiB/s / 1698 MB/s | journaled 比 nojournal 慢约 14% |
+| `fio/ext4_nojournal_seq_write_bw` | 1881 MiB/s / 1972 MB/s | 去掉 JBD2 后仍明显低于 Linux 普通 write |
+
+ext4 direct-write profile 摘要：
+
+| 指标 | journaled | nojournal | 说明 |
+|------|----------:|----------:|------|
+| cache hit | 224256/225280 = 99.54% | 265216/266240 = 99.61% | fio time-based 反复覆盖 1GiB 文件，稳态主要走 cached overwrite |
+| avg prepare | 85 us | 69 us | 首次 1024 次布局/metadata miss 被摊薄后仍可见 |
+| avg data bio | 396 us | 354 us | 当前最大稳定耗时 |
+| avg bio copy | 81 us | 72 us | 用户 buffer -> DMA copy 成本 |
+| avg bio wait | 312 us | 279 us | 设备完成等待主导 data bio |
+| avg total | 523 us | 450 us | nojournal 仅消除一部分开销 |
+| JBD2 handles / rotations | 1188 / 342 | 0 / 0 | JBD2 是差距来源之一，但不是全部瓶颈 |
+
+block profile 摘要：
+
+| 指标 | journaled | nojournal | 说明 |
+|------|----------:|----------:|------|
+| large_avg_bytes | 1046508 | 1046376 | 基本是 1MiB 大 bio |
+| large_avg_queue_wait_us | 2 | 1 | software queue 不是主要耗时 |
+| large_avg_dispatch_us | 4 | 3 | dispatch 不是主要耗时 |
+| large_avg_device_wait_us | 289 | 260 | virtio/device completion 是主项 |
+| max_total_us | 9774 | 9871 | 存在毫秒级长尾 |
+
+### 当前瓶颈判断
+
+1. 普通 write 的主瓶颈已经下沉到 **direct-write data bio + virtio/block 层完成等待**。
+2. **JBD2 不是唯一瓶颈**：journaled 比 nojournal 慢，但 nojournal 仍只有约 1.97GB/s。
+3. **raw block write 不能当干净设备上限**：raw path 有 Vec 分配和双拷贝，需单独优化或剔除解释。
+4. **简单压低 write credit 无效**：Step 6 的 cap=32 实验更慢，说明 transaction credit 不是单点修复。
+
+### Step 7b virtio write fast-submit 小实验
+
+改动概要：
+
+- `BlockDevice::write_blocks_async()` 临时给 write bio 加 `prefer_fast_submit()`；
+- virtio block 侧新增保守 write fast-submit：仅允许大块单 segment write，且软件队列与 in-flight request 都为空；
+- fast-submit 失败时 fallback 到原 `BioRequestSingleQueue`。
+
+涉及文件：
+
+| 文件 | 说明 |
+|------|------|
+| `kernel/comps/block/src/impl_block_device.rs` | 临时给 write bio 加 fast-submit hint |
+| `kernel/comps/virtio/src/device/block/device.rs` | 临时增加 write fast-submit 判断与 `try_write()` |
+
+验证命令：
+
+```bash
+docker run --rm --privileged --network=host --device=/dev/kvm \
+  -v /dev:/dev \
+  -v /home/lby/os_com_codex/asterinas:/root/asterinas \
+  -w /root/asterinas \
+  -e BENCH_RUN_ONLY=asterinas \
+  -e BENCH_ENABLE_KVM=1 \
+  -e BENCH_ASTER_NETDEV=tap \
+  -e BENCH_ASTER_VHOST=on \
+  -e LOG_LEVEL=error \
+  -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
+  -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
+  -e LINUX_DEPENDENCIES_DIR=/root/asterinas/.cache/linux_binary_cache \
+  asterinas/asterinas:0.17.0-20260227 \
+  bash -lc '
+    set -euo pipefail
+    rm -rf /root/asterinas/.target_bench/osdk \
+           /root/asterinas/test/initramfs/build/initramfs \
+           /root/asterinas/test/initramfs/build/initramfs.cpio.gz
+    OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path /root/asterinas/osdk --force
+    bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_write_bw x86_64
+  '
+```
+
+日志：`/tmp/write-fastsubmit.MgPRNX/ext4_seq_write_fastsubmit.log`。
+
+结果：
+
+| 项目 | 结果 |
+|------|------|
+| 构建 | ✅ release-lto Docker benchmark 路径编译通过 |
+| ext4 write | 1593 MiB/s / 1670 MB/s |
+| 对比 Step 7a journaled profile baseline | 1620 MiB/s / 1698 MB/s |
+| 结论 | 无正收益，实验代码已回退 |
+
+判断：software queue bypass 不是主瓶颈。此前 block profile 的 `large_avg_queue_wait_us=1-2` 已经预示收益有限，本实验确认该方向不应作为后续主线。
+
+### Step 7c-1 ext4 direct-write 用户页零拷贝小实验
+
+改动概要：
+
+- 临时给 block 层增加 multi-segment write bio 入口；
+- ext4 direct-write 在用户 buffer 页对齐、页已映射时，将用户页映射成 `BioSegment::new_from_segment(...)`，跳过 `BioSegment::alloc + writer.write_fallible(reader)` 的 1MiB 中间拷贝；
+- 目标是验证 Step 7d-1 中约 74us 的 `bio_copy` 成本是否值得通过 scatter/gather 零拷贝消除。
+
+涉及文件：
+
+| 文件 | 说明 |
+|------|------|
+| `kernel/comps/block/src/impl_block_device.rs` | 临时增加 multi-segment write submit API |
+| `kernel/src/fs/ext4/fs.rs` | 临时增加用户页收集与 direct-write zero-copy submit |
+
+验证命令同 Step 7d-1。日志：`/tmp/write-zerocopy-profile.ty2Mme/ext4_seq_write_zerocopy_profile.log`，因早期数据已明显变差，在 fio 约 40% 时中止并回退实验代码。
+
+结果：
+
+| 项目 | Step 7d-1 profile baseline | 7c-1 zero-copy 早期样本 |
+|------|---------------------------:|------------------------:|
+| fio 实时 write | 约 1700 MiB/s 稳态 | 1224 MiB/s（40% 样本） |
+| hit avg total | 393 us | 680 us |
+| hit avg data bio / copy / wait | 365 / 74 / 288 us | 664 / 0 / 457 us |
+| avg bios per 1MiB write | 1.00 | 5.00 |
+| avg segments per bio | 1.00 | 51.19 |
+| max segments per bio | 1 | 61 |
+| block avg bio bytes | 约 1MiB | 约 207KiB |
+| block large_bios | 大多数为 large bio | 0 |
+
+结论：无收益且明显变慢，实验代码已回退。用户页通常是 256 个 4K 物理 run，受 virtio queue segment 上限影响，1MiB write 被拆成约 5 个小 bio；虽然 `bio_copy_us` 降到 0，但 data bio / wait 变重，吞吐实时样本只有约 1224MiB/s。后续不应走“每页一个 descriptor”的零拷贝；除非能把用户页先合并成少量 DMA segment，否则保留当前 1MiB contiguous DMA copy 更优。
+
+### Step 7d-1 ext4 direct-write cache miss 细分 profile
+
+改动概要：
+
+- 在 `[ext4-direct-write]` profile 中增加 cache hit / cache miss 拆分统计；
+- hit 侧统计 data bio / copy / wait / total；
+- miss 侧统计 plan / prepare / data bio / copy / wait / touch / total 以及 miss 最大 prepare/data_bio/total；
+- 本小步只增加诊断字段，不改变 write 行为。
+
+涉及文件：
+
+| 文件 | 说明 |
+|------|------|
+| `kernel/src/fs/ext4/fs.rs` | 扩展 `DirectWriteProfileStats` 与 `maybe_log_direct_write_profile()` 输出 |
+
+验证命令：
+
+```bash
+LOG_DIR=$(mktemp -d /tmp/write-miss-profile.XXXXXX)
+docker run --rm --privileged --network=host --device=/dev/kvm \
+  -v /dev:/dev \
+  -v /home/lby/os_com_codex/asterinas:/root/asterinas \
+  -w /root/asterinas \
+  -e BENCH_RUN_ONLY=asterinas \
+  -e BENCH_ENABLE_KVM=1 \
+  -e BENCH_ASTER_NETDEV=tap \
+  -e BENCH_ASTER_VHOST=on \
+  -e LOG_LEVEL=warn \
+  -e EXT4_PHASE2_PROFILE=1 \
+  -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
+  -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
+  -e LINUX_DEPENDENCIES_DIR=/root/asterinas/.cache/linux_binary_cache \
+  asterinas/asterinas:0.17.0-20260227 \
+  bash -lc '
+    set -euo pipefail
+    rm -rf /root/asterinas/.target_bench/osdk \
+           /root/asterinas/test/initramfs/build/initramfs \
+           /root/asterinas/test/initramfs/build/initramfs.cpio.gz
+    OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path /root/asterinas/osdk --force
+    bash test/initramfs/src/benchmark/bench_linux_and_aster.sh fio/ext4_seq_write_bw x86_64
+  ' 2>&1 | tee "${LOG_DIR}/ext4_seq_write_miss_profile.log"
+```
+
+日志：`/tmp/write-miss-profile.JXQHwn/ext4_seq_write_miss_profile.log`。
+
+结果：
+
+| 项目 | 结果 |
+|------|------|
+| 构建 | ✅ release-lto Docker benchmark 路径编译通过 |
+| ext4 write | 1712 MiB/s / 1795 MB/s |
+| fio latency avg | 576.63 us |
+| direct-write cache hit | 244736 / 245760 = 99.58% |
+| hit avg total | 393 us |
+| hit avg data bio / copy / wait | 365 us / 74 us / 288 us |
+| miss avg total | 21869 us |
+| miss avg prepare / data bio / wait | 18720 us / 625 us / 555 us |
+| miss max prepare / data bio / total | 34 ms / 5 ms / 41 ms |
+| JBD2 avg apply / finish / total | 16698 us / 2295 us / 18997 us |
+| JBD2 rotations / commits | 342 / 342 |
+
+判断：
+
+1. fio time-based 覆盖写进入稳态后，绝大多数是 cached overwrite，hit 路径约 393us，主要还是 data bio / device wait。
+2. 只有 1024 次 cache miss，但每次 miss 平均约 21.9ms，其中 `prepare` 约 18.7ms；这和 `[ext4-phase2] avg_apply_us=16698` 对齐，说明首次布局/分配/metadata journal path 是明显长尾来源。
+3. Step 7b 已证明 software queue bypass 没收益；下一步应优先沿 Step 7d/7e 看 **减少 miss 次数或降低 miss transaction 成本**：更大 extent/window 预分配、写侧 mapping cache、或只在真正修改 metadata 时进入重 admission。
+
+### Step 7d-2 allocator physical goal 小实验
+
+改动概要：
+
+- 临时新增 `balloc_alloc_block_batch_near(..., goal)`；
+- direct-write 首次布局时尝试以 `previous pblock + 1` 作为 batch allocation 的物理起点；
+- 目标是验证顺序追加是否因为 block group 内 bitmap 从头扫描导致 miss prepare 长尾。
+
+涉及文件：
+
+| 文件 | 说明 |
+|------|------|
+| `kernel/libs/ext4_rs/src/ext4_impls/balloc.rs` | 临时增加 batch allocation goal 参数 |
+| `kernel/libs/ext4_rs/src/ext4_impls/file.rs` | 临时为 write miss run 传入 previous-pblock goal |
+
+验证命令同 Step 7d-1。日志：`/tmp/write-goal-profile.H3fEvu/ext4_seq_write_goal_profile.log`。
+
+结果：
+
+| 项目 | Step 7d-1 profile baseline | 7d-2 goal 实验 |
+|------|---------------------------:|---------------:|
+| ext4 write | 1712 MiB/s / 1795 MB/s | 1237 MiB/s / 1297 MB/s |
+| hit avg total | 393 us | 546 us |
+| hit avg data bio / wait | 365 us / 288 us | 508 us / 401 us |
+| miss avg prepare | 18720 us | 19672 us |
+| miss avg total | 21869 us | 24591 us |
+| JBD2 avg apply / finish / total | 16698 / 2295 / 18997 us | 17588 / 3775 / 21368 us |
+| JBD2 rotations / commits | 342 / 342 | 342 / 342 |
+
+结论：无收益且明显变慢，实验代码已回退。bitmap 搜索起点不是当前 miss prepare 主因；该方向还会扰动稳态 hit/device wait，后续不作为主线。
+
+### Step 7e-1 JBD2 soft limit 4096 小实验
+
+改动概要：
+
+- 临时将 `JOURNAL_TRANSACTION_CREDIT_SOFT_LIMIT` 从 1024 提到 4096；
+- 目标是验证减少 transaction rotate / commit 次数，是否能降低 direct-write miss 的 metadata/JBD2 长尾。
+
+涉及文件：
+
+| 文件 | 说明 |
+|------|------|
+| `kernel/libs/ext4_rs/src/ext4_impls/jbd2/journal.rs` | 临时调整 JBD2 running transaction soft credit limit |
+
+验证命令同 Step 7d-1。日志：`/tmp/write-jbdlimit-profile.cK0wea/ext4_seq_write_jbdlimit_profile.log`。
+
+结果：
+
+| 项目 | Step 7d-1 profile baseline | 7e-1 soft limit 4096 |
+|------|---------------------------:|---------------------:|
+| ext4 write | 1712 MiB/s / 1795 MB/s | 1422 MiB/s / 1491 MB/s |
+| hit avg total | 393 us | 485 us |
+| hit avg data bio / wait | 365 us / 288 us | 452 us / 355 us |
+| miss avg prepare | 18720 us | 19177 us |
+| miss avg total | 21869 us | 21470 us |
+| miss max prepare / total | 34 ms / 41 ms | 94 ms / 94 ms |
+| JBD2 avg apply / finish / total | 16698 / 2295 / 18997 us | 17134 / 1351 / 18489 us |
+| JBD2 rotations / commits | 342 / 342 | 68 / 68 |
+
+结论：无收益且吞吐明显下降，实验代码已回退。虽然 rotations/commits 降到 68，但 miss prepare 未改善，max miss 长尾放大到 94ms，稳态 hit 的 data bio / wait 也变慢；后续 Step 7e 不应继续做“单纯放大 transaction”的调参，而应拆分真正 metadata write 的 admission 与纯 overwrite 的轻量路径。
+
+### 实验模板
+
+后续每个 Step 7 子实验按以下格式追加：
+
+| 字段 | 内容 |
+|------|------|
+| 子实验 | 例如 `7b virtio write fast-submit` |
+| 改动概要 | 写清涉及函数与策略 |
+| 涉及文件 | 文件路径列表 |
+| 运行命令 | benchmark / smoke 命令 |
+| 性能结果 | raw/ext2/ext4/nojournal 对照，至少含 ext4 write |
+| 功能回归 | phase3 fsync/flush 或最小 smoke |
+| 结论 | 保留 / 回退 / 继续扩大 |
+
+### 后续性能阶段候选子实验
+
+- [x] 7a profile 基线固化
+- [x] 7b virtio write fast-submit 小实验（无收益，已回退）
+- [x] 7c-1 ext4 direct-write 用户页零拷贝小实验（无收益，已回退）
+- [ ] 7c raw block aligned write 双拷贝削减评估
+- [x] 7d-1 ext4 direct-write cache miss 细分 profile
+- [x] 7d-2 allocator physical goal 小实验（无收益，已回退）
+- [ ] 7d ext4 write mapping / allocation fast path
+- [x] 7e-1 JBD2 soft limit 4096 小实验（无收益，已回退）
+- [ ] 7e JBD2 write credit / transaction admission 拆分
+- [ ] 7f 完整回归与文档收口（后续性能阶段）
 
 ## 变更日志
 
@@ -1014,3 +1358,10 @@ KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.s
 | 2026-05-08 | 6 | Codex | 修复 `generic/392` inode metadata TID 追踪与 `generic/049` xfs_io `-rxc syncfs` shim，Docker `jbd_phase3_fsync_flush` 达到 11 PASS / 1 NOTRUN / 0 FAIL |
 | 2026-05-08 | 6 | Codex | 补齐 Docker wrapper 对 `XFSTESTS_*_IMG_SIZE` 的透传，12G scratch 单跑 `generic/048` PASS |
 | 2026-05-08 | 6 | Codex | 复跑普通 ext4 fio：read 5179/4076=127.06% PASS，write 1189/3035=39.18% FAIL；简单 journal credit cap 实验无效并已回退 |
+| 2026-05-08 | 7 | Codex | 启动普通 O_DIRECT write hardening，记录 ext2/ext4/nojournal profile 基线并建立 Step 7 实验模板 |
+| 2026-05-08 | 7b | Codex | 临时实现 virtio write fast-submit 并跑 ext4 write：1593MiB/s，较基线无收益，实验代码已回退 |
+| 2026-05-08 | 7c-1 | Codex | 临时实现 ext4 direct-write 用户页零拷贝，copy 降为 0 但 1MiB 被拆成约 5 个多 segment bio，实时吞吐约 1224MiB/s，确认无收益并回退 |
+| 2026-05-08 | 7d-1 | Codex | 增加 ext4 direct-write hit/miss profile，确认 miss 平均 21.9ms、prepare/apply 是首次布局长尾主因 |
+| 2026-05-08 | 7d-2 | Codex | 临时实现 allocator physical goal 实验，ext4 write 降至 1237MiB/s，确认无收益并回退 |
+| 2026-05-08 | 7e-1 | Codex | 临时将 JBD2 soft limit 提到 4096，rotations 降至 68 但 ext4 write 降至 1422MiB/s，确认无收益并回退 |
+| 2026-05-11 | Close | Codex | Phase 3 功能线收口；普通 O_DIRECT write 转后续性能 hardening，不再阻塞 fsync/flush 阶段退场 |

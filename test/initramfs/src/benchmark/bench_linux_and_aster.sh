@@ -122,6 +122,9 @@ run_benchmark() {
     local bench_enable_kvm="${BENCH_ENABLE_KVM:-1}"
     local bench_aster_netdev="${BENCH_ASTER_NETDEV:-tap}"
     local bench_aster_vhost="${BENCH_ASTER_VHOST:-on}"
+    local bench_fio_bs="${BENCH_FIO_BS:-}"
+    local bench_fio_fsync="${BENCH_FIO_FSYNC:-}"
+    local ext4_direct_read_cache="${EXT4_DIRECT_READ_CACHE:-1}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
@@ -132,10 +135,19 @@ run_benchmark() {
         RELEASE_LTO=1
         "NETDEV=${bench_aster_netdev}"
         "VHOST=${bench_aster_vhost}"
+        "EXT4_DIRECT_READ_CACHE=${ext4_direct_read_cache}"
     )
+    [[ -n "$bench_fio_bs" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=${bench_fio_bs}")
+    [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=1M")
+    [[ -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_FSYNC=${bench_fio_fsync}")
     if [[ "$platform" == "tdx" ]]; then
         asterinas_cmd_arr+=(INTEL_TDX=1)
     fi
+
+    local linux_init_args="/benchmark/common/bench_runner.sh ${benchmark} linux"
+    [[ -n "$bench_fio_bs" ]] && linux_init_args+=" ${bench_fio_bs}"
+    [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && linux_init_args+=" 1M"
+    [[ -n "$bench_fio_fsync" ]] && linux_init_args+=" ${bench_fio_fsync}"
 
     local linux_cmd_arr=(
         qemu-system-x86_64
@@ -149,7 +161,7 @@ run_benchmark() {
         -drive "if=none,format=raw,id=x0,file=${BENCHMARK_ROOT}/../../build/ext2.img"
         -device "virtio-blk-pci,bus=pcie.0,addr=0x6,drive=x0,serial=vext2,disable-legacy=on,disable-modern=off,queue-size=64,num-queues=1,request-merging=off,backend_defaults=off,discard=off,write-zeroes=off,event_idx=off,indirect_desc=off,queue_reset=off"
         -device "virtio-net-pci,netdev=net01,disable-legacy=on,disable-modern=off,csum=off,guest_csum=off,ctrl_guest_offloads=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,mrg_rxbuf=off,ctrl_vq=off,ctrl_rx=off,ctrl_vlan=off,ctrl_rx_extra=off,guest_announce=off,ctrl_mac_addr=off,host_ufo=off,guest_uso4=off,guest_uso6=off,host_uso=off"
-        -append "console=ttyS0 rdinit=/benchmark/common/bench_runner.sh ${benchmark} linux mitigations=off hugepages=0 transparent_hugepage=never quiet"
+        -append "console=ttyS0 rdinit=${linux_init_args} mitigations=off hugepages=0 transparent_hugepage=never quiet"
         -netdev "tap,id=net01,script=${BENCHMARK_ROOT}/../../../../tools/net/qemu-ifup.sh,downscript=${BENCHMARK_ROOT}/../../../../tools/net/qemu-ifdown.sh,vhost=on"
         -nographic
     )

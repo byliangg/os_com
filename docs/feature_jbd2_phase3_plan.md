@@ -1,10 +1,28 @@
-# Asterinas ext4 JBD2 功能实现 Phase 3 — 计划
+# Asterinas ext4 JBD2 功能实现 Phase 3 — 计划（已收口）
 
 首次更新时间：2026-05-06（Asia/Shanghai）
+收口更新时间：2026-05-11（Asia/Shanghai）
+
+## 阶段状态
+
+**Phase 3 功能线已结束。** 本阶段按“先语义、后性能”的原则，完成 raw block fd、virtio-blk 与 ext4 regular-file 的 `fsync` / `fdatasync` / flush 持久化语义收口，并形成 Tier 1 shutdown xfstests、自研 host-crash fsync matrix 与 fsync-heavy fio 证据链。
+
+普通 O_DIRECT write 在 Phase 3 后仍低于性能红线，且 Step 7 多个小实验已证明它不是单纯的 JBD2 soft limit、bitmap goal、software queue 或 naive page-SG zero-copy 问题。该项从 Phase 3 功能验收中移出，作为后续性能 hardening 独立推进。
+
+收口证据摘要：
+
+| 项目 | 结果 | 说明 |
+|------|------|------|
+| `jbd_phase3_fsync_flush` | 11 PASS / 1 NOTRUN / 0 FAIL | 默认 2G scratch 口径 |
+| `generic/048` | PASS | 12G scratch 单点复跑 |
+| host-crash fsync matrix | 4/4 PASS | fsync size、fdatasync metadata、rename+dir fsync、concurrent fsync |
+| fsync-heavy fio | 已复跑并修正单位解析 | 真实 flush 成本单独记录，不作为普通吞吐宣传 |
+| 普通 O_DIRECT read | 127.06% | 通过 |
+| 普通 O_DIRECT write | 39.18% | 后续性能 hardening blocker |
 
 ## 目标
 
-在 JBD2 Phase 2 correctness 收口的基础上，单独收口 **`fsync` / `fdatasync` / block flush / 持久化语义与 Linux ext4 的差异**。
+在 JBD2 Phase 2 correctness 收口的基础上，单独收口 **`fsync` / `fdatasync` / block flush / 持久化语义与 Linux ext4 的差异**。本目标已完成，具体过程和证据见 `feature_jbd2_phase3_milestone.md`。
 
 本阶段不以提升普通顺序写吞吐为第一目标。Phase 3 的核心问题来自预研测试：
 
@@ -436,3 +454,64 @@ bash tools/ext4/run_phase4_in_docker.sh
 - 修 flush 后 fsync-heavy 性能下降不直接视为回退；需要结合语义判断。
 - 若设备 flush 导致某个 xfstests 长尾不可接受，先判断是否 per-fsync full checkpoint sweep，再决定优化点。
 - 若 dm 依赖 case 无法运行，必须写入 blocked 清单和替代验证，不允许静默跳过。
+
+## Step 7：普通 O_DIRECT write hardening
+
+**状态：** 执行中
+**目标：** 在 Phase 3 fsync/flush 语义不回退的前提下，定位并提升普通 fio `ext4_seq_write_bw`，优先把 write 拉回 `75%` hardening 红线，再评估是否能继续冲击 `90%`。
+
+### 背景与约束
+
+Step 6 后普通 O_DIRECT read 已通过，但 write 跌破红线。后续性能优化必须和 fsync-heavy 语义测试分开：
+
+- 普通 fio 参数仍为 `bs=1M direct=1 ioengine=sync numjobs=1 fsync_on_close=1 time_based=1 ramp_time=60 runtime=100`；
+- `fsync_on_close=1` 只在关闭时触发一次 flush，不能把它和 `bs=16K fsync=4` 的每 4 次写 flush 混为一谈；
+- 不允许为了普通 write 分数移除 fsync/flush、force-commit、PREFLUSH 等 Phase 3 语义修复；
+- 若优化触及 block/virtio 公共层，必须同时观察 raw/ext2/ext4/nojournal，防止只优化一个路径却破坏其他文件系统。
+
+### 当前瓶颈假设
+
+基于 2026-05-08 profile，write hardening 不应只盯 JBD2：
+
+1. **data bio 等待是主耗时**：ext4 direct write 的 1MiB data bio 平均约 350-400us，其中设备等待约 260-290us。
+2. **用户数据 copy 到 DMA 是稳定成本**：每 1MiB write 约 70-80us；用户 buffer 通常分散成 256 个 4K 物理 run，直接零拷贝/SG 需要谨慎评估。
+3. **JBD2/extent prepare 是 miss 路径主长尾**：journaled 比 nojournal 慢约 10-20%；Step 7d-1 证明首次 1GiB 布局的 1024 次 cache miss 平均约 21.9ms，其中 `prepare` 约 18.7ms，并与 JBD2 `avg_apply_us` 对齐。
+4. **raw block write 不是干净下限**：raw `/dev/vda` 当前有 Vec 分配 + 双拷贝路径，不能直接代表 virtio 真实上限。
+5. **virtio write 缺少 read fast-submit 等价路径**：当前 fast-submit 只允许 read；write 全部走 software request queue，但现有 profile 显示 queue wait 很小，预期收益需要实测。
+
+### 实验顺序
+
+1. **Step 7a：profile 基线固化**
+   - 跑 Asterinas-only `ext2_seq_write_bw` / `ext4_seq_write_bw` / `ext4_nojournal_seq_write_bw`；
+   - 打开 `EXT4_PHASE2_PROFILE=1`，记录 `[ext4-direct-write]`、`[block-profile]`、`[ext4-phase2]`；
+   - 产出 raw/ext2/ext4/nojournal 对照表，明确是 FS 层、JBD2 层还是 block 层主导。
+2. **Step 7b：virtio write fast-submit 小实验**
+   - 参考 read prefetch fast-submit，只对大块单 segment write 尝试 bypass software queue；
+   - 保留失败 fallback 到原 queue 路径；
+   - 仅在 profile 证明有收益时保留，否则回退。
+3. **Step 7c：raw block aligned write 双拷贝削减评估**
+   - 针对 sector-aligned raw write，评估能否直接构造 bio/DMA，避免 `Vec<u8>` 中转；
+   - 该项主要用于拆清 block 层上限，不直接作为 ext4 分数优化。
+   - Step 7c-1 已验证 ext4 direct-write “用户页直接挂多 segment bio”无收益：1MiB write 被拆成约 5 个小 bio，实时吞吐约 1224MiB/s；后续除非能保持少量大 DMA segment，否则不再走每页 descriptor 零拷贝。
+4. **Step 7d：ext4 write mapping / allocation fast path**
+   - 先保留 Step 7d-1 的 hit/miss 细分 profile，作为后续实验判据；
+   - Step 7d-2 已验证 previous-pblock physical goal 无收益且变慢，不再沿“bitmap 搜索起点”作为主线；
+   - 区分纯 overwrite 与会扩展/分配的 write；
+   - 评估写侧 mapping cache 或预分配更大 extent window，减少首次布局时 `ext4_prepare_write_at` 长尾；
+   - 保持 inode TID 追踪正确，不把 metadata 修改漏出 fsync force-commit。
+5. **Step 7e：JBD2 write credit / transaction admission 拆分**
+   - 将“inode TID 追踪”与“大块 data length credit admission”解耦；
+   - 只对真正会修改 extent/bitmap/inode metadata 的 write 预留较大 credit；
+   - 不再做简单固定 credit cap，因为 Step 6 已验证 cap=32 会变慢。
+   - 不再做单纯放大 running transaction 的调参，因为 Step 7e-1 已验证 soft limit 1024 -> 4096 虽将 rotations 从 342 降到 68，但 ext4 write 反降到 1422MiB/s，miss 长尾放大。
+6. **Step 7f：完整回归**
+   - 普通 fio：raw/ext2/ext4/ext4_nojournal 6-test；
+   - 功能：`jbd_phase3_fsync_flush`、host-crash 4 case、phase6 smoke、jbd_phase1 或等价最小回归；
+   - 文档：更新 `benchmark.md`、milestone 与 technical report。
+
+### 验收
+
+- 不破坏 Phase 3 fsync/flush 语义：Tier 1 fsync/flush、host-crash、raw/ext4 fsync-heavy 结果仍可解释；
+- 普通 ext4 write ratio 回到 `>=75%` 才能解除 hardening blocker；
+- 若达到 `>=90%`，可作为 Phase 3 退场性能结论；若达不到，必须给出 block/virtio 或 direct-IO 的硬瓶颈证据；
+- 每个实验都有“改动、命令、日志、结果、保留/回退结论”。

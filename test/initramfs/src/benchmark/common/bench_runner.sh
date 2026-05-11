@@ -10,7 +10,17 @@ READY_MESSAGE="The VM is ready for the benchmark."
 
 BENCHMARK_NAME=$1
 SYSTEM="${2:-asterinas}"
+FIO_BS="${3:-}"
+FIO_FSYNC="${4:-}"
 echo "Running benchmark: ${BENCHMARK_NAME} on ${SYSTEM}"
+if [ -n "${FIO_BS}" ]; then
+    export FIO_BS
+    echo "Using FIO_BS=${FIO_BS}"
+fi
+if [ -n "${FIO_FSYNC}" ]; then
+    export FIO_FSYNC
+    echo "Using FIO_FSYNC=${FIO_FSYNC}"
+fi
 
 is_ext4_benchmark() {
     case "${BENCHMARK_NAME}" in

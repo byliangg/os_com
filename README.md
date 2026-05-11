@@ -1,8 +1,8 @@
 # Asterinas EXT4 + JBD2 赛题版本
 
-本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 3 规划状态**：Phase 2 已完成 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery、多文件并发读写 correctness baseline、核心 xfstests 回归、crash matrix、lmbench 与 fio 守底验证；Phase 3 聚焦 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐。
+本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经完成 **JBD2 Phase 3 功能收口**：在 Phase 2 的完整事务管理、崩溃恢复与多文件并发 correctness baseline 之上，补齐了 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐、Tier 1 shutdown xfstests、自研 host-crash fsync 场景与 fsync-heavy benchmark 证据链。
 
-当前日期口径：2026-05-06（Asia/Shanghai）；最新功能验证基线为 2026-05-05。
+当前日期口径：2026-05-11（Asia/Shanghai）；最新 Phase 3 功能验证基线为 2026-05-08，普通 O_DIRECT write 性能 hardening 转入后续阶段。
 
 ## 当前状态
 
@@ -10,10 +10,10 @@
 
 - EXT4 基础文件与目录能力：`create/open/close/read/write/truncate/lseek/mkdir/rmdir/unlink/rename/stat` 等核心路径已接入并持续通过阶段回归。
 - Extent 连续块管理：支持多块分配、extent tree 插入/删除/折叠修复，并修复 `generic/013`、`generic/068` 等长期暴露的一致性问题。
-- fio O_DIRECT 性能 Phase 1：顺序读写已达到守底目标，最新 JBD2 收口后结果为 read `93.49%`、write `87.01%`（对比 Linux ext4）。
+- fio O_DIRECT 性能 Phase 1：顺序读写曾达到守底目标，JBD2 Phase 1 收口后结果为 read `93.49%`、write `87.01%`（对比 Linux ext4）。Phase 3 语义收口后普通 write 重新暴露为性能 hardening blocker，见下方最新 fio 结果。
 - JBD2 Phase 1：已完成完整事务管理、日志写盘、checkpoint、dirty journal recovery、crash 注入与旧 CrashJournal 移除。
 - JBD2 Phase 2：多文件并发读写 correctness baseline 已收口；完成锁顺序文档化、`runtime_block_size` 显式化、handle-local context、operation-local allocator guard、allocator/block-group correctness 协议、目录 cache-backed readdir，以及 Step 8 fio write profile。
-- JBD2 Phase 3：已完成预研测试与计划模板，当前准备从环境/测试资产固化开始，后续收口 raw block fd、virtio-blk 与 ext4 regular-file 的 fsync/flush 持久化语义。
+- JBD2 Phase 3：已完成 raw block fd、virtio-blk 与 ext4 regular-file 的 fsync/flush 持久化语义收口；`jbd_phase3_fsync_flush` 默认 11 PASS / 1 NOTRUN / 0 FAIL，12G scratch 下 `generic/048` 单点 PASS，自研 host-crash fsync matrix 4/4 PASS。
 
 ### Phase 2 收口结论
 
@@ -48,6 +48,17 @@ Phase 2 correctness 收口能力已经完成：
 - 完成 Step 8 fio write profile：当前 fio write 稳态为 1 mapping / 1 bio / 1 segment，request queue merge 为 0；fio 1MiB user buffer 为 256 pages / 256 physical runs，因此 naive page-SG zero-copy 不作为当前收口实现。
 - 最新功能大全量复跑通过：crash 18/18、phase3 10 PASS + 6 NOTRUN、phase4 12 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency 7/7。
 
+## JBD2 Phase 3 收口结论
+
+Phase 3 已按“先语义、后性能”的边界结束。阶段目标不是继续追普通顺序写吞吐，而是把此前偏轻量的 `fsync` / `fdatasync` / flush 语义补到可解释、可回归的持久化边界。
+
+- raw `/dev/vda` `fsync` / `fdatasync` 已接入底层 `BlockDevice::sync()`，virtio-blk `FLUSH` feature 判断与请求分支已修正。
+- ext4 regular-file `fsync` / `fdatasync` 走 inode -> TID 追踪、目标事务 force commit、ordered data drain 与最终 device flush；`fdatasync` 当前采用保守等价实现。
+- JBD2 commit block 前增加 PREFLUSH 等价 barrier，VFS inode sync 末尾保留 block-device flush。
+- `EXT4_IOC_SHUTDOWN` 三种 flag 已接入，Tier 1 shutdown xfstests 不再依赖 sync-marker shim 伪造 recovery 状态。
+- dm-flakey / dm-log-writes / dm-error 等环境依赖 case 保持 blocked 透明化，并用 4 个自研 host-crash 场景覆盖核心 fsync、fdatasync、rename+dir fsync 与并发 fsync 风险。
+- 普通 O_DIRECT write 已确认是后续性能 hardening blocker，不作为 Phase 3 功能退场条件继续纠缠。
+
 ## 最新验证结果
 
 ### 功能回归
@@ -61,6 +72,9 @@ Phase 2 correctness 收口能力已经完成：
 | JBD2 crash matrix | `18/18 PASS` |
 | lmbench regression | `8/8 PASS` |
 | Phase 2 concurrency baseline | `7/7 PASS`（`workers=4 rounds=8 seed=78`） |
+| `jbd_phase3_fsync_flush` | `11 PASS / 0 FAIL / 1 NOTRUN` |
+| Phase 3 12G scratch `generic/048` | `PASS` |
+| Phase 3 host-crash fsync matrix | `4/4 PASS` |
 
 最新证据日志：
 
@@ -71,6 +85,9 @@ Phase 2 correctness 收口能力已经完成：
 - `benchmark/logs/crash/phase4_part3_crash_summary_20260505_144845.tsv`
 - `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260505_144845.tsv`
 - `benchmark/logs/jbd_phase2_concurrency_20260505_153745.log`
+- `benchmark/logs/jbd_phase3_fsync_durability_20260508_023301.log`
+- `benchmark/logs/jbd_phase3_fsync_durability_20260508_025646.log`
+- `benchmark/logs/crash/phase4_part3_crash_summary_20260507_173023.tsv`
 
 严格关键词扫描为空，扫描范围包括 `ERROR`、`panic`、`BUG`、`logical block not mapped`、`mapped block out of range`、`Extentindex not found`、`ext4 write_at failed`、`Heap allocation error`、`Failed to allocate a large slot`。
 
@@ -80,10 +97,10 @@ fio 参数口径：`size=1G bs=1M ioengine=sync direct=1 numjobs=1 fsync_on_clos
 
 | 测试项 | Asterinas | Linux | 比值 | Phase 1 守底 |
 | --- | ---: | ---: | ---: | --- |
-| `ext4_seq_read_bw` | `4453 MB/s` | `4763 MB/s` | `93.49%` | PASS（>= 90%） |
-| `ext4_seq_write_bw` | `2417 MB/s` | `2778 MB/s` | `87.01%` | PASS（>= 85%） |
+| `ext4_seq_read_bw` | `5179 MB/s` | `4076 MB/s` | `127.06%` | PASS（>= 90%） |
+| `ext4_seq_write_bw` | `1189 MB/s` | `3035 MB/s` | `39.18%` | 后续性能 hardening |
 
-历史 optimize Phase 1 基线为 read `95.79%`、write `90.48%`。JBD2 Phase 1 收口后，read/write 相对基线均未超过 5 个百分点回退。
+历史 optimize Phase 1 基线为 read `95.79%`、write `90.48%`。JBD2 Phase 1 收口后 read/write 为 `93.49%` / `87.01%`；Phase 3 fsync/flush 语义收口后，read 仍通过，write 暴露为 block/virtio/direct-write 路径性能 hardening 问题。
 
 ## 复现命令
 
@@ -147,6 +164,44 @@ bash tools/ext4/run_phase4_in_docker.sh
 
 - `test/initramfs/src/syscall/xfstests/testcases/jbd_phase1.list`
 - `test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_excluded.tsv`
+
+### JBD2 Phase 3 fsync/flush 回归
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase3_fsync_flush \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+默认 2G scratch 口径结果为 11 PASS / 1 NOTRUN / 0 FAIL；`generic/048` 需要 12G scratch 单独复跑：
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase3_fsync_flush \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_SCRATCH_IMG_SIZE=12G \
+XFSTESTS_TEST_IMG_SIZE=12G \
+XFSTESTS_CASES=generic/048 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+Phase 3 自研 host-crash fsync matrix：
+
+```bash
+PHASE4_DOCKER_MODE=jbd_phase3_host_crash \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+KLOG_LEVEL=warn \
+bash tools/ext4/run_phase4_in_docker.sh
+```
 
 ### Phase 2 并发 baseline
 
@@ -244,8 +299,8 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | `docs/feature_jbd2_phase2_lock_order.md` | JBD2 Phase 2 锁顺序、同步原语与回退约定 |
 | `docs/feature_jbd2_phase2_milestone.md` | JBD2 Phase 2 进度跟踪模板 |
 | `docs/feature_jbd2_phase3_pretest.md` | JBD2 Phase 3 预研测试，记录 fsync/flush 语义风险与 fsync-heavy fio 现象 |
-| `docs/feature_jbd2_phase3_plan.md` | JBD2 Phase 3 实现计划，覆盖环境固化、raw/virtio/ext4 fsync/flush 语义收口 |
-| `docs/feature_jbd2_phase3_milestone.md` | JBD2 Phase 3 进度跟踪模板 |
+| `docs/feature_jbd2_phase3_plan.md` | JBD2 Phase 3 实现计划与完成口径，覆盖环境固化、raw/virtio/ext4 fsync/flush 语义收口 |
+| `docs/feature_jbd2_phase3_milestone.md` | JBD2 Phase 3 进度、验证证据与后续性能 hardening 记录 |
 | `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
 | `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
 | `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |
@@ -259,8 +314,8 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 - Revoke 机制已有结构与扫描骨架，当前 crash/recovery 验证覆盖的是本实现实际写出的 descriptor/data/commit 事务格式。
 - `rename_across_dir` crash 场景函数已保留，但 marker 触发不稳定，未纳入默认 crash matrix；默认矩阵每轮 9 个场景，最新收口复跑两轮共 18/18 PASS。
 - `STATIC_BLOCKED` 用例主要来自当前阶段未覆盖的 Linux ext4 语义或环境能力，例如 hardlink/symlink、AIO、xattr/chacl、renameat2、部分 fallocate/fiemap/collapse-range、device-mapper crash tests。
-- 多文件并发基本读写 correctness 已完成；更激进拆锁、更高并发吞吐、PageCache 深度优化与 fio write >= 90% 属于后续性能 hardening。
-- Phase 3 开始前确认：`bs=16K fsync=4` 预研中 Asterinas sync latency 远低于 Linux，说明现有 fsync/flush 语义仍需收口；该结果在修复前不能作为性能宣传。
+- 多文件并发基本读写 correctness 与 Phase 3 fsync/flush 持久化语义已完成；更激进拆锁、更高并发吞吐、PageCache 深度优化与 fio write >= 90% 属于后续性能 hardening。
+- Phase 3 已确认：`bs=16K fsync=4` 修复后触发真实 flush，旧的纳秒级/微秒级高吞吐结果不能作为性能宣传；fsync-heavy 与普通顺序吞吐分开统计。
 
 ## 来源说明
 
