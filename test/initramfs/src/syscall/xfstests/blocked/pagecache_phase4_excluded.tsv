@@ -1,0 +1,5 @@
+# test	reason
+# Static exclusions for pagecache_phase4 acceptance.
+# This file is intentionally empty: every case in pagecache_phase4.list is part
+# of the Phase 4 PageCache acceptance scope unless a future blocker is recorded
+# with a concrete reason.

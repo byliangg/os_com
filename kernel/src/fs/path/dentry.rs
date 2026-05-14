@@ -391,7 +391,7 @@ impl DirDentry<'_> {
         };
 
         let dir_inode = &self.inode;
-        let child_inode = match cached_child {
+        let child_inode = match &cached_child {
             Some(child) => {
                 // Cache hit: use the cached dentry
                 child.inode().clone()
@@ -404,8 +404,10 @@ impl DirDentry<'_> {
 
         dir_inode.unlink(name)?;
         self.children.write().delete(name);
+        drop(cached_child);
 
         let nlinks = child_inode.metadata().nlinks;
+        let can_cleanup_unlinked = nlinks == 0 && Arc::strong_count(&child_inode) == 1;
         fs::notify::on_link_count(&child_inode);
         if nlinks == 0 {
             // FIXME: `DELETE_SELF` should be generated after closing the last FD.
@@ -422,6 +424,9 @@ impl DirDentry<'_> {
                 .fs()
                 .fs_event_subscriber_stats()
                 .remove_subscribers(removed_nr_subscribers);
+        }
+        if can_cleanup_unlinked {
+            child_inode.cleanup_unlinked()?;
         }
         Ok(())
     }

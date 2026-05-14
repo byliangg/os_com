@@ -19,6 +19,7 @@ CONTAINER_LOG_DIR=${CONTAINER_LOG_DIR:-${CONTAINER_WORKDIR}/benchmark/logs}
 
 AUTO_PREPARE_XFSTESTS=${AUTO_PREPARE_XFSTESTS:-1}
 PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
+PAGECACHE_PHASE4_THRESHOLD=${PAGECACHE_PHASE4_THRESHOLD:-100}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
@@ -31,6 +32,7 @@ EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
 EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED:-1}
 EXT4_PHASE2_TIMEOUT_SEC=${EXT4_PHASE2_TIMEOUT_SEC:-900}
 XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
+XFSTESTS_TEST_LIST_OVERRIDE=${XFSTESTS_TEST_LIST_OVERRIDE:-}
 XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE:-0}
 if [ -n "${XFSTESTS_CASE_TIMEOUT_SEC+x}" ]; then
   XFSTESTS_CASE_TIMEOUT_SEC="${XFSTESTS_CASE_TIMEOUT_SEC}"
@@ -40,6 +42,9 @@ else
       XFSTESTS_CASE_TIMEOUT_SEC=1200
       ;;
     jbd_phase3_fsync_flush)
+      XFSTESTS_CASE_TIMEOUT_SEC=1200
+      ;;
+    pagecache_phase4|phase4_with_guard|phase6_with_guard|part3_full)
       XFSTESTS_CASE_TIMEOUT_SEC=1200
       ;;
     *)
@@ -62,6 +67,9 @@ else
       XFSTESTS_RUN_TIMEOUT_SEC=5400
       ;;
     jbd_phase3_fsync_flush)
+      XFSTESTS_RUN_TIMEOUT_SEC=5400
+      ;;
+    pagecache_phase4|phase4_with_guard|phase6_with_guard|part3_full)
       XFSTESTS_RUN_TIMEOUT_SEC=5400
       ;;
     *)
@@ -102,6 +110,7 @@ DOCKER_ENV_ARGS=(
   -e CONTAINER_LOG_DIR="${CONTAINER_LOG_DIR}"
   -e AUTO_PREPARE_XFSTESTS="${AUTO_PREPARE_XFSTESTS}"
   -e PHASE4_GOOD_THRESHOLD="${PHASE4_GOOD_THRESHOLD}"
+  -e PAGECACHE_PHASE4_THRESHOLD="${PAGECACHE_PHASE4_THRESHOLD}"
   -e PHASE6_GOOD_THRESHOLD="${PHASE6_GOOD_THRESHOLD}"
   -e CRASH_ROUNDS="${CRASH_ROUNDS}"
   -e CRASH_PREPARE_WAIT_SEC="${CRASH_PREPARE_WAIT_SEC}"
@@ -114,6 +123,7 @@ DOCKER_ENV_ARGS=(
   -e EXT4_PHASE2_SEED="${EXT4_PHASE2_SEED}"
   -e EXT4_PHASE2_TIMEOUT_SEC="${EXT4_PHASE2_TIMEOUT_SEC}"
   -e XFSTESTS_SINGLE_TEST="${XFSTESTS_SINGLE_TEST}"
+  -e XFSTESTS_TEST_LIST_OVERRIDE="${XFSTESTS_TEST_LIST_OVERRIDE}"
   -e XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE="${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE}"
   -e XFSTESTS_CASE_TIMEOUT_SEC="${XFSTESTS_CASE_TIMEOUT_SEC}"
   -e XFSTESTS_TRACE_RUN="${XFSTESTS_TRACE_RUN}"
@@ -197,10 +207,12 @@ run_part3_with_flags() {
     KLOG_LEVEL="${KLOG_LEVEL}" \
     LOG_DIR="${CONTAINER_LOG_DIR}" INITRAMFS_IMG="${CONTAINER_INITRAMFS}" \
     BASE_INITRAMFS="${CONTAINER_BASE_INITRAMFS}" PHASE4_GOOD_THRESHOLD="${PHASE4_GOOD_THRESHOLD}" \
+    PAGECACHE_PHASE4_THRESHOLD="${PAGECACHE_PHASE4_THRESHOLD}" \
     PHASE6_GOOD_THRESHOLD="${PHASE6_GOOD_THRESHOLD}" \
     CRASH_ROUNDS="${CRASH_ROUNDS}" CRASH_PREPARE_WAIT_SEC="${CRASH_PREPARE_WAIT_SEC}" \
     CRASH_HOLD_STAGE="${CRASH_HOLD_STAGE}" CRASH_SCENARIOS="${CRASH_SCENARIOS}" CRASH_EXPECT="${CRASH_EXPECT}" \
     XFSTESTS_SINGLE_TEST="${XFSTESTS_SINGLE_TEST}" \
+    XFSTESTS_TEST_LIST_OVERRIDE="${XFSTESTS_TEST_LIST_OVERRIDE}" \
     XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE="${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE}" \
     XFSTESTS_CASE_TIMEOUT_SEC="${XFSTESTS_CASE_TIMEOUT_SEC}" \
     XFSTESTS_TRACE_RUN="${XFSTESTS_TRACE_RUN}" XFSTESTS_CHILD_XTRACE="${XFSTESTS_CHILD_XTRACE}" \
@@ -211,6 +223,7 @@ run_part3_with_flags() {
     EXT4_PHASE2_ROUNDS="${EXT4_PHASE2_ROUNDS}" EXT4_PHASE2_SEED="${EXT4_PHASE2_SEED}" \
     EXT4_PHASE2_TIMEOUT_SEC="${EXT4_PHASE2_TIMEOUT_SEC}" \
     RUN_CRASH_SUITE="${RUN_CRASH_SUITE}" RUN_PHASE4_GOOD="${RUN_PHASE4_GOOD}" \
+    RUN_PAGECACHE_PHASE4="${RUN_PAGECACHE_PHASE4:-0}" \
     RUN_PHASE3_BASE="${RUN_PHASE3_BASE}" RUN_PHASE6_GOOD="${RUN_PHASE6_GOOD}" RUN_LMBENCH="${RUN_LMBENCH}" \
     RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}" RUN_PHASE2_CONCURRENCY="${RUN_PHASE2_CONCURRENCY:-0}" \
     RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}" \
@@ -220,59 +233,63 @@ run_part3_with_flags() {
 case "${PHASE4_DOCKER_MODE}" in
   phase4_good)
     echo "[INFO] mode=phase4_good (only xfstests phase4_good)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
+    ;;
+  pagecache_phase4)
+    echo "[INFO] mode=pagecache_phase4 (Phase 4 PageCache upstream xfstests acceptance)"
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=1 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   phase3_only)
     echo "[INFO] mode=phase3_only (only xfstests phase3_base)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   lmbench_only)
     echo "[INFO] mode=lmbench_only (only lmbench regression)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=1 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=1 run_part3_with_flags
     ;;
   phase4_with_guard)
-    echo "[INFO] mode=phase4_with_guard (phase4_good + phase3_base)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
+    echo "[INFO] mode=phase4_with_guard (pagecache_phase4 + phase4_good + phase3_base)"
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PAGECACHE_PHASE4=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   phase6_only)
     echo "[INFO] mode=phase6_only (only xfstests phase6_good)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=1 RUN_LMBENCH=0 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=1 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   phase6_with_guard)
-    echo "[INFO] mode=phase6_with_guard (phase6_good + phase4_good + phase3_base)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=1 RUN_LMBENCH=0 run_part3_with_flags
+    echo "[INFO] mode=phase6_with_guard (phase6_good + pagecache_phase4 + phase4_good + phase3_base)"
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=1 RUN_PAGECACHE_PHASE4=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=1 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   crash_only)
     echo "[INFO] mode=crash_only (only ext4 crash suite)"
-    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
+    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 run_part3_with_flags
     ;;
   part3_full)
-    echo "[INFO] mode=part3_full (crash + phase4_good + phase3_base + lmbench)"
-    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=1 run_part3_with_flags
+    echo "[INFO] mode=part3_full (crash + pagecache_phase4 + phase4_good + phase3_base + lmbench)"
+    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=1 RUN_PAGECACHE_PHASE4=1 RUN_PHASE3_BASE=1 RUN_PHASE6_GOOD=0 RUN_LMBENCH=1 run_part3_with_flags
     ;;
   jbd_phase1)
     echo "[INFO] mode=jbd_phase1 (only xfstests jbd_phase1)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=1 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=1 run_part3_with_flags
     ;;
   jbd_phase2_concurrency)
     echo "[INFO] mode=jbd_phase2_concurrency (only ext4 Phase 2 concurrency baseline)"
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=1 RUN_JBD_PHASE3=0 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=1 RUN_JBD_PHASE3=0 run_part3_with_flags
     ;;
   jbd_phase3_fsync_flush)
     echo "[INFO] mode=jbd_phase3_fsync_flush (Phase 3 fsync/flush durability xfstests)"
     echo "[INFO] Tier 1 tests will NOTRUN until EXT4_IOC_SHUTDOWN is implemented (Step 4)."
-    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=1 run_part3_with_flags
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=1 run_part3_with_flags
     ;;
   jbd_phase3_host_crash)
     echo "[INFO] mode=jbd_phase3_host_crash (Phase 3 fsync host-crash substitutes)"
     CRASH_ROUNDS=1 \
     CRASH_HOLD_STAGE=prepare_done \
     CRASH_SCENARIOS="${CRASH_SCENARIOS:-host_crash_fsync_size_durability:prepare_done host_crash_fdatasync_metadata:prepare_done host_crash_rename_fsync_dst:prepare_done host_crash_concurrent_fsync:prepare_done}" \
-    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 run_part3_with_flags
+    RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 run_part3_with_flags
     ;;
   *)
     echo "Error: unsupported PHASE4_DOCKER_MODE=${PHASE4_DOCKER_MODE}" >&2
-    echo "Supported: phase4_good | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
+    echo "Supported: phase4_good | pagecache_phase4 | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
     exit 3
     ;;
 esac

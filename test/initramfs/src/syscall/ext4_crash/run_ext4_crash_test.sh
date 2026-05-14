@@ -151,7 +151,7 @@ verify_rename() {
 
 prepare_truncate_append() {
     mkdir -p "${CASE_DIR}"
-    dd if=/dev/zero of="${CASE_DIR}/truncate_append.txt" bs=512 count=1 >/dev/null 2>&1
+    truncate -s 512 "${CASE_DIR}/truncate_append.txt"
     : > "${CASE_DIR}/truncate_append.txt"
     printf "after-truncate-append" >> "${CASE_DIR}/truncate_append.txt"
 }

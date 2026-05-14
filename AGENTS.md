@@ -154,8 +154,8 @@ Key test matrices:
 
 在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
 
-- **性能目标**：fio 顺序读写 >= 90%（optimize Phase 1 已达成：read 95.79%、write 90.48%；JBD2 Phase 1 收口后 read 93.49%、write 87.01%）
-- **功能目标**：JBD2 完整事务管理、全量崩溃恢复与多文件并发读写 Phase 2 已收口；当前进入 feature_jbd2_phase3，聚焦 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐。
+- **性能目标**：fio 顺序读写 >= 90%（optimize Phase 1 已达成：read 95.79%、write 90.48%；JBD2 Phase 1 收口后 read 93.49%、write 87.01%；Phase 3 收口后 read 127.06%、write 39.18%，write 转入后续 hardening）
+- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写与 Phase 3 fsync/flush 持久化语义已收口；当前进入 feature_pagecache_phase4，聚焦集成 Asterinas PageCache，替换 ext4 buffered I/O 自研/直通 cache 路径。
 
 ## 工作树约定
 
@@ -182,6 +182,8 @@ Key test matrices:
 | `feature_jbd2_phase3_pretest.md` / `docs/feature_jbd2_phase3_pretest.md` | JBD2 功能 Phase 3 预研测试：fsync/flush 语义风险与性能现象 |
 | `feature_jbd2_phase3_plan.md` / `docs/feature_jbd2_phase3_plan.md` | JBD2 功能 Phase 3 实现计划：环境固化、raw/virtio/ext4 fsync/flush 语义收口 |
 | `feature_jbd2_phase3_milestone.md` / `docs/feature_jbd2_phase3_milestone.md` | JBD2 功能 Phase 3 进度跟踪模板 |
+| `feature_pagecache_phase4_plan.md` / `docs/feature_pagecache_phase4_plan.md` | PageCache Phase 4 实现计划：ext4 buffered I/O / mmap 接入 Asterinas PageCache，自研 cache 退役边界 |
+| `feature_pagecache_phase4_milestone.md` / `docs/feature_pagecache_phase4_milestone.md` | PageCache Phase 4 进度、代码审计、回归与 benchmark 记录 |
 | `赛题要求.md` | 比赛评审标准 |
 
 ## 仓库结构
@@ -215,6 +217,7 @@ Key test matrices:
   - Phase 1：阅读 `feature_jbd2_phase1_plan.md` 和 `feature_jbd2_phase1_analysis.md`
   - Phase 2：阅读 `feature_jbd2_phase2_plan.md` 和 `feature_jbd2_phase2_analysis.md`
   - Phase 3：阅读 `feature_jbd2_phase3_plan.md` 和 `feature_jbd2_phase3_pretest.md`
+  - Phase 4：阅读 `feature_pagecache_phase4_plan.md` 和 `feature_pagecache_phase4_milestone.md`，并参考 ext2 PageCache 实现
 - 确定要修改的文件和函数
 - 如有需要，先阅读 ext2 对应实现作为参考
 
@@ -242,7 +245,7 @@ Key test matrices:
 
 ### 4. 记录阶段
 
-- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 Phase 1：`feature_jbd2_phase1_milestone.md`；JBD2 Phase 2：`feature_jbd2_phase2_milestone.md`；JBD2 Phase 3：`feature_jbd2_phase3_milestone.md`）对应 Step 下：
+- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 Phase 1：`feature_jbd2_phase1_milestone.md`；JBD2 Phase 2：`feature_jbd2_phase2_milestone.md`；JBD2 Phase 3：`feature_jbd2_phase3_milestone.md`；PageCache Phase 4：`feature_pagecache_phase4_milestone.md`）对应 Step 下：
   - **改动概要**：简述做了什么
   - **涉及文件**：列出修改的文件路径
   - **性能结果**：贴上新的性能数据表格，与基线对比
@@ -264,13 +267,15 @@ Key test matrices:
 |-------|------|------|
 | feature_jbd2_phase1 | JBD2 事务管理、日志刷盘、全量崩溃恢复 | ✅ 已完成（`jbd_phase1` 有效样本 100%，crash 9/9） |
 | feature_jbd2_phase2 | 多文件并发读写、xfstests core >= 95%，先 correctness，再性能 | ✅ 已完成（Phase 2 concurrency 7/7，phase6 25/25，crash 18/18） |
-| feature_jbd2_phase3 | fsync/fdatasync/block flush 与 Linux 持久化语义对齐 | 已启动规划（Step 0 环境与测试资产固化待执行） |
+| feature_jbd2_phase3 | fsync/fdatasync/block flush 与 Linux 持久化语义对齐 | ✅ 已完成（Tier 1 11 PASS / 1 NOTRUN / 0 FAIL，host-crash fsync 4/4） |
+| feature_pagecache_phase4 | ext4 regular-file buffered I/O / mmap 接入 Asterinas PageCache，隔离自研 direct-read cache | 已启动规划（Step 0 代码审计与基线固化进行中） |
 
 ## 注意事项
 
-- fio 使用 `direct=1`（O_DIRECT），PageCache 对 fio 测试无效，必须实现 bio 直接 I/O
-- lmbench 走缓冲 I/O，PageCache + inode 缓存对其有效
+- fio 使用 `direct=1`（O_DIRECT），PageCache 对普通 fio 守底测试无效，必须继续维护 bio 直接 I/O；Phase 4 的 PageCache 指标需与 O_DIRECT 指标分开统计
+- lmbench 走缓冲 I/O，PageCache + inode 缓存对其有效，是 Phase 4 重点观察项
 - 全局锁 `EXT4_RS_RUNTIME_LOCK` 的历史直接根因是 ext4_rs 的全局 `runtime_block_size` 变量；Phase 2 已移除该全局 block size 状态，并完成 JBD2 handle context、operation-local alloc guard、inode/目录 correctness 锁与 allocator block group 协议；更激进拆锁列入后续 hardening
-- Phase 3 重点不是普通吞吐优化，而是确认 raw block fd、virtio-blk 与 ext4 regular-file `fsync` / `fdatasync` / flush 是否具备 Linux 等价持久化语义；`bs=16K fsync=4` 的高性能结果在语义收口前不能用于性能宣传
+- Phase 3 已确认 raw block fd、virtio-blk 与 ext4 regular-file `fsync` / `fdatasync` / flush 的 Linux 等价持久化语义；`bs=16K fsync=4` 旧高性能结果不能用于性能宣传
+- Phase 4 中 PageCache 只服务 buffered I/O / mmap / writeback；O_DIRECT 仍绕过 PageCache，但必须和 PageCache 建立 flush/discard 一致性协议
 - ext2 是最好的参考实现，位于 `asterinas/kernel/src/fs/ext2/`
-- 每次改动后必须确认 phase3/phase4/phase6/jbd_phase1/crash/Phase 2 concurrency 功能测试不回归；Phase 3 还必须增加 fsync/flush 语义验证
+- 每次改动后必须确认 phase3/phase4/phase6/jbd_phase1/crash/Phase 2 concurrency/Phase 3 fsync-flush 功能测试不回归；Phase 4 还必须增加 buffered/direct coherency、mmap 与 dirty PageCache fsync 验证

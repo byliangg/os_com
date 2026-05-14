@@ -12,6 +12,10 @@ BENCHMARK_NAME=$1
 SYSTEM="${2:-asterinas}"
 FIO_BS="${3:-}"
 FIO_FSYNC="${4:-}"
+FIO_SIZE="${5:-}"
+[ "${FIO_BS}" = "-" ] && FIO_BS=""
+[ "${FIO_FSYNC}" = "-" ] && FIO_FSYNC=""
+[ "${FIO_SIZE}" = "-" ] && FIO_SIZE=""
 echo "Running benchmark: ${BENCHMARK_NAME} on ${SYSTEM}"
 if [ -n "${FIO_BS}" ]; then
     export FIO_BS
@@ -20,6 +24,10 @@ fi
 if [ -n "${FIO_FSYNC}" ]; then
     export FIO_FSYNC
     echo "Using FIO_FSYNC=${FIO_FSYNC}"
+fi
+if [ -n "${FIO_SIZE}" ]; then
+    export FIO_SIZE
+    echo "Using FIO_SIZE=${FIO_SIZE}"
 fi
 
 is_ext4_benchmark() {

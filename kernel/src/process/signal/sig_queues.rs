@@ -222,7 +222,7 @@ impl Queues {
             }
 
             // Dequeue signals that should be ignored but not blocked.
-            if sig_dispositions.will_ignore(signal_ref) {
+            if !signal_ref.is_fault() && sig_dispositions.will_ignore(signal_ref) {
                 dequeued_signals += 1;
                 *signal = None;
                 return false;
@@ -239,7 +239,7 @@ impl Queues {
             }
 
             // Dequeue signals that should be ignored but not blocked.
-            if sig_dispositions.will_ignore(signal.as_ref()) {
+            if !signal.is_fault() && sig_dispositions.will_ignore(signal.as_ref()) {
                 dequeued_signals += rt_queue.len();
                 rt_queue.clear();
                 return false;

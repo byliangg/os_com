@@ -23,12 +23,14 @@ mkdir -p "${LOG_DIR}" "${LOG_DIR}/lmbench" "${LOG_DIR}/crash"
 INITRAMFS_IMG=${INITRAMFS_IMG:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase4_part3.cpio.gz"}
 BASE_INITRAMFS=${BASE_INITRAMFS:-"${ROOT_DIR}/benchmark/assets/initramfs/initramfs_phase3.cpio.gz"}
 PHASE4_GOOD_THRESHOLD=${PHASE4_GOOD_THRESHOLD:-90}
+PAGECACHE_PHASE4_THRESHOLD=${PAGECACHE_PHASE4_THRESHOLD:-100}
 CRASH_ROUNDS=${CRASH_ROUNDS:-2}
 CRASH_PREPARE_WAIT_SEC=${CRASH_PREPARE_WAIT_SEC:-180}
 CRASH_HOLD_STAGE=${CRASH_HOLD_STAGE:-after_commit}
 CRASH_SCENARIOS=${CRASH_SCENARIOS:-"create_write:write rename:rename truncate_append:write large_write:rename fsync_durability:rename multi_file_create:rename dir_tree_churn:rmdir truncate_shrink:truncate append_concurrent:rename"}
 CRASH_EXPECT=${CRASH_EXPECT:-committed}
 XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
+XFSTESTS_TEST_LIST_OVERRIDE=${XFSTESTS_TEST_LIST_OVERRIDE:-}
 XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE:-0}
 XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC:-600}
 XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN:-0}
@@ -40,6 +42,7 @@ XFSTESTS_TEST_IMG_SIZE=${XFSTESTS_TEST_IMG_SIZE:-2G}
 XFSTESTS_SCRATCH_IMG_SIZE=${XFSTESTS_SCRATCH_IMG_SIZE:-2G}
 RUN_CRASH_SUITE=${RUN_CRASH_SUITE:-1}
 RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD:-1}
+RUN_PAGECACHE_PHASE4=${RUN_PAGECACHE_PHASE4:-0}
 RUN_PHASE3_BASE=${RUN_PHASE3_BASE:-1}
 RUN_PHASE6_GOOD=${RUN_PHASE6_GOOD:-0}
 RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
@@ -54,6 +57,15 @@ EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
 EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
 EXT4_PHASE2_SEED=${EXT4_PHASE2_SEED:-1}
 EXT4_PHASE2_TIMEOUT_SEC=${EXT4_PHASE2_TIMEOUT_SEC:-900}
+
+if [ "${RUN_PAGECACHE_PHASE4}" = "1" ]; then
+  if [ "${XFSTESTS_CASE_TIMEOUT_SEC}" = "600" ]; then
+    XFSTESTS_CASE_TIMEOUT_SEC=1200
+  fi
+  if [ "${XFSTESTS_RUN_TIMEOUT_SEC}" = "1800" ]; then
+    XFSTESTS_RUN_TIMEOUT_SEC=5400
+  fi
+fi
 
 if [ ! -f "${INITRAMFS_IMG}" ]; then
   "${ROOT_DIR}/tools/ext4/prepare_phase4_part3_initramfs.sh" "${BASE_INITRAMFS}" "${INITRAMFS_IMG}"
@@ -198,6 +210,10 @@ run_xfstests_mode() {
   local mode="$1"
   local threshold="$2"
   local log_file="$3"
+  local ext4_page_cache=0
+  if [ "${mode}" = "pagecache_phase4" ]; then
+    ext4_page_cache=1
+  fi
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
@@ -211,6 +227,7 @@ run_xfstests_mode() {
     --kcmd-args='ostd.log_level=${KLOG_LEVEL}' \
     --kcmd-args='console=${CONSOLE}' \
     --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
+    --kcmd-args='ext4fs.page_cache=${ext4_page_cache}' \
     --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \
     --kcmd-args='SYSCALL_TEST_WORKDIR=/ext4' \
     --kcmd-args='EXTRA_BLOCKLISTS_DIRS=' \
@@ -223,6 +240,7 @@ run_xfstests_mode() {
     --kcmd-args='XFSTESTS_SCRATCH_MNT=/ext4_scratch' \
     --kcmd-args='XFSTESTS_SKIP_MKFS=1' \
     --kcmd-args='XFSTESTS_SINGLE_TEST=${XFSTESTS_SINGLE_TEST}' \
+    --kcmd-args='XFSTESTS_TEST_LIST_OVERRIDE=${XFSTESTS_TEST_LIST_OVERRIDE}' \
     --kcmd-args='XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE}' \
     --kcmd-args='XFSTESTS_CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC}' \
     --kcmd-args='XFSTESTS_TRACE_RUN=${XFSTESTS_TRACE_RUN}' \
@@ -380,6 +398,7 @@ run_lmbench_regression() {
 TS=$(date +%Y%m%d_%H%M%S)
 CRASH_SUMMARY="${LOG_DIR}/crash/phase4_part3_crash_summary_${TS}.tsv"
 PHASE4_LOG="${LOG_DIR}/phase4_good_${TS}.log"
+PAGECACHE_PHASE4_LOG="${LOG_DIR}/pagecache_phase4_${TS}.log"
 PHASE3_LOG="${LOG_DIR}/phase3_base_guard_${TS}.log"
 PHASE6_LOG="${LOG_DIR}/phase6_good_${TS}.log"
 JBD_PHASE1_LOG="${LOG_DIR}/jbd_phase1_${TS}.log"
@@ -401,6 +420,13 @@ if [ "${RUN_PHASE4_GOOD}" = "1" ]; then
   ANY_STAGE_RAN=1
 else
   echo "[SKIP] phase4_good disabled (RUN_PHASE4_GOOD=${RUN_PHASE4_GOOD})"
+fi
+
+if [ "${RUN_PAGECACHE_PHASE4}" = "1" ]; then
+  run_xfstests_mode pagecache_phase4 "${PAGECACHE_PHASE4_THRESHOLD}" "${PAGECACHE_PHASE4_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] pagecache_phase4 disabled (RUN_PAGECACHE_PHASE4=${RUN_PAGECACHE_PHASE4})"
 fi
 
 if [ "${RUN_PHASE3_BASE}" = "1" ]; then
@@ -446,7 +472,7 @@ else
 fi
 
 if [ "${ANY_STAGE_RAN}" -ne 1 ]; then
-  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_PHASE2_CONCURRENCY/RUN_JBD_PHASE3/RUN_LMBENCH." >&2
+  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PAGECACHE_PHASE4/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_PHASE2_CONCURRENCY/RUN_JBD_PHASE3/RUN_LMBENCH." >&2
   exit 2
 fi
 
@@ -460,6 +486,11 @@ if [ "${RUN_PHASE4_GOOD}" = "1" ]; then
   echo "phase4_good_log=${PHASE4_LOG}"
 else
   echo "phase4_good_log=<disabled>"
+fi
+if [ "${RUN_PAGECACHE_PHASE4}" = "1" ]; then
+  echo "pagecache_phase4_log=${PAGECACHE_PHASE4_LOG}"
+else
+  echo "pagecache_phase4_log=<disabled>"
 fi
 if [ "${RUN_PHASE3_BASE}" = "1" ]; then
   echo "phase3_base_log=${PHASE3_LOG}"

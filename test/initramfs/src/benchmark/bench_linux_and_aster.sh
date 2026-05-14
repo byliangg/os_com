@@ -124,7 +124,9 @@ run_benchmark() {
     local bench_aster_vhost="${BENCH_ASTER_VHOST:-on}"
     local bench_fio_bs="${BENCH_FIO_BS:-}"
     local bench_fio_fsync="${BENCH_FIO_FSYNC:-}"
+    local bench_fio_size="${BENCH_FIO_SIZE:-}"
     local ext4_direct_read_cache="${EXT4_DIRECT_READ_CACHE:-1}"
+    local ext4_page_cache="${EXT4_PAGE_CACHE:-0}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
@@ -136,10 +138,12 @@ run_benchmark() {
         "NETDEV=${bench_aster_netdev}"
         "VHOST=${bench_aster_vhost}"
         "EXT4_DIRECT_READ_CACHE=${ext4_direct_read_cache}"
+        "EXT4_PAGE_CACHE=${ext4_page_cache}"
     )
     [[ -n "$bench_fio_bs" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=${bench_fio_bs}")
     [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=1M")
     [[ -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_FSYNC=${bench_fio_fsync}")
+    [[ -n "$bench_fio_size" ]] && asterinas_cmd_arr+=("BENCH_FIO_SIZE=${bench_fio_size}")
     if [[ "$platform" == "tdx" ]]; then
         asterinas_cmd_arr+=(INTEL_TDX=1)
     fi
@@ -148,6 +152,11 @@ run_benchmark() {
     [[ -n "$bench_fio_bs" ]] && linux_init_args+=" ${bench_fio_bs}"
     [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && linux_init_args+=" 1M"
     [[ -n "$bench_fio_fsync" ]] && linux_init_args+=" ${bench_fio_fsync}"
+    if [[ -n "$bench_fio_size" ]]; then
+        [[ -z "$bench_fio_bs" ]] && linux_init_args+=" 1M"
+        [[ -z "$bench_fio_fsync" ]] && linux_init_args+=" -"
+        linux_init_args+=" ${bench_fio_size}"
+    fi
 
     local linux_cmd_arr=(
         qemu-system-x86_64

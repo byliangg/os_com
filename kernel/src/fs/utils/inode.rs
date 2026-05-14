@@ -317,6 +317,14 @@ pub trait Inode: Any + InodeIo + Send + Sync {
         None
     }
 
+    fn on_open_file_handle(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_close_file_handle(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
         Err(Error::new(Errno::ENOTDIR))
     }
@@ -327,6 +335,10 @@ pub trait Inode: Any + InodeIo + Send + Sync {
 
     fn unlink(&self, name: &str) -> Result<()> {
         Err(Error::new(Errno::ENOTDIR))
+    }
+
+    fn cleanup_unlinked(&self) -> Result<()> {
+        Ok(())
     }
 
     fn rmdir(&self, name: &str) -> Result<()> {

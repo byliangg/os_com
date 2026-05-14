@@ -1,0 +1,88 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2017 Red Hat Inc.  All Rights Reserved.
+#
+# FS QA Test 418
+#
+# Test pagecache invalidation in buffer/direct write/read combination.
+#
+# Fork N children, each child writes to and reads from its own region of the
+# same test file, and check if what it reads is what it writes. The test region
+# is determined by N * blksz. Write and read operation can be either direct or
+# buffered.
+#
+# Regression test for commit c771c14baa33 ("iomap: invalidate page caches
+# should be after iomap_dio_complete() in direct write")
+#
+. ./common/preamble
+_begin_fstest auto rw
+
+# Import common functions.
+. ./common/filter
+
+_require_test
+_require_odirect
+_require_block_device $TEST_DEV
+_require_test_program "dio-invalidate-cache"
+_require_test_program "feature"
+
+diotest=$here/src/dio-invalidate-cache
+testfile=$TEST_DIR/$seq-diotest
+sectorsize=`$here/src/min_dio_alignment $TEST_DIR $TEST_DEV`
+pagesize=`$here/src/feature -s`
+
+# test case array, test different write/read combinations
+# -r: use direct read
+# -w: use direct write
+# -t: truncate file to final size before test, i.e. write to hole
+# -p: fallocate whole file before test, i.e. write to allocated but unwritten extents
+# -F: fulfill whole file before test, i.e. write to allocated & written extents
+t_cases=(
+	"-w"
+	"-wt"
+	"-wp"
+	"-wF"
+	"-r"
+	"-rt"
+	"-rp"
+	"-rF"
+	"-rw"
+	"-rwt"
+	"-rwp"
+	"-rwF"
+)
+
+runtest()
+{
+	local i=0
+	local tc=""
+	local loop=$1
+	shift
+
+	for tc in ${t_cases[*]}; do
+		echo "diotest $tc $*" >> $seqres.full
+		i=0
+		while [ $i -lt $loop ]; do
+			$diotest $tc $* -f $testfile
+			if [ $? -ne 0 ]; then
+				echo "diotest $tc $* failed at loop $i" | \
+					tee -a $seqres.full
+				break
+			fi
+			let i=i+1
+		done
+	done
+}
+
+while [ $sectorsize -le $((pagesize * 2)) ]; do
+	# reproducer for the original bug
+	runtest $((10 * LOAD_FACTOR)) -b $sectorsize -n 3 -i 1
+	# try more processes and iterations
+	runtest $((5 * LOAD_FACTOR))  -b $sectorsize -n 8 -i 4
+	sectorsize=$((sectorsize * 2))
+done
+echo "Silence is golden"
+
+# success, all done
+status=0
+exit

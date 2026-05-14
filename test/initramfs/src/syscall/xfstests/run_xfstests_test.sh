@@ -12,6 +12,7 @@ MODE=${XFSTESTS_MODE:-phase3_base}
 THRESHOLD_PERCENT=${XFSTESTS_THRESHOLD_PERCENT:-90}
 RESULTS_DIR=${XFSTESTS_RESULTS_DIR:-/tmp/xfstests_results}
 SINGLE_TEST=${XFSTESTS_SINGLE_TEST:-}
+TEST_LIST_OVERRIDE=${XFSTESTS_TEST_LIST_OVERRIDE:-}
 IGNORE_STATIC_EXCLUDED_FOR_SINGLE=${XFSTESTS_IGNORE_STATIC_EXCLUDED_FOR_SINGLE:-0}
 TRACE_RUN=${XFSTESTS_TRACE_RUN:-0}
 CASE_TIMEOUT_SEC=${XFSTESTS_CASE_TIMEOUT_SEC:-0}
@@ -30,6 +31,8 @@ PHASE3_BASE_LIST=${SCRIPT_DIR}/testcases/phase3_base.list
 PHASE3_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase3_excluded.tsv
 PHASE4_GOOD_LIST=${SCRIPT_DIR}/testcases/phase4_good.list
 PHASE4_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase4_excluded.tsv
+PAGECACHE_PHASE4_LIST=${SCRIPT_DIR}/testcases/pagecache_phase4.list
+PAGECACHE_PHASE4_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/pagecache_phase4_excluded.tsv
 PHASE6_GOOD_LIST=${SCRIPT_DIR}/testcases/phase6_good.list
 PHASE6_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/phase6_excluded.tsv
 JBD_PHASE1_LIST=${SCRIPT_DIR}/testcases/jbd_phase1.list
@@ -412,10 +415,67 @@ END {
     esac
 fi
 
+if [ "${1:-}" = "-ne" ] && [ $# -ge 2 ]; then
+    script="$2"
+    shift 2
+
+    # xfstests common/filter common_line_filter(). Collapse repeated
+    # hex-dump lines by the part after the first colon.
+    case "${script}" in
+        *'if (/.*:(.*)/)'*'$last_line'*'$first_match'*)
+        exec /usr/bin/busybox awk '
+{
+    line = $0
+    if (match(line, /.*:.*/)) {
+        suffix = line
+        sub(/.*:/, "", suffix)
+        if (last_line != suffix) {
+            print line
+            first_match = 1
+        } else if (first_match == 1) {
+            print "*"
+            first_match = 0
+        }
+        last_line = suffix
+    } else {
+        print line
+        last_line = line
+    }
+}
+'
+        ;;
+    esac
+fi
+
 echo "perl shim invoked but perl is unavailable: $*" >&2
 exit 127
 EOF
 chmod +x "${SHIM_DIR}/perl"
+
+# Minimal getconf subset used by xfstests common/rc.
+cat > "${SHIM_DIR}/getconf" <<'EOF'
+#!/bin/bash
+set -eu
+case "${1:-}" in
+    PAGE_SIZE|PAGESIZE)
+        echo 4096
+        ;;
+    LONG_BIT)
+        echo 64
+        ;;
+    ULONG_MAX)
+        echo 18446744073709551615
+        ;;
+    _NPROCESSORS_CONF|_NPROCESSORS_ONLN)
+        awk '/^processor[[:space:]]*:/ { n++ } END { print n > 0 ? n : 1 }' /proc/cpuinfo 2>/dev/null || echo 1
+        ;;
+    *)
+        echo "getconf shim unsupported key: ${1:-}" >&2
+        exit 127
+        ;;
+esac
+EOF
+chmod +x "${SHIM_DIR}/getconf"
 
 # xfstests requires xfs_io to exist even for ext4 runs.
 # Provide a minimal shim so ext4 tests can run and unsupported commands become "notrun".
@@ -729,7 +789,16 @@ for cand in /usr/sbin/xfs_io /usr/bin/xfs_io /sbin/xfs_io /bin/xfs_io /opt/xfste
     fi
 done
 
-if [ -n "${real}" ]; then
+has_fiemap_cmd=0
+for cmd in "${cmds[@]}"; do
+    case "${cmd}" in
+        help\ fiemap*|fiemap*)
+            has_fiemap_cmd=1
+            ;;
+    esac
+done
+
+if [ -n "${real}" ] && [ "${has_fiemap_cmd}" -eq 0 ]; then
     if [ "${XFSTESTS_XFS_IO_DEBUG:-0}" = "1" ]; then
         echo "xfs_io shim: use real ${real}" >&2
     fi
@@ -1398,6 +1467,10 @@ case "${MODE}" in
         BASE_LIST=${PHASE4_GOOD_LIST}
         STATIC_EXCLUDED=${PHASE4_STATIC_EXCLUDED}
         ;;
+    pagecache_phase4)
+        BASE_LIST=${PAGECACHE_PHASE4_LIST}
+        STATIC_EXCLUDED=${PAGECACHE_PHASE4_STATIC_EXCLUDED}
+        ;;
     phase6_good)
         BASE_LIST=${PHASE6_GOOD_LIST}
         STATIC_EXCLUDED=${PHASE6_STATIC_EXCLUDED}
@@ -1419,6 +1492,14 @@ esac
 if [ ! -f "${BASE_LIST}" ]; then
     echo "Error: base test list not found at ${BASE_LIST}" >&2
     exit 4
+fi
+
+if [ -n "${TEST_LIST_OVERRIDE}" ]; then
+    OVERRIDE_LIST=${RESULTS_DIR}/${MODE}_override.list
+    printf "%s\n" "${TEST_LIST_OVERRIDE}" \
+        | tr ', ' '\n\n' \
+        | awk 'NF { print }' >"${OVERRIDE_LIST}"
+    BASE_LIST=${OVERRIDE_LIST}
 fi
 
 : >"${EXCLUDED_FILE}"
