@@ -401,6 +401,40 @@ impl Ext4 {
         self.prepare_write_at(inode, offset, len)
     }
 
+    /// Allocate blocks in a file range. If `keep_size` is false, the inode
+    /// size is extended to cover the range.
+    pub fn ext4_allocate_range(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        self.allocate_range(inode, offset, len, keep_size)
+    }
+
+    /// Zero a file range. If `keep_size` is true, visible data past EOF is not
+    /// exposed even though missing blocks may be prepared.
+    pub fn ext4_zero_range(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<usize> {
+        self.zero_range(inode, offset, len, keep_size)
+    }
+
+    /// Zero the visible bytes in a range while preserving file size.
+    pub fn ext4_punch_hole_keep_size(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<usize> {
+        self.punch_hole_keep_size(inode, offset, len)
+    }
+
     /// Write bytes to a file inode.
     pub fn ext4_write_at(&self, inode: u32, offset: usize, write_buf: &[u8]) -> Result<usize> {
         self.write_at(inode, offset, write_buf)

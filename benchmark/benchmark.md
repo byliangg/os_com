@@ -1,8 +1,10 @@
 # Asterinas EXT4 Benchmark 最新结果快照
 
-更新时间：2026-05-08（Asia/Shanghai）
+更新时间：2026-05-14（Asia/Shanghai）
 
 Phase 3 收口说明（2026-05-11）：`fsync` / `fdatasync` / block flush / shutdown ioctl / host-crash fsync 语义线已结束；普通 O_DIRECT write 仍低于红线，作为后续性能 hardening blocker 单独推进，不再阻塞 Phase 3 功能退场。
+
+Phase 4 PageCache 说明（2026-05-14）：PageCache correctness 守底已恢复，性能最小闭环采用 A-E 口径：`lmbench_only`、官方 fio `direct=0` buffered cold/warm read、官方 fio `direct=0` buffered write、原 O_DIRECT fio cache-off 守底。O_DIRECT 结果单独作为 non-PageCache guard，不与 buffered PageCache 收益混算。
 
 ## 1. 本文用途
 
@@ -91,6 +93,36 @@ KEEP_LOGS=1 bash ./asterinas/test/initramfs/src/benchmark/fio/run_ext4_summary.s
 ```
 
 保存日志：write 最终复跑 `/tmp/ext4-fio-summary.final/ext4_seq_write_bw.log`，read 复跑 `/tmp/ext4-fio-summary.iqspHK/ext4_seq_read_bw.log`。普通 write 首轮同代码观察 `1625/3192=50.91%`，仍低于红线；最终 JSON 当前记录 `1189/3035=39.18%`。该回归与 fsync-heavy 口径分开记录，作为后续性能 hardening blocker。
+
+### 2.8 PageCache Phase 4 benchmark A-E
+
+本组用于观察 PageCache buffered I/O 收益和守底回归。buffered fio 使用官方 `/benchmark/bin/fio`，核心参数为 `direct=0`；Asterinas 侧用 `EXT4_PAGE_CACHE=0/1` 对比 `ext4fs.page_cache` 开关。
+
+| 测试项 | Asterinas | Linux | ratio / 说明 | 日志 |
+|--------|----------:|------:|--------------|------|
+| A. `lmbench_only` | `8/8 PASS` | N/A | VFS/lmbench regression clean | `benchmark/logs/lmbench/phase4_part3_lmbench_summary_20260514_051539.tsv` |
+| B/C. buffered fio read, `page_cache=0` | cold 121.0 MB/s, warm 122.0 MB/s | cold 3948.0 MB/s, warm 7457.0 MB/s | warm 为 Linux 1.64% | `benchmark/logs/pagecache_buffered_fio/pagecache_buffered_fio_summary_20260514_130056.tsv` |
+| B/C. buffered fio read, `page_cache=1` | cold 19.9 MB/s, warm 4022.0 MB/s | cold 3948.0 MB/s, warm 7457.0 MB/s | warm 为 Linux 53.94%，为 `page_cache=0` warm 的 3296.72% | 同上 |
+| D. buffered fio write, `page_cache=0` | 38.4 MB/s | 633.0 MB/s | 6.07% | 同上 |
+| D. buffered fio write, `page_cache=1` | 10.8 MB/s | 633.0 MB/s | 1.71%，后续 hardening 点 | 同上 |
+| E. O_DIRECT ext4 read cache-off | 2570 MB/s | 2643 MB/s | 97.24% | `benchmark/logs/fio_ext4_cacheoff_20260514_1345/ext4_seq_read_bw.log` |
+| E. O_DIRECT ext4 write cache-off | 1706 MB/s | 3158 MB/s | 54.02%，仍为 hardening blocker | `benchmark/logs/fio_ext4_cacheoff_20260514_1345/ext4_seq_write_bw.log` |
+
+结论：PageCache-on 的 warm read 已能体现缓存命中收益；cold read 和 buffered write 暴露出当前 PageCache backend / dirty writeback 的性能成本，列入 Phase 4 Step 7 hardening。
+
+### 2.9 PageCache Phase 4 correctness 测试记录
+
+本组记录 Phase 4 新增 `pagecache_phase4` upstream xfstests 验收集的最近几次结果。该集合专门覆盖 buffered/direct coherency、mmap、truncate、PageCache invalidation 与 writeback 相关风险；默认通过 `PHASE4_DOCKER_MODE=pagecache_phase4` 运行，并显式开启 `ext4fs.page_cache=1`。
+
+| 时间 | 测试项 | 结果 | 日志 / 说明 |
+|------|--------|------|-------------|
+| 2026-05-12 | `pagecache_phase4` full list | `7 PASS / 2 FAIL / 4 NOTRUN` | 早期 full-list 基线，剩余 blocker 为 `generic/263`、`generic/418` |
+| 2026-05-12 | `pagecache_phase4` full list | `8 PASS / 1 FAIL / 4 NOTRUN` | `benchmark/logs/pagecache_phase4_20260512_160858.log`，仅剩 `generic/418` |
+| 2026-05-13 | clean `generic/263` | `PASS` | `benchmark/logs/pagecache_phase4_20260513_091148.log` |
+| 2026-05-13 | clean `generic/247,generic/418` | `2 PASS / 0 FAIL` | `benchmark/logs/pagecache_phase4_20260513_091558.log` |
+| 2026-05-13 | `pagecache_phase4` full list | `9 PASS / 0 FAIL / 4 NOTRUN` | `benchmark/logs/pagecache_phase4_20260513_091938.log`，有效样本 pass rate `100.00%` |
+
+当前结论：PageCache Phase 4 correctness 验收集已恢复到 `FAIL=0`；4 个 `NOTRUN` 来自 helper/debugfs/512-byte aligned O_DIRECT 能力缺口，未作为静态排除规避。性能侧则以 2.8 的 A-E benchmark 为当前闭环。
 
 ## 3. 当前 fio 参数口径
 
@@ -185,6 +217,27 @@ bash test/initramfs/src/benchmark/bench_linux_and_aster.sh <job> x86_64
 - `fio/ext2_seq_read_bw`
 - `fio/ext4_seq_write_bw`
 - `fio/ext4_seq_read_bw`
+- `fio/ext4_buffered_seq_read_bw`
+- `fio/ext4_buffered_seq_write_bw`
+
+PageCache Phase 4 新增 benchmark 入口：
+
+```bash
+EXT4_DIRECT_READ_CACHE=0 \
+BENCH_FIO_SIZE=1G \
+LOG_LEVEL=error \
+bash test/initramfs/src/benchmark/fio/run_pagecache_buffered_summary.sh
+```
+
+O_DIRECT cache-off 守底入口：
+
+```bash
+EXT4_DIRECT_READ_CACHE=0 \
+EXT4_PAGE_CACHE=0 \
+KEEP_LOGS=1 \
+LOG_LEVEL=error \
+bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
 
 ## 5. 整体综合测试（按需运行）
 

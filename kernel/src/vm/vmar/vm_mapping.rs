@@ -406,6 +406,10 @@ impl VmMapping {
                     let new_flags = PageFlags::W | PageFlags::ACCESSED | PageFlags::DIRTY;
 
                     if self.is_shared || only_reference {
+                        if self.is_shared && let MappedMemory::Vmo(vmo) = &self.mapped_mem {
+                            let page_offset = va.start - self.map_to_addr;
+                            vmo.vmo().update_page(vmo.offset() + page_offset)?;
+                        }
                         cursor.protect_next(PAGE_SIZE, |flags, _cache| {
                             *flags |= new_flags;
                         });
@@ -456,6 +460,10 @@ impl VmMapping {
                     page_flags |= PageFlags::ACCESSED;
                     if is_write {
                         page_flags |= PageFlags::DIRTY;
+                        if self.is_shared && let MappedMemory::Vmo(vmo) = &self.mapped_mem {
+                            let page_offset = page_aligned_addr - self.map_to_addr;
+                            vmo.vmo().update_page(vmo.offset() + page_offset)?;
+                        }
                     }
                     let map_prop = PageProperty::new_user(page_flags, CachePolicy::Writeback);
 
@@ -492,6 +500,12 @@ impl VmMapping {
         };
 
         let page_offset = page_aligned_addr - self.map_to_addr;
+        if self.is_shared && page_offset >= vmo.valid_size() {
+            return Err(VmoCommitError::Err(Error::with_message(
+                Errno::ENXIO,
+                "shared VMO-backed mapping access is outside the object",
+            )));
+        }
         if !self.is_shared && page_offset >= vmo.valid_size() {
             // The page index is outside the VMO. This is only allowed in private mapping.
             return Ok((FrameAllocOptions::new().alloc_frame()?.into(), is_readonly));

@@ -27,6 +27,8 @@ virtio-net.pcap
 /result_*.json
 .local/
 target_lby/
+.cache/
+.target_bench/
 
 # profile results
 aster-kernel-profile-*.json

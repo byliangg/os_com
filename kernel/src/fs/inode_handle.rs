@@ -33,6 +33,7 @@ pub struct InodeHandle {
     offset: Mutex<usize>,
     status_flags: AtomicStatusFlags,
     rights: Rights,
+    has_open_inode_ref: bool,
 }
 
 impl InodeHandle {
@@ -64,12 +65,18 @@ impl InodeHandle {
             (file_io, rights)
         };
 
+        let has_open_inode_ref = !status_flags.contains(StatusFlags::O_PATH);
+        if has_open_inode_ref {
+            inode.on_open_file_handle()?;
+        }
+
         Ok(Self {
             path,
             file_io,
             offset: Mutex::new(0),
             status_flags: AtomicStatusFlags::new(status_flags),
             rights,
+            has_open_inode_ref,
         })
     }
 
@@ -450,12 +457,10 @@ impl FileLike for InodeHandle {
                 "the flags do not work on the append-only file"
             );
         }
-        if status_flags.contains(StatusFlags::O_DIRECT)
-            || status_flags.contains(StatusFlags::O_PATH)
-        {
+        if status_flags.contains(StatusFlags::O_PATH) {
             return_errno_with_message!(
                 Errno::EBADF,
-                "currently fallocate file with O_DIRECT or O_PATH is not supported"
+                "currently fallocate file with O_PATH is not supported"
             );
         }
 
@@ -497,6 +502,11 @@ impl Drop for InodeHandle {
     fn drop(&mut self) {
         self.release_range_locks();
         let _ = self.unlock_flock();
+        if self.has_open_inode_ref {
+            if let Err(err) = self.path.inode().on_close_file_handle() {
+                warn!("failed to close inode file handle: {:?}", err);
+            }
+        }
     }
 }
 

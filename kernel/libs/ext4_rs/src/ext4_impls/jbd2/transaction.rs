@@ -108,6 +108,10 @@ impl JournalTransaction {
         self.buffers.contains_key(&block_nr)
     }
 
+    pub fn remove_metadata_block(&mut self, block_nr: u64) -> bool {
+        self.buffers.remove(&block_nr).is_some()
+    }
+
     pub fn register_handle(&mut self, reserved_blocks: u32, trigger_op: Option<&'static str>) {
         self.handle_count = self.handle_count.saturating_add(1);
         self.reserved_blocks = self.reserved_blocks.saturating_add(reserved_blocks);

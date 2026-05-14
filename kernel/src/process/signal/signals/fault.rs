@@ -31,4 +31,8 @@ impl Signal for FaultSignal {
         // info.set_si_addr(self.addr.unwrap_or_default() as *const c_void);
         // info
     }
+
+    fn is_fault(&self) -> bool {
+        true
+    }
 }

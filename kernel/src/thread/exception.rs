@@ -12,7 +12,7 @@ use ostd::{arch::cpu::context::UserContext, task::Task};
 
 use crate::{
     prelude::*,
-    process::signal::signals::fault::FaultSignal,
+    process::signal::{constants::*, signals::fault::FaultSignal},
     vm::{perms::VmPerms, vmar::Vmar},
 };
 
@@ -37,8 +37,15 @@ pub fn handle_exception(ctx: &Context, context: &UserContext, exception: CpuExce
     if let Ok(page_fault_info) = PageFaultInfo::try_from(&exception) {
         let user_space = ctx.user_space();
         let vmar = user_space.vmar();
-        if handle_page_fault_from_vmar(vmar, &page_fault_info).is_ok() {
-            return;
+        match handle_page_fault_from_vmar(vmar, &page_fault_info) {
+            Ok(()) => return,
+            Err(err) if err.error() == Errno::ENXIO => {
+                let signal =
+                    FaultSignal::new(SIGBUS, BUS_ADRERR, Some(page_fault_info.address as u64));
+                ctx.posix_thread.enqueue_signal(Box::new(signal));
+                return;
+            }
+            Err(_) => {}
         }
     }
 
@@ -49,13 +56,13 @@ pub fn handle_exception(ctx: &Context, context: &UserContext, exception: CpuExce
 fn handle_page_fault_from_vmar(
     vmar: &Vmar,
     page_fault_info: &PageFaultInfo,
-) -> core::result::Result<(), ()> {
+) -> Result<()> {
     if let Err(e) = vmar.handle_page_fault(page_fault_info) {
         warn!(
             "page fault handler failed: addr: 0x{:x}, err: {:?}",
             page_fault_info.address, e
         );
-        return Err(());
+        return Err(e);
     }
     Ok(())
 }
@@ -77,5 +84,5 @@ pub(super) fn page_fault_handler(info: &CpuException) -> core::result::Result<()
     }
 
     let user_space = CurrentUserSpace::new(thread_local);
-    handle_page_fault_from_vmar(user_space.vmar(), &info.try_into().unwrap())
+    handle_page_fault_from_vmar(user_space.vmar(), &info.try_into().unwrap()).map_err(|_| ())
 }

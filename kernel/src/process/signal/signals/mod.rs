@@ -14,4 +14,8 @@ pub trait Signal: Send + Sync + Debug + Any {
     fn num(&self) -> SigNum;
     /// Returns the siginfo_t that gives more details about a signal.
     fn to_info(&self) -> siginfo_t;
+    /// Returns whether this signal was raised by a synchronous CPU fault.
+    fn is_fault(&self) -> bool {
+        false
+    }
 }

@@ -221,6 +221,13 @@ impl Vmo {
         self.try_commit_with_cursor(&mut cursor)
     }
 
+    pub fn update_page(&self, offset: usize) -> Result<()> {
+        if let Some(pager) = &self.pager {
+            pager.update_page(offset / PAGE_SIZE)?;
+        }
+        Ok(())
+    }
+
     /// Traverses the indices within a specified range of a VMO sequentially.
     ///
     /// For each index position, you have the option to commit the page as well as

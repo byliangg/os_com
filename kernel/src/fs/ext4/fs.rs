@@ -4,31 +4,31 @@ use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_block::{
+    BlockDevice, SECTOR_SIZE,
     bio::{
-        reset_read_bio_profile, reset_write_bio_profile, set_write_bio_profile_enabled,
-        BioDirection, BioSegment, BioStatus, BioWaiter,
+        BioDirection, BioSegment, BioStatus, BioWaiter, reset_read_bio_profile,
+        reset_write_bio_profile, set_write_bio_profile_enabled,
     },
     id::Bid,
     request_queue::bio_request_merge_count,
-    BlockDevice, SECTOR_SIZE,
 };
-use aster_cmdline::{ModuleArg, KCMDLINE};
+use aster_cmdline::{KCMDLINE, ModuleArg};
 use aster_time::read_monotonic_time;
 use ext4_rs::{
-    BlockDevice as Ext4BlockDevice, Ext4, Jbd2Journal, JournalCommitWriteStage, JournalHandle,
-    JournalRecoveryResult, JournalRuntime, LocalOperationAllocGuard,
-    MetadataWriter as Ext4MetadataWriter, OperationAllocGuard as Ext4OperationAllocGuard,
-    OperationScopedAllocGuard, SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
-    BLOCK_SIZE as EXT4_BLOCK_SIZE, EXT4_ROOT_INODE,
+    BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
+    Jbd2Journal, JournalCommitWriteStage, JournalHandle, JournalRecoveryResult, JournalRuntime,
+    LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter,
+    OperationAllocGuard as Ext4OperationAllocGuard, OperationScopedAllocGuard, SimpleBlockRange,
+    SimpleDirEntry, SimpleInodeMeta,
 };
 use ostd::{
+    Error as OstdError,
     mm::{
-        io_util::HasVmReaderWriter, vm_space::VmQueriedItem, HasPaddr, PageFlags, Vaddr, VmIo,
-        VmWriter, PAGE_SIZE,
+        HasPaddr, PAGE_SIZE, PageFlags, Vaddr, VmIo, VmWriter, io_util::HasVmReaderWriter,
+        vm_space::VmQueriedItem,
     },
     sync::{RwMutex, WaitQueue},
     task::disable_preempt,
-    Error as OstdError,
 };
 
 use crate::{
@@ -36,11 +36,15 @@ use crate::{
         path::PerMountFlags,
         registry::{FsProperties, FsType},
         utils::{
-            FileSystem, FsEventSubscriberStats, FsFlags, Inode, StatusFlags, SuperBlock, NAME_MAX,
+            CachePage, FallocMode, FileSystem, FsEventSubscriberStats, FsFlags, Inode, NAME_MAX,
+            PageCache, PageCacheBackend, StatusFlags, SuperBlock,
         },
     },
     prelude::*,
-    vm::vmar::{VMAR_CAP_ADDR, VMAR_LOWEST_ADDR},
+    vm::{
+        vmar::{VMAR_CAP_ADDR, VMAR_LOWEST_ADDR},
+        vmo::Vmo,
+    },
 };
 
 const EXT4_MAGIC: u64 = 0xEF53;
@@ -925,6 +929,133 @@ impl Ext4MetadataWriter for JournalOperationMetadataWriter {
     }
 }
 
+struct Ext4PageCacheState {
+    page_cache: PageCache,
+    _backend: Arc<Ext4PageCacheBackend>,
+}
+
+impl Ext4PageCacheState {
+    fn new(fs: Weak<Ext4Fs>, ino: u32, capacity: usize) -> Result<Self> {
+        let backend = Arc::new(Ext4PageCacheBackend { fs, ino });
+        let page_cache = PageCache::with_capacity(capacity, Arc::downgrade(&backend) as _)?;
+        Ok(Self {
+            page_cache,
+            _backend: backend,
+        })
+    }
+
+    fn pages(&self) -> Arc<Vmo> {
+        self.page_cache.pages().clone()
+    }
+
+    fn cached_size(&self) -> usize {
+        self.page_cache.pages().size()
+    }
+
+    fn resize(&self, new_size: usize) -> Result<()> {
+        self.page_cache.resize(new_size)
+    }
+
+    fn evict_range(&self, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = start.saturating_add(len);
+        self.page_cache.evict_range(start..end)?;
+        self.decommit_vmo_range(start, end)
+    }
+
+    fn evict_all(&self, file_size: usize) -> Result<()> {
+        self.page_cache.evict_range(0..file_size)?;
+        self.decommit_vmo_range(0, file_size)
+    }
+
+    fn discard_range(&self, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len);
+        self.page_cache.discard_range(start..end);
+        let _ = self.decommit_vmo_range(start, end);
+    }
+
+    fn discard_all(&self) {
+        let size = self.page_cache.pages().size();
+        self.page_cache.discard_range(0..size);
+        let _ = self.decommit_vmo_range(0, size);
+    }
+
+    fn decommit_vmo_range(&self, start: usize, end: usize) -> Result<()> {
+        let size = self.page_cache.pages().size();
+        if start >= size {
+            return Ok(());
+        }
+        self.page_cache.pages().decommit(start..end.min(size))
+    }
+}
+
+struct Ext4PageCacheBackend {
+    fs: Weak<Ext4Fs>,
+    ino: u32,
+}
+
+impl Ext4PageCacheBackend {
+    fn fs(&self) -> Result<Arc<Ext4Fs>> {
+        self.fs
+            .upgrade()
+            .ok_or_else(|| Error::with_message(Errno::EIO, "ext4 fs is dropped"))
+    }
+
+    fn page_offset(idx: usize) -> Result<usize> {
+        idx.checked_mul(PAGE_SIZE)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page cache offset overflow"))
+    }
+}
+
+impl PageCacheBackend for Ext4PageCacheBackend {
+    fn read_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let fs = self.fs()?;
+        let offset = Self::page_offset(idx)?;
+        let mut data = vec![0u8; PAGE_SIZE];
+        let file_size = fs.stat(self.ino)?.size as usize;
+
+        if offset < file_size {
+            let read_len = PAGE_SIZE.min(file_size - offset);
+            fs.read_page_cache_data_at(self.ino, offset, &mut data[..read_len])?;
+        }
+
+        frame.writer().write(&mut VmReader::from(data.as_slice()));
+        Ok(BioWaiter::new())
+    }
+
+    fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter> {
+        let fs = self.fs()?;
+        let offset = Self::page_offset(idx)?;
+        let file_size = fs.stat(self.ino)?.size as usize;
+        if offset >= file_size {
+            return Ok(BioWaiter::new());
+        }
+
+        let write_len = PAGE_SIZE.min(file_size - offset);
+        let mut data = vec![0u8; write_len];
+        frame
+            .reader()
+            .read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())
+            .map_err(|(err, _)| Error::from(err))?;
+        fs.write_page_cache_data_at(self.ino, offset, data.as_slice())?;
+        Ok(BioWaiter::new())
+    }
+
+    fn npages(&self) -> usize {
+        let Ok(fs) = self.fs() else {
+            return 0;
+        };
+        fs.stat(self.ino)
+            .map(|meta| (meta.size as usize).div_ceil(PAGE_SIZE))
+            .unwrap_or(0)
+    }
+}
+
 pub(super) struct Ext4Fs {
     inner: Mutex<Ext4>,
     block_device: Arc<dyn BlockDevice>,
@@ -958,10 +1089,13 @@ pub(super) struct Ext4Fs {
     /// remount + recovery (Phase 1 path).
     shutdown_state: AtomicU32,
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
+    inode_page_caches: Mutex<BTreeMap<u32, Arc<Ext4PageCacheState>>>,
+    open_file_handles: Mutex<BTreeMap<u32, usize>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    page_cache_enabled: bool,
     direct_read_cache_enabled: bool,
     phase2_profile_enabled: bool,
     direct_read_profile_started: AtomicBool,
@@ -1002,10 +1136,13 @@ impl Ext4Fs {
             commit_notifier: WaitQueue::new(),
             shutdown_state: AtomicU32::new(0),
             dir_entry_cache: Mutex::new(BTreeMap::new()),
+            inode_page_caches: Mutex::new(BTreeMap::new()),
+            open_file_handles: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
+            page_cache_enabled: Self::page_cache_enabled_from_kcmdline(),
             direct_read_cache_enabled: Self::direct_read_cache_enabled_from_kcmdline(),
             phase2_profile_enabled: Self::phase2_profile_enabled_from_kcmdline(),
             direct_read_profile_started: AtomicBool::new(false),
@@ -1058,8 +1195,126 @@ impl Ext4Fs {
         Self::ext4fs_bool_arg_from_kcmdline(b"phase2_profile", false)
     }
 
+    fn page_cache_enabled_from_kcmdline() -> bool {
+        Self::ext4fs_bool_arg_from_kcmdline(b"page_cache", false)
+    }
+
     fn direct_read_cache_enabled_from_kcmdline() -> bool {
         Self::ext4fs_bool_arg_from_kcmdline(b"direct_read_cache", true)
+    }
+
+    pub(super) fn page_cache_enabled(&self) -> bool {
+        self.page_cache_enabled
+    }
+
+    fn page_cache_state_for_inode(
+        self: &Arc<Self>,
+        ino: u32,
+        capacity: usize,
+    ) -> Result<Arc<Ext4PageCacheState>> {
+        if let Some(state) = self.inode_page_caches.lock().get(&ino).cloned() {
+            state.resize(capacity)?;
+            return Ok(state);
+        }
+
+        let new_state = Arc::new(Ext4PageCacheState::new(
+            Arc::downgrade(self),
+            ino,
+            capacity,
+        )?);
+        let state = self
+            .inode_page_caches
+            .lock()
+            .entry(ino)
+            .or_insert(new_state)
+            .clone();
+        state.resize(capacity)?;
+        Ok(state)
+    }
+
+    pub(super) fn page_cache_for_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<Vmo>> {
+        let capacity = self.stat(ino)?.size as usize;
+        Ok(self.page_cache_state_for_inode(ino, capacity)?.pages())
+    }
+
+    fn page_cache_state_if_present(&self, ino: u32) -> Option<Arc<Ext4PageCacheState>> {
+        self.inode_page_caches.lock().get(&ino).cloned()
+    }
+
+    fn discard_page_cache_range(&self, ino: u32, start: usize, len: usize) {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.discard_range(start, len);
+        }
+    }
+
+    fn evict_page_cache_range(&self, ino: u32, start: usize, len: usize) -> Result<()> {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.evict_range(start, len)?;
+        }
+        Ok(())
+    }
+
+    fn sync_page_cache_for_inode_locked(&self, ino: u32) -> Result<()> {
+        let Some(state) = self.page_cache_state_if_present(ino) else {
+            return Ok(());
+        };
+        let file_size = self.stat(ino)?.size as usize;
+        state.evict_all(file_size)
+    }
+
+    pub(super) fn sync_page_cache_for_inode(&self, ino: u32) -> Result<()> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+        self.sync_page_cache_for_inode_locked(ino)
+    }
+
+    fn sync_all_page_caches(&self) -> Result<()> {
+        let states: Vec<(u32, Arc<Ext4PageCacheState>)> = self
+            .inode_page_caches
+            .lock()
+            .iter()
+            .map(|(ino, state)| (*ino, state.clone()))
+            .collect();
+
+        for (ino, state) in states {
+            let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+            let _inode_guard = inode_lock.lock();
+            let file_size = self.stat(ino)?.size as usize;
+            state.evict_all(file_size)?;
+        }
+        Ok(())
+    }
+
+    fn reset_page_cache_after_truncate(&self, ino: u32, new_size: usize) -> Result<()> {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.discard_all();
+            state.resize(new_size)?;
+        }
+        Ok(())
+    }
+
+    fn drop_page_cache_state(&self, ino: u32) {
+        let Some(state) = self.inode_page_caches.lock().remove(&ino) else {
+            return;
+        };
+        let file_size = self
+            .stat(ino)
+            .map(|meta| meta.size as usize)
+            .unwrap_or_else(|_| state.cached_size());
+        if let Err(err) = state.evict_all(file_size) {
+            warn!(
+                "ext4: failed to evict page cache while dropping inode state ino={} err={:?}",
+                ino, err
+            );
+            state.discard_all();
+        }
+    }
+
+    fn discard_page_cache_state(&self, ino: u32) {
+        let Some(state) = self.inode_page_caches.lock().remove(&ino) else {
+            return;
+        };
+        state.discard_all();
     }
 
     fn correctness_lock_for(
@@ -1362,7 +1617,7 @@ impl Ext4Fs {
         // Only single-inode ops carry inode info in v1; directory ops touch
         // multiple inodes (parent + child) and rely on the Phase 2 inode
         // correctness lock to serialize fsync after the op completes.
-        if succeeded {
+        if succeeded && summary.modified_blocks > 0 {
             if let Some(ino) = op.and_then(JournaledOp::affected_ino) {
                 self.record_inode_tid(ino, summary.transaction_id);
             }
@@ -2836,6 +3091,10 @@ impl Ext4Fs {
         offset: usize,
         len: usize,
     ) -> Result<Option<Vec<SimpleBlockRange>>> {
+        if self.page_cache_enabled {
+            return Ok(None);
+        }
+
         let (direct_len, mappings) = self.plan_direct_read_cached(ino, offset, len, true)?;
         if direct_len != len {
             return Ok(None);
@@ -2943,6 +3202,26 @@ impl Ext4Fs {
 
     fn invalidate_direct_read_cache(&self, ino: u32) {
         self.inode_direct_read_cache.lock().remove(&ino);
+    }
+
+    fn revoke_jbd2_checkpoint_metadata_blocks(&self, mappings: &[SimpleBlockRange]) {
+        let mut runtime_guard = self.jbd2_runtime.write();
+        let Some(runtime) = runtime_guard.as_mut() else {
+            return;
+        };
+
+        for mapping in mappings {
+            for block in 0..mapping.len {
+                let block_nr = mapping.pblock.saturating_add(u64::from(block));
+                let revoked = runtime.revoke_checkpoint_metadata_block(block_nr);
+                if revoked > 0 {
+                    debug!(
+                        "ext4: revoked stale checkpoint metadata block={} count={}",
+                        block_nr, revoked
+                    );
+                }
+            }
+        }
     }
 
     fn clear_pending_direct_read(&self, ino: u32) {
@@ -3062,6 +3341,9 @@ impl Ext4Fs {
     ) -> Result<(Option<PreparedDirectRead>, u64)> {
         const SPECULATIVE_DIRECT_READ_MIN_BYTES: usize = 512 * 1024;
 
+        if self.page_cache_enabled {
+            return Ok((None, 0));
+        }
         if direct_len < SPECULATIVE_DIRECT_READ_MIN_BYTES {
             return Ok((None, 0));
         }
@@ -3376,11 +3658,7 @@ impl Ext4Fs {
             Some(filter_op) => filter_op == op_name,
             None => true,
         };
-        if op_matches {
-            Some(stage)
-        } else {
-            None
-        }
+        if op_matches { Some(stage) } else { None }
     }
 
     fn should_force_commit_for_injected_crash(op_name: &str) -> bool {
@@ -3574,6 +3852,7 @@ impl Ext4Fs {
     }
 
     fn clear_inode_touch_cache(&self, ino: u32) {
+        self.drop_page_cache_state(ino);
         self.invalidate_direct_read_cache(ino);
         self.inode_atime_cache.lock().remove(&ino);
         self.inode_ctime_cache.lock().remove(&ino);
@@ -3683,6 +3962,12 @@ impl Ext4Fs {
         })?;
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _child_guard = child_lock.lock();
+        // A freshly allocated inode must not inherit stale VMO/PageCache state
+        // from an earlier lifetime with the same inode number. Discard instead
+        // of evicting: writing old cached pages through the new inode mapping
+        // would corrupt the new file.
+        self.discard_page_cache_state(ino);
+        self.invalidate_direct_read_cache(ino);
         self.cache_insert_entry(parent, name, ino, Self::dirent_type_from_inode_mode(mode));
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
@@ -3753,6 +4038,56 @@ impl Ext4Fs {
         self.cache_remove_entry(parent, name);
         self.clear_inode_touch_cache(target_ino);
         self.touch_mtime_ctime(parent)?;
+        Ok(())
+    }
+
+    pub(super) fn on_open_file_handle(&self, ino: u32) {
+        let mut open_file_handles = self.open_file_handles.lock();
+        *open_file_handles.entry(ino).or_insert(0) += 1;
+    }
+
+    pub(super) fn on_close_file_handle(&self, ino: u32) -> Result<()> {
+        let mut open_file_handles = self.open_file_handles.lock();
+        let Some(count) = open_file_handles.get_mut(&ino) else {
+            return Ok(());
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            open_file_handles.remove(&ino);
+        }
+        Ok(())
+    }
+
+    fn has_open_file_handles(&self, ino: u32) -> bool {
+        self.open_file_handles
+            .lock()
+            .get(&ino)
+            .is_some_and(|count| *count > 0)
+    }
+
+    pub(super) fn cleanup_unlinked_file(&self, ino: u32) -> Result<()> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+
+        let meta = self.stat(ino)?;
+        if meta.nlink != 0 || meta.file_type != ext4_rs::InodeFileType::S_IFREG.bits() {
+            return Ok(());
+        }
+        if self.has_open_file_handles(ino) {
+            return Ok(());
+        }
+
+        self.reset_page_cache_after_truncate(ino, 0)?;
+        let now = Self::now_unix_seconds_u32();
+        let op = JournaledOp::Truncate { ino };
+        self.run_journaled_ext4(Some(op), |ext4| {
+            ext4.ext4_truncate(ino, 0).map_err(map_ext4_error)?;
+            ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
+                .map_err(map_ext4_error)?;
+            Ok(())
+        })?;
+        self.invalidate_direct_read_cache(ino);
+        self.inode_mtime_ctime_cache.lock().insert(ino, now);
         Ok(())
     }
 
@@ -3876,6 +4211,32 @@ impl Ext4Fs {
         Ok(read_len)
     }
 
+    pub(super) fn read_at_page_cache(
+        self: &Arc<Self>,
+        ino: u32,
+        offset: usize,
+        writer: &mut VmWriter,
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+        let file_size = self.stat(ino)?.size as usize;
+        let read_len = file_size.saturating_sub(offset).min(writer.avail());
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let page_cache = self.page_cache_state_for_inode(ino, file_size)?.pages();
+        let old_avail = writer.avail();
+        writer.limit(read_len);
+        page_cache.read(offset, writer)?;
+        debug_assert_eq!(writer.avail(), old_avail - read_len);
+        if read_len > 0 {
+            self.touch_atime(ino, status_flags)?;
+        }
+        Ok(read_len)
+    }
+
     pub(super) fn read_direct_at(
         &self,
         ino: u32,
@@ -3886,12 +4247,17 @@ impl Ext4Fs {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
         self.maybe_start_direct_read_profile();
+        self.evict_page_cache_range(ino, offset, writer.avail())?;
+        if self.page_cache_enabled {
+            self.invalidate_direct_read_cache(ino);
+        }
 
         let mut plan_ns = 0u64;
         let mut alloc_ns = 0u64;
         let mut submit_ns = 0u64;
-        let (direct_len, mappings, bio_waiter) = if let Some(pending) =
-            self.take_matching_pending_direct_read(ino, offset, writer.avail())
+        let (direct_len, mappings, bio_waiter) = if !self.page_cache_enabled
+            && let Some(pending) =
+                self.take_matching_pending_direct_read(ino, offset, writer.avail())
         {
             (pending.len, pending.mappings, pending.waiter)
         } else {
@@ -3900,7 +4266,7 @@ impl Ext4Fs {
                 ino,
                 offset,
                 writer.avail(),
-                self.direct_read_cache_enabled,
+                self.direct_read_cache_enabled && !self.page_cache_enabled,
             )?;
             plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
             if direct_len == 0 {
@@ -4008,6 +4374,7 @@ impl Ext4Fs {
         self.invalidate_direct_read_cache(ino);
         let written = write_result?;
         if written > 0 {
+            self.discard_page_cache_range(ino, offset, written);
             self.inode_mtime_ctime_cache.lock().insert(ino, now);
         }
         if generic014_like_write {
@@ -4032,6 +4399,170 @@ impl Ext4Fs {
         Ok(written)
     }
 
+    pub(super) fn write_at_page_cache(
+        self: &Arc<Self>,
+        ino: u32,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+
+        let mut data = vec![0u8; write_len];
+        reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
+
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+        let now = Self::now_unix_seconds_u32();
+        let op = JournaledOp::for_small_write(ino, offset, data.as_slice());
+        let mappings = self
+            .run_journaled_ext4(op, |ext4| {
+                let mappings = ext4
+                    .ext4_prepare_write_at(ino, offset, write_len)
+                    .map_err(map_ext4_error)?;
+                ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
+                    .map_err(map_ext4_error)?;
+                Ok(mappings)
+            })
+            .map_err(|err| {
+                if err.error() == Errno::ENOSPC {
+                    debug!(
+                        "ext4 page-cache prepare write returned ENOSPC: ino={} offset={} len={}",
+                        ino, offset, write_len
+                    );
+                } else {
+                    error!(
+                        "ext4 page-cache prepare write failed: ino={} offset={} len={} err={:?}",
+                        ino, offset, write_len, err
+                    );
+                }
+                err
+            })?;
+        self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+
+        self.invalidate_direct_read_cache(ino);
+        self.inode_mtime_ctime_cache.lock().insert(ino, now);
+        let file_size = self.stat(ino)?.size as usize;
+        let page_cache = self.page_cache_state_for_inode(ino, file_size)?.pages();
+        page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
+        Ok(write_len)
+    }
+
+    fn write_page_cache_data_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let block_size = EXT4_BLOCK_SIZE;
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page-cache write range overflow"))?;
+        let lblock_start = offset / block_size;
+        let lblock_end = end.div_ceil(block_size);
+        let lblock_count = lblock_end
+            .checked_sub(lblock_start)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page-cache write range overflow"))?;
+        let lblock_start_u32 = u32::try_from(lblock_start)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache write lblock overflow"))?;
+        let lblock_count_u32 = u32::try_from(lblock_count)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache write lblock overflow"))?;
+        let mappings = self.run_ext4_file_read_only(|ext4| {
+            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        })?;
+        self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+
+        let op = JournaledOp::Write {
+            ino,
+            len: data.len(),
+        };
+        let written = self.run_journaled_ext4(Some(op), |ext4| {
+            ext4.ext4_write_at(ino, offset, data)
+                .map_err(map_ext4_error)
+        })?;
+        self.invalidate_direct_read_cache(ino);
+        Ok(written)
+    }
+
+    fn read_page_cache_data_at(&self, ino: u32, offset: usize, data: &mut [u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        data.fill(0);
+        let file_size = self.stat(ino)?.size as usize;
+        let read_len = file_size.saturating_sub(offset).min(data.len());
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let block_size = EXT4_BLOCK_SIZE;
+        let end = offset
+            .checked_add(read_len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page-cache read range overflow"))?;
+        let lblock_start = offset / block_size;
+        let lblock_end = end.div_ceil(block_size);
+        let lblock_count = lblock_end
+            .checked_sub(lblock_start)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page-cache read range overflow"))?;
+        let lblock_start_u32 = u32::try_from(lblock_start)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache read lblock overflow"))?;
+        let lblock_count_u32 = u32::try_from(lblock_count)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache read lblock overflow"))?;
+
+        let mappings = self.run_ext4_file_read_only(|ext4| {
+            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        })?;
+
+        for mapping in mappings {
+            let mapping_start_lblock = mapping.lblock as usize;
+            let mapping_end_lblock = mapping_start_lblock
+                .checked_add(mapping.len as usize)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped range overflow"))?;
+            let overlap_start_lblock = mapping_start_lblock.max(lblock_start);
+            let overlap_end_lblock = mapping_end_lblock.min(lblock_end);
+            if overlap_start_lblock >= overlap_end_lblock {
+                continue;
+            }
+
+            for lblock in overlap_start_lblock..overlap_end_lblock {
+                let pblock = mapping
+                    .pblock
+                    .checked_add((lblock - mapping_start_lblock) as u64)
+                    .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped pblock overflow"))?;
+                let pblock = usize::try_from(pblock)
+                    .map_err(|_| Error::with_message(Errno::EFBIG, "mapped pblock overflow"))?;
+                let block_offset = pblock
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Error::with_message(Errno::EFBIG, "mapped offset overflow"))?;
+                let file_block_start = lblock
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Error::with_message(Errno::EFBIG, "file offset overflow"))?;
+                let copy_start = file_block_start.max(offset);
+                let copy_end = file_block_start
+                    .checked_add(block_size)
+                    .ok_or_else(|| Error::with_message(Errno::EFBIG, "file offset overflow"))?
+                    .min(end);
+                if copy_start >= copy_end {
+                    continue;
+                }
+
+                let mut block_data = vec![0u8; block_size];
+                self.adapter
+                    .read_offset_into(block_offset, block_data.as_mut_slice());
+                let out_start = copy_start - offset;
+                let out_end = copy_end - offset;
+                let block_start = copy_start - file_block_start;
+                data[out_start..out_end].copy_from_slice(
+                    &block_data[block_start..block_start + (copy_end - copy_start)],
+                );
+            }
+        }
+
+        Ok(read_len)
+    }
+
     pub(super) fn write_direct_at(
         &self,
         ino: u32,
@@ -4044,6 +4575,7 @@ impl Ext4Fs {
         if write_len == 0 {
             return Ok(0);
         }
+        self.evict_page_cache_range(ino, offset, write_len)?;
 
         let profile_enabled = self.phase2_profile_enabled;
         let profile_start_ns = if profile_enabled {
@@ -4062,6 +4594,8 @@ impl Ext4Fs {
         let mut bio_call_profile = DirectWriteBioCallProfile::default();
         let user_buffer_start = reader.cursor() as Vaddr;
         let mut reused_read_mapping_cache = false;
+        let mut touched_inside_write_handle = false;
+        let now = Self::now_unix_seconds_u32();
         if profile_enabled {
             self.maybe_start_direct_write_profile();
         }
@@ -4094,29 +4628,12 @@ impl Ext4Fs {
                         let mappings = ext4
                             .ext4_prepare_write_at(ino, offset, write_len)
                             .map_err(map_ext4_error)?;
+                        ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
+                            .map_err(map_ext4_error)?;
+                        touched_inside_write_handle = true;
                         if profile_enabled {
                             prepare_elapsed_ns =
                                 Self::monotonic_nanos().saturating_sub(prepare_start_ns);
-                        }
-
-                        let data_bio_start_ns = if profile_enabled {
-                            Self::monotonic_nanos()
-                        } else {
-                            0
-                        };
-                        self.submit_direct_write_mappings(
-                            &mappings,
-                            reader,
-                            profile_enabled,
-                            &mut bio_alloc_elapsed_ns,
-                            &mut bio_copy_elapsed_ns,
-                            &mut bio_submit_elapsed_ns,
-                            &mut bio_wait_elapsed_ns,
-                            &mut bio_call_profile,
-                        )?;
-                        if profile_enabled {
-                            data_bio_elapsed_ns =
-                                Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
                         }
 
                         Ok(mappings)
@@ -4127,25 +4644,24 @@ impl Ext4Fs {
                 plan_elapsed_ns = Self::monotonic_nanos().saturating_sub(plan_start_ns);
             }
 
-            if reused_read_mapping_cache {
-                let data_bio_start_ns = if profile_enabled {
-                    Self::monotonic_nanos()
-                } else {
-                    0
-                };
-                self.submit_direct_write_mappings(
-                    &mappings,
-                    reader,
-                    profile_enabled,
-                    &mut bio_alloc_elapsed_ns,
-                    &mut bio_copy_elapsed_ns,
-                    &mut bio_submit_elapsed_ns,
-                    &mut bio_wait_elapsed_ns,
-                    &mut bio_call_profile,
-                )?;
-                if profile_enabled {
-                    data_bio_elapsed_ns = Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
-                }
+            let data_bio_start_ns = if profile_enabled {
+                Self::monotonic_nanos()
+            } else {
+                0
+            };
+            self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+            self.submit_direct_write_mappings(
+                &mappings,
+                reader,
+                profile_enabled,
+                &mut bio_alloc_elapsed_ns,
+                &mut bio_copy_elapsed_ns,
+                &mut bio_submit_elapsed_ns,
+                &mut bio_wait_elapsed_ns,
+                &mut bio_call_profile,
+            )?;
+            if profile_enabled {
+                data_bio_elapsed_ns = Self::monotonic_nanos().saturating_sub(data_bio_start_ns);
             }
 
             Ok(write_len)
@@ -4170,14 +4686,23 @@ impl Ext4Fs {
                 } else {
                     0
                 };
-                let touch_result = self.touch_mtime_ctime(ino);
+                let touch_result = if touched_inside_write_handle {
+                    self.inode_mtime_ctime_cache.lock().insert(ino, now);
+                    Ok(())
+                } else {
+                    self.touch_mtime_ctime(ino)
+                };
                 if profile_enabled {
                     touch_elapsed_ns = Self::monotonic_nanos().saturating_sub(touch_start_ns);
                 }
-                touch_result.map(|_| written)
+                touch_result?;
+                Ok(written)
             }
             Err(err) => Err(err),
         };
+        if result.is_ok() {
+            self.discard_page_cache_range(ino, offset, write_len);
+        }
         if profile_enabled {
             let writes = self.direct_write_profile.record_write(
                 write_len,
@@ -4209,6 +4734,7 @@ impl Ext4Fs {
                 seq, ino, new_size
             );
         }
+        self.sync_page_cache_for_inode_locked(ino)?;
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Truncate { ino };
         let truncate_result = self
@@ -4227,6 +4753,84 @@ impl Ext4Fs {
             });
         self.invalidate_direct_read_cache(ino);
         truncate_result?;
+        self.reset_page_cache_after_truncate(ino, new_size as usize)?;
+        self.inode_mtime_ctime_cache.lock().insert(ino, now);
+        Ok(())
+    }
+
+    pub(super) fn fallocate(
+        &self,
+        ino: u32,
+        mode: FallocMode,
+        offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.lock();
+        self.evict_page_cache_range(ino, offset, len)?;
+
+        let now = Self::now_unix_seconds_u32();
+        let op = JournaledOp::Write { ino, len };
+        self.run_journaled_ext4(Some(op), |ext4| {
+            match mode {
+                FallocMode::Allocate => {
+                    ext4.ext4_allocate_range(ino, offset, len, false)
+                        .map_err(map_ext4_error)?;
+                }
+                FallocMode::AllocateKeepSize => {
+                    ext4.ext4_allocate_range(ino, offset, len, true)
+                        .map_err(map_ext4_error)?;
+                }
+                FallocMode::ZeroRange => {
+                    ext4.ext4_zero_range(ino, offset, len, false)
+                        .map_err(map_ext4_error)?;
+                }
+                FallocMode::ZeroRangeKeepSize => {
+                    ext4.ext4_zero_range(ino, offset, len, true)
+                        .map_err(map_ext4_error)?;
+                }
+                FallocMode::PunchHoleKeepSize => {
+                    ext4.ext4_punch_hole_keep_size(ino, offset, len)
+                        .map_err(map_ext4_error)?;
+                }
+                FallocMode::CollapseRange
+                | FallocMode::InsertRange
+                | FallocMode::AllocateUnshareRange => {
+                    return_errno_with_message!(
+                        Errno::EOPNOTSUPP,
+                        "ext4 fallocate mode is not supported"
+                    );
+                }
+            }
+            ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
+                .map_err(map_ext4_error)?;
+            Ok(())
+        })
+        .map_err(|err| {
+            if err.error() == Errno::EOPNOTSUPP {
+                debug!(
+                    "ext4 fallocate unsupported: ino={} mode={:?} offset={} len={}",
+                    ino, mode, offset, len
+                );
+            } else {
+                error!(
+                    "ext4 fallocate failed: ino={} mode={:?} offset={} len={} err={:?}",
+                    ino, mode, offset, len, err
+                );
+            }
+            err
+        })?;
+
+        self.invalidate_direct_read_cache(ino);
+        self.evict_page_cache_range(ino, offset, len)?;
+        let file_size = self.stat(ino)?.size as usize;
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.resize(file_size)?;
+        }
         self.inode_mtime_ctime_cache.lock().insert(ino, now);
         Ok(())
     }
@@ -4488,6 +5092,7 @@ impl FileSystem for Ext4Fs {
         if self.is_shutdown() {
             return Ok(());
         }
+        self.sync_all_page_caches()?;
         self.flush_pending_jbd2_transactions();
         self.block_device.sync()?;
         self.flush_pending_jbd2_transactions();

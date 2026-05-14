@@ -9,18 +9,18 @@ use ostd::mm::VmIo;
 
 use super::fs::Ext4Fs;
 use crate::{
-    current_userspace,
-    device,
+    current_userspace, device,
     fs::{
         inode_handle::FileIo,
         utils::{
-            AccessMode, DirentVisitor, Extension, FileSystem, Inode, InodeIo, InodeMode,
-            InodeType, Metadata, MknodType, StatusFlags, SymbolicLink,
+            AccessMode, DirentVisitor, Extension, FallocMode, FileSystem, Inode, InodeIo,
+            InodeMode, InodeType, Metadata, MknodType, StatusFlags, SymbolicLink,
         },
     },
     prelude::*,
     process::{Gid, Uid},
     util::ioctl::RawIoctl,
+    vm::vmo::Vmo,
 };
 
 // Step 4b: `FS_IOC_GOINGDOWN = _IOR('X', 125, __u32)` from Linux
@@ -162,6 +162,10 @@ impl InodeIo for Ext4Inode {
             return fs.read_direct_at(self.ino, offset, writer, status_flags);
         }
 
+        if fs.page_cache_enabled() {
+            return fs.read_at_page_cache(self.ino, offset, writer, status_flags);
+        }
+
         let mut data = vec![0u8; writer.avail()];
         let read_len = fs.read_at(self.ino, offset, data.as_mut_slice(), status_flags)?;
         writer.write_fallible(&mut VmReader::from(&data[..read_len]).to_fallible())?;
@@ -189,6 +193,10 @@ impl InodeIo for Ext4Inode {
             return fs.write_direct_at(self.ino, offset, reader);
         }
 
+        if fs.page_cache_enabled() {
+            return fs.write_at_page_cache(self.ino, offset, reader);
+        }
+
         let mut data = vec![0u8; reader.remain()];
         reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
         fs.write_at(self.ino, offset, data.as_slice())
@@ -203,6 +211,14 @@ impl Inode for Ext4Inode {
     fn resize(&self, new_size: usize) -> Result<()> {
         let fs = self.ext4_fs()?;
         fs.truncate(self.ino, new_size as u64)
+    }
+
+    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        if self.type_() != InodeType::File {
+            return_errno!(Errno::EOPNOTSUPP);
+        }
+        let fs = self.ext4_fs()?;
+        fs.fallocate(self.ino, mode, offset, len)
     }
 
     fn metadata(&self) -> Metadata {
@@ -273,6 +289,17 @@ impl Inode for Ext4Inode {
         Self::type_from_mode(self.stat_meta().mode)
     }
 
+    fn page_cache(&self) -> Option<Arc<Vmo>> {
+        if self.type_() != InodeType::File {
+            return None;
+        }
+        let fs = self.ext4_fs().ok()?;
+        if !fs.page_cache_enabled() {
+            return None;
+        }
+        fs.page_cache_for_inode(self.ino).ok()
+    }
+
     fn mode(&self) -> Result<InodeMode> {
         Ok(InodeMode::from_bits_truncate(self.stat_meta().mode as _))
     }
@@ -327,6 +354,18 @@ impl Inode for Ext4Inode {
             }
             _ => None,
         }
+    }
+
+    fn on_open_file_handle(&self) -> Result<()> {
+        let fs = self.ext4_fs()?;
+        fs.on_open_file_handle(self.ino);
+        Ok(())
+    }
+
+    fn on_close_file_handle(&self) -> Result<()> {
+        let fs = self.ext4_fs()?;
+        fs.on_close_file_handle(self.ino)?;
+        Ok(())
     }
 
     fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
@@ -436,6 +475,14 @@ impl Inode for Ext4Inode {
         fs.unlink_at(self.ino, name)
     }
 
+    fn cleanup_unlinked(&self) -> Result<()> {
+        if self.type_() != InodeType::File || self.metadata().nlinks != 0 {
+            return Ok(());
+        }
+        let fs = self.ext4_fs()?;
+        fs.cleanup_unlinked_file(self.ino)
+    }
+
     fn rmdir(&self, name: &str) -> Result<()> {
         if self.type_() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -471,8 +518,11 @@ impl Inode for Ext4Inode {
             // The trailing block_device().sync() ensures the journal commit
             // block (and any in-flight metadata writes) reach durable storage,
             // making this fsync host-crash safe (was missing prior to 4a-1).
+            fs.sync_page_cache_for_inode(self.ino)?;
             fs.fsync_regular_file(self.ino)?;
-            fs.block_device().sync().map_err(|_| Error::new(Errno::EIO))?;
+            fs.block_device()
+                .sync()
+                .map_err(|_| Error::new(Errno::EIO))?;
             Ok(())
         } else {
             // Directory / other types: fall back to fs-wide sync (already
@@ -486,8 +536,11 @@ impl Inode for Ext4Inode {
         if self.type_() == InodeType::File {
             // Step 4a-1: same pattern as sync_all. fdatasync semantics are
             // currently equivalent to fsync (conservative); see plan §4.6.
+            fs.sync_page_cache_for_inode(self.ino)?;
             fs.fsync_regular_file(self.ino)?;
-            fs.block_device().sync().map_err(|_| Error::new(Errno::EIO))?;
+            fs.block_device()
+                .sync()
+                .map_err(|_| Error::new(Errno::EIO))?;
             Ok(())
         } else {
             fs.sync()

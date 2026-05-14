@@ -8,10 +8,10 @@ use crate::simple_interface::SimpleBlockRange;
 use crate::utils::path_check;
 // use std::time::{Duration, Instant};
 
-// Keep sparse-write allocation modest: large enough to avoid pathological
-// one-block extent growth under random sparse writes, but still conservative
-// enough not to explode mapping size under truncate-heavy workloads.
-const WRITE_PREALLOC_BLOCKS: u32 = 16;
+// ext4_rs does not model unwritten extents yet. Do not map extra blocks beyond
+// the write range, otherwise later reads from sparse regions can expose stale
+// contents from reused physical blocks.
+const WRITE_PREALLOC_BLOCKS: u32 = 1;
 const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 1;
 const GENERIC014_MAP_PROFILE_LIMIT: u64 = 64;
 
@@ -1139,37 +1139,241 @@ impl Ext4 {
         if len == 0 {
             return Ok(Vec::new());
         }
-        if offset % block_size != 0 || len % block_size != 0 {
-            return_errno_with_message!(Errno::EINVAL, "direct write range is not block aligned");
-        }
 
         let mut inode_ref = self.get_inode_ref(inode);
         let file_size = inode_ref.inode.size();
         let write_end = offset
             .checked_add(len)
             .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        if write_end > EXT4_MAX_FILE_SIZE as usize {
+            return_errno_with_message!(Errno::EFBIG, "file size too large");
+        }
         let lblock_start = u32::try_from(offset / block_size)
             .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
-        let lblock_end = u32::try_from(write_end / block_size)
+        let lblock_end = u32::try_from((write_end - 1) / block_size + 1)
             .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
 
+        let mut newly_hole_lblocks = Vec::new();
+        for lblock in lblock_start..lblock_end {
+            match self.get_pblock_idx(&inode_ref, lblock) {
+                Ok(_) => {}
+                Err(err) if err.error() == Errno::ENOENT => newly_hole_lblocks.push(lblock),
+                Err(err) => return Err(err),
+            }
+        }
+
         let mut start_bgid = self.initial_write_alloc_bgid(&inode_ref, lblock_start, lblock_end);
-        self.ensure_write_range_mapped(
+        let allocated_total = self.ensure_write_range_mapped(
             &mut inode_ref,
             lblock_start,
             lblock_end,
             &mut start_bgid,
         )?;
 
-        if write_end > file_size as usize {
-            if write_end > EXT4_MAX_FILE_SIZE as usize {
-                return_errno_with_message!(Errno::EFBIG, "file size too large");
+        if !newly_hole_lblocks.is_empty() {
+            let zero_block = vec![0u8; block_size];
+            for lblock in newly_hole_lblocks {
+                let pblock = self.get_pblock_idx(&inode_ref, lblock)?;
+                let pblock = usize::try_from(pblock).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+                let block_offset = pblock
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+                self.block_device.write_offset(block_offset, zero_block.as_slice());
             }
+        }
+
+        if write_end > file_size as usize {
             inode_ref.inode.set_size(write_end as u64);
+            self.write_back_inode(&mut inode_ref);
+        } else if allocated_total > 0 {
             self.write_back_inode(&mut inode_ref);
         }
 
         self.collect_block_ranges(&inode_ref, lblock_start, lblock_end - lblock_start)
+    }
+
+    pub fn allocate_range(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        let block_size = self.super_block.block_size() as usize;
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size();
+        let range_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        if range_end > EXT4_MAX_FILE_SIZE as usize {
+            return_errno_with_message!(Errno::EFBIG, "file size too large");
+        }
+
+        let lblock_start = u32::try_from(offset / block_size)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_end = u32::try_from((range_end - 1) / block_size + 1)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+
+        let mut previously_hole = Vec::new();
+        for lblock in lblock_start..lblock_end {
+            match self.get_pblock_idx(&inode_ref, lblock) {
+                Ok(_) => {}
+                Err(e) if e.error() == Errno::ENOENT => previously_hole.push(lblock),
+                Err(e) => return Err(e),
+            }
+        }
+
+        let mut start_bgid = self.initial_write_alloc_bgid(&inode_ref, lblock_start, lblock_end);
+        let allocated_total = self.ensure_write_range_mapped(
+            &mut inode_ref,
+            lblock_start,
+            lblock_end,
+            &mut start_bgid,
+        )?;
+
+        if !previously_hole.is_empty() {
+            let zero_block = vec![0u8; block_size];
+            for lblock in previously_hole {
+                let pblock = self.get_pblock_idx(&inode_ref, lblock)?;
+                let pblock = usize::try_from(pblock).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+                let block_offset = pblock
+                    .checked_mul(block_size)
+                    .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+                self.block_device.write_offset(block_offset, zero_block.as_slice());
+            }
+        }
+
+        if !keep_size && range_end > file_size as usize {
+            inode_ref.inode.set_size(range_end as u64);
+            self.write_back_inode(&mut inode_ref);
+        } else if allocated_total > 0 {
+            self.write_back_inode(&mut inode_ref);
+        }
+
+        self.collect_block_ranges(&inode_ref, lblock_start, lblock_end - lblock_start)
+    }
+
+    pub fn zero_range(
+        &self,
+        inode: u32,
+        offset: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<usize> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        self.allocate_range(inode, offset, len, keep_size)?;
+
+        let mut inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size() as usize;
+        let range_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        let zero_end = if keep_size {
+            range_end.min(file_size)
+        } else {
+            range_end
+        };
+        if offset >= zero_end {
+            return Ok(0);
+        }
+
+        let zero_len = zero_end - offset;
+        drop(inode_ref);
+        self.write_zeros_at(inode, offset, zero_len)?;
+        Ok(zero_len)
+    }
+
+    pub fn punch_hole_keep_size(&self, inode: u32, offset: usize, len: usize) -> Result<usize> {
+        if len == 0 {
+            return Ok(0);
+        }
+
+        let mut inode_ref = self.get_inode_ref(inode);
+        let file_size = inode_ref.inode.size() as usize;
+        if offset >= file_size {
+            return Ok(0);
+        }
+        let range_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?
+            .min(file_size);
+        let zero_len = range_end - offset;
+        drop(inode_ref);
+        self.write_zeros_at(inode, offset, zero_len)?;
+        Ok(zero_len)
+    }
+
+    fn write_zeros_at(&self, inode: u32, offset: usize, len: usize) -> Result<()> {
+        const ZERO_WRITE_CHUNK: usize = 64 * 1024;
+
+        let zero_buf = vec![0u8; ZERO_WRITE_CHUNK.min(len)];
+        let mut written = 0usize;
+        while written < len {
+            let chunk_len = (len - written).min(zero_buf.len());
+            self.write_at(inode, offset + written, &zero_buf[..chunk_len])?;
+            written += chunk_len;
+        }
+        Ok(())
+    }
+
+    fn zero_mapped_range(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        offset: usize,
+        len: usize,
+        require_mapped: bool,
+    ) -> Result<()> {
+        let block_size = self.super_block.block_size() as usize;
+        let range_end = offset
+            .checked_add(len)
+            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+        if offset >= range_end {
+            return Ok(());
+        }
+
+        let lblock_start = u32::try_from(offset / block_size)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let lblock_end = u32::try_from((range_end - 1) / block_size + 1)
+            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+        let zero_block = vec![0u8; block_size];
+        let mut block_data = vec![0u8; block_size];
+
+        for lblock in lblock_start..lblock_end {
+            let pblock = match self.get_pblock_idx(inode_ref, lblock) {
+                Ok(pblock) => pblock,
+                Err(e) if e.error() == Errno::ENOENT && !require_mapped => continue,
+                Err(e) => return Err(e),
+            };
+            let pblock = usize::try_from(pblock).map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            let block_offset = pblock
+                .checked_mul(block_size)
+                .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+            let file_block_start = (lblock as usize)
+                .checked_mul(block_size)
+                .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+            let zero_start = offset.max(file_block_start);
+            let zero_end = range_end.min(file_block_start + block_size);
+            let in_block_start = zero_start - file_block_start;
+            let in_block_end = zero_end - file_block_start;
+
+            if in_block_start == 0 && in_block_end == block_size {
+                self.block_device.write_offset(block_offset, zero_block.as_slice());
+            } else {
+                self.block_device
+                    .read_offset_into(block_offset, block_data.as_mut_slice());
+                block_data[in_block_start..in_block_end].fill(0);
+                self.block_device.write_offset(block_offset, block_data.as_slice());
+            }
+        }
+
+        Ok(())
     }
 
     /// Write data to a file at a given offset
@@ -1210,6 +1414,14 @@ impl Ext4 {
         } else {
             None
         };
+        let mut newly_hole_lblocks = Vec::new();
+        for lblock in lblock_start..lblock_end {
+            match self.get_pblock_idx(&inode_ref, lblock) {
+                Ok(_) => {}
+                Err(err) if err.error() == Errno::ENOENT => newly_hole_lblocks.push(lblock),
+                Err(err) => return Err(err),
+            }
+        }
 
         let mut start_bgid = self.initial_write_alloc_bgid(&inode_ref, lblock_start, lblock_end);
         let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
@@ -1326,6 +1538,15 @@ impl Ext4 {
             })
         };
 
+        if !newly_hole_lblocks.is_empty() {
+            let zero_block = vec![0u8; block_size];
+            for lblock in newly_hole_lblocks {
+                let pblock_idx = resolve_pblock(lblock)?;
+                let blk_off = block_offset(pblock_idx)?;
+                self.block_device.write_offset(blk_off, zero_block.as_slice());
+            }
+        }
+
         let mut written = 0usize;
         let mut iblk_idx = lblock_start;
         let unaligned = offset % block_size;
@@ -1392,6 +1613,8 @@ impl Ext4 {
                 return_errno_with_message!(Errno::EFBIG, "file size too large");
             }
             inode_ref.inode.set_size(new_size as u64);
+            self.write_back_inode(&mut inode_ref);
+        } else if allocated_total > 0 {
             self.write_back_inode(&mut inode_ref);
         }
 
@@ -1465,6 +1688,27 @@ impl Ext4 {
         let new_blocks_cnt = ((new_size + block_size - 1) / block_size) as u32;
         let old_blocks_cnt = ((old_size + block_size - 1) / block_size) as u32;
         let diff_blocks_cnt = old_blocks_cnt - new_blocks_cnt;
+
+        let tail_offset = (new_size % block_size) as usize;
+        if tail_offset != 0 {
+            let tail_lblock = u32::try_from(new_size / block_size)
+                .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+            match self.get_pblock_idx(inode_ref, tail_lblock) {
+                Ok(pblock) => {
+                    let block_offset = usize::try_from(pblock)
+                        .map_err(|_| Ext4Error::new(Errno::EFBIG))?
+                        .checked_mul(block_size as usize)
+                        .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+                    let mut block_data = vec![0u8; block_size as usize];
+                    self.block_device
+                        .read_offset_into(block_offset, block_data.as_mut_slice());
+                    block_data[tail_offset..].fill(0);
+                    self.block_device.write_offset(block_offset, block_data.as_slice());
+                }
+                Err(e) if e.error() == Errno::ENOENT => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         if diff_blocks_cnt > 0 {
             self.extent_remove_space(inode_ref, new_blocks_cnt, EXT_MAX_BLOCKS)?;

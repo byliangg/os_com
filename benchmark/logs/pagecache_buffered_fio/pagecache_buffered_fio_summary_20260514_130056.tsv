@@ -1,0 +1,7 @@
+label	kind	cold_or_write_MBps	warm_MBps	warm_vs_cold_percent	log
+linux	read	3948.0	7457.0	188.88	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/linux_buffered_read_20260514_130056.log
+asterinas_page_cache_0	read	121.0	122.0	100.83	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/aster_pagecache0_buffered_read_20260514_130056.log
+asterinas_page_cache_1	read	19.9	4022.0	20211.06	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/aster_pagecache1_buffered_read_20260514_130056.log
+linux	write	633.0	N/A	N/A	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/linux_buffered_write_20260514_130056.log
+asterinas_page_cache_0	write	38.4	N/A	N/A	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/aster_pagecache0_buffered_write_20260514_130056.log
+asterinas_page_cache_1	write	10.8	N/A	N/A	/home/lby/os_com_codex/asterinas/benchmark/logs/pagecache_buffered_fio/aster_pagecache1_buffered_write_20260514_130056.log

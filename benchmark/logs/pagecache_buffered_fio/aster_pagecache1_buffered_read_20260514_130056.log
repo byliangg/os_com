@@ -1,0 +1,647 @@
+info: syncing channel updates for 'nightly-2025-12-06-x86_64-unknown-linux-gnu'
+info: latest update on 2025-12-06, rust version 1.94.0-nightly (1aa9bab4e 2025-12-05)
+info: component 'llvm-tools' for target 'x86_64-unknown-linux-gnu' is up to date
+info: component 'rust-src' is up to date
+info: component 'rustc-dev' for target 'x86_64-unknown-linux-gnu' is up to date
+info: component 'rustfmt' for target 'x86_64-unknown-linux-gnu' is up to date
+info: downloading component 'rust-std' for 'loongarch64-unknown-none-softfloat'
+info: downloading component 'rust-std' for 'riscv64imac-unknown-none-elf'
+info: downloading component 'rust-std' for 'x86_64-unknown-none'
+info: installing component 'rust-std' for 'loongarch64-unknown-none-softfloat'
+info: installing component 'rust-std' for 'riscv64imac-unknown-none-elf'
+info: installing component 'rust-std' for 'x86_64-unknown-none'
+  Installing cargo-osdk v0.17.0 (/root/asterinas/osdk)
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded allocator-api2 v0.2.21
+  Downloaded anstyle-query v1.1.2
+  Downloaded cfg-if v1.0.0
+  Downloaded anstyle v1.0.10
+  Downloaded adler32 v1.2.0
+  Downloaded anstream v0.6.18
+  Downloaded clap_lex v0.7.4
+  Downloaded bitflags v1.3.2
+  Downloaded arrayvec v0.7.6
+  Downloaded anstyle-parse v0.2.6
+  Downloaded colorchoice v1.0.3
+  Downloaded number_prefix v0.4.0
+  Downloaded str_stack v0.1.0
+  Downloaded rev_buf_reader v0.3.0
+  Downloaded autocfg v1.4.0
+  Downloaded clap_derive v4.5.32
+  Downloaded env_home v0.1.0
+  Downloaded errno v0.3.12
+  Downloaded toml_datetime v0.6.9
+  Downloaded zero v0.1.3
+  Downloaded toml_write v0.1.1
+  Downloaded quote v1.0.40
+  Downloaded is-terminal v0.4.16
+  Downloaded rgb v0.8.50
+  Downloaded semver v1.0.27
+  Downloaded iana-time-zone v0.1.63
+  Downloaded unicode-ident v1.0.18
+  Downloaded xmas-elf v0.10.0
+  Downloaded clap v4.5.38
+  Downloaded dashmap v6.1.0
+  Downloaded dary_heap v0.3.7
+  Downloaded which v8.0.0
+  Downloaded bitflags v2.9.0
+  Downloaded whoami v1.6.1
+  Downloaded parking_lot_core v0.9.10
+  Downloaded lock_api v0.4.12
+  Downloaded tempfile v3.14.0
+  Downloaded log v0.4.27
+  Downloaded smallvec v1.15.0
+  Downloaded num-traits v0.2.19
+  Downloaded crc32fast v1.4.2
+  Downloaded rle-decode-fast v1.0.3
+  Downloaded bytemuck v1.23.0
+  Downloaded console v0.15.11
+  Downloaded serde_derive v1.0.219
+  Downloaded proc-macro2 v1.0.95
+  Downloaded num-format v0.4.4
+  Downloaded clap_builder v4.5.38
+  Downloaded chrono v0.4.41
+  Downloaded serde v1.0.219
+  Downloaded indicatif v0.17.11
+  Downloaded toml v0.8.22
+  Downloaded indexmap v2.9.0
+  Downloaded inferno v0.11.21
+  Downloaded quick-xml v0.26.0
+  Downloaded hashbrown v0.15.3
+  Downloaded hashbrown v0.14.5
+  Downloaded portable-atomic v1.11.0
+  Downloaded regex v1.11.1
+  Downloaded rustix v0.38.44
+  Downloaded rustix v1.0.7
+  Downloaded jiff v0.2.13
+  Downloaded libc v0.2.172
+  Downloaded linux-raw-sys v0.4.15
+  Downloaded linux-raw-sys v0.9.4
+  Downloaded toml_edit v0.22.26
+  Downloaded serde_json v1.0.140
+  Downloaded crossbeam-channel v0.5.15
+  Downloaded unicode-width v0.2.0
+  Downloaded syn v2.0.101
+  Downloaded winnow v0.7.10
+  Downloaded zerocopy v0.8.39
+  Downloaded regex-automata v0.4.9
+  Downloaded zerocopy-derive v0.8.39
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `libflate` (lib) generated 5 warnings
+    Finished `release` profile [optimized] target(s) in 9.98s
+  Installing /root/.cargo/bin/cargo-osdk
+   Installed package `cargo-osdk v0.17.0 (/root/asterinas/osdk)` (executable `cargo-osdk`)
+Running benchmark fio/ext4_buffered_seq_read_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 7012375f-0b5c-443f-9df9-d08d7985459e
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv
+  /nix/store/q1ngyrcfx6a4srlnlzy2hbidb8yg3nk1-benchmark-0.1.0.drv
+  /nix/store/zip2a5i5iqxdn7vpn42lpidiqjc8032a-runtime-deps.drv
+  /nix/store/k3rjd90yvjpgb25zqdgax18qmippzwhk-initramfs.drv
+building '/nix/store/q1ngyrcfx6a4srlnlzy2hbidb8yg3nk1-benchmark-0.1.0.drv'...
+building '/nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv'...
+Warning: the host's /etc/resolv.conf is not valid for the guest VM (containing lookback addresses).
+Fall back to Cloudflare's public DNS servers (1.1.1.1).
+Consider using the DNS_SERVER Makefile variable to specify DNS server explicitly.
+For example: make DNS_SERVER="192.168.1.1"
+building '/nix/store/zip2a5i5iqxdn7vpn42lpidiqjc8032a-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/k3rjd90yvjpgb25zqdgax18qmippzwhk-initramfs.drv'...
+/nix/store/xfsfrplp6nfnz70n6nvpzq8d4i1dwqmp-initramfs
+this derivation will be built:
+  /nix/store/x6ysr3x92lf2294i8q2a5bqcksfnzy5m-initramfs-image.drv
+building '/nix/store/x6ysr3x92lf2294i8q2a5bqcksfnzy5m-initramfs-image.drv'...
+/build/tmp.sjXB0ASOu3 /build
+176148 blocks
+/build
+/nix/store/xrzr11h4vm36366pxj9syqgxr9y0czb5-initramfs-image
+Running benchmark fio/ext4_buffered_seq_read_bw on Asterinas...
+these 3 derivations will be built:
+  /nix/store/9xzw8pjsr8ifhsqbhllpawcmfwl098cj-benchmark-0.1.0.drv
+  /nix/store/grw171wxsh8wm4197xxzkzr1m0lvmld0-runtime-deps.drv
+  /nix/store/id9ixps5ans80fl2kjyr2ksfhfi350zx-initramfs.drv
+building '/nix/store/9xzw8pjsr8ifhsqbhllpawcmfwl098cj-benchmark-0.1.0.drv'...
+building '/nix/store/grw171wxsh8wm4197xxzkzr1m0lvmld0-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/id9ixps5ans80fl2kjyr2ksfhfi350zx-initramfs.drv'...
+/nix/store/v1ipm5iv0haxf5iikm215z64525pin6y-initramfs
+these 4 derivations will be built:
+  /nix/store/clzgr428w0z4nampv6s1ylidw13m44mb-benchmark-0.1.0.drv
+  /nix/store/spyg437hwvwgwb0vqp2vwsg9m13daflc-runtime-deps.drv
+  /nix/store/fhiqpff7gz488zqrpwvb47zchn5fnmry-initramfs.drv
+  /nix/store/vp1i8hl0rpd56a1sqzy1mi6dx9hagxpa-initramfs-image.drv
+building '/nix/store/clzgr428w0z4nampv6s1ylidw13m44mb-benchmark-0.1.0.drv'...
+building '/nix/store/spyg437hwvwgwb0vqp2vwsg9m13daflc-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/fhiqpff7gz488zqrpwvb47zchn5fnmry-initramfs.drv'...
+building '/nix/store/vp1i8hl0rpd56a1sqzy1mi6dx9hagxpa-initramfs-image.drv'...
+/build/tmp.ohMPCwIoJz /build
+176150 blocks
+/build
+/nix/store/ckmamfy8x5vdhcajdy22dvxa4banh5i6-initramfs-image
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+     Locking 221 packages to latest Rust 1.94.0-nightly compatible versions
+      Adding subtle v2.4.1 (available: v2.6.1)
+ Downloading crates ...
+  Downloaded acpi v5.2.0
+  Downloaded bit_field v0.10.3
+  Downloaded universal-hash v0.4.1
+  Downloaded defmt-parser v1.0.0
+  Downloaded volatile v0.6.1
+  Downloaded defmt v0.3.100
+  Downloaded ext-trait v1.0.1
+  Downloaded cobs v0.3.0
+  Downloaded darling v0.13.4
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded bittle v0.5.7
+  Downloaded darling_macro v0.13.4
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded cipher v0.3.0
+  Downloaded byteorder v1.5.0
+  Downloaded aead v0.4.3
+  Downloaded dary_heap v0.3.9
+  Downloaded ctr v0.8.0
+  Downloaded autocfg v1.5.0
+  Downloaded opaque-debug v0.3.1
+  Downloaded getset v0.1.6
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded hash32 v0.2.1
+  Downloaded powerfmt v0.2.0
+  Downloaded ghash v0.4.4
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded serde_spanned v0.6.9
+  Downloaded extension-traits v1.0.1
+  Downloaded ptr_meta v0.3.1
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded defmt v1.1.0
+  Downloaded deranged v0.5.8
+  Downloaded num-conv v0.2.1
+  Downloaded radium v0.7.0
+  Downloaded subtle v2.4.1
+  Downloaded defmt-macros v1.1.0
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded funty v2.0.0
+  Downloaded takeable v0.2.2
+  Downloaded time-core v0.1.8
+  Downloaded hash32 v0.3.1
+  Downloaded tap v1.0.1
+  Downloaded never-say-never v6.6.666
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded nougat v0.2.4
+  Downloaded volatile v0.4.6
+  Downloaded toml_datetime v0.6.11
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded managed v0.8.0
+  Downloaded polyval v0.5.3
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded thiserror-impl v2.0.18
+  Downloaded rand_core v0.9.5
+  Downloaded thiserror v2.0.18
+  Downloaded unicode-ident v1.0.24
+  Downloaded bitflags v2.11.1
+  Downloaded memoffset v0.9.1
+  Downloaded lru v0.16.4
+  Downloaded crc32fast v1.5.0
+  Downloaded rustversion v1.0.22
+  Downloaded tdx-guest v0.2.4
+  Downloaded quote v1.0.45
+  Downloaded foldhash v0.2.0
+  Downloaded wyz v0.5.1
+  Downloaded unwinding v0.2.8
+  Downloaded owo-colors v4.3.0
+  Downloaded semver v1.0.28
+  Downloaded paste v1.0.15
+  Downloaded once_cell v1.21.4
+  Downloaded ghost v0.1.21
+  Downloaded generic-array v0.14.9
+  Downloaded uguid v2.2.1
+  Downloaded font8x8 v0.2.7
+  Downloaded darling_core v0.13.4
+  Downloaded postcard v1.1.3
+  Downloaded toml v0.7.8
+  Downloaded const_format v0.2.36
+  Downloaded aes-gcm v0.9.4
+  Downloaded aes v0.7.5
+  Downloaded spin v0.9.8
+  Downloaded bitvec v1.0.1
+  Downloaded toml_edit v0.19.15
+  Downloaded proc-macro2 v1.0.106
+  Downloaded multiboot2 v0.24.1
+  Downloaded log v0.4.29
+  Downloaded lending-iterator v0.1.7
+  Downloaded intrusive-collections v0.9.7
+  Downloaded syn v2.0.117
+  Downloaded zerocopy v0.8.48
+  Downloaded x86_64 v0.14.13
+  Downloaded konst v0.2.20
+  Downloaded typenum v1.20.0
+  Downloaded rand v0.9.4
+  Downloaded json v0.12.4
+  Downloaded iced-x86 v1.21.0
+  Downloaded time v0.3.47
+  Downloaded winnow v0.5.40
+  Downloaded uefi-raw v0.12.0
+  Downloaded raw-cpuid v10.7.0
+  Downloaded itertools v0.10.5
+  Downloaded heapless v0.7.17
+  Downloaded gimli v0.28.1
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded libc v0.2.186
+  Downloaded gimli v0.32.3
+  Downloaded multiboot2-common v0.3.0
+  Downloaded heapless v0.8.0
+  Downloaded memchr v2.8.0
+  Downloaded indexmap v2.14.0
+  Downloaded hashbrown v0.17.1
+  Downloaded x86 v0.52.0
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded rustc-literal-escaper v0.0.5
+  Downloaded getopts v0.2.24
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `linux-boot-params` (lib) generated 1 warning
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:79:7
+   |
+79 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1798:8
+     |
+1111 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1798 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/.target_bench/osdk/aster-kernel-run-base)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 43.71s
+grub-mkrescue: warning: cannot open directory `/usr/local/grub/share/locale': No such file or directory.
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 30.0g free
+Added to ISO image: directory '/'='/tmp/grub.rOEIxb'
+xorriso : UPDATE :     298 files added in 1 seconds
+Added to ISO image: directory '/'='/root/asterinas/.target_bench/osdk/iso_root'
+xorriso : UPDATE :     303 files added in 1 seconds
+ISO image produced: 23271 sectors
+Written to medium : 23271 sectors at LBA 0
+Writing to 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso' completed successfully.
+
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+WARNING: no console will be available to OS
+error: no suitable video mode[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running benchmark: fio/ext4_buffered_seq_read_bw on asterinas
+Using FIO_BS=1M
+Using FIO_SIZE=1G
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the FIO buffered sequential read test (Ext4) ***
+*** Preparing the read file with direct I/O to avoid pre-warming buffered cache ***
+prepare_direct_write: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+prepare_direct_write: Laying out IO file (1 file / 1024MiB)
+Jobs: 1 (f=1)Jobs: 1 (f=1): [W(1)][10.7%][w=53.9MiB/s][w=53 IOPS][eta 00m:25s]Jobs: 1 (f=1): [W(1)][16.7%][w=56.9MiB/s][w=56 IOPS][eta 00m:20s]Jobs: 1 (f=1): [W(1)][21.7%][w=56.9MiB/s][w=56 IOPS][eta 00m:18s]Jobs: 1 (f=1): [W(1)][27.3%][w=56.9MiB/s][w=56 IOPS][eta 00m:16s]Jobs: 1 (f=1): [W(1)][33.3%][w=52.9MiB/s][w=52 IOPS][eta 00m:14s]Jobs: 1 (f=1): [W(1)][38.1%][w=55.9MiB/s][w=55 IOPS][eta 00m:13s]Jobs: 1 (f=1): [W(1)][45.0%][w=56.9MiB/s][w=56 IOPS][eta 00m:11s]Jobs: 1 (f=1): [W(1)][50.0%][w=55.9MiB/s][w=55 IOPS][eta 00m:10s]Jobs: 1 (f=1): [W(1)][55.0%][w=53.9MiB/s][w=53 IOPS][eta 00m:09s]Jobs: 1 (f=1): [W(1)][60.0%][w=56.9MiB/s][w=56 IOPS][eta 00m:08s]Jobs: 1 (f=1): [W(1)][68.4%][w=54.9MiB/s][w=54 IOPS][eta 00m:06s]Jobs: 1 (f=1): [W(1)][73.7%][w=56.9MiB/s][w=56 IOPS][eta 00m:05s]Jobs: 1 (f=1): [W(1)][78.9%][w=52.9MiB/s][w=52 IOPS][eta 00m:04s]Jobs: 1 (f=1): [W(1)][84.2%][w=54.9MiB/s][w=54 IOPS][eta 00m:03s]Jobs: 1 (f=1): [W(1)][89.5%][w=56.9MiB/s][w=56 IOPS][eta 00m:02s]Jobs: 1 (f=1): [W(1)][94.7%][w=54.9MiB/s][w=54 IOPS][eta 00m:01s]Jobs: 1 (f=1): [W(1)][100.0%][w=36.9MiB/s][w=36 IOPS][eta 00m:00s]
+prepare_direct_write: (groupid=0, jobs=1): err= 0: pid=17: Thu May 14 05:07:10 2026
+  write: IOPS=54, BW=54.2MiB/s (56.8MB/s)(1024MiB/18889msec); 0 zone resets
+    clat (usec): min=15942, max=50125, avg=18390.16, stdev=2947.93
+     lat (usec): min=15956, max=50182, avg=18405.70, stdev=2949.48
+    clat percentiles (usec):
+     |  1.00th=[16188],  5.00th=[16450], 10.00th=[16712], 20.00th=[16909],
+     | 30.00th=[17171], 40.00th=[17433], 50.00th=[17695], 60.00th=[17957],
+     | 70.00th=[18744], 80.00th=[19006], 90.00th=[19792], 95.00th=[21103],
+     | 99.00th=[37487], 99.50th=[38536], 99.90th=[41157], 99.95th=[50070],
+     | 99.99th=[50070]
+   bw (  KiB/s): min=36790, max=59392, per=100.00%, avg=55762.73, stdev=4729.75, samples=37
+   iops        : min=   35, max=   58, avg=54.19, stdev= 4.82, samples=37
+  lat (msec)   : 20=91.70%, 50=8.20%, 100=0.10%
+  cpu          : usr=0.13%, sys=28.32%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,1024,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=54.2MiB/s (56.8MB/s), 54.2MiB/s-54.2MiB/s (56.8MB/s-56.8MB/s), io=1024MiB (1074MB), run=18889-18889msec
+*** Running the cold buffered read pass (direct=0) ***
+buffered_cold_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+Jobs: 1 (f=1)Jobs: 1 (f=1)Jobs: 1 (f=1): [R(1)][5.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:53s]Jobs: 1 (f=1): [R(1)][7.3%][r=20.0MiB/s][r=20 IOPS][eta 00m:51s]Jobs: 1 (f=1): [R(1)][9.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:50s]Jobs: 1 (f=1): [R(1)][11.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:48s]Jobs: 1 (f=1): [R(1)][13.0%][r=19.0MiB/s][r=19 IOPS][eta 00m:47s]Jobs: 1 (f=1): [R(1)][14.8%][r=19.0MiB/s][r=19 IOPS][eta 00m:46s]Jobs: 1 (f=1): [R(1)][16.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:45s]Jobs: 1 (f=1): [R(1)][18.5%][r=19.0MiB/s][r=19 IOPS][eta 00m:44s]Jobs: 1 (f=1): [R(1)][20.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:43s]Jobs: 1 (f=1): [R(1)][22.2%][r=19.0MiB/s][r=19 IOPS][eta 00m:42s]Jobs: 1 (f=1): [R(1)][24.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:41s]Jobs: 1 (f=1): [R(1)][25.9%][r=19.0MiB/s][r=19 IOPS][eta 00m:40s]Jobs: 1 (f=1): [R(1)][27.8%][r=18.0MiB/s][r=18 IOPS][eta 00m:39s]Jobs: 1 (f=1): [R(1)][29.6%][r=19.0MiB/s][r=19 IOPS][eta 00m:38s]Jobs: 1 (f=1): [R(1)][31.5%][r=19.0MiB/s][r=19 IOPS][eta 00m:37s]Jobs: 1 (f=1): [R(1)][33.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:36s]Jobs: 1 (f=1): [R(1)][35.2%][r=18.0MiB/s][r=18 IOPS][eta 00m:35s]Jobs: 1 (f=1): [R(1)][37.0%][r=20.0MiB/s][r=20 IOPS][eta 00m:34s]Jobs: 1 (f=1): [R(1)][38.9%][r=19.0MiB/s][r=19 IOPS][eta 00m:33s]Jobs: 1 (f=1): [R(1)][40.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:32s]Jobs: 1 (f=1): [R(1)][42.6%][r=18.0MiB/s][r=18 IOPS][eta 00m:31s]Jobs: 1 (f=1): [R(1)][44.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:30s]Jobs: 1 (f=1): [R(1)][46.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:29s]Jobs: 1 (f=1): [R(1)][48.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:28s]Jobs: 1 (f=1): [R(1)][50.0%][r=18.0MiB/s][r=18 IOPS][eta 00m:27s]Jobs: 1 (f=1): [R(1)][51.9%][r=18.0MiB/s][r=18 IOPS][eta 00m:26s]Jobs: 1 (f=1): [R(1)][53.7%][r=18.0MiB/s][r=18 IOPS][eta 00m:25s]Jobs: 1 (f=1): [R(1)][55.6%][r=19.0MiB/s][r=19 IOPS][eta 00m:24s]Jobs: 1 (f=1): [R(1)][57.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:23s]Jobs: 1 (f=1): [R(1)][59.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:22s]Jobs: 1 (f=1): [R(1)][61.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:21s]Jobs: 1 (f=1): [R(1)][63.0%][r=19.0MiB/s][r=19 IOPS][eta 00m:20s]Jobs: 1 (f=1): [R(1)][64.8%][r=19.0MiB/s][r=19 IOPS][eta 00m:19s]Jobs: 1 (f=1): [R(1)][66.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:18s]Jobs: 1 (f=1): [R(1)][68.5%][r=20.0MiB/s][r=20 IOPS][eta 00m:17s]Jobs: 1 (f=1): [R(1)][70.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:16s]Jobs: 1 (f=1): [R(1)][72.2%][r=18.0MiB/s][r=18 IOPS][eta 00m:15s]Jobs: 1 (f=1): [R(1)][74.1%][r=20.0MiB/s][r=20 IOPS][eta 00m:14s]Jobs: 1 (f=1): [R(1)][75.9%][r=20.0MiB/s][r=20 IOPS][eta 00m:13s]Jobs: 1 (f=1): [R(1)][77.8%][r=19.0MiB/s][r=19 IOPS][eta 00m:12s]Jobs: 1 (f=1): [R(1)][79.6%][r=19.0MiB/s][r=19 IOPS][eta 00m:11s]Jobs: 1 (f=1): [R(1)][81.8%][r=18.9MiB/s][r=18 IOPS][eta 00m:10s]Jobs: 1 (f=1): [R(1)][83.3%][r=18.1MiB/s][r=18 IOPS][eta 00m:09s]Jobs: 1 (f=1): [R(1)][85.2%][r=19.0MiB/s][r=19 IOPS][eta 00m:08s]Jobs: 1 (f=1): [R(1)][87.0%][r=19.0MiB/s][r=19 IOPS][eta 00m:07s]Jobs: 1 (f=1): [R(1)][88.9%][r=19.0MiB/s][r=19 IOPS][eta 00m:06s]Jobs: 1 (f=1): [R(1)][90.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:05s]Jobs: 1 (f=1): [R(1)][92.6%][r=19.0MiB/s][r=19 IOPS][eta 00m:04s]Jobs: 1 (f=1): [R(1)][94.4%][r=18.0MiB/s][r=18 IOPS][eta 00m:03s]Jobs: 1 (f=1): [R(1)][96.3%][r=20.0MiB/s][r=20 IOPS][eta 00m:02s]Jobs: 1 (f=1): [R(1)][98.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:01s]Jobs: 1 (f=1): [R(1)][100.0%][r=19.0MiB/s][r=19 IOPS][eta 00m:00s]
+buffered_cold_seqread: (groupid=0, jobs=1): err= 0: pid=20: Thu May 14 05:08:00 2026
+  read: IOPS=18, BW=18.9MiB/s (19.9MB/s)(1024MiB/54077msec)
+    clat (usec): min=42246, max=69346, avg=52805.17, stdev=2433.06
+     lat (usec): min=42246, max=69347, avg=52805.44, stdev=2433.12
+    clat percentiles (usec):
+     |  1.00th=[48497],  5.00th=[49546], 10.00th=[50070], 20.00th=[51119],
+     | 30.00th=[51643], 40.00th=[52167], 50.00th=[52691], 60.00th=[53216],
+     | 70.00th=[53216], 80.00th=[53740], 90.00th=[55313], 95.00th=[56886],
+     | 99.00th=[62653], 99.50th=[64226], 99.90th=[68682], 99.95th=[69731],
+     | 99.99th=[69731]
+   bw (  KiB/s): min=18395, max=20480, per=100.00%, avg=19390.62, stdev=1025.42, samples=107
+   iops        : min=   17, max=   20, avg=18.50, stdev= 1.08, samples=107
+  lat (msec)   : 50=7.52%, 100=92.48%
+  cpu          : usr=0.01%, sys=30.17%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=18.9MiB/s (19.9MB/s), 18.9MiB/s-18.9MiB/s (19.9MB/s-19.9MB/s), io=1024MiB (1074MB), run=54077-54077msec
+*** Running the warm buffered read pass (direct=0) ***
+buffered_warm_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+buffered_warm_seqread: (groupid=0, jobs=1): err= 0: pid=23: Thu May 14 05:08:00 2026
+  read: IOPS=3835, BW=3835MiB/s (4022MB/s)(1024MiB/267msec)
+    clat (usec): min=206, max=1982, avg=258.47, stdev=90.40
+     lat (usec): min=206, max=1984, avg=258.54, stdev=90.47
+    clat percentiles (usec):
+     |  1.00th=[  212],  5.00th=[  217], 10.00th=[  219], 20.00th=[  223],
+     | 30.00th=[  225], 40.00th=[  229], 50.00th=[  231], 60.00th=[  235],
+     | 70.00th=[  243], 80.00th=[  269], 90.00th=[  338], 95.00th=[  388],
+     | 99.00th=[  619], 99.50th=[  709], 99.90th=[  881], 99.95th=[ 1975],
+     | 99.99th=[ 1975]
+  lat (usec)   : 250=74.61%, 500=23.14%, 750=1.95%, 1000=0.20%
+  lat (msec)   : 2=0.10%
+  cpu          : usr=0.00%, sys=55.26%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=3835MiB/s (4022MB/s), 3835MiB/s-3835MiB/s (4022MB/s-4022MB/s), io=1024MiB (1074MB), run=267-267msec
+Skipping result aggregation because BENCH_RUN_ONLY=asterinas.
+Cleaning up...
+Benchmark completed successfully.

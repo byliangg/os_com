@@ -1,0 +1,33 @@
+# PageCache Phase 4 upstream xfstests acceptance list
+# Goal: validate ext4 PageCache integration only with upstream xfstests cases.
+# No self-developed PageCache smoke/coherency tests are required for Phase 4
+# acceptance unless these upstream cases expose a blocker that needs reduction.
+#
+# Coverage:
+# - generic/091: fsx O_DIRECT with sub-block sizes and concurrent buffered I/O
+# - generic/130: buffered/direct coherency, holes, direct EOF zeroing
+# - generic/133: concurrent buffered/direct readers and writers on one file
+# - generic/208: AIO DIO read-cache invalidation race
+# - generic/209: sync DIO invalidation of readahead/page cache
+# - generic/247: direct I/O and mmap writer race
+# - generic/263: fsx direct I/O vs sub-block buffered I/O
+# - generic/366: mixed direct read/write and buffered write hang regression
+# - generic/412: direct I/O + buffered write + truncate into hole durability
+# - generic/418: explicit pagecache invalidation for buffered/direct mixtures
+# - generic/469: truncate-down must zero page cache beyond new EOF
+# - generic/749: mmap EOF partial-page zero-fill and SIGBUS boundary semantics
+# - generic/751: page-cache truncation + writeback stress
+
+generic/091
+generic/130
+generic/133
+generic/208
+generic/209
+generic/247
+generic/263
+generic/366
+generic/412
+generic/418
+generic/469
+generic/749
+generic/751

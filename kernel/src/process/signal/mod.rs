@@ -143,9 +143,17 @@ fn dequeue_pending_signal(ctx: &Context) -> Option<(Box<dyn Signal>, SigAction)>
     let (signal, sig_num, sig_action) = loop {
         let signal = ctx.dequeue_signal(&sig_mask)?;
         let sig_num = signal.num();
-        let sig_action = sig_dispositions.get(sig_num);
+        let mut sig_action = sig_dispositions.get(sig_num);
         if sig_action.will_ignore(sig_num) {
-            continue;
+            if signal.is_fault() {
+                // A synchronous CPU fault cannot be allowed to resume the
+                // faulting instruction forever. Treat ignored fault signals as
+                // their default fatal action, matching Linux-visible mmap EOF
+                // SIGBUS behavior.
+                sig_action = SigAction::Dfl;
+            } else {
+                continue;
+            }
         }
 
         break (signal, sig_num, sig_action);

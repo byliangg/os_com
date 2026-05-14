@@ -69,6 +69,8 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase3_base.lis
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase3_base.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase4_good.list \
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase4_good.list"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/pagecache_phase4.list \
+  "${ROOTFS_DIR}/opt/xfstests/testcases/pagecache_phase4.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/phase6_good.list \
   "${ROOTFS_DIR}/opt/xfstests/testcases/phase6_good.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/jbd_phase1.list \
@@ -77,6 +79,8 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase3_excluded.t
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase3_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase4_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase4_excluded.tsv"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/pagecache_phase4_excluded.tsv \
+  "${ROOTFS_DIR}/opt/xfstests/blocked/pagecache_phase4_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/phase6_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/phase6_excluded.tsv"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/jbd_phase1_excluded.tsv \
@@ -94,6 +98,15 @@ echo "[INFO] Injecting host e2fsprogs tools into initramfs ..."
 install_host_tool_with_libs /usr/sbin/mkfs.ext4 /usr/sbin/mkfs.ext4
 install_host_tool_with_libs /usr/sbin/dumpe2fs /usr/sbin/dumpe2fs
 install_host_tool_with_libs /usr/sbin/e2fsck /usr/sbin/e2fsck
+if [ -x "${ROOT_DIR}/.local/xfs_pkg/usr/sbin/xfs_io" ]; then
+  echo "[INFO] Injecting repo-local xfs_io into initramfs ..."
+  install_host_tool_with_libs "${ROOT_DIR}/.local/xfs_pkg/usr/sbin/xfs_io" /usr/sbin/xfs_io
+elif command -v xfs_io >/dev/null 2>&1; then
+  echo "[INFO] Injecting host xfs_io into initramfs ..."
+  install_host_tool_with_libs "$(command -v xfs_io)" /usr/sbin/xfs_io
+else
+  echo "[WARN] xfs_io not found; xfstests will fall back to limited shim" >&2
+fi
 
 echo "[INFO] Building xfstests file I/O helper ..."
 XFSTESTS_FSYNC_HELPER="${WORK_DIR}/fsync_file"

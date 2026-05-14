@@ -1,11 +1,13 @@
-use crate::prelude::*;
-use core::cmp::{max, min};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::{
+    cmp::{max, min},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use super::{
     JournalCheckpointRange, JournalHandle, JournalHandleSummary, JournalTransaction,
     JournalTransactionState,
 };
+use crate::prelude::*;
 
 const JOURNAL_TRANSACTION_CREDIT_SOFT_LIMIT: u32 = 1024;
 
@@ -130,6 +132,20 @@ impl JournalRuntime {
 
     pub fn checkpoint_depth(&self) -> usize {
         self.checkpoint_list.len()
+    }
+
+    pub fn revoke_checkpoint_metadata_block(&mut self, block_nr: u64) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+
+        let mut revoked = 0usize;
+        for transaction in self.checkpoint_list.iter_mut() {
+            if transaction.remove_metadata_block(block_nr) {
+                revoked = revoked.saturating_add(1);
+            }
+        }
+        revoked
     }
 
     /// Returns the highest TID whose `finish_commit` has succeeded.
@@ -475,8 +491,7 @@ impl JournalRuntime {
         offset: usize,
         data: &[u8],
         mut load_block: F,
-    )
-    where
+    ) where
         F: FnMut(u64) -> Vec<u8>,
     {
         if !self.enabled || data.is_empty() || self.block_size == 0 {
@@ -716,7 +731,10 @@ mod tests {
         assert_eq!(plan.tid, 1);
         assert_eq!(plan.metadata_blocks.len(), 1);
         assert_eq!(plan.metadata_blocks[0].block_nr, 0);
-        assert_eq!(plan.metadata_blocks[0].block_data, vec![9, 9, 1, 2, 3, 9, 9, 9]);
+        assert_eq!(
+            plan.metadata_blocks[0].block_data,
+            vec![9, 9, 1, 2, 3, 9, 9, 9]
+        );
         assert!(runtime.finish_commit(plan.tid, 5, 8));
         assert_eq!(runtime.checkpoint_depth(), 1);
     }
@@ -754,6 +772,21 @@ mod tests {
     }
 
     #[test]
+    fn revoke_checkpoint_metadata_block_removes_stale_home_write() {
+        let mut runtime = JournalRuntime::new(8, 1);
+
+        let handle1 = runtime.start_handle(4, None).unwrap();
+        record_metadata(&mut runtime, &handle1, 16, &[0xAA]);
+        runtime.stop_handle(handle1).unwrap();
+        let plan1 = runtime.prepare_commit().unwrap();
+        assert!(runtime.finish_commit(plan1.tid, 5, 7));
+
+        assert_eq!(runtime.revoke_checkpoint_metadata_block(2), 1);
+        let checkpoint = runtime.prepare_checkpoint().unwrap();
+        assert!(checkpoint.metadata_blocks.is_empty());
+    }
+
+    #[test]
     fn overlay_metadata_read_prefers_newest_transaction_state() {
         let mut runtime = JournalRuntime::new(8, 1);
 
@@ -764,12 +797,9 @@ mod tests {
         assert!(runtime.finish_commit(plan1.tid, 5, 7));
 
         let handle2 = runtime.start_handle(4, None).unwrap();
-        runtime.record_metadata_write_for_handle(
-            handle2.handle_id(),
-            8,
-            &[2, 2, 2, 2],
-            |_| vec![9; 8],
-        );
+        runtime.record_metadata_write_for_handle(handle2.handle_id(), 8, &[2, 2, 2, 2], |_| {
+            vec![9; 8]
+        });
 
         let mut out = vec![0xFF; 8];
         assert!(runtime.overlay_metadata_read(8, &mut out));
