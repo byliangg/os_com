@@ -20,49 +20,15 @@
 
 - PageCache Phase 4 performance hardening：继续优化 buffered cold read、buffered write / dirty writeback；O_DIRECT 仍保持 direct bypass，并维持 cache-off 守底回归。
 
-### Phase 2 收口结论
+## PageCache Phase 4 收口结论
 
-- 赛题功能侧要求已经覆盖：JBD2 完整事务管理、崩溃恢复、多文件并发基本读写 correctness 均有固定测试资产与 2026-05-05 验证日志。
-- 当前保留的全局 fence/局部锁策略是 correctness-first 的实现选择；Phase 2 验收以数据正确性、日志恢复和核心回归为主，不把更激进的并发吞吐拆锁作为本轮必过项。
-- fio read 达标；fio write 最新正式值为 `87.01%`，低于 90%，已通过 Step 8 profile 判断为后续性能优化项，而不是 Phase 2 功能缺口。
-- `EXT4_PHASE2_WORKERS=8 EXT4_PHASE2_ROUNDS=64 EXT4_PHASE2_SEED=100` 属于额外高压探针，曾观察到偶发短读/extent mapping 风险；当前功能验收 baseline 固定为 `workers=4 rounds=8 seed=78`。
+Phase 4 已把 ext4 regular-file buffered I/O / mmap 接入 Asterinas `PageCache` / `Vmo`，并将旧的自研 direct-read cache 从默认 correctness / benchmark 口径中隔离。当前阶段按“先 correctness、再 hardening”的边界收口：PageCache 负责 buffered read/write、mmap 与 dirty writeback；O_DIRECT 继续绕过 PageCache，但必须和 PageCache 建立 flush / discard 一致性协议。
 
-## JBD2 Phase 2 收口进展
-
-JBD2 Phase 2 在 Phase 1 完整日志与崩溃恢复能力之上，补齐赛题优秀档剩余功能要求：多文件并发基本读写 correctness、核心 xfstests 回归、并发 workload 固定 baseline，以及功能大全量复跑。Phase 1 的 block-level journal 能力是 Phase 2 的基础，当前已经作为整体收口结果统一验收。
-
-Phase 1 日志基础能力已经完成：
-
-- 新增 JBD2 on-disk 数据结构：journal header、superblock v2、descriptor tag、commit block、revoke block header 与相关 feature/type 常量。
-- 复用 mkfs.ext4 创建的 journal inode（默认 inode 8），实现 journal inode 物理块映射、journal superblock 读取/校验、ring buffer head/tail 管理。
-- 新增 `JournalHandle`、`JournalTransaction`、`JournalRuntime`，按事务记录 metadata block 镜像、handle 生命周期、提交计划与 checkpoint 队列。
-- 新增 `MetadataWriter` 拦截层，superblock、inode、block group、bitmap、dir、extent 等 metadata 写入路径统一进入 JBD2 handle。
-- ordered mode 语义：文件 data block 仍写 home location，metadata 进入 journal；commit 前保证需要的数据写入顺序。
-- 实现 JBD2 commit 序列：descriptor block、metadata data block、commit block、journal superblock head/sequence 更新。
-- 实现 checkpoint：committed transaction 的 metadata block 批量回写 home block，随后推进 journal tail / `s_start`。
-- 实现标准 recovery 入口：mount 时根据 journal `s_start` 或 ext4 `needs_recovery` 扫描 descriptor/data/commit transaction，replay metadata，清空 journal，并清除 `needs_recovery`。
-- 新增 host 工具 `jbd2_probe`，支持 `show-super`、`write-probe-tx`、`recover`，用于离线构造 dirty journal 与验证 recovery。
-- 移除旧 CrashJournal 路径：旧 sector record、mount replay、sector 0 read/write、`crash_journal` 参数与 sync 清理分支均已删除。
-
-Phase 2 correctness 收口能力已经完成：
-
-- 新增 `jbd_phase2_concurrency` 自研并发测试资产，覆盖多文件写后校验、读写交错、create/unlink churn、rename churn、write/truncate/fsync、allocator churn 与 unlink-open 等核心并发路径。
-- 移除或显式化关键共享状态：`runtime_block_size` 改为显式上下文，JBD2 metadata/data-sync 归属改为 handle-local context，operation allocated block guard 改为 operation-local / handle-local。
-- 补齐 inode、目录、allocator 与 block-group correctness 协议，在保守锁/fence 下保证不同文件并发 workload 不出现数据错乱、重复物理块、旧 mapping 或 metadata 归属错误。
-- 完成目录 cache-backed readdir，修复 `ext4/045` 1200s 预算边界问题，并保持 `generic/011`、Phase 2 并发 baseline 与 crash matrix 不回退。
-- 完成 Step 8 fio write profile：当前 fio write 稳态为 1 mapping / 1 bio / 1 segment，request queue merge 为 0；fio 1MiB user buffer 为 256 pages / 256 physical runs，因此 naive page-SG zero-copy 不作为当前收口实现。
-- 最新功能大全量复跑通过：crash 18/18、phase3 10 PASS + 6 NOTRUN、phase4 12 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency 7/7。
-
-## JBD2 Phase 3 收口结论
-
-Phase 3 已按“先语义、后性能”的边界结束。阶段目标不是继续追普通顺序写吞吐，而是把此前偏轻量的 `fsync` / `fdatasync` / flush 语义补到可解释、可回归的持久化边界。
-
-- raw `/dev/vda` `fsync` / `fdatasync` 已接入底层 `BlockDevice::sync()`，virtio-blk `FLUSH` feature 判断与请求分支已修正。
-- ext4 regular-file `fsync` / `fdatasync` 走 inode -> TID 追踪、目标事务 force commit、ordered data drain 与最终 device flush；`fdatasync` 当前采用保守等价实现。
-- JBD2 commit block 前增加 PREFLUSH 等价 barrier，VFS inode sync 末尾保留 block-device flush。
-- `EXT4_IOC_SHUTDOWN` 三种 flag 已接入，Tier 1 shutdown xfstests 不再依赖 sync-marker shim 伪造 recovery 状态。
-- dm-flakey / dm-log-writes / dm-error 等环境依赖 case 保持 blocked 透明化，并用 4 个自研 host-crash 场景覆盖核心 fsync、fdatasync、rename+dir fsync 与并发 fsync 风险。
-- 普通 O_DIRECT write 已确认是后续性能 hardening blocker，不作为 Phase 3 功能退场条件继续纠缠。
+- `pagecache_phase4` upstream xfstests 验收集最新 full list 为 `9 PASS / 0 FAIL / 4 NOTRUN`，有效样本 pass rate `100.00%`；4 个 `NOTRUN` 来自 helper 未构建、debugfs 不可用或 512-byte aligned O_DIRECT 能力缺口，没有通过静态排除规避。
+- buffered/direct/mmap coherency 已覆盖 `generic/091`、`generic/130`、`generic/133`、`generic/247`、`generic/263`、`generic/412`、`generic/418`、`generic/469`、`generic/749` 等关键场景；checkpoint metadata 覆盖复用后 data block 的 stale data 风险已通过 revoke 协议修复。
+- Phase 2/3 守底回归保持通过：Phase 2 concurrency `7/7`，JBD2 crash matrix `18/18`，`jbd_phase3_fsync_flush` `11 PASS / 0 FAIL / 1 NOTRUN`，Phase 3 host-crash fsync matrix `4/4`，lmbench regression `8/8`。
+- PageCache benchmark A-E 已建立：`lmbench_only` 通过；buffered fio warm read 在 `page_cache=1` 下达到 `4022.0 MB/s`，相比 `page_cache=0` 的 `122.0 MB/s` 已体现缓存命中收益；cold read 与 buffered write 仍是 Phase 4 Step 7 hardening 点。
+- O_DIRECT fio cache-off 守底单独统计，不与 PageCache 收益混算：read `2570/2643 MB/s = 97.24%` 通过，write `1706/3158 MB/s = 54.02%` 仍作为后续 direct-write 性能 hardening blocker。
 
 ## 最新验证结果
 
