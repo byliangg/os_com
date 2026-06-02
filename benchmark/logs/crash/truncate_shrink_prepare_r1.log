@@ -2,11 +2,11 @@ warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
   |
   = note: this feature is not stably supported; its behavior can change in the future
 
-warning: `ostd-test` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning
 warning: `align_ext` (lib) generated 1 warning (1 duplicate)
-warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
-warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
 warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
 warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
 warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
 warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
@@ -27,17 +27,18 @@ warning: `aster-util` (lib) generated 1 warning (1 duplicate)
 warning: `aster-console` (lib) generated 1 warning (1 duplicate)
 warning: `aster-input` (lib) generated 1 warning (1 duplicate)
 warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
-warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
 warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
-warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
 warning: `aster-time` (lib) generated 1 warning (1 duplicate)
 warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
-warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
 warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
-warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
 warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
 warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
 warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
 warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
 warning: unexpected `cfg` condition name: `fuzzing`
    --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
@@ -114,19 +115,35 @@ warning: the feature `error_in_core` has been stable since 1.81.0 and no longer 
   |
   = note: `#[warn(stable_features)]` on by default
 
-warning: `aster-block` (lib) generated 1 warning (1 duplicate)
 warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
 warning: `libflate` (lib) generated 6 warnings (1 duplicate)
-warning: `xarray` (lib) generated 1 warning (1 duplicate)
 warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
 warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
 warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
 warning: `aster-network` (lib) generated 1 warning (1 duplicate)
 warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
 warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
-warning: `aster-kernel` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:79:7
+   |
+79 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1798:8
+     |
+1111 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1798 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
 warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
-    Finished `release-lto` profile [optimized] target(s) in 0.11s
+    Finished `release-lto` profile [optimized] target(s) in 0.12s
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
 qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
@@ -151,8 +168,8 @@ Press Ctrl-B to configure iPXE (PCI 00:02.0)...
 
 Booting from ROM..WARN: IOMMU initialization error:NoIommu
 [kernel] OSTD initialized. Preparing components.
-[32m[     0.556][0m [93mWARN [0m: [39mFramebuffer not found[0m
-[32m[     0.557][0m [93mWARN [0m: [39mFramebuffer not initialized[0m
+[32m[     0.543][0m [93mWARN [0m: [39mFramebuffer not found[0m
+[32m[     0.543][0m [93mWARN [0m: [39mFramebuffer not initialized[0m
 [kernel] Spawn the first kernel thread
 [kernel] unpacking the initramfs.cpio.gz to rootfs ...
 [kernel] rootfs is ready
@@ -182,23 +199,25 @@ Booting from ROM..WARN: IOMMU initialization error:NoIommu
     [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
     [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
 
-[32m[     1.132][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.133][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.134][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.135][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.136][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.137][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.170][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.171][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.172][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.173][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.174][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.175][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
 mount: mounting /dev/vda on /ext2 failed: Invalid argument
-[32m[     1.139][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.177][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
 mount: mounting /dev/vdb on /exfat failed: Invalid argument
 Running ext4 crash-recovery tests...
-[32m[     1.141][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.142][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.143][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.144][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.145][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.146][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.150][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.153][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
-[32m[     1.159][0m [93mWARN [0m: [39mext4: replay hold point reached for op=truncate stage=after_commit (kill VM now to simulate power loss)[0m
-qemu-system-x86_64: terminating on signal 15 from pid 4356 ()
+[32m[     1.179][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.180][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.181][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.182][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.183][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.184][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.187][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.190][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.195][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.196][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.205][0m [93mWARN [0m: [39mext4: replay hold point reached for op=truncate stage=after_commit (kill VM now to simulate power loss)[0m
+qemu-system-x86_64: terminating on signal 15 from pid 4379 ()

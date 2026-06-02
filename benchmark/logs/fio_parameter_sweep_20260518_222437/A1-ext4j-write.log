@@ -1,0 +1,521 @@
+Running benchmark fio/ext4_seq_write_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 9ae7fc33-b76f-4561-b008-52b782284775
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv
+  /nix/store/zi58pvszwmxd0p1gmxj2hc276mnls594-benchmark-0.1.0.drv
+  /nix/store/nf9inclabp0cjja0qxawqppglhyjvz91-runtime-deps.drv
+  /nix/store/yypq3570cnpql4h7jqvd67xg5fbipjc1-initramfs.drv
+building '/nix/store/zi58pvszwmxd0p1gmxj2hc276mnls594-benchmark-0.1.0.drv'...
+building '/nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv'...
+Warning: the host's /etc/resolv.conf is not valid for the guest VM (containing lookback addresses).
+Fall back to Cloudflare's public DNS servers (1.1.1.1).
+Consider using the DNS_SERVER Makefile variable to specify DNS server explicitly.
+For example: make DNS_SERVER="192.168.1.1"
+building '/nix/store/nf9inclabp0cjja0qxawqppglhyjvz91-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/yypq3570cnpql4h7jqvd67xg5fbipjc1-initramfs.drv'...
+/nix/store/f6lhvdlsq1pnldjkcbrd5nsacwi4qvlh-initramfs
+this derivation will be built:
+  /nix/store/nzr72mprqsj3k9h2m6x1sazk5318s3nk-initramfs-image.drv
+building '/nix/store/nzr72mprqsj3k9h2m6x1sazk5318s3nk-initramfs-image.drv'...
+/build/tmp.3ioGZ0RtAQ /build
+176190 blocks
+/build
+/nix/store/7mj8j343gm75y8i3j648a9a1vkwmdlyy-initramfs-image
+Running benchmark fio/ext4_seq_write_bw on Asterinas...
+these 3 derivations will be built:
+  /nix/store/x6kb8g6hrppi7s7zhmkqhyrhqj0h82nr-benchmark-0.1.0.drv
+  /nix/store/7snmx10gmcv940pih5x1n28mdizbb9xz-runtime-deps.drv
+  /nix/store/wimjacv489ffd3lard11cdz2gjq1s374-initramfs.drv
+building '/nix/store/x6kb8g6hrppi7s7zhmkqhyrhqj0h82nr-benchmark-0.1.0.drv'...
+building '/nix/store/7snmx10gmcv940pih5x1n28mdizbb9xz-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/wimjacv489ffd3lard11cdz2gjq1s374-initramfs.drv'...
+/nix/store/dabl5hyjrvf9w2vk36di36ylmsijln09-initramfs
+these 4 derivations will be built:
+  /nix/store/3m73f8v1r60nyq0r8ha9p9fvin0drd7q-benchmark-0.1.0.drv
+  /nix/store/s5x9z4l725h26rip9jnzs19syk46vy66-runtime-deps.drv
+  /nix/store/d3fsh6iwzf5hz97wzkfsc5dmx80rjnj4-initramfs.drv
+  /nix/store/n7rs8gkays6s9virmjn0yvlf52hf5sm5-initramfs-image.drv
+building '/nix/store/3m73f8v1r60nyq0r8ha9p9fvin0drd7q-benchmark-0.1.0.drv'...
+building '/nix/store/s5x9z4l725h26rip9jnzs19syk46vy66-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/d3fsh6iwzf5hz97wzkfsc5dmx80rjnj4-initramfs.drv'...
+building '/nix/store/n7rs8gkays6s9virmjn0yvlf52hf5sm5-initramfs-image.drv'...
+/build/tmp.2DHi7b1tzU /build
+176191 blocks
+/build
+/nix/store/i9hgikpqh6z3gkg2m1dlwr38pm6pxmgd-initramfs-image
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+     Locking 221 packages to latest Rust 1.94.0-nightly compatible versions
+      Adding subtle v2.4.1 (available: v2.6.1)
+ Downloading crates ...
+  Downloaded aead v0.4.3
+  Downloaded bitflags v2.11.1
+  Downloaded cobs v0.3.0
+  Downloaded defmt v0.3.100
+  Downloaded darling_macro v0.13.4
+  Downloaded defmt-parser v1.0.0
+  Downloaded byteorder v1.5.0
+  Downloaded autocfg v1.5.0
+  Downloaded wyz v0.5.1
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded hash32 v0.3.1
+  Downloaded opaque-debug v0.3.1
+  Downloaded ghash v0.4.4
+  Downloaded extension-traits v1.0.1
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded hash32 v0.2.1
+  Downloaded funty v2.0.0
+  Downloaded darling v0.13.4
+  Downloaded dary_heap v0.3.9
+  Downloaded defmt-macros v1.1.0
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded getset v0.1.6
+  Downloaded ptr_meta v0.3.1
+  Downloaded memoffset v0.9.1
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded num-conv v0.2.1
+  Downloaded nougat v0.2.4
+  Downloaded foldhash v0.2.0
+  Downloaded generic-array v0.14.9
+  Downloaded deranged v0.5.8
+  Downloaded ghost v0.1.21
+  Downloaded never-say-never v6.6.666
+  Downloaded powerfmt v0.2.0
+  Downloaded radium v0.7.0
+  Downloaded serde_spanned v0.6.9
+  Downloaded ext-trait v1.0.1
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded crc32fast v1.5.0
+  Downloaded defmt v1.1.0
+  Downloaded universal-hash v0.4.1
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded managed v0.8.0
+  Downloaded takeable v0.2.2
+  Downloaded toml_datetime v0.6.11
+  Downloaded quote v1.0.45
+  Downloaded polyval v0.5.3
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded subtle v2.4.1
+  Downloaded paste v1.0.15
+  Downloaded time-core v0.1.8
+  Downloaded thiserror-impl v2.0.18
+  Downloaded lru v0.16.4
+  Downloaded darling_core v0.13.4
+  Downloaded rustversion v1.0.22
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded rand_core v0.9.5
+  Downloaded thiserror v2.0.18
+  Downloaded uguid v2.2.1
+  Downloaded owo-colors v4.3.0
+  Downloaded volatile v0.6.1
+  Downloaded tdx-guest v0.2.4
+  Downloaded semver v1.0.28
+  Downloaded spin v0.9.8
+  Downloaded log v0.4.29
+  Downloaded postcard v1.1.3
+  Downloaded toml v0.7.8
+  Downloaded proc-macro2 v1.0.106
+  Downloaded unicode-ident v1.0.24
+  Downloaded intrusive-collections v0.9.7
+  Downloaded bittle v0.5.7
+  Downloaded lending-iterator v0.1.7
+  Downloaded font8x8 v0.2.7
+  Downloaded acpi v5.2.0
+  Downloaded ctr v0.8.0
+  Downloaded cipher v0.3.0
+  Downloaded once_cell v1.21.4
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded bit_field v0.10.3
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded multiboot2 v0.24.1
+  Downloaded tap v1.0.1
+  Downloaded unwinding v0.2.8
+  Downloaded volatile v0.4.6
+  Downloaded bitvec v1.0.1
+  Downloaded const_format v0.2.36
+  Downloaded aes-gcm v0.9.4
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded heapless v0.8.0
+  Downloaded memchr v2.8.0
+  Downloaded aes v0.7.5
+  Downloaded typenum v1.20.0
+  Downloaded winnow v0.5.40
+  Downloaded x86_64 v0.14.13
+  Downloaded libc v0.2.186
+  Downloaded multiboot2-common v0.3.0
+  Downloaded indexmap v2.14.0
+  Downloaded konst v0.2.20
+  Downloaded json v0.12.4
+  Downloaded gimli v0.32.3
+  Downloaded itertools v0.10.5
+  Downloaded heapless v0.7.17
+  Downloaded time v0.3.47
+  Downloaded zerocopy v0.8.48
+  Downloaded toml_edit v0.19.15
+  Downloaded syn v2.0.117
+  Downloaded hashbrown v0.17.1
+  Downloaded rand v0.9.4
+  Downloaded gimli v0.28.1
+  Downloaded iced-x86 v1.21.0
+  Downloaded uefi-raw v0.12.0
+  Downloaded raw-cpuid v10.7.0
+  Downloaded x86 v0.52.0
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded getopts v0.2.24
+  Downloaded rustc-literal-escaper v0.0.5
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:79:7
+   |
+79 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1798:8
+     |
+1111 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1798 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/.target_bench/osdk/aster-kernel-run-base)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 48.77s
+grub-mkrescue: warning: cannot open directory `/usr/local/grub/share/locale': No such file or directory.
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 31.5g free
+Added to ISO image: directory '/'='/tmp/grub.5m0bKE'
+xorriso : UPDATE :     298 files added in 1 seconds
+Added to ISO image: directory '/'='/root/asterinas/.target_bench/osdk/iso_root'
+xorriso : UPDATE :     303 files added in 1 seconds
+ISO image produced: 23272 sectors
+Written to medium : 23272 sectors at LBA 0
+Writing to 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso' completed successfully.
+
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+WARNING: no console will be available to OS
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running benchmark: fio/ext4_seq_write_bw on asterinas
+Using FIO_BS=1M
+Using FIO_NUMJOBS=1
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the FIO sequential write test (Ext4) ***
+seqwrite: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+seqwrite: Laying out IO file (1 file / 1024MiB)
+Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=1): [W(1)][37.9%][eta 01m:40s]Jobs: 1 (f=1): [W(1)][38.1%][w=3732KiB/s][w=3 IOPS][eta 01m:39s]Jobs: 1 (f=1): [W(1)][38.8%][w=1235MiB/s][w=1235 IOPS][eta 01m:38s]Jobs: 1 (f=1): [W(1)][39.4%][w=1406MiB/s][w=1406 IOPS][eta 01m:37s]Jobs: 1 (f=1): [W(1)][40.0%][w=2419MiB/s][w=2418 IOPS][eta 01m:36s]Jobs: 1 (f=1): [W(1)][40.6%][w=900MiB/s][w=900 IOPS][eta 01m:35s]  Jobs: 1 (f=1): [W(1)][41.2%][w=1049MiB/s][w=1049 IOPS][eta 01m:34s]Jobs: 1 (f=1): [W(1)][42.1%][w=1466MiB/s][w=1466 IOPS][eta 01m:32s]Jobs: 1 (f=1): [W(1)][42.5%][w=1413MiB/s][w=1412 IOPS][eta 01m:32s]Jobs: 1 (f=1): [W(1)][43.1%][w=796MiB/s][w=796 IOPS][eta 01m:31s]  Jobs: 1 (f=1): [W(1)][43.8%][w=1524MiB/s][w=1524 IOPS][eta 01m:30s]Jobs: 1 (f=1): [W(1)][44.4%][w=979MiB/s][w=978 IOPS][eta 01m:29s]  Jobs: 1 (f=1): [W(1)][45.0%][w=1495MiB/s][w=1494 IOPS][eta 01m:28s]Jobs: 1 (f=1): [W(1)][45.6%][w=1465MiB/s][w=1464 IOPS][eta 01m:27s]Jobs: 1 (f=1): [W(1)][46.5%][w=2432MiB/s][w=2432 IOPS][eta 01m:25s]Jobs: 1 (f=1): [W(1)][46.9%][w=1572MiB/s][w=1571 IOPS][eta 01m:25s]Jobs: 1 (f=1): [W(1)][47.5%][w=2406MiB/s][w=2406 IOPS][eta 01m:24s]Jobs: 1 (f=1): [W(1)][48.4%][w=1228MiB/s][w=1228 IOPS][eta 01m:22s]Jobs: 1 (f=1): [W(1)][48.8%][w=1919MiB/s][w=1919 IOPS][eta 01m:22s]Jobs: 1 (f=1): [W(1)][49.4%][w=1150MiB/s][w=1150 IOPS][eta 01m:21s]Jobs: 1 (f=1): [W(1)][50.0%][w=1183MiB/s][w=1183 IOPS][eta 01m:20s]Jobs: 1 (f=1): [W(1)][50.6%][w=873MiB/s][w=873 IOPS][eta 01m:19s]  Jobs: 1 (f=1): [W(1)][51.2%][w=1654MiB/s][w=1653 IOPS][eta 01m:18s]Jobs: 1 (f=1): [W(1)][51.9%][w=1482MiB/s][w=1482 IOPS][eta 01m:17s]Jobs: 1 (f=1): [W(1)][52.5%][w=2697MiB/s][w=2697 IOPS][eta 01m:16s]Jobs: 1 (f=1): [W(1)][53.1%][w=1168MiB/s][w=1168 IOPS][eta 01m:15s]Jobs: 1 (f=1): [W(1)][53.8%][w=2312MiB/s][w=2311 IOPS][eta 01m:14s]Jobs: 1 (f=1): [W(1)][54.4%][w=1115MiB/s][w=1115 IOPS][eta 01m:13s]Jobs: 1 (f=1): [W(1)][55.3%][w=1192MiB/s][w=1192 IOPS][eta 01m:11s]Jobs: 1 (f=1): [W(1)][55.6%][w=773MiB/s][w=773 IOPS][eta 01m:11s]  Jobs: 1 (f=1): [W(1)][56.2%][w=1047MiB/s][w=1047 IOPS][eta 01m:10s]Jobs: 1 (f=1): [W(1)][56.9%][w=975MiB/s][w=974 IOPS][eta 01m:09s]  Jobs: 1 (f=1): [W(1)][57.5%][w=2375MiB/s][w=2375 IOPS][eta 01m:08s]Jobs: 1 (f=1): [W(1)][58.1%][w=1406MiB/s][w=1406 IOPS][eta 01m:07s]Jobs: 1 (f=1): [W(1)][59.1%][w=2838MiB/s][w=2837 IOPS][eta 01m:05s]Jobs: 1 (f=1): [W(1)][59.4%][w=1143MiB/s][w=1143 IOPS][eta 01m:05s]Jobs: 1 (f=1): [W(1)][60.0%][w=2409MiB/s][w=2408 IOPS][eta 01m:04s]Jobs: 1 (f=1): [W(1)][60.6%][w=1665MiB/s][w=1665 IOPS][eta 01m:03s]Jobs: 1 (f=1): [W(1)][61.3%][w=1542MiB/s][w=1542 IOPS][eta 01m:02s]Jobs: 1 (f=1): [W(1)][61.9%][w=1057MiB/s][w=1057 IOPS][eta 01m:01s]Jobs: 1 (f=1): [W(1)][62.5%][w=2238MiB/s][w=2238 IOPS][eta 01m:00s]Jobs: 1 (f=1): [W(1)][63.1%][w=905MiB/s][w=905 IOPS][eta 00m:59s]  Jobs: 1 (f=1): [W(1)][63.7%][w=1986MiB/s][w=1985 IOPS][eta 00m:58s]Jobs: 1 (f=1): [W(1)][64.4%][w=1091MiB/s][w=1091 IOPS][eta 00m:57s]Jobs: 1 (f=1): [W(1)][65.0%][w=1265MiB/s][w=1265 IOPS][eta 00m:56s]Jobs: 1 (f=1): [W(1)][65.6%][w=839MiB/s][w=839 IOPS][eta 00m:55s]  Jobs: 1 (f=1): [W(1)][66.2%][w=2106MiB/s][w=2106 IOPS][eta 00m:54s]Jobs: 1 (f=1): [W(1)][66.9%][w=1076MiB/s][w=1076 IOPS][eta 00m:53s]Jobs: 1 (f=1): [W(1)][67.5%][w=1630MiB/s][w=1630 IOPS][eta 00m:52s]Jobs: 1 (f=1): [W(1)][68.1%][w=1334MiB/s][w=1334 IOPS][eta 00m:51s]Jobs: 1 (f=1): [W(1)][68.8%][w=1344MiB/s][w=1344 IOPS][eta 00m:50s]Jobs: 1 (f=1): [W(1)][69.4%][w=1740MiB/s][w=1740 IOPS][eta 00m:49s]Jobs: 1 (f=1): [W(1)][70.0%][w=1652MiB/s][w=1652 IOPS][eta 00m:48s]Jobs: 1 (f=1): [W(1)][70.6%][w=1360MiB/s][w=1359 IOPS][eta 00m:47s]Jobs: 1 (f=1): [W(1)][71.2%][w=1534MiB/s][w=1534 IOPS][eta 00m:46s]Jobs: 1 (f=1): [W(1)][72.3%][w=1504MiB/s][w=1504 IOPS][eta 00m:44s]Jobs: 1 (f=1): [W(1)][73.0%][w=2328MiB/s][w=2328 IOPS][eta 00m:43s]Jobs: 1 (f=1): [W(1)][73.1%][w=2896MiB/s][w=2896 IOPS][eta 00m:43s]Jobs: 1 (f=1): [W(1)][73.8%][w=2043MiB/s][w=2042 IOPS][eta 00m:42s]Jobs: 1 (f=1): [W(1)][74.4%][w=1098MiB/s][w=1098 IOPS][eta 00m:41s]Jobs: 1 (f=1): [W(1)][75.0%][w=1404MiB/s][w=1404 IOPS][eta 00m:40s]Jobs: 1 (f=1): [W(1)][75.6%][w=1413MiB/s][w=1413 IOPS][eta 00m:39s]Jobs: 1 (f=1): [W(1)][76.2%][w=1149MiB/s][w=1149 IOPS][eta 00m:38s]Jobs: 1 (f=1): [W(1)][76.9%][w=1104MiB/s][w=1104 IOPS][eta 00m:37s]Jobs: 1 (f=1): [W(1)][77.5%][w=1568MiB/s][w=1568 IOPS][eta 00m:36s]Jobs: 1 (f=1): [W(1)][78.1%][w=1210MiB/s][w=1210 IOPS][eta 00m:35s]Jobs: 1 (f=1): [W(1)][78.8%][w=1000MiB/s][w=1000 IOPS][eta 00m:34s]Jobs: 1 (f=1): [W(1)][79.4%][w=1460MiB/s][w=1459 IOPS][eta 00m:33s]Jobs: 1 (f=1): [W(1)][80.5%][w=2830MiB/s][w=2829 IOPS][eta 00m:31s]Jobs: 1 (f=1): [W(1)][80.6%][w=1041MiB/s][w=1041 IOPS][eta 00m:31s]Jobs: 1 (f=1): [W(1)][81.2%][w=2115MiB/s][w=2115 IOPS][eta 00m:30s]Jobs: 1 (f=1): [W(1)][81.9%][w=1094MiB/s][w=1094 IOPS][eta 00m:29s]Jobs: 1 (f=1): [W(1)][82.5%][w=2590MiB/s][w=2590 IOPS][eta 00m:28s]Jobs: 1 (f=1): [W(1)][83.1%][w=1919MiB/s][w=1919 IOPS][eta 00m:27s]Jobs: 1 (f=1): [W(1)][83.8%][w=2756MiB/s][w=2756 IOPS][eta 00m:26s]Jobs: 1 (f=1): [W(1)][84.4%][w=1206MiB/s][w=1206 IOPS][eta 00m:25s]Jobs: 1 (f=1): [W(1)][85.0%][w=2592MiB/s][w=2592 IOPS][eta 00m:24s]Jobs: 1 (f=1): [W(1)][85.6%][w=1178MiB/s][w=1178 IOPS][eta 00m:23s]Jobs: 1 (f=1): [W(1)][86.2%][w=1077MiB/s][w=1076 IOPS][eta 00m:22s]Jobs: 1 (f=1): [W(1)][86.9%][w=1552MiB/s][w=1551 IOPS][eta 00m:21s]Jobs: 1 (f=1): [W(1)][87.5%][w=2325MiB/s][w=2325 IOPS][eta 00m:20s]Jobs: 1 (f=1): [W(1)][88.1%][w=1513MiB/s][w=1512 IOPS][eta 00m:19s]Jobs: 1 (f=1): [W(1)][88.8%][w=1892MiB/s][w=1892 IOPS][eta 00m:18s]Jobs: 1 (f=1): [W(1)][89.4%][w=1106MiB/s][w=1106 IOPS][eta 00m:17s]Jobs: 1 (f=1): [W(1)][90.0%][w=1572MiB/s][w=1572 IOPS][eta 00m:16s]Jobs: 1 (f=1): [W(1)][90.6%][w=1218MiB/s][w=1218 IOPS][eta 00m:15s]Jobs: 1 (f=1): [W(1)][91.2%][w=1642MiB/s][w=1642 IOPS][eta 00m:14s]Jobs: 1 (f=1): [W(1)][91.9%][w=1430MiB/s][w=1429 IOPS][eta 00m:13s]Jobs: 1 (f=1): [W(1)][92.5%][w=2524MiB/s][w=2523 IOPS][eta 00m:12s]Jobs: 1 (f=1): [W(1)][93.1%][w=2580MiB/s][w=2579 IOPS][eta 00m:11s]Jobs: 1 (f=1): [W(1)][93.8%][w=1204MiB/s][w=1203 IOPS][eta 00m:10s]Jobs: 1 (f=1): [W(1)][94.4%][w=1172MiB/s][w=1172 IOPS][eta 00m:09s]Jobs: 1 (f=1): [W(1)][95.0%][w=3080MiB/s][w=3079 IOPS][eta 00m:08s]Jobs: 1 (f=1): [W(1)][95.6%][w=1954MiB/s][w=1954 IOPS][eta 00m:07s]Jobs: 1 (f=1): [W(1)][96.2%][w=2276MiB/s][w=2276 IOPS][eta 00m:06s]Jobs: 1 (f=1): [W(1)][96.9%][w=1333MiB/s][w=1333 IOPS][eta 00m:05s]Jobs: 1 (f=1): [W(1)][97.5%][w=2669MiB/s][w=2669 IOPS][eta 00m:04s]Jobs: 1 (f=1): [W(1)][98.1%][w=2533MiB/s][w=2532 IOPS][eta 00m:03s]Jobs: 1 (f=1): [W(1)][98.8%][w=2522MiB/s][w=2522 IOPS][eta 00m:02s]Jobs: 1 (f=1): [W(1)][99.4%][w=1437MiB/s][w=1437 IOPS][eta 00m:01s]Jobs: 1 (f=1): [W(1)][100.0%][w=1603MiB/s][w=1602 IOPS][eta 00m:00s]
+seqwrite: (groupid=0, jobs=1): err= 0: pid=17: Mon May 18 14:28:48 2026
+  write: IOPS=1627, BW=1628MiB/s (1707MB/s)(159GiB/100013msec); 0 zone resets
+    clat (usec): min=257, max=258299, avg=586.78, stdev=722.73
+     lat (usec): min=264, max=258322, avg=612.62, stdev=729.26
+    clat percentiles (usec):
+     |  1.00th=[  269],  5.00th=[  277], 10.00th=[  281], 20.00th=[  297],
+     | 30.00th=[  322], 40.00th=[  367], 50.00th=[  494], 60.00th=[  611],
+     | 70.00th=[  685], 80.00th=[  832], 90.00th=[ 1074], 95.00th=[ 1254],
+     | 99.00th=[ 1598], 99.50th=[ 1745], 99.90th=[ 2114], 99.95th=[ 2278],
+     | 99.99th=[ 2835]
+   bw (  MiB/s): min=  708, max= 3200, per=100.00%, avg=1628.36, stdev=664.42, samples=199
+   iops        : min=  708, max= 3200, avg=1628.07, stdev=664.45, samples=199
+  lat (usec)   : 500=50.25%, 750=25.27%, 1000=11.87%
+  lat (msec)   : 2=12.45%, 4=0.14%, 10=0.01%, 500=0.01%
+  cpu          : usr=4.82%, sys=25.96%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,162775,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=1628MiB/s (1707MB/s), 1628MiB/s-1628MiB/s (1707MB/s-1707MB/s), io=159GiB (171GB), run=100013-100013msec
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: b90ea6a8-cedf-448d-b1ae-fc573f9c25f1
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 3 derivations will be built:
+  /nix/store/mani549137zg6l5ylap1jz20pjrg8nj1-benchmark-0.1.0.drv
+  /nix/store/kj02qcf3228hxbwm67w21gcf7ly57fmf-runtime-deps.drv
+  /nix/store/pag5q6rv5pag85nxkgdx5cydf2y5c088-initramfs.drv
+building '/nix/store/mani549137zg6l5ylap1jz20pjrg8nj1-benchmark-0.1.0.drv'...
+building '/nix/store/kj02qcf3228hxbwm67w21gcf7ly57fmf-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/pag5q6rv5pag85nxkgdx5cydf2y5c088-initramfs.drv'...
+/nix/store/rx53hi8p2xnc846a2xmrn2804pc1gkbc-initramfs
+this derivation will be built:
+  /nix/store/dqcb2sjgj09hhznzbg0arp1glycwhyd2-initramfs-image.drv
+building '/nix/store/dqcb2sjgj09hhznzbg0arp1glycwhyd2-initramfs-image.drv'...
+/build/tmp.uhtPVeOVoG /build
+176281 blocks
+/build
+/nix/store/ciaivzvm3vswxi91kxdps382vqkm43fa-initramfs-image
+Running benchmark fio/ext4_seq_write_bw on Linux...
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19A0+7EF319A0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..c[?7l[2J[0m.[    0.302680] kvm_intel: VMX not supported by CPU 0
+Running benchmark: fio/ext4_seq_write_bw on linux
+Using FIO_BS=1M
+Using FIO_NUMJOBS=1
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the FIO sequential write test (Ext4) ***
+seqwrite: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+seqwrite: Laying out IO file (1 file / 1024MiB)
+Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0)Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:37s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:36s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:35s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:34s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:33s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:32s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:31s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:30s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:29s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:28s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:27s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:26s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:25s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:24s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:23s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:22s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:21s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:20s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:19s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:18s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:17s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:16s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:15s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:14s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:13s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:12s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:11s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:10s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:09s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:08s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:07s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:06s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:05s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:04s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:03s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:02s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:01s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 02m:00s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:59s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:58s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:57s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:56s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:55s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:54s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:53s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:52s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:51s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:50s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:49s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:48s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:47s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:46s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:45s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:44s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:43s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:42s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:41s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=0): [/(1)][-.-%][eta 01m:40s]Jobs: 1 (f=1): [W(1)][37.9%][eta 01m:40s]Jobs: 1 (f=1): [W(1)][38.1%][w=14.1MiB/s][w=14 IOPS][eta 01m:39s]Jobs: 1 (f=1): [W(1)][38.8%][w=3525MiB/s][w=3524 IOPS][eta 01m:38s]Jobs: 1 (f=1): [W(1)][39.4%][w=3132MiB/s][w=3132 IOPS][eta 01m:37s]Jobs: 1 (f=1): [W(1)][40.0%][w=2470MiB/s][w=2470 IOPS][eta 01m:36s]Jobs: 1 (f=1): [W(1)][40.6%][w=2326MiB/s][w=2326 IOPS][eta 01m:35s]Jobs: 1 (f=1): [W(1)][41.2%][w=3124MiB/s][w=3124 IOPS][eta 01m:34s]Jobs: 1 (f=1): [W(1)][42.1%][w=3203MiB/s][w=3203 IOPS][eta 01m:32s]Jobs: 1 (f=1): [W(1)][42.5%][w=3512MiB/s][w=3512 IOPS][eta 01m:32s]Jobs: 1 (f=1): [W(1)][43.1%][w=3604MiB/s][w=3603 IOPS][eta 01m:31s]Jobs: 1 (f=1): [W(1)][43.8%][w=3439MiB/s][w=3439 IOPS][eta 01m:30s]Jobs: 1 (f=1): [W(1)][44.4%][w=2559MiB/s][w=2559 IOPS][eta 01m:29s]Jobs: 1 (f=1): [W(1)][45.0%][w=3727MiB/s][w=3726 IOPS][eta 01m:28s]Jobs: 1 (f=1): [W(1)][45.6%][w=3643MiB/s][w=3643 IOPS][eta 01m:27s]Jobs: 1 (f=1): [W(1)][46.5%][w=3524MiB/s][w=3523 IOPS][eta 01m:25s]Jobs: 1 (f=1): [W(1)][46.9%][w=3049MiB/s][w=3049 IOPS][eta 01m:25s]Jobs: 1 (f=1): [W(1)][47.5%][w=2109MiB/s][w=2109 IOPS][eta 01m:24s]Jobs: 1 (f=1): [W(1)][48.4%][w=3413MiB/s][w=3413 IOPS][eta 01m:22s]Jobs: 1 (f=1): [W(1)][48.8%][w=3670MiB/s][w=3670 IOPS][eta 01m:22s]Jobs: 1 (f=1): [W(1)][49.4%][w=3032MiB/s][w=3032 IOPS][eta 01m:21s]Jobs: 1 (f=1): [W(1)][50.0%][w=3479MiB/s][w=3479 IOPS][eta 01m:20s]Jobs: 1 (f=1): [W(1)][50.6%][w=2232MiB/s][w=2232 IOPS][eta 01m:19s]Jobs: 1 (f=1): [W(1)][51.2%][w=3479MiB/s][w=3479 IOPS][eta 01m:18s]Jobs: 1 (f=1): [W(1)][51.9%][w=2954MiB/s][w=2954 IOPS][eta 01m:17s]Jobs: 1 (f=1): [W(1)][52.5%][w=3487MiB/s][w=3487 IOPS][eta 01m:16s]Jobs: 1 (f=1): [W(1)][53.1%][w=3609MiB/s][w=3609 IOPS][eta 01m:15s]Jobs: 1 (f=1): [W(1)][53.8%][w=3078MiB/s][w=3078 IOPS][eta 01m:14s]Jobs: 1 (f=1): [W(1)][54.4%][w=2145MiB/s][w=2145 IOPS][eta 01m:13s]Jobs: 1 (f=1): [W(1)][55.3%][w=3501MiB/s][w=3501 IOPS][eta 01m:11s]Jobs: 1 (f=1): [W(1)][55.6%][w=3721MiB/s][w=3720 IOPS][eta 01m:11s]Jobs: 1 (f=1): [W(1)][56.2%][w=3697MiB/s][w=3697 IOPS][eta 01m:10s]Jobs: 1 (f=1): [W(1)][56.9%][w=3350MiB/s][w=3350 IOPS][eta 01m:09s]Jobs: 1 (f=1): [W(1)][57.5%][w=2556MiB/s][w=2556 IOPS][eta 01m:08s]Jobs: 1 (f=1): [W(1)][58.1%][w=3536MiB/s][w=3536 IOPS][eta 01m:07s]Jobs: 1 (f=1): [W(1)][59.1%][w=3555MiB/s][w=3554 IOPS][eta 01m:05s]Jobs: 1 (f=1): [W(1)][59.4%][w=3133MiB/s][w=3133 IOPS][eta 01m:05s]Jobs: 1 (f=1): [W(1)][60.0%][w=3625MiB/s][w=3624 IOPS][eta 01m:04s]Jobs: 1 (f=1): [W(1)][60.6%][w=2342MiB/s][w=2342 IOPS][eta 01m:03s]Jobs: 1 (f=1): [W(1)][61.3%][w=3424MiB/s][w=3424 IOPS][eta 01m:02s]Jobs: 1 (f=1): [W(1)][61.9%][w=3100MiB/s][w=3100 IOPS][eta 01m:01s]Jobs: 1 (f=1): [W(1)][62.5%][w=3529MiB/s][w=3529 IOPS][eta 01m:00s]Jobs: 1 (f=1): [W(1)][63.1%][w=3484MiB/s][w=3484 IOPS][eta 00m:59s]Jobs: 1 (f=1): [W(1)][63.7%][w=2487MiB/s][w=2487 IOPS][eta 00m:58s]Jobs: 1 (f=1): [W(1)][64.4%][w=3028MiB/s][w=3028 IOPS][eta 00m:57s]Jobs: 1 (f=1): [W(1)][65.0%][w=3498MiB/s][w=3498 IOPS][eta 00m:56s]Jobs: 1 (f=1): [W(1)][65.6%][w=3477MiB/s][w=3477 IOPS][eta 00m:55s]Jobs: 1 (f=1): [W(1)][66.2%][w=3599MiB/s][w=3599 IOPS][eta 00m:54s]Jobs: 1 (f=1): [W(1)][66.9%][w=3181MiB/s][w=3181 IOPS][eta 00m:53s]Jobs: 1 (f=1): [W(1)][67.5%][w=2285MiB/s][w=2285 IOPS][eta 00m:52s]Jobs: 1 (f=1): [W(1)][68.1%][w=3673MiB/s][w=3672 IOPS][eta 00m:51s]Jobs: 1 (f=1): [W(1)][68.8%][w=3646MiB/s][w=3646 IOPS][eta 00m:50s]Jobs: 1 (f=1): [W(1)][69.4%][w=3155MiB/s][w=3155 IOPS][eta 00m:49s]Jobs: 1 (f=1): [W(1)][70.0%][w=3387MiB/s][w=3387 IOPS][eta 00m:48s]Jobs: 1 (f=1): [W(1)][70.6%][w=1489MiB/s][w=1489 IOPS][eta 00m:47s]Jobs: 1 (f=1): [W(1)][71.2%][w=2947MiB/s][w=2947 IOPS][eta 00m:46s]Jobs: 1 (f=1): [W(1)][72.3%][w=2846MiB/s][w=2845 IOPS][eta 00m:44s]Jobs: 1 (f=1): [W(1)][73.0%][w=3402MiB/s][w=3402 IOPS][eta 00m:43s]Jobs: 1 (f=1): [W(1)][73.1%][w=3731MiB/s][w=3730 IOPS][eta 00m:43s]Jobs: 1 (f=1): [W(1)][73.8%][w=3156MiB/s][w=3156 IOPS][eta 00m:42s]Jobs: 1 (f=1): [W(1)][74.4%][w=1926MiB/s][w=1925 IOPS][eta 00m:41s]Jobs: 1 (f=1): [W(1)][75.0%][w=3577MiB/s][w=3577 IOPS][eta 00m:40s]Jobs: 1 (f=1): [W(1)][75.6%][w=3425MiB/s][w=3425 IOPS][eta 00m:39s]Jobs: 1 (f=1): [W(1)][76.2%][w=3543MiB/s][w=3543 IOPS][eta 00m:38s]Jobs: 1 (f=1): [W(1)][76.9%][w=3221MiB/s][w=3221 IOPS][eta 00m:37s]Jobs: 1 (f=1): [W(1)][77.5%][w=1990MiB/s][w=1989 IOPS][eta 00m:36s]Jobs: 1 (f=1): [W(1)][78.1%][w=3425MiB/s][w=3425 IOPS][eta 00m:35s]Jobs: 1 (f=1): [W(1)][78.8%][w=3669MiB/s][w=3668 IOPS][eta 00m:34s]Jobs: 1 (f=1): [W(1)][79.4%][w=3163MiB/s][w=3163 IOPS][eta 00m:33s]Jobs: 1 (f=1): [W(1)][80.5%][w=3429MiB/s][w=3429 IOPS][eta 00m:31s]Jobs: 1 (f=1): [W(1)][80.6%][w=2480MiB/s][w=2480 IOPS][eta 00m:31s]Jobs: 1 (f=1): [W(1)][81.2%][w=3207MiB/s][w=3207 IOPS][eta 00m:30s]Jobs: 1 (f=1): [W(1)][81.9%][w=3083MiB/s][w=3083 IOPS][eta 00m:29s]Jobs: 1 (f=1): [W(1)][82.5%][w=3381MiB/s][w=3381 IOPS][eta 00m:28s]Jobs: 1 (f=1): [W(1)][83.1%][w=3265MiB/s][w=3265 IOPS][eta 00m:27s]Jobs: 1 (f=1): [W(1)][83.8%][w=2367MiB/s][w=2367 IOPS][eta 00m:26s]Jobs: 1 (f=1): [W(1)][84.4%][w=3018MiB/s][w=3018 IOPS][eta 00m:25s]Jobs: 1 (f=1): [W(1)][85.0%][w=3353MiB/s][w=3353 IOPS][eta 00m:24s]Jobs: 1 (f=1): [W(1)][85.6%][w=3588MiB/s][w=3588 IOPS][eta 00m:23s]Jobs: 1 (f=1): [W(1)][86.2%][w=3685MiB/s][w=3684 IOPS][eta 00m:22s]Jobs: 1 (f=1): [W(1)][86.9%][w=2876MiB/s][w=2876 IOPS][eta 00m:21s]Jobs: 1 (f=1): [W(1)][87.5%][w=2911MiB/s][w=2910 IOPS][eta 00m:20s]Jobs: 1 (f=1): [W(1)][88.1%][w=3562MiB/s][w=3562 IOPS][eta 00m:19s]Jobs: 1 (f=1): [W(1)][88.8%][w=3740MiB/s][w=3739 IOPS][eta 00m:18s]Jobs: 1 (f=1): [W(1)][89.4%][w=3027MiB/s][w=3027 IOPS][eta 00m:17s]Jobs: 1 (f=1): [W(1)][90.0%][w=3396MiB/s][w=3396 IOPS][eta 00m:16s]Jobs: 1 (f=1): [W(1)][90.6%][w=2515MiB/s][w=2515 IOPS][eta 00m:15s]Jobs: 1 (f=1): [W(1)][91.2%][w=3576MiB/s][w=3576 IOPS][eta 00m:14s]Jobs: 1 (f=1): [W(1)][91.9%][w=3153MiB/s][w=3153 IOPS][eta 00m:13s]Jobs: 1 (f=1): [W(1)][92.5%][w=3338MiB/s][w=3338 IOPS][eta 00m:12s]Jobs: 1 (f=1): [W(1)][93.1%][w=3569MiB/s][w=3568 IOPS][eta 00m:11s]Jobs: 1 (f=1): [W(1)][93.8%][w=2459MiB/s][w=2459 IOPS][eta 00m:10s]Jobs: 1 (f=1): [W(1)][94.4%][w=3111MiB/s][w=3111 IOPS][eta 00m:09s]Jobs: 1 (f=1): [W(1)][95.0%][w=3467MiB/s][w=3467 IOPS][eta 00m:08s]Jobs: 1 (f=1): [W(1)][95.6%][w=3551MiB/s][w=3551 IOPS][eta 00m:07s]Jobs: 1 (f=1): [W(1)][96.2%][w=3597MiB/s][w=3596 IOPS][eta 00m:06s]Jobs: 1 (f=1): [W(1)][96.9%][w=2131MiB/s][w=2131 IOPS][eta 00m:05s]Jobs: 1 (f=1): [W(1)][97.5%][w=2103MiB/s][w=2103 IOPS][eta 00m:04s]Jobs: 1 (f=1): [W(1)][98.1%][w=3576MiB/s][w=3575 IOPS][eta 00m:03s]Jobs: 1 (f=1): [W(1)][98.8%][w=3669MiB/s][w=3669 IOPS][eta 00m:02s]Jobs: 1 (f=1): [W(1)][99.4%][w=3151MiB/s][w=3151 IOPS][eta 00m:01s]Jobs: 1 (f=1): [W(1)][100.0%][w=3346MiB/s][w=3346 IOPS][eta 00m:00s]
+seqwrite: (groupid=0, jobs=1): err= 0: pid=99: Mon May 18 14:32:23 2026
+  write: IOPS=3154, BW=3155MiB/s (3308MB/s)(308GiB/100091msec); 0 zone resets
+    clat (usec): min=216, max=682736, avg=299.87, stdev=2833.53
+     lat (usec): min=226, max=682766, avg=316.71, stdev=2833.61
+    clat percentiles (usec):
+     |  1.00th=[  227],  5.00th=[  231], 10.00th=[  235], 20.00th=[  239],
+     | 30.00th=[  243], 40.00th=[  249], 50.00th=[  265], 60.00th=[  277],
+     | 70.00th=[  289], 80.00th=[  310], 90.00th=[  343], 95.00th=[  379],
+     | 99.00th=[  490], 99.50th=[  553], 99.90th=[  816], 99.95th=[ 1057],
+     | 99.99th=[ 7046]
+   bw (  MiB/s): min=  298, max= 3813, per=100.00%, avg=3175.10, stdev=673.22, samples=199
+   iops        : min=  298, max= 3813, avg=3174.94, stdev=673.24, samples=199
+  lat (usec)   : 250=40.18%, 500=58.96%, 750=0.73%, 1000=0.07%
+  lat (msec)   : 2=0.04%, 4=0.01%, 10=0.01%, 20=0.01%, 50=0.01%
+  lat (msec)   : 100=0.01%, 250=0.01%, 500=0.01%, 750=0.01%
+  cpu          : usr=5.63%, sys=5.06%, ctx=316041, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,315741,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=3155MiB/s (3308MB/s), 3155MiB/s-3155MiB/s (3308MB/s-3308MB/s), io=308GiB (331GB), run=100091-100091msec
+[  161.150103] reboot: Power down
+Skipping result aggregation because BENCH_RUN_ONLY=both.
+Cleaning up...
+Benchmark completed successfully.

@@ -1,0 +1,2 @@
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	host_crash_fsync_size_durability	prepare_done	prepare_done	/root/asterinas/benchmark/logs/crash/host_crash_fsync_size_durability_prepare_r1.log	/root/asterinas/benchmark/logs/crash/host_crash_fsync_size_durability_verify_r1.log	PASS

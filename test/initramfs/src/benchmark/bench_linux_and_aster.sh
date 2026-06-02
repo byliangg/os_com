@@ -116,7 +116,18 @@ run_benchmark() {
                  exit 1
                  ;;
          esac
-     done <<< "$runtime_configs_str"
+    done <<< "$runtime_configs_str"
+
+    # Environment override for ad-hoc diagnostic runs.  Use
+    # BENCH_ASTER_SCHEME=null to remove the default SCHEME=iommu.
+    local bench_aster_scheme="${BENCH_ASTER_SCHEME:-}"
+    if [[ -n "$bench_aster_scheme" ]]; then
+        if [[ "$bench_aster_scheme" == "null" ]]; then
+            aster_scheme_cmd_part=""
+        else
+            aster_scheme_cmd_part="SCHEME=${bench_aster_scheme}"
+        fi
+    fi
 
     # Prepare commands for Asterinas and Linux using arrays
     local bench_enable_kvm="${BENCH_ENABLE_KVM:-1}"
@@ -125,6 +136,7 @@ run_benchmark() {
     local bench_fio_bs="${BENCH_FIO_BS:-}"
     local bench_fio_fsync="${BENCH_FIO_FSYNC:-}"
     local bench_fio_size="${BENCH_FIO_SIZE:-}"
+    local bench_fio_numjobs="${BENCH_FIO_NUMJOBS:-}"
     local ext4_direct_read_cache="${EXT4_DIRECT_READ_CACHE:-1}"
     local ext4_page_cache="${EXT4_PAGE_CACHE:-0}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
@@ -144,19 +156,22 @@ run_benchmark() {
     [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=1M")
     [[ -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_FSYNC=${bench_fio_fsync}")
     [[ -n "$bench_fio_size" ]] && asterinas_cmd_arr+=("BENCH_FIO_SIZE=${bench_fio_size}")
+    [[ -n "$bench_fio_numjobs" ]] && asterinas_cmd_arr+=("BENCH_FIO_NUMJOBS=${bench_fio_numjobs}")
     if [[ "$platform" == "tdx" ]]; then
         asterinas_cmd_arr+=(INTEL_TDX=1)
     fi
 
     local linux_init_args="/benchmark/common/bench_runner.sh ${benchmark} linux"
-    [[ -n "$bench_fio_bs" ]] && linux_init_args+=" ${bench_fio_bs}"
-    [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && linux_init_args+=" 1M"
-    [[ -n "$bench_fio_fsync" ]] && linux_init_args+=" ${bench_fio_fsync}"
-    if [[ -n "$bench_fio_size" ]]; then
-        [[ -z "$bench_fio_bs" ]] && linux_init_args+=" 1M"
-        [[ -z "$bench_fio_fsync" ]] && linux_init_args+=" -"
-        linux_init_args+=" ${bench_fio_size}"
+    if [[ -n "$bench_fio_bs" || -n "$bench_fio_fsync" || -n "$bench_fio_size" || -n "$bench_fio_numjobs" ]]; then
+        linux_init_args+=" ${bench_fio_bs:-1M}"
     fi
+    if [[ -n "$bench_fio_fsync" || -n "$bench_fio_size" || -n "$bench_fio_numjobs" ]]; then
+        linux_init_args+=" ${bench_fio_fsync:--}"
+    fi
+    if [[ -n "$bench_fio_size" || -n "$bench_fio_numjobs" ]]; then
+        linux_init_args+=" ${bench_fio_size:--}"
+    fi
+    [[ -n "$bench_fio_numjobs" ]] && linux_init_args+=" ${bench_fio_numjobs}"
 
     local linux_cmd_arr=(
         qemu-system-x86_64
@@ -296,7 +311,7 @@ main() {
     # Run the benchmark, passing the config string
     run_benchmark "$benchmark" "$run_mode" "$runtime_configs_str"
 
-    if [[ "${bench_run_only}" == "both" ]]; then
+    if [[ "${bench_run_only}" == "both" && "${BENCH_SKIP_RESULT_PARSE:-0}" != "1" ]]; then
         # Parse results if benchmark configuration exists
         if [[ -f "$bench_result" ]]; then
             parse_results "$bench_result"

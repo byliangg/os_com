@@ -1,0 +1,305 @@
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:79:7
+   |
+79 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1798:8
+     |
+1111 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1798 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 0.12s
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19D0+7EF319D0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..WARN: IOMMU initialization error:NoIommu
+[kernel] OSTD initialized. Preparing components.
+[32m[     0.544][0m [93mWARN [0m: [39mFramebuffer not found[0m
+[32m[     0.545][0m [93mWARN [0m: [39mFramebuffer not initialized[0m
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+[32m[     1.151][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.152][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.153][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.154][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.155][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.156][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+[32m[     1.157][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running benchmark: lmbench/ext4_create_delete_files_0k_ops on asterinas
+[32m[     1.159][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.160][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+[32m[     1.164][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+[32m[     1.165][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+*** Running the LMbench file system create/delete test (Ext4) ***
+[32m[     1.166][0m [93mWARN [0m: [39mUnimplemented syscall number: 334[0m
+0k[32m[     1.671][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.672][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.682][0m [93mWARN [0m: [39mext4: jbd2 committed tid=1 sequence=1 start=1 commit=11 next_head=12 metadata_blocks=9 data_sync_required=false free_blocks=16372[0m
+[32m[     1.738][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.739][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.740][0m [93mWARN [0m: [39mext4: jbd2 committed tid=2 sequence=2 start=12 commit=23 next_head=24 metadata_blocks=10 data_sync_required=false free_blocks=16360[0m
+[32m[     1.798][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.799][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.801][0m [93mWARN [0m: [39mext4: jbd2 committed tid=3 sequence=3 start=24 commit=35 next_head=36 metadata_blocks=10 data_sync_required=false free_blocks=16348[0m
+	7	1209[32m[     1.847][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.848][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.849][0m [93mWARN [0m: [39mext4: jbd2 committed tid=4 sequence=4 start=36 commit=47 next_head=48 metadata_blocks=10 data_sync_required=false free_blocks=16336[0m
+[32m[     1.896][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.897][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.898][0m [93mWARN [0m: [39mext4: jbd2 committed tid=5 sequence=5 start=48 commit=59 next_head=60 metadata_blocks=10 data_sync_required=false free_blocks=16324[0m
+[32m[     1.952][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     1.953][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     1.954][0m [93mWARN [0m: [39mext4: jbd2 committed tid=6 sequence=6 start=60 commit=71 next_head=72 metadata_blocks=10 data_sync_required=false free_blocks=16312[0m
+[32m[     2.011][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.012][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.014][0m [93mWARN [0m: [39mext4: jbd2 committed tid=7 sequence=7 start=72 commit=83 next_head=84 metadata_blocks=10 data_sync_required=false free_blocks=16300[0m
+	1183
+1k[32m[     2.069][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.070][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.071][0m [93mWARN [0m: [39mext4: jbd2 committed tid=8 sequence=8 start=84 commit=96 next_head=97 metadata_blocks=11 data_sync_required=true free_blocks=16287[0m
+[32m[     2.132][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.133][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.135][0m [93mWARN [0m: [39mext4: jbd2 committed tid=9 sequence=9 start=97 commit=109 next_head=110 metadata_blocks=11 data_sync_required=true free_blocks=16274[0m
+[32m[     2.192][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.193][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.194][0m [93mWARN [0m: [39mext4: jbd2 committed tid=10 sequence=10 start=110 commit=121 next_head=122 metadata_blocks=10 data_sync_required=true free_blocks=16262[0m
+	4	638[32m[     2.257][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.258][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.259][0m [93mWARN [0m: [39mext4: jbd2 committed tid=11 sequence=11 start=122 commit=134 next_head=135 metadata_blocks=11 data_sync_required=true free_blocks=16249[0m
+[32m[     2.313][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.314][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.315][0m [93mWARN [0m: [39mext4: jbd2 committed tid=12 sequence=12 start=135 commit=147 next_head=148 metadata_blocks=11 data_sync_required=true free_blocks=16236[0m
+[32m[     2.370][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.371][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.372][0m [93mWARN [0m: [39mext4: jbd2 committed tid=13 sequence=13 start=148 commit=160 next_head=161 metadata_blocks=11 data_sync_required=true free_blocks=16223[0m
+[32m[     2.424][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.425][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.426][0m [93mWARN [0m: [39mext4: jbd2 committed tid=14 sequence=14 start=161 commit=173 next_head=174 metadata_blocks=11 data_sync_required=true free_blocks=16210[0m
+	1160
+4k[32m[     2.482][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.483][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.485][0m [93mWARN [0m: [39mext4: jbd2 committed tid=15 sequence=15 start=174 commit=186 next_head=187 metadata_blocks=11 data_sync_required=true free_blocks=16197[0m
+[32m[     2.542][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.543][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.545][0m [93mWARN [0m: [39mext4: jbd2 committed tid=16 sequence=16 start=187 commit=199 next_head=200 metadata_blocks=11 data_sync_required=true free_blocks=16184[0m
+	4	722[32m[     2.602][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.603][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.605][0m [93mWARN [0m: [39mext4: jbd2 committed tid=17 sequence=17 start=200 commit=212 next_head=213 metadata_blocks=11 data_sync_required=true free_blocks=16171[0m
+[32m[     2.667][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.668][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.670][0m [93mWARN [0m: [39mext4: jbd2 committed tid=18 sequence=18 start=213 commit=224 next_head=225 metadata_blocks=10 data_sync_required=true free_blocks=16159[0m
+[32m[     2.727][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.728][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.729][0m [93mWARN [0m: [39mext4: jbd2 committed tid=19 sequence=19 start=225 commit=237 next_head=238 metadata_blocks=11 data_sync_required=true free_blocks=16146[0m
+[32m[     2.788][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.789][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.791][0m [93mWARN [0m: [39mext4: jbd2 committed tid=20 sequence=20 start=238 commit=250 next_head=251 metadata_blocks=11 data_sync_required=true free_blocks=16133[0m
+[32m[     2.848][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.849][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.851][0m [93mWARN [0m: [39mext4: jbd2 committed tid=21 sequence=21 start=251 commit=263 next_head=264 metadata_blocks=11 data_sync_required=true free_blocks=16120[0m
+	1170
+10k[32m[     2.905][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.906][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.907][0m [93mWARN [0m: [39mext4: jbd2 committed tid=22 sequence=22 start=264 commit=276 next_head=277 metadata_blocks=11 data_sync_required=true free_blocks=16107[0m
+[32m[     2.969][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     2.970][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     2.972][0m [93mWARN [0m: [39mext4: jbd2 committed tid=23 sequence=23 start=277 commit=289 next_head=290 metadata_blocks=11 data_sync_required=true free_blocks=16094[0m
+	4	602[32m[     3.036][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     3.037][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     3.039][0m [93mWARN [0m: [39mext4: jbd2 committed tid=24 sequence=24 start=290 commit=302 next_head=303 metadata_blocks=11 data_sync_required=true free_blocks=16081[0m
+[32m[     3.102][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     3.103][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     3.105][0m [93mWARN [0m: [39mext4: jbd2 committed tid=25 sequence=25 start=303 commit=315 next_head=316 metadata_blocks=11 data_sync_required=true free_blocks=16068[0m
+[32m[     3.167][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     3.168][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     3.170][0m [93mWARN [0m: [39mext4: jbd2 committed tid=26 sequence=26 start=316 commit=328 next_head=329 metadata_blocks=11 data_sync_required=true free_blocks=16055[0m
+[32m[     3.228][0m [93mWARN [0m: [39mblock: BlockDevice::sync() called — BioType::Flush will be submitted[0m
+[32m[     3.229][0m [93mWARN [0m: [39mvirtio-blk: flush() support_flush=true → sending ReqType::Flush to device[0m
+[32m[     3.232][0m [93mWARN [0m: [39mext4: jbd2 committed tid=27 sequence=27 start=329 commit=340 next_head=341 metadata_blocks=10 data_sync_required=true free_blocks=16043[0m
+	1123
+

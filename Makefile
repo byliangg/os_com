@@ -142,18 +142,17 @@ endif
 # If the BENCHMARK is set, we will run the benchmark in the kernel mode.
 ifneq ($(BENCHMARK), none)
 BENCHMARK_INIT_ARGS := /benchmark/common/bench_runner.sh $(BENCHMARK) asterinas
-ifneq ($(BENCH_FIO_BS),)
-BENCHMARK_INIT_ARGS += $(BENCH_FIO_BS)
-else ifneq ($(or $(BENCH_FIO_FSYNC),$(BENCH_FIO_SIZE)),)
-BENCHMARK_INIT_ARGS += 1M
+ifneq ($(or $(BENCH_FIO_BS),$(BENCH_FIO_FSYNC),$(BENCH_FIO_SIZE),$(BENCH_FIO_NUMJOBS)),)
+BENCHMARK_INIT_ARGS += $(if $(BENCH_FIO_BS),$(BENCH_FIO_BS),1M)
 endif
-ifneq ($(BENCH_FIO_FSYNC),)
-BENCHMARK_INIT_ARGS += $(BENCH_FIO_FSYNC)
-else ifneq ($(BENCH_FIO_SIZE),)
-BENCHMARK_INIT_ARGS += -
+ifneq ($(or $(BENCH_FIO_FSYNC),$(BENCH_FIO_SIZE),$(BENCH_FIO_NUMJOBS)),)
+BENCHMARK_INIT_ARGS += $(if $(BENCH_FIO_FSYNC),$(BENCH_FIO_FSYNC),-)
 endif
-ifneq ($(BENCH_FIO_SIZE),)
-BENCHMARK_INIT_ARGS += $(BENCH_FIO_SIZE)
+ifneq ($(or $(BENCH_FIO_SIZE),$(BENCH_FIO_NUMJOBS)),)
+BENCHMARK_INIT_ARGS += $(if $(BENCH_FIO_SIZE),$(BENCH_FIO_SIZE),-)
+endif
+ifneq ($(BENCH_FIO_NUMJOBS),)
+BENCHMARK_INIT_ARGS += $(BENCH_FIO_NUMJOBS)
 endif
 CARGO_OSDK_BUILD_ARGS += --init-args="$(BENCHMARK_INIT_ARGS)"
 endif

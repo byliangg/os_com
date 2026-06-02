@@ -1,0 +1,2 @@
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	truncate_append	write	after_commit	/root/asterinas/benchmark/logs/crash/truncate_append_prepare_r1.log	/root/asterinas/benchmark/logs/crash/truncate_append_verify_r1.log	PASS
