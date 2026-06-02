@@ -363,6 +363,67 @@ Asterinas 内部 fs-vs-raw 分层：
 - journaled write / nojournal write 为 98.64%，本轮下 JBD2 额外写开销很小；write hardening 应优先看 ext4 data I/O 共同路径、direct-write bio/metadata prepare，而不是单独归因到 JBD2。
 - ext4 journaled/nojournal read 均约为 raw read 的 117%，说明在本轮 cache-off 口径下，read 侧不是当前主要 blocker；该现象可能来自同轮 raw 读基线偏低或 ext4 顺序映射组织更有利，后续应继续用同轮分层结果判断。
 
+## 6. fio 参数 sweep 工具（A–G 全量参数画像）
+
+用于在单个 Docker 容器内，一次性跑出 ext4 O_DIRECT / buffered 的全量参数画像（不同 `bs`/`numjobs`/`fsync`/`direct`/`page_cache`），并对每个 case 与 Linux ext4 同轮对照，输出一张可信的 ratio 汇总 TSV。是 Phase 5 性能优化的基线证据来源。
+
+- **脚本**：`asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh`
+- **前置**：宿主机有 `docker` 且 `/dev/kvm` 可用（脚本会自检，缺失直接报错退出）
+
+### 6.1 运行方法
+
+```bash
+cd /home/lby/os_com_codex
+./asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+```
+
+跑完后：
+
+```
+fio parameter sweep finished.
+Summary TSV: .../benchmark/logs/fio_parameter_sweep_<TS>/fio_parameter_sweep_summary.tsv
+```
+
+- **输出目录**：`asterinas/benchmark/logs/fio_parameter_sweep_<TS>/`（每个 case 一个 `<case>.log` + 一张 `fio_parameter_sweep_summary.tsv`）
+- **汇总 TSV 列**：`group / case / target / journal / rw / direct / page_cache / direct_read_cache / bs / numjobs / fsync / asterinas_mb_s / linux_mb_s / ratio_pct / log / note`
+
+### 6.2 测试分组（A–G）
+
+| 组 | 内容 | 主要用途 |
+|----|------|----------|
+| A | 官方 O_DIRECT 守底（`bs=1M, nj=1, cache-off`）write/read | 复现守底 ratio |
+| B | 6-test 分层（raw / ext4 journaled / ext4 nojournal）| 区分 block 层 vs ext4 vs JBD2 |
+| C | bs sweep（`4K/16K/64K/256K/1M/4M`）| 找块大小拐点、小块 per-request 开销 |
+| D | direct/cache 对照（direct×page_cache 四象限）| 分离 O_DIRECT 与 buffered/PageCache |
+| E | fsync sweep（`none/4/16/64`，`bs=16K/1M`）| 持久化语义成本（不作普通吞吐宣传）|
+| F | numjobs sweep（`1/2/4`）| 判断并发提交能力 / 队列深度 |
+| G | correctness 回归（crash / phase3-6 / jbd / concurrency / pagecache / host-crash fsync）| 确认性能没有建立在 correctness 回退上 |
+
+### 6.3 可调环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `IMAGE` | `asterinas/asterinas:0.17.0-20260227` | Docker 镜像 |
+| `LOG_DIR` | `benchmark/logs/fio_parameter_sweep_<TS>` | 输出目录 |
+| `SUMMARY_TSV` | `<LOG_DIR>/fio_parameter_sweep_summary.tsv` | 汇总文件 |
+| `RUN_G_CORRECTNESS` | `1` | 设 `0` 跳过 G 组 correctness，只跑 A–F 性能（省时间）|
+| `LOG_LEVEL` | `error` | guest 内核日志级别。**勿设 verbose/trace**，否则单个 case 日志可达数百 MB |
+| `BENCH_ASTER_SCHEME` | `null` | `null` = no-IOMMU 诊断口径 |
+| `http_proxy` / `https_proxy` / `all_proxy` | `127.0.0.1:7890` | 容器内首次装 `cargo-osdk` 用 |
+
+只跑性能、不跑 correctness：
+
+```bash
+RUN_G_CORRECTNESS=0 ./asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+```
+
+### 6.4 注意
+
+- 全量（含 G）一轮约 2–3 小时；纯 A–F 明显更快。
+- 固定口径：A–F 全程 `direct` 用 O_DIRECT、`EXT4_DIRECT_READ_CACHE=0`；page_cache 仅 D 组开启对照。
+- `LOG_LEVEL` 默认 `error` 即可；曾出现过 656MB 的 verbose 日志，既超 GitHub 100MB 上限又无分析价值，不要提交。
+- 最近一轮完整结果与三瓶颈分析见根目录 `fio_direct_parameter_sweep_report.md`（2026-05-18/19）。
+
 ## 7. 当前观察与说明
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。
