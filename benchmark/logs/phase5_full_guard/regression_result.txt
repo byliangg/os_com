@@ -1,0 +1,12 @@
+>>> [non-reg] pagecache_phase4 (default page_cache=1, drc=1)
+    pagecache_phase4 rc=0
+>>> [cache-AB] generic/091 page_cache=0 direct_read_cache=1 extent_map_cache=1
+    ab_generic_091_drc1 rc=0
+        xfstests case done: generic/091 rc=1
+>>> [cache-AB] generic/091 page_cache=0 direct_read_cache=0 extent_map_cache=1
+    ab_generic_091_drc0 rc=0
+        xfstests case done: generic/091 rc=1
+>>> [cache-AB] generic/130 page_cache=0 direct_read_cache=1 extent_map_cache=1
+    ab_generic_130_drc1 rc=1
+>>> [cache-AB] generic/130 page_cache=0 direct_read_cache=0 extent_map_cache=1
+    ab_generic_130_drc0 rc=1

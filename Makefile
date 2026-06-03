@@ -18,6 +18,7 @@ LOG_LEVEL ?= error
 EXT4_PHASE2_PROFILE ?= 0
 EXT4_DIRECT_READ_CACHE ?= 1
 EXT4_PAGE_CACHE ?= 0
+EXT4_EXTENT_MAP_CACHE ?= 1
 SCHEME ?= ""
 SMP ?= 1
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
@@ -95,6 +96,7 @@ CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.phase2_profile=$(EXT4_PHASE2_PROFILE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.direct_read_cache=$(EXT4_DIRECT_READ_CACHE)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.page_cache=$(EXT4_PAGE_CACHE)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4fs.extent_map_cache=$(EXT4_EXTENT_MAP_CACHE)"
 CARGO_OSDK_TEST_ARGS :=
 
 ifeq ($(AUTO_TEST), syscall)

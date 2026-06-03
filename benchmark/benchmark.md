@@ -424,6 +424,24 @@ RUN_G_CORRECTNESS=0 ./asterinas/test/initramfs/src/benchmark/fio/run_parameter_s
 - `LOG_LEVEL` 默认 `error` 即可；曾出现过 656MB 的 verbose 日志，既超 GitHub 100MB 上限又无分析价值，不要提交。
 - 最近一轮完整结果与三瓶颈分析见根目录 `fio_direct_parameter_sweep_report.md`（2026-05-18/19）。
 
+## 6.5 宿主机 page cache 与 Linux 基线口径（drop_caches，Phase 5 起默认）
+
+**现象**：同一配置下 Linux O_DIRECT 顺序读基线跨会话剧烈波动（1M read 2768 ↔ 4942 MB/s）。
+
+**根因**：QEMU `-drive` 默认 `cache=writeback`，宿主机会缓存 backing image（`build/ext2.img`）；guest 侧 `direct=1`（O_DIRECT）**不绕过宿主机的 page cache**。fio 读测试先写出 1G 文件再读，读的是热在宿主机 RAM 里的数据，吞吐取决于"这 1G 有多少留在宿主机 cache"——随宿主机内存压力波动。**与 KVM 无关**（`kvm_intel: VMX not supported` 是 guest 嵌套虚拟化噪音，host 仍正常加速）。
+
+**口径（Phase 5 起默认开）**：`bench_linux_and_aster.sh` 在每次 QEMU 启动前 `sync; echo 3 > /proc/sys/vm/drop_caches`（privileged 容器共享宿主内核），由 `BENCH_DROP_CACHES`（默认 `1`）控制，`=0` 可恢复旧 warm-cache 行为。仅影响 perf 路径（correctness 走 `cargo osdk run`，不经此脚本）。
+
+**实测效果**（同套 A/B，1M read Linux 基线）：
+
+| | Linux 1M read |
+|---|---|
+| 2 周前 sweep | 2768 |
+| 不带 drop | 4942–5111（warm cache 虚高）|
+| **带 drop（默认）** | **2818–2813**（复现 sweep、c0/c1 仅差 0.2%）|
+
+**重要**：drop 后比较才公平——之前"Asterinas 1M read 49–61%"是被 Linux 的热 cache 坑了；公平测量下 **Asterinas 1M read = 104–126%**（追平/反超 Linux）。小块读（per-IO bound）受 host cache 影响小、波动主要是 per-IO 噪声，建议每档跑 3 次取中位数。更彻底的备选：QEMU `-drive cache=none`（宿主机也 O_DIRECT、永不缓存）。
+
 ## 7. 当前观察与说明
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。

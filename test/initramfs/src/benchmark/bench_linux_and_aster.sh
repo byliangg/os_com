@@ -139,6 +139,12 @@ run_benchmark() {
     local bench_fio_numjobs="${BENCH_FIO_NUMJOBS:-}"
     local ext4_direct_read_cache="${EXT4_DIRECT_READ_CACHE:-1}"
     local ext4_page_cache="${EXT4_PAGE_CACHE:-0}"
+    # Phase 5: forward the ext4 latency-attribution profile gate and log level
+    # so fio runs can emit the end-of-run perf summary. Both default to the
+    # current behavior (profile off, Makefile default log level) when unset.
+    local ext4_phase2_profile="${EXT4_PHASE2_PROFILE:-0}"
+    local ext4_extent_map_cache="${EXT4_EXTENT_MAP_CACHE:-1}"
+    local bench_log_level="${LOG_LEVEL:-}"
     local asterinas_cmd_arr=(make run_kernel "BENCHMARK=${benchmark}")
     # Add scheme part only if it's not empty and the platform is not TDX (OSDK doesn't support multiple SCHEME)
     [[ -n "$aster_scheme_cmd_part" && "$platform" != "tdx" ]] && asterinas_cmd_arr+=("$aster_scheme_cmd_part")
@@ -151,7 +157,10 @@ run_benchmark() {
         "VHOST=${bench_aster_vhost}"
         "EXT4_DIRECT_READ_CACHE=${ext4_direct_read_cache}"
         "EXT4_PAGE_CACHE=${ext4_page_cache}"
+        "EXT4_PHASE2_PROFILE=${ext4_phase2_profile}"
+        "EXT4_EXTENT_MAP_CACHE=${ext4_extent_map_cache}"
     )
+    [[ -n "$bench_log_level" ]] && asterinas_cmd_arr+=("LOG_LEVEL=${bench_log_level}")
     [[ -n "$bench_fio_bs" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=${bench_fio_bs}")
     [[ -z "$bench_fio_bs" && -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_BS=1M")
     [[ -n "$bench_fio_fsync" ]] && asterinas_cmd_arr+=("BENCH_FIO_FSYNC=${bench_fio_fsync}")
@@ -204,12 +213,32 @@ run_benchmark() {
         )
     fi
 
+    # Optionally drop the host page cache before each QEMU launch so both
+    # Asterinas and Linux start from the same cold backing-image state. The
+    # QEMU drive uses the default host cache (writeback), and O_DIRECT in the
+    # guest does NOT bypass the host's page cache of the backing image, so a
+    # warm/partially-evicted image makes the Linux baseline swing run-to-run.
+    # Privileged container shares the host kernel, so this drops host caches.
+    # Default ON (Phase 5 baseline): measured to bring the Linux 1M read
+    # baseline back from a warm-cache-inflated ~4900 MB/s to a reproducible
+    # ~2800 MB/s that matches historical sweeps and makes the comparison fair.
+    # Set BENCH_DROP_CACHES=0 to restore the old warm-cache behavior.
+    maybe_drop_caches() {
+        if [[ "${BENCH_DROP_CACHES:-1}" == "1" ]]; then
+            sync
+            echo 3 > /proc/sys/vm/drop_caches 2>/dev/null \
+                && echo "[bench] dropped host page cache" \
+                || echo "[bench] WARN: drop_caches failed (need privileged container)"
+        fi
+    }
+
     # Run the benchmark depending on the mode
     case "${run_mode}" in
         "guest_only")
             # Ensure Asterinas and Linux both run on a freshly prepared image.
             if [[ "${bench_run_only}" != "linux" ]]; then
                 prepare_fs
+                maybe_drop_caches
                 echo "Running benchmark ${benchmark} on Asterinas..."
                 # Execute directly from array, redirect stderr to stdout, then tee
                 "${asterinas_cmd_arr[@]}" 2>&1 | tee "${ASTER_OUTPUT}"
@@ -217,6 +246,7 @@ run_benchmark() {
 
             if [[ "${bench_run_only}" != "asterinas" ]]; then
                 prepare_fs
+                maybe_drop_caches
                 echo "Running benchmark ${benchmark} on Linux..."
                 # Execute directly from array, redirect stderr to stdout, then tee
                 "${linux_cmd_arr[@]}" 2>&1 | tee "${LINUX_OUTPUT}"
