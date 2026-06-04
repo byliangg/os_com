@@ -1120,6 +1120,17 @@ pub(super) struct Ext4Fs {
     // (a few integers per extent) so sequential reads skip the per-read
     // `find_extent` walk. Holds no file data and does no speculative readahead.
     inode_extent_map_cache: Mutex<BTreeMap<u32, ExtentMapCacheEntry>>,
+    // Phase 5: in-memory inode metadata (stat) cache. ext4_rs `get_inode_ref`
+    // re-reads the inode block from the device on every stat, and the read path
+    // stats several times per read (type check, size, atime), so small reads
+    // paid ~25us per stat. ext2 keeps the inode in memory; this closes that gap.
+    // Correctness: any journaled mutation bumps `meta_cache_generation` and
+    // clears this cache (run_journaled_ext4 is the single chokepoint for all
+    // create/write/truncate/setattr/dir ops); `stat` only inserts when the
+    // generation did not advance across its disk read, closing the read-vs-write
+    // TOCTOU.
+    inode_meta_cache: Mutex<BTreeMap<u32, SimpleInodeMeta>>,
+    meta_cache_generation: AtomicU64,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
@@ -1169,6 +1180,8 @@ impl Ext4Fs {
             open_file_handles: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_extent_map_cache: Mutex::new(BTreeMap::new()),
+            inode_meta_cache: Mutex::new(BTreeMap::new()),
+            meta_cache_generation: AtomicU64::new(0),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
@@ -3734,7 +3747,12 @@ impl Ext4Fs {
         if journal_enabled {
             self.run_journaled_ext4(op, |ext4| f(ext4).map_err(map_ext4_error))
         } else {
-            self.run_ext4(f)
+            // No-journal setattr bypasses run_journaled_ext4, so invalidate the
+            // inode meta cache here too (same generation-bump + clear protocol).
+            let result = self.run_ext4(f);
+            self.meta_cache_generation.fetch_add(1, Ordering::Release);
+            self.inode_meta_cache.lock().clear();
+            result
         }
     }
 
@@ -3889,6 +3907,14 @@ impl Ext4Fs {
         };
         let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
 
+        // Phase 5 (inode meta cache): this journaled op may have changed inode
+        // metadata (size/mtime/nlink/mode/...) for the target and/or its parent
+        // directory. Bump the generation and drop all cached stats so the next
+        // stat re-reads. The generation guard in `stat` prevents a racing stat
+        // from re-inserting a value it read across this mutation.
+        self.meta_cache_generation.fetch_add(1, Ordering::Release);
+        self.inode_meta_cache.lock().clear();
+
         let finish_handle_start_ns = Self::monotonic_nanos();
         self.finish_jbd2_handle(jbd2_handle, op.as_ref(), op_name, result.is_ok());
         let finish_handle_elapsed_ns =
@@ -3933,7 +3959,21 @@ impl Ext4Fs {
     }
 
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
-        self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))
+        // Fast path: serve from the in-memory metadata cache.
+        let gen_before = self.meta_cache_generation.load(Ordering::Acquire);
+        if let Some(meta) = self.inode_meta_cache.lock().get(&ino).copied() {
+            return Ok(meta);
+        }
+
+        // Miss: read the inode from the device once.
+        let meta = self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))?;
+
+        // Only cache if no journaled mutation raced our read (generation
+        // unchanged), so we never insert a value read across a mutation.
+        if self.meta_cache_generation.load(Ordering::Acquire) == gen_before {
+            self.inode_meta_cache.lock().insert(ino, meta);
+        }
+        Ok(meta)
     }
 
     fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
