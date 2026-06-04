@@ -1,0 +1,23 @@
+[SKIP] crash suite disabled (RUN_CRASH_SUITE=0)
+[DONE] mode=phase4_good rc=0 log=/reg-logs/phase4_good_20260603_101408.log
+227:xfstests case done: generic/091 rc=1
+494:===== phase4_good detailed results =====
+497:xfstests phase4_good passed: pass_rate=0.00% >= 0%
+501:All syscall tests passed.
+[SKIP] pagecache_phase4 disabled (RUN_PAGECACHE_PHASE4=0)
+[SKIP] phase3_base disabled (RUN_PHASE3_BASE=0)
+[SKIP] phase6_good disabled (RUN_PHASE6_GOOD=0)
+[SKIP] jbd_phase1 disabled (RUN_JBD_PHASE1=0)
+[SKIP] phase2 concurrency disabled (RUN_PHASE2_CONCURRENCY=0)
+[SKIP] jbd_phase3 disabled (RUN_JBD_PHASE3=0)
+[SKIP] lmbench disabled (RUN_LMBENCH=0)
+[DONE] phase4_part3 run finished
+crash_summary=<disabled>
+phase4_good_log=/reg-logs/phase4_good_20260603_101408.log
+pagecache_phase4_log=<disabled>
+phase3_base_log=<disabled>
+phase6_good_log=<disabled>
+jbd_phase1_log=<disabled>
+jbd_phase2_concurrency_log=<disabled>
+jbd_phase3_fsync_durability_log=<disabled>
+lmbench_summary=<disabled>

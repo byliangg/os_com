@@ -1,0 +1,4 @@
+[SKIP] crash suite disabled (RUN_CRASH_SUITE=0)
+[DONE] mode=phase4_good rc=1 log=/reg-logs/phase4_good_20260603_101550.log
+227:===== phase4_good detailed results =====
+230:Error: xfstests failed.

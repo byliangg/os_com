@@ -358,6 +358,21 @@ pub fn reset_write_bio_profile() {
     WRITE_BIO_PROFILE_STATS.reset();
 }
 
+/// Force-prints the accumulated read-bio latency profile regardless of the
+/// interval / enabled gate. Used by the ext4 end-of-run perf summary dump so a
+/// single complete snapshot is emitted on `sync()` / unmount.
+pub fn dump_read_bio_profile() {
+    let bios = READ_BIO_PROFILE_STATS.read_bios.load(Ordering::Relaxed);
+    maybe_log_read_bio_profile(bios, true);
+}
+
+/// Force-prints the accumulated write-bio latency profile regardless of the
+/// interval / enabled gate. Used by the ext4 end-of-run perf summary dump.
+pub fn dump_write_bio_profile() {
+    let bios = WRITE_BIO_PROFILE_STATS.write_bios.load(Ordering::Relaxed);
+    maybe_log_write_bio_profile(bios, true);
+}
+
 #[inline]
 fn monotonic_nanos() -> u64 {
     let duration = read_monotonic_time();
@@ -367,11 +382,11 @@ fn monotonic_nanos() -> u64 {
         .saturating_add(u64::from(duration.subsec_nanos()))
 }
 
-fn maybe_log_read_bio_profile(bios: u64) {
-    if !READ_BIO_PROFILE_LOG_ENABLED {
+fn maybe_log_read_bio_profile(bios: u64, force: bool) {
+    if !force && !READ_BIO_PROFILE_LOG_ENABLED {
         return;
     }
-    if bios == 0 || bios % ReadBioProfileStats::LOG_INTERVAL_BIOS != 0 {
+    if bios == 0 || (!force && bios % ReadBioProfileStats::LOG_INTERVAL_BIOS != 0) {
         return;
     }
 
@@ -502,11 +517,11 @@ fn maybe_log_read_bio_profile(bios: u64) {
     ));
 }
 
-fn maybe_log_write_bio_profile(bios: u64) {
-    if !WRITE_BIO_PROFILE_ENABLED.load(Ordering::Relaxed) {
+fn maybe_log_write_bio_profile(bios: u64, force: bool) {
+    if !force && !WRITE_BIO_PROFILE_ENABLED.load(Ordering::Relaxed) {
         return;
     }
-    if bios == 0 || (bios != 1 && bios % WriteBioProfileStats::LOG_INTERVAL_BIOS != 0) {
+    if bios == 0 || (!force && bios != 1 && bios % WriteBioProfileStats::LOG_INTERVAL_BIOS != 0) {
         return;
     }
 
@@ -1036,7 +1051,7 @@ impl SubmittedBio {
                 complete_path_ns,
                 total_ns,
             );
-            maybe_log_read_bio_profile(bios);
+            maybe_log_read_bio_profile(bios, false);
         }
 
         if status == BioStatus::Complete && bio_type == BioType::Write && write_profile_enabled {
@@ -1079,7 +1094,7 @@ impl SubmittedBio {
                 complete_path_ns,
                 total_ns,
             );
-            maybe_log_write_bio_profile(bios);
+            maybe_log_write_bio_profile(bios, false);
         }
 
         self.0.wait_queue.wake_all();

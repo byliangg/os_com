@@ -6,8 +6,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use aster_block::{
     BlockDevice, SECTOR_SIZE,
     bio::{
-        BioDirection, BioSegment, BioStatus, BioWaiter, reset_read_bio_profile,
-        reset_write_bio_profile, set_write_bio_profile_enabled,
+        BioDirection, BioSegment, BioStatus, BioWaiter, dump_read_bio_profile,
+        dump_write_bio_profile, reset_read_bio_profile, reset_write_bio_profile,
+        set_write_bio_profile_enabled,
     },
     id::Bid,
     request_queue::bio_request_merge_count,
@@ -126,6 +127,11 @@ struct DirectReadProfileStats {
     submit_ns: AtomicU64,
     wait_ns: AtomicU64,
     copy_ns: AtomicU64,
+    // Phase 5 full-path probe: total wall time of read_direct_at (so we can see
+    // how much per-read overhead is outside the measured stages), and the atime
+    // bookkeeping time specifically.
+    total_ns: AtomicU64,
+    atime_ns: AtomicU64,
 }
 
 struct DirectWriteProfileStats {
@@ -241,6 +247,8 @@ impl DirectReadProfileStats {
             submit_ns: AtomicU64::new(0),
             wait_ns: AtomicU64::new(0),
             copy_ns: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            atime_ns: AtomicU64::new(0),
         }
     }
 
@@ -263,6 +271,8 @@ impl DirectReadProfileStats {
         submit_ns: u64,
         wait_ns: u64,
         copy_ns: u64,
+        total_ns: u64,
+        atime_ns: u64,
     ) -> u64 {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let mappings = u64::try_from(mappings).unwrap_or(u64::MAX);
@@ -282,6 +292,8 @@ impl DirectReadProfileStats {
         self.submit_ns.fetch_add(submit_ns, Ordering::Relaxed);
         self.wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
         self.copy_ns.fetch_add(copy_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(total_ns, Ordering::Relaxed);
+        self.atime_ns.fetch_add(atime_ns, Ordering::Relaxed);
         reads
     }
 
@@ -643,6 +655,16 @@ struct DirectReadCache {
     last_atime_sec: u32,
     last_read_end: usize,
     pending: Option<PendingDirectRead>,
+    mappings: Vec<SimpleBlockRange>,
+}
+
+/// Phase 5: a cached logical->physical extent mapping for one inode, covering
+/// the file byte range `[file_offset, file_offset + len)`. Metadata only — no
+/// file data, no speculative readahead. Lets sequential O_DIRECT reads reuse a
+/// single `find_extent` walk instead of re-resolving the mapping per read.
+struct ExtentMapCacheEntry {
+    file_offset: usize,
+    len: usize,
     mappings: Vec<SimpleBlockRange>,
 }
 
@@ -1092,11 +1114,29 @@ pub(super) struct Ext4Fs {
     inode_page_caches: Mutex<BTreeMap<u32, Arc<Ext4PageCacheState>>>,
     open_file_handles: Mutex<BTreeMap<u32, usize>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
+    // Phase 5: metadata-only extent mapping cache for O_DIRECT reads. Distinct
+    // from `inode_direct_read_cache` above (which is the retired speculative
+    // *data* read cache): this caches only the logical->physical extent mapping
+    // (a few integers per extent) so sequential reads skip the per-read
+    // `find_extent` walk. Holds no file data and does no speculative readahead.
+    inode_extent_map_cache: Mutex<BTreeMap<u32, ExtentMapCacheEntry>>,
+    // Phase 5: in-memory inode metadata (stat) cache. ext4_rs `get_inode_ref`
+    // re-reads the inode block from the device on every stat, and the read path
+    // stats several times per read (type check, size, atime), so small reads
+    // paid ~25us per stat. ext2 keeps the inode in memory; this closes that gap.
+    // Correctness: any journaled mutation bumps `meta_cache_generation` and
+    // clears this cache (run_journaled_ext4 is the single chokepoint for all
+    // create/write/truncate/setattr/dir ops); `stat` only inserts when the
+    // generation did not advance across its disk read, closing the read-vs-write
+    // TOCTOU.
+    inode_meta_cache: Mutex<BTreeMap<u32, SimpleInodeMeta>>,
+    meta_cache_generation: AtomicU64,
     inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
     page_cache_enabled: bool,
     direct_read_cache_enabled: bool,
+    extent_map_cache_enabled: bool,
     phase2_profile_enabled: bool,
     direct_read_profile_started: AtomicBool,
     direct_write_profile_started: AtomicBool,
@@ -1139,11 +1179,15 @@ impl Ext4Fs {
             inode_page_caches: Mutex::new(BTreeMap::new()),
             open_file_handles: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
+            inode_extent_map_cache: Mutex::new(BTreeMap::new()),
+            inode_meta_cache: Mutex::new(BTreeMap::new()),
+            meta_cache_generation: AtomicU64::new(0),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
             inode_ctime_cache: Mutex::new(BTreeMap::new()),
             inode_mtime_ctime_cache: Mutex::new(BTreeMap::new()),
             page_cache_enabled: Self::page_cache_enabled_from_kcmdline(),
             direct_read_cache_enabled: Self::direct_read_cache_enabled_from_kcmdline(),
+            extent_map_cache_enabled: Self::extent_map_cache_enabled_from_kcmdline(),
             phase2_profile_enabled: Self::phase2_profile_enabled_from_kcmdline(),
             direct_read_profile_started: AtomicBool::new(false),
             direct_write_profile_started: AtomicBool::new(false),
@@ -1201,6 +1245,15 @@ impl Ext4Fs {
 
     fn direct_read_cache_enabled_from_kcmdline() -> bool {
         Self::ext4fs_bool_arg_from_kcmdline(b"direct_read_cache", true)
+    }
+
+    /// Metadata-only O_DIRECT extent mapping cache. Default on: it is an honest
+    /// filesystem optimization (the logical->physical mapping only, like Linux's
+    /// extent_status cache) and is independent of the retired speculative data
+    /// read cache (`direct_read_cache`), so it stays active in the cache-off
+    /// benchmark guard. Disable with `ext4fs.extent_map_cache=0`.
+    fn extent_map_cache_enabled_from_kcmdline() -> bool {
+        Self::ext4fs_bool_arg_from_kcmdline(b"extent_map_cache", true)
     }
 
     pub(super) fn page_cache_enabled(&self) -> bool {
@@ -2231,6 +2284,28 @@ impl Ext4Fs {
         }
     }
 
+    /// Force-emits one complete snapshot of all four profiling layers — FS
+    /// direct read/write stages, JBD2 / runtime-lock, and block/virtio bio
+    /// latency — regardless of the interval sampling gates. Called from
+    /// `sync()` so a benchmark run ends with a full cumulative summary instead
+    /// of relying on periodic interval logs. No-op unless
+    /// `ext4fs.phase2_profile=1`.
+    fn dump_perf_summary(&self) {
+        if !self.phase2_profile_enabled {
+            return;
+        }
+        let acquires = self.runtime_lock_stats.acquire_count.load(Ordering::Relaxed);
+        if acquires > 0 {
+            self.maybe_log_phase2_debug_stats(acquires);
+        }
+        let writes = self.direct_write_profile.write_calls.load(Ordering::Relaxed);
+        self.maybe_log_direct_write_profile(writes, true);
+        let reads = self.direct_read_profile.read_calls.load(Ordering::Relaxed);
+        self.maybe_log_direct_read_profile(reads, true);
+        dump_write_bio_profile();
+        dump_read_bio_profile();
+    }
+
     fn maybe_log_phase2_debug_stats(&self, runtime_lock_acquires: u64) {
         if !self.phase2_profile_enabled || runtime_lock_acquires == 0 {
             return;
@@ -2324,12 +2399,14 @@ impl Ext4Fs {
         );
     }
 
-    fn maybe_log_direct_read_profile(&self, reads: u64) {
-        const DIRECT_READ_PROFILE_LOG_ENABLED: bool = false;
-        if !DIRECT_READ_PROFILE_LOG_ENABLED {
+    fn maybe_log_direct_read_profile(&self, reads: u64, force: bool) {
+        // Gated by `ext4fs.phase2_profile`; off by default so guard regressions
+        // see no extra logging. `force` (from the end-of-run perf summary)
+        // bypasses the interval so one complete snapshot is always emitted.
+        if !self.phase2_profile_enabled || reads == 0 {
             return;
         }
-        if reads == 0 || reads % DirectReadProfileStats::LOG_INTERVAL_READS != 0 {
+        if !force && reads % DirectReadProfileStats::LOG_INTERVAL_READS != 0 {
             return;
         }
 
@@ -2364,9 +2441,22 @@ impl Ext4Fs {
         let submit_ns = self.direct_read_profile.submit_ns.load(Ordering::Relaxed);
         let wait_ns = self.direct_read_profile.wait_ns.load(Ordering::Relaxed);
         let copy_ns = self.direct_read_profile.copy_ns.load(Ordering::Relaxed);
+        let total_ns = self.direct_read_profile.total_ns.load(Ordering::Relaxed);
+        let atime_ns = self.direct_read_profile.atime_ns.load(Ordering::Relaxed);
+        // `other` = read_direct_at wall time minus the individually-measured
+        // stages and atime. Captures the in-function overhead not otherwise
+        // attributed (lock, evict, note, bookkeeping). Per-read time ABOVE
+        // read_direct_at (syscall / VFS / framekernel) is fio_per_read - total.
+        let measured_ns = plan_ns
+            .saturating_add(alloc_ns)
+            .saturating_add(submit_ns)
+            .saturating_add(wait_ns)
+            .saturating_add(copy_ns)
+            .saturating_add(atime_ns);
+        let other_ns = total_ns.saturating_sub(measured_ns);
 
         println!(
-            "[ext4-profile] direct-read reads={} bytes={} avg_bytes={} avg_mapped_bytes={} avg_zero_fill_bytes={} max_mapped_bytes={} cache_hit={} cache_miss={} avg_mappings_x100={} max_mappings={} avg_plan_us={} avg_alloc_us={} avg_submit_us={} avg_wait_us={} avg_copy_us={}",
+            "[ext4-profile] direct-read reads={} bytes={} avg_bytes={} avg_mapped_bytes={} avg_zero_fill_bytes={} max_mapped_bytes={} cache_hit={} cache_miss={} avg_mappings_x100={} max_mappings={} avg_plan_us={} avg_alloc_us={} avg_submit_us={} avg_wait_us={} avg_copy_us={} avg_atime_us={} avg_other_us={} avg_total_us={}",
             reads,
             total_bytes,
             total_bytes / reads,
@@ -2382,14 +2472,19 @@ impl Ext4Fs {
             submit_ns / reads / 1_000,
             wait_ns / reads / 1_000,
             copy_ns / reads / 1_000,
+            atime_ns / reads / 1_000,
+            other_ns / reads / 1_000,
+            total_ns / reads / 1_000,
         );
     }
 
-    fn maybe_log_direct_write_profile(&self, writes: u64) {
+    fn maybe_log_direct_write_profile(&self, writes: u64, force: bool) {
         if !self.phase2_profile_enabled || writes == 0 {
             return;
         }
-        if writes != 1 && writes % DirectWriteProfileStats::LOG_INTERVAL_WRITES != 0 {
+        // `force` (end-of-run perf summary) bypasses the interval so one
+        // complete snapshot is always emitted regardless of write count.
+        if !force && writes != 1 && writes % DirectWriteProfileStats::LOG_INTERVAL_WRITES != 0 {
             return;
         }
 
@@ -2835,7 +2930,15 @@ impl Ext4Fs {
 
         if !mount_flags.contains(PerMountFlags::STRICTATIME) {
             match self.stat(ino) {
-                Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => return Ok(()),
+                Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => {
+                    // Phase 5: cache the relatime "no atime update needed"
+                    // decision for this second so subsequent reads skip the
+                    // per-read `stat(ino)` (which re-reads the inode block,
+                    // ~31us/read at small bs). A write removes this inode's
+                    // atime-cache entry, so a later mtime/ctime bump re-stats.
+                    self.inode_atime_cache.lock().insert(ino, now);
+                    return Ok(());
+                }
                 Ok(_) => {}
                 Err(err) => {
                     warn!(
@@ -3054,6 +3157,92 @@ impl Ext4Fs {
         Ok((direct_len, mappings))
     }
 
+    /// Phase 5: resolve the O_DIRECT read mapping for `[offset, requested_len)`
+    /// through the metadata-only extent mapping cache.
+    ///
+    /// On a cache hit the cached extent mapping is sliced to the requested range
+    /// and returned without touching the extent tree. On a miss the mapping is
+    /// resolved once for a large window (mapping metadata only, no data and no
+    /// speculative bio), cached, and sliced. Cache entries are dropped by
+    /// `invalidate_direct_read_cache` on every block-changing operation (write /
+    /// truncate / fallocate / unlink / rename), and reads and writes on the same
+    /// inode are serialized by the inode correctness lock, so a cached mapping
+    /// can never outlive the extents it describes.
+    ///
+    /// Step 3b: the window is wide enough to cover a whole typical file in one
+    /// entry, so *random* reads also hit (the cached base offset monotonically
+    /// drops toward 0 across misses until the whole file is covered) — the same
+    /// effect Linux's extent_status cache provides. This caches only the
+    /// resolved logical->physical mapping, so it eliminates both the extent-tree
+    /// disk reads *and* the tree walk per read (a raw metadata-block cache would
+    /// only remove the disk reads). Pathologically fragmented files are bounded
+    /// by `MAX_CACHED_EXTENTS`.
+    fn plan_direct_read_extent_map_cached(
+        &self,
+        ino: u32,
+        offset: usize,
+        requested_len: usize,
+    ) -> Result<(usize, Vec<SimpleBlockRange>)> {
+        // Wide mapping-resolution window so one cache entry covers a whole
+        // typical file and random reads also hit. This only controls how much
+        // *mapping metadata* is resolved per walk; no file data is read here.
+        const EXTENT_MAP_PLAN_WINDOW_BYTES: usize = 1024 * 1024 * 1024;
+        // Memory bound: skip caching a single inode's mapping past this many
+        // extents (e.g. a maximally fragmented multi-GiB file). ~12 bytes each,
+        // so the cap is ~192 KiB per inode.
+        const MAX_CACHED_EXTENTS: usize = 16384;
+
+        if requested_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let requested_direct_len = requested_len / EXT4_BLOCK_SIZE * EXT4_BLOCK_SIZE;
+        if requested_direct_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        {
+            let cache = self.inode_extent_map_cache.lock();
+            if let Some(entry) = cache.get(&ino) {
+                let cache_end = entry.file_offset.saturating_add(entry.len);
+                let request_end = offset.saturating_add(requested_direct_len);
+                if offset >= entry.file_offset && request_end <= cache_end {
+                    self.direct_read_profile.record_cache_hit();
+                    let mappings = Self::slice_mappings_for_range(
+                        offset,
+                        requested_direct_len,
+                        &entry.mappings,
+                    )?;
+                    return Ok((requested_direct_len, mappings));
+                }
+            }
+        }
+
+        self.direct_read_profile.record_cache_miss();
+        let plan_window = requested_len.max(EXTENT_MAP_PLAN_WINDOW_BYTES);
+        let (resolved_len, resolved_mappings) = self
+            .run_ext4_file_read_only(|ext4| ext4.ext4_plan_direct_read(ino, offset, plan_window))?;
+        if resolved_len == 0 {
+            return Ok((0, Vec::new()));
+        }
+
+        let direct_len = resolved_len.min(requested_direct_len);
+        let mappings = Self::slice_mappings_for_range(offset, direct_len, &resolved_mappings)?;
+        // Bound per-inode memory: only cache when the resolved mapping is small
+        // enough. Fragmented files past the cap fall back to a per-read walk
+        // (still correct, just unaccelerated).
+        if resolved_mappings.len() <= MAX_CACHED_EXTENTS {
+            self.inode_extent_map_cache.lock().insert(
+                ino,
+                ExtentMapCacheEntry {
+                    file_offset: offset,
+                    len: resolved_len,
+                    mappings: resolved_mappings,
+                },
+            );
+        }
+        Ok((direct_len, mappings))
+    }
+
     fn mappings_fully_cover_range(
         offset: usize,
         len: usize,
@@ -3202,6 +3391,11 @@ impl Ext4Fs {
 
     fn invalidate_direct_read_cache(&self, ino: u32) {
         self.inode_direct_read_cache.lock().remove(&ino);
+        // Phase 5: the metadata-only extent mapping cache must be dropped on the
+        // exact same block-changing events; sharing this entry point inherits
+        // every existing invalidation call site (write/truncate/fallocate/
+        // unlink/rename/shutdown).
+        self.inode_extent_map_cache.lock().remove(&ino);
     }
 
     fn revoke_jbd2_checkpoint_metadata_blocks(&self, mappings: &[SimpleBlockRange]) {
@@ -3553,7 +3747,12 @@ impl Ext4Fs {
         if journal_enabled {
             self.run_journaled_ext4(op, |ext4| f(ext4).map_err(map_ext4_error))
         } else {
-            self.run_ext4(f)
+            // No-journal setattr bypasses run_journaled_ext4, so invalidate the
+            // inode meta cache here too (same generation-bump + clear protocol).
+            let result = self.run_ext4(f);
+            self.meta_cache_generation.fetch_add(1, Ordering::Release);
+            self.inode_meta_cache.lock().clear();
+            result
         }
     }
 
@@ -3708,6 +3907,14 @@ impl Ext4Fs {
         };
         let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
 
+        // Phase 5 (inode meta cache): this journaled op may have changed inode
+        // metadata (size/mtime/nlink/mode/...) for the target and/or its parent
+        // directory. Bump the generation and drop all cached stats so the next
+        // stat re-reads. The generation guard in `stat` prevents a racing stat
+        // from re-inserting a value it read across this mutation.
+        self.meta_cache_generation.fetch_add(1, Ordering::Release);
+        self.inode_meta_cache.lock().clear();
+
         let finish_handle_start_ns = Self::monotonic_nanos();
         self.finish_jbd2_handle(jbd2_handle, op.as_ref(), op_name, result.is_ok());
         let finish_handle_elapsed_ns =
@@ -3752,7 +3959,21 @@ impl Ext4Fs {
     }
 
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
-        self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))
+        // Fast path: serve from the in-memory metadata cache.
+        let gen_before = self.meta_cache_generation.load(Ordering::Acquire);
+        if let Some(meta) = self.inode_meta_cache.lock().get(&ino).copied() {
+            return Ok(meta);
+        }
+
+        // Miss: read the inode from the device once.
+        let meta = self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))?;
+
+        // Only cache if no journaled mutation raced our read (generation
+        // unchanged), so we never insert a value read across a mutation.
+        if self.meta_cache_generation.load(Ordering::Acquire) == gen_before {
+            self.inode_meta_cache.lock().insert(ino, meta);
+        }
+        Ok(meta)
     }
 
     fn lookup_cache(&self, parent: u32, name: &str) -> DirLookupCacheResult {
@@ -4244,6 +4465,10 @@ impl Ext4Fs {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
+        // Phase 5 full-path probe: wall clock from the very entry (includes the
+        // lock acquire, evict, atime, etc.) so we can see how much per-read
+        // overhead lives outside the individually-measured stages.
+        let rda_start = Self::monotonic_nanos();
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
         self.maybe_start_direct_read_profile();
@@ -4262,12 +4487,18 @@ impl Ext4Fs {
             (pending.len, pending.mappings, pending.waiter)
         } else {
             let plan_start = Self::monotonic_nanos();
-            let (direct_len, mappings) = self.plan_direct_read_cached(
-                ino,
-                offset,
-                writer.avail(),
-                self.direct_read_cache_enabled && !self.page_cache_enabled,
-            )?;
+            let (direct_len, mappings) = if self.direct_read_cache_enabled
+                && !self.page_cache_enabled
+            {
+                // Speculative data read cache (opt-in, off in the cache-off guard).
+                self.plan_direct_read_cached(ino, offset, writer.avail(), true)?
+            } else if self.extent_map_cache_enabled && !self.page_cache_enabled {
+                // Phase 5: metadata-only extent mapping cache — skips the
+                // per-read find_extent walk on sequential reads.
+                self.plan_direct_read_extent_map_cached(ino, offset, writer.avail())?
+            } else {
+                self.plan_direct_read_cached(ino, offset, writer.avail(), false)?
+            };
             plan_ns = Self::monotonic_nanos().saturating_sub(plan_start);
             if direct_len == 0 {
                 return Ok(0);
@@ -4295,7 +4526,10 @@ impl Ext4Fs {
         let zero_fill_bytes = direct_len.saturating_sub(mapped_bytes);
 
         self.note_completed_direct_read(ino, offset, direct_len);
+        let atime_start = Self::monotonic_nanos();
         self.touch_atime_after_direct_read(ino, status_flags)?;
+        let atime_ns = Self::monotonic_nanos().saturating_sub(atime_start);
+        let total_ns = Self::monotonic_nanos().saturating_sub(rda_start);
         let reads = self.direct_read_profile.record_read(
             direct_len,
             mappings.len(),
@@ -4306,8 +4540,10 @@ impl Ext4Fs {
             submit_ns,
             wait_ns,
             copy_ns,
+            total_ns,
+            atime_ns,
         );
-        self.maybe_log_direct_read_profile(reads);
+        self.maybe_log_direct_read_profile(reads, false);
         Ok(direct_len)
     }
 
@@ -4719,7 +4955,7 @@ impl Ext4Fs {
                 touch_elapsed_ns,
                 Self::monotonic_nanos().saturating_sub(profile_start_ns),
             );
-            self.maybe_log_direct_write_profile(writes);
+            self.maybe_log_direct_write_profile(writes, false);
         }
         result
     }
@@ -5096,6 +5332,9 @@ impl FileSystem for Ext4Fs {
         self.flush_pending_jbd2_transactions();
         self.block_device.sync()?;
         self.flush_pending_jbd2_transactions();
+        // Phase 5: emit one complete latency-attribution snapshot at the end of
+        // a benchmark run (syncfs / unmount). No-op unless ext4fs.phase2_profile=1.
+        self.dump_perf_summary();
         Ok(())
     }
 

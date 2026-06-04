@@ -1,0 +1,5 @@
+>>> [full-guard drc=0] phase4_good + phase3_base + jbd_phase1 (extent_map_cache=1)
+    full_guard_drc0 rc=0
+        xfstests phase4_good passed: pass_rate=100.00%
+        xfstests phase3_base passed: pass_rate=100.00%
+        xfstests jbd_phase1 passed: pass_rate=100.00%

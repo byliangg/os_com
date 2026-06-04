@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Run 6 diagnostic benchmarks: raw / ext4-journaled / ext4-nojournal (read+write each)
-# Usage: [KEEP_LOGS=1] [EXT4_DIRECT_READ_CACHE=0|1] ./run_6test_summary.sh
-# Default EXT4_DIRECT_READ_CACHE=0 keeps the comprehensive test on the
-# cache-off direct-I/O diagnostic baseline documented in benchmark.md.
+# Usage: [KEEP_LOGS=1] [BENCH_ASTER_SCHEME=null|iommu|normal]
+#        [EXT4_PAGE_CACHE=0|1] [EXT4_DIRECT_READ_CACHE=0|1]
+#        ./run_6test_summary.sh
+# Defaults keep the comprehensive test on the PageCache-off, direct-read-cache-off,
+# Asterinas no-IOMMU direct-I/O diagnostic baseline documented in benchmark.md.
 
 set -euo pipefail
 
@@ -39,6 +41,8 @@ ALL_PROXY_VALUE="${all_proxy:-socks5://127.0.0.1:7890}"
 BENCH_RUN_ONLY_VALUE="${BENCH_RUN_ONLY:-both}"
 LOG_LEVEL_VALUE="${LOG_LEVEL:-error}"
 EXT4_DIRECT_READ_CACHE_VALUE="${EXT4_DIRECT_READ_CACHE:-0}"
+EXT4_PAGE_CACHE_VALUE="${EXT4_PAGE_CACHE:-0}"
+BENCH_ASTER_SCHEME_VALUE="${BENCH_ASTER_SCHEME:-null}"
 
 run_job() {
     local job="$1"
@@ -56,8 +60,11 @@ run_job() {
         -e BENCH_ENABLE_KVM=1 \
         -e BENCH_ASTER_NETDEV=tap \
         -e BENCH_ASTER_VHOST=on \
+        -e BENCH_ASTER_SCHEME="${BENCH_ASTER_SCHEME_VALUE}" \
+        -e BENCH_SKIP_RESULT_PARSE=1 \
         -e LOG_LEVEL="${LOG_LEVEL_VALUE}" \
         -e EXT4_DIRECT_READ_CACHE="${EXT4_DIRECT_READ_CACHE_VALUE}" \
+        -e EXT4_PAGE_CACHE="${EXT4_PAGE_CACHE_VALUE}" \
         -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
         -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
         -e LINUX_DEPENDENCIES_DIR=/root/asterinas/.cache/linux_binary_cache \
@@ -152,3 +159,50 @@ echo "===== 6-Test Summary ====="
 for i in "${!JOBS[@]}"; do
     extract_result "${LABELS[$i]}" "${LOG_FILES[$i]}" "${OPS[$i]}"
 done
+
+echo ""
+echo "===== Asterinas FS-vs-Raw Ratios ====="
+python3 - "${LOG_FILES[@]}" <<'PY'
+import pathlib
+import re
+import sys
+
+labels = [
+    "raw_read",
+    "raw_write",
+    "ext4_journaled_read",
+    "ext4_journaled_write",
+    "ext4_nojournal_read",
+    "ext4_nojournal_write",
+]
+ops = ["READ", "WRITE", "READ", "WRITE", "READ", "WRITE"]
+scale = {"": 1e-6, "K": 1e-3, "M": 1.0, "G": 1e3, "T": 1e6}
+values = {}
+
+for label, op, log_file in zip(labels, ops, sys.argv[1:]):
+    text = pathlib.Path(log_file).read_text(errors="replace")
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    pattern = re.compile(rf"\b{op}: bw=[^\n]*?\(([\d.]+)([KMGT]?)B/s\)", re.IGNORECASE)
+    matches = pattern.findall(text)
+    if not matches:
+        raise SystemExit(f"{label}: failed to parse {op} bandwidth from {log_file}")
+    value, unit = matches[0]
+    values[label] = float(value) * scale[unit.upper()]
+
+def ratio(numerator, denominator):
+    return values[numerator] / values[denominator] * 100.0 if values[denominator] else 0.0
+
+rows = [
+    ("ext4 journaled read / raw read", "ext4_journaled_read", "raw_read"),
+    ("ext4 nojournal read / raw read", "ext4_nojournal_read", "raw_read"),
+    ("ext4 journaled write / raw write", "ext4_journaled_write", "raw_write"),
+    ("ext4 nojournal write / raw write", "ext4_nojournal_write", "raw_write"),
+    ("journaled write / nojournal write", "ext4_journaled_write", "ext4_nojournal_write"),
+]
+
+for name, numerator, denominator in rows:
+    print(
+        f"{name}: {values[numerator]:.1f}/{values[denominator]:.1f} "
+        f"= {ratio(numerator, denominator):.2f}%"
+    )
+PY

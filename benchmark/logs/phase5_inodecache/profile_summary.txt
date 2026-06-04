@@ -1,0 +1,30 @@
+===== ext4j-read-4K (job=fio/ext4_seq_read_bw bs=4K) =====
+--- [ext4-direct-write] (last) ---
+--- [ext4-profile] direct-read (last) ---
+[ext4-profile] direct-read reads=5931008 bytes=24293408768 avg_bytes=4096 avg_mapped_bytes=4096 avg_zero_fill_bytes=0 max_mapped_bytes=4096 cache_hit=5931007 cache_miss=1 avg_mappings_x100=100 max_mappings=1 avg_plan_us=0 avg_alloc_us=0 avg_submit_us=0 avg_wait_us=23 avg_copy_us=0 avg_atime_us=0 avg_other_us=0 avg_total_us=25
+--- [ext4-phase2] (last) ---
+[32m[   151.988][0m [93mWARN [0m: [39m[ext4-phase2] runtime_lock_acquires=524288 avg_wait_us=0 max_wait_us=54 avg_hold_us=305 max_hold_us=41214832 journaled_ops=262144 mkdir_ops=0 rmdir_ops=0 write_ops=262140 avg_start_handle_us=0 avg_apply_us=506 avg_finish_handle_us=58 avg_finish_alloc_us=0 avg_finish_io_us=0 avg_total_us=565 max_apply_ms=40810 max_finish_handle_ms=403 max_total_ms=41214 jbd2_handles_started=262144 finished=262144 max_active=1 avg_active_x100=66 max_running_handles=1 max_running_reserved=262152 max_running_metadata=14 rotations=2321 commits_prepared=2321 commits_finished=2321 checkpoints=0 overlay_reads=2883651 overlay_hits=2883631 metadata_writes=262200 alloc_clear_calls=0 alloc_reserve_calls=2 alloc_reserved_blocks=262145 alloc_contains_checks=262145 alloc_max_operation_blocks=262145[0m
+--- [block-profile] write-bio (last) ---
+[block-profile] write-bio bios=538112 bytes=2204103680 avg_bytes=4095 avg_segments_x100=100 avg_submit_to_enqueue_us=0 avg_queue_wait_us=0 avg_dispatch_us=1 avg_device_wait_us=28 avg_irq_delivery_us=27 avg_irq_reap_us=0 avg_resp_sync_us=0 avg_complete_us=0 large_bios=0 large_avg_bytes=0 large_avg_segments_x100=0 large_avg_submit_to_enqueue_us=0 large_avg_queue_wait_us=0 large_avg_dispatch_us=0 large_avg_device_wait_us=0 large_avg_irq_delivery_us=0 large_avg_irq_reap_us=0 large_avg_resp_sync_us=0 large_avg_complete_us=0 max_total_us=7933
+--- [block-profile] read-bio (last) ---
+
+===== ext4j-read-16K (job=fio/ext4_seq_read_bw bs=16K) =====
+--- [ext4-direct-write] (last) ---
+--- [ext4-profile] direct-read (last) ---
+[ext4-profile] direct-read reads=5259264 bytes=86167781376 avg_bytes=16384 avg_mapped_bytes=16384 avg_zero_fill_bytes=0 max_mapped_bytes=16384 cache_hit=5259263 cache_miss=1 avg_mappings_x100=100 max_mappings=2 avg_plan_us=0 avg_alloc_us=0 avg_submit_us=0 avg_wait_us=26 avg_copy_us=1 avg_atime_us=0 avg_other_us=0 avg_total_us=28
+--- [ext4-phase2] (last) ---
+[32m[    89.205][0m [93mWARN [0m: [39m[ext4-phase2] runtime_lock_acquires=131072 avg_wait_us=0 max_wait_us=183 avg_hold_us=704 max_hold_us=40618977 journaled_ops=65536 mkdir_ops=0 rmdir_ops=0 write_ops=65532 avg_start_handle_us=0 avg_apply_us=1290 avg_finish_handle_us=76 avg_finish_alloc_us=0 avg_finish_io_us=0 avg_total_us=1368 max_apply_ms=40512 max_finish_handle_ms=104 max_total_ms=40618 jbd2_handles_started=65536 finished=65536 max_active=1 avg_active_x100=66 max_running_handles=1 max_running_reserved=262152 max_running_metadata=14 rotations=772 commits_prepared=772 commits_finished=772 checkpoints=0 overlay_reads=1900573 overlay_hits=1900553 metadata_writes=65592 alloc_clear_calls=0 alloc_reserve_calls=2 alloc_reserved_blocks=262145 alloc_contains_checks=262145 alloc_max_operation_blocks=262145[0m
+--- [block-profile] write-bio (last) ---
+[block-profile] write-bio bios=332288 bytes=2166326272 avg_bytes=6519 avg_segments_x100=100 avg_submit_to_enqueue_us=0 avg_queue_wait_us=0 avg_dispatch_us=1 avg_device_wait_us=28 avg_irq_delivery_us=27 avg_irq_reap_us=0 avg_resp_sync_us=0 avg_complete_us=0 large_bios=0 large_avg_bytes=0 large_avg_segments_x100=0 large_avg_submit_to_enqueue_us=0 large_avg_queue_wait_us=0 large_avg_dispatch_us=0 large_avg_device_wait_us=0 large_avg_irq_delivery_us=0 large_avg_irq_reap_us=0 large_avg_resp_sync_us=0 large_avg_complete_us=0 max_total_us=7116
+--- [block-profile] read-bio (last) ---
+
+===== ext4j-read-64K (job=fio/ext4_seq_read_bw bs=64K) =====
+--- [ext4-direct-write] (last) ---
+--- [ext4-profile] direct-read (last) ---
+[ext4-profile] direct-read reads=3719168 bytes=243739394048 avg_bytes=65536 avg_mapped_bytes=65536 avg_zero_fill_bytes=0 max_mapped_bytes=65536 cache_hit=3719167 cache_miss=1 avg_mappings_x100=100 max_mappings=2 avg_plan_us=0 avg_alloc_us=0 avg_submit_us=0 avg_wait_us=35 avg_copy_us=4 avg_atime_us=0 avg_other_us=0 avg_total_us=41
+--- [ext4-phase2] (last) ---
+[32m[    79.208][0m [93mWARN [0m: [39m[ext4-phase2] runtime_lock_acquires=32768 avg_wait_us=0 max_wait_us=30 avg_hold_us=2485 max_hold_us=41488441 journaled_ops=16384 mkdir_ops=0 rmdir_ops=0 write_ops=16380 avg_start_handle_us=0 avg_apply_us=4572 avg_finish_handle_us=355 avg_finish_alloc_us=0 avg_finish_io_us=0 avg_total_us=4928 max_apply_ms=41332 max_finish_handle_ms=154 max_total_ms=41488 jbd2_handles_started=16384 finished=16384 max_active=1 avg_active_x100=66 max_running_handles=1 max_running_reserved=262152 max_running_metadata=14 rotations=391 commits_prepared=391 commits_finished=391 checkpoints=0 overlay_reads=1654635 overlay_hits=1654615 metadata_writes=16440 alloc_clear_calls=0 alloc_reserve_calls=2 alloc_reserved_blocks=262145 alloc_contains_checks=262145 alloc_max_operation_blocks=262145[0m
+--- [block-profile] write-bio (last) ---
+[block-profile] write-bio bios=280576 bytes=2155832320 avg_bytes=7683 avg_segments_x100=100 avg_submit_to_enqueue_us=0 avg_queue_wait_us=0 avg_dispatch_us=1 avg_device_wait_us=28 avg_irq_delivery_us=28 avg_irq_reap_us=0 avg_resp_sync_us=0 avg_complete_us=0 large_bios=0 large_avg_bytes=0 large_avg_segments_x100=0 large_avg_submit_to_enqueue_us=0 large_avg_queue_wait_us=0 large_avg_dispatch_us=0 large_avg_device_wait_us=0 large_avg_irq_delivery_us=0 large_avg_irq_reap_us=0 large_avg_resp_sync_us=0 large_avg_complete_us=0 max_total_us=4895
+--- [block-profile] read-bio (last) ---
+

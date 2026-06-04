@@ -228,6 +228,8 @@ run_xfstests_mode() {
     --kcmd-args='console=${CONSOLE}' \
     --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
     --kcmd-args='ext4fs.page_cache=${ext4_page_cache}' \
+    --kcmd-args='ext4fs.direct_read_cache=${EXT4_DIRECT_READ_CACHE:-1}' \
+    --kcmd-args='ext4fs.extent_map_cache=${EXT4_EXTENT_MAP_CACHE:-1}' \
     --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \
     --kcmd-args='SYSCALL_TEST_WORKDIR=/ext4' \
     --kcmd-args='EXTRA_BLOCKLISTS_DIRS=' \

@@ -1,0 +1,74 @@
+[SKIP] crash suite disabled (RUN_CRASH_SUITE=0)
+[DONE] mode=phase4_good rc=0 log=/reg-logs/phase4_good_20260604_094351.log
+397:xfstests case done: generic/001 rc=0
+401:xfstests case done: generic/006 rc=0
+405:xfstests case done: generic/013 rc=0
+409:xfstests case done: generic/028 rc=0
+413:xfstests case done: generic/035 rc=0
+417:xfstests case done: generic/036 rc=0
+433:xfstests case done: generic/041 rc=0
+449:xfstests case done: generic/047 rc=0
+453:xfstests case done: generic/051 rc=0
+457:xfstests case done: generic/052 rc=0
+461:xfstests case done: generic/054 rc=0
+465:xfstests case done: generic/062 rc=0
+481:xfstests case done: generic/068 rc=0
+485:xfstests case done: generic/070 rc=0
+684:xfstests case done: generic/083 rc=0
+688:xfstests case done: generic/084 rc=0
+692:xfstests case done: generic/090 rc=0
+708:xfstests case done: generic/093 rc=0
+724:===== phase4_good detailed results =====
+766:xfstests phase4_good passed: pass_rate=100.00% >= 90%
+770:All syscall tests passed.
+[SKIP] pagecache_phase4 disabled (RUN_PAGECACHE_PHASE4=0)
+[DONE] mode=phase3_base rc=0 log=/reg-logs/phase3_base_guard_20260604_094351.log
+227:xfstests case done: generic/006 rc=0
+231:xfstests case done: generic/013 rc=0
+235:xfstests case done: generic/028 rc=0
+239:xfstests case done: generic/036 rc=0
+255:xfstests case done: generic/041 rc=0
+271:xfstests case done: generic/047 rc=0
+275:xfstests case done: generic/051 rc=0
+279:xfstests case done: generic/052 rc=0
+283:xfstests case done: generic/054 rc=0
+287:xfstests case done: generic/062 rc=0
+303:xfstests case done: generic/068 rc=0
+307:xfstests case done: generic/070 rc=0
+546:xfstests case done: generic/083 rc=0
+550:xfstests case done: generic/084 rc=0
+554:xfstests case done: generic/090 rc=0
+570:xfstests case done: generic/093 rc=0
+586:===== phase3_base detailed results =====
+628:xfstests phase3_base passed: pass_rate=100.00% >= 90%
+632:All syscall tests passed.
+[SKIP] phase6_good disabled (RUN_PHASE6_GOOD=0)
+[DONE] mode=jbd_phase1 rc=0 log=/reg-logs/jbd_phase1_20260604_094351.log
+227:xfstests case done: generic/068 rc=0
+231:xfstests case done: generic/076 rc=0
+434:xfstests case done: generic/083 rc=0
+438:xfstests case done: generic/192 rc=0
+442:xfstests case done: generic/530 rc=0
+458:xfstests case done: ext4/021 rc=0
+462:xfstests case done: ext4/022 rc=0
+478:xfstests case done: ext4/030 rc=0
+494:xfstests case done: ext4/031 rc=0
+510:xfstests case done: ext4/032 rc=0
+526:xfstests case done: ext4/033 rc=0
+542:xfstests case done: ext4/045 rc=0
+546:===== jbd_phase1 detailed results =====
+560:xfstests jbd_phase1 passed: pass_rate=100.00% >= 90%
+564:All syscall tests passed.
+[SKIP] phase2 concurrency disabled (RUN_PHASE2_CONCURRENCY=0)
+[SKIP] jbd_phase3 disabled (RUN_JBD_PHASE3=0)
+[SKIP] lmbench disabled (RUN_LMBENCH=0)
+[DONE] phase4_part3 run finished
+crash_summary=<disabled>
+phase4_good_log=/reg-logs/phase4_good_20260604_094351.log
+pagecache_phase4_log=<disabled>
+phase3_base_log=/reg-logs/phase3_base_guard_20260604_094351.log
+phase6_good_log=<disabled>
+jbd_phase1_log=/reg-logs/jbd_phase1_20260604_094351.log
+jbd_phase2_concurrency_log=<disabled>
+jbd_phase3_fsync_durability_log=<disabled>
+lmbench_summary=<disabled>

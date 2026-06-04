@@ -1,0 +1,457 @@
+Running benchmark fio/ext4_buffered_seq_read_bw...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 9ac5f5e6-aafe-4796-9283-e5b41edbfd1d
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+/nix/store/f6lhvdlsq1pnldjkcbrd5nsacwi4qvlh-initramfs
+/nix/store/7mj8j343gm75y8i3j648a9a1vkwmdlyy-initramfs-image
+Running benchmark fio/ext4_buffered_seq_read_bw on Asterinas...
+/nix/store/dabl5hyjrvf9w2vk36di36ylmsijln09-initramfs
+/nix/store/6vxif9rj1cjnzf9zrd19a6dkv816cd2d-initramfs-image
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `int-to-c-enum` (lib) generated 1 warning
+warning: `align_ext` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:79:7
+   |
+79 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1798:8
+     |
+1111 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1798 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 0.11s
+grub-mkrescue: warning: cannot open directory `/usr/local/grub/share/locale': No such file or directory.
+xorriso 1.5.4 : RockRidge filesystem manipulator, libburnia project.
+
+Drive current: -outdev 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso'
+Media current: stdio file, overwriteable
+Media status : is blank
+Media summary: 0 sessions, 0 data blocks, 0 data, 24.7g free
+Added to ISO image: directory '/'='/tmp/grub.gfFkRQ'
+xorriso : UPDATE :     298 files added in 1 seconds
+Added to ISO image: directory '/'='/root/asterinas/.target_bench/osdk/iso_root'
+xorriso : UPDATE :     303 files added in 1 seconds
+ISO image produced: 23271 sectors
+Written to medium : 23271 sectors at LBA 0
+Writing to 'stdio:/root/asterinas/.target_bench/osdk/aster-kernel-osdk-bin.iso' completed successfully.
+
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU DVD-ROM QM00005 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x2,0xFFFF,0x0)
+WARNING: no console will be available to OS
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running benchmark: fio/ext4_buffered_seq_read_bw on asterinas
+Using FIO_BS=1M
+Using FIO_NUMJOBS=1
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the FIO buffered sequential read test (Ext4) ***
+*** Preparing the read file with direct I/O to avoid pre-warming buffered cache ***
+prepare_direct_write: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+prepare_direct_write: Laying out IO file (1 file / 1024MiB)
+Jobs: 1 (f=1)Jobs: 1 (f=1): [W(1)][15.0%][w=56.0MiB/s][w=56 IOPS][eta 00m:17s]Jobs: 1 (f=1): [W(1)][21.1%][w=58.1MiB/s][w=58 IOPS][eta 00m:15s]Jobs: 1 (f=1): [W(1)][25.0%][w=48.0MiB/s][w=48 IOPS][eta 00m:15s]Jobs: 1 (f=1): [W(1)][31.6%][w=59.1MiB/s][w=59 IOPS][eta 00m:13s]Jobs: 1 (f=1): [W(1)][36.8%][w=57.1MiB/s][w=57 IOPS][eta 00m:12s]Jobs: 1 (f=1): [W(1)][42.1%][w=57.0MiB/s][w=57 IOPS][eta 00m:11s]Jobs: 1 (f=1): [W(1)][47.4%][w=48.0MiB/s][w=48 IOPS][eta 00m:10s]Jobs: 1 (f=1): [W(1)][52.6%][w=57.1MiB/s][w=57 IOPS][eta 00m:09s]Jobs: 1 (f=1): [W(1)][57.9%][w=53.1MiB/s][w=53 IOPS][eta 00m:08s]Jobs: 1 (f=1): [W(1)][63.2%][w=55.1MiB/s][w=55 IOPS][eta 00m:07s]Jobs: 1 (f=1): [W(1)][65.0%][w=49.0MiB/s][w=49 IOPS][eta 00m:07s]Jobs: 1 (f=1): [W(1)][73.7%][w=57.1MiB/s][w=57 IOPS][eta 00m:05s]Jobs: 1 (f=1): [W(1)][78.9%][w=57.0MiB/s][w=57 IOPS][eta 00m:04s]Jobs: 1 (f=1): [W(1)][84.2%][w=52.9MiB/s][w=52 IOPS][eta 00m:03s]Jobs: 1 (f=1): [W(1)][85.0%][w=47.0MiB/s][w=47 IOPS][eta 00m:03s]Jobs: 1 (f=1): [W(1)][90.0%][w=55.0MiB/s][w=55 IOPS][eta 00m:02s]Jobs: 1 (f=1): [W(1)][95.0%][w=55.1MiB/s][w=55 IOPS][eta 00m:01s]Jobs: 1 (f=1): [W(1)][100.0%][w=53.0MiB/s][w=53 IOPS][eta 00m:00s]
+prepare_direct_write: (groupid=0, jobs=1): err= 0: pid=17: Mon May 18 19:18:45 2026
+  write: IOPS=53, BW=53.9MiB/s (56.6MB/s)(1024MiB/18987msec); 0 zone resets
+    clat (usec): min=15285, max=57167, avg=18491.83, stdev=3680.72
+     lat (usec): min=15293, max=57210, avg=18509.97, stdev=3684.04
+    clat percentiles (usec):
+     |  1.00th=[15533],  5.00th=[15926], 10.00th=[16319], 20.00th=[16712],
+     | 30.00th=[16909], 40.00th=[17433], 50.00th=[17695], 60.00th=[18220],
+     | 70.00th=[18744], 80.00th=[19268], 90.00th=[20317], 95.00th=[22152],
+     | 99.00th=[38011], 99.50th=[39584], 99.90th=[45876], 99.95th=[57410],
+     | 99.99th=[57410]
+   bw (  KiB/s): min=40960, max=61440, per=100.00%, avg=55434.54, stdev=4947.90, samples=37
+   iops        : min=   40, max=   60, avg=53.92, stdev= 4.81, samples=37
+  lat (msec)   : 20=87.79%, 50=12.11%, 100=0.10%
+  cpu          : usr=0.10%, sys=28.87%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,1024,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=53.9MiB/s (56.6MB/s), 53.9MiB/s-53.9MiB/s (56.6MB/s-56.6MB/s), io=1024MiB (1074MB), run=18987-18987msec
+*** Running the cold buffered read pass (direct=0) ***
+buffered_cold_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+Jobs: 1 (f=1)Jobs: 1 (f=1)Jobs: 1 (f=1): [R(1)][5.5%][r=20.0MiB/s][r=20 IOPS][eta 00m:52s]Jobs: 1 (f=1): [R(1)][7.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:51s]Jobs: 1 (f=1): [R(1)][9.1%][r=18.0MiB/s][r=18 IOPS][eta 00m:50s]Jobs: 1 (f=1): [R(1)][10.9%][r=19.0MiB/s][r=18 IOPS][eta 00m:49s]Jobs: 1 (f=1): [R(1)][13.0%][r=20.0MiB/s][r=20 IOPS][eta 00m:47s]Jobs: 1 (f=1): [R(1)][14.8%][r=19.0MiB/s][r=19 IOPS][eta 00m:46s]Jobs: 1 (f=1): [R(1)][16.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:45s]Jobs: 1 (f=1): [R(1)][18.5%][r=19.0MiB/s][r=19 IOPS][eta 00m:44s]Jobs: 1 (f=1): [R(1)][20.4%][r=20.0MiB/s][r=20 IOPS][eta 00m:43s]Jobs: 1 (f=1): [R(1)][22.2%][r=19.0MiB/s][r=19 IOPS][eta 00m:42s]Jobs: 1 (f=1): [R(1)][24.1%][r=19.0MiB/s][r=18 IOPS][eta 00m:41s]Jobs: 1 (f=1): [R(1)][26.4%][r=20.0MiB/s][r=20 IOPS][eta 00m:39s]Jobs: 1 (f=1): [R(1)][28.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:38s]Jobs: 1 (f=1): [R(1)][30.2%][r=20.0MiB/s][r=20 IOPS][eta 00m:37s]Jobs: 1 (f=1): [R(1)][32.1%][r=19.0MiB/s][r=19 IOPS][eta 00m:36s]Jobs: 1 (f=1): [R(1)][34.0%][r=20.0MiB/s][r=20 IOPS][eta 00m:35s]Jobs: 1 (f=1): [R(1)][35.8%][r=20.0MiB/s][r=20 IOPS][eta 00m:34s]Jobs: 1 (f=1): [R(1)][37.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:33s]Jobs: 1 (f=1): [R(1)][39.6%][r=18.0MiB/s][r=18 IOPS][eta 00m:32s]Jobs: 1 (f=1): [R(1)][41.5%][r=20.0MiB/s][r=20 IOPS][eta 00m:31s]Jobs: 1 (f=1): [R(1)][43.4%][r=20.0MiB/s][r=20 IOPS][eta 00m:30s]Jobs: 1 (f=1): [R(1)][45.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:29s]Jobs: 1 (f=1): [R(1)][47.2%][r=18.0MiB/s][r=18 IOPS][eta 00m:28s]Jobs: 1 (f=1): [R(1)][49.1%][r=20.0MiB/s][r=20 IOPS][eta 00m:27s]Jobs: 1 (f=1): [R(1)][50.9%][r=20.0MiB/s][r=20 IOPS][eta 00m:26s]Jobs: 1 (f=1): [R(1)][52.8%][r=20.0MiB/s][r=20 IOPS][eta 00m:25s]Jobs: 1 (f=1): [R(1)][54.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:24s]Jobs: 1 (f=1): [R(1)][56.6%][r=20.0MiB/s][r=19 IOPS][eta 00m:23s]Jobs: 1 (f=1): [R(1)][58.5%][r=19.0MiB/s][r=19 IOPS][eta 00m:22s]Jobs: 1 (f=1): [R(1)][60.4%][r=19.0MiB/s][r=19 IOPS][eta 00m:21s]Jobs: 1 (f=1): [R(1)][62.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:20s]Jobs: 1 (f=1): [R(1)][64.2%][r=20.0MiB/s][r=20 IOPS][eta 00m:19s]Jobs: 1 (f=1): [R(1)][66.0%][r=20.0MiB/s][r=20 IOPS][eta 00m:18s]Jobs: 1 (f=1): [R(1)][67.9%][r=19.0MiB/s][r=19 IOPS][eta 00m:17s]Jobs: 1 (f=1): [R(1)][69.8%][r=19.0MiB/s][r=19 IOPS][eta 00m:16s]Jobs: 1 (f=1): [R(1)][71.7%][r=19.0MiB/s][r=19 IOPS][eta 00m:15s]Jobs: 1 (f=1): [R(1)][73.6%][r=20.0MiB/s][r=20 IOPS][eta 00m:14s]Jobs: 1 (f=1): [R(1)][75.5%][r=20.0MiB/s][r=20 IOPS][eta 00m:13s]Jobs: 1 (f=1): [R(1)][77.4%][r=18.0MiB/s][r=18 IOPS][eta 00m:12s]Jobs: 1 (f=1): [R(1)][79.2%][r=21.0MiB/s][r=21 IOPS][eta 00m:11s]Jobs: 1 (f=1): [R(1)][81.5%][r=19.9MiB/s][r=19 IOPS][eta 00m:10s]Jobs: 1 (f=1): [R(1)][83.0%][r=18.1MiB/s][r=18 IOPS][eta 00m:09s]Jobs: 1 (f=1): [R(1)][84.9%][r=19.0MiB/s][r=18 IOPS][eta 00m:08s]Jobs: 1 (f=1): [R(1)][86.8%][r=20.0MiB/s][r=20 IOPS][eta 00m:07s]Jobs: 1 (f=1): [R(1)][88.7%][r=20.0MiB/s][r=20 IOPS][eta 00m:06s]Jobs: 1 (f=1): [R(1)][90.6%][r=19.0MiB/s][r=19 IOPS][eta 00m:05s]Jobs: 1 (f=1): [R(1)][92.5%][r=19.0MiB/s][r=19 IOPS][eta 00m:04s]Jobs: 1 (f=1): [R(1)][94.3%][r=19.0MiB/s][r=19 IOPS][eta 00m:03s]Jobs: 1 (f=1): [R(1)][96.2%][r=20.0MiB/s][r=20 IOPS][eta 00m:02s]Jobs: 1 (f=1): [R(1)][98.1%][r=20.0MiB/s][r=20 IOPS][eta 00m:01s]Jobs: 1 (f=1): [R(1)][100.0%][r=19.0MiB/s][r=19 IOPS][eta 00m:00s]
+buffered_cold_seqread: (groupid=0, jobs=1): err= 0: pid=20: Mon May 18 19:19:35 2026
+  read: IOPS=19, BW=19.3MiB/s (20.3MB/s)(1024MiB/52929msec)
+    clat (usec): min=39075, max=82481, avg=51684.89, stdev=3058.72
+     lat (usec): min=39076, max=82482, avg=51685.27, stdev=3058.79
+    clat percentiles (usec):
+     |  1.00th=[46924],  5.00th=[47973], 10.00th=[48497], 20.00th=[49546],
+     | 30.00th=[50070], 40.00th=[50594], 50.00th=[51119], 60.00th=[51643],
+     | 70.00th=[52167], 80.00th=[53740], 90.00th=[55837], 95.00th=[56886],
+     | 99.00th=[60031], 99.50th=[63177], 99.90th=[70779], 99.95th=[82314],
+     | 99.99th=[82314]
+   bw (  KiB/s): min=16351, max=22528, per=100.00%, avg=19817.04, stdev=1180.78, samples=105
+   iops        : min=   15, max=   22, avg=18.89, stdev= 1.26, samples=105
+  lat (msec)   : 50=27.25%, 100=72.75%
+  cpu          : usr=0.01%, sys=31.78%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=19.3MiB/s (20.3MB/s), 19.3MiB/s-19.3MiB/s (20.3MB/s-20.3MB/s), io=1024MiB (1074MB), run=52929-52929msec
+*** Running the warm buffered read pass (direct=0) ***
+buffered_warm_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+buffered_warm_seqread: (groupid=0, jobs=1): err= 0: pid=23: Mon May 18 19:19:35 2026
+  read: IOPS=4015, BW=4016MiB/s (4211MB/s)(1024MiB/255msec)
+    clat (usec): min=205, max=938, avg=247.08, stdev=79.38
+     lat (usec): min=205, max=939, avg=247.14, stdev=79.41
+    clat percentiles (usec):
+     |  1.00th=[  210],  5.00th=[  215], 10.00th=[  217], 20.00th=[  219],
+     | 30.00th=[  221], 40.00th=[  225], 50.00th=[  225], 60.00th=[  229],
+     | 70.00th=[  231], 80.00th=[  239], 90.00th=[  277], 95.00th=[  379],
+     | 99.00th=[  635], 99.50th=[  758], 99.90th=[  930], 99.95th=[  938],
+     | 99.99th=[  938]
+  lat (usec)   : 250=85.35%, 500=12.01%, 750=1.95%, 1000=0.68%
+  cpu          : usr=0.00%, sys=61.42%, ctx=0, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=4016MiB/s (4211MB/s), 4016MiB/s-4016MiB/s (4211MB/s-4211MB/s), io=1024MiB (1074MB), run=255-255msec
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 224e0b17-03df-498a-81c5-61e0360b369c
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 3 derivations will be built:
+  /nix/store/xvadn4s067lx5nhrnk5ffpirlkkdca24-benchmark-0.1.0.drv
+  /nix/store/7x5chx7iy8lq0y1xzl2mbvm9w65wdqqf-runtime-deps.drv
+  /nix/store/5snfz7a1svxvqbrf9s6b9vshjspwjdqa-initramfs.drv
+building '/nix/store/xvadn4s067lx5nhrnk5ffpirlkkdca24-benchmark-0.1.0.drv'...
+building '/nix/store/7x5chx7iy8lq0y1xzl2mbvm9w65wdqqf-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/5snfz7a1svxvqbrf9s6b9vshjspwjdqa-initramfs.drv'...
+/nix/store/15cv6pnf4jw3fbv4lrhazwzl8618kzs7-initramfs
+this derivation will be built:
+  /nix/store/w2173rczv3lzsyvk43hq3gja23sc5v90-initramfs-image.drv
+building '/nix/store/w2173rczv3lzsyvk43hq3gja23sc5v90-initramfs-image.drv'...
+/build/tmp.x5go3zOBt2 /build
+176254 blocks
+/build
+/nix/store/1bzwqvypx1gh0nm5k1iikyq1bhiab6fx-initramfs-image
+Running benchmark fio/ext4_buffered_seq_read_bw on Linux...
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19A0+7EF319A0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.352624] kvm_intel: VMX not supported by CPU 0
+Running benchmark: fio/ext4_buffered_seq_read_bw on linux
+Using FIO_BS=1M
+Using FIO_NUMJOBS=1
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the FIO buffered sequential read test (Ext4) ***
+*** Preparing the read file with direct I/O to avoid pre-warming buffered cache ***
+prepare_direct_write: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+prepare_direct_write: Laying out IO file (1 file / 1024MiB)
+
+prepare_direct_write: (groupid=0, jobs=1): err= 0: pid=99: Mon May 18 19:19:54 2026
+  write: IOPS=1154, BW=1154MiB/s (1211MB/s)(1024MiB/887msec); 0 zone resets
+    clat (usec): min=375, max=1660, avg=490.57, stdev=155.52
+     lat (usec): min=385, max=1697, avg=507.49, stdev=160.38
+    clat percentiles (usec):
+     |  1.00th=[  383],  5.00th=[  392], 10.00th=[  400], 20.00th=[  416],
+     | 30.00th=[  429], 40.00th=[  437], 50.00th=[  441], 60.00th=[  457],
+     | 70.00th=[  469], 80.00th=[  490], 90.00th=[  660], 95.00th=[  881],
+     | 99.00th=[ 1156], 99.50th=[ 1270], 99.90th=[ 1500], 99.95th=[ 1663],
+     | 99.99th=[ 1663]
+   bw (  MiB/s): min= 1954, max= 1954, per=100.00%, avg=1954.09, stdev= 0.00, samples=1
+   iops        : min= 1954, max= 1954, avg=1954.00, stdev= 0.00, samples=1
+  lat (usec)   : 500=82.52%, 750=11.33%, 1000=3.61%
+  lat (msec)   : 2=2.54%
+  cpu          : usr=2.37%, sys=2.03%, ctx=1025, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,1024,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=1154MiB/s (1211MB/s), 1154MiB/s-1154MiB/s (1211MB/s-1211MB/s), io=1024MiB (1074MB), run=887-887msec
+*** Running the cold buffered read pass (direct=0) ***
+buffered_cold_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+buffered_cold_seqread: (groupid=0, jobs=1): err= 0: pid=102: Mon May 18 19:19:55 2026
+  read: IOPS=3447, BW=3448MiB/s (3615MB/s)(1024MiB/297msec)
+    clat (usec): min=57, max=2076, avg=288.33, stdev=226.17
+     lat (usec): min=57, max=2076, avg=288.42, stdev=226.21
+    clat percentiles (usec):
+     |  1.00th=[   62],  5.00th=[   65], 10.00th=[   68], 20.00th=[   74],
+     | 30.00th=[  118], 40.00th=[  151], 50.00th=[  306], 60.00th=[  330],
+     | 70.00th=[  351], 80.00th=[  453], 90.00th=[  586], 95.00th=[  660],
+     | 99.00th=[ 1029], 99.50th=[ 1254], 99.90th=[ 1713], 99.95th=[ 2073],
+     | 99.99th=[ 2073]
+  lat (usec)   : 100=28.03%, 250=19.14%, 500=35.45%, 750=15.04%, 1000=1.27%
+  lat (msec)   : 2=0.98%, 4=0.10%
+  cpu          : usr=0.00%, sys=38.18%, ctx=593, majf=0, minf=256
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=3448MiB/s (3615MB/s), 3448MiB/s-3448MiB/s (3615MB/s-3615MB/s), io=1024MiB (1074MB), run=297-297msec
+*** Running the warm buffered read pass (direct=0) ***
+buffered_warm_seqread: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+buffered_warm_seqread: (groupid=0, jobs=1): err= 0: pid=105: Mon May 18 19:19:55 2026
+  read: IOPS=9570, BW=9570MiB/s (10.0GB/s)(1024MiB/107msec)
+    clat (usec): min=85, max=750, avg=103.29, stdev=24.27
+     lat (usec): min=85, max=750, avg=103.35, stdev=24.28
+    clat percentiles (usec):
+     |  1.00th=[   90],  5.00th=[   93], 10.00th=[   94], 20.00th=[   95],
+     | 30.00th=[   98], 40.00th=[   99], 50.00th=[  100], 60.00th=[  101],
+     | 70.00th=[  103], 80.00th=[  106], 90.00th=[  111], 95.00th=[  118],
+     | 99.00th=[  172], 99.50th=[  178], 99.90th=[  212], 99.95th=[  750],
+     | 99.99th=[  750]
+  lat (usec)   : 100=49.41%, 250=50.49%, 1000=0.10%
+  cpu          : usr=0.00%, sys=96.23%, ctx=34, majf=0, minf=256
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=9570MiB/s (10.0GB/s), 9570MiB/s-9570MiB/s (10.0GB/s-10.0GB/s), io=1024MiB (1074MB), run=107-107msec
+[    2.818509] reboot: Power down
+Skipping result aggregation because BENCH_RUN_ONLY=both.
+Cleaning up...
+Benchmark completed successfully.

@@ -203,6 +203,7 @@ cd /home/lby/os_com_codex
   - `BENCH_ENABLE_KVM=1`
   - `BENCH_ASTER_NETDEV=tap`
   - `BENCH_ASTER_VHOST=on`
+  - `BENCH_ASTER_SCHEME=null`：仅用于 raw/ext4 分层诊断时关闭 Asterinas IOMMU；官方/历史可比口径未显式设置时仍沿用 benchmark runner 默认 `SCHEME=iommu`
 - 代理：Clash `127.0.0.1:7890`
 
 实际使用的 benchmark 入口是：
@@ -239,6 +240,17 @@ LOG_LEVEL=error \
 bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 ```
 
+如需按“关闭 IOMMU 后先看 fs/disk”的诊断建议复跑官方 ext4 双项，可额外加：
+
+```bash
+BENCH_ASTER_SCHEME=null \
+EXT4_DIRECT_READ_CACHE=0 \
+EXT4_PAGE_CACHE=0 \
+KEEP_LOGS=1 \
+LOG_LEVEL=error \
+bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+```
+
 ## 5. 整体综合测试（按需运行）
 
 > **注意**：本节测试耗时约 30 分钟，仅在需要诊断各层开销时运行，日常评审和功能验收不需要跑。
@@ -251,6 +263,8 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 - **ext4 nojournal vs ext4 journaled**：JBD2 日志层的写开销
 - **Asterinas raw vs Linux raw**：virtio-blk / 块设备驱动层的差距
 
+其中“fs 和裸盘比”指同一个系统内比较 `ext4` 文件 I/O 与 `/dev/vda` raw 块设备 I/O，例如 `Asterinas ext4_journaled_write / Asterinas raw_write`。这个口径先不问 Asterinas 是否接近 Linux，而是先判断 ext4/JBD2 是否明显拖慢了本机块层上限；如果 raw 本身已经慢，优先看 block/virtio/IOMMU，如果 raw 快但 ext4 慢，才优先看 ext4/JBD2。
+
 ### 5.2 6 个测试项
 
 | # | job | filename | rw | 说明 |
@@ -262,7 +276,7 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | 5 | `fio/ext4_nojournal_seq_read_bw` | `/ext4/fio-test` | read | 无日志 ext4（`^has_journal`） |
 | 6 | `fio/ext4_nojournal_seq_write_bw` | `/ext4/fio-test` | write | 无日志 ext4（`^has_journal`） |
 
-6 个测试共用相同 fio 参数。综合诊断默认额外关闭 Asterinas ext4 O_DIRECT direct-read cache，用于观察不依赖自研 direct-read cache / speculative direct read 的直通读写成本：
+6 个测试共用相同 fio 参数。综合诊断默认使用 `direct=1`，并额外关闭 Asterinas IOMMU、PageCache 与 ext4 O_DIRECT direct-read cache，用于观察不依赖 IOMMU/DMA remapping、PageCache、自研 direct-read cache / speculative direct read 的直通读写成本：
 
 ```bash
 -size=1G -bs=1M
@@ -273,59 +287,190 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 Asterinas 侧默认附加参数：
 
 ```bash
+BENCH_ASTER_SCHEME=null
+EXT4_PAGE_CACHE=0
 EXT4_DIRECT_READ_CACHE=0
 ```
 
-- 该变量会传入内核命令行 `ext4fs.direct_read_cache=0`。
+- `BENCH_ASTER_SCHEME=null` 会移除 benchmark runner 默认的 `SCHEME=iommu`，即 Asterinas 侧不启用 IOMMU；如需复跑历史 IOMMU-on 对照，可显式设置 `BENCH_ASTER_SCHEME=iommu`。
+- `EXT4_PAGE_CACHE=0` 会传入内核命令行 `ext4fs.page_cache=0`，即关闭 Asterinas PageCache；配合 fio `direct=1`，避免 buffered/mmap PageCache 命中混入 fs-vs-raw 诊断。
+- `EXT4_DIRECT_READ_CACHE=0` 会传入内核命令行 `ext4fs.direct_read_cache=0`。
 - 关闭范围：ext4 O_DIRECT read mapping cache 与 speculative direct read。
 - 保留范围：write overwrite mapping reuse 仍按默认路径启用，避免把写路径映射复用也一并关掉后混入额外变量。
 - 如需复跑历史 cache-on 对照，可显式设置 `EXT4_DIRECT_READ_CACHE=1`。
+- `BENCH_ASTER_VHOST=on` 只影响 tap 网络后端 `vhost=on`，不表示磁盘 fio 使用 vhost 块设备；六项 fio 磁盘路径仍是 virtio-blk。
 
 ### 5.3 入口与运行方法
 
 ```bash
 cd /home/lby/os_com_codex
-EXT4_DIRECT_READ_CACHE=0 ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+BENCH_ASTER_SCHEME=null EXT4_PAGE_CACHE=0 EXT4_DIRECT_READ_CACHE=0 \
+    ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
 ```
 
 - 脚本：`asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh`
 - 行为：顺序执行 6 个 job，每个都跑 Asterinas 和 Linux 两侧，最后打印汇总
-- 默认口径：脚本默认 `EXT4_DIRECT_READ_CACHE=0`，上面的命令显式写出该参数只是为了避免误读
+- 输出：先打印每项的 Asterinas/Linux ratio，再打印 Asterinas 内部 `ext4/raw`、`nojournal/raw`、`journaled/nojournal` 分层 ratio
+- 默认口径：脚本默认 `BENCH_ASTER_SCHEME=null`、`EXT4_PAGE_CACHE=0` 与 `EXT4_DIRECT_READ_CACHE=0`，上面的命令显式写出参数只是为了避免误读
+- 脚本会跳过 `result_*.json` 写回，只从日志汇总结果，避免 no-IOMMU 诊断数据覆盖官方 fio 快照
 - 日志：默认执行完自动清理；如需保留日志排查问题，加 `KEEP_LOGS=1`：
 
 ```bash
-EXT4_DIRECT_READ_CACHE=0 KEEP_LOGS=1 ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+BENCH_ASTER_SCHEME=null EXT4_PAGE_CACHE=0 EXT4_DIRECT_READ_CACHE=0 KEEP_LOGS=1 \
+    ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
 ```
 
 - 仅跑 Asterinas 侧（跳过 Linux，节省一半时间）：
 
 ```bash
-EXT4_DIRECT_READ_CACHE=0 BENCH_RUN_ONLY=aster ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+BENCH_ASTER_SCHEME=null EXT4_PAGE_CACHE=0 EXT4_DIRECT_READ_CACHE=0 BENCH_RUN_ONLY=asterinas \
+    ./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
 ```
 
-### 5.4 最新结果（2026-05-09，6-test 综合诊断，direct-read cache off）
+### 5.4 最新结果（2026-05-14，6-test 综合诊断，no-IOMMU，PageCache/direct-read cache off）
+
+命令：
+
+```bash
+BENCH_ASTER_SCHEME=null EXT4_PAGE_CACHE=0 EXT4_DIRECT_READ_CACHE=0 \
+KEEP_LOGS=1 LOG_LEVEL=error \
+./asterinas/test/initramfs/src/benchmark/fio/run_6test_summary.sh
+```
 
 | 测试 | Asterinas | Linux | Aster/Linux |
 |------|----------:|------:|:-----------:|
-| raw read | 1827.0 MB/s | 4791.0 MB/s | 38.13% |
-| raw write | 1708.0 MB/s | 4176.0 MB/s | 40.90% |
-| ext4 journaled read | 2463.0 MB/s | 2328.0 MB/s | 105.80% |
-| ext4 journaled write | 1713.0 MB/s | 3302.0 MB/s | 51.88% |
-| ext4 nojournal read | 2582.0 MB/s | 3366.0 MB/s | 76.71% |
-| ext4 nojournal write | 2068.0 MB/s | 4554.0 MB/s | 45.41% |
+| raw read | 2535.0 MB/s | 4887.0 MB/s | 51.87% |
+| raw write | 2480.0 MB/s | 3631.0 MB/s | 68.30% |
+| ext4 journaled read | 2978.0 MB/s | 3939.0 MB/s | 75.60% |
+| ext4 journaled write | 1954.0 MB/s | 3128.0 MB/s | 62.47% |
+| ext4 nojournal read | 2968.0 MB/s | 2995.0 MB/s | 99.10% |
+| ext4 nojournal write | 1981.0 MB/s | 3518.0 MB/s | 56.31% |
+
+Asterinas 内部 fs-vs-raw 分层：
+
+| 分层比值 | ratio |
+|----------|------:|
+| ext4 journaled read / raw read | 117.48% |
+| ext4 nojournal read / raw read | 117.08% |
+| ext4 journaled write / raw write | 78.79% |
+| ext4 nojournal write / raw write | 79.88% |
+| journaled write / nojournal write | 98.64% |
 
 关键结论：
 
-- 本轮为 cache-off 直通诊断口径，不再把自研 direct-read cache / speculative direct read 的收益计入综合测试。
-- 关闭 direct-read cache 后，Asterinas ext4 read 从历史 cache-on 的 5GB/s 级别回落到约 2.5GB/s，说明此前 ext4 read 显著高于 raw read 的主要来源是 direct-read cache / speculative direct read。
-- 同轮对比下，journaled write（1713.0 MB/s）低于 nojournal write（2068.0 MB/s）约 355 MB/s，JBD2 写路径仍有可见开销。
-- raw read 在本轮为 1827.0 MB/s，低于历史 run，后续分析应优先使用同轮 raw/ext4/Linux 对比，避免跨轮环境波动误判。
-- 本轮 Linux 侧仍出现 `kvm_intel: VMX not supported by CPU 0`，Linux 绝对值仅供参考，以同轮相对趋势和 Asterinas 绝对值为主。
+- 本轮为 no-IOMMU + PageCache/direct-read-cache off 的 direct-I/O 诊断口径，已排除 Asterinas IOMMU、PageCache、direct-read mapping cache 与 speculative direct read 变量。
+- Asterinas raw write 提升到 2480.0 MB/s；ext4 journaled/nojournal write 分别为 raw write 的 78.79% / 79.88%，说明当前 ext4 direct-write 共同路径仍有约 20% 损耗。
+- journaled write / nojournal write 为 98.64%，本轮下 JBD2 额外写开销很小；write hardening 应优先看 ext4 data I/O 共同路径、direct-write bio/metadata prepare，而不是单独归因到 JBD2。
+- ext4 journaled/nojournal read 均约为 raw read 的 117%，说明在本轮 cache-off 口径下，read 侧不是当前主要 blocker；该现象可能来自同轮 raw 读基线偏低或 ext4 顺序映射组织更有利，后续应继续用同轮分层结果判断。
+
+## 6. fio 参数 sweep 工具（A–G 全量参数画像）
+
+用于在单个 Docker 容器内，一次性跑出 ext4 O_DIRECT / buffered 的全量参数画像（不同 `bs`/`numjobs`/`fsync`/`direct`/`page_cache`），并对每个 case 与 Linux ext4 同轮对照，输出一张可信的 ratio 汇总 TSV。是 Phase 5 性能优化的基线证据来源。
+
+- **脚本**：`asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh`
+- **前置**：宿主机有 `docker` 且 `/dev/kvm` 可用（脚本会自检，缺失直接报错退出）
+
+### 6.1 运行方法
+
+```bash
+cd /home/lby/os_com_codex
+./asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+```
+
+跑完后：
+
+```
+fio parameter sweep finished.
+Summary TSV: .../benchmark/logs/fio_parameter_sweep_<TS>/fio_parameter_sweep_summary.tsv
+```
+
+- **输出目录**：`asterinas/benchmark/logs/fio_parameter_sweep_<TS>/`（每个 case 一个 `<case>.log` + 一张 `fio_parameter_sweep_summary.tsv`）
+- **汇总 TSV 列**：`group / case / target / journal / rw / direct / page_cache / direct_read_cache / bs / numjobs / fsync / asterinas_mb_s / linux_mb_s / ratio_pct / log / note`
+
+### 6.2 测试分组（A–G）
+
+| 组 | 内容 | 主要用途 |
+|----|------|----------|
+| A | 官方 O_DIRECT 守底（`bs=1M, nj=1, cache-off`）write/read | 复现守底 ratio |
+| B | 6-test 分层（raw / ext4 journaled / ext4 nojournal）| 区分 block 层 vs ext4 vs JBD2 |
+| C | bs sweep（`4K/16K/64K/256K/1M/4M`）| 找块大小拐点、小块 per-request 开销 |
+| D | direct/cache 对照（direct×page_cache 四象限）| 分离 O_DIRECT 与 buffered/PageCache |
+| E | fsync sweep（`none/4/16/64`，`bs=16K/1M`）| 持久化语义成本（不作普通吞吐宣传）|
+| F | numjobs sweep（`1/2/4`）| 判断并发提交能力 / 队列深度 |
+| G | correctness 回归（crash / phase3-6 / jbd / concurrency / pagecache / host-crash fsync）| 确认性能没有建立在 correctness 回退上 |
+
+### 6.3 可调环境变量
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `IMAGE` | `asterinas/asterinas:0.17.0-20260227` | Docker 镜像 |
+| `LOG_DIR` | `benchmark/logs/fio_parameter_sweep_<TS>` | 输出目录 |
+| `SUMMARY_TSV` | `<LOG_DIR>/fio_parameter_sweep_summary.tsv` | 汇总文件 |
+| `RUN_G_CORRECTNESS` | `1` | 设 `0` 跳过 G 组 correctness，只跑 A–F 性能（省时间）|
+| `LOG_LEVEL` | `error` | guest 内核日志级别。**勿设 verbose/trace**，否则单个 case 日志可达数百 MB |
+| `BENCH_ASTER_SCHEME` | `null` | `null` = no-IOMMU 诊断口径 |
+| `http_proxy` / `https_proxy` / `all_proxy` | `127.0.0.1:7890` | 容器内首次装 `cargo-osdk` 用 |
+
+只跑性能、不跑 correctness：
+
+```bash
+RUN_G_CORRECTNESS=0 ./asterinas/test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+```
+
+### 6.4 注意
+
+- 全量（含 G）一轮约 2–3 小时；纯 A–F 明显更快。
+- 固定口径：A–F 全程 `direct` 用 O_DIRECT、`EXT4_DIRECT_READ_CACHE=0`；page_cache 仅 D 组开启对照。
+- `LOG_LEVEL` 默认 `error` 即可；曾出现过 656MB 的 verbose 日志，既超 GitHub 100MB 上限又无分析价值，不要提交。
+- 最近一轮完整结果与三瓶颈分析见根目录 `fio_direct_parameter_sweep_report.md`（2026-05-18/19）。
+
+## 6.5 宿主机 page cache 与 Linux 基线口径（drop_caches，Phase 5 起默认）
+
+**现象**：同一配置下 Linux O_DIRECT 顺序读基线跨会话剧烈波动（1M read 2768 ↔ 4942 MB/s）。
+
+**根因**：QEMU `-drive` 默认 `cache=writeback`，宿主机会缓存 backing image（`build/ext2.img`）；guest 侧 `direct=1`（O_DIRECT）**不绕过宿主机的 page cache**。fio 读测试先写出 1G 文件再读，读的是热在宿主机 RAM 里的数据，吞吐取决于"这 1G 有多少留在宿主机 cache"——随宿主机内存压力波动。**与 KVM 无关**（`kvm_intel: VMX not supported` 是 guest 嵌套虚拟化噪音，host 仍正常加速）。
+
+**口径（Phase 5 起默认开）**：`bench_linux_and_aster.sh` 在每次 QEMU 启动前 `sync; echo 3 > /proc/sys/vm/drop_caches`（privileged 容器共享宿主内核），由 `BENCH_DROP_CACHES`（默认 `1`）控制，`=0` 可恢复旧 warm-cache 行为。仅影响 perf 路径（correctness 走 `cargo osdk run`，不经此脚本）。
+
+**实测效果**（同套 A/B，1M read Linux 基线）：
+
+| | Linux 1M read |
+|---|---|
+| 2 周前 sweep | 2768 |
+| 不带 drop | 4942–5111（warm cache 虚高）|
+| **带 drop（默认）** | **2818–2813**（复现 sweep、c0/c1 仅差 0.2%）|
+
+**重要**：drop 后比较才公平——之前"Asterinas 1M read 49–61%"是被 Linux 的热 cache 坑了；公平测量下 **Asterinas 1M read = 104–126%**（追平/反超 Linux）。小块读（per-IO bound）受 host cache 影响小、波动主要是 per-IO 噪声，建议每档跑 3 次取中位数。更彻底的备选：QEMU `-drive cache=none`（宿主机也 O_DIRECT、永不缓存）。
+
+## 6.6 Phase 5 读写优化结果与测量脚本
+
+四个 ext4 优化（extent 映射缓存 / 全文件覆盖 / atime 按秒节流 / **inode 元数据缓存**）把 O_DIRECT 读写从 16–63% 拉到 **75–123%**。详见 `feature_perf_phase5_milestone.md`。
+
+### 当前结果（`direct=1, nj=1`，cache-off + `extent_map_cache=1` + inode 缓存默认 on + `BENCH_DROP_CACHES=1`，中位数）
+
+| bs | read ratio | write ratio |
+|----|-----------:|------------:|
+| 4K | 86.38% | 75.54% |
+| 16K | 84.42% | 75.78% |
+| 64K | 86.89% | 84.09% |
+| 256K | 94.81% | 121.07% |
+| 1M | 122.94% | 88.28% |
+
+ext4 域内 per-op 固定开销（extent 查找 / atime stat / inode stat）已榨干；读写现都顶在 **virtio 设备往返**这个平台地板（跨 FS 通用，ext2 同此极限）。
+
+### Phase 5 测量脚本（均默认 `BENCH_DROP_CACHES=1`）
+
+| 脚本 | 用途 |
+|------|------|
+| `fio/run_phase5_guard_median.sh` | 单 job 守底 / bs 扫描，多轮取**中位数**，两边对照。env：`READ_BS_LIST` `WRITE_BS_LIST`（` ` 空格=跳过该方向）、`READ_JOB`/`WRITE_JOB`（可指向 `fio/ext2_seq_*` 做 ext2 对照）、`REPEATS`、`CASE_TIMEOUT_SEC`（每-case 超时防 hang）|
+| `fio/run_phase5_ratio_ab.sh` | extent_map_cache `0 vs 1` 同轮 A/B（两边）；`RATIO_BS_LIST`/`RATIO_READ_JOB` 可调 |
+| `fio/run_phase5_profile_probe.sh` | Asterinas-only 四层 profile（`phase2_profile=1` `LOG_LEVEL=warn`），收割 `[ext4-direct-write]`/`[ext4-profile] direct-read`/`[block-profile]`；`CASES` 选 `ext4j-{read,write,randread}-{4K..1M}` |
+| `tools/ext4/run_phase5_regression.sh` | 守底回归：`FULL_SUITE=1` 跑完整套（crash+concurrency+fsync+全 xfstests+host-crash），`FULL_GUARD=1` 跑 phase4_good/phase3_base/jbd_phase1，均 drc=0 激活 extent+inode 缓存 |
 
 ## 7. 当前观察与说明
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。
-- 2026-05-09 起，6-test 综合诊断默认关闭 Asterinas ext4 direct-read cache：`EXT4_DIRECT_READ_CACHE=0` / `ext4fs.direct_read_cache=0`；2026-05-06 的 cache-on 结果仅作为历史对照，不再作为默认综合测试口径。
+- 2026-05-14 起，6-test 综合诊断默认关闭 Asterinas IOMMU：`BENCH_ASTER_SCHEME=null`，并关闭 Asterinas PageCache：`EXT4_PAGE_CACHE=0` / `ext4fs.page_cache=0`、ext4 direct-read cache：`EXT4_DIRECT_READ_CACHE=0` / `ext4fs.direct_read_cache=0`；2026-05-09 的 IOMMU-on 结果与 2026-05-06 的 cache-on 结果仅作为历史对照，不再作为默认综合测试口径。
 - 2026-04-24 的 ext4 结果来自 JBD2 Phase 1 收口后的 fio 守底复跑：read `93.49%`、write `87.01%`，满足 Phase 1 “相对基线不下降超过 5 个百分点”的守底线（read ≥ 90%、write ≥ 85%）。
 - 2026-05-08 Phase 3 Step 6 普通 fio 复跑：read `127.06%` 通过；write `39.18%` 低于 `75%` hardening 红线。当前不能继续沿用 `87.01%` 作为 Phase 3 最新写性能结论；该问题转入后续性能 hardening，不阻塞 Phase 3 fsync/flush 功能收口。
 - 2026-05-05 的 Phase 2 收口口径：完整功能回归大全量已复跑通过，包括 phase3、phase4、phase6、jbd_phase1、crash matrix、lmbench 与 Phase 2 concurrency；其中 xfstests 统计按 `PASS / FAIL / NOTRUN / STATIC_BLOCKED` 原始口径记录，NOTRUN/STATIC_BLOCKED 为环境或赛题范围外跳过项；fio write 仍低于 90%，作为性能优化遗留项继续推进。

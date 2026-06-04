@@ -1,0 +1,205 @@
+[DONE] crash prepare killed: scenario=create_write round=1 log=/fio-sweep-logs/G_correctness/crash/create_write_prepare_r1.log
+[DONE] crash verify passed: scenario=create_write round=1 log=/fio-sweep-logs/G_correctness/crash/create_write_verify_r1.log
+[DONE] crash prepare killed: scenario=rename round=1 log=/fio-sweep-logs/G_correctness/crash/rename_prepare_r1.log
+[DONE] crash verify passed: scenario=rename round=1 log=/fio-sweep-logs/G_correctness/crash/rename_verify_r1.log
+[DONE] crash prepare killed: scenario=truncate_append round=1 log=/fio-sweep-logs/G_correctness/crash/truncate_append_prepare_r1.log
+[DONE] crash verify passed: scenario=truncate_append round=1 log=/fio-sweep-logs/G_correctness/crash/truncate_append_verify_r1.log
+[DONE] crash prepare killed: scenario=large_write round=1 log=/fio-sweep-logs/G_correctness/crash/large_write_prepare_r1.log
+[DONE] crash verify passed: scenario=large_write round=1 log=/fio-sweep-logs/G_correctness/crash/large_write_verify_r1.log
+[DONE] crash prepare killed: scenario=fsync_durability round=1 log=/fio-sweep-logs/G_correctness/crash/fsync_durability_prepare_r1.log
+[DONE] crash verify passed: scenario=fsync_durability round=1 log=/fio-sweep-logs/G_correctness/crash/fsync_durability_verify_r1.log
+[DONE] crash prepare killed: scenario=multi_file_create round=1 log=/fio-sweep-logs/G_correctness/crash/multi_file_create_prepare_r1.log
+[DONE] crash verify passed: scenario=multi_file_create round=1 log=/fio-sweep-logs/G_correctness/crash/multi_file_create_verify_r1.log
+[DONE] crash prepare killed: scenario=dir_tree_churn round=1 log=/fio-sweep-logs/G_correctness/crash/dir_tree_churn_prepare_r1.log
+[DONE] crash verify passed: scenario=dir_tree_churn round=1 log=/fio-sweep-logs/G_correctness/crash/dir_tree_churn_verify_r1.log
+[DONE] crash prepare killed: scenario=truncate_shrink round=1 log=/fio-sweep-logs/G_correctness/crash/truncate_shrink_prepare_r1.log
+[DONE] crash verify passed: scenario=truncate_shrink round=1 log=/fio-sweep-logs/G_correctness/crash/truncate_shrink_verify_r1.log
+[DONE] crash prepare killed: scenario=append_concurrent round=1 log=/fio-sweep-logs/G_correctness/crash/append_concurrent_prepare_r1.log
+[DONE] crash verify passed: scenario=append_concurrent round=1 log=/fio-sweep-logs/G_correctness/crash/append_concurrent_verify_r1.log
+[DONE] crash prepare killed: scenario=create_write round=2 log=/fio-sweep-logs/G_correctness/crash/create_write_prepare_r2.log
+[DONE] crash verify passed: scenario=create_write round=2 log=/fio-sweep-logs/G_correctness/crash/create_write_verify_r2.log
+[DONE] crash prepare killed: scenario=rename round=2 log=/fio-sweep-logs/G_correctness/crash/rename_prepare_r2.log
+[DONE] crash verify passed: scenario=rename round=2 log=/fio-sweep-logs/G_correctness/crash/rename_verify_r2.log
+[DONE] crash prepare killed: scenario=truncate_append round=2 log=/fio-sweep-logs/G_correctness/crash/truncate_append_prepare_r2.log
+[DONE] crash verify passed: scenario=truncate_append round=2 log=/fio-sweep-logs/G_correctness/crash/truncate_append_verify_r2.log
+[DONE] crash prepare killed: scenario=large_write round=2 log=/fio-sweep-logs/G_correctness/crash/large_write_prepare_r2.log
+[DONE] crash verify passed: scenario=large_write round=2 log=/fio-sweep-logs/G_correctness/crash/large_write_verify_r2.log
+[DONE] crash prepare killed: scenario=fsync_durability round=2 log=/fio-sweep-logs/G_correctness/crash/fsync_durability_prepare_r2.log
+[DONE] crash verify passed: scenario=fsync_durability round=2 log=/fio-sweep-logs/G_correctness/crash/fsync_durability_verify_r2.log
+[DONE] crash prepare killed: scenario=multi_file_create round=2 log=/fio-sweep-logs/G_correctness/crash/multi_file_create_prepare_r2.log
+[DONE] crash verify passed: scenario=multi_file_create round=2 log=/fio-sweep-logs/G_correctness/crash/multi_file_create_verify_r2.log
+[DONE] crash prepare killed: scenario=dir_tree_churn round=2 log=/fio-sweep-logs/G_correctness/crash/dir_tree_churn_prepare_r2.log
+[DONE] crash verify passed: scenario=dir_tree_churn round=2 log=/fio-sweep-logs/G_correctness/crash/dir_tree_churn_verify_r2.log
+[DONE] crash prepare killed: scenario=truncate_shrink round=2 log=/fio-sweep-logs/G_correctness/crash/truncate_shrink_prepare_r2.log
+[DONE] crash verify passed: scenario=truncate_shrink round=2 log=/fio-sweep-logs/G_correctness/crash/truncate_shrink_verify_r2.log
+[DONE] crash prepare killed: scenario=append_concurrent round=2 log=/fio-sweep-logs/G_correctness/crash/append_concurrent_prepare_r2.log
+[DONE] crash verify passed: scenario=append_concurrent round=2 log=/fio-sweep-logs/G_correctness/crash/append_concurrent_verify_r2.log
+===== Crash summary =====
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	create_write	write	after_commit	/fio-sweep-logs/G_correctness/crash/create_write_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/create_write_verify_r1.log	PASS
+1	rename	rename	after_commit	/fio-sweep-logs/G_correctness/crash/rename_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/rename_verify_r1.log	PASS
+1	truncate_append	write	after_commit	/fio-sweep-logs/G_correctness/crash/truncate_append_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/truncate_append_verify_r1.log	PASS
+1	large_write	rename	after_commit	/fio-sweep-logs/G_correctness/crash/large_write_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/large_write_verify_r1.log	PASS
+1	fsync_durability	rename	after_commit	/fio-sweep-logs/G_correctness/crash/fsync_durability_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/fsync_durability_verify_r1.log	PASS
+1	multi_file_create	rename	after_commit	/fio-sweep-logs/G_correctness/crash/multi_file_create_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/multi_file_create_verify_r1.log	PASS
+1	dir_tree_churn	rmdir	after_commit	/fio-sweep-logs/G_correctness/crash/dir_tree_churn_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/dir_tree_churn_verify_r1.log	PASS
+1	truncate_shrink	truncate	after_commit	/fio-sweep-logs/G_correctness/crash/truncate_shrink_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/truncate_shrink_verify_r1.log	PASS
+1	append_concurrent	rename	after_commit	/fio-sweep-logs/G_correctness/crash/append_concurrent_prepare_r1.log	/fio-sweep-logs/G_correctness/crash/append_concurrent_verify_r1.log	PASS
+2	create_write	write	after_commit	/fio-sweep-logs/G_correctness/crash/create_write_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/create_write_verify_r2.log	PASS
+2	rename	rename	after_commit	/fio-sweep-logs/G_correctness/crash/rename_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/rename_verify_r2.log	PASS
+2	truncate_append	write	after_commit	/fio-sweep-logs/G_correctness/crash/truncate_append_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/truncate_append_verify_r2.log	PASS
+2	large_write	rename	after_commit	/fio-sweep-logs/G_correctness/crash/large_write_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/large_write_verify_r2.log	PASS
+2	fsync_durability	rename	after_commit	/fio-sweep-logs/G_correctness/crash/fsync_durability_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/fsync_durability_verify_r2.log	PASS
+2	multi_file_create	rename	after_commit	/fio-sweep-logs/G_correctness/crash/multi_file_create_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/multi_file_create_verify_r2.log	PASS
+2	dir_tree_churn	rmdir	after_commit	/fio-sweep-logs/G_correctness/crash/dir_tree_churn_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/dir_tree_churn_verify_r2.log	PASS
+2	truncate_shrink	truncate	after_commit	/fio-sweep-logs/G_correctness/crash/truncate_shrink_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/truncate_shrink_verify_r2.log	PASS
+2	append_concurrent	rename	after_commit	/fio-sweep-logs/G_correctness/crash/append_concurrent_prepare_r2.log	/fio-sweep-logs/G_correctness/crash/append_concurrent_verify_r2.log	PASS
+[DONE] mode=phase4_good rc=0 log=/fio-sweep-logs/G_correctness/phase4_good_20260518_234727.log
+227:xfstests case done: generic/001 rc=0
+231:xfstests case done: generic/006 rc=0
+272:xfstests case done: generic/013 rc=0
+276:xfstests case done: generic/028 rc=0
+280:xfstests case done: generic/035 rc=0
+284:xfstests case done: generic/036 rc=0
+300:xfstests case done: generic/041 rc=0
+316:xfstests case done: generic/047 rc=0
+320:xfstests case done: generic/051 rc=0
+324:xfstests case done: generic/052 rc=0
+328:xfstests case done: generic/054 rc=0
+332:xfstests case done: generic/062 rc=0
+348:xfstests case done: generic/068 rc=0
+352:xfstests case done: generic/070 rc=0
+516:xfstests case done: generic/083 rc=0
+520:xfstests case done: generic/084 rc=0
+524:xfstests case done: generic/090 rc=0
+540:xfstests case done: generic/093 rc=0
+556:===== phase4_good detailed results =====
+598:xfstests phase4_good passed: pass_rate=100.00% >= 90%
+602:All syscall tests passed.
+[DONE] mode=pagecache_phase4 rc=0 log=/fio-sweep-logs/G_correctness/pagecache_phase4_20260518_234727.log
+227:xfstests case done: generic/091 rc=0
+231:xfstests case done: generic/130 rc=0
+235:xfstests case done: generic/133 rc=0
+239:xfstests case done: generic/208 rc=0
+255:xfstests case done: generic/209 rc=0
+271:xfstests case done: generic/247 rc=0
+275:xfstests case done: generic/263 rc=0
+279:xfstests case done: generic/366 rc=0
+295:xfstests case done: generic/412 rc=0
+299:xfstests case done: generic/418 rc=0
+303:xfstests case done: generic/469 rc=0
+307:xfstests case done: generic/749 rc=0
+311:xfstests case done: generic/751 rc=0
+327:===== pagecache_phase4 detailed results =====
+342:xfstests pagecache_phase4 passed: pass_rate=100.00% >= 100%
+346:All syscall tests passed.
+[DONE] mode=phase3_base rc=0 log=/fio-sweep-logs/G_correctness/phase3_base_guard_20260518_234727.log
+227:xfstests case done: generic/006 rc=0
+231:xfstests case done: generic/013 rc=0
+235:xfstests case done: generic/028 rc=0
+239:xfstests case done: generic/036 rc=0
+255:xfstests case done: generic/041 rc=0
+271:xfstests case done: generic/047 rc=0
+275:xfstests case done: generic/051 rc=0
+279:xfstests case done: generic/052 rc=0
+283:xfstests case done: generic/054 rc=0
+287:xfstests case done: generic/062 rc=0
+303:xfstests case done: generic/068 rc=0
+307:xfstests case done: generic/070 rc=0
+475:xfstests case done: generic/083 rc=0
+479:xfstests case done: generic/084 rc=0
+483:xfstests case done: generic/090 rc=0
+499:xfstests case done: generic/093 rc=0
+515:===== phase3_base detailed results =====
+557:xfstests phase3_base passed: pass_rate=100.00% >= 90%
+561:All syscall tests passed.
+[DONE] mode=phase6_good rc=0 log=/fio-sweep-logs/G_correctness/phase6_good_20260518_234727.log
+227:xfstests case done: generic/001 rc=0
+231:xfstests case done: generic/003 rc=0
+235:xfstests case done: generic/006 rc=0
+239:xfstests case done: generic/007 rc=0
+243:xfstests case done: generic/011 rc=1
+279:xfstests case done: generic/013 rc=0
+283:xfstests case done: generic/014 rc=0
+287:xfstests case done: generic/015 rc=0
+291:xfstests case done: generic/027 rc=0
+295:xfstests case done: generic/028 rc=0
+299:xfstests case done: generic/035 rc=0
+303:xfstests case done: generic/047 rc=0
+307:xfstests case done: generic/051 rc=0
+311:xfstests case done: generic/052 rc=0
+315:xfstests case done: generic/054 rc=0
+319:xfstests case done: generic/068 rc=0
+323:xfstests case done: generic/076 rc=0
+483:xfstests case done: generic/083 rc=0
+487:xfstests case done: generic/084 rc=0
+491:xfstests case done: generic/087 rc=0
+495:xfstests case done: generic/100 rc=0
+499:xfstests case done: generic/124 rc=0
+503:xfstests case done: generic/126 rc=0
+507:xfstests case done: generic/184 rc=0
+511:xfstests case done: generic/192 rc=0
+515:===== phase6_good detailed results =====
+568:xfstests phase6_good passed: pass_rate=96.00% >= 90%
+572:All syscall tests passed.
+[DONE] mode=jbd_phase1 rc=0 log=/fio-sweep-logs/G_correctness/jbd_phase1_20260518_234727.log
+227:xfstests case done: generic/068 rc=0
+231:xfstests case done: generic/076 rc=0
+426:xfstests case done: generic/083 rc=0
+430:xfstests case done: generic/192 rc=0
+434:xfstests case done: generic/530 rc=0
+450:xfstests case done: ext4/021 rc=0
+454:xfstests case done: ext4/022 rc=0
+470:xfstests case done: ext4/030 rc=0
+486:xfstests case done: ext4/031 rc=0
+502:xfstests case done: ext4/032 rc=0
+518:xfstests case done: ext4/033 rc=0
+534:xfstests case done: ext4/045 rc=0
+538:===== jbd_phase1 detailed results =====
+552:xfstests jbd_phase1 passed: pass_rate=100.00% >= 90%
+556:All syscall tests passed.
+[DONE] mode=jbd_phase2_concurrency rc=0 log=/fio-sweep-logs/G_correctness/jbd_phase2_concurrency_20260518_234727.log
+202:EXT4_PHASE2_CASE_START case=multi_file_write_verify seed=78 workers=4 rounds=8
+203:EXT4_PHASE2_CASE_PASS case=multi_file_write_verify seed=78 workers=4 rounds=8
+204:EXT4_PHASE2_CASE_START case=multi_file_read_write seed=78 workers=4 rounds=8
+205:EXT4_PHASE2_CASE_PASS case=multi_file_read_write seed=78 workers=4 rounds=8
+206:EXT4_PHASE2_CASE_START case=create_unlink_churn seed=78 workers=4 rounds=8
+207:EXT4_PHASE2_CASE_PASS case=create_unlink_churn seed=78 workers=4 rounds=8
+208:EXT4_PHASE2_CASE_START case=rename_churn seed=78 workers=4 rounds=8
+209:EXT4_PHASE2_CASE_PASS case=rename_churn seed=78 workers=4 rounds=8
+210:EXT4_PHASE2_CASE_START case=write_truncate_fsync seed=78 workers=4 rounds=8
+211:EXT4_PHASE2_CASE_PASS case=write_truncate_fsync seed=78 workers=4 rounds=8
+212:EXT4_PHASE2_CASE_START case=unlink_while_open seed=78 workers=4 rounds=8
+213:EXT4_PHASE2_CASE_PASS case=unlink_while_open seed=78 workers=4 rounds=8
+214:EXT4_PHASE2_CASE_START case=allocator_churn seed=78 workers=4 rounds=8
+215:EXT4_PHASE2_CASE_PASS case=allocator_churn seed=78 workers=4 rounds=8
+218:===== jbd_phase2_concurrency detailed results =====
+227:EXT4_PHASE2_CONCURRENCY_PASS pass=7 fail=0 seed=78 workers=4 rounds=8
+228:All syscall tests passed.
+[DONE] mode=jbd_phase3_fsync_durability rc=0 log=/fio-sweep-logs/G_correctness/jbd_phase3_fsync_durability_20260518_234727.log
+227:xfstests case done: generic/043 rc=0
+231:xfstests case done: generic/044 rc=0
+235:xfstests case done: generic/045 rc=0
+239:xfstests case done: generic/046 rc=0
+243:xfstests case done: generic/047 rc=0
+247:xfstests case done: generic/048 rc=0
+263:xfstests case done: generic/049 rc=0
+267:xfstests case done: generic/052 rc=0
+271:xfstests case done: generic/054 rc=0
+275:xfstests case done: generic/055 rc=0
+285:xfstests case done: generic/388 rc=0
+289:xfstests case done: generic/392 rc=0
+293:===== jbd_phase3_fsync_durability detailed results =====
+307:xfstests jbd_phase3_fsync_durability passed: pass_rate=100.00% >= 90%
+311:All syscall tests passed.
+[SKIP] lmbench disabled (RUN_LMBENCH=0)
+[DONE] phase4_part3 run finished
+crash_summary=/fio-sweep-logs/G_correctness/crash/phase4_part3_crash_summary_20260518_234727.tsv
+phase4_good_log=/fio-sweep-logs/G_correctness/phase4_good_20260518_234727.log
+pagecache_phase4_log=/fio-sweep-logs/G_correctness/pagecache_phase4_20260518_234727.log
+phase3_base_log=/fio-sweep-logs/G_correctness/phase3_base_guard_20260518_234727.log
+phase6_good_log=/fio-sweep-logs/G_correctness/phase6_good_20260518_234727.log
+jbd_phase1_log=/fio-sweep-logs/G_correctness/jbd_phase1_20260518_234727.log
+jbd_phase2_concurrency_log=/fio-sweep-logs/G_correctness/jbd_phase2_concurrency_20260518_234727.log
+jbd_phase3_fsync_durability_log=/fio-sweep-logs/G_correctness/jbd_phase3_fsync_durability_20260518_234727.log
+lmbench_summary=<disabled>

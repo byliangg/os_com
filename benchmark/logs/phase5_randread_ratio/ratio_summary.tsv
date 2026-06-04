@@ -1,0 +1,5 @@
+label	rw	bs	cache	aster_mb_s	linux_mb_s	ratio_pct
+read-4K-c0	read	4K	0	12.8	177.0	7.23
+read-16K-c0	read	16K	0	50.6	624.0	8.11
+read-4K-c1	read	4K	1	16.5	173.0	9.54
+read-16K-c1	read	16K	1	64.9	614.0	10.57
