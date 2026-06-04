@@ -1,0 +1,763 @@
+    Updating crates.io index
+    Updating git repository `https://github.com/asterinas/inherit-methods-macro`
+    Updating git repository `https://github.com/asterinas/smoltcp`
+    Updating git repository `https://github.com/asterinas/inventory`
+    Updating git repository `https://github.com/asterinas/rust-ctor`
+     Locking 221 packages to latest Rust 1.94.0-nightly compatible versions
+      Adding subtle v2.4.1 (available: v2.6.1)
+ Downloading crates ...
+  Downloaded const_format_proc_macros v0.2.34
+  Downloaded byteorder v1.5.0
+  Downloaded darling v0.13.4
+  Downloaded cfg-if v1.0.4
+  Downloaded time-core v0.1.8
+  Downloaded ext-trait v1.0.1
+  Downloaded darling_macro v0.13.4
+  Downloaded stable_deref_trait v1.2.1
+  Downloaded bit_field v0.10.3
+  Downloaded universal-hash v0.4.1
+  Downloaded takeable v0.2.2
+  Downloaded cpufeatures v0.2.17
+  Downloaded subtle v2.4.1
+  Downloaded bitflags v2.12.1
+  Downloaded uguid v2.2.1
+  Downloaded autocfg v1.5.1
+  Downloaded defmt v0.3.100
+  Downloaded ctr v0.8.0
+  Downloaded defmt-parser v1.0.0
+  Downloaded cobs v0.3.0
+  Downloaded defmt-macros v1.1.0
+  Downloaded volatile v0.4.6
+  Downloaded crc32fast v1.5.0
+  Downloaded dary_heap v0.3.9
+  Downloaded ext-trait-proc_macros v1.0.1
+  Downloaded ident_case v1.0.1
+  Downloaded tap v1.0.1
+  Downloaded tdx-guest v0.2.4
+  Downloaded macro_rules_attribute-proc_macro v0.1.3
+  Downloaded lru v0.16.4
+  Downloaded wyz v0.5.1
+  Downloaded ghost v0.1.21
+  Downloaded serde_derive v1.0.228
+  Downloaded cipher v0.3.0
+  Downloaded bittle v0.5.7
+  Downloaded either v1.16.0
+  Downloaded acpi v5.2.0
+  Downloaded hash32 v0.3.1
+  Downloaded proc-macro-error2 v2.0.1
+  Downloaded once_cell v1.21.4
+  Downloaded funty v2.0.0
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded lending-iterator v0.1.7
+  Downloaded lending-iterator-proc_macros v0.1.7
+  Downloaded memoffset v0.9.1
+  Downloaded owo-colors v4.3.0
+  Downloaded strsim v0.10.0
+  Downloaded quote v1.0.45
+  Downloaded foldhash v0.2.0
+  Downloaded lock_api v0.4.14
+  Downloaded nougat v0.2.4
+  Downloaded hash32 v0.2.1
+  Downloaded toml v0.7.8
+  Downloaded smallvec v1.15.1
+  Downloaded radium v0.7.0
+  Downloaded opaque-debug v0.3.1
+  Downloaded rustversion v1.0.22
+  Downloaded serde_core v1.0.228
+  Downloaded postcard v1.1.3
+  Downloaded rand_chacha v0.9.0
+  Downloaded log v0.4.31
+  Downloaded konst_macro_rules v0.2.19
+  Downloaded thiserror-impl v2.0.18
+  Downloaded proc-macro2 v1.0.106
+  Downloaded getrandom v0.3.4
+  Downloaded generic-array v0.14.9
+  Downloaded nougat-proc_macros v0.2.4
+  Downloaded ghash v0.4.4
+  Downloaded spin v0.9.8
+  Downloaded rand_core v0.9.5
+  Downloaded powerfmt v0.2.0
+  Downloaded deranged v0.5.8
+  Downloaded font8x8 v0.2.7
+  Downloaded fnv v1.0.7
+  Downloaded proc-macro-error-attr2 v2.0.0
+  Downloaded multiboot2 v0.24.1
+  Downloaded num-conv v0.2.2
+  Downloaded never-say-never v6.6.666
+  Downloaded polyval v0.5.3
+  Downloaded semver v1.0.28
+  Downloaded lazy_static v1.5.0
+  Downloaded ptr_meta v0.3.1
+  Downloaded getset v0.1.6
+  Downloaded ptr_meta_derive v0.3.1
+  Downloaded extension-traits v1.0.1
+  Downloaded macro_rules_attribute v0.1.3
+  Downloaded aead v0.4.3
+  Downloaded serde_spanned v0.6.9
+  Downloaded defmt v1.1.0
+  Downloaded volatile v0.6.1
+  Downloaded polonius-the-crab v0.2.1
+  Downloaded managed v0.8.0
+  Downloaded paste v1.0.15
+  Downloaded thiserror v2.0.18
+  Downloaded darling_core v0.13.4
+  Downloaded const_format v0.2.36
+  Downloaded intrusive-collections v0.9.7
+  Downloaded unicode-xid v0.2.6
+  Downloaded bitvec v1.0.1
+  Downloaded serde v1.0.228
+  Downloaded aes-gcm v0.9.4
+  Downloaded toml_datetime v0.6.11
+  Downloaded unwinding v0.2.8
+  Downloaded iced-x86 v1.21.0
+  Downloaded json v0.12.4
+  Downloaded indexmap v2.14.0
+  Downloaded heapless v0.8.0
+  Downloaded hashbrown v0.17.1
+  Downloaded aes v0.7.5
+  Downloaded unicode-ident v1.0.24
+  Downloaded gimli v0.32.3
+  Downloaded konst v0.2.20
+  Downloaded syn v1.0.109
+  Downloaded multiboot2-common v0.3.0
+  Downloaded rand v0.9.4
+  Downloaded memchr v2.8.1
+  Downloaded itertools v0.10.5
+  Downloaded syn v2.0.117
+  Downloaded libc v0.2.186
+  Downloaded heapless v0.7.17
+  Downloaded raw-cpuid v10.7.0
+  Downloaded hashbrown v0.16.1
+  Downloaded zerocopy v0.8.50
+  Downloaded time v0.3.47
+  Downloaded gimli v0.28.1
+  Downloaded x86 v0.52.0
+  Downloaded uefi-raw v0.12.0
+  Downloaded zerocopy-derive v0.8.50
+  Downloaded winnow v0.5.40
+  Downloaded typenum v1.20.1
+  Downloaded toml_edit v0.19.15
+  Downloaded x86_64 v0.14.13
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded rustc-demangle v0.1.26
+  Downloaded getopts v0.2.24
+  Downloaded rustc-literal-escaper v0.0.5
+  Downloaded libc v0.2.177
+warning: unstable feature specified for `-Ctarget-feature`: `ermsb`
+  |
+  = note: this feature is not stably supported; its behavior can change in the future
+
+warning: `align_ext` (lib) generated 1 warning
+warning: `linux-boot-params` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-test` (lib) generated 1 warning (1 duplicate)
+warning: `typeflags-util` (lib) generated 1 warning (1 duplicate)
+warning: `int-to-c-enum` (lib) generated 1 warning (1 duplicate)
+warning: `id-alloc` (lib) generated 1 warning (1 duplicate)
+warning: `aster-rights` (lib) generated 1 warning (1 duplicate)
+warning: `ostd-pod` (lib) generated 1 warning (1 duplicate)
+warning: `jhash` (lib) generated 1 warning (1 duplicate)
+   Compiling ostd v0.17.0 (/root/asterinas/ostd)
+warning: the feature `maybe_uninit_ref` has been stable since 1.55.0 and no longer requires an attribute to enable
+ --> /root/asterinas/third_party/core2/src/lib.rs:1:42
+  |
+1 | #![cfg_attr(feature = "nightly", feature(maybe_uninit_ref))]
+  |                                          ^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `component` (lib) generated 1 warning (1 duplicate)
+warning: `core2` (lib) generated 2 warnings (1 duplicate)
+warning: the feature `error_in_core` has been stable since 1.81.0 and no longer requires an attribute to enable
+ --> /root/asterinas/kernel/libs/ext4_rs/src/lib.rs:1:12
+  |
+1 | #![feature(error_in_core)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: `ext4_rs` (lib) generated 2 warnings (1 duplicate)
+warning: `libflate_lz77` (lib) generated 1 warning (1 duplicate)
+warning: `cpio-decoder` (lib) generated 1 warning (1 duplicate)
+warning: `keyable-arc` (lib) generated 1 warning (1 duplicate)
+warning: `logo-ascii-art` (lib) generated 1 warning (1 duplicate)
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/gzip.rs:430:44
+    |
+430 |         if flags & F_HCRC != 0 && cfg!(not(fuzzing)) {
+    |                                            ^^^^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, `ktest`, and `test` and 31 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unexpected `cfg` condition name: `fuzzing`
+    --> /root/asterinas/third_party/libflate/src/gzip.rs:1034:29
+     |
+1034 |                 if cfg!(not(fuzzing)) && trailer.crc32 != self.crc32.value() {
+     |                             ^^^^^^^
+     |
+     = help: consider using a Cargo feature instead
+     = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+              [lints.rust]
+              unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+     = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+     = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/gzip.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && trailer.crc32() != self.crc32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/non_blocking/zlib.rs:138:29
+    |
+138 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: unexpected `cfg` condition name: `fuzzing`
+   --> /root/asterinas/third_party/libflate/src/zlib.rs:395:29
+    |
+395 |                 if cfg!(not(fuzzing)) && adler32 != self.adler32.value() {
+    |                             ^^^^^^^
+    |
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(fuzzing)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+
+warning: `libflate` (lib) generated 6 warnings (1 duplicate)
+   Compiling osdk-heap-allocator v0.17.0 (/root/asterinas/osdk/deps/heap-allocator)
+   Compiling aster-console v0.1.0 (/root/asterinas/kernel/comps/console)
+   Compiling aster-input v0.1.0 (/root/asterinas/kernel/comps/input)
+   Compiling aster-cmdline v0.1.0 (/root/asterinas/kernel/comps/cmdline)
+   Compiling aster-pci v0.1.0 (/root/asterinas/kernel/comps/pci)
+   Compiling osdk-frame-allocator v0.17.0 (/root/asterinas/osdk/deps/frame-allocator)
+   Compiling xarray v0.1.0 (/root/asterinas/kernel/libs/xarray)
+   Compiling aster-util v0.1.0 (/root/asterinas/kernel/libs/aster-util)
+   Compiling aster-logger v0.1.0 (/root/asterinas/kernel/comps/logger)
+   Compiling aster-uart v0.1.0 (/root/asterinas/kernel/comps/uart)
+warning: `xarray` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-i8042 v0.1.0 (/root/asterinas/kernel/comps/i8042)
+   Compiling aster-framebuffer v0.1.0 (/root/asterinas/kernel/comps/framebuffer)
+warning: `aster-logger` (lib) generated 1 warning (1 duplicate)
+warning: `aster-cmdline` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-frame-allocator` (lib) generated 1 warning (1 duplicate)
+warning: `aster-uart` (lib) generated 1 warning (1 duplicate)
+warning: `aster-console` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-time v0.1.0 (/root/asterinas/kernel/comps/time)
+   Compiling aster-softirq v0.1.0 (/root/asterinas/kernel/comps/softirq)
+   Compiling device-id v0.1.0 (/root/asterinas/kernel/libs/device-id)
+   Compiling aster-systree v0.1.0 (/root/asterinas/kernel/comps/systree)
+warning: `aster-input` (lib) generated 1 warning (1 duplicate)
+warning: `device-id` (lib) generated 1 warning (1 duplicate)
+warning: `osdk-heap-allocator` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-bigtcp v0.1.0 (/root/asterinas/kernel/libs/aster-bigtcp)
+warning: `aster-util` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-block v0.1.0 (/root/asterinas/kernel/comps/block)
+warning: `aster-framebuffer` (lib) generated 1 warning (1 duplicate)
+warning: `aster-pci` (lib) generated 1 warning (1 duplicate)
+warning: `aster-time` (lib) generated 1 warning (1 duplicate)
+warning: `aster-softirq` (lib) generated 1 warning (1 duplicate)
+warning: `aster-i8042` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-network v0.1.0 (/root/asterinas/kernel/comps/network)
+warning: `aster-bigtcp` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-mlsdisk v0.1.0 (/root/asterinas/kernel/comps/mlsdisk)
+warning: `aster-systree` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-virtio v0.1.0 (/root/asterinas/kernel/comps/virtio)
+warning: `aster-block` (lib) generated 1 warning (1 duplicate)
+warning: `aster-network` (lib) generated 1 warning (1 duplicate)
+warning: `ostd` (lib) generated 1 warning (1 duplicate)
+   Compiling aster-kernel v0.1.0 (/root/asterinas/kernel)
+warning: `aster-virtio` (lib) generated 1 warning (1 duplicate)
+warning: `aster-mlsdisk` (lib) generated 1 warning (1 duplicate)
+warning: constant `JOURNALED_SMALL_WRITE_MAX_BYTES` is never used
+  --> /root/asterinas/kernel/src/fs/ext4/fs.rs:80:7
+   |
+80 | const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `commit_pending_jbd2_transactions` is never used
+    --> /root/asterinas/kernel/src/fs/ext4/fs.rs:1838:8
+     |
+1140 | impl Ext4Fs {
+     | ----------- method in this implementation
+...
+1838 |     fn commit_pending_jbd2_transactions(&self) {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `aster-kernel` (lib) generated 3 warnings (1 duplicate)
+   Compiling aster-kernel-osdk-bin v0.1.0 (/root/asterinas/.target_bench/osdk/aster-kernel-run-base)
+warning: `aster-kernel-osdk-bin` (bin "aster-kernel-osdk-bin") generated 1 warning (1 duplicate)
+    Finished `release-lto` profile [optimized] target(s) in 1m 30s
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=01h].ECX.pcid [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19D0+7EF319D0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM..[kernel] OSTD initialized. Preparing components.
+[kernel] Spawn the first kernel thread
+[kernel] unpacking the initramfs.cpio.gz to rootfs ...
+[kernel] rootfs is ready
+
+                                  [38;2;87;180;249m.[39m[38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m[38;2;94;197;250m.[39m[38;2;96;201;250m.[39m
+                                [38;2;83;172;249m.[39m[38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                               [38;2;82;168;249m.[39m[38;2;83;172;249m=[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                              [38;2;80;163;249m:[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m:[39m
+                            [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                           [38;2;74;151;248m.[39m[38;2;76;155;248m=[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m=[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                          [38;2;73;147;248m:[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                        [38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m+[39m[38;2;82;168;249m:[39m [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m.[39m
+                       [38;2;67;134;248m.[39m[38;2;69;138;248m+[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m=[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m.[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+                     [38;2;63;125;247m.[39m[38;2;65;130;247m-[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m   [38;2;85;176;249m:[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m-[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m:[39m[38;2;38;66;245m-[39m[38;2;40;70;245m=[39m[38;2;42;75;245m=[39m[38;2;43;79;245m=[39m[38;2;45;83;246m=[39m[38;2;47;87;246m=[39m[38;2;49;92;246m=[39m[38;2;51;96;246m=[39m[38;2;53;100;246m=[39m[38;2;54;104;246m=[39m[38;2;56;108;247m=[39m[38;2;58;113;247m=[39m[38;2;60;117;247m=[39m[38;2;62;121;247m=[39m[38;2;63;125;247m+[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m-[39m[38;2;78;159;248m-[39m[38;2;80;163;249m-[39m[38;2;82;168;249m-[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m-[39m[38;2;98;206;250m:[39m[38;2;100;210;250m:[39m[38;2;102;214;251m:[39m[38;2;103;218;251m:[39m[38;2;105;223;251m:[39m[38;2;107;227;251m:[39m[38;2;109;231;251m:[39m[38;2;111;235;251m.[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m.[39m[38;2;43;79;245m:[39m[38;2;45;83;246m-[39m[38;2;47;87;246m*[39m[38;2;49;92;246m#[39m[38;2;51;96;246m#[39m[38;2;53;100;246m#[39m[38;2;54;104;246m#[39m[38;2;56;108;247m#[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m=[39m[38;2;105;223;251m=[39m[38;2;107;227;251m:[39m[38;2;109;231;251m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m:[39m[38;2;54;104;246m+[39m[38;2;56;108;247m*[39m[38;2;58;113;247m#[39m[38;2;60;117;247m#[39m[38;2;62;121;247m#[39m[38;2;63;125;247m#[39m[38;2;65;130;247m#[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m+[39m[38;2;76;155;248m+[39m[38;2;78;159;248m+[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m=[39m[38;2;96;201;250m=[39m[38;2;98;206;250m=[39m[38;2;100;210;250m=[39m[38;2;102;214;251m=[39m[38;2;103;218;251m-[39m[38;2;105;223;251m.[39m[38;2;107;227;251m.[39m
+                 [38;2;56;108;247m.[39m[38;2;58;113;247m.[39m[38;2;60;117;247m-[39m[38;2;62;121;247m+[39m[38;2;63;125;247m#[39m[38;2;65;130;247m*[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m=[39m[38;2;78;159;248m.[39m[38;2;80;163;249m.[39m  [38;2;85;176;249m-[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+                [38;2;54;104;246m-[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m[38;2;63;125;247m.[39m[38;2;65;130;247m:[39m[38;2;67;134;248m*[39m[38;2;69;138;248m*[39m[38;2;71;142;248m*[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m=[39m[38;2;82;168;249m.[39m[38;2;83;172;249m.[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+              [38;2;51;96;246m.[39m[38;2;53;100;246m+[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m+[39m[38;2;60;117;247m+[39m[38;2;62;121;247m=[39m[38;2;63;125;247m.[39m [38;2;67;134;248m.[39m[38;2;69;138;248m.[39m[38;2;71;142;248m=[39m[38;2;73;147;248m*[39m[38;2;74;151;248m*[39m[38;2;76;155;248m*[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m-[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m+[39m[38;2;94;197;250m.[39m
+            [38;2;47;87;246m.[39m[38;2;49;92;246m:[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m*[39m[38;2;56;108;247m+[39m[38;2;58;113;247m=[39m[38;2;60;117;247m.[39m[38;2;62;121;247m.[39m     [38;2;73;147;248m.[39m[38;2;74;151;248m-[39m[38;2;76;155;248m+[39m[38;2;78;159;248m*[39m[38;2;80;163;249m*[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m[38;2;94;197;250m.[39m
+           [38;2;45;83;246m.[39m[38;2;47;87;246m-[39m[38;2;49;92;246m*[39m[38;2;51;96;246m*[39m[38;2;53;100;246m*[39m[38;2;54;104;246m+[39m[38;2;56;108;247m:[39m          [38;2;76;155;248m.[39m[38;2;78;159;248m-[39m[38;2;80;163;249m+[39m[38;2;82;168;249m+[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+          [38;2;43;79;245m.[39m[38;2;45;83;246m*[39m[38;2;47;87;246m#[39m[38;2;49;92;246m*[39m[38;2;51;96;246m=[39m[38;2;53;100;246m.[39m              [38;2;80;163;249m.[39m[38;2;82;168;249m=[39m[38;2;83;172;249m+[39m[38;2;85;176;249m+[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m=[39m
+        [38;2;40;70;245m.[39m[38;2;42;75;245m-[39m[38;2;43;79;245m*[39m[38;2;45;83;246m#[39m[38;2;47;87;246m+[39m[38;2;49;92;246m.[39m[38;2;51;96;246m.[39m                [38;2;82;168;249m.[39m[38;2;83;172;249m:[39m[38;2;85;176;249m=[39m[38;2;87;180;249m+[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+       [38;2;38;66;245m.[39m[38;2;40;70;245m=[39m[38;2;42;75;245m#[39m[38;2;43;79;245m=[39m[38;2;45;83;246m.[39m                     [38;2;85;176;249m.[39m[38;2;87;180;249m=[39m[38;2;89;185;249m+[39m[38;2;91;189;250m+[39m[38;2;93;193;250m-[39m
+      [38;2;36;62;245m:[39m[38;2;38;66;245m*[39m[38;2;40;70;245m=[39m[38;2;42;75;245m.[39m                         [38;2;89;185;249m.[39m[38;2;91;189;250m.[39m[38;2;93;193;250m.[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m:[39m[38;2;36;62;245m-[39m[38;2;38;66;245m.[39m [38;2;42;75;245mP[39m[38;2;43;79;245mr[39m[38;2;45;83;246me[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246mn[39m[38;2;53;100;246mt[39m[38;2;54;104;246me[39m[38;2;56;108;247md[39m [38;2;60;117;247mb[39m[38;2;62;121;247my[39m [38;2;65;130;247mt[39m[38;2;67;134;248mh[39m[38;2;69;138;248me[39m [38;2;73;147;248mA[39m[38;2;74;151;248ms[39m[38;2;76;155;248mt[39m[38;2;78;159;248me[39m[38;2;80;163;249mr[39m[38;2;82;168;249mi[39m[38;2;83;172;249mn[39m[38;2;85;176;249ma[39m[38;2;87;180;249ms[39m [38;2;91;189;250md[39m[38;2;93;193;250me[39m[38;2;94;197;250mv[39m[38;2;96;201;250me[39m[38;2;98;206;250ml[39m[38;2;100;210;250mo[39m[38;2;102;214;251mp[39m[38;2;103;218;251me[39m[38;2;105;223;251mr[39m[38;2;107;227;251ms[39m
+    [38;2;33;54;245m.[39m[38;2;34;58;245m.[39m [38;2;38;66;245mR[39m[38;2;40;70;245me[39m[38;2;42;75;245ml[39m[38;2;43;79;245me[39m[38;2;45;83;246ma[39m[38;2;47;87;246ms[39m[38;2;49;92;246me[39m[38;2;51;96;246md[39m [38;2;54;104;246mu[39m[38;2;56;108;247mn[39m[38;2;58;113;247md[39m[38;2;60;117;247me[39m[38;2;62;121;247mr[39m [38;2;65;130;247mM[39m[38;2;67;134;248mo[39m[38;2;69;138;248mz[39m[38;2;71;142;248mi[39m[38;2;73;147;248ml[39m[38;2;74;151;248ml[39m[38;2;76;155;248ma[39m [38;2;80;163;249mP[39m[38;2;82;168;249mu[39m[38;2;83;172;249mb[39m[38;2;85;176;249ml[39m[38;2;87;180;249mi[39m[38;2;89;185;249mc[39m [38;2;93;193;250mL[39m[38;2;94;197;250mi[39m[38;2;96;201;250mc[39m[38;2;98;206;250me[39m[38;2;100;210;250mn[39m[38;2;102;214;251ms[39m[38;2;103;218;251me[39m [38;2;107;227;251mv[39m[38;2;109;231;251m2[39m[38;2;111;235;251m.[39m[38;2;113;240;252m0[39m
+
+mount: mounting /dev/vda on /ext2 failed: Invalid argument
+mount: mounting /dev/vdb on /exfat failed: Invalid argument
+Running xfstests...
+xfstests probe: is_block TEST_DEV=1 SCRATCH_DEV=1
+brw-rw-rw-    1 root     root      254,   0 Jun  4 00:33 [1;35m/dev/vda[m
+brw-rw-rw-    1 root     root      254,  16 Jun  4 00:33 [1;35m/dev/vdb[m
+xfstests probe: lstat64 raw TEST_DEV=Device type: shim shim shim shim shim shim fe:0
+xfstests probe: lstat64 raw SCRATCH_DEV=Device type: shim shim shim shim shim shim fe:10
+xfstests probe: lstat64 TEST_DEV_TYPE=fe:0 SCRATCH_DEV_TYPE=fe:10
+xfstests probe: CHECK_SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash SHELL=/nix/store/xy4jjgw87sbgwylm5kn047d9gkbhsr9x-bash-5.2p37/bin/bash
+xfstests probe: grep=/opt/xfstests/shims/bin/grep readlink=/opt/xfstests/shims/bin/readlink
+xfstests probe: HOST_OPTIONS=/opt/xfstests/xfstests-dev/local.config
+xfstests probe: single_test=none trace_run=0
+xfstests probe: ignore_static_excluded_for_single=1
+xfstests probe: TEST_DEV=/dev/vda TEST_DIR=/ext4_test SCRATCH_DEV=/dev/vdb SCRATCH_MNT=/ext4_scratch
+xfstests probe: local.config
+EMAIL=root@localhost
+FSTYP=ext4
+TEST_DEV=/dev/vda
+TEST_DIR=/ext4_test
+SCRATCH_DEV=/dev/vdb
+SCRATCH_MNT=/ext4_scratch
+xfstests probe: fill rc=1
+fill: cannot create "(null)": Bad address
+xfstests probe: shim grep rc=1 shim readlink rc=0 shim findmnt rc=1
+xfstests env: MKFS_PROG=/usr/sbin/mkfs.ext4 FSCK_PROG=/usr/sbin/e2fsck
+xfstests fsstate: pre:generic/001 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/001 timeout=1200s trace=0
+xfstests case done: generic/001 rc=0
+xfstests fsstate: post:generic/001 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/006 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/006 timeout=1200s trace=0
+xfstests case done: generic/006 rc=0
+xfstests fsstate: post:generic/006 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/013 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/013 timeout=1200s trace=0
+xfstests case done: generic/013 rc=0
+xfstests fsstate: post:generic/013 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/028 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/028 timeout=1200s trace=0
+xfstests case done: generic/028 rc=0
+xfstests fsstate: post:generic/028 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/035 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/035 timeout=1200s trace=0
+xfstests case done: generic/035 rc=0
+xfstests fsstate: post:generic/035 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/036 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/036 timeout=1200s trace=0
+xfstests case done: generic/036 rc=0
+xfstests fsstate: post:generic/036 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/036 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/036        [not run] kernel does not support asynchronous I/O
+Ran: generic/036
+Not run: generic/036
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+xfstests fsstate: pre:generic/041 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/041 timeout=1200s trace=0
+xfstests case done: generic/041 rc=0
+xfstests fsstate: post:generic/041 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/041 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/041        [not run] No hardlink support
+Ran: generic/041
+Not run: generic/041
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+xfstests fsstate: pre:generic/047 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/047 timeout=1200s trace=0
+xfstests case done: generic/047 rc=0
+xfstests fsstate: post:generic/047 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/051 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/051 timeout=1200s trace=0
+[32m[   387.364][0m [31mERROR[0m: [39mext4 fallocate failed: ino=541 mode=AllocateKeepSize offset=292506 len=960831 err=Error { errno: EIO, msg: Some("ext4: filesystem is shutdown") }[0m
+xfstests case done: generic/051 rc=0
+xfstests fsstate: post:generic/051 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/052 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/052 timeout=1200s trace=0
+xfstests case done: generic/052 rc=0
+xfstests fsstate: post:generic/052 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/054 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/054 timeout=1200s trace=0
+xfstests case done: generic/054 rc=0
+xfstests fsstate: post:generic/054 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/062 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/062 timeout=1200s trace=0
+xfstests case done: generic/062 rc=0
+xfstests fsstate: post:generic/062 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/062 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/062        [not run] attr command not found
+Ran: generic/062
+Not run: generic/062
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+xfstests fsstate: pre:generic/068 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/068 timeout=1200s trace=0
+xfstests case done: generic/068 rc=0
+xfstests fsstate: post:generic/068 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/070 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/070 timeout=1200s trace=0
+xfstests case done: generic/070 rc=0
+xfstests fsstate: post:generic/070 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/070 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/070        [not run] attr command not found
+Ran: generic/070
+Not run: generic/070
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+xfstests fsstate: pre:generic/083 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/083 timeout=1200s trace=0
+[32m[   644.189][0m [31mERROR[0m: [39mext4 fallocate failed: ino=543 mode=ZeroRange offset=2125062 len=1030895 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.256][0m [31mERROR[0m: [39mext4 fallocate failed: ino=409 mode=ZeroRangeKeepSize offset=3009902 len=965812 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.296][0m [31mERROR[0m: [39mext4 fallocate failed: ino=886 mode=ZeroRange offset=737678 len=191509 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.494][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1316 mode=Allocate offset=127041 len=346416 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.591][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1402 mode=AllocateKeepSize offset=881807 len=840447 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.599][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1541 mode=AllocateKeepSize offset=258304 len=48982 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.661][0m [31mERROR[0m: [39mext4 fallocate failed: ino=231 mode=ZeroRange offset=2716599 len=942138 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.744][0m [31mERROR[0m: [39mext4 fallocate failed: ino=710 mode=Allocate offset=2187792 len=799950 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   644.842][0m [31mERROR[0m: [39mext4 fallocate failed: ino=456 mode=AllocateKeepSize offset=1907330 len=6243 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.504][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1531 mode=ZeroRangeKeepSize offset=510577 len=567843 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.785][0m [31mERROR[0m: [39mext4 fallocate failed: ino=824 mode=Allocate offset=1075115 len=862418 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.830][0m [31mERROR[0m: [39mext4 fallocate failed: ino=617 mode=AllocateKeepSize offset=1661262 len=1037059 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.856][0m [31mERROR[0m: [39mext4 fallocate failed: ino=918 mode=Allocate offset=288563 len=799991 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.901][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1596 mode=ZeroRangeKeepSize offset=556721 len=761879 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   645.954][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1034 mode=AllocateKeepSize offset=404431 len=805841 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   646.224][0m [31mERROR[0m: [39mext4 fallocate failed: ino=300 mode=ZeroRangeKeepSize offset=3088889 len=664780 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   646.389][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1367 mode=ZeroRange offset=110848 len=666307 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.055][0m [31mERROR[0m: [39mext4 fallocate failed: ino=344 mode=ZeroRangeKeepSize offset=34897 len=979233 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.175][0m [31mERROR[0m: [39mext4 fallocate failed: ino=521 mode=Allocate offset=1392426 len=612006 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.185][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1289 mode=ZeroRange offset=676267 len=285500 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.207][0m [31mERROR[0m: [39mext4 fallocate failed: ino=885 mode=ZeroRangeKeepSize offset=801579 len=302870 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.259][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1245 mode=ZeroRangeKeepSize offset=779390 len=92604 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.402][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1035 mode=ZeroRangeKeepSize offset=2286003 len=558857 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.433][0m [31mERROR[0m: [39mext4 fallocate failed: ino=279 mode=Allocate offset=2503314 len=365499 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.617][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1343 mode=ZeroRangeKeepSize offset=437632 len=595260 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   647.674][0m [31mERROR[0m: [39mext4 fallocate failed: ino=326 mode=ZeroRangeKeepSize offset=322327 len=357194 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.246][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1342 mode=ZeroRangeKeepSize offset=751545 len=277738 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.736][0m [31mERROR[0m: [39mext4 fallocate failed: ino=433 mode=Allocate offset=350348 len=348064 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.751][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1055 mode=ZeroRange offset=329818 len=611140 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.768][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1504 mode=ZeroRangeKeepSize offset=537963 len=607704 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.791][0m [31mERROR[0m: [39mext4 fallocate failed: ino=900 mode=ZeroRange offset=794760 len=263365 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.809][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1221 mode=PunchHoleKeepSize offset=462479 len=859676 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   648.926][0m [31mERROR[0m: [39mext4 fallocate failed: ino=978 mode=PunchHoleKeepSize offset=911147 len=258468 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   649.999][0m [31mERROR[0m: [39mext4 fallocate failed: ino=953 mode=ZeroRangeKeepSize offset=1921314 len=780420 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   650.646][0m [31mERROR[0m: [39mext4 fallocate failed: ino=826 mode=ZeroRange offset=408695 len=648160 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   650.726][0m [31mERROR[0m: [39mext4 fallocate failed: ino=700 mode=ZeroRange offset=2138027 len=732443 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   650.739][0m [31mERROR[0m: [39mext4 fallocate failed: ino=839 mode=ZeroRange offset=2231504 len=284407 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   652.893][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1680 mode=ZeroRange offset=787984 len=926589 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   652.906][0m [31mERROR[0m: [39mext4 fallocate failed: ino=953 mode=Allocate offset=437719 len=702664 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.429][0m [31mERROR[0m: [39mext4 fallocate failed: ino=359 mode=AllocateKeepSize offset=2208547 len=203556 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.454][0m [31mERROR[0m: [39mext4 fallocate failed: ino=672 mode=AllocateKeepSize offset=530731 len=1040398 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.549][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1050 mode=ZeroRange offset=260598 len=1022776 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.758][0m [31mERROR[0m: [39mext4 fallocate failed: ino=924 mode=ZeroRangeKeepSize offset=1016013 len=834428 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.802][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1175 mode=ZeroRangeKeepSize offset=153899 len=68120 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.836][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1564 mode=Allocate offset=268817 len=26423 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   653.980][0m [31mERROR[0m: [39mext4 fallocate failed: ino=230 mode=ZeroRangeKeepSize offset=1810223 len=1437 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   654.487][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1719 mode=ZeroRangeKeepSize offset=122779 len=913574 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   654.655][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1451 mode=Allocate offset=1611179 len=838151 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   654.732][0m [31mERROR[0m: [39mext4 fallocate failed: ino=167 mode=Allocate offset=1673396 len=420952 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   654.855][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1553 mode=ZeroRangeKeepSize offset=482860 len=448578 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   654.890][0m [31mERROR[0m: [39mext4 fallocate failed: ino=693 mode=ZeroRangeKeepSize offset=636319 len=836084 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   655.005][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1504 mode=Allocate offset=872286 len=186605 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   655.040][0m [31mERROR[0m: [39mext4 fallocate failed: ino=710 mode=PunchHoleKeepSize offset=37529 len=218314 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   655.164][0m [31mERROR[0m: [39mext4 fallocate failed: ino=238 mode=PunchHoleKeepSize offset=1386999 len=375005 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   657.398][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1076 mode=ZeroRangeKeepSize offset=455225 len=1024375 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   657.417][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1166 mode=ZeroRangeKeepSize offset=879785 len=61401 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   657.489][0m [31mERROR[0m: [39mext4 fallocate failed: ino=608 mode=ZeroRangeKeepSize offset=2820999 len=722418 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   657.598][0m [31mERROR[0m: [39mext4 fallocate failed: ino=924 mode=Allocate offset=1373949 len=481682 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   657.630][0m [31mERROR[0m: [39mext4 fallocate failed: ino=818 mode=AllocateKeepSize offset=780905 len=638694 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   658.068][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1845 mode=AllocateKeepSize offset=112241 len=507624 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   658.078][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1316 mode=Allocate offset=406558 len=82011 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   658.109][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1403 mode=AllocateKeepSize offset=1630417 len=303864 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   658.742][0m [31mERROR[0m: [39mext4 fallocate failed: ino=349 mode=ZeroRange offset=4308074 len=644697 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   659.094][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1342 mode=AllocateKeepSize offset=1057723 len=274423 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   659.301][0m [31mERROR[0m: [39mext4 fallocate failed: ino=678 mode=ZeroRangeKeepSize offset=1748299 len=1015845 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   660.839][0m [31mERROR[0m: [39mext4 fallocate failed: ino=409 mode=Allocate offset=3159345 len=232112 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   660.851][0m [31mERROR[0m: [39mext4 fallocate failed: ino=167 mode=AllocateKeepSize offset=2291188 len=499652 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   661.442][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1123 mode=AllocateKeepSize offset=1155708 len=240666 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   661.464][0m [31mERROR[0m: [39mext4 fallocate failed: ino=102 mode=AllocateKeepSize offset=283834 len=893392 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   661.611][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1833 mode=AllocateKeepSize offset=663559 len=955508 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   661.914][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1116 mode=ZeroRangeKeepSize offset=282243 len=1008462 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   661.943][0m [31mERROR[0m: [39mext4 fallocate failed: ino=586 mode=AllocateKeepSize offset=690265 len=300349 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.013][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1153 mode=ZeroRange offset=2002925 len=794138 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.021][0m [31mERROR[0m: [39mext4 fallocate failed: ino=755 mode=Allocate offset=1176130 len=671456 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.099][0m [31mERROR[0m: [39mext4 fallocate failed: ino=538 mode=Allocate offset=1052621 len=540129 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.313][0m [31mERROR[0m: [39mext4 fallocate failed: ino=525 mode=ZeroRange offset=963815 len=745417 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.384][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1444 mode=ZeroRangeKeepSize offset=613002 len=137119 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.878][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1781 mode=Allocate offset=547394 len=999312 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   662.947][0m [31mERROR[0m: [39mext4 fallocate failed: ino=645 mode=ZeroRange offset=340415 len=854558 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   663.823][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1217 mode=PunchHoleKeepSize offset=748297 len=890330 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   663.890][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1232 mode=ZeroRangeKeepSize offset=222565 len=422582 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   663.962][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1002 mode=Allocate offset=78237 len=272585 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.330][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1792 mode=ZeroRangeKeepSize offset=610138 len=525231 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.333][0m [31mERROR[0m: [39mext4 fallocate failed: ino=32 mode=PunchHoleKeepSize offset=841951 len=812784 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.346][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1131 mode=Allocate offset=904410 len=1043114 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.363][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1219 mode=Allocate offset=108355 len=429292 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.422][0m [31mERROR[0m: [39mext4 fallocate failed: ino=334 mode=AllocateKeepSize offset=993969 len=785356 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   664.951][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1232 mode=Allocate offset=1524877 len=863065 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   665.259][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1432 mode=Allocate offset=649316 len=956250 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   665.718][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1820 mode=Allocate offset=378224 len=3024 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   665.844][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1346 mode=ZeroRange offset=873610 len=105590 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.080][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1529 mode=ZeroRange offset=852020 len=690854 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.098][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1891 mode=ZeroRangeKeepSize offset=56034 len=1031796 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.123][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1695 mode=ZeroRangeKeepSize offset=514610 len=606617 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.158][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1294 mode=Allocate offset=1140313 len=144199 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.189][0m [31mERROR[0m: [39mext4 fallocate failed: ino=463 mode=ZeroRange offset=520786 len=147715 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.209][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1316 mode=ZeroRange offset=116875 len=327151 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.319][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1196 mode=ZeroRange offset=2431189 len=233038 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.590][0m [31mERROR[0m: [39mext4 fallocate failed: ino=168 mode=Allocate offset=32500 len=370328 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   666.895][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1383 mode=AllocateKeepSize offset=469143 len=275439 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   667.284][0m [31mERROR[0m: [39mext4 fallocate failed: ino=419 mode=ZeroRange offset=2204000 len=492807 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   667.709][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1841 mode=ZeroRange offset=653806 len=190605 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   667.729][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1271 mode=Allocate offset=1104926 len=914350 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   668.434][0m [31mERROR[0m: [39mext4 fallocate failed: ino=345 mode=Allocate offset=2012622 len=274551 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   668.560][0m [31mERROR[0m: [39mext4 fallocate failed: ino=409 mode=ZeroRangeKeepSize offset=2132302 len=790702 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.104][0m [31mERROR[0m: [39mext4 fallocate failed: ino=501 mode=Allocate offset=794621 len=390622 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.141][0m [31mERROR[0m: [39mext4 fallocate failed: ino=286 mode=Allocate offset=2417808 len=181425 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.164][0m [31mERROR[0m: [39mext4 fallocate failed: ino=640 mode=ZeroRangeKeepSize offset=1331811 len=924125 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.167][0m [31mERROR[0m: [39mext4 fallocate failed: ino=810 mode=PunchHoleKeepSize offset=415786 len=435546 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.300][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1501 mode=AllocateKeepSize offset=273695 len=880860 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.415][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1356 mode=AllocateKeepSize offset=301988 len=938925 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.527][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1495 mode=ZeroRange offset=440411 len=817785 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.823][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1158 mode=ZeroRangeKeepSize offset=1633630 len=500667 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.887][0m [31mERROR[0m: [39mext4 fallocate failed: ino=972 mode=AllocateKeepSize offset=241474 len=105385 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   669.986][0m [31mERROR[0m: [39mext4 fallocate failed: ino=354 mode=ZeroRangeKeepSize offset=2740068 len=381211 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.343][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1707 mode=ZeroRangeKeepSize offset=404066 len=338414 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.380][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1710 mode=Allocate offset=813111 len=127503 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.450][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1118 mode=PunchHoleKeepSize offset=277922 len=61493 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.660][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1572 mode=AllocateKeepSize offset=948775 len=56870 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.671][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1280 mode=ZeroRangeKeepSize offset=1253603 len=197562 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.692][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1891 mode=ZeroRange offset=888026 len=877866 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.801][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1846 mode=ZeroRangeKeepSize offset=526989 len=643402 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.849][0m [31mERROR[0m: [39mext4 fallocate failed: ino=537 mode=Allocate offset=72776 len=530688 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   670.946][0m [31mERROR[0m: [39mext4 fallocate failed: ino=465 mode=Allocate offset=3579867 len=741172 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   671.369][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1892 mode=ZeroRangeKeepSize offset=406754 len=986154 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   671.416][0m [31mERROR[0m: [39mext4 fallocate failed: ino=871 mode=ZeroRangeKeepSize offset=997384 len=1019542 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   671.779][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2017 mode=ZeroRange offset=261343 len=795035 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   674.000][0m [31mERROR[0m: [39mext4 fallocate failed: ino=918 mode=ZeroRangeKeepSize offset=1902858 len=954835 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   674.493][0m [31mERROR[0m: [39mext4 fallocate failed: ino=444 mode=ZeroRangeKeepSize offset=443571 len=465920 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   674.715][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1615 mode=ZeroRangeKeepSize offset=560156 len=780334 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   674.874][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2007 mode=AllocateKeepSize offset=725142 len=396403 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   676.837][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2133 mode=Allocate offset=723000 len=675026 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   676.858][0m [31mERROR[0m: [39mext4 fallocate failed: ino=879 mode=Allocate offset=1888912 len=743225 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   676.897][0m [31mERROR[0m: [39mext4 fallocate failed: ino=527 mode=Allocate offset=1108628 len=979412 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   677.786][0m [31mERROR[0m: [39mext4 fallocate failed: ino=219 mode=AllocateKeepSize offset=2644621 len=678741 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   677.890][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1157 mode=ZeroRange offset=142216 len=307415 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.018][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1720 mode=ZeroRangeKeepSize offset=972807 len=102553 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.155][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1577 mode=ZeroRangeKeepSize offset=894761 len=618645 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.835][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1179 mode=ZeroRangeKeepSize offset=694365 len=664606 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.873][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1717 mode=Allocate offset=448558 len=859525 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.931][0m [31mERROR[0m: [39mext4 fallocate failed: ino=687 mode=Allocate offset=480401 len=971454 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   678.953][0m [31mERROR[0m: [39mext4 fallocate failed: ino=666 mode=ZeroRange offset=4144322 len=496986 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   679.696][0m [31mERROR[0m: [39mext4 fallocate failed: ino=312 mode=Allocate offset=2158960 len=1026956 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   679.854][0m [31mERROR[0m: [39mext4 fallocate failed: ino=916 mode=ZeroRange offset=2029928 len=436580 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   680.875][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1769 mode=Allocate offset=1336987 len=529510 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.040][0m [31mERROR[0m: [39mext4 fallocate failed: ino=589 mode=ZeroRangeKeepSize offset=1246038 len=959150 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.158][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2017 mode=ZeroRange offset=743021 len=646904 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.171][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2126 mode=ZeroRange offset=764407 len=962980 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.192][0m [31mERROR[0m: [39mext4 fallocate failed: ino=167 mode=ZeroRangeKeepSize offset=4013540 len=44903 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.501][0m [31mERROR[0m: [39mext4 fallocate failed: ino=976 mode=Allocate offset=164842 len=951577 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.632][0m [31mERROR[0m: [39mext4 fallocate failed: ino=237 mode=ZeroRangeKeepSize offset=284408 len=605006 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.719][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1888 mode=Allocate offset=51159 len=365722 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.745][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1116 mode=AllocateKeepSize offset=547076 len=19969 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   681.777][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2139 mode=ZeroRangeKeepSize offset=975946 len=977982 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   682.112][0m [31mERROR[0m: [39mext4 fallocate failed: ino=518 mode=Allocate offset=3846061 len=533471 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   682.631][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1153 mode=AllocateKeepSize offset=2126687 len=462904 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   682.705][0m [31mERROR[0m: [39mext4 fallocate failed: ino=318 mode=AllocateKeepSize offset=1649009 len=625786 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   683.024][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1685 mode=ZeroRange offset=778117 len=468661 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   683.105][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2021 mode=ZeroRange offset=1008367 len=390844 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   683.182][0m [31mERROR[0m: [39mext4 fallocate failed: ino=961 mode=ZeroRangeKeepSize offset=1292153 len=824585 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   683.428][0m [31mERROR[0m: [39mext4 fallocate failed: ino=143 mode=Allocate offset=1462572 len=319727 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   683.476][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2065 mode=ZeroRangeKeepSize offset=563204 len=753204 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   684.674][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1926 mode=ZeroRangeKeepSize offset=29777 len=1039049 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   684.960][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1970 mode=Allocate offset=1010179 len=965115 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   684.977][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2164 mode=Allocate offset=182530 len=596253 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   685.057][0m [31mERROR[0m: [39mext4 fallocate failed: ino=745 mode=ZeroRange offset=505620 len=140003 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   685.825][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2273 mode=ZeroRangeKeepSize offset=142230 len=736555 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.086][0m [31mERROR[0m: [39mext4 fallocate failed: ino=842 mode=ZeroRange offset=382360 len=325645 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.126][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1579 mode=PunchHoleKeepSize offset=483267 len=222428 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.194][0m [31mERROR[0m: [39mext4 fallocate failed: ino=1890 mode=ZeroRangeKeepSize offset=1130214 len=515569 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.218][0m [31mERROR[0m: [39mext4 fallocate failed: ino=645 mode=AllocateKeepSize offset=1272614 len=579178 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.808][0m [31mERROR[0m: [39mext4 fallocate failed: ino=699 mode=ZeroRange offset=1831617 len=524399 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.814][0m [31mERROR[0m: [39mext4 fallocate failed: ino=2076 mode=Allocate offset=537339 len=47279 err=Error { errno: ENOSPC, msg: None }[0m
+[32m[   686.831][0m [31mERROR[0m: [39mext4 fallocate failed: ino=919 mode=Allocate offset=1498295 len=770099 err=Error { errno: ENOSPC, msg: None }[0m
+xfstests case done: generic/083 rc=0
+xfstests fsstate: post:generic/083 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/084 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/084 timeout=1200s trace=0
+xfstests case done: generic/084 rc=0
+xfstests fsstate: post:generic/084 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests fsstate: pre:generic/090 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/090 timeout=1200s trace=0
+xfstests case done: generic/090 rc=0
+xfstests fsstate: post:generic/090 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/090 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/090        [not run] No hardlink support
+Ran: generic/090
+Not run: generic/090
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+xfstests fsstate: pre:generic/093 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+xfstests case start: generic/093 timeout=1200s trace=0
+xfstests case done: generic/093 rc=0
+xfstests fsstate: post:generic/093 TEST_DIR='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_test ' SCRATCH_MNT='drwxr-xr-x    2 root     root             2 Jun  4 00:33 /ext4_scratch ' TEST_DEV_MOUNTS='<none>' SCRATCH_MOUNTS='<none>'
+----- NOTRUN LOG TAIL: generic/093 -----
+FSTYP         -- ext4
+PLATFORM      -- Linux/x86_64 (none) 5.13.0 #1 SMP Thu Jan  1 00:00:00 UTC 1970
+MKFS_OPTIONS  -- -F /dev/vdb
+MOUNT_OPTIONS -- -o acl,user_xattr /dev/vdb /ext4_scratch
+
+generic/093        [not run] attr command not found
+Ran: generic/093
+Not run: generic/093
+Passed all 1 tests
+
+----- END NOTRUN LOG TAIL -----
+mode\tpass\tfail\tnotrun\tstatic_blocked\tdenominator\tpass_rate_percent\tthreshold_percent
+phase4_good\t12\t0\t6\t22\t12\t100.00\t90
+===== phase4_good detailed results =====
+test	status	rc	reason
+generic/001	PASS	0	
+generic/002	STATIC_BLOCKED	NA	hardlink semantics out of phase4_part1 scope
+generic/004	STATIC_BLOCKED	NA	O_TMPFILE/flink support out of phase4_part1 scope
+generic/005	STATIC_BLOCKED	NA	symlink support out of phase4_part1 scope
+generic/006	PASS	0	
+generic/007	STATIC_BLOCKED	NA	heavy nametest stress deferred to later stability rounds
+generic/011	STATIC_BLOCKED	NA	heavy dirstress concurrency deferred to later rounds
+generic/013	PASS	0	
+generic/014	STATIC_BLOCKED	NA	sparse truncation stress deferred to later rounds
+generic/017	STATIC_BLOCKED	NA	fallocate collapse-range support out of phase4_part1 scope
+generic/021	STATIC_BLOCKED	NA	fpunch/fcollapse/fiemap semantics out of phase4_part1 scope
+generic/022	STATIC_BLOCKED	NA	delalloc + collapse-range semantics out of phase4_part1 scope
+generic/023	STATIC_BLOCKED	NA	symlink support out of phase4_part1 scope
+generic/024	STATIC_BLOCKED	NA	renameat2 semantics out of phase4_part1 scope
+generic/026	STATIC_BLOCKED	NA	chacl/xattr tooling dependency out of phase4_part1 scope
+generic/027	STATIC_BLOCKED	NA	scratch size requirement exceeds current part1 test image
+generic/028	PASS	0	
+generic/029	STATIC_BLOCKED	NA	mmap+truncate stress with xfs_io dependency out of phase4_part1 scope
+generic/031	STATIC_BLOCKED	NA	fcollapse stress with xfs_io dependency out of phase4_part1 scope
+generic/032	STATIC_BLOCKED	NA	unwritten-extent stress with xfs_io dependency out of phase4_part1 scope
+generic/035	PASS	0	
+generic/036	NOTRUN	NA	generic/036        [not run] kernel does not support asynchronous I/O
+generic/041	NOTRUN	NA	generic/041        [not run] No hardlink support
+generic/047	PASS	0	
+generic/051	PASS	0	
+generic/052	PASS	0	
+generic/054	PASS	0	
+generic/062	NOTRUN	NA	generic/062        [not run] attr command not found
+generic/063	STATIC_BLOCKED	NA	finsert/fpunch/fiemap semantics out of phase4_part1 scope
+generic/068	PASS	0	
+generic/069	STATIC_BLOCKED	NA	O_APPEND heavy stress deferred to later rounds
+generic/070	NOTRUN	NA	generic/070        [not run] attr command not found
+generic/071	STATIC_BLOCKED	NA	fallocate prealloc behavior out of phase4_part1 scope
+generic/083	PASS	0	
+generic/084	PASS	0	
+generic/086	STATIC_BLOCKED	NA	unwritten/delayed extent stress out of phase4_part1 scope
+generic/088	STATIC_BLOCKED	NA	ownership/capability (DAC override) semantics out of phase4_part1 scope
+generic/090	NOTRUN	NA	generic/090        [not run] No hardlink support
+generic/091	STATIC_BLOCKED	NA	odirect+fsx stress out of phase4_part1 scope
+generic/093	NOTRUN	NA	generic/093        [not run] attr command not found
+xfstests phase4_good passed: pass_rate=100.00% >= 90%
+summary=/tmp/xfstests_results/phase4_good_summary.tsv
+results=/tmp/xfstests_results/phase4_good_results.tsv
+excluded=/tmp/xfstests_results/phase4_good_excluded.tsv
+All syscall tests passed.
+[

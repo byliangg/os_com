@@ -127,6 +127,11 @@ struct DirectReadProfileStats {
     submit_ns: AtomicU64,
     wait_ns: AtomicU64,
     copy_ns: AtomicU64,
+    // Phase 5 full-path probe: total wall time of read_direct_at (so we can see
+    // how much per-read overhead is outside the measured stages), and the atime
+    // bookkeeping time specifically.
+    total_ns: AtomicU64,
+    atime_ns: AtomicU64,
 }
 
 struct DirectWriteProfileStats {
@@ -242,6 +247,8 @@ impl DirectReadProfileStats {
             submit_ns: AtomicU64::new(0),
             wait_ns: AtomicU64::new(0),
             copy_ns: AtomicU64::new(0),
+            total_ns: AtomicU64::new(0),
+            atime_ns: AtomicU64::new(0),
         }
     }
 
@@ -264,6 +271,8 @@ impl DirectReadProfileStats {
         submit_ns: u64,
         wait_ns: u64,
         copy_ns: u64,
+        total_ns: u64,
+        atime_ns: u64,
     ) -> u64 {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let mappings = u64::try_from(mappings).unwrap_or(u64::MAX);
@@ -283,6 +292,8 @@ impl DirectReadProfileStats {
         self.submit_ns.fetch_add(submit_ns, Ordering::Relaxed);
         self.wait_ns.fetch_add(wait_ns, Ordering::Relaxed);
         self.copy_ns.fetch_add(copy_ns, Ordering::Relaxed);
+        self.total_ns.fetch_add(total_ns, Ordering::Relaxed);
+        self.atime_ns.fetch_add(atime_ns, Ordering::Relaxed);
         reads
     }
 
@@ -2417,9 +2428,22 @@ impl Ext4Fs {
         let submit_ns = self.direct_read_profile.submit_ns.load(Ordering::Relaxed);
         let wait_ns = self.direct_read_profile.wait_ns.load(Ordering::Relaxed);
         let copy_ns = self.direct_read_profile.copy_ns.load(Ordering::Relaxed);
+        let total_ns = self.direct_read_profile.total_ns.load(Ordering::Relaxed);
+        let atime_ns = self.direct_read_profile.atime_ns.load(Ordering::Relaxed);
+        // `other` = read_direct_at wall time minus the individually-measured
+        // stages and atime. Captures the in-function overhead not otherwise
+        // attributed (lock, evict, note, bookkeeping). Per-read time ABOVE
+        // read_direct_at (syscall / VFS / framekernel) is fio_per_read - total.
+        let measured_ns = plan_ns
+            .saturating_add(alloc_ns)
+            .saturating_add(submit_ns)
+            .saturating_add(wait_ns)
+            .saturating_add(copy_ns)
+            .saturating_add(atime_ns);
+        let other_ns = total_ns.saturating_sub(measured_ns);
 
         println!(
-            "[ext4-profile] direct-read reads={} bytes={} avg_bytes={} avg_mapped_bytes={} avg_zero_fill_bytes={} max_mapped_bytes={} cache_hit={} cache_miss={} avg_mappings_x100={} max_mappings={} avg_plan_us={} avg_alloc_us={} avg_submit_us={} avg_wait_us={} avg_copy_us={}",
+            "[ext4-profile] direct-read reads={} bytes={} avg_bytes={} avg_mapped_bytes={} avg_zero_fill_bytes={} max_mapped_bytes={} cache_hit={} cache_miss={} avg_mappings_x100={} max_mappings={} avg_plan_us={} avg_alloc_us={} avg_submit_us={} avg_wait_us={} avg_copy_us={} avg_atime_us={} avg_other_us={} avg_total_us={}",
             reads,
             total_bytes,
             total_bytes / reads,
@@ -2435,6 +2459,9 @@ impl Ext4Fs {
             submit_ns / reads / 1_000,
             wait_ns / reads / 1_000,
             copy_ns / reads / 1_000,
+            atime_ns / reads / 1_000,
+            other_ns / reads / 1_000,
+            total_ns / reads / 1_000,
         );
     }
 
@@ -2890,7 +2917,15 @@ impl Ext4Fs {
 
         if !mount_flags.contains(PerMountFlags::STRICTATIME) {
             match self.stat(ino) {
-                Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => return Ok(()),
+                Ok(meta) if meta.atime > meta.mtime && meta.atime > meta.ctime => {
+                    // Phase 5: cache the relatime "no atime update needed"
+                    // decision for this second so subsequent reads skip the
+                    // per-read `stat(ino)` (which re-reads the inode block,
+                    // ~31us/read at small bs). A write removes this inode's
+                    // atime-cache entry, so a later mtime/ctime bump re-stats.
+                    self.inode_atime_cache.lock().insert(ino, now);
+                    return Ok(());
+                }
                 Ok(_) => {}
                 Err(err) => {
                     warn!(
@@ -4390,6 +4425,10 @@ impl Ext4Fs {
         writer: &mut VmWriter,
         status_flags: StatusFlags,
     ) -> Result<usize> {
+        // Phase 5 full-path probe: wall clock from the very entry (includes the
+        // lock acquire, evict, atime, etc.) so we can see how much per-read
+        // overhead lives outside the individually-measured stages.
+        let rda_start = Self::monotonic_nanos();
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
         self.maybe_start_direct_read_profile();
@@ -4447,7 +4486,10 @@ impl Ext4Fs {
         let zero_fill_bytes = direct_len.saturating_sub(mapped_bytes);
 
         self.note_completed_direct_read(ino, offset, direct_len);
+        let atime_start = Self::monotonic_nanos();
         self.touch_atime_after_direct_read(ino, status_flags)?;
+        let atime_ns = Self::monotonic_nanos().saturating_sub(atime_start);
+        let total_ns = Self::monotonic_nanos().saturating_sub(rda_start);
         let reads = self.direct_read_profile.record_read(
             direct_len,
             mappings.len(),
@@ -4458,6 +4500,8 @@ impl Ext4Fs {
             submit_ns,
             wait_ns,
             copy_ns,
+            total_ns,
+            atime_ns,
         );
         self.maybe_log_direct_read_profile(reads, false);
         Ok(direct_len)

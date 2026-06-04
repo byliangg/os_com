@@ -1,0 +1,11 @@
+run	bs	rw	aster_mb_s	linux_mb_s	ratio_pct
+1	16K	read	643.0	750.0	85.73
+1	64K	read	1869.0	2127.0	87.87
+1	256K	read	3216.0	4034.0	79.72
+1	1M	read	NA	NA	NA
+1	1M	write	1908.0	2965.0	64.35
+2	16K	read	636.0	747.0	85.14
+2	64K	read	1654.0	2073.0	79.79
+2	256K	read	3296.0	3864.0	85.30
+2	1M	read	NA	NA	NA
+2	1M	write	1840.0	2933.0	62.73
