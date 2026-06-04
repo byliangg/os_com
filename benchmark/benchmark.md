@@ -442,6 +442,31 @@ RUN_G_CORRECTNESS=0 ./asterinas/test/initramfs/src/benchmark/fio/run_parameter_s
 
 **重要**：drop 后比较才公平——之前"Asterinas 1M read 49–61%"是被 Linux 的热 cache 坑了；公平测量下 **Asterinas 1M read = 104–126%**（追平/反超 Linux）。小块读（per-IO bound）受 host cache 影响小、波动主要是 per-IO 噪声，建议每档跑 3 次取中位数。更彻底的备选：QEMU `-drive cache=none`（宿主机也 O_DIRECT、永不缓存）。
 
+## 6.6 Phase 5 读写优化结果与测量脚本
+
+四个 ext4 优化（extent 映射缓存 / 全文件覆盖 / atime 按秒节流 / **inode 元数据缓存**）把 O_DIRECT 读写从 16–63% 拉到 **75–123%**。详见 `feature_perf_phase5_milestone.md`。
+
+### 当前结果（`direct=1, nj=1`，cache-off + `extent_map_cache=1` + inode 缓存默认 on + `BENCH_DROP_CACHES=1`，中位数）
+
+| bs | read ratio | write ratio |
+|----|-----------:|------------:|
+| 4K | 86.38% | 75.54% |
+| 16K | 84.42% | 75.78% |
+| 64K | 86.89% | 84.09% |
+| 256K | 94.81% | 121.07% |
+| 1M | 122.94% | 88.28% |
+
+ext4 域内 per-op 固定开销（extent 查找 / atime stat / inode stat）已榨干；读写现都顶在 **virtio 设备往返**这个平台地板（跨 FS 通用，ext2 同此极限）。
+
+### Phase 5 测量脚本（均默认 `BENCH_DROP_CACHES=1`）
+
+| 脚本 | 用途 |
+|------|------|
+| `fio/run_phase5_guard_median.sh` | 单 job 守底 / bs 扫描，多轮取**中位数**，两边对照。env：`READ_BS_LIST` `WRITE_BS_LIST`（` ` 空格=跳过该方向）、`READ_JOB`/`WRITE_JOB`（可指向 `fio/ext2_seq_*` 做 ext2 对照）、`REPEATS`、`CASE_TIMEOUT_SEC`（每-case 超时防 hang）|
+| `fio/run_phase5_ratio_ab.sh` | extent_map_cache `0 vs 1` 同轮 A/B（两边）；`RATIO_BS_LIST`/`RATIO_READ_JOB` 可调 |
+| `fio/run_phase5_profile_probe.sh` | Asterinas-only 四层 profile（`phase2_profile=1` `LOG_LEVEL=warn`），收割 `[ext4-direct-write]`/`[ext4-profile] direct-read`/`[block-profile]`；`CASES` 选 `ext4j-{read,write,randread}-{4K..1M}` |
+| `tools/ext4/run_phase5_regression.sh` | 守底回归：`FULL_SUITE=1` 跑完整套（crash+concurrency+fsync+全 xfstests+host-crash），`FULL_GUARD=1` 跑 phase4_good/phase3_base/jbd_phase1，均 drc=0 激活 extent+inode 缓存 |
+
 ## 7. 当前观察与说明
 
 - ext4 已经按本轮要求对齐到 ext2 参数，不再使用此前的 `size=128M` 口径。

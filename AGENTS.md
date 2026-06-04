@@ -154,7 +154,7 @@ Key test matrices:
 
 在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
 
-- **性能目标**：fio 顺序读写 >= 90%。注意历史 `read 127.06% / write 39.18%` 是 speculative direct-read cache **开**的数，不能用于答辩；Phase 5 起一律用 cache-off 诚实口径：`direct=1, bs=1M, numjobs=1` 下 read 101.91%（达标）、write 51.60%（主 blocker）。
+- **性能目标**：fio 顺序读写 >= 90%。诚实口径（cache-off + extent_map/inode 缓存 + drop 公平基线，`direct=1, nj=1`，中位数）下 Phase 5 读优化已收口：**read 4K/16K/64K/256K/1M = 86/84/87/95/123%，write = 76/76/84/121/88%**（优化前小块 16–24% / write 4K 20%、1M 63%）。ext4 域内 per-op 固定开销已榨干，剩余瓶颈在 Asterinas virtio 设备往返（平台层、跨 FS 通用）。历史 `read 127% / write 39%` 是 speculative data cache **开**的不诚实数，不能用于答辩。
 - **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写、Phase 3 fsync/flush 持久化语义、Phase 4 PageCache buffered I/O / mmap 集成均已收口（守底回归全绿）。当前进入 **feature_perf_phase5**：性能优化主线，延迟归因驱动，聚焦 O_DIRECT write / 小块 per-request 开销 / 读并发退化。
 
 ## 工作树约定
@@ -265,7 +265,7 @@ Key test matrices:
 | Phase | 目标 | 状态 |
 |-------|------|------|
 | optimize_phase1 | O_DIRECT speculative readahead，fio read/write >= 90% | ✅ 已完成（read 95.79%，write 90.48%） |
-| feature_perf_phase5 | 延迟归因驱动优化：O_DIRECT write（守底 51.60%）冲 90%、小块 per-request 开销、读并发退化 | 🔵 当前阶段（Step 0 基线/profile 盘点完成，Step 1 收割占比表待执行） |
+| feature_perf_phase5 | 延迟归因驱动优化：extent 映射缓存 / 全文件覆盖 / atime 节流 / inode 元数据缓存 | ✅ 读优化收口：读写 75–123%（小块读 ×2.6–5.2、write 4K 20→76%）；完整守底全绿；剩余 virtio 平台瓶颈待与学长定位 |
 
 ### JBD2 功能系列（feature_jbd2）
 
