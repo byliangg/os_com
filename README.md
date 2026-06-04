@@ -1,8 +1,10 @@
 # Asterinas EXT4 + JBD2 赛题版本
 
-本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经完成 **JBD2 Phase 3 功能收口**，并进入 **PageCache Phase 4 收口/性能 hardening**：在 Phase 2 的完整事务管理、崩溃恢复与多文件并发 correctness baseline 之上，补齐了 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐，并已将 ext4 regular-file buffered I/O / mmap 接入 Asterinas `PageCache` / `Vmo`。Phase 4 correctness 验收集当前为 `9 PASS / 0 FAIL / 4 NOTRUN`，新增 PageCache benchmark A-E 已完成首轮记录。
+本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。功能主线（JBD2 完整事务管理 / 全量崩溃恢复 / 多文件并发 correctness / Phase 3 fsync/flush 持久化语义 / Phase 4 PageCache buffered I/O / mmap）均已收口，守底回归全绿。当前主线已完成 **性能优化 Phase 5 读侧收口**：以延迟归因 profiling 驱动，落地 extent 映射缓存、全文件覆盖、atime 节流与 **inode 元数据缓存** 四个 ext4 域内优化，在诚实 cache-off + drop 公平口径下把读写从优化前的 16–63% 拉到 **read 86/84/87/95/123%、write 76/76/84/121/88%**（bs=4K/16K/64K/256K/1M，`direct=1 nj=1` 中位数）。ext4 域内 per-op 固定开销已榨干，剩余瓶颈在 Asterinas virtio 设备往返（平台层、跨 FS 通用，ext2 同口径同样卡在 82–85%）。
 
-当前日期口径：2026-05-14（Asia/Shanghai）；最新 Phase 4 证据链见 `docs/feature_pagecache_phase4_plan.md` / `docs/feature_pagecache_phase4_milestone.md` / `benchmark/benchmark.md`。
+当前日期口径：2026-06-05（Asia/Shanghai）；最新 Phase 5 证据链见 `docs/feature_perf_phase5_plan.md` / `docs/feature_perf_phase5_milestone.md` / `benchmark/benchmark.md` §6.6。
+
+> 口径声明：历史 `read 127.06% / write 39.18%` 是 speculative direct-read **data cache 开**的不诚实数，**不能用于答辩**。Phase 5 起一律 cache-off + extent_map/inode 元数据缓存 + drop 公平基线，中位数取数。
 
 ## 当前状态
 
@@ -16,9 +18,29 @@
 - JBD2 Phase 3：已完成 raw block fd、virtio-blk 与 ext4 regular-file 的 fsync/flush 持久化语义收口；`jbd_phase3_fsync_flush` 默认 11 PASS / 1 NOTRUN / 0 FAIL，12G scratch 下 `generic/048` 单点 PASS，自研 host-crash fsync matrix 4/4 PASS。
 - PageCache Phase 4 correctness：ext4 buffered read/write 与 mmap 已接入共享 `PageCache` / `Vmo`；`pagecache_phase4` upstream xfstests 最新 full list 为 `9 PASS / 0 FAIL / 4 NOTRUN`，有效样本 pass rate `100.00%`。
 
+- 性能优化 Phase 5 读侧：以四层延迟归因 profiling（FS / virtio / 锁 / JBD2，门控 `ext4fs.phase2_profile=1`）定位 per-op 固定开销，落地 extent 映射缓存、随机读全文件覆盖、relatime atime 节流、in-memory inode 元数据缓存，小块读 ×2.6–5.2、write 4K 20%→76%；完整守底回归全绿。
+
 ### 进行中
 
-- PageCache Phase 4 performance hardening：继续优化 buffered cold read、buffered write / dirty writeback；O_DIRECT 仍保持 direct bypass，并维持 cache-off 守底回归。
+- 性能 Phase 5 剩余开放项（virtio / 平台层，需与学长对齐答辩口径）：并发读 `nj>1` 锁退化、bio_copy、symlink / 512B-align 小缺口；ext2 4K O_DIRECT write 在同平台挂死（参考实现侧问题，非本实现）。
+
+## EXT4 性能优化 Phase 5 收口结论
+
+Phase 5 是延迟归因驱动的性能优化主线。诚实口径下（cache-off、`ext4fs.extent_map_cache` + inode 元数据缓存开启、host drop-caches 公平基线、`direct=1 nj=1`、中位数），四个 ext4 域内优化把读写带宽拉到下表水平：
+
+| bs | read | write |
+| --- | ---: | ---: |
+| 4K | `86.38%` | `75.54%` |
+| 16K | `84.42%` | `75.78%` |
+| 64K | `86.89%` | `84.09%` |
+| 256K | `94.81%` | `121.07%` |
+| 1M | `122.94%` | `88.28%` |
+
+- 四个优化：(1) O_DIRECT 读 extent 映射 plan 缓存（带 generation guard，TOCTOU 安全）；(2) 随机读全文件覆盖窗口；(3) relatime atime 决策缓存，消除每次读的 atime stat；(4) **in-memory inode 元数据缓存**（最大收益 —— `get_inode_ref` 此前每次 `stat` 都从设备重读 inode block，小块读热路径上每读多次 ~25µs 的 inode-block 重读）。
+- 优化前小块读 16–24%、write 4K=20% / 1M=63%；inode 缓存把小块读拉到 84–87%，write 也因 `write_at` 的 `type_()` stat 命中缓存而受益。
+- 单点失效协议：所有写路径经 `run_journaled_ext4` 单一收敛点 `fetch_add` generation 并清空缓存，保证缓存与磁盘一致。
+- ext4 域内 per-op 固定开销已榨干；剩余 read/write gap 是 Asterinas virtio 设备写往返比读慢（平台层）。用 Asterinas 成熟的 ext2 同口径对照确认：ext2 在同平台同样卡在 82–85%，证明瓶颈不是 ext4 模块特有，而是 virtio 平台底噪。
+- 完整守底回归全绿：crash matrix `18/18`、Phase 2 concurrency `7/7`、xfstests 各集有效样本 `100%`，读优化未改变功能正确性。证据见 `docs/feature_perf_phase5_milestone.md` 与 `benchmark/logs/phase5_*`。
 
 ## PageCache Phase 4 收口结论
 
@@ -67,16 +89,19 @@ Phase 4 已把 ext4 regular-file buffered I/O / mmap 接入 Asterinas `PageCache
 
 严格关键词扫描为空，扫描范围包括 `ERROR`、`panic`、`BUG`、`logical block not mapped`、`mapped block out of range`、`Extentindex not found`、`ext4 write_at failed`、`Heap allocation error`、`Failed to allocate a large slot`。
 
-### fio EXT4 对照
+### fio EXT4 对照（Phase 5 诚实口径）
 
-fio 参数口径：`size=1G bs=1M ioengine=sync direct=1 numjobs=1 fsync_on_close=1 time_based=1 ramp_time=60 runtime=100`。
+fio 参数口径：`direct=1 ioengine=sync numjobs=1`，bs 全扫，host drop-caches 公平基线，`ext4fs.extent_map_cache` + inode 元数据缓存开启，中位数取数。复跑入口 `test/initramfs/src/benchmark/fio/run_phase5_guard_median.sh`，详见 `benchmark/benchmark.md` §6.6。
 
-| 测试项 | Asterinas | Linux | 比值 | Phase 1 守底 |
-| --- | ---: | ---: | ---: | --- |
-| `ext4_seq_read_bw` | `5179 MB/s` | `4076 MB/s` | `127.06%` | PASS（>= 90%） |
-| `ext4_seq_write_bw` | `1189 MB/s` | `3035 MB/s` | `39.18%` | 后续性能 hardening |
+| bs | read 比值 | write 比值 |
+| --- | ---: | ---: |
+| 4K | `86.38%` | `75.54%` |
+| 16K | `84.42%` | `75.78%` |
+| 64K | `86.89%` | `84.09%` |
+| 256K | `94.81%` | `121.07%` |
+| 1M | `122.94%` | `88.28%` |
 
-历史 optimize Phase 1 基线为 read `95.79%`、write `90.48%`。JBD2 Phase 1 收口后 read/write 为 `93.49%` / `87.01%`；Phase 3 fsync/flush 语义收口后，read 仍通过，write 暴露为 block/virtio/direct-write 路径性能 hardening 问题。
+**口径演进**：历史 optimize Phase 1 基线 read `95.79%` / write `90.48%`，JBD2 Phase 1 后 `93.49%` / `87.01%`，但这些与 Phase 3 一度宣传的 `read 127.06% / write 39.18%` 都受 speculative direct-read **data cache** 影响，属不诚实口径，**不能用于答辩**。Phase 5 起统一改为 cache-off + 元数据缓存 + drop 公平基线的诚实口径，并补齐小块全扫，即上表。剩余 read/write gap 在 Asterinas virtio 设备写往返（平台层，跨 FS 通用）。
 
 ### PageCache Phase 4 benchmark
 
@@ -357,6 +382,10 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
 | `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
 | `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |
+| `docs/feature_perf_phase5_plan.md` | 性能优化 Phase 5 计划：延迟归因驱动，extent/inode 缓存、小块、读并发优化 |
+| `docs/feature_perf_phase5_milestone.md` | 性能优化 Phase 5 进度、read/write 完整占比表、回归与 benchmark 记录 |
+| `docs/fio_direct_parameter_sweep_report.md` | Phase 5 基线证据：fio direct 全量参数 sweep（A–G 组），三瓶颈分解 |
+| `docs/fio_direct_senior_feedback_response.md` | Phase 5 基线证据：学长性能优化指导与三方对齐结论 |
 | `docs/benchmark.md` | docs 目录 benchmark 快照，与 `benchmark/benchmark.md` 和根目录 `benchmark.md` 同步 |
 | `benchmark/benchmark.md` | 仓库内 benchmark 快照，含 Phase 4 PageCache A-E benchmark 与最近 PageCache correctness 测试结果 |
 | `docs/environment.md` | Docker、KVM、代理、benchmark 环境说明 |
@@ -368,7 +397,7 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 - Revoke 机制已有结构与扫描骨架，当前 crash/recovery 验证覆盖的是本实现实际写出的 descriptor/data/commit 事务格式。
 - `rename_across_dir` crash 场景函数已保留，但 marker 触发不稳定，未纳入默认 crash matrix；默认矩阵每轮 9 个场景，最新收口复跑两轮共 18/18 PASS。
 - `STATIC_BLOCKED` 用例主要来自当前阶段未覆盖的 Linux ext4 语义或环境能力，例如 hardlink/symlink、AIO、xattr/chacl、renameat2、部分 fallocate/fiemap/collapse-range、device-mapper crash tests。
-- 多文件并发基本读写 correctness、Phase 3 fsync/flush 持久化语义与 Phase 4 PageCache correctness 已完成；PageCache cold read / buffered write、fio write >= 90%、更激进拆锁和更高并发吞吐属于后续性能 hardening。
+- 多文件并发基本读写 correctness、Phase 3 fsync/flush 持久化语义、Phase 4 PageCache correctness 与 Phase 5 读侧性能优化均已收口；ext4 域内 per-op 开销已榨干。剩余开放项属 virtio / 平台层：PageCache cold read / buffered write、并发读 `nj>1` 锁退化、write 与 read 的 virtio 写往返 gap、更激进拆锁与更高并发吞吐。
 - Phase 4 中 PageCache 只服务 buffered I/O / mmap / writeback；O_DIRECT 继续绕过 PageCache，并通过 cache-off 守底单独统计。
 - Phase 3 已确认：`bs=16K fsync=4` 修复后触发真实 flush，旧的纳秒级/微秒级高吞吐结果不能作为性能宣传；fsync-heavy 与普通顺序吞吐分开统计。
 
