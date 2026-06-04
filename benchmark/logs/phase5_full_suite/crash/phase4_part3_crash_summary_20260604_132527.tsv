@@ -1,0 +1,5 @@
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	host_crash_fsync_size_durability	prepare_done	prepare_done	/reg-logs/crash/host_crash_fsync_size_durability_prepare_r1.log	/reg-logs/crash/host_crash_fsync_size_durability_verify_r1.log	PASS
+1	host_crash_fdatasync_metadata	prepare_done	prepare_done	/reg-logs/crash/host_crash_fdatasync_metadata_prepare_r1.log	/reg-logs/crash/host_crash_fdatasync_metadata_verify_r1.log	PASS
+1	host_crash_rename_fsync_dst	prepare_done	prepare_done	/reg-logs/crash/host_crash_rename_fsync_dst_prepare_r1.log	/reg-logs/crash/host_crash_rename_fsync_dst_verify_r1.log	PASS
+1	host_crash_concurrent_fsync	prepare_done	prepare_done	/reg-logs/crash/host_crash_concurrent_fsync_prepare_r1.log	/reg-logs/crash/host_crash_concurrent_fsync_verify_r1.log	PASS

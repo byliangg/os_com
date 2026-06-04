@@ -1,0 +1,32 @@
+[DONE] crash prepare killed: scenario=host_crash_fsync_size_durability round=1 log=/reg-logs/crash/host_crash_fsync_size_durability_prepare_r1.log
+[DONE] crash verify passed: scenario=host_crash_fsync_size_durability round=1 log=/reg-logs/crash/host_crash_fsync_size_durability_verify_r1.log
+[DONE] crash prepare killed: scenario=host_crash_fdatasync_metadata round=1 log=/reg-logs/crash/host_crash_fdatasync_metadata_prepare_r1.log
+[DONE] crash verify passed: scenario=host_crash_fdatasync_metadata round=1 log=/reg-logs/crash/host_crash_fdatasync_metadata_verify_r1.log
+[DONE] crash prepare killed: scenario=host_crash_rename_fsync_dst round=1 log=/reg-logs/crash/host_crash_rename_fsync_dst_prepare_r1.log
+[DONE] crash verify passed: scenario=host_crash_rename_fsync_dst round=1 log=/reg-logs/crash/host_crash_rename_fsync_dst_verify_r1.log
+[DONE] crash prepare killed: scenario=host_crash_concurrent_fsync round=1 log=/reg-logs/crash/host_crash_concurrent_fsync_prepare_r1.log
+[DONE] crash verify passed: scenario=host_crash_concurrent_fsync round=1 log=/reg-logs/crash/host_crash_concurrent_fsync_verify_r1.log
+===== Crash summary =====
+round	scenario	hold_op	hold_stage	prepare_log	verify_log	result
+1	host_crash_fsync_size_durability	prepare_done	prepare_done	/reg-logs/crash/host_crash_fsync_size_durability_prepare_r1.log	/reg-logs/crash/host_crash_fsync_size_durability_verify_r1.log	PASS
+1	host_crash_fdatasync_metadata	prepare_done	prepare_done	/reg-logs/crash/host_crash_fdatasync_metadata_prepare_r1.log	/reg-logs/crash/host_crash_fdatasync_metadata_verify_r1.log	PASS
+1	host_crash_rename_fsync_dst	prepare_done	prepare_done	/reg-logs/crash/host_crash_rename_fsync_dst_prepare_r1.log	/reg-logs/crash/host_crash_rename_fsync_dst_verify_r1.log	PASS
+1	host_crash_concurrent_fsync	prepare_done	prepare_done	/reg-logs/crash/host_crash_concurrent_fsync_prepare_r1.log	/reg-logs/crash/host_crash_concurrent_fsync_verify_r1.log	PASS
+[SKIP] phase4_good disabled (RUN_PHASE4_GOOD=0)
+[SKIP] pagecache_phase4 disabled (RUN_PAGECACHE_PHASE4=0)
+[SKIP] phase3_base disabled (RUN_PHASE3_BASE=0)
+[SKIP] phase6_good disabled (RUN_PHASE6_GOOD=0)
+[SKIP] jbd_phase1 disabled (RUN_JBD_PHASE1=0)
+[SKIP] phase2 concurrency disabled (RUN_PHASE2_CONCURRENCY=0)
+[SKIP] jbd_phase3 disabled (RUN_JBD_PHASE3=0)
+[SKIP] lmbench disabled (RUN_LMBENCH=0)
+[DONE] phase4_part3 run finished
+crash_summary=/reg-logs/crash/phase4_part3_crash_summary_20260604_132527.tsv
+phase4_good_log=<disabled>
+pagecache_phase4_log=<disabled>
+phase3_base_log=<disabled>
+phase6_good_log=<disabled>
+jbd_phase1_log=<disabled>
+jbd_phase2_concurrency_log=<disabled>
+jbd_phase3_fsync_durability_log=<disabled>
+lmbench_summary=<disabled>

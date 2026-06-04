@@ -46,6 +46,7 @@ docker run --pull=never --rm --privileged --network=host --device=/dev/kvm \
     -e AB_TESTS="${AB_TESTS}" \
     -e RUN_PAGECACHE_NONREG="${RUN_PAGECACHE_NONREG}" \
     -e FULL_GUARD="${FULL_GUARD:-0}" \
+    -e FULL_SUITE="${FULL_SUITE:-0}" \
     "${IMAGE}" \
     bash -lc '
         set -uo pipefail
@@ -77,6 +78,45 @@ docker run --pull=never --rm --privileged --network=host --device=/dev/kvm \
         RESULT=/reg-logs/regression_result.txt
         : > "${RESULT}"
         note() { echo "$1" | tee -a "${RESULT}"; }
+
+        if [ "${FULL_SUITE:-0}" = "1" ]; then
+            # Complete guard at drc=0 (extent + inode cache active): all xfstests
+            # modes + crash matrix + Phase 2 concurrency + jbd3 fsync, then the
+            # host-crash fsync matrix. Mirrors the sweep G group.
+            note ">>> [full-suite drc=0] crash + phase4_good + pagecache_phase4 + phase3_base + phase6_good + jbd_phase1 + concurrency + jbd_phase3"
+            common_env \
+                RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=1 RUN_PAGECACHE_PHASE4=1 RUN_PHASE3_BASE=1 \
+                RUN_PHASE6_GOOD=1 RUN_JBD_PHASE1=1 RUN_PHASE2_CONCURRENCY=1 RUN_JBD_PHASE3=1 \
+                PHASE4_GOOD_THRESHOLD=90 PHASE6_GOOD_THRESHOLD=90 \
+                CRASH_ROUNDS=2 CRASH_PREPARE_WAIT_SEC=180 CRASH_HOLD_STAGE=after_commit \
+                CRASH_SCENARIOS="" CRASH_EXPECT=committed \
+                EXT4_PHASE2_CASES="multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync,unlink_while_open,allocator_churn" \
+                EXT4_PHASE2_WORKERS=4 EXT4_PHASE2_ROUNDS=8 EXT4_PHASE2_SEED=78 EXT4_PHASE2_TIMEOUT_SEC=900 \
+                EXT4_DIRECT_READ_CACHE=0 EXT4_EXTENT_MAP_CACHE=1 \
+                tools/ext4/run_phase4_part3.sh > /reg-logs/full_suite_main.log 2>&1 \
+                && note "    full_suite_main rc=0" || note "    full_suite_main rc=$?"
+
+            note ">>> [full-suite] host-crash fsync matrix"
+            common_env \
+                RUN_CRASH_SUITE=1 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 \
+                RUN_PHASE6_GOOD=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 \
+                CRASH_ROUNDS=1 CRASH_PREPARE_WAIT_SEC=180 CRASH_HOLD_STAGE=prepare_done \
+                CRASH_SCENARIOS="host_crash_fsync_size_durability:prepare_done host_crash_fdatasync_metadata:prepare_done host_crash_rename_fsync_dst:prepare_done host_crash_concurrent_fsync:prepare_done" \
+                CRASH_EXPECT=committed \
+                EXT4_DIRECT_READ_CACHE=0 EXT4_EXTENT_MAP_CACHE=1 \
+                tools/ext4/run_phase4_part3.sh > /reg-logs/full_suite_host_crash.log 2>&1 \
+                && note "    full_suite_host_crash rc=0" || note "    full_suite_host_crash rc=$?"
+
+            note "=== xfstests verdicts ==="
+            grep -hoE "xfstests (phase4_good|pagecache_phase4|phase3_base|phase6_good|jbd_phase1|jbd_phase3_fsync_durability) (passed|failed): pass_rate=[0-9.]+%" \
+                /reg-logs/full_suite_main.log 2>/dev/null | sed "s/^/    /" | tee -a "${RESULT}" || true
+            note "=== concurrency / crash verdicts ==="
+            grep -hiE "concurrency .*(PASS|FAIL)|[0-9]+/[0-9]+ PASS|crash summary|Error: xfstests failed" \
+                /reg-logs/full_suite_main.log /reg-logs/full_suite_host_crash.log 2>/dev/null | tail -15 | sed "s/^/    /" | tee -a "${RESULT}" || true
+            echo "================ REGRESSION RESULT ================"
+            cat "${RESULT}"
+            exit 0
+        fi
 
         if [ "${FULL_GUARD:-0}" = "1" ]; then
             # Standard guard full lists with the new cache forced active

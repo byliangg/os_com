@@ -1,0 +1,14 @@
+>>> [full-suite drc=0] crash + phase4_good + pagecache_phase4 + phase3_base + phase6_good + jbd_phase1 + concurrency + jbd_phase3
+    full_suite_main rc=0
+>>> [full-suite] host-crash fsync matrix
+    full_suite_host_crash rc=0
+=== xfstests verdicts ===
+    xfstests phase4_good passed: pass_rate=100.00%
+    xfstests pagecache_phase4 passed: pass_rate=100.00%
+    xfstests phase3_base passed: pass_rate=100.00%
+    xfstests phase6_good passed: pass_rate=100.00%
+    xfstests jbd_phase1 passed: pass_rate=100.00%
+    xfstests jbd_phase3_fsync_durability passed: pass_rate=100.00%
+=== concurrency / crash verdicts ===
+    ===== Crash summary =====
+    ===== Crash summary =====
