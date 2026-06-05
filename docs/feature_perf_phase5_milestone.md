@@ -449,3 +449,4 @@ ext2 对照（你提议测的）直接揭示根因（ext4 缺 inode 缓存）并
 | 2026-06-04 | Step 3d ⭐ ext4 inode 元数据缓存（gen 防 TOCTOU + run_journaled_ext4 单一失效点）：**小块读 16–24%→84–95%（×2.6–5.2）**，1M write 63→76%；full-guard@drc=0 三模式 100% | fs.rs |
 | 2026-06-04 | 完整守底 FULL_SUITE@drc=0 全绿：crash 18/18、host-crash 4/4、concurrency 7/7、xfstests 全 100%；读优化（A/3b/3c/3d）定版 | run_phase5_regression.sh |
 | 2026-06-05 | write 全 bs 重测（inode 缓存 build）：4K/16K/64K/256K/1M write = 75.5/75.8/84.1/121.1/88.3%（inode 缓存把写也拉上来）；write profile 确认 prepare(mtime)=0、above≈3–20µs，写已 virtio-bound，ext4 域内榨干 | guard_median/profile_probe |
+| 2026-06-05 | 衍生：并发功能正确性 xfstests 专套件（`concurrency` mode）落地——聚拢 fsstress/恢复并发 case + 新增 generic/476（多线程全写）、269（并行 ENOSPC）；**10 PASS / 0 FAIL / 100%**，两个新写路径并发压测均过 → ext4 并发写健全。247/263（dio-vs-buffered 一致性，需 page_cache=1）归 pagecache_phase4。自研 phase2_concurrency 保留（互补，未改动） | concurrency.list, run_xfstests_test.sh, run_phase4_part3.sh, run_phase4_in_docker.sh, prepare_phase4_part3_initramfs.sh |
