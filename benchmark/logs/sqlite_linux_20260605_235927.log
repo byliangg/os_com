@@ -1,0 +1,103 @@
+Running benchmark sqlite/ext4_speedtest1...
+Preparing libraries...
+mke2fs 1.46.5 (30-Dec-2021)
+Discarding device blocks:      0/524288             done                            
+Creating filesystem with 524288 4k blocks and 131072 inodes
+Filesystem UUID: 95f0b323-e560-4219-b291-2bd6f02bf2c7
+Superblock backups stored on blocks: 
+	32768, 98304, 163840, 229376, 294912
+
+Allocating group tables:  0/16     done                            
+Writing inode tables:  0/16     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/16     done
+
+these 4 derivations will be built:
+  /nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv
+  /nix/store/fxgs8s5zfq04m6p2fsk0lv7izm8pja9z-benchmark-0.1.0.drv
+  /nix/store/7mn67jwd9n2bfq3800rgqlsk6j94qh4g-runtime-deps.drv
+  /nix/store/2j2lscydp65mz865y4z1yc3n92k48il6-initramfs.drv
+building '/nix/store/fxgs8s5zfq04m6p2fsk0lv7izm8pja9z-benchmark-0.1.0.drv'...
+building '/nix/store/073pwvqc6vl98n270xzkgiqwri6qb3l9-resolv-conf.drv'...
+Warning: the host's /etc/resolv.conf is not valid for the guest VM (containing lookback addresses).
+Fall back to Cloudflare's public DNS servers (1.1.1.1).
+Consider using the DNS_SERVER Makefile variable to specify DNS server explicitly.
+For example: make DNS_SERVER="192.168.1.1"
+building '/nix/store/7mn67jwd9n2bfq3800rgqlsk6j94qh4g-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/2j2lscydp65mz865y4z1yc3n92k48il6-initramfs.drv'...
+/nix/store/p8kh37yi4xqb34vs3smnv0mb0r6v3zgc-initramfs
+this derivation will be built:
+  /nix/store/16rrfn90w43cgbchmb1mkkvx9imcwxyk-initramfs-image.drv
+building '/nix/store/16rrfn90w43cgbchmb1mkkvx9imcwxyk-initramfs-image.drv'...
+/build/tmp.eX3tsx71Hp /build
+176289 blocks
+/build
+/nix/store/kiaqg9j08klnflq3m7ry7i6a6jckqbvc-initramfs-image
+[bench] dropped host page cache
+Running benchmark sqlite/ext4_speedtest1 on Linux...
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD19A0+7EF319A0 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.294602] kvm_intel: VMX not supported by CPU 0
+Running benchmark: sqlite/ext4_speedtest1 on linux
+Mounted ext4 benchmark fs on /dev/vda -> /ext4
+The VM is ready for the benchmark.
+*** Running the SQLite speedtest1 (Ext4) ***
+-- Speedtest1 for SQLite 3.48.0 2025-01-14 11:05:00 d2fe6b05f38d9d7cd78c5d252e99
+ 100 - 500000 INSERTs into table with no index.....................    0.284s
+ 110 - 500000 ordered INSERTS with one index/PK....................    0.411s
+ 120 - 500000 unordered INSERTS with one index/PK..................    0.918s
+ 130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.358s
+ 140 - 10 SELECTS, LIKE, unindexed.................................    0.683s
+ 142 - 10 SELECTS w/ORDER BY, unindexed............................    1.146s
+ 145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.509s
+ 150 - CREATE INDEX five times.....................................    0.999s
+ 160 - 100000 SELECTS, numeric BETWEEN, indexed....................    1.777s
+ 161 - 100000 SELECTS, numeric BETWEEN, PK.........................    1.762s
+ 170 - 100000 SELECTS, text BETWEEN, indexed.......................    1.776s
+ 180 - 500000 INSERTS with three indexes...........................    2.124s
+ 190 - DELETE and REFILL one table.................................    2.088s
+ 200 - VACUUM......................................................    2.008s
+ 210 - ALTER TABLE ADD COLUMN, and query...........................    0.020s
+ 230 - 100000 UPDATES, numeric BETWEEN, indexed....................    1.639s
+ 240 - 500000 UPDATES of individual rows...........................    1.229s
+ 250 - One big UPDATE of the whole 500000-row table................    0.204s
+ 260 - Query added column after filling............................    0.020s
+ 270 - 100000 DELETEs, numeric BETWEEN, indexed....................    2.374s
+ 280 - 500000 DELETEs of individual rows...........................    2.102s
+ 290 - Refill two 500000-row tables using REPLACE..................    3.695s
+ 300 - Refill a 500000-row table using (b&1)==(a&1)................    2.248s
+ 310 - 100000 four-ways joins......................................    3.765s
+ 320 - subquery in result set......................................    6.315s
+ 400 - 700000 REPLACE ops on an IPK................................    1.414s
+ 410 - 700000 SELECTS on an IPK....................................    2.095s
+ 500 - 700000 REPLACE on TEXT PK...................................    1.633s
+ 510 - 700000 SELECTS on a TEXT PK.................................    2.337s
+ 520 - 700000 SELECT DISTINCT......................................    0.555s
+ 980 - PRAGMA integrity_check......................................    3.272s
+ 990 - ANALYZE.....................................................    0.203s
+       TOTAL.......................................................   51.963s
+[   52.687719] reboot: Power down
+Skipping result aggregation because BENCH_RUN_ONLY=linux.
+Cleaning up...
+Benchmark completed successfully.

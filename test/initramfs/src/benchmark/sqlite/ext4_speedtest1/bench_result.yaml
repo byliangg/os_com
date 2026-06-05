@@ -1,0 +1,11 @@
+alert:
+  bigger_is_better: false
+  threshold: 125%
+chart:
+  description: 'sqlite-speedtest1 --size 1000 /ext4/test.db: total wall time'
+  legend: Total speed on {system} (Ext4)
+  title: '[Ext4] The total result of sqlite speedtest'
+  unit: second
+result_extraction:
+  result_index: 2
+  search_pattern: TOTAL....
