@@ -101,7 +101,137 @@
 4. **PageCache direct/buffered hardening（D2/D3/D4-write）** 维持为独立 Phase 4 hardening，不混入 O_DIRECT 守底。
 5. 多 job 达标参数（raw nj2/4 已 113–116%）可作为"设备本身能 scale、瓶颈在 ext4 串行化"的佐证，但 ext4 nj 写当前未达标，不能作为达标宣传。
 
-## 9. 原始数据索引
+## 9. 完整数据表（96 case，2026-06-05）
+
+> 口径：`direct=1`，`ioengine=sync`，`size=1G`，`ramp_time=60`，`runtime=100`，`fsync_on_close=1`；speculative 数据 cache 关、extent_map + inode 元数据缓存开、drop 公平基线。ratio = Asterinas / Linux。
+
+### A 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| A1-ext4j-write | ext4 | journaled | write | 1M | 1 | none | 3046.0 | 3300.0 | 92.30% |
+| A2-ext4j-read | ext4 | journaled | read | 1M | 1 | none | 4080.0 | 3206.0 | 127.26% |
+
+### B 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| B1-raw-write | raw | none | write | 1M | 1 | none | 2803.0 | 3598.0 | 77.90% |
+| B2-raw-read | raw | none | read | 1M | 1 | none | 3601.0 | 5668.0 | 63.53% |
+| B3-ext4j-write | ext4 | journaled | write | 1M | 1 | none | 3000.0 | 3329.0 | 90.12% |
+| B4-ext4j-read | ext4 | journaled | read | 1M | 1 | none | 3707.0 | 3218.0 | 115.20% |
+| B5-ext4n-write | ext4 | nojournal | write | 1M | 1 | none | 2983.0 | 3593.0 | 83.02% |
+| B6-ext4n-read | ext4 | nojournal | read | 1M | 1 | none | 3888.0 | 3203.0 | 121.39% |
+
+### C 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| C-W-raw-4K | raw | none | write | 4K | 1 | none | 132.0 | 251.0 | 52.59% |
+| C-R-raw-4K | raw | none | read | 4K | 1 | none | 134.0 | 260.0 | 51.54% |
+| C-W-ext4j-4K | ext4 | journaled | write | 4K | 1 | none | 180.0 | 238.0 | 75.63% |
+| C-R-ext4j-4K | ext4 | journaled | read | 4K | 1 | none | 177.0 | 217.0 | 81.57% |
+| C-W-ext4n-4K | ext4 | nojournal | write | 4K | 1 | none | 181.0 | 230.0 | 78.70% |
+| C-R-ext4n-4K | ext4 | nojournal | read | 4K | 1 | none | 176.0 | 218.0 | 80.73% |
+| C-W-raw-16K | raw | none | write | 16K | 1 | none | 470.0 | 880.0 | 53.41% |
+| C-R-raw-16K | raw | none | read | 16K | 1 | none | 507.0 | 921.0 | 55.05% |
+| C-W-ext4j-16K | ext4 | journaled | write | 16K | 1 | none | 634.0 | 841.0 | 75.39% |
+| C-R-ext4j-16K | ext4 | journaled | read | 16K | 1 | none | 660.0 | 786.0 | 83.97% |
+| C-W-ext4n-16K | ext4 | nojournal | write | 16K | 1 | none | 642.0 | 848.0 | 75.71% |
+| C-R-ext4n-16K | ext4 | nojournal | read | 16K | 1 | none | 662.0 | 778.0 | 85.09% |
+| C-W-raw-64K | raw | none | write | 64K | 1 | none | 1376.0 | 2293.0 | 60.01% |
+| C-R-raw-64K | raw | none | read | 64K | 1 | none | 1514.0 | 2664.0 | 56.83% |
+| C-W-ext4j-64K | ext4 | journaled | write | 64K | 1 | none | 1758.0 | 2177.0 | 80.75% |
+| C-R-ext4j-64K | ext4 | journaled | read | 64K | 1 | none | 1954.0 | 2154.0 | 90.71% |
+| C-W-ext4n-64K | ext4 | nojournal | write | 64K | 1 | none | 1781.0 | 2364.0 | 75.34% |
+| C-R-ext4n-64K | ext4 | nojournal | read | 64K | 1 | none | 1956.0 | 2176.0 | 89.89% |
+| C-W-raw-256K | raw | none | write | 256K | 1 | none | 2727.0 | 3108.0 | 87.74% |
+| C-R-raw-256K | raw | none | read | 256K | 1 | none | 3154.0 | 3970.0 | 79.45% |
+| C-W-ext4j-256K | ext4 | journaled | write | 256K | 1 | none | 3399.0 | 3812.0 | 89.17% |
+| C-R-ext4j-256K | ext4 | journaled | read | 256K | 1 | none | 4179.0 | 4665.0 | 89.58% |
+| C-W-ext4n-256K | ext4 | nojournal | write | 256K | 1 | none | 3471.0 | 3065.0 | 113.25% |
+| C-R-ext4n-256K | ext4 | nojournal | read | 256K | 1 | none | 4224.0 | 4696.0 | 89.95% |
+| C-W-raw-1M | raw | none | write | 1M | 1 | none | 2811.0 | 3661.0 | 76.78% |
+| C-R-raw-1M | raw | none | read | 1M | 1 | none | 3638.0 | 5705.0 | 63.77% |
+| C-W-ext4j-1M | ext4 | journaled | write | 1M | 1 | none | 2814.0 | 3349.0 | 84.03% |
+| C-R-ext4j-1M | ext4 | journaled | read | 1M | 1 | none | 3691.0 | 3900.0 | 94.64% |
+| C-W-ext4n-1M | ext4 | nojournal | write | 1M | 1 | none | 2934.0 | 3438.0 | 85.34% |
+| C-R-ext4n-1M | ext4 | nojournal | read | 1M | 1 | none | 3922.0 | 3053.0 | 128.46% |
+| C-W-raw-4M | raw | none | write | 4M | 1 | none | 2477.0 | 2111.0 | 117.34% |
+| C-R-raw-4M | raw | none | read | 4M | 1 | none | 2859.0 | 4865.0 | 58.77% |
+| C-W-ext4j-4M | ext4 | journaled | write | 4M | 1 | none | 2876.0 | 3444.0 | 83.51% |
+| C-R-ext4j-4M | ext4 | journaled | read | 4M | 1 | none | 3073.0 | 3936.0 | 78.07% |
+| C-W-ext4n-4M | ext4 | nojournal | write | 4M | 1 | none | 2950.0 | 3500.0 | 84.29% |
+| C-R-ext4n-4M | ext4 | nojournal | read | 4M | 1 | none | 3097.0 | 7384.0 | 41.94% |
+
+### D 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| D1-write | ext4 | journaled | write | 1M | 1 | none | 2816.0 | 3354.0 | 83.96% |
+| D1-read | ext4 | journaled | read | 1M | 1 | none | 3648.0 | 3028.0 | 120.48% |
+| D2-write | ext4 | journaled | write | 1M | 1 | none | 35.6 | 562.0 | 6.33% |
+| D2-read-cold | ext4 | journaled | read-cold | 1M | 1 | none | 132.0 | 3324.0 | 3.97% |
+| D2-read-warm | ext4 | journaled | read-warm | 1M | 1 | none | 135.0 | 10300.0 | 1.31% |
+| D3-write | ext4 | journaled | write | 1M | 1 | none | 11.8 | 559.0 | 2.11% |
+| D3-read-cold | ext4 | journaled | read-cold | 1M | 1 | none | 43.9 | 3264.0 | 1.34% |
+| D3-read-warm | ext4 | journaled | read-warm | 1M | 1 | none | 7895.0 | 7457.0 | 105.87% |
+| D4-write | ext4 | journaled | write | 1M | 1 | none | 39.7 | 3322.0 | 1.20% |
+| D4-read | ext4 | journaled | read | 1M | 1 | none | 3994.0 | 4233.0 | 94.35% |
+
+### E 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| E-raw-16K-none | raw | none | write | 16K | 1 | none | 371.0 | 601.0 | 61.73% |
+| E-ext4j-16K-none | ext4 | journaled | write | 16K | 1 | none | 479.0 | 695.0 | 68.92% |
+| E-ext4n-16K-none | ext4 | nojournal | write | 16K | 1 | none | 639.0 | 849.0 | 75.27% |
+| E-raw-16K-4 | raw | none | write | 16K | 1 | 4 | 26.5 | 39.8 | 66.58% |
+| E-ext4j-16K-4 | ext4 | journaled | write | 16K | 1 | 4 | 49.6 | 18.1 | 274.03% |
+| E-ext4n-16K-4 | ext4 | nojournal | write | 16K | 1 | 4 | 27.4 | 27.4 | 100.00% |
+| E-raw-16K-16 | raw | none | write | 16K | 1 | 16 | 85.7 | 78.0 | 109.87% |
+| E-ext4j-16K-16 | ext4 | journaled | write | 16K | 1 | 16 | 125.0 | 50.0 | 250.00% |
+| E-ext4n-16K-16 | ext4 | nojournal | write | 16K | 1 | 16 | 71.0 | 105.0 | 67.62% |
+| E-raw-16K-64 | raw | none | write | 16K | 1 | 64 | 193.0 | 195.0 | 98.97% |
+| E-ext4j-16K-64 | ext4 | journaled | write | 16K | 1 | 64 | 209.0 | 130.0 | 160.77% |
+| E-ext4n-16K-64 | ext4 | nojournal | write | 16K | 1 | 64 | 236.0 | 201.0 | 117.41% |
+| E-raw-1M-none | raw | none | write | 1M | 1 | none | 2381.0 | 3682.0 | 64.67% |
+| E-ext4j-1M-none | ext4 | journaled | write | 1M | 1 | none | 2874.0 | 3457.0 | 83.14% |
+| E-ext4n-1M-none | ext4 | nojournal | write | 1M | 1 | none | 2829.0 | 3518.0 | 80.42% |
+| E-raw-1M-4 | raw | none | write | 1M | 1 | 4 | 495.0 | 528.0 | 93.75% |
+| E-ext4j-1M-4 | ext4 | journaled | write | 1M | 1 | 4 | 572.0 | 408.0 | 140.20% |
+| E-ext4n-1M-4 | ext4 | nojournal | write | 1M | 1 | 4 | 579.0 | 522.0 | 110.92% |
+| E-raw-1M-16 | raw | none | write | 1M | 1 | 16 | 761.0 | 1047.0 | 72.68% |
+| E-ext4j-1M-16 | ext4 | journaled | write | 1M | 1 | 16 | 871.0 | 791.0 | 110.11% |
+| E-ext4n-1M-16 | ext4 | nojournal | write | 1M | 1 | 16 | 832.0 | 744.0 | 111.83% |
+| E-raw-1M-64 | raw | none | write | 1M | 1 | 64 | 834.0 | 972.0 | 85.80% |
+| E-ext4j-1M-64 | ext4 | journaled | write | 1M | 1 | 64 | 1000.0 | 914.0 | 109.41% |
+| E-ext4n-1M-64 | ext4 | nojournal | write | 1M | 1 | 64 | 912.0 | 941.0 | 96.92% |
+
+### F 组
+
+| case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
+|------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
+| F-raw-write-nj1 | raw | none | write | 1M | 1 | none | 2354.0 | 3689.0 | 63.81% |
+| F-ext4j-write-nj1 | ext4 | journaled | write | 1M | 1 | none | 2996.0 | 3554.0 | 84.30% |
+| F-ext4n-write-nj1 | ext4 | nojournal | write | 1M | 1 | none | 3017.0 | 3264.0 | 92.43% |
+| F-raw-read-nj1 | raw | none | read | 1M | 1 | none | 3245.0 | 4714.0 | 68.84% |
+| F-ext4j-read-nj1 | ext4 | journaled | read | 1M | 1 | none | 3707.0 | 3090.0 | 119.97% |
+| F-ext4n-read-nj1 | ext4 | nojournal | read | 1M | 1 | none | 3982.0 | 3083.0 | 129.16% |
+| F-raw-write-nj2 | raw | none | write | 1M | 2 | none | 5326.0 | 4594.0 | 115.93% |
+| F-ext4j-write-nj2 | ext4 | journaled | write | 1M | 2 | none | 2791.0 | 4139.0 | 67.43% |
+| F-ext4n-write-nj2 | ext4 | nojournal | write | 1M | 2 | none | 2811.0 | 4542.0 | 61.89% |
+| F-raw-read-nj2 | raw | none | read | 1M | 2 | none | 5860.0 | 5643.0 | 103.85% |
+| F-ext4j-read-nj2 | ext4 | journaled | read | 1M | 2 | none | 3404.0 | 4933.0 | 69.00% |
+| F-ext4n-read-nj2 | ext4 | nojournal | read | 1M | 2 | none | 4037.0 | 4215.0 | 95.78% |
+| F-raw-write-nj4 | raw | none | write | 1M | 4 | none | 5311.0 | 4663.0 | 113.90% |
+| F-ext4j-write-nj4 | ext4 | journaled | write | 1M | 4 | none | 2760.0 | 4304.0 | 64.13% |
+| F-ext4n-write-nj4 | ext4 | nojournal | write | 1M | 4 | none | 2985.0 | 2992.0 | 99.77% |
+| F-raw-read-nj4 | raw | none | read | 1M | 4 | none | 5704.0 | 25600.0 | 22.28% |
+| F-ext4j-read-nj4 | ext4 | journaled | read | 1M | 4 | none | 3447.0 | 9006.0 | 38.27% |
+| F-ext4n-read-nj4 | ext4 | nojournal | read | 1M | 4 | none | 4194.0 | 4439.0 | 94.48% |
+
+## 10. 原始数据索引
 
 | 类型 | 路径 |
 |------|------|
