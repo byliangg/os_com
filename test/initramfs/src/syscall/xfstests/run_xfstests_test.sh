@@ -39,6 +39,8 @@ JBD_PHASE1_LIST=${SCRIPT_DIR}/testcases/jbd_phase1.list
 JBD_PHASE1_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/jbd_phase1_excluded.tsv
 JBD_PHASE3_LIST=${SCRIPT_DIR}/testcases/jbd_phase3_fsync_durability.list
 JBD_PHASE3_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/jbd_phase3_excluded.tsv
+CONCURRENCY_LIST=${SCRIPT_DIR}/testcases/concurrency.list
+CONCURRENCY_STATIC_EXCLUDED=${SCRIPT_DIR}/blocked/concurrency_excluded.tsv
 
 BASE_LIST=""
 STATIC_EXCLUDED=""
@@ -1482,6 +1484,10 @@ case "${MODE}" in
     jbd_phase3_fsync_durability)
         BASE_LIST=${JBD_PHASE3_LIST}
         STATIC_EXCLUDED=${JBD_PHASE3_STATIC_EXCLUDED}
+        ;;
+    concurrency)
+        BASE_LIST=${CONCURRENCY_LIST}
+        STATIC_EXCLUDED=${CONCURRENCY_STATIC_EXCLUDED}
         ;;
     *)
         echo "Error: unsupported XFSTESTS_MODE=${MODE}" >&2

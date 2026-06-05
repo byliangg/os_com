@@ -48,10 +48,12 @@ RUN_PHASE6_GOOD=${RUN_PHASE6_GOOD:-0}
 RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
 RUN_PHASE2_CONCURRENCY=${RUN_PHASE2_CONCURRENCY:-0}
 RUN_JBD_PHASE3=${RUN_JBD_PHASE3:-0}
+RUN_CONCURRENCY=${RUN_CONCURRENCY:-0}
 RUN_LMBENCH=${RUN_LMBENCH:-1}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
 EXT4_PHASE2_PROFILE=${EXT4_PHASE2_PROFILE:-0}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
+CONCURRENCY_THRESHOLD=${CONCURRENCY_THRESHOLD:-90}
 EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync,unlink_while_open,allocator_churn"}
 EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
 EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
@@ -406,6 +408,7 @@ PHASE6_LOG="${LOG_DIR}/phase6_good_${TS}.log"
 JBD_PHASE1_LOG="${LOG_DIR}/jbd_phase1_${TS}.log"
 PHASE2_CONCURRENCY_LOG="${LOG_DIR}/jbd_phase2_concurrency_${TS}.log"
 JBD_PHASE3_LOG="${LOG_DIR}/jbd_phase3_fsync_durability_${TS}.log"
+CONCURRENCY_LOG="${LOG_DIR}/concurrency_${TS}.log"
 LMB_SUMMARY="${LOG_DIR}/lmbench/phase4_part3_lmbench_summary_${TS}.tsv"
 
 ANY_STAGE_RAN=0
@@ -466,6 +469,13 @@ else
   echo "[SKIP] jbd_phase3 disabled (RUN_JBD_PHASE3=${RUN_JBD_PHASE3})"
 fi
 
+if [ "${RUN_CONCURRENCY}" = "1" ]; then
+  run_xfstests_mode concurrency "${CONCURRENCY_THRESHOLD}" "${CONCURRENCY_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] concurrency disabled (RUN_CONCURRENCY=${RUN_CONCURRENCY})"
+fi
+
 if [ "${RUN_LMBENCH}" = "1" ]; then
   run_lmbench_regression "${LMB_SUMMARY}"
   ANY_STAGE_RAN=1
@@ -474,7 +484,7 @@ else
 fi
 
 if [ "${ANY_STAGE_RAN}" -ne 1 ]; then
-  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PAGECACHE_PHASE4/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_PHASE2_CONCURRENCY/RUN_JBD_PHASE3/RUN_LMBENCH." >&2
+  echo "Error: no stage selected. Enable at least one of RUN_CRASH_SUITE/RUN_PHASE4_GOOD/RUN_PAGECACHE_PHASE4/RUN_PHASE3_BASE/RUN_PHASE6_GOOD/RUN_JBD_PHASE1/RUN_PHASE2_CONCURRENCY/RUN_JBD_PHASE3/RUN_CONCURRENCY/RUN_LMBENCH." >&2
   exit 2
 fi
 
@@ -518,6 +528,11 @@ if [ "${RUN_JBD_PHASE3}" = "1" ]; then
   echo "jbd_phase3_fsync_durability_log=${JBD_PHASE3_LOG}"
 else
   echo "jbd_phase3_fsync_durability_log=<disabled>"
+fi
+if [ "${RUN_CONCURRENCY}" = "1" ]; then
+  echo "concurrency_log=${CONCURRENCY_LOG}"
+else
+  echo "concurrency_log=<disabled>"
 fi
 if [ "${RUN_LMBENCH}" = "1" ]; then
   echo "lmbench_summary=${LMB_SUMMARY}"

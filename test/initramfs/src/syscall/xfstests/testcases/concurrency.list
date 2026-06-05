@@ -1,0 +1,28 @@
+# Concurrency-focused xfstests suite (2026-06-05)
+#
+# Dedicated suite gathering the concurrency / multi-process stress cases that
+# were previously scattered across phase1/3/4/6 lists, plus new write-path
+# concurrency stressors. Complements (does NOT replace) the self-developed
+# deterministic multi-file data-integrity test in ext4_phase2/phase2_concurrency.c
+# (fsstress-based xfstests check fs consistency but not byte-level data hash).
+#
+# Deliberately excluded cases (attrs / quota / dm-error) are documented with
+# rationale in blocked/concurrency_excluded.tsv.
+
+# --- A. Pure concurrent fsstress stress (multi-process random fs ops) ---
+generic/013
+generic/068
+generic/076
+generic/083
+generic/476
+generic/269
+
+# --- B. Concurrent stress + crash recovery (fsstress + shutdown/godown) ---
+generic/051
+generic/054
+generic/055
+generic/388
+
+# --- C. Concurrent direct I/O / mmap races ---
+generic/247
+generic/263

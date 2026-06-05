@@ -289,6 +289,22 @@ bash tools/ext4/run_phase4_in_docker.sh
 
 该模式运行自研多文件并发 baseline，并执行严格关键词扫描；case 列表可通过 `EXT4_PHASE2_CASES=multi_file_write_verify,rename_churn` 缩小。
 
+### 并发专项 xfstests 套件
+
+标准 xfstests 并发/压力 case 的独立套件（`testcases/concurrency.list`），与自研 `phase2_concurrency.c` 互补——前者用 fsstress 多进程随机操作 + shutdown 恢复 + 并发 dio 覆盖标准并发场景，后者做确定性多文件数据完整性校验。
+
+```bash
+PHASE4_DOCKER_MODE=concurrency \
+ENABLE_KVM=1 \
+BENCH_ENABLE_KVM=1 \
+BENCH_ASTER_NETDEV=tap \
+BENCH_ASTER_VHOST=on \
+XFSTESTS_CASE_TIMEOUT_SEC=1200 \
+bash tools/ext4/run_phase4_in_docker.sh
+```
+
+套件内容（`concurrency.list`）：fsstress 并发压力 `generic/013/068/076/083/476/269`、并发压力+崩溃恢复 `generic/051/054/055/388`、并发 direct I/O / mmap 竞态 `generic/247/263`。刻意排除项（attrs/quota/dm-error）见 `blocked/concurrency_excluded.tsv`。
+
 Phase 2 最终收口证据：完整功能大全量已复跑通过，包含 crash 18/18、phase3 10 PASS + 6 NOTRUN、phase4 12 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency 7/7；严格关键词扫描为空。
 
 ### Crash 测试

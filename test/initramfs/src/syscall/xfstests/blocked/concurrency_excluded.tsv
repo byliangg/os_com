@@ -1,0 +1,11 @@
+# test	reason
+# Static exclusions for the concurrency suite.
+# These are concurrency/fsstress-adjacent cases we deliberately leave out
+# because they depend on features Asterinas ext4 does not (yet) support.
+
+generic/070	fsstress + extended attributes; attrs/xattr not in scope
+generic/117	serial fsstress + extended attributes; attrs/xattr not in scope
+generic/232	fsstress + quota accounting; quota not supported
+generic/233	fsstress + quota limits; quota not supported
+generic/270	fsstress + ENOSPC + quota + attrs; quota/attrs not supported
+generic/475	fsstress + dm-error injected disk failure; Asterinas has no device-mapper (covered by custom ext4_crash scenarios)

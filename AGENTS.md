@@ -285,4 +285,5 @@ Key test matrices:
 - Phase 4 中 PageCache 只服务 buffered I/O / mmap / writeback；O_DIRECT 仍绕过 PageCache，但必须和 PageCache 建立 flush/discard 一致性协议
 - ext2 是最好的参考实现，位于 `asterinas/kernel/src/fs/ext2/`
 - 每次改动后必须确认 phase3/phase4/phase6/jbd_phase1/crash/Phase 2 concurrency/Phase 3 fsync-flush 功能测试不回归；Phase 4 还必须增加 buffered/direct coherency、mmap 与 dirty PageCache fsync 验证
+- 并发功能正确性有两层互补证据，均不可回退：①自研 `phase2_concurrency.c`（多文件确定性数据完整性 hash 校验，`RUN_PHASE2_CONCURRENCY`）②标准 `concurrency` xfstests 套件（`testcases/concurrency.list`，fsstress 多进程 / 崩溃恢复 / 并发 dio，`PHASE4_DOCKER_MODE=concurrency`）
 - **Phase 5（性能）**：profiling 基建已端到端建好（FS / virtio / 锁 / JBD2 四层 ns 级，门控 `ext4fs.phase2_profile=1`），**不要重造**；先收割占比表再优化。三瓶颈：①大块单 job 在 block/virtio（ext4≈raw，非 ext4 锅）②小块 per-request 开销在 ext4（最具优化故事）③读并发退化在锁。JBD2 与大块 ext4 路径数据上已洗清嫌疑。1M 大块定位（virtio vs ext4 成果）需与学长对齐答辩口径

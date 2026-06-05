@@ -226,7 +226,8 @@ run_part3_with_flags() {
     RUN_PAGECACHE_PHASE4="${RUN_PAGECACHE_PHASE4:-0}" \
     RUN_PHASE3_BASE="${RUN_PHASE3_BASE}" RUN_PHASE6_GOOD="${RUN_PHASE6_GOOD}" RUN_LMBENCH="${RUN_LMBENCH}" \
     RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}" RUN_PHASE2_CONCURRENCY="${RUN_PHASE2_CONCURRENCY:-0}" \
-    RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}" \
+    RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}" RUN_CONCURRENCY="${RUN_CONCURRENCY:-0}" \
+    CONCURRENCY_THRESHOLD="${CONCURRENCY_THRESHOLD:-90}" \
     tools/ext4/run_phase4_part3.sh
 }
 
@@ -275,6 +276,10 @@ case "${PHASE4_DOCKER_MODE}" in
     echo "[INFO] mode=jbd_phase2_concurrency (only ext4 Phase 2 concurrency baseline)"
     RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=1 RUN_JBD_PHASE3=0 run_part3_with_flags
     ;;
+  concurrency)
+    echo "[INFO] mode=concurrency (only concurrency-focused xfstests suite)"
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 RUN_CONCURRENCY=1 run_part3_with_flags
+    ;;
   jbd_phase3_fsync_flush)
     echo "[INFO] mode=jbd_phase3_fsync_flush (Phase 3 fsync/flush durability xfstests)"
     echo "[INFO] Tier 1 tests will NOTRUN until EXT4_IOC_SHUTDOWN is implemented (Step 4)."
@@ -289,7 +294,7 @@ case "${PHASE4_DOCKER_MODE}" in
     ;;
   *)
     echo "Error: unsupported PHASE4_DOCKER_MODE=${PHASE4_DOCKER_MODE}" >&2
-    echo "Supported: phase4_good | pagecache_phase4 | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
+    echo "Supported: phase4_good | pagecache_phase4 | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
     exit 3
     ;;
 esac
