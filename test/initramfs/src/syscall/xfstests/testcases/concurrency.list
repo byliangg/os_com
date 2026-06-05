@@ -23,6 +23,7 @@ generic/054
 generic/055
 generic/388
 
-# --- C. Concurrent direct I/O / mmap races ---
-generic/247
-generic/263
+# Note: concurrent direct-I/O-vs-mmap / direct-vs-buffered coherency
+# (generic/247, generic/263) is a PageCache-coherency concern that requires
+# ext4fs.page_cache=1. This suite runs at page_cache=0, so those cases live in
+# the pagecache_phase4 mode instead (see blocked/concurrency_excluded.tsv).

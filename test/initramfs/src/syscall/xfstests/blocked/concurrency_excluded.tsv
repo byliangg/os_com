@@ -9,3 +9,5 @@ generic/232	fsstress + quota accounting; quota not supported
 generic/233	fsstress + quota limits; quota not supported
 generic/270	fsstress + ENOSPC + quota + attrs; quota/attrs not supported
 generic/475	fsstress + dm-error injected disk failure; Asterinas has no device-mapper (covered by custom ext4_crash scenarios)
+generic/247	direct I/O vs mmap race; needs PageCache coherency (page_cache=1), covered in pagecache_phase4 mode (PASS there); this suite runs page_cache=0
+generic/263	fsx direct I/O vs sub-block buffered I/O; needs PageCache coherency (page_cache=1), covered in pagecache_phase4 mode; this suite runs page_cache=0

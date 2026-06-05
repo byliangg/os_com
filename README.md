@@ -303,7 +303,7 @@ XFSTESTS_CASE_TIMEOUT_SEC=1200 \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 
-套件内容（`concurrency.list`）：fsstress 并发压力 `generic/013/068/076/083/476/269`、并发压力+崩溃恢复 `generic/051/054/055/388`、并发 direct I/O / mmap 竞态 `generic/247/263`。刻意排除项（attrs/quota/dm-error）见 `blocked/concurrency_excluded.tsv`。
+套件内容（`concurrency.list`，page_cache=0，10 case）：fsstress 并发压力 `generic/013/068/076/083/476/269`、并发压力+崩溃恢复 `generic/051/054/055/388`。并发 direct-I/O-vs-mmap / direct-vs-buffered 一致性（`generic/247/263`）依赖 PageCache（`page_cache=1`），归属 `pagecache_phase4` 模式覆盖，不在本套件。刻意排除项（attrs/quota/dm-error/PageCache 依赖）见 `blocked/concurrency_excluded.tsv`。
 
 Phase 2 最终收口证据：完整功能大全量已复跑通过，包含 crash 18/18、phase3 10 PASS + 6 NOTRUN、phase4 12 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency 7/7；严格关键词扫描为空。
 
