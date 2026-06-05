@@ -43,6 +43,12 @@ docker run --pull=never --rm --privileged --network=host --device=/dev/kvm \
     "${IMAGE}" \
     bash -lc '
         set -uo pipefail
+        # Network resilience: a transient proxy TLS blip during a per-case
+        # initramfs rebuild must fall back to local building, not error out.
+        export NIX_CONFIG="fallback = true
+download-attempts = 10
+connect-timeout = 20
+stalled-download-timeout = 90"
         rm -rf /root/asterinas/.target_bench/osdk
         OSDK_LOCAL_DEV=1 cargo install --locked cargo-osdk --path /root/asterinas/osdk --force
 
