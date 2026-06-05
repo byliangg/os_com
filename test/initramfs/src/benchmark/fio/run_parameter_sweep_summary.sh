@@ -58,6 +58,14 @@ docker run --pull=never --rm --privileged --network=host --device=/dev/kvm \
     bash -lc '
         set -euo pipefail
 
+        # Network resilience: each case rebuilds the initramfs, which makes nix
+        # re-check the binary cache. A transient proxy TLS blip must fall back to
+        # local building instead of aborting the whole multi-hour sweep.
+        export NIX_CONFIG="fallback = true
+download-attempts = 10
+connect-timeout = 20
+stalled-download-timeout = 90"
+
         rm -rf /root/asterinas/.target_bench/osdk \
                /root/asterinas/test/initramfs/build/initramfs \
                /root/asterinas/test/initramfs/build/initramfs.cpio.gz
@@ -177,16 +185,26 @@ PY
             fi
 
             echo ">>> [${group}] ${case_name}: benchmark=${benchmark} bs=${bs} numjobs=${numjobs} fsync=${fsync} page_cache=${page_cache} direct_read_cache=${direct_read_cache} scheme=${scheme}"
-            if ! env \
-                BENCH_FIO_BS="${bs}" \
-                BENCH_FIO_NUMJOBS="${numjobs}" \
-                EXT4_PAGE_CACHE="${page_cache}" \
-                EXT4_DIRECT_READ_CACHE="${direct_read_cache}" \
-                BENCH_ASTER_SCHEME="${scheme}" \
-                "${fsync_env[@]}" \
-                bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${benchmark}" x86_64 >"${log_file}" 2>&1; then
-                append_row "${group}" "${case_name}" "${target}" "${journal}" "${rw}" "${direct}" "${page_cache}" "${direct_read_cache}" "${bs}" "${numjobs}" "${fsync}" "FAIL" "FAIL" "FAIL" "${log_file}" "benchmark failed"
-                echo "FAILED: ${case_name}; see ${log_file}" >&2
+            local max_attempts="${SWEEP_CASE_RETRIES:-3}" attempt=1 case_ok=0
+            while [ "${attempt}" -le "${max_attempts}" ]; do
+                if env \
+                    BENCH_FIO_BS="${bs}" \
+                    BENCH_FIO_NUMJOBS="${numjobs}" \
+                    EXT4_PAGE_CACHE="${page_cache}" \
+                    EXT4_DIRECT_READ_CACHE="${direct_read_cache}" \
+                    BENCH_ASTER_SCHEME="${scheme}" \
+                    "${fsync_env[@]}" \
+                    bash test/initramfs/src/benchmark/bench_linux_and_aster.sh "${benchmark}" x86_64 >"${log_file}" 2>&1; then
+                    case_ok=1
+                    break
+                fi
+                echo ">>> [${group}] ${case_name} attempt ${attempt}/${max_attempts} failed (likely transient nix/proxy); retrying in 10s" >&2
+                attempt=$((attempt + 1))
+                sleep 10
+            done
+            if [ "${case_ok}" != "1" ]; then
+                append_row "${group}" "${case_name}" "${target}" "${journal}" "${rw}" "${direct}" "${page_cache}" "${direct_read_cache}" "${bs}" "${numjobs}" "${fsync}" "FAIL" "FAIL" "FAIL" "${log_file}" "benchmark failed after ${max_attempts} attempts"
+                echo "FAILED: ${case_name} after ${max_attempts} attempts; see ${log_file}" >&2
                 exit 1
             fi
 
