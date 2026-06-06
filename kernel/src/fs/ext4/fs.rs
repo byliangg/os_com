@@ -58,6 +58,13 @@ const EXT4_MAGIC: u64 = 0xEF53;
 const JOURNAL_LOW_WATER_MARK: u32 = 64;
 // Post-commit: if free < JOURNAL_CHECKPOINT_THRESHOLD, checkpoint to keep headroom.
 const JOURNAL_CHECKPOINT_THRESHOLD: u32 = 128;
+// Post-commit memory bound: committed-but-not-checkpointed transactions keep a
+// copy of every metadata block they touched (~4 KiB each) in the in-memory
+// `checkpoint_list`. The journal-space trigger above can leave that list to
+// grow into the gigabytes during a long fsync-less transaction (e.g. SQLite's
+// 500k-row inserts), exhausting the kernel heap. Force a checkpoint once the
+// list reaches this depth so the in-memory footprint stays bounded.
+const JOURNAL_CHECKPOINT_MAX_DEPTH: usize = 64;
 // Maximum number of metadata blocks to accumulate before forcing a commit.
 // Batching many handles into one transaction reduces commit frequency and
 // eliminates the per-handle journal write overhead for high-concurrency workloads
@@ -2117,9 +2124,14 @@ impl Ext4Fs {
                     plan.data_sync_required,
                     free_after_commit,
                 );
-                // Lazy checkpoint: only flush home blocks when journal space is tight.
-                // Use batch to amortize the sync cost over all pending transactions.
-                if free_after_commit < JOURNAL_CHECKPOINT_THRESHOLD {
+                // Lazy checkpoint: flush home blocks when journal space is tight,
+                // OR when the in-memory checkpoint list has grown deep enough to
+                // threaten the kernel heap (a long fsync-less transaction never
+                // drops journal free space below the threshold, so the list would
+                // otherwise grow unbounded). Batch to amortize the sync cost.
+                if free_after_commit < JOURNAL_CHECKPOINT_THRESHOLD
+                    || self.checkpoint_depth() >= JOURNAL_CHECKPOINT_MAX_DEPTH
+                {
                     self.try_batch_checkpoint_all_jbd2_transactions();
                 }
                 true

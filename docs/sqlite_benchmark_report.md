@@ -114,3 +114,23 @@ fio 用 O_DIRECT 绕过了 buffered 写路径，所以守底数据漂亮；SQLit
 ## 8. 结论
 
 SQLite 真实应用测试**成功落地并产出强信号**：读路径已追平/接近 Linux（Phase 5 成果延续到真实负载），但 **buffered write + fsync 路径是真实瓶颈（慢 28–244×）且在标准负载下崩溃（2 个真实 bug）**。这既补齐了赛题"真实应用测试"维度，也明确了下一阶段的优化主线：**先修两个崩溃 bug，再攻 buffered write 吞吐**。
+
+## 11. 更新（2026-06-06）：修复 A1 + B 后 SQLite 端到端跑通
+
+继 §5 两个崩溃 bug 后，按"研究→plan→instrument→修→守底"流程修复：
+
+- **A1（分配器 free 下溢 panic）**：截断时零长度空 extent → `end=0+0-1` u32 下溢 → 释放 43 亿块越界 → block group 越界 panic。修：截断循环跳过零长度 extent + `ext_remove_blocks` 拒绝坏范围。守底全绿，已提交（`88aadcfc2`）。
+- **B（内核堆 OOM）**：instrument 实测 `checkpoint_list`（已提交待 checkpoint 事务，各持 ~4KB metadata 内存副本）无界涨到 **1.2 GB**（2208 事务），而 checkpoint 触发只看磁盘 journal 空间、长事务中途从不触发。修：加 `JOURNAL_CHECKPOINT_MAX_DEPTH=64`，checkpoint 深度达阈值即主动 checkpoint，内存 bound 在 ~35MB。
+
+**结果：page_cache=1（真实应用默认配置）下 SQLite speedtest1 完整跑完**：
+
+| 项 | 值 |
+|----|----|
+| 完成度 | 全部 ~30 个 sub-test + `PRAGMA integrity_check` **通过**（数据无损铁证） |
+| Asterinas TOTAL | 4773.13s |
+| Linux TOTAL | 60.20s |
+| ratio | **1.26%**（慢 ~79×） |
+
+读类操作（SELECT）仍 1–4×、写类（INSERT/UPDATE/VACUUM/REPLACE）仍慢两个数量级——**剩余差距是 buffered write + 每事务 fsync 吞吐**（对应 fio D2/D3 = 1–6%），是纯性能问题、非崩溃/正确性。这是下一阶段优化主线。
+
+**里程碑**：真实应用 benchmark 第一次端到端跑通并产出完整 TOTAL ratio + 自带完整性校验通过。剩余开放项：A2（page_cache=0 旧 Vec 路径 corruption，page_cache=1 不受影响）、buffered write 吞吐。
