@@ -275,7 +275,7 @@ impl Ext4 {
     ) -> Result<()> {
         let newex_first_block = newex.first_block;
         let mut search_path = self.find_extent(inode_ref, newex_first_block)?;
-        
+
         let depth = search_path.depth as usize;
         let node = &search_path.path[depth]; // Get the node at the current depth
 
@@ -1156,6 +1156,15 @@ impl Ext4 {
             let offset = extent_area_off + i * extent_size;
             let mut ex: Ext4Extent = ext4block.read_offset_as(offset);
 
+            // A zero-length extent maps no blocks; it is an invalid/garbage slot
+            // (e.g. a zeroed entry counted by entries_count). Computing
+            // `end = first_block + actual_len - 1` on it underflows to u32::MAX,
+            // which then frees a huge out-of-range range and corrupts the fs.
+            // Drop it (compact it out) instead of processing it.
+            if ex.get_actual_len() == 0 {
+                continue;
+            }
+
             if ex.first_block > to {
                 if write_pos != i {
                     let dst = extent_area_off + write_pos * extent_size;
@@ -1404,9 +1413,28 @@ impl Ext4 {
         from: u32,
         to: u32,
     ) {
+        // Defense-in-depth: refuse to free a bogus range rather than walk past
+        // the filesystem end. `to < from` / `from < first_block` would underflow
+        // the u32 length, and `start + len > total` would step into a
+        // non-existent block group (out-of-bounds `lock_block_group` panic).
+        if to < from || from < ex.first_block {
+            log::warn!(
+                "[ext4] ext_remove_blocks skipped invalid range: from={} to={} first_block={}",
+                from, to, ex.first_block
+            );
+            return;
+        }
         let len = to - from + 1;
         let num = from - ex.first_block;
         let start: u32 = ex.get_pblock() as u32 + num;
+        let total = self.super_block.blocks_count() as u64;
+        if (start as u64) + (len as u64) > total {
+            log::warn!(
+                "[ext4] ext_remove_blocks skipped out-of-range free: start={} len={} total={} (ex.pblock={} ex.actual_len={})",
+                start, len, total, ex.get_pblock(), ex.get_actual_len()
+            );
+            return;
+        }
         self.balloc_free_blocks(inode_ref, start as _, len);
     }
 
