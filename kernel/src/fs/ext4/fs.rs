@@ -4663,6 +4663,27 @@ impl Ext4Fs {
 
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
+
+        // Fast path: a pure overwrite of already-allocated blocks (no append, no
+        // hole) needs no block allocation, so skip the per-write() journaled
+        // prepare entirely. The data reaches disk via the journaled writeback at
+        // fsync/sync; mtime/ctime is journaled at most once per second by
+        // `touch_mtime_ctime` (ext4 inode timestamps are seconds-granularity, so
+        // this loses no precision). This removes the dominant per-write() cost on
+        // buffered overwrite-heavy workloads (e.g. SQLite).
+        let cur_size = self.stat(ino)?.size as usize;
+        if let Some(write_end) = offset.checked_add(write_len)
+            && write_end <= cur_size
+            && self.write_range_fully_mapped(ino, offset, write_len)?
+        {
+            self.touch_mtime_ctime(ino)?;
+            self.invalidate_direct_read_cache(ino);
+            let page_cache = self.page_cache_state_for_inode(ino, cur_size)?.pages();
+            page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
+            return Ok(write_len);
+        }
+
+        // Slow path: append / sparse / unmapped range — needs journaled allocation.
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::for_small_write(ino, offset, data.as_slice());
         let mappings = self
@@ -4696,6 +4717,30 @@ impl Ext4Fs {
         let page_cache = self.page_cache_state_for_inode(ino, file_size)?.pages();
         page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
         Ok(write_len)
+    }
+
+    /// Read-only check that every block backing `[offset, offset+len)` is already
+    /// allocated (no holes). Used by the buffered-write fast path to decide
+    /// whether a write is a pure overwrite that needs no journaled allocation.
+    fn write_range_fully_mapped(&self, ino: u32, offset: usize, len: usize) -> Result<bool> {
+        if len == 0 {
+            return Ok(true);
+        }
+        let block_size = EXT4_BLOCK_SIZE;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "write range overflow"))?;
+        let lblock_start = offset / block_size;
+        let lblock_count = end.div_ceil(block_size) - lblock_start;
+        let lblock_start_u32 = u32::try_from(lblock_start)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
+        let lblock_count_u32 = u32::try_from(lblock_count)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
+        let mappings = self.run_ext4_file_read_only(|ext4| {
+            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        })?;
+        let mapped_blocks: u64 = mappings.iter().map(|m| m.len as u64).sum();
+        Ok(mapped_blocks == lblock_count as u64)
     }
 
     fn write_page_cache_data_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {

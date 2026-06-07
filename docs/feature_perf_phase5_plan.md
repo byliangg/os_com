@@ -293,3 +293,40 @@ instrument（`jbd2_memory_footprint()` 每 8192 ops dump）实测：`checkpoint_
 **修复（仅 fs.rs，15 行）**：加 `JOURNAL_CHECKPOINT_MAX_DEPTH=64`，commit 后 `checkpoint_depth() >= 64` 即主动 `try_batch_checkpoint_all_jbd2_transactions()`，内存 bound 在 ~35MB。checkpoint 是正常 JBD2 行为（刷 home 块 + 推进 tail），更频繁不影响崩溃恢复正确性。
 
 **结果**：page_cache=1 下 **SQLite speedtest1 完整跑完**（TOTAL 4773s vs Linux 60s = 1.26%，`PRAGMA integrity_check` 通过=数据无损）。真实应用 benchmark 端到端跑通。守底验证中。剩余：A2（page_cache=0 旧路径 corruption）、buffered write 吞吐（纯性能）。
+
+## 衍生任务：buffered write 吞吐优化（2026-06-06 立项）
+
+**背景**：SQLite page_cache=1 跑通后 TOTAL 仅 1.26%（写类操作慢两个数量级，VACUUM 412s≈1 MB/s）。
+
+**根因（已研读代码确认，零猜测）**：
+- 写回路径 `Ext4PageCacheBackend::write_page_async` 名为 async 实为**同步、逐页（4KB）**：每页 `vec![0u8;4096]` 拷贝 → `write_page_cache_data_at` → `ext4_map_blocks` + `run_journaled_ext4(JournaledOp::Write)` = **每个 4KB 页跑一遍完整 journaled 写事务**（JBD2 handle 起停 + EXT4_RS_RUNTIME_LOCK + 映射），返回**空 BioWaiter**。
+- 共享 `page_cache.rs::evict_range` 本想 concat 所有 per-page waiter 一次 wait 批量化，但被同步的 write_page_async 废掉。
+- VACUUM 重写几十万页 = 几十万次完整 journaled 写 + 逐页 virtio 往返 → ~1 MB/s（virtio 带宽地板 ~2800 MB/s，**2000× 头部空间，全在写回代码**）。
+
+**修复设计（合并连续脏页成大块写）**：
+1. `PageCacheBackend` trait 加 `write_pages_async(start_idx, pages)`，**默认实现逐页调 write_page_async**（ext2 行为不变、零影响）。
+2. 共享 `evict_range` 把连续脏页分组成 run，按 run 调 `write_pages_async`。
+3. ext4 override `write_pages_async`：把整 run 的页读进一个大连续缓冲，**一次 `write_page_cache_data_at`** 覆盖整段 → 一次 journaled op + `ext4_write_at` 内按 mapping 发大 bio（非逐 4KB）。
+4. 预期：N 次逐页 journaled op → 每 run 1 次；大 bio 取代逐 4KB；从 1–6% 提到数十 %。
+
+**风险/边界**：
+- 共享 evict_range 改动需保 ext2 行为不变（默认 per-page 实现 = 原逻辑）；合并逻辑（连续 run/标记 clean/waiter）要正确。
+- 批量化不改写入内容（比 checkpoint-timing 风险低），但仍需全守底（crash/xfstests/concurrency）+ pagecache_phase4 一致性 + SQLite pc1 重验。
+- 最终 ceiling 仍是 virtio 写往返地板（64–78%），不会到 100%，但巨大改善。
+- HEAD（含 A1+B）为安全基线。
+
+**方法论**：研究（已完成）→ plan（本节）→ 实现批量写回 → 守底 + SQLite 重验。
+
+### buffered write 优化：profile 驱动重定位 + 覆盖写快路径（2026-06-07）
+
+**纠错**：先前的"写回批量化"打偏（profile 前动手），只 ~3%，已回退。补做 profile（BUFW probe）后铁证：
+- `write_at_page_cache` 每次 write() 一次完整 journaled prepare：**count=9,068,544，total=3890s，avg=428µs = 全程 83%**。
+- DB 才几百 MB 却 900 万次写 → 绝大多数是**已分配块的覆盖写**，却每次跑 `run_journaled_ext4`（含分配尝试 + JBD2 handle + runtime 锁 + meta cache clear）+ `set_inode_times`。
+
+**修复（覆盖写快路径，仅 fs.rs）**：
+- `write_at_page_cache`：若 `offset+len <= file_size`（不扩展）且 `write_range_fully_mapped`（只读检查全映射、无 hole）→ **跳过 run_journaled_ext4**，改 `touch_mtime_ctime`（已有节流助手，秒变化才 journal；ext4 mtime 秒精度=零损失）+ 页缓存写；慢路径（append/sparse）保持原 journaled 分配。
+- 正确性逐链验证：data 经 fsync 时 journaled writeback 落盘；mtime 节流 journal 时 `run_inode_metadata_update` 清 meta cache 使 stat 重读新值；durability 靠 fsync force-commit；锁序 inode_lock→runtime_lock 一致。
+
+**结果**：SQLite pc1 TOTAL **4773s→2022s（2.36×）**，ratio 1.26%→2.97%，`PRAGMA integrity_check` 仍过（数据无损）。剩余慢项（索引插入/VACUUM）是**追加/新分配**走慢路径——下一步若要再快需**延迟分配 delalloc**（写时不分配、writeback 时批量分配，更大工程）。
+
+守底验证中（重点 crash/jbd3/mtime，因改了时间戳时机）。HEAD（含 A1+B）为安全基线。
