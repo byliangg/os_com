@@ -119,7 +119,28 @@
 - **小块（4K）裸盘只有 ~52%**：Asterinas virtio-blk 单请求往返延迟约为 Linux 的 2 倍。这是纯平台层（virtio 驱动 + block 层），跨文件系统通用，与 ext4 无关。
 - **大块 1M：read 62% / write 79%**：吞吐差 1/5–1/3，同为 virtio 平台层。
 - Aster 侧绝对带宽非常稳（raw 1M read 三轮 3596/3600/3569），比值噪声主要来自 Linux readahead 抖动（Linux 1M read 在 4621–6205 间跳），故 1M read 比值偏保守。
-- **关键对照**：同一 drop 口径下，我们的 ext4 单 job 比值（4K read 81.57%、64K read 90.71%、4K write 75.63%）**反而高于裸盘比值**。原因是两者 Linux 分母不同（Linux-ext4 本身也慢于 Linux-raw），而我们靠 inode/extent 元数据缓存把 ext4 per-op 开销榨到极低，ext4 路径甚至比纯裸盘 per-IO 更高效。这坐实了 **ext4 模块已无短板，剩余与 Linux 的绝对差距来自 virtio 平台层**。
+
+### 8.5.1 口径勘误（2026-06-09，回应学长质疑）
+
+> **virtio 后端**：`-drive if=none,format=raw,file=ext2.img` —— virtio-blk 的 host 后端是**文件镜像 ext2.img，不是物理裸盘**。所谓"裸盘"= 直接读写 virtio-blk 设备 `/dev/vda`（绕过文件系统），符合赛题"统一 virtio-blk 接口"要求；Aster 与 Linux 用**同一文件、同一份 `qemu_args.sh normal` 配置**（virtio-blk-pci 逐字节相同），口径一致。
+> **device flush**：日志实证 `virtio-blk: flush() support_flush=true → sending ReqType::Flush to device`——`cache=writeback` 默认下 QEMU advertise `VIRTIO_BLK_F_FLUSH`，Aster **真发 flush、非 no-op**，与 Linux 公平（不存在"Aster 跳过 flush 显得快"）。
+> **fio 口径**：raw 与 ext4 job **仅 `-filename` 不同**（`/dev/vda` vs `/ext4/fio-test`），其余 `-rw=write -size=1G -bs -ioengine=sync -direct=1 -numjobs=1 -fsync_on_close=1 -ramp_time=60 -runtime=100` 完全相同。
+
+**纠正一处口径错误 + 一处误判**：
+
+1. **此前一张"裸盘 vs ext4"对照表混用了 ext4 单次值（sweep）+ raw 中位数（raw_median），不同 run/不同统计法，sloppy。** 应以**同一次 sweep（同容器同 boot）**的同 run 绝对值为准（下表）。
+2. **此前把"ext4 ≥ 裸盘"解释成"混 run 假象/Linux 分母不同"是错的。** 同一次 sweep 的同 run 数据证明它**真实可复现**：
+
+| bs | rw | 裸盘 Aster | ext4 Aster | 裸盘 Linux | ext4 Linux |
+|----|----|---:|---:|---:|---:|
+| 4K | write | 132 | **180** | 251 | 238 |
+| 64K | write | 1376 | **1758** | 2293 | 2177 |
+| 1M | write | 2811 | 2814 | 3661 | 3349 |
+
+- **Linux 侧 raw > ext4（251>238，符合"FS≤裸设备"理论）；Asterinas 侧 raw < ext4（132<180，倒挂）。**
+- 所以**不是"我们 ext4 魔法超过裸盘"，而是 Asterinas 自己的裸块设备（/dev/vda）O_DIRECT 写路径比我们 ext4 文件写路径还慢**——同 fio、同设备，写裸设备反而慢。
+- **原因**：Phase 5 把 ext4 direct-write 路径优化得很好（extent 映射缓存等），而 Asterinas 的裸块设备写路径未享此优化、per-request 开销更高；我们的 ext4 反而绕过了它。
+- **两个含义**：①"裸盘地板"其实**偏悲观**——raw fio 路径本身在 Asterinas 上不够优化，**ext4 绝对吞吐更代表真实设备能力**；②这是平台/块层观察（Asterinas 裸设备写路径待优化），应同步田老师。结论方向（剩余差距在 virtio 平台层）不变，但"裸盘=干净地板"的 framing 需修正。
 
 ## 9. 完整数据表（96 case，2026-06-05）
 
@@ -127,12 +148,69 @@
 
 ### A 组
 
+参数：
+
+| 参数项 | 取值 |
+|--------|------|
+| 测试对象 | ext4 journaled regular file |
+| `rw` | `write`, `read` |
+| `direct` | `1` |
+| `bs` | `1M` |
+| `numjobs` | `1` |
+| `fsync` | `none`，仅保留 `fsync_on_close=1` |
+| Asterinas PageCache | 关（O_DIRECT 守底，不走 PageCache） |
+| speculative direct-read 数据 cache | 关（`direct_read_cache=0`，诚实口径） |
+| extent 映射缓存 | 开（`EXT4_EXTENT_MAP_CACHE=1` 默认） |
+| inode 元数据缓存 | 开（代码常开） |
+| host page cache 基线 | drop 公平基线（`BENCH_DROP_CACHES=1` 默认） |
+| 对照方式 | Asterinas ext4 vs Linux ext4 |
+
+Cache 使用情况：
+
+| cache 类型 | 是否使用 | 说明 |
+|------------|----------|------|
+| fio / 文件 PageCache | 否 | `direct=1`，O_DIRECT 绕过文件 PageCache |
+| Asterinas ext4 PageCache | 否 | O_DIRECT 守底路径不依赖 PageCache |
+| Asterinas ext4 direct-read 数据 cache | 否 | 本次硬编码关闭，避免 speculative cache 口径 |
+| Asterinas extent / inode 元数据缓存 | 是 | Phase 5 读侧优化默认启用 |
+| Linux ext4 PageCache | 否 | Linux 对照同样使用 `direct=1`，并在 drop 口径下运行 |
+| raw/block cache | 不适用 | 本组只测 ext4 regular file |
+
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
 | A1-ext4j-write | ext4 | journaled | write | 1M | 1 | none | 3046.0 | 3300.0 | 92.30% |
 | A2-ext4j-read | ext4 | journaled | read | 1M | 1 | none | 4080.0 | 3206.0 | 127.26% |
 
 ### B 组
+
+参数：
+
+| 参数项 | 取值 |
+|--------|------|
+| 测试对象 | raw `/dev/vda`, ext4 journaled, ext4 nojournal |
+| `rw` | `write`, `read` |
+| `direct` | `1` |
+| `bs` | `1M` |
+| `numjobs` | `1` |
+| `fsync` | `none`，仅保留 `fsync_on_close=1` |
+| Asterinas PageCache | 关（O_DIRECT 守底） |
+| speculative direct-read 数据 cache | 关（`direct_read_cache=0`，诚实口径） |
+| extent 映射缓存 | 开（ext4 case 默认启用） |
+| inode 元数据缓存 | 开（ext4 case 默认启用） |
+| host page cache 基线 | drop 公平基线 |
+| 对照方式 | 每个 target 同轮分别跑 Asterinas 与 Linux |
+| 诊断目的 | 区分 raw/block 层、ext4 direct I/O 路径、JBD2 额外成本 |
+
+Cache 使用情况：
+
+| cache 类型 | 是否使用 | 说明 |
+|------------|----------|------|
+| fio / 文件 PageCache | 否 | 全部 case `direct=1` |
+| Asterinas ext4 PageCache | 否 | O_DIRECT 守底路径不依赖 PageCache |
+| Asterinas ext4 direct-read 数据 cache | 否 | 本次硬编码关闭 |
+| Asterinas extent / inode 元数据缓存 | ext4 case 使用 | raw case 不经过 ext4；ext4 case 使用 Phase 5 元数据缓存 |
+| Linux ext4 PageCache | 否 | Linux ext4 对照同样 `direct=1`，并使用 drop 口径 |
+| raw block cache | 不使用文件 cache | raw case 走 `/dev/vda`，不经过 ext4/PageCache |
 
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
@@ -144,6 +222,35 @@
 | B6-ext4n-read | ext4 | nojournal | read | 1M | 1 | none | 3888.0 | 3203.0 | 121.39% |
 
 ### C 组
+
+参数：
+
+| 参数项 | 取值 |
+|--------|------|
+| 测试对象 | raw `/dev/vda`, ext4 journaled, ext4 nojournal |
+| `rw` | `write`, `read` |
+| `direct` | `1` |
+| `bs` | `4K`, `16K`, `64K`, `256K`, `1M`, `4M` |
+| `numjobs` | `1` |
+| `fsync` | `none`，仅保留 `fsync_on_close=1` |
+| Asterinas PageCache | 关（O_DIRECT 守底） |
+| speculative direct-read 数据 cache | 关（`direct_read_cache=0`，诚实口径） |
+| extent 映射缓存 | 开（ext4 case 默认启用） |
+| inode 元数据缓存 | 开（ext4 case 默认启用） |
+| host page cache 基线 | drop 公平基线 |
+| 对照方式 | 每个 `bs`、target、rw 组合都与 Linux 对比 |
+| 诊断目的 | 找 direct I/O 块大小拐点，确认小块和大块 before/after 收益 |
+
+Cache 使用情况：
+
+| cache 类型 | 是否使用 | 说明 |
+|------------|----------|------|
+| fio / 文件 PageCache | 否 | 全部 `bs` 组合均为 `direct=1` |
+| Asterinas ext4 PageCache | 否 | O_DIRECT 守底路径不依赖 PageCache |
+| Asterinas ext4 direct-read 数据 cache | 否 | 本次硬编码关闭 |
+| Asterinas extent / inode 元数据缓存 | ext4 case 使用 | Phase 5 小块读收益主要来自这两类元数据缓存 |
+| Linux ext4 PageCache | 否 | Linux 对照同样 `direct=1`，并使用 drop 口径 |
+| raw block cache | 不使用文件 cache | raw case 走块设备直接 I/O 对照 |
 
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
@@ -186,6 +293,26 @@
 
 ### D 组
 
+参数：
+
+| 子组 | `direct` | Asterinas PageCache | speculative direct-read 数据 cache | `rw` | `bs` | `numjobs` | 目标 |
+|------|---------:|--------------------:|-----------------------------------:|------|------|----------:|------|
+| D1 | 1 | 关 | 关 | `write`, `read` | 1M | 1 | O_DIRECT cache-off 守底 |
+| D2 | 0 | 关 | 关 | `write`, `read-cold`, `read-warm` | 1M | 1 | buffered 旧路径 / PageCache-off 对照 |
+| D3 | 0 | 开 | 关 | `write`, `read-cold`, `read-warm` | 1M | 1 | buffered PageCache-on |
+| D4 | 1 | 开 | 关 | `write`, `read` | 1M | 1 | direct 与 PageCache coherency 守底 |
+
+共同参数：测试对象为 ext4 journaled regular file；`fsync=none`，仅保留 `fsync_on_close=1`；extent 映射缓存和 inode 元数据缓存按 Phase 5 默认启用；host page cache 基线使用 drop 公平口径；每项均与 Linux ext4 对比。
+
+Cache 使用情况：
+
+| 子组 | fio / 文件 PageCache | Asterinas ext4 PageCache | direct-read 数据 cache | extent / inode 元数据缓存 | Linux PageCache | 说明 |
+|------|----------------------|--------------------------|------------------------|---------------------------|-----------------|------|
+| D1 | 否 | 否 | 否 | 是 | 否 | `direct=1,page_cache=0`，纯 O_DIRECT 守底 |
+| D2 | 是 | 否 | 否 | 是 | 是 | `direct=0,page_cache=0`，buffered I/O 但 Asterinas PageCache 关闭 |
+| D3 | 是 | 是 | 否 | 是 | 是 | `direct=0,page_cache=1`，专门测试 PageCache-on buffered 路径 |
+| D4 | 理论上否 | 是 | 否 | 是 | 理论上否 | `direct=1,page_cache=1`，测试 PageCache 开启时 O_DIRECT 是否受 coherency 协议拖累 |
+
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
 | D1-write | ext4 | journaled | write | 1M | 1 | none | 2816.0 | 3354.0 | 83.96% |
@@ -200,6 +327,36 @@
 | D4-read | ext4 | journaled | read | 1M | 1 | none | 3994.0 | 4233.0 | 94.35% |
 
 ### E 组
+
+参数：
+
+| 参数项 | 取值 |
+|--------|------|
+| 测试对象 | raw `/dev/vda`, ext4 journaled, ext4 nojournal |
+| `rw` | `write` |
+| `direct` | `1` |
+| `bs` | `16K`, `1M` |
+| `numjobs` | `1` |
+| `fsync` | `none`, `4`, `16`, `64` |
+| Asterinas PageCache | 关（O_DIRECT 守底） |
+| speculative direct-read 数据 cache | 关（`direct_read_cache=0`，诚实口径） |
+| extent 映射缓存 | 开（ext4 case 默认启用） |
+| inode 元数据缓存 | 开（ext4 case 默认启用） |
+| host page cache 基线 | drop 公平基线 |
+| 对照方式 | 每个 fsync 周期分别与 Linux 对比 |
+| 诊断目的 | 观察 durable write / flush / fsync 频率对吞吐的影响 |
+| 注意 | fsync-heavy 结果只用于语义成本分析，不作为普通顺序吞吐主结论 |
+
+Cache 使用情况：
+
+| cache 类型 | 是否使用 | 说明 |
+|------------|----------|------|
+| fio / 文件 PageCache | 否 | 全部 fsync 组合均为 `direct=1` |
+| Asterinas ext4 PageCache | 否 | O_DIRECT 守底路径不依赖 PageCache |
+| Asterinas ext4 direct-read 数据 cache | 否 | 本组只测 write，仍保持关闭 |
+| Asterinas extent / inode 元数据缓存 | ext4 case 使用 | Phase 5 默认缓存口径 |
+| Linux ext4 PageCache | 否 | Linux ext4 对照同样 `direct=1`，并使用 drop 口径 |
+| raw block cache | 不使用文件 cache | raw case 走 `/dev/vda`，fsync/flush 用于块设备或文件持久化成本对照 |
 
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
@@ -229,6 +386,35 @@
 | E-ext4n-1M-64 | ext4 | nojournal | write | 1M | 1 | 64 | 912.0 | 941.0 | 96.92% |
 
 ### F 组
+
+参数：
+
+| 参数项 | 取值 |
+|--------|------|
+| 测试对象 | raw `/dev/vda`, ext4 journaled, ext4 nojournal |
+| `rw` | `write`, `read` |
+| `direct` | `1` |
+| `bs` | `1M` |
+| `numjobs` | `1`, `2`, `4` |
+| `fsync` | `none`，仅保留 `fsync_on_close=1` |
+| Asterinas PageCache | 关（O_DIRECT 守底） |
+| speculative direct-read 数据 cache | 关（`direct_read_cache=0`，诚实口径） |
+| extent 映射缓存 | 开（ext4 case 默认启用） |
+| inode 元数据缓存 | 开（ext4 case 默认启用） |
+| host page cache 基线 | drop 公平基线 |
+| 对照方式 | 每个 `numjobs`、target、rw 组合都与 Linux 对比 |
+| 诊断目的 | 判断并发提交能力，定位 raw 能 scale 但 ext4 写不 scale 的串行化瓶颈 |
+
+Cache 使用情况：
+
+| cache 类型 | 是否使用 | 说明 |
+|------------|----------|------|
+| fio / 文件 PageCache | 否 | 全部 `numjobs` 组合均为 `direct=1` |
+| Asterinas ext4 PageCache | 否 | O_DIRECT 守底路径不依赖 PageCache |
+| Asterinas ext4 direct-read 数据 cache | 否 | 本次硬编码关闭 |
+| Asterinas extent / inode 元数据缓存 | ext4 case 使用 | Phase 5 默认缓存口径；并发写下需关注失效和锁竞争 |
+| Linux ext4 PageCache | 否 | Linux ext4 对照同样 `direct=1`，并使用 drop 口径；读侧仍可能受 Linux readahead/cache 假象影响 |
+| raw block cache | 不使用文件 cache | raw case 用于块设备并发提交能力对照 |
 
 | case | target | journal | rw | bs | nj | fsync | Asterinas MB/s | Linux MB/s | ratio |
 |------|--------|---------|----|----|----|-------|---------------:|-----------:|------:|
