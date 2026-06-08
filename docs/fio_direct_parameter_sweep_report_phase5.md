@@ -142,6 +142,16 @@
 - **原因**：Phase 5 把 ext4 direct-write 路径优化得很好（extent 映射缓存等），而 Asterinas 的裸块设备写路径未享此优化、per-request 开销更高；我们的 ext4 反而绕过了它。
 - **两个含义**：①"裸盘地板"其实**偏悲观**——raw fio 路径本身在 Asterinas 上不够优化，**ext4 绝对吞吐更代表真实设备能力**；②这是平台/块层观察（Asterinas 裸设备写路径待优化），应同步田老师。结论方向（剩余差距在 virtio 平台层）不变，但"裸盘=干净地板"的 framing 需修正。
 
+### 8.5.2 根因实证：裸路径多一次拷贝（2026-06-09 profile + 代码）
+
+**代码层**（拷贝次数不对称）：
+- ext4 O_DIRECT 写（`fs.rs::submit_direct_write_mappings`）：`BioSegment::alloc_inner` → 拷贝(用户→segment) → `write_blocks_async`。**1 分配 + 1 拷贝。**
+- 裸盘写（`device/registry/block.rs::OpenBlockFile::write_at` → `comps/block::BlockDevice::write`）：`vec![0u8; aligned_len]`（分配+memset 零初始化）→ 拷贝(用户→aligned) → `BlockDevice::write` 内 `BioSegment::alloc_inner` + 拷贝(aligned→segment) + `submit_and_wait`。**2 分配 + 1 次零初始化 + 2 拷贝**（对齐写时零初始化纯浪费）。
+
+**profile 层**（ext4 已无软件开销，门控 `ext4fs.phase2_profile=1`）：ext4 4K 写 `avg_bio_copy_us=0`、`avg_bio_wait_us=29`、`avg_total_us=31`、block 层 `avg_device_wait_us=20`——**几乎全是设备往返，ext4 软件开销 ≈0**。（裸盘侧因测试时未挂 ext4、全局 bio profile 开关未开，未采到；但同一 `/dev/vda` 设备往返相同，故裸盘多出的时间即上述多余分配+拷贝。）
+
+**结论**：ext4 > 裸盘是真实可复现且**可解释**的——不是 ext4 魔法，是 **Asterinas 裸块设备写路径（`OpenBlockFile::write_at`）的"中间对齐缓冲 + 二次拷贝"朴素实现**有多余开销，而 ext4 direct-write 已优化成单拷贝直提交绕过它。Linux 裸路径是零拷贝 DMA 故 raw>ext4（常态）。这是平台层明确的可优化点（裸路径做零拷贝/对齐快路径即可回到 ext4 之上）。
+
 ## 9. 完整数据表（96 case，2026-06-05）
 
 > 口径：`direct=1`，`ioengine=sync`，`size=1G`，`ramp_time=60`，`runtime=100`，`fsync_on_close=1`；speculative 数据 cache 关、extent_map + inode 元数据缓存开、drop 公平基线。ratio = Asterinas / Linux。
