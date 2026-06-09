@@ -90,25 +90,65 @@ Phase 6 承接 feature_perf_phase5（O_DIRECT 读写守底已收口 75–123%，
 
 **验收：** 一张"SQLite TOTAL 时间归因表"（含 ext4/ext2/ramfs 三角 + 四层 profile），明确剩余时间里"逐页 journaled 分配 + 逐 4KB bio"占多少、其中多少是 ext4 可优化 vs 平台地板 → 定 delalloc / 批量化的预期上限。
 
-## Step 1：定位 → 选优化点
+## Step 1：定位 → 选优化点（已定档，2026-06-09）
 
-**状态：** 待执行（依赖 Step 0 数据）
+**状态：** ✅ 已完成。Step 0 归因表（见 milestone）+ 两次失败尝试已把方向钉死。
 
-分支决策：
-- 若**慢在逐页 journaled 分配**（每页一 handle/锁/映射占大头）→ 主攻 ①delalloc 或 ②批量化（按风险选）。
-- 若**慢在逐 4KB bio 往返**（writeback 没合并大 bio）→ delalloc 的"批量分配大 extent + 大 bio"同时解决。
-- 若**慢在每事务 fsync 同步**（commit 往返占大头）→ 加 ③group commit 评估（需与学长对齐 crash 语义）。
+**Step 0 归因**（profile run，占比对总）：快路径覆盖（每写 `ext4_map_blocks` 全 extent 树遍历 + 全局 `EXT4_RS_RUNTIME_LOCK`）**41%** + 慢路径每页 journaled 分配 **32%** + 每 COMMIT 的 journal-commit/fsync + 逐 4KB bio **24%**；virtio 平台往返仅数十 s（薄地板）。三 FS 三角：ext4 3.02% / ext2 94.91% / ramfs 95.87% → **损失几乎全在 ext4 写路径，平台不背锅**。
 
-**与学长对齐项**：delalloc 改写时机/ENOSPC 语义、group commit 改 fsync 时序——都触及崩溃恢复正确性，动手前过一遍。
+**两次失败尝试（记录教训，不可重蹈）：**
+1. **2a：缓存覆盖写的映射检查**（前缀/窗口 cache，3 个变体）→ **死路**。SQLite B 树散点 + truncate 扩容 → 任何前缀 cache 命中率 0.005%；whole-file extent-list 在碎片文件上 >MAX_CACHED_EXTENTS → 每 miss 重走整文件 → 灾难性回退（被 tripwire 在 commit 前抓住，已回退）。**结论：那 41% 必须"去掉检查"而非"缓存检查"。**
+2. **2b-1：直接去掉 size 以内的映射检查**（让写回分配）→ **540s OOM 崩溃**。去掉检查后，size 以内填空洞的写不再在 write() 时分配，磁盘满（free_blocks=1637）时写回分配失败 → 脏页无法 drain → 内核堆耗尽。**结论：块预留（reservation）是必须的，不是可选——这正是完整 delalloc 的核心。**
 
-## Step 2：实施优化（主线 delalloc / 备选批量化）
+**最终定档 = 完整 Linux delalloc**（写时预留 + 写回批量分配 + 脏页节流），保稀疏语义、收益最大、最正统。详见 Step 2 分阶段计划。
 
-**状态：** 待执行（手段待 Step 0/1 定档）
+**已读码确认的架构事实（Step 2 实现依据）：**
+- **fsync 链已 delalloc-friendly**：`Ext4Inode::sync_all` → `sync_page_cache_for_inode`（`evict_all` → 逐页 `write_page_async` → `write_page_cache_data_at` → `run_journaled_ext4(ext4_write_at)`，`ext4_write_at` 经 `ensure_write_range_mapped` **按需分配**）→ `fsync_regular_file`（journal force-commit）→ `block_device().sync()`（设备 flush）。即「fsync 强制延迟页落盘 + 日志 + flush」已天然满足。
+- **写回是逐页的**：`page_cache.rs::evict_range` 对 `[start,end)` 逐 idx 调 `write_page_async` → 逐 4KB bio（24% 桶）；要大 bio 需新增按 run 的批量写回路径。
+- **分配无批量**：`ensure_write_range_mapped` 的 `WRITE_PREALLOC_BLOCKS=1`，逐块分配（32% 桶）。
+- **可预留**：`super_block.free_blocks_count()` 可查；`decrease/increase_free_blocks_count` 已有 → 预留可用「一个内存 `delayed_reserved_blocks` 原子计数叠在 free_blocks 之上」实现。
+- **OOM 已有界基建**：Phase 5 的 `JOURNAL_CHECKPOINT_MAX_DEPTH` bound 了 journal/checkpoint 内存；2b-1 的 OOM 是**脏页**侧（非 journal 侧），需脏页节流补位。
 
-实施原则（继承 Phase 5）：
-- 最小改动、默认行为安全；delayed 块的 ENOSPC 必须预留（不能 writeback 时才发现没空间丢数据）；
-- 参考 ext2 / Linux ext4 delalloc 语义；writeback 批量分配要与 extent 树、PageCache 脏页、JBD2 一致；
-- 每个中间态可守底、可回退；HEAD（含 Phase 5 全部修复）为安全基线。
+**与学长对齐项（动手阶段 1/2 前过一遍）**：① 写时块预留的 ENOSPC 语义（过预留导致的提前 ENOSPC 是否可接受）；② 写回批量分配改 journal 事务边界、与 crash 恢复的一致性；③ 脏页节流阈值。
+
+## Step 2：实施优化 —— 完整 delalloc，分阶段（主线）
+
+**状态：** 🔄 进行中（按下列 Stage 0→3 顺序执行，每 Stage 独立守底 + 可回退 + 存档 commit）。
+
+**总原则**：每个 Stage 都是一个能编译、能跑、能守底、能回退的中间态；HEAD（Step 0 存档 `8394f31a6`，含 Phase 5 全部修复）为安全基线；任一守底 / `integrity_check` / O_DIRECT 守底回退 = 该 Stage 改错，立即回退。**铁律：不为提速砍日志。**
+
+### Stage 0：OOM 根因确认（只读诊断，先做）
+
+- **目标**：用只读 instrument（脏页数 / 待写回页数 / 预留缺口 / 当前 free_blocks）+ 短复现，确认 2b-1 的 OOM 是「磁盘满 → 脏页堆积」而非「journal/checkpoint 内存增长」。
+- **为什么先做**：决定 delalloc 是否被一个 journal-内存暗坑直接打死；便宜（崩在 ~540s，十几分钟）。
+- **涉及文件**：`kernel/src/fs/ext4/fs.rs`（只读计数器，门控 `phase2_profile`）。
+- **验收**：明确 OOM 归因；若确属脏页侧 → Stage 1 的预留 + 节流可根治，delalloc 放行。
+
+### Stage 1：写时预留 + 延迟写（攻 41%，保 ENOSPC，防 OOM）
+
+- **目标**：`write_at_page_cache` 改为「纯页缓存写 + 块预留 + （追加时）journaled size 更新」，**去掉每写的 `ext4_map_blocks` 检查和 `ext4_prepare_write_at` 分配**。分配全部推迟到写回。
+- **机制**：
+  - 新增内存计数 `delayed_reserved_blocks`（原子）。write() 对其将脏的页**悲观预留**（每脏一页预留 1 块；已脏页不重复预留——用 PageCache 脏位判断 clean→dirty 跃迁）；若 `free_blocks_count - delayed_reserved_blocks < 需求` → 立即返回 `ENOSPC`（语义正确）。
+  - 写回 `write_page_cache_data_at` 分配成功后 **释放对应预留**（真分配的从 free_blocks 扣、预留归还）；覆盖写（本就已分配）也归还预留（over-reserve true-up，照 Linux）。
+  - **脏页节流**：当 `delayed_reserved_blocks` / 脏页数超阈值，write() 先触发该 inode 的 `evict`（写回 drain）再接受新写 → bound 内存，根治 2b-1 的 OOM。
+  - 追加（write_end > cur_size）：仍需 journaled **size 更新**（不分配块，轻量），保证 stat/读/写回看到正确 size。
+- **涉及文件**：`kernel/src/fs/ext4/fs.rs`（`write_at_page_cache`、预留计数、节流、`write_page_cache_data_at` 释放）；可能 `kernel/src/fs/utils/page_cache.rs`（脏位/写回钩子）；`kernel/libs/ext4_rs`（free_blocks 查询接口，若缺）。
+- **ENOSPC / 崩溃**：预留保证 write() 正确报满；未 fsync 的延迟数据崩溃丢失 = POSIX 合法；fsync 链已强制落盘+日志+flush。
+- **验收门控**：build → SQLite（41% 是否消失？是否不再 OOM 跑完？`integrity_check` PASS）→ 完整守底矩阵（重点 ENOSPC / 稀疏 / crash matrix）→ 绿则 commit 存档。
+- **预期**：SQLite TOTAL 显著下降（吃掉 41%）；32%/24% 仍在（Stage 2 攻）。
+
+### Stage 2：写回批量分配 + 大 bio（攻 32% + 24%）
+
+- **目标**：写回时把一个 inode 的**连续延迟脏页**合并 → **一次 `run_journaled_ext4` 分配一大段 extent**（`ensure_write_range_mapped` 按 run 长度分配 / 提高 prealloc）→ **一个大 bio**。
+- **机制**：新增按 run 的批量写回路径（`evict_range` 传区间给 backend，或 backend 侧合并连续脏页）；批量分配走单个 journaled 事务（与 alloc_guard / JBD2 handle 协议一致）；大 bio 替代逐 4KB。
+- **涉及文件**：`kernel/src/fs/ext4/fs.rs`（批量写回）；`kernel/src/fs/utils/page_cache.rs`（区间写回 API）；`kernel/libs/ext4_rs`（按 run 分配 / prealloc）；`kernel/comps/block`（大 bio 提交，复用 Phase 5 路径）。
+- **崩溃**：写回分配改 journal 事务边界 → **必过 crash matrix + `integrity_check`**。
+- **验收门控**：build → SQLite（32%/24% 是否下降？）→ 完整守底 + crash matrix → 绿则 commit。
+
+### Stage 3：调参 + 硬化 + 收口
+
+- **目标**：调脏页节流阈值 / prealloc 大小；复跑完整守底 + crash matrix + O_DIRECT 守底（不回退）；SQLite 终测出诚实 TOTAL（error 口径）+ 逐写类前后表。
+- **验收**：守底全绿 + `integrity_check` PASS + O_DIRECT 75–123% 不回退 + SQLite ≥5% 提升量化 → milestone 收口。
 
 ## Step 3：全量回归 + SQLite 重测收口
 

@@ -10,9 +10,20 @@
 | Step | 内容 | 状态 |
 |------|------|------|
 | Step 0 | 起点固化 & SQLite profile 盘点（含 Step 0a 三 FS 诊断三角 ext4/ext2/ramfs）| ✅ 已完成：三角 + 四层 profile 归因表出齐（见下）|
-| Step 1 | 定位 → 选优化点（delalloc / 批量化 / group commit）| ✅ 定档：主线 delalloc（write 纯页缓存化 + writeback 批量分配/大 bio），次线 commit/fsync 合并 |
-| Step 2 | 实施优化（主线 delalloc）| ⏳ 待执行 |
+| Step 1 | 定位 → 选优化点 | ✅ 定档：完整 delalloc（写时预留 + 写回批量分配 + 脏页节流）。记录 2a（缓存检查→死路 0.005% 命中）/ 2b-1（去检查→540s OOM，证明预留必须）两次失败教训 |
+| Step 2 | 实施 delalloc，分阶段 | 🔄 进行中：Stage 0 OOM 根因诊断 → Stage 1 写时预留+延迟写（攻 41%）→ Stage 2 写回批量分配+大 bio（攻 32%/24%）→ Stage 3 调参收口。详见 plan |
 | Step 3 | 全量回归 + SQLite 重测收口 | ⏳ 待执行 |
+
+### Step 2 分阶段（详见 `feature_sqlite_phase6_plan.md` §Step 2）
+
+| Stage | 目标 | 攻哪个桶 | 门控 |
+|-------|------|---------|------|
+| 0 | 只读诊断确认 OOM 根因（脏页堆积 vs journal 内存）| — | 放行判定 |
+| 1 | 写时块预留 + 延迟写（去掉每写 map 检查/prepare）+ 脏页节流 | 41% + 防 OOM + ENOSPC 正确 | SQLite 不 OOM 跑完 + integrity + 守底矩阵 |
+| 2 | 写回合并连续脏页：一次 journaled 大 extent 分配 + 大 bio | 32% + 24% | crash matrix + integrity |
+| 3 | 调参 + 硬化 + 诚实 TOTAL 终测 | — | 守底全绿 + O_DIRECT 不回退 + ≥5% 量化 |
+
+**安全基线**：HEAD `8394f31a6`（Step 0 instrument + 诊断，含 Phase 5 全部修复），任一阶段回退即退到此。
 
 ## Phase 6 起点基线（继承 Phase 5 收口，2026-06-07）
 
