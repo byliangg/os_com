@@ -192,6 +192,28 @@ struct DirectWriteProfileStats {
     max_miss_total_ns: AtomicU64,
 }
 
+/// Read-only Phase 6 probe for the buffered (page-cache) write path
+/// (`write_at_page_cache`) — the path SQLite takes under `page_cache=1`. Splits
+/// the per-`write()` cost into the overwrite fast path (no block allocation) vs
+/// the append/sparse slow path (journaled allocation via `run_journaled_ext4` +
+/// `ext4_prepare_write_at`), so Step 0 can attribute SQLite write time to
+/// "new-allocation journaled prepare" vs "in-place overwrite", and confirm how
+/// many disk blocks the slow path allocates. Gated by `ext4fs.phase2_profile`;
+/// off by default so guard regressions see no extra work.
+struct BufferedWriteProfileStats {
+    calls: AtomicU64,
+    fast_calls: AtomicU64,
+    fast_bytes: AtomicU64,
+    fast_ns: AtomicU64,
+    slow_calls: AtomicU64,
+    slow_bytes: AtomicU64,
+    slow_blocks: AtomicU64,
+    slow_prepare_ns: AtomicU64,
+    slow_ns: AtomicU64,
+    max_slow_ns: AtomicU64,
+    max_slow_prepare_ns: AtomicU64,
+}
+
 #[derive(Default)]
 struct DirectWriteBioCallProfile {
     mappings: u64,
@@ -325,6 +347,59 @@ impl DirectReadProfileStats {
             match self.max_mapped_bytes.compare_exchange_weak(
                 current,
                 mapped_bytes,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl BufferedWriteProfileStats {
+    const fn new() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            fast_calls: AtomicU64::new(0),
+            fast_bytes: AtomicU64::new(0),
+            fast_ns: AtomicU64::new(0),
+            slow_calls: AtomicU64::new(0),
+            slow_bytes: AtomicU64::new(0),
+            slow_blocks: AtomicU64::new(0),
+            slow_prepare_ns: AtomicU64::new(0),
+            slow_ns: AtomicU64::new(0),
+            max_slow_ns: AtomicU64::new(0),
+            max_slow_prepare_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn record_fast(&self, bytes: usize, elapsed_ns: u64) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.fast_calls.fetch_add(1, Ordering::Relaxed);
+        self.fast_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.fast_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+    }
+
+    fn record_slow(&self, bytes: usize, blocks: u64, prepare_ns: u64, elapsed_ns: u64) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.slow_calls.fetch_add(1, Ordering::Relaxed);
+        self.slow_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.slow_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.slow_prepare_ns.fetch_add(prepare_ns, Ordering::Relaxed);
+        self.slow_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        Self::bump_max(&self.max_slow_ns, elapsed_ns);
+        Self::bump_max(&self.max_slow_prepare_ns, prepare_ns);
+    }
+
+    fn bump_max(field: &AtomicU64, value: u64) {
+        let mut current = field.load(Ordering::Relaxed);
+        while value > current {
+            match field.compare_exchange_weak(
+                current,
+                value,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -1149,6 +1224,7 @@ pub(super) struct Ext4Fs {
     direct_write_profile_started: AtomicBool,
     direct_read_profile: DirectReadProfileStats,
     direct_write_profile: DirectWriteProfileStats,
+    buffered_write_profile: BufferedWriteProfileStats,
     runtime_lock_stats: Ext4RsRuntimeLockStats,
     journaled_op_profile: JournaledOpProfileStats,
     fs_event_subscriber_stats: FsEventSubscriberStats,
@@ -1200,6 +1276,7 @@ impl Ext4Fs {
             direct_write_profile_started: AtomicBool::new(false),
             direct_read_profile: DirectReadProfileStats::new(),
             direct_write_profile: DirectWriteProfileStats::new(),
+            buffered_write_profile: BufferedWriteProfileStats::new(),
             runtime_lock_stats: Ext4RsRuntimeLockStats::new(),
             journaled_op_profile: JournaledOpProfileStats::new(),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -2314,8 +2391,51 @@ impl Ext4Fs {
         self.maybe_log_direct_write_profile(writes, true);
         let reads = self.direct_read_profile.read_calls.load(Ordering::Relaxed);
         self.maybe_log_direct_read_profile(reads, true);
+        self.dump_buffered_write_profile();
         dump_write_bio_profile();
         dump_read_bio_profile();
+    }
+
+    /// Phase 6 buffered-write attribution: emits one snapshot of the
+    /// page-cache write path split into overwrite fast path vs append/alloc slow
+    /// path (the SQLite `page_cache=1` write profile). No-op unless
+    /// `ext4fs.phase2_profile=1`.
+    fn dump_buffered_write_profile(&self) {
+        if !self.phase2_profile_enabled {
+            return;
+        }
+        let p = &self.buffered_write_profile;
+        let calls = p.calls.load(Ordering::Relaxed);
+        if calls == 0 {
+            return;
+        }
+        let fast_calls = p.fast_calls.load(Ordering::Relaxed);
+        let fast_bytes = p.fast_bytes.load(Ordering::Relaxed);
+        let fast_ns = p.fast_ns.load(Ordering::Relaxed);
+        let slow_calls = p.slow_calls.load(Ordering::Relaxed);
+        let slow_bytes = p.slow_bytes.load(Ordering::Relaxed);
+        let slow_blocks = p.slow_blocks.load(Ordering::Relaxed);
+        let slow_prepare_ns = p.slow_prepare_ns.load(Ordering::Relaxed);
+        let slow_ns = p.slow_ns.load(Ordering::Relaxed);
+        let avg_us = |sum: u64, n: u64| if n == 0 { 0 } else { sum / n / 1_000 };
+
+        warn!(
+            "[ext4-bufw] calls={} fast_calls={} fast_bytes={} avg_fast_us={} slow_calls={} slow_bytes={} slow_blocks={} avg_slow_prepare_us={} avg_slow_us={} total_slow_ms={} total_slow_prepare_ms={} total_fast_ms={} max_slow_prepare_us={} max_slow_us={}",
+            calls,
+            fast_calls,
+            fast_bytes,
+            avg_us(fast_ns, fast_calls),
+            slow_calls,
+            slow_bytes,
+            slow_blocks,
+            avg_us(slow_prepare_ns, slow_calls),
+            avg_us(slow_ns, slow_calls),
+            slow_ns / 1_000_000,
+            slow_prepare_ns / 1_000_000,
+            fast_ns / 1_000_000,
+            p.max_slow_prepare_ns.load(Ordering::Relaxed) / 1_000,
+            p.max_slow_ns.load(Ordering::Relaxed) / 1_000,
+        );
     }
 
     fn maybe_log_phase2_debug_stats(&self, runtime_lock_acquires: u64) {
@@ -4658,6 +4778,16 @@ impl Ext4Fs {
             return Ok(0);
         }
 
+        // Phase 6 read-only probe: time the whole per-write() path so Step 0 can
+        // split SQLite buffered-write cost into overwrite fast path vs
+        // append/alloc slow path. No-op unless `ext4fs.phase2_profile=1`.
+        let profile_enabled = self.phase2_profile_enabled;
+        let call_start_ns = if profile_enabled {
+            Self::monotonic_nanos()
+        } else {
+            0
+        };
+
         let mut data = vec![0u8; write_len];
         reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
 
@@ -4680,12 +4810,23 @@ impl Ext4Fs {
             self.invalidate_direct_read_cache(ino);
             let page_cache = self.page_cache_state_for_inode(ino, cur_size)?.pages();
             page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
+            if profile_enabled {
+                self.buffered_write_profile.record_fast(
+                    write_len,
+                    Self::monotonic_nanos().saturating_sub(call_start_ns),
+                );
+            }
             return Ok(write_len);
         }
 
         // Slow path: append / sparse / unmapped range — needs journaled allocation.
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::for_small_write(ino, offset, data.as_slice());
+        let prepare_start_ns = if profile_enabled {
+            Self::monotonic_nanos()
+        } else {
+            0
+        };
         let mappings = self
             .run_journaled_ext4(op, |ext4| {
                 let mappings = ext4
@@ -4709,6 +4850,11 @@ impl Ext4Fs {
                 }
                 err
             })?;
+        let prepare_ns = if profile_enabled {
+            Self::monotonic_nanos().saturating_sub(prepare_start_ns)
+        } else {
+            0
+        };
         self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
 
         self.invalidate_direct_read_cache(ino);
@@ -4716,6 +4862,15 @@ impl Ext4Fs {
         let file_size = self.stat(ino)?.size as usize;
         let page_cache = self.page_cache_state_for_inode(ino, file_size)?.pages();
         page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
+        if profile_enabled {
+            let blocks: u64 = mappings.iter().map(|m| u64::from(m.len)).sum();
+            self.buffered_write_profile.record_slow(
+                write_len,
+                blocks,
+                prepare_ns,
+                Self::monotonic_nanos().saturating_sub(call_start_ns),
+            );
+        }
         Ok(write_len)
     }
 
