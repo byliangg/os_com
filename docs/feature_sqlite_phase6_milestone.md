@@ -25,6 +25,20 @@
 
 **安全基线**：HEAD `8394f31a6`（Step 0 instrument + 诊断，含 Phase 5 全部修复），任一阶段回退即退到此。
 
+### Stage 0 结果（OOM 根因，2026-06-09）
+
+口径：临时复现 2b-1（去 size 内 map 检查）+ 只读 instrument（`[ext4-phase2]` 增 `checkpoint_depth` 与 `bufw_dirty_backlog_kb`），跑到 OOM（guest 537s）。日志 `benchmark/logs/sqlite_phase6_stage0_oom/`。
+
+| 指标 | 趋势到 OOM | 结论 |
+|------|-----------|------|
+| `checkpoint_depth`（日志内存）| **有界**，0–58 抖动、多在 <15 | Phase 5 的 `JOURNAL_CHECKPOINT_MAX_DEPTH` 生效，**非 OOM 原因** |
+| `bufw_dirty_backlog_kb`（页缓存脏数据）| **无界**，涨到 ~9.6 GB（VM 仅 8 GB）→ 堆耗尽 | **OOM 真因** |
+
+**定论**：OOM 是**页缓存脏页超过内存**，不是日志内存、也不是磁盘满（free_blocks ~16k，充足；早先「磁盘满」是我误读截断行）。机理：去掉每写检查后写变快 → 写入(生产)速度超过写回(消费,仅 fsync 时 drain) → 脏页堆积。原检查的慢充当了隐式背压。
+
+**对 Stage 1 的指导（已确认）**：① **脏页节流**（脏量超阈值即强制写回，相当于 Linux `balance_dirty_pages`）是 OOM 的**必需修复**；② **块预留**独立解决 ENOSPC。两者都在 plan Stage 1 内。诊断 instrument（`writeback_bytes` + phase2 两字段，只读、`phase2_profile` 门控）保留，用于 Stage 1 观察节流是否生效。
+- 注：backlog 指标对「同页多次改写」会重复计数 → 实际脏内存 ≤ 9.6 GB；但「无界增长且超 RAM」+「日志有界」这一对比是定论依据。
+
 ## Phase 6 起点基线（继承 Phase 5 收口，2026-06-07）
 
 口径：`page_cache=1`，`sqlite-speedtest1 --size 1000 /ext4/test.db`，drop_caches 公平基线，Linux 同口径。

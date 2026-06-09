@@ -212,6 +212,11 @@ struct BufferedWriteProfileStats {
     slow_ns: AtomicU64,
     max_slow_ns: AtomicU64,
     max_slow_prepare_ns: AtomicU64,
+    // Stage 0 OOM diagnosis: total bytes written back to disk by the page-cache
+    // writeback path (`write_page_cache_data_at`). Outstanding dirty data ≈
+    // (fast_bytes + slow_bytes) − writeback_bytes; if that grows unbounded toward
+    // an OOM the cause is page-cache dirty pages, not journal memory.
+    writeback_bytes: AtomicU64,
 }
 
 #[derive(Default)]
@@ -371,6 +376,7 @@ impl BufferedWriteProfileStats {
             slow_ns: AtomicU64::new(0),
             max_slow_ns: AtomicU64::new(0),
             max_slow_prepare_ns: AtomicU64::new(0),
+            writeback_bytes: AtomicU64::new(0),
         }
     }
 
@@ -2475,7 +2481,7 @@ impl Ext4Fs {
         };
 
         warn!(
-            "[ext4-phase2] runtime_lock_acquires={} avg_wait_us={} max_wait_us={} avg_hold_us={} max_hold_us={} journaled_ops={} mkdir_ops={} rmdir_ops={} write_ops={} avg_start_handle_us={} avg_apply_us={} avg_finish_handle_us={} avg_finish_alloc_us={} avg_finish_io_us={} avg_total_us={} max_apply_ms={} max_finish_handle_ms={} max_total_ms={} jbd2_handles_started={} finished={} max_active={} avg_active_x100={} max_running_handles={} max_running_reserved={} max_running_metadata={} rotations={} commits_prepared={} commits_finished={} checkpoints={} overlay_reads={} overlay_hits={} metadata_writes={} alloc_clear_calls={} alloc_reserve_calls={} alloc_reserved_blocks={} alloc_contains_checks={} alloc_max_operation_blocks={}",
+            "[ext4-phase2] runtime_lock_acquires={} avg_wait_us={} max_wait_us={} avg_hold_us={} max_hold_us={} journaled_ops={} mkdir_ops={} rmdir_ops={} write_ops={} avg_start_handle_us={} avg_apply_us={} avg_finish_handle_us={} avg_finish_alloc_us={} avg_finish_io_us={} avg_total_us={} max_apply_ms={} max_finish_handle_ms={} max_total_ms={} jbd2_handles_started={} finished={} max_active={} avg_active_x100={} max_running_handles={} max_running_reserved={} max_running_metadata={} rotations={} commits_prepared={} commits_finished={} checkpoints={} overlay_reads={} overlay_hits={} metadata_writes={} alloc_clear_calls={} alloc_reserve_calls={} alloc_reserved_blocks={} alloc_contains_checks={} alloc_max_operation_blocks={} checkpoint_depth={} bufw_dirty_backlog_kb={}",
             runtime_lock_acquires,
             total_wait_ns / runtime_lock_acquires / 1_000,
             max_wait_ns / 1_000,
@@ -2528,6 +2534,16 @@ impl Ext4Fs {
             alloc_guard_stats.reserved_blocks,
             alloc_guard_stats.contains_checks,
             alloc_guard_stats.max_operation_blocks,
+            self.checkpoint_depth(),
+            {
+                let p = &self.buffered_write_profile;
+                let dirtied = p
+                    .fast_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(p.slow_bytes.load(Ordering::Relaxed));
+                let written = p.writeback_bytes.load(Ordering::Relaxed);
+                dirtied.saturating_sub(written) / 1024
+            },
         );
     }
 
@@ -4929,6 +4945,11 @@ impl Ext4Fs {
             ext4.ext4_write_at(ino, offset, data)
                 .map_err(map_ext4_error)
         })?;
+        if self.phase2_profile_enabled {
+            self.buffered_write_profile
+                .writeback_bytes
+                .fetch_add(written as u64, Ordering::Relaxed);
+        }
         self.invalidate_direct_read_cache(ino);
         Ok(written)
     }
