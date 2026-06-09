@@ -9,7 +9,7 @@
 
 | Step | 内容 | 状态 |
 |------|------|------|
-| Step 0 | 起点固化 & SQLite profile 盘点 | ⏳ 待执行 |
+| Step 0 | 起点固化 & SQLite profile 盘点（含 Step 0a 三 FS 诊断三角 ext4/ext2/ramfs）| ⏳ 待执行 |
 | Step 1 | 定位 → 选优化点（delalloc / 批量化 / group commit）| ⏳ 待执行 |
 | Step 2 | 实施优化（主线 delalloc）| ⏳ 待执行 |
 | Step 3 | 全量回归 + SQLite 重测收口 | ⏳ 待执行 |
@@ -55,6 +55,7 @@
 ## 备注
 
 - 方法论铁律（Phase 5 教训）：**先 profile 再优化**，每个优化点动手前必须有占比数支撑。
+- **Step 0a 三 FS 诊断三角**（harness 已存在：`sqlite/{ext4_speedtest1,ext2_benchmarks,ramfs_benchmarks}`）：ext4 vs ext2 = 我们 journaling/每页分配净代价（可攻）；ext2 vs ramfs = 平台地板（改不动）；ramfs vs Linux = framekernel syscall 开销。**ext2 无日志，是"非日志写回天花板"+ 实现范例，非"ext4 必达目标"——不得为提速砍日志（优秀档功能要求）**。详见 plan §Step 0a。
 - 主线先验 = delalloc（延迟分配）；备选 = 慢路径 journaled prepare 批量化（更轻、可作中间收益/回退）。
 - delalloc / group commit 触及持久化语义，必须过 crash matrix + `integrity_check`。
 - HEAD（含 Phase 5 全部修复：A1 / B / 覆盖写快路径）为随时回退安全基线。

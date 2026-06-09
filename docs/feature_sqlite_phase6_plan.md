@@ -65,7 +65,30 @@ Phase 6 承接 feature_perf_phase5（O_DIRECT 读写守底已收口 75–123%，
 - 复用已有 `Ext4PageCacheBackend::write_page_async` / writeback 路径打点；如缺"分配 vs 覆盖"分流计数，补**只读** instrument（区分慢路径 journaled-alloc 次数/耗时 vs 快路径覆盖次数）。
 - 产出：①各写类 sub-test（100/110/120/150/180/VACUUM）各自耗时；②慢路径每页 journaled-alloc 的 count×avg；③writeback 每页 bio 大小分布（确认是否逐 4KB）。
 
-**验收：** 一张"SQLite TOTAL 时间归因表"，明确剩余时间里"逐页 journaled 分配 + 逐 4KB bio"占多少 → 定 delalloc / 批量化的预期上限。
+### Step 0a：三 FS 诊断三角（ext4 / ext2 / ramfs，harness 已存在，先跑）
+
+在 profile 之前先拿一张**三 FS 同口径对比**，用来判定 2.97% 里多少是"我们 ext4 写路径可优化的"、多少是"平台地板改不动的"——这直接决定 delalloc 该不该重仓。
+
+**harness 已存在，不需新建**（`test/initramfs/src/benchmark/sqlite/` 下三个 case，均 `sqlite-speedtest1 --size 1000`）：
+
+| case | DB 路径 | 隔离出什么 |
+|------|---------|-----------|
+| `ext4_speedtest1` | `/ext4/test.db` | 我们的 ext4（journaled）= 现状 2.97% |
+| `ext2_benchmarks` | `/ext2/test.db` | ext2 参考实现（PageCache buffered，**无 journaling**）|
+| `ramfs_benchmarks` | `/tmp/test.db` | tmpfs 纯内存（无块设备）|
+
+跑法：`bench_linux_and_aster.sh sqlite/ext2_benchmarks x86_64` / `sqlite/ramfs_benchmarks x86_64`（与 ext4 同；可把 `run_sqlite_summary.sh` 泛化成 `FS_LIST="ext4 ext2 ramfs"` 一条命令三发，待 Step 0 落地时决定）。三个都对 Linux 同口径 drop_caches。
+
+**诊断三角**（差值的含义）：
+- **ext4 vs ext2** = 我们 journaling + 每页 journaled 分配的**净代价**（← Phase 6 真正可攻、可优化的那块）；
+- **ext2 vs ramfs** = virtio 块往返 + PageCache 写回的**平台地板**（跨 FS 通用，改不动）；
+- **ramfs vs Linux** = framekernel 每-syscall 开销（更底，改不动）。
+
+**判定**：若 ext2 远高于 ext4（如 ext2 ~40% vs ext4 3%）→ 大头在我们写路径，delalloc 头部空间大、值得重仓；若 ext2 也只有个位数 → 大头是平台墙，delalloc 收益有限，转向更轻的批量化 / 与学长重定方向。
+
+**诚实警告（防误借鉴）**：ext2 **无 journaling**，它快一部分是省了日志成本，**不是"ext4 应追平 ext2"的目标**——ext4 故意为崩溃一致性付日志代价，那是优秀档功能要求，**不得为提速砍日志**。该借鉴的是 ext2 的**写回/分配模式**（buffered write → PageCache → writeback 批量分配大 extent + 大 bio = delalloc 的形状），ext2 是 Asterinas 里这条路做得最正的范例，作 Phase 6 实现参照代码。
+
+**验收：** 一张"SQLite TOTAL 时间归因表"（含 ext4/ext2/ramfs 三角 + 四层 profile），明确剩余时间里"逐页 journaled 分配 + 逐 4KB bio"占多少、其中多少是 ext4 可优化 vs 平台地板 → 定 delalloc / 批量化的预期上限。
 
 ## Step 1：定位 → 选优化点
 
