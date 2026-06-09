@@ -39,6 +39,21 @@
 **对 Stage 1 的指导（已确认）**：① **脏页节流**（脏量超阈值即强制写回，相当于 Linux `balance_dirty_pages`）是 OOM 的**必需修复**；② **块预留**独立解决 ENOSPC。两者都在 plan Stage 1 内。诊断 instrument（`writeback_bytes` + phase2 两字段，只读、`phase2_profile` 门控）保留，用于 Stage 1 观察节流是否生效。
 - 注：backlog 指标对「同页多次改写」会重复计数 → 实际脏内存 ≤ 9.6 GB；但「无界增长且超 RAM」+「日志有界」这一对比是定论依据。
 
+### Stage 1a 结果（2026-06-10）：节流防住 OOM，但**「写途中刷回」损坏数据** —— delalloc 撞平台墙
+
+实现：去掉每写映射检查（41% 提速）+ 脏页节流（脏量超 256MB 即强制写回当前 inode）。结果：
+
+- ✅ **节流防住 OOM**：脏页内存压在 ~261MB（vs 9.6GB），不再 OOM。内存可控。
+- ❌ **数据损坏**：~64s 时 SQLite 报 `database disk image is malformed`。
+
+**根因调查（隔离实验，逐步缩小）：**
+1. **2b-1**（只延迟、只 fsync 写回）→ 不损坏（跑到 OOM）；**Stage 1a**（延迟 + 途中节流写回）→ 损坏 → 罪在「途中写回」。
+2. **隔离实验 A**（**基线写路径** + 每 4096 写强制 `evict_all`）→ **也损坏**（77s）→ 与 delalloc **无关**，是「途中写回」本身的问题。
+3. 代码定位：`evict_all` = 写回 + **`decommit_vmo_range`（释放整文件页帧）**。途中调用会把 SQLite 正在用的页释放掉 → 重读从磁盘 → 损坏。fsync 时安全（静默边界）。
+4. **隔离实验 B**（基线 + 途中写回，**改成只写回不 decommit**）→ **仍损坏**（182s）→ 不只是 decommit；**「途中调用写回路径」本身就损坏**（写回路径在非 fsync 点被驱动时不安全）。`run_journaled_ext4` 锁/operation scope 是顺序、干净的（非嵌套 bug）。
+
+**定论（平台级阻塞）**：完整 delalloc 的脏页节流**必须**途中写回来控内存，但 **Asterinas ext4 的「途中写回」会损坏数据**（与 delalloc 无关、与 decommit 无关，是 fs 层在非 fsync 点驱动写回的深层 bug/限制）。Linux delalloc 靠**后台 flusher 线程**在安全点写回，Asterinas **没有这套基础设施**。→ 完整 delalloc 在 Phase 6 现有范围内被此平台限制阻塞。已全部回退，HEAD = `0d86d3ede`（干净）。**精确根因（exact line）未钉死**，需更侵入式调试（写回处 dump 页内容对比）。
+
 ## Phase 6 起点基线（继承 Phase 5 收口，2026-06-07）
 
 口径：`page_cache=1`，`sqlite-speedtest1 --size 1000 /ext4/test.db`，drop_caches 公平基线，Linux 同口径。
