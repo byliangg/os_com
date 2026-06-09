@@ -155,7 +155,7 @@ Key test matrices:
 在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
 
 - **性能目标**：fio 顺序读写 >= 90%。诚实口径（cache-off + extent_map/inode 缓存 + drop 公平基线，`direct=1, nj=1`，中位数）下 Phase 5 读优化已收口：**read 4K/16K/64K/256K/1M = 86/84/87/95/123%，write = 76/76/84/121/88%**（优化前小块 16–24% / write 4K 20%、1M 63%）。ext4 域内 per-op 固定开销已榨干，剩余瓶颈在 Asterinas virtio 设备往返（平台层、跨 FS 通用）。历史 `read 127% / write 39%` 是 speculative data cache **开**的不诚实数，不能用于答辩。
-- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写、Phase 3 fsync/flush 持久化语义、Phase 4 PageCache buffered I/O / mmap 集成均已收口（守底回归全绿）。当前进入 **feature_perf_phase5**：性能优化主线，延迟归因驱动，聚焦 O_DIRECT write / 小块 per-request 开销 / 读并发退化。
+- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写、Phase 3 fsync/flush 持久化语义、Phase 4 PageCache buffered I/O / mmap 集成、Phase 5 性能优化（O_DIRECT 读写守底 75–123% + SQLite 崩溃 bug + 覆盖写快路径）均已收口（守底回归全绿）。当前进入 **feature_sqlite_phase6**：SQLite 真实应用写优化主线，攻追加/新分配类写（INSERT 新块 / CREATE INDEX / VACUUM），delalloc 延迟分配为先验主线，profile 先行。
 
 ## 工作树约定
 
@@ -184,8 +184,11 @@ Key test matrices:
 | `feature_jbd2_phase3_milestone.md` / `docs/feature_jbd2_phase3_milestone.md` | JBD2 功能 Phase 3 进度跟踪模板 |
 | `feature_pagecache_phase4_plan.md` / `docs/feature_pagecache_phase4_plan.md` | PageCache Phase 4 实现计划：ext4 buffered I/O / mmap 接入 Asterinas PageCache，自研 cache 退役边界 |
 | `feature_pagecache_phase4_milestone.md` / `docs/feature_pagecache_phase4_milestone.md` | PageCache Phase 4 进度、代码审计、回归与 benchmark 记录 |
-| `feature_perf_phase5_plan.md` | **当前阶段** 性能优化 Phase 5 计划：延迟归因驱动，O_DIRECT write / 小块 / 读并发优化 |
-| `feature_perf_phase5_milestone.md` | 性能优化 Phase 5 进度、占比表、回归与 benchmark 记录 |
+| `feature_perf_phase5_plan.md` / `docs/feature_perf_phase5_plan.md` | 性能优化 Phase 5 计划（已完成）：延迟归因驱动，O_DIRECT write / 小块 / 读并发优化 |
+| `feature_perf_phase5_milestone.md` / `docs/feature_perf_phase5_milestone.md` | 性能优化 Phase 5 进度、占比表、回归与 benchmark 记录（已完成）|
+| `feature_sqlite_phase6_plan.md` / `docs/feature_sqlite_phase6_plan.md` | **当前阶段** SQLite 真实应用写优化 Phase 6 计划：追加/新分配写，delalloc 延迟分配主线，profile 先行 |
+| `feature_sqlite_phase6_milestone.md` / `docs/feature_sqlite_phase6_milestone.md` | **当前阶段** Phase 6 进度、起点基线（2.97%）、守底门控与 SQLite 重测记录 |
+| `sqlite_benchmark_report.md` / `docs/sqlite_benchmark_report.md` | SQLite speedtest1 真实应用 benchmark 报告（读追平 / 写瓶颈 / 崩溃 bug / 端到端跑通）|
 | `fio_direct_parameter_sweep_report.md` | Phase 5 基线证据：fio direct 全量参数 sweep（A–G 组），三瓶颈分解 |
 | `fio_direct_senior_feedback_response.md` | Phase 5 基线证据：学长性能优化指导与三方对齐结论 |
 | `赛题要求.md` | 比赛评审标准 |
@@ -222,7 +225,8 @@ Key test matrices:
   - Phase 2：阅读 `feature_jbd2_phase2_plan.md` 和 `feature_jbd2_phase2_analysis.md`
   - Phase 3：阅读 `feature_jbd2_phase3_plan.md` 和 `feature_jbd2_phase3_pretest.md`
   - Phase 4：阅读 `feature_pagecache_phase4_plan.md` 和 `feature_pagecache_phase4_milestone.md`，并参考 ext2 PageCache 实现
-  - Phase 5（当前）：阅读 `feature_perf_phase5_plan.md` 和 `feature_perf_phase5_milestone.md`，基线证据见 `fio_direct_parameter_sweep_report.md`；先收割已有 profile，再优化
+  - Phase 5：阅读 `feature_perf_phase5_plan.md` 和 `feature_perf_phase5_milestone.md`，基线证据见 `fio_direct_parameter_sweep_report.md`；先收割已有 profile，再优化
+  - Phase 6（当前）：阅读 `feature_sqlite_phase6_plan.md` 和 `feature_sqlite_phase6_milestone.md`，起点证据见 `sqlite_benchmark_report.md`；攻 SQLite 追加/新分配写，delalloc 主线，**profile 先行再优化**
 - 确定要修改的文件和函数
 - 如有需要，先阅读 ext2 对应实现作为参考
 
@@ -250,7 +254,7 @@ Key test matrices:
 
 ### 4. 记录阶段
 
-- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 Phase 1：`feature_jbd2_phase1_milestone.md`；JBD2 Phase 2：`feature_jbd2_phase2_milestone.md`；JBD2 Phase 3：`feature_jbd2_phase3_milestone.md`；PageCache Phase 4：`feature_pagecache_phase4_milestone.md`；性能 Phase 5：`feature_perf_phase5_milestone.md`）对应 Step 下：
+- 将结果写入对应 milestone 文件（性能阶段：`optimize_phase1_milestone.md`；JBD2 Phase 1：`feature_jbd2_phase1_milestone.md`；JBD2 Phase 2：`feature_jbd2_phase2_milestone.md`；JBD2 Phase 3：`feature_jbd2_phase3_milestone.md`；PageCache Phase 4：`feature_pagecache_phase4_milestone.md`；性能 Phase 5：`feature_perf_phase5_milestone.md`；SQLite Phase 6：`feature_sqlite_phase6_milestone.md`）对应 Step 下：
   - **改动概要**：简述做了什么
   - **涉及文件**：列出修改的文件路径
   - **性能结果**：贴上新的性能数据表格，与基线对比
@@ -265,7 +269,8 @@ Key test matrices:
 | Phase | 目标 | 状态 |
 |-------|------|------|
 | optimize_phase1 | O_DIRECT speculative readahead，fio read/write >= 90% | ✅ 已完成（read 95.79%，write 90.48%） |
-| feature_perf_phase5 | 延迟归因驱动优化：extent 映射缓存 / 全文件覆盖 / atime 节流 / inode 元数据缓存 | ✅ 读优化收口：读写 75–123%（小块读 ×2.6–5.2、write 4K 20→76%）；完整守底全绿；剩余 virtio 平台瓶颈待与学长定位 |
+| feature_perf_phase5 | 延迟归因驱动优化：extent 映射缓存 / 全文件覆盖 / atime 节流 / inode 元数据缓存 / SQLite 崩溃 bug / 覆盖写快路径 | ✅ 已完成：fio 读写 75–123%（小块读 ×2.6–5.2、write 4K 20→76%）；SQLite 端到端跑通（4773→2022s，2.36×）；完整守底全绿 |
+| feature_sqlite_phase6 | SQLite 真实应用追加/新分配写优化（delalloc 延迟分配主线），profile 先行 | 🔄 进行中：起点 2.97%（2022s），攻 INSERT 新块 / CREATE INDEX / VACUUM 慢路径 |
 
 ### JBD2 功能系列（feature_jbd2）
 
@@ -287,3 +292,4 @@ Key test matrices:
 - 每次改动后必须确认 phase3/phase4/phase6/jbd_phase1/crash/Phase 2 concurrency/Phase 3 fsync-flush 功能测试不回归；Phase 4 还必须增加 buffered/direct coherency、mmap 与 dirty PageCache fsync 验证
 - 并发功能正确性有两层互补证据，均不可回退：①自研 `phase2_concurrency.c`（多文件确定性数据完整性 hash 校验，`RUN_PHASE2_CONCURRENCY`）②标准 `concurrency` xfstests 套件（`testcases/concurrency.list`，fsstress 多进程 / 崩溃恢复 / 并发 dio，`PHASE4_DOCKER_MODE=concurrency`）
 - **Phase 5（性能）**：profiling 基建已端到端建好（FS / virtio / 锁 / JBD2 四层 ns 级，门控 `ext4fs.phase2_profile=1`），**不要重造**；先收割占比表再优化。三瓶颈：①大块单 job 在 block/virtio（ext4≈raw，非 ext4 锅）②小块 per-request 开销在 ext4（最具优化故事）③读并发退化在锁。JBD2 与大块 ext4 路径数据上已洗清嫌疑。1M 大块定位（virtio vs ext4 成果）需与学长对齐答辩口径
+- **Phase 6（SQLite 真实应用写）**：起点 SQLite speedtest1 TOTAL 2022s = Linux 的 2.97%（覆盖写快路径已落地）。剩余慢项全在**追加/新分配类写**（INSERT 新块 / CREATE INDEX / VACUUM）——每个新分配 4KB 页跑一遍完整 journaled 分配 + 每事务 fsync + 逐 4KB bio。主线 = **delalloc 延迟分配**（write 时不分配、writeback 批量分配大 extent + 大 bio）；备选 = 慢路径 journaled prepare 批量化（更轻）。**铁律：先 profile 再优化**（Phase 5 "写回批量化未 profile 先动手只拿 3% 被回退" 的教训）；delalloc/group-commit 触及持久化语义，必须过 crash matrix + SQLite `integrity_check`，不得回退 O_DIRECT 守底
