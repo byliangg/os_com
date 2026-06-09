@@ -168,7 +168,7 @@ Key test matrices:
 | 文件 | 用途 |
 |------|------|
 | `environment.md` | 环境指引：记录当前推荐工作目录、Docker/代理/KVM 约定、benchmark 执行注意事项；根目录与仓库内对应副本需同步维护 |
-| `benchmark.md` | benchmark 指引与最新结果快照 |
+| `benchmark.md` / `benchmark/benchmark.md` / `docs/benchmark.md` | benchmark 指引与最新结果快照（含 §6.7 SQLite speedtest1 确切跑法 / 入口 `run_sqlite_summary.sh` / 最新 2.97%）；三处副本须同步 |
 | `analysis_phase1.md` | 性能优化 Phase 1 诊断报告（已完成，95.79%）|
 | `optimize_plan_phase1.md` | 性能优化 Phase 1 计划（已完成）|
 | `optimize_phase1_milestone.md` | 性能优化 Phase 1 进度跟踪（已完成）|
