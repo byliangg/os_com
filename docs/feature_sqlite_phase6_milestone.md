@@ -171,5 +171,10 @@
 - **主线（2026-06-10 重定档）= fsync 安全点 + 缓存层 + 写时预分配**（S1→S6），不引入任何"非 fsync 点的途中写回"（Stage 1a 撞死的墙）。delalloc 降 S7，被"途中写回损坏"平台限制阻塞，仅当未来修好该 bug 或加后台 flusher 才解锁。
 - **铁律升级（Stage 1a 教训）**：动写回路径前先钉死正确性不变量（S1 断言）；所有写回只落在 fsync 安全点（静默边界，已证安全）或 write() 时（不延迟）。
 - **S3 实测教训（2026-06-10）**：review/technical_report.md §6.2 预测 P1（删 decommit）是"最大单点、降到 600–1000s"，**实测只 −7%（2010→1868s）**。原因：profile 显示大头是 41% 每写 `ext4_map_blocks` 树块重读（S3 不碰），decommit→refill 只是小头。**再次印证：信实测 profile 胜过 reviewer 假设。** 真正大头在 S5（缓存 map_blocks，41%）/ S6（预分配，32%）。S3 仍留（correctness-safe、>5% 阈值、S4 前置、移除 refill 以免遮蔽后续增益），但其全部收益可能要 S5 去掉 41% 后才解蔽。
+- **S5/S6 可行性调查（2026-06-10，只读）**：
+  - **S5 继承 2a 碎片悬崖**：现成 `inode_extent_map_cache`（fs.rs:3345）是"1GB 窗口一条覆盖整文件"的对粒度缓存，但有 `MAX_CACHED_EXTENTS=16384` 上限；2a 正是栽在"碎片文件超上限→每 miss 重走整文件→灾难回退"。SQLite DB 经 INSERT/DELETE/VACUUM 会碎片化 → S5a（直接接 extent_map_cache）不安全。稳健解 = **S5b 按 pblock 缓存 extent 树块**（树块即使碎片也几百个、miss 只付单次树块读），但是新缓存层、工程量更大 → 放最后慎做。
+  - **S6 不是改常量那么简单**：SQLite 多为 1 块写走 `SMALL_WRITE_PREALLOC_BLOCKS`；改大后 1 块写遇洞会 prealloc 32–64 块，这些"已分配未写"块若落 i_size 内（sparse 写涨 i_size 过它们）会**暴露磁盘垃圾**（ext4_rs 可能无 unwritten extent）。安全版 = **仅顺序追加、仅 prealloc 超 i_size** + e2fsck 实验确认无告警/无暴露。
+  - **结论**：S5、S6 都需额外设计/实验 → 印证 report 的风险优先排序 P1→P2→P3→P4 正确。**先做安全的 fsync 安全点 S4，再啃 S5b/S6。**
+- **S4 设计（fsync 安全点批量写回，下一步）**：给 `PageCacheBackend` trait 加 `write_pages_async`（默认逐页 = ext2 零影响），ext4 override = 连续脏页 run 一次 `ext4_map_blocks` + **已映射 run 免 JBD2 handle**（report P2：ordered 语义下纯数据写回不需 handle，现每页一 handle 是纯浪费）+ 一个大 bio；shared `page_cache.rs::evict_range` 按 run 分组。必保 C4 clamp 语义（`write_page_async` fs.rs:1158/1162）。⚠️ Phase 5 那次批量化只拿 3% = 只合并 bio 没干掉逐页 handle——本次必须干掉 handle。触碰 ext2 共享路径，默认实现必须保 ext2 行为不变。
 - delalloc / group commit / S3 / S4 触及持久化语义或页生命周期，必须过 crash matrix + `integrity_check` + buffered/direct coherency + mmap 守底。
 - HEAD（含 Phase 5 全部修复：A1 / B / 覆盖写快路径 + Step 0 instrument）为随时回退安全基线。
