@@ -1080,6 +1080,19 @@ impl Ext4PageCacheState {
         self.decommit_vmo_range(0, file_size)
     }
 
+    /// Writes back every dirty page but keeps the pages resident as clean
+    /// (no `decommit`). This is the `fsync`/`sync` safe point: Linux `fsync`
+    /// flushes dirty pages yet never drops them, so the working set stays warm
+    /// and later reads or sub-page writes hit the cache instead of refilling the
+    /// whole file 4KB at a time from the device. Page frames are still released
+    /// by `evict_all` (dropping inode state), `discard_all` (truncate) and the
+    /// O_DIRECT path (which evicts+discards its own range before touching the
+    /// device), so buffered/direct coherency is preserved without decommitting
+    /// here.
+    fn flush_all(&self, file_size: usize) -> Result<()> {
+        self.page_cache.evict_range(0..file_size)
+    }
+
     fn discard_range(&self, start: usize, len: usize) {
         if len == 0 {
             return;
@@ -1402,7 +1415,11 @@ impl Ext4Fs {
             return Ok(());
         };
         let file_size = self.stat(ino)?.size as usize;
-        state.evict_all(file_size)
+        // S3 (Phase 6): fsync writes dirty pages back but keeps them resident as
+        // clean, instead of decommitting the whole file on every COMMIT. Keeps
+        // the working set warm and removes the "clear-on-fsync -> per-4KB sync
+        // refill" loop that made even in-place UPDATE 15-35x slower than ext2.
+        state.flush_all(file_size)
     }
 
     pub(super) fn sync_page_cache_for_inode(&self, ino: u32) -> Result<()> {

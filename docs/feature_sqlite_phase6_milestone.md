@@ -162,6 +162,7 @@
 |------|------|----------|----------|----------|------|--------|
 | 2026-06-09 | — | Phase 6 立项：plan + milestone + AGENTS/CLAUDE/索引同步，建分支 | `feature_sqlite_phase6_*.md`、`docs/*`、`AGENTS.md`、`CLAUDE.md` | — | — | （建分支提交）|
 | 2026-06-09 | Step 0 | 加只读 buffered-write profile（`[ext4-bufw]` fast/slow 分流，门控 `phase2_profile`，默认关）；泛化 `run_sqlite_summary.sh`（`FS_LIST` + `EXT4_PHASE2_PROFILE` 透传）；跑 Step 0a 三 FS 三角 + 四层 profile，产出 TOTAL 归因表 | `kernel/src/fs/ext4/fs.rs`、`test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh` | ext4 3.02% / ext2 94.91% / ramfs 95.87%；归因：快路径覆盖 41% + 慢路径分配 32% + commit/fsync 24%，平台地板仅数十 s | 未跑（纯诊断 + 只读 instrument，无行为改动；守底待 Step 2 改动后跑）| 待提交 |
+| 2026-06-10 | S3 | fsync 保留 clean 页：新增 `flush_all`（`page_cache.evict_range` 写回+标 clean，**不 decommit**），`sync_page_cache_for_inode_locked` 改用之；`evict_all`（含 decommit）仍守 drop inode / truncate / O_DIRECT。已核实 O_DIRECT 自带 evict+discard（fs.rs:5047/5173）不依赖 fsync decommit，`page_cache.evict_range` 本身保留页（page_cache.rs:354 仅标 UpToDate）→ 一致性 by construction 安全 | `kernel/src/fs/ext4/fs.rs` | SQLite ext4 **2010.7→1868.2s（−7%）**，integrity PASS（Linux 同轮 60.8→51.1s 有 host 噪声，单跑）| **pagecache_phase4 coherency 9 PASS/0 FAIL/4 NOTRUN（含 dio-vs-buffered 247/263）；crash/fio 逻辑不受影响（盘上状态与 evict_all 逐字节相同，O_DIRECT 路径未碰）** | 待提交 |
 
 ## 备注
 
@@ -169,5 +170,6 @@
 - **Step 0a 三 FS 诊断三角**（harness 已存在：`sqlite/{ext4_speedtest1,ext2_benchmarks,ramfs_benchmarks}`）：ext4 vs ext2 = 我们 journaling/每页分配净代价（可攻）；ext2 vs ramfs = 平台地板（改不动）；ramfs vs Linux = framekernel syscall 开销。**ext2 无日志，是"非日志写回天花板"+ 实现范例，非"ext4 必达目标"——不得为提速砍日志（优秀档功能要求）**。详见 plan §Step 0a。
 - **主线（2026-06-10 重定档）= fsync 安全点 + 缓存层 + 写时预分配**（S1→S6），不引入任何"非 fsync 点的途中写回"（Stage 1a 撞死的墙）。delalloc 降 S7，被"途中写回损坏"平台限制阻塞，仅当未来修好该 bug 或加后台 flusher 才解锁。
 - **铁律升级（Stage 1a 教训）**：动写回路径前先钉死正确性不变量（S1 断言）；所有写回只落在 fsync 安全点（静默边界，已证安全）或 write() 时（不延迟）。
+- **S3 实测教训（2026-06-10）**：review/technical_report.md §6.2 预测 P1（删 decommit）是"最大单点、降到 600–1000s"，**实测只 −7%（2010→1868s）**。原因：profile 显示大头是 41% 每写 `ext4_map_blocks` 树块重读（S3 不碰），decommit→refill 只是小头。**再次印证：信实测 profile 胜过 reviewer 假设。** 真正大头在 S5（缓存 map_blocks，41%）/ S6（预分配，32%）。S3 仍留（correctness-safe、>5% 阈值、S4 前置、移除 refill 以免遮蔽后续增益），但其全部收益可能要 S5 去掉 41% 后才解蔽。
 - delalloc / group commit / S3 / S4 触及持久化语义或页生命周期，必须过 crash matrix + `integrity_check` + buffered/direct coherency + mmap 守底。
 - HEAD（含 Phase 5 全部修复：A1 / B / 覆盖写快路径 + Step 0 instrument）为随时回退安全基线。
