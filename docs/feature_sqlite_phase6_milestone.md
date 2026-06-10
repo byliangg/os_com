@@ -10,8 +10,9 @@
 | Step | 内容 | 状态 |
 |------|------|------|
 | Step 0 | 起点固化 & SQLite profile 盘点（含 Step 0a 三 FS 诊断三角 ext4/ext2/ramfs）| ✅ 已完成：三角 + 四层 profile 归因表出齐（见下）|
-| Step 1 | 定位 → 选优化点 | ✅ 定档：完整 delalloc（写时预留 + 写回批量分配 + 脏页节流）。记录 2a（缓存检查→死路 0.005% 命中）/ 2b-1（去检查→540s OOM，证明预留必须）两次失败教训 |
-| Step 2 | 实施 delalloc，分阶段 | 🔄 进行中：Stage 0 OOM 根因诊断 → Stage 1 写时预留+延迟写（攻 41%）→ Stage 2 写回批量分配+大 bio（攻 32%/24%）→ Stage 3 调参收口。详见 plan |
+| Step 1 | 定位 → 选优化点 | ✅ **重定档（2026-06-10）**：delalloc 实测被平台墙堵死（Stage 1a「途中写回损坏数据」）→ 改 **fsync 安全点 + 缓存层 + 写时预分配**路线。记录 2a/2b-1/Stage 1a 三次失败教训 |
+| Step 2 | 实施新路线（S1 断言 → S3 删 fsync decommit → S4 fsync 批量写回 → S5 映射缓存 → S6 预分配；delalloc 降 S7 阻塞）| 🔄 进行中：详见 plan §新技术路线 |
+| 并行 | revoke 正确性修复（F1，外部 review + 代码核实：revoke 从不写入 journal）| ⏳ 待执行（不涨分，保答辩；S6 块复用加大暴露面）|
 | Step 3 | 全量回归 + SQLite 重测收口 | ⏳ 待执行 |
 
 ### Step 2 分阶段（详见 `feature_sqlite_phase6_plan.md` §Step 2）
@@ -166,6 +167,7 @@
 
 - 方法论铁律（Phase 5 教训）：**先 profile 再优化**，每个优化点动手前必须有占比数支撑。
 - **Step 0a 三 FS 诊断三角**（harness 已存在：`sqlite/{ext4_speedtest1,ext2_benchmarks,ramfs_benchmarks}`）：ext4 vs ext2 = 我们 journaling/每页分配净代价（可攻）；ext2 vs ramfs = 平台地板（改不动）；ramfs vs Linux = framekernel syscall 开销。**ext2 无日志，是"非日志写回天花板"+ 实现范例，非"ext4 必达目标"——不得为提速砍日志（优秀档功能要求）**。详见 plan §Step 0a。
-- 主线先验 = delalloc（延迟分配）；备选 = 慢路径 journaled prepare 批量化（更轻、可作中间收益/回退）。
-- delalloc / group commit 触及持久化语义，必须过 crash matrix + `integrity_check`。
-- HEAD（含 Phase 5 全部修复：A1 / B / 覆盖写快路径）为随时回退安全基线。
+- **主线（2026-06-10 重定档）= fsync 安全点 + 缓存层 + 写时预分配**（S1→S6），不引入任何"非 fsync 点的途中写回"（Stage 1a 撞死的墙）。delalloc 降 S7，被"途中写回损坏"平台限制阻塞，仅当未来修好该 bug 或加后台 flusher 才解锁。
+- **铁律升级（Stage 1a 教训）**：动写回路径前先钉死正确性不变量（S1 断言）；所有写回只落在 fsync 安全点（静默边界，已证安全）或 write() 时（不延迟）。
+- delalloc / group commit / S3 / S4 触及持久化语义或页生命周期，必须过 crash matrix + `integrity_check` + buffered/direct coherency + mmap 守底。
+- HEAD（含 Phase 5 全部修复：A1 / B / 覆盖写快路径 + Step 0 instrument）为随时回退安全基线。
