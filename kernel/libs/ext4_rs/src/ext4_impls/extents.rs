@@ -457,8 +457,17 @@ impl Ext4 {
             return false;
         }
 
-        // Check if the merged length would exceed the maximum allowed length
-        if ext1_ee_len + ext2_ee_len > EXT_INIT_MAX_LEN as usize{
+        // Check if the merged length would exceed the maximum allowed length.
+        // The unwritten flag occupies the top bit of the on-disk length, so an
+        // unwritten extent encodes at most EXT_INIT_MAX_LEN - 1 blocks; merging
+        // two unwritten extents to exactly EXT_INIT_MAX_LEN would silently drop
+        // the flag and expose uninitialized blocks as written data.
+        let max_merged_len = if ex1.is_unwritten() {
+            (EXT_INIT_MAX_LEN - 1) as usize
+        } else {
+            EXT_INIT_MAX_LEN as usize
+        };
+        if ext1_ee_len + ext2_ee_len > max_merged_len {
             return false;
         }
 
@@ -897,6 +906,235 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Applies in-place entry edits (and at most one entry removal) to the
+    /// leaf node described by `node`, persisting through the journaled
+    /// metadata writers (`write_back_inode` for the root node,
+    /// `sync_blk_to_disk(&self.metadata_writer)` for tree blocks).
+    ///
+    /// `edits` positions refer to the pre-removal entry layout; the removal,
+    /// if any, is applied after the edits. Callers must never change an
+    /// entry's `first_block` at position 0 (that would require an ancestor
+    /// index update, which this helper does not perform).
+    fn rewrite_leaf_entries(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        node: &ExtentPathNode,
+        edits: &[(usize, Ext4Extent)],
+        remove_pos: Option<usize>,
+    ) -> Result<()> {
+        let entries = node.header.entries_count as usize;
+        for (pos, _) in edits {
+            if *pos >= entries {
+                return_errno_with_message!(Errno::EIO, "leaf entry edit out of range");
+            }
+        }
+        if let Some(pos) = remove_pos {
+            if pos == 0 || pos >= entries {
+                return_errno_with_message!(Errno::EIO, "leaf entry removal out of range");
+            }
+        }
+
+        if node.pblock_of_node == 0 {
+            for (pos, ex) in edits {
+                *inode_ref.inode.root_extent_mut_at(*pos) = *ex;
+            }
+            if let Some(pos) = remove_pos {
+                for i in pos + 1..entries {
+                    let moved = inode_ref.inode.root_extent_at(i);
+                    *inode_ref.inode.root_extent_mut_at(i - 1) = moved;
+                }
+                *inode_ref.inode.root_extent_mut_at(entries - 1) = Ext4Extent::default();
+                inode_ref.inode.root_extent_header_mut().entries_count -= 1;
+            }
+            self.write_back_inode(inode_ref);
+            return Ok(());
+        }
+
+        let block_size = self.super_block.block_size() as usize;
+        let header_size = core::mem::size_of::<Ext4ExtentHeader>();
+        let extent_size = core::mem::size_of::<Ext4Extent>();
+        let mut ext4block = Block::load(
+            &self.block_device,
+            node.pblock_of_node * block_size,
+            block_size,
+        );
+        for (pos, ex) in edits {
+            let offset = header_size + pos * extent_size;
+            let slot: &mut Ext4Extent = ext4block.read_offset_as_mut(offset);
+            *slot = *ex;
+        }
+        if let Some(pos) = remove_pos {
+            if entries > pos + 1 {
+                let src = header_size + (pos + 1) * extent_size;
+                let dst = header_size + pos * extent_size;
+                let bytes_to_move = (entries - pos - 1) * extent_size;
+                ext4block.data.copy_within(src..src + bytes_to_move, dst);
+            }
+            let last = header_size + (entries - 1) * extent_size;
+            ext4block.data[last..last + extent_size].fill(0);
+            let header: &mut Ext4ExtentHeader = ext4block.read_offset_as_mut(0);
+            header.entries_count -= 1;
+        }
+        self.set_extent_block_checksum_in_block(inode_ref, node.pblock_of_node, &mut ext4block)?;
+        ext4block.sync_blk_to_disk(&self.metadata_writer);
+        Ok(())
+    }
+
+    /// S6 (Phase 6): convert the leading part of the unwritten extent covering
+    /// `from` to written state, for the span `[from, min(extent_end, max_end))`.
+    ///
+    /// Returns the first logical block after the converted span; callers loop,
+    /// so a range crossing several unwritten extents converges over multiple
+    /// calls.
+    ///
+    /// Layout transforms (E = unwritten extent [es, ee), C = converted span):
+    /// 1. Left-merge fast path (`from == es`, previous entry in the same leaf
+    ///    is written and logically+physically contiguous): grow the left
+    ///    extent by |C| and shrink E from the left (or drop E when fully
+    ///    consumed). Sequential appends into preallocated space thus keep one
+    ///    growing written extent plus one shrinking unwritten tail instead of
+    ///    one new entry per write.
+    /// 2. `from == es`: E becomes the written piece [es, cov_end) in place;
+    ///    the unwritten remainder [cov_end, ee) is re-inserted.
+    /// 3. `from > es`: E is shrunk in place to the unwritten head [es, from);
+    ///    the written piece [from, cov_end) and the unwritten remainder
+    ///    [cov_end, ee) are inserted.
+    ///
+    /// Crash safety: all mutations go through the same journaled metadata
+    /// writers as extent insertion, so the conversion commits atomically with
+    /// the enclosing JBD2 handle. In-place edits never change an entry's
+    /// `first_block` except when shrinking E from the left in the merge fast
+    /// path, where E sits at `pos >= 1` and needs no ancestor index update.
+    ///
+    /// Failure containment: if a remainder insert fails (e.g. ENOSPC while
+    /// growing the tree), the remainder blocks stay allocated in the bitmap
+    /// but unreferenced -- a leak e2fsck can reclaim, never exposed garbage.
+    pub fn convert_unwritten_span(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        from: Ext4Lblk,
+        max_end: Ext4Lblk,
+    ) -> Result<Ext4Lblk> {
+        let search_path = self.find_extent(inode_ref, from)?;
+        let depth = search_path.depth as usize;
+        let node = &search_path.path[depth];
+        let Some(ex) = node.extent else {
+            return_errno_with_message!(Errno::EIO, "no extent covers unwritten lblock");
+        };
+
+        let es = ex.get_first_block();
+        let ext_len = ex.get_actual_len() as u32;
+        let ee = es
+            .checked_add(ext_len)
+            .ok_or_else(|| Ext4Error::new(Errno::EIO))?;
+        if !ex.is_unwritten() || from < es || from >= ee || max_end <= from {
+            return_errno_with_message!(Errno::EIO, "convert target is not an unwritten mapping");
+        }
+        let ep = ex.get_pblock();
+        let cov_end = ee.min(max_end);
+        let cov_len = cov_end - from;
+        let pos = node.position;
+
+        // Fast path: merge the converted span into a contiguous written left
+        // neighbour in the same leaf.
+        if from == es && pos > 0 {
+            let left = if node.pblock_of_node == 0 {
+                inode_ref.inode.root_extent_at(pos - 1)
+            } else {
+                self.get_extent_from_node(inode_ref, node, pos - 1)?
+            };
+            let left_len = left.get_actual_len() as u32;
+            let mergeable = !left.is_unwritten()
+                && left.get_first_block().checked_add(left_len) == Some(es)
+                && left.get_pblock() + left_len as u64 == ep
+                && left_len + cov_len <= EXT_INIT_MAX_LEN as u32;
+            if mergeable {
+                let mut new_left = left;
+                new_left.set_actual_len((left_len + cov_len) as u16);
+                if cov_end == ee {
+                    self.rewrite_leaf_entries(
+                        inode_ref,
+                        node,
+                        &[(pos - 1, new_left)],
+                        Some(pos),
+                    )?;
+                } else {
+                    let mut new_cur = ex;
+                    new_cur.first_block = cov_end;
+                    new_cur.store_pblock(ep + cov_len as u64);
+                    new_cur.set_actual_len((ee - cov_end) as u16);
+                    new_cur.mark_unwritten();
+                    self.rewrite_leaf_entries(
+                        inode_ref,
+                        node,
+                        &[(pos - 1, new_left), (pos, new_cur)],
+                        None,
+                    )?;
+                }
+                return Ok(cov_end);
+            }
+        }
+
+        if from == es {
+            // E becomes the written piece in place; first_block is unchanged.
+            let mut written_piece = ex;
+            written_piece.set_actual_len(cov_len as u16);
+            written_piece.mark_written();
+            self.rewrite_leaf_entries(inode_ref, node, &[(pos, written_piece)], None)?;
+
+            if cov_end < ee {
+                let mut tail = Ext4Extent::default();
+                tail.first_block = cov_end;
+                tail.store_pblock(ep + cov_len as u64);
+                tail.set_actual_len((ee - cov_end) as u16);
+                tail.mark_unwritten();
+                self.insert_extent(inode_ref, &mut tail).map_err(|e| {
+                    log::error!(
+                        "[convert_unwritten_span] tail re-insert failed, blocks leaked: inode={} tail=[{}, {}) err={:?}",
+                        inode_ref.inode_num, cov_end, ee, e
+                    );
+                    e
+                })?;
+            }
+            return Ok(cov_end);
+        }
+
+        // from > es: shrink E in place to the unwritten head; first_block is
+        // unchanged.
+        let mut head = ex;
+        head.set_actual_len((from - es) as u16);
+        head.mark_unwritten();
+        self.rewrite_leaf_entries(inode_ref, node, &[(pos, head)], None)?;
+
+        let mut written_piece = Ext4Extent::default();
+        written_piece.first_block = from;
+        written_piece.store_pblock(ep + (from - es) as u64);
+        written_piece.set_actual_len(cov_len as u16);
+        self.insert_extent(inode_ref, &mut written_piece).map_err(|e| {
+            log::error!(
+                "[convert_unwritten_span] written piece insert failed, blocks leaked: inode={} piece=[{}, {}) err={:?}",
+                inode_ref.inode_num, from, cov_end, e
+            );
+            e
+        })?;
+
+        if cov_end < ee {
+            let mut tail = Ext4Extent::default();
+            tail.first_block = cov_end;
+            tail.store_pblock(ep + (cov_end - es) as u64);
+            tail.set_actual_len((ee - cov_end) as u16);
+            tail.mark_unwritten();
+            self.insert_extent(inode_ref, &mut tail).map_err(|e| {
+                log::error!(
+                    "[convert_unwritten_span] tail insert failed, blocks leaked: inode={} tail=[{}, {}) err={:?}",
+                    inode_ref.inode_num, cov_end, ee, e
+                );
+                e
+            })?;
+        }
+        Ok(cov_end)
+    }
+
 }
 
 impl Ext4 {
@@ -1191,7 +1429,11 @@ impl Ext4 {
                 let remove_from = from;
                 let remove_to = end.min(to);
                 self.ext_remove_blocks(inode_ref, &mut ex, remove_from, remove_to);
+                let unwritten = ex.is_unwritten();
                 ex.block_count = (from - ex.first_block) as u16;
+                if unwritten {
+                    ex.mark_unwritten();
+                }
                 kept = Some(ex);
             } else if end > to {
                 let remove_from = ex.first_block;

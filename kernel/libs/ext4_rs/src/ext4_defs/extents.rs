@@ -553,14 +553,23 @@ impl Ext4Extent {
         self.block_count |= EXT_INIT_MAX_LEN;
     }
 
+    /// Marks the extent as written (initialized), keeping the actual length.
+    pub fn mark_written(&mut self) {
+        self.block_count = self.get_actual_len();
+    }
+
     /// Get the last file block number that this extent covers.
     pub fn get_last_block(&self) -> u32 {
-        self.first_block + self.block_count as u32 - 1
+        self.first_block + self.get_actual_len() as u32 - 1
     }
 
     /// Set the last file block number for this extent.
     pub fn set_last_block(&mut self, last_block: u32) {
+        let unwritten = self.is_unwritten();
         self.block_count = (last_block - self.first_block + 1) as u16;
+        if unwritten {
+            self.mark_unwritten();
+        }
     }
 }
 

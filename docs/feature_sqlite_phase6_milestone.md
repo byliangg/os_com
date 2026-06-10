@@ -11,9 +11,9 @@
 |------|------|------|
 | Step 0 | 起点固化 & SQLite profile 盘点（含 Step 0a 三 FS 诊断三角 ext4/ext2/ramfs）| ✅ 已完成：三角 + 四层 profile 归因表出齐（见下）|
 | Step 1 | 定位 → 选优化点 | ✅ **重定档（2026-06-10）**：delalloc 实测被平台墙堵死（Stage 1a「途中写回损坏数据」）→ 改 **fsync 安全点 + 缓存层 + 写时预分配**路线。记录 2a/2b-1/Stage 1a 三次失败教训 |
-| Step 2 | 实施新路线（S1 断言 → S3 删 fsync decommit → S4 fsync 批量写回 → S5 映射缓存 → S6 预分配；delalloc 降 S7 阻塞）| 🔄 进行中：详见 plan §新技术路线 |
-| 并行 | revoke 正确性修复（F1，外部 review + 代码核实：revoke 从不写入 journal）| ⏳ 待执行（不涨分，保答辩；S6 块复用加大暴露面）|
-| Step 3 | 全量回归 + SQLite 重测收口 | ⏳ 待执行 |
+| Step 2 | 实施新路线（S1 断言 → S3 删 fsync decommit → S4 fsync 批量写回 → S5 映射缓存 → S6 预分配；delalloc 降 S7 阻塞）| 🔄 进行中：S3 ✅（−7%）、S4 ✅（−5%）、**S6 ✅（−25%，unwritten extent + 预分配，守底全绿）**；剩 S5b 树块缓存 |
+| 并行 | revoke 正确性修复（F1，外部 review + 代码核实：revoke 从不写入 journal）| ⏳ 待执行（不涨分，保答辩；**S6 已落地块复用节奏加大暴露面，优先级上调**）|
+| Step 3 | 全量回归 + SQLite 重测收口 | 🔄 每步滚动执行：S6 轮全绿（crash 18/18 / xfstests 四包 / 并发两层 / host-crash 4/4 / fsync_flush 100% / fio 守底）|
 
 ### Step 2 分阶段（详见 `feature_sqlite_phase6_plan.md` §Step 2）
 
@@ -163,20 +163,22 @@
 | 2026-06-09 | — | Phase 6 立项：plan + milestone + AGENTS/CLAUDE/索引同步，建分支 | `feature_sqlite_phase6_*.md`、`docs/*`、`AGENTS.md`、`CLAUDE.md` | — | — | （建分支提交）|
 | 2026-06-09 | Step 0 | 加只读 buffered-write profile（`[ext4-bufw]` fast/slow 分流，门控 `phase2_profile`，默认关）；泛化 `run_sqlite_summary.sh`（`FS_LIST` + `EXT4_PHASE2_PROFILE` 透传）；跑 Step 0a 三 FS 三角 + 四层 profile，产出 TOTAL 归因表 | `kernel/src/fs/ext4/fs.rs`、`test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh` | ext4 3.02% / ext2 94.91% / ramfs 95.87%；归因：快路径覆盖 41% + 慢路径分配 32% + commit/fsync 24%，平台地板仅数十 s | 未跑（纯诊断 + 只读 instrument，无行为改动；守底待 Step 2 改动后跑）| 待提交 |
 | 2026-06-10 | S3 | fsync 保留 clean 页：新增 `flush_all`（`page_cache.evict_range` 写回+标 clean，**不 decommit**），`sync_page_cache_for_inode_locked` 改用之；`evict_all`（含 decommit）仍守 drop inode / truncate / O_DIRECT。已核实 O_DIRECT 自带 evict+discard（fs.rs:5047/5173）不依赖 fsync decommit，`page_cache.evict_range` 本身保留页（page_cache.rs:354 仅标 UpToDate）→ 一致性 by construction 安全 | `kernel/src/fs/ext4/fs.rs` | SQLite ext4 **2010.7→1868.2s（−7%）**，integrity PASS（Linux 同轮 60.8→51.1s 有 host 噪声，单跑）| **pagecache_phase4 coherency 9 PASS/0 FAIL/4 NOTRUN（含 dio-vs-buffered 247/263）；crash/fio 逻辑不受影响（盘上状态与 evict_all 逐字节相同，O_DIRECT 路径未碰）** | 已提交 730ddf30a |
+| 2026-06-10 | S6 | **unwritten extent 支持 + 写时预分配**：ext4_rs 实现 unwritten extent 语义（此前 file.rs:11 明确不支持）——①读语义：`get_pblock_idx_state` 暴露 unwritten 位；`read_at`/`collect_block_ranges`（→ map_blocks/plan_direct_read）把 unwritten 当洞→**读返回零**；内核层 fs.rs **零改动**（`write_range_fully_mapped`/O_DIRECT overwrite-cached 因覆盖检查失败自动落回 journaled 慢路径转换，by construction 安全）②写转换：`convert_unwritten_span`（extents.rs）单 extent 内转换，左邻 written 物理连续时走**合并快路径**（append 树不碎：200 次 append 仅 2 个 extent），否则原地改+插剩余片；原地编辑永不改 first_block（免祖先索引更新）；全部走 journaled metadata writer，崩溃原子性继承 JBD2 handle ③预分配：洞分配运行拆两段——写覆盖段 written + 越界尾段 **unwritten**，`SMALL_WRITE_PREALLOC_BLOCKS=1→32`；尾段插入失败即释放 ④zero-fill：write_at/prepare_write_at/allocate_range 把 unwritten 块纳入零填充列表（与洞同等崩溃窗口防御：元数据先于数据 commit 也只暴露零）。**顺手修 3 个真 bug**：truncate 保留 unwritten 头部丢标志（extents.rs:1194）、`get_last_extent` 直接用含标志位的 block_count（inode.rs:694）、defs `last_block`/`set_last_block` 同类。**顶级模型（opus）定点审计**：主路径崩溃安全判定 SOUND（zero-fill 直写在 journaled commit 前落盘，与既有洞分配同构）；2 个发现已修——can_merge unwritten 对合并到 32768 会静默丢标志暴露垃圾（major 潜伏，加 ≤32767 上限）、truncate 尾块对 unwritten 做 RMW 持久化垃圾（minor，跳过）| `kernel/libs/ext4_rs/src/ext4_defs/extents.rs`、`ext4_impls/{extents,file,inode}.rs`（+459/−42）、新 `src/bin/unwritten_probe.rs`（宿主机安全实验 harness）| 宿主机实验全过：unwritten_probe（200 append→[0,200) written+[200,224) Uninit 仅 2 extent；sparse 三路拆分；unwritten 读零）+ **e2fsck -fn 完全干净（exit 0）** + debugfs 验 Uninit 标志与 cat 读零；单测 29/29。**SQLite ext4 1772.4→1332.2s（S6 单步 −25%；自起点 2010.7s 累计 −34%），ratio 2.97%→3.86%，integrity PASS**；逐项：CREATE INDEX 131.8→39.2s（×3.4）、ordered INSERT 35.2→9.6s（×3.7）、INSERT w/3idx 341.4→143.3s（×2.4）、unordered INSERT 84.6→43.5s、VACUUM 193.8→130.6s、REPLACE TEXT PK 163.2→78.1s（均 vs Step 0a 2010s 基线）| **全绿**：crash matrix 18/18（含编译门）；phase6_good 25 / pagecache_phase4 13 / phase4_good 17 / phase3_base 16 全 rc=0；jbd_phase1 PASS；phase2 concurrency 7/7；concurrency xfstests 10/10（含 generic/269 近满盘 fsstress；注意整体预算需 `XFSTESTS_RUN_TIMEOUT_SEC=5400`，默认 1800s 不够——疑似 prealloc 在近满盘下增加 balloc 工作量，correctness 无回退，低剩余空间跳过 prealloc 列为后续调优）；host-crash 4/4；jbd_phase3_fsync_flush 100%；fio O_DIRECT cache-off write 82.32%/read 109.92%（Aster write 绝对值 2692≥基线 2659 MB/s，ratio 波动来自 Linux 侧，无回退）| 待提交 |
 | 2026-06-10 | S4 | fsync 安全点批量写回：`PageCacheBackend` trait 加 `write_pages_async`（默认逐页 = **ext2 等逐字节不变**）；shared `evict_range` 按连续脏页 run 分组；ext4 override = 按 run 收数据（保 C4 clamp）→ 一次 `write_page_cache_data_at`（一次 map_blocks + 一次 revoke + **每 run 一个 JBD2 handle** + `write_at` 合并连续物理块成大 bio）。**稳健版保留 handle**（不做免-handle 崩溃安全风险点）| `kernel/src/fs/utils/page_cache.rs`、`kernel/src/fs/ext4/fs.rs` | SQLite ext4 **1868.2→1772.4s（−5%，累计 2010→1772 −12%）**，integrity PASS（Linux 51.1→50.6s 稳定，对比干净）| coherency 9/0/4（含 247/263，ext2 也走）+ **broad 守底全绿**（crash matrix 全 PASS / host-crash rc=0 / concurrency 7/7 / 全 xfstests 100%）| 已提交 334e97329 |
 
-## 阶段性结论（2026-06-10，S3+S4 后）
+## 阶段性结论（2026-06-11，S3+S4+S6 后）
 
-**安全收益已拿满**：S3（−7%）+ S4（−5%）= **2010→1772s（−12%），integrity 全程 PASS**。fsync 安全点 + 共享写回批量化是低风险区，已收割。
+**累计**：S3（−7%）+ S4（−5%）+ **S6（−25%）** = **2010.7→1332.2s（累计 −34%），ratio 2.97%→3.86%，integrity 全程 PASS，完整守底全绿**。
 
-**剩余三块都是多日、正确性关键的基建**（非快胜，建议干净窗口 + 顶级模型审崩溃安全/正确性后再做）：
+**S6 是 Linux 对齐真功能**（unwritten extent 语义 + 写时预分配），不只是调参：ext4_rs 此前完全不支持 unwritten（file.rs:11），现在读返零/写转换/map 处理齐备，e2fsck/debugfs 互操作验证通过，crash matrix + host-crash 全过，opus 定点审计判定主路径崩溃安全 SOUND。新分配类写如归因预期拿到大头（CREATE INDEX ×3.4、ordered INSERT ×3.7、INSERT w/3idx ×2.4）。
+
+**剩余两块**（S6 后 1332s 的構成：剩余大头是 41% 桶的每写 map_blocks 树块重读 + 24% 桶的 commit/fsync 串行）：
 | 块 | 攻 | 为何是基建 | 估时 |
 |----|----|-----------|------|
-| **S6 物理预分配** | 32%（慢路径分配，SQLite INSERT/VACUUM 主场景）| **ext4_rs 不支持 unwritten extent**（file.rs:11），需先实现读返回零 + 写转换 + map 处理；是 Linux 对齐真功能（答辩加分）| 2–4 天 |
-| **S5b 树块 buffer cache** | 41%（每写 map_blocks 树块重读，最大单桶）| 新缓存层（按 pblock 缓存 extent 树块，防 2a 碎片悬崖）；失效复用 chokepoint | ~1 周 |
-| **revoke（C1+C2）** | 不涨分，保答辩正确性 | JBD2 commit 写 revoke 块 + recovery 序列号过滤（两者必须一起）；独立于写回路径 | 3–5 天 |
+| **S5b 树块 buffer cache** | 41% 桶（每写 map_blocks 树块重读，现最大单桶；fast-path 覆盖写 + S6 转换路径都受益）| 新缓存层（按 pblock 缓存 extent 树块，防 2a 碎片悬崖）；失效复用 chokepoint | ~1 周 |
+| **revoke（C1+C2）** | 不涨分，保答辩正确性 | JBD2 commit 写 revoke 块 + recovery 序列号过滤（两者必须一起）；**S6 块复用节奏加大暴露面，优先级上调** | 3–5 天 |
 
-S3+S4 是干净 checkpoint，三块都不能建在未提交的 S4 上 → 先过 broad 守底 + 提交 S3/S4，再选其一开干。
+S6 调优备忘：①低剩余空间跳过 prealloc 尾段（generic/269 近满盘预算变紧的对症项）②SMALL_WRITE_PREALLOC_BLOCKS 32→64 需重新过 ENOSPC/守底③多块写（WRITE_PREALLOC_BLOCKS=1）尚未吃到预分配。
 
 ## 备注
 

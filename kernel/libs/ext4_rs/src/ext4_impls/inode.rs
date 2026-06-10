@@ -245,9 +245,12 @@ impl Ext4 {
         inode_ref: &Ext4InodeRef,
         lblock: Ext4Lblk,
         allow_refresh: bool,
-    ) -> Result<Ext4Fsblk> {
+    ) -> Result<(Ext4Fsblk, bool)> {
         if !Self::inode_uses_extents(inode_ref) {
-            return self.get_pblock_idx_legacy(inode_ref, lblock);
+            // Legacy block maps have no unwritten state.
+            return self
+                .get_pblock_idx_legacy(inode_ref, lblock)
+                .map(|pblock| (pblock, false));
         }
 
         let search_path = self.find_extent(inode_ref, lblock);
@@ -274,7 +277,7 @@ impl Ext4 {
                             );
                             return_errno_with_message!(Errno::EIO, "mapped block out of range");
                         }
-                        return Ok(fblock);
+                        return Ok((fblock, extent.is_unwritten()));
                     }
                 }
             }
@@ -323,6 +326,11 @@ impl Ext4 {
 
     /// Get physical block id of a logical block.
     ///
+    /// Returns `Ok` for any *allocated* block, written or unwritten, so write
+    /// paths can use it to detect holes without double-allocating preallocated
+    /// (unwritten) blocks. Callers that must distinguish unwritten blocks
+    /// (read-as-zero / convert-before-write) use `get_pblock_idx_state`.
+    ///
     /// Params:
     /// inode_ref: &Ext4InodeRef - inode reference
     /// lblock: Ext4Lblk - logical block id
@@ -330,6 +338,19 @@ impl Ext4 {
     /// Returns:
     /// `Result<Ext4Fsblk>` - physical block id
     pub fn get_pblock_idx(&self, inode_ref: &Ext4InodeRef, lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
+        self.get_pblock_idx_inner(inode_ref, lblock, true)
+            .map(|(pblock, _)| pblock)
+    }
+
+    /// Like `get_pblock_idx`, but also reports whether the mapping is an
+    /// unwritten (preallocated) extent. Unwritten blocks are allocated but
+    /// hold no data: reads must return zeros and writes must convert them to
+    /// written first.
+    pub fn get_pblock_idx_state(
+        &self,
+        inode_ref: &Ext4InodeRef,
+        lblock: Ext4Lblk,
+    ) -> Result<(Ext4Fsblk, bool)> {
         self.get_pblock_idx_inner(inode_ref, lblock, true)
     }
 
@@ -691,7 +712,7 @@ impl Ext4 {
         let mut last_extent_end = if root_header.entries_count > 0 {
             // Get the end position of the last extent
             let last_extent = match self.get_last_extent(inode_ref) {
-                Ok(extent) => extent.first_block + extent.block_count as u32,
+                Ok(extent) => extent.first_block + extent.get_actual_len() as u32,
                 Err(_) => {
                     log::warn!(
                         "[Batch Append] Could not get last extent, starting at block {}",

@@ -8,11 +8,15 @@ use crate::simple_interface::SimpleBlockRange;
 use crate::utils::path_check;
 // use std::time::{Duration, Instant};
 
-// ext4_rs does not model unwritten extents yet. Do not map extra blocks beyond
-// the write range, otherwise later reads from sparse regions can expose stale
-// contents from reused physical blocks.
+// S6 (Phase 6): ext4_rs models unwritten extents now. Blocks preallocated
+// beyond the write range are inserted as *unwritten* extents (reads return
+// zeros; writes convert them to written via `convert_unwritten_span`), so
+// preallocation can no longer expose stale contents from reused physical
+// blocks. Single-block appends (the dominant SQLite pattern) preallocate
+// `SMALL_WRITE_PREALLOC_BLOCKS` so subsequent appends skip the journaled
+// allocation entirely; multi-block writes keep no preallocation for now.
 const WRITE_PREALLOC_BLOCKS: u32 = 1;
-const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 1;
+const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 32;
 const GENERIC014_MAP_PROFILE_LIMIT: u64 = 64;
 
 static GENERIC014_MAP_PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -297,16 +301,24 @@ impl Ext4 {
         mappings.push(SimpleBlockRange { lblock, pblock, len });
     }
 
+    /// Resolves a logical block to a *readable* physical block. Unwritten
+    /// (preallocated) extents are reported as `None`, exactly like holes, so
+    /// every read-side consumer (read_at, map_blocks, plan_direct_read) sees
+    /// zeros instead of the uninitialized device contents. The cache keeps
+    /// the unwritten flag so probing inside an unwritten extent stays O(1).
     fn resolve_block_mapping(
         &self,
         inode_ref: &Ext4InodeRef,
         uses_extents: bool,
-        extent_cache: &mut Option<(u32, u32, Ext4Fsblk)>,
+        extent_cache: &mut Option<(u32, u32, Ext4Fsblk, bool)>,
         lblock: u32,
     ) -> Result<Option<Ext4Fsblk>> {
         if uses_extents {
-            if let Some((ext_start, ext_end, pblock_start)) = *extent_cache {
+            if let Some((ext_start, ext_end, pblock_start, unwritten)) = *extent_cache {
                 if lblock >= ext_start && lblock < ext_end {
+                    if unwritten {
+                        return Ok(None);
+                    }
                     return Ok(Some(pblock_start + (lblock - ext_start) as u64));
                 }
             }
@@ -321,11 +333,14 @@ impl Ext4 {
                             return None;
                         }
                         let pblock_start = extent.get_pblock();
-                        Some((ext_start, ext_end, pblock_start))
+                        Some((ext_start, ext_end, pblock_start, extent.is_unwritten()))
                     });
 
-                    if let Some((ext_start, ext_end, pblock_start)) = mapped {
-                        *extent_cache = Some((ext_start, ext_end, pblock_start));
+                    if let Some((ext_start, ext_end, pblock_start, unwritten)) = mapped {
+                        *extent_cache = Some((ext_start, ext_end, pblock_start, unwritten));
+                        if unwritten {
+                            return Ok(None);
+                        }
                         return Ok(Some(pblock_start + (lblock - ext_start) as u64));
                     }
 
@@ -357,7 +372,7 @@ impl Ext4 {
             .checked_add(lblock_count)
             .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
         let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
-        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk, bool)> = None;
         let mut mappings = Vec::new();
         let mut cursor = lblock_start;
 
@@ -370,8 +385,8 @@ impl Ext4 {
             };
 
             if uses_extents {
-                if let Some((ext_start, ext_end, cached_pblock_start)) = extent_cache {
-                    if cursor >= ext_start && cursor < ext_end {
+                if let Some((ext_start, ext_end, cached_pblock_start, unwritten)) = extent_cache {
+                    if !unwritten && cursor >= ext_start && cursor < ext_end {
                         let run_end = ext_end.min(lblock_end);
                         Self::push_block_range(
                             &mut mappings,
@@ -684,11 +699,17 @@ impl Ext4 {
         }
 
         let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
-        let mut extent_cache: Option<(u32, u32, Ext4Fsblk)> = None;
+        // Unwritten (preallocated) extents resolve to `None` so the read
+        // below zero-fills them, exactly like holes; the cache keeps the
+        // unwritten flag so repeated probes inside one extent stay O(1).
+        let mut extent_cache: Option<(u32, u32, Ext4Fsblk, bool)> = None;
         let mut resolve_pblock = |lblock: u32| -> Result<Option<Ext4Fsblk>> {
             if uses_extents {
-                if let Some((ext_start, ext_end, pblock_start)) = extent_cache {
+                if let Some((ext_start, ext_end, pblock_start, unwritten)) = extent_cache {
                     if lblock >= ext_start && lblock < ext_end {
+                        if unwritten {
+                            return Ok(None);
+                        }
                         return Ok(Some(pblock_start + (lblock - ext_start) as u64));
                     }
                 }
@@ -703,11 +724,14 @@ impl Ext4 {
                                 return None;
                             }
                             let pblock_start = extent.get_pblock();
-                            Some((ext_start, ext_end, pblock_start))
+                            Some((ext_start, ext_end, pblock_start, extent.is_unwritten()))
                         });
 
-                        if let Some((ext_start, ext_end, pblock_start)) = mapped {
-                            extent_cache = Some((ext_start, ext_end, pblock_start));
+                        if let Some((ext_start, ext_end, pblock_start, unwritten)) = mapped {
+                            extent_cache = Some((ext_start, ext_end, pblock_start, unwritten));
+                            if unwritten {
+                                return Ok(None);
+                            }
                             return Ok(Some(pblock_start + (lblock - ext_start) as u64));
                         }
 
@@ -811,9 +835,39 @@ impl Ext4 {
         lblock_start: u32,
         allocated_blocks: &[Ext4Fsblk],
     ) -> Result<usize> {
+        self.insert_allocated_blocks_as_extents_inner(inode_ref, lblock_start, allocated_blocks, false)
+    }
+
+    /// Inserts preallocated blocks past the write range as *unwritten*
+    /// extents: reads return zeros and a later write converts them, so the
+    /// uninitialized device contents are never exposed.
+    fn insert_unwritten_blocks_as_extents(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        lblock_start: u32,
+        allocated_blocks: &[Ext4Fsblk],
+    ) -> Result<usize> {
+        self.insert_allocated_blocks_as_extents_inner(inode_ref, lblock_start, allocated_blocks, true)
+    }
+
+    fn insert_allocated_blocks_as_extents_inner(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        lblock_start: u32,
+        allocated_blocks: &[Ext4Fsblk],
+        unwritten: bool,
+    ) -> Result<usize> {
         if allocated_blocks.is_empty() {
             return Ok(0);
         }
+
+        // The unwritten flag occupies the top bit of the on-disk length, so
+        // an unwritten extent encodes at most EXT_INIT_MAX_LEN - 1 blocks.
+        let max_chunk = if unwritten {
+            (EXT_INIT_MAX_LEN - 1) as usize
+        } else {
+            EXT_INIT_MAX_LEN as usize
+        };
 
         let mut inserted = 0usize;
         let mut logical = lblock_start;
@@ -830,12 +884,15 @@ impl Ext4 {
             let mut phys = allocated_blocks[seg_begin];
             let mut remaining = seg_end - seg_begin;
             while remaining > 0 {
-                let chunk_len = min(remaining, EXT_INIT_MAX_LEN as usize);
+                let chunk_len = min(remaining, max_chunk);
 
                 let mut newex = Ext4Extent::default();
                 newex.first_block = logical;
                 newex.store_pblock(phys);
                 newex.block_count = chunk_len as u16;
+                if unwritten {
+                    newex.mark_unwritten();
+                }
                 self.insert_extent(inode_ref, &mut newex)?;
 
                 logical = logical
@@ -919,19 +976,37 @@ impl Ext4 {
                     cursor
                 );
             }
-            let initial_probe = self.get_pblock_idx(inode_ref, cursor);
+            let initial_probe = self.get_pblock_idx_state(inode_ref, cursor);
             match initial_probe {
-                Ok(pblock) => {
+                Ok((pblock, unwritten)) => {
                     if let Some(seq) = profile_seq {
                         log::debug!(
-                "ext4_rs: generic014-map seq={} phase=initial_probe_mapped inode={} cursor={} pblock={}",
+                "ext4_rs: generic014-map seq={} phase=initial_probe_mapped inode={} cursor={} pblock={} unwritten={}",
                             seq,
                             inode_ref.inode_num,
                             cursor,
-                            pblock
+                            pblock,
+                            unwritten
                         );
                     }
-                    cursor += 1;
+                    if unwritten {
+                        // Preallocated (unwritten) blocks: convert the covered
+                        // span to written in place instead of allocating.
+                        // Counted into allocated_total so callers know the
+                        // extent tree changed and write the inode back.
+                        let conv_end =
+                            self.convert_unwritten_span(inode_ref, cursor, end_lblock)?;
+                        if conv_end <= cursor {
+                            return_errno_with_message!(
+                                Errno::EIO,
+                                "unwritten conversion made no progress"
+                            );
+                        }
+                        allocated_total += (conv_end - cursor) as usize;
+                        cursor = conv_end;
+                    } else {
+                        cursor += 1;
+                    }
                 }
                 Err(e) if e.error() == Errno::ENOENT => {
                     let run_start = cursor;
@@ -1021,19 +1096,29 @@ impl Ext4 {
                         );
                     }
 
+                    // Split the allocation: blocks inside the write range are
+                    // inserted as written (their data lands right after this
+                    // mapping step); surplus preallocated blocks past the
+                    // write range become *unwritten* extents so reads return
+                    // zeros until a later write converts them.
+                    let write_run_len = end_lblock.saturating_sub(run_start).min(cursor - run_start) as usize;
+                    let written_take = allocated_blocks.len().min(write_run_len);
+                    let (write_part, tail_part) = allocated_blocks.split_at(written_take);
+
                     if let Some(seq) = profile_seq {
                         log::debug!(
-                "ext4_rs: generic014-map seq={} phase=insert_start inode={} run_start={} blocks={:?}",
+                "ext4_rs: generic014-map seq={} phase=insert_start inode={} run_start={} blocks={:?} tail_blocks={}",
                             seq,
                             inode_ref.inode_num,
                             run_start,
-                            allocated_blocks
+                            allocated_blocks,
+                            tail_part.len()
                         );
                     }
                     let inserted = self.insert_allocated_blocks_as_extents(
                         inode_ref,
                         run_start,
-                        &allocated_blocks,
+                        write_part,
                     )?;
                     if let Some(seq) = profile_seq {
                         log::debug!(
@@ -1110,7 +1195,42 @@ impl Ext4 {
                         );
                     }
 
-                    if inserted < run_len {
+                    // Preallocation tail is best effort: if inserting the
+                    // unwritten extent fails, free the blocks back instead of
+                    // leaking them and continue with the write untouched.
+                    if !tail_part.is_empty() && inserted == written_take {
+                        let tail_start = run_start + written_take as u32;
+                        if let Err(e) = self.insert_unwritten_blocks_as_extents(
+                            inode_ref,
+                            tail_start,
+                            tail_part,
+                        ) {
+                            log::warn!(
+                                "[ensure_write_range_mapped] prealloc tail insert failed, freeing tail: inode={} tail_start={} blocks={} err={:?}",
+                                inode_ref.inode_num,
+                                tail_start,
+                                tail_part.len(),
+                                e
+                            );
+                            let mut seg_begin = 0usize;
+                            while seg_begin < tail_part.len() {
+                                let mut seg_end = seg_begin + 1;
+                                while seg_end < tail_part.len()
+                                    && tail_part[seg_end] == tail_part[seg_end - 1] + 1
+                                {
+                                    seg_end += 1;
+                                }
+                                self.balloc_free_blocks(
+                                    inode_ref,
+                                    tail_part[seg_begin],
+                                    (seg_end - seg_begin) as u32,
+                                );
+                                seg_begin = seg_end;
+                            }
+                        }
+                    }
+
+                    if inserted < write_run_len {
                         cursor = run_start + inserted as u32;
                     }
                 }
@@ -1153,10 +1273,17 @@ impl Ext4 {
         let lblock_end = u32::try_from((write_end - 1) / block_size + 1)
             .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
 
+        // Holes *and* unwritten (preallocated) blocks both need a zero fill
+        // once they become written: their device contents are uninitialized
+        // garbage and the mapping step below makes them readable.
         let mut newly_hole_lblocks = Vec::new();
         for lblock in lblock_start..lblock_end {
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(_) => {}
+            match self.get_pblock_idx_state(&inode_ref, lblock) {
+                Ok((_, unwritten)) => {
+                    if unwritten {
+                        newly_hole_lblocks.push(lblock);
+                    }
+                }
                 Err(err) if err.error() == Errno::ENOENT => newly_hole_lblocks.push(lblock),
                 Err(err) => return Err(err),
             }
@@ -1218,10 +1345,17 @@ impl Ext4 {
         let lblock_end = u32::try_from((range_end - 1) / block_size + 1)
             .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
 
+        // Unwritten (preallocated) blocks are zero-filled along with holes:
+        // the mapping step converts them to written, exposing their device
+        // contents, which must read back as zeros.
         let mut previously_hole = Vec::new();
         for lblock in lblock_start..lblock_end {
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(_) => {}
+            match self.get_pblock_idx_state(&inode_ref, lblock) {
+                Ok((_, unwritten)) => {
+                    if unwritten {
+                        previously_hole.push(lblock);
+                    }
+                }
                 Err(e) if e.error() == Errno::ENOENT => previously_hole.push(lblock),
                 Err(e) => return Err(e),
             }
@@ -1414,10 +1548,17 @@ impl Ext4 {
         } else {
             None
         };
+        // Unwritten (preallocated) blocks join the zero-fill list with holes:
+        // the mapping step converts them to written, so their uninitialized
+        // device contents must be zeroed before they become readable.
         let mut newly_hole_lblocks = Vec::new();
         for lblock in lblock_start..lblock_end {
-            match self.get_pblock_idx(&inode_ref, lblock) {
-                Ok(_) => {}
+            match self.get_pblock_idx_state(&inode_ref, lblock) {
+                Ok((_, unwritten)) => {
+                    if unwritten {
+                        newly_hole_lblocks.push(lblock);
+                    }
+                }
                 Err(err) if err.error() == Errno::ENOENT => newly_hole_lblocks.push(lblock),
                 Err(err) => return Err(err),
             }
@@ -1693,8 +1834,12 @@ impl Ext4 {
         if tail_offset != 0 {
             let tail_lblock = u32::try_from(new_size / block_size)
                 .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
-            match self.get_pblock_idx(inode_ref, tail_lblock) {
-                Ok(pblock) => {
+            match self.get_pblock_idx_state(inode_ref, tail_lblock) {
+                // An unwritten tail block already reads as zeros; a
+                // read-modify-write here would persist its uninitialized
+                // device contents. Leave it untouched.
+                Ok((_, true)) => {}
+                Ok((pblock, false)) => {
                     let block_offset = usize::try_from(pblock)
                         .map_err(|_| Ext4Error::new(Errno::EFBIG))?
                         .checked_mul(block_size as usize)
