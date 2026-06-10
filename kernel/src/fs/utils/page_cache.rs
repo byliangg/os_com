@@ -358,13 +358,28 @@ impl PageCacheManager {
         let mut pages = self.pages.lock();
         let backend = self.backend();
         let backend_npages = backend.npages();
-        for idx in page_idx_range.start..page_idx_range.end {
-            if let Some(page) = pages.peek(&idx)
-                && page.load_state() == PageState::Dirty
-                && idx < backend_npages
-            {
-                let waiter = backend.write_page_async(idx, page)?;
-                bio_waiter.concat(waiter);
+        // Coalesce contiguous dirty pages into runs and write each run in one
+        // batch, so backends can resolve the mapping / take the journal handle /
+        // issue the bio once per run instead of once per page.
+        let mut idx = page_idx_range.start;
+        while idx < page_idx_range.end {
+            let run_start = idx;
+            let mut run: Vec<&CachePage> = Vec::new();
+            while idx < page_idx_range.end {
+                match pages.peek(&idx) {
+                    Some(page)
+                        if page.load_state() == PageState::Dirty && idx < backend_npages =>
+                    {
+                        run.push(page);
+                        idx += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if run.is_empty() {
+                idx += 1;
+            } else {
+                bio_waiter.concat(backend.write_pages_async(run_start, &run)?);
             }
         }
 
@@ -585,6 +600,22 @@ pub trait PageCacheBackend: Sync + Send {
     fn write_page_async(&self, idx: usize, frame: &CachePage) -> Result<BioWaiter>;
     /// Returns the number of pages in the backend.
     fn npages(&self) -> usize;
+
+    /// Writes a contiguous run of dirty pages to the backend asynchronously.
+    ///
+    /// `start_idx` is the page index of `frames[0]`; the run covers
+    /// `[start_idx, start_idx + frames.len())`. The default implementation
+    /// writes each page individually via [`Self::write_page_async`], so backends
+    /// that do not override it keep their existing per-page behavior. Backends
+    /// may override it to coalesce the run into a single mapping resolution,
+    /// journal handle and bio.
+    fn write_pages_async(&self, start_idx: usize, frames: &[&CachePage]) -> Result<BioWaiter> {
+        let mut waiter = BioWaiter::new();
+        for (offset, &frame) in frames.iter().enumerate() {
+            waiter.concat(self.write_page_async(start_idx + offset, frame)?);
+        }
+        Ok(waiter)
+    }
 }
 
 impl dyn PageCacheBackend {

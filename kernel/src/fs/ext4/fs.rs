@@ -1169,6 +1169,49 @@ impl PageCacheBackend for Ext4PageCacheBackend {
         Ok(BioWaiter::new())
     }
 
+    /// S4 (Phase 6): write a contiguous run of dirty pages in one batch.
+    ///
+    /// Gathers the run's page contents into a single buffer and writes it with
+    /// one `write_page_cache_data_at` call, so the whole run is mapped once,
+    /// journaled under one handle and written as coalesced bios (`write_at`
+    /// merges contiguous physical blocks) -- instead of one mapping + one JBD2
+    /// handle + one 4KB bio per page. Preserves the same size clamp as
+    /// `write_page_async` (C4 invariant: never write past the on-disk size).
+    fn write_pages_async(&self, start_idx: usize, frames: &[&CachePage]) -> Result<BioWaiter> {
+        if frames.is_empty() {
+            return Ok(BioWaiter::new());
+        }
+        let fs = self.fs()?;
+        let offset = Self::page_offset(start_idx)?;
+        let file_size = fs.stat(self.ino)?.size as usize;
+        if offset >= file_size {
+            return Ok(BioWaiter::new());
+        }
+        let run_bytes = frames
+            .len()
+            .checked_mul(PAGE_SIZE)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "page cache run overflow"))?;
+        let write_len = run_bytes.min(file_size - offset);
+        if write_len == 0 {
+            return Ok(BioWaiter::new());
+        }
+        let mut data = vec![0u8; write_len];
+        let mut copied = 0;
+        for &frame in frames {
+            if copied >= write_len {
+                break;
+            }
+            let chunk = PAGE_SIZE.min(write_len - copied);
+            frame
+                .reader()
+                .read_fallible(&mut VmWriter::from(&mut data[copied..copied + chunk]).to_fallible())
+                .map_err(|(err, _)| Error::from(err))?;
+            copied += chunk;
+        }
+        fs.write_page_cache_data_at(self.ino, offset, data.as_slice())?;
+        Ok(BioWaiter::new())
+    }
+
     fn npages(&self) -> usize {
         let Ok(fs) = self.fs() else {
             return 0;
