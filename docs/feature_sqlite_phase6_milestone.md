@@ -5,15 +5,17 @@
 配套计划：`feature_sqlite_phase6_plan.md`
 起点证据：`sqlite_benchmark_report.md`（speedtest1 报告）、`feature_perf_phase5_milestone.md`（Phase 5 收口）
 
-## 当前状态（2026-06-09）
+## 当前状态（2026-06-11 收口）
 
-| Step | 内容 | 状态 |
-|------|------|------|
-| Step 0 | 起点固化 & SQLite profile 盘点（含 Step 0a 三 FS 诊断三角 ext4/ext2/ramfs）| ✅ 已完成：三角 + 四层 profile 归因表出齐（见下）|
-| Step 1 | 定位 → 选优化点 | ✅ **重定档（2026-06-10）**：delalloc 实测被平台墙堵死（Stage 1a「途中写回损坏数据」）→ 改 **fsync 安全点 + 缓存层 + 写时预分配**路线。记录 2a/2b-1/Stage 1a 三次失败教训 |
-| Step 2 | 实施新路线（S1 断言 → S3 删 fsync decommit → S4 fsync 批量写回 → S5 映射缓存 → S6 预分配；delalloc 降 S7 阻塞）| 🔄 进行中：S3 ✅（−7%）、S4 ✅（−5%）、**S6 ✅（−25%，unwritten extent + 预分配，守底全绿）**；剩 S5b 树块缓存 |
-| 并行 | revoke 正确性修复（F1，外部 review + 代码核实：revoke 从不写入 journal）| ⏳ 待执行（不涨分，保答辩；**S6 已落地块复用节奏加大暴露面，优先级上调**）|
-| Step 3 | 全量回归 + SQLite 重测收口 | 🔄 每步滚动执行：S6 轮全绿（crash 18/18 / xfstests 四包 / 并发两层 / host-crash 4/4 / fsync_flush 100% / fio 守底）|
+**性能线最终战绩：SQLite speedtest1 2010.7s → 234.9s（ratio 2.97% → 21.92%，7.4×），integrity 全程 PASS，守底全绿，HEAD 干净（bc883375a）。** 路线、上限理论依据与 delalloc 解锁链见 plan §P 系列。
+
+| 阶段 | 内容 | 状态 | SQLite |
+|------|------|------|-------:|
+| Step 0/0a | 起点固化 + 三 FS 三角 + 四层 profile 归因 | ✅ | 2010.7s（2.97%）|
+| S 系列 | S3 fsync 保留 clean 页（−7%）→ S4 批量写回（−5%）→ S6 unwritten extent + 写时预分配（−25%）| ✅ | 1332.2s（3.86%）|
+| P 系列 | P1 设备块缓存（−66%）→ P2 写快路径 ext2 化（−46%）→ P3b journal 合并写（中性）→ P5a lean prepare（−4%）；P3-1/P4 实测出局（负结果已记录）| ✅ | **234.9s（21.92%）** |
+| 收敛评估 | 曲线趋平（−66→−46→−4%）；类别内现实可达 ~24-27%（P5b 脏页索引 ~12-15s 为最后机械项）；90% 需 delalloc 解锁链（赛期外，见 plan）| 已与理论对齐 | — |
+| 并行（待执行）| revoke 正确性修复（F1，保答辩；S6/P2 块复用加大暴露面）；476/388 压力垃圾节点共同根因追踪（现有防御已保证降级 EIO 不 panic）| ⏳ | — |
 
 ### Step 2 分阶段（详见 `feature_sqlite_phase6_plan.md` §Step 2）
 

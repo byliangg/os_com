@@ -2,6 +2,7 @@
 
 首次创建时间：2026-06-09（Asia/Shanghai）
 重大方向调整：2026-06-10（delalloc 实测被平台墙堵死 → 改 fsync 安全点 + 缓存层路线）
+第二轮路线（2026-06-11）：S 系列收口后启动 **P 系列（90% 目标路线）**，见 §P 系列——已执行完毕并收敛，最终 **234.9s = 21.92%**，结论与 delalloc 解锁链见该节。
 
 ## 阶段定位
 
@@ -72,6 +73,36 @@ Phase 6 承接 feature_perf_phase5（O_DIRECT 读写守底已收口 75–123%，
 **revoke 修复（F1，外部 review 发现、已代码核实）**：`RevokeBlockHeader::new` 全仓零调用方 → **revoke 记录从不写入 journal**，但 recovery 完整实现了 revoke 扫描（`scan_revoke_blocks`/`parse_revoke_entries`）。后果：元数据块释放后重分配为数据块、tail 越过前崩溃 → replay 用陈旧元数据镜像静默覆盖用户数据。这是崩溃一致性叙事**唯一的真窟窿**（优秀档功能正确性被问到会翻车），且 S6 的块复用节奏会加大暴露面。
 - **修法**：释放元数据块（truncate/rmdir/extent 树收缩）时记 revoke 集合 → commit 写 `JBD2_REVOKE_BLOCK` → **必须同时给 replay 加序列号过滤**（recovery.rs:48 现对所有事务生效，无序列号上界；朴素写 revoke 会把后续重新 journal 的合法元数据也跳掉——两者必须一起修，否则修一个洞开一个洞）。
 - **验证**：加"块复用崩溃"用例进 crash matrix（建大目录→删→建大文件占同批块→fsync→replay 前杀 VM→remount 比对 CRC）。约 3–5 天。
+
+## P 系列（90% 目标路线，2026-06-11 执行完毕）——合并自 `feature_sqlite_phase6_90pct_roadmap.md`
+
+S 系列收口（S6，1332.2s=3.86%）后，以 90% 为目标做了第二轮"逐层代码排查 × Linux/ext2 对照 × profile 先行"的路线。**最终落点 234.9s = 21.92%（起点 2.97% 的 7.4×），守底全绿。**
+
+### P 系列执行结果总表
+
+| 步 | 内容 | 结果 | SQLite |
+|----|------|------|-------:|
+| P0 | S6 后 profile：**写 33GB 读 166GB（39.2M 次 4KB 读 ≈705s 设备等待）**——ext4_rs 全程零元数据缓存是单一最大瓶颈 | 归因 | 1332.2s |
+| P1 | **adapter 层 DeviceBlockCache**（write-through 设备镜像，JBD2 overlay 之下，O_DIRECT bio 显式失效；ext4_rs 仅 get_inode_ref 改对齐读）。命中率 98.5% | ✅ −66% | **454.3s（11.26%）** |
+| P2 | **写快路径 ext2 化**：WrittenCoverage 区间集（coverage⊆truth）+ VmReader 直写去双拷贝 + meta cache per-ino 失效。捎带修 S6 潜伏 388 panic（尾段部分插入失败双重释放） | ✅ −46% | **243.9s（20.88%）** |
+| P3-1 | size-only append（写时不转换，推迟到 writeback） | ❌ 三配置实测净负（462.9/312.8/468.0），含未解的读侧 30% 回退，回退；patch 留存 `benchmark/logs/p3_1_size_only_append_attempt_20260611.patch` | — |
+| P3b | journal commit 块合并大写（descriptor+payload 一次 bio） | ✅ 中性保留（证实 commit 桶大头不在 journal 块写） | 243.97s |
+| P4 | 真 fdatasync | ❌ 动手前核实出局：inode_tids 已门控 modified_blocks>0、commit 由批量轮转驱动（rotations 4742/5131）、[ext4-fsync] 实测 fsync 桶仅 28.6s | — |
+| P5a | **lean append prepare**（全已分配写单遍探测，3 遍树查→1 遍）+ insert_extent 损坏节点防御 + crash runner 端口碰撞修复 | ✅ −4% | **234.9s（21.92%）** |
+
+### 最终结论：上限的理论依据（答辩可直接引用）
+
+1. **不是根本极限**：Linux ext4 带完整 JBD2 = 51s（100%）。日志不贵，贵的是付税方式——Linux delalloc 把每页元数据成本摊到每 extent（≈0），我们"写时同步转换"每 4KB 全额支付。
+2. **当前架构类别的数学下限**：workload 含 549K 次新分配写（SQLite 行为，不可减）。写时同步转换下每次 append 的不可压缩成本（零填设备写 ~30us + handle/overlay ~60-100us + 转换手术 ~30-50us）即便理想化到 100us：549K×100us ≈ 55s，**仅此一项就逼近 90% 目标总预算（57s）**。类别内理论最优 ≈ 110-120s（43-46%，无已知路径）；**现实可达 ≈ 190-210s（24-27%）**（P5b 脏页索引 ~12-15s + 零碎）。
+3. **曲线实测趋平**：P1 −66% → P2 −46% → P5a −4%。
+
+### delalloc 解锁链（通往 50-90% 的唯一通道，赛期外）
+
+依赖链：**① 钉死 Stage 1a"途中写回损坏"exact-line 根因**（milestone 明示未钉死——可能是可修 bug 而非铁墙，是第一张多米诺）→ **② 安全写回驱动**（修好①或建后台 flusher，OSTD 级周级工程）→ **③ 解开 P3-1 读侧 30% 回退之谜**（先加细分 instrumentation：写回转换计时/populate/find_extent 计数）→ **④ delalloc 本体 + 全量崩溃语义门控**。估 2-4 周，①③带不确定性。**赛期内决策：24-27% 收口 + 三角归因叙事答辩。**
+
+### P 系列方法论收获（负结果也是成果）
+
+三次"先核实/先 profile"各省一轮实现：delalloc（Stage 1a 隔离实验）、P3-1（三配置对照后按铁律回退）、P4（计数器核实 0 实现成本出局）。两个压力潜伏 bug（388 双重释放修复、476 防御降级）+ harness 端口碰撞根治为守底基建净赚项。
 
 ## Step 3：全量回归 + SQLite 重测收口
 
