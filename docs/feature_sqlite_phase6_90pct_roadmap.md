@@ -84,7 +84,8 @@
 | P0 | ✅ S6 后 profile 已回填 §2：166GB 元数据读风暴 = 单一最大瓶颈 | — | — | 已完成 | — |
 | P1 | ✅ **已落地（2026-06-11，实测 454.3s = 11.26%，−66%）**：adapter 层 `DeviceBlockCache`（write-through 设备镜像，O_DIRECT bio 显式失效；ext4_rs 仅 get_inode_ref 对齐读）。命中率 98.5%（38.58M hits），fast path 93→23us、slow prepare 552→216us。守底全绿（crash 18/18 / 八套件 / 并发两层 / host-crash 4/4 / fio write 79.08%）。P1 后新桶：fast 200.5s/41% + slow 161.5s/33% + commit/fsync ~100s/20%（489s profile 口径）| — | ~~350–500s~~ **454.3s ✓** | 1 天（设计将一致性局部化到 adapter，远低于原估 1 周）| 已过门控 |
 | P2 | ✅ **已落地（2026-06-11，实测 243.9s = 20.88%，−46%）**：WrittenCoverage 区间集（coverage⊆truth，populate-on-miss + prepare 后插入 + Truncate/touch-cache 失效）+ VmReader 直写去双拷贝 + meta cache per-ino 失效。"接纳预分配追加走快路径"未做（移入 P3/P4 与 fdatasync 一并考虑）。**捎带修复 S6 潜伏 388 panic（尾段部分插入失败整体释放→双重释放，修为只释放未插入后缀 + ext_remove_leaf 防御钳制）**。守底全绿（fsync_flush 修复后 ×2、crash 18/18×2、fio write 75.02% 贴线待复跑）| — | ~~180–280s~~ **243.9s ✓** | 1 天 | 已过门控 |
-| P3 | a) 脏页索引化 fsync b) jbd2 commit 大 bio + sb 延迟 + 核实 checkpoints=5155/commit 是否过频 | P1 | **~120–190s（27–43%）**| 4–7 天 | a) 动 ext2 共享路径 b) recovery 正确性 |
+| P3-1 | ❌ **size-only append 已试已回退（2026-06-11）**：三轮实测均净负（462.9/312.8/468.0 vs P2 243.9）。journal 侧省 23s 被 +69s 非 journal 开销和读侧 30% 回退吃掉，全局病灶未钉死。patch 留存 `benchmark/logs/p3_1_size_only_append_attempt_20260611.patch`；重启前置条件 = 细分 instrumentation（writeback 转换/populate/find_extent 计数）。P2 后真实桶：fast 4.9s + slow 153s（549K×278us，其中 journaled op avg 229us = 框架 40us + apply 187us）+ commit/fsync ~90s | — | 净负回退 | 1 天 | 教训已记 milestone |
+| P3 | a) 脏页索引化 fsync b) jbd2 commit 大 bio + sb 延迟 + 核实 checkpoints=5131/commit 语义 | P1 | **~150–200s（25–34%）**（攻 ~90s commit/fsync 桶 + slow 中的框架开销）| 4–7 天 | a) 动 ext2 共享路径 b) recovery 正确性 |
 | P4 | 真 fdatasync（数据型同步免 commit）| P3 | **~85–140s（37–60%）**| 2–3 天 | 持久化语义（host-crash + fsync/flush 套件）|
 | P5 | 残余按 P4 后 profile 定（候选：目录 op 缓存化——SQLite journal 文件每事务 create/unlink；group commit；锁粒度）| P4 | 冲 **65–110s（47–80%+）**| 按需 | — |
 
