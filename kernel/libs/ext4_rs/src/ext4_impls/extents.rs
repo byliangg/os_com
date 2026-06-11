@@ -282,6 +282,26 @@ impl Ext4 {
         let at_root = node.pblock_of_node == 0;
         let header = node.header;
 
+        // Defensive (generic/476 hardening): never insert into a node whose
+        // entries_count exceeds its physical capacity (a corrupted or
+        // garbage node) -- the entry shift loops in insert_new_extent would
+        // index out of bounds and panic the kernel. Degrade to EIO instead.
+        let node_capacity = if at_root {
+            (inode_ref.inode.block.len() * 4 - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE
+        } else {
+            (self.super_block.block_size() as usize - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE
+        };
+        if header.entries_count as usize > node_capacity {
+            log::error!(
+                "[insert_extent] corrupted extent node: entries_count={} capacity={} at_root={} node_pblock={} -- refusing insert",
+                header.entries_count,
+                node_capacity,
+                at_root,
+                node.pblock_of_node
+            );
+            return_errno_with_message!(Errno::EIO, "corrupted extent node");
+        }
+
         // Node is empty (no extents)
         if header.entries_count == 0 {
             self.insert_new_extent(inode_ref, &mut search_path, newex)?;

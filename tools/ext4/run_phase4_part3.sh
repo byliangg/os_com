@@ -198,7 +198,13 @@ run_crash_suite() {
       local verify_log="${LOG_DIR}/crash/${scenario}_verify_r${round}.log"
 
       run_crash_prepare_once "${scenario}" "${hold_op}" "${CRASH_HOLD_STAGE}" "${round}" "${prepare_log}"
+      # Let the killed prepare VM fully release its random hostfwd ports
+      # before the next QEMU launch: back-to-back launches within the same
+      # second occasionally pick colliding ports ("Could not set up host
+      # forwarding rule" flakes).
+      sleep 2
       run_crash_verify_once "${scenario}" "${CRASH_EXPECT}" "${round}" "${verify_log}"
+      sleep 2
       printf "%s\t%s\t%s\t%s\t%s\t%s\tPASS\n" \
         "${round}" "${scenario}" "${hold_op}" "${CRASH_HOLD_STAGE}" "${prepare_log}" "${verify_log}" >> "${summary}"
     done

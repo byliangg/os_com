@@ -1303,6 +1303,69 @@ impl Ext4 {
         let lblock_end = u32::try_from((write_end - 1) / block_size + 1)
             .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
 
+        // P5a (Phase 6): lean path for writes whose blocks are already
+        // allocated (written or unwritten/preallocated) -- the dominant
+        // SQLite shape after S6: a 1-block append into the preallocation
+        // tail. One probe pass records pblock+state; unwritten spans are
+        // converted (conversion preserves the physical mapping, so the
+        // recorded pblocks stay valid) and zero-filled exactly like the
+        // general path; the returned mappings are built straight from the
+        // probe records. This replaces three extent-tree passes (hole
+        // pre-probe, ensure re-probe, collect) and the allocation-hint
+        // lookup with a single pass. Any hole falls through to the general
+        // allocation path below. No persistence-semantics change.
+        {
+            let mut runs: Vec<SimpleBlockRange> = Vec::new();
+            let mut unwritten_blocks: Vec<(u32, Ext4Fsblk)> = Vec::new();
+            let mut all_allocated = true;
+            for lblock in lblock_start..lblock_end {
+                match self.get_pblock_idx_state(&inode_ref, lblock) {
+                    Ok((pblock, unwritten)) => {
+                        if unwritten {
+                            unwritten_blocks.push((lblock, pblock));
+                        }
+                        Self::push_block_range(&mut runs, lblock, pblock, 1);
+                    }
+                    Err(err) if err.error() == Errno::ENOENT => {
+                        all_allocated = false;
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            if all_allocated {
+                let mut i = 0usize;
+                while i < unwritten_blocks.len() {
+                    let (from, _) = unwritten_blocks[i];
+                    let conv_end = self.convert_unwritten_span(&mut inode_ref, from, lblock_end)?;
+                    while i < unwritten_blocks.len() && unwritten_blocks[i].0 < conv_end {
+                        i += 1;
+                    }
+                }
+
+                if !unwritten_blocks.is_empty() {
+                    let zero_block = vec![0u8; block_size];
+                    for (_, pblock) in &unwritten_blocks {
+                        let pblock = usize::try_from(*pblock)
+                            .map_err(|_| Ext4Error::new(Errno::EFBIG))?;
+                        let block_offset = pblock
+                            .checked_mul(block_size)
+                            .ok_or_else(|| Ext4Error::new(Errno::EFBIG))?;
+                        self.block_device
+                            .write_offset(block_offset, zero_block.as_slice());
+                    }
+                }
+
+                if write_end > file_size as usize {
+                    inode_ref.inode.set_size(write_end as u64);
+                    self.write_back_inode(&mut inode_ref);
+                }
+
+                return Ok(runs);
+            }
+        }
+
         // Holes *and* unwritten (preallocated) blocks both need a zero fill
         // once they become written: their device contents are uninitialized
         // garbage and the mapping step below makes them readable.
