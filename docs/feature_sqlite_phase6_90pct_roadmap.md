@@ -95,3 +95,9 @@
 ## 5. 验收与守底（不变）
 
 每步不回退：crash matrix 18/18、host-crash 4/4、phase6/pagecache/phase4/phase3 xfstests、并发两层、fsync_flush、fio O_DIRECT 75%+、SQLite `integrity_check` PASS。P3a 动共享 page_cache.rs 必须 ext2 行为不变 + coherency 套件；P3b/P4 动持久化语义，crash 类全量 + 新增"fdatasync 后 crash"用例。
+
+## 6. fsync 桶细分实测（2026-06-11，[ext4-fsync] instrumentation，commit d17f01e5a）
+
+790 次 fsync：写回 21.5s（avg 27.2ms，含 evict_range 全范围扫描+IO+per-run handle）+ commit 等待 5.1s + flush 2.0s = **fsync 桶全部仅 ~28.6s**（此前估 ~90s 系高估）。**P4 真 fdatasync 出局**：inode_tids 已门控 modified_blocks>0（纯覆盖 fsync 本就常走已提交快路径），commit 由批量轮转驱动（rotations 4742/5131）非 fsync 驱动。
+
+**修正后的剩余地图（244s 诚实口径）**：slow path（journaled append prepare）153s/63% >> 读 26s（已平）> fsync 写回 ~19s（其中扫描估 12-15s，P3a 脏页索引可吃）> commit+flush ~7s。**结构性结论：要破 150s 必须破 153s 慢路径**——每次 1 块 append 付 278us journaled prepare（3 遍探测+转换+零填+2 次 inode overlay 记录+handle 启停）。candidates：①lean append prepare（单块 append 捷径：跳过 3 遍探测/initial_bgid/collect，保留转换+零填+size，预期 278→~120-150us，省 ~50-70s，无语义变化）②P3a 脏页索引（~12-15s，动共享 page_cache.rs）③P3-1 重启（需先钉死读侧 30% 回退之谜）。推荐顺序 ①→②。
