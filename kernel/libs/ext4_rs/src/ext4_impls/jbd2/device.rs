@@ -87,6 +87,62 @@ impl JournalDevice {
         Ok(block.data)
     }
 
+    /// P3 (Phase 6): writes a sequence of journal blocks, coalescing runs
+    /// that are consecutive in BOTH logical journal order and physical disk
+    /// placement into single large writes (one bio each, instead of one
+    /// synchronous virtio round trip per block). mkfs journals are typically
+    /// fully contiguous, so a whole commit (descriptor + N metadata blocks)
+    /// usually lands as one write.
+    pub fn write_blocks_coalesced(
+        &self,
+        block_device: &Arc<dyn BlockDevice>,
+        blocks: &[(u32, &[u8])],
+    ) -> Result<()> {
+        let block_size = self.fs_block_size as usize;
+        let mut i = 0usize;
+        while i < blocks.len() {
+            let (run_logical, _) = blocks[i];
+            let run_phys = self.logical_to_physical(run_logical)?;
+            let mut run_len = 1usize;
+            while i + run_len < blocks.len() {
+                let (next_logical, _) = blocks[i + run_len];
+                if next_logical != run_logical.wrapping_add(run_len as u32) {
+                    break;
+                }
+                let next_phys = self.logical_to_physical(next_logical)?;
+                if next_phys != run_phys + run_len as u64 {
+                    break;
+                }
+                run_len += 1;
+            }
+
+            if run_len == 1 {
+                let (logical, data) = blocks[i];
+                self.write_block(block_device, logical, data)?;
+            } else {
+                let mut buf = vec![0u8; run_len * block_size];
+                for (j, (_, data)) in blocks[i..i + run_len].iter().enumerate() {
+                    if data.len() > block_size {
+                        return_errno_with_message!(
+                            Errno::EINVAL,
+                            "journal block write too large"
+                        );
+                    }
+                    buf[j * block_size..j * block_size + data.len()].copy_from_slice(data);
+                }
+                let offset = run_phys
+                    .checked_mul(self.fs_block_size as u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| {
+                        Ext4Error::with_message(Errno::EINVAL, "journal block offset overflow")
+                    })?;
+                block_device.write_offset(offset, &buf);
+            }
+            i += run_len;
+        }
+        Ok(())
+    }
+
     pub fn write_block(
         &self,
         block_device: &Arc<dyn BlockDevice>,

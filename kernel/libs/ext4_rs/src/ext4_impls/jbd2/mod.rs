@@ -178,13 +178,20 @@ impl Jbd2Journal {
 
         let descriptor = self.build_descriptor_block(sequence, entries.as_slice())?;
         hook(JournalCommitWriteStage::BeforeDescriptor);
-        self.device.write_block(block_device, descriptor_block, &descriptor)?;
-
+        // P3 (Phase 6): write descriptor + payload as coalesced large writes
+        // (one bio per physically contiguous run) instead of one synchronous
+        // round trip per block. Ordering vs the commit block is preserved by
+        // the device sync below.
+        let mut seq_blocks: Vec<(u32, &[u8])> =
+            Vec::with_capacity(entries.len() + 1);
+        seq_blocks.push((descriptor_block, descriptor.as_slice()));
         let mut data_block = self.space.advance(descriptor_block, 1);
         for entry in &entries {
-            self.device.write_block(block_device, data_block, entry.data.as_slice())?;
+            seq_blocks.push((data_block, entry.data.as_slice()));
             data_block = self.space.advance(data_block, 1);
         }
+        self.device
+            .write_blocks_coalesced(block_device, seq_blocks.as_slice())?;
 
         let commit = self.build_commit_block(sequence);
         hook(JournalCommitWriteStage::BeforeCommitBlock);
