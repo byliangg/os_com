@@ -1390,6 +1390,26 @@ impl Ext4 {
         let extent_area_off = size_of::<Ext4ExtentHeader>();
         let mut write_pos = pos;
 
+        // Defensive: a corrupted node (e.g. a leaf overwritten by foreign
+        // data) can carry an entries_count far beyond what the node can hold.
+        // Clamp to the physical capacity so a bad filesystem state degrades
+        // into an error path instead of an out-of-bounds panic.
+        let capacity = ext4block
+            .data
+            .len()
+            .saturating_sub(extent_area_off)
+            / extent_size;
+        let mut entry_count = entry_count;
+        if entry_count as usize > capacity {
+            log::error!(
+                "[ext_remove_leaf] corrupted extent node: entries_count={} capacity={} node_pblock={} -- clamping",
+                entry_count,
+                capacity,
+                path.path[depth as usize].pblock_of_node
+            );
+            entry_count = capacity as u16;
+        }
+
         for i in pos..entry_count as usize {
             let offset = extent_area_off + i * extent_size;
             let mut ex: Ext4Extent = ext4block.read_offset_as(offset);

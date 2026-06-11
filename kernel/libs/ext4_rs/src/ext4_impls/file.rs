@@ -835,19 +835,40 @@ impl Ext4 {
         lblock_start: u32,
         allocated_blocks: &[Ext4Fsblk],
     ) -> Result<usize> {
-        self.insert_allocated_blocks_as_extents_inner(inode_ref, lblock_start, allocated_blocks, false)
+        let mut inserted = 0usize;
+        self.insert_allocated_blocks_as_extents_inner(
+            inode_ref,
+            lblock_start,
+            allocated_blocks,
+            false,
+            &mut inserted,
+        )?;
+        Ok(inserted)
     }
 
     /// Inserts preallocated blocks past the write range as *unwritten*
     /// extents: reads return zeros and a later write converts them, so the
     /// uninitialized device contents are never exposed.
+    ///
+    /// On error, `inserted_out` reports how many leading blocks were already
+    /// referenced by successfully inserted extents. The caller must NOT free
+    /// those (they are reachable from the tree); freeing them would put
+    /// referenced blocks back into the allocator and corrupt the filesystem
+    /// once they are reallocated.
     fn insert_unwritten_blocks_as_extents(
         &self,
         inode_ref: &mut Ext4InodeRef,
         lblock_start: u32,
         allocated_blocks: &[Ext4Fsblk],
-    ) -> Result<usize> {
-        self.insert_allocated_blocks_as_extents_inner(inode_ref, lblock_start, allocated_blocks, true)
+        inserted_out: &mut usize,
+    ) -> Result<()> {
+        self.insert_allocated_blocks_as_extents_inner(
+            inode_ref,
+            lblock_start,
+            allocated_blocks,
+            true,
+            inserted_out,
+        )
     }
 
     fn insert_allocated_blocks_as_extents_inner(
@@ -856,9 +877,11 @@ impl Ext4 {
         lblock_start: u32,
         allocated_blocks: &[Ext4Fsblk],
         unwritten: bool,
-    ) -> Result<usize> {
+        inserted_out: &mut usize,
+    ) -> Result<()> {
+        *inserted_out = 0;
         if allocated_blocks.is_empty() {
-            return Ok(0);
+            return Ok(());
         }
 
         // The unwritten flag occupies the top bit of the on-disk length, so
@@ -869,7 +892,6 @@ impl Ext4 {
             EXT_INIT_MAX_LEN as usize
         };
 
-        let mut inserted = 0usize;
         let mut logical = lblock_start;
         let mut seg_begin = 0usize;
 
@@ -899,14 +921,14 @@ impl Ext4 {
                     .checked_add(chunk_len as u32)
                     .ok_or_else(|| Ext4Error::new(Errno::EINVAL))?;
                 phys += chunk_len as u64;
-                inserted += chunk_len;
+                *inserted_out += chunk_len;
                 remaining -= chunk_len;
             }
 
             seg_begin = seg_end;
         }
 
-        Ok(inserted)
+        Ok(())
     }
 
     fn ensure_write_range_mapped(
@@ -1196,33 +1218,41 @@ impl Ext4 {
                     }
 
                     // Preallocation tail is best effort: if inserting the
-                    // unwritten extent fails, free the blocks back instead of
-                    // leaking them and continue with the write untouched.
+                    // unwritten extents fails partway (e.g. ENOSPC while
+                    // growing the tree on a nearly full fs), blocks already
+                    // referenced by inserted extents MUST stay allocated --
+                    // freeing them would hand referenced blocks back to the
+                    // allocator and corrupt whoever reallocates them. Only
+                    // the un-inserted suffix is freed.
                     if !tail_part.is_empty() && inserted == written_take {
                         let tail_start = run_start + written_take as u32;
+                        let mut tail_inserted = 0usize;
                         if let Err(e) = self.insert_unwritten_blocks_as_extents(
                             inode_ref,
                             tail_start,
                             tail_part,
+                            &mut tail_inserted,
                         ) {
+                            let leftover = &tail_part[tail_inserted..];
                             log::warn!(
-                                "[ensure_write_range_mapped] prealloc tail insert failed, freeing tail: inode={} tail_start={} blocks={} err={:?}",
+                                "[ensure_write_range_mapped] prealloc tail insert failed, freeing un-inserted suffix: inode={} tail_start={} blocks={} inserted={} err={:?}",
                                 inode_ref.inode_num,
                                 tail_start,
                                 tail_part.len(),
+                                tail_inserted,
                                 e
                             );
                             let mut seg_begin = 0usize;
-                            while seg_begin < tail_part.len() {
+                            while seg_begin < leftover.len() {
                                 let mut seg_end = seg_begin + 1;
-                                while seg_end < tail_part.len()
-                                    && tail_part[seg_end] == tail_part[seg_end - 1] + 1
+                                while seg_end < leftover.len()
+                                    && leftover[seg_end] == leftover[seg_end - 1] + 1
                                 {
                                     seg_end += 1;
                                 }
                                 self.balloc_free_blocks(
                                     inode_ref,
-                                    tail_part[seg_begin],
+                                    leftover[seg_begin],
                                     (seg_end - seg_begin) as u32,
                                 );
                                 seg_begin = seg_end;

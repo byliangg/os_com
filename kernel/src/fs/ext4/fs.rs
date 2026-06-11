@@ -86,6 +86,13 @@ const EXT4_SB_MAGIC_OFFSET: usize = 56;
 const EXT4_SB_DESC_SIZE_OFFSET: usize = 254;
 const JOURNALED_SMALL_WRITE_MAX_BYTES: usize = 192;
 
+// P2 (Phase 6): bounds for the per-inode written-extent coverage cache.
+// A populated entry holds the file's merged written ranges (~16 bytes each);
+// files whose extent tree exceeds the range cap are marked TooFragmented and
+// fall back to the per-write mapping walk.
+const WRITTEN_COVERAGE_MAX_RANGES: usize = 4096;
+const WRITTEN_COVERAGE_MAX_INODES: usize = 64;
+
 // ext4_rs currently stores runtime block size in a global variable.
 // Serialize ext4_rs calls across mounted ext4 instances to avoid
 // cross-filesystem block-size races during xfstests mkfs/remount cycles.
@@ -1229,6 +1236,84 @@ impl Ext4MetadataWriter for JournalOperationMetadataWriter {
     }
 }
 
+/// P2 (Phase 6): per-inode in-memory coverage of *written* extents, so the
+/// buffered overwrite fast path can answer "is this range fully written?"
+/// with one BTreeMap lookup instead of an extent-tree walk per write().
+///
+/// Correctness invariant: **coverage ⊆ truth**. Entries are created only by
+/// `coverage_populate` (an authoritative whole-file mapping walk under the
+/// inode correctness lock) and extended only with post-success prepare
+/// mappings (ranges the journaled prepare just made written). Paths that can
+/// *remove* written mappings — truncate (`JournaledOp::Truncate` chokepoint),
+/// unlink / rmdir / rename-overwrite (`clear_inode_touch_cache`) — drop the
+/// whole entry. Untracked additions (e.g. mmap-hole allocation during
+/// writeback) only make coverage pessimistic, never wrong: a miss falls back
+/// to the real mapping walk.
+enum WrittenCoverage {
+    /// Merged, maximal, non-adjacent written ranges: start lblock -> len.
+    /// Because ranges are maximal, a query window is fully covered iff the
+    /// single predecessor range covers it.
+    Ranges(BTreeMap<u32, u32>),
+    /// The file's written extent set exceeded `WRITTEN_COVERAGE_MAX_RANGES`;
+    /// skip caching until the next invalidation.
+    TooFragmented,
+}
+
+impl WrittenCoverage {
+    fn covers(&self, start: u32, count: u32) -> bool {
+        let WrittenCoverage::Ranges(ranges) = self else {
+            return false;
+        };
+        let Some(end) = start.checked_add(count) else {
+            return false;
+        };
+        let Some((&range_start, &range_len)) = ranges.range(..=start).next_back() else {
+            return false;
+        };
+        range_start.saturating_add(range_len) >= end
+    }
+
+    /// Merge-inserts a written range, keeping ranges maximal and
+    /// non-adjacent.
+    fn insert(&mut self, start: u32, len: u32) {
+        let WrittenCoverage::Ranges(ranges) = self else {
+            return;
+        };
+        if len == 0 {
+            return;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return;
+        };
+        let mut merged_start = start;
+        let mut merged_end = end;
+        // Absorb the predecessor if it overlaps or touches the new range.
+        if let Some((&prev_start, &prev_len)) = ranges.range(..=start).next_back() {
+            let prev_end = prev_start.saturating_add(prev_len);
+            if prev_end >= merged_start {
+                merged_start = prev_start;
+                merged_end = merged_end.max(prev_end);
+            }
+        }
+        // Absorb successors that overlap or touch.
+        let mut absorbed = Vec::new();
+        for (&next_start, &next_len) in ranges.range(merged_start..) {
+            if next_start > merged_end {
+                break;
+            }
+            absorbed.push(next_start);
+            merged_end = merged_end.max(next_start.saturating_add(next_len));
+        }
+        for key in absorbed {
+            ranges.remove(&key);
+        }
+        ranges.insert(merged_start, merged_end - merged_start);
+        if ranges.len() > WRITTEN_COVERAGE_MAX_RANGES {
+            *self = WrittenCoverage::TooFragmented;
+        }
+    }
+}
+
 struct Ext4PageCacheState {
     page_cache: PageCache,
     _backend: Arc<Ext4PageCacheBackend>,
@@ -1454,6 +1539,10 @@ pub(super) struct Ext4Fs {
     // (a few integers per extent) so sequential reads skip the per-read
     // `find_extent` walk. Holds no file data and does no speculative readahead.
     inode_extent_map_cache: Mutex<BTreeMap<u32, ExtentMapCacheEntry>>,
+    // P2 (Phase 6): per-inode written-extent coverage for the buffered
+    // overwrite fast path. See `WrittenCoverage` for the ⊆-truth invariant
+    // and the invalidation sites.
+    inode_written_coverage: Mutex<BTreeMap<u32, WrittenCoverage>>,
     // Phase 5: in-memory inode metadata (stat) cache. ext4_rs `get_inode_ref`
     // re-reads the inode block from the device on every stat, and the read path
     // stats several times per read (type check, size, atime), so small reads
@@ -1515,6 +1604,7 @@ impl Ext4Fs {
             open_file_handles: Mutex::new(BTreeMap::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_extent_map_cache: Mutex::new(BTreeMap::new()),
+            inode_written_coverage: Mutex::new(BTreeMap::new()),
             inode_meta_cache: Mutex::new(BTreeMap::new()),
             meta_cache_generation: AtomicU64::new(0),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
@@ -4334,12 +4424,31 @@ impl Ext4Fs {
         let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
 
         // Phase 5 (inode meta cache): this journaled op may have changed inode
-        // metadata (size/mtime/nlink/mode/...) for the target and/or its parent
-        // directory. Bump the generation and drop all cached stats so the next
-        // stat re-reads. The generation guard in `stat` prevents a racing stat
-        // from re-inserting a value it read across this mutation.
+        // metadata (size/mtime/nlink/mode/...). Bump the generation and drop
+        // the affected cached stats so the next stat re-reads. The generation
+        // guard in `stat` prevents a racing stat from re-inserting a value it
+        // read across this mutation.
+        //
+        // P2 (Phase 6): single-inode ops (the overwhelming majority — SQLite's
+        // journal-file writes) only touch their own inode's metadata, so only
+        // that entry is dropped; directory ops touch parent + child inodes and
+        // keep the conservative clear-all. Truncate is the only journaled op
+        // that can *remove* written mappings, so it also drops the written
+        // coverage (unlink/rmdir/rename-overwrite go through
+        // `clear_inode_touch_cache`).
         self.meta_cache_generation.fetch_add(1, Ordering::Release);
-        self.inode_meta_cache.lock().clear();
+        match op.as_ref() {
+            Some(JournaledOp::Write { ino, .. }) | Some(JournaledOp::InodeMetadata { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+            }
+            Some(JournaledOp::Truncate { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+                self.coverage_invalidate(*ino);
+            }
+            _ => {
+                self.inode_meta_cache.lock().clear();
+            }
+        }
 
         let finish_handle_start_ns = Self::monotonic_nanos();
         self.finish_jbd2_handle(jbd2_handle, op.as_ref(), op_name, result.is_ok());
@@ -4501,6 +4610,7 @@ impl Ext4Fs {
     fn clear_inode_touch_cache(&self, ino: u32) {
         self.drop_page_cache_state(ino);
         self.invalidate_direct_read_cache(ino);
+        self.coverage_invalidate(ino);
         self.inode_atime_cache.lock().remove(&ino);
         self.inode_ctime_cache.lock().remove(&ino);
         self.inode_mtime_ctime_cache.lock().remove(&ino);
@@ -5082,28 +5192,29 @@ impl Ext4Fs {
             0
         };
 
-        let mut data = vec![0u8; write_len];
-        reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
-
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
 
-        // Fast path: a pure overwrite of already-allocated blocks (no append, no
-        // hole) needs no block allocation, so skip the per-write() journaled
-        // prepare entirely. The data reaches disk via the journaled writeback at
-        // fsync/sync; mtime/ctime is journaled at most once per second by
-        // `touch_mtime_ctime` (ext4 inode timestamps are seconds-granularity, so
-        // this loses no precision). This removes the dominant per-write() cost on
-        // buffered overwrite-heavy workloads (e.g. SQLite).
+        // Fast path: a pure overwrite of already-written blocks (no append, no
+        // hole, no unwritten extent) needs no block allocation, so skip the
+        // per-write() journaled prepare entirely. The data reaches disk via the
+        // journaled writeback at fsync/sync; mtime/ctime is journaled at most
+        // once per second by `touch_mtime_ctime` (ext4 inode timestamps are
+        // seconds-granularity, so this loses no precision).
+        //
+        // P2 (Phase 6): the written check is answered by the in-memory
+        // coverage cache (one BTreeMap lookup), and the user data is copied
+        // straight from the `VmReader` into the page cache — the same shape
+        // as ext2's write path (no intermediate buffer, no extent walk).
         let cur_size = self.stat(ino)?.size as usize;
         if let Some(write_end) = offset.checked_add(write_len)
             && write_end <= cur_size
-            && self.write_range_fully_mapped(ino, offset, write_len)?
+            && self.write_range_covered_written(ino, offset, write_len)?
         {
             self.touch_mtime_ctime(ino)?;
             self.invalidate_direct_read_cache(ino);
             let page_cache = self.page_cache_state_for_inode(ino, cur_size)?.pages();
-            page_cache.write(offset, &mut VmReader::from(data.as_slice()).to_fallible())?;
+            page_cache.write(offset, reader)?;
             if profile_enabled {
                 self.buffered_write_profile.record_fast(
                     write_len,
@@ -5112,6 +5223,11 @@ impl Ext4Fs {
             }
             return Ok(write_len);
         }
+
+        // Slow path needs the data in a kernel buffer: the journaled prepare
+        // must run before the page-cache copy.
+        let mut data = vec![0u8; write_len];
+        reader.read_fallible(&mut VmWriter::from(data.as_mut_slice()).to_fallible())?;
 
         // Slow path: append / sparse / unmapped range — needs journaled allocation.
         let now = Self::now_unix_seconds_u32();
@@ -5150,6 +5266,9 @@ impl Ext4Fs {
             0
         };
         self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+        // P2: the prepare made the whole write range written; extend the
+        // coverage so subsequent overwrites of it take the fast path.
+        self.coverage_insert_ranges(ino, &mappings);
 
         self.invalidate_direct_read_cache(ino);
         self.inode_mtime_ctime_cache.lock().insert(ino, now);
@@ -5166,6 +5285,99 @@ impl Ext4Fs {
             );
         }
         Ok(write_len)
+    }
+
+    /// P2 (Phase 6): answers "is `[offset, offset+len)` fully written?" for
+    /// the buffered overwrite fast path, preferring the in-memory coverage
+    /// cache over the extent-tree walk.
+    ///
+    /// - Coverage hit → true with one BTreeMap lookup.
+    /// - No entry → populate it with one authoritative whole-file mapping
+    ///   walk (read-semantics `map_blocks`, which skips unwritten extents),
+    ///   then answer from it: post-populate the entry IS the truth.
+    /// - TooFragmented → fall back to the per-write range walk.
+    ///
+    /// Caller must hold the inode correctness lock (all mutators of this
+    /// inode's mappings do), which serializes coverage reads/populates with
+    /// truncate/unlink invalidation.
+    fn write_range_covered_written(&self, ino: u32, offset: usize, len: usize) -> Result<bool> {
+        if len == 0 {
+            return Ok(true);
+        }
+        let block_size = EXT4_BLOCK_SIZE;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "write range overflow"))?;
+        let lblock_start = u32::try_from(offset / block_size)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
+        let lblock_count = u32::try_from(end.div_ceil(block_size) - offset / block_size)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
+
+        {
+            let coverage = self.inode_written_coverage.lock();
+            match coverage.get(&ino) {
+                Some(entry @ WrittenCoverage::Ranges(_)) => {
+                    return Ok(entry.covers(lblock_start, lblock_count));
+                }
+                Some(WrittenCoverage::TooFragmented) => {
+                    drop(coverage);
+                    return self.write_range_fully_mapped(ino, offset, len);
+                }
+                None => {}
+            }
+        }
+
+        self.coverage_populate(ino)?;
+        Ok(self
+            .inode_written_coverage
+            .lock()
+            .get(&ino)
+            .is_some_and(|c| c.covers(lblock_start, lblock_count)))
+    }
+
+    /// Builds the written coverage for `ino` from one authoritative
+    /// whole-file mapping walk. Caller holds the inode correctness lock.
+    fn coverage_populate(&self, ino: u32) -> Result<()> {
+        let file_size = self.stat(ino)?.size as usize;
+        let lblock_count = u32::try_from(file_size.div_ceil(EXT4_BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "file lblock overflow"))?;
+        let mappings = if lblock_count == 0 {
+            Vec::new()
+        } else {
+            self.run_ext4_file_read_only(|ext4| ext4.ext4_map_blocks(ino, 0, lblock_count))?
+        };
+
+        let mut entry = WrittenCoverage::Ranges(BTreeMap::new());
+        for mapping in &mappings {
+            entry.insert(mapping.lblock, mapping.len);
+            if matches!(entry, WrittenCoverage::TooFragmented) {
+                break;
+            }
+        }
+
+        let mut coverage = self.inode_written_coverage.lock();
+        if coverage.len() >= WRITTEN_COVERAGE_MAX_INODES && !coverage.contains_key(&ino) {
+            coverage.clear();
+        }
+        coverage.insert(ino, entry);
+        Ok(())
+    }
+
+    /// Extends `ino`'s coverage with ranges a successful journaled prepare
+    /// just made written. No-op when the entry is absent (the next fast-path
+    /// miss repopulates) or TooFragmented.
+    fn coverage_insert_ranges(&self, ino: u32, mappings: &[SimpleBlockRange]) {
+        let mut coverage = self.inode_written_coverage.lock();
+        let Some(entry) = coverage.get_mut(&ino) else {
+            return;
+        };
+        for mapping in mappings {
+            entry.insert(mapping.lblock, mapping.len);
+        }
+    }
+
+    fn coverage_invalidate(&self, ino: u32) {
+        self.inode_written_coverage.lock().remove(&ino);
     }
 
     /// Read-only check that every block backing `[offset, offset+len)` is already
@@ -5397,6 +5609,9 @@ impl Ext4Fs {
                 0
             };
             self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+            // P2: the prepare (or the verified overwrite plan) covers a fully
+            // written range; extend coverage for later buffered overwrites.
+            self.coverage_insert_ranges(ino, &mappings);
             self.submit_direct_write_mappings(
                 &mappings,
                 reader,
