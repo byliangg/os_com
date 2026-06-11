@@ -859,6 +859,14 @@ impl DeviceBlockCache {
 }
 
 #[derive(Debug, Default)]
+struct FsyncProfileStats {
+    calls: AtomicU64,
+    writeback_ns: AtomicU64,
+    commit_ns: AtomicU64,
+    flush_ns: AtomicU64,
+}
+
+#[derive(Debug, Default)]
 struct DeviceBlockCacheStats {
     hits: AtomicU64,
     misses: AtomicU64,
@@ -1543,6 +1551,7 @@ pub(super) struct Ext4Fs {
     // overwrite fast path. See `WrittenCoverage` for the ⊆-truth invariant
     // and the invalidation sites.
     inode_written_coverage: Mutex<BTreeMap<u32, WrittenCoverage>>,
+    fsync_profile: FsyncProfileStats,
     // Phase 5: in-memory inode metadata (stat) cache. ext4_rs `get_inode_ref`
     // re-reads the inode block from the device on every stat, and the read path
     // stats several times per read (type check, size, atime), so small reads
@@ -1605,6 +1614,7 @@ impl Ext4Fs {
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_extent_map_cache: Mutex::new(BTreeMap::new()),
             inode_written_coverage: Mutex::new(BTreeMap::new()),
+            fsync_profile: FsyncProfileStats::default(),
             inode_meta_cache: Mutex::new(BTreeMap::new()),
             meta_cache_generation: AtomicU64::new(0),
             inode_atime_cache: Mutex::new(BTreeMap::new()),
@@ -1749,6 +1759,34 @@ impl Ext4Fs {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.lock();
         self.sync_page_cache_for_inode_locked(ino)
+    }
+
+    /// fsync/fdatasync entry for regular files: writeback + journal
+    /// force-commit + device flush, with a per-stage latency breakdown under
+    /// `ext4fs.phase2_profile=1` so the fsync cost can be attributed
+    /// (writeback scan+IO vs commit wait vs flush).
+    pub(super) fn sync_regular_file_blocking(&self, ino: u32) -> Result<()> {
+        let profile = self.phase2_profile_enabled;
+        let t0 = if profile { Self::monotonic_nanos() } else { 0 };
+        self.sync_page_cache_for_inode(ino)?;
+        let t1 = if profile { Self::monotonic_nanos() } else { 0 };
+        self.fsync_regular_file(ino)?;
+        let t2 = if profile { Self::monotonic_nanos() } else { 0 };
+        self.block_device
+            .sync()
+            .map_err(|_| Error::new(Errno::EIO))?;
+        if profile {
+            let t3 = Self::monotonic_nanos();
+            let p = &self.fsync_profile;
+            p.calls.fetch_add(1, Ordering::Relaxed);
+            p.writeback_ns
+                .fetch_add(t1.saturating_sub(t0), Ordering::Relaxed);
+            p.commit_ns
+                .fetch_add(t2.saturating_sub(t1), Ordering::Relaxed);
+            p.flush_ns
+                .fetch_add(t3.saturating_sub(t2), Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     fn sync_all_page_caches(&self) -> Result<()> {
@@ -2739,6 +2777,7 @@ impl Ext4Fs {
         self.maybe_log_direct_read_profile(reads, true);
         self.dump_buffered_write_profile();
         self.dump_block_cache_profile();
+        self.dump_fsync_profile();
         dump_write_bio_profile();
         dump_read_bio_profile();
     }
@@ -2800,6 +2839,32 @@ impl Ext4Fs {
             stats.evictions.load(Ordering::Relaxed),
             stats.invalidations.load(Ordering::Relaxed),
             self.adapter.block_cache.lock().blocks.len(),
+        );
+    }
+
+    /// P4 precursor (Phase 6): per-stage fsync latency breakdown. No-op
+    /// unless `ext4fs.phase2_profile=1`.
+    fn dump_fsync_profile(&self) {
+        if !self.phase2_profile_enabled {
+            return;
+        }
+        let p = &self.fsync_profile;
+        let calls = p.calls.load(Ordering::Relaxed);
+        if calls == 0 {
+            return;
+        }
+        let writeback = p.writeback_ns.load(Ordering::Relaxed);
+        let commit = p.commit_ns.load(Ordering::Relaxed);
+        let flush = p.flush_ns.load(Ordering::Relaxed);
+        warn!(
+            "[ext4-fsync] calls={} writeback_ms={} avg_writeback_us={} commit_ms={} avg_commit_us={} flush_ms={} avg_flush_us={}",
+            calls,
+            writeback / 1_000_000,
+            writeback / calls / 1_000,
+            commit / 1_000_000,
+            commit / calls / 1_000,
+            flush / 1_000_000,
+            flush / calls / 1_000,
         );
     }
 

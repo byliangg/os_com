@@ -518,12 +518,7 @@ impl Inode for Ext4Inode {
             // The trailing block_device().sync() ensures the journal commit
             // block (and any in-flight metadata writes) reach durable storage,
             // making this fsync host-crash safe (was missing prior to 4a-1).
-            fs.sync_page_cache_for_inode(self.ino)?;
-            fs.fsync_regular_file(self.ino)?;
-            fs.block_device()
-                .sync()
-                .map_err(|_| Error::new(Errno::EIO))?;
-            Ok(())
+            fs.sync_regular_file_blocking(self.ino)
         } else {
             // Directory / other types: fall back to fs-wide sync (already
             // includes block_device.sync() inside).
@@ -536,12 +531,7 @@ impl Inode for Ext4Inode {
         if self.type_() == InodeType::File {
             // Step 4a-1: same pattern as sync_all. fdatasync semantics are
             // currently equivalent to fsync (conservative); see plan §4.6.
-            fs.sync_page_cache_for_inode(self.ino)?;
-            fs.fsync_regular_file(self.ino)?;
-            fs.block_device()
-                .sync()
-                .map_err(|_| Error::new(Errno::EIO))?;
-            Ok(())
+            fs.sync_regular_file_blocking(self.ino)
         } else {
             fs.sync()
         }
