@@ -756,10 +756,121 @@ struct ExtentMapCacheEntry {
     mappings: Vec<SimpleBlockRange>,
 }
 
-#[derive(Debug)]
+// P1 (Phase 6): capacity of the adapter-level device block cache, in 4 KiB
+// blocks (8192 = 32 MiB). Sized for the metadata working set (inode table
+// blocks, extent tree blocks, bitmaps, directory blocks); data blocks that
+// pass through only via buffered RMW reads just cycle the LRU tail.
+const DEVICE_BLOCK_CACHE_CAPACITY: usize = 8192;
+// Evict this many least-recently-used entries per eviction pass, so the
+// O(n) scan is amortized over many inserts.
+const DEVICE_BLOCK_CACHE_EVICT_BATCH: usize = 1024;
+
+/// P1 (Phase 6): bounded write-through mirror of device blocks.
+///
+/// Sits at the lowest layer (`KernelBlockDeviceAdapter`), *below* the JBD2
+/// overlay: a cached block always equals the device's home-location content,
+/// and `JournalIoBridge` patches the journal overlay on top of it exactly as
+/// it does on top of a real device read. This makes coherence local to the
+/// adapter:
+/// - every `write_offset` (data writes, checkpoint home writes, journal
+///   recovery replay) updates full blocks in place and drops partially
+///   overwritten ones;
+/// - deferred metadata writes (active JBD2 handle) never reach the adapter,
+///   so the cache keeps serving the pre-write home content that the overlay
+///   correctly overrides — and the eventual checkpoint write refreshes it.
+///
+/// The only writer that bypasses the adapter is the O_DIRECT data path
+/// (`submit_direct_write_mappings`, raw `write_blocks_async`); it must call
+/// `invalidate_block_range` after its bios complete.
+struct DeviceBlockCache {
+    blocks: BTreeMap<usize, CachedDeviceBlock>,
+    use_counter: u64,
+}
+
+struct CachedDeviceBlock {
+    data: Vec<u8>,
+    last_use: u64,
+}
+
+impl DeviceBlockCache {
+    fn new() -> Self {
+        Self {
+            blocks: BTreeMap::new(),
+            use_counter: 0,
+        }
+    }
+
+    fn get(&mut self, block_idx: usize, out: &mut [u8]) -> bool {
+        self.use_counter += 1;
+        let counter = self.use_counter;
+        if let Some(cached) = self.blocks.get_mut(&block_idx) {
+            out.copy_from_slice(&cached.data);
+            cached.last_use = counter;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn put(&mut self, block_idx: usize, data: &[u8]) -> u64 {
+        let mut evicted = 0u64;
+        if self.blocks.len() >= DEVICE_BLOCK_CACHE_CAPACITY
+            && !self.blocks.contains_key(&block_idx)
+        {
+            let mut by_age: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .map(|(idx, cached)| (cached.last_use, *idx))
+                .collect();
+            by_age.sort_unstable();
+            for (_, idx) in by_age.into_iter().take(DEVICE_BLOCK_CACHE_EVICT_BATCH) {
+                self.blocks.remove(&idx);
+                evicted += 1;
+            }
+        }
+        self.use_counter += 1;
+        let last_use = self.use_counter;
+        self.blocks.insert(
+            block_idx,
+            CachedDeviceBlock {
+                data: data.to_vec(),
+                last_use,
+            },
+        );
+        evicted
+    }
+
+    fn update_if_present(&mut self, block_idx: usize, data: &[u8]) {
+        if let Some(cached) = self.blocks.get_mut(&block_idx) {
+            cached.data.copy_from_slice(data);
+        }
+    }
+
+    fn remove(&mut self, block_idx: usize) {
+        self.blocks.remove(&block_idx);
+    }
+}
+
+#[derive(Debug, Default)]
+struct DeviceBlockCacheStats {
+    hits: AtomicU64,
+    misses: AtomicU64,
+    unaligned_reads: AtomicU64,
+    evictions: AtomicU64,
+    invalidations: AtomicU64,
+}
+
 struct KernelBlockDeviceAdapter {
     inner: Arc<dyn BlockDevice>,
     io_failure_epoch: AtomicU64,
+    block_cache: Mutex<DeviceBlockCache>,
+    block_cache_stats: DeviceBlockCacheStats,
+}
+
+impl core::fmt::Debug for KernelBlockDeviceAdapter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("KernelBlockDeviceAdapter").finish()
+    }
 }
 
 impl KernelBlockDeviceAdapter {
@@ -767,6 +878,51 @@ impl KernelBlockDeviceAdapter {
         Self {
             inner,
             io_failure_epoch: AtomicU64::new(0),
+            block_cache: Mutex::new(DeviceBlockCache::new()),
+            block_cache_stats: DeviceBlockCacheStats::default(),
+        }
+    }
+
+    /// Drops cached copies of the device blocks overlapping
+    /// `[start_byte, start_byte + len)`. Required by every writer that
+    /// bypasses `write_offset` (the O_DIRECT data bios).
+    fn invalidate_block_range(&self, start_byte: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let first = start_byte / EXT4_BLOCK_SIZE;
+        let last = start_byte
+            .saturating_add(len)
+            .saturating_sub(1)
+            / EXT4_BLOCK_SIZE;
+        let mut cache = self.block_cache.lock();
+        for idx in first..=last {
+            cache.remove(idx);
+        }
+        self.block_cache_stats
+            .invalidations
+            .fetch_add((last - first + 1) as u64, Ordering::Relaxed);
+    }
+
+    /// Mirrors a completed device write into the cache: full blocks are
+    /// updated in place (kept warm), partially covered blocks are dropped.
+    fn mirror_write_to_cache(&self, offset: usize, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let end = offset.saturating_add(data.len());
+        let first = offset / EXT4_BLOCK_SIZE;
+        let last = (end - 1) / EXT4_BLOCK_SIZE;
+        let mut cache = self.block_cache.lock();
+        for idx in first..=last {
+            let block_start = idx * EXT4_BLOCK_SIZE;
+            let block_end = block_start + EXT4_BLOCK_SIZE;
+            if offset <= block_start && end >= block_end {
+                let src = &data[block_start - offset..block_end - offset];
+                cache.update_if_present(idx, src);
+            } else {
+                cache.remove(idx);
+            }
         }
     }
 
@@ -828,6 +984,22 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
             return;
         }
 
+        // P1 (Phase 6): block cache fast path for whole-block aligned reads
+        // (the shape of every metadata read: inode table blocks, extent tree
+        // blocks, bitmaps, directory blocks). Other shapes pass through.
+        let cacheable = offset % EXT4_BLOCK_SIZE == 0 && read_len == EXT4_BLOCK_SIZE;
+        if cacheable {
+            let block_idx = offset / EXT4_BLOCK_SIZE;
+            if self.block_cache.lock().get(block_idx, out) {
+                self.block_cache_stats.hits.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        } else {
+            self.block_cache_stats
+                .unaligned_reads
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
         let aligned_start = Self::align_down(offset);
         let aligned_end = Self::align_up(offset + read_len);
         let aligned_len = aligned_end - aligned_start;
@@ -838,6 +1010,16 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
                 self.mark_io_failure();
                 error!("ext4 block read failed at offset {}: {:?}", offset, err);
                 out.fill(0);
+                return;
+            }
+            if cacheable {
+                self.block_cache_stats.misses.fetch_add(1, Ordering::Relaxed);
+                let evicted = self.block_cache.lock().put(offset / EXT4_BLOCK_SIZE, out);
+                if evicted > 0 {
+                    self.block_cache_stats
+                        .evictions
+                        .fetch_add(evicted, Ordering::Relaxed);
+                }
             }
             return;
         }
@@ -890,7 +1072,12 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
             if let Err(err) = self.inner.write(offset, &mut reader) {
                 self.mark_io_failure();
                 error!("ext4 block write failed at offset {}: {:?}", offset, err);
+                // A failed write leaves the device content undefined; drop
+                // the cached copies instead of mirroring.
+                self.invalidate_block_range(offset, data.len());
+                return;
             }
+            self.mirror_write_to_cache(offset, data);
             return;
         }
 
@@ -916,7 +1103,10 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         if let Err(err) = self.inner.write(aligned_start, &mut reader) {
             self.mark_io_failure();
             error!("ext4 block write failed at offset {}: {:?}", offset, err);
+            self.invalidate_block_range(aligned_start, aligned_len);
+            return;
         }
+        self.mirror_write_to_cache(aligned_start, aligned.as_slice());
     }
 
     fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
@@ -2458,6 +2648,7 @@ impl Ext4Fs {
         let reads = self.direct_read_profile.read_calls.load(Ordering::Relaxed);
         self.maybe_log_direct_read_profile(reads, true);
         self.dump_buffered_write_profile();
+        self.dump_block_cache_profile();
         dump_write_bio_profile();
         dump_read_bio_profile();
     }
@@ -2501,6 +2692,24 @@ impl Ext4Fs {
             fast_ns / 1_000_000,
             p.max_slow_prepare_ns.load(Ordering::Relaxed) / 1_000,
             p.max_slow_ns.load(Ordering::Relaxed) / 1_000,
+        );
+    }
+
+    /// P1 (Phase 6): one snapshot of the adapter device block cache counters.
+    /// No-op unless `ext4fs.phase2_profile=1`.
+    fn dump_block_cache_profile(&self) {
+        if !self.phase2_profile_enabled {
+            return;
+        }
+        let stats = &self.adapter.block_cache_stats;
+        warn!(
+            "[ext4-blkcache] hits={} misses={} unaligned_reads={} evictions={} invalidations={} resident={}",
+            stats.hits.load(Ordering::Relaxed),
+            stats.misses.load(Ordering::Relaxed),
+            stats.unaligned_reads.load(Ordering::Relaxed),
+            stats.evictions.load(Ordering::Relaxed),
+            stats.invalidations.load(Ordering::Relaxed),
+            self.adapter.block_cache.lock().blocks.len(),
         );
     }
 
@@ -3593,6 +3802,15 @@ impl Ext4Fs {
         }
         if Some(BioStatus::Complete) != status {
             return_errno!(Errno::EIO);
+        }
+        // P1 (Phase 6): these bios bypassed the adapter, so its device block
+        // cache may hold stale copies of the overwritten blocks (e.g. from an
+        // earlier buffered RMW read). Drop them.
+        for mapping in mappings {
+            self.adapter.invalidate_block_range(
+                (mapping.pblock as usize).saturating_mul(EXT4_BLOCK_SIZE),
+                (mapping.len as usize).saturating_mul(EXT4_BLOCK_SIZE),
+            );
         }
         Ok(())
     }

@@ -216,6 +216,18 @@ impl Ext4 {
         let block_size = self.super_block.block_size() as usize;
         let offset = self.inode_disk_pos(inode_num);
 
+        // Read the aligned block containing the inode (the same shape as
+        // `write_inode_image`), so the read can be served by the device block
+        // cache. Inodes never straddle blocks when inode_size divides
+        // block_size; fall back to the legacy unaligned read otherwise.
+        let block_offset = offset / block_size * block_size;
+        let offset_in_block = offset - block_offset;
+        if offset_in_block + size_of::<Ext4Inode>() <= block_size {
+            let ext4block = Block::load(&self.block_device, block_offset, block_size);
+            let inode: Ext4Inode = ext4block.read_offset_as(offset_in_block);
+            return Ext4InodeRef { inode_num, inode };
+        }
+
         let mut ext4block = Block::load(&self.block_device, offset, block_size);
 
         let inode: &mut Ext4Inode = ext4block.read_as_mut();
