@@ -89,8 +89,8 @@ flowchart TB
 |---|---|---|---|
 | `EXT4_RS_RUNTIME_LOCK`（全局 Mutex） | fs.rs:92 | 全部 journaled 变更操作（create/write/truncate/dir ops） | 单线程 profile 显示持有≈47% wall；**只在 `run_journaled_ext4` 内持有，只读路径不持有** |
 | `inner: Mutex<Ext4>` | fs.rs:1170, lock_inner fs.rs:1515 | Ext4 实例（per-op clone 的源） | **只读路径（`run_ext4_file_read_only`）持此锁横跨整个设备 I/O**——nj>1 读并发退化的第一序列化点其实是它，不是 RUNTIME_LOCK |
-| per-inode correctness 锁（独占 Mutex 表） | fs.rs:1180 | 单文件读写/fsync/truncate 串行 | 同文件并发读也互斥；多 inode 按 ino 排序获取（fs.rs:1485） |
-| per-dir correctness 锁 | fs.rs:1181 | 目录操作 | |
+| per-inode correctness 锁 | fs.rs:1180 | 单文件读写/fsync/truncate 串行 | **【2026-06-12 C1 已改造，见 §7.2】** 原独占 Mutex 同文件并发读写全互斥且横跨设备等待（并发卡 ~2800 的根因）；现为 RwMutex：`page_cache=0` 下经映射验证的纯覆盖 O_DIRECT 写与 O_DIRECT 读持共享锁并行，元数据变更路径维持独占；多 inode 按 ino 排序获取（fs.rs:1485）|
+| per-dir correctness 锁 | fs.rs:1181 | 目录操作 | C1 同步 RwMutex 化（持锁点全独占，语义不变）|
 | `jbd2_runtime: RwMutex<Option<JournalRuntime>>` | fs.rs:1175 | 事务状态机、overlay 读 | |
 | `jbd2_journal: Mutex` + `jbd2_checkpoint_lock` | fs.rs:1174/1179 | 日志盘上空间、checkpoint 串行 | |
 
@@ -444,6 +444,8 @@ fio 守底不动（O_DIRECT 路径与 B 组改动正交，B1 的页保留对 O_D
 
 **对照 §6.2 预测（200–400s / 15–30%）：实测 234.9s / 21.92%，正中区间。** fio O_DIRECT 守底未回退（最近复跑 write 79–83% / read 98–110%）。全程 integrity PASS、crash matrix 18/18、xfstests 四包 + 并发两层 + host-crash 4/4 + fsync_flush 每步全绿。
 
+**并发维度（C1，2026-06-12）**：fio numjobs 同文件 1M——write nj2 2708→**6024 MB/s（65%→165%）**、nj4 2724→**5139（63%→187%）**，read nj4 3640→13200；并发墙（per-inode 互斥锁横跨设备等待，单流封顶 ~2800）经 C1 共享锁改造拆除，反超 Linux 与 raw 基线。读侧绝对值含 host cache 效应，引用以"锁不再封顶"为结论。数据与参数详见 `fio_direct_parameter_sweep_report_phase6.md` §8–9。
+
 负结果（同样是结论）：①delalloc 仍被 Stage 1a"途中写回损坏"挡死（§7.5）②P3-1 size-only append（写时不转换）三配置实测净负（462.9/312.8/468.0s），含未解的读侧 30% 回退，已回退留 patch ③P4 真 fdatasync 动手前被计数器证伪（fsync 桶实测仅 28.6s，commit 由批量轮转驱动而非 fsync 驱动）。
 
 ### 7.2 本轮结构变更（附录 B 的增量）
@@ -458,6 +460,7 @@ fio 守底不动（O_DIRECT 路径与 B 组改动正交，B1 的页保留对 O_D
 | `[ext4-fsync]` 三段计时 | `fs.rs` `sync_regular_file_blocking` | fsync 写回/commit 等待/flush 拆分（fsync/fdatasync 统一入口）|
 | meta cache per-ino 失效（P2）| `fs.rs` chokepoint | Write/InodeMetadata/Truncate 单 ino remove；目录 op 保守 clear-all |
 | 防御加固 | `ext4_rs extents.rs` | `ext_remove_leaf` 与 `insert_extent` 容量钳制：损坏节点降级 EIO 不再 panic（388/476 家族）|
+| **C1 共享锁 dio**（2026-06-12）| `fs.rs` correctness 锁层 | per-inode/dir 锁 Mutex→RwMutex；`page_cache=0` 下纯覆盖 O_DIRECT 写在 **shared** 锁内完成 overwrite 判定（TOCTOU 安全：映射变更方均独占）并并行提交，O_DIRECT 读同享；= Linux shared `i_rwsem` dio overwrite 对应实现。§2.2 锁全景中 per-inode 锁的描述已被本行取代 |
 
 ### 7.3 问题清单状态更新（对照 §5）
 
