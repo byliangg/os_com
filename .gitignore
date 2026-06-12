@@ -44,3 +44,10 @@ cachix.list
 # temporary configuration file for NixOS tests
 distro/etc_nixos/_config_for_test.nix
 /.target_check/
+
+# Local benchmark run artifacts. Evidence files that must be versioned
+# (summary TSVs, crash matrices, retained patches) are added explicitly
+# with `git add -f`.
+benchmark/logs/
+test/initramfs/src/benchmark/aster_output.txt
+test/initramfs/src/benchmark/linux_output.txt

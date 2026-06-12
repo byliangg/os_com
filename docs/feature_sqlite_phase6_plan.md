@@ -104,6 +104,30 @@ S 系列收口（S6，1332.2s=3.86%）后，以 90% 为目标做了第二轮"逐
 
 三次"先核实/先 profile"各省一轮实现：delalloc（Stage 1a 隔离实验）、P3-1（三配置对照后按铁律回退）、P4（计数器核实 0 实现成本出局）。两个压力潜伏 bug（388 双重释放修复、476 防御降级）+ harness 端口碰撞根治为守底基建净赚项。
 
+## C 系列（并发 scale 主攻，2026-06-12 立项）
+
+### C0 调研结论（代码 + sweep 数据闭环）
+
+1. **fio numjobs 写同一个文件**（`-filename=/ext4/fio-test` 固定）；fio 测量前先 layout（fallocate→written extents）→ 测量阶段全是**纯覆盖 O_DIRECT 写**。
+2. **per-inode correctness 锁（Mutex，独占）横跨整个 O_DIRECT 读/写路径，包括 ~190us/MB 的设备等待**（`write_direct_at` fs.rs:5152、`read_direct_at` fs.rs:5073-5074）→ 同文件并发被钉在单流水平 ~2800 MB/s，nj 无效。
+3. 三证闭环：raw 线性 scale 至 5300+（117%，设备能力充足）；ext4 卡死 ~2800；**journaled ≈ nojournal 同水位 → 锁而非 JBD2**。
+4. 对照 Linux：ext4 对 dio **overwrite** 用 shared `i_rwsem`（不改映射的写并发执行，元数据写才独占）。我们已有判定基础设施：`plan_direct_write_overwrite_cached`（pc=0 时活跃，要求映射全覆盖，extent map cache 命中则纯内存判定）。
+
+### C1 实现：per-inode 锁 RwMutex 化 + dio overwrite/read 共享锁
+
+- `inode_correctness_locks` / `dir_correctness_locks`：`Arc<Mutex<()>>` → `Arc<RwMutex<()>>`；所有现有持锁点改 `.write()`（语义不变）。
+- `write_direct_at`（仅 `page_cache=0`）：先持 **shared** 做 overwrite 判定（判定在锁内 → 映射不可变，TOCTOU 安全：改映射的路径全部需独占）；命中 → shared 下提交数据 bio（同文件并发写并行，重叠 offset 的结果归应用负责 = POSIX dio 语义，fs 结构无损）；未命中 → 释放 shared 改持独占走 prepare（重做判定，无状态依赖）。
+- `read_direct_at`（仅 `page_cache=0`，evict 为 no-op）：shared。`page_cache=1` 两路径维持独占（动页缓存，保守）。
+- 共享锁下触碰的全部状态各有内部锁：extent map cache / direct read cache / coverage / jbd2_runtime（revoke）/ profile Atomic ✓。
+
+### C2 验证门控
+
+并发正确性双层（phase2_concurrency 7/7 + concurrency xfstests 10/10）是本改动的**专属把关**，加 crash matrix / fsync_flush / host-crash / 全 xfstests / fio 守底不回退；F 组 nj1/2/4 重测为收益判定（目标：ext4 write nj2/4 显著脱离 2800 向 raw 5300 靠近）。
+
+### C3 残余串行点（按 C2 后 profile）
+
+候选：`run_ext4_file_read_only` 的全局 `inner: Mutex<Ext4>`（shared 路径的 plan miss 时进入）、adapter 块缓存全局 Mutex、block 层提交路径。仅在 C1 后 F 组仍不 scale 时按归因继续。
+
 ## Step 3：全量回归 + SQLite 重测收口
 
 **状态：** 待执行（每个 S3/S4/S5/S6 落地后都跑一次本节门控）
