@@ -85,7 +85,7 @@ EXT4_DIRECT_READ_CACHE=0 EXT4_PAGE_CACHE=0 LOG_LEVEL=error BENCH_ENABLE_KVM=1 \
 FS_LIST=ext4 PAGE_CACHE_LIST=1 LOG_LEVEL=error bash test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh
 ```
 
-完整环境约定（KVM/代理/initramfs/常见问题）见 **[docs/environment.md](docs/environment.md)**；各 benchmark 的精确口径、可调参数与历史汇总见 **[docs/benchmark.md](docs/benchmark.md)**（§0 为最新结果快照）。
+完整环境约定（KVM/代理/initramfs/生成物/常见问题）与各 benchmark 的精确口径、可调参数、历史汇总统一见 **[docs/benchmark.md](docs/benchmark.md)**（§0 最新结果快照、§1 环境准备与判定口径）。
 
 ## 4. 主要优化技术（创新点摘要）
 
@@ -113,8 +113,7 @@ FS_LIST=ext4 PAGE_CACHE_LIST=1 LOG_LEVEL=error bash test/initramfs/src/benchmark
 | [docs/sqlite_benchmark_report.md](docs/sqlite_benchmark_report.md) | SQLite 真实应用基准报告 |
 | [docs/feature_sqlite_phase6_plan.md](docs/feature_sqlite_phase6_plan.md) / [milestone](docs/feature_sqlite_phase6_milestone.md) | 性能优化主线计划与全过程记录（含负结果与教训） |
 | [docs/feature_jbd2_phase1_plan.md](docs/feature_jbd2_phase1_plan.md) 等 | JBD2 / 并发 / fsync / PageCache 各功能阶段的 plan、analysis、milestone 系列 |
-| [docs/benchmark.md](docs/benchmark.md) | benchmark 口径与阶段性汇总 |
-| [docs/environment.md](docs/environment.md) | 环境搭建、Docker/KVM 约定、复现清单 |
+| **[docs/benchmark.md](docs/benchmark.md)** | **环境准备 + 复现命令 + benchmark 口径（唯一指引）**：§0 最新结果快照、§1 环境/快速复现/判定口径、§4–6 各 benchmark 精确跑法 |
 | [docs/赛题要求.md](docs/赛题要求.md) | 赛题原文与评审标准 |
 
 ## 7. 口径声明

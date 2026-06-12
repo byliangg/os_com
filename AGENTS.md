@@ -167,7 +167,7 @@ Key test matrices:
 
 | 文件 | 用途 |
 |------|------|
-| `environment.md` | 环境指引：记录当前推荐工作目录、Docker/代理/KVM 约定、benchmark 执行注意事项；根目录与仓库内对应副本需同步维护 |
+| `benchmark.md` | benchmark 与复现唯一指引（§0 最新快照、§1 环境准备与快速复现、§4–6 精确跑法；原 environment.md 已并入后删除）；根目录与 `asterinas/benchmark/`、`asterinas/docs/` 三处副本需同步维护 |
 | `benchmark.md` / `benchmark/benchmark.md` / `docs/benchmark.md` | benchmark 指引与最新结果快照（含 §6.7 SQLite speedtest1 确切跑法 / 入口 `run_sqlite_summary.sh` / 最新 2.97%）；三处副本须同步 |
 | `analysis_phase1.md` | 性能优化 Phase 1 诊断报告（已完成，95.79%）|
 | `optimize_plan_phase1.md` | 性能优化 Phase 1 计划（已完成）|
@@ -209,8 +209,8 @@ Key test matrices:
 
 补充说明：
 
-- 根目录文档 `environment.md`、`benchmark.md` 是顶层工作指引。
-- 仓库内存在对应副本：`asterinas/environment.md`、`asterinas/benchmark/benchmark.md`。
+- 根目录文档 `benchmark.md` 是顶层工作与复现指引（原 `environment.md` 已并入后删除）。
+- 仓库内存在对应副本：`asterinas/benchmark/benchmark.md`、`asterinas/docs/benchmark.md`。
 - 修改环境或 benchmark 口径时，默认需要同步检查并更新这两处文档，避免根目录说明与仓库内记录不一致。
 
 ## 每阶段工作流程

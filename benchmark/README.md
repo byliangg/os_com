@@ -5,7 +5,7 @@
 ## 目录内容
 
 - `benchmark.md`：当前测试结果汇总。
-- `environment.md`：当前环境记录。
+- `benchmark.md`（仓库根/docs）：环境准备、复现命令与 benchmark 口径的唯一指引。
 - `assets/`：运行测试所需依赖资产（initramfs、xfstests、vDSO 等）。
 - `datasets/xfstests/`：用例清单、静态排除原因、样例脚本副本。
 - `logs/`：ext4 测试脚本默认日志输出目录。
