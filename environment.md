@@ -1,6 +1,28 @@
-# Asterinas EXT4 Environment（Current, Phase 4 PageCache）
+# Asterinas EXT4 Environment（Current）
 
-更新时间：2026-05-14（Asia/Shanghai）
+更新时间：2026-06-12（Asia/Shanghai）
+
+> **快速复现（拿到仓库即可执行）**——前提：宿主机有 Docker + `/dev/kvm`，已拉取镜像 `asterinas/asterinas:0.17.0-20260227`：
+>
+> ```bash
+> # 1) 功能回归（按 PHASE4_DOCKER_MODE 选套件：crash_only / phase6_with_guard / concurrency / jbd_phase3_host_crash ...）
+> PHASE4_DOCKER_MODE=crash_only ENABLE_KVM=1 BENCH_ENABLE_KVM=1 \
+>   BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on bash tools/ext4/run_phase4_in_docker.sh
+>
+> # 2) fio 96-case 参数广度测试（SWEEP_GROUPS=F 可只跑并发组；RUN_G_CORRECTNESS=0 跳过附带回归）
+> bash test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+>
+> # 3) fio O_DIRECT 守底（单 job，诚实口径）
+> EXT4_DIRECT_READ_CACHE=0 EXT4_PAGE_CACHE=0 LOG_LEVEL=error BENCH_ENABLE_KVM=1 \
+>   BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+>
+> # 4) SQLite 真实应用（三 FS 对照可加 FS_LIST="ext4 ext2 ramfs"）
+> FS_LIST=ext4 PAGE_CACHE_LIST=1 LOG_LEVEL=error bash test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh
+> ```
+>
+> 最新成绩与详细口径见 `benchmark.md` §0 与 `docs/fio_direct_parameter_sweep_report_phase6.md`。
+>
+> 注：本文以下"当前结论/baseline"各节含 2026-05-14 时点的历史数据（如 ext4 write 39.18% 等），均已被 Phase 5/6/C1 修复或超越，保留作过程记录；现行数据一律以上述两个文档为准。
 
 ## 1. 目标与范围
 

@@ -64,7 +64,28 @@
 | SQLite integrity_check | PASS（每轮性能测试后验证） |
 | e2fsck 互操作（unwritten extent 镜像）| 干净（exit 0） |
 
-复现入口：`tools/ext4/run_phase4_in_docker.sh`（功能回归，按 `PHASE4_DOCKER_MODE` 选套件）、`test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh`（96-case 性能广度测试，支持 `SWEEP_GROUPS` 过滤）、`test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh`（SQLite 三 FS 对照）。环境与口径约定见 [docs/environment.md](docs/environment.md)、[docs/benchmark.md](docs/benchmark.md)。
+### 3.1 快速复现
+
+前提：宿主机有 Docker 与 `/dev/kvm`，拉取镜像 `asterinas/asterinas:0.17.0-20260227`。所有入口均在宿主机执行、脚本自管容器：
+
+```bash
+# 功能回归（PHASE4_DOCKER_MODE 可选：crash_only / phase6_with_guard / concurrency /
+#           jbd_phase1 / jbd_phase2_concurrency / jbd_phase3_host_crash / jbd_phase3_fsync_flush ...）
+PHASE4_DOCKER_MODE=crash_only ENABLE_KVM=1 BENCH_ENABLE_KVM=1 \
+  BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on bash tools/ext4/run_phase4_in_docker.sh
+
+# fio 96-case 参数广度测试（SWEEP_GROUPS=F 只跑并发组；RUN_G_CORRECTNESS=0 跳过附带回归）
+bash test/initramfs/src/benchmark/fio/run_parameter_sweep_summary.sh
+
+# fio O_DIRECT 守底（单 job 诚实口径）
+EXT4_DIRECT_READ_CACHE=0 EXT4_PAGE_CACHE=0 LOG_LEVEL=error BENCH_ENABLE_KVM=1 \
+  BENCH_ASTER_NETDEV=tap BENCH_ASTER_VHOST=on bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
+
+# SQLite 真实应用（FS_LIST="ext4 ext2 ramfs" 可跑三 FS 诊断三角）
+FS_LIST=ext4 PAGE_CACHE_LIST=1 LOG_LEVEL=error bash test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh
+```
+
+完整环境约定（KVM/代理/initramfs/常见问题）见 **[docs/environment.md](docs/environment.md)**；各 benchmark 的精确口径、可调参数与历史汇总见 **[docs/benchmark.md](docs/benchmark.md)**（§0 为最新结果快照）。
 
 ## 4. 主要优化技术（创新点摘要）
 

@@ -1,8 +1,20 @@
 # Asterinas EXT4 Benchmark 最新结果快照
 
-更新时间：2026-05-14（Asia/Shanghai）
+更新时间：2026-06-12（Asia/Shanghai）
 
-Phase 3 收口说明（2026-05-11）：`fsync` / `fdatasync` / block flush / shutdown ioctl / host-crash fsync 语义线已结束；普通 O_DIRECT write 仍低于红线，作为后续性能 hardening blocker 单独推进，不再阻塞 Phase 3 功能退场。
+## 0. 最新结果快照（2026-06-12，Phase 6 + C1 收口；以下为当前有效口径）
+
+| 维度 | 最新值 | 详细报告 |
+|---|---|---|
+| fio O_DIRECT 顺序（`direct=1 nj=1`，cache-off + drop）| read 82–140% / write 75–121%（bs=4K–4M 全档 ≥ 红线 75%）| `docs/fio_direct_parameter_sweep_report_phase6.md` §4–5 |
+| fio 并发（numjobs 同文件 1M，C1 共享锁后）| **write nj2/4 = 6024/5139 MB/s（165%/187%，反超 Linux 与 raw）** | 同上 §8–9 |
+| fio buffered（D 组）| write 7.9–29.3%（Phase 6 前仅 1.2–6.3%，绝对值 ×4.3–13.2）| 同上 §6 |
+| SQLite speedtest1（page_cache=1，--size 1000）| **234.9s = Linux 的 21.92%**（起点 2.97%，7.4×），integrity PASS | §6.7 与 `docs/technical_report.md` §7 |
+| 守底回归 | crash 18/18、host-crash 4/4、并发双层 7/7+10/10、xfstests 四包 0 FAIL | `docs/feature_sqlite_phase6_milestone.md` |
+
+> 历史提醒：本文 §2 的"当前结果总览"为 2026-05-14 历史快照（其中 ext4 write 39.18% 为 Phase 3 时点数据，Phase 5/6 已修复至上表水平），保留作过程记录；引用成绩一律以本节与上表所指报告为准。
+
+Phase 3 收口说明（2026-05-11，历史）：`fsync` / `fdatasync` / block flush / shutdown ioctl / host-crash fsync 语义线已结束；当时普通 O_DIRECT write 低于红线的问题已由 Phase 5/6 修复（见 §0）。
 
 Phase 4 PageCache 说明（2026-05-14）：PageCache correctness 守底已恢复，性能最小闭环采用 A-E 口径：`lmbench_only`、官方 fio `direct=0` buffered cold/warm read、官方 fio `direct=0` buffered write、原 O_DIRECT fio cache-off 守底。O_DIRECT 结果单独作为 non-PageCache guard，不与 buffered PageCache 收益混算。
 
@@ -487,12 +499,18 @@ bash test/initramfs/src/benchmark/sqlite/run_sqlite_summary.sh
 - **产出**：`benchmark/logs/sqlite_<ts>/sqlite_summary.tsv`，列 `page_cache / aster_sec / linux_sec / ratio_pct`（ratio = Linux_sec / Aster_sec，越高越好）；逐 sub-test 明细在 `sqlite_pc<pc>.log`。
 - **完整性校验**：报告口径下额外跑 `PRAGMA integrity_check`，必须 PASS（数据无损铁证），不得回退。
 
-### 最新结果（page_cache=1，`--size 1000`，drop_caches，2026-06-07）
+### 最新结果（page_cache=1，`--size 1000`，drop_caches，2026-06-12 更新）
 
 | 配置 | Aster TOTAL | Linux TOTAL | ratio | integrity_check |
 |------|------------:|------------:|------:|:---------------:|
-| 修 A1+B 后 | 4773s | 60.2s | 1.26% | PASS |
-| **覆盖写快路径后（Phase 6 起点）** | **2022s** | 60.2s | **2.97%** | PASS |
+| 修 A1+B 后（历史）| 4773s | 60.2s | 1.26% | PASS |
+| 覆盖写快路径后（Phase 6 起点）| 2022s | 60.2s | 2.97% | PASS |
+| S6 unwritten extent + 预分配 | 1332.2s | ~51s | 3.86% | PASS |
+| P1 设备块缓存 | 454.3s | ~51s | 11.26% | PASS |
+| P2 写快路径 ext2 化 | 243.9s | ~51s | 20.88% | PASS |
+| **P5a lean prepare（当前）** | **234.9s** | ~51s | **21.92%** | PASS |
+
+完整轨迹、逐项 sub-test 提升与上限理论分析见 `docs/technical_report.md` §7、`docs/feature_sqlite_phase6_milestone.md`。
 
 读类（SELECT）已追平 Linux（1–4×）；剩余慢项全在**追加/新分配类写**（INSERT 新块 243× / CREATE INDEX 127× / VACUUM ~1 MB/s）——Phase 6 主线。详见 `sqlite_benchmark_report.md`、`feature_sqlite_phase6_plan.md`。
 
