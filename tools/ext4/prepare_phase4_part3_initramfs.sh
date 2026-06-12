@@ -93,6 +93,10 @@ install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/concurrency.lis
   "${ROOTFS_DIR}/opt/xfstests/testcases/concurrency.list"
 install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/concurrency_excluded.tsv \
   "${ROOTFS_DIR}/opt/xfstests/blocked/concurrency_excluded.tsv"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/testcases/official.list \
+  "${ROOTFS_DIR}/opt/xfstests/testcases/official.list"
+install -D -m 0644 test/initramfs/src/syscall/xfstests/blocked/official_excluded.tsv \
+  "${ROOTFS_DIR}/opt/xfstests/blocked/official_excluded.tsv"
 install -D -m 0755 test/initramfs/src/syscall/ext4_crash/run_ext4_crash_test.sh \
   "${ROOTFS_DIR}/opt/ext4_crash/run_ext4_crash_test.sh"
 install -D -m 0755 test/initramfs/src/syscall/ext4_phase2/run_ext4_phase2_concurrency.sh \

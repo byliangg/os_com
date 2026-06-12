@@ -49,11 +49,13 @@ RUN_JBD_PHASE1=${RUN_JBD_PHASE1:-0}
 RUN_PHASE2_CONCURRENCY=${RUN_PHASE2_CONCURRENCY:-0}
 RUN_JBD_PHASE3=${RUN_JBD_PHASE3:-0}
 RUN_CONCURRENCY=${RUN_CONCURRENCY:-0}
+RUN_OFFICIAL=${RUN_OFFICIAL:-0}
 RUN_LMBENCH=${RUN_LMBENCH:-1}
 KLOG_LEVEL=${KLOG_LEVEL:-error}
 EXT4_PHASE2_PROFILE=${EXT4_PHASE2_PROFILE:-0}
 PHASE6_GOOD_THRESHOLD=${PHASE6_GOOD_THRESHOLD:-90}
 CONCURRENCY_THRESHOLD=${CONCURRENCY_THRESHOLD:-90}
+OFFICIAL_THRESHOLD=${OFFICIAL_THRESHOLD:-100}
 EXT4_PHASE2_CASES=${EXT4_PHASE2_CASES:-"multi_file_write_verify,multi_file_read_write,create_unlink_churn,rename_churn,write_truncate_fsync,unlink_while_open,allocator_churn"}
 EXT4_PHASE2_WORKERS=${EXT4_PHASE2_WORKERS:-4}
 EXT4_PHASE2_ROUNDS=${EXT4_PHASE2_ROUNDS:-8}
@@ -415,6 +417,7 @@ JBD_PHASE1_LOG="${LOG_DIR}/jbd_phase1_${TS}.log"
 PHASE2_CONCURRENCY_LOG="${LOG_DIR}/jbd_phase2_concurrency_${TS}.log"
 JBD_PHASE3_LOG="${LOG_DIR}/jbd_phase3_fsync_durability_${TS}.log"
 CONCURRENCY_LOG="${LOG_DIR}/concurrency_${TS}.log"
+OFFICIAL_LOG="${LOG_DIR}/official_${TS}.log"
 LMB_SUMMARY="${LOG_DIR}/lmbench/phase4_part3_lmbench_summary_${TS}.tsv"
 
 ANY_STAGE_RAN=0
@@ -482,6 +485,13 @@ else
   echo "[SKIP] concurrency disabled (RUN_CONCURRENCY=${RUN_CONCURRENCY})"
 fi
 
+if [ "${RUN_OFFICIAL}" = "1" ]; then
+  run_xfstests_mode official "${OFFICIAL_THRESHOLD}" "${OFFICIAL_LOG}"
+  ANY_STAGE_RAN=1
+else
+  echo "[SKIP] official disabled (RUN_OFFICIAL=${RUN_OFFICIAL})"
+fi
+
 if [ "${RUN_LMBENCH}" = "1" ]; then
   run_lmbench_regression "${LMB_SUMMARY}"
   ANY_STAGE_RAN=1
@@ -539,6 +549,11 @@ if [ "${RUN_CONCURRENCY}" = "1" ]; then
   echo "concurrency_log=${CONCURRENCY_LOG}"
 else
   echo "concurrency_log=<disabled>"
+fi
+if [ "${RUN_OFFICIAL}" = "1" ]; then
+  echo "official_log=${OFFICIAL_LOG}"
+else
+  echo "official_log=<disabled>"
 fi
 if [ "${RUN_LMBENCH}" = "1" ]; then
   echo "lmbench_summary=${LMB_SUMMARY}"

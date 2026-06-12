@@ -47,6 +47,9 @@ else
     pagecache_phase4|phase4_with_guard|phase6_with_guard|part3_full)
       XFSTESTS_CASE_TIMEOUT_SEC=1200
       ;;
+    official)
+      XFSTESTS_CASE_TIMEOUT_SEC=600
+      ;;
     *)
       XFSTESTS_CASE_TIMEOUT_SEC=600
       ;;
@@ -71,6 +74,10 @@ else
       ;;
     pagecache_phase4|phase4_with_guard|phase6_with_guard|part3_full)
       XFSTESTS_RUN_TIMEOUT_SEC=5400
+      ;;
+    official)
+      # 81 cases in one VM run; allow up to 6h before declaring a hang.
+      XFSTESTS_RUN_TIMEOUT_SEC=21600
       ;;
     *)
       XFSTESTS_RUN_TIMEOUT_SEC=1800
@@ -112,6 +119,7 @@ DOCKER_ENV_ARGS=(
   -e PHASE4_GOOD_THRESHOLD="${PHASE4_GOOD_THRESHOLD}"
   -e PAGECACHE_PHASE4_THRESHOLD="${PAGECACHE_PHASE4_THRESHOLD}"
   -e PHASE6_GOOD_THRESHOLD="${PHASE6_GOOD_THRESHOLD}"
+  -e OFFICIAL_THRESHOLD="${OFFICIAL_THRESHOLD:-100}"
   -e CRASH_ROUNDS="${CRASH_ROUNDS}"
   -e CRASH_PREPARE_WAIT_SEC="${CRASH_PREPARE_WAIT_SEC}"
   -e CRASH_HOLD_STAGE="${CRASH_HOLD_STAGE}"
@@ -228,6 +236,7 @@ run_part3_with_flags() {
     RUN_JBD_PHASE1="${RUN_JBD_PHASE1:-0}" RUN_PHASE2_CONCURRENCY="${RUN_PHASE2_CONCURRENCY:-0}" \
     RUN_JBD_PHASE3="${RUN_JBD_PHASE3:-0}" RUN_CONCURRENCY="${RUN_CONCURRENCY:-0}" \
     CONCURRENCY_THRESHOLD="${CONCURRENCY_THRESHOLD:-90}" \
+    RUN_OFFICIAL="${RUN_OFFICIAL:-0}" OFFICIAL_THRESHOLD="${OFFICIAL_THRESHOLD:-100}" \
     tools/ext4/run_phase4_part3.sh
 }
 
@@ -280,6 +289,10 @@ case "${PHASE4_DOCKER_MODE}" in
     echo "[INFO] mode=concurrency (only concurrency-focused xfstests suite)"
     RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_JBD_PHASE1=0 RUN_PHASE2_CONCURRENCY=0 RUN_JBD_PHASE3=0 RUN_CONCURRENCY=1 run_part3_with_flags
     ;;
+  official)
+    echo "[INFO] mode=official (competition functional-correctness xfstests list)"
+    RUN_CRASH_SUITE=0 RUN_PHASE4_GOOD=0 RUN_PAGECACHE_PHASE4=0 RUN_PHASE3_BASE=0 RUN_PHASE6_GOOD=0 RUN_LMBENCH=0 RUN_OFFICIAL=1 run_part3_with_flags
+    ;;
   jbd_phase3_fsync_flush)
     echo "[INFO] mode=jbd_phase3_fsync_flush (Phase 3 fsync/flush durability xfstests)"
     echo "[INFO] Tier 1 tests will NOTRUN until EXT4_IOC_SHUTDOWN is implemented (Step 4)."
@@ -294,7 +307,7 @@ case "${PHASE4_DOCKER_MODE}" in
     ;;
   *)
     echo "Error: unsupported PHASE4_DOCKER_MODE=${PHASE4_DOCKER_MODE}" >&2
-    echo "Supported: phase4_good | pagecache_phase4 | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | concurrency | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
+    echo "Supported: phase4_good | pagecache_phase4 | phase3_only | phase6_only | lmbench_only | phase4_with_guard | phase6_with_guard | crash_only | part3_full | jbd_phase1 | jbd_phase2_concurrency | concurrency | official | jbd_phase3_fsync_flush | jbd_phase3_host_crash" >&2
     exit 3
     ;;
 esac
