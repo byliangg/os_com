@@ -1516,8 +1516,8 @@ pub(super) struct Ext4Fs {
     alloc_guard: Arc<LocalOperationAllocGuard>,
     next_alloc_operation_id: AtomicU64,
     jbd2_checkpoint_lock: Mutex<()>,
-    inode_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
-    dir_correctness_locks: Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
+    inode_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
+    dir_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
     /// Step 4a-2: per-ino "highest TID containing a metadata change for this
     /// inode" map.  Equivalent to Linux `EXT4_I(inode)->i_sync_tid`.
     /// Updated by `finish_jbd2_handle` after a Write/Truncate handle stops;
@@ -1757,7 +1757,7 @@ impl Ext4Fs {
 
     pub(super) fn sync_page_cache_for_inode(&self, ino: u32) -> Result<()> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         self.sync_page_cache_for_inode_locked(ino)
     }
 
@@ -1799,7 +1799,7 @@ impl Ext4Fs {
 
         for (ino, state) in states {
             let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-            let _inode_guard = inode_lock.lock();
+            let _inode_guard = inode_lock.write();
             let file_size = self.stat(ino)?.size as usize;
             state.evict_all(file_size)?;
         }
@@ -1838,14 +1838,20 @@ impl Ext4Fs {
         state.discard_all();
     }
 
+    /// C1 (Phase 6): per-inode/dir correctness locks are RwMutex. Every
+    /// metadata-mutating or page-cache-touching path takes `.write()`
+    /// (semantics identical to the previous Mutex); the O_DIRECT
+    /// overwrite-write and read paths under `page_cache=0` take `.read()` so
+    /// concurrent dio on the same file is no longer serialized across the
+    /// device wait (Linux ext4 shared-i_rwsem dio overwrite equivalent).
     fn correctness_lock_for(
-        table: &Mutex<BTreeMap<u32, Arc<Mutex<()>>>>,
+        table: &Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
         ino: u32,
-    ) -> Arc<Mutex<()>> {
+    ) -> Arc<RwMutex<()>> {
         table
             .lock()
             .entry(ino)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(RwMutex::new(())))
             .clone()
     }
 
@@ -1868,7 +1874,7 @@ impl Ext4Fs {
             .collect();
         let mut guards = Vec::with_capacity(locks.len());
         for lock in &locks {
-            guards.push(lock.lock());
+            guards.push(lock.write());
         }
         f()
     }
@@ -1885,7 +1891,7 @@ impl Ext4Fs {
             .collect();
         let mut guards = Vec::with_capacity(locks.len());
         for lock in &locks {
-            guards.push(lock.lock());
+            guards.push(lock.write());
         }
         f()
     }
@@ -4766,7 +4772,7 @@ impl Ext4Fs {
 
     pub(super) fn lookup_at(&self, parent: u32, name: &str) -> Result<u32> {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
-        let _parent_guard = parent_lock.lock();
+        let _parent_guard = parent_lock.write();
         self.lookup_at_locked(parent, name)
     }
 
@@ -4776,14 +4782,14 @@ impl Ext4Fs {
 
     pub(super) fn create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
-        let _parent_guard = parent_lock.lock();
+        let _parent_guard = parent_lock.write();
         let op = JournaledOp::Create;
         let ino = self.run_journaled_ext4(Some(op), |ext4| {
             ext4.ext4_create_at(parent, name, mode)
                 .map_err(map_ext4_error)
         })?;
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _child_guard = child_lock.lock();
+        let _child_guard = child_lock.write();
         // A freshly allocated inode must not inherit stale VMO/PageCache state
         // from an earlier lifetime with the same inode number. Discard instead
         // of evicting: writing old cached pages through the new inode mapping
@@ -4799,7 +4805,7 @@ impl Ext4Fs {
 
     pub(super) fn mkdir_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
-        let _parent_guard = parent_lock.lock();
+        let _parent_guard = parent_lock.write();
         // Ensure the parent directory cache is fully loaded so subsequent existence
         // checks (lookup_cache → Miss) can bypass the O(n) dir_find_entry disk scan.
         // The first call reads the directory once; subsequent calls return immediately.
@@ -4816,7 +4822,7 @@ impl Ext4Fs {
                             .map_err(map_ext4_error)
                     })?;
                     let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-                    let _child_guard = child_lock.lock();
+                    let _child_guard = child_lock.write();
                     self.cache_insert_entry_with_offset(parent, name, ino, dir_byte_offset, 2);
                     self.cache_remove_dir(ino);
                     self.touch_birth_times(ino)?;
@@ -4834,7 +4840,7 @@ impl Ext4Fs {
                 .map_err(map_ext4_error)
         })?;
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _child_guard = child_lock.lock();
+        let _child_guard = child_lock.write();
         self.cache_insert_entry(parent, name, ino, 2);
         self.cache_remove_dir(ino);
         self.touch_birth_times(ino)?;
@@ -4844,14 +4850,14 @@ impl Ext4Fs {
 
     pub(super) fn unlink_at(&self, parent: u32, name: &str) -> Result<()> {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
-        let _parent_guard = parent_lock.lock();
+        let _parent_guard = parent_lock.write();
         let target_ino = self.lookup_at_locked(parent, name)?;
         let target_meta = self.stat(target_ino)?;
         if target_meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
             return_errno!(Errno::EISDIR);
         }
         let target_lock = Self::correctness_lock_for(&self.inode_correctness_locks, target_ino);
-        let _target_guard = target_lock.lock();
+        let _target_guard = target_lock.write();
 
         let op = JournaledOp::Unlink;
         self.run_journaled_ext4(Some(op), |ext4| {
@@ -4889,7 +4895,7 @@ impl Ext4Fs {
 
     pub(super) fn cleanup_unlinked_file(&self, ino: u32) -> Result<()> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
 
         let meta = self.stat(ino)?;
         if meta.nlink != 0 || meta.file_type != ext4_rs::InodeFileType::S_IFREG.bits() {
@@ -4915,14 +4921,14 @@ impl Ext4Fs {
 
     pub(super) fn rmdir_at(&self, parent: u32, name: &str) -> Result<()> {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
-        let _parent_guard = parent_lock.lock();
+        let _parent_guard = parent_lock.write();
         let child_ino = self.lookup_at_locked(parent, name)?;
         let child_meta = self.stat(child_ino)?;
         if child_meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
             return_errno!(Errno::ENOTDIR);
         }
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, child_ino);
-        let _child_guard = child_lock.lock();
+        let _child_guard = child_lock.write();
 
         let entries = self.readdir_locked(child_ino)?;
         let has_real_child = entries
@@ -5025,7 +5031,7 @@ impl Ext4Fs {
         status_flags: StatusFlags,
     ) -> Result<usize> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let read_len = self.run_ext4_file_read_only(|ext4| ext4.ext4_read_at(ino, offset, data))?;
         if read_len > 0 {
             self.touch_atime(ino, status_flags)?;
@@ -5041,7 +5047,7 @@ impl Ext4Fs {
         status_flags: StatusFlags,
     ) -> Result<usize> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let file_size = self.stat(ino)?.size as usize;
         let read_len = file_size.saturating_sub(offset).min(writer.avail());
         if read_len == 0 {
@@ -5071,7 +5077,16 @@ impl Ext4Fs {
         // overhead lives outside the individually-measured stages.
         let rda_start = Self::monotonic_nanos();
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        // C1 (Phase 6): under page_cache=0 the read path mutates no inode
+        // state (the evict below is a no-op without page-cache state, all
+        // caches it touches have their own locks), so concurrent dio reads
+        // of the same file take the lock shared. page_cache=1 keeps the
+        // exclusive guard (it evicts page-cache ranges).
+        let (_shared_guard, _excl_guard) = if self.page_cache_enabled {
+            (None, Some(inode_lock.write()))
+        } else {
+            (Some(inode_lock.read()), None)
+        };
         self.maybe_start_direct_read_profile();
         self.evict_page_cache_range(ino, offset, writer.avail())?;
         if self.page_cache_enabled {
@@ -5150,7 +5165,7 @@ impl Ext4Fs {
 
     pub(super) fn write_at(&self, ino: u32, offset: usize, data: &[u8]) -> Result<usize> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let generic014_like_write = data.len() == 512;
         let mut generic014_write_seq = 0;
         let mut generic014_write_start_ns = 0;
@@ -5258,7 +5273,7 @@ impl Ext4Fs {
         };
 
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
 
         // Fast path: a pure overwrite of already-written blocks (no append, no
         // hole, no unwritten extent) needs no block allocation, so skip the
@@ -5593,12 +5608,40 @@ impl Ext4Fs {
         offset: usize,
         reader: &mut VmReader,
     ) -> Result<usize> {
-        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
         let write_len = reader.remain();
         if write_len == 0 {
             return Ok(0);
         }
+
+        // C1 (Phase 6): dio overwrite concurrency. Under page_cache=0, try
+        // the overwrite plan while holding the per-inode lock SHARED: the
+        // verified mappings cannot change concurrently (every mapping
+        // mutator — prepare/truncate/fallocate — takes the lock exclusive),
+        // so concurrent same-file overwrite dio proceeds in parallel through
+        // bio submission instead of serializing across the device wait
+        // (Linux ext4 shared-i_rwsem dio overwrite equivalent). Overlapping
+        // concurrent writes to the same bytes are the application's race,
+        // exactly as in Linux; filesystem metadata is untouched on this
+        // path. Anything that needs the journaled prepare falls back to the
+        // exclusive guard.
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let mut shared_overwrite_mappings: Option<Vec<SimpleBlockRange>> = None;
+        let mut shared_guard = None;
+        if !self.page_cache_enabled {
+            let guard = inode_lock.read();
+            if let Some(mappings) =
+                self.plan_direct_write_overwrite_cached(ino, offset, write_len)?
+            {
+                shared_overwrite_mappings = Some(mappings);
+                shared_guard = Some(guard);
+            }
+        }
+        let _shared_guard = shared_guard;
+        let _excl_guard = if _shared_guard.is_none() {
+            Some(inode_lock.write())
+        } else {
+            None
+        };
         self.evict_page_cache_range(ino, offset, write_len)?;
 
         let profile_enabled = self.phase2_profile_enabled;
@@ -5629,9 +5672,7 @@ impl Ext4Fs {
             } else {
                 0
             };
-            let mappings = if let Some(cached_mappings) =
-                self.plan_direct_write_overwrite_cached(ino, offset, write_len)?
-            {
+            let mappings = if let Some(cached_mappings) = shared_overwrite_mappings.take() {
                 reused_read_mapping_cache = true;
                 cached_mappings
             } else {
@@ -5753,7 +5794,7 @@ impl Ext4Fs {
 
     pub(super) fn truncate(&self, ino: u32, new_size: u64) -> Result<()> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let seq = GENERIC014_TRUNCATE_PROGRESS.fetch_add(1, Ordering::Relaxed) + 1;
         if seq <= 8 || seq % GENERIC014_PROGRESS_LOG_INTERVAL == 0 {
             debug!(
@@ -5797,7 +5838,7 @@ impl Ext4Fs {
         }
 
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         self.evict_page_cache_range(ino, offset, len)?;
 
         let now = Self::now_unix_seconds_u32();
@@ -5878,7 +5919,7 @@ impl Ext4Fs {
 
     pub(super) fn readdir(&self, ino: u32) -> Result<Vec<SimpleDirEntry>> {
         let dir_lock = Self::correctness_lock_for(&self.dir_correctness_locks, ino);
-        let _dir_guard = dir_lock.lock();
+        let _dir_guard = dir_lock.write();
         self.readdir_locked(ino)
     }
 
@@ -6053,7 +6094,7 @@ impl Ext4Fs {
         self.check_not_shutdown()?;
 
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
 
         // Step 4a-2: look up the highest TID that contains a metadata change
         // for this inode (recorded by `finish_jbd2_handle` after Write/Truncate).

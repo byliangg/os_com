@@ -50,6 +50,7 @@ docker run --pull=never --rm --privileged --network=host --device=/dev/kvm \
     -e BENCH_ASTER_SCHEME="${BENCH_ASTER_SCHEME_VALUE}" \
     -e BENCH_SKIP_RESULT_PARSE=1 \
     -e RUN_G_CORRECTNESS="${RUN_G_CORRECTNESS:-1}" \
+    -e SWEEP_GROUPS="${SWEEP_GROUPS:-all}" \
     -e LOG_LEVEL="${LOG_LEVEL_VALUE}" \
     -e CARGO_TARGET_DIR=/root/asterinas/.target_bench \
     -e VDSO_LIBRARY_DIR=/root/asterinas/.local/linux_vdso \
@@ -176,6 +177,12 @@ PY
             local page_cache="$7" direct_read_cache="$8" bs="$9" numjobs="${10}"
             local fsync="${11}" benchmark="${12}" op="${13}" parse_mode="${14}"
             local scheme="${15:-${BENCH_ASTER_SCHEME:-null}}"
+            # Optional group filter: SWEEP_GROUPS="F" or "C,F" runs only those
+            # groups (default: all).
+            case ",${SWEEP_GROUPS:-all}," in
+                *,all,*|*",${group},"*) ;;
+                *) return 0 ;;
+            esac
             local safe_case
             safe_case=$(sanitize "${case_name}")
             local log_file="/fio-sweep-logs/${safe_case}.log"
