@@ -155,7 +155,7 @@ Key test matrices:
 在 Asterinas OS 中优化 ext4 文件系统性能，并实现优秀档功能要求（JBD2 完整日志、并发读写、崩溃恢复）。
 
 - **性能目标**：fio 顺序读写 >= 90%。诚实口径（cache-off + extent_map/inode 缓存 + drop 公平基线，`direct=1, nj=1`，中位数）下 Phase 5 读优化已收口：**read 4K/16K/64K/256K/1M = 86/84/87/95/123%，write = 76/76/84/121/88%**（优化前小块 16–24% / write 4K 20%、1M 63%）。ext4 域内 per-op 固定开销已榨干，剩余瓶颈在 Asterinas virtio 设备往返（平台层、跨 FS 通用）。历史 `read 127% / write 39%` 是 speculative data cache **开**的不诚实数，不能用于答辩。
-- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写、Phase 3 fsync/flush 持久化语义、Phase 4 PageCache buffered I/O / mmap 集成、Phase 5 性能优化（O_DIRECT 读写守底 75–123% + SQLite 崩溃 bug + 覆盖写快路径）均已收口（守底回归全绿）。当前进入 **feature_sqlite_phase6**：SQLite 真实应用写优化主线，攻追加/新分配类写（INSERT 新块 / CREATE INDEX / VACUUM），delalloc 延迟分配为先验主线，profile 先行。
+- **功能目标**：JBD2 完整事务管理、全量崩溃恢复、多文件并发读写、fsync/flush 持久化语义、PageCache 集成、性能优化全线（Phase 5 + Phase 6 S/P/C 系列）**均已收口**：SQLite 234.9s = Linux 21.92%（起点 2.97%，7.4×）、fio O_DIRECT 守底 75–121%、并发 C1 后 write nj2/4 = 165%/187% 反超 Linux，守底全绿，已推送 GitHub main（a38bda464）。**当前任务：revoke 正确性修复（technical_report C1/C2）**——revoke 记录从不写入 journal + recovery 无序列号上界，两者必须一起修（修一个洞开一个洞）；修法与验证用例设计见 technical_report §5 C1/C2 + 附录 A-1、feature_sqlite_phase6_plan.md §并行正确性任务。次优先：学术研究报告（20% 文档分）。
 
 ## 工作树约定
 
@@ -186,8 +186,8 @@ Key test matrices:
 | `feature_pagecache_phase4_milestone.md` / `docs/feature_pagecache_phase4_milestone.md` | PageCache Phase 4 进度、代码审计、回归与 benchmark 记录 |
 | `feature_perf_phase5_plan.md` / `docs/feature_perf_phase5_plan.md` | 性能优化 Phase 5 计划（已完成）：延迟归因驱动，O_DIRECT write / 小块 / 读并发优化 |
 | `feature_perf_phase5_milestone.md` / `docs/feature_perf_phase5_milestone.md` | 性能优化 Phase 5 进度、占比表、回归与 benchmark 记录（已完成）|
-| `feature_sqlite_phase6_plan.md` / `docs/feature_sqlite_phase6_plan.md` | **当前阶段** SQLite 真实应用写优化 Phase 6 计划：追加/新分配写，delalloc 延迟分配主线，profile 先行 |
-| `feature_sqlite_phase6_milestone.md` / `docs/feature_sqlite_phase6_milestone.md` | **当前阶段** Phase 6 进度、起点基线（2.97%）、守底门控与 SQLite 重测记录 |
+| `feature_sqlite_phase6_plan.md` / `docs/feature_sqlite_phase6_plan.md` | Phase 6 计划（已收口）：S/P/C 系列全过程 + §P 系列 90% 上限分析 + §并行任务 revoke 修复设计 |
+| `feature_sqlite_phase6_milestone.md` / `docs/feature_sqlite_phase6_milestone.md` | Phase 6 进度（已收口）：全部变更日志、负结果教训、守底记录 |
 | `sqlite_benchmark_report.md` / `docs/sqlite_benchmark_report.md` | SQLite speedtest1 真实应用 benchmark 报告（读追平 / 写瓶颈 / 崩溃 bug / 端到端跑通）|
 | `fio_direct_parameter_sweep_report.md` | Phase 5 基线证据：fio direct 全量参数 sweep（A–G 组），三瓶颈分解 |
 | `fio_direct_senior_feedback_response.md` | Phase 5 基线证据：学长性能优化指导与三方对齐结论 |
