@@ -1,0 +1,19 @@
+group	case	target	journal	rw	direct	page_cache	direct_read_cache	bs	numjobs	fsync	asterinas_mb_s	linux_mb_s	ratio_pct	log	note
+F	F-raw-write-nj1	raw	none	write	1	0	0	1M	1	none	2286.0	3147.0	72.64	/fio-sweep-logs/F-raw-write-nj1.log	
+F	F-ext4j-write-nj1	ext4	journaled	write	1	0	0	1M	1	none	1432.0	2873.0	49.84	/fio-sweep-logs/F-ext4j-write-nj1.log	
+F	F-ext4n-write-nj1	ext4	nojournal	write	1	0	0	1M	1	none	1603.0	1643.0	97.57	/fio-sweep-logs/F-ext4n-write-nj1.log	
+F	F-raw-read-nj1	raw	none	read	1	0	0	1M	1	none	1633.0	4122.0	39.62	/fio-sweep-logs/F-raw-read-nj1.log	
+F	F-ext4j-read-nj1	ext4	journaled	read	1	0	0	1M	1	none	1645.0	1786.0	92.11	/fio-sweep-logs/F-ext4j-read-nj1.log	
+F	F-ext4n-read-nj1	ext4	nojournal	read	1	0	0	1M	1	none	1663.0	1777.0	93.58	/fio-sweep-logs/F-ext4n-read-nj1.log	
+F	F-raw-write-nj2	raw	none	write	1	0	0	1M	2	none	4734.0	3899.0	121.42	/fio-sweep-logs/F-raw-write-nj2.log	
+F	F-ext4j-write-nj2	ext4	journaled	write	1	0	0	1M	2	none	6024.0	3641.0	165.45	/fio-sweep-logs/F-ext4j-write-nj2.log	
+F	F-ext4n-write-nj2	ext4	nojournal	write	1	0	0	1M	2	none	5803.0	3129.0	185.46	/fio-sweep-logs/F-ext4n-write-nj2.log	
+F	F-raw-read-nj2	raw	none	read	1	0	0	1M	2	none	2289.0	4080.0	56.10	/fio-sweep-logs/F-raw-read-nj2.log	
+F	F-ext4j-read-nj2	ext4	journaled	read	1	0	0	1M	2	none	7456.0	2912.0	256.04	/fio-sweep-logs/F-ext4j-read-nj2.log	
+F	F-ext4n-read-nj2	ext4	nojournal	read	1	0	0	1M	2	none	7172.0	2066.0	347.14	/fio-sweep-logs/F-ext4n-read-nj2.log	
+F	F-raw-write-nj4	raw	none	write	1	0	0	1M	4	none	4625.0	3935.0	117.53	/fio-sweep-logs/F-raw-write-nj4.log	
+F	F-ext4j-write-nj4	ext4	journaled	write	1	0	0	1M	4	none	5139.0	2750.0	186.87	/fio-sweep-logs/F-ext4j-write-nj4.log	
+F	F-ext4n-write-nj4	ext4	nojournal	write	1	0	0	1M	4	none	5126.0	3833.0	133.73	/fio-sweep-logs/F-ext4n-write-nj4.log	
+F	F-raw-read-nj4	raw	none	read	1	0	0	1M	4	none	5397.0	5142.0	104.96	/fio-sweep-logs/F-raw-read-nj4.log	
+F	F-ext4j-read-nj4	ext4	journaled	read	1	0	0	1M	4	none	13200.0	4215.0	313.17	/fio-sweep-logs/F-ext4j-read-nj4.log	
+F	F-ext4n-read-nj4	ext4	nojournal	read	1	0	0	1M	4	none	14100.0	6406.0	220.11	/fio-sweep-logs/F-ext4n-read-nj4.log	
