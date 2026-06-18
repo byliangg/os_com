@@ -66,6 +66,15 @@ impl PageCache {
         self.manager.discard_range(range)
     }
 
+    /// Marks resident pages in the range dirty.
+    ///
+    /// Shared writable mappings can update an already-writable PTE without
+    /// taking another write fault, so a filesystem may conservatively call this
+    /// before a sync point to make sure resident mmap updates are written back.
+    pub fn mark_dirty_range(&self, range: Range<usize>) {
+        self.manager.mark_dirty_range(range)
+    }
+
     /// Returns the backend.
     pub fn backend(&self) -> Arc<dyn PageCacheBackend> {
         self.manager.backend()
@@ -397,6 +406,17 @@ impl PageCacheManager {
         Ok(())
     }
 
+    pub fn mark_dirty_range(&self, range: Range<usize>) {
+        let page_idx_range = get_page_idx_range(&range);
+        let mut pages = self.pages.lock();
+        for (_, page) in pages
+            .iter_mut()
+            .filter(|(idx, _)| page_idx_range.contains(*idx))
+        {
+            page.store_state(PageState::Dirty);
+        }
+    }
+
     fn ondemand_readahead(&self, idx: usize) -> Result<UFrame> {
         let mut pages = self.pages.lock();
         let mut ra_state = self.ra_state.lock();
@@ -459,11 +479,11 @@ impl Pager for PageCacheManager {
     }
 
     fn update_page(&self, idx: usize) -> Result<()> {
-        let mut pages = self.pages.lock();
+        let Some(mut pages) = self.pages.try_lock() else {
+            return Ok(());
+        };
         if let Some(page) = pages.get_mut(&idx) {
             page.store_state(PageState::Dirty);
-        } else {
-            warn!("The page {} is not in page cache", idx);
         }
 
         Ok(())

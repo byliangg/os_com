@@ -41,6 +41,70 @@ impl Ext4 {
         *super_block
     }
 
+    pub fn current_superblock_counters(&self) -> Ext4Superblock {
+        *self.allocator_locks.lock_superblock_counter()
+    }
+
+    pub fn statfs_overhead_blocks(&self) -> u64 {
+        let mut overhead = 0u64;
+
+        if let Some(zones) = self.system_zone_cache.as_ref() {
+            for zone in zones {
+                overhead = overhead
+                    .saturating_add(zone.end_blk.saturating_sub(zone.start_blk).saturating_add(1));
+            }
+        }
+
+        if self.super_block.has_journal() {
+            let journal_inode = self.super_block.journal_inode_number();
+            if journal_inode != 0 {
+                let inode_ref = self.get_inode_ref(journal_inode);
+                let sectors_per_block = (self.super_block.block_size() as u64 / 512).max(1);
+                overhead = overhead.saturating_add(
+                    inode_ref
+                        .inode
+                        .blocks_count()
+                        .saturating_add(sectors_per_block - 1)
+                        / sectors_per_block,
+                );
+            }
+        }
+
+        overhead.min(self.super_block.blocks_count() as u64)
+    }
+
+    pub fn statfs_free_blocks_from_bitmaps(&self) -> u64 {
+        let block_size = self.super_block.block_size() as usize;
+        let blocks_per_group = self.super_block.blocks_per_group();
+        let max_bits_per_group = core::cmp::min(blocks_per_group, (block_size * 8) as u32);
+        let blocks_count = self.super_block.blocks_count() as u64;
+        let mut free_blocks = 0u64;
+
+        for bgid in 0..self.super_block.block_group_count() {
+            let block_group =
+                Ext4BlockGroup::load_new(&self.block_device, &self.super_block, bgid as usize);
+            let bitmap_block = block_group.get_block_bitmap_block(&self.super_block);
+            let bitmap = self
+                .block_device
+                .read_offset(bitmap_block as usize * block_size);
+
+            for idx in 0..max_bits_per_group {
+                let block_num = self.bg_idx_to_addr(idx, bgid);
+                if block_num >= blocks_count {
+                    break;
+                }
+                if self.is_system_reserved_block(block_num, bgid) {
+                    continue;
+                }
+                if ext4_bmap_is_bit_clr(&bitmap, idx) {
+                    free_blocks += 1;
+                }
+            }
+        }
+
+        free_blocks
+    }
+
     /// 获取system zone缓存
     pub fn get_system_zone(&self) -> Vec<SystemZone> {
         let mut zones = Vec::new();
@@ -116,6 +180,7 @@ impl Ext4 {
             super_block,
             system_zone_cache: None,
             inode_table_blocks: Vec::new(),
+            small_write_prealloc_blocks: crate::DEFAULT_SMALL_WRITE_PREALLOC_BLOCKS,
         };
         let zones = ext4_tmp.get_system_zone();
         let inode_table_blocks = ext4_tmp.load_inode_table_blocks();

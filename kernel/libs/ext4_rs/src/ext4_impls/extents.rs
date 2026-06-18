@@ -7,6 +7,136 @@ use crate::utils::crc::*;
 
 
 impl Ext4 {
+    fn collect_extent_node_blocks_recursive(
+        &self,
+        runs: &mut Vec<(Ext4Fsblk, u32)>,
+        node_pblock: Ext4Fsblk,
+        expected_depth: u16,
+    ) -> Result<usize> {
+        if node_pblock == 0 || node_pblock >= self.super_block.blocks_count() as u64 {
+            log::warn!(
+                "[truncate_extents_to_empty] skip invalid extent node block={} depth={}",
+                node_pblock,
+                expected_depth
+            );
+            return Ok(0);
+        }
+
+        let block_size = self.super_block.block_size() as usize;
+        let node_block = Block::load(
+            &self.block_device,
+            node_pblock as usize * block_size,
+            block_size,
+        );
+        let header = Ext4ExtentHeader::load_from_u8(&node_block.data[..EXT4_EXTENT_HEADER_SIZE]);
+        if header.magic != EXT4_EXTENT_MAGIC || header.depth != expected_depth {
+            log::warn!(
+                "[truncate_extents_to_empty] invalid extent node header: block={} magic={:#x} depth={} expected_depth={}",
+                node_pblock,
+                header.magic,
+                header.depth,
+                expected_depth
+            );
+            return_errno_with_message!(Errno::EIO, "invalid extent node while truncating");
+        }
+
+        let entry_size = if header.depth == 0 {
+            EXT4_EXTENT_SIZE
+        } else {
+            EXT4_EXTENT_INDEX_SIZE
+        };
+        let capacity = node_block
+            .data
+            .len()
+            .saturating_sub(EXT4_EXTENT_HEADER_SIZE)
+            / entry_size;
+        let entries = (header.entries_count as usize).min(capacity);
+        let mut freed = 0usize;
+
+        if header.depth == 0 {
+            for pos in 0..entries {
+                let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+                let extent = Ext4Extent::load_from_u8(&node_block.data[off..off + EXT4_EXTENT_SIZE]);
+                let len = extent.get_actual_len() as u32;
+                if len == 0 {
+                    continue;
+                }
+                runs.push((extent.get_pblock(), len));
+                freed += len as usize;
+            }
+        } else {
+            for pos in 0..entries {
+                let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_INDEX_SIZE;
+                let index = Ext4ExtentIndex::load_from_u8(
+                    &node_block.data[off..off + EXT4_EXTENT_INDEX_SIZE],
+                );
+                freed += self.collect_extent_node_blocks_recursive(
+                    runs,
+                    index.get_pblock(),
+                    header.depth - 1,
+                )?;
+            }
+        }
+
+        runs.push((node_pblock, 1));
+        Ok(freed + 1)
+    }
+
+    pub fn truncate_extents_to_empty(&self, inode_ref: &mut Ext4InodeRef) -> Result<usize> {
+        let header = inode_ref.inode.root_extent_header();
+        if header.magic != EXT4_EXTENT_MAGIC {
+            return Ok(0);
+        }
+
+        let mut freed = 0usize;
+        let mut runs: Vec<(Ext4Fsblk, u32)> = Vec::new();
+        if header.depth == 0 {
+            let capacity = (inode_ref.inode.block.len() * 4 - EXT4_EXTENT_HEADER_SIZE)
+                / EXT4_EXTENT_SIZE;
+            let entries = (header.entries_count as usize).min(capacity);
+            for pos in 0..entries {
+                let extent = inode_ref.inode.root_extent_at(pos);
+                let len = extent.get_actual_len() as u32;
+                if len == 0 {
+                    continue;
+                }
+                runs.push((extent.get_pblock(), len));
+                freed += len as usize;
+            }
+        } else {
+            let capacity = (inode_ref.inode.block.len() * 4 - EXT4_EXTENT_HEADER_SIZE)
+                / EXT4_EXTENT_INDEX_SIZE;
+            let entries = (header.entries_count as usize).min(capacity);
+            for pos in 0..entries {
+                let off = EXT4_EXTENT_HEADER_SIZE / 4 + pos * (EXT4_EXTENT_INDEX_SIZE / 4);
+                let index = Ext4ExtentIndex::load_from_u32(&inode_ref.inode.block[off..]);
+                freed += self.collect_extent_node_blocks_recursive(
+                    &mut runs,
+                    index.get_pblock(),
+                    header.depth - 1,
+                )?;
+            }
+        }
+
+        self.balloc_free_block_runs_bulk(inode_ref, &mut runs);
+
+        {
+            let root_header = inode_ref.inode.root_extent_header_mut();
+            root_header.magic = EXT4_EXTENT_MAGIC;
+            root_header.entries_count = 0;
+            root_header.max_entries_count = 4;
+            root_header.depth = 0;
+            root_header.generation = 0;
+        }
+        unsafe {
+            let root_block_ptr = inode_ref.inode.block.as_mut_ptr() as *mut u8;
+            let extents_ptr = root_block_ptr.add(EXT4_EXTENT_HEADER_SIZE);
+            core::ptr::write_bytes(extents_ptr, 0, 60 - EXT4_EXTENT_HEADER_SIZE);
+        }
+        self.write_back_inode(inode_ref);
+        Ok(freed)
+    }
+
     fn inode_root_first_index(inode: &Ext4Inode) -> Ext4ExtentIndex {
         Ext4ExtentIndex::load_from_u32(&inode.block[3..])
     }

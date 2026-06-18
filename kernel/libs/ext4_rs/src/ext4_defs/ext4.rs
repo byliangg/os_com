@@ -46,4 +46,5 @@ pub struct Ext4 {
     pub super_block: Ext4Superblock,
     pub system_zone_cache: Option<Vec<SystemZone>>,
     pub inode_table_blocks: Vec<Ext4Fsblk>,
+    pub small_write_prealloc_blocks: u32,
 }

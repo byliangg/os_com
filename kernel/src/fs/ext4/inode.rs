@@ -162,7 +162,7 @@ impl InodeIo for Ext4Inode {
             return fs.read_direct_at(self.ino, offset, writer, status_flags);
         }
 
-        if fs.page_cache_enabled() {
+        if fs.page_cache_io_enabled() || fs.has_page_cache_state(self.ino) {
             return fs.read_at_page_cache(self.ino, offset, writer, status_flags);
         }
 
@@ -193,7 +193,7 @@ impl InodeIo for Ext4Inode {
             return fs.write_direct_at(self.ino, offset, reader);
         }
 
-        if fs.page_cache_enabled() {
+        if fs.page_cache_io_enabled() || fs.has_page_cache_state(self.ino) {
             return fs.write_at_page_cache(self.ino, offset, reader);
         }
 
@@ -364,8 +364,7 @@ impl Inode for Ext4Inode {
 
     fn on_close_file_handle(&self) -> Result<()> {
         let fs = self.ext4_fs()?;
-        fs.on_close_file_handle(self.ino)?;
-        Ok(())
+        fs.on_close_file_handle(self.ino)
     }
 
     fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {

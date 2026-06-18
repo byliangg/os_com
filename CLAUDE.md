@@ -1,6 +1,6 @@
 See [AGENTS.md](AGENTS.md).
 
-Current ext4 context: JBD2 Phase 1/2/3, PageCache Phase 4, and performance Phase 5 are all complete (guard regressions all green). Phase 5 closed out the O_DIRECT read/write floor (75–123%), fixed the two SQLite crash bugs (A1 allocator underflow, B checkpoint OOM), and landed the overwrite fast-path (SQLite 4773→2022s, 2.36×). The current line is **feature_sqlite_phase6**: optimizing SQLite real-application *append / new-allocation* writes (INSERT new blocks / CREATE INDEX / VACUUM), with **delalloc (delayed allocation)** as the prior main line and a profile-first methodology.
+Current ext4 context: JBD2 Phase 1/2/3, PageCache Phase 4, performance Phase 5, and SQLite Phase 6 are complete (guard regressions all green). Phase 6 closed out the SQLite real-application write line at 234.9s = Linux 21.92% (7.4× from the 2.97% starting point), with fio O_DIRECT guard floors preserved. The current line is **feature_fixerror_phase7** on branch `feature-fixerror-phase-7`: fix all official xfstests errors exposed by the new runner.
 
 Honest cache-off baseline (NOT the old cache-on `read 127% / write 39%`, which must not be used for the defense). All numbers `direct=1, nj=1`, drop-caches fair口径, median-of-N, with `ext4fs.extent_map_cache` + inode metadata cache active:
 
@@ -14,11 +14,17 @@ Honest cache-off baseline (NOT the old cache-on `read 127% / write 39%`, which m
 
 Before optimization small blocks sat at 16–24% read and write 4K=20% / 1M=63%. Four ext4-domain optimizations got us here: (1) extent mapping plan cache, (2) whole-file coverage for random reads, (3) relatime atime throttling, (4) **inode metadata cache** (the big win — `get_inode_ref` was reloading the inode block from device on every `stat`). The ext4-domain per-op fixed overhead is now exhausted; the remaining gap is the Asterinas virtio device round-trip (platform layer, common across FS — confirmed by ext2 hitting the same 82–85% ceiling on the same platform).
 
-Phase 6 references (current):
+Phase 7 references (current):
+- Plan: `feature_fixerror_phase7_plan.md` / `docs/feature_fixerror_phase7_plan.md`
+- Milestone: `feature_fixerror_phase7_milestone.md` / `docs/feature_fixerror_phase7_milestone.md`
+- Starting evidence: `benchmark/logs/official_20260612_082930.log`
+- Starting result: official full run completed 47 cases (35 PASS / 12 FAIL) and then stopped during `generic/320` with `Failed to allocate a large slot` / heap allocation error. Completed FAILs: `ext4/042`, `generic/030`, `generic/074`, `generic/141`, `generic/246`, `generic/248`, `generic/249`, `generic/257`, `generic/273`, `generic/275`, `generic/309`, `generic/313`.
+- Method: first make the official full run complete, then fix failures by bad-output/root-cause clusters. Do not expand excludes casually; if a case seems outside the contest requirements, check `/home/lby/os_com_codex/赛题要求.md` and ask for human confirmation.
+
+Phase 6 references (complete):
 - Plan: `feature_sqlite_phase6_plan.md` / `docs/feature_sqlite_phase6_plan.md`
-- Milestone: `feature_sqlite_phase6_milestone.md` / `docs/feature_sqlite_phase6_milestone.md` (starting baseline 2.97%, guard gates, SQLite re-measure)
+- Milestone: `feature_sqlite_phase6_milestone.md` / `docs/feature_sqlite_phase6_milestone.md`
 - Starting evidence: `sqlite_benchmark_report.md` / `docs/sqlite_benchmark_report.md`
-- Phase 6 target path: SQLite append/new-allocation writes still take the slow journaled-allocation path in `write_at_page_cache` (`kernel/src/fs/ext4/fs.rs`) — every newly-allocated 4KB page runs a full `run_journaled_ext4(JournaledOp::Write)` (JBD2 handle + `EXT4_RS_RUNTIME_LOCK` + `ext4_map_blocks` alloc + meta cache clear) plus per-transaction fsync plus per-4KB bio. The overwrite fast-path (`write_range_fully_mapped` → `touch_mtime_ctime` + page_cache.write) already bypasses this for in-place rewrites. **Profile-first** (Phase 5 lesson: the un-profiled writeback-batching attempt only got 3% and was reverted).
 
 Phase 5 references (complete):
 - Plan/Milestone: `feature_perf_phase5_plan.md`, `feature_perf_phase5_milestone.md` (full read/write table, before→after)

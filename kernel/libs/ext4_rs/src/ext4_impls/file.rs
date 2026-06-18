@@ -16,12 +16,16 @@ use crate::utils::path_check;
 // `SMALL_WRITE_PREALLOC_BLOCKS` so subsequent appends skip the journaled
 // allocation entirely; multi-block writes keep no preallocation for now.
 const WRITE_PREALLOC_BLOCKS: u32 = 1;
-const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 32;
+pub const DEFAULT_SMALL_WRITE_PREALLOC_BLOCKS: u32 = 32;
 const GENERIC014_MAP_PROFILE_LIMIT: u64 = 64;
 
 static GENERIC014_MAP_PROFILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 impl Ext4 {
+    pub fn set_small_write_prealloc_blocks(&mut self, blocks: u32) {
+        self.small_write_prealloc_blocks = blocks.max(1);
+    }
+
     fn initial_write_alloc_bgid(
         &self,
         inode_ref: &Ext4InodeRef,
@@ -836,13 +840,25 @@ impl Ext4 {
         allocated_blocks: &[Ext4Fsblk],
     ) -> Result<usize> {
         let mut inserted = 0usize;
-        self.insert_allocated_blocks_as_extents_inner(
+        if let Err(e) = self.insert_allocated_blocks_as_extents_inner(
             inode_ref,
             lblock_start,
             allocated_blocks,
             false,
             &mut inserted,
-        )?;
+        ) {
+            let leftover = &allocated_blocks[inserted..];
+            log::warn!(
+                "[ensure_write_range_mapped] written extent insert failed, freeing un-inserted suffix: inode={} lblock_start={} blocks={} inserted={} err={:?}",
+                inode_ref.inode_num,
+                lblock_start,
+                allocated_blocks.len(),
+                inserted,
+                e
+            );
+            self.free_allocated_block_runs(inode_ref, leftover);
+            return Err(e);
+        }
         Ok(inserted)
     }
 
@@ -931,6 +947,28 @@ impl Ext4 {
         Ok(())
     }
 
+    fn free_allocated_block_runs(
+        &self,
+        inode_ref: &mut Ext4InodeRef,
+        allocated_blocks: &[Ext4Fsblk],
+    ) {
+        let mut seg_begin = 0usize;
+        while seg_begin < allocated_blocks.len() {
+            let mut seg_end = seg_begin + 1;
+            while seg_end < allocated_blocks.len()
+                && allocated_blocks[seg_end] == allocated_blocks[seg_end - 1] + 1
+            {
+                seg_end += 1;
+            }
+            self.balloc_free_blocks(
+                inode_ref,
+                allocated_blocks[seg_begin],
+                (seg_end - seg_begin) as u32,
+            );
+            seg_begin = seg_end;
+        }
+    }
+
     fn ensure_write_range_mapped(
         &self,
         inode_ref: &mut Ext4InodeRef,
@@ -945,7 +983,7 @@ impl Ext4 {
         let uses_extents = (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0;
         let requested_blocks = end_lblock.saturating_sub(start_lblock);
         let prealloc_blocks = if requested_blocks <= 1 {
-            SMALL_WRITE_PREALLOC_BLOCKS
+            self.small_write_prealloc_blocks
         } else {
             WRITE_PREALLOC_BLOCKS
         };
@@ -1242,21 +1280,7 @@ impl Ext4 {
                                 tail_inserted,
                                 e
                             );
-                            let mut seg_begin = 0usize;
-                            while seg_begin < leftover.len() {
-                                let mut seg_end = seg_begin + 1;
-                                while seg_end < leftover.len()
-                                    && leftover[seg_end] == leftover[seg_end - 1] + 1
-                                {
-                                    seg_end += 1;
-                                }
-                                self.balloc_free_blocks(
-                                    inode_ref,
-                                    leftover[seg_begin],
-                                    (seg_end - seg_begin) as u32,
-                                );
-                                seg_begin = seg_end;
-                            }
+                            self.free_allocated_block_runs(inode_ref, leftover);
                         }
                     }
 
@@ -1914,6 +1938,15 @@ impl Ext4 {
             }
             // Keep sparse semantics for growth: only advance i_size and leave holes unmapped.
             inode_ref.inode.set_size(new_size);
+            self.write_back_inode(inode_ref);
+            return Ok(EOK);
+        }
+
+        if new_size == 0
+            && (inode_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS as u32) != 0
+        {
+            self.truncate_extents_to_empty(inode_ref)?;
+            inode_ref.inode.set_size(0);
             self.write_back_inode(inode_ref);
             return Ok(EOK);
         }

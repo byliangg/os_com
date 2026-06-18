@@ -45,6 +45,7 @@ pub use crate::ext4_impls::JournalTransaction;
 pub use crate::ext4_impls::JournalTransactionState;
 pub use crate::ext4_impls::LocalOperationAllocGuard;
 pub use crate::ext4_impls::OperationScopedAllocGuard;
+pub use crate::ext4_impls::DEFAULT_SMALL_WRITE_PREALLOC_BLOCKS;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {

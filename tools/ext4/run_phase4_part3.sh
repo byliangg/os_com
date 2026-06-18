@@ -71,6 +71,12 @@ if [ "${RUN_PAGECACHE_PHASE4}" = "1" ]; then
   fi
 fi
 
+if [ "${RUN_OFFICIAL}" = "1" ]; then
+  if [ "${XFSTESTS_RUN_TIMEOUT_SEC}" = "1800" ]; then
+    XFSTESTS_RUN_TIMEOUT_SEC=21600
+  fi
+fi
+
 if [ ! -f "${INITRAMFS_IMG}" ]; then
   "${ROOT_DIR}/tools/ext4/prepare_phase4_part3_initramfs.sh" "${BASE_INITRAMFS}" "${INITRAMFS_IMG}"
 fi
@@ -221,9 +227,23 @@ run_xfstests_mode() {
   local threshold="$2"
   local log_file="$3"
   local ext4_page_cache=0
+  local ext4_page_cache_io=1
   if [ "${mode}" = "pagecache_phase4" ]; then
     ext4_page_cache=1
   fi
+  if [ "${mode}" = "official" ]; then
+    ext4_page_cache=1
+    ext4_page_cache_io=0
+  fi
+  local ext4_small_write_prealloc=1
+  local ext4_page_cache_evict_on_close=0
+  if [ "${mode}" = "official" ]; then
+    ext4_small_write_prealloc=0
+  fi
+  ext4_page_cache="${EXT4_PAGE_CACHE_OVERRIDE:-${ext4_page_cache}}"
+  ext4_page_cache_io="${EXT4_PAGE_CACHE_IO_OVERRIDE:-${ext4_page_cache_io}}"
+  ext4_small_write_prealloc="${EXT4_SMALL_WRITE_PREALLOC_OVERRIDE:-${ext4_small_write_prealloc}}"
+  ext4_page_cache_evict_on_close="${EXT4_PAGE_CACHE_EVICT_ON_CLOSE_OVERRIDE:-${ext4_page_cache_evict_on_close}}"
 
   pkill -f qemu-system >/dev/null 2>&1 || true
   rm -f qemu.log kernel/qemu.log
@@ -238,6 +258,9 @@ run_xfstests_mode() {
     --kcmd-args='console=${CONSOLE}' \
     --kcmd-args='ext4fs.phase2_profile=${EXT4_PHASE2_PROFILE}' \
     --kcmd-args='ext4fs.page_cache=${ext4_page_cache}' \
+    --kcmd-args='ext4fs.page_cache_io=${ext4_page_cache_io}' \
+    --kcmd-args='ext4fs.small_write_prealloc=${ext4_small_write_prealloc}' \
+    --kcmd-args='ext4fs.page_cache_evict_on_close=${ext4_page_cache_evict_on_close}' \
     --kcmd-args='ext4fs.direct_read_cache=${EXT4_DIRECT_READ_CACHE:-1}' \
     --kcmd-args='ext4fs.extent_map_cache=${EXT4_EXTENT_MAP_CACHE:-1}' \
     --kcmd-args='SYSCALL_TEST_SUITE=xfstests' \

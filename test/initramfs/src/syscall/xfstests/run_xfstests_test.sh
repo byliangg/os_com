@@ -1003,6 +1003,190 @@ exit 1
 EOF
 chmod +x "${SHIM_DIR}/xfs_io"
 
+cat > "${SHIM_DIR}/dd" <<'EOF'
+#!/bin/bash
+set -eu
+
+orig_args=("$@")
+args=()
+need_sync=0
+
+for arg in "$@"; do
+    case "${arg}" in
+        oflag=sync)
+            need_sync=1
+            ;;
+        oflag=*)
+            value="${arg#oflag=}"
+            kept=""
+            old_ifs="${IFS}"
+            IFS=,
+            set -- ${value}
+            IFS="${old_ifs}"
+            for flag in "$@"; do
+                if [ "${flag}" = "sync" ]; then
+                    need_sync=1
+                    continue
+                fi
+                if [ -z "${kept}" ]; then
+                    kept="${flag}"
+                else
+                    kept="${kept},${flag}"
+                fi
+            done
+            if [ -n "${kept}" ]; then
+                args+=("oflag=${kept}")
+            fi
+            ;;
+        *)
+            args+=("${arg}")
+            ;;
+    esac
+done
+
+if [ "${need_sync}" != "1" ]; then
+    for cand in /usr/bin/dd /bin/dd; do
+        if [ -x "${cand}" ] && [ "$(readlink -f "${cand}" 2>/dev/null || printf '%s' "${cand}")" != "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
+            exec "${cand}" "${orig_args[@]}"
+        fi
+    done
+    exec /usr/bin/busybox dd "${orig_args[@]}"
+fi
+
+set +e
+for cand in /usr/bin/dd /bin/dd; do
+    if [ -x "${cand}" ] && [ "$(readlink -f "${cand}" 2>/dev/null || printf '%s' "${cand}")" != "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
+        "${cand}" "${args[@]}"
+        rc=$?
+        sync >/dev/null 2>&1 || true
+        exit "${rc}"
+    fi
+done
+/usr/bin/busybox dd "${args[@]}"
+rc=$?
+sync >/dev/null 2>&1 || true
+exit "${rc}"
+EOF
+chmod +x "${SHIM_DIR}/dd"
+
+cat > "${SHIM_DIR}/od" <<'EOF'
+#!/bin/bash
+set -eu
+
+orig_args=("$@")
+want_addr_x=0
+want_type_x1z=0
+files=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -Ax|-A)
+            if [ "$1" = "-A" ]; then
+                shift
+                [ "${1:-}" = "x" ] && want_addr_x=1
+            else
+                want_addr_x=1
+            fi
+            ;;
+        -tx1z|-t)
+            if [ "$1" = "-t" ]; then
+                shift
+                [ "${1:-}" = "x1z" ] && want_type_x1z=1
+            else
+                want_type_x1z=1
+            fi
+            ;;
+        --)
+            shift
+            while [ "$#" -gt 0 ]; do
+                files+=("$1")
+                shift
+            done
+            break
+            ;;
+        -*)
+            want_addr_x=0
+            break
+            ;;
+        *)
+            files+=("$1")
+            ;;
+    esac
+    shift
+done
+
+if [ "${want_addr_x}" != "1" ] || [ "${want_type_x1z}" != "1" ]; then
+    for cand in /usr/bin/od /bin/od; do
+        if [ -x "${cand}" ] && [ "$(readlink -f "${cand}" 2>/dev/null || printf '%s' "${cand}")" != "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
+            exec "${cand}" "${orig_args[@]}"
+        fi
+    done
+    exec /usr/bin/busybox od "${orig_args[@]}"
+fi
+
+if [ "${#files[@]}" -eq 0 ]; then
+    files=(-)
+fi
+
+/usr/bin/busybox hexdump -v -e '1/1 "%02x\n"' "${files[@]}" | awk '
+function hex_value(c) {
+    if (c >= "0" && c <= "9") return c + 0
+    if (c >= "a" && c <= "f") return index("abcdef", c) + 9
+    if (c >= "A" && c <= "F") return index("ABCDEF", c) + 9
+    return 0
+}
+function hex_to_dec(hex,    i, out) {
+    out = 0
+    for (i = 1; i <= length(hex); i++) {
+        out = out * 16 + hex_value(substr(hex, i, 1))
+    }
+    return out
+}
+function emit_line(offset, n, bytes, ascii, sig) {
+    sig = ""
+    for (i = 0; i < n; i++) {
+        sig = sig bytes[i] " "
+    }
+    if (n == 16 && sig == prev_sig) {
+        if (!star_printed) {
+            print "*"
+            star_printed = 1
+        }
+        return
+    }
+    printf "%06x", offset
+    for (i = 0; i < n; i++) {
+        printf " %s", bytes[i]
+    }
+    if (n < 16) {
+        for (i = n; i < 16; i++) {
+            printf "   "
+        }
+    }
+    printf "  >%s<\n", ascii
+    prev_sig = sig
+    star_printed = 0
+}
+{
+    value = hex_to_dec($1)
+    bytes[count % 16] = $1
+    ascii = ascii ((value >= 32 && value <= 126) ? sprintf("%c", value) : ".")
+    count++
+    if (count % 16 == 0) {
+        emit_line(count - 16, 16, bytes, ascii)
+        ascii = ""
+    }
+}
+END {
+    rem = count % 16
+    if (rem != 0) {
+        emit_line(count - rem, rem, bytes, ascii)
+    }
+    printf "%06x\n", count
+}'
+EOF
+chmod +x "${SHIM_DIR}/od"
+
 cat > "${SHIM_DIR}/umount" <<'EOF'
 #!/bin/bash
 set -eu
@@ -1024,6 +1208,14 @@ translate_target() {
             printf '%s\n' "${mountpoint}"
             return 0
         fi
+        if [ "${arg}" = "${SCRATCH_DEV:-}" ] && [ -n "${SCRATCH_MNT:-}" ]; then
+            printf '%s\n' "${SCRATCH_MNT}"
+            return 0
+        fi
+        if [ "${arg}" = "${TEST_DEV:-}" ] && [ -n "${TEST_DIR:-}" ]; then
+            printf '%s\n' "${TEST_DIR}"
+            return 0
+        fi
     fi
 
     printf '%s\n' "${arg}"
@@ -1034,6 +1226,8 @@ for arg in "$@"; do
     args+=("$(translate_target "${arg}")")
 done
 
+sync >/dev/null 2>&1 || true
+
 for cand in /usr/bin/umount /bin/umount; do
     if [ -x "${cand}" ] && [ "$(readlink -f "${cand}" 2>/dev/null || printf '%s' "${cand}")" != "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")" ]; then
         exec "${cand}" "${args[@]}"
@@ -1043,6 +1237,13 @@ done
 exec /usr/bin/busybox umount "${args[@]}"
 EOF
 chmod +x "${SHIM_DIR}/umount"
+
+cat > "${SHIM_DIR}/ls" <<'EOF'
+#!/bin/bash
+set -eu
+exec /usr/bin/busybox ls "$@"
+EOF
+chmod +x "${SHIM_DIR}/ls"
 
 # xfstests freeze/shutdown groups rely on xfs_freeze/godown helpers.
 # Asterinas ext4 test environment currently lacks native ioctl support for
@@ -1117,7 +1318,10 @@ fi
 # Keep xfstests config deterministic. Relying only on inherited env vars can
 # leave TEST_DIR/SCRATCH_MNT unset after config re-sourcing.
 HOST_CONFIG_FILE="${XFSTESTS_DEV_DIR}/local.config"
-cat > "${HOST_CONFIG_FILE}" <<EOF
+write_host_config()
+{
+    local mount_options="${1:-}"
+    cat > "${HOST_CONFIG_FILE}" <<EOF
 EMAIL=root@localhost
 FSTYP=${FSTYP}
 TEST_DEV=${TEST_DEV}
@@ -1125,6 +1329,12 @@ TEST_DIR=${TEST_DIR}
 SCRATCH_DEV=${SCRATCH_DEV}
 SCRATCH_MNT=${SCRATCH_MNT}
 EOF
+    if [ -n "${mount_options}" ]; then
+        printf "MOUNT_OPTIONS='%s'\n" "${mount_options}" >> "${HOST_CONFIG_FILE}"
+    fi
+}
+
+write_host_config ""
 export HOST_OPTIONS="${HOST_CONFIG_FILE}"
 
 # Some prebuilt trees may ship src/lstat64 as a binary that is not runnable
@@ -1667,6 +1877,7 @@ while IFS= read -r test_name; do
     fi
 
     test_log="${RESULTS_DIR}/$(echo "${test_name}" | tr '/' '_').log"
+    write_host_config ""
     log_case_fs_state "pre:${test_name}"
     echo "xfstests case start: ${test_name} timeout=${CASE_TIMEOUT_SEC}s trace=${TRACE_RUN}" >&2
     set +e
