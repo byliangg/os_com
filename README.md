@@ -2,7 +2,7 @@
 
 本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经从早期 EXT4 适配与 fio 性能优化，推进到 **JBD2 Phase 1 完成状态**：在 Asterinas 上实现 block-level JBD2 事务管理、日志刷盘、checkpoint、标准 recovery，并用 xfstests、crash matrix、fio 与编译/单测完成闭环验证。
 
-当前日期口径：2026-04-24（Asia/Shanghai）。
+当前日期口径：2026-04-24。
 
 ## 当前状态
 
