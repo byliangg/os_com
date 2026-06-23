@@ -52,6 +52,9 @@ pub use crate::ext4_defs::Ext4Inode;
 pub use crate::ext4_defs::Ext4Superblock;
 // === TEMP differential-test export (phase 2): SystemZone for group-geometry diff; remove with ext4_rs in phase 6.
 pub use crate::ext4_defs::SystemZone;
+// === TEMP differential-test export (phase 2): Ext4InodeRef for the block-allocator (balloc) diff
+//     — lets the ktest hand the old engine an empty-extent inode ref; remove with ext4_rs in phase 6.
+pub use crate::ext4_defs::Ext4InodeRef;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {
