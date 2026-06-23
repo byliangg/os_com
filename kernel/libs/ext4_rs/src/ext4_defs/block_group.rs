@@ -4,7 +4,7 @@ use crate::utils::*;
 use super::*;
 
 /// Represents the structure of an Ext4 block group descriptor.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 #[repr(C, packed)]
 pub struct Ext4BlockGroup {
     pub block_bitmap_lo: u32,            // Block bitmap block
@@ -31,6 +31,13 @@ pub struct Ext4BlockGroup {
     pub block_bitmap_csum_hi: u16,       // crc32c(s_uuid+grp_num+bbitmap) BE
     pub inode_bitmap_csum_hi: u16,       // crc32c(s_uuid+grp_num+ibitmap) BE
     pub reserved: u32,                   // Padding
+}
+
+impl Ext4BlockGroup {
+    /// TEMP（rewrite phase 1 差分用）：按 ext4_rs 内部一致的 unaligned 读法从字节解析。phase 6 随本 crate 删除。
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
 }
 
 impl Ext4BlockGroup {

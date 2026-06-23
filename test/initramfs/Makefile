@@ -28,6 +28,7 @@ INITRAMFS_COMPRESSED := true
 endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
+EXT4_IMAGE := $(BUILD_DIR)/ext4.img
 
 # Include benchmark, if BENCHMARK is set.
 ifeq ($(BENCHMARK), none)
@@ -53,11 +54,11 @@ all: build
 
 .PHONY: build
 ifeq ($(OSDK_TARGET_ARCH), loongarch64)
-build: $(EXT2_IMAGE) $(EXFAT_IMAGE)
+build: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE)
 	@echo "For loongarch, we generate a fake initramfs to successfully test or build."
 	@touch $(INITRAMFS_IMAGE)
 else
-build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE)
+build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE)
 endif
 
 .PHONY: $(INITRAMFS_IMAGE)
@@ -167,6 +168,11 @@ $(EXFAT_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@fallocate -l 64M $(EXFAT_IMAGE)
 	@mkfs.exfat $(EXFAT_IMAGE)
+
+$(EXT4_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@dd if=/dev/zero of=$(EXT4_IMAGE) bs=1M count=64
+	@mkfs.ext4 -F $(EXT4_IMAGE)
 
 .PHONY: format
 format:

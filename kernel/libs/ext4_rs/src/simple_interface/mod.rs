@@ -45,6 +45,9 @@ pub use crate::ext4_impls::JournalTransaction;
 pub use crate::ext4_impls::JournalTransactionState;
 pub use crate::ext4_impls::LocalOperationAllocGuard;
 pub use crate::ext4_impls::OperationScopedAllocGuard;
+// === TEMP differential-test exports for the safe rewrite (phase 1); remove with ext4_rs in phase 6.
+pub use crate::ext4_defs::Ext4BlockGroup;
+pub use crate::ext4_defs::Ext4Superblock;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {

@@ -105,6 +105,13 @@ pub struct Ext4Superblock {
 }
 
 impl Ext4Superblock {
+    /// TEMP（rewrite phase 1 差分用）：按 ext4_rs 内部一致的 unaligned 读法从字节解析。phase 6 随本 crate 删除。
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
+}
+
+impl Ext4Superblock {
     /// Returns the size of inode structure.
     pub fn inode_size(&self) -> u16 {
         self.inode_size
