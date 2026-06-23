@@ -818,6 +818,10 @@ fn compute_system_zones<R: BlockReader>(sb: &RawSuperblock, reader: &R) -> Vec<S
 mod test {
     use ostd::prelude::*;
 
+    // `OperationAllocGuard` 需在作用域内才能在 `Arc<dyn OperationAllocGuard>` 上调用
+    // `clear_current_operation()`（见 `balloc_diff_free_then_realloc` 的对称化处理）。
+    use ext4_rs::OperationAllocGuard;
+
     use super::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::diff_harness::{
         assert_meta_eq, snapshot_meta, DirectMetadataWriter, MemDisk,
@@ -1156,8 +1160,19 @@ mod test {
         diff_free(8, None, 4);
     }
 
-    /// 释放后可重分配差分：分配 4 块 → 释放首块 → 再分配一次（应落回刚释放的位）。
-    /// 比每步块号 + 最终盘面 + i_blocks，验证 free 把位真正清回、可被后续 alloc 复用。
+    /// 释放后可重分配差分（guard 无关）：分配 4 块 → 清空 alloc_guard → 释放首块 → 再分配
+    /// 一次（应落回刚释放的位）。比每步块号 + 最终盘面 + i_blocks，验证 free 把位真正清回、
+    /// 可被后续 alloc 复用。
+    ///
+    /// 为何要先清空 guard：ext4_rs 的 `balloc_alloc_block` 在每次命中后把块登记进当前操作的
+    /// `alloc_guard`，而 `balloc_free_blocks` 只清位、**不释放 guard 预留**。本测试在同一个
+    /// `old` 句柄、同一次默认操作内连续分配/释放/再分配——若不清 guard，旧侧再分配会跳过刚
+    /// 释放的块（仍被 guard 预留），单组镜像下耗尽扫描返回 ENOSPC，而新侧的 `AllocGuardStub`
+    /// 不预留任何块，两侧 guard 行为不对称，构不成有效差分（guard 在 Task 5 才两侧接实）。
+    /// 故先 `clear_current_operation()` 把旧侧默认操作清空，使两侧 guard 同为空——本测试遂成
+    /// 「free 清位即可被复用」这一 **guard 无关** 的有效差分。
+    /// guard 敏感的 free-then-realloc 复用（不清 guard、应跳过刚释放块）留待 Task 5 两侧接实
+    /// 真实 guard 后专门验证。
     #[ktest]
     fn balloc_diff_free_then_realloc() {
         let disk_old = MemDisk::from_image(EXT4_IMAGE);
@@ -1182,6 +1197,10 @@ mod test {
                 first_block = o;
             }
         }
+
+        // 清空旧侧默认操作的 alloc_guard，使两侧 guard 同为空（新侧 AllocGuardStub 本就不预留）。
+        // 这样刚释放的块在两侧都不再被 guard 跳过，本测试遂只验证「free 清位 → 可被复用」。
+        old.alloc_guard.clear_current_operation();
 
         // 释放首块。
         old.balloc_free_blocks(&mut old_inode, first_block, 1);
