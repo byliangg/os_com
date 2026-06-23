@@ -12,6 +12,7 @@ pub mod types;
 mod io;
 mod bitmap;
 mod balloc;
+mod ialloc;
 
 #[cfg(ktest)]
 mod test_util;

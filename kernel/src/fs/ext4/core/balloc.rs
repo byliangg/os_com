@@ -25,7 +25,9 @@
 
 use core::cmp::min;
 
-use super::bitmap::{ext4_bmap_bit_find_clr, ext4_bmap_bit_set, ext4_bmap_is_bit_clr};
+use super::bitmap::{
+    ext4_bmap_bit_find_clr, ext4_bmap_bit_set, ext4_bmap_bits_free, ext4_bmap_is_bit_clr,
+};
 use super::block_group::{GroupGeometry, RawGroupDescriptor, SystemZone};
 use super::io::BlockReader;
 use super::metadata_writer::MetadataWriter;
@@ -35,9 +37,6 @@ use super::superblock::RawSuperblock;
 /// 每个文件系统块折算成的 512-byte「inode 块」数的分母。
 /// [对照] ext4_rs `EXT4_INODE_BLOCK_SIZE`（consts.rs:19）。
 const EXT4_INODE_BLOCK_SIZE: u64 = 512;
-/// inode 「使用 extent」标志位。
-/// [对照] ext4_rs `EXT4_INODE_FLAG_EXTENTS`（consts.rs:21）。
-const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
 
 /// 分配占位 guard（Task 5 接真实 `OperationAllocGuard`）。
 ///
@@ -551,7 +550,6 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             let max_to_find = min(remaining, free_blocks as usize);
             let mut rel_blk_idx = 0u32;
             let mut current_idx = idx_in_bg;
-            let mut allocated_rel_idxs: Vec<u32> = Vec::new();
 
             // 顺扫段：从 current_idx 起逐位。
             while found_blocks < max_to_find && current_idx < blocks_per_group {
@@ -575,7 +573,6 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                     ext4_bmap_bit_set(&mut bitmap, current_idx);
                     let block_num = geom.bg_idx_to_addr(current_idx, bgid);
                     result.push(block_num);
-                    allocated_rel_idxs.push(current_idx);
                     found_blocks += 1;
                 }
                 current_idx += 1;
@@ -605,7 +602,6 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                     ext4_bmap_bit_set(&mut bitmap, rel_blk_idx);
                     let block_num = geom.bg_idx_to_addr(rel_blk_idx, bgid);
                     result.push(block_num);
-                    allocated_rel_idxs.push(rel_blk_idx);
                     found_blocks += 1;
                 }
             }
@@ -650,6 +646,109 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
         }
 
         Ok(result)
+    }
+
+    // ------------------------------------------------------------------
+    // 入口 4：balloc_free_blocks(&mut inode, start, count)
+    // [对照] ext4_rs balloc.rs:612-688
+    // ------------------------------------------------------------------
+
+    /// 释放从 `start` 起的连续 `count` 个块：逐组定位区间 → `ext4_bmap_bits_free`（闭区间）
+    /// 清位 → 位图 csum + 写 → 超级块 free_blocks += → inode i_blocks -= → 组 free_blocks += +
+    /// csum + 写。逐位复刻 ext4_rs `balloc_free_blocks`（含 §3.1 怪癖，见下）。
+    ///
+    /// **§3.1 first_data_block 怪癖（PARITY）**：ext4_rs free 路径用裸除法
+    /// `bg = start / blocks_per_group`、`idx_in_bg = start % blocks_per_group` 定位组与组内
+    /// 下标，**不**像几何 helper `get_bgid_of_block`/`addr_to_idx_bg` 那样在
+    /// `first_data_block != 0 && baddr != 0` 时先减 1。故此处**刻意不走** [`GroupGeometry`]，
+    /// 直接裸除——与 ext4_rs 字节级一致。真镜像 `first_data_block == 0`，两种算法本就重合；
+    /// 在 `first_data_block != 0` 的盘上会与 alloc 侧的几何 helper 产生偏差，但这是 ext4_rs
+    /// 既有行为，parity-first 原样复刻（bug 修复推迟，见 roadmap §5）。
+    pub(super) fn balloc_free_blocks(
+        &mut self,
+        inode: &mut InodeAllocCtx,
+        start: Ext4Fsblk,
+        count: u32,
+    ) {
+        let block_size = self.block_size();
+        let mut count = count as usize;
+        let mut start = start;
+
+        let mut any_freed = false;
+        let mut inode_blocks = inode.i_blocks();
+
+        let blocks_per_group = self.sb.blocks_per_group();
+        let max_bits_per_bitmap = block_size * 8;
+        let max_bits_per_group = min(blocks_per_group as usize, max_bits_per_bitmap);
+
+        // §3.1 怪癖：裸除法定位组（不减 first_data_block）。
+        let mut bg_first = start / blocks_per_group as u64;
+        let bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
+
+        while bg_first <= bg_last {
+            let idx_in_bg = (start % blocks_per_group as u64) as usize;
+            if idx_in_bg >= max_bits_per_group {
+                // 防御越界位图偏移：跳到下一组（与 ext4_rs 一致：仅 bg_first += 1，不动 start/count）。
+                bg_first += 1;
+                continue;
+            }
+
+            let current_bgid = bg_first as u32;
+            // ext4_rs 此处 lock_block_group(current_bgid)；core 单线程 ktest 无并发，
+            // 锁语义在集成层接入（Phase 5），此处不复制锁，行为等价。
+            let mut desc = self.load_group_desc(current_bgid);
+
+            let block_bitmap_block = desc.block_bitmap();
+            let mut bitmap = self.load_block_bitmap(&desc);
+
+            let mut free_cnt = max_bits_per_group - idx_in_bg;
+            if count <= free_cnt {
+                free_cnt = count;
+            }
+            if free_cnt == 0 {
+                bg_first += 1;
+                continue;
+            }
+
+            // 闭区间清位：[idx_in_bg, idx_in_bg + free_cnt - 1]。
+            ext4_bmap_bits_free(
+                &mut bitmap,
+                idx_in_bg as u32,
+                idx_in_bg as u32 + free_cnt as u32 - 1,
+            );
+
+            count -= free_cnt;
+            start += free_cnt as u64;
+
+            // 位图 csum + 写（与 ext4_rs 顺序：先 set_csum 再 write_metadata）。
+            desc.set_block_bitmap_csum(&self.sb, &bitmap);
+            self.write_block_bitmap(block_bitmap_block, &bitmap)
+                .expect("write block bitmap");
+
+            // 超级块 free_blocks += free_cnt + csum + 写（对照 add_superblock_free_blocks）。
+            let free = self.sb.free_blocks_count();
+            self.sb.set_free_blocks_count(free + free_cnt as u64);
+            self.write_superblock().expect("write superblock");
+
+            // inode i_blocks -= free_cnt * (block_size/512)（内存累减；core 不落 inode 表）。
+            inode_blocks -= (free_cnt * (block_size / EXT4_INODE_BLOCK_SIZE as usize)) as u64;
+            any_freed = true;
+
+            // 组 free_blocks += free_cnt + csum（用更新后 SB）+ 写。
+            let mut fb_cnt = desc.get_free_blocks_count();
+            fb_cnt += free_cnt as u64;
+            desc.set_free_blocks_count(fb_cnt as u32);
+            desc.set_checksum(current_bgid, &self.sb);
+            self.write_group_desc(current_bgid, &desc)
+                .expect("write group desc");
+
+            bg_first += 1;
+        }
+
+        if any_freed {
+            inode.set_i_blocks(inode_blocks);
+            // ext4_rs 此处 write_back_inode（落 inode 表）；core 不落 inode 表，i_blocks 已在内存累减。
+        }
     }
 }
 
@@ -973,6 +1072,135 @@ mod test {
             old_inode.inode.blocks_count(),
             new_inode.i_blocks(),
             "batch i_blocks mismatch count={count}"
+        );
+    }
+
+    // ============================== balloc_free_blocks 差分 ==============================
+
+    /// free 差分公共体：两侧先用 `balloc_alloc_block(None)` 各分配 `n_alloc` 个块（无 goal、
+    /// 同序列 → 同块号集合），再 `balloc_free_blocks(free_start, free_count)` 释放同一区间，
+    /// 比 (A) 分配阶段每步块号一致；(B) 释放后 snapshot_meta 逐字节；(C) i_blocks。
+    /// `free_start` 若为 `None`，则取首次分配返回的块号作为释放区间起点。
+    fn diff_free(n_alloc: usize, free_start: Option<u64>, free_count: u32) {
+        let disk_old = MemDisk::from_image(EXT4_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_IMAGE);
+
+        // --- 旧侧分配 ---
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        // --- 新侧分配 ---
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        let mut first_block: Option<u64> = None;
+        for i in 0..n_alloc {
+            let old_ret = old.balloc_alloc_block(&mut old_inode, None);
+            let new_ret = alloc.balloc_alloc_block(&mut new_inode, None);
+            match (&old_ret, &new_ret) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "free-setup alloc step {i} block mismatch");
+                    if first_block.is_none() {
+                        first_block = Some(*a);
+                    }
+                }
+                (Err(_), Err(_)) => {}
+                _ => panic!(
+                    "free-setup alloc step {i} ok/err mismatch: old={old_ret:?} new={new_ret:?}"
+                ),
+            }
+        }
+
+        // 分配后两侧盘面应一致（前置自检）。
+        {
+            let sb_old = read_sb(&disk_old);
+            assert_meta_eq(
+                &snapshot_meta(&disk_old, &sb_old),
+                &snapshot_meta(&disk_new, alloc.superblock()),
+            );
+        }
+
+        let start = free_start.or(first_block).expect("no block to free");
+
+        // --- 两侧释放同一区间 ---
+        old.balloc_free_blocks(&mut old_inode, start, free_count);
+        alloc.balloc_free_blocks(&mut new_inode, start, free_count);
+
+        // (B) 释放后盘面逐字节一致。
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+
+        // (C) i_blocks 一致。
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "free i_blocks mismatch start={start} count={free_count}"
+        );
+    }
+
+    /// 单块释放差分：分配 4 块后释放首块（free_count=1）。
+    #[ktest]
+    fn balloc_diff_free_single_block() {
+        diff_free(4, None, 1);
+    }
+
+    /// 多块释放差分：分配 8 块后从首块起释放 4 块（连续区间，落在同一组内）。
+    #[ktest]
+    fn balloc_diff_free_multi_block() {
+        diff_free(8, None, 4);
+    }
+
+    /// 释放后可重分配差分：分配 4 块 → 释放首块 → 再分配一次（应落回刚释放的位）。
+    /// 比每步块号 + 最终盘面 + i_blocks，验证 free 把位真正清回、可被后续 alloc 复用。
+    #[ktest]
+    fn balloc_diff_free_then_realloc() {
+        let disk_old = MemDisk::from_image(EXT4_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 分配 4 块，记录首块。
+        let mut first_block = 0u64;
+        for i in 0..4 {
+            let o = old.balloc_alloc_block(&mut old_inode, None).expect("old alloc");
+            let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new alloc");
+            assert_eq!(o, n, "realloc-setup step {i} mismatch");
+            if i == 0 {
+                first_block = o;
+            }
+        }
+
+        // 释放首块。
+        old.balloc_free_blocks(&mut old_inode, first_block, 1);
+        alloc.balloc_free_blocks(&mut new_inode, first_block, 1);
+
+        // 再分配一次：两侧应返回同一块号（极可能就是刚释放的 first_block）。
+        let o = old.balloc_alloc_block(&mut old_inode, None).expect("old realloc");
+        let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new realloc");
+        assert_eq!(o, n, "realloc block number mismatch");
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "free-then-realloc final i_blocks mismatch"
         );
     }
 }
