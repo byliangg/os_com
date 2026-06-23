@@ -17,3 +17,4 @@ pub mod block_group;
 pub mod inode;
 pub mod extents;
 pub mod dir;
+pub mod journal;
