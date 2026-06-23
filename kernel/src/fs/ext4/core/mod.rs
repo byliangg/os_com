@@ -11,6 +11,7 @@ pub mod types;
 
 mod io;
 mod bitmap;
+mod alloc_guard;
 mod balloc;
 mod ialloc;
 

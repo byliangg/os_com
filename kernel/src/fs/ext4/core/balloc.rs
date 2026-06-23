@@ -16,7 +16,11 @@
 //!   达到与 ext4_rs 字节级一致（ext4_rs 用 byte-offset 直写，core 的 [`MetadataWriter`]
 //!   是块号粒度，故 RMW）。
 //! - 系统保留区（system zone）在 core 内自行计算（对照 ext4_rs `get_system_zone`），
-//!   不依赖 ext4_rs；`alloc_guard` 本 Task 用恒「不含」桩占位（Task 5 接真实 guard）。
+//!   不依赖 ext4_rs；`alloc_guard`（每操作块预留，[`super::alloc_guard`]）在扫描候选时
+//!   `contains_current_block` 跳过本操作已预留块、命中后 `reserve_current_block` 登记，
+//!   调用点逐位对齐 ext4_rs。注意：本 Phase 的 [`MetadataWriter`] 立即写、无 JBD2 overlay，
+//!   位图当场即权威，故 guard 的端到端 skip 效果不会真正触发（要等 Phase 5 deferred 写才
+//!   显现）；本 Phase 验的是 guard 机制 + balloc 接线点 parity。
 //!
 //! inode 侧：本 Phase 尚无 extent 逻辑（Phase 3），故 [`InodeAllocCtx::maps_block`] 恒
 //! 返回 `false`，`i_blocks` 仅在内存累加（balloc 不写 inode 表）。
@@ -25,6 +29,7 @@
 
 use core::cmp::min;
 
+use super::alloc_guard::{LocalOperationAllocGuard, OperationAllocGuard};
 use super::bitmap::{
     ext4_bmap_bit_find_clr, ext4_bmap_bit_set, ext4_bmap_bits_free, ext4_bmap_is_bit_clr,
 };
@@ -37,30 +42,6 @@ use super::superblock::RawSuperblock;
 /// 每个文件系统块折算成的 512-byte「inode 块」数的分母。
 /// [对照] ext4_rs `EXT4_INODE_BLOCK_SIZE`（consts.rs:19）。
 const EXT4_INODE_BLOCK_SIZE: u64 = 512;
-
-/// 分配占位 guard（Task 5 接真实 `OperationAllocGuard`）。
-///
-/// ext4_rs balloc 在三处用 `self.alloc_guard.contains_current_block(block)` 跳过「本次
-/// 操作已预留」的块，并在命中后 `reserve_current_block` 登记。本 Task 尚无并发操作语义，
-/// 故 [`contains`] 恒返回 `false`、[`reserve`] 为空——与 ext4_rs 在「单次独立分配、guard
-/// 为空」时的行为一致（差分两侧都不触发 guard 跳过）。Task 5 会把这里换成真实 guard。
-struct AllocGuardStub;
-
-impl AllocGuardStub {
-    /// 恒「不含」——占位语义，Task 5 接实。
-    #[inline]
-    fn contains(&self, _block: Ext4Fsblk) -> bool {
-        false
-    }
-
-    /// 空登记——占位语义，Task 5 接实。
-    #[inline]
-    fn reserve(&self, _block: Ext4Fsblk) {}
-
-    /// 空批量登记——占位语义，Task 5 接实。
-    #[inline]
-    fn reserve_blocks(&self, _blocks: &[Ext4Fsblk]) {}
-}
 
 /// 分配路径所需的 inode 视图（i_blocks 累加 + 已映射块查询）。
 ///
@@ -102,7 +83,7 @@ impl InodeAllocCtx {
 }
 
 /// 安全块分配器。持一份可变超级块（free-blocks 计数权威）+ 读接缝 + 元数据写回 +
-/// 系统保留区 + alloc_guard 占位。**不复制 ext4_rs 的 `Ext4` god-object**。
+/// 系统保留区 + 每操作块预留 guard。**不复制 ext4_rs 的 `Ext4` god-object**。
 pub(super) struct BlockAllocator<'a, R: BlockReader, W: MetadataWriter> {
     /// 运行期可变超级块（free-blocks 随分配递减；其余字段同盘上初值）。
     sb: RawSuperblock,
@@ -112,22 +93,40 @@ pub(super) struct BlockAllocator<'a, R: BlockReader, W: MetadataWriter> {
     writer: &'a W,
     /// 系统保留区列表（core 自算，对照 ext4_rs `get_system_zone`）。
     zones: Vec<SystemZone>,
-    /// 分配占位 guard（Task 5 接实）。
-    guard: AllocGuardStub,
+    /// 每操作块预留 guard。balloc 在扫描候选时 `contains_current_block` 跳过本操作已预留
+    /// 的块、命中后 `reserve_current_block` 登记——调用点逐位对齐 ext4_rs `balloc_*`。
+    /// [`new`] 默认装一个 `Arc<LocalOperationAllocGuard>`，与 ext4_rs `Ext4::open` 安装的
+    /// 默认 guard（默认操作 id=0）行为一致；[`with_guard`] 可注入共享 guard（差分用）。
+    ///
+    /// [`new`]: BlockAllocator::new
+    /// [`with_guard`]: BlockAllocator::with_guard
+    guard: Arc<dyn OperationAllocGuard>,
     /// 写元数据用的 JBD2 handle id 占位（本 Phase 直写，handle 语义 Phase 5 接入）。
     handle_id: u64,
 }
 
 impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
-    /// 用初始超级块字节 + 读/写接缝构造，并自算系统保留区。
+    /// 用初始超级块字节 + 读/写接缝构造，并自算系统保留区。默认装一个空的
+    /// `LocalOperationAllocGuard`（默认操作 id=0），与 ext4_rs `Ext4::open` 一致。
     pub(super) fn new(sb: RawSuperblock, reader: &'a R, writer: &'a W) -> Self {
+        Self::with_guard(sb, reader, writer, Arc::new(LocalOperationAllocGuard::new()))
+    }
+
+    /// 用外部注入的共享 guard 构造（差分用：跨多步保留同一 guard 以便读 `debug_stats`、
+    /// 验证 free 后块仍被预留等 guard 敏感行为）。
+    pub(super) fn with_guard(
+        sb: RawSuperblock,
+        reader: &'a R,
+        writer: &'a W,
+        guard: Arc<dyn OperationAllocGuard>,
+    ) -> Self {
         let zones = compute_system_zones(&sb, reader);
         Self {
             sb,
             reader,
             writer,
             zones,
-            guard: AllocGuardStub,
+            guard,
             handle_id: 0,
         }
     }
@@ -319,7 +318,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             if ext4_bmap_is_bit_clr(&bitmap, idx_in_bg) {
                 let block_num = geom.bg_idx_to_addr(idx_in_bg, bgid);
                 if self.is_system_reserved_block(block_num)
-                    || self.guard.contains(block_num)
+                    || self.guard.contains_current_block(block_num)
                     || inode.maps_block(block_num)
                 {
                     // 跳过 system zone
@@ -329,7 +328,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                     self.write_block_bitmap(bmp_blk_adr, &bitmap)?;
                     let alloc = geom.bg_idx_to_addr(idx_in_bg, bgid);
                     self.update_free_block_counts(inode, bgid, &mut desc)?;
-                    self.guard.reserve(alloc);
+                    self.guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -340,7 +339,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             for tmp_idx in (idx_in_bg + 1)..end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap, tmp_idx) {
                     let block_num = geom.bg_idx_to_addr(tmp_idx, bgid);
-                    if self.is_system_reserved_block(block_num) || self.guard.contains(block_num) {
+                    if self.is_system_reserved_block(block_num) || self.guard.contains_current_block(block_num) {
                         continue;
                     }
                     ext4_bmap_bit_set(&mut bitmap, tmp_idx);
@@ -348,7 +347,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                     self.write_block_bitmap(bmp_blk_adr, &bitmap)?;
                     let alloc = geom.bg_idx_to_addr(tmp_idx, bgid);
                     self.update_free_block_counts(inode, bgid, &mut desc)?;
-                    self.guard.reserve(alloc);
+                    self.guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -357,13 +356,13 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             let mut rel_blk_idx = 0;
             if ext4_bmap_bit_find_clr(&bitmap, idx_in_bg, blk_in_bg, &mut rel_blk_idx) {
                 let block_num = geom.bg_idx_to_addr(rel_blk_idx, bgid);
-                if !self.is_system_reserved_block(block_num) && !self.guard.contains(block_num) {
+                if !self.is_system_reserved_block(block_num) && !self.guard.contains_current_block(block_num) {
                     ext4_bmap_bit_set(&mut bitmap, rel_blk_idx);
                     desc.set_block_bitmap_csum(&self.sb, &bitmap);
                     self.write_block_bitmap(bmp_blk_adr, &bitmap)?;
                     let alloc = geom.bg_idx_to_addr(rel_blk_idx, bgid);
                     self.update_free_block_counts(inode, bgid, &mut desc)?;
-                    self.guard.reserve(alloc);
+                    self.guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -436,7 +435,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             //     命中 guard 时 idx+1 后 `continue`（不递减 count，不换组）——原样复刻。
             if ext4_bmap_is_bit_clr(&bitmap, idx_in_bg) {
                 let block_num = geom.bg_idx_to_addr(idx_in_bg, bgid);
-                if self.guard.contains(block_num) {
+                if self.guard.contains_current_block(block_num) {
                     idx_in_bg = idx_in_bg.saturating_add(1);
                     continue;
                 }
@@ -446,7 +445,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                 let alloc = block_num;
                 self.update_free_block_counts(inode, bgid, &mut desc)?;
                 *start_bgid = bgid;
-                self.guard.reserve(alloc);
+                self.guard.reserve_current_block(alloc);
                 return Ok(alloc);
             }
 
@@ -455,7 +454,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             for tmp_idx in (idx_in_bg + 1)..end_idx {
                 if ext4_bmap_is_bit_clr(&bitmap, tmp_idx) {
                     let block_num = geom.bg_idx_to_addr(tmp_idx, bgid);
-                    if self.is_system_reserved_block(block_num) || self.guard.contains(block_num) {
+                    if self.is_system_reserved_block(block_num) || self.guard.contains_current_block(block_num) {
                         continue;
                     }
                     ext4_bmap_bit_set(&mut bitmap, tmp_idx);
@@ -464,7 +463,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                     let alloc = geom.bg_idx_to_addr(tmp_idx, bgid);
                     self.update_free_block_counts(inode, bgid, &mut desc)?;
                     *start_bgid = bgid;
-                    self.guard.reserve(alloc);
+                    self.guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -473,14 +472,14 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             let mut rel_blk_idx = 0;
             if ext4_bmap_bit_find_clr(&bitmap, idx_in_bg, max_blocks_in_bitmap, &mut rel_blk_idx) {
                 let block_num = geom.bg_idx_to_addr(rel_blk_idx, bgid);
-                if !self.is_system_reserved_block(block_num) && !self.guard.contains(block_num) {
+                if !self.is_system_reserved_block(block_num) && !self.guard.contains_current_block(block_num) {
                     ext4_bmap_bit_set(&mut bitmap, rel_blk_idx);
                     desc.set_block_bitmap_csum(&self.sb, &bitmap);
                     self.write_block_bitmap(bmp_blk_adr, &bitmap)?;
                     let alloc = geom.bg_idx_to_addr(rel_blk_idx, bgid);
                     self.update_free_block_counts(inode, bgid, &mut desc)?;
                     *start_bgid = bgid;
-                    self.guard.reserve(alloc);
+                    self.guard.reserve_current_block(alloc);
                     return Ok(alloc);
                 }
             }
@@ -562,7 +561,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                         current_idx += 1;
                         continue;
                     }
-                    if self.guard.contains(block_num) {
+                    if self.guard.contains_current_block(block_num) {
                         current_idx += 1;
                         continue;
                     }
@@ -591,7 +590,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
                         start_idx = rel_blk_idx + 1;
                         continue;
                     }
-                    if self.guard.contains(block_num) {
+                    if self.guard.contains_current_block(block_num) {
                         start_idx = rel_blk_idx + 1;
                         continue;
                     }
@@ -641,7 +640,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
         *start_bgid = bgid;
 
         if !result.is_empty() {
-            self.guard.reserve_blocks(&result);
+            self.guard.reserve_current_blocks(&result);
             // ext4_rs 此处 write_back_inode（落 inode 表）；core 不落 inode 表，i_blocks 已在内存累加。
         }
 
@@ -818,10 +817,18 @@ fn compute_system_zones<R: BlockReader>(sb: &RawSuperblock, reader: &R) -> Vec<S
 mod test {
     use ostd::prelude::*;
 
-    // `OperationAllocGuard` 需在作用域内才能在 `Arc<dyn OperationAllocGuard>` 上调用
-    // `clear_current_operation()`（见 `balloc_diff_free_then_realloc` 的对称化处理）。
-    use ext4_rs::OperationAllocGuard;
+    // ext4_rs 的 `OperationAllocGuard` trait 需在作用域内才能在 `Arc<dyn OperationAllocGuard>`
+    // 上调用 `clear_current_operation()`（见 guard 敏感差分的对称化处理）；核心侧同名 trait
+    // 别名为 `CoreOperationAllocGuard` 以免冲突。
+    use ext4_rs::{
+        LocalOperationAllocGuard as OldLocalGuard, OperationAllocGuard,
+        OperationScopedAllocGuard as OldScopedGuard,
+    };
 
+    use super::super::alloc_guard::{
+        LocalOperationAllocGuard as CoreLocalGuard, OperationAllocGuard as CoreOperationAllocGuard,
+        OperationScopedAllocGuard as CoreScopedGuard,
+    };
     use super::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::diff_harness::{
         assert_meta_eq, snapshot_meta, DirectMetadataWriter, MemDisk,
@@ -1160,19 +1167,17 @@ mod test {
         diff_free(8, None, 4);
     }
 
-    /// 释放后可重分配差分（guard 无关）：分配 4 块 → 清空 alloc_guard → 释放首块 → 再分配
-    /// 一次（应落回刚释放的位）。比每步块号 + 最终盘面 + i_blocks，验证 free 把位真正清回、
-    /// 可被后续 alloc 复用。
+    /// 释放后可重分配差分（guard 无关）：分配 4 块 → **两侧都清空 alloc_guard** → 释放首块
+    /// → 再分配一次（应落回刚释放的位）。比每步块号 + 最终盘面 + i_blocks，验证 free 把位
+    /// 真正清回、可被后续 alloc 复用。
     ///
     /// 为何要先清空 guard：ext4_rs 的 `balloc_alloc_block` 在每次命中后把块登记进当前操作的
-    /// `alloc_guard`，而 `balloc_free_blocks` 只清位、**不释放 guard 预留**。本测试在同一个
-    /// `old` 句柄、同一次默认操作内连续分配/释放/再分配——若不清 guard，旧侧再分配会跳过刚
-    /// 释放的块（仍被 guard 预留），单组镜像下耗尽扫描返回 ENOSPC，而新侧的 `AllocGuardStub`
-    /// 不预留任何块，两侧 guard 行为不对称，构不成有效差分（guard 在 Task 5 才两侧接实）。
-    /// 故先 `clear_current_operation()` 把旧侧默认操作清空，使两侧 guard 同为空——本测试遂成
-    /// 「free 清位即可被复用」这一 **guard 无关** 的有效差分。
-    /// guard 敏感的 free-then-realloc 复用（不清 guard、应跳过刚释放块）留待 Task 5 两侧接实
-    /// 真实 guard 后专门验证。
+    /// `alloc_guard`，而 `balloc_free_blocks` 只清位、**不释放 guard 预留**。本测试在同一次
+    /// 默认操作内连续分配/释放/再分配——若不清 guard，再分配会跳过刚释放的块（仍被 guard
+    /// 预留），这正是 guard 的作用。本测试要验的是「free 清位 → 可被复用」这一 **guard 无关**
+    /// 行为，故先把两侧 guard 都清空（Task 5 起两侧都挂真实 guard，故核心侧也须显式 clear，
+    /// 与旧侧对称），使刚释放块在两侧都不再被 guard 跳过。
+    /// guard 敏感版（不清 guard、应跳过刚释放块）见 `balloc_guard_sensitive_free_then_realloc_no_clear`。
     #[ktest]
     fn balloc_diff_free_then_realloc() {
         let disk_old = MemDisk::from_image(EXT4_IMAGE);
@@ -1184,7 +1189,9 @@ mod test {
         let sb = read_sb(&disk_new);
         let bs = sb.block_size();
         let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
-        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        // 注入共享 guard，便于在核心侧与旧侧对称地 clear_current_operation()。
+        let new_guard = Arc::new(CoreLocalGuard::new());
+        let mut alloc = BlockAllocator::with_guard(sb, &disk_new, &writer, new_guard.clone());
         let mut new_inode = InodeAllocCtx::new(0);
 
         // 分配 4 块，记录首块。
@@ -1198,9 +1205,10 @@ mod test {
             }
         }
 
-        // 清空旧侧默认操作的 alloc_guard，使两侧 guard 同为空（新侧 AllocGuardStub 本就不预留）。
-        // 这样刚释放的块在两侧都不再被 guard 跳过，本测试遂只验证「free 清位 → 可被复用」。
+        // 两侧都清空默认操作的 alloc_guard，使刚释放的块在两侧都不再被 guard 跳过，
+        // 本测试遂只验证「free 清位 → 可被复用」（guard 无关）。
         old.alloc_guard.clear_current_operation();
+        CoreOperationAllocGuard::clear_current_operation(&*new_guard);
 
         // 释放首块。
         old.balloc_free_blocks(&mut old_inode, first_block, 1);
@@ -1220,6 +1228,400 @@ mod test {
             old_inode.inode.blocks_count(),
             new_inode.i_blocks(),
             "free-then-realloc final i_blocks mismatch"
+        );
+    }
+
+    // ============================== alloc_guard 差分 ==============================
+    //
+    // 说明：alloc_guard 的端到端「跳过位图未显示块」效果需 Phase 5 的 JBD2 overlay
+    // （延迟位图写）才显现——本 Phase 的 DirectMetadataWriter 立即写、位图当场即权威。
+    // 故本组差分聚焦两点：
+    //   (1) guard 数据结构 parity：reserve/contains/clear/reserve_blocks/debug_stats 的
+    //       行为逐项对拍 ext4_rs `LocalOperationAllocGuard`（standalone）；
+    //   (2) balloc 接线 parity：把真 guard 接进 balloc 后，跑一段分配序列，guard.debug_stats
+    //       与 ext4_rs 在同序列下逐项一致——证明 balloc 在与 ext4_rs **完全相同位置**调用了
+    //       contains_current_block / reserve_current_block / reserve_current_blocks。
+
+    /// 逐项断言 ext4_rs 与核心两侧 `debug_stats` 五项一致。
+    fn assert_stats_eq(
+        old: ext4_rs::OperationAllocGuardDebugStats,
+        new: super::super::alloc_guard::OperationAllocGuardDebugStats,
+        ctx: &str,
+    ) {
+        assert_eq!(old.clear_calls, new.clear_calls, "{ctx}: clear_calls");
+        assert_eq!(old.reserve_calls, new.reserve_calls, "{ctx}: reserve_calls");
+        assert_eq!(
+            old.reserved_blocks, new.reserved_blocks,
+            "{ctx}: reserved_blocks"
+        );
+        assert_eq!(
+            old.contains_checks, new.contains_checks,
+            "{ctx}: contains_checks"
+        );
+        assert_eq!(
+            old.max_operation_blocks, new.max_operation_blocks,
+            "{ctx}: max_operation_blocks"
+        );
+    }
+
+    /// standalone guard 差分：同一串 begin/reserve/contains/reserve_blocks/clear/finish 操作
+    /// 喂给 ext4_rs `LocalOperationAllocGuard` 与核心 `LocalOperationAllocGuard`，逐步对拍
+    /// `contains_*` 返回值 + 每步后的 debug_stats 五项。覆盖：多操作槽隔离、reserve 去重、
+    /// 批量、clear 计数、finish 不计 clear。
+    #[ktest]
+    fn alloc_guard_diff_local_ops() {
+        let old = OldLocalGuard::new();
+        let new = CoreLocalGuard::new();
+
+        // 逐步执行同一组操作，并在每步后比 debug_stats。
+        macro_rules! step {
+            ($ctx:literal, $op:expr) => {{
+                $op;
+                assert_stats_eq(old.debug_stats(), new.debug_stats(), $ctx);
+            }};
+        }
+
+        step!("begin(1)", {
+            old.begin_operation(1);
+            new.begin_operation(1);
+        });
+        step!("reserve(1,10)", {
+            old.reserve_block_for_operation(1, 10);
+            new.reserve_block_for_operation(1, 10);
+        });
+        // contains 命中/未命中返回值逐位一致 + 计数同步。
+        step!("contains(1,10)", {
+            assert_eq!(
+                old.contains_block_for_operation(1, 10),
+                new.contains_block_for_operation(1, 10),
+                "contains(1,10) value"
+            );
+        });
+        step!("contains(1,20)", {
+            assert_eq!(
+                old.contains_block_for_operation(1, 20),
+                new.contains_block_for_operation(1, 20),
+                "contains(1,20) value"
+            );
+        });
+        // 第二个操作槽隔离。
+        step!("begin(2)", {
+            old.begin_operation(2);
+            new.begin_operation(2);
+        });
+        step!("contains(2,10)", {
+            assert_eq!(
+                old.contains_block_for_operation(2, 10),
+                new.contains_block_for_operation(2, 10),
+                "contains(2,10) value"
+            );
+        });
+        step!("reserve(2,20)", {
+            old.reserve_block_for_operation(2, 20);
+            new.reserve_block_for_operation(2, 20);
+        });
+        // 同块重复 reserve：集合去重，但 reserve_calls/reserved_blocks 仍累加；
+        // max_operation_blocks 不应因去重而抬高（验 update_max 逻辑一致）。
+        step!("reserve(1,10)-dup", {
+            old.reserve_block_for_operation(1, 10);
+            new.reserve_block_for_operation(1, 10);
+        });
+        // 批量 reserve（含与已有块重叠）：reserve_calls +1、reserved_blocks += slice.len()。
+        step!("reserve_blocks(1,[10,11,12])", {
+            old.reserve_blocks_for_operation(1, &[10, 11, 12]);
+            new.reserve_blocks_for_operation(1, &[10, 11, 12]);
+        });
+        // 空批量：直接返回、不计数（两侧 stats 不变）。
+        step!("reserve_blocks(1,[])", {
+            old.reserve_blocks_for_operation(1, &[]);
+            new.reserve_blocks_for_operation(1, &[]);
+        });
+        // max_operation_blocks 此时应为操作1的 {10,11,12} = 3。
+        step!("contains(1,11)", {
+            assert_eq!(
+                old.contains_block_for_operation(1, 11),
+                new.contains_block_for_operation(1, 11),
+                "contains(1,11) value"
+            );
+        });
+        // clear 计 clear_calls 并清槽。
+        step!("clear(2)", {
+            old.clear_operation(2);
+            new.clear_operation(2);
+        });
+        step!("contains(2,20)-after-clear", {
+            assert_eq!(
+                old.contains_block_for_operation(2, 20),
+                new.contains_block_for_operation(2, 20),
+                "contains(2,20) after clear value"
+            );
+        });
+        // finish 不计 clear_calls，仅移除槽。
+        step!("finish(1)", {
+            old.finish_operation(1);
+            new.finish_operation(1);
+        });
+        step!("contains(1,10)-after-finish", {
+            assert_eq!(
+                old.contains_block_for_operation(1, 10),
+                new.contains_block_for_operation(1, 10),
+                "contains(1,10) after finish value"
+            );
+        });
+
+        // 终态五项一致（macro 每步已比，这里再做一次显式终态断言）。
+        assert_stats_eq(old.debug_stats(), new.debug_stats(), "final");
+    }
+
+    /// standalone scoped guard 差分：两侧各建一对 scoped 视图（op_id 200/201）转发到内层
+    /// Local guard，比嵌套 clear 不影响外层 + contains 返回值 + debug_stats。对照 ext4_rs
+    /// `scoped_guard_nested_clear_preserves_outer_operation`。
+    #[ktest]
+    fn alloc_guard_diff_scoped_nested() {
+        let old_inner = Arc::new(OldLocalGuard::new());
+        let new_inner = Arc::new(CoreLocalGuard::new());
+
+        old_inner.begin_operation(200);
+        old_inner.begin_operation(201);
+        new_inner.begin_operation(200);
+        new_inner.begin_operation(201);
+
+        let old_outer = OldScopedGuard::new(old_inner.clone(), 200);
+        let old_nested = OldScopedGuard::new(old_inner.clone(), 201);
+        let new_outer = CoreScopedGuard::new(new_inner.clone(), 200);
+        let new_nested = CoreScopedGuard::new(new_inner.clone(), 201);
+
+        old_outer.reserve_current_block(30);
+        old_nested.reserve_current_block(40);
+        new_outer.reserve_current_block(30);
+        new_nested.reserve_current_block(40);
+
+        // 嵌套 clear 只清内层 201，不动外层 200。
+        old_nested.clear_current_operation();
+        new_nested.clear_current_operation();
+
+        assert_eq!(
+            old_outer.contains_current_block(30),
+            new_outer.contains_current_block(30),
+            "outer contains 30"
+        );
+        assert_eq!(
+            old_outer.contains_current_block(40),
+            new_outer.contains_current_block(40),
+            "outer contains 40"
+        );
+        assert_eq!(
+            old_nested.contains_current_block(40),
+            new_nested.contains_current_block(40),
+            "nested contains 40 after clear"
+        );
+
+        old_outer.reserve_current_block(31);
+        new_outer.reserve_current_block(31);
+        old_outer.clear_current_operation();
+        new_outer.clear_current_operation();
+        assert_eq!(
+            old_outer.contains_current_block(30),
+            new_outer.contains_current_block(30),
+            "outer contains 30 after own clear"
+        );
+
+        assert_stats_eq(old_inner.debug_stats(), new_inner.debug_stats(), "scoped final");
+    }
+
+    /// balloc 接线 parity 差分：把真 guard 接进 balloc（核心侧经 `with_guard` 注入共享
+    /// `Arc<LocalOperationAllocGuard>`，旧侧用 `Ext4::open` 自带的默认 guard），跑一段
+    /// 无 goal 分配序列，比 (A) 每步块号；(B) 跑完后盘面逐字节；(C) 跑完后 guard.debug_stats
+    /// 五项一致——证明 balloc 在与 ext4_rs 完全相同的扫描点调用 contains/reserve。
+    #[ktest]
+    fn balloc_guard_wiring_stats_parity() {
+        let disk_old = MemDisk::from_image(EXT4_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        // 注入共享 guard，跑完后据此读 debug_stats。
+        let new_guard = Arc::new(CoreLocalGuard::new());
+        let mut alloc = BlockAllocator::with_guard(sb, &disk_new, &writer, new_guard.clone());
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 混合 goal 序列（与 balloc_diff_alloc_block_sequence 同款，含命中/保留/相邻/无 goal）。
+        let goals: [Option<u64>; 10] = [
+            Some(5000),
+            Some(5001),
+            Some(1),
+            None,
+            Some(20000),
+            Some(20000),
+            Some(2),
+            None,
+            Some(5000),
+            None,
+        ];
+        for (i, &g) in goals.iter().enumerate() {
+            let old_ret = old.balloc_alloc_block(&mut old_inode, g);
+            let new_ret = alloc.balloc_alloc_block(&mut new_inode, g);
+            match (&old_ret, &new_ret) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "guard-wiring step {i} block mismatch g={g:?}"),
+                (Err(_), Err(_)) => {}
+                _ => panic!(
+                    "guard-wiring step {i} ok/err mismatch g={g:?}: old={old_ret:?} new={new_ret:?}"
+                ),
+            }
+        }
+
+        // 也跑一次 batch（验 reserve_current_blocks 接线点 + 计数）。
+        let mut old_cursor = 0u32;
+        let mut new_cursor = 0u32;
+        let old_vec = old
+            .balloc_alloc_block_batch(&mut old_inode, &mut old_cursor, 8)
+            .expect("old batch");
+        let new_vec = alloc
+            .balloc_alloc_block_batch(&mut new_inode, &mut new_cursor, 8)
+            .expect("new batch");
+        assert_eq!(old_vec.len(), new_vec.len(), "guard-wiring batch len mismatch");
+        for (i, (a, b)) in old_vec.iter().zip(new_vec.iter()).enumerate() {
+            assert_eq!(a, b, "guard-wiring batch block[{i}] mismatch");
+        }
+
+        // (B) 盘面逐字节一致（接线没破坏分配落盘）。
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+
+        // (C) guard.debug_stats 五项一致——这是接线点 parity 的核心证据。
+        assert_stats_eq(
+            old.alloc_guard.debug_stats(),
+            new_guard.debug_stats(),
+            "guard-wiring final stats",
+        );
+    }
+
+    /// guard 敏感重分配差分（**重点**，Task 4 当时绕过的场景，现在两侧都挂真 guard 正面测）：
+    /// 在**同一个不清空的 operation** 内：alloc 4 块 → free 第一块 → realloc。
+    ///
+    /// ext4_rs `balloc_alloc_block` 在每次命中后把块登记进当前操作（默认 id=0）的 alloc_guard，
+    /// 而 `balloc_free_blocks` 只清位图位、**不释放 guard 预留**。故 realloc 时刚释放的块仍被
+    /// guard 跳过，扫描会拿下一个空闲块（而非刚释放的位）。核心侧默认 guard（同样 id=0，跨
+    /// 同一 `alloc` 实例的多步持续累积预留）必须**逐位复刻**此行为。比每步块号 + 最终盘面。
+    ///
+    /// 注：本测试**不**调 `clear_current_operation()`（与 `balloc_diff_free_then_realloc` 的
+    /// guard 无关版对照）——那个 guard 无关版先 clear 再 realloc、刚释放块可立即复用；这里
+    /// 不 clear，把 guard 的真正作用（保留刚释放块、不立即重用）钉死。
+    #[ktest]
+    fn balloc_guard_sensitive_free_then_realloc_no_clear() {
+        let disk_old = MemDisk::from_image(EXT4_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        // 核心侧用默认 guard（`new`）——同一 `alloc` 实例跨多步持续累积预留，与旧侧默认
+        // 操作 id=0 的 guard 行为对齐。**全程不 clear**。
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 分配 4 块（无 goal、同序列），记首块。
+        let mut first_block = 0u64;
+        for i in 0..4 {
+            let o = old.balloc_alloc_block(&mut old_inode, None).expect("old alloc");
+            let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new alloc");
+            assert_eq!(o, n, "guard-sensitive setup step {i} mismatch");
+            if i == 0 {
+                first_block = o;
+            }
+        }
+
+        // 释放首块（只清位图位，**不**清 guard 预留）。
+        old.balloc_free_blocks(&mut old_inode, first_block, 1);
+        alloc.balloc_free_blocks(&mut new_inode, first_block, 1);
+
+        // realloc：两侧 guard 都仍保留 first_block，故都跳过它、返回**下一个**空闲块——
+        // 必逐位一致，且都 != first_block（证明 guard 确实在起作用）。
+        let o = old.balloc_alloc_block(&mut old_inode, None).expect("old realloc");
+        let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new realloc");
+        assert_eq!(o, n, "guard-sensitive realloc block number mismatch");
+        assert_ne!(
+            o, first_block,
+            "guard should keep freed block reserved (not immediately reused)"
+        );
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "guard-sensitive final i_blocks mismatch"
+        );
+    }
+
+    /// guard 敏感重分配差分（对照版：清空后可复用）：alloc 4 块 → free 第一块 →
+    /// **clear_current_operation()** → realloc。clear 后 guard 空，刚释放块可被复用——
+    /// 两侧应都返回 first_block。这是 `balloc_diff_free_then_realloc`（Task 4 fix 后的
+    /// guard 无关版）的镜像，确认「先 clear 再 realloc」这条路径在两侧真 guard 下也一致。
+    #[ktest]
+    fn balloc_guard_sensitive_free_then_realloc_with_clear() {
+        let disk_old = MemDisk::from_image(EXT4_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        // 注入共享 guard，便于在核心侧调 clear_current_operation()。
+        let new_guard = Arc::new(CoreLocalGuard::new());
+        let mut alloc = BlockAllocator::with_guard(sb, &disk_new, &writer, new_guard.clone());
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        let mut first_block = 0u64;
+        for i in 0..4 {
+            let o = old.balloc_alloc_block(&mut old_inode, None).expect("old alloc");
+            let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new alloc");
+            assert_eq!(o, n, "guard-clear setup step {i} mismatch");
+            if i == 0 {
+                first_block = o;
+            }
+        }
+
+        old.balloc_free_blocks(&mut old_inode, first_block, 1);
+        alloc.balloc_free_blocks(&mut new_inode, first_block, 1);
+
+        // 两侧都清空默认操作 guard（CoreOperationAllocGuard trait 已在作用域内）。
+        old.alloc_guard.clear_current_operation();
+        CoreOperationAllocGuard::clear_current_operation(&*new_guard);
+
+        // realloc：guard 已空，刚释放块可复用——两侧都应返回 first_block。
+        let o = old.balloc_alloc_block(&mut old_inode, None).expect("old realloc");
+        let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new realloc");
+        assert_eq!(o, n, "guard-clear realloc block number mismatch");
+        assert_eq!(
+            o, first_block,
+            "after clear, freed block should be reusable"
+        );
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "guard-clear final i_blocks mismatch"
         );
     }
 }
