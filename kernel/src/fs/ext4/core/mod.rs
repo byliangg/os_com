@@ -9,8 +9,12 @@
 mod prelude;
 pub mod types;
 
+mod io;
+
 #[cfg(ktest)]
 mod test_util;
+#[cfg(ktest)]
+mod diff_harness;
 
 pub mod superblock;
 pub mod block_group;
