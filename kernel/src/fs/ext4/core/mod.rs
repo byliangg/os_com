@@ -11,3 +11,5 @@ pub mod types;
 
 #[cfg(ktest)]
 mod test_util;
+
+pub mod superblock;
