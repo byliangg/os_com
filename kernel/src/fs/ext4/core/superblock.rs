@@ -10,7 +10,9 @@ const COMPAT_HAS_JOURNAL: u32 = 0x4;
 
 /// ext4 on-disk 超级块（1024 字节，小端）。逐字段镜像磁盘布局。
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Default)]
+// 不派生 Default：超级块含 >32 元素数组（[u8;64]/[u32;100] 等），Rust 数组 Default 仅到 32。
+// 本阶段一律经 Pod `from_bytes` 解析，无需 Default。
+#[derive(Clone, Copy, Debug, Pod)]
 pub struct RawSuperblock {
     pub inodes_count: u32,
     pub blocks_count_lo: u32,
