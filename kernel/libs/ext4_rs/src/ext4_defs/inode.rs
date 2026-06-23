@@ -284,6 +284,11 @@ impl Ext4Inode {
     pub fn set_i_version_hi(&mut self, i_version_hi: u32) {
         self.i_version_hi = i_version_hi;
     }
+
+    /// TEMP（rewrite phase 1 差分用）：按内部一致的 unaligned 读法从字节解析。phase 6 随本 crate 删除。
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
+    }
 }
 
 impl Ext4Inode {
