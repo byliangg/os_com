@@ -16,3 +16,4 @@ pub mod superblock;
 pub mod block_group;
 pub mod inode;
 pub mod extents;
+pub mod dir;
