@@ -148,14 +148,10 @@ mod test {
         ext4_bmap_bit_clr, ext4_bmap_bit_find_clr, ext4_bmap_bit_set, ext4_bmap_bits_free,
         ext4_bmap_is_bit_clr, ext4_bmap_is_bit_set,
     };
+    use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+    use crate::fs::ext4::core::superblock::RawSuperblock;
     use crate::fs::ext4::core::test_util::slice_at;
     use crate::prelude::*;
-
-    /// 取真镜像里一段位图块字节当差分输入。
-    /// ext4.img：4096 块、first_data_block=1 → 块 1 是 group desc，块 2 是 block bitmap。
-    /// 偏移 = 2 * 4096 = 8192，取整块 4096 字节（既含已分配的满 0xFF 区，也含尾部空闲 0 区）。
-    const BLOCK_BITMAP_OFF: usize = 2 * 4096;
-    const BLOCK_BITMAP_LEN: usize = 4096;
 
     /// 一组覆盖典型边界的手工缓冲：(名字, 字节)。
     fn handcrafted_buffers() -> Vec<(&'static str, Vec<u8>)> {
@@ -177,13 +173,18 @@ mod test {
         ]
     }
 
-    /// 真镜像位图块 + 手工缓冲拼成统一的差分输入集。
+    /// 真镜像 group-0 块位图 + 手工缓冲拼成统一的差分输入集。
+    /// 块位图块号从超级块 + 组 0 描述符推导（不写死偏移，兼容任意几何）。
+    /// 实测 ext4.img：first_data_block=0、block_size=4096、64BIT、desc_size=64，
+    /// 真块位图在块 9（offset 36864），含已分配满 0xFF 区 + 尾部空闲 0 区（非全 0/全 1）。
     fn diff_inputs() -> Vec<(&'static str, Vec<u8>)> {
         let mut v = handcrafted_buffers();
-        v.push((
-            "real_block_bitmap",
-            slice_at(BLOCK_BITMAP_OFF, BLOCK_BITMAP_LEN).to_vec(),
-        ));
+        let sb = RawSuperblock::from_bytes(slice_at(1024, 1024));
+        let bs = sb.block_size();
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc0 = RawGroupDescriptor::from_bytes(slice_at(gdt_off, size_of::<RawGroupDescriptor>()));
+        let bbmp_off = desc0.block_bitmap() as usize * bs;
+        v.push(("real_block_bitmap", slice_at(bbmp_off, bs).to_vec()));
         v
     }
 
