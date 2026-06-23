@@ -29,6 +29,8 @@ endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
 EXT4_IMAGE := $(BUILD_DIR)/ext4.img
+EXT4_MG_IMAGE := $(BUILD_DIR)/ext4_multigroup.img
+EXT4_NOCSUM_IMAGE := $(BUILD_DIR)/ext4_nocsum.img
 
 # Include benchmark, if BENCHMARK is set.
 ifeq ($(BENCHMARK), none)
@@ -54,11 +56,11 @@ all: build
 
 .PHONY: build
 ifeq ($(OSDK_TARGET_ARCH), loongarch64)
-build: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE)
+build: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE) $(EXT4_MG_IMAGE) $(EXT4_NOCSUM_IMAGE)
 	@echo "For loongarch, we generate a fake initramfs to successfully test or build."
 	@touch $(INITRAMFS_IMAGE)
 else
-build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE)
+build: $(INITRAMFS_IMAGE) $(EXT2_IMAGE) $(EXFAT_IMAGE) $(EXT4_IMAGE) $(EXT4_MG_IMAGE) $(EXT4_NOCSUM_IMAGE)
 endif
 
 .PHONY: $(INITRAMFS_IMAGE)
@@ -173,6 +175,21 @@ $(EXT4_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@dd if=/dev/zero of=$(EXT4_IMAGE) bs=1M count=64
 	@mkfs.ext4 -F $(EXT4_IMAGE)
+
+# 多块组 ext4 镜像：1K 块 → 64M = 65536 块、blocks_per_group 8192 → 8 个块组，
+# 且 first_data_block=1（4K 单组镜像测不到的跨组分配/组满回绕 + first_data_block!=0 几何）。
+# 供 Phase 2 跨组差分（Task 6）。
+$(EXT4_MG_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@dd if=/dev/zero of=$(EXT4_MG_IMAGE) bs=1M count=64
+	@mkfs.ext4 -F -b 1024 $(EXT4_MG_IMAGE)
+
+# metadata_csum 关闭的 ext4 镜像（4K 单组，几何同 EXT4_IMAGE，仅 csum 特性关）。
+# 供差分验证 csum gating 路径（RO-compat 0x400 关时跳过位图/描述符 csum 写）。供 Phase 2 Task 6。
+$(EXT4_NOCSUM_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@dd if=/dev/zero of=$(EXT4_NOCSUM_IMAGE) bs=1M count=64
+	@mkfs.ext4 -F -O ^metadata_csum $(EXT4_NOCSUM_IMAGE)
 
 .PHONY: format
 format:
