@@ -64,6 +64,7 @@ mod test {
     use super::RawGroupDescriptor;
     use crate::fs::ext4::core::superblock::RawSuperblock;
     use crate::fs::ext4::core::test_util::slice_at;
+    use crate::prelude::*;
 
     #[ktest]
     fn group_desc_roundtrip_and_diff_old() {

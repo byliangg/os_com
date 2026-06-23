@@ -150,6 +150,7 @@ mod test {
 
     use super::{EXT4_MAGIC, RawSuperblock};
     use crate::fs::ext4::core::test_util::slice_at;
+    use crate::prelude::*;
 
     const SB_OFFSET: usize = 1024;
     const SB_SIZE: usize = 1024;
