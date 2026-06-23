@@ -4,6 +4,8 @@ use crate::utils::*;
 use super::*;
 
 /// Represents the structure of an Ext4 block group descriptor.
+// TEMP (ext4 safe-rewrite phase 1): `PartialEq` is derived only for the differential
+// ktest in `kernel/src/fs/ext4/core`; remove it together with this crate in rewrite phase 6.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 #[repr(C, packed)]
 pub struct Ext4BlockGroup {
