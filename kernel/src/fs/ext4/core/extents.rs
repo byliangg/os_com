@@ -10,7 +10,7 @@ const UNWRITTEN_MAX_LEN: u16 = 32768;
 /// extent 树节点头（12 字节，小端）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawExtentHeader {
+pub(super) struct RawExtentHeader {
     pub magic: u16,
     pub entries_count: u16,
     pub max_entries_count: u16,
@@ -22,7 +22,7 @@ const_assert!(size_of::<RawExtentHeader>() == 12);
 /// extent 树内部索引项（12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawExtentIndex {
+pub(super) struct RawExtentIndex {
     pub first_block: u32,
     pub leaf_lo: u32,
     pub leaf_hi: u16,
@@ -33,7 +33,7 @@ const_assert!(size_of::<RawExtentIndex>() == 12);
 /// extent 叶子项（12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawExtent {
+pub(super) struct RawExtent {
     pub first_block: u32,
     pub block_count: u16,
     pub start_hi: u16,
@@ -44,7 +44,7 @@ const_assert!(size_of::<RawExtent>() == 12);
 /// 非根 extent 块尾的校验和（4 字节）。
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawExtentTail {
+pub(super) struct RawExtentTail {
     pub et_checksum: u32,
 }
 const_assert!(size_of::<RawExtentTail>() == 4);

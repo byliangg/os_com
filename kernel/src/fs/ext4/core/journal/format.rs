@@ -10,7 +10,7 @@ pub const JBD2_MAGIC: u32 = 0xC03B3998;
 /// JBD2 块通用头（12 字节，大端）。嵌在 superblock / commit / revoke 块开头。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawJournalHeader {
+pub(super) struct RawJournalHeader {
     pub h_magic: u32,
     pub h_blocktype: u32,
     pub h_sequence: u32,
@@ -35,7 +35,7 @@ impl RawJournalHeader {
 /// JBD2 日志超级块（1024 字节，大端）。含大数组，**不派生 Default**。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub struct RawJournalSuperblock {
+pub(super) struct RawJournalSuperblock {
     pub s_header: RawJournalHeader,
     pub s_blocksize: u32,
     pub s_maxlen: u32,
@@ -79,7 +79,7 @@ impl RawJournalSuperblock {
 /// descriptor 块的 tag（CSUM_V2 / pre-v3，8 字节，大端）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawJournalBlockTag {
+pub(super) struct RawJournalBlockTag {
     pub t_blocknr: u32,
     pub t_checksum: u16,
     pub t_flags: u16,
@@ -98,7 +98,7 @@ impl RawJournalBlockTag {
 /// descriptor 块的 tag（CSUM_V3，64 位块号，16 字节，大端）。字段序与 RawJournalBlockTag 不同。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawJournalBlockTag3 {
+pub(super) struct RawJournalBlockTag3 {
     pub t_blocknr: u32,
     pub t_flags: u32,
     pub t_blocknr_high: u32,
@@ -119,7 +119,7 @@ impl RawJournalBlockTag3 {
 /// commit 块（大端）。末尾 `_padding_tail` 是为 Pod 显式补齐 u64 引入的隐式 padding。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawCommitBlock {
+pub(super) struct RawCommitBlock {
     pub h_header: RawJournalHeader,
     pub h_chksum_type: u8,
     pub h_chksum_size: u8,
@@ -146,7 +146,7 @@ impl RawCommitBlock {
 /// revoke 块头（16 字节，大端）。其后跟变长 revoke 记录（Phase 5 解析）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawRevokeBlockHeader {
+pub(super) struct RawRevokeBlockHeader {
     pub r_header: RawJournalHeader,
     pub r_count: u32,
 }
@@ -165,7 +165,7 @@ impl RawRevokeBlockHeader {
 /// descriptor / revoke 块尾校验和（4 字节，大端）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawJournalBlockTail {
+pub(super) struct RawJournalBlockTail {
     pub t_checksum: u32,
 }
 const_assert!(size_of::<RawJournalBlockTail>() == 4);

@@ -6,7 +6,7 @@ use super::prelude::*;
 /// ext4 on-disk inode 的 OS-dependent #2 区（Linux 变体，12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawOsd2 {
+pub(super) struct RawOsd2 {
     pub l_i_blocks_high: u16,
     pub l_i_file_acl_high: u16,
     pub l_i_uid_high: u16,
@@ -20,7 +20,7 @@ pub struct RawOsd2 {
 /// block:[u32;15] 兼作 extent 树根（接缝4，本阶段只保字节、不解释）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawInode {
+pub(super) struct RawInode {
     pub mode: u16,
     pub uid: u16,
     pub size: u32,

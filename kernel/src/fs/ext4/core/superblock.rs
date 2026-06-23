@@ -13,7 +13,7 @@ const COMPAT_HAS_JOURNAL: u32 = 0x4;
 // 不派生 Default：超级块含 >32 元素数组（[u8;64]/[u32;100] 等），Rust 数组 Default 仅到 32。
 // 本阶段一律经 Pod `from_bytes` 解析，无需 Default。
 #[derive(Clone, Copy, Debug, Pod)]
-pub struct RawSuperblock {
+pub(super) struct RawSuperblock {
     pub inodes_count: u32,
     pub blocks_count_lo: u32,
     pub reserved_blocks_count_lo: u32,

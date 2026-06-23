@@ -6,7 +6,7 @@ use super::prelude::*;
 /// ext4 on-disk 组描述符（64 字节，小端，packed）。
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawGroupDescriptor {
+pub(super) struct RawGroupDescriptor {
     pub block_bitmap_lo: u32,
     pub inode_bitmap_lo: u32,
     pub inode_table_first_block_lo: u32,

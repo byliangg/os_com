@@ -40,7 +40,7 @@ impl From<u8> for DirEntryFileType {
 /// 不整体 Pod 化变长结构（旧实现含 255 字节 name + union）。变长尾的解析留 Phase 4。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawDirEntryHeader {
+pub(super) struct RawDirEntryHeader {
     pub inode: u32,
     pub rec_len: u16,
     pub name_len: u8,
@@ -51,7 +51,7 @@ const_assert!(size_of::<RawDirEntryHeader>() == 8);
 /// 目录块尾的校验和结构（12 字节）。占用一个普通目录项槽，靠 reserved_ft==0xDE 识别。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub struct RawDirEntryTail {
+pub(super) struct RawDirEntryTail {
     pub reserved_zero1: u32,
     pub rec_len: u16,
     pub reserved_zero2: u8,
