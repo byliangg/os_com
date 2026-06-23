@@ -10,6 +10,7 @@ mod prelude;
 pub mod types;
 
 mod io;
+mod bitmap;
 
 #[cfg(ktest)]
 mod test_util;
