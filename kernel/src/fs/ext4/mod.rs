@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+mod core;
 mod fs;
 mod inode;
 
