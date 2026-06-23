@@ -18,3 +18,4 @@ pub mod inode;
 pub mod extents;
 pub mod dir;
 pub mod journal;
+pub mod crc;
