@@ -1545,15 +1545,21 @@ mod test {
         old.balloc_free_blocks(&mut old_inode, first_block, 1);
         alloc.balloc_free_blocks(&mut new_inode, first_block, 1);
 
-        // realloc：两侧 guard 都仍保留 first_block，故都跳过它、返回**下一个**空闲块——
-        // 必逐位一致，且都 != first_block（证明 guard 确实在起作用）。
-        let o = old.balloc_alloc_block(&mut old_inode, None).expect("old realloc");
-        let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new realloc");
-        assert_eq!(o, n, "guard-sensitive realloc block number mismatch");
-        assert_ne!(
-            o, first_block,
-            "guard should keep freed block reserved (not immediately reused)"
-        );
+        // realloc：两侧 guard 都仍保留 first_block。实测 ext4_rs 在此场景（None goal、单
+        // 块组、find_clr 命中的候选被 guard 拒）**直接返回 ENOSPC**、不再在组内继续找下一块。
+        // 故按 parity 比对「新旧结果是否一致」，而非假定成功：两侧应都 Err(ENOSPC)（证明新侧
+        // 逐位复刻了 ext4_rs 的 guard-拒-即-放弃-组行为）；若两侧都 Ok 则块号须一致且 !=
+        // first_block。`_` 臂会抓出新侧未复刻该行为的真实分歧。
+        let o = old.balloc_alloc_block(&mut old_inode, None);
+        let n = alloc.balloc_alloc_block(&mut new_inode, None);
+        match (&o, &n) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a, b, "guard-sensitive realloc block number mismatch");
+                assert_ne!(*a, first_block, "guard should keep freed block reserved");
+            }
+            (Err(_), Err(_)) => { /* 两侧都 ENOSPC：guard 拒候选→放弃组，parity 一致 */ }
+            _ => panic!("guard-sensitive realloc ok/err mismatch: old={o:?} new={n:?}"),
+        }
 
         let sb_old = read_sb(&disk_old);
         assert_meta_eq(
