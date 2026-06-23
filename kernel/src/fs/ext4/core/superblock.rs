@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 use ostd::const_assert;
 
+use super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
 use super::prelude::*;
 
 const SUPERBLOCK_SIZE: usize = 1024;
 const EXT4_MAGIC: u16 = 0xEF53;
 const INCOMPAT_EXTENTS: u32 = 0x40;
 const COMPAT_HAS_JOURNAL: u32 = 0x4;
+
+/// crc32c 覆盖范围上界（与 ext4_rs `sync_to_disk_with_csum` 的 0x3fc 一致）。
+/// 超级块 `checksum` 字段位于偏移 0x3fc，校验和覆盖 `[0, 0x3fc)`，恰好排除自身。
+const SUPERBLOCK_CSUM_LEN: usize = 0x3fc;
 
 /// ext4 on-disk 超级块（1024 字节，小端）。逐字段镜像磁盘布局。
 #[repr(C)]
@@ -144,6 +149,122 @@ impl RawSuperblock {
             32
         }
     }
+
+    // ------------------------------------------------------------------
+    // 分配器路径计数访问（与 ext4_rs `Ext4Superblock` 逐位一致）。
+    //
+    // 差分比的是落盘字节，而 alloc 路径「读计数→增/减→写回」，故 getter/setter
+    // 必须与 ext4_rs 同语义，否则写回字节不同、差分失败。
+    // [对照来源] ext4_rs/src/ext4_defs/super_block.rs:213-221, 131-133, 205-211
+    // ------------------------------------------------------------------
+
+    /// 空闲块计数（lo | hi<<32）。
+    /// [对照] ext4_rs `free_blocks_count`（super_block.rs:213）。
+    pub(super) fn free_blocks_count(&self) -> u64 {
+        let (lo, hi) = (self.free_blocks_count_lo, self.free_blocks_count_hi);
+        (lo as u64) | ((hi as u64) << 32)
+    }
+
+    /// 写空闲块计数（lo = v&0xffffffff, hi = v>>32）。
+    /// [对照] ext4_rs `set_free_blocks_count`（super_block.rs:217）。
+    pub(super) fn set_free_blocks_count(&mut self, free_blocks: u64) {
+        self.free_blocks_count_lo = (free_blocks & 0xffff_ffff) as u32;
+        self.free_blocks_count_hi = (free_blocks >> 32) as u32;
+    }
+
+    /// 空闲 inode 计数。ext4_rs 超级块此处是**单 u32 字段、无 hi 半**（不同于组描述符）。
+    /// [对照] ext4_rs `free_inodes_count`（super_block.rs:131）。
+    pub(super) fn free_inodes_count(&self) -> u32 {
+        self.free_inodes_count
+    }
+
+    /// 写空闲 inode 计数（单 u32 字段）。ext4_rs 实际用 `increase/decrease_free_inodes_count`
+    /// 做 ±1；此处提供直接 set 供 alloc 路径在算好新值后写回，落盘字节一致。
+    /// [对照] ext4_rs `decrease_free_inodes_count`/`increase_free_inodes_count`（super_block.rs:205-211）。
+    pub(super) fn set_free_inodes_count(&mut self, free_inodes: u32) {
+        self.free_inodes_count = free_inodes;
+    }
+
+    /// 当前 checksum 字段值（供测试/校验对拍）。
+    pub(super) fn checksum(&self) -> u32 {
+        self.checksum
+    }
+
+    // ------------------------------------------------------------------
+    // 组几何 / csum 计算所需的超级块字段读取（packed/数组先拷局部再用）。
+    // ------------------------------------------------------------------
+
+    /// 卷 UUID（128 位）。crc32c 种子。
+    pub(super) fn uuid(&self) -> [u8; 16] {
+        self.uuid
+    }
+    /// RO-compat 特性位（含 metadata_csum 0x400）。
+    pub(super) fn features_read_only(&self) -> u32 {
+        self.features_read_only
+    }
+    /// INCOMPAT 特性位（含 meta_bg 0x10）。
+    pub(super) fn features_incompatible(&self) -> u32 {
+        self.features_incompatible
+    }
+    /// 首数据块号（first_data_block）。组几何 ±1 调整的判据。
+    pub(super) fn first_data_block(&self) -> u32 {
+        self.first_data_block
+    }
+    /// 每组块数。
+    pub(super) fn blocks_per_group(&self) -> u32 {
+        self.blocks_per_group
+    }
+    /// 每组 inode 数。
+    pub(super) fn inodes_per_group(&self) -> u32 {
+        self.inodes_per_group
+    }
+    /// 在线增长保留的 GDT 块数。
+    pub(super) fn reserved_gdt_blocks(&self) -> u16 {
+        self.s_reserved_gdt_blocks
+    }
+    /// 组总数：`ceil(blocks_count / blocks_per_group)`。
+    /// [对照] ext4_rs `block_group_count`（super_block.rs:161-173）。
+    pub(super) fn block_group_count(&self) -> u32 {
+        let blocks_count = self.blocks_count();
+        let blocks_per_group = self.blocks_per_group as u64;
+        let mut count = blocks_count / blocks_per_group;
+        if blocks_count % blocks_per_group != 0 {
+            count += 1;
+        }
+        count as u32
+    }
+
+    // ------------------------------------------------------------------
+    // 块/inode 位图校验和（crc32c，种子 = crc32c(uuid)）。
+    // [对照来源] ext4_rs/src/ext4_defs/super_block.rs:290-307
+    // ------------------------------------------------------------------
+
+    /// 块分配位图 crc32c：`crc32c(crc32c(INIT, uuid), bitmap[..blocks_per_group/8])`。
+    /// [对照] ext4_rs `ext4_balloc_bitmap_csum`（super_block.rs:290-297）。
+    pub(super) fn balloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
+        let uuid = self.uuid;
+        let len = (self.blocks_per_group / 8) as usize;
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
+        ext4_crc32c(csum, &bitmap[..len])
+    }
+
+    /// inode 分配位图 crc32c：长度取 `(inodes_per_group + 7) / 8`。
+    /// [对照] ext4_rs `ext4_ialloc_bitmap_csum`（super_block.rs:300-307）。
+    pub(super) fn ialloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
+        let uuid = self.uuid;
+        let len = ((self.inodes_per_group + 7) / 8) as usize;
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
+        ext4_crc32c(csum, &bitmap[..len])
+    }
+
+    /// 重算并写入超级块校验和：`crc32c(INIT, &self_bytes[0, 0x3fc))` → `checksum` 字段。
+    /// 安全实现：序列化全 1024 字节、对前 0x3fc 字节求 crc，再写回 `checksum`（不取 packed 引用）。
+    /// [对照] ext4_rs `sync_to_disk_with_csum`（super_block.rs:230-241）的 csum 计算半部。
+    pub(super) fn recompute_csum(&mut self) {
+        let bytes = self.as_bytes();
+        let csum = ext4_crc32c(EXT4_CRC32_INIT, &bytes[..SUPERBLOCK_CSUM_LEN]);
+        self.checksum = csum;
+    }
 }
 
 #[cfg(ktest)]
@@ -174,5 +295,64 @@ mod test {
         assert_eq!(raw.inodes_count(), old.inodes_count);
         assert_eq!(raw.inode_size(), old.inode_size);
         assert_eq!(raw.desc_size(), old.desc_size);
+    }
+
+    /// 超级块计数 get/set + recompute_csum 与 ext4_rs 逐位/逐值对拍。
+    /// 计数读初值一致；set 后落盘字节逐字节一致；csum 与旧 crc32c 计算一致。
+    #[ktest]
+    fn superblock_logic_diff_counts_and_csum() {
+        let bytes = slice_at(SB_OFFSET, SB_SIZE);
+
+        // --- 读初值：free_blocks（u64）/ free_inodes（u32）逐值一致。 ---
+        let raw = RawSuperblock::from_bytes(bytes);
+        let old = ext4_rs::Ext4Superblock::from_bytes(bytes);
+        assert_eq!(raw.free_blocks_count(), old.free_blocks_count(), "free_blocks init");
+        assert_eq!(raw.free_inodes_count(), old.free_inodes_count(), "free_inodes init");
+
+        // --- set free_blocks：同一批 u64（含 >2^32 暴露 hi 半）后落盘字节逐字节一致。 ---
+        for &v in &[0u64, 1, 0xffff, 0x1_0000, 14319, 0xffff_ffff, 0x1_0000_0000, 0xdead_beef_cafe] {
+            let mut a = RawSuperblock::from_bytes(bytes);
+            let mut b = ext4_rs::Ext4Superblock::from_bytes(bytes);
+            a.set_free_blocks_count(v);
+            b.set_free_blocks_count(v);
+            assert_eq!(a.as_bytes(), b.bytes_for_diff().as_slice(), "set_free_blocks bytes v={v}");
+            // 写回的值再读回与旧侧一致（含 lo|hi<<32 重组）。
+            assert_eq!(a.free_blocks_count(), b.free_blocks_count(), "set_free_blocks readback v={v}");
+        }
+
+        // --- set free_inodes：单 u32 字段，set 后字节一致；并验证 ±1 与旧 increase/decrease 一致。 ---
+        for &v in &[0u32, 1, 16373, 0xffff, 0x1_0000, 0xffff_ffff] {
+            let mut a = RawSuperblock::from_bytes(bytes);
+            let mut b = ext4_rs::Ext4Superblock::from_bytes(bytes);
+            a.set_free_inodes_count(v);
+            // 旧侧无直接 set，用 set→对比字段：先把旧值调成 v（通过加减不便），改用直接构造比较。
+            b.set_free_inodes_for_diff(v);
+            assert_eq!(a.as_bytes(), b.bytes_for_diff().as_slice(), "set_free_inodes bytes v={v}");
+        }
+        {
+            // ±1 与 ext4_rs decrease/increase 行为对拍（在真镜像初值上）。
+            let mut a = RawSuperblock::from_bytes(bytes);
+            let mut b = ext4_rs::Ext4Superblock::from_bytes(bytes);
+            a.set_free_inodes_count(a.free_inodes_count() - 1);
+            b.decrease_free_inodes_count();
+            assert_eq!(a.as_bytes(), b.bytes_for_diff().as_slice(), "decrease free_inodes bytes");
+            a.set_free_inodes_count(a.free_inodes_count() + 1);
+            b.increase_free_inodes_count();
+            assert_eq!(a.as_bytes(), b.bytes_for_diff().as_slice(), "increase free_inodes bytes");
+        }
+
+        // --- recompute_csum：与 ext4_rs `ext4_crc32c(INIT, bytes, 0x3fc)` 一致（覆盖 [0,0x3fc)，排除 checksum 自身）。 ---
+        {
+            let mut a = RawSuperblock::from_bytes(bytes);
+            a.recompute_csum();
+            // ext4_rs sync_to_disk_with_csum 的 csum = crc32c(INIT, &sb_bytes[..0x3fc])（不预清零，因范围已排除）。
+            let old_csum = ext4_rs::ext4_crc32c(0xFFFF_FFFF, &bytes[..0x3fc], 0x3fc);
+            assert_eq!(a.checksum(), old_csum, "recompute_csum vs ext4_rs crc32c");
+            // 改一个计数后再算，csum 必须随之变化（防呆：证明确实覆盖了被改区）。
+            let mut c = RawSuperblock::from_bytes(bytes);
+            c.set_free_blocks_count(c.free_blocks_count() + 1);
+            c.recompute_csum();
+            assert_ne!(c.checksum(), a.checksum(), "csum changes when counted field changes");
+        }
     }
 }

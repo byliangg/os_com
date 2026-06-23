@@ -40,6 +40,14 @@ impl Ext4BlockGroup {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
+
+    /// TEMP（rewrite phase 2 差分用）：导出当前结构的全 64 字节，供逐字节落盘对拍。phase 6 删。
+    pub fn bytes_for_diff(&self) -> Vec<u8> {
+        let p = unsafe {
+            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4BlockGroup>())
+        };
+        p.to_vec()
+    }
 }
 
 impl Ext4BlockGroup {

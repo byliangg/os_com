@@ -173,7 +173,9 @@ impl Ext4 {
 
     /// Return the first candidate bit index in a block group that is not known
     /// to belong to ext4 metadata/system-reserved regions.
-    fn first_non_reserved_idx_in_group(&self, bgid: u32) -> u32 {
+    // TEMP (ext4 safe-rewrite phase 2): widened to `pub` only so the core
+    // differential ktest can pin its result; revert to private with ext4_rs in phase 6.
+    pub fn first_non_reserved_idx_in_group(&self, bgid: u32) -> u32 {
         let mut idx = self.addr_to_idx_bg(self.get_block_of_bgid(bgid));
 
         if let Some(zones) = &self.system_zone_cache {

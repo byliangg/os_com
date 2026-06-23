@@ -50,6 +50,8 @@ pub use crate::ext4_defs::Ext4BlockGroup;
 pub use crate::ext4_defs::Ext4ExtentHeader;
 pub use crate::ext4_defs::Ext4Inode;
 pub use crate::ext4_defs::Ext4Superblock;
+// === TEMP differential-test export (phase 2): SystemZone for group-geometry diff; remove with ext4_rs in phase 6.
+pub use crate::ext4_defs::SystemZone;
 
 #[derive(Clone, Debug)]
 pub struct SimpleDirEntry {

@@ -109,6 +109,19 @@ impl Ext4Superblock {
     pub fn from_bytes(bytes: &[u8]) -> Self {
         unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const Self) }
     }
+
+    /// TEMP（rewrite phase 2 差分用）：导出当前结构的全 1024 字节，供逐字节落盘对拍。phase 6 删。
+    pub fn bytes_for_diff(&self) -> Vec<u8> {
+        let p = unsafe {
+            core::slice::from_raw_parts(self as *const _ as *const u8, size_of::<Ext4Superblock>())
+        };
+        p.to_vec()
+    }
+
+    /// TEMP（rewrite phase 2 差分用）：直接写私有 `free_inodes_count` 字段（无公开 setter）。phase 6 删。
+    pub fn set_free_inodes_for_diff(&mut self, v: u32) {
+        self.free_inodes_count = v;
+    }
 }
 
 impl Ext4Superblock {
