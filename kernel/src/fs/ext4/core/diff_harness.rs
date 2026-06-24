@@ -1451,8 +1451,8 @@ mod test {
     // =================================================================
 
     use crate::fs::ext4::core::dir::{
-        create_at, create_unchecked_at, lookup_at, mkdir_at, mkdir_unchecked_at, rmdir_at,
-        rmdir_at_fast, unlink_at, NamespaceCtx,
+        create_at, create_unchecked_at, lookup_at, mkdir_at, mkdir_unchecked_at, rename_at,
+        rmdir_at, rmdir_at_fast, unlink_at, NamespaceCtx,
     };
     use crate::fs::ext4::core::file::ReadCtx;
 
@@ -1564,6 +1564,78 @@ mod test {
         rmdir_at(&mut nctx, parent, name.as_bytes()).map_err(|e| map_ns_errno(e.error()))
     }
 
+    /// 旧侧（ext4_rs）rename：返回 Ok(())-Err。注意 `ext4_rename_at` 返回 `Result<usize>`——成功
+    /// 时丢弃 usize（EOK），失败时映射 errno。**禁 `.expect()`**：旧侧可能返回
+    /// EXDEV / EISDIR / ENOTDIR / ENOTEMPTY / ENOENT。
+    fn old_rename_at(
+        disk: &MemDisk,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_rename_at(old_parent, old_name, new_parent, new_name)
+            .map(|_| ())
+            .map_err(|e| e.error())
+    }
+
+    /// 新侧（core）rename：建 NamespaceCtx → `rename_at`。返回 Ok(())-Err。
+    fn core_rename_at(
+        disk: &MemDisk,
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let bs = read_sb(disk).block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut nctx = make_nctx(disk, &writer);
+        rename_at(
+            &mut nctx,
+            old_parent,
+            old_name.as_bytes(),
+            new_parent,
+            new_name.as_bytes(),
+        )
+        .map_err(|e| map_ns_errno(e.error()))
+    }
+
+    /// rename 差分一步：两盘从 `image` 起，旧/新各 rename，比 Ok-Err + 全盘逐字节（先对所有可能
+    /// 被触及的目录 `mask_dirent_padding` 归一 BUG-21 padding——rename 写新目录项，携 ext4_rs 的
+    /// padding 泄漏）。`touched` 列出所有需要归一的目录 inode（old_parent / new_parent，以及覆盖
+    /// 目录场景里被 truncate 的 dest 目录）。返回新侧结果字节（链式起步）。
+    fn diff_rename_step(
+        image: &[u8],
+        old_parent: u32,
+        old_name: &str,
+        new_parent: u32,
+        new_name: &str,
+        touched: &[u32],
+    ) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_rename_at(&old_disk, old_parent, old_name, new_parent, new_name);
+        let new_ret = core_rename_at(&new_disk, old_parent, old_name, new_parent, new_name);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => assert_eq!(
+                o, n,
+                "rename '{old_name}'->'{new_name}' errno mismatch: old {o:?} new {n:?}"
+            ),
+            (o, n) => panic!(
+                "rename '{old_name}'->'{new_name}' ok/err divergence: old={o:?} new={n:?}"
+            ),
+        }
+        let sb = read_sb(&new_disk);
+        for &ino in touched {
+            mask_dirent_padding(&old_disk, &sb, ino);
+            mask_dirent_padding(&new_disk, &sb, ino);
+        }
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
     /// 扩展 errno 映射（命名空间路径可能出现 EEXIST / ENOTEMPTY / EISDIR / EINVAL / ENOSPC）。
     fn map_ns_errno(e: crate::prelude::Errno) -> ext4_rs::Errno {
         use crate::prelude::Errno as K;
@@ -1574,6 +1646,7 @@ mod test {
             K::EEXIST => ext4_rs::Errno::EEXIST,
             K::ENOTEMPTY => ext4_rs::Errno::ENOTEMPTY,
             K::EISDIR => ext4_rs::Errno::EISDIR,
+            K::EXDEV => ext4_rs::Errno::EXDEV,
             K::EINVAL => ext4_rs::Errno::EINVAL,
             K::ENOSPC => ext4_rs::Errno::ENOSPC,
             _ => ext4_rs::Errno::EINVAL,
@@ -1915,6 +1988,257 @@ mod test {
         let sb2 = read_sb(&new_disk);
         mask_dirent_padding(&old_disk, &sb2, 2);
         mask_dirent_padding(&new_disk, &sb2, 2);
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    // =================================================================
+    // Phase 4 Task 4：rename 差分（仅同目录——BUG-20）。
+    //
+    // 差分驱动 `diff_rename_step`：两张独立 `MemDisk`（同初始字节），旧侧 ext4_rs
+    // `ext4_rename_at`、新侧 core `rename_at`，比 Ok-Err + `assert_disk_eq` 全盘逐字节
+    // （先对触及的目录 `mask_dirent_padding` 归一 BUG-21 padding——rename 写新目录项携 padding 泄漏）。
+    // 全程 `match (old, new)`，**禁 `.expect()`**：旧侧可能返回 EXDEV/EISDIR/ENOTDIR/ENOTEMPTY。
+    // =================================================================
+
+    /// 同目录改名（dest 不存在）：rename f1 → f2。对拍全盘（old 项 inode=0 标删 + 前驱合并 +
+    /// 新项 f2 指向同 inode + **末尾不显式写回父**的字节态）+ 返回 Ok。
+    #[ktest]
+    fn dir_rename_same_dir_parity() {
+        let (img, _inos) = build_files(&["f1"]);
+        // rename f1 → f2（同目录、dest 不存在）。触及目录：根（ino 2）。
+        let _ = diff_rename_step(&img, 2, "f1", 2, "f2", &[2]);
+    }
+
+    /// 覆盖文件：f1、f2 都存在 → rename f1 → f2 覆盖 f2。
+    /// PARITY：文件覆盖路径 `unlink`(文件分支：仅 write_back 子) → **不** write_back(父)。
+    #[ktest]
+    fn dir_rename_overwrite_file_parity() {
+        let (img, _inos) = build_files(&["f1", "f2"]);
+        // rename f1 → f2：先 unlink(f2)（文件分支，不写回父）+ 删 f1 项 + 加 f2 项指向 f1 inode。
+        let _ = diff_rename_step(&img, 2, "f1", 2, "f2", &[2]);
+    }
+
+    /// 覆盖空目录：d1、d2 都是空目录 → rename d1 → d2 覆盖 d2。
+    /// PARITY：目录覆盖路径 `truncate_inode(d2, 0)` + `unlink`(目录分支：父 nlink-1 + 子 nlink=0 +
+    /// write_back 子 + write_back 父) + **再显式 write_back(父)**。
+    #[ktest]
+    fn dir_rename_overwrite_empty_dir_parity() {
+        let img = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d1",
+                mode: 0o40755,
+            },
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d2",
+                mode: 0o40755,
+            },
+        ]);
+        // 触及目录：根（ino 2）。d2 被 truncate 到 0（数据块释放），其目录块不再可达 → 不归一 d2、
+        // 不归一 d1（d1 内部 '.'/'..' 块未变、且 rename 不重写 d1 自身块——只改根目录项与 d2 inode/块）。
+        let _ = diff_rename_step(&img, 2, "d1", 2, "d2", &[2]);
+    }
+
+    /// 覆盖非空目录 → ENOTEMPTY：d1 空、d2 含一项 → rename d1 → d2 在 dir_has_entry 判到 d2 非空。
+    #[ktest]
+    fn dir_rename_overwrite_nonempty_dir_ENOTEMPTY() {
+        let img = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d1",
+                mode: 0o40755,
+            },
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d2",
+                mode: 0o40755,
+            },
+        ]);
+        let d2_ino = old_lookup(&MemDisk::from_image(&img), 2, "d2").expect("d2 present");
+        // 在 d2 里建一项使其非空。
+        let img2 = {
+            let disk = MemDisk::from_image(&img);
+            let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+            ext4.ext4_create_at(d2_ino, "inside", 0o100644)
+                .expect("create inside d2");
+            disk.backing().lock().clone()
+        };
+        let old_disk = MemDisk::from_image(&img2);
+        let new_disk = MemDisk::from_image(&img2);
+        let o = old_rename_at(&old_disk, 2, "d1", 2, "d2");
+        let n = core_rename_at(&new_disk, 2, "d1", 2, "d2");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "rename overwrite non-empty errno mismatch"),
+            other => panic!("rename overwrite non-empty must be ENOTEMPTY on both; got {other:?}"),
+        }
+        assert_eq!(
+            o,
+            Err(ext4_rs::Errno::ENOTEMPTY),
+            "rename overwrite non-empty dir → ENOTEMPTY"
+        );
+        // 失败路径不改盘（两侧都未动）→ 全盘一致。
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// 类型不符：dir → 已存在文件 = ENOTDIR；file → 已存在目录 = EISDIR。
+    #[ktest]
+    fn dir_rename_type_mismatch() {
+        // (a) dir → file：mkdir d1 + create f2 → rename d1 → f2（old 是目录、dest 是文件）= ENOTDIR。
+        let img = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d1",
+                mode: 0o40755,
+            },
+            DirOp::Create {
+                parent: 2,
+                name: "f2",
+                mode: 0o100644,
+            },
+        ]);
+        let old_disk = MemDisk::from_image(&img);
+        let new_disk = MemDisk::from_image(&img);
+        let o = old_rename_at(&old_disk, 2, "d1", 2, "f2");
+        let n = core_rename_at(&new_disk, 2, "d1", 2, "f2");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "rename dir->file errno mismatch"),
+            other => panic!("rename dir->file must be ENOTDIR on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::ENOTDIR), "rename dir over file → ENOTDIR");
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // (b) file → dir：create f1 + mkdir d2 → rename f1 → d2（old 是文件、dest 是目录）= EISDIR。
+        let img2 = build_dir_populated_image(&[
+            DirOp::Create {
+                parent: 2,
+                name: "f1",
+                mode: 0o100644,
+            },
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d2",
+                mode: 0o40755,
+            },
+        ]);
+        let old_disk = MemDisk::from_image(&img2);
+        let new_disk = MemDisk::from_image(&img2);
+        let o = old_rename_at(&old_disk, 2, "f1", 2, "d2");
+        let n = core_rename_at(&new_disk, 2, "f1", 2, "d2");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "rename file->dir errno mismatch"),
+            other => panic!("rename file->dir must be EISDIR on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::EISDIR), "rename file over dir → EISDIR");
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// '.' / '..' 拒绝 → EISDIR：old 或 new 任一为 "." / ".."。
+    #[ktest]
+    fn dir_rename_dot_EISDIR() {
+        let (img, _inos) = build_files(&["f1"]);
+        // 四种位置都验：old="." / old=".." / new="." / new=".."。
+        for (on, nn) in [(".", "f1"), ("..", "f1"), ("f1", "."), ("f1", "..")] {
+            let old_disk = MemDisk::from_image(&img);
+            let new_disk = MemDisk::from_image(&img);
+            let o = old_rename_at(&old_disk, 2, on, 2, nn);
+            let n = core_rename_at(&new_disk, 2, on, 2, nn);
+            match (o, n) {
+                (Err(eo), Err(en)) => assert_eq!(eo, en, "rename '{on}'->'{nn}' errno mismatch"),
+                other => panic!("rename '{on}'->'{nn}' must be EISDIR on both; got {other:?}"),
+            }
+            assert_eq!(
+                o,
+                Err(ext4_rs::Errno::EISDIR),
+                "rename with '.'/'..' → EISDIR"
+            );
+            assert_disk_eq(&old_disk, &new_disk);
+        }
+    }
+
+    /// 跨目录 → EXDEV（BUG-20：仅同目录 rename，无 '..' 重定父）。
+    #[ktest]
+    fn dir_rename_cross_dir_EXDEV() {
+        // 建子目录 d1 + 在根建文件 f1 → rename(root, f1, d1, f1moved)：old_parent(2) != new_parent(d1)。
+        let img = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d1",
+                mode: 0o40755,
+            },
+            DirOp::Create {
+                parent: 2,
+                name: "f1",
+                mode: 0o100644,
+            },
+        ]);
+        let d1_ino = old_lookup(&MemDisk::from_image(&img), 2, "d1").expect("d1 present");
+        let old_disk = MemDisk::from_image(&img);
+        let new_disk = MemDisk::from_image(&img);
+        let o = old_rename_at(&old_disk, 2, "f1", d1_ino, "f1moved");
+        let n = core_rename_at(&new_disk, 2, "f1", d1_ino, "f1moved");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "cross-dir rename errno mismatch"),
+            other => panic!("cross-dir rename must be EXDEV on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::EXDEV), "cross-directory rename → EXDEV");
+        // EXDEV 在任何盘改动前返回 → 两侧未动 → 全盘一致。
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// 同名短路：old_name == new_name → Ok（无盘改动）。
+    #[ktest]
+    fn dir_rename_same_name_noop() {
+        let (img, _inos) = build_files(&["f1"]);
+        let old_disk = MemDisk::from_image(&img);
+        let new_disk = MemDisk::from_image(&img);
+        let o = old_rename_at(&old_disk, 2, "f1", 2, "f1");
+        let n = core_rename_at(&new_disk, 2, "f1", 2, "f1");
+        match (o, n) {
+            (Ok(()), Ok(())) => {}
+            other => panic!("same-name rename must be Ok no-op on both; got {other:?}"),
+        }
+        // 同名短路在比较 old/new 后立即 return Ok，不动盘 → 全盘一致（也与起始 img 一致）。
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// 同 inode 短路：dest 已存在且指向 old 同一 inode → Ok（无盘改动）。
+    ///
+    /// 构造法：用硬链接让两个名字指向同一 inode。ext4_rs 的命名空间公开法无对外 link 接口，
+    /// 但底层 `dir_add_entry(parent, &child_ref, name)` 可在 old_disk 上手工加第二个名字 f2 指向
+    /// f1 的 inode（不改 nlink，仅加目录项），从而 lookup(2,"f1")==lookup(2,"f2")。rename f1→f2
+    /// 触发 `new_ino == old_ino` 短路返回 Ok。
+    #[ktest]
+    fn dir_rename_same_inode_noop() {
+        let (img, inos) = build_files(&["f1"]);
+        let f1_ino = inos[0];
+        // 在同一目录里手工再加一项 f2 指向 f1 的 inode（经 ext4_rs 底层 dir_add_entry）。
+        let img2 = {
+            let disk = MemDisk::from_image(&img);
+            let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+            let mut parent_ref = ext4.get_inode_ref(2);
+            let f1_ref = ext4.get_inode_ref(f1_ino);
+            ext4.dir_add_entry(&mut parent_ref, &f1_ref, "f2")
+                .expect("add second name f2 -> f1 inode");
+            ext4.write_back_inode(&mut parent_ref);
+            disk.backing().lock().clone()
+        };
+        // 确认 f1 与 f2 指向同一 inode。
+        let probe = MemDisk::from_image(&img2);
+        assert_eq!(
+            old_lookup(&probe, 2, "f1"),
+            old_lookup(&probe, 2, "f2"),
+            "f1 and f2 must alias the same inode"
+        );
+        // rename f1 → f2：dest 存在且 new_ino == old_ino → Ok 短路（无盘改动）。
+        let old_disk = MemDisk::from_image(&img2);
+        let new_disk = MemDisk::from_image(&img2);
+        let o = old_rename_at(&old_disk, 2, "f1", 2, "f2");
+        let n = core_rename_at(&new_disk, 2, "f1", 2, "f2");
+        match (o, n) {
+            (Ok(()), Ok(())) => {}
+            other => panic!("same-inode rename must be Ok no-op on both; got {other:?}"),
+        }
         assert_disk_eq(&old_disk, &new_disk);
     }
 

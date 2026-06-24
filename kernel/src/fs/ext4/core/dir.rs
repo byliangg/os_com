@@ -1376,6 +1376,153 @@ fn unlink_dir_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     Ok(())
 }
 
+/// 复刻 ext4_rs `unlink` 的**文件分支**（ext4_impls/ext4.rs:245-258）：`dir_remove_entry(parent,
+/// name)` → child nlink > 1 减一、否则置 0 → `write_back(child)`。**不** write_back(parent)
+/// （ext4_rs 的文件分支只在 child links>0 时写 child，且不碰 parent）——这是 rename 文件覆盖
+/// 路径不写回父的来源。BUG-19：不 ialloc_free_inode、不 truncate_inode。
+fn unlink_file_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent: &mut Inode,
+    child: &mut Inode,
+    name: &[u8],
+) -> Result<()> {
+    {
+        let ctx = nctx.write_ctx();
+        dir_remove_entry(&ctx, parent, name)?;
+    }
+    // PARITY: 文件 nlink > 1 减一、否则置 0。
+    let cl = child.links_count();
+    if cl > 1 {
+        child.set_links_count(cl - 1);
+    } else {
+        child.set_links_count(0);
+    }
+    // PARITY: BUG-19 — 不 ialloc_free_inode、不 truncate_inode；仅 write_back(child)，不碰 parent。
+    nctx.write_back(child)?;
+    Ok(())
+}
+
+/// 在 `old_parent` 下把 `old_name` 改名为 `new_name`（**仅同目录**——逐字复刻 ext4_rs
+/// `ext4_rename_at`，simple_interface/mod.rs:322）。
+///
+/// PARITY（BUG-20，已登记 bug.md D 段）：
+/// - **仅同目录**：`old_parent != new_parent` → **EXDEV**（无 '..' 重定父——ext4_rs 在跨目录
+///   情况直接拒绝，不做父向链调整）；
+/// - **'.' / '..' 拒绝**：old / new 任一为 "." / ".." → **EISDIR**；
+/// - **同名短路**：`old_name == new_name` → Ok（无盘改动）；
+/// - **同 inode 短路**：dest 已存在且 `new_ino == old_ino` → Ok；
+/// - **目录覆盖**：dest 是空目录 → `truncate_inode(new, 0)` + `unlink`(目录分支：父 nlink-1 +
+///   子 nlink=0 + write_back 子 + write_back 父) + **再显式 write_back(父)**；
+/// - **文件覆盖**：dest 是文件 → `unlink`(文件分支：仅 write_back 子) → **不** write_back(父)；
+///   （目录覆盖 write_back 父、文件覆盖不写回父——此不对称严格照搬 ext4_rs）；
+/// - **末尾不显式 write_back 父**：`dir_remove_entry(old_name)` + `dir_add_entry(new_name,
+///   old_ino, old_ftype)` 后不再 write_back 父（仅 `dir_add_entry` 分配新块时其内部写回 i_size）。
+///
+/// `old_ftype` = old inode 派生的目录项类型（`inode_to_dir_entry_type`）——与 ext4_rs 传
+/// `&old_inode_ref` 给 `dir_add_entry`（由 inode 派生类型）一致。
+pub(super) fn rename_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    old_parent: u32,
+    old_name: &[u8],
+    new_parent: u32,
+    new_name: &[u8],
+) -> Result<()> {
+    // ① old / new 任一为 "." / ".." → EISDIR。
+    if old_name == b"." || old_name == b".." || new_name == b"." || new_name == b".." {
+        return Err(Error::with_message(
+            Errno::EISDIR,
+            "rename on . or .. is not allowed",
+        ));
+    }
+
+    // ② PARITY (BUG-20): 仅同目录 rename——跨目录 → EXDEV，无 '..' 重定父。
+    if old_parent != new_parent {
+        return Err(Error::with_message(
+            Errno::EXDEV,
+            "cross-directory rename is not supported",
+        ));
+    }
+
+    // ③ 同名短路（无盘改动）。
+    if old_name == new_name {
+        return Ok(());
+    }
+
+    // ④ 解析 old：未命中 ENOENT 传播；记 old 是否目录。
+    let old_ino = {
+        let parent = nctx.load(old_parent)?;
+        let rctx = nctx.read_ctx();
+        lookup_at(&rctx, &parent, old_name)?
+    };
+    let old_inode = nctx.load(old_ino)?;
+    let old_is_dir = old_inode.is_dir();
+    // old_ftype 由 old inode 派生（与 ext4_rs 传 &old_inode_ref 给 dir_add_entry 一致）。
+    let old_ftype = inode_to_dir_entry_type(&old_inode);
+
+    // ⑤ dest 已存在？
+    let dest = {
+        let parent = nctx.load(new_parent)?;
+        let rctx = nctx.read_ctx();
+        // lookup_at 未命中返回 Err(ENOENT)——dest 不存在等价于 ext4_rs `if let Ok(new_ino) = ...`。
+        lookup_at(&rctx, &parent, new_name).ok()
+    };
+    if let Some(new_ino) = dest {
+        // 同 inode 短路（rename 一个名字到指向同 inode 的名字）。
+        if new_ino == old_ino {
+            return Ok(());
+        }
+        let mut new_inode = nctx.load(new_ino)?;
+        if old_is_dir {
+            // old 是目录：dest 必须是空目录，否则报错。
+            if !new_inode.is_dir() {
+                return Err(Error::with_message(
+                    Errno::ENOTDIR,
+                    "cannot overwrite non-directory",
+                ));
+            }
+            {
+                let rctx = nctx.read_ctx();
+                if dir_has_entry(&rctx, &new_inode)? {
+                    return Err(Error::with_message(
+                        Errno::ENOTEMPTY,
+                        "directory not empty",
+                    ));
+                }
+            }
+            // truncate dest → unlink(目录分支：父 nlink-1 + 子 nlink=0 + write_back 两者)。
+            nctx.truncate(&mut new_inode, 0)?;
+            let mut parent = nctx.load(new_parent)?;
+            unlink_dir_branch(nctx, &mut parent, &mut new_inode, new_name)?;
+            // PARITY: 目录覆盖路径在 unlink 后**再显式** write_back(父)（ext4_rs mod.rs:362）。
+            nctx.write_back(&mut parent)?;
+        } else {
+            // old 是文件：dest 不能是目录。
+            if new_inode.is_dir() {
+                return Err(Error::with_message(
+                    Errno::EISDIR,
+                    "cannot overwrite directory",
+                ));
+            }
+            // unlink(文件分支：仅 write_back 子)。
+            // PARITY: 文件覆盖路径**不** write_back(父)（ext4_rs mod.rs:367-368 缺该调用）。
+            let mut parent = nctx.load(new_parent)?;
+            unlink_file_branch(nctx, &mut parent, &mut new_inode, new_name)?;
+        }
+    }
+
+    // ⑥ 在 old_parent（== new_parent）下删 old_name + 加 new_name（指向 old_ino，类型 old_ftype）。
+    // PARITY: 末尾**不**显式 write_back(父)——仅 dir_add_entry 分配新块时其内部写回父 i_size。
+    let mut parent = nctx.load(old_parent)?;
+    {
+        let ctx = nctx.write_ctx();
+        dir_remove_entry(&ctx, &mut parent, old_name)?;
+    }
+    nctx.with_block_alloc(&mut parent, |ctx, alloc, parent| {
+        dir_add_entry(ctx, alloc, parent, old_ino, old_ftype, new_name)
+    })?;
+    Ok(())
+}
+
 /// 用预算好的 dir-stream 字节偏移删除空目录（绕过 `dir_find_entry` 扫描）。
 ///
 /// PARITY（ext4_rs `ext4_rmdir_at_fast`，simple_interface/mod.rs:266）：
