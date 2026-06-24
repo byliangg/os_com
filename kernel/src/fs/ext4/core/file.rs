@@ -31,6 +31,12 @@ const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 32;
 /// 多块写的预分配尾块数（无预分配）。= ext4_rs `WRITE_PREALLOC_BLOCKS`（file.rs:18）。
 const WRITE_PREALLOC_BLOCKS: u32 = 1;
 
+/// fallocate 文件大小上界（值逐字复刻 ext4_rs `EXT4_MAX_FILE_SIZE`，consts.rs:43——
+/// 字面量 `16 * 1024 * 1024 * 1024`；ext4_rs 注释写 16TB 但常量实际为 16GiB，**按值复刻**）。
+/// `allocate_range` 用它做 EFBIG 守卫——这道上界正是 BUG-12 里 write_at/prepare 缺、
+/// 唯独 allocate_range 复刻到位的那道（部分闭合 BUG-12）。
+const EXT4_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+
 /// 逻辑块 → 物理块的连续映射段（读路径载体）。
 ///
 /// 字段名/序/类型逐字对齐 ext4_rs `SimpleBlockRange`（simple_interface/mod.rs:85），
@@ -872,11 +878,196 @@ pub(super) fn prepare_write_at(
     Ok((lblock_start as usize, mappings))
 }
 
+// =====================================================================
+// fallocate 入口三件套（Phase 3 Task 4）。
+//
+// 安全复刻 ext4_rs `ext4_impls/file.rs`：`allocate_range`（:1415）、`zero_range`（:1487）、
+// `punch_hole_keep_size`（:1520）、`write_zeros_at`（:1540）。全建在 Task 3 的写映射
+// （`ensure_write_range_mapped` 含 unwritten→written 转换）+ 读侧 `collect_block_ranges`
+// 之上，**不持全局锁**、不重新实现 `convert_unwritten_span`。
+//
+// **语义（parity-first，逐字节复刻）：**
+// - `allocate_range`：`len==0→空`；EFBIG 守卫（`offset+len` 溢出或 `> EXT4_MAX_FILE_SIZE`）；
+//   预扫记录「曾经 hole/unwritten」逻辑块 → 映射（分配 + unwritten 转 written）→ 把那些块
+//   **零填**（转 written 后必须读零）；`!keep_size && range_end>file_size` 才长 i_size；
+//   返回 `[lblock_start, lblock_end)` 的 coalesce 映射向量。
+// - `zero_range` = `allocate_range` 后再零写可见区：`zero_end = keep_size ? min(range_end,
+//   file_size) : range_end`，零写 `[offset, zero_end)`，返回 zero_len。
+// - `punch_hole_keep_size`：**只零可见字节、不释放块**（i_blocks 不变——名副其实 keep_size；
+//   这是刻意简化、非真 FALLOC_FL_PUNCH_HOLE，登记 bug.md）；零写 `[offset,
+//   min(offset+len, file_size))`，返回 zero_len。
+// - Collapse / Insert / Unshare 在集成层（fs.rs:5868）即 `EOPNOTSUPP`——core 不提供入口。
+// =====================================================================
+
+/// `allocate_range`：为 `[offset, offset+len)` 分配/转换块，曾经 hole/unwritten 的块零填；
+/// `keep_size` 控制是否长 i_size。返回该逻辑区间的 coalesce 映射向量。
+/// 逐字节复刻 ext4_rs `allocate_range`（file.rs:1415）。
+pub(super) fn allocate_range(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    offset: usize,
+    len: usize,
+    keep_size: bool,
+) -> Result<Vec<SimpleBlockRange>> {
+    let block_size = ctx.block_size;
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let file_size = inode.size();
+    let range_end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::with_message(Errno::EFBIG, "fallocate range end overflow"))?;
+    // PARITY: EXT4_MAX_FILE_SIZE 上界 EFBIG（ext4_rs file.rs:1432；部分闭合 BUG-12——
+    //   唯独 allocate_range 有这道，write_at/prepare 仍缺）。
+    if range_end > EXT4_MAX_FILE_SIZE as usize {
+        return Err(Error::with_message(Errno::EFBIG, "file size too large"));
+    }
+
+    let lblock_start = u32::try_from(offset / block_size)
+        .map_err(|_| Error::with_message(Errno::EFBIG, "lblock start too big"))?;
+    let lblock_end = u32::try_from((range_end - 1) / block_size + 1)
+        .map_err(|_| Error::with_message(Errno::EFBIG, "lblock end too big"))?;
+
+    // PARITY: unwritten（预分配）块与 hole 一起记入零填表——映射步把它们转 written，
+    //   暴露设备里的旧内容，必须读回零（ext4_rs file.rs:1444 同语义）。
+    let mut previously_hole = Vec::new();
+    for lblock in lblock_start..lblock_end {
+        match get_pblock_idx_state(ctx, inode, lblock) {
+            Ok((_, unwritten)) => {
+                if unwritten {
+                    previously_hole.push(lblock);
+                }
+            }
+            Err(e) if e.error() == Errno::ENOENT => previously_hole.push(lblock),
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut start_bgid = initial_write_alloc_bgid(ctx, inode, lblock_start, lblock_end);
+    let allocated_total =
+        ensure_write_range_mapped(ctx, alloc, inode, &mut start_bgid, lblock_start, lblock_end)?;
+
+    if !previously_hole.is_empty() {
+        let zero_block = vec![0u8; block_size];
+        for lblock in previously_hole {
+            let pblock = get_pblock_idx(ctx, inode, lblock)?;
+            let pblock = usize::try_from(pblock)
+                .map_err(|_| Error::with_message(Errno::EFBIG, "pblock too big"))?;
+            let block_offset = pblock
+                .checked_mul(block_size)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "block offset overflow"))?;
+            ctx.data_writer.write_at(block_offset, zero_block.as_slice());
+        }
+    }
+
+    // PARITY: 仅 `!keep_size && range_end>file_size` 才长 i_size；否则只在分配过时写回
+    //   （ext4_rs file.rs:1477）。
+    if !keep_size && range_end > file_size as usize {
+        inode.set_size(range_end as u64);
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+    } else if allocated_total > 0 {
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+    }
+
+    let read_ctx = ctx.read_ctx();
+    collect_block_ranges(&read_ctx, inode, lblock_start, lblock_end - lblock_start)
+}
+
+/// `zero_range`：`allocate_range`(`keep_size`) 后零写可见区，返回零写字节数。
+/// 逐字节复刻 ext4_rs `zero_range`（file.rs:1487）。
+pub(super) fn zero_range(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    offset: usize,
+    len: usize,
+    keep_size: bool,
+) -> Result<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    allocate_range(ctx, alloc, inode, offset, len, keep_size)?;
+
+    let file_size = inode.size() as usize;
+    let range_end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::with_message(Errno::EFBIG, "zero_range end overflow"))?;
+    // PARITY: zero_end = keep_size ? min(range_end, file_size) : range_end（ext4_rs file.rs:1505）。
+    let zero_end = if keep_size {
+        range_end.min(file_size)
+    } else {
+        range_end
+    };
+    if offset >= zero_end {
+        return Ok(0);
+    }
+
+    let zero_len = zero_end - offset;
+    write_zeros_at(ctx, alloc, inode, offset, zero_len)?;
+    Ok(zero_len)
+}
+
+/// `punch_hole_keep_size`：**只零可见字节、不释放块**（i_blocks 不变），返回零写字节数。
+/// 逐字节复刻 ext4_rs `punch_hole_keep_size`（file.rs:1520）。
+///
+/// PARITY: 刻意简化——名副其实 keep_size，只把 `[offset, min(offset+len, file_size))` 写零，
+/// **不**回收物理块（非真 FALLOC_FL_PUNCH_HOLE；登记 bug.md）。
+pub(super) fn punch_hole_keep_size(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    offset: usize,
+    len: usize,
+) -> Result<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+
+    let file_size = inode.size() as usize;
+    if offset >= file_size {
+        return Ok(0);
+    }
+    let range_end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::with_message(Errno::EFBIG, "punch range end overflow"))?
+        .min(file_size);
+    let zero_len = range_end - offset;
+    write_zeros_at(ctx, alloc, inode, offset, zero_len)?;
+    Ok(zero_len)
+}
+
+/// `write_zeros_at`：按 64K chunk 循环 `write_at` 零写 `[offset, offset+len)`。
+/// 逐字节复刻 ext4_rs `write_zeros_at`（file.rs:1540）。
+fn write_zeros_at(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    offset: usize,
+    len: usize,
+) -> Result<()> {
+    const ZERO_WRITE_CHUNK: usize = 64 * 1024;
+
+    let zero_buf = vec![0u8; ZERO_WRITE_CHUNK.min(len)];
+    let mut written = 0usize;
+    while written < len {
+        let chunk_len = (len - written).min(zero_buf.len());
+        write_at(ctx, alloc, inode, offset + written, &zero_buf[..chunk_len])?;
+        written += chunk_len;
+    }
+    Ok(())
+}
+
 #[cfg(ktest)]
 mod test {
     use ostd::prelude::*;
 
-    use super::{map_blocks, plan_direct_read, prepare_write_at, read_at, write_at, ReadCtx};
+    use super::{
+        allocate_range, map_blocks, plan_direct_read, prepare_write_at, punch_hole_keep_size,
+        read_at, write_at, zero_range, ReadCtx,
+    };
     use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::diff_harness::{assert_disk_eq, DirectMetadataWriter, MemDisk};
     use crate::fs::ext4::core::extents::{get_pblock_idx_state, BlockAlloc, RawExtentHeader, WriteCtx};
@@ -1280,5 +1471,239 @@ mod test {
 
         // 全盘逐字节（已在每步 diff_write_step 比过，这里再确认终态）。
         assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    // =================================================================
+    // Phase 3 Task 4：fallocate 入口三件套差分。
+    //
+    // 旧侧 ext4_rs `allocate_range`/`zero_range`/`punch_hole_keep_size`，新侧 core 同名 fn。
+    // 每步从盘重建 ctx/分配器/inode；每步后 `assert_disk_eq` **全盘逐字节**（覆盖 inode 表
+    // i_blocks/size + extent 块 + 数据块 + 位图 + GDT + SB）。
+    // =================================================================
+
+    /// 在 `new_disk` 上跑一次 core `allocate_range`，返回映射向量。每步重建分配器/WriteCtx/inode。
+    fn core_allocate_range(
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<Vec<super::SimpleBlockRange>> {
+        let (sb, writer) = new_sb_and_writer(new_disk);
+        let alloc = BlockAllocator::new(sb, new_disk, &writer);
+        let mut inode = load_inode(new_disk, &sb, ino)?;
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(new_disk, &writer, new_disk, &sb);
+        allocate_range(&ctx, &mut adapter, &mut inode, off, len, keep_size)
+    }
+
+    /// 在 `new_disk` 上跑一次 core `zero_range`，返回零写字节数。
+    fn core_zero_range(
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+        keep_size: bool,
+    ) -> Result<usize> {
+        let (sb, writer) = new_sb_and_writer(new_disk);
+        let alloc = BlockAllocator::new(sb, new_disk, &writer);
+        let mut inode = load_inode(new_disk, &sb, ino)?;
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(new_disk, &writer, new_disk, &sb);
+        zero_range(&ctx, &mut adapter, &mut inode, off, len, keep_size)
+    }
+
+    /// 在 `new_disk` 上跑一次 core `punch_hole_keep_size`，返回零写字节数。
+    fn core_punch_hole(
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+    ) -> Result<usize> {
+        let (sb, writer) = new_sb_and_writer(new_disk);
+        let alloc = BlockAllocator::new(sb, new_disk, &writer);
+        let mut inode = load_inode(new_disk, &sb, ino)?;
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(new_disk, &writer, new_disk, &sb);
+        punch_hole_keep_size(&ctx, &mut adapter, &mut inode, off, len)
+    }
+
+    /// 一步 allocate_range 差分：旧侧 ext4_rs.allocate_range，新侧 core，比 (A) 映射向量 /
+    /// Ok-Err（EFBIG 别 expect）；(B) 全盘逐字节（含 i_blocks/size）。
+    fn diff_allocate_step(
+        old_disk: &MemDisk,
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+        keep_size: bool,
+    ) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let old_ret = ext4.allocate_range(ino, off, len, keep_size);
+        let new_ret = core_allocate_range(new_disk, ino, off, len, keep_size);
+        match (&old_ret, &new_ret) {
+            (Ok(old_v), Ok(new_v)) => {
+                let old_t: Vec<(u32, u64, u32)> =
+                    old_v.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+                let new_t: Vec<(u32, u64, u32)> =
+                    new_v.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+                assert_eq!(
+                    new_t, old_t,
+                    "allocate_range mapping mismatch off={off} len={len} keep={keep_size}"
+                );
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "allocate_range ok/err mismatch off={off} len={len}: old_ok={} new_ok={}",
+                old_ret.is_ok(),
+                new_ret.is_ok()
+            ),
+        }
+        assert_disk_eq(old_disk, new_disk);
+    }
+
+    /// 一步 zero_range 差分：返回 zero_len + Ok/Err + 全盘逐字节。
+    fn diff_zero_step(
+        old_disk: &MemDisk,
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+        keep_size: bool,
+    ) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let old_ret = ext4.zero_range(ino, off, len, keep_size);
+        let new_ret = core_zero_range(new_disk, ino, off, len, keep_size);
+        match (&old_ret, &new_ret) {
+            (Ok(a), Ok(b)) => assert_eq!(
+                a, b,
+                "zero_range zero_len mismatch off={off} len={len} keep={keep_size}"
+            ),
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "zero_range ok/err mismatch off={off} len={len}: old={old_ret:?} new={new_ret:?}"
+            ),
+        }
+        assert_disk_eq(old_disk, new_disk);
+    }
+
+    /// 一步 punch_hole_keep_size 差分：返回 zero_len + Ok/Err + 全盘逐字节。
+    /// 全盘比对覆盖「i_blocks 不变」（punch 只零不释放——名副其实 keep_size）。
+    fn diff_punch_step(
+        old_disk: &MemDisk,
+        new_disk: &MemDisk,
+        ino: u32,
+        off: usize,
+        len: usize,
+    ) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let old_ret = ext4.punch_hole_keep_size(ino, off, len);
+        let new_ret = core_punch_hole(new_disk, ino, off, len);
+        match (&old_ret, &new_ret) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a, b, "punch zero_len mismatch off={off} len={len}")
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "punch ok/err mismatch off={off} len={len}: old={old_ret:?} new={new_ret:?}"
+            ),
+        }
+        assert_disk_eq(old_disk, new_disk);
+    }
+
+    /// 读回逐字节对拍（新侧 core read_at vs 旧侧 ext4_rs read_at），不改盘。
+    fn assert_read_eq(old_disk: &MemDisk, new_disk: &MemDisk, ino: u32, off: usize, len: usize) {
+        let sb = read_sb(new_disk);
+        let ctx = ReadCtx::new(new_disk, &sb);
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let new_inode = load_inode(new_disk, &sb, ino).expect("load inode");
+        let mut new_buf = vec![0xEEu8; len];
+        let mut old_buf = vec![0xEEu8; len];
+        let new_n = read_at(&ctx, &new_inode, off, &mut new_buf).expect("new read_at");
+        let old_n = ext4.read_at(ino, off, &mut old_buf).expect("old read_at");
+        assert_eq!(new_n, old_n, "read count mismatch off={off} len={len}");
+        assert_eq!(new_buf, old_buf, "read bytes mismatch off={off} len={len}");
+    }
+
+    /// fallocate 差分主测试。序列（每步全盘逐字节 + 返回值对拍）：
+    /// ① `allocate_range`(keep_size=false) 造 unwritten 区 → ② `read_at` 读得**零**
+    ///    （补 Task 2 deferred 的 unwritten 读零覆盖）→ ③ 部分写（`write_at`）触发
+    ///    `convert_unwritten_span` 分裂 → ④ 跨 unwritten 写。
+    /// 覆盖：keep_size 真/假（i_size 长不长，由全盘比对捕获）、post-EOF 可见性、
+    /// `zero_range` keep_size 截断、**punch 只零不释放（i_blocks 不变）**、
+    /// Collapse/Insert/Unshare 在集成层即 EOPNOTSUPP（core 无入口，不在 core 测）。
+    #[ktest]
+    fn unwritten_fallocate_parity() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_IMAGE, "ufp");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let bs = read_sb(&new_disk).block_size();
+
+        // ① allocate_range(keep_size=false)：在空文件上为 [0, 8*bs) 分配，i_size 长到 8*bs。
+        //    单块写预分配尾使部分块成 unwritten；但 allocate_range 把请求区零填成可读零。
+        diff_allocate_step(&old_disk, &new_disk, ino, 0, 8 * bs, false);
+
+        // ② 读回 [0, 8*bs)：全零（hole/unwritten 都读零）。补 Task 2 deferred 的 unwritten 读零。
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 8 * bs);
+
+        // ③ keep_size=true：为 [16*bs, 20*bs) 预分配但不长 i_size（区在 EOF 之外）。
+        //    全盘比对捕获「i_size 不变」；随后 read_at 读这段在 EOF 之外应为 0（被 clamp）。
+        diff_allocate_step(&old_disk, &new_disk, ino, 16 * bs, 4 * bs, true);
+        assert_read_eq(&old_disk, &new_disk, ino, 16 * bs, 4 * bs); // EOF 之外 → 读 0
+
+        // ④ 部分写：往 [bs+3, ...) 写 (bs+13) 字节，触发 unwritten→written 分裂转换 +
+        //    convert_unwritten_span。全盘比对 + 读回对拍。
+        diff_write_step(&old_disk, &new_disk, ino, bs + 3, &vec![0x55u8; bs + 13]);
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 8 * bs);
+
+        // ⑤ 跨 unwritten 写：一次写多块跨过仍 unwritten 的逻辑块（4*bs，从 lblock 4 起），
+        //    触发跨段的分裂/合并路径。
+        diff_write_step(&old_disk, &new_disk, ino, 4 * bs, &vec![0x66u8; 4 * bs]);
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 8 * bs);
+
+        // ⑥ post-EOF 可见性：keep_size=false 为 [8*bs, 12*bs) 分配，长 i_size 到 12*bs；
+        //    随后这段可见、读回应为 0（曾经 hole/unwritten 已零填）。
+        diff_allocate_step(&old_disk, &new_disk, ino, 8 * bs, 4 * bs, false);
+        assert_read_eq(&old_disk, &new_disk, ino, 8 * bs, 4 * bs);
+
+        // ⑦ zero_range keep_size=false：把 [0, 2*bs) 写零（区在 i_size 内）。
+        diff_zero_step(&old_disk, &new_disk, ino, 0, 2 * bs, false);
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 4 * bs);
+
+        // ⑧ zero_range keep_size=true 截断：区 [10*bs, 30*bs) 跨过 i_size(12*bs)——
+        //    keep_size 把 zero_end clamp 到 file_size，只零 [10*bs, 12*bs)；返回 zero_len。
+        diff_zero_step(&old_disk, &new_disk, ino, 10 * bs, 20 * bs, true);
+        assert_read_eq(&old_disk, &new_disk, ino, 10 * bs, 4 * bs);
+
+        // ⑨ punch_hole_keep_size：只零可见字节、不释放块（i_blocks 不变，由全盘比对捕获）。
+        //    punch [bs, 3*bs) 在 i_size 内 → 写零 [bs, 3*bs)，返回 2*bs。
+        diff_punch_step(&old_disk, &new_disk, ino, bs, 2 * bs);
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 4 * bs);
+
+        // ⑩ punch 跨 EOF 截断：punch [11*bs, 40*bs) → range_end clamp 到 file_size(12*bs)，
+        //    只零 [11*bs, 12*bs)，返回 bs。
+        diff_punch_step(&old_disk, &new_disk, ino, 11 * bs, 29 * bs);
+        assert_read_eq(&old_disk, &new_disk, ino, 8 * bs, 4 * bs);
+
+        // ⑪ punch 起点 >= file_size → 返回 0、不改盘。
+        diff_punch_step(&old_disk, &new_disk, ino, 100 * bs, bs);
+
+        // ⑫ EFBIG 守卫：offset+len 超 EXT4_MAX_FILE_SIZE（16GiB）→ 两侧同 Err，不改盘。
+        diff_allocate_step(
+            &old_disk,
+            &new_disk,
+            ino,
+            (16 * 1024 * 1024 * 1024usize) - bs,
+            2 * bs,
+            false,
+        );
+
+        // ⑬ len==0：allocate/zero/punch 都返回空/0、不改盘。
+        diff_allocate_step(&old_disk, &new_disk, ino, 0, 0, false);
+        diff_zero_step(&old_disk, &new_disk, ino, 0, 0, false);
+        diff_punch_step(&old_disk, &new_disk, ino, 0, 0);
     }
 }
