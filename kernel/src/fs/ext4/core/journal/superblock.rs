@@ -14,7 +14,6 @@
 
 use super::super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
 use super::super::io::BlockReader;
-use super::super::metadata_writer::MetadataWriter;
 use super::super::prelude::*;
 use super::format::{
     RawJournalSuperblock, JBD2_MAGIC, JBD2_SUPERBLOCK_SIZE, JBD2_SUPERBLOCK_V2,
@@ -64,25 +63,9 @@ pub(in crate::fs::ext4::core) fn load_journal_sb(
     Ok(sb)
 }
 
-/// 把 `sb` 写回 journal **逻辑块 0**（= `physical_blocks[0]`）。
-///
-/// PARITY: ext4_rs `JournalSuperblockState::store`（superblock.rs:155-162）`device.write_block(.., 0, bytes)`。
-/// 经 `MetadataWriter::write_metadata_for_handle`（差分里 home 直写同一份字节）落 SB 的 1024 字节
-/// 到块 0 的前 1024 字节。注意：调用方负责在改字段后重算 csum（见 [`journal_sb_checksum`]）——
-/// 本函数只负责落盘当前镜像（store 不重算，与 ext4_rs 一致）。
-#[allow(dead_code)] // Task 3 (commit) wires SB store back to journal block 0 after ring advance
-pub(in crate::fs::ext4::core) fn store_journal_sb(
-    writer: &dyn MetadataWriter,
-    handle_id: u64,
-    physical_blocks: &[Ext4Fsblk],
-    sb: &RawJournalSuperblock,
-) -> Result<()> {
-    let sb_pblock = *physical_blocks.first().ok_or_else(|| {
-        Error::with_message(Errno::EINVAL, "journal has no physical blocks")
-    })?;
-    // SB 是 1024 字节；ext4_rs `to_bytes` 写恰 1024 字节到块 0 前段。
-    writer.write_metadata_for_handle(handle_id, sb_pblock, sb.as_bytes())
-}
+// 注：journal SB 落盘（store）由 commit / recovery 各自经其写上下文（`CommitCtx` / `RecoverCtx`）
+// 完成（见 `commit.rs` / `recovery.rs` 的 `store_journal_sb`）。P6 集成接 `MetadataWriter` 时再按需
+// 提供统一 store 接缝；此处不预留死代码（YAGNI）。
 
 /// 计算 journal 超级块校验和（`s_checksum` 字段值，未做大端编码）。
 ///
