@@ -1285,8 +1285,8 @@ mod test {
                 off += rec_len;
             }
             if masked {
-                // Fix 2: 清零过 +263 → 在归一后的内容上重算 tail.csum（metadata_csum 关时 no-op），
-                // 再整块写回。两盘 block[..bs-12] 已逐字节相同 → 同 csum。
+                // Fix 2: 清零过 +263 → 在归一后的内容上重算 tail.csum（dir_set_csum 现无条件写——
+                // BUG-22 un-gate，metadata_csum 关也写），再整块写回。两盘 block[..bs-12] 已逐字节相同 → 同 csum。
                 dir_set_csum(&mut buf, sb, dir_gen, bs);
                 let backing = disk.backing();
                 let mut guard = backing.lock();

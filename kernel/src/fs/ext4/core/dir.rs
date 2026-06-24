@@ -490,13 +490,14 @@ pub(super) fn dir_write_entry_bytes(
     buf[off..off + EXT4_DIR_ENTRY_INMEM_SIZE].copy_from_slice(&entry);
 }
 
-/// 在目录块字节上写 tail.checksum（门控 metadata_csum）。
+/// 在目录块字节上写 tail.checksum（**无条件写，不门控 metadata_csum**——BUG-22 parity）。
 ///
 /// PARITY（ext4_rs `dir_set_csum`，dir.rs:252）：`ino_index = parse(block, 0).inode`
 /// （**块首项 inode**——块 0 是 "." = 目录自身，块 ≥1 是普通子项 inode，偏离规范但照搬）；
 /// 重算 [`dir_block_csum`]（复用 Task 1）；把结果写进 tail 的 checksum 字段
-/// （`block[block_size-4 .. block_size]`）。**门控 metadata_csum**：特性关时不写（与 Task 1
-/// `dir_verify_block_csum` 同门控；`EXT4_NOCSUM_IMAGE` 覆盖此路径）。
+/// （`block[block_size-4 .. block_size]`）。**写路径无条件**：ext4_rs 无视 metadata_csum 特性、
+/// 关 csum 的盘上也照写（BUG-22），故 core 写路径也无条件写以保 parity。读路径
+/// `dir_verify_block_csum` **仍门控**（ext4_rs 读不校验目录 csum，读/写非对称是忠实的）。
 pub(super) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, block_size: usize) {
     // PARITY: ext4_rs dir_set_csum writes the dir-block csum unconditionally, ignoring the
     // metadata_csum feature gate (ext4_impls/dir.rs:252 + ext4_defs/direntry.rs:185; all 7
