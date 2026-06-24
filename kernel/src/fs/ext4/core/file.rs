@@ -645,6 +645,9 @@ pub(super) fn write_at(
         return Ok(0);
     }
     let file_size = inode.size();
+    // PARITY/TODO(BUG-12): ext4_rs write_at (file.rs:1846) 还有 `write_end > EXT4_MAX_FILE_SIZE → EFBIG`
+    // 上界检查，core 这里只防 checked_add 溢出（allocate_range 已复刻该上界）。16GiB 阈值现实小文件
+    // 不触发，迁移后与 ext4_rs 对齐（见 bug.md BUG-12）。
     let write_end = offset
         .checked_add(write_buf.len())
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "write end overflow"))?;
@@ -776,6 +779,8 @@ pub(super) fn prepare_write_at(
         return Ok((0, Vec::new()));
     }
     let file_size = inode.size();
+    // PARITY/TODO(BUG-12): ext4_rs prepare_write_at (file.rs:1298) 还有 `> EXT4_MAX_FILE_SIZE → EFBIG`
+    // 上界，core 只防溢出（见 bug.md BUG-12，迁移后对齐）。
     let write_end = offset
         .checked_add(len)
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "write end overflow"))?;
@@ -1879,12 +1884,11 @@ mod test {
     /// **参照侧鲁棒性约束（BUG-14 + BUG-15 + BUG-16，已登记 bug.md）**：
     /// - BUG-14：ext4_rs `balloc_free_blocks`（balloc.rs:672）`inode_blocks -= free_cnt*(bs/512)`
     ///   **无符号减法不做下溢保护** → debug 下溢即 panic（不 saturate）。
-    /// - BUG-15：ext4_rs `extent_remove_space` 自叶向上循环（extents.rs:1333）对**叶层**也调
-    ///   `more_to_rm`；叶节点 `path.index == None` → `more_to_rm` 跳过 index 守卫**直落
-    ///   `return true`** → 循环 `i += 1` 重下钻，但 **`path[depth]` 从未重载**（仍指旧叶）→
-    ///   同一叶被**重复处理 / 重复释放** → 单次 free 的块数超过当前 i_blocks → 撞 BUG-14 panic。
-    ///   **任何 depth>0 树、其叶含 >1 extent 的「清叶」删除（含 truncate-shrink-to-0）都会触发**，
-    ///   与 root 索引数无关（之前以为单索引可绕开，错——触发在叶层）。
+    /// - BUG-15：ext4_rs `extent_remove_space` 自叶向上循环（extents.rs:1333）在清空 depth>0 树时
+    ///   经 `more_to_rm` 触发**重下钻而 `path[depth]` 从未重载** → 同一节点被**重复释放** →
+    ///   单次 free 的块数超过当前 i_blocks → 撞 BUG-14 panic。**精确触发层级（叶层 vs index 层 i<depth）
+    ///   为近似、待运行时 trace**（见 bug.md BUG-15 caveat）；但「清空 depth>0 多 extent 树
+    ///   （含 truncate-shrink-to-0）必 panic」经 ktest 实证为真——故本差分一律避开清空 depth>0 树。
     /// - BUG-16：ext4_rs `extent_remove_space`（extents.rs:1258/1283）对**空叶**（entries_count==0）
     ///   做 `root_extent_at(entries_count - 1)` / `read_offset_as(...*(entries_count-1))` **无下溢守卫**
     ///   → 缩一棵 entries==0 的树（**稀疏 grow 出来的**、或**已清空再缩**）即 panic。**故差分绝不

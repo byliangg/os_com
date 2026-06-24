@@ -158,7 +158,6 @@ pub(super) fn inode_checksum(raw: &RawInode, inode_id: u32, sb: &RawSuperblock) 
 
 /// 算出 csum 后写回 `raw` 的 lo/hi 字段，对齐 ext4_rs `set_inode_checksum`（`inode.rs:461`）：
 /// `osd2.l_i_checksum_lo = c & 0xFFFF`；`if inode_size > 128 { i_checksum_hi = c >> 16 }`。
-#[allow(dead_code)]
 pub(super) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &RawSuperblock) {
     let c = inode_checksum(raw, inode_id, sb);
     raw.osd2.l_i_checksum_lo = (c & 0xFFFF) as u16;
@@ -185,11 +184,11 @@ impl Inode {
         self.raw.size()
     }
     /// 写文件大小（委托 [`RawInode::set_size`]）。
-    #[allow(dead_code)]
     pub(super) fn set_size(&mut self, size: u64) {
         self.raw.set_size(size);
     }
     /// inode generation（委托 [`RawInode::generation`]）。
+    /// 对称访问器，当前 core 路径用 `raw.generation()`，本包装暂无调用者（保留以备目录/属性路径）。
     #[allow(dead_code)]
     pub(super) fn generation(&self) -> u32 {
         self.raw.generation()
@@ -265,7 +264,6 @@ fn load_group_desc(reader: &dyn BlockReader, sb: &RawSuperblock, group: u32) -> 
 /// ext4_rs 读 `self.inode_table_blocks[group]`（启动期缓存）；该缓存即各组描述符的
 /// `get_inode_table_blk_num()`（ext4_impls/ext4.rs:90-98），故此处直接从盘读该组描述符
 /// 取 `inode_table()`，字节等价、且不引入全局缓存/单例。
-#[allow(dead_code)]
 pub(super) fn inode_disk_pos(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
