@@ -835,7 +835,9 @@ mod test {
     };
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::test_util::{
+        EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE,
+    };
     use crate::prelude::*;
 
     /// 读镜像超级块（盘内偏移 1024、长 1024）。
@@ -1628,6 +1630,359 @@ mod test {
             old_inode.inode.blocks_count(),
             new_inode.i_blocks(),
             "guard-clear final i_blocks mismatch"
+        );
+    }
+
+    // ====================================================================
+    // Task 6 收口：跨组 / first_data_block!=0 / metadata_csum 边角差分。
+    //
+    // 这些场景在单组 4K `EXT4_IMAGE` 上测不到，改用控制器备好的多组镜像
+    // `EXT4_MULTIGROUP_IMAGE`（1K 块、8 组、first_data_block=1、64bit、desc_size=64、
+    // metadata_csum 开）与 `EXT4_NOCSUM_IMAGE`（4K 单组、metadata_csum 关）。
+    //
+    // 多组镜像几何（mkfs 实测，供下方用例选 goal/count）：
+    //   blocks_per_group=8192，block_size=1024，8 组（块 1..65535，first_data_block=1）。
+    //   group0 空闲块 3808（块 4385..8192）；group1 空闲块 7934（块 8451..16384）；
+    //   group2 空闲块 4096（块 20481..24576）；group5 空闲块 7934（块 41219..49152）。
+    //   inodes_per_group=2048；group0 空闲 inode 2037（11 个保留/已用）。
+    // ====================================================================
+
+    /// 带 goal 分配的镜像可参数化版（差分体同 [`diff_one_goal`]，但盘取任意 `image`）。
+    /// 比 (A) 返回块号（match Ok/Err，不假定成功）；(B) snapshot_meta 逐字节；(C) i_blocks。
+    fn diff_one_goal_img(image: &[u8], goal: Option<u64>) {
+        let disk_old = MemDisk::from_image(image);
+        let disk_new = MemDisk::from_image(image);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+        let old_ret = old.balloc_alloc_block(&mut old_inode, goal);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+        let new_ret = alloc.balloc_alloc_block(&mut new_inode, goal);
+
+        match (&old_ret, &new_ret) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "alloc block mismatch goal={goal:?}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("alloc ok/err mismatch goal={goal:?}: old={old_ret:?} new={new_ret:?}"),
+        }
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "i_blocks mismatch goal={goal:?}"
+        );
+    }
+
+    /// 跨组 balloc：goal 指向 group 2 的数据区起点（块 20481），分配应落在 group 2。
+    /// 验证 `get_bgid_of_block`/`addr_to_idx_bg`/`bg_idx_to_addr` 在 first_data_block=1 下
+    /// 定位到后面的组，且组内候选与 ext4_rs 逐位一致。fixture: EXT4_MULTIGROUP_IMAGE。
+    #[ktest]
+    fn balloc_diff_crossgroup_goal_group2() {
+        diff_one_goal_img(EXT4_MULTIGROUP_IMAGE, Some(20481));
+    }
+
+    /// 跨组 balloc：goal 指向 group 5 的数据区起点（块 41219），分配应落在 group 5。
+    /// 进一步覆盖「goal 指向更后面的组」+ group 5 带 super 备份（5 是 5 的幂）的保留区计算。
+    /// fixture: EXT4_MULTIGROUP_IMAGE。
+    #[ktest]
+    fn balloc_diff_crossgroup_goal_group5() {
+        diff_one_goal_img(EXT4_MULTIGROUP_IMAGE, Some(41219));
+    }
+
+    /// 跨组 balloc 组满回绕：先用一次 `balloc_alloc_block_batch` 把 group 0 的全部空闲块
+    /// （3808）分掉，再单块 `balloc_alloc_block(None)`——默认 bgid=1 起扫，应落到 group 1
+    /// （块 8451 附近）。验证 group 0 被填满后下一块跨到下一组、`(bgid+1)%count` 回绕逻辑
+    /// 与 ext4_rs 逐位一致。两侧逐步比块号 + 最终盘面 + i_blocks。fixture: EXT4_MULTIGROUP_IMAGE。
+    #[ktest]
+    fn balloc_diff_crossgroup_exhaust_wraparound() {
+        let disk_old = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 步 1：batch 填满 group 0（其空闲块 3808；用足够大的 count 仅在 group 0 内取尽，
+        // 但 batch 会继续向后组扫描——为只填 group 0，请求恰 = group 0 空闲数）。
+        // group 0 空闲块数从盘上读（free_blocks_count_lo，desc 0），避免写死。
+        let g0_free = {
+            // 直接读 group 0 描述符的 free_blocks 计数（lo/hi 合成，与 alloc 内部一致）。
+            let d = alloc.load_group_desc(0);
+            d.get_free_blocks_count() as usize
+        };
+        let mut old_cursor = 0u32;
+        let mut new_cursor = 0u32;
+        let old_vec = old
+            .balloc_alloc_block_batch(&mut old_inode, &mut old_cursor, g0_free)
+            .expect("old fill group0");
+        let new_vec = alloc
+            .balloc_alloc_block_batch(&mut new_inode, &mut new_cursor, g0_free)
+            .expect("new fill group0");
+        assert_eq!(old_vec.len(), new_vec.len(), "fill-group0 batch len mismatch");
+        for (i, (a, b)) in old_vec.iter().zip(new_vec.iter()).enumerate() {
+            assert_eq!(a, b, "fill-group0 block[{i}] mismatch");
+        }
+        // 填满后两侧盘面一致（前置自检）。
+        {
+            let sb_old = read_sb(&disk_old);
+            assert_meta_eq(
+                &snapshot_meta(&disk_old, &sb_old),
+                &snapshot_meta(&disk_new, alloc.superblock()),
+            );
+        }
+
+        // 步 2：再单块分配（无 goal，默认从 bgid=1 起扫）——group 0 已满，应落到 group 1。
+        let bpg = read_sb(&disk_new).blocks_per_group() as u64;
+        let o = old.balloc_alloc_block(&mut old_inode, None).expect("old wrap alloc");
+        let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new wrap alloc");
+        assert_eq!(o, n, "wraparound block number mismatch");
+        // 该块应在 group 1（块号 >= 1*bpg + first_data_block 区间），证明确已跨组。
+        assert!(o > bpg, "wraparound alloc {o} should land beyond group 0 (bpg={bpg})");
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "wraparound final i_blocks mismatch"
+        );
+    }
+
+    /// 跨组 `balloc_alloc_block_from` 游标差分：从 bgid=0 起反复分配，足够多次以推进过 group 0
+    /// 进入后面的组（验证游标跨组前进 + 每命中回写 `*start_bgid`）。每步比返回块号 + 游标，
+    /// 最后比盘面 + i_blocks。fixture: EXT4_MULTIGROUP_IMAGE（单组镜像跨不了组）。
+    #[ktest]
+    fn balloc_diff_crossgroup_from_cursor() {
+        let disk_old = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // group 0 空闲块 3808；分配 3810 次必跨进 group 1（游标随之回写为 1）。
+        let g0_free = {
+            let d = alloc.load_group_desc(0);
+            d.get_free_blocks_count() as usize
+        };
+        let steps = g0_free + 2;
+        let mut old_cursor = 0u32;
+        let mut new_cursor = 0u32;
+        let mut saw_group1 = false;
+        let bpg = read_sb(&disk_new).blocks_per_group() as u64;
+        for i in 0..steps {
+            let old_ret = old.balloc_alloc_block_from(&mut old_inode, &mut old_cursor);
+            let new_ret = alloc.balloc_alloc_block_from(&mut new_inode, &mut new_cursor);
+            match (&old_ret, &new_ret) {
+                (Ok(a), Ok(b)) => {
+                    assert_eq!(a, b, "from-crossgroup step {i} block mismatch");
+                    if *a > bpg {
+                        saw_group1 = true;
+                    }
+                }
+                (Err(_), Err(_)) => {}
+                _ => panic!(
+                    "from-crossgroup step {i} ok/err mismatch: old={old_ret:?} new={new_ret:?}"
+                ),
+            }
+            assert_eq!(old_cursor, new_cursor, "from-crossgroup step {i} cursor mismatch");
+        }
+        assert!(saw_group1, "cursor scan should have crossed into group 1");
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "from-crossgroup final i_blocks mismatch"
+        );
+    }
+
+    /// 跨组 `balloc_alloc_block_batch` 差分：单次请求 count 大于 group 0 空闲块数，迫使一次
+    /// batch 调用**真正跨 >1 个组**（group 0 取尽后续在 group 1 续取）。比返回块号向量逐个、
+    /// 游标、盘面、i_blocks，且断言结果块跨越了组边界。fixture: EXT4_MULTIGROUP_IMAGE。
+    #[ktest]
+    fn balloc_diff_batch_crossgroup() {
+        let disk_old = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = BlockAllocator::new(sb, &disk_new, &writer);
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // group 0 空闲块 3808；请求 5000 → 必跨进 group 1（部分在 group 0、部分在 group 1）。
+        let count = 5000usize;
+        let bpg = read_sb(&disk_new).blocks_per_group() as u64;
+        let mut old_cursor = 0u32;
+        let mut new_cursor = 0u32;
+        let old_vec = old
+            .balloc_alloc_block_batch(&mut old_inode, &mut old_cursor, count)
+            .expect("old batch crossgroup");
+        let new_vec = alloc
+            .balloc_alloc_block_batch(&mut new_inode, &mut new_cursor, count)
+            .expect("new batch crossgroup");
+
+        assert_eq!(old_vec.len(), new_vec.len(), "batch-crossgroup len mismatch");
+        for (i, (a, b)) in old_vec.iter().zip(new_vec.iter()).enumerate() {
+            assert_eq!(a, b, "batch-crossgroup block[{i}] mismatch");
+        }
+        assert_eq!(old_cursor, new_cursor, "batch-crossgroup cursor mismatch");
+        // 断言确实跨组：返回向量里既有 group 0 的块（<= bpg）又有 group 1 的块（> bpg）。
+        let has_g0 = new_vec.iter().any(|&b| b <= bpg);
+        let has_g1 = new_vec.iter().any(|&b| b > bpg);
+        assert!(has_g0 && has_g1, "batch should span group 0 and group 1");
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "batch-crossgroup i_blocks mismatch"
+        );
+    }
+
+    /// first_data_block!=0 几何 + free 路径怪癖（**bug-4 收口**）：在 1K 多组镜像
+    /// （first_data_block=1）上跑 alloc + free。alloc 侧走几何 helper（`get_bgid_of_block`/
+    /// `addr_to_idx_bg`/`bg_idx_to_addr` 在 first_data_block!=0 时减/加 1），free 侧走裸除法
+    /// （ext4_rs 怪癖，不减 first_data_block）。两套定位算法在 first_data_block!=0 时本会偏差，
+    /// 但这是 ext4_rs 既有行为，parity-first 逐位复刻——两侧逐字节一致即证明 core 忠实复刻。
+    /// 这条怪癖此前只在 4K（first_data_block=0）镜像测，两算法重合、测不出差异；此处用 1K
+    /// 镜像正面覆盖 first_data_block!=0 分支。fixture: EXT4_MULTIGROUP_IMAGE。
+    #[ktest]
+    fn balloc_diff_first_data_block_nonzero_alloc_free() {
+        let disk_old = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        // 共享 guard，便于 free 前在两侧对称 clear（使释放块可被后续 alloc 复用，验 free 清位）。
+        let new_guard = Arc::new(CoreLocalGuard::new());
+        let mut alloc = BlockAllocator::with_guard(sb, &disk_new, &writer, new_guard.clone());
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 分配 8 块（无 goal、同序列），记录首块。
+        let mut first_block = 0u64;
+        for i in 0..8 {
+            let o = old.balloc_alloc_block(&mut old_inode, None).expect("old fdb alloc");
+            let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new fdb alloc");
+            assert_eq!(o, n, "fdb!=0 alloc step {i} block mismatch");
+            if i == 0 {
+                first_block = o;
+            }
+        }
+        // 分配后盘面一致（前置自检）。
+        {
+            let sb_old = read_sb(&disk_old);
+            assert_meta_eq(
+                &snapshot_meta(&disk_old, &sb_old),
+                &snapshot_meta(&disk_new, alloc.superblock()),
+            );
+        }
+
+        // 释放从首块起 4 块（free 路径裸除法定位组，触发 first_data_block!=0 下与 alloc 几何
+        // 的偏差——两侧须同样偏差，逐字节一致）。
+        old.balloc_free_blocks(&mut old_inode, first_block, 4);
+        alloc.balloc_free_blocks(&mut new_inode, first_block, 4);
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "fdb!=0 final i_blocks mismatch"
+        );
+    }
+
+    /// metadata_csum 关差分（csum gating 路径）：在 `EXT4_NOCSUM_IMAGE`（RO-compat 0x400 关）
+    /// 上跑 alloc + free。两侧的 `set_block_bitmap_csum` / `set_inode_bitmap_csum` 都应因
+    /// 特性关而**提前 return、不写位图 csum**，组描述符 csum（crc16）仍照写；其余计数/位图
+    /// 字节照常。验证 csum 门控分支两侧逐字节一致（new==old）。fixture: EXT4_NOCSUM_IMAGE。
+    #[ktest]
+    fn balloc_diff_nocsum_alloc_free() {
+        let disk_old = MemDisk::from_image(EXT4_NOCSUM_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_NOCSUM_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+        let mut old_inode = make_old_inode_ref(11);
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let new_guard = Arc::new(CoreLocalGuard::new());
+        let mut alloc = BlockAllocator::with_guard(sb, &disk_new, &writer, new_guard.clone());
+        let mut new_inode = InodeAllocCtx::new(0);
+
+        // 分配 6 块（无 goal、同序列），记首块。
+        let mut first_block = 0u64;
+        for i in 0..6 {
+            let o = old.balloc_alloc_block(&mut old_inode, None).expect("old nocsum alloc");
+            let n = alloc.balloc_alloc_block(&mut new_inode, None).expect("new nocsum alloc");
+            assert_eq!(o, n, "nocsum alloc step {i} block mismatch");
+            if i == 0 {
+                first_block = o;
+            }
+        }
+        {
+            let sb_old = read_sb(&disk_old);
+            assert_meta_eq(
+                &snapshot_meta(&disk_old, &sb_old),
+                &snapshot_meta(&disk_new, alloc.superblock()),
+            );
+        }
+
+        // 释放首块起 3 块。
+        old.balloc_free_blocks(&mut old_inode, first_block, 3);
+        alloc.balloc_free_blocks(&mut new_inode, first_block, 3);
+
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
+        );
+        assert_eq!(
+            old_inode.inode.blocks_count(),
+            new_inode.i_blocks(),
+            "nocsum final i_blocks mismatch"
         );
     }
 }

@@ -286,7 +286,7 @@ mod test {
     };
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::test_util::{EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE};
     use crate::prelude::*;
 
     /// 构造空 extent / 不映射任何块的旧侧 inode_ref（同 balloc 差分用法）：`Ext4Inode::default()`
@@ -495,6 +495,69 @@ mod test {
             old_inode.inode.blocks_count(),
             new_inode.i_blocks(),
             "mixed: final i_blocks mismatch"
+        );
+    }
+
+    // ============================== 跨组 ialloc 差分（Task 6 收口）==============================
+
+    /// 跨组 ialloc 差分：在多组镜像 `EXT4_MULTIGROUP_IMAGE`（8 组、inodes_per_group=2048、
+    /// group 0 空闲 inode 2037）上连续分配 inode，直到 group 0 inode 用尽 → 下一个落到 group 1。
+    /// 验证 ext4_rs `ialloc_alloc_inode` 的线性跨组扫描（`bgid += 1`）逐位复刻：两侧每步 inode
+    /// 号一致、跨组那一步 group 0→1，最终每组 inode 位图 + 组描述符 free_inodes/itable_unused +
+    /// 超级块 free_inodes 逐字节一致。
+    ///
+    /// 规模：group 0 有 2037 个空闲 inode，分配 2037 次填满 group 0、第 2038 次落 group 1，
+    /// 共 2038 次（×新旧两侧 = 4076 次 ialloc）。每次只动一张 1K inode 位图块的 RMW，循环可接受；
+    /// 逐字节 snapshot 比对**仅在序列跑完后做一次**（不逐步比），以控规模。全 file 分配（is_dir=false）
+    /// 避开 used_dirs 噪声，专注跨组扫描 + 计数 parity。
+    #[ktest]
+    fn ialloc_diff_crossgroup_fill_group0() {
+        let disk_old = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let disk_new = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+
+        let old = ext4_rs::Ext4::open(Arc::new(disk_old.clone()));
+
+        let sb = read_sb(&disk_new);
+        let bs = sb.block_size();
+        let inodes_per_group = sb.inodes_per_group();
+        let writer = DirectMetadataWriter::new(disk_new.clone(), bs);
+        let mut alloc = InodeAllocator::new(sb, &disk_new, &writer);
+
+        // group 0 空闲 inode 数从盘上读（free_inodes_count，desc 0），不写死。
+        let g0_free = {
+            let d = alloc.load_group_desc(0);
+            d.get_free_inodes_count() as usize
+        };
+        assert!(g0_free > 0, "group 0 must have free inodes to fill");
+
+        // 分配 g0_free 次填满 group 0；最后一次仍应落在 group 0（inode 号 <= inodes_per_group）。
+        let mut last_g0_inode = 0u32;
+        for i in 0..g0_free {
+            let o = old.ialloc_alloc_inode(false).expect("old fill ialloc");
+            let n = alloc.ialloc_alloc_inode(false).expect("new fill ialloc");
+            assert_eq!(o, n, "crossgroup-ialloc fill step {i} inode-num mismatch");
+            last_g0_inode = n;
+        }
+        // group 0 inode 号是 1-based 且 <= inodes_per_group（落在 group 0）。
+        assert!(
+            last_g0_inode >= 1 && last_g0_inode <= inodes_per_group,
+            "last group-0 inode {last_g0_inode} should be within group 0 (ipg={inodes_per_group})"
+        );
+
+        // 填满后再分配一个——group 0 空满，线性扫描跨到 group 1，inode 号落入 (ipg, 2*ipg]。
+        let o = old.ialloc_alloc_inode(false).expect("old crossgroup ialloc");
+        let n = alloc.ialloc_alloc_inode(false).expect("new crossgroup ialloc");
+        assert_eq!(o, n, "crossgroup-ialloc next-group inode-num mismatch");
+        assert!(
+            n > inodes_per_group && n <= 2 * inodes_per_group,
+            "crossgroup inode {n} should land in group 1 (ipg={inodes_per_group})"
+        );
+
+        // 跑完一次性逐字节比对元数据（含每组 inode 位图块 + GDT + 超级块）。
+        let sb_old = read_sb(&disk_old);
+        assert_meta_eq(
+            &snapshot_meta(&disk_old, &sb_old),
+            &snapshot_meta(&disk_new, alloc.superblock()),
         );
     }
 }
