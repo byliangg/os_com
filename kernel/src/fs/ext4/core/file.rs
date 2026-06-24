@@ -1146,12 +1146,16 @@ mod test {
         read_at, write_at, zero_range, ReadCtx,
     };
     use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
+    use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::diff_harness::{assert_disk_eq, DirectMetadataWriter, MemDisk};
-    use crate::fs::ext4::core::extents::{get_pblock_idx_state, BlockAlloc, RawExtentHeader, WriteCtx};
+    use crate::fs::ext4::core::extents::{
+        find_extent, get_pblock_idx_state, insert_extent, BlockAlloc, RawExtent, RawExtentHeader,
+        WriteCtx,
+    };
     use crate::fs::ext4::core::inode::{load_inode, Inode};
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::{EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE};
+    use crate::fs::ext4::core::test_util::{EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE};
     use crate::fs::ext4::core::types::Ext4Fsblk;
     // 核心路径返回 `crate::Result`（= ostd::Result 别名）；显式引入 core prelude 的
     // `Result`/`Error`/`Errno` 以免 `use ostd::prelude::*` 引入的同名项遮蔽造成歧义。
@@ -1997,5 +2001,354 @@ mod test {
         diff_truncate_step(&old_b, &new_b, ino_b, 600 * bs as u64);
         assert!(root_depth(&old_b, ino_b) > 0, "B: leaf still non-empty after truncate partial (old)");
         assert!(root_depth(&new_b, ino_b) > 0, "B: leaf still non-empty after truncate partial (new)");
+    }
+
+    // =================================================================
+    // Phase 3 Task 6：边角差分（深树 depth>1 / 多组 / csum 门控 / 损坏节点 / 乱序插入）。
+    //
+    // 全部建在前序的两盘差分骨架上（old=ext4_rs、new=core，每盘独立 `MemDisk`、同一份
+    // setup 字节）。延续 Task 5 教训：差分只喂 ext4_rs 能优雅处理的输入——深树/乱序只
+    // **读 + PARTIAL 删（永不清空叶、永不 empty depth>0 树）**；损坏节点验**两侧同 Err、
+    // 都不 panic**。
+    // =================================================================
+
+    /// 不做逐步全盘对拍的「建树写」：两盘各跑同一 `write_at`、断言返回字节一致，
+    /// **不**每步 `assert_disk_eq`（深树建树要几百步，逐步比对 64M 盘过慢）。两侧跑完全
+    /// 相同的序列，终态由调用方一次性 `assert_disk_eq` 兜底——任何分歧终态比对必现。
+    fn build_write_step(old_disk: &MemDisk, new_disk: &MemDisk, ino: u32, off: usize, buf: &[u8]) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let old_ret = ext4.write_at(ino, off, buf);
+        let new_ret = core_write_at(new_disk, ino, off, buf);
+        match (&old_ret, &new_ret) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "build write_at bytes mismatch off={off}"),
+            (Err(_), Err(_)) => {}
+            _ => panic!("build write_at ok/err mismatch off={off}: old={old_ret:?} new={new_ret:?}"),
+        }
+    }
+
+    /// 逐 lblock + map_blocks 向量读对拍（不改盘），覆盖 `[0, end)` 全逻辑块 + 尾后一段 hole。
+    fn assert_map_read_eq(old_disk: &MemDisk, new_disk: &MemDisk, ino: u32, end: u32) {
+        let sb = read_sb(new_disk);
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let new_inode = load_inode(new_disk, &sb, ino).expect("load inode");
+        let old_ref = ext4.get_inode_ref(ino);
+        for lblock in 0..end {
+            let new_res = get_pblock_idx_state(new_disk, &sb, &new_inode, lblock);
+            let old_res = ext4.get_pblock_idx_state(&old_ref, lblock);
+            match (new_res, old_res) {
+                (Ok(Some((np, nu))), Ok((op, ou))) => {
+                    assert_eq!(np, op, "lblock={lblock} pblock");
+                    assert_eq!(nu, ou, "lblock={lblock} unwritten");
+                }
+                (Ok(None), Err(e)) => assert_eq!(
+                    e.error(),
+                    ext4_rs::Errno::ENOENT,
+                    "lblock={lblock}: new hole but old err != ENOENT"
+                ),
+                (nr, or) => panic!(
+                    "lblock={lblock} divergence: new={:?} old_ok={:?}",
+                    nr.as_ref().map(|o| o.is_some()),
+                    or.is_ok()
+                ),
+            }
+        }
+        let ctx = ReadCtx::new(new_disk, &sb);
+        let new_mb = map_blocks(&ctx, &new_inode, 0, end).expect("new map_blocks");
+        let old_mb = ext4.map_blocks(ino, 0, end).expect("old map_blocks");
+        let new_t: Vec<(u32, u64, u32)> =
+            new_mb.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+        let old_t: Vec<(u32, u64, u32)> =
+            old_mb.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+        assert_eq!(new_t, old_t, "map_blocks vector mismatch over [0,{end})");
+    }
+
+    /// 场景1（深树 depth≥2）：在 1K-块多组镜像上插入大量**离散、单块、逻辑升序**的 extent，
+    /// 逼非根叶填满（1K 叶容量 84）后反复 `create_new_leaf` 充满 root index(4)、再 `ext_grow_indepth`
+    /// → depth≥2。补 Task 2 deferred 的 **depth>1 读**覆盖（per-lblock + map_blocks 向量对拍）。
+    ///
+    /// 删除遵 Task 5 教训：**只做 PARTIAL 删**——对最高一段 extent 做**中间删（middle-split
+    /// punch）**：删一段严格落在某 written extent 内侧的逻辑块（`extent_remove_space` 的早返回
+    /// `②` 分支：截前段 + 尾段 reinsert，**不进自叶向上的索引删除循环**）。该路径完整下钻
+    /// depth-2 的两层 index + 触发 split-reinsert，**绝不清空叶、绝不触 ext_remove_idx/根塌**，
+    /// 故不撞 ext4_rs BUG-14/15/16；删后断言 depth 仍 >0。
+    /// （depth>0 的清叶/idx 删/根塌差分仍 differential-deferred——见 `extent_delete_truncate_parity`
+    /// 与 bug.md BUG-14/15/16；本测试只补 depth>1 的**读** + **split-punch 删**覆盖。）
+    #[ktest]
+    fn extents_deep_tree_parity() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_MULTIGROUP_IMAGE, "deep");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let bs = read_sb(&new_disk).block_size();
+        assert_eq!(bs, 1024, "deep tree fixture is the 1K multigroup image");
+
+        // 1K 叶容量 = (1024-12)/12 = 84；root index 容量 4 → 充满 ~4 个叶（≈84*4=336）后
+        // 再插一个触发第二次 ext_grow_indepth → depth=2。N=380 留足余量越过阈值。
+        // 离散 **3-块** extent（lblock = i*4，每段占 3 块、间隔 1 不可合并），逻辑升序规整生长。
+        // 3-块（非单块）是为后续 middle-split 删留「严格内侧」逻辑块。
+        const N: u32 = 380;
+        for i in 0..N {
+            let lblk = (i as usize) * 4;
+            build_write_step(&old_disk, &new_disk, ino, lblk * bs, &vec![(i & 0xff) as u8; 3 * bs]);
+        }
+
+        // 终态一次性全盘逐字节对拍（覆盖 inode 表 + 全部 node 块 + 叶块 + 数据 + 位图 + GDT + SB）。
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // 确认确为 depth≥2 深树（两侧同）。
+        let d_old = root_depth(&old_disk, ino);
+        let d_new = root_depth(&new_disk, ino);
+        assert_eq!(d_old, d_new, "deep: depth parity");
+        assert!(d_new >= 2, "deep: expected depth>=2 tree, got {d_new}");
+
+        // depth>1 读对拍：逐 lblock get_pblock_idx_state + map_blocks 向量（含段间/尾后 hole）。
+        let read_end = N * 4 + 8;
+        assert_map_read_eq(&old_disk, &new_disk, ino, read_end);
+
+        // 写后读回字节对拍（多段，含 hole/已写/跨块）。
+        for &(off, len) in &[
+            (0usize, 8 * bs),
+            (bs, 6 * bs),
+            ((N as usize - 2) * 4 * bs, 6 * bs), // 高段附近
+        ] {
+            assert_read_eq(&old_disk, &new_disk, ino, off, len);
+        }
+
+        // PARTIAL 删（middle-split punch，Task 5 安全约束）：删最高一段 extent [top, top+3)
+        // 的**严格内侧中间块** [top+1, top+1]——`extent_remove_space` 走 `②` 早返回（截前段
+        // + 尾段 reinsert，不进索引删循环、不清叶）。下钻 depth-2 两层 index + split-reinsert。
+        let top = (N - 1) * 4;
+        diff_remove_step(&old_disk, &new_disk, ino, top + 1, top + 1);
+        assert!(root_depth(&old_disk, ino) > 0, "deep: depth stays >0 after split punch (old)");
+        assert!(root_depth(&new_disk, ino) > 0, "deep: depth stays >0 after split punch (new)");
+        // 删后再读对拍（中间块成 hole，前/尾段仍在）。
+        assert_map_read_eq(&old_disk, &new_disk, ino, read_end);
+    }
+
+    /// 场景2（多组）：在 1K-块、8 组、first_data_block=1 几何上写/读/truncate 差分。
+    /// 验证 1K 块 + first_data_block=1 下 extent 块 csum 与位置正确（4K 单组镜像测不到）；
+    /// 物理块分配随段增长自然推进，覆盖跨组以外的 1K 几何专属路径。每步全盘逐字节对拍。
+    #[ktest]
+    fn extent_multigroup_parity() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_MULTIGROUP_IMAGE, "mgf");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let bs = read_sb(&new_disk).block_size();
+        assert_eq!(bs, 1024, "multigroup fixture is the 1K image");
+
+        // ① 顺序 append 多块（连续 extent + 预分配尾，1K 块下 extent 块 csum 位置）。
+        diff_write_step(&old_disk, &new_disk, ino, 0, &vec![0x11u8; 8 * bs]); // [0,8)
+        // ② 稀疏远块写造 hole（跨段，强制独立 extent）。
+        diff_write_step(&old_disk, &new_disk, ino, 500 * bs, &vec![0x22u8; 4 * bs]); // [500,504)
+        // ③ 跨已有 extent 边界的多块写。
+        diff_write_step(&old_disk, &new_disk, ino, 6 * bs, &vec![0x33u8; 6 * bs]); // [6,12)
+        // ④ 离散多 extent 逼出 depth>0（验 1K 下 node 块 csum/位置），仍 ≤ 单叶容量。
+        for k in 0..10u32 {
+            let lblk = 100 + k * 20;
+            diff_write_step(&old_disk, &new_disk, ino, lblk as usize * bs, &vec![0x40 + k as u8; bs]);
+        }
+        assert!(root_depth(&old_disk, ino) > 0, "mg: depth>0 (old)");
+        assert!(root_depth(&new_disk, ino) > 0, "mg: depth>0 (new)");
+
+        // 读回逐字节 + map_blocks 向量对拍。
+        assert_map_read_eq(&old_disk, &new_disk, ino, 520);
+        assert_read_eq(&old_disk, &new_disk, ino, 0, 12 * bs);
+        assert_read_eq(&old_disk, &new_disk, ino, 500 * bs, 4 * bs);
+
+        // ⑤ truncate（depth>0、PARTIAL：缩到 (101)*bs，保留低段 [0,12) 与 100 段 → 叶非空、
+        //    永不清空 depth>0 叶）。全盘逐字节（含 i_size/i_blocks/位图释放）。
+        diff_truncate_step(&old_disk, &new_disk, ino, 101 * bs as u64);
+        assert!(root_depth(&old_disk, ino) > 0, "mg: depth stays >0 after partial truncate (old)");
+        assert!(root_depth(&new_disk, ino) > 0, "mg: depth stays >0 after partial truncate (new)");
+    }
+
+    /// 场景3（csum 门控）：同一写/truncate 序列在 csum-开（`EXT4_IMAGE`）与 csum-关
+    /// （`EXT4_NOCSUM_IMAGE`）两镜像各跑一遍，每步两盘全盘对拍。证 RO_COMPAT_METADATA_CSUM
+    /// 门控——csum 开时写 extent 块 tail csum、关时不写，且每镜像内 new==old。
+    /// （门控正确性由「关-镜像全盘 new==old」捕获：core 若误写 csum，关-镜像即与 old 不符。）
+    #[ktest]
+    fn extent_csum_gating_parity() {
+        for &(image, label) in &[(EXT4_IMAGE, "csum-on"), (EXT4_NOCSUM_IMAGE, "csum-off")] {
+            let (base_bytes, ino) = make_base_disk_with_empty_file(image, "csg");
+            let old_disk = MemDisk::from_image(&base_bytes);
+            let new_disk = MemDisk::from_image(&base_bytes);
+            let bs = read_sb(&new_disk).block_size();
+
+            // 写序列：连续段 + 稀疏段 + 离散多 extent 逼出 depth>0（node 块 → 走 csum 门控写路径）。
+            diff_write_step(&old_disk, &new_disk, ino, 0, &vec![0x77u8; 4 * bs]); // [0,4)
+            diff_write_step(&old_disk, &new_disk, ino, 50 * bs, &vec![0x88u8; 2 * bs]); // [50,52)
+            for k in 0..8u32 {
+                let lblk = 200 + k * 100;
+                diff_write_step(&old_disk, &new_disk, ino, lblk as usize * bs, &vec![0x90 + k as u8; bs]);
+            }
+            assert!(root_depth(&old_disk, ino) > 0, "{label}: depth>0 (old)");
+            assert!(root_depth(&new_disk, ino) > 0, "{label}: depth>0 (new)");
+
+            // 读回对拍（确认 csum 门控不影响数据/映射语义）。
+            assert_map_read_eq(&old_disk, &new_disk, ino, 920);
+
+            // truncate PARTIAL（缩到 201*bs，保留 [0,4)+50 段+200 段 → 叶非空）。
+            diff_truncate_step(&old_disk, &new_disk, ino, 201 * bs as u64);
+            assert!(root_depth(&old_disk, ino) > 0, "{label}: depth stays >0 after truncate (old)");
+            assert!(root_depth(&new_disk, ino) > 0, "{label}: depth stays >0 after truncate (new)");
+        }
+    }
+
+    /// 把 inode `ino` 的 i_block（extent 树根，inode 内偏移 40 起 60 字节）的**头**字节按
+    /// 给定 (magic, entries_count) 改坏，**两盘喂同样的坏字节**。定位逻辑同 `read_inode_bytes`。
+    fn corrupt_root_header(disk: &MemDisk, sb: &RawSuperblock, ino: u32, magic: u16, entries: u16) {
+        let bs = sb.block_size();
+        let inode_size = sb.inode_size() as usize;
+        let inodes_per_group = sb.inodes_per_group();
+        let group = (ino - 1) / inodes_per_group;
+        let index = ((ino - 1) % inodes_per_group) as usize;
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc_size = sb.group_desc_size();
+        let mut raw = vec![0u8; desc_size];
+        disk.read_at(gdt_off + group as usize * desc_size, raw.as_mut_slice());
+        let mut desc_buf = [0u8; 64];
+        let take = core::cmp::min(desc_size, 64);
+        desc_buf[..take].copy_from_slice(&raw[..take]);
+        let desc = RawGroupDescriptor::from_bytes(&desc_buf);
+        // i_block 位于 inode 内偏移 40；extent 头前 4 字节 = magic(2) + entries_count(2)。
+        let hdr_off = desc.inode_table() as usize * bs + index * inode_size + 40;
+        let mut four = [0u8; 4];
+        disk.read_at(hdr_off, four.as_mut_slice());
+        four[0..2].copy_from_slice(&magic.to_le_bytes());
+        four[2..4].copy_from_slice(&entries.to_le_bytes());
+        // 经数据-写路径直写这 4 字节（两盘同字节）。
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let block = (hdr_off / bs) as Ext4Fsblk;
+        let off_in_block = hdr_off % bs;
+        let mut full = vec![0u8; bs];
+        disk.read_at(block as usize * bs, full.as_mut_slice());
+        full[off_in_block..off_in_block + 4].copy_from_slice(&four);
+        use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+        writer
+            .write_metadata_for_handle(0, block, &full)
+            .expect("write corrupted root header");
+    }
+
+    /// 场景4（损坏节点防御）：把 extent 树**根头**改坏（坏 magic 0xDEAD + entries_count 越界
+    /// 9999），**两盘喂同样的坏字节**，对 `find_extent`/`get_pblock_idx_state`/`map_blocks`/
+    /// `insert_extent` 验**新旧同样 Err/clamp、都不 panic**。
+    ///
+    /// PARITY 依据：core `NodeView::valid_entries`（extents.rs:214）与 ext4_rs
+    /// `valid_entries_count` 同样在 `entries>capacity` 时返回 None → 读路径降级为 hole；
+    /// core `insert_extent` 的 `entries_count>capacity → EIO` 防御（extents.rs:737）逐字复刻
+    /// ext4_rs `insert_extent` 的同名 EIO 守卫（ext4_impls/extents.rs:294）。坏 magic 不被读
+    /// 路径检查（两侧 `find_extent` 都不验 magic）→ 同样被 entries 越界主导。**两侧均不 panic。**
+    ///
+    /// **insert_extent 部分单侧验 core**：ext4_rs `insert_extent(&mut, &mut Ext4Extent)` 的
+    /// 入参 `Ext4Extent` **未从 ext4_rs 顶层重导出**（不像 `Ext4ExtentHeader`），外部无法命名
+    /// 构造之 → 无法对拍调用。故 insert_extent 损坏防御**单侧验 core 优雅 EIO 不 panic**；
+    /// 旧侧同名 EIO 守卫由源码 review 覆盖（ext4_impls/extents.rs:294，注释引）。读路径
+    /// （find_extent/map_blocks/get_pblock_idx_state）的损坏防御仍**双侧对拍**。
+    #[ktest]
+    fn extent_corrupted_node_defense() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_IMAGE, "cor");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let sb = read_sb(&new_disk);
+
+        // 两盘喂同样的坏字节：坏 magic + 越界 entries_count（depth 保持 0 → 根叶插入路径）。
+        corrupt_root_header(&old_disk, &sb, ino, 0xDEAD, 9999);
+        corrupt_root_header(&new_disk, &sb, ino, 0xDEAD, 9999);
+
+        // (1) 读路径：get_pblock_idx_state 多个 lblock —— core 优雅返回 Ok(None)（hole），
+        //     ext4_rs 返回 ENOENT；两侧都不 panic、语义一致。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let new_inode = load_inode(&new_disk, &sb, ino).expect("load inode (corrupted)");
+        let old_ref = ext4.get_inode_ref(ino);
+        for lblock in [0u32, 1, 5, 100] {
+            let new_res = get_pblock_idx_state(&new_disk, &sb, &new_inode, lblock);
+            let old_res = ext4.get_pblock_idx_state(&old_ref, lblock);
+            match (new_res, old_res) {
+                (Ok(None), Err(e)) => assert_eq!(
+                    e.error(),
+                    ext4_rs::Errno::ENOENT,
+                    "corrupted lblock={lblock}: new hole but old err != ENOENT"
+                ),
+                (Ok(None), Ok(_)) => {
+                    panic!("corrupted lblock={lblock}: old unexpectedly mapped a block")
+                }
+                (nr, or) => panic!(
+                    "corrupted lblock={lblock} divergence: new={:?} old_ok={:?}",
+                    nr.as_ref().map(|o| o.is_some()),
+                    or.is_ok()
+                ),
+            }
+        }
+
+        // (2) find_extent：core 不 panic（返回 fallback 叶节点，无命中）；map_blocks 全 hole。
+        let _ = find_extent(&new_disk, &sb, &new_inode, 0).expect("find_extent on corrupted root");
+        let ctx = ReadCtx::new(&new_disk, &sb);
+        let new_mb = map_blocks(&ctx, &new_inode, 0, 8).expect("map_blocks on corrupted root");
+        let old_mb = ext4.map_blocks(ino, 0, 8).expect("old map_blocks on corrupted root");
+        let new_t: Vec<(u32, u64, u32)> =
+            new_mb.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+        let old_t: Vec<(u32, u64, u32)> =
+            old_mb.iter().map(|r| (r.lblock, r.pblock, r.len)).collect();
+        assert_eq!(new_t, old_t, "corrupted map_blocks vector mismatch");
+
+        // (3) 写路径（单侧验 core，见 doc）：insert_extent 在 entries_count(9999)>capacity(4)
+        //     时**优雅 EIO、不 panic**。core 侧：从盘重建 WriteCtx/分配器/inode，调 insert_extent。
+        let newex = {
+            let mut e = RawExtent::default();
+            e.first_block = 0;
+            e.set_actual_len(1);
+            e.store_pblock(1234);
+            e
+        };
+        let (sb2, writer) = new_sb_and_writer(&new_disk);
+        let alloc = BlockAllocator::new(sb2, &new_disk, &writer);
+        let mut inode = load_inode(&new_disk, &sb2, ino).expect("load inode for insert");
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let wctx = WriteCtx::new(&new_disk, &writer, &new_disk, &sb2);
+        let new_ins = insert_extent(&wctx, &mut adapter, &mut inode, &newex);
+        assert!(new_ins.is_err(), "core insert_extent must EIO on corrupted node");
+        assert_eq!(
+            new_ins.as_ref().err().map(|e| e.error()),
+            Some(Errno::EIO),
+            "core insert_extent corrupted-node error must be EIO"
+        );
+    }
+
+    /// 场景5（乱序插入压 position）：以**逆序 + 随机交错**的逻辑块插入序列建树，
+    /// 全盘逐字节对拍 + 逐 lblock read 对拍。压 `first_block`/`position` 在移位插入 /
+    /// pos==0 传播 / create_new_leaf 选位下的正确性（report §7 风险点）。
+    ///
+    /// 删除遵 Task 5 教训：建树后只做 PARTIAL 删（留叶 ≥1 extent、永不清空 depth>0 叶）。
+    #[ktest]
+    fn extent_out_of_order_insert_parity() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_IMAGE, "ooo");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let bs = read_sb(&new_disk).block_size();
+
+        // 乱序逻辑块（逆序 + 交错），每段 1 块、互不相邻（间隔 ≥2，不可合并）→ 每次插入都要
+        // 在已存项中**选位移位**，强压 binsearch_pos/insert_pos/first_block 传播。
+        let order: [u32; 16] = [
+            900, 100, 700, 300, 1100, 50, 1300, 250, 1500, 450, 1700, 650, 1900, 850, 2100, 1050,
+        ];
+        for (k, &lblk) in order.iter().enumerate() {
+            // 逐步全盘对拍（16 步，盘小可承受）——任何 position/first_block 偏差立现。
+            diff_write_step(&old_disk, &new_disk, ino, lblk as usize * bs, &vec![(0x10 + k) as u8; bs]);
+        }
+        // 越过 root(4) → ext_grow_indepth → depth>0（16 ≪ 单叶容量 → 单叶，position 全在叶内）。
+        let d = root_depth(&old_disk, ino);
+        assert_eq!(d, root_depth(&new_disk, ino), "ooo: depth parity");
+        assert!(d > 0, "ooo: expected depth>0, got {d}");
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // 逐 lblock + map_blocks 向量读对拍（覆盖全 16 段 + 段间 hole + 尾后 hole）。
+        assert_map_read_eq(&old_disk, &new_disk, ino, 2200);
+
+        // PARTIAL 删：删最低逻辑块单段 [50,50]（叶 pos==0 → first_block 向 root index 传播），
+        // 叶仍留 15 段 → 永不清空 depth>0 叶。删后再读对拍。
+        diff_remove_step(&old_disk, &new_disk, ino, 50, 50);
+        assert!(root_depth(&old_disk, ino) > 0, "ooo: depth stays >0 after pos==0 delete (old)");
+        assert!(root_depth(&new_disk, ino) > 0, "ooo: depth stays >0 after pos==0 delete (new)");
+        assert_map_read_eq(&old_disk, &new_disk, ino, 2200);
     }
 }
