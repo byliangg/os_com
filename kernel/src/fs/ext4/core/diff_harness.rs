@@ -1218,11 +1218,18 @@ mod test {
     /// 若 `rec_len >= 264`（即 padding 字节落在本项自己的槽内、且后继项起点 ≥264 不覆盖它），
     /// `entry_start + 263` 可能是 ext4_rs 垃圾**。rec_len < 264 的项其 +263 被下一项写覆盖、不合格。
     ///
-    /// 本 helper 对 `dir_inode` 的每个目录块走项（`parse_entry`），对每个 `rec_len >= 264` 的项把盘
-    /// 上 `pblock*bs + entry_off + 263` 这**一个字节**清零。两盘都调用（core 侧本就是 0、no-op，
-    /// 但对称归一更显然正确）。**外科级**：只动这一个字节/项，绝不放宽——其它字节仍逐字节对拍。
+    /// 本 helper 对 `dir_inode` 的每个目录块走项（`parse_entry`），对每个 `rec_len >= 264` 的项把
+    /// 块内 `entry_off + 263` 这**一个字节**清零。两盘都调用（core 侧本就是 0、no-op，但对称归一更
+    /// 显然正确）。**外科级**：只动这一个字节/项，绝不放宽——其它字节仍逐字节对拍。
+    ///
+    /// **Fix 2（BUG-21 二阶效应）**：块尾 csum 是对 `block[..bs-12]` 算的，**含** +263 字节；ext4_rs
+    /// 把 csum 算在泄漏的 0x88 上、core 算在 0x00 上，故即便两盘都把 +263 清零，盘上 tail.checksum
+    /// 仍分叉（实测 `0x8d != 0xbb`）。所以：**某块若清零了 +263 字节、且 metadata_csum 开启**，就在
+    /// 归一后的块内容上用 `dir_set_csum` 重算 tail.checksum 写回（两盘都做）。归一后 `block[..bs-12]`
+    /// 两盘逐字节相同 → 重算出**同一个** csum → `assert_disk_eq` 过，且块保持 csum-valid（利于后续
+    /// e2fsck）。NOCSUM 镜像下 `dir_set_csum` 早返回、是 no-op。**仅清零过 +263 的块**重算，不碰别的块。
     fn mask_dirent_padding(disk: &MemDisk, sb: &RawSuperblock, dir_inode: u32) {
-        use crate::fs::ext4::core::dir::parse_entry;
+        use crate::fs::ext4::core::dir::{dir_set_csum, parse_entry};
         use crate::fs::ext4::core::extents::get_pblock_idx_state;
 
         let bs = sb.block_size();
@@ -1234,6 +1241,7 @@ mod test {
         if !dir.raw.is_dir() {
             return;
         }
+        let dir_gen = dir.raw.generation();
         let total_blocks = dir.size().div_ceil(bs as u64);
         let mut buf = vec![0u8; bs];
         let mut iblock = 0u64;
@@ -1247,7 +1255,8 @@ mod test {
                 }
             };
             disk.read_at(pblock as usize * bs, buf.as_mut_slice());
-            // 走项（停于 tail 区 bs-12，坏 rec_len 静默 break，同枚举防御）。
+            // 在**内存块**上走项 + 清零（避免逐字节回盘），最后整块写回一次。
+            let mut masked = false;
             let mut off = 0usize;
             while off + 8 <= bs - 12 {
                 let de = match parse_entry(&buf, off, bs) {
@@ -1260,14 +1269,24 @@ mod test {
                 }
                 // BUG-21: rec_len>=264 → padding 字节 (+263) 落在本项槽内且不被后继覆盖 → 清零。
                 if rec_len >= EXT4_DIR_ENTRY_INMEM_SIZE {
-                    let leak_off = pblock as usize * bs + off + (EXT4_DIR_ENTRY_INMEM_SIZE - 1);
-                    let backing = disk.backing();
-                    let mut guard = backing.lock();
-                    if leak_off < guard.len() {
-                        guard[leak_off] = 0;
+                    let leak = off + (EXT4_DIR_ENTRY_INMEM_SIZE - 1);
+                    if leak < bs {
+                        buf[leak] = 0;
+                        masked = true;
                     }
                 }
                 off += rec_len;
+            }
+            if masked {
+                // Fix 2: 清零过 +263 → 在归一后的内容上重算 tail.csum（metadata_csum 关时 no-op），
+                // 再整块写回。两盘 block[..bs-12] 已逐字节相同 → 同 csum。
+                dir_set_csum(&mut buf, sb, dir_gen, bs);
+                let backing = disk.backing();
+                let mut guard = backing.lock();
+                let base = pblock as usize * bs;
+                if base + bs <= guard.len() {
+                    guard[base..base + bs].copy_from_slice(&buf);
+                }
             }
             iblock += 1;
         }
