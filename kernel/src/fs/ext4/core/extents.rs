@@ -8,7 +8,7 @@ use super::metadata_writer::MetadataWriter;
 use super::prelude::*;
 use super::superblock::RawSuperblock;
 
-const EXTENT_MAGIC: u16 = 0xF30A;
+pub(super) const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENT_HEADER_SIZE: usize = 12;
 const EXT4_EXTENT_SIZE: usize = 12;
 /// RO-compat metadata_csum 特性位（门控 extent 块 csum）。

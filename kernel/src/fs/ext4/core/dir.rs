@@ -111,8 +111,11 @@ use super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
 use super::extents::{
     self, get_pblock_idx_state, BlockAlloc, RawExtent, WriteCtx,
 };
-use super::file::ReadCtx;
-use super::inode::{write_back_inode, Inode};
+use super::file::{self, ReadCtx};
+use super::ialloc::InodeAllocator;
+use super::inode::{init_new_inode, load_inode, write_back_inode, Inode};
+use super::io::{BlockReader, BlockWriter};
+use super::metadata_writer::MetadataWriter;
 use super::superblock::RawSuperblock;
 
 /// `RawDirEntryHeader` 定长头字节数（= ext4_rs `Ext4FakeDirEntry` 的 `size_of`=8）。
@@ -914,6 +917,503 @@ pub(super) fn inode_to_dir_entry_type(inode: &Inode) -> u8 {
         S_IFSOCK => DE_SOCK,
         _ => DE_REG_FILE,
     }
+}
+
+// =====================================================================
+// Phase 4 Task 3：命名空间编排（create / mkdir / unlink / rmdir + lookup）。
+//
+// 逐字节复刻 ext4_rs `simple_interface/mod.rs`（ext4_create_at/ext4_mkdir_at/...）+
+// `ext4_impls/file.rs`（create/create_unchecked/link/link_unchecked）+ `ext4_impls/ext4.rs`
+// （unlink）+ `ext4_impls/dir.rs`（dir_remove）。关键 PARITY 雷区：
+//
+// - **链计数 (H)**：新 inode links_count 起 **0**；create 文件分支 link 后 child=1；mkdir
+//   目录分支：写 '.'/'..' + child=2 + **parent nlink++**。'.' / '..' 的 DE filetype = DIR(2)。
+// - **create 写回等价化**：ext4_rs `create` 做 `write_back_inode_without_csum(child)` → reload
+//   → `link` → `write_back(parent)` + `write_back(child)`。那个「先写无 csum 再 reload」对**最终
+//   盘字节不可见**（被末尾 csummed 写覆盖）。差分比**最终**盘面，故 core 直接在内存里把 child
+//   构造完、跑 link 逻辑、再各 write_back 一次——最终 inode 表 / dir 块 / 位图 / GDT / SB 字节
+//   与 ext4_rs 逐字节一致（write_back 是按 inode 表块 RMW，写序不改最终态；父子若同表块，每次
+//   write_back 都重读最新块、各自落对字节）。
+// - **unlink 不 free 不截块（BUG-19）**：`unlink` 里 `free_child` 写死 false——**永不**
+//   `ialloc_free_inode`；普通文件 unlink **不截块**（不调 truncate_inode），只 dir_remove_entry +
+//   nlink 调整（>1 减一否则置 0）+ write_back(child)。故 unlink 文件后 inode 位图 + 数据块仍占用。
+// - **rmdir（dir_remove）**：拒 '.'/'..' EINVAL → find ENOENT → 非目录 ENOTDIR → dir_has_entry
+//   非空 ENOTEMPTY → truncate_inode(child,0)（释放子数据块；inode 位图 NOT free——BUG-19）→
+//   unlink 目录分支（父 nlink-1 + 子 nlink=0 + write_back 两者）→ dir_remove 再 write_back(parent)
+//   一次（小重复写，最终字节同）。
+// - **SB/GDT/位图一致性**：InodeAllocator 与 BlockAllocator 各自持私有 RawSuperblock 快照，
+//   且 `write_superblock` 写**整 1024 字节**——若两者各从陈旧快照写、后写者会用陈旧 free_inodes/
+//   free_blocks 覆盖前写者。复刻 ext4_rs 单一权威 `super_block` 的办法：`NamespaceCtx` 持一份
+//   **权威 SB**，每次分配前用它构造分配器、分配后把分配器的运行期 SB（`superblock()`）同步回权威
+//   SB。这样块分配器看到的 SB 已含 inode 分配的计数变化，落盘的 SB 字节与 ext4_rs 一致。
+//   GDT 写是「读整块 → 覆盖该组 64 字节 → 写」，每次操作都 `load_group_desc` 重读盘（含上次写），
+//   故同组的 free_inodes / free_blocks / used_dirs 顺序写不互相覆盖；位图块互不相交。
+// =====================================================================
+
+use super::balloc::{BlockAllocator, InodeAllocCtx};
+
+/// S_IFDIR mode 位（构造目录 inode 时 `mode | S_IFDIR`）。
+const S_IFDIR_FULL: u16 = 0x4000;
+
+/// 命名空间编排上下文：持读 / 元数据写 / 数据写接缝 + **权威可变超级块**。
+///
+/// 泛型 `R: BlockReader` / `W: MetadataWriter`（与 Phase-2 分配器同形）——`InodeAllocator` /
+/// `BlockAllocator` 都要具体 sized 接缝类型，故本上下文也泛型化，由调用方（差分 / P6 集成层）
+/// 传具体盘类型（如差分的 `MemDisk`）。数据写接缝 `data_writer` 仅为组装 [`WriteCtx`]（命名空间
+/// 写路径只动元数据，不写文件数据块——dir 块走 metadata writer）。
+///
+/// **权威 SB 是 SB/GDT/位图一致性的关键**：分配 inode（InodeAllocator）与分配 dir 块
+/// （BlockAllocator）各持私有 SB 快照并写整 1024 字节——若各从陈旧快照写，后写者会用陈旧
+/// free_inodes/free_blocks 覆盖前写者。复刻 ext4_rs 单一权威 `super_block` 的办法：本上下文持
+/// 一份 `sb`，**每次分配前据它构造分配器、分配后把分配器运行期 SB（`superblock()`）同步回**。
+/// 这样块分配器看到的 SB 已含 inode 分配的计数变化，最终 SB 字节与 ext4_rs 一致。
+pub(super) struct NamespaceCtx<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> {
+    reader: &'a R,
+    writer: &'a W,
+    data_writer: &'a D,
+    /// 权威运行期超级块（free_inodes / free_blocks 随分配递减；其余同盘初值）。
+    sb: RawSuperblock,
+}
+
+/// 把 Phase-2 `BlockAllocator` + `InodeAllocCtx` 适配成写半部要的 [`BlockAlloc`]——与
+/// diff_harness / file.rs 的 `CoreAllocAdapter` 同套（分配 / 释放后把 i_blocks 同步回 inode）。
+struct NamespaceBlockAlloc<'a, R: BlockReader, W: MetadataWriter> {
+    alloc: BlockAllocator<'a, R, W>,
+    ictx: InodeAllocCtx,
+}
+
+impl<'a, R: BlockReader, W: MetadataWriter> BlockAlloc for NamespaceBlockAlloc<'a, R, W> {
+    fn alloc_one(&mut self, inode: &mut Inode) -> Result<Ext4Fsblk> {
+        let blk = self.alloc.balloc_alloc_block(&mut self.ictx, None)?;
+        inode.set_blocks_count(self.ictx.i_blocks());
+        Ok(blk)
+    }
+    fn alloc_batch(
+        &mut self,
+        inode: &mut Inode,
+        start_bgid: &mut u32,
+        count: usize,
+    ) -> Result<Vec<Ext4Fsblk>> {
+        let v = self
+            .alloc
+            .balloc_alloc_block_batch(&mut self.ictx, start_bgid, count)?;
+        inode.set_blocks_count(self.ictx.i_blocks());
+        Ok(v)
+    }
+    fn free_blocks(&mut self, inode: &mut Inode, start: Ext4Fsblk, count: u32) {
+        self.alloc.balloc_free_blocks(&mut self.ictx, start, count);
+        inode.set_blocks_count(self.ictx.i_blocks());
+    }
+}
+
+impl<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> NamespaceCtx<'a, R, W, D> {
+    /// 用读 / 元数据写 / 数据写接缝 + 初始超级块构造。`sb` 应为操作开始时盘上 SB 的快照
+    /// （差分两侧从同字节起步）。
+    pub(super) fn new(reader: &'a R, writer: &'a W, data_writer: &'a D, sb: RawSuperblock) -> Self {
+        Self {
+            reader,
+            writer,
+            data_writer,
+            sb,
+        }
+    }
+
+    /// 当前权威超级块（差分跑完据此对拍）。
+    #[allow(dead_code)]
+    pub(super) fn superblock(&self) -> &RawSuperblock {
+        &self.sb
+    }
+
+    /// 从权威 SB 借出只读上下文（读路径用）。
+    fn read_ctx(&self) -> ReadCtx<'_> {
+        ReadCtx::new(self.reader, &self.sb)
+    }
+
+    /// 从权威 SB 借出写上下文（dir 块 / inode 写回路径用）。
+    fn write_ctx(&self) -> WriteCtx<'_> {
+        WriteCtx::new(self.reader, self.writer, self.data_writer, &self.sb)
+    }
+
+    /// 分配一个 inode（按 `is_dir` 走 ialloc 计数分支），返回 1-based inode 号，并把分配器
+    /// 运行期 SB 同步回权威 `self.sb`。复刻 ext4_rs `alloc_inode`。
+    fn alloc_inode(&mut self, is_dir: bool) -> Result<u32> {
+        let mut ialloc = InodeAllocator::new(self.sb, self.reader, self.writer);
+        let ino = ialloc.ialloc_alloc_inode(is_dir)?;
+        // 关键：把 inode 分配后的运行期 SB（free_inodes-1 等）同步回权威 SB，使后续块分配器
+        // 据此构造、落盘 SB 不丢 inode 计数变化。
+        self.sb = *ialloc.superblock();
+        Ok(ino)
+    }
+
+    /// 在 `parent`（已加载）下加一项指向 `child`（已加载），并按 ext4_rs `link` 调链计数。
+    ///
+    /// PARITY（ext4_rs `link`，ext4_impls/file.rs:470）：
+    /// 1. `dir_add_entry(parent, child, name)`（用 child 的 DE filetype）；
+    /// 2. **child 是目录**：`dir_add_entry(child, child, ".")`（child 空 → dir_append_block 分配
+    ///    首数据块）+ `dir_add_entry(child, parent, "..")`（同块 try_insert）+ child links=2 +
+    ///    **parent links += 1**；'.' / '..' 的 DE filetype = DIR(2)；
+    /// 3. **child 是文件**：child links += 1（从 0 → 1）。
+    ///
+    /// 不在此 write_back（由 create / create_unchecked 末尾各 write_back 父 + 子一次）。
+    /// 块分配经 [`NamespaceBlockAlloc`]，分配后把运行期 SB 同步回 `self.sb`。
+    fn link(&mut self, parent: &mut Inode, child: &mut Inode, name: &[u8]) -> Result<()> {
+        let child_ftype = inode_to_dir_entry_type(child);
+        let child_is_dir = child.is_dir();
+        let child_num = child.num;
+
+        // ① 父目录加项（可能触发父目录新建块——dir_add_entry 内部分配）。
+        self.with_block_alloc(parent, |ctx, alloc, parent| {
+            dir_add_entry(ctx, alloc, parent, child_num, child_ftype, name)
+        })?;
+
+        if child_is_dir {
+            // ② child 空 → 写 '.'（dir_append_block 分配 child 首块）+ '..'（同块 try_insert）。
+            //    '.' / '..' DE filetype = DIR(2)（child 与 parent 都是目录）。
+            let child_ino = child.num;
+            let parent_ino = parent.num;
+            self.with_block_alloc(child, |ctx, alloc, child| {
+                dir_add_entry(ctx, alloc, child, child_ino, DE_DIR, b".")?;
+                dir_add_entry(ctx, alloc, child, parent_ino, DE_DIR, b"..")
+            })?;
+            // ③ child links = 2，parent links += 1（PARITY (H)）。
+            child.set_links_count(2);
+            let pl = parent.links_count() + 1;
+            parent.set_links_count(pl);
+        } else {
+            // PARITY: 文件分支 child links += 1（0 → 1）。
+            let cl = child.links_count() + 1;
+            child.set_links_count(cl);
+        }
+        Ok(())
+    }
+
+    /// 同 [`link`] 但父目录加项用 `dir_add_entry_unchecked`（只动末块），返回新项 abs byte offset。
+    /// PARITY（ext4_rs `link_unchecked`，ext4_impls/file.rs:562）：'.' / '..' 仍用 dir_add_entry
+    /// （恒落 child 首块、无扫描）。
+    fn link_unchecked(&mut self, parent: &mut Inode, child: &mut Inode, name: &[u8]) -> Result<u64> {
+        let child_ftype = inode_to_dir_entry_type(child);
+        let child_is_dir = child.is_dir();
+
+        let child_num = child.num;
+        let dir_byte_offset = self.with_block_alloc(parent, |ctx, alloc, parent| {
+            dir_add_entry_unchecked(ctx, alloc, parent, child_num, child_ftype, name)
+        })?;
+
+        if child_is_dir {
+            let child_ino = child.num;
+            let parent_ino = parent.num;
+            self.with_block_alloc(child, |ctx, alloc, child| {
+                dir_add_entry(ctx, alloc, child, child_ino, DE_DIR, b".")?;
+                dir_add_entry(ctx, alloc, child, parent_ino, DE_DIR, b"..")
+            })?;
+            child.set_links_count(2);
+            let pl = parent.links_count() + 1;
+            parent.set_links_count(pl);
+        } else {
+            let cl = child.links_count() + 1;
+            child.set_links_count(cl);
+        }
+        Ok(dir_byte_offset)
+    }
+
+    /// 在 `inode` 上跑一段需要块分配的写操作 `f`：据权威 SB 造 BlockAllocator + adapter +
+    /// WriteCtx，跑 `f`，跑完把块分配器运行期 SB 同步回 `self.sb`（保 free_blocks 一致）。
+    fn with_block_alloc<T>(
+        &mut self,
+        inode: &mut Inode,
+        f: impl FnOnce(&WriteCtx, &mut NamespaceBlockAlloc<'_, R, W>, &mut Inode) -> Result<T>,
+    ) -> Result<T> {
+        let sb = self.sb;
+        let alloc = BlockAllocator::new(sb, self.reader, self.writer);
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = NamespaceBlockAlloc { alloc, ictx };
+        let ctx = WriteCtx::new(self.reader, self.writer, self.data_writer, &sb);
+        let r = f(&ctx, &mut adapter, inode);
+        // 同步运行期 SB（free_blocks 变化）回权威 SB。
+        self.sb = *adapter.alloc.superblock();
+        r
+    }
+
+    /// 把一个 inode 写回盘（据权威 SB；csum 用权威 SB 的 uuid/inode_size）。
+    fn write_back(&self, inode: &mut Inode) -> Result<()> {
+        write_back_inode(self.writer, self.reader, &self.sb, inode)
+    }
+
+    /// 截断一个 inode 到 `new_size`（释放数据块；释放后把运行期 SB 同步回）。
+    fn truncate(&mut self, inode: &mut Inode, new_size: u64) -> Result<()> {
+        self.with_block_alloc(inode, |ctx, alloc, inode| {
+            file::truncate_inode(ctx, alloc, inode, new_size)
+        })
+    }
+
+    /// 加载一个 inode（据权威 SB）。
+    fn load(&self, inode_num: u32) -> Result<Inode> {
+        load_inode(self.reader, &self.sb, inode_num)
+    }
+}
+
+/// 在 `parent`（已加载目录）下查 `name`，命中返回 inode 号，未命中 **ENOENT**。
+///
+/// PARITY（ext4_rs `ext4_lookup_at`，simple_interface/mod.rs:201）：`dir_find_entry` 命中→
+/// `search_result.dentry.inode`；未命中（ext4_rs `dir_find_entry` 走完 ENOENT）→ core 把
+/// `Ok(None)` 映射成 `Err(ENOENT)`。
+pub(super) fn lookup_at(ctx: &ReadCtx, parent: &Inode, name: &[u8]) -> Result<u32> {
+    match dir_find_entry(ctx, parent, name)? {
+        Some(hit) => Ok(hit.inode),
+        None => Err(Error::with_message(Errno::ENOENT, "dir search fail")),
+    }
+}
+
+/// 在 `parent_ino` 下创建一个名为 `name`、mode 为 `mode` 的文件 / 节点，返回新 inode 号。
+///
+/// PARITY（ext4_rs `create`，ext4_impls/file.rs:520）：`create_inode`（alloc inode + init mode/
+/// flags/extent header，links=0）→ `link`（文件分支 child=1；若 mode 是目录则走目录分支）→
+/// write_back 父 + 子。**create 写回等价化**：ext4_rs 先 write_back_inode_without_csum(child)
+/// 再 reload 再 link，core 直接在内存里构造 child 完跑 link、末尾各 write_back 一次——最终盘
+/// 字节等价（见模块顶 PARITY 注）。
+pub(super) fn create_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+    mode: u16,
+) -> Result<u32> {
+    let mut parent = nctx.load(parent_ino)?;
+    // create_inode：alloc inode（is_dir 据 mode 类型位）+ init。
+    let is_dir = (mode & S_IFMT) == S_IFDIR_FULL;
+    let ino = nctx.alloc_inode(is_dir)?;
+    let mut child = init_new_inode(ino, mode, &nctx.sb);
+
+    nctx.link(&mut parent, &mut child, name)?;
+
+    nctx.write_back(&mut parent)?;
+    nctx.write_back(&mut child)?;
+    Ok(ino)
+}
+
+/// 同 [`create_at`] 但用 `link_unchecked`（只动父末块、无扫描），返回 `(新 inode 号, 新项 abs byte offset)`。
+///
+/// PARITY（ext4_rs `create_unchecked`，ext4_impls/file.rs:543）。
+pub(super) fn create_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+    mode: u16,
+) -> Result<(u32, u64)> {
+    let mut parent = nctx.load(parent_ino)?;
+    let is_dir = (mode & S_IFMT) == S_IFDIR_FULL;
+    let ino = nctx.alloc_inode(is_dir)?;
+    let mut child = init_new_inode(ino, mode, &nctx.sb);
+
+    let dir_byte_offset = nctx.link_unchecked(&mut parent, &mut child, name)?;
+
+    nctx.write_back(&mut parent)?;
+    nctx.write_back(&mut child)?;
+    Ok((ino, dir_byte_offset))
+}
+
+/// 在 `parent_ino` 下创建子目录 `name`（mode 自动 `| S_IFDIR`），返回新目录 inode 号。
+///
+/// PARITY（ext4_rs `ext4_mkdir_at`，simple_interface/mod.rs:243）：先 `dir_find_entry(parent,
+/// name)` 查重——命中 → **EEXIST**；否则 `create(parent, name, mode)`——注意 ext4_rs 传给
+/// `create` 的 `mode` 由调用方带上 S_IFDIR 类型位（`ext4_dir_mk` / 集成层传 `S_IFDIR|perm`），
+/// 故 core `mkdir_at` 用 `mode | S_IFDIR` 调 `create_at`，使 `create_inode` 走目录分支、`link`
+/// 走目录分支（写 '.'/'..' + child=2 + 父 nlink++）。
+pub(super) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+    mode: u16,
+) -> Result<u32> {
+    // PARITY: 先查重 → EEXIST。
+    let parent = nctx.load(parent_ino)?;
+    let rctx = nctx.read_ctx();
+    if dir_find_entry(&rctx, &parent, name)?.is_some() {
+        return Err(Error::with_message(Errno::EEXIST, "directory already exists"));
+    }
+    drop(rctx);
+    drop(parent);
+    // 走 create_at（mode 带 S_IFDIR 类型位 → create_inode/link 目录分支）。
+    create_at(nctx, parent_ino, name, mode | S_IFDIR_FULL)
+}
+
+/// 同 [`mkdir_at`] 但用 `create_unchecked`（无查重、只动父末块），返回 `(新目录 inode 号, abs byte offset)`。
+///
+/// PARITY（ext4_rs `ext4_mkdir_unchecked_at`，simple_interface/mod.rs:258）：调用方保证 name
+/// 不存在（无查重）。
+pub(super) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+    mode: u16,
+) -> Result<(u32, u64)> {
+    create_unchecked_at(nctx, parent_ino, name, mode | S_IFDIR_FULL)
+}
+
+/// 删除 `parent_ino` 下名为 `name` 的**文件**（目录请用 [`rmdir_at`]）。
+///
+/// PARITY（ext4_rs `ext4_unlink_at` → `unlink`，simple_interface/mod.rs:299 / ext4_impls/ext4.rs:220）：
+/// 1. lookup → 目标 inode；若目标 `is_dir()` → **EISDIR**；
+/// 2. `unlink`：`dir_remove_entry(parent, name)` → 文件分支：child links > 1 减一、否则置 0 →
+///    `write_back_inode(child)`。
+/// **BUG-19**：`free_child` 写死 false——**永不** `ialloc_free_inode`；**不截块**（不调
+/// truncate_inode）。故 unlink 文件后：项删 + child nlink 调整，但 inode 位图位 + 文件数据块仍占用。
+pub(super) fn unlink_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+) -> Result<()> {
+    // ① lookup（ext4_unlink_at 先 ext4_lookup_at）。
+    let parent_for_lookup = nctx.load(parent_ino)?;
+    let rctx = nctx.read_ctx();
+    let child_ino = lookup_at(&rctx, &parent_for_lookup, name)?;
+    drop(rctx);
+    drop(parent_for_lookup);
+
+    // ② 目标是目录 → EISDIR（ext4_unlink_at 在 unlink 前判）。
+    let mut child = nctx.load(child_ino)?;
+    if child.is_dir() {
+        return Err(Error::with_message(Errno::EISDIR, "target is a directory"));
+    }
+
+    // ③ unlink 文件分支：dir_remove_entry + nlink 调整 + write_back(child)。
+    let mut parent = nctx.load(parent_ino)?;
+    {
+        let ctx = nctx.write_ctx();
+        dir_remove_entry(&ctx, &mut parent, name)?;
+    }
+    // PARITY: 文件 nlink > 1 减一、否则置 0。
+    let cl = child.links_count();
+    if cl > 1 {
+        child.set_links_count(cl - 1);
+    } else {
+        child.set_links_count(0);
+    }
+    // PARITY: BUG-19 — 不 ialloc_free_inode、不 truncate_inode；仅 write_back(child)。
+    nctx.write_back(&mut child)?;
+    Ok(())
+}
+
+/// 删除 `parent_ino` 下名为 `name` 的**空目录**。
+///
+/// PARITY（ext4_rs `ext4_rmdir_at` = `dir_remove`，ext4_impls/dir.rs:749）：
+/// 1. `name == "." | ".."` → **EINVAL**；
+/// 2. `dir_find_entry`（未命中 → **ENOENT**）；
+/// 3. 载 child；非目录 → **ENOTDIR**；
+/// 4. `dir_has_entry(child)` 非空 → **ENOTEMPTY**；
+/// 5. `truncate_inode(child, 0)`（释放子数据块；inode 位图 NOT free——BUG-19）；
+/// 6. `unlink(parent, child, name)` 目录分支：父 nlink-1 + 子 nlink=0 + write_back 两者；
+/// 7. `dir_remove` 末尾再 `write_back_inode(parent)` 一次（小重复写，最终字节同）。
+pub(super) fn rmdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    name: &[u8],
+) -> Result<()> {
+    // ① 拒 '.' / '..'。
+    if name == b"." || name == b".." {
+        return Err(Error::with_message(Errno::EINVAL, "invalid directory name"));
+    }
+
+    // ② find（未命中 ENOENT）。
+    let parent_probe = nctx.load(parent_ino)?;
+    let rctx = nctx.read_ctx();
+    let child_ino = match dir_find_entry(&rctx, &parent_probe, name)? {
+        Some(hit) => hit.inode,
+        None => return Err(Error::with_message(Errno::ENOENT, "dir search fail")),
+    };
+    drop(rctx);
+    drop(parent_probe);
+
+    // ③ 载 child；非目录 → ENOTDIR。
+    let mut child = nctx.load(child_ino)?;
+    if !child.is_dir() {
+        return Err(Error::with_message(Errno::ENOTDIR, "target is not a directory"));
+    }
+
+    // ④ dir_has_entry 非空 → ENOTEMPTY。
+    {
+        let rctx = nctx.read_ctx();
+        if dir_has_entry(&rctx, &child)? {
+            return Err(Error::with_message(Errno::ENOTEMPTY, "directory not empty"));
+        }
+    }
+
+    // ⑤ truncate(child, 0)（释放子数据块——BUG-19：inode 位图不释放）。
+    nctx.truncate(&mut child, 0)?;
+
+    // ⑥ unlink 目录分支：dir_remove_entry + 父 nlink-1 + 子 nlink=0 + write_back 两者。
+    let mut parent = nctx.load(parent_ino)?;
+    unlink_dir_branch(nctx, &mut parent, &mut child, name)?;
+
+    // ⑦ dir_remove 末尾再 write_back(parent)（小重复写，最终字节同）。
+    nctx.write_back(&mut parent)?;
+    Ok(())
+}
+
+/// 复刻 ext4_rs `unlink` 的**目录分支**（ext4_impls/ext4.rs:228-244）：`dir_remove_entry(parent,
+/// name)` → 父 nlink > 0 减一 → 子 nlink = 0 → `write_back(child)` + `write_back(parent)`。
+/// （文件分支在 [`unlink_at`] 内联，目录分支单独抽出供 rmdir 复用。）
+fn unlink_dir_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent: &mut Inode,
+    child: &mut Inode,
+    name: &[u8],
+) -> Result<()> {
+    {
+        let ctx = nctx.write_ctx();
+        dir_remove_entry(&ctx, parent, name)?;
+    }
+    // PARITY: 父 nlink > 0 减一（rmdir 移除子目录的 '..' 反向链接）。
+    let pl = parent.links_count();
+    if pl > 0 {
+        parent.set_links_count(pl - 1);
+    }
+    // PARITY: 子目录 nlink = 0（'.' + 父向链都没了）。BUG-19：不 ialloc_free_inode。
+    child.set_links_count(0);
+    nctx.write_back(child)?;
+    nctx.write_back(parent)?;
+    Ok(())
+}
+
+/// 用预算好的 dir-stream 字节偏移删除空目录（绕过 `dir_find_entry` 扫描）。
+///
+/// PARITY（ext4_rs `ext4_rmdir_at_fast`，simple_interface/mod.rs:266）：
+/// 1. 载 parent + child；child 非目录 → **ENOTDIR**；
+/// 2. `truncate_inode(child, 0)`（释放子数据块）；
+/// 3. `dir_remove_entry_at_offset(parent, dir_byte_offset)`（O(1) 删）；
+/// 4. 父 nlink > 0 减一 + 子 nlink = 0 → write_back(child) + write_back(parent)。
+/// 注意 ext4_rmdir_at_fast **不**判 dir_has_entry（调用方保证空）、**不**拒 '.'/'..'（按偏移删）。
+pub(super) fn rmdir_at_fast<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    parent_ino: u32,
+    child_ino: u32,
+    dir_byte_offset: u64,
+) -> Result<()> {
+    let mut parent = nctx.load(parent_ino)?;
+    let mut child = nctx.load(child_ino)?;
+
+    // ① child 非目录 → ENOTDIR。
+    if !child.is_dir() {
+        return Err(Error::with_message(Errno::ENOTDIR, "target is not a directory"));
+    }
+
+    // ② 释放 child 数据块。
+    nctx.truncate(&mut child, 0)?;
+
+    // ③ 按偏移删项。
+    {
+        let ctx = nctx.write_ctx();
+        dir_remove_entry_at_offset(&ctx, &mut parent, dir_byte_offset)?;
+    }
+
+    // ④ 父 nlink-1 + 子 nlink=0 → write_back(child) + write_back(parent)。
+    let pl = parent.links_count();
+    if pl > 0 {
+        parent.set_links_count(pl - 1);
+    }
+    child.set_links_count(0);
+    nctx.write_back(&mut child)?;
+    nctx.write_back(&mut parent)?;
+    Ok(())
 }
 
 #[cfg(ktest)]

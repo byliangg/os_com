@@ -1440,4 +1440,505 @@ mod test {
         assert!(abs_off > 0, "'off_b' is not the first entry (offset>0)");
         let _ = diff_remove_at_offset_step(&img, 2, abs_off);
     }
+
+    // =================================================================
+    // Phase 4 Task 3：命名空间编排差分（create / mkdir / unlink / rmdir + lookup）。
+    //
+    // 差分驱动：两张独立 `MemDisk`（同初始字节），旧侧 `ext4_rs` 的公开命名空间法
+    // （ext4_create_at / ext4_mkdir_at / ext4_unlink_at / ext4_rmdir_at），新侧 core 的
+    // `NamespaceCtx` + create_at/mkdir_at/unlink_at/rmdir_at。比返回（inode 号 / Ok-Err）+
+    // `assert_disk_eq` 全盘逐字节（先对触及的目录 `mask_dirent_padding` 归一 BUG-21 padding）。
+    // =================================================================
+
+    use crate::fs::ext4::core::dir::{
+        create_at, create_unchecked_at, lookup_at, mkdir_at, mkdir_unchecked_at, rmdir_at,
+        rmdir_at_fast, unlink_at, NamespaceCtx,
+    };
+    use crate::fs::ext4::core::file::ReadCtx;
+
+    /// 在 `disk` 上构造 core 命名空间上下文：reader=disk、metadata writer=直写、data writer=disk、
+    /// sb=从盘重读。WriteCtx/分配器在 NamespaceCtx 内部据权威 SB 自管。
+    ///
+    /// 返回 `(NamespaceCtx, writer)`——`writer` 由调用方持有以满足借用期（NamespaceCtx 借它）。
+    /// 故调用模式：`let w = DirectMetadataWriter::new(disk.clone(), bs); let mut nctx =
+    /// NamespaceCtx::new(disk, &w, disk, sb);`。
+    fn make_nctx<'a>(
+        disk: &'a MemDisk,
+        writer: &'a DirectMetadataWriter,
+    ) -> NamespaceCtx<'a, MemDisk, DirectMetadataWriter, MemDisk> {
+        let sb = read_sb(disk);
+        NamespaceCtx::new(disk, writer, disk, sb)
+    }
+
+    /// 旧侧（ext4_rs）create：返回 Ok(inode 号)-Err(数值映射)。
+    fn old_create_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+        mode: u16,
+    ) -> core::result::Result<u32, ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_create_at(parent, name, mode).map_err(|e| e.error())
+    }
+
+    /// 旧侧（ext4_rs）mkdir：返回 Ok(inode 号)-Err。注意 ext4_rs `ext4_mkdir_at` 传给 `create`
+    /// 的 mode **已带** S_IFDIR 类型位（调用方约定）；差分两侧都传 `0o40755`（含 0x4000）。
+    fn old_mkdir_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+        mode: u16,
+    ) -> core::result::Result<u32, ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_mkdir_at(parent, name, mode).map_err(|e| e.error())
+    }
+
+    /// 旧侧（ext4_rs）unlink：返回 Ok(())-Err。
+    fn old_unlink_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_unlink_at(parent, name).map(|_| ()).map_err(|e| e.error())
+    }
+
+    /// 旧侧（ext4_rs）rmdir：返回 Ok(())-Err。
+    fn old_rmdir_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_rmdir_at(parent, name).map(|_| ()).map_err(|e| e.error())
+    }
+
+    /// 新侧（core）create：建 NamespaceCtx → `create_at`。返回 Ok(inode 号)-Err（数值映射）。
+    fn core_create_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+        mode: u16,
+    ) -> core::result::Result<u32, ext4_rs::Errno> {
+        let bs = read_sb(disk).block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut nctx = make_nctx(disk, &writer);
+        create_at(&mut nctx, parent, name.as_bytes(), mode).map_err(|e| map_ns_errno(e.error()))
+    }
+
+    /// 新侧（core）mkdir：建 NamespaceCtx → `mkdir_at`（core 内部 `| S_IFDIR`）。两侧 mode 都带
+    /// S_IFDIR；core `mkdir_at` 再 `| S_IFDIR` 是幂等（0x4000 | 0x4000）。返回 Ok(inode 号)-Err。
+    fn core_mkdir_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+        mode: u16,
+    ) -> core::result::Result<u32, ext4_rs::Errno> {
+        let bs = read_sb(disk).block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut nctx = make_nctx(disk, &writer);
+        mkdir_at(&mut nctx, parent, name.as_bytes(), mode).map_err(|e| map_ns_errno(e.error()))
+    }
+
+    /// 新侧（core）unlink：建 NamespaceCtx → `unlink_at`。返回 Ok(())-Err。
+    fn core_unlink_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let bs = read_sb(disk).block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut nctx = make_nctx(disk, &writer);
+        unlink_at(&mut nctx, parent, name.as_bytes()).map_err(|e| map_ns_errno(e.error()))
+    }
+
+    /// 新侧（core）rmdir：建 NamespaceCtx → `rmdir_at`。返回 Ok(())-Err。
+    fn core_rmdir_at(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let bs = read_sb(disk).block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut nctx = make_nctx(disk, &writer);
+        rmdir_at(&mut nctx, parent, name.as_bytes()).map_err(|e| map_ns_errno(e.error()))
+    }
+
+    /// 扩展 errno 映射（命名空间路径可能出现 EEXIST / ENOTEMPTY / EISDIR / EINVAL / ENOSPC）。
+    fn map_ns_errno(e: crate::prelude::Errno) -> ext4_rs::Errno {
+        use crate::prelude::Errno as K;
+        match e {
+            K::ENOENT => ext4_rs::Errno::ENOENT,
+            K::ENOTDIR => ext4_rs::Errno::ENOTDIR,
+            K::EIO => ext4_rs::Errno::EIO,
+            K::EEXIST => ext4_rs::Errno::EEXIST,
+            K::ENOTEMPTY => ext4_rs::Errno::ENOTEMPTY,
+            K::EISDIR => ext4_rs::Errno::EISDIR,
+            K::EINVAL => ext4_rs::Errno::EINVAL,
+            K::ENOSPC => ext4_rs::Errno::ENOSPC,
+            _ => ext4_rs::Errno::EINVAL,
+        }
+    }
+
+    /// create 差分一步：两盘从 `image` 起，旧/新各 create，比 inode 号 + 全盘（归一 padding）。
+    /// 返回新侧结果字节（链式起步）。
+    fn diff_create_step(image: &[u8], parent: u32, name: &str, mode: u16) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_create_at(&old_disk, parent, name, mode);
+        let new_ret = core_create_at(&new_disk, parent, name, mode);
+        match (old_ret, new_ret) {
+            (Ok(o), Ok(n)) => assert_eq!(o, n, "create '{name}' inode mismatch: old {o} new {n}"),
+            (Err(o), Err(n)) => assert_eq!(o, n, "create '{name}' errno mismatch: old {o:?} new {n:?}"),
+            (o, n) => panic!("create '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        }
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// mkdir 差分一步：旧/新各 mkdir，比 inode 号 + 全盘（归一父目录 + 新目录的 padding）。
+    fn diff_mkdir_step(image: &[u8], parent: u32, name: &str, mode: u16) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_mkdir_at(&old_disk, parent, name, mode);
+        let new_ret = core_mkdir_at(&new_disk, parent, name, mode);
+        let new_dir_ino = match (old_ret, new_ret) {
+            (Ok(o), Ok(n)) => {
+                assert_eq!(o, n, "mkdir '{name}' inode mismatch: old {o} new {n}");
+                Some(o)
+            }
+            (Err(o), Err(n)) => {
+                assert_eq!(o, n, "mkdir '{name}' errno mismatch: old {o:?} new {n:?}");
+                None
+            }
+            (o, n) => panic!("mkdir '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        };
+        let sb = read_sb(&new_disk);
+        // 父目录新增项 + 新目录的 '.'/'..' 块都可能含 padding：归一两者。成功时才有新目录块——
+        // 失败（EEXIST）时仅父目录可能变（实际未变）。
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
+        if let Some(dino) = new_dir_ino {
+            mask_dirent_padding(&old_disk, &sb, dino);
+            mask_dirent_padding(&new_disk, &sb, dino);
+        }
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// unlink 差分一步：旧/新各 unlink，比 Ok-Err + 全盘（归一父目录 padding）。
+    fn diff_unlink_step(image: &[u8], parent: u32, name: &str) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_unlink_at(&old_disk, parent, name);
+        let new_ret = core_unlink_at(&new_disk, parent, name);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => assert_eq!(o, n, "unlink '{name}' errno mismatch: old {o:?} new {n:?}"),
+            (o, n) => panic!("unlink '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        }
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// rmdir 差分一步：旧/新各 rmdir，比 Ok-Err + 全盘（归一父目录 padding）。
+    fn diff_rmdir_step(image: &[u8], parent: u32, name: &str) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_rmdir_at(&old_disk, parent, name);
+        let new_ret = core_rmdir_at(&new_disk, parent, name);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => assert_eq!(o, n, "rmdir '{name}' errno mismatch: old {o:?} new {n:?}"),
+            (o, n) => panic!("rmdir '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        }
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// create 文件差分：在根目录建一个常规文件，对拍返回 inode 号 + 全盘（新 inode 表项含
+    /// mode/links=1/extent header/csum、父 dir 块新增项、ialloc 位图/SB/GDT）。
+    #[ktest]
+    fn dir_create_file_parity() {
+        let _ = diff_create_step(EXT4_IMAGE, 2, "f1", 0o100644);
+        // 连续建多个文件（每步全盘对拍，逼 inode 号递增 + 父目录连续切槽）。
+        let mut img = EXT4_IMAGE.to_vec();
+        img = diff_create_step(&img, 2, "a", 0o100644);
+        img = diff_create_step(&img, 2, "bb", 0o100600);
+        let _ = diff_create_step(&img, 2, "ccc", 0o100755);
+    }
+
+    /// mkdir 差分：建子目录（新目录 inode links=2 + '.'/'..' 块 + 父 nlink++ + 位图/SB）；
+    /// 重复 mkdir → EEXIST；嵌套 mkdir d1 后 mkdir d1/d2。
+    #[ktest]
+    fn dir_mkdir_parity() {
+        // 单个 mkdir。
+        let img = diff_mkdir_step(EXT4_IMAGE, 2, "d1", 0o40755);
+
+        // 重复 mkdir "d1" → 两侧 EEXIST（在已建 d1 的盘上）。
+        let old_disk = MemDisk::from_image(&img);
+        let new_disk = MemDisk::from_image(&img);
+        let o = old_mkdir_at(&old_disk, 2, "d1", 0o40755);
+        let n = core_mkdir_at(&new_disk, 2, "d1", 0o40755);
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "duplicate mkdir errno mismatch"),
+            other => panic!("duplicate mkdir must be EEXIST on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::EEXIST), "duplicate mkdir → EEXIST");
+        // 失败路径不改盘（两侧都未动）→ 全盘一致。
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // 嵌套：在 d1 下 mkdir d2。先取 d1 的 inode 号。
+        let d1_ino = old_lookup(&MemDisk::from_image(&img), 2, "d1").expect("d1 present");
+        let old_disk = MemDisk::from_image(&img);
+        let new_disk = MemDisk::from_image(&img);
+        let o = old_mkdir_at(&old_disk, d1_ino, "d2", 0o40755);
+        let n = core_mkdir_at(&new_disk, d1_ino, "d2", 0o40755);
+        match (o, n) {
+            (Ok(oi), Ok(ni)) => assert_eq!(oi, ni, "nested mkdir inode mismatch"),
+            other => panic!("nested mkdir must succeed on both; got {other:?}"),
+        }
+        let sb = read_sb(&new_disk);
+        // 触及 d1（父，nlink++ + 新项）与 d2（新目录 '.'/'..'）。
+        mask_dirent_padding(&old_disk, &sb, d1_ino);
+        mask_dirent_padding(&new_disk, &sb, d1_ino);
+        let d2_ino = o.expect("d2 inode");
+        mask_dirent_padding(&old_disk, &sb, d2_ino);
+        mask_dirent_padding(&new_disk, &sb, d2_ino);
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// unlink 文件差分（含 BUG-19 验证）：create f1 后 unlink；对拍全盘（项删 + 子 nlink 调整；
+    /// **inode 位图仍占用、数据块未释放** = BUG-19）。再 unlink 目录 → EISDIR。
+    #[ktest]
+    fn dir_unlink_file_parity() {
+        // 建一个文件 f1（用 ext4_rs builder，两侧从同字节起步）。
+        let (img, inos) = build_files(&["f1"]);
+        let f1_ino = inos[0];
+
+        // unlink f1：全盘对拍（BUG-19：core 与 ext4_rs 都不 free inode / 不截块）。
+        let after = diff_unlink_step(&img, 2, "f1");
+
+        // BUG-19 显式验证：unlink 后 f1 的 inode 位图位仍置位（未释放）。
+        let disk = MemDisk::from_image(&after);
+        let sb = read_sb(&disk);
+        assert!(
+            inode_bitmap_bit_set(&disk, &sb, f1_ino),
+            "BUG-19: unlinked file inode bitmap bit must remain set (not freed)"
+        );
+        // f1 inode 仍可加载、links_count 已调整为 0（原 1 → 0）。
+        let f1 = crate::fs::ext4::core::inode::load_inode(&disk, &sb, f1_ino).expect("load f1");
+        assert_eq!(f1.raw.links_count(), 0, "unlinked file nlink == 0");
+
+        // unlink 一个目录 → EISDIR（两侧）。建 d1，unlink d1。
+        let dimg = build_dir_populated_image(&[DirOp::Mkdir {
+            parent: 2,
+            name: "d1",
+            mode: 0o40755,
+        }]);
+        let old_disk = MemDisk::from_image(&dimg);
+        let new_disk = MemDisk::from_image(&dimg);
+        let o = old_unlink_at(&old_disk, 2, "d1");
+        let n = core_unlink_at(&new_disk, 2, "d1");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "unlink dir errno mismatch"),
+            other => panic!("unlink dir must be EISDIR on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::EISDIR), "unlink dir → EISDIR");
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// rmdir 差分：mkdir d1 后 rmdir；对拍（父 nlink-1 + 子 nlink=0 + 子数据块释放 + 项删；
+    /// 子 inode 位图仍占用）。+ 删非空目录 ENOTEMPTY + 删 '.'/'..' EINVAL + 删文件用 rmdir → ENOTDIR。
+    #[ktest]
+    fn dir_rmdir_parity() {
+        // mkdir d1（空目录），再 rmdir d1。
+        let img = build_dir_populated_image(&[DirOp::Mkdir {
+            parent: 2,
+            name: "d1",
+            mode: 0o40755,
+        }]);
+        let d1_ino = old_lookup(&MemDisk::from_image(&img), 2, "d1").expect("d1 present");
+        let after = diff_rmdir_step(&img, 2, "d1");
+        // 子 inode 位图仍占用（BUG-19：rmdir 不 free inode）。
+        let disk = MemDisk::from_image(&after);
+        let sb = read_sb(&disk);
+        assert!(
+            inode_bitmap_bit_set(&disk, &sb, d1_ino),
+            "BUG-19: rmdir'd dir inode bitmap bit must remain set (not freed)"
+        );
+        let d1 = crate::fs::ext4::core::inode::load_inode(&disk, &sb, d1_ino).expect("load d1");
+        assert_eq!(d1.raw.links_count(), 0, "rmdir'd dir nlink == 0");
+
+        // 删非空目录 → ENOTEMPTY：在 d1 里建一个文件，再 rmdir d1。
+        let img2 = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "full",
+                mode: 0o40755,
+            },
+        ]);
+        let full_ino = old_lookup(&MemDisk::from_image(&img2), 2, "full").expect("full present");
+        // 在 full 下建一个文件（用 ext4_rs builder 续写同盘）。
+        let img3 = {
+            let disk = MemDisk::from_image(&img2);
+            let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+            ext4.ext4_create_at(full_ino, "inside", 0o100644)
+                .expect("create inside full");
+            disk.backing().lock().clone()
+        };
+        let old_disk = MemDisk::from_image(&img3);
+        let new_disk = MemDisk::from_image(&img3);
+        let o = old_rmdir_at(&old_disk, 2, "full");
+        let n = core_rmdir_at(&new_disk, 2, "full");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "rmdir non-empty errno mismatch"),
+            other => panic!("rmdir non-empty must be ENOTEMPTY on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::ENOTEMPTY), "rmdir non-empty → ENOTEMPTY");
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // 删 '.' / '..' → EINVAL（两侧；用 d1 已删的盘或原镜像均可，取原镜像根目录）。
+        for nm in [".", ".."] {
+            let old_disk = MemDisk::from_image(EXT4_IMAGE);
+            let new_disk = MemDisk::from_image(EXT4_IMAGE);
+            let o = old_rmdir_at(&old_disk, 2, nm);
+            let n = core_rmdir_at(&new_disk, 2, nm);
+            match (o, n) {
+                (Err(eo), Err(en)) => assert_eq!(eo, en, "rmdir '{nm}' errno mismatch"),
+                other => panic!("rmdir '{nm}' must be EINVAL on both; got {other:?}"),
+            }
+            assert_eq!(o, Err(ext4_rs::Errno::EINVAL), "rmdir '{nm}' → EINVAL");
+            assert_disk_eq(&old_disk, &new_disk);
+        }
+
+        // 删文件用 rmdir → ENOTDIR：建 f1，rmdir f1。
+        let (fimg, _) = build_files(&["f1"]);
+        let old_disk = MemDisk::from_image(&fimg);
+        let new_disk = MemDisk::from_image(&fimg);
+        let o = old_rmdir_at(&old_disk, 2, "f1");
+        let n = core_rmdir_at(&new_disk, 2, "f1");
+        match (o, n) {
+            (Err(eo), Err(en)) => assert_eq!(eo, en, "rmdir file errno mismatch"),
+            other => panic!("rmdir file must be ENOTDIR on both; got {other:?}"),
+        }
+        assert_eq!(o, Err(ext4_rs::Errno::ENOTDIR), "rmdir file → ENOTDIR");
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// lookup_at 差分：core `lookup_at`（命中 Ok(inode)、未命中 ENOENT）对拍 ext4_rs。
+    /// 复用 Task-1 的 `diff_lookup`，但新侧改走 core `lookup_at`（Task-3 的 namespace lookup）。
+    #[ktest]
+    fn dir_lookup_at_parity() {
+        let core_lookup_at =
+            |disk: &MemDisk, parent: u32, name: &str| -> core::result::Result<u32, ext4_rs::Errno> {
+                let sb = read_sb(disk);
+                let ctx = ReadCtx::new(disk, &sb);
+                let parent_inode = match crate::fs::ext4::core::inode::load_inode(disk, &sb, parent) {
+                    Ok(i) => i,
+                    Err(_) => return Err(ext4_rs::Errno::ENOENT),
+                };
+                match lookup_at(&ctx, &parent_inode, name.as_bytes()) {
+                    Ok(ino) => Ok(ino),
+                    Err(e) => Err(map_ns_errno(e.error())),
+                }
+            };
+        diff_lookup(EXT4_IMAGE, 2, "lost+found", core_lookup_at);
+        diff_lookup(EXT4_IMAGE, 2, "no-such", core_lookup_at);
+    }
+
+    /// create_unchecked / mkdir_unchecked + rmdir_at_fast 差分：core unchecked 接口与 checked
+    /// 接口落盘一致（unchecked 只动末块、返回 abs offset），且 rmdir_at_fast 按偏移删 == rmdir_at。
+    #[ktest]
+    fn dir_unchecked_and_fast_parity() {
+        // create_unchecked f1 vs ext4_rs ext4_create_at f1：最终盘字节应一致（根目录末块 try_insert）。
+        let old_disk = MemDisk::from_image(EXT4_IMAGE);
+        let new_disk = MemDisk::from_image(EXT4_IMAGE);
+        let old_ret = old_create_at(&old_disk, 2, "uf1", 0o100644);
+        let new_ret = {
+            let bs = read_sb(&new_disk).block_size();
+            let writer = DirectMetadataWriter::new(new_disk.clone(), bs);
+            let mut nctx = make_nctx(&new_disk, &writer);
+            create_unchecked_at(&mut nctx, 2, b"uf1", 0o100644)
+                .map(|(ino, _off)| ino)
+                .map_err(|e| map_ns_errno(e.error()))
+        };
+        match (old_ret, new_ret) {
+            (Ok(o), Ok(n)) => assert_eq!(o, n, "create_unchecked inode mismatch"),
+            other => panic!("create_unchecked must succeed on both; got {other:?}"),
+        }
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, 2);
+        mask_dirent_padding(&new_disk, &sb, 2);
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // mkdir_unchecked d1 vs ext4_rs ext4_mkdir_at d1：对拍。
+        let old_disk = MemDisk::from_image(EXT4_IMAGE);
+        let new_disk = MemDisk::from_image(EXT4_IMAGE);
+        let old_ret = old_mkdir_at(&old_disk, 2, "ud1", 0o40755);
+        let (new_ino, dir_off) = {
+            let bs = read_sb(&new_disk).block_size();
+            let writer = DirectMetadataWriter::new(new_disk.clone(), bs);
+            let mut nctx = make_nctx(&new_disk, &writer);
+            mkdir_unchecked_at(&mut nctx, 2, b"ud1", 0o40755).expect("mkdir_unchecked")
+        };
+        assert_eq!(old_ret, Ok(new_ino), "mkdir_unchecked inode mismatch");
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, 2);
+        mask_dirent_padding(&new_disk, &sb, 2);
+        mask_dirent_padding(&old_disk, &sb, new_ino);
+        mask_dirent_padding(&new_disk, &sb, new_ino);
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // rmdir_at_fast(parent, child, dir_off) vs ext4_rs ext4_rmdir_at: 在 mkdir_unchecked 后的
+        // new_disk 上跑 core rmdir_at_fast；旧侧用 ext4_rmdir_at 在 old_disk（同状态）上删 ud1。
+        let fast_ret = {
+            let bs = sb.block_size();
+            let writer = DirectMetadataWriter::new(new_disk.clone(), bs);
+            let mut nctx = make_nctx(&new_disk, &writer);
+            rmdir_at_fast(&mut nctx, 2, new_ino, dir_off).map_err(|e| map_ns_errno(e.error()))
+        };
+        let old_rm = old_rmdir_at(&old_disk, 2, "ud1");
+        match (old_rm, fast_ret) {
+            (Ok(()), Ok(())) => {}
+            other => panic!("rmdir_at_fast vs ext4_rmdir_at divergence: {other:?}"),
+        }
+        let sb2 = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb2, 2);
+        mask_dirent_padding(&new_disk, &sb2, 2);
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// 读出 inode `ino` 在其组 inode 位图里的 bit 是否置位（BUG-19 验证用）。
+    fn inode_bitmap_bit_set(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> bool {
+        let bs = sb.block_size();
+        let inodes_per_group = sb.inodes_per_group();
+        let group = (ino - 1) / inodes_per_group;
+        let index_in_group = ((ino - 1) % inodes_per_group) as usize;
+
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc_size = sb.group_desc_size();
+        let mut desc_buf = [0u8; 64];
+        let take = core::cmp::min(desc_size, 64);
+        let mut raw = vec![0u8; desc_size];
+        disk.read_at(gdt_off + group as usize * desc_size, raw.as_mut_slice());
+        desc_buf[..take].copy_from_slice(&raw[..take]);
+        let desc = RawGroupDescriptor::from_bytes(&desc_buf);
+
+        let bmp_off = desc.inode_bitmap() as usize * bs;
+        let byte_idx = index_in_group / 8;
+        let bit_idx = index_in_group % 8;
+        let mut byte = [0u8; 1];
+        disk.read_at(bmp_off + byte_idx, &mut byte);
+        (byte[0] >> bit_idx) & 1 == 1
+    }
 }

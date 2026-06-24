@@ -71,6 +71,31 @@ impl RawInode {
     pub fn links_count(&self) -> u16 {
         self.links_count
     }
+    /// 写 links_count（委托同名字段）。
+    /// [对照] ext4_rs `Ext4Inode::set_links_count`（ext4_defs/inode.rs:143）。
+    pub fn set_links_count(&mut self, links_count: u16) {
+        self.links_count = links_count;
+    }
+    /// 写 mode（含类型位 + 权限位）。
+    /// [对照] ext4_rs `Ext4Inode::set_mode`（ext4_defs/inode.rs:78）。
+    pub fn set_mode(&mut self, mode: u16) {
+        self.mode = mode;
+    }
+    /// 写 inode 标志位（含 extent 标志）。
+    /// [对照] ext4_rs `Ext4Inode::set_flags`（ext4_defs/inode.rs:164）。
+    pub fn set_flags(&mut self, flags: u32) {
+        self.flags = flags;
+    }
+    /// 写 i_extra_isize（128B+ inode 的额外尺寸）。
+    /// [对照] ext4_rs `Ext4Inode::set_i_extra_isize`（ext4_defs/inode.rs:228）。
+    pub fn set_i_extra_isize(&mut self, i_extra_isize: u16) {
+        self.i_extra_isize = i_extra_isize;
+    }
+    /// 文件类型位（mode & 0xF000）。
+    /// [对照] ext4_rs `Ext4Inode::file_type` 取 `mode & EXT4_INODE_MODE_TYPE_MASK`。
+    pub fn file_type(&self) -> u16 {
+        self.mode & S_IFMT
+    }
     /// 文件大小（size | size_hi<<32）。
     pub fn size(&self) -> u64 {
         (self.size as u64) | ((self.size_hi as u64) << 32)
@@ -235,6 +260,102 @@ impl Inode {
     pub(super) fn blocks_count(&self) -> u64 {
         self.raw.blocks()
     }
+
+    /// 链接计数（委托 [`RawInode::links_count`]）。
+    pub(super) fn links_count(&self) -> u16 {
+        self.raw.links_count()
+    }
+    /// 写链接计数（委托 [`RawInode::set_links_count`]）。
+    pub(super) fn set_links_count(&mut self, n: u16) {
+        self.raw.set_links_count(n);
+    }
+    /// 文件类型位（mode & 0xF000，委托 [`RawInode::file_type`]）。
+    pub(super) fn file_type(&self) -> u16 {
+        self.raw.file_type()
+    }
+    /// 是否目录（委托 [`RawInode::is_dir`]）。
+    pub(super) fn is_dir(&self) -> bool {
+        self.raw.is_dir()
+    }
+}
+
+/// 构造一个**新分配** inode 的逻辑句柄（in-memory），逐字节复刻 ext4_rs `create_inode`
+/// （ext4_impls/file.rs:589）：从全 0 的 [`RawInode`] 起，按 `inode_mode` 设 mode、按
+/// `inode_size > 128` 设 i_extra_isize，再按类型（dir/reg）设 EXTENTS flag + 初始化空
+/// extent header。links_count 起 **0**（ext4_rs `Ext4Inode::default()`；link 时再 +1/=2）。
+///
+/// PARITY 要点：
+/// - `mode = file_type_bits(inode_mode & 0xF000，非 dir/reg 归一为 REG 的语义见下) | (inode_mode & 0x0FFF)`。
+///   ext4_rs：`InodeFileType::from_bits(inode_mode & 0xF000)`，无法识别的类型位回落 S_IFREG
+///   （`bits()`=0x8000）；core 用 [`normalize_file_type_bits`] 复刻同一回落。
+/// - extra_isize：仅 `inode_size > 128` 时设为 SB 的 `want_extra_isize`。
+/// - dir 或 reg：flags = EXTENTS(0x80000)，extent header = {magic:0xF30A, entries:0, max:4,
+///   depth:0, generation:0} 写在 i_block 前 12 字节；其余 i_block 字节保持 0。其它类型 flags=0。
+pub(super) fn init_new_inode(inode_num: u32, inode_mode: u16, sb: &RawSuperblock) -> Inode {
+    const EXT4_INODE_MODE_TYPE_MASK: u16 = 0xF000;
+    const EXT4_INODE_MODE_PERM_MASK: u16 = 0x0FFF;
+    const S_IFREG: u16 = 0x8000;
+    const S_IFDIR_TY: u16 = 0x4000;
+    const EXT4_GOOD_OLD_INODE_SIZE: u16 = 128;
+
+    let mut raw = RawInode::default();
+
+    // PARITY: ext4_rs `InodeFileType::from_bits(inode_mode & TYPE_MASK)`，未知类型位 → S_IFREG。
+    let file_type_bits = normalize_file_type_bits(inode_mode & EXT4_INODE_MODE_TYPE_MASK);
+    let is_dir = file_type_bits == S_IFDIR_TY;
+    let is_reg = file_type_bits == S_IFREG;
+
+    // PARITY: 保留调用方权限位，仅归一类型位。
+    let file_mode = file_type_bits | (inode_mode & EXT4_INODE_MODE_PERM_MASK);
+    raw.set_mode(file_mode);
+
+    // PARITY: inode_size > 128 时设 i_extra_isize = SB want_extra_isize。
+    if sb.inode_size() > EXT4_GOOD_OLD_INODE_SIZE {
+        raw.set_i_extra_isize(sb.want_extra_isize);
+    }
+
+    if is_dir || is_reg {
+        raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+        extent_tree_init_into(&mut raw);
+    } else {
+        raw.set_flags(0);
+    }
+
+    Inode {
+        raw,
+        num: inode_num,
+    }
+}
+
+/// 把 `mode & 0xF000` 归一为 ext4_rs `InodeFileType::from_bits` 的语义：识别的类型位原样
+/// 返回，未知类型位回落 S_IFREG（0x8000）。复刻 `create_inode` 里 `from_bits(...).unwrap_or(S_IFREG)`。
+fn normalize_file_type_bits(type_bits: u16) -> u16 {
+    const S_IFIFO: u16 = 0x1000;
+    const S_IFCHR: u16 = 0x2000;
+    const S_IFDIR_TY: u16 = 0x4000;
+    const S_IFBLK: u16 = 0x6000;
+    const S_IFREG: u16 = 0x8000;
+    const S_IFLNK: u16 = 0xA000;
+    const S_IFSOCK: u16 = 0xC000;
+    match type_bits {
+        S_IFIFO | S_IFCHR | S_IFDIR_TY | S_IFBLK | S_IFREG | S_IFLNK | S_IFSOCK => type_bits,
+        _ => S_IFREG,
+    }
+}
+
+/// 在 `raw.block`（i_block 的 [u32;15]）前 12 字节写入空 extent 根头——安全 Pod 等价
+/// ext4_rs `Ext4Inode::extent_tree_init`（ext4_defs/inode.rs:384，原用裸指针写 header）。
+///
+/// PARITY：header = {magic:0xF30A, entries_count:0, max_entries_count:4, depth:0, generation:0}；
+/// i_block 其余字节（`init_new_inode` 从全 0 起步）保持 0。
+fn extent_tree_init_into(raw: &mut RawInode) {
+    use super::extents::{RawExtentHeader, EXTENT_MAGIC};
+    let header = RawExtentHeader::new(EXTENT_MAGIC, 0, 4, 0, 0);
+    let mut i_block = [0u8; 60];
+    i_block.copy_from_slice(raw.block.as_bytes());
+    i_block[..size_of::<RawExtentHeader>()].copy_from_slice(header.as_bytes());
+    let block: [u32; 15] = Pod::from_bytes(&i_block);
+    raw.block = block;
 }
 
 /// 从盘读第 `group` 组的组描述符（GDT 紧跟超级块块），与 Phase-2 分配器
