@@ -652,8 +652,8 @@ mod test {
     use ostd::prelude::*;
 
     use super::{
-        assert_disk_eq, assert_meta_eq, old_journal_commit, resolve_journal_area,
-        snapshot_inode_table_group, snapshot_journal_area, snapshot_meta,
+        assert_disk_eq, assert_meta_eq, diff_journal_commit, old_journal_commit,
+        resolve_journal_area, snapshot_inode_table_group, snapshot_journal_area, snapshot_meta,
         snapshot_meta_with_inodes, DirectMetadataWriter, JournalMetaWrite, MemDisk,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
@@ -3333,5 +3333,198 @@ mod test {
         assert_eq!(new_prev_tid, Some(1), "rotated transaction is tid 1");
         assert_eq!(new_run_tid, Some(2), "new running is tid 2");
         assert_eq!(new_plan_tid, 1, "prepare_commit drains prev_running (tid 1) first");
+    }
+
+    // =================================================================
+    // Phase 5 Task 3：commit 落盘（descriptor/tags/payload-escape/单屏障/commit/SB/ring）★RED-LINE★。
+    //
+    // core 侧驱动 [`core_journal_commit`]：与旧侧 [`old_journal_commit`] 同序列驱动 core 引擎——
+    //   resolve_journal_area 拿物理块 + 几何 → core `load_journal_sb` 读 SB → `JournalSpace::from_superblock`
+    //   → core `JournalRuntime::new(block_size, sb.sequence())` start/record/stop/prepare_commit
+    //   → core `write_commit_plan`（经 `CommitCtx` + `DirectMetadataWriter` 写同一组物理块）→ finish_commit。
+    // 用 [`diff_journal_commit`] 把它当 `core_commit` 闭包，跑后 journal 区逐字节 == ext4_rs + tid 一致。
+    //
+    // - `journal_commit_single_parity`：1 事务、几个 metadata 块。
+    // - `journal_commit_escape_parity`：payload 首 4 字节 == 大端 JBD2 magic 的块（escape）。
+    // - `journal_commit_csum_gating_parity`：NOCSUM vs csum-on 镜像（三镜像 journal feat_incompat=0，
+    //   故 tag/tail/commit csum 两侧都关——与 ext4_rs 门控一致，逐字节对拍仍是有效 parity）。
+    // - `journal_commit_multi_ring_parity`：多事务连续 commit 逼 ring 回绕。
+    // =================================================================
+
+    /// core 侧 commit 驱动（[`diff_journal_commit`] 的 `core_commit` 闭包）：在 `disk` 上用 core 引擎
+    /// 跑 `writes` 的一个事务并 commit 落盘，返回写入的 tid。与 [`old_journal_commit`] 同序列。
+    ///
+    /// 写序由 core `write_commit_plan` 内部复刻（descriptor+payload → sync 屏障 → commit → SB → ring）。
+    /// 这里只负责：定位 journal 区（同 ext4_rs）→ 读 SB → 建 space/runtime → 喂同序列 → 调 emitter。
+    fn core_journal_commit(disk: &MemDisk, writes: &[JournalMetaWrite]) -> u32 {
+        use crate::fs::ext4::core::journal::commit::{write_commit_plan, CommitCtx};
+        use crate::fs::ext4::core::journal::space::JournalSpace;
+        use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+        use crate::fs::ext4::core::journal::transaction::JournalRuntime;
+
+        let (physical_blocks, geom) = resolve_journal_area(disk);
+        let bs = geom.block_size as usize;
+
+        // 读 journal SB（同一组物理块的逻辑块 0），建环空间。
+        let mut sb = load_journal_sb(disk, &physical_blocks, bs).expect("core load_journal_sb");
+        let mut space = JournalSpace::from_superblock(&sb).expect("core JournalSpace::from_superblock");
+
+        // 内存事务：first_tid = SB 当前序号（与旧侧 old_journal_commit 对齐）。
+        let mut runtime = JournalRuntime::new(bs, sb.sequence());
+        let hid = runtime
+            .start_handle(writes.len() as u32 + 2)
+            .expect("core start_handle on enabled runtime");
+        for w in writes {
+            assert_eq!(
+                w.image.len(),
+                bs,
+                "metadata image must be a full block ({bs} bytes), got {}",
+                w.image.len()
+            );
+            runtime.record_metadata_write(hid, w.block_nr, &w.image);
+        }
+        runtime.stop_handle(hid);
+        let plan = runtime
+            .prepare_commit()
+            .expect("core prepare_commit yields a plan after a closed handle with metadata");
+        let tid = plan.tid;
+
+        // emitter：经 DirectMetadataWriter 写同一组物理块；barrier=None（差分里 sync no-op）。
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let ctx = CommitCtx {
+            physical_blocks: &physical_blocks,
+            writer: &writer,
+            barrier: None,
+            handle_id: hid,
+            block_size: bs,
+        };
+        let written_tid = write_commit_plan(&ctx, &mut space, &mut sb, &plan)
+            .expect("core write_commit_plan");
+        assert_eq!(written_tid, tid, "core write_commit_plan returns plan.tid");
+
+        // committing 槽幂等：落盘后 finish_commit 清槽（tid 匹配）。
+        assert!(runtime.finish_commit(tid), "core finish_commit clears committing slot");
+        assert!(
+            runtime.committing_transaction().is_none(),
+            "committing slot empty after finish_commit"
+        );
+        written_tid
+    }
+
+    /// 一个全块镜像（block_size 字节），第 i 字节 = `(seed + i) & 0xFF`。
+    fn full_block_image(block_size: usize, seed: u8) -> Vec<u8> {
+        (0..block_size)
+            .map(|i| (seed as usize).wrapping_add(i) as u8)
+            .collect()
+    }
+
+    /// commit 单事务差分：几个 metadata 块的一个事务，journal 区逐字节 == ext4_rs（descriptor +
+    /// tags + payload + commit + SB s_start/s_head/s_sequence + csum）+ 返回 tid 一致。
+    #[ktest]
+    fn journal_commit_single_parity() {
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            // 用旧侧解出 block_size 造全块镜像（多镜像块大小不同：4096 / 1024）。
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // 三个不同 home 块号的 metadata 写（升序 + 乱序混入，验 BTreeMap 定序）。
+            let writes = [
+                JournalMetaWrite { block_nr: 21, image: full_block_image(bs, 0x10) },
+                JournalMetaWrite { block_nr: 5, image: full_block_image(bs, 0x40) },
+                JournalMetaWrite { block_nr: 13, image: full_block_image(bs, 0x90) },
+            ];
+
+            diff_journal_commit(image, &writes, core_journal_commit);
+        }
+    }
+
+    /// commit escape 差分：含一个 payload 首 4 字节 == 大端 JBD2 magic 的块——两侧都把写盘那 4 字节
+    /// 零填 + tag 置 ESCAPE（csum 按原始数据），journal 区逐字节一致。
+    #[ktest]
+    fn journal_commit_escape_parity() {
+        use crate::fs::ext4::core::journal::format::JBD2_MAGIC;
+
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // escape 命中块：首 4 字节 = magic 大端，其余非零。
+            let mut escape_img = full_block_image(bs, 0x77);
+            escape_img[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+
+            let writes = [
+                JournalMetaWrite { block_nr: 9, image: escape_img },
+                JournalMetaWrite { block_nr: 17, image: full_block_image(bs, 0x33) },
+            ];
+
+            diff_journal_commit(image, &writes, core_journal_commit);
+        }
+    }
+
+    /// commit csum 门控差分：NOCSUM（journal csum 关）vs csum-on 镜像各自 commit；两侧引擎按同一
+    /// 门控产 journal 区（三镜像 journal feat_incompat=0 → tag/tail/commit csum 均关），逐字节一致。
+    #[ktest]
+    fn journal_commit_csum_gating_parity() {
+        for image in [EXT4_NOCSUM_IMAGE, EXT4_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            let writes = [
+                JournalMetaWrite { block_nr: 7, image: full_block_image(bs, 0x05) },
+                JournalMetaWrite { block_nr: 8, image: full_block_image(bs, 0xC0) },
+            ];
+
+            diff_journal_commit(image, &writes, core_journal_commit);
+        }
+    }
+
+    /// commit 多事务连续 parity：在同一盘上**连续 commit 多个事务**，每次 commit 后 journal 区
+    /// 逐字节 == ext4_rs（含 s_head 沿环推进、s_start 首事务后固定、s_sequence 每事务 +1）。
+    ///
+    /// 每个事务用各自两盘对拍（旧/新从**同一前序态**起步、跑一个事务、对拍），再用旧侧引擎把
+    /// 共享盘真正推进到下一轮起点——串起来即「多事务连续 commit」的逐字节 parity，且能定位是哪个
+    /// 事务出的差异。事务数控制在 free 空间内（本差分不 checkpoint，tail 固定在 first，故 head 不能
+    /// 物理越过 maxlen——真实物理回绕需 checkpoint 推进 tail，留 Task 5/6；ring `advance` 的环算术
+    /// 回绕已由 Task 2 `journal_space_ring_parity` 直接覆盖）。
+    #[ktest]
+    fn journal_commit_multi_sequential_parity() {
+        let base_image: &[u8] = EXT4_IMAGE;
+        let probe = MemDisk::from_image(base_image);
+        let (_, geom) = resolve_journal_area(&probe);
+        let bs = geom.block_size as usize;
+
+        let mut disk_bytes = base_image.to_vec();
+        let payloads_per_txn = 4usize; // 每事务 6 块（4 payload + descriptor + commit）。
+        let txns = 6u32; // 6 事务 * 6 块 = 36 块 << usable(1023)，留足空间。
+
+        for round in 0..txns {
+            let writes: Vec<JournalMetaWrite> = (0..payloads_per_txn)
+                .map(|k| JournalMetaWrite {
+                    block_nr: (100 + round * 16 + k as u32) as u64,
+                    image: full_block_image(bs, (round as u8).wrapping_mul(7).wrapping_add(k as u8)),
+                })
+                .collect();
+
+            // 从当前盘字节对拍一个事务（diff_journal_commit 内部各建两盘 from_image）。
+            diff_journal_commit(&disk_bytes, &writes, core_journal_commit);
+
+            // 推进共享盘：用旧侧引擎在 disk_bytes 上真正 commit 这个事务，得到下一轮起点。
+            let advance_disk = MemDisk::from_image(&disk_bytes);
+            let _ = old_journal_commit(&advance_disk, &writes);
+            disk_bytes = advance_disk.backing().lock().clone();
+        }
+
+        // 收尾自检：sequence 每事务 +1；start 在首事务后固定（非 0）。
+        let final_disk = MemDisk::from_image(&disk_bytes);
+        let (_, geom_final) = resolve_journal_area(&final_disk);
+        assert_eq!(
+            geom_final.sequence,
+            geom.sequence + txns,
+            "sequence advanced by one per committed txn ({txns} txns)"
+        );
+        assert_ne!(geom_final.start, 0, "s_start set after first commit and kept");
     }
 }

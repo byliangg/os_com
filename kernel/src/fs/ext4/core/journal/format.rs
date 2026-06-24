@@ -11,6 +11,28 @@ pub const JBD2_MAGIC: u32 = 0xC03B3998;
 /// 对应 ext4_rs `JBD2_SUPERBLOCK_V2`。
 pub const JBD2_SUPERBLOCK_V2: u32 = 4;
 
+/// descriptor 块类型（`h_blocktype` 逻辑值 1）。对应 ext4_rs `JBD2_DESCRIPTOR_BLOCK`。
+pub const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
+/// commit 块类型（`h_blocktype` 逻辑值 2）。对应 ext4_rs `JBD2_COMMIT_BLOCK`。
+pub const JBD2_COMMIT_BLOCK: u32 = 2;
+
+/// commit 块校验和类型 crc32c（`h_chksum_type`）。对应 ext4_rs `JBD2_CHECKSUM_TYPE_CRC32C`。
+pub const JBD2_CHECKSUM_TYPE_CRC32C: u8 = 4;
+
+/// incompat 特性位：64BIT（descriptor tag 携带 64 位块号高半，tag 长 12 字节而非 8）。
+/// 对应 ext4_rs `JBD2_FEATURE_INCOMPAT_64BIT`。
+pub const JBD2_FEATURE_INCOMPAT_64BIT: u32 = 0x0000_0002;
+
+/// descriptor tag flag：本 tag 的 journaled 块首 4 字节被 escape（写盘置零）。
+/// 对应 ext4_rs `JBD2_FLAG_ESCAPE`。
+pub const JBD2_FLAG_ESCAPE: u32 = 0x0000_0001;
+/// descriptor tag flag：该 tag 与上一个 tag 共用同一 UUID（不另携带 UUID）。
+/// 对应 ext4_rs `JBD2_FLAG_SAME_UUID`。
+pub const JBD2_FLAG_SAME_UUID: u32 = 0x0000_0002;
+/// descriptor tag flag：本 tag 是该 descriptor 块的最后一个 tag。
+/// 对应 ext4_rs `JBD2_FLAG_LAST_TAG`。
+pub const JBD2_FLAG_LAST_TAG: u32 = 0x0000_0008;
+
 /// journal 超级块大小（字节）；JBD2 SB 占 journal 逻辑块 0 的前 1024 字节。
 /// 对应 ext4_rs `JBD2_SUPERBLOCK_SIZE`。
 pub const JBD2_SUPERBLOCK_SIZE: usize = 1024;
@@ -34,6 +56,15 @@ pub(in crate::fs::ext4::core) struct RawJournalHeader {
 const_assert!(size_of::<RawJournalHeader>() == 12);
 
 impl RawJournalHeader {
+    /// 构造大端块头：magic 固定 `JBD2_MAGIC`，`blocktype`/`sequence` 编码为大端。
+    /// PARITY: ext4_rs `JournalHeader::new`（jbd2.rs:45-51）。
+    pub fn new(blocktype: u32, sequence: u32) -> Self {
+        Self {
+            h_magic: JBD2_MAGIC.to_be(),
+            h_blocktype: blocktype.to_be(),
+            h_sequence: sequence.to_be(),
+        }
+    }
     pub fn magic(&self) -> u32 {
         u32::from_be(self.h_magic)
     }
@@ -123,6 +154,30 @@ impl RawJournalSuperblock {
         (self.feature_incompat() & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3))
             != 0
     }
+    /// 是否开启某 incompat 特性。PARITY: ext4_rs `JournalSuperblock::has_incompat_feature`（jbd2.rs:233-235）。
+    pub fn has_incompat_feature(&self, feature: u32) -> bool {
+        (self.feature_incompat() & feature) != 0
+    }
+    /// 置环写入头（`s_head`，大端编码）。PARITY: ext4_rs `set_head`（jbd2.rs:229-231）。
+    pub fn set_head(&mut self, head: u32) {
+        self.s_head = head.to_be();
+    }
+    /// 置最老未 checkpoint 事务起点（`s_start`，大端编码）。
+    /// PARITY: ext4_rs `set_start`（jbd2.rs:225-227）。
+    pub fn set_start(&mut self, start: u32) {
+        self.s_start = start.to_be();
+    }
+    /// 置下一个事务序号。PARITY: ext4_rs `JournalSuperblock::set_sequence`（jbd2.rs:220-223）——
+    /// **同时**更新 `s_header.h_sequence` 与 `s_sequence`（两处都大端编码），逐字复刻。
+    pub fn set_sequence(&mut self, sequence: u32) {
+        self.s_header.h_sequence = sequence.to_be();
+        self.s_sequence = sequence.to_be();
+    }
+    /// 置 SB 校验和字段（`s_checksum`，大端编码）。逻辑值由 [`super::superblock::journal_sb_checksum`] 算。
+    /// PARITY: ext4_rs `update_checksum`（jbd2.rs:264-266）`s_checksum = compute_checksum().to_be()`。
+    pub fn set_checksum(&mut self, checksum: u32) {
+        self.s_checksum = checksum.to_be();
+    }
 }
 
 /// descriptor 块的 tag（CSUM_V2 / pre-v3，8 字节，大端）。
@@ -136,6 +191,14 @@ pub(super) struct RawJournalBlockTag {
 const_assert!(size_of::<RawJournalBlockTag>() == 8);
 
 impl RawJournalBlockTag {
+    /// 构造大端 8 字节 tag。PARITY: ext4_rs `JournalBlockTag::new`（jbd2.rs:278-284）。
+    pub fn new(blocknr: u32, checksum: u16, flags: u16) -> Self {
+        Self {
+            t_blocknr: blocknr.to_be(),
+            t_checksum: checksum.to_be(),
+            t_flags: flags.to_be(),
+        }
+    }
     pub fn blocknr(&self) -> u32 {
         u32::from_be(self.t_blocknr)
     }
@@ -156,6 +219,16 @@ pub(super) struct RawJournalBlockTag3 {
 const_assert!(size_of::<RawJournalBlockTag3>() == 16);
 
 impl RawJournalBlockTag3 {
+    /// 构造大端 16 字节 tag（64 位块号拆 low/high）。
+    /// PARITY: ext4_rs `JournalBlockTag3::new`（jbd2.rs:309-316）。
+    pub fn new(blocknr: u64, checksum: u32, flags: u32) -> Self {
+        Self {
+            t_blocknr: (blocknr as u32).to_be(),
+            t_flags: flags.to_be(),
+            t_blocknr_high: ((blocknr >> 32) as u32).to_be(),
+            t_checksum: checksum.to_be(),
+        }
+    }
     /// 64 位块号（high<<32 | low），均大端。
     pub fn blocknr(&self) -> u64 {
         ((u32::from_be(self.t_blocknr_high) as u64) << 32) | (u32::from_be(self.t_blocknr) as u64)
@@ -181,6 +254,27 @@ pub(super) struct RawCommitBlock {
 const_assert!(size_of::<RawCommitBlock>() == 64);
 
 impl RawCommitBlock {
+    /// 构造 commit 块（h_chksum_type=CRC32C(4)、h_chksum_size=4，其余零；时间戳留 0）。
+    /// PARITY: ext4_rs `CommitBlock::new`（jbd2.rs:344-354）——**逐字复刻**含 h_commit_sec/nsec=0
+    /// （ext4_rs 不填真实时间）。`_padding_tail` 是 core 为 Pod u64 对齐显式补的隐式 padding，置 0。
+    pub fn new(sequence: u32) -> Self {
+        Self {
+            h_header: RawJournalHeader::new(JBD2_COMMIT_BLOCK, sequence),
+            h_chksum_type: JBD2_CHECKSUM_TYPE_CRC32C,
+            h_chksum_size: 4,
+            h_padding: [0; 2],
+            h_chksum: [0; 8],
+            h_commit_sec: 0,
+            h_commit_nsec: 0,
+            _padding_tail: 0,
+        }
+    }
+    /// 写入 commit 校验和到 `h_chksum[0]`（大端编码）。
+    /// PARITY: ext4_rs `CommitBlock::with_checksum`（jbd2.rs:364-367）`h_chksum[0] = checksum.to_be()`。
+    pub fn with_checksum(mut self, checksum: u32) -> Self {
+        self.h_chksum[0] = checksum.to_be();
+        self
+    }
     pub fn header(&self) -> RawJournalHeader {
         self.h_header
     }
@@ -220,6 +314,12 @@ pub(super) struct RawJournalBlockTail {
 const_assert!(size_of::<RawJournalBlockTail>() == 4);
 
 impl RawJournalBlockTail {
+    /// 构造大端块尾校验和。PARITY: ext4_rs `JournalBlockTail::new`（jbd2.rs:409-413）。
+    pub fn new(checksum: u32) -> Self {
+        Self {
+            t_checksum: checksum.to_be(),
+        }
+    }
     pub fn checksum(&self) -> u32 {
         u32::from_be(self.t_checksum)
     }

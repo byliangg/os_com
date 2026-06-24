@@ -202,6 +202,10 @@ pub(in crate::fs::ext4::core) struct JournalRuntime {
     next_handle_id: u64,
     running: Option<JournalTransaction>,
     prev_running: Option<JournalTransaction>,
+    /// 正在 commit 落盘的事务槽。PARITY: ext4_rs journal.rs:63 `committing: Option<..>`。
+    /// `prepare_commit` 取出事务后停在此槽（不丢弃），`prepare_commit` 入口对它做幂等门控
+    /// （`committing.is_some()` → 返回 None），`finish_commit` 在 Task 3 commit 落盘后清空。
+    committing: Option<JournalTransaction>,
     active_handles: VecDeque<JournalHandle>,
 }
 
@@ -215,6 +219,7 @@ impl JournalRuntime {
             next_handle_id: 1,
             running: None,
             prev_running: None,
+            committing: None,
             active_handles: VecDeque::new(),
         }
     }
@@ -314,6 +319,14 @@ impl JournalRuntime {
         {
             return self.prev_running.as_mut();
         }
+        // PARITY: ext4_rs journal.rs:444-448 —— committing 槽也在查找范围内。
+        if self
+            .committing
+            .as_ref()
+            .is_some_and(|transaction| transaction.tid() == tid)
+        {
+            return self.committing.as_mut();
+        }
         None
     }
 
@@ -372,14 +385,23 @@ impl JournalRuntime {
         Some(tid)
     }
 
+    /// 当前正在 commit 落盘的事务（committing 槽）。PARITY: ext4_rs journal.rs:129-130
+    /// （`committing_transaction`）。差分用它确认 `prepare_commit` 后事务停在 committing 槽。
+    pub(in crate::fs::ext4::core) fn committing_transaction(&self) -> Option<&JournalTransaction> {
+        self.committing.as_ref()
+    }
+
     /// 产 commit plan（纯内存）：取 prev_running（无则 running），若仍有未关 handle 则放回返回 None；
-    /// 否则置 Commit、收集 buffers（BTreeMap 序 = block_nr 升序）成 plan。
+    /// 否则置 Commit、把事务停进 **committing 槽**、收集 buffers（BTreeMap 序 = block_nr 升序）成 plan。
     ///
-    /// PARITY: ext4_rs journal.rs:561-599（`prepare_commit`）；core 无 committing 槽——取出事务直接
-    /// 丢弃（commit 落盘由 Task 3 接），返回 plan。`metadata_blocks` 按 `buffers().values()` 序
-    /// （BTreeMap 升序）收集。
+    /// PARITY: ext4_rs journal.rs:561-599（`prepare_commit`）——**含 committing 槽 + 幂等门控**
+    /// （Task-2 review 补：Task 2 曾把取出的事务直接丢弃、无 committing 槽）：入口 `committing.is_some()`
+    /// → 返回 None（一次只能有一个 in-commit 事务）；取出事务置 Commit 后 `committing = Some(transaction)`
+    /// 停泊（不丢弃），落盘后由 [`finish_commit`](Self::finish_commit) 清槽。`metadata_blocks` 按
+    /// `buffers().values()` 序（BTreeMap 升序）收集——与停泊的事务字节一致。
     pub(in crate::fs::ext4::core) fn prepare_commit(&mut self) -> Option<JournalCommitPlan> {
-        if !self.enabled {
+        // PARITY: ext4_rs journal.rs:562 —— 幂等：已有 in-commit 事务则不再开新 commit。
+        if !self.enabled || self.committing.is_some() {
             return None;
         }
 
@@ -410,9 +432,28 @@ impl JournalRuntime {
                 block_data: buffer.block_data.clone(),
             })
             .collect();
-        Some(JournalCommitPlan {
+        let plan = JournalCommitPlan {
             tid: transaction.tid(),
             metadata_blocks,
-        })
+        };
+        // PARITY: ext4_rs journal.rs:596 —— 事务停进 committing 槽（不丢弃）。
+        self.committing = Some(transaction);
+        Some(plan)
+    }
+
+    /// 落盘完成后清 committing 槽（tid 匹配才清）。PARITY: ext4_rs journal.rs:601-619
+    /// （`finish_commit` 子集——core/journal 不做 checkpoint_list/last_committed_tid，那是 P6 集成层；
+    /// 此处只复刻「committing 槽幂等清除」语义：tid 不匹配则放回返回 false）。Task 3 的 commit 编排
+    /// 在 `write_commit_plan` 成功后调它，使 runtime 可接受下一个 commit。
+    pub(in crate::fs::ext4::core) fn finish_commit(&mut self, tid: u32) -> bool {
+        let Some(transaction) = self.committing.take() else {
+            return false;
+        };
+        if transaction.tid() != tid {
+            // PARITY: ext4_rs journal.rs:605-608 —— tid 不匹配，放回不清。
+            self.committing = Some(transaction);
+            return false;
+        }
+        true
     }
 }

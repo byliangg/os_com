@@ -11,6 +11,7 @@
 //! Task 0 仅扩展差分 harness（`super::diff_harness`，仅 ktest）以驱动/对拍 JBD2；
 //! 本模块的逻辑子模块由 Task 1+ 逐个 `pub mod` 进来。
 
+pub mod commit;
 pub mod format;
 pub mod space;
 pub mod superblock;
