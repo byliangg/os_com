@@ -18,30 +18,34 @@
 //! 派发**谓词**（`inode.uses_extents()`）与 ext4_rs `inode_uses_extents` 逐位一致，由 ktest
 //! `dispatch_predicate_parity` 钉死。
 
+use super::extents;
 use super::indirect;
 use super::inode::Inode;
+use super::io::BlockReader;
 use super::prelude::*;
+use super::superblock::RawSuperblock;
 
 /// 逻辑块 `lblock` → 物理块映射（读路径）。据 inode extent 标志派发：
-/// - `uses_extents()` → extent 读半部（Task 2 填，本 Task `unimplemented!`）；
+/// - `uses_extents()` → extent 读半部（[`extents::get_pblock_idx_state`]，Phase 3 Task 2）；
 /// - 否则 → 间接映射（[`indirect::get_pblock_idx_legacy`]，Phase 3 非目标，`unimplemented!`）。
 ///
 /// 返回 `Some((pblock, is_unwritten))`：映射到的物理块号 + 是否 unwritten extent；
 /// `None` 表示空洞（hole）。间接映射无 unwritten 状态（恒 `false`）。
 ///
-/// `ctx` 的具体类型由 Task 2 在填 extent 读半部时定（届时需块设备读 extent 树）；本 Task
-/// 不触发任一分支的实际映射，故仅取 `inode` 做派发谓词，`ctx` 暂以单元类型占位。
+/// extent 分支需经块设备读 extent 树，故注入 `reader` + `sb`（不持全局锁，只读路径
+/// 共享 guard 安全）；间接分支当前不读盘。
 ///
 /// [对照] ext4_rs `Ext4::get_pblock_idx_inner`（ext4_impls/inode.rs:255-261）的派发首段。
 #[allow(dead_code)]
 pub(super) fn map_block_for_read(
-    _ctx: (),
+    reader: &dyn BlockReader,
+    sb: &RawSuperblock,
     inode: &Inode,
     lblock: Ext4Lblk,
 ) -> Result<Option<(Ext4Fsblk, bool)>> {
     if inode.uses_extents() {
-        // extent 读半部：Phase 3 Task 2 落地（届时调 `extents::get_pblock_idx_state`）。
-        unimplemented!("extent block map — Phase 3 Task 2")
+        // extent 读半部（Task 2）：返回 Some((pblock, unwritten)) / None(hole)。
+        extents::get_pblock_idx_state(reader, sb, inode, lblock)
     } else {
         // 间接映射：Phase 3 非目标，stub。
         let pblock = indirect::get_pblock_idx_legacy(inode, lblock)?;

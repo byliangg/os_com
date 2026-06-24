@@ -27,6 +27,7 @@ pub mod block_map;
 mod indirect;
 mod migrate;
 pub mod extents;
+pub mod file;
 pub mod dir;
 pub mod journal;
 pub mod crc;

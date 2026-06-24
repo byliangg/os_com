@@ -199,6 +199,18 @@ impl Inode {
     pub(super) fn uses_extents(&self) -> bool {
         (self.flags() & EXT4_INODE_FLAG_EXTENTS) != 0
     }
+
+    /// i_block 的 60 字节（小端）——extent 树根字节视图。
+    ///
+    /// 安全替代 ext4_rs `find_extent` 里的 `transmute::<&[u32;15], &[u8;60]>`
+    /// （ext4_impls/extents.rs:188）：`[u32;15]` 是 Pod，`as_bytes()` 给出其
+    /// 60 字节小端镜像，与 transmute 逐字节等价。
+    pub(super) fn i_block_bytes(&self) -> [u8; 60] {
+        let block = self.raw.i_block();
+        let mut out = [0u8; 60];
+        out.copy_from_slice(block.as_bytes());
+        out
+    }
 }
 
 /// 从盘读第 `group` 组的组描述符（GDT 紧跟超级块块），与 Phase-2 分配器
