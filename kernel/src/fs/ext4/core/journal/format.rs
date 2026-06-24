@@ -8,9 +8,12 @@ use crate::fs::ext4::core::prelude::*;
 pub const JBD2_MAGIC: u32 = 0xC03B3998;
 
 /// JBD2 块通用头（12 字节，大端）。嵌在 superblock / commit / revoke 块开头。
+///
+/// 可见性 `pub(in crate::fs::ext4::core)`：随 [`RawJournalSuperblock::header`] 一同暴露给
+/// core 下的 ktest 差分 harness（避免 `pub` accessor 返回更私有类型的 private-in-public）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawJournalHeader {
+pub(in crate::fs::ext4::core) struct RawJournalHeader {
     pub h_magic: u32,
     pub h_blocktype: u32,
     pub h_sequence: u32,
@@ -33,9 +36,13 @@ impl RawJournalHeader {
 }
 
 /// JBD2 日志超级块（1024 字节，大端）。含大数组，**不派生 Default**。
+///
+/// 可见性 `pub(in crate::fs::ext4::core)`：除 `journal` 模块自身外，仅 ktest 差分 harness
+/// （`super::super::diff_harness`，core 下的兄弟模块）需要直接读它来对拍 journal 超级块；
+/// 其余 `RawJournal*` 内部类型保持 `pub(super)`。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawJournalSuperblock {
+pub(in crate::fs::ext4::core) struct RawJournalSuperblock {
     pub s_header: RawJournalHeader,
     pub s_blocksize: u32,
     pub s_maxlen: u32,
@@ -71,8 +78,20 @@ impl RawJournalSuperblock {
     pub fn maxlen(&self) -> u32 {
         u32::from_be(self.s_maxlen)
     }
+    /// 日志环第一个可用块（紧随逻辑块 0 的超级块）。
+    pub fn first(&self) -> u32 {
+        u32::from_be(self.s_first)
+    }
     pub fn sequence(&self) -> u32 {
         u32::from_be(self.s_sequence)
+    }
+    /// 当前最老未 checkpoint 事务的起始块；0 表示日志为空（无需恢复）。
+    pub fn start(&self) -> u32 {
+        u32::from_be(self.s_start)
+    }
+    /// 环形写入头（下一次 commit 的起始块）。
+    pub fn head(&self) -> u32 {
+        u32::from_be(self.s_head)
     }
 }
 

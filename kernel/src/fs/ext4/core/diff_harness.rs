@@ -355,6 +355,296 @@ pub(super) fn assert_meta_eq(a: &MetaSnapshot, b: &MetaSnapshot) {
     }
 }
 
+// =====================================================================
+// Phase 5 Task 0：JBD2 日志差分地基（仅 ktest）。
+//
+// 复用 Phase 2-4 的两-MemDisk 模式（旧 ext4_rs vs 新 core，同 journal 镜像、
+// 跑同序列、逐字节对拍），把它扩到 journal 区：
+//
+// - [`resolve_journal_area`]：经 ext4_rs `Jbd2Journal::load` 拿 journal inode 的
+//   物理块向量 + journal 超级块几何（first/maxlen/start/head/sequence/blocksize）。
+//   两侧差分引擎必须打到**同一组物理 journal 块**——本函数是唯一权威定位。
+// - [`snapshot_journal_area`]：按物理块逐块读出 journal 区字节，供 commit 后逐字节对拍。
+// - 旧侧驱动 [`old_journal_commit`]（open → JournalRuntime: start_handle →
+//   record_metadata_write_for_handle* → stop_handle → prepare_commit →
+//   `Jbd2Journal::write_commit_plan`）跑一段最小事务。
+// - 崩溃注入 seam [`JournalCrashStage`] + [`old_journal_commit_with_crash`]：包住
+//   ext4_rs `write_commit_plan_with_hook` 的 4 个 stage（BeforeDescriptor /
+//   BeforeCommitBlock / AfterCommitBlock / AfterSuperblock），供 Task 5 的恢复差分。
+// - [`diff_journal_commit`] / [`diff_journal_recover`] 骨架：旧半部现成，新（core）半部
+//   留闭包注入——Task 3 接 commit、Task 5 接 recovery，无需返工旧侧。
+//
+// 注意：JBD2 全大端，journal 超级块在 journal **逻辑块 0**（= physical_blocks[0]）。
+// =====================================================================
+
+/// journal 超级块几何（全大端读出后的逻辑值）。块号均为 journal **逻辑块**号
+/// （相对 journal 区起点，0 = journal 超级块所在块），经 physical_blocks 折成物理块。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JournalGeom {
+    /// journal 块大小（应 == fs block_size）。
+    pub block_size: u32,
+    /// 环第一个可用块（journal 逻辑块号；超级块占逻辑块 0，故 first 通常为 1）。
+    pub first: u32,
+    /// 环可用长度（journal 逻辑块数，含超级块前的保留？见 ext4_rs：maxlen = 总逻辑块）。
+    pub maxlen: u32,
+    /// 最老未 checkpoint 事务起始块；0 = 日志为空（无需恢复）。
+    pub start: u32,
+    /// 环写入头（下一次 commit 起始块）；0 表示尚未写过。
+    pub head: u32,
+    /// 下一个事务序号。
+    pub sequence: u32,
+}
+
+/// 经 ext4_rs `Jbd2Journal::load` 定位 journal 区：返回 journal inode 的**物理块向量**
+/// （`physical_blocks[i]` = journal 逻辑块 i 的 fs 物理块号）+ 几何 [`JournalGeom`]。
+///
+/// 这是差分两侧（旧 ext4_rs / 新 core）打 journal 的唯一权威定位——两侧用同一向量才能
+/// 保证写到**同一组物理块**、对拍才有意义。失败即 panic（fixture 必须带合法 journal inode）。
+pub(super) fn resolve_journal_area(disk: &MemDisk) -> (Vec<Ext4Fsblk>, JournalGeom) {
+    let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+    let journal = ext4_rs::Jbd2Journal::load(&ext4)
+        .unwrap_or_else(|e| panic!("Jbd2Journal::load failed (fixture must have a journal): {e:?}"));
+
+    let physical_blocks: Vec<Ext4Fsblk> = journal.device.physical_blocks().to_vec();
+    let geom = JournalGeom {
+        block_size: journal.superblock.block_size(),
+        first: journal.superblock.first(),
+        maxlen: journal.superblock.maxlen(),
+        start: journal.superblock.start(),
+        head: journal.superblock.head(),
+        sequence: journal.superblock.sequence(),
+    };
+    (physical_blocks, geom)
+}
+
+/// 读出 journal 区字节：按 `physical_blocks` 顺序逐块（`block_size` 字节）读出拼成一段。
+///
+/// 结果是「journal 逻辑块 0..N 的连续字节镜像」，与物理盘上是否连续无关——故两侧用各自的
+/// `physical_blocks`（实为同一组，由 [`resolve_journal_area`] 在同布局盘上解出）读出后可直接
+/// 逐字节比较。commit 前后各取一次即可判断「commit 是否写了 journal 区 / 写了哪里」。
+pub(super) fn snapshot_journal_area(
+    disk: &MemDisk,
+    physical_blocks: &[Ext4Fsblk],
+    block_size: usize,
+) -> Vec<u8> {
+    let mut out = vec![0u8; physical_blocks.len() * block_size];
+    for (i, &pblock) in physical_blocks.iter().enumerate() {
+        let off = (pblock as usize) * block_size;
+        disk.read_at(off, &mut out[i * block_size..(i + 1) * block_size]);
+    }
+    out
+}
+
+/// 崩溃注入阶段，一一对应 ext4_rs `JournalCommitWriteStage` 的 4 个 hook 点。
+///
+/// commit 写序（RED LINE）：写 descriptor+payload（异步）→ **sync 屏障** → 写 commit 块 →
+/// 更新 journal SB store → ring advance。这 4 个 stage 是「在某步**之后/之前**剪断」的注入点：
+/// - `BeforeDescriptor`：descriptor/payload 尚未写——模拟 commit 完全未开始。
+/// - `BeforeCommitBlock`：descriptor/payload 已写、commit 块尚未写——事务**不可** replay。
+/// - `AfterCommitBlock`：commit 块已写、SB 尚未更新——事务**可** replay，但 SB 还没指向它。
+/// - `AfterSuperblock`：SB 已更新——事务完全持久、可恢复。
+///
+/// Task 5 用 [`crash_at`] 把某 stage 当「崩溃点」：在该 hook 触发时记下/快照，得到一份
+/// 「崩在该 stage」的 journal 区，再喂给两侧 `recover` 对拍。
+#[allow(dead_code)] // Task 5 wires the recovery differential that consumes these stages
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JournalCrashStage {
+    BeforeDescriptor,
+    BeforeCommitBlock,
+    AfterCommitBlock,
+    AfterSuperblock,
+}
+
+impl JournalCrashStage {
+    /// 映射到 ext4_rs 的 stage 枚举（崩溃注入 hook 用）。
+    fn to_ext4_rs(self) -> ext4_rs::JournalCommitWriteStage {
+        match self {
+            JournalCrashStage::BeforeDescriptor => {
+                ext4_rs::JournalCommitWriteStage::BeforeDescriptor
+            }
+            JournalCrashStage::BeforeCommitBlock => {
+                ext4_rs::JournalCommitWriteStage::BeforeCommitBlock
+            }
+            JournalCrashStage::AfterCommitBlock => {
+                ext4_rs::JournalCommitWriteStage::AfterCommitBlock
+            }
+            JournalCrashStage::AfterSuperblock => {
+                ext4_rs::JournalCommitWriteStage::AfterSuperblock
+            }
+        }
+    }
+}
+
+/// 旧侧驱动用的一条「写元数据块」操作：把 `image`（全块镜像，长度应 == block_size）
+/// 记到 journal 逻辑块 `block_nr`（= 在 `JournalRuntime` 里按 `block_nr*block_size` 字节偏移
+/// 记录，落进事务的 `BTreeMap<block_nr, JournalBuffer>`，对应 descriptor tag 的 target 块号）。
+#[derive(Debug, Clone)]
+pub(super) struct JournalMetaWrite {
+    pub block_nr: Ext4Fsblk,
+    pub image: Vec<u8>,
+}
+
+/// 用 ext4_rs 在 `disk` 上跑一段最小 journal 事务并 commit 落盘：
+/// `Ext4::open` → `Jbd2Journal::load` → `JournalRuntime::new(block_size, sequence)` →
+/// `start_handle` → 每个 [`JournalMetaWrite`] `record_metadata_write_for_handle` →
+/// `stop_handle` → `prepare_commit` → `Jbd2Journal::write_commit_plan`。
+///
+/// 返回 commit 写入的 tid（= 序号）。任一环节失败即 panic（这是构造良性 fixture 的旧侧驱动，
+/// 不是被对拍的 core 侧；setup 失败属测试用法错误）。`writes` 不可为空（commit plan 至少 1 块）。
+pub(super) fn old_journal_commit(disk: &MemDisk, writes: &[JournalMetaWrite]) -> u32 {
+    old_journal_commit_inner(disk, writes, None, || {})
+}
+
+/// 同 [`old_journal_commit`]，但在 commit 写序的某 stage 注入「崩溃」：当 ext4_rs 触发
+/// `crash_at` 对应的 hook 时，`on_crash` 被调用一次（可在此对 `disk` 快照）。注入**只观测**，
+/// 不打断 ext4_rs 后续步骤——「崩在此 stage」的 journal 区 = `on_crash` 触发瞬间的盘字节，
+/// 由调用方在 `on_crash` 里截取。返回 commit tid。供 Task 5 造各 stage 的崩溃态。
+#[allow(dead_code)] // Task 5 wires the recovery differential (crash-injection seam)
+pub(super) fn old_journal_commit_with_crash(
+    disk: &MemDisk,
+    writes: &[JournalMetaWrite],
+    crash_at: JournalCrashStage,
+    on_crash: impl FnMut(),
+) -> u32 {
+    old_journal_commit_inner(disk, writes, Some(crash_at), on_crash)
+}
+
+/// [`old_journal_commit`] / [`old_journal_commit_with_crash`] 的公共实现。
+/// `crash_at` 为某 stage 时，ext4_rs 触发该 stage 的 hook 会调用一次 `on_crash`（仅观测，
+/// 不打断后续步骤）；为 `None` 时 `on_crash` 永不被调用（传 no-op 即可，非 `'static`，
+/// 故 `on_crash` 用泛型不装箱——允许借用本地状态对 `disk` 快照）。
+fn old_journal_commit_inner(
+    disk: &MemDisk,
+    writes: &[JournalMetaWrite],
+    crash_at: Option<JournalCrashStage>,
+    mut on_crash: impl FnMut(),
+) -> u32 {
+    assert!(
+        !writes.is_empty(),
+        "old_journal_commit needs ≥1 metadata write (commit plan must have ≥1 block)"
+    );
+
+    let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+    let block_device = ext4.block_device.clone();
+    let mut journal = ext4_rs::Jbd2Journal::load(&ext4)
+        .unwrap_or_else(|e| panic!("Jbd2Journal::load failed: {e:?}"));
+    let block_size = journal.superblock.block_size() as usize;
+
+    // 内存事务状态机：first_tid = journal SB 当前序号（与 ext4_rs commit 写的 plan.tid 对齐）。
+    let mut runtime = ext4_rs::JournalRuntime::new(block_size, journal.superblock.sequence());
+
+    let handle = runtime
+        .start_handle(writes.len() as u32 + 2, None)
+        .expect("start_handle on enabled runtime");
+    let handle_id = handle.handle_id();
+    for w in writes {
+        assert_eq!(
+            w.image.len(),
+            block_size,
+            "metadata image must be a full block ({} bytes), got {}",
+            block_size,
+            w.image.len()
+        );
+        // record_metadata_write_for_handle 按 byte offset 记录，block_nr = offset/block_size。
+        let offset = (w.block_nr as usize) * block_size;
+        let image = w.image.clone();
+        runtime.record_metadata_write_for_handle(handle_id, offset, &w.image, move |_| image.clone());
+    }
+    runtime.stop_handle(handle);
+
+    let plan = runtime
+        .prepare_commit()
+        .expect("prepare_commit yields a plan after a closed handle with metadata");
+    let tid = plan.tid;
+
+    let result = match crash_at {
+        None => journal.write_commit_plan(&block_device, &plan),
+        Some(stage) => {
+            let target = stage.to_ext4_rs();
+            journal.write_commit_plan_with_hook(&block_device, &plan, |reached| {
+                if reached == target {
+                    on_crash();
+                }
+            })
+        }
+    };
+    result.unwrap_or_else(|e| panic!("write_commit_plan failed: {e:?}"));
+    tid
+}
+
+/// commit 差分骨架：两张独立 `MemDisk`（同初始 `image` 字节），旧侧用 [`old_journal_commit`]
+/// 跑 `writes` 并 commit，新（core）侧由 `core_commit` 闭包注入（**Task 3 wires the core side**）。
+/// 跑后对拍 journal 区逐字节 + 两侧返回 tid 一致。
+///
+/// Task 0 仅提供结构与旧半部；新半部留闭包，Task 3 接 core `write_commit_plan` 时无需返工旧侧。
+/// 故 Task 0 暂无调用者 → `#[allow(dead_code)]`。
+#[allow(dead_code)] // Task 3 wires the core side (core::journal::commit::write_commit_plan)
+pub(super) fn diff_journal_commit(
+    image: &[u8],
+    writes: &[JournalMetaWrite],
+    core_commit: impl FnOnce(&MemDisk, &[JournalMetaWrite]) -> u32,
+) {
+    let old_disk = MemDisk::from_image(image);
+    let new_disk = MemDisk::from_image(image);
+
+    // 两侧用各自盘解出的物理块向量（同布局盘 → 同一组物理块）。
+    let (old_blocks, geom) = resolve_journal_area(&old_disk);
+    let (new_blocks, _) = resolve_journal_area(&new_disk);
+    assert_eq!(old_blocks, new_blocks, "journal physical blocks must match across disks");
+    let bs = geom.block_size as usize;
+
+    let old_tid = old_journal_commit(&old_disk, writes);
+    let new_tid = core_commit(&new_disk, writes);
+    assert_eq!(old_tid, new_tid, "commit tid mismatch: old {old_tid} new {new_tid}");
+
+    let old_area = snapshot_journal_area(&old_disk, &old_blocks, bs);
+    let new_area = snapshot_journal_area(&new_disk, &new_blocks, bs);
+    assert_journal_area_eq(&old_area, &new_area, &old_blocks, bs);
+}
+
+/// recovery 差分骨架：给一份**已崩溃**（某 stage）的初始 `image`，两侧各跑恢复/replay，
+/// 对拍 home 区逐字节 + 恢复结果。旧侧由 `old_recover` 闭包（Task 5 接 ext4_rs `recovery`），
+/// 新侧由 `core_recover` 闭包（**Task 5 wires the core side**：core `recovery::recover`）。
+///
+/// Task 0 仅提供结构 + journal-区/全盘对拍工具；两侧 recover 闭包留待 Task 5。
+/// 故 Task 0 暂无调用者 → `#[allow(dead_code)]`。
+#[allow(dead_code)] // Task 5 wires both recover sides (ext4_rs recovery vs core::journal::recovery)
+pub(super) fn diff_journal_recover(
+    crashed_image: &[u8],
+    old_recover: impl FnOnce(&MemDisk),
+    core_recover: impl FnOnce(&MemDisk),
+) {
+    let old_disk = MemDisk::from_image(crashed_image);
+    let new_disk = MemDisk::from_image(crashed_image);
+    old_recover(&old_disk);
+    core_recover(&new_disk);
+    // replay 后 home 区（整盘）逐字节一致。
+    assert_disk_eq(&old_disk, &new_disk);
+}
+
+/// 逐字节比对两段 journal 区镜像；不等时 panic 并报**首个差异的 journal 逻辑块 + 块内偏移 +
+/// 物理块号 + 两侧字节值**（比 `assert_disk_eq` 的盘内 offset 更便于定位 descriptor/tag/commit）。
+#[allow(dead_code)] // consumed by diff_journal_commit (Task 3+)
+pub(super) fn assert_journal_area_eq(
+    a: &[u8],
+    b: &[u8],
+    physical_blocks: &[Ext4Fsblk],
+    block_size: usize,
+) {
+    assert_eq!(a.len(), b.len(), "journal area length differs ({} vs {})", a.len(), b.len());
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x != y {
+            let lblock = i / block_size;
+            let in_block = i % block_size;
+            let pblock = physical_blocks.get(lblock).copied().unwrap_or(0);
+            panic!(
+                "journal area mismatch at logical block {lblock} (phys {pblock}) byte {in_block}: \
+                 {x:#04x} != {y:#04x}"
+            );
+        }
+    }
+}
+
 #[cfg(ktest)]
 mod test {
     use alloc::format;
@@ -362,8 +652,9 @@ mod test {
     use ostd::prelude::*;
 
     use super::{
-        assert_disk_eq, assert_meta_eq, snapshot_inode_table_group, snapshot_meta,
-        snapshot_meta_with_inodes, DirectMetadataWriter, MemDisk,
+        assert_disk_eq, assert_meta_eq, old_journal_commit, resolve_journal_area,
+        snapshot_inode_table_group, snapshot_journal_area, snapshot_meta,
+        snapshot_meta_with_inodes, DirectMetadataWriter, JournalMetaWrite, MemDisk,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::inode::{inode_checksum, RawInode};
@@ -2447,5 +2738,102 @@ mod test {
             entries.is_empty() || entries.iter().all(|e| !e.name.is_empty()),
             "corrupted-block enumeration must not panic and must yield only well-formed entries"
         );
+    }
+
+    // =================================================================
+    // Phase 5 Task 0：JBD2 日志差分地基 ktest。
+    //
+    // 注：新-vs-旧的 `journal_sb_load_parity`（core 侧读 journal SB）推迟到 Task 1
+    // （core::journal::superblock 实现后）。本 Task 只验证 harness 本身：
+    // (a) journal 区可定位且几何合理；(b) 旧侧驱动能跑一个最小 commit、journal 区确实被写、
+    //     journal SB s_sequence 推进——证明 harness 能驱动 ext4_rs JBD2。
+    // =================================================================
+
+    /// journal 区定位基线：`resolve_journal_area(EXT4_IMAGE)` 解出物理块向量 + 几何，
+    /// 并直接从 journal 逻辑块 0（physical_blocks[0]）大端读出 journal 超级块，断言：
+    /// magic == 0xC03B3998、s_blocksize == fs block_size、s_maxlen > 0、first 合理、物理块非空。
+    #[ktest]
+    fn journal_area_resolve_baseline() {
+        use crate::fs::ext4::core::journal::format::{RawJournalSuperblock, JBD2_MAGIC};
+
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&disk);
+        let fs_bs = sb.block_size() as u32;
+
+        let (physical_blocks, geom) = resolve_journal_area(&disk);
+
+        // 物理块向量非空，且块数与 maxlen 一致（journal inode 的逻辑块数 = maxlen）。
+        assert!(!physical_blocks.is_empty(), "journal physical_blocks must be non-empty");
+        assert!(geom.maxlen > 0, "journal s_maxlen must be > 0; got {}", geom.maxlen);
+        assert_eq!(
+            geom.block_size, fs_bs,
+            "journal s_blocksize ({}) must equal fs block_size ({fs_bs})",
+            geom.block_size
+        );
+        // first 是环第一个可用块；超级块占逻辑块 0，故 first 在 (0, maxlen) 内。
+        assert!(
+            geom.first > 0 && geom.first < geom.maxlen,
+            "journal s_first ({}) must be in (0, maxlen={})",
+            geom.first,
+            geom.maxlen
+        );
+
+        // 直接大端读 journal 超级块（journal 逻辑块 0 = 第一个物理块），核对 magic。
+        let bs = geom.block_size as usize;
+        let mut sb_block = vec![0u8; bs];
+        disk.read_at((physical_blocks[0] as usize) * bs, sb_block.as_mut_slice());
+        let jsb = RawJournalSuperblock::from_bytes(&sb_block[..1024]);
+        assert_eq!(
+            jsb.header().magic(),
+            JBD2_MAGIC,
+            "journal SB magic must be 0xC03B3998 (big-endian at journal block 0)"
+        );
+        assert_eq!(jsb.blocksize(), geom.block_size, "RawJournalSuperblock blocksize == geom");
+        assert_eq!(jsb.maxlen(), geom.maxlen, "RawJournalSuperblock maxlen == geom");
+        assert_eq!(jsb.first(), geom.first, "RawJournalSuperblock first == geom");
+        assert_eq!(jsb.sequence(), geom.sequence, "RawJournalSuperblock sequence == geom");
+    }
+
+    /// 旧侧驱动基线：用 ext4_rs 在 `EXT4_IMAGE` 克隆盘上跑一个最小事务（写 1 个元数据块镜像）
+    /// 并 commit，断言 (a) journal 区字节**确实变了**（commit 写了 descriptor/payload/commit/SB）、
+    /// (b) journal SB 的 s_sequence **推进了** 1（ext4_rs commit 写序第 ④ 步）。
+    /// 证明 [`old_journal_commit`] 能驱动 ext4_rs JBD2——后续 Task 3 的 commit 差分靠它当旧基准。
+    #[ktest]
+    fn journal_old_driver_commit_advances() {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let (physical_blocks, geom_before) = resolve_journal_area(&disk);
+        let bs = geom_before.block_size as usize;
+
+        // commit 前的 journal 区快照 + 起始序号。
+        let before = snapshot_journal_area(&disk, &physical_blocks, bs);
+        let seq_before = geom_before.sequence;
+
+        // 一个全块镜像（block_size 字节）的元数据写，记到 journal 逻辑块 1
+        // （随便选的 home 块号——Task 0 不验 home 内容，只验 commit 落进 journal 区）。
+        let mut image = vec![0u8; bs];
+        for (i, b) in image.iter_mut().enumerate() {
+            *b = (i & 0xFF) as u8;
+        }
+        let writes = [JournalMetaWrite { block_nr: 1, image }];
+
+        let tid = old_journal_commit(&disk, &writes);
+        assert_eq!(tid, seq_before, "commit tid must equal the SB sequence at commit time");
+
+        // commit 后：journal 区字节应已改变（至少 descriptor + commit + SB 块被写）。
+        let after = snapshot_journal_area(&disk, &physical_blocks, bs);
+        assert_ne!(before, after, "journal area must change after a commit (commit wrote nothing?)");
+
+        // journal SB s_sequence 推进了（write_commit_plan: update_sequence(seq+1)）。
+        let (_, geom_after) = resolve_journal_area(&disk);
+        assert_eq!(
+            geom_after.sequence,
+            seq_before.saturating_add(1),
+            "journal SB s_sequence must advance by 1 after commit (before {seq_before}, after {})",
+            geom_after.sequence
+        );
+        // s_start 在原本为空（start==0）时被置为 descriptor 块（commit 写序第 ④ 步）。
+        if geom_before.start == 0 {
+            assert_ne!(geom_after.start, 0, "empty journal: s_start must be set to the commit's start block");
+        }
     }
 }
