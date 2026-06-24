@@ -622,6 +622,85 @@ pub(super) fn diff_journal_recover(
     assert_disk_eq(&old_disk, &new_disk);
 }
 
+/// 造一份「崩在 `crash_at` stage」的盘字节：在 `image` 克隆盘上用 ext4_rs commit-with-hook
+/// 跑 `writes`，在 `crash_at` 对应的 hook 触发瞬间快照整盘字节并返回——即「崩溃后的盘」。
+///
+/// ext4_rs 的崩溃注入是**只观测、不打断**（hook 后 ext4_rs 仍继续写完）；故「崩在某 stage」
+/// 的盘 = 该 hook 触发那一刻的字节快照（此刻该 stage 之前的写已落、之后的写未落）。Task 5
+/// 用它造各 stage 的恢复输入：
+/// - `BeforeDescriptor`：descriptor/payload/commit/SB 全未写——journal 区仍是初始 fixture（空，
+///   `s_start==0`），两侧 recover 均不 replay（needs_recovery=false），home 不变。
+/// - `BeforeCommitBlock`：descriptor+payload 已写、commit 未写、SB 未更新（`s_start` 仍 0）——
+///   SCAN 找不到 commit（needs_recovery 仍 false，因 SB 未指向），不 replay。
+/// - `AfterCommitBlock`：commit 已写、SB 未更新（`s_start` 仍 0）——SB 未指向该事务，needs_recovery
+///   仍 false，不 replay（事务可 replay 但 SB 没记录它，恢复无从知晓——与真盘崩溃语义一致）。
+/// - `AfterSuperblock`：SB 已更新（`s_start` 指向 descriptor）——needs_recovery=true，两侧 replay
+///   该事务到 home。
+pub(super) fn build_crashed_journal_image(
+    image: &[u8],
+    writes: &[JournalMetaWrite],
+    crash_at: JournalCrashStage,
+) -> Vec<u8> {
+    let disk = MemDisk::from_image(image);
+    let backing = disk.backing();
+    let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let captured_cb = captured.clone();
+    let on_crash = move || {
+        // 首次触发该 stage 时快照整盘（commit plan 单事务、单次触发即足）。
+        let mut slot = captured_cb.lock();
+        if slot.is_none() {
+            *slot = Some(backing.lock().clone());
+        }
+    };
+    old_journal_commit_with_crash(&disk, writes, crash_at, on_crash);
+    captured
+        .lock()
+        .take()
+        .expect("crash hook must fire once for the requested stage")
+}
+
+/// 旧侧（ext4_rs）恢复驱动：`Ext4::open` → `Jbd2Journal::load` → `journal.recover(&block_device)`。
+/// 返回 ext4_rs `JournalRecoveryResult`（差分对拍其字段）。setup 失败即 panic（旧侧是基准）；
+/// `recover` 本身的 Ok/Err 由调用方用 `match (old, new)` 对拍——本 helper 返回 `Result` 透传。
+#[allow(dead_code)] // consumed by Task 5 recovery differential tests
+pub(super) fn old_journal_recover(
+    disk: &MemDisk,
+) -> core::result::Result<ext4_rs::JournalRecoveryResult, ext4_rs::Ext4Error> {
+    let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+    let block_device = ext4.block_device.clone();
+    let mut journal = ext4_rs::Jbd2Journal::load(&ext4)
+        .unwrap_or_else(|e| panic!("Jbd2Journal::load failed (recovery fixture): {e:?}"));
+    journal.recover(&block_device)
+}
+
+/// 新侧（core）恢复驱动：`load_journal_sb` → 建 [`RecoverCtx`]（reader/writer = 同一 `MemDisk`）→
+/// core `recovery::recover(&ctx, &mut sb)`。返回 `(core RecoverResult, 重置后的 sb)`，透传 `Result`。
+///
+/// 注意：core `recover` 把重置后的 SB 既 store 回盘（块 0）又写进 `sb` 出参——差分用出参 `sb`
+/// 对拍 `s_start/s_sequence/s_head/checksum`，用整盘对拍盘上 SB 块字节。
+#[allow(dead_code)] // consumed by Task 5 recovery differential tests
+pub(super) fn core_journal_recover(
+    disk: &MemDisk,
+) -> Result<(
+    crate::fs::ext4::core::journal::recovery::RecoverResult,
+    crate::fs::ext4::core::journal::format::RawJournalSuperblock,
+)> {
+    use crate::fs::ext4::core::journal::recovery::{recover, RecoverCtx};
+    use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+
+    let (physical_blocks, geom) = resolve_journal_area(disk);
+    let bs = geom.block_size as usize;
+    let mut sb = load_journal_sb(disk, &physical_blocks, bs)?;
+    let ctx = RecoverCtx {
+        physical_blocks: &physical_blocks,
+        reader: disk,
+        writer: disk,
+        block_size: bs,
+    };
+    let result = recover(&ctx, &mut sb)?;
+    Ok((result, sb))
+}
+
 /// 逐字节比对两段 journal 区镜像；不等时 panic 并报**首个差异的 journal 逻辑块 + 块内偏移 +
 /// 物理块号 + 两侧字节值**（比 `assert_disk_eq` 的盘内 offset 更便于定位 descriptor/tag/commit）。
 #[allow(dead_code)] // consumed by diff_journal_commit (Task 3+)
@@ -652,10 +731,11 @@ mod test {
     use ostd::prelude::*;
 
     use super::{
-        assert_disk_eq, assert_journal_area_eq, assert_meta_eq, diff_journal_commit,
-        old_journal_commit, resolve_journal_area, snapshot_inode_table_group,
-        snapshot_journal_area, snapshot_meta, snapshot_meta_with_inodes, DirectMetadataWriter,
-        JournalMetaWrite, MemDisk,
+        assert_disk_eq, assert_journal_area_eq, assert_meta_eq, build_crashed_journal_image,
+        core_journal_recover, diff_journal_commit, old_journal_commit, old_journal_recover,
+        resolve_journal_area, snapshot_inode_table_group, snapshot_journal_area, snapshot_meta,
+        snapshot_meta_with_inodes, DirectMetadataWriter, JournalCrashStage, JournalMetaWrite,
+        MemDisk,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::inode::{inode_checksum, RawInode};
@@ -3674,6 +3754,315 @@ mod test {
             assert_eq!(new_removed, 1, "block 13 removed from exactly one checkpoint txn");
             assert!(new_table_revoked, "core revoke table records the revoked block");
             assert!(new_buffer_gone, "core checkpoint buffer for revoked block deleted");
+        }
+    }
+
+    // =================================================================
+    // Phase 5 Task 5：recovery / replay 三趟差分（★RED-LINE★）。
+    //
+    // 设计（grounded against ext4_rs recovery.rs）：
+    // - 用崩溃注入 seam（`build_crashed_journal_image`）造各 stage 的崩溃态盘字节。
+    // - 两侧各跑 recover：旧 `old_journal_recover`（ext4_rs `Jbd2Journal::recover`），
+    //   新 `core_journal_recover`（core `journal::recovery::recover`）。
+    // - **对拍（显式，brief Task-0 note）**：
+    //   (a) HOME 目标块逐字节相等（replay 真正落到的 fs 块）——直接 read_at(block*bs) 比对；
+    //   (b) 重置后的 journal SB 字段 s_start / s_sequence / s_head + s_checksum 相等；
+    //   (c) `RecoverResult` 字段（transactions_replayed / metadata_blocks_replayed /
+    //       revoked_blocks / last_sequence）相等；
+    //   (d) **整盘** `assert_disk_eq` 作为兜底——因 (b) 已先确认两侧把 SB 重置成字节相同
+    //       （replay 会改写 s_start/s_sequence/s_head/csum），整盘对拍不会被良性 SB 分歧误报。
+    // - csum：ext4_rs recovery **全程不校 crc**（仅 magic+blocktype+commit.seq==desc.seq）——
+    //   故「坏 csum」不改变 recovery 行为；`journal_recover_badcsum_parity` 改坏 commit
+    //   块（magic / seq），那才是 ext4_rs 真正的「事务无效→停 replay」判据，两侧同停。
+    // - 崩溃采样**非穷举**（report §10.3）：4 stage 采样，不假称穷举。
+    // - e2fsck scoping：replay 后 HOME 字节 == ext4_rs HOME 字节即 parity gate；真「dump
+    //   replayed MemDisk → 宿主 e2fsck」不在 ktest 内可行（QEMU/宿主侧），是 P6 端到端项——
+    //   见 task-5-report.md。这里**不**跑 e2fsck / QEMU。
+    // =================================================================
+
+    /// 读 `disk` 上 home 块 `block`（block_size 字节）。
+    fn read_home_block(disk: &MemDisk, block: Ext4Fsblk, block_size: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; block_size];
+        disk.read_at((block as usize) * block_size, buf.as_mut_slice());
+        buf
+    }
+
+    /// 对拍重置后的 journal SB 字段（两侧均已 replay 并重置）。
+    /// 旧侧从盘上 journal 块 0 解 ext4_rs SB；新侧用 core `recover` 的出参 SB（== 盘上）。
+    fn assert_reset_sb_eq(
+        old_disk: &MemDisk,
+        old_blocks: &[Ext4Fsblk],
+        new_sb: &crate::fs::ext4::core::journal::format::RawJournalSuperblock,
+        block_size: usize,
+    ) {
+        use crate::fs::ext4::core::journal::format::RawJournalSuperblock;
+        use crate::fs::ext4::core::journal::format::JBD2_SUPERBLOCK_SIZE;
+
+        let sb_pblock = old_blocks[0];
+        let mut sb_block = vec![0u8; block_size];
+        old_disk.read_at((sb_pblock as usize) * block_size, sb_block.as_mut_slice());
+        let old_sb = RawJournalSuperblock::from_bytes(&sb_block[..JBD2_SUPERBLOCK_SIZE]);
+
+        assert_eq!(old_sb.start(), new_sb.start(), "reset s_start mismatch");
+        assert_eq!(old_sb.sequence(), new_sb.sequence(), "reset s_sequence mismatch");
+        assert_eq!(old_sb.head(), new_sb.head(), "reset s_head mismatch");
+        assert_eq!(old_sb.checksum(), new_sb.checksum(), "reset s_checksum mismatch");
+        // 头 sequence（set_sequence 同改 s_header.h_sequence）也对拍。
+        assert_eq!(
+            old_sb.header().sequence(),
+            new_sb.header().sequence(),
+            "reset s_header.h_sequence mismatch"
+        );
+    }
+
+    /// 一个全块镜像（block_size 字节），第 i 字节 = `(seed + i) & 0xFF`。
+    fn recover_block_image(block_size: usize, seed: u8) -> Vec<u8> {
+        (0..block_size)
+            .map(|i| (seed as usize).wrapping_add(i) as u8)
+            .collect()
+    }
+
+    /// 跑一个 stage 的恢复差分，返回 `(old_blocks, bs, home_blocks)` 供调用方做额外断言。
+    /// 内部：造崩溃态 → 两侧 recover → 对拍 (a) HOME 块 (b) 重置 SB (c) RecoverResult (d) 整盘。
+    /// `expect_replayed`：该 stage 是否应有事务被 replay（HOME 块是否应被写）。
+    fn run_recover_stage(
+        image: &[u8],
+        writes: &[JournalMetaWrite],
+        stage: JournalCrashStage,
+        expect_replayed: bool,
+    ) {
+        let probe = MemDisk::from_image(image);
+        let (probe_blocks, geom) = resolve_journal_area(&probe);
+        let bs = geom.block_size as usize;
+
+        let crashed = build_crashed_journal_image(image, writes, stage);
+
+        // pristine 盘（未崩溃、未恢复）——对照 home 块的「原始」字节（不应被 replay 改写时用）。
+        let pristine = MemDisk::from_image(image);
+
+        let old_disk = MemDisk::from_image(&crashed);
+        let new_disk = MemDisk::from_image(&crashed);
+
+        // 旧 / 新各跑 recover；用 `match (old, new)` 对拍 Ok/Err（绝不 .expect 假定旧侧成功）。
+        let old_res = old_journal_recover(&old_disk);
+        let new_res = core_journal_recover(&new_disk);
+        match (&old_res, &new_res) {
+            (Ok(old), Ok((new, new_sb))) => {
+                // (c) RecoverResult 字段对拍。
+                assert_eq!(
+                    old.transactions_replayed, new.transactions_replayed,
+                    "transactions_replayed mismatch [{image:?} {stage:?}]"
+                );
+                assert_eq!(
+                    old.metadata_blocks_replayed, new.metadata_blocks_replayed,
+                    "metadata_blocks_replayed mismatch [{image:?} {stage:?}]"
+                );
+                assert_eq!(
+                    old.revoked_blocks, new.revoked_blocks,
+                    "revoked_blocks mismatch [{image:?} {stage:?}]"
+                );
+                assert_eq!(
+                    old.last_sequence, new.last_sequence,
+                    "last_sequence mismatch [{image:?} {stage:?}]"
+                );
+
+                // (a) HOME 目标块逐字节相等。
+                for w in writes {
+                    let old_home = read_home_block(&old_disk, w.block_nr, bs);
+                    let new_home = read_home_block(&new_disk, w.block_nr, bs);
+                    assert_eq!(
+                        old_home, new_home,
+                        "HOME block {} bytes differ between engines [{image:?} {stage:?}]",
+                        w.block_nr
+                    );
+                    if expect_replayed {
+                        // replay 应把 journaled 镜像写到 home。
+                        assert_eq!(
+                            new_home, w.image,
+                            "replayed HOME block {} != journaled image [{image:?} {stage:?}]",
+                            w.block_nr
+                        );
+                    } else {
+                        // 未 commit / SB 未指向 → 不 replay；home 仍是 pristine 字节。
+                        let orig = read_home_block(&pristine, w.block_nr, bs);
+                        assert_eq!(
+                            new_home, orig,
+                            "non-replayed HOME block {} must be unchanged [{image:?} {stage:?}]",
+                            w.block_nr
+                        );
+                    }
+                }
+
+                // 该 stage 是否真有事务被 replay 的不变量。
+                if expect_replayed {
+                    assert!(
+                        new.transactions_replayed >= 1,
+                        "expected ≥1 replayed txn [{image:?} {stage:?}]"
+                    );
+                    assert!(
+                        new.metadata_blocks_replayed >= 1,
+                        "expected ≥1 replayed metadata block [{image:?} {stage:?}]"
+                    );
+                } else {
+                    assert_eq!(
+                        new.transactions_replayed, 0,
+                        "expected 0 replayed txn [{image:?} {stage:?}]"
+                    );
+                    assert_eq!(
+                        new.metadata_blocks_replayed, 0,
+                        "expected 0 replayed metadata block [{image:?} {stage:?}]"
+                    );
+                }
+
+                // (b) 重置后 journal SB 字段对拍（两侧都重置，replay 与否都 store）。
+                assert_reset_sb_eq(&old_disk, &probe_blocks, new_sb, bs);
+
+                // (d) 兜底：整盘逐字节相等（已先确认 SB 重置字节同 → 不误报）。
+                assert_disk_eq(&old_disk, &new_disk);
+            }
+            (Err(_), Err(_)) => { /* 两侧同样失败也算 parity（本测试 fixture 不应触发） */ }
+            (o, n) => panic!(
+                "recover Ok/Err divergence [{image:?} {stage:?}]: old={:?} new_is_ok={}",
+                o.as_ref().map(|_| ()),
+                n.is_ok()
+            ),
+        }
+    }
+
+    /// AfterSuperblock（已 commit、SB 已指向）→ 两侧 replay → HOME 逐字节 + SB 重置 + RecoverResult
+    /// 一致。**核心 happy-path recovery parity。**
+    #[ktest]
+    fn journal_recover_replay_parity() {
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // 三个 home 块（升序 + 乱序混入，验 BTreeMap 定序在 replay 序里也保持）。
+            let writes = [
+                JournalMetaWrite { block_nr: 21, image: recover_block_image(bs, 0x11) },
+                JournalMetaWrite { block_nr: 5, image: recover_block_image(bs, 0x55) },
+                JournalMetaWrite { block_nr: 13, image: recover_block_image(bs, 0x99) },
+            ];
+
+            run_recover_stage(image, &writes, JournalCrashStage::AfterSuperblock, true);
+        }
+    }
+
+    /// 4 崩溃 stage 覆盖：BeforeDescriptor / BeforeCommitBlock / AfterCommitBlock（均 SB 未指向 →
+    /// needs_recovery=false → 不 replay）/ AfterSuperblock（SB 已指向 → replay）。各 stage replay
+    /// 后 HOME 逐字节 + SB + RecoverResult 一致。
+    #[ktest]
+    fn journal_recover_crash_stage_parity() {
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            let writes = [
+                JournalMetaWrite { block_nr: 13, image: recover_block_image(bs, 0x20) },
+                JournalMetaWrite { block_nr: 5, image: recover_block_image(bs, 0x40) },
+                JournalMetaWrite { block_nr: 21, image: recover_block_image(bs, 0x60) },
+            ];
+
+            // 未 commit / SB 未指向 → recover 不 replay（home 不变）。
+            run_recover_stage(image, &writes, JournalCrashStage::BeforeDescriptor, false);
+            run_recover_stage(image, &writes, JournalCrashStage::BeforeCommitBlock, false);
+            run_recover_stage(image, &writes, JournalCrashStage::AfterCommitBlock, false);
+            // SB 已指向 → replay。
+            run_recover_stage(image, &writes, JournalCrashStage::AfterSuperblock, true);
+        }
+    }
+
+    /// 坏 csum parity：造一个已 commit 态（AfterSuperblock）的盘，再**破坏 commit 块**（改其序号，
+    /// 使 commit.sequence != descriptor.sequence）——这是 ext4_rs recovery 唯一的「事务无效→停」
+    /// 判据（recovery 不校 crc）。两侧 SCAN 都在该事务前停（视为未 commit），不 replay；HOME 逐字节
+    /// 一致（都没写）。验证「坏 csum/坏 commit 停 replay 一致」。
+    #[ktest]
+    fn journal_recover_badcsum_parity() {
+        use crate::fs::ext4::core::journal::format::{RawJournalHeader, JBD2_COMMIT_BLOCK};
+
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (probe_blocks, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            let writes = [
+                JournalMetaWrite { block_nr: 13, image: recover_block_image(bs, 0x33) },
+                JournalMetaWrite { block_nr: 21, image: recover_block_image(bs, 0x77) },
+            ];
+
+            // 造已 commit + SB 指向的盘。
+            let mut crashed = build_crashed_journal_image(image, &writes, JournalCrashStage::AfterSuperblock);
+
+            // 定位 commit 块（journal 逻辑块）：descriptor=s_start，commit=descriptor + N(payload) + 1。
+            // 这里事务的 commit 在 journal 区里：descriptor 块后跟 writes.len() 个 payload，再 commit。
+            // 解出当前 s_start（崩溃态的 SB 已指向 descriptor）。
+            let crashed_disk = MemDisk::from_image(&crashed);
+            let (_, crashed_geom) = resolve_journal_area(&crashed_disk);
+            let start = crashed_geom.start;
+            assert_ne!(start, 0, "AfterSuperblock crash must leave s_start != 0");
+            // commit 逻辑块 = start + writes.len() + 1（descriptor + payloads + commit）。
+            // journal 环在该事务范围内不回绕（fixture maxlen 远大于 N+2），故线性偏移成立。
+            let commit_logical = start + writes.len() as u32 + 1;
+            let commit_phys = probe_blocks[commit_logical as usize];
+            let commit_off = (commit_phys as usize) * bs;
+
+            // 破坏 commit 块：读出 12B 头，把 h_sequence 改成一个不匹配的值，写回。
+            // recovery 据 commit.sequence == descriptor.sequence 判事务有效——改坏即「该事务无效」。
+            let mut hdr_bytes = vec![0u8; size_of::<RawJournalHeader>()];
+            crashed_disk.read_at(commit_off, hdr_bytes.as_mut_slice());
+            let hdr = RawJournalHeader::from_bytes(&hdr_bytes);
+            assert_eq!(
+                hdr.blocktype(),
+                JBD2_COMMIT_BLOCK,
+                "located block must be the commit block [{image:?}]"
+            );
+            // 改 h_sequence（偏移 8..12，大端）成一个绝不匹配 descriptor.sequence 的值。
+            let bad_seq = hdr.sequence().wrapping_add(0x5A5A_5A5A).wrapping_add(1);
+            let corrupt = RawJournalHeader::new(JBD2_COMMIT_BLOCK, bad_seq);
+            crashed[commit_off..commit_off + size_of::<RawJournalHeader>()]
+                .copy_from_slice(corrupt.as_bytes());
+
+            // 现在两侧 recover：commit.seq != descriptor.seq → SCAN 视该事务未 commit → 不 replay。
+            let pristine = MemDisk::from_image(image);
+            let old_disk = MemDisk::from_image(&crashed);
+            let new_disk = MemDisk::from_image(&crashed);
+
+            let old_res = old_journal_recover(&old_disk);
+            let new_res = core_journal_recover(&new_disk);
+            match (&old_res, &new_res) {
+                (Ok(old), Ok((new, new_sb))) => {
+                    assert_eq!(
+                        old.transactions_replayed, new.transactions_replayed,
+                        "badcsum transactions_replayed mismatch [{image:?}]"
+                    );
+                    assert_eq!(
+                        new.transactions_replayed, 0,
+                        "corrupt commit → 0 replayed txns [{image:?}]"
+                    );
+                    assert_eq!(
+                        old.metadata_blocks_replayed, new.metadata_blocks_replayed,
+                        "badcsum metadata_blocks_replayed mismatch [{image:?}]"
+                    );
+                    // HOME 块未被写（都 stop 在坏 commit 前）：两侧 + pristine 三者一致。
+                    for w in &writes {
+                        let old_home = read_home_block(&old_disk, w.block_nr, bs);
+                        let new_home = read_home_block(&new_disk, w.block_nr, bs);
+                        let orig = read_home_block(&pristine, w.block_nr, bs);
+                        assert_eq!(old_home, new_home, "badcsum HOME {} engine mismatch [{image:?}]", w.block_nr);
+                        assert_eq!(new_home, orig, "badcsum HOME {} must be unchanged [{image:?}]", w.block_nr);
+                    }
+                    assert_reset_sb_eq(&old_disk, &probe_blocks, new_sb, bs);
+                    assert_disk_eq(&old_disk, &new_disk);
+                }
+                (Err(_), Err(_)) => {}
+                (o, n) => panic!(
+                    "badcsum recover Ok/Err divergence [{image:?}]: old={:?} new_is_ok={}",
+                    o.as_ref().map(|_| ()),
+                    n.is_ok()
+                ),
+            }
         }
     }
 }
