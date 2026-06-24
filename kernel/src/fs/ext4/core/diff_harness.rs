@@ -2993,4 +2993,345 @@ mod test {
         // v2 取低 16 位是调用方截断——这里确认截断语义与全 32 位一致。
         assert_eq!((new_tag & 0xFFFF) as u16, (old_tag & 0xFFFF) as u16, "v2 tag low-16 truncation");
     }
+
+    // =================================================================
+    // Phase 5 Task 2：JournalSpace 环形空间 + 事务/handle 状态机 → JournalCommitPlan 差分。
+    //
+    // - `journal_space_ring_parity`：同几何构造 core/ext4_rs `JournalSpace`，跑同一串
+    //   advance_head/set_tail（含 WRAP-AROUND：advance 越过 maxlen），对拍
+    //   free_blocks/distance/head/tail；再用真镜像几何对拍 from_superblock。
+    // - `journal_commit_plan_parity`：同序列（start_handle → record_metadata_write* 含重复
+    //   block + 短/超 block_size 镜像 → stop_handle → prepare_commit）喂两侧 JournalRuntime，
+    //   对拍 plan.tid + metadata_blocks（block 集合 + 序 + 镜像字节）。`match (old,new)`，
+    //   旧侧不 `.expect()`（admission/commit 失败也参与对拍）。
+    // =================================================================
+
+    /// JournalSpace 环形数学差分：core `JournalSpace`（`from_superblock`）vs ext4_rs
+    /// `JournalSpace`（经 `Jbd2Journal::load(&ext4).space` 取实例——其类型未在 ext4_rs 公开
+    /// 命名，但 `Jbd2Journal.space` 字段公开、方法公开，可直驱）。两侧从**同一真镜像**几何起步，
+    /// 跑同一串 advance_head/set_tail（含 WRAP-AROUND：advance 量越过 maxlen），逐步对拍
+    /// free_blocks/distance/head/tail。
+    #[ktest]
+    fn journal_space_ring_parity() {
+        use crate::fs::ext4::core::journal::space::JournalSpace;
+        use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let disk = MemDisk::from_image(image);
+            let (physical_blocks, geom) = resolve_journal_area(&disk);
+            let bs = geom.block_size as usize;
+
+            // 新侧：core from_superblock（读同一组物理块的逻辑块 0）。
+            let sb = load_journal_sb(&disk, &physical_blocks, bs).expect("core load SB for ring");
+            let mut new_space = JournalSpace::from_superblock(&sb).expect("core from_superblock");
+
+            // 旧侧：ext4_rs Jbd2Journal::load(&ext4).space（同镜像几何）。类型未公开命名，
+            // 故用 `let mut old_space = journal.space;`（类型推断，从不书写其名）。
+            let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+            let journal = ext4_rs::Jbd2Journal::load(&ext4).expect("ext4_rs Jbd2Journal::load");
+            let mut old_space = journal.space;
+
+            // from_superblock parity：初始几何 + free_blocks 一致。
+            assert_eq!(new_space.first(), old_space.first(), "from_superblock first ({image:?})");
+            assert_eq!(new_space.maxlen(), old_space.maxlen(), "from_superblock maxlen");
+            assert_eq!(new_space.head(), old_space.head(), "from_superblock head");
+            assert_eq!(new_space.tail(), old_space.tail(), "from_superblock tail");
+            assert_eq!(new_space.free_blocks(), old_space.free_blocks(), "from_superblock free_blocks");
+
+            // usable = maxlen - first；选若干 advance 量含越过 usable 的回绕（usable+5 / 2*usable）。
+            let usable = old_space.maxlen() - old_space.first();
+            let advances = [3u32, usable + 5, 7, 2 * usable, 0, usable.saturating_sub(1)];
+            for &blocks in &advances {
+                let new_h = new_space.advance_head(blocks);
+                let old_h = old_space.advance_head(blocks);
+                assert_eq!(new_h, old_h, "advance_head({blocks}) head value (wrap-aware)");
+                assert_eq!(new_space.head(), old_space.head(), "head after advance_head({blocks})");
+                assert_eq!(
+                    new_space.free_blocks(),
+                    old_space.free_blocks(),
+                    "free_blocks after advance_head({blocks})"
+                );
+                // distance(tail, head) 含回绕分支对拍。
+                assert_eq!(
+                    new_space.distance(new_space.tail(), new_space.head()),
+                    old_space.distance(old_space.tail(), old_space.head()),
+                    "distance(tail,head) after advance_head({blocks})"
+                );
+            }
+
+            // set_tail 串：合法值（first / first+usable/2 / maxlen-1）+ 越界值（0 / maxlen）。
+            let first = old_space.first();
+            let maxlen = old_space.maxlen();
+            let tails = [first, first + usable / 2, maxlen - 1, 0, maxlen];
+            for &t in &tails {
+                let new_r = new_space.set_tail(t);
+                let old_r = old_space.set_tail(t);
+                // `match (old, new)` —— Ok/Err 同构；不 `.expect()` 旧侧。
+                match (old_r, new_r) {
+                    (Ok(()), Ok(())) => {
+                        assert_eq!(new_space.tail(), old_space.tail(), "tail after set_tail({t})");
+                        assert_eq!(
+                            new_space.free_blocks(),
+                            old_space.free_blocks(),
+                            "free_blocks after set_tail({t})"
+                        );
+                        assert_eq!(
+                            new_space.distance(new_space.tail(), new_space.head()),
+                            old_space.distance(old_space.tail(), old_space.head()),
+                            "distance after set_tail({t})"
+                        );
+                    }
+                    (Err(oe), Err(ne)) => {
+                        assert_eq!(oe.error() as i32, ne.error() as i32, "set_tail({t}) errno");
+                    }
+                    (o, n) => panic!(
+                        "set_tail({t}) Ok/Err shape mismatch: old ok={} new ok={}",
+                        o.is_ok(),
+                        n.is_ok()
+                    ),
+                }
+            }
+
+            // 直接对拍 distance 的全部三分支（from==to / to>from / 回绕 to<from）。
+            let probes = [(first, first), (first, maxlen - 1), (maxlen - 1, first)];
+            for &(f, t) in &probes {
+                assert_eq!(
+                    new_space.distance(f, t),
+                    old_space.distance(f, t),
+                    "distance({f},{t}) standalone"
+                );
+            }
+        }
+    }
+
+    /// JournalCommitPlan 差分（Part A）：同序列喂 core/ext4_rs `JournalRuntime`，对拍 plan.tid +
+    /// metadata_blocks（block 集合 + 序 + 镜像字节）。序列含**重复 block**（去重 → 最新镜像）+
+    /// **短镜像**（< block_size → 零填）——这两种在两侧 runtime API（core 全块 API vs ext4_rs
+    /// offset API at offset 0）产同一 `BTreeMap<block_nr, JournalBuffer>` 结果。
+    ///
+    /// 注：**超长镜像**（> block_size）的 BUG-8 截断单独在 [`journal_commit_plan_bug8_clamp`]
+    /// 验证——ext4_rs 的 runtime offset API 会把超长镜像**跨块切片**（journal.rs:503-540 的
+    /// `chunk_len = min(block_size - offset, ..)`），与 core 全块 API 的「单块截断」形状不同，
+    /// 故超长项的 parity 在 transaction 级（base-image clamp = BUG-8 的真实触发处）单独对拍。
+    #[ktest]
+    fn journal_commit_plan_parity() {
+        use crate::fs::ext4::core::journal::transaction::JournalRuntime;
+
+        let block_size = 8usize;
+        let first_tid = 1u32;
+
+        // (block_nr, image)；BTreeMap 去重 + block_nr 升序 → 期望 plan 顺序 0,1,2。
+        let writes: &[(u64, Vec<u8>)] = &[
+            (2u64, (10..18u8).collect::<Vec<u8>>()), // 恰好 8 字节
+            (0u64, vec![1, 2, 3]),                   // 短：3 < 8 → 零填到 8
+            (1u64, (20..28u8).collect::<Vec<u8>>()), // 恰好 8 字节
+            (0u64, vec![7, 7, 7, 7, 7]),             // 重复 block 0：覆盖为 5 字节 → 零填到 8
+        ];
+
+        // ---- 新侧（core）：全块 API ----
+        let new_plan = {
+            let mut rt = JournalRuntime::new(block_size, first_tid);
+            let hid = rt.start_handle(writes.len() as u32 + 2).expect("core start_handle");
+            for (block, image) in writes {
+                rt.record_metadata_write(hid, *block, image);
+            }
+            let tid = rt.stop_handle(hid).expect("core stop_handle returns tid");
+            let plan = rt.prepare_commit().expect("core prepare_commit yields plan");
+            assert_eq!(plan.tid, tid, "core plan.tid == stop_handle tid");
+            plan
+        };
+
+        // ---- 旧侧（ext4_rs）：offset API at offset = block_nr*block_size ----
+        let old_plan = {
+            let mut rt = ext4_rs::JournalRuntime::new(block_size, first_tid);
+            // `match` 旧侧 Option（start_handle 可能 None）——不 `.expect()` 假定成功。
+            let handle = match rt.start_handle(writes.len() as u32 + 2, None) {
+                Some(h) => h,
+                None => panic!("ext4_rs start_handle returned None on enabled runtime"),
+            };
+            let hid = handle.handle_id();
+            for (block, image) in writes {
+                let offset = (*block as usize) * block_size;
+                // load_block 闭包用独立 clone（与传入 `image` 借用不冲突）。短镜像由 load_block 给基底。
+                let base = image.clone();
+                rt.record_metadata_write_for_handle(hid, offset, image, move |_| base.clone());
+            }
+            rt.stop_handle(handle);
+            match rt.prepare_commit() {
+                Some(p) => p,
+                None => panic!("ext4_rs prepare_commit yielded None"),
+            }
+        };
+
+        // ---- 对拍：tid + metadata_blocks（block 集合 + 序 + 镜像字节） ----
+        assert_eq!(new_plan.tid, old_plan.tid, "commit plan tid: core vs ext4_rs");
+        assert_eq!(
+            new_plan.metadata_blocks.len(),
+            old_plan.metadata_blocks.len(),
+            "metadata_blocks count: core vs ext4_rs"
+        );
+        for (i, (n, o)) in new_plan
+            .metadata_blocks
+            .iter()
+            .zip(old_plan.metadata_blocks.iter())
+            .enumerate()
+        {
+            assert_eq!(n.block_nr, o.block_nr, "metadata_blocks[{i}] block_nr");
+            assert_eq!(
+                n.block_data, o.block_data,
+                "metadata_blocks[{i}] image bytes (block {})",
+                n.block_nr
+            );
+            assert_eq!(
+                n.block_data.len(),
+                block_size,
+                "metadata_blocks[{i}] full block ({block_size} bytes)"
+            );
+        }
+        // 显式验证去重定序：block 0,1,2 升序、block 0 = 覆盖后最新镜像（零填）。
+        let new_blocks: Vec<u64> = new_plan.metadata_blocks.iter().map(|b| b.block_nr).collect();
+        assert_eq!(new_blocks, vec![0, 1, 2], "BTreeMap dedup+order: 0,1,2");
+        assert_eq!(
+            new_plan.metadata_blocks[0].block_data,
+            vec![7, 7, 7, 7, 7, 0, 0, 0],
+            "block 0 dedup → latest image, zero-padded"
+        );
+    }
+
+    /// BUG-8 size-clamp 差分（Part B）：base-image clamp 的真实触发处。core 全块 API 把
+    /// `full_image` 直接 clamp 到 block_size（短→零填，超长→截断）；ext4_rs 在 transaction 级
+    /// 对 `load_block()` 基底做同一 clamp（transaction.rs:154-158），随后 offset-0 的 data 写
+    /// 落在块内（不再 re-grow）→ 同一 8 字节结果。直驱 ext4_rs public `JournalTransaction`
+    /// 对拍，避开 runtime offset API 的跨块切片形状差异。
+    #[ktest]
+    fn journal_commit_plan_bug8_clamp() {
+        use crate::fs::ext4::core::journal::transaction::JournalRuntime;
+
+        let block_size = 8usize;
+
+        // 三种基底：短(3<8)/恰好(8)/超长(12>8)。core 全块 API 收基底当 full_image 直接 clamp；
+        // ext4_rs 在 transaction 级把 load_block() 基底 clamp，再写 0 长 data（不改字节，只验基底 clamp）。
+        let bases: &[Vec<u8>] = &[
+            vec![1, 2, 3],                    // 短 → 零填 [1,2,3,0,0,0,0,0]
+            (40..48u8).collect::<Vec<u8>>(),  // 恰好 8
+            vec![9u8; 12],                    // 超长 → 截断 [9;8]
+        ];
+
+        for (idx, base) in bases.iter().enumerate() {
+            let block_nr = idx as u64;
+
+            // 新侧（core）：record 全块镜像 = base，clamp 到 block_size。
+            let new_data = {
+                let mut rt = JournalRuntime::new(block_size, 1);
+                let hid = rt.start_handle(4).expect("core start_handle");
+                rt.record_metadata_write(hid, block_nr, base);
+                rt.stop_handle(hid);
+                let plan = rt.prepare_commit().expect("core prepare_commit");
+                assert_eq!(plan.metadata_blocks.len(), 1, "one block");
+                plan.metadata_blocks[0].block_data.clone()
+            };
+
+            // 旧侧（ext4_rs）：transaction 级 record_metadata_write，load_block() 返回 base
+            // → BUG-8 clamp 基底；data 为空（offset 0, len 0），不触发 re-grow，结果 = clamp 后基底。
+            let old_data = {
+                let mut tx = ext4_rs::JournalTransaction::new(1);
+                let base_for_load = base.clone();
+                tx.record_metadata_write(block_nr, 0, &[], block_size, move || base_for_load.clone());
+                match tx.buffer(block_nr) {
+                    Some(buf) => buf.block_data.clone(),
+                    None => panic!("ext4_rs transaction buffer must exist after record"),
+                }
+            };
+
+            assert_eq!(
+                new_data, old_data,
+                "BUG-8 base-image clamp: core full-image vs ext4_rs load_block clamp (block {block_nr})"
+            );
+            assert_eq!(new_data.len(), block_size, "clamped to block_size (block {block_nr})");
+        }
+
+        // 直接断 core 的两个 clamp 方向（短零填 / 超长截断）。
+        let mut rt = JournalRuntime::new(block_size, 1);
+        let hid = rt.start_handle(8).expect("core start_handle");
+        rt.record_metadata_write(hid, 0, &[1, 2, 3]); // 短
+        rt.record_metadata_write(hid, 1, &[9u8; 12]); // 超长
+        rt.stop_handle(hid);
+        let plan = rt.prepare_commit().expect("core prepare_commit");
+        assert_eq!(
+            plan.metadata_blocks[0].block_data,
+            vec![1, 2, 3, 0, 0, 0, 0, 0],
+            "short image zero-padded to block_size (BUG-8)"
+        );
+        assert_eq!(
+            plan.metadata_blocks[1].block_data,
+            vec![9u8; 8],
+            "over-long image truncated to block_size (BUG-8)"
+        );
+    }
+
+    /// soft-credit admission 轮转差分：第一个 handle 预留 1020 块（接近 1024 上限）+ 记一块
+    /// 元数据后，第二个 handle（预留 8 → 1020+8 > 1024）触发 admission 轮转：旧 running 移到
+    /// prev_running（tid=1），新 running 用下一个 tid（=2）。对拍 core vs ext4_rs 的 running/
+    /// prev_running tid + 两侧各自 prepare_commit 的 plan.tid（应先 commit tid=1）。
+    /// PARITY: ext4_rs journal.rs 的 `credit_admission_rotates_idle_transaction_before_overflow`。
+    #[ktest]
+    fn journal_credit_rotation_parity() {
+        use crate::fs::ext4::core::journal::transaction::JournalRuntime;
+
+        let block_size = 8usize;
+        let first_tid = 1u32;
+
+        // ---- 新侧（core） ----
+        let (new_prev_tid, new_run_tid, new_plan_tid) = {
+            let mut rt = JournalRuntime::new(block_size, first_tid);
+            let h1 = rt.start_handle(1020).expect("core start_handle h1");
+            rt.record_metadata_write(h1, 0, &[1u8; 8]); // running 有 buffer → 轮转条件之一
+            rt.stop_handle(h1);
+            // h2 预留 8：1020 + 8 > 1024 → admission 轮转。
+            let h2 = rt.start_handle(8).expect("core start_handle h2");
+            let prev_tid = rt.prev_running_transaction().map(|t| t.tid());
+            let run_tid = rt.running_transaction().map(|t| t.tid());
+            rt.record_metadata_write(h2, 8, &[2u8; 8]);
+            rt.stop_handle(h2);
+            // prepare_commit 先取 prev_running（tid=1）。
+            let plan = rt.prepare_commit().expect("core prepare_commit after rotation");
+            (prev_tid, run_tid, plan.tid)
+        };
+
+        // ---- 旧侧（ext4_rs） ----
+        let (old_prev_tid, old_run_tid, old_plan_tid) = {
+            let mut rt = ext4_rs::JournalRuntime::new(block_size, first_tid);
+            let h1 = match rt.start_handle(1020, None) {
+                Some(h) => h,
+                None => panic!("ext4_rs start_handle h1 None"),
+            };
+            let img1 = vec![1u8; 8];
+            let b1 = img1.clone();
+            rt.record_metadata_write_for_handle(h1.handle_id(), 0, &b1, move |_| img1.clone());
+            rt.stop_handle(h1);
+            let h2 = match rt.start_handle(8, None) {
+                Some(h) => h,
+                None => panic!("ext4_rs start_handle h2 None"),
+            };
+            let prev_tid = rt.prev_running_transaction().map(|t| t.tid());
+            let run_tid = rt.running_transaction().map(|t| t.tid());
+            let img2 = vec![2u8; 8];
+            let b2 = img2.clone();
+            rt.record_metadata_write_for_handle(h2.handle_id(), 8, &b2, move |_| img2.clone());
+            rt.stop_handle(h2);
+            let plan = match rt.prepare_commit() {
+                Some(p) => p,
+                None => panic!("ext4_rs prepare_commit after rotation None"),
+            };
+            (prev_tid, run_tid, plan.tid)
+        };
+
+        assert_eq!(new_prev_tid, old_prev_tid, "prev_running tid after rotation");
+        assert_eq!(new_run_tid, old_run_tid, "running tid after rotation");
+        assert_eq!(new_plan_tid, old_plan_tid, "commit plan tid (prev_running first)");
+        // 语义自检：轮转把 tid=1 移到 prev_running、新 running=tid 2、先 commit tid 1。
+        assert_eq!(new_prev_tid, Some(1), "rotated transaction is tid 1");
+        assert_eq!(new_run_tid, Some(2), "new running is tid 2");
+        assert_eq!(new_plan_tid, 1, "prepare_commit drains prev_running (tid 1) first");
+    }
 }

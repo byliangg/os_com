@@ -12,4 +12,6 @@
 //! 本模块的逻辑子模块由 Task 1+ 逐个 `pub mod` 进来。
 
 pub mod format;
+pub mod space;
 pub mod superblock;
+pub mod transaction;
