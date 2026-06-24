@@ -286,12 +286,13 @@ pub(super) fn load_inode(
 /// [对照] ext4_rs `Ext4::write_back_inode`（ext4_impls/inode.rs:242）= `set_inode_checksum`
 /// 再 `write_inode_image`（:185）。
 ///
-/// **PARITY**：`RawInode` 只有 156 字节，而本镜像 `inode_size`=256，故写回时需把 inode 槽位的
-/// 156 真实字节覆盖、其余 100 字节（i_extra 区之外的 extra）以**盘上原值**保留——RMW 整块
-/// 天然保留这 100 字节。ext4_rs `write_inode_image` 把 `Ext4Inode`（其结构同样 156 字节）按
-/// `min(inode_size, sizeof)`=156 拷入，余下 `[156, inode_size)` 用 `fill(0)` 清零。
-/// 本镜像下两者一致：inode 槽的尾 100 字节盘上本就是 0（mkfs 造的真镜像），RMW 保留即等于
-/// ext4_rs 的清零。若某 inode 尾 100 字节盘上非 0，两者会分歧——见下方处理。
+/// **PARITY（BUG-10）**：`RawInode` 建模 156 字节，本镜像 `inode_size`=256。ext4_rs
+/// `write_inode_image` 把 `Ext4Inode`（同样 156 字节）按 `min(inode_size, sizeof)`=156 拷入
+/// inode 槽，再把余下 `[156, inode_size)` 用 `fill(0)` **清零**——即 inode 尾 100 字节落盘恒为
+/// 0，**不是**保留盘上原值。core 逐字节复刻：覆盖 156 真实字节后同样把尾 100 字节清零（而非
+/// 依赖 RMW 保留）。整块用 RMW 是为了保留**同块内其它 inode** 的字节，不是为了保留本 inode 的
+/// 尾区。语义上这丢弃了未建模的 inode 尾字节（标准 mkfs 镜像该区本就是 0，故无感）；登记
+/// 根目录 `bug.md` BUG-10，迁移后评估。
 pub(super) fn write_back_inode(
     writer: &dyn MetadataWriter,
     reader: &dyn BlockReader,
