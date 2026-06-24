@@ -211,6 +211,31 @@ impl Inode {
         out.copy_from_slice(block.as_bytes());
         out
     }
+
+    /// i_block 的 60 字节作 `Vec`（写半部要可变 buffer 做移位/改 extent）。
+    pub(super) fn i_block_bytes_vec(&self) -> Vec<u8> {
+        self.i_block_bytes().to_vec()
+    }
+
+    /// 把 60 字节写回 `raw.block: [u32;15]`（安全 Pod，替代 ext4_rs 裸指针改 i_block）。
+    /// `bytes` 必须恰 60 字节（一个 [u32;15] 的字节镜像）。
+    pub(super) fn set_i_block_bytes(&mut self, bytes: &[u8]) {
+        debug_assert_eq!(bytes.len(), 60, "i_block must be 60 bytes");
+        let block: [u32; 15] = Pod::from_bytes(bytes);
+        self.raw.block = block;
+    }
+
+    /// 写 i_blocks（512B 单位）：lo = blocks & 0xffffffff，hi = blocks >> 32。
+    /// [对照] ext4_rs `Ext4Inode::set_blocks_count`（i_blocks 累加用）。
+    pub(super) fn set_blocks_count(&mut self, blocks: u64) {
+        self.raw.blocks = (blocks & 0xffff_ffff) as u32;
+        self.raw.osd2.l_i_blocks_high = (blocks >> 32) as u16;
+    }
+
+    /// 读 i_blocks（512B 单位，委托 [`RawInode::blocks`]）。
+    pub(super) fn blocks_count(&self) -> u64 {
+        self.raw.blocks()
+    }
 }
 
 /// 从盘读第 `group` 组的组描述符（GDT 紧跟超级块块），与 Phase-2 分配器

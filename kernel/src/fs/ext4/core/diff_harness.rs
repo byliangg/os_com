@@ -14,7 +14,7 @@
 //! 注意：core 生产代码只依赖 [`BlockReader`] / [`MetadataWriter`]，对 `ext4_rs`
 //! 的桥接**只**出现在本 `#[cfg(ktest)]` 模块里（满足新旧解耦约束）。
 
-use super::io::BlockReader;
+use super::io::{BlockReader, BlockWriter};
 use super::metadata_writer::MetadataWriter;
 use super::prelude::*;
 use super::superblock::RawSuperblock;
@@ -106,6 +106,38 @@ impl ext4_rs::BlockDevice for MemDisk {
 impl BlockReader for MemDisk {
     fn read_at(&self, off: usize, out: &mut [u8]) {
         self.read_into(off, out);
+    }
+}
+
+impl BlockWriter for MemDisk {
+    /// 写**数据块**（按字节偏移）——与 ext4_rs `write_at` 里 `block_device.write_offset` 等价，
+    /// 写穿同一份共享字节（差分两侧同盘对拍）。
+    fn write_at(&self, off: usize, data: &[u8]) {
+        self.write_from(off, data);
+    }
+}
+
+/// 全盘逐字节比对：锁两盘底层字节，断言每字节相等；首个差异报盘内 offset + 两侧值。
+///
+/// Task 3 用它作主检查（B）——extent 树非根块落在数据区，`snapshot_meta_with_inodes`
+/// 不覆盖；全盘比对一次性覆盖 inode 表 + extent 块 + 数据块 + 位图 + GDT + SB。
+pub(super) fn assert_disk_eq(a: &MemDisk, b: &MemDisk) {
+    let ga = a.bytes.lock();
+    let gb = b.bytes.lock();
+    assert_eq!(
+        ga.len(),
+        gb.len(),
+        "disk length differs ({} vs {})",
+        ga.len(),
+        gb.len()
+    );
+    for (i, (x, y)) in ga.iter().zip(gb.iter()).enumerate() {
+        if x != y {
+            panic!(
+                "full-disk mismatch at offset {}: {:#04x} != {:#04x}",
+                i, x, y
+            );
+        }
     }
 }
 

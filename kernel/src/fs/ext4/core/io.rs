@@ -12,3 +12,15 @@ pub(super) trait BlockReader {
     /// 从偏移 `off` 读出 `out.len()` 字节到 `out`。
     fn read_at(&self, off: usize, out: &mut [u8]);
 }
+
+/// 按字节偏移写**数据块**的本地接缝（写路径用）。
+///
+/// 与 [`super::metadata_writer::MetadataWriter`] 分工：`MetadataWriter` 写的是经 JBD2
+/// 记账的**元数据**全块镜像（inode 表 / extent 树块 / 位图 / SB），按块号粒度；本 trait
+/// 写的是**文件数据块**（write_at 的字节落盘、prepare_write_at 的零填），按字节偏移、绕过
+/// journal——逐位对齐 ext4_rs `write_at` 里直接走 `block_device.write_offset(...)` 的数据写。
+/// 集成层在 Phase 5 接入真实块设备；差分里 `MemDisk` 同实现本 trait，把数据写穿同一份字节。
+pub(super) trait BlockWriter {
+    /// 把 `data` 写到字节偏移 `[off, off + data.len())`（盘尾外丢弃）。
+    fn write_at(&self, off: usize, data: &[u8]);
+}

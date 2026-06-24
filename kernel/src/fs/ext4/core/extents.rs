@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 use ostd::const_assert;
 
-use super::inode::Inode;
-use super::io::BlockReader;
+use super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
+use super::inode::{write_back_inode, Inode};
+use super::io::{BlockReader, BlockWriter};
+use super::metadata_writer::MetadataWriter;
 use super::prelude::*;
 use super::superblock::RawSuperblock;
 
 const EXTENT_MAGIC: u16 = 0xF30A;
+const EXT4_EXTENT_HEADER_SIZE: usize = 12;
+const EXT4_EXTENT_SIZE: usize = 12;
+/// RO-compat metadata_csum 特性位（门控 extent 块 csum）。
+/// = ext4_rs `EXT4_FEATURE_RO_COMPAT_METADATA_CSUM`（0x400）。
+const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
+/// 写态 extent 合并长度上限。= ext4_rs `EXT_INIT_MAX_LEN`（consts.rs:24）。
+const EXT_INIT_MAX_LEN: u16 = 32768;
 /// block_count 高于此值表示 unwritten extent（实际长度 = block_count - 此值）。
 /// = ext4_rs `EXT_INIT_MAX_LEN`（consts.rs:24）= `EXT_INIT_MAX_LEN`。
 const UNWRITTEN_MAX_LEN: u16 = 32768;
@@ -98,6 +107,57 @@ impl RawExtent {
     /// 物理起始块号（start_lo | start_hi<<32）。
     pub fn start(&self) -> Ext4Fsblk {
         (self.start_lo as u64) | ((self.start_hi as u64) << 32)
+    }
+
+    // ------------------------------------------------------------------
+    // 写半部 setter（逐位对齐 ext4_rs `Ext4Extent` 的同名方法）。
+    // ------------------------------------------------------------------
+
+    /// 写物理起始块号（lo = pblock&0xffffffff，hi = pblock>>32）。
+    /// [对照] ext4_rs `Ext4Extent::store_pblock`（ext4_defs/extents.rs:527）。
+    pub fn store_pblock(&mut self, pblock: Ext4Fsblk) {
+        self.start_lo = (pblock & 0xffff_ffff) as u32;
+        self.start_hi = (pblock >> 32) as u16;
+    }
+
+    /// 设实际长度（直写 block_count，不带 unwritten 标志）。
+    /// [对照] ext4_rs `Ext4Extent::set_actual_len`（ext4_defs/extents.rs:547）。
+    pub fn set_actual_len(&mut self, len: u16) {
+        self.block_count = len;
+    }
+
+    /// 标记 unwritten（block_count |= EXT_INIT_MAX_LEN）。
+    /// [对照] ext4_rs `Ext4Extent::mark_unwritten`（ext4_defs/extents.rs:552）。
+    pub fn mark_unwritten(&mut self) {
+        self.block_count |= EXT_INIT_MAX_LEN;
+    }
+
+    /// 标记 written（保留实际长度，去掉 unwritten 标志）。
+    /// [对照] ext4_rs `Ext4Extent::mark_written`（ext4_defs/extents.rs:557）。
+    pub fn mark_written(&mut self) {
+        self.block_count = self.len();
+    }
+}
+
+impl RawExtentIndex {
+    /// 写指向的下层块号（leaf_lo | leaf_hi<<32），padding 不动。
+    /// [对照] ext4_rs `Ext4ExtentIndex::store_pblock`（ext4_defs/extents.rs:502）。
+    pub fn store_pblock(&mut self, pblock: Ext4Fsblk) {
+        self.leaf_lo = (pblock & 0xffff_ffff) as u32;
+        self.leaf_hi = (pblock >> 32) as u16;
+    }
+}
+
+impl RawExtentHeader {
+    /// 构造新节点头。[对照] ext4_rs `Ext4ExtentHeader::new`（ext4_defs/extents.rs）。
+    pub fn new(magic: u16, entries: u16, max_entries: u16, depth: u16, generation: u32) -> Self {
+        Self {
+            magic,
+            entries_count: entries,
+            max_entries_count: max_entries,
+            depth,
+            generation,
+        }
     }
 }
 
@@ -421,6 +481,821 @@ pub(super) fn get_pblock_idx_state(
     }
     // hole：ext4_rs 返回 ENOENT；core 用 None 表达。
     Ok(None)
+}
+
+// =====================================================================
+// extent 树写半部（Phase 3 Task 3）。
+//
+// 安全复刻 ext4_rs 写半部（`ext4_impls/extents.rs`：insert_extent / can_merge /
+// merge_extent / insert_new_extent / create_new_leaf / ext_grow_indepth /
+// convert_unwritten_span + extent 块 csum）。ext4_rs 的写半部用裸指针把
+// `inode.block: [u32;15]` 当 `*mut Ext4ExtentHeader`/`*mut Ext4Extent` 改、用
+// `from_raw_parts` 拼节点字节、`copy_within` 移位——core 一律改 Pod
+// `from_bytes`/`as_bytes` 在「一段字节 + 字节偏移 12 + pos*12」上读写，逐字节等价。
+//
+// **parity-first 限制（每条 `// PARITY`）：**
+// - insert_extent 只合并 found extent、不与邻居合并；
+// - 无真正节点内分裂：满叶 → create_new_leaf（兄弟叶，父在 root）/ ext_grow_indepth；
+// - insert extent at nonroot → ENOTSUP；split leaf with full non-root parent → ENOTSUP；
+// - corrupted node（entries_count > capacity）→ EIO；
+// - 合并长上限：written 32768、unwritten 32767。
+// =====================================================================
+
+/// 写上下文：读 + 元数据写 + 数据块写 + 可变 SB（分配器持有），core **不获取全局锁**。
+///
+/// `sb` 是只读几何视图（块大小 / 块数等稳定字段）；分配的「运行期权威 SB」由注入的
+/// 分配上下文（Phase 2 `BlockAllocator`）自持。extent 树块写、inode 写回经 `writer`
+/// （[`MetadataWriter`]）；文件数据块写经 `data_writer`（[`BlockWriter`]）。
+pub(super) struct WriteCtx<'a> {
+    pub reader: &'a dyn BlockReader,
+    pub writer: &'a dyn MetadataWriter,
+    pub data_writer: &'a dyn BlockWriter,
+    pub sb: &'a RawSuperblock,
+    pub block_size: usize,
+}
+
+impl<'a> WriteCtx<'a> {
+    pub(super) fn new(
+        reader: &'a dyn BlockReader,
+        writer: &'a dyn MetadataWriter,
+        data_writer: &'a dyn BlockWriter,
+        sb: &'a RawSuperblock,
+    ) -> Self {
+        let block_size = sb.block_size();
+        Self {
+            reader,
+            writer,
+            data_writer,
+            sb,
+            block_size,
+        }
+    }
+
+    /// 从写上下文借出只读上下文（读路径复用，避免重复持 reader/sb）。
+    pub(super) fn read_ctx(&self) -> super::file::ReadCtx<'_> {
+        super::file::ReadCtx {
+            reader: self.reader,
+            sb: self.sb,
+            block_size: self.block_size,
+        }
+    }
+}
+
+/// 分配回调：写半部要分配新块（extent 兄弟叶 / 加深用单块、数据块用批量），但 core 不持
+/// 全局分配器单例。把两类分配抽象成本回调，由调用方（差分 / 集成层）注入 Phase-2
+/// `BlockAllocator` 的 `balloc_alloc_block(None)` / `balloc_alloc_block_batch(...)`。
+///
+/// **关键（ambiguity #4）**：两类分配必须背靠**同一个**分配器实例（同一份运行期 SB +
+/// 位图状态），否则 tree-block 与 data-block 的 free 计数 / 位图会分叉、落盘字节不一致。
+/// 故合成单 trait、单 `&mut dyn` 传参（一个对象同持两入口），不拆两个 `&mut dyn`。
+pub(super) trait BlockAlloc {
+    /// 分配一个块（无 goal），对应 ext4_rs `balloc_alloc_block(None)`（extent 树块用）。
+    /// 入参 `inode` 让实现把 i_blocks（512B 单位）累加写回 `inode.raw.blocks`——与 ext4_rs
+    /// 在共享 `Ext4InodeRef` 上累加 `blocks_count` 等价，使后续 `write_back_inode` 落对值。
+    fn alloc_one(&mut self, inode: &mut Inode) -> Result<Ext4Fsblk>;
+    /// 跨组批量分配（部分成功），对应 ext4_rs `balloc_alloc_block_batch`（数据块用）。
+    /// `start_bgid` 是起扫组游标（命中后回写），由调用方按 `initial_write_alloc_bgid` 算好。
+    fn alloc_batch(
+        &mut self,
+        inode: &mut Inode,
+        start_bgid: &mut u32,
+        count: usize,
+    ) -> Result<Vec<Ext4Fsblk>>;
+}
+
+/// 节点容量（项数）：root=(60-12)/12=4，非 root=(bs-12)/12。
+/// [对照] ext4_rs insert_extent 防御段的 `node_capacity`（extents.rs:289-293）。
+fn node_capacity(block_size: usize, at_root: bool) -> usize {
+    if at_root {
+        (15 * 4 - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE
+    } else {
+        (block_size - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE
+    }
+}
+
+/// 从一段节点字节读第 `pos` 个 extent（字节偏移 12 + pos*12）。
+fn read_extent_at(bytes: &[u8], pos: usize) -> RawExtent {
+    let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+    RawExtent::from_bytes(&bytes[off..off + EXT4_EXTENT_SIZE])
+}
+
+/// 把第 `pos` 个 extent 写进节点字节（字节偏移 12 + pos*12）。
+fn write_extent_at(bytes: &mut [u8], pos: usize, ex: &RawExtent) {
+    let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+    bytes[off..off + EXT4_EXTENT_SIZE].copy_from_slice(ex.as_bytes());
+}
+
+/// 把第 `pos` 个 index 写进节点字节（字节偏移 12 + pos*12）。
+fn write_index_at(bytes: &mut [u8], pos: usize, idx: &RawExtentIndex) {
+    let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+    bytes[off..off + EXT4_EXTENT_SIZE].copy_from_slice(idx.as_bytes());
+}
+
+/// 读节点头并写回（在节点字节上原地更新前 12 字节）。
+fn write_header(bytes: &mut [u8], header: &RawExtentHeader) {
+    bytes[..EXT4_EXTENT_HEADER_SIZE].copy_from_slice(header.as_bytes());
+}
+
+/// extent 块 tail 偏移：`12 + max_entries_count*12`（从盘上读到的头算，不写死）。
+/// [对照] ext4_rs `ext4_extent_tail_offset`（extents.rs:1805）。
+fn extent_tail_offset(header: &RawExtentHeader) -> usize {
+    EXT4_EXTENT_HEADER_SIZE + (header.max_entries_count as usize) * EXT4_EXTENT_SIZE
+}
+
+/// 在**非根** extent 块字节上设置 tail csum（门控 metadata_csum）。**root 无 tail/无 csum**。
+/// [对照] ext4_rs `set_extent_block_checksum_in_block`（extents.rs:79）+
+/// `calculate_extent_block_checksum`（extents.rs:1770）。
+///
+/// csum = crc32c(uuid → inum(le4) → generation(le4) → block[..tail_offset])，写在 tail 处 4 字节。
+fn set_extent_block_checksum_in_block(
+    ctx: &WriteCtx,
+    inode: &Inode,
+    block: &mut [u8],
+) -> Result<()> {
+    let has_csum = (ctx.sb.features_read_only() & RO_COMPAT_METADATA_CSUM) != 0;
+    if !has_csum {
+        return Ok(());
+    }
+    let header = RawExtentHeader::from_bytes(&block[..EXT4_EXTENT_HEADER_SIZE]);
+    // PARITY: ext4_rs 此处 magic != EXT4_EXTENT_MAGIC → EINVAL。
+    if header.magic != EXTENT_MAGIC {
+        return Err(Error::with_message(Errno::EINVAL, "Invalid extent magic"));
+    }
+    let tail_offset = extent_tail_offset(&header);
+    let uuid = ctx.sb.uuid();
+    let mut c = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
+    c = ext4_crc32c(c, &inode.num.to_le_bytes());
+    c = ext4_crc32c(c, &inode.raw.generation().to_le_bytes());
+    c = ext4_crc32c(c, &block[..tail_offset]);
+    block[tail_offset..tail_offset + 4].copy_from_slice(&c.to_le_bytes());
+    Ok(())
+}
+
+/// 读一个 extent 树块满 block_size 字节（ext4_rs read_offset 的 resize/truncate 等价）。
+fn load_tree_block(ctx: &WriteCtx, pblock: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; ctx.block_size];
+    ctx.reader.read_at(pblock * ctx.block_size, buf.as_mut_slice());
+    buf
+}
+
+/// 把一个 extent 树块经 [`MetadataWriter`] 整块写回（对齐 ext4_rs `sync_blk_to_disk`）。
+fn sync_tree_block(ctx: &WriteCtx, pblock: usize, block: &[u8]) -> Result<()> {
+    ctx.writer
+        .write_metadata_for_handle(0, pblock as Ext4Fsblk, block)
+}
+
+/// 两 extent 能否合并。逐位复刻 ext4_rs `can_merge`（extents.rs:467）。
+///
+/// PARITY 合并长上限：written `EXT_INIT_MAX_LEN=32768`；unwritten `EXT_INIT_MAX_LEN-1=32767`
+/// （合并两 unwritten 到恰 32768 会丢 unwritten 标志、把未初始化块当 written 暴露）。
+fn can_merge(ex1: &RawExtent, ex2: &RawExtent) -> bool {
+    if ex1.is_unwritten() != ex2.is_unwritten() {
+        return false;
+    }
+    let ext1_len = ex1.len() as usize;
+    let ext2_len = ex2.len() as usize;
+    // 逻辑连续。
+    if ex1.first_block() + ext1_len as u32 != ex2.first_block() {
+        return false;
+    }
+    // PARITY: 合并长上限（unwritten 取 32767）。
+    let max_merged_len = if ex1.is_unwritten() {
+        (EXT_INIT_MAX_LEN - 1) as usize
+    } else {
+        EXT_INIT_MAX_LEN as usize
+    };
+    if ext1_len + ext2_len > max_merged_len {
+        return false;
+    }
+    // 物理连续。
+    ex1.start() + ext1_len as u64 == ex2.start()
+}
+
+/// 合并：把 `right` 并入 `left`（left 长 += right 长，保留 unwritten 态）。
+/// 逐位复刻 ext4_rs `merge_extent`（extents.rs:502）——只更新 `left` 局部值；
+/// 非根（max_entries_count > 4）时再把合并结果写回该叶块的 `position` 槽并 sync。
+fn merge_extent(
+    ctx: &WriteCtx,
+    inode: &Inode,
+    leaf: &ExtentPathNode,
+    left: &mut RawExtent,
+    right: &RawExtent,
+) -> Result<()> {
+    let unwritten = left.is_unwritten();
+    let len = left.len() + right.len();
+    left.set_actual_len(len);
+    if unwritten {
+        left.mark_unwritten();
+    }
+    // PARITY: ext4_rs 仅在 max_entries_count > 4（即非根叶）时回写盘上叶块；
+    //   root（max=4）只改 inode.block 局部、由 insert_extent 调用方 root_extent_mut_at 写回。
+    if leaf.header.max_entries_count > 4 {
+        let block_no = leaf.pblock_of_node;
+        let mut block = load_tree_block(ctx, block_no);
+        // 在盘块上重读该槽（与 ext4_rs 一致：load_offset_as_mut 后再合并一次）。
+        let pos = leaf.position;
+        let mut slot = read_extent_at(&block, pos);
+        let unwritten = slot.is_unwritten();
+        let len = slot.len() + right.len();
+        slot.set_actual_len(len);
+        if unwritten {
+            slot.mark_unwritten();
+        }
+        write_extent_at(&mut block, pos, &slot);
+        set_extent_block_checksum_in_block(ctx, inode, &mut block)?;
+        sync_tree_block(ctx, block_no, &block)?;
+    }
+    Ok(())
+}
+
+/// 把一个新 extent 插入 extent 树。逐字节复刻 ext4_rs `insert_extent`（extents.rs:271）。
+///
+/// 流程：find_extent 找槽 → 防御（entries > capacity → EIO）→ 空节点 → insert_new_extent
+/// → 命中 extent 且 can_merge → merge_extent（root 时写回 inode 槽）→ 否则 entries<max
+/// 移位插入、满 → create_new_leaf。**不与邻居合并（PARITY）**。
+pub(super) fn insert_extent(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    newex: &RawExtent,
+) -> Result<()> {
+    let newex_first_block = newex.first_block();
+    let path = find_extent(ctx.reader, ctx.sb, inode, newex_first_block)?;
+    // ext4_rs `search_path.depth` = 叶在 path 中的下标 = path.len()-1。
+    let depth = path.path.len() - 1;
+    let node = &path.path[depth];
+
+    let at_root = node.pblock_of_node == 0;
+    let header = node.header;
+
+    // PARITY: corrupted node（entries_count > capacity）→ EIO（防御，extents.rs:289-303）。
+    let capacity = node_capacity(ctx.block_size, at_root);
+    if header.entries_count as usize > capacity {
+        return Err(Error::with_message(Errno::EIO, "corrupted extent node"));
+    }
+
+    // 空节点：直接插。
+    if header.entries_count == 0 {
+        insert_new_extent(ctx, alloc, inode, &path, depth, newex)?;
+        return Ok(());
+    }
+
+    // 命中 found extent 且可合并 → merge_extent（PARITY: 只合并 found，不碰邻居）。
+    if let Some(ex) = node.extent {
+        let mut ex = ex;
+        if can_merge(&ex, newex) {
+            merge_extent(ctx, inode, node, &mut ex, newex)?;
+            if at_root {
+                // root：把合并结果写回 inode i_block 的 position 槽。
+                let mut root = inode.i_block_bytes_vec();
+                write_extent_at(&mut root, node.position, &ex);
+                inode.set_i_block_bytes(&root);
+            }
+            return Ok(());
+        }
+        // PARITY: 不与左右邻居合并——fall through 走常规插入。
+    }
+
+    // 有空位移位插入，满则 create_new_leaf。
+    if header.entries_count < header.max_entries_count {
+        insert_new_extent(ctx, alloc, inode, &path, depth, newex)?;
+    } else {
+        create_new_leaf(ctx, alloc, inode, &path, depth, newex)?;
+    }
+    Ok(())
+}
+
+/// 把新 extent 插入指定节点（root 或非根叶）。复刻 ext4_rs `insert_new_extent`（extents.rs:538）。
+fn insert_new_extent(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    path: &SearchPath,
+    depth: usize,
+    newex: &RawExtent,
+) -> Result<()> {
+    let node = &path.path[depth];
+    let header = node.header;
+
+    if depth == 0 {
+        // ---- 插入 root ----
+        let mut root = inode.i_block_bytes_vec();
+        // 空节点：写槽 position、entries +=1，write_back。
+        if header.entries_count == 0 {
+            write_extent_at(&mut root, node.position, newex);
+            let mut h = RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE]);
+            h.entries_count += 1;
+            write_header(&mut root, &h);
+            inode.set_i_block_bytes(&root);
+            write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+            return Ok(());
+        }
+        // root 满 → 加深后重插。
+        if header.entries_count == header.max_entries_count {
+            ext_grow_indepth(ctx, alloc, inode)?;
+            return insert_extent(ctx, alloc, inode, newex);
+        }
+        // 非空：按 key 序选插入位。
+        let insert_pos = if let Some(cur) = node.extent {
+            if newex.first_block() < cur.first_block() {
+                node.position
+            } else {
+                node.position + 1
+            }
+        } else {
+            node.position + 1
+        };
+        let entries = header.entries_count as usize;
+        if insert_pos < entries {
+            for i in (insert_pos..entries).rev() {
+                let moved = read_extent_at(&root, i);
+                write_extent_at(&mut root, i + 1, &moved);
+            }
+        }
+        write_extent_at(&mut root, insert_pos, newex);
+        let mut h = RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE]);
+        h.entries_count += 1;
+        write_header(&mut root, &h);
+        inode.set_i_block_bytes(&root);
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+        return Ok(());
+    }
+
+    // ---- 插入非根叶 ----
+    let insert_pos = if let Some(cur) = node.extent {
+        if newex.first_block() < cur.first_block() {
+            node.position
+        } else {
+            node.position + 1
+        }
+    } else {
+        node.position + 1
+    };
+    let node_block = node.pblock_of_node;
+    let mut block = load_tree_block(ctx, node_block);
+    let entries_count = {
+        let h = RawExtentHeader::from_bytes(&block[..EXT4_EXTENT_HEADER_SIZE]);
+        h.entries_count as usize
+    };
+    if insert_pos < entries_count {
+        let src = EXT4_EXTENT_HEADER_SIZE + insert_pos * EXT4_EXTENT_SIZE;
+        let dst = EXT4_EXTENT_HEADER_SIZE + (insert_pos + 1) * EXT4_EXTENT_SIZE;
+        let bytes_to_move = (entries_count - insert_pos) * EXT4_EXTENT_SIZE;
+        block.copy_within(src..src + bytes_to_move, dst);
+    }
+    write_extent_at(&mut block, insert_pos, newex);
+    {
+        let mut h = RawExtentHeader::from_bytes(&block[..EXT4_EXTENT_HEADER_SIZE]);
+        h.entries_count += 1;
+        write_header(&mut block, &h);
+    }
+    set_extent_block_checksum_in_block(ctx, inode, &mut block)?;
+    sync_tree_block(ctx, node_block, &block)?;
+    if insert_pos == 0 {
+        propagate_first_block_to_ancestors(ctx, inode, path, depth, newex.first_block())?;
+    }
+    Ok(())
+}
+
+/// 把 `first_block` 沿祖先 index 向上传播。复刻 ext4_rs `propagate_first_block_to_ancestors`
+/// （extents.rs:152）+ `update_index_first_block_in_node`（extents.rs:105）。
+fn propagate_first_block_to_ancestors(
+    ctx: &WriteCtx,
+    inode: &mut Inode,
+    path: &SearchPath,
+    mut child_level: usize,
+    first_block: u32,
+) -> Result<()> {
+    while child_level > 0 {
+        let parent_level = child_level - 1;
+        let parent_node = &path.path[parent_level];
+        let parent_pos = parent_node.position;
+        update_index_first_block_in_node(ctx, inode, parent_node, parent_pos, first_block)?;
+        if parent_pos != 0 {
+            break;
+        }
+        child_level = parent_level;
+    }
+    Ok(())
+}
+
+/// 更新某节点第 `pos` 个 index 的 first_block。复刻 ext4_rs `update_index_first_block_in_node`。
+fn update_index_first_block_in_node(
+    ctx: &WriteCtx,
+    inode: &mut Inode,
+    node: &ExtentPathNode,
+    pos: usize,
+    first_block: u32,
+) -> Result<()> {
+    if node.pblock_of_node == 0 {
+        // root index 节点（在 inode body）。
+        let entries = node.header.entries_count as usize;
+        if pos >= entries {
+            return Err(Error::with_message(
+                Errno::EINVAL,
+                "root index position out of range",
+            ));
+        }
+        let mut root = inode.i_block_bytes_vec();
+        let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+        let mut idx = RawExtentIndex::from_bytes(&root[off..off + EXT4_EXTENT_SIZE]);
+        idx.first_block = first_block;
+        write_index_at(&mut root, pos, &idx);
+        inode.set_i_block_bytes(&root);
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+        return Ok(());
+    }
+    // 非根内部块。
+    let mut block = load_tree_block(ctx, node.pblock_of_node);
+    let entries = {
+        let h = RawExtentHeader::from_bytes(&block[..EXT4_EXTENT_HEADER_SIZE]);
+        h.entries_count as usize
+    };
+    if pos >= entries {
+        return Err(Error::with_message(
+            Errno::EINVAL,
+            "index position out of range",
+        ));
+    }
+    let off = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+    let mut idx = RawExtentIndex::from_bytes(&block[off..off + EXT4_EXTENT_SIZE]);
+    idx.first_block = first_block;
+    write_index_at(&mut block, pos, &idx);
+    set_extent_block_checksum_in_block(ctx, inode, &mut block)?;
+    sync_tree_block(ctx, node.pblock_of_node, &block)?;
+    Ok(())
+}
+
+/// 满叶分裂：分配兄弟叶（depth>0）、装 1 项、往父插 index。复刻 ext4_rs
+/// `create_new_leaf`（extents.rs:654）。**PARITY: 父在 root 才支持；满非根父 → ENOTSUP。**
+fn create_new_leaf(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    path: &SearchPath,
+    depth: usize,
+    newex: &RawExtent,
+) -> Result<()> {
+    if depth > 0 {
+        let parent = &path.path[depth - 1];
+        let new_leaf_block = alloc.alloc_one(inode)?;
+        // 装兄弟叶：头（1 项）+ newex，清零余下，写 csum，sync。
+        let mut leaf = vec![0u8; ctx.block_size];
+        let leaf_header = RawExtentHeader::new(
+            EXTENT_MAGIC,
+            1,
+            ((ctx.block_size - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE) as u16,
+            0,
+            0,
+        );
+        write_header(&mut leaf, &leaf_header);
+        write_extent_at(&mut leaf, 0, newex);
+        set_extent_block_checksum_in_block(ctx, inode, &mut leaf)?;
+        sync_tree_block(ctx, new_leaf_block as usize, &leaf)?;
+
+        let insert_pos = if let Some(cur_idx) = parent.index {
+            if newex.first_block() < cur_idx.first_block() {
+                parent.position
+            } else {
+                parent.position + 1
+            }
+        } else {
+            parent.position + 1
+        };
+
+        if parent.pblock_of_node == 0 {
+            // 父是 root index 节点。
+            let root_header = root_extent_header(inode);
+            if root_header.entries_count >= root_header.max_entries_count {
+                // root index 满 → 加深重插。
+                ext_grow_indepth(ctx, alloc, inode)?;
+                return insert_extent(ctx, alloc, inode, newex);
+            }
+            let parent_entries = root_header.entries_count as usize;
+            let mut root = inode.i_block_bytes_vec();
+            if insert_pos < parent_entries {
+                for i in (insert_pos..parent_entries).rev() {
+                    let off = EXT4_EXTENT_HEADER_SIZE + i * EXT4_EXTENT_SIZE;
+                    let moved = RawExtentIndex::from_bytes(&root[off..off + EXT4_EXTENT_SIZE]);
+                    write_index_at(&mut root, i + 1, &moved);
+                }
+            }
+            let mut new_index = RawExtentIndex::default();
+            new_index.first_block = newex.first_block();
+            new_index.store_pblock(new_leaf_block);
+            new_index.padding = 0;
+            write_index_at(&mut root, insert_pos, &new_index);
+            let mut h = RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE]);
+            h.entries_count += 1;
+            write_header(&mut root, &h);
+            inode.set_i_block_bytes(&root);
+            write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+            return Ok(());
+        }
+
+        // 父是非根内部块。
+        let mut parent_block = load_tree_block(ctx, parent.pblock_of_node);
+        let (parent_entries, parent_max) = {
+            let h = RawExtentHeader::from_bytes(&parent_block[..EXT4_EXTENT_HEADER_SIZE]);
+            (h.entries_count as usize, h.max_entries_count as usize)
+        };
+        // PARITY: 满非根父 → ENOTSUP（extents.rs:757-762）。
+        if parent_entries >= parent_max {
+            return Err(Error::with_message(
+                Errno::EOPNOTSUPP,
+                "split leaf with full non-root parent is not supported",
+            ));
+        }
+        if insert_pos < parent_entries {
+            let src = EXT4_EXTENT_HEADER_SIZE + insert_pos * EXT4_EXTENT_SIZE;
+            let dst = EXT4_EXTENT_HEADER_SIZE + (insert_pos + 1) * EXT4_EXTENT_SIZE;
+            let bytes_to_move = (parent_entries - insert_pos) * EXT4_EXTENT_SIZE;
+            parent_block.copy_within(src..src + bytes_to_move, dst);
+        }
+        let mut new_index = RawExtentIndex::default();
+        new_index.first_block = newex.first_block();
+        new_index.store_pblock(new_leaf_block);
+        new_index.padding = 0;
+        write_index_at(&mut parent_block, insert_pos, &new_index);
+        {
+            let mut h = RawExtentHeader::from_bytes(&parent_block[..EXT4_EXTENT_HEADER_SIZE]);
+            h.entries_count += 1;
+            write_header(&mut parent_block, &h);
+        }
+        set_extent_block_checksum_in_block(ctx, inode, &mut parent_block)?;
+        sync_tree_block(ctx, parent.pblock_of_node, &parent_block)?;
+        if insert_pos == 0 {
+            propagate_first_block_to_ancestors(ctx, inode, path, depth - 1, newex.first_block())?;
+        }
+        return Ok(());
+    }
+
+    // depth == 0：树满 → 加深后重插。
+    ext_grow_indepth(ctx, alloc, inode)?;
+    insert_extent(ctx, alloc, inode, newex)
+}
+
+/// 树加深：根内容搬进新块、根变 1 项 index 节点、depth+1。复刻 ext4_rs
+/// `ext_grow_indepth`（extents.rs:815）。
+fn ext_grow_indepth(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+) -> Result<()> {
+    let new_block = alloc.alloc_one(inode)?;
+    let mut new_blk = vec![0u8; ctx.block_size];
+
+    let root = inode.i_block_bytes_vec();
+    let old_root_header = RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE]);
+    let old_depth = old_root_header.depth;
+    let old_entries_count = old_root_header.entries_count;
+
+    // 第一个子项的逻辑块号（depth==0 取 extent[0].first_block，否则 index[0].first_block）。
+    let first_logical_block = if old_entries_count > 0 {
+        let off = EXT4_EXTENT_HEADER_SIZE; // pos 0
+        // extent 与 index 的 first_block 同在偏移 0，统一从 root[off..] 读 u32。
+        u32::from_le_bytes([root[off], root[off + 1], root[off + 2], root[off + 3]])
+    } else {
+        0
+    };
+
+    // 新块头：保留 old_depth，max 按整块算。
+    let new_header = RawExtentHeader::new(
+        EXTENT_MAGIC,
+        old_entries_count,
+        ((ctx.block_size - EXT4_EXTENT_HEADER_SIZE) / EXT4_EXTENT_SIZE) as u16,
+        old_depth,
+        0,
+    );
+    write_header(&mut new_blk, &new_header);
+    // 搬根的项区（12 起，old_entries_count*12 字节）。
+    if old_entries_count > 0 {
+        let sz = old_entries_count as usize * EXT4_EXTENT_SIZE;
+        new_blk[EXT4_EXTENT_HEADER_SIZE..EXT4_EXTENT_HEADER_SIZE + sz]
+            .copy_from_slice(&root[EXT4_EXTENT_HEADER_SIZE..EXT4_EXTENT_HEADER_SIZE + sz]);
+    }
+    set_extent_block_checksum_in_block(ctx, inode, &mut new_blk)?;
+    sync_tree_block(ctx, new_block as usize, &new_blk)?;
+
+    // 根变 1 项 index 节点：在**原根头**上改 magic/entries=1/max=4/depth+1（保留 generation），
+    //   再清项区、写首 index——与 ext4_rs `root_extent_header_mut()` 就地改 + `write_bytes` 清
+    //   extent 区逐字节一致（generation 字段不被触碰）。
+    let mut new_root = vec![0u8; root.len()];
+    let mut root_header = old_root_header;
+    root_header.magic = EXTENT_MAGIC;
+    root_header.entries_count = 1;
+    root_header.max_entries_count = 4;
+    root_header.depth = old_depth + 1;
+    write_header(&mut new_root, &root_header);
+    // 清根项区（write_bytes 0），再写首 index。
+    let mut first_index = RawExtentIndex::default();
+    first_index.first_block = first_logical_block;
+    first_index.store_pblock(new_block);
+    write_index_at(&mut new_root, 0, &first_index);
+    inode.set_i_block_bytes(&new_root);
+    write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+    Ok(())
+}
+
+/// 读 inode root 的 extent 头（前 12 字节）。
+fn root_extent_header(inode: &Inode) -> RawExtentHeader {
+    let root = inode.i_block_bytes();
+    RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE])
+}
+
+/// 在叶节点上做就地编辑（+ 至多一项删除）。复刻 ext4_rs `rewrite_leaf_entries`（extents.rs:938）。
+///
+/// `edits` 的 pos 指删除前布局；删除（若有）在编辑之后应用。**调用方不得改 pos 0 的
+/// first_block**（那需要祖先 index 更新，本 helper 不做）。
+fn rewrite_leaf_entries(
+    ctx: &WriteCtx,
+    inode: &mut Inode,
+    node: &ExtentPathNode,
+    edits: &[(usize, RawExtent)],
+    remove_pos: Option<usize>,
+) -> Result<()> {
+    let entries = node.header.entries_count as usize;
+    for (pos, _) in edits {
+        if *pos >= entries {
+            return Err(Error::with_message(Errno::EIO, "leaf entry edit out of range"));
+        }
+    }
+    if let Some(pos) = remove_pos {
+        if pos == 0 || pos >= entries {
+            return Err(Error::with_message(Errno::EIO, "leaf entry removal out of range"));
+        }
+    }
+
+    if node.pblock_of_node == 0 {
+        // root 叶。
+        let mut root = inode.i_block_bytes_vec();
+        for (pos, ex) in edits {
+            write_extent_at(&mut root, *pos, ex);
+        }
+        if let Some(pos) = remove_pos {
+            for i in pos + 1..entries {
+                let moved = read_extent_at(&root, i);
+                write_extent_at(&mut root, i - 1, &moved);
+            }
+            // 末项清零。
+            write_extent_at(&mut root, entries - 1, &RawExtent::default());
+            let mut h = RawExtentHeader::from_bytes(&root[..EXT4_EXTENT_HEADER_SIZE]);
+            h.entries_count -= 1;
+            write_header(&mut root, &h);
+        }
+        inode.set_i_block_bytes(&root);
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+        return Ok(());
+    }
+
+    // 非根叶块。
+    let mut block = load_tree_block(ctx, node.pblock_of_node);
+    for (pos, ex) in edits {
+        write_extent_at(&mut block, *pos, ex);
+    }
+    if let Some(pos) = remove_pos {
+        if entries > pos + 1 {
+            let src = EXT4_EXTENT_HEADER_SIZE + (pos + 1) * EXT4_EXTENT_SIZE;
+            let dst = EXT4_EXTENT_HEADER_SIZE + pos * EXT4_EXTENT_SIZE;
+            let bytes_to_move = (entries - pos - 1) * EXT4_EXTENT_SIZE;
+            block.copy_within(src..src + bytes_to_move, dst);
+        }
+        let last = EXT4_EXTENT_HEADER_SIZE + (entries - 1) * EXT4_EXTENT_SIZE;
+        block[last..last + EXT4_EXTENT_SIZE].fill(0);
+        let mut h = RawExtentHeader::from_bytes(&block[..EXT4_EXTENT_HEADER_SIZE]);
+        h.entries_count -= 1;
+        write_header(&mut block, &h);
+    }
+    set_extent_block_checksum_in_block(ctx, inode, &mut block)?;
+    sync_tree_block(ctx, node.pblock_of_node, &block)?;
+    Ok(())
+}
+
+/// 把覆盖 `from` 的 unwritten extent 的前段 `[from, min(ee, max_end))` 转 written。
+/// 复刻 ext4_rs `convert_unwritten_span`（extents.rs:1032）。返回转换后首个逻辑块。
+///
+/// 三形态：① from==es 且左邻 written 且连续 → 左并（grow left + shrink/drop E）；
+/// ② from==es → E 原地变 written 片，余下 unwritten 尾 re-insert；
+/// ③ from>es → E 原地缩成 unwritten 头，written 片 + unwritten 尾 insert。
+pub(super) fn convert_unwritten_span(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    from: Ext4Lblk,
+    max_end: Ext4Lblk,
+) -> Result<Ext4Lblk> {
+    let path = find_extent(ctx.reader, ctx.sb, inode, from)?;
+    let depth = path.path.len() - 1;
+    let node = &path.path[depth];
+    let Some(ex) = node.extent else {
+        return Err(Error::with_message(
+            Errno::EIO,
+            "no extent covers unwritten lblock",
+        ));
+    };
+
+    let es = ex.first_block();
+    let ext_len = ex.len() as u32;
+    let ee = es
+        .checked_add(ext_len)
+        .ok_or_else(|| Error::with_message(Errno::EIO, "extent end overflow"))?;
+    if !ex.is_unwritten() || from < es || from >= ee || max_end <= from {
+        return Err(Error::with_message(
+            Errno::EIO,
+            "convert target is not an unwritten mapping",
+        ));
+    }
+    let ep = ex.start();
+    let cov_end = ee.min(max_end);
+    let cov_len = cov_end - from;
+    let pos = node.position;
+
+    // ① 左并 fast path。
+    if from == es && pos > 0 {
+        let left = read_leaf_extent_at(ctx, inode, node, pos - 1)?;
+        let left_len = left.len() as u32;
+        let mergeable = !left.is_unwritten()
+            && left.first_block().checked_add(left_len) == Some(es)
+            && left.start() + left_len as u64 == ep
+            && left_len + cov_len <= EXT_INIT_MAX_LEN as u32;
+        if mergeable {
+            let mut new_left = left;
+            new_left.set_actual_len((left_len + cov_len) as u16);
+            if cov_end == ee {
+                rewrite_leaf_entries(ctx, inode, node, &[(pos - 1, new_left)], Some(pos))?;
+            } else {
+                let mut new_cur = ex;
+                new_cur.first_block = cov_end;
+                new_cur.store_pblock(ep + cov_len as u64);
+                new_cur.set_actual_len((ee - cov_end) as u16);
+                new_cur.mark_unwritten();
+                rewrite_leaf_entries(
+                    ctx,
+                    inode,
+                    node,
+                    &[(pos - 1, new_left), (pos, new_cur)],
+                    None,
+                )?;
+            }
+            return Ok(cov_end);
+        }
+    }
+
+    // ② from == es：E 原地变 written，尾 re-insert。
+    if from == es {
+        let mut written_piece = ex;
+        written_piece.set_actual_len(cov_len as u16);
+        written_piece.mark_written();
+        rewrite_leaf_entries(ctx, inode, node, &[(pos, written_piece)], None)?;
+
+        if cov_end < ee {
+            let mut tail = RawExtent::default();
+            tail.first_block = cov_end;
+            tail.store_pblock(ep + cov_len as u64);
+            tail.set_actual_len((ee - cov_end) as u16);
+            tail.mark_unwritten();
+            insert_extent(ctx, alloc, inode, &tail)?;
+        }
+        return Ok(cov_end);
+    }
+
+    // ③ from > es：E 缩成 unwritten 头，written 片 + unwritten 尾 insert。
+    let mut head = ex;
+    head.set_actual_len((from - es) as u16);
+    head.mark_unwritten();
+    rewrite_leaf_entries(ctx, inode, node, &[(pos, head)], None)?;
+
+    let mut written_piece = RawExtent::default();
+    written_piece.first_block = from;
+    written_piece.store_pblock(ep + (from - es) as u64);
+    written_piece.set_actual_len(cov_len as u16);
+    insert_extent(ctx, alloc, inode, &written_piece)?;
+
+    if cov_end < ee {
+        let mut tail = RawExtent::default();
+        tail.first_block = cov_end;
+        tail.store_pblock(ep + (cov_end - es) as u64);
+        tail.set_actual_len((ee - cov_end) as u16);
+        tail.mark_unwritten();
+        insert_extent(ctx, alloc, inode, &tail)?;
+    }
+    Ok(cov_end)
+}
+
+/// 读叶节点第 `pos` 个 extent（root 从 inode i_block，非根从盘块）。
+/// 对应 ext4_rs convert 路径里 `root_extent_at` / `get_extent_from_node` 的取项。
+fn read_leaf_extent_at(
+    ctx: &WriteCtx,
+    inode: &Inode,
+    node: &ExtentPathNode,
+    pos: usize,
+) -> Result<RawExtent> {
+    if node.pblock_of_node == 0 {
+        let root = inode.i_block_bytes();
+        return Ok(read_extent_at(&root, pos));
+    }
+    let block = load_tree_block(ctx, node.pblock_of_node);
+    Ok(read_extent_at(&block, pos))
 }
 
 #[cfg(ktest)]
