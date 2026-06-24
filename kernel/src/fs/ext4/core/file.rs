@@ -1060,6 +1060,83 @@ fn write_zeros_at(
     Ok(())
 }
 
+/// extent 删除上界（逻辑块号）。= ext4_rs `EXT_MAX_BLOCKS`（ext4_defs/consts.rs:26）= `u32::MAX`。
+const EXT_MAX_BLOCKS: u32 = u32::MAX;
+
+/// 文件截断到 `new_size`。逐字节复刻 ext4_rs `truncate_inode`（ext4_impls/file.rs:1904）。
+///
+/// - `old == new` → 空操作（EOK）；
+/// - `old < new`（增长）→ EFBIG 守卫（`new_size > EXT4_MAX_FILE_SIZE`）+ **稀疏** set_size
+///   + write_back（只推进 i_size、留 hole 不映射）；
+/// - `old > new`（缩小）→ ① 算 new/old 块数与 diff；② `new_size % bs != 0` 时**零填尾分块**
+///   （unwritten 尾不动、written 尾 RMW 零填 `[tail_offset..]`、hole 不动）；③ `diff > 0` →
+///   `extent_remove_space(new_blocks_cnt, EXT_MAX_BLOCKS)`；④ set_size + write_back。
+///
+/// PARITY（控制器澄清）：core `truncate_inode` 本身**干净**——bug.md 的「truncate size-clamp」
+/// 实指集成层 `write_page_async` 的 PageCache 写回 clamp（C4），不在本函数内。这里只逐字节
+/// 复刻这个干净的 truncate。**仅 extent 缩路径**；legacy（间接映射）缩不在本 Phase 范围。
+pub(super) fn truncate_inode(
+    ctx: &WriteCtx,
+    alloc: &mut dyn BlockAlloc,
+    inode: &mut Inode,
+    new_size: u64,
+) -> Result<()> {
+    let block_size = ctx.block_size as u64;
+    let old_size = inode.size();
+
+    if old_size == new_size {
+        return Ok(());
+    }
+    if old_size < new_size {
+        // 增长：EFBIG 守卫 + 稀疏 set_size + write_back（不分配、留 hole）。
+        if new_size > EXT4_MAX_FILE_SIZE {
+            return Err(Error::with_message(Errno::EFBIG, "file size too large"));
+        }
+        inode.set_size(new_size);
+        write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+        return Ok(());
+    }
+
+    // 缩小：算 new/old 块数（ceil）与 diff。
+    let new_blocks_cnt = ((new_size + block_size - 1) / block_size) as u32;
+    let old_blocks_cnt = ((old_size + block_size - 1) / block_size) as u32;
+    let diff_blocks_cnt = old_blocks_cnt - new_blocks_cnt;
+
+    // 尾分块零填（new_size 落在块中部时）。
+    let tail_offset = (new_size % block_size) as usize;
+    if tail_offset != 0 {
+        let tail_lblock = u32::try_from(new_size / block_size)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "tail lblock overflow"))?;
+        match extents::get_pblock_idx_state(ctx.reader, ctx.sb, inode, tail_lblock) {
+            // unwritten 尾本就读零——RMW 会把未初始化盘内容写实，故不动。
+            Ok(Some((_, true))) => {}
+            Ok(Some((pblock, false))) => {
+                // written 尾：RMW 把 `[tail_offset..]` 清零。
+                let block_offset = usize::try_from(pblock)
+                    .map_err(|_| Error::with_message(Errno::EFBIG, "tail pblock overflow"))?
+                    .checked_mul(block_size as usize)
+                    .ok_or_else(|| Error::with_message(Errno::EFBIG, "tail offset overflow"))?;
+                let mut block_data = vec![0u8; block_size as usize];
+                ctx.reader.read_at(block_offset, block_data.as_mut_slice());
+                block_data[tail_offset..].fill(0);
+                ctx.data_writer.write_at(block_offset, block_data.as_slice());
+            }
+            // hole 尾：不动（ext4_rs ENOENT 分支）。
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    if diff_blocks_cnt > 0 {
+        extents::extent_remove_space(ctx, alloc, inode, new_blocks_cnt, EXT_MAX_BLOCKS)?;
+    }
+
+    inode.set_size(new_size);
+    write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+
+    Ok(())
+}
+
 #[cfg(ktest)]
 mod test {
     use ostd::prelude::*;
@@ -1263,6 +1340,12 @@ mod test {
                 .balloc_alloc_block_batch(&mut self.ictx, start_bgid, count)?;
             inode.set_blocks_count(self.ictx.i_blocks());
             Ok(v)
+        }
+        fn free_blocks(&mut self, inode: &mut Inode, start: Ext4Fsblk, count: u32) {
+            self.alloc.balloc_free_blocks(&mut self.ictx, start, count);
+            // 与 ext4_rs 在共享 inode_ref 上递减 blocks_count 等价：释放后把 ictx 的
+            // i_blocks（512B 单位）同步回 Inode，使随后 write_back_inode 落对值。
+            inode.set_blocks_count(self.ictx.i_blocks());
         }
     }
 
@@ -1706,4 +1789,168 @@ mod test {
         diff_zero_step(&old_disk, &new_disk, ino, 0, 0, false);
         diff_punch_step(&old_disk, &new_disk, ino, 0, 0);
     }
+
+    // =================================================================
+    // Phase 3 Task 5：extent 树删除 + truncate 差分。
+    //
+    // 旧侧 ext4_rs `extent_remove_space`/`truncate_inode`，新侧 core 同名 fn。每步从盘重建
+    // ctx/分配器/inode；每步后 `assert_disk_eq` **全盘逐字节**（覆盖 inode 表 i_blocks/size
+    // + extent 块 + 位图释放 + GDT/SB）。覆盖：缩到 extent 中间 split、删到叶空 idx 删/根塌、
+    // pos==0 first_block 传播（传到根 + 中途停两分支）、跨多 extent 释放、truncate grow（稀疏）
+    // / shrink（零尾 + remove + free）、乱序插入后删的 position 正确性。
+    // =================================================================
+
+    /// 在 `new_disk` 上跑一次 core `extent_remove_space(from, to)`，返回 Result。
+    /// 每步重建分配器/WriteCtx/inode，**不**额外 write_back（与 ext4_rs 直接调一致）。
+    fn core_extent_remove_space(new_disk: &MemDisk, ino: u32, from: u32, to: u32) -> Result<()> {
+        let (sb, writer) = new_sb_and_writer(new_disk);
+        let alloc = BlockAllocator::new(sb, new_disk, &writer);
+        let mut inode = load_inode(new_disk, &sb, ino)?;
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(new_disk, &writer, new_disk, &sb);
+        crate::fs::ext4::core::extents::extent_remove_space(&ctx, &mut adapter, &mut inode, from, to)
+    }
+
+    /// 在 `new_disk` 上跑一次 core `truncate_inode(new_size)`，返回 Result。每步重建。
+    fn core_truncate(new_disk: &MemDisk, ino: u32, new_size: u64) -> Result<()> {
+        let (sb, writer) = new_sb_and_writer(new_disk);
+        let alloc = BlockAllocator::new(sb, new_disk, &writer);
+        let mut inode = load_inode(new_disk, &sb, ino)?;
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = CoreAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(new_disk, &writer, new_disk, &sb);
+        super::truncate_inode(&ctx, &mut adapter, &mut inode, new_size)
+    }
+
+    /// 一步 extent_remove_space 差分：旧侧 ext4_rs，新侧 core，比 (A) Ok/Err；(B) 全盘逐字节。
+    /// 旧侧调 `extent_remove_space` 后**不** write_back（与 ext4_rs 既有调用约定一致——
+    /// 内部触及 root 时已写 inode；i_blocks 递减是否落盘由内部 write_back 决定，两侧同步）。
+    fn diff_remove_step(old_disk: &MemDisk, new_disk: &MemDisk, ino: u32, from: u32, to: u32) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let mut old_ref = ext4.get_inode_ref(ino);
+        let old_ret = ext4.extent_remove_space(&mut old_ref, from, to);
+        let new_ret = core_extent_remove_space(new_disk, ino, from, to);
+        match (&old_ret, &new_ret) {
+            (Ok(_), Ok(_)) => {}
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "extent_remove_space ok/err mismatch from={from} to={to}: old={:?} new={:?}",
+                old_ret.is_ok(),
+                new_ret.is_ok()
+            ),
+        }
+        assert_disk_eq(old_disk, new_disk);
+    }
+
+    /// 一步 truncate_inode 差分：旧侧 ext4_rs（get_inode_ref → truncate_inode），新侧 core，
+    /// 比 (A) Ok/Err；(B) 全盘逐字节（含 i_size/i_blocks——truncate 内部 write_back）。
+    fn diff_truncate_step(old_disk: &MemDisk, new_disk: &MemDisk, ino: u32, new_size: u64) {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let mut old_ref = ext4.get_inode_ref(ino);
+        let old_ret = ext4.truncate_inode(&mut old_ref, new_size);
+        let new_ret = core_truncate(new_disk, ino, new_size);
+        match (&old_ret, &new_ret) {
+            (Ok(_), Ok(_)) => {}
+            (Err(_), Err(_)) => {}
+            _ => panic!(
+                "truncate_inode ok/err mismatch new_size={new_size}: old={:?} new={:?}",
+                old_ret.is_ok(),
+                new_ret.is_ok()
+            ),
+        }
+        assert_disk_eq(old_disk, new_disk);
+    }
+
+    /// 取 inode 的 extent 树 root depth（验证确为 depth>0 深树）。
+    fn root_depth(disk: &MemDisk, ino: u32) -> u16 {
+        let sb = read_sb(disk);
+        let inode = load_inode(disk, &sb, ino).expect("load inode for depth");
+        let root = inode.i_block_bytes();
+        RawExtentHeader::from_bytes(&root[..size_of::<RawExtentHeader>()]).depth
+    }
+
+    /// extent 删除 + truncate 主差分：构造深树（depth>0）后跑删除/截断序列，每步全盘对拍。
+    #[ktest]
+    fn extent_delete_truncate_parity() {
+        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_IMAGE, "dtf");
+        let old_disk = MemDisk::from_image(&base_bytes);
+        let new_disk = MemDisk::from_image(&base_bytes);
+        let bs = read_sb(&new_disk).block_size();
+
+        // ===== 构造阶段：先在两侧写出同一棵 depth>0 深树（乱序插入压 position 正确性）。 =====
+        // 乱序逻辑块（互不相邻、各成独立 extent），逼满 root（4 槽）后 ext_grow_indepth。
+        // 顺序故意乱：先大后小再中间，制造 binsearch 插入位移与 first_block 传播。
+        let build_lblocks: [u32; 10] = [300, 100, 700, 200, 500, 50, 900, 400, 1100, 800];
+        for (k, &lblk) in build_lblocks.iter().enumerate() {
+            diff_write_step(
+                &old_disk,
+                &new_disk,
+                ino,
+                lblk as usize * bs,
+                &vec![0x40 + k as u8; bs],
+            );
+        }
+        // 再补一串连续块，制造可压实的多 extent 叶（供 cross-multi-extent 释放）。
+        for k in 0..6u32 {
+            let lblk = 1000 + k; // 1000..1005 连续 → 合并/相邻 extent
+            diff_write_step(&old_disk, &new_disk, ino, lblk as usize * bs, &vec![0x70 + k as u8; bs]);
+        }
+
+        // 确认两侧确成 depth>0 深树。
+        let d_old = root_depth(&old_disk, ino);
+        let d_new = root_depth(&new_disk, ino);
+        assert_eq!(d_old, d_new, "build: depth parity");
+        assert!(d_old > 0, "build: expected depth>0 tree, got {d_old}");
+        assert_disk_eq(&old_disk, &new_disk);
+
+        // ===== 删除/截断序列。 =====
+
+        // ① 缩到 extent 中间触发 split（middle-remove + 尾段重插）：
+        //    在 [1000,1005] 连续 extent 内删 [1002,1003]（严格内侧）→ 截前段 + 尾段 reinsert。
+        diff_remove_step(&old_disk, &new_disk, ino, 1002, 1003);
+
+        // ② 删 pos==0 触发 first_block 传播（中途停 / 传到根两分支）：
+        //    删某叶首块区间 → 叶 pos==0 → ext_correct_indexes 传播。删一个独立小块 50。
+        diff_remove_step(&old_disk, &new_disk, ino, 50, 50);
+
+        // ③ 跨多 extent 释放：删一大段覆盖多个独立 extent（200/300/400/500）。
+        diff_remove_step(&old_disk, &new_disk, ino, 150, 550);
+
+        // ④ 删到叶空触发 ext_remove_idx / 根塌：把剩余高逻辑块大范围删尽，逼空叶 + 删父 index。
+        diff_remove_step(&old_disk, &new_disk, ino, 600, EXT4_MAX_BLOCKS_TEST);
+
+        // ⑤ 把余下全删尽（含 root 末项 → 根塌回空叶）。
+        diff_remove_step(&old_disk, &new_disk, ino, 0, EXT4_MAX_BLOCKS_TEST);
+
+        // ===== truncate 序列（独立盘，避免与上面已删空树耦合）。 =====
+        let (base2, ino2) = make_base_disk_with_empty_file(EXT4_IMAGE, "trf");
+        let old2 = MemDisk::from_image(&base2);
+        let new2 = MemDisk::from_image(&base2);
+
+        // 先写一段连续数据建一棵浅树（写 12 块）。
+        diff_write_step(&old2, &new2, ino2, 0, &vec![0x55u8; 12 * bs]);
+
+        // ⑥ truncate grow（稀疏）：扩到 20*bs → 只推进 i_size、留 hole（不分配）。
+        diff_truncate_step(&old2, &new2, ino2, 20 * bs as u64);
+
+        // ⑦ truncate shrink 到块边界（无尾分块）：缩到 8*bs → extent_remove_space + free。
+        diff_truncate_step(&old2, &new2, ino2, 8 * bs as u64);
+
+        // ⑧ truncate shrink 到块中部（零填尾分块 written 尾 RMW）：缩到 5*bs + 7。
+        diff_truncate_step(&old2, &new2, ino2, 5 * bs as u64 + 7);
+
+        // ⑨ truncate shrink 到 0：删尽所有块（叶/根塌）。
+        diff_truncate_step(&old2, &new2, ino2, 0);
+
+        // ⑩ truncate 同尺寸：no-op。
+        diff_truncate_step(&old2, &new2, ino2, 0);
+
+        // ⑪ truncate grow 再 shrink，验证空树后再 truncate 不崩。
+        diff_truncate_step(&old2, &new2, ino2, 3 * bs as u64);
+        diff_truncate_step(&old2, &new2, ino2, bs as u64 + 3);
+    }
+
+    /// 测试用 EXT_MAX_BLOCKS（= u32::MAX），与 core/ext4_rs 的删除上界一致。
+    const EXT4_MAX_BLOCKS_TEST: u32 = u32::MAX;
 }
