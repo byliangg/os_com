@@ -13,6 +13,7 @@
 
 pub mod commit;
 pub mod format;
+pub mod revoke;
 pub mod space;
 pub mod superblock;
 pub mod transaction;

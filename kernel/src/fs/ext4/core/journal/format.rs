@@ -15,6 +15,9 @@ pub const JBD2_SUPERBLOCK_V2: u32 = 4;
 pub const JBD2_DESCRIPTOR_BLOCK: u32 = 1;
 /// commit 块类型（`h_blocktype` 逻辑值 2）。对应 ext4_rs `JBD2_COMMIT_BLOCK`。
 pub const JBD2_COMMIT_BLOCK: u32 = 2;
+/// revoke 块类型（`h_blocktype` 逻辑值 5）。对应 ext4_rs `JBD2_REVOKE_BLOCK`。
+/// **复刻 BUG-5：commit 路径从不产出此类型块**（bug.md B-05）；仅 recovery 解析侧门控用。
+pub const JBD2_REVOKE_BLOCK: u32 = 5;
 
 /// commit 块校验和类型 crc32c（`h_chksum_type`）。对应 ext4_rs `JBD2_CHECKSUM_TYPE_CRC32C`。
 pub const JBD2_CHECKSUM_TYPE_CRC32C: u8 = 4;

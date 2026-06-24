@@ -652,9 +652,10 @@ mod test {
     use ostd::prelude::*;
 
     use super::{
-        assert_disk_eq, assert_meta_eq, diff_journal_commit, old_journal_commit,
-        resolve_journal_area, snapshot_inode_table_group, snapshot_journal_area, snapshot_meta,
-        snapshot_meta_with_inodes, DirectMetadataWriter, JournalMetaWrite, MemDisk,
+        assert_disk_eq, assert_journal_area_eq, assert_meta_eq, diff_journal_commit,
+        old_journal_commit, resolve_journal_area, snapshot_inode_table_group,
+        snapshot_journal_area, snapshot_meta, snapshot_meta_with_inodes, DirectMetadataWriter,
+        JournalMetaWrite, MemDisk,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::inode::{inode_checksum, RawInode};
@@ -3526,5 +3527,153 @@ mod test {
             "sequence advanced by one per committed txn ({txns} txns)"
         );
         assert_ne!(geom_final.start, 0, "s_start set after first commit and kept");
+    }
+
+    // =================================================================
+    // Phase 5 Task 4：revoke 记录 + revoke 表（复刻 BUG-5 revoke 从不写盘）。
+    //
+    // - `journal_revoke_no_disk_parity`：含 revoke 的序列后，两侧（旧 ext4_rs / 新 core）的
+    //   journal 区都**无** revoke 块（blocktype==5）= BUG-5 parity（都不写盘）+ journal 区
+    //   逐字节一致；revoke 表内存语义对拍（删 checkpoint buffer 数 + 表记录）。
+    // =================================================================
+
+    /// 扫一段 journal 区镜像，数其中 blocktype == JBD2_REVOKE_BLOCK(5) 的块数。
+    /// 每个 journal 逻辑块开头是 12B 大端 `RawJournalHeader`；magic 合法且 blocktype==5 即计一块。
+    fn count_revoke_blocks(area: &[u8], block_size: usize) -> usize {
+        use crate::fs::ext4::core::journal::format::{RawJournalHeader, JBD2_REVOKE_BLOCK};
+
+        let hdr_len = size_of::<RawJournalHeader>();
+        let mut count = 0usize;
+        let mut off = 0usize;
+        while off + block_size <= area.len() {
+            if block_size >= hdr_len {
+                let header = RawJournalHeader::from_bytes(&area[off..off + hdr_len]);
+                if header.is_valid_magic() && header.blocktype() == JBD2_REVOKE_BLOCK {
+                    count += 1;
+                }
+            }
+            off += block_size;
+        }
+        count
+    }
+
+    /// revoke parity（BUG-5）：含 revoke 的序列后，两侧 journal 区**无** revoke 块（type=5）——
+    /// 新旧引擎都不写盘——且 journal 区逐字节一致；revoke 表/checkpoint-删-buffer 内存语义对拍。
+    ///
+    /// 步骤：
+    /// 1. 用 [`diff_journal_commit`] 跑一个事务（旧 ext4_rs / 新 core 各自盘），它已断言 journal 区
+    ///    逐字节 == + tid ==。commit 后两侧 journal 区都只含 descriptor/payload/commit/SB，无 type=5。
+    /// 2. 各自快照 journal 区，断言 `count_revoke_blocks == 0`（BUG-5：都不写 revoke 块）。
+    /// 3. 内存语义对拍：两侧各建 runtime → commit → finish_commit 把事务推入 checkpoint 队列 →
+    ///    `revoke_checkpoint_metadata_block(blk)` → 对拍「删到的 checkpoint buffer 数」一致 +
+    ///    被 revoke 的块确实从 checkpoint 事务删掉。core 侧额外验 revoke 表记录该块。
+    #[ktest]
+    fn journal_revoke_no_disk_parity() {
+        use crate::fs::ext4::core::journal::revoke::{CheckpointTransaction, RevokeRuntime};
+        use crate::fs::ext4::core::journal::transaction::JournalRuntime;
+
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (probe_blocks, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // 一个事务的若干 metadata 写（升序 + 含一个稍后被 revoke 的块号 13）。
+            let writes = [
+                JournalMetaWrite { block_nr: 13, image: full_block_image(bs, 0x10) },
+                JournalMetaWrite { block_nr: 5, image: full_block_image(bs, 0x40) },
+                JournalMetaWrite { block_nr: 21, image: full_block_image(bs, 0x90) },
+            ];
+
+            // ---- (1)+(2) 盘上 BUG-5 parity：commit 后两侧 journal 区无 revoke 块 + 逐字节一致 ----
+            // diff_journal_commit 内部各建两盘、对拍 journal 区逐字节 + tid；这里再各跑一次落到我们
+            // 持有的盘上，单独验「无 type=5 块」（diff_journal_commit 不暴露其内部盘）。
+            diff_journal_commit(image, &writes, core_journal_commit);
+
+            let old_disk = MemDisk::from_image(image);
+            let new_disk = MemDisk::from_image(image);
+            let old_tid = old_journal_commit(&old_disk, &writes);
+            let new_tid = core_journal_commit(&new_disk, &writes);
+            assert_eq!(old_tid, new_tid, "revoke-seq commit tid mismatch");
+
+            let old_area = snapshot_journal_area(&old_disk, &probe_blocks, bs);
+            let new_area = snapshot_journal_area(&new_disk, &probe_blocks, bs);
+            assert_eq!(
+                count_revoke_blocks(&old_area, bs),
+                0,
+                "BUG-5: ext4_rs journal area must contain NO revoke block (type=5) [{image:?}]"
+            );
+            assert_eq!(
+                count_revoke_blocks(&new_area, bs),
+                0,
+                "BUG-5: core journal area must contain NO revoke block (type=5) [{image:?}]"
+            );
+            // 两侧 journal 区逐字节一致（含「都没写 revoke 块」这一事实）。
+            assert_journal_area_eq(&old_area, &new_area, &probe_blocks, bs);
+
+            // ---- (3) 内存 revoke 语义对拍：删 checkpoint buffer 数一致 ----
+            let revoke_block = 13u64; // 上面 writes 里出现，故 checkpoint 事务持有它。
+
+            // 旧侧（ext4_rs）：commit → finish_commit 入 checkpoint_list → revoke_checkpoint_metadata_block。
+            let old_removed = {
+                let mut rt = ext4_rs::JournalRuntime::new(bs, 1);
+                let h = match rt.start_handle(writes.len() as u32 + 2, None) {
+                    Some(h) => h,
+                    None => panic!("ext4_rs start_handle None on enabled runtime"),
+                };
+                let hid = h.handle_id();
+                for w in &writes {
+                    let off = (w.block_nr as usize) * bs;
+                    let base = w.image.clone();
+                    rt.record_metadata_write_for_handle(hid, off, &w.image, move |_| base.clone());
+                }
+                rt.stop_handle(h);
+                let plan = match rt.prepare_commit() {
+                    Some(p) => p,
+                    None => panic!("ext4_rs prepare_commit None after closed handle"),
+                };
+                // finish_commit 把事务推入 checkpoint_list（start_block/next_head 任意，本检查不依赖环位置）。
+                assert!(rt.finish_commit(plan.tid, 1, 5), "ext4_rs finish_commit → checkpoint_list");
+                assert_eq!(rt.checkpoint_depth(), 1, "ext4_rs one checkpoint txn");
+                rt.revoke_checkpoint_metadata_block(revoke_block)
+            };
+
+            // 新侧（core）：同序列 commit（内存 plan）→ 把 plan 推入 RevokeRuntime checkpoint 队列 →
+            // revoke_checkpoint_metadata_block。core 的内存事务半部（JournalRuntime）无 checkpoint_list，
+            // 故 revoke 用独立 RevokeRuntime（语义逐字对齐 ext4_rs revoke_checkpoint_metadata_block）。
+            let (new_removed, new_table_revoked, new_buffer_gone) = {
+                let mut rt = JournalRuntime::new(bs, 1);
+                let hid = rt.start_handle(writes.len() as u32 + 2).expect("core start_handle");
+                for w in &writes {
+                    rt.record_metadata_write(hid, w.block_nr, &w.image);
+                }
+                rt.stop_handle(hid);
+                let plan = rt.prepare_commit().expect("core prepare_commit");
+                let tid = plan.tid;
+
+                let mut revoke_rt = RevokeRuntime::new();
+                revoke_rt.push_checkpoint(CheckpointTransaction::new(
+                    tid,
+                    plan.metadata_blocks
+                        .iter()
+                        .map(|b| (b.block_nr, b.block_data.clone())),
+                ));
+                assert_eq!(revoke_rt.checkpoint_depth(), 1, "core one checkpoint txn");
+                let removed = revoke_rt.revoke_checkpoint_metadata_block(revoke_block);
+                let table_revoked = revoke_rt.table().is_revoked(revoke_block);
+                let buffer_gone = !revoke_rt
+                    .checkpoint_transaction(tid)
+                    .expect("core checkpoint txn present")
+                    .has_buffer(revoke_block);
+                (removed, table_revoked, buffer_gone)
+            };
+
+            assert_eq!(
+                new_removed, old_removed,
+                "revoke_checkpoint_metadata_block removed-count: core vs ext4_rs [{image:?}]"
+            );
+            assert_eq!(new_removed, 1, "block 13 removed from exactly one checkpoint txn");
+            assert!(new_table_revoked, "core revoke table records the revoked block");
+            assert!(new_buffer_gone, "core checkpoint buffer for revoked block deleted");
+        }
     }
 }
