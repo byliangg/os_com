@@ -1870,109 +1870,116 @@ mod test {
         RawExtentHeader::from_bytes(&root[..size_of::<RawExtentHeader>()]).depth
     }
 
-    /// extent 删除 + truncate 主差分：构造 depth>0 树后跑删除/截断序列，每步全盘对拍。
+    /// extent 删除 + truncate 主差分。**两棵树，避开参照侧 ext4_rs 的 panic。**
     ///
-    /// **参照侧鲁棒性约束（BUG-13 + BUG-14）**：
-    /// - BUG-13：ext4_rs `balloc_free_blocks`（balloc.rs:672）的 `inode_blocks -= free_cnt*(bs/512)`
-    ///   **不做下溢保护**，debug 下溢即 panic（不 saturate）。
-    /// - BUG-14：ext4_rs `extent_remove_space` 的自叶向上循环在**多叶**（root 索引数 >1）
-    ///   depth>0 树上做 `(_, u32::MAX)` 跨叶删时，`more_to_rm` 返回 true → `i += 1` 重下钻，
-    ///   但 **path[depth] 未重载**（仍指旧叶），导致同一叶被**重复处理 / 重复释放** → 单次
-    ///   `balloc_free_blocks` 释放的 512B 当量超过当前 i_blocks → 撞 BUG-13 panic，无法对拍。
+    /// **参照侧鲁棒性约束（BUG-14 + BUG-15，已登记 bug.md）**：
+    /// - BUG-14：ext4_rs `balloc_free_blocks`（balloc.rs:672）`inode_blocks -= free_cnt*(bs/512)`
+    ///   **无符号减法不做下溢保护** → debug 下溢即 panic（不 saturate）。
+    /// - BUG-15：ext4_rs `extent_remove_space` 自叶向上循环（extents.rs:1333）对**叶层**也调
+    ///   `more_to_rm`；叶节点 `path.index == None` → `more_to_rm` 跳过 index 守卫**直落
+    ///   `return true`** → 循环 `i += 1` 重下钻，但 **`path[depth]` 从未重载**（仍指旧叶）→
+    ///   同一叶被**重复处理 / 重复释放** → 单次 free 的块数超过当前 i_blocks → 撞 BUG-14 panic。
+    ///   **任何 depth>0 树、其叶含 >1 extent 的「清叶」删除（含 truncate-shrink-to-0）都会触发**，
+    ///   与 root 索引数无关（之前以为单索引可绕开，错——触发在叶层）。
     ///
-    /// **core 不退**（仍逐字节复刻全部缺陷）；测试只**避开**把 ext4_rs 推进 panic 的输入：
-    /// 1. **建 depth=1 单根索引树**（一个叶持多 extent）——写 ≥5 个离散紧凑 extent 逼
-    ///    `ext_grow_indepth`（root 4 槽满 → depth=1, **1 个索引**, 叶持全部），总数远低于叶容量
-    ///    `(bs-12)/12`（4K 块=340）故不分裂出第二叶。**root 索引数==1 → `more_to_rm` 立即返回
-    ///    false → 永不重下钻 → 绕开 BUG-14**，于是 `(_, u32::MAX)` 全删 / truncate-shrink-to-0
-    ///    在该树上**安全**，且仍覆盖 ext_remove_idx + 根塌 + first_block 传播 + cross-multi-extent。
-    /// 2. **多块写**（≥2 块/段 → `WRITE_PREALLOC_BLOCKS=1`，无 32 块预分配尾）建紧凑 extent，
-    ///    i_blocks 精确可控。
-    /// BUG-13/14 登记 bug.md（迁移后修：free 应 saturating、删除循环应重载子路径）。
+    /// **core 逐字节复刻 BUG-14/15（不退）；差分只喂不会把 ext4_rs 推进 panic 的输入**：
+    /// - **Tree A（depth-0，root i_block 持 ≤4 extent，盘上无 node 块）**：无 node-block 释放路径，
+    ///   `more_to_rm` 在 depth-0 循环里**根本不被调**（无 index 层）→ 清叶（shrink-to-0）也安全。
+    ///   覆盖大头：middle-split、cross-multi-extent free、truncate grow/shrink-边界/shrink-中部
+    ///   （written 尾 RMW）/**shrink-to-0**/同尺寸/空树再 grow。
+    /// - **Tree B（depth=1，仅 PARTIAL 删，永不清空叶）**：删/缩**只下探到留 ≥1 extent 在叶**，
+    ///   故 `ext_remove_idx` 永不触发、node 块永不释放、i_blocks 永不下溢。覆盖 depth>0 遍历删、
+    ///   partial free、**pos==0 first_block 向 root index 传播**。每步断言 depth 仍 >0（叶非空）。
+    /// - **差分推迟（仅源码 review 覆盖，非测试）**：depth>0 树的 `ext_remove_idx` + 根塌
+    ///   （即清空 depth>0 树）——因 ext4_rs BUG-14/15 重复释放 + panic，**无法**逐字节对拍。
+    ///   该路径由 reviewer 逐行核（同 Task 2 depth>0 读、Phase 2 跨组释放的差分推迟先例），
+    ///   理由见 bug.md BUG-14/15。
     #[ktest]
     fn extent_delete_truncate_parity() {
-        let (base_bytes, ino) = make_base_disk_with_empty_file(EXT4_IMAGE, "dtf");
-        let old_disk = MemDisk::from_image(&base_bytes);
-        let new_disk = MemDisk::from_image(&base_bytes);
-        let bs = read_sb(&new_disk).block_size();
+        let bs = read_sb(&MemDisk::from_image(EXT4_IMAGE)).block_size();
 
-        // ===== 构造：depth=1 单根索引紧凑树（乱序多块写压 position 正确性）。 =====
-        // 8 个离散紧凑 extent（每段 2 块、间隔 100）→ 满 root(4) 后 ext_grow_indepth → depth=1,
-        // 单索引, 叶持全部 8 个（8 ≪ 340 叶容量，不分裂第二叶 → root 索引数恒为 1）。
-        // 顺序故意乱：制造 binsearch 插入位移 + first_block 传播。
-        let build_lblocks: [u32; 8] = [300, 100, 700, 200, 500, 50, 800, 400];
-        for (k, &lblk) in build_lblocks.iter().enumerate() {
-            diff_write_step(
-                &old_disk,
-                &new_disk,
-                ino,
-                lblk as usize * bs,
-                &vec![0x40 + k as u8; 2 * bs],
-            );
+        // =================================================================
+        // Tree A — depth-0（root i_block 持 ≤4 extent，无 node 块 → 清叶亦安全）。
+        // =================================================================
+        let (base_a, ino_a) = make_base_disk_with_empty_file(EXT4_IMAGE, "dta");
+        let old_a = MemDisk::from_image(&base_a);
+        let new_a = MemDisk::from_image(&base_a);
+
+        // ① 中间删触发 split（middle-remove + 尾段重插，**不释放块**）：造 3 块宽 extent [10,13)，
+        //    删严格内侧 [11,11]（first(10)<11 且 11<10+3-1=12）→ 截前段 + 尾段 reinsert。
+        diff_write_step(&old_a, &new_a, ino_a, 10 * bs, &vec![0x99u8; 3 * bs]);
+        // depth 仍 0（单 extent）。
+        assert_eq!(root_depth(&old_a, ino_a), 0, "A: stays depth-0 after one extent");
+        diff_remove_step(&old_a, &new_a, ino_a, 11, 11);
+
+        // ② cross-multi-extent free：在 root 里再写 2 个离散 extent（共 ≤4 槽，depth 不增），
+        //    删一段跨多个 extent → 仅释放数据块（depth-0 无 node 块）。
+        diff_write_step(&old_a, &new_a, ino_a, 40 * bs, &vec![0xA1u8; 2 * bs]); // [40,42)
+        diff_write_step(&old_a, &new_a, ino_a, 60 * bs, &vec![0xA2u8; 2 * bs]); // [60,62)
+        assert_eq!(root_depth(&old_a, ino_a), 0, "A: still depth-0 (<=4 root extents)");
+        // 删 [11,61] 跨 [10,13) 尾段 + [40,42) + [60,62) 头 → 多 extent 部分/整段释放。
+        diff_remove_step(&old_a, &new_a, ino_a, 11, 61);
+
+        // ③ truncate（depth-0 树）：grow 稀疏 / shrink 边界 / shrink 中部（written 尾 RMW）/
+        //    shrink-to-0（清空 root 叶，depth 仍 0，无 node 块 → 安全）/ 同尺寸 / 空树再 grow。
+        let (base_t, ino_t) = make_base_disk_with_empty_file(EXT4_IMAGE, "dtt");
+        let old_t = MemDisk::from_image(&base_t);
+        let new_t = MemDisk::from_image(&base_t);
+        // 写 3 个连续 extent 段（仍 ≤4 槽，depth-0），共 12 块连续。
+        diff_write_step(&old_t, &new_t, ino_t, 0, &vec![0x55u8; 12 * bs]); // [0,12)
+        assert_eq!(root_depth(&old_t, ino_t), 0, "T: depth-0 shallow tree");
+
+        diff_truncate_step(&old_t, &new_t, ino_t, 20 * bs as u64); // grow 稀疏
+        diff_truncate_step(&old_t, &new_t, ino_t, 8 * bs as u64); // shrink 到块边界
+        diff_truncate_step(&old_t, &new_t, ino_t, 5 * bs as u64 + 7); // shrink 块中部（written 尾 RMW）
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // shrink-to-0（清 root 叶，depth 仍 0）
+        assert_eq!(root_depth(&old_t, ino_t), 0, "T: depth-0 after shrink-to-0");
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // 同尺寸 no-op
+        diff_truncate_step(&old_t, &new_t, ino_t, 3 * bs as u64); // 空树再 grow
+        diff_truncate_step(&old_t, &new_t, ino_t, bs as u64 + 3); // 再 shrink 到块中部
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // 再清零
+
+        // =================================================================
+        // Tree B — depth=1，仅 PARTIAL 删（叶永不清空 → ext_remove_idx 永不触发 → 不下溢）。
+        // =================================================================
+        let (base_b, ino_b) = make_base_disk_with_empty_file(EXT4_IMAGE, "dtb");
+        let old_b = MemDisk::from_image(&base_b);
+        let new_b = MemDisk::from_image(&base_b);
+
+        // 建 depth=1 树：8 个离散紧凑 extent（每段 2 块、间隔 100）→ 满 root(4) 后
+        // ext_grow_indepth → depth=1（8 ≪ 340 叶容量 → 单叶）。
+        let build_b: [u32; 8] = [300, 100, 700, 200, 500, 50, 800, 400];
+        for (k, &lblk) in build_b.iter().enumerate() {
+            diff_write_step(&old_b, &new_b, ino_b, lblk as usize * bs, &vec![0x40 + k as u8; 2 * bs]);
         }
+        let d_b = root_depth(&old_b, ino_b);
+        assert_eq!(d_b, root_depth(&new_b, ino_b), "B: depth parity");
+        assert!(d_b > 0, "B: expected depth>0 tree, got {d_b}");
+        assert_disk_eq(&old_b, &new_b);
 
-        // 确认成 depth>0 树、且两侧一致。
-        let d_old = root_depth(&old_disk, ino);
-        assert_eq!(d_old, root_depth(&new_disk, ino), "build: depth parity");
-        assert!(d_old > 0, "build: expected depth>0 tree, got {d_old}");
-        assert_disk_eq(&old_disk, &new_disk);
+        // ④ depth>0 partial free：删一段高逻辑块，**只删尾部若干 extent、留 ≥1 在叶**。
+        //    删 [750,801] 覆盖 800 段 + 700 段尾——但保留 50/100/200/300/400/500 等多个 extent。
+        diff_remove_step(&old_b, &new_b, ino_b, 750, 801);
+        assert!(root_depth(&old_b, ino_b) > 0, "B: leaf still non-empty after partial #1 (old)");
+        assert!(root_depth(&new_b, ino_b) > 0, "B: leaf still non-empty after partial #1 (new)");
 
-        // ① extent 中间删触发 split（middle-remove + 尾段重插，**不释放块**）：
-        //    造一个 3 块宽 extent [2000,2003)，删严格内侧 [2001,2001]
-        //    （first(2000)<from(2001) 且 to(2001)<2000+3-1=2002）→ 截前段 + 尾段 reinsert。
-        diff_write_step(&old_disk, &new_disk, ino, 2000 * bs, &vec![0x99u8; 3 * bs]);
-        diff_remove_step(&old_disk, &new_disk, ino, 2001, 2001);
+        // ⑤ depth>0 pos==0 first_block 传播：删**叶首 extent 的首块**（最小逻辑块 50 段的
+        //    [50,51]）→ 叶 pos==0 → ext_correct_indexes → propagate_first_block_to_ancestors
+        //    更新 root index 的 first_block 键。叶仍留 ≥1 extent（100/200/... 还在）。
+        diff_remove_step(&old_b, &new_b, ino_b, 50, 51);
+        assert!(root_depth(&old_b, ino_b) > 0, "B: leaf still non-empty after pos==0 (old)");
+        assert!(root_depth(&new_b, ino_b) > 0, "B: leaf still non-empty after pos==0 (new)");
 
-        // ② 删某 extent 首块区间触发 pos==0 → ext_correct_indexes → first_block 传播
-        //    （删 lblock 50 段首块 [50,51]）。
-        diff_remove_step(&old_disk, &new_disk, ino, 50, 51);
+        // ⑥ depth>0 中间多 extent partial free：删 [150,450] 覆盖 200/300/400 段，
+        //    仍保留 100 段 + 500 段 → 叶非空。
+        diff_remove_step(&old_b, &new_b, ino_b, 150, 450);
+        assert!(root_depth(&old_b, ino_b) > 0, "B: leaf still non-empty after partial #2 (old)");
+        assert!(root_depth(&new_b, ino_b) > 0, "B: leaf still non-empty after partial #2 (new)");
 
-        // ③ 跨多 extent 释放（有界）：删 [150,599] 覆盖 200/300/400/500 多个独立 extent。
-        diff_remove_step(&old_disk, &new_disk, ino, 150, 599);
-
-        // ④ **全删**（单索引树 → more_to_rm 恒 false → 绕开 BUG-14）：删尽剩余 → 末叶空 →
-        //    ext_remove_idx 删唯一根索引 → 根塌回空叶。单索引下不重下钻、不下溢，可安全 (_, u32::MAX)。
-        diff_remove_step(&old_disk, &new_disk, ino, 0, u32::MAX);
-        // 删尽后应塌回 depth-0 空树。
-        assert_eq!(root_depth(&old_disk, ino), 0, "after full delete: collapsed to depth-0");
-        assert_eq!(root_depth(&new_disk, ino), 0, "after full delete: collapsed to depth-0 (core)");
-
-        // ===== truncate 序列（独立盘，同样 depth=1 单根索引树）。 =====
-        let (base2, ino2) = make_base_disk_with_empty_file(EXT4_IMAGE, "trf");
-        let old2 = MemDisk::from_image(&base2);
-        let new2 = MemDisk::from_image(&base2);
-
-        // 建 depth=1 单索引紧凑树（同手法：8 个离散 2 块段）。
-        let build2: [u32; 8] = [300, 100, 700, 200, 500, 60, 800, 400];
-        for (k, &lblk) in build2.iter().enumerate() {
-            diff_write_step(&old2, &new2, ino2, lblk as usize * bs, &vec![0x40 + k as u8; 2 * bs]);
-        }
-        let d2 = root_depth(&old2, ino2);
-        assert_eq!(d2, root_depth(&new2, ino2), "build2: depth parity");
-        assert!(d2 > 0, "build2: expected depth>0 tree, got {d2}");
-
-        // ⑤ truncate grow（稀疏）：扩到 (802+8)*bs → 只推进 i_size、留 hole（不分配）。
-        let top = 802u64; // 当前最大已分配 lblock+1（[800,802)）
-        diff_truncate_step(&old2, &new2, ino2, (top + 8) * bs as u64);
-
-        // ⑥ truncate shrink 到块边界（无尾分块）：缩到 350*bs → extent_remove_space + free 高段。
-        //    单索引树 → more_to_rm 恒 false → (_, u32::MAX) 安全。
-        diff_truncate_step(&old2, &new2, ino2, 350 * bs as u64);
-
-        // ⑦ truncate shrink 到块中部（零填尾分块 written 尾 RMW）：缩到 100*bs+7
-        //    （落在 [100,102) 段中部，written 尾 RMW 零填 [7..]）。
-        diff_truncate_step(&old2, &new2, ino2, 100 * bs as u64 + 7);
-
-        // ⑧ truncate shrink 到 0：单索引树全清（叶空 + ext_remove_idx + 根塌），不下溢。
-        diff_truncate_step(&old2, &new2, ino2, 0);
-        assert_eq!(root_depth(&old2, ino2), 0, "after truncate 0: collapsed to depth-0");
-
-        // ⑨ truncate 同尺寸：no-op。
-        diff_truncate_step(&old2, &new2, ino2, 0);
-
-        // ⑩ 空树后再 grow / shrink（depth-0 浅树路径），验证不崩。
-        diff_truncate_step(&old2, &new2, ino2, 3 * bs as u64);
-        diff_truncate_step(&old2, &new2, ino2, bs as u64 + 3);
-        diff_truncate_step(&old2, &new2, ino2, 0);
+        // ⑦ depth>0 truncate partial：缩到 (601)*bs（>500 段尾 502，故 500/100 段保留），
+        //    free 高段但叶留 ≥1 extent → ext_remove_idx 不触发。
+        diff_truncate_step(&old_b, &new_b, ino_b, 600 * bs as u64);
+        assert!(root_depth(&old_b, ino_b) > 0, "B: leaf still non-empty after truncate partial (old)");
+        assert!(root_depth(&new_b, ino_b) > 0, "B: leaf still non-empty after truncate partial (new)");
     }
 }
