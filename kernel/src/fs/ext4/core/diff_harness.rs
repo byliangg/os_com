@@ -7,8 +7,9 @@
 //! - 直写 [`DirectMetadataWriter`]：实现 core 本地 [`MetadataWriter`]，把元数据
 //!   全块镜像**立即**写穿同一份字节（无 JBD2 延迟——overlay 留 Phase 5）。
 //!
-//! 这样新旧两侧共享同一 `Arc`，跑同一序列后用 [`snapshot_meta`] / [`assert_meta_eq`]
-//! 逐字节对拍元数据区。后续 Task 1-6 的分配器差分全靠它。
+//! Step 0 的往返自检让新旧共享同一 `Arc`；而 Task 1-6 的**分配器差分用两张独立
+//! `MemDisk`**（各自 `from_image` 同一镜像字节、互不污染），跑同一序列后用
+//! [`snapshot_meta`] / [`assert_meta_eq`] 逐字节对拍元数据区。两盘设计更强：两侧不可能交叉污染。
 //!
 //! 注意：core 生产代码只依赖 [`BlockReader`] / [`MetadataWriter`]，对 `ext4_rs`
 //! 的桥接**只**出现在本 `#[cfg(ktest)]` 模块里（满足新旧解耦约束）。
