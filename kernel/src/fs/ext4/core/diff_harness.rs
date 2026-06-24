@@ -972,4 +972,373 @@ mod test {
         diff_lookup(&bytes, d1_ino, ".", core_lookup);
         diff_lookup(&bytes, d1_ino, "ghost", core_lookup);
     }
+
+    // =================================================================
+    // Phase 4 Task 2：目录项 CRUD 写差分（切槽插入 / 删除合并 / 块 csum 写 / 追加新块）。
+    //
+    // 差分驱动（控制器裁决：经 ext4_rs 公开 dir 法直接对拍）：
+    // - OLD：`ext4_rs::Ext4::open` → `get_inode_ref(parent)` → 调 `dir_add_entry` /
+    //   `dir_remove_entry` / `dir_remove_entry_at_offset`（均为 `pub fn` on `impl Ext4`）。
+    // - NEW：core `dir_add_entry` / `dir_remove_entry` / `dir_remove_entry_at_offset`，同 parent
+    //   inode + 同 child ino/type；core 分配器经 `CoreDirAllocAdapter`（Phase-2 `BlockAllocator`
+    //   + `InodeAllocCtx`，与 file.rs 差分同一套），WriteCtx 经 `DirectMetadataWriter`。
+    // 每步两盘 `assert_disk_eq` 全盘逐字节（dir 块 + inode 表 i_size/links + 位图/SB/extent）。
+    // 另含一个 byte-exact 单测（`try_insert` / `insert_to_new_block` 在内存块上跑、对拍手算值）。
+    // =================================================================
+
+    use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
+    use crate::fs::ext4::core::dir::{
+        dir_add_entry, dir_remove_entry, dir_remove_entry_at_offset, inode_to_dir_entry_type,
+        insert_to_new_block, try_insert_to_existing_block, EXT4_DIR_ENTRY_INMEM_SIZE,
+    };
+    use crate::fs::ext4::core::extents::{BlockAlloc, WriteCtx};
+    use crate::fs::ext4::core::inode::{load_inode, Inode};
+    use crate::fs::ext4::core::types::Ext4Fsblk as Fsblk;
+    // core 写半部用 `crate::prelude::Result`（= core/prelude 的 Result，带 core Error）；
+    // 显式（非 glob）引入以消除 `ostd::prelude::*` 同名 `Result` 的歧义（与 file.rs 差分一致）。
+    use crate::prelude::Result;
+
+    /// 把 Phase-2 `BlockAllocator` + `InodeAllocCtx` 适配成 core 写半部要的 [`BlockAlloc`]
+    /// （与 file.rs 差分里的 `CoreAllocAdapter` 同套：分配后把 i_blocks 同步回 inode）。
+    struct CoreDirAllocAdapter<'a, R: BlockReader, W: MetadataWriter> {
+        alloc: BlockAllocator<'a, R, W>,
+        ictx: InodeAllocCtx,
+    }
+
+    impl<'a, R: BlockReader, W: MetadataWriter> BlockAlloc for CoreDirAllocAdapter<'a, R, W> {
+        fn alloc_one(&mut self, inode: &mut Inode) -> Result<Fsblk> {
+            let blk = self.alloc.balloc_alloc_block(&mut self.ictx, None)?;
+            inode.set_blocks_count(self.ictx.i_blocks());
+            Ok(blk)
+        }
+        fn alloc_batch(
+            &mut self,
+            inode: &mut Inode,
+            start_bgid: &mut u32,
+            count: usize,
+        ) -> Result<Vec<Fsblk>> {
+            let v = self
+                .alloc
+                .balloc_alloc_block_batch(&mut self.ictx, start_bgid, count)?;
+            inode.set_blocks_count(self.ictx.i_blocks());
+            Ok(v)
+        }
+        fn free_blocks(&mut self, inode: &mut Inode, start: Fsblk, count: u32) {
+            self.alloc.balloc_free_blocks(&mut self.ictx, start, count);
+            inode.set_blocks_count(self.ictx.i_blocks());
+        }
+    }
+
+    /// 旧侧（ext4_rs）`dir_add_entry`：open → get_inode_ref(parent) + get_inode_ref(child) →
+    /// `dir_add_entry(&mut parent_ref, &child_ref, name)`。返回 Ok-Err（数值映射），盘字节就地变。
+    fn old_dir_add_entry(
+        disk: &MemDisk,
+        parent: u32,
+        child: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        let mut parent_ref = ext4.get_inode_ref(parent);
+        let child_ref = ext4.get_inode_ref(child);
+        ext4.dir_add_entry(&mut parent_ref, &child_ref, name)
+            .map(|_| ())
+            .map_err(|e| e.error())
+    }
+
+    /// 新侧（core）`dir_add_entry`：从盘重建 SB / 分配器 / WriteCtx / parent inode；child 的
+    /// DE filetype 由 core `inode_to_dir_entry_type(child_inode)` 算。返回 Ok-Err（数值映射）。
+    fn core_dir_add_entry(
+        disk: &MemDisk,
+        parent: u32,
+        child: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let sb = read_sb(disk);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let alloc = BlockAllocator::new(sb, disk, &writer);
+        let mut parent_inode = match load_inode(disk, &sb, parent) {
+            Ok(i) => i,
+            Err(e) => return Err(map_core_errno(e.error())),
+        };
+        let child_inode = match load_inode(disk, &sb, child) {
+            Ok(i) => i,
+            Err(e) => return Err(map_core_errno(e.error())),
+        };
+        let child_ftype = inode_to_dir_entry_type(&child_inode);
+        let ictx = InodeAllocCtx::new(parent_inode.blocks_count());
+        let mut adapter = CoreDirAllocAdapter { alloc, ictx };
+        let ctx = WriteCtx::new(disk, &writer, disk, &sb);
+        dir_add_entry(
+            &ctx,
+            &mut adapter,
+            &mut parent_inode,
+            child,
+            child_ftype,
+            name.as_bytes(),
+        )
+        .map_err(|e| map_core_errno(e.error()))
+    }
+
+    /// 旧侧（ext4_rs）`dir_remove_entry`：open → get_inode_ref(parent) → `dir_remove_entry`。
+    fn old_dir_remove_entry(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        let mut parent_ref = ext4.get_inode_ref(parent);
+        ext4.dir_remove_entry(&mut parent_ref, name)
+            .map(|_| ())
+            .map_err(|e| e.error())
+    }
+
+    /// 新侧（core）`dir_remove_entry`。
+    fn core_dir_remove_entry(
+        disk: &MemDisk,
+        parent: u32,
+        name: &str,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let sb = read_sb(disk);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut parent_inode = match load_inode(disk, &sb, parent) {
+            Ok(i) => i,
+            Err(e) => return Err(map_core_errno(e.error())),
+        };
+        let ctx = WriteCtx::new(disk, &writer, disk, &sb);
+        dir_remove_entry(&ctx, &mut parent_inode, name.as_bytes())
+            .map_err(|e| map_core_errno(e.error()))
+    }
+
+    /// 旧侧（ext4_rs）`dir_remove_entry_at_offset`。
+    fn old_dir_remove_at_offset(
+        disk: &MemDisk,
+        parent: u32,
+        abs_off: u64,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        let mut parent_ref = ext4.get_inode_ref(parent);
+        ext4.dir_remove_entry_at_offset(&mut parent_ref, abs_off)
+            .map(|_| ())
+            .map_err(|e| e.error())
+    }
+
+    /// 新侧（core）`dir_remove_entry_at_offset`。
+    fn core_dir_remove_at_offset(
+        disk: &MemDisk,
+        parent: u32,
+        abs_off: u64,
+    ) -> core::result::Result<(), ext4_rs::Errno> {
+        let sb = read_sb(disk);
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut parent_inode = match load_inode(disk, &sb, parent) {
+            Ok(i) => i,
+            Err(e) => return Err(map_core_errno(e.error())),
+        };
+        let ctx = WriteCtx::new(disk, &writer, disk, &sb);
+        dir_remove_entry_at_offset(&ctx, &mut parent_inode, abs_off)
+            .map_err(|e| map_core_errno(e.error()))
+    }
+
+    /// add-entry 差分一步：两盘从同一 `image` 起步，旧/新各跑 `dir_add_entry(parent, child, name)`，
+    /// 比 Ok-Err + 全盘逐字节。返回供链式调用的结果字节（用最新盘面继续下一步）。
+    fn diff_add_step(image: &[u8], parent: u32, child: u32, name: &str) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_dir_add_entry(&old_disk, parent, child, name);
+        let new_ret = core_dir_add_entry(&new_disk, parent, child, name);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => assert_eq!(o, n, "add '{name}' errno mismatch: old {o:?} new {n:?}"),
+            (o, n) => panic!("add '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        }
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// remove-by-name 差分一步：旧/新各跑 `dir_remove_entry(parent, name)`，比 Ok-Err + 全盘。
+    fn diff_remove_step(image: &[u8], parent: u32, name: &str) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_dir_remove_entry(&old_disk, parent, name);
+        let new_ret = core_dir_remove_entry(&new_disk, parent, name);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => {
+                assert_eq!(o, n, "remove '{name}' errno mismatch: old {o:?} new {n:?}")
+            }
+            (o, n) => panic!("remove '{name}' ok/err divergence: old={o:?} new={n:?}"),
+        }
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// remove-by-offset 差分一步：旧/新各跑 `dir_remove_entry_at_offset(parent, abs_off)`。
+    fn diff_remove_at_offset_step(image: &[u8], parent: u32, abs_off: u64) -> Vec<u8> {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old_ret = old_dir_remove_at_offset(&old_disk, parent, abs_off);
+        let new_ret = core_dir_remove_at_offset(&new_disk, parent, abs_off);
+        match (old_ret, new_ret) {
+            (Ok(()), Ok(())) => {}
+            (Err(o), Err(n)) => assert_eq!(
+                o, n,
+                "remove@{abs_off} errno mismatch: old {o:?} new {n:?}"
+            ),
+            (o, n) => panic!("remove@{abs_off} ok/err divergence: old={o:?} new={n:?}"),
+        }
+        assert_disk_eq(&old_disk, &new_disk);
+        new_disk.backing().lock().clone()
+    }
+
+    /// 用 ext4_rs 在 `EXT4_IMAGE` 上建若干文件，返回 (盘字节, 各文件 inode 号)。供 CRUD 差分起步。
+    fn build_files(names: &[&str]) -> (Vec<u8>, Vec<u32>) {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        let mut inos = Vec::new();
+        for name in names {
+            ext4.ext4_create_at(2, name, 0o100644)
+                .unwrap_or_else(|e| panic!("create '{name}' failed: {e:?}"));
+            let ino = ext4
+                .ext4_lookup_at(2, name)
+                .unwrap_or_else(|e| panic!("lookup '{name}' failed: {e:?}"));
+            inos.push(ino);
+        }
+        (disk.backing().lock().clone(), inos)
+    }
+
+    /// 切槽插入 byte-exact 单测（无 ext4_rs 依赖）：用 core `insert_to_new_block` 初始化一个新
+    /// dir 块（首项 "." rec_len=bs-12），再 core `try_insert_to_existing_block(".." )` 切槽，
+    /// 对拍**手算**期望块字节。覆盖 264/8 不对称 + 264B 写 + 现有项 rec_len 缩短只改 2 字节。
+    #[ktest]
+    fn dir_try_insert_slot_split_parity() {
+        let sb = read_sb(&MemDisk::from_image(EXT4_IMAGE));
+        let bs = sb.block_size();
+        const DE_DIR: u8 = 2;
+
+        // ---- core 侧：新块写 "." → 切槽插 ".." ----
+        let mut block = vec![0u8; bs];
+        insert_to_new_block(&mut block, 2, b".", DE_DIR, bs);
+        // 切槽前：首项 "." rec_len = bs-12。
+        assert_eq!(
+            u16::from_le_bytes([block[4], block[5]]) as usize,
+            bs - 12,
+            "'.' initial rec_len = bs-12"
+        );
+        let off = try_insert_to_existing_block(&mut block, b"..", 2, DE_DIR, bs)
+            .expect("slot-split '..' must fit a fresh block");
+
+        // ---- 手算期望 ----
+        // sz_dot = align4(8 + name_len(1)) = align4(9) = 12 → 首项缩到 12，".." 落在 off=12。
+        let sz_dot = {
+            let l = 8 + 1usize;
+            (l + 3) & !3
+        };
+        assert_eq!(sz_dot, 12, "align4(8+1)=12 (用 8，非 264)");
+        assert_eq!(off, sz_dot, "new entry within-block offset = sz of '.'");
+        // 首项 "." rec_len 缩短到 12；inode/name 不变。
+        assert_eq!(
+            u16::from_le_bytes([block[4], block[5]]) as usize,
+            sz_dot,
+            "'.' rec_len shrunk to 12"
+        );
+        assert_eq!(u32::from_le_bytes([block[0], block[1], block[2], block[3]]), 2, "'.' inode kept");
+        assert_eq!(block[6], 1, "'.' name_len kept");
+        assert_eq!(&block[8..9], b".", "'.' name kept");
+        // 新项 ".."：rec_len = free_space = (bs-12) - 12 = bs-24；inode=2、name_len=2、type=DIR。
+        let free_space = (bs - 12) - sz_dot;
+        assert_eq!(
+            u16::from_le_bytes([block[off + 4], block[off + 5]]) as usize,
+            free_space,
+            "'..' rec_len = whole remaining free_space (= bs-24)"
+        );
+        assert_eq!(block[off + 6], 2, "'..' name_len 2");
+        assert_eq!(block[off + 7], DE_DIR, "'..' file_type DIR");
+        assert_eq!(&block[off + 8..off + 10], b"..", "'..' name bytes");
+        // 264B 写 parity：新项的 [off+8+2 .. off+264] 全 0（name 尾零填 + 对齐）。
+        assert!(
+            block[off + 10..off + EXT4_DIR_ENTRY_INMEM_SIZE].iter().all(|&b| b == 0),
+            "264B write: trailing [name_len..264] zero-filled"
+        );
+    }
+
+    /// 同块连续切槽插入若干短名项：每步 core vs ext4_rs `dir_add_entry` 全盘对拍。
+    /// 在根目录（单块、有空间）下连插多个项，逼 try_insert 在同一块里反复切槽。child 复用
+    /// 已建文件 inode（项只存 ino+type，无需新分配）。
+    #[ktest]
+    fn dir_add_entry_same_block_parity() {
+        // 先建几个"目标"文件（提供 child inode 号），并在根目录留好空间。
+        let (mut img, inos) = build_files(&["src_a", "src_b", "src_c"]);
+        // 连续把这些 inode 以新名字插进根目录（同块切槽）。
+        img = diff_add_step(&img, 2, inos[0], "link_a");
+        img = diff_add_step(&img, 2, inos[1], "link_bb");
+        let _ = diff_add_step(&img, 2, inos[2], "link_ccc");
+    }
+
+    /// 触发新建 dir 块：把根目录末块塞满（连插大量项）直到 try_insert 失败 → `dir_append_block`
+    /// 新建块 + `insert_to_new_block`。对拍 extent/位图/SB/i_size + 新块字节（全盘）。
+    #[ktest]
+    fn dir_add_entry_new_block_parity() {
+        // child inode：复用 lost+found(11)（仅存 ino+type，不分配）。
+        const CHILD: u32 = 11;
+        let mut img = EXT4_IMAGE.to_vec();
+        // 4K 块单根目录块约容 ~250 短名项；插到溢出第一块、逼 append 新块。
+        // 逐步全盘对拍（任何 rec_len/分配/extent/i_size 偏差立现）。
+        for i in 0..260usize {
+            let name = format!("entry_{i:05}");
+            img = diff_add_step(&img, 2, CHILD, &name);
+        }
+        // 佐证确实跨块：旧侧 readdir 项数应远超单块容量。
+        let probe = old_readdir(&MemDisk::from_image(&img), 2);
+        assert!(
+            probe.len() > 250,
+            "expected a 2nd dir block (>250 entries); got {}",
+            probe.len()
+        );
+    }
+
+    /// 删中间项（前驱 rec_len 吞并）：建多个文件后删一个**非首项**，core vs ext4_rs 全盘对拍。
+    #[ktest]
+    fn dir_remove_middle_merge_parity() {
+        let (img, _inos) = build_files(&["rm_a", "rm_b", "rm_c", "rm_d"]);
+        // 删一个中间文件名（非块首项；前驱合并路径）。
+        let _ = diff_remove_step(&img, 2, "rm_b");
+        // 再删一个，验证连续删 + 合并。
+        let img2 = diff_remove_step(&img, 2, "rm_c");
+        let _ = diff_remove_step(&img2, 2, "rm_d");
+    }
+
+    /// 删块首项（**不合并**，inode=0 标删）：删根目录块首项 "."（offset 0）。
+    /// core 与 ext4_rs 都只置 inode=0、不合并（parity）；全盘对拍。
+    #[ktest]
+    fn dir_remove_first_entry_parity() {
+        // 根目录块首项是 "."（offset 0）。删它走「首项不合并」分支。
+        let _ = diff_remove_step(EXT4_IMAGE, 2, ".");
+    }
+
+    /// 按 abs offset 删：先用 `dir_get_entries_with_next_offset` 算出某项的 within-block 偏移，
+    /// 再两侧 `dir_remove_entry_at_offset` 对拍。删一个中间项（offset != 0，合并路径）。
+    #[ktest]
+    fn dir_remove_at_offset_parity() {
+        let (img, _inos) = build_files(&["off_a", "off_b", "off_c"]);
+        // 用旧侧底层枚举（带 next_offset）定位 "off_b" 这一项的**自身** abs offset。
+        // next_offset = abs_off_of_entry + rec_len；故该项 abs_off = 前一项的 next_offset。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(MemDisk::from_image(&img).clone()));
+        let entries = ext4.dir_get_entries_with_next_offset(2);
+        // 找 "off_b" 的绝对 offset：它等于其前一项的 next_offset（枚举按块内顺序）。
+        let mut abs_off = None;
+        let mut prev_next = 0u64;
+        for (de, next_off) in &entries {
+            if de.get_name() == "off_b" {
+                abs_off = Some(prev_next);
+                break;
+            }
+            prev_next = *next_off as u64;
+        }
+        let abs_off = abs_off.expect("'off_b' present in enumeration");
+        assert!(abs_off > 0, "'off_b' is not the first entry (offset>0)");
+        let _ = diff_remove_at_offset_step(&img, 2, abs_off);
+    }
 }
