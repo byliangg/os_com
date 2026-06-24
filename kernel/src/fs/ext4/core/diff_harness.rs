@@ -1154,6 +1154,10 @@ mod test {
             (Err(o), Err(n)) => assert_eq!(o, n, "add '{name}' errno mismatch: old {o:?} new {n:?}"),
             (o, n) => panic!("add '{name}' ok/err divergence: old={o:?} new={n:?}"),
         }
+        // BUG-21: 归一 ext4_rs 写项的未初始化 padding 字节（仅 rec_len>=264 项的 +263）再全盘对拍。
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
         assert_disk_eq(&old_disk, &new_disk);
         new_disk.backing().lock().clone()
     }
@@ -1171,6 +1175,10 @@ mod test {
             }
             (o, n) => panic!("remove '{name}' ok/err divergence: old={o:?} new={n:?}"),
         }
+        // BUG-21: 删项后块尾项 rec_len 可能因合并增长到 >=264（吞并出大槽），同样归一 padding 字节。
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
         assert_disk_eq(&old_disk, &new_disk);
         new_disk.backing().lock().clone()
     }
@@ -1189,8 +1197,80 @@ mod test {
             ),
             (o, n) => panic!("remove@{abs_off} ok/err divergence: old={o:?} new={n:?}"),
         }
+        // BUG-21: 同 diff_remove_step——归一 padding 字节再全盘对拍。
+        let sb = read_sb(&new_disk);
+        mask_dirent_padding(&old_disk, &sb, parent);
+        mask_dirent_padding(&new_disk, &sb, parent);
         assert_disk_eq(&old_disk, &new_disk);
         new_disk.backing().lock().clone()
+    }
+
+    /// 归一化 ext4_rs 的 `Ext4DirEntry` 未初始化 padding 泄漏（**BUG-21**）后再对拍。
+    ///
+    /// BUG-21：`Ext4DirEntry` 是 `#[repr(C)]`，字段共 263 字节、对齐到 **264**；其
+    /// `impl Default`（direntry.rs:96）用结构体字面量（**非** `mem::zeroed()`），故结构体**字节
+    /// 263 是未初始化的 padding**。ext4_rs 写项经 `copy_to_slice` / `copy_dir_entry_to_array`
+    /// 做 `unsafe` 264 字节 `copy_nonoverlapping`，把那个未初始化的栈字节（实测 0x88）泄漏到盘。
+    /// core 的 `dir_write_entry_bytes` 写干净零缓冲（字节 263 = 0x00）——**core 才是对的**
+    /// （确定性、无信息泄漏，正是重写要修的 bug 之一），core 绝不复刻 UB 垃圾。
+    ///
+    /// 泄漏字节在 `entry_start + 263`，仅当该位置不被后继项覆盖时存活——精确地：**对目录每块每项，
+    /// 若 `rec_len >= 264`（即 padding 字节落在本项自己的槽内、且后继项起点 ≥264 不覆盖它），
+    /// `entry_start + 263` 可能是 ext4_rs 垃圾**。rec_len < 264 的项其 +263 被下一项写覆盖、不合格。
+    ///
+    /// 本 helper 对 `dir_inode` 的每个目录块走项（`parse_entry`），对每个 `rec_len >= 264` 的项把盘
+    /// 上 `pblock*bs + entry_off + 263` 这**一个字节**清零。两盘都调用（core 侧本就是 0、no-op，
+    /// 但对称归一更显然正确）。**外科级**：只动这一个字节/项，绝不放宽——其它字节仍逐字节对拍。
+    fn mask_dirent_padding(disk: &MemDisk, sb: &RawSuperblock, dir_inode: u32) {
+        use crate::fs::ext4::core::dir::parse_entry;
+        use crate::fs::ext4::core::extents::get_pblock_idx_state;
+
+        let bs = sb.block_size();
+        let dir = match load_inode(disk, sb, dir_inode) {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        // 仅目录才有目录项槽（防御；调用点都传目录 inode）。
+        if !dir.raw.is_dir() {
+            return;
+        }
+        let total_blocks = dir.size().div_ceil(bs as u64);
+        let mut buf = vec![0u8; bs];
+        let mut iblock = 0u64;
+        while iblock < total_blocks {
+            // hole / 映射失败的块跳过（与读路径枚举一致，不报错）。
+            let pblock = match get_pblock_idx_state(disk, sb, &dir, iblock as u32) {
+                Ok(Some((p, _unwritten))) => p,
+                _ => {
+                    iblock += 1;
+                    continue;
+                }
+            };
+            disk.read_at(pblock as usize * bs, buf.as_mut_slice());
+            // 走项（停于 tail 区 bs-12，坏 rec_len 静默 break，同枚举防御）。
+            let mut off = 0usize;
+            while off + 8 <= bs - 12 {
+                let de = match parse_entry(&buf, off, bs) {
+                    Ok(de) => de,
+                    Err(_) => break,
+                };
+                let rec_len = de.rec_len as usize;
+                if rec_len == 0 || rec_len > bs - off {
+                    break;
+                }
+                // BUG-21: rec_len>=264 → padding 字节 (+263) 落在本项槽内且不被后继覆盖 → 清零。
+                if rec_len >= EXT4_DIR_ENTRY_INMEM_SIZE {
+                    let leak_off = pblock as usize * bs + off + (EXT4_DIR_ENTRY_INMEM_SIZE - 1);
+                    let backing = disk.backing();
+                    let mut guard = backing.lock();
+                    if leak_off < guard.len() {
+                        guard[leak_off] = 0;
+                    }
+                }
+                off += rec_len;
+            }
+            iblock += 1;
+        }
     }
 
     /// 用 ext4_rs 在 `EXT4_IMAGE` 上建若干文件，返回 (盘字节, 各文件 inode 号)。供 CRUD 差分起步。
