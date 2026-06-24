@@ -4065,4 +4065,361 @@ mod test {
             }
         }
     }
+
+    // =================================================================
+    // Phase 5 Task 6：边角差分 + 收口。
+    //
+    // 在 Task 1-5 已有的 commit/recover/space/revoke 差分之上补边角，硬化对拍面。
+    // 全部 **test-only**——无生产改动（core recovery 的 parse 路径已全程 bounds-checked：
+    // `raw.get(..)` / `try_into().ok()?` / `checked_mul`，对坏/截断输入返回 None/Err，
+    // 不会 panic；本节坐实这一点而非引入新代码）。
+    //
+    // - `journal_tag_form_used_parity`：三镜像 journal SB 的 feature_incompat 实测——确认它们
+    //   用的是 **8 字节 v2-form tag**（CSUM_V2/V3/64BIT 位全关），断言 recovery 用的 `tag_length`
+    //   走 8 字节路径。**不**伪造镜像没有的特性（v3 16B / 64BIT 12B 路径的解码已由 recovery.rs
+    //   的 read_descriptor_tag 单测覆盖类型层；此处只 ground 实测镜像走的那条）。
+    // - `journal_escape_recover_parity`：escape 块（payload 首 4B==大端 magic）commit 后再 recover——
+    //   两侧 replay 把 home 还原成**原始**字节（含 magic 头），HOME 逐字节 + 整盘 parity。
+    //   补上 Task 3 escape（只验 commit 写盘 4B 零填）缺的「replay 还原」半程。
+    // - `journal_empty_no_recovery_parity`：pristine 镜像（s_start==0）——两侧 needs_recovery=false、
+    //   recover 不 replay、journal 区逐字节不变；整盘不变（no-op）。
+    // - `journal_recover_corrupt_descriptor_parity`：AfterSuperblock 崩溃态（s_start!=0）后**破坏
+    //   descriptor 块头**（坏 magic / 坏 blocktype）——两侧 SCAN 把它当无效事务、优雅停（0 replay），
+    //   HOME 不变 + 整盘 parity。坐实「坏头不 panic、停得一致」。
+    // - `journal_recover_corrupt_input_core_graceful`：把若干结构性坏/截断 journal 区喂给 core
+    //   `recover`——core 必返回 Ok/Err（**绝不 panic**），且不 replay 越界块。ext4_rs 在同输入也优雅
+    //   则双侧对拍；本测试聚焦 core 健壮性（无生产改动地坐实 bounds-checked 解析）。
+    // =================================================================
+
+    /// 实测三镜像 journal SB 的 tag-form（feature_incompat），断言它们都走 **8 字节 v2-form tag**。
+    /// recovery 的 `tag_length`：CSUM_V3→16 / 64BIT→12 / 否则 8。三镜像 feat_incompat=0 → 全 8B。
+    /// 这是 grounded 断言（不伪造特性）：v3/64BIT 解码路径由类型层单测覆盖，此处坐实镜像走的那条。
+    #[ktest]
+    fn journal_tag_form_used_parity() {
+        use crate::fs::ext4::core::journal::format::{
+            JBD2_FEATURE_INCOMPAT_64BIT, JBD2_FEATURE_INCOMPAT_CSUM_V2,
+            JBD2_FEATURE_INCOMPAT_CSUM_V3,
+        };
+        use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let disk = MemDisk::from_image(image);
+            let (physical_blocks, geom) = resolve_journal_area(&disk);
+            let bs = geom.block_size as usize;
+            let sb = load_journal_sb(&disk, &physical_blocks, bs).expect("load journal SB");
+
+            let feat = sb.feature_incompat();
+            // 三镜像实测：journal feature_incompat 不含 CSUM_V2/V3/64BIT → 8 字节 v2-form tag。
+            assert_eq!(
+                feat & (JBD2_FEATURE_INCOMPAT_CSUM_V2
+                    | JBD2_FEATURE_INCOMPAT_CSUM_V3
+                    | JBD2_FEATURE_INCOMPAT_64BIT),
+                0,
+                "image journal must use 8-byte v2-form tags (no CSUM_V2/V3/64BIT) [{image:?}], \
+                 feature_incompat={feat:#010x}"
+            );
+            assert!(
+                !sb.has_checksum_v2_or_v3(),
+                "journal csum gate must be OFF on these images [{image:?}]"
+            );
+            assert!(
+                !sb.has_incompat_feature(JBD2_FEATURE_INCOMPAT_64BIT),
+                "journal 64BIT must be OFF on these images [{image:?}]"
+            );
+        }
+    }
+
+    /// escape 块的 commit + recover 全程 parity：payload 首 4 字节 == 大端 JBD2 magic 的块，
+    /// commit 写盘时两侧都把那 4 字节零填 + tag 置 ESCAPE（Task 3 已验 commit 半程）；**本测试补
+    /// recover 半程**——AfterSuperblock 崩溃态后两侧 replay，escape 块还原成**原始**字节（含 magic 头），
+    /// HOME 逐字节 + 整盘 parity。
+    #[ktest]
+    fn journal_escape_recover_parity() {
+        use crate::fs::ext4::core::journal::format::JBD2_MAGIC;
+
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (_, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // 一个 escape 命中块（首 4B = 大端 magic，其余非零）+ 一个普通块。
+            let mut escape_img = recover_block_image(bs, 0x77);
+            escape_img[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+            let writes = [
+                JournalMetaWrite { block_nr: 9, image: escape_img.clone() },
+                JournalMetaWrite { block_nr: 17, image: recover_block_image(bs, 0x33) },
+            ];
+
+            // 造已 commit + SB 指向的盘，两侧 recover → replay → HOME 逐字节 + 整盘 parity
+            // （run_recover_stage 内部对 replayed 块断言 new_home == w.image，即还原回原始字节）。
+            run_recover_stage(image, &writes, JournalCrashStage::AfterSuperblock, true);
+        }
+    }
+
+    /// 空 journal（pristine 镜像，s_start==0）no-op parity：两侧 needs_recovery=false、recover 不 replay、
+    /// journal 区逐字节不变、整盘不变。坐实 `needs_recovery == (s_start != 0)`（PARITY recovery.rs:28-30）。
+    #[ktest]
+    fn journal_empty_no_recovery_parity() {
+        use crate::fs::ext4::core::journal::recovery::needs_recovery;
+        use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (probe_blocks, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+
+            // pristine 镜像的 journal SB：s_start==0 → 不需恢复。
+            let pristine_sb =
+                load_journal_sb(&probe, &probe_blocks, bs).expect("load pristine journal SB");
+            assert_eq!(pristine_sb.start(), 0, "pristine image journal s_start must be 0 [{image:?}]");
+            assert!(
+                !needs_recovery(&pristine_sb),
+                "pristine journal must not need recovery [{image:?}]"
+            );
+
+            // 起点字节快照（journal 区 + 整盘）。
+            let pre_journal = snapshot_journal_area(&probe, &probe_blocks, bs);
+            let pre_disk = probe.backing().lock().clone();
+
+            // 两侧 recover：均应为 no-op（0 replay），用 `match (old,new)` 对拍。
+            let old_disk = MemDisk::from_image(image);
+            let new_disk = MemDisk::from_image(image);
+            let old_res = old_journal_recover(&old_disk);
+            let new_res = core_journal_recover(&new_disk);
+            match (&old_res, &new_res) {
+                (Ok(old), Ok((new, _new_sb))) => {
+                    assert_eq!(old.transactions_replayed, 0, "old empty recover 0 txn [{image:?}]");
+                    assert_eq!(new.transactions_replayed, 0, "core empty recover 0 txn [{image:?}]");
+                    assert_eq!(
+                        new.metadata_blocks_replayed, 0,
+                        "core empty recover 0 metadata blocks [{image:?}]"
+                    );
+                    assert_eq!(new.last_sequence, None, "core empty recover last_sequence None [{image:?}]");
+                }
+                (o, n) => panic!(
+                    "empty recover Ok/Err divergence [{image:?}]: old={:?} new_is_ok={}",
+                    o.as_ref().map(|_| ()),
+                    n.is_ok()
+                ),
+            }
+
+            // journal 区 + 整盘逐字节不变（no-op：needs_recovery=false 早返，不动盘）。
+            let post_journal_new = snapshot_journal_area(&new_disk, &probe_blocks, bs);
+            assert_eq!(
+                post_journal_new, pre_journal,
+                "core empty recover must leave journal area unchanged [{image:?}]"
+            );
+            assert_eq!(
+                new_disk.backing().lock().clone(),
+                pre_disk,
+                "core empty recover must leave whole disk unchanged [{image:?}]"
+            );
+            // 旧侧（ext4_rs）also no-op：整盘字节与新侧一致（兜底，两侧都没动盘）。
+            assert_disk_eq(&old_disk, &new_disk);
+        }
+    }
+
+    /// 坏 descriptor 头防御 parity：AfterSuperblock 崩溃态（s_start!=0、needs_recovery=true）后破坏
+    /// **descriptor 块头**——分别测「坏 magic」「坏 blocktype（改成非 DESCRIPTOR）」两种坏法。两侧 SCAN
+    /// 在 `read_header` / blocktype 检查处把它当无效事务，优雅停（0 replay，**不 panic**），HOME 不变 +
+    /// 整盘 parity + SB 仍被重置一致。
+    #[ktest]
+    fn journal_recover_corrupt_descriptor_parity() {
+        use crate::fs::ext4::core::journal::format::{
+            RawJournalHeader, JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK,
+        };
+
+        // corruption kind：0 = 坏 magic（清头 4 字节）；1 = 坏 blocktype（改成 COMMIT，非 DESCRIPTOR）。
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            for corrupt_kind in 0u8..2 {
+                let probe = MemDisk::from_image(image);
+                let (probe_blocks, geom) = resolve_journal_area(&probe);
+                let bs = geom.block_size as usize;
+
+                let writes = [
+                    JournalMetaWrite { block_nr: 13, image: recover_block_image(bs, 0x44) },
+                    JournalMetaWrite { block_nr: 21, image: recover_block_image(bs, 0x88) },
+                ];
+
+                // 已 commit + SB 指向的盘。
+                let mut crashed =
+                    build_crashed_journal_image(image, &writes, JournalCrashStage::AfterSuperblock);
+
+                // 定位 descriptor 块（崩溃态 s_start 指向它）。
+                let crashed_disk = MemDisk::from_image(&crashed);
+                let (_, crashed_geom) = resolve_journal_area(&crashed_disk);
+                let start = crashed_geom.start;
+                assert_ne!(start, 0, "AfterSuperblock crash must set s_start != 0 [{image:?}]");
+                let desc_phys = probe_blocks[start as usize];
+                let desc_off = (desc_phys as usize) * bs;
+
+                // 确认它本是合法 descriptor。
+                let mut hdr_bytes = vec![0u8; size_of::<RawJournalHeader>()];
+                crashed_disk.read_at(desc_off, hdr_bytes.as_mut_slice());
+                let hdr = RawJournalHeader::from_bytes(&hdr_bytes);
+                assert_eq!(
+                    hdr.blocktype(),
+                    JBD2_DESCRIPTOR_BLOCK,
+                    "located block must be the descriptor [{image:?}]"
+                );
+
+                // 破坏它。
+                match corrupt_kind {
+                    0 => {
+                        // 坏 magic：头 4 字节清零（is_valid_magic 失败 → read_header=None）。
+                        crashed[desc_off..desc_off + 4].fill(0);
+                    }
+                    _ => {
+                        // 坏 blocktype：magic 保留、blocktype 改成 COMMIT（非 DESCRIPTOR）。
+                        let corrupt = RawJournalHeader::new(JBD2_COMMIT_BLOCK, hdr.sequence());
+                        crashed[desc_off..desc_off + size_of::<RawJournalHeader>()]
+                            .copy_from_slice(corrupt.as_bytes());
+                    }
+                }
+
+                let pristine = MemDisk::from_image(image);
+                let old_disk = MemDisk::from_image(&crashed);
+                let new_disk = MemDisk::from_image(&crashed);
+
+                // 两侧 recover：坏 descriptor → SCAN 视无效 → 优雅停（不 panic），0 replay。
+                let old_res = old_journal_recover(&old_disk);
+                let new_res = core_journal_recover(&new_disk);
+                match (&old_res, &new_res) {
+                    (Ok(old), Ok((new, new_sb))) => {
+                        assert_eq!(
+                            old.transactions_replayed, new.transactions_replayed,
+                            "corrupt-desc transactions_replayed mismatch [{image:?} kind={corrupt_kind}]"
+                        );
+                        assert_eq!(
+                            new.transactions_replayed, 0,
+                            "corrupt descriptor → 0 replayed txns [{image:?} kind={corrupt_kind}]"
+                        );
+                        assert_eq!(
+                            old.metadata_blocks_replayed, new.metadata_blocks_replayed,
+                            "corrupt-desc metadata_blocks_replayed mismatch [{image:?} kind={corrupt_kind}]"
+                        );
+                        // HOME 块未被写：两侧 + pristine 三者一致。
+                        for w in &writes {
+                            let old_home = read_home_block(&old_disk, w.block_nr, bs);
+                            let new_home = read_home_block(&new_disk, w.block_nr, bs);
+                            let orig = read_home_block(&pristine, w.block_nr, bs);
+                            assert_eq!(
+                                old_home, new_home,
+                                "corrupt-desc HOME {} engine mismatch [{image:?} kind={corrupt_kind}]",
+                                w.block_nr
+                            );
+                            assert_eq!(
+                                new_home, orig,
+                                "corrupt-desc HOME {} must be unchanged [{image:?} kind={corrupt_kind}]",
+                                w.block_nr
+                            );
+                        }
+                        assert_reset_sb_eq(&old_disk, &probe_blocks, new_sb, bs);
+                        assert_disk_eq(&old_disk, &new_disk);
+                    }
+                    (Err(_), Err(_)) => { /* 两侧同样失败也算 parity */ }
+                    (o, n) => panic!(
+                        "corrupt-desc recover Ok/Err divergence [{image:?} kind={corrupt_kind}]: \
+                         old={:?} new_is_ok={}",
+                        o.as_ref().map(|_| ()),
+                        n.is_ok()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// core 对结构性坏 / 截断 journal 区的健壮性：直接在 SB 上写一个**指向坏内容的 s_start**
+    /// （needs_recovery=true 但 descriptor 区是垃圾 / 全零 / 越界状），喂给 core `recover`——
+    /// core 必返回 `Ok`/`Err`（**绝不 panic**），且不把任何块 replay 到 home（无有效事务）。
+    /// 这坐实 core recovery 的 parse 路径全程 bounds-checked（`raw.get(..)`/`try_into().ok()?`/
+    /// `checked_mul`），是 forbid(unsafe) 下的健壮性下限——无生产改动。
+    ///
+    /// ext4_rs 在同输入也优雅时双侧对拍（needs_recovery / 0 replay）；本测试主验 core 侧。
+    #[ktest]
+    fn journal_recover_corrupt_input_core_graceful() {
+        use crate::fs::ext4::core::journal::format::{RawJournalSuperblock, JBD2_SUPERBLOCK_SIZE};
+        use crate::fs::ext4::core::journal::recovery::{needs_recovery, recover, RecoverCtx};
+        use crate::fs::ext4::core::journal::superblock::{journal_sb_checksum, load_journal_sb};
+
+        for image in [EXT4_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let probe = MemDisk::from_image(image);
+            let (probe_blocks, geom) = resolve_journal_area(&probe);
+            let bs = geom.block_size as usize;
+            let usable = geom.maxlen.saturating_sub(geom.first);
+
+            // s_start 候选：环内合法但内容是垃圾的位置 + 一个接近 maxlen 边界的位置。
+            // （s_start 必须在 [first, maxlen) 内 JournalSpace::from_superblock 才不报错；
+            //  本测试要的是「needs_recovery=true 但 descriptor 是垃圾」→ 走完 SCAN/parse 路径。）
+            let mut starts = vec![geom.first];
+            if usable > 2 {
+                starts.push(geom.first + 1);
+                starts.push(geom.maxlen - 1);
+            }
+
+            for &bad_start in &starts {
+                // 取 pristine 盘字节，改写 journal SB：s_start=bad_start（needs_recovery=true），
+                // 重算 SB csum；再把整个 descriptor 区填成垃圾（0xEE），制造坏/无效事务输入。
+                let mut bytes = image.to_vec();
+                let sb_pblock = probe_blocks[0] as usize;
+                let sb_off = sb_pblock * bs;
+
+                // 改 SB。
+                let mut sb = load_journal_sb(&probe, &probe_blocks, bs).expect("load SB");
+                sb.set_start(bad_start);
+                let mut sb_image = [0u8; JBD2_SUPERBLOCK_SIZE];
+                sb_image.copy_from_slice(sb.as_bytes());
+                let csum = journal_sb_checksum(&sb_image);
+                sb.set_checksum(csum);
+                bytes[sb_off..sb_off + JBD2_SUPERBLOCK_SIZE].copy_from_slice(sb.as_bytes());
+
+                // 把所有非-SB 的 journal 物理块填成垃圾（0xEE）——descriptor 区全是无效头。
+                for &pblock in probe_blocks.iter().skip(1) {
+                    let off = (pblock as usize) * bs;
+                    bytes[off..off + bs].fill(0xEE);
+                }
+
+                // ---- core 侧：必不 panic，返回 Ok/Err，且 0 replay ----
+                let new_disk = MemDisk::from_image(&bytes);
+                let mut new_sb = load_journal_sb(&new_disk, &probe_blocks, bs)
+                    .expect("load corrupted SB (magic/version still valid)");
+                assert!(
+                    needs_recovery(&new_sb),
+                    "bad_start={bad_start} must trigger needs_recovery [{image:?}]"
+                );
+                let ctx = RecoverCtx {
+                    physical_blocks: &probe_blocks,
+                    reader: &new_disk,
+                    writer: &new_disk,
+                    block_size: bs,
+                };
+                // recover 必须**收敛**（Ok/Err），不 panic；垃圾 descriptor → 0 有效事务。
+                match recover(&ctx, &mut new_sb) {
+                    Ok(res) => {
+                        assert_eq!(
+                            res.transactions_replayed, 0,
+                            "garbage descriptor → 0 replayed txns [{image:?} start={bad_start}]"
+                        );
+                        assert_eq!(
+                            res.metadata_blocks_replayed, 0,
+                            "garbage descriptor → 0 replayed metadata blocks [{image:?} start={bad_start}]"
+                        );
+                    }
+                    Err(_) => { /* 优雅 Err 也是 graceful（无 panic）——同样可接受 */ }
+                }
+
+                // ---- 旧侧（ext4_rs）：同输入也优雅时双侧对拍 0 replay（透传 Result，不 expect）----
+                let old_disk = MemDisk::from_image(&bytes);
+                let old_res = old_journal_recover(&old_disk);
+                if let Ok(old) = old_res {
+                    assert_eq!(
+                        old.transactions_replayed, 0,
+                        "ext4_rs garbage descriptor → 0 replayed txns [{image:?} start={bad_start}]"
+                    );
+                }
+                // 留意 `RawJournalSuperblock` 不直接对拍盘 SB（两侧都重置成空），本测试只验 graceful。
+                let _ = RawJournalSuperblock::from_bytes(&bytes[sb_off..sb_off + JBD2_SUPERBLOCK_SIZE]);
+            }
+        }
+    }
 }
