@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 use ostd::const_assert;
 
+use super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
 use super::prelude::*;
+use super::superblock::RawSuperblock;
 
 /// ext4 on-disk inode 的 OS-dependent #2 区（Linux 变体，12 字节）。
 #[repr(C)]
@@ -75,6 +77,68 @@ impl RawInode {
     }
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
+    }
+}
+
+/// inode 元数据校验和（crc32c）——**纯函数**，逐字节复刻 ext4_rs
+/// `Ext4Inode::get_inode_checksum`（`ext4_defs/inode.rs:425`）。
+///
+/// 计算前在**本地拷贝**上把两个 csum 字段清零（`osd2.l_i_checksum_lo` / `i_checksum_hi`），
+/// **不**改入参 `raw`；要写回 lo/hi 用 [`write_inode_checksum_into`]。
+///
+/// 步骤（与 ext4_rs 一一对应）：
+/// 1. 本地拷贝清零 csum lo/hi；
+/// 2. `c = crc32c(INIT, uuid)`（16 字节）；
+/// 3. `c = crc32c(c, inode_id.to_le_bytes())`（4 字节小端）；
+/// 4. `c = crc32c(c, generation.to_le_bytes())`（4 字节小端）；
+/// 5. 把 inode 的**前 0x9c = 156 字节**拷进 256 字节零缓冲（其余 100 字节保持 0）；
+/// 6. `c = crc32c(c, &raw_data[..inode_size])`（覆盖 156 真实 + 100 零字节）；
+/// 7. `if inode_size == 128 { c &= 0xFFFF }`。
+pub(super) fn inode_checksum(raw: &RawInode, inode_id: u32, sb: &RawSuperblock) -> u32 {
+    let inode_size = sb.inode_size() as usize;
+
+    // 1) 本地拷贝（不动入参 raw），在拷贝上清零 csum lo/hi——与 ext4_rs 在算前
+    //    把 `osd2.l_i_checksum_lo`/`i_checksum_hi` 置 0 一致（否则把旧 csum 算进去）。
+    let mut work = *raw;
+    work.osd2.l_i_checksum_lo = 0;
+    work.i_checksum_hi = 0;
+
+    // 2) crc32c(INIT, uuid)（16 字节）。
+    let uuid = sb.uuid();
+    let mut c = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
+    // 3) inode_id（4 字节小端）。
+    c = ext4_crc32c(c, &inode_id.to_le_bytes());
+    // 4) generation（4 字节小端）。
+    c = ext4_crc32c(c, &work.generation.to_le_bytes());
+
+    // 5) PARITY: replicate ext4_rs behavior, fix deferred (roadmap §5)
+    //    ext4_rs `copy_to_slice`(inode.rs:417) 只拷 0x9c=156 字节进 256 字节零缓冲——
+    //    这是实现细节（非 ext4 规范的整 inode），逐字节复刻。`RawInode` 恰 156 字节，
+    //    故 `as_bytes()`（156 字节）即那 0x9c 字节；其余 100 字节保持 0。
+    let mut raw_data = [0u8; 0x100];
+    let work_bytes = work.as_bytes();
+    raw_data[..work_bytes.len()].copy_from_slice(work_bytes);
+
+    // 6) PARITY: replicate ext4_rs behavior, fix deferred (roadmap §5)
+    //    crc 覆盖 `&raw_data[..inode_size]`——长度是 `sb.inode_size()`（本镜像=256），
+    //    即 156 真实字节 + 100 零字节，而非仅 156。
+    c = ext4_crc32c(c, &raw_data[..inode_size]);
+
+    // 7) 128B inode 只有 lo 半。
+    if inode_size == 128 {
+        c &= 0xFFFF;
+    }
+    c
+}
+
+/// 算出 csum 后写回 `raw` 的 lo/hi 字段，对齐 ext4_rs `set_inode_checksum`（`inode.rs:461`）：
+/// `osd2.l_i_checksum_lo = c & 0xFFFF`；`if inode_size > 128 { i_checksum_hi = c >> 16 }`。
+#[allow(dead_code)]
+pub(super) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &RawSuperblock) {
+    let c = inode_checksum(raw, inode_id, sb);
+    raw.osd2.l_i_checksum_lo = (c & 0xFFFF) as u16;
+    if sb.inode_size() > 128 {
+        raw.i_checksum_hi = (c >> 16) as u16;
     }
 }
 

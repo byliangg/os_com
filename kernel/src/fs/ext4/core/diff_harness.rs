@@ -141,21 +141,62 @@ struct MetaRegion {
     bytes: Vec<u8>,
 }
 
-/// 一次「元数据区」的快照：超级块计数/csum 区 + 全部组描述符表 + 每组的块/ inode 位图块。
+/// 一次「元数据区」的快照：超级块计数/csum 区 + 全部组描述符表 + 每组的块/inode 位图块
+/// + 每组的 inode 表整区（Task 0 起追加）。
 pub(super) struct MetaSnapshot {
     regions: Vec<MetaRegion>,
 }
 
+/// 截取某组的 inode 表整区：`inode_table()*bs` 起、`inodes_per_group*inode_size` 字节。
+///
+/// 定位辅助（便于报「哪个 inode 字节差」）：组 `group` 的 inode 表首块由该组描述符的
+/// `inode_table()` 给出；整区长度 = `inodes_per_group * inode_size`。区段结构对两张同
+/// 布局盘一致。本函数与 [`snapshot_meta`] 追加 inode 表区用同一定位逻辑。
+pub(super) fn snapshot_inode_table_group(
+    disk: &MemDisk,
+    sb: &RawSuperblock,
+    group: u32,
+) -> MetaRegion {
+    use super::block_group::RawGroupDescriptor;
+
+    let bs = sb.block_size();
+    let desc_size = sb.group_desc_size();
+    let inode_size = sb.inode_size() as usize;
+    let inodes_per_group = sb.inodes_per_group() as usize;
+
+    // 读该组描述符（GDT 紧跟超级块块），定位 inode 表首块。
+    let gdt_off = (sb.first_data_block as usize + 1) * bs;
+    let desc_off = gdt_off + (group as usize) * desc_size;
+    let mut desc_buf = [0u8; 64];
+    let take = core::cmp::min(desc_size, 64);
+    let mut raw = vec![0u8; desc_size];
+    disk.read_at(desc_off, raw.as_mut_slice());
+    desc_buf[..take].copy_from_slice(&raw[..take]);
+    let desc = RawGroupDescriptor::from_bytes(&desc_buf);
+
+    let off = (desc.inode_table() as usize) * bs;
+    let len = inodes_per_group * inode_size;
+    let mut bytes = vec![0u8; len];
+    disk.read_at(off, bytes.as_mut_slice());
+    MetaRegion {
+        disk_off: off,
+        bytes,
+    }
+}
+
 /// 从超级块推导并截取元数据区，得到一张可逐字节比对的快照。
 ///
-/// 截取范围（覆盖分配器会动到的元数据）：
+/// 截取范围（覆盖分配器 + inode/extent/文件路径会动到的元数据）：
 /// 1. **超级块区**：偏移 1024、长 1024——含 free_blocks/free_inodes 计数与 checksum；
 /// 2. **组描述符表（GDT）**：偏移 `(first_data_block + 1) * block_size`，
 ///    长 `num_groups * group_desc_size`——含每组的 free 计数与位图 csum；
-/// 3. **每组两张位图块**：`block_bitmap` / `inode_bitmap` 各一个块大小。
+/// 3. **每组两张位图块**：`block_bitmap` / `inode_bitmap` 各一个块大小；
+/// 4. **每组 inode 表整区**（Task 0 起）：`inode_table() * block_size` 起、
+///    `inodes_per_group * inode_size` 字节——含全部 inode 字节与其 csum，
+///    供 inode/extent/文件路径差分定位「哪个 inode 字节差」。
 ///
-/// `num_groups = ceil(blocks_count / blocks_per_group)`。位图块偏移逐组从对应组描述符
-/// 读出（兼容任意布局），故先截 GDT、再据之定位各位图。
+/// `num_groups = ceil(blocks_count / blocks_per_group)`。位图块与 inode 表偏移逐组从
+/// 对应组描述符读出（兼容任意布局），故先截 GDT、再据之定位各位图 / inode 表。
 pub(super) fn snapshot_meta(disk: &MemDisk, sb: &RawSuperblock) -> MetaSnapshot {
     use super::block_group::RawGroupDescriptor;
 
@@ -188,7 +229,10 @@ pub(super) fn snapshot_meta(disk: &MemDisk, sb: &RawSuperblock) -> MetaSnapshot 
     //    描述符按 `desc_size` 间隔排布；`RawGroupDescriptor::from_bytes` 要求恰 64 字节，
     //    故把该条的 `desc_size` 字节拷进 64 字节零填充缓冲再解析——desc_size==32 时
     //    高 32 字节（含各 _hi 字段）保持 0，恰等于「64bit 特性关」的语义，且绝不跨读下一条。
+    let inode_size = sb.inode_size() as usize;
+    let inodes_per_group = sb.inodes_per_group() as usize;
     let mut bitmap_regions: Vec<MetaRegion> = Vec::new();
+    let mut inode_table_regions: Vec<MetaRegion> = Vec::new();
     for g in 0..num_groups {
         let mut desc_buf = [0u8; 64];
         let src = &gdt_bytes[g * desc_size..g * desc_size + desc_size];
@@ -204,6 +248,15 @@ pub(super) fn snapshot_meta(disk: &MemDisk, sb: &RawSuperblock) -> MetaSnapshot 
                 bytes: buf,
             });
         }
+        // 每组 inode 表整区：`inode_table()*bs` 起、`inodes_per_group*inode_size` 字节。
+        let itable_off = (desc.inode_table() as usize) * bs;
+        let itable_len = inodes_per_group * inode_size;
+        let mut itable_buf = vec![0u8; itable_len];
+        disk.read_at(itable_off, itable_buf.as_mut_slice());
+        inode_table_regions.push(MetaRegion {
+            disk_off: itable_off,
+            bytes: itable_buf,
+        });
     }
 
     regions.push(MetaRegion {
@@ -211,6 +264,7 @@ pub(super) fn snapshot_meta(disk: &MemDisk, sb: &RawSuperblock) -> MetaSnapshot 
         bytes: gdt_bytes,
     });
     regions.extend(bitmap_regions);
+    regions.extend(inode_table_regions);
 
     MetaSnapshot { regions }
 }
@@ -263,13 +317,48 @@ pub(super) fn assert_meta_eq(a: &MetaSnapshot, b: &MetaSnapshot) {
 mod test {
     use ostd::prelude::*;
 
-    use super::{assert_meta_eq, snapshot_meta, DirectMetadataWriter, MemDisk};
+    use super::{
+        assert_meta_eq, snapshot_inode_table_group, snapshot_meta, DirectMetadataWriter, MemDisk,
+    };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+    use crate::fs::ext4::core::inode::{inode_checksum, RawInode};
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::metadata_writer::MetadataWriter;
     use crate::fs::ext4::core::superblock::RawSuperblock;
     use crate::fs::ext4::core::test_util::EXT4_IMAGE;
     use crate::prelude::*;
+
+    /// 从内存盘按超级块布局读出 inode `ino` 的 156 字节原始字节。
+    /// 组 = (ino-1)/inodes_per_group；组内序号 = (ino-1)%inodes_per_group。
+    fn read_inode_bytes(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> Vec<u8> {
+        let bs = sb.block_size();
+        let inode_size = sb.inode_size() as usize;
+        let inodes_per_group = sb.inodes_per_group();
+        let group = (ino - 1) / inodes_per_group;
+        let index = ((ino - 1) % inodes_per_group) as usize;
+
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc_size = sb.group_desc_size();
+        let mut desc_buf = [0u8; 64];
+        let take = core::cmp::min(desc_size, 64);
+        let mut raw = vec![0u8; desc_size];
+        disk.read_at(gdt_off + group as usize * desc_size, raw.as_mut_slice());
+        desc_buf[..take].copy_from_slice(&raw[..take]);
+        let desc = RawGroupDescriptor::from_bytes(&desc_buf);
+
+        let off = (desc.inode_table() as usize) * bs + index * inode_size;
+        let n = size_of::<RawInode>();
+        let mut out = vec![0u8; n];
+        disk.read_at(off, out.as_mut_slice());
+        out
+    }
+
+    /// 读超级块（布局推导用）。
+    fn read_sb(disk: &MemDisk) -> RawSuperblock {
+        let mut sb_buf = vec![0u8; 1024];
+        disk.read_at(1024, sb_buf.as_mut_slice());
+        RawSuperblock::from_bytes(&sb_buf)
+    }
 
     /// 往返一致 + 负向能抓差异：证明这张共享内存盘 + snapshot 框架可靠。
     #[ktest]
@@ -328,5 +417,153 @@ mod test {
             .expect("direct metadata write (restore)");
         let restored = snapshot_meta(&disk, &sb);
         assert_meta_eq(&before, &restored);
+    }
+
+    /// inode 元数据 csum 与 ext4_rs 逐字节对拍：对多个真实 inode（#2 根、#11 lost+found），
+    /// 新 `inode_checksum`（纯函数）== 旧 `Ext4Inode::get_inode_checksum`。
+    #[ktest]
+    fn inode_csum_parity() {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&disk);
+
+        // 旧侧引擎：经 ext4_rs::Ext4::open 取 inode 引用，调其 get_inode_checksum。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+
+        for &ino in &[2u32, 11] {
+            // 新侧：从盘读 156 字节 → RawInode → 纯函数 inode_checksum（不改 raw）。
+            let bytes = read_inode_bytes(&disk, &sb, ino);
+            let raw = RawInode::from_bytes(&bytes);
+            let new_csum = inode_checksum(&raw, ino, &sb);
+
+            // 旧侧：克隆 Ext4Inode（get_inode_checksum 取 &mut self，会改本地拷贝），算 csum。
+            let mut old_inode = ext4.get_inode_ref(ino).inode;
+            let old_sb = ext4_rs::Ext4Superblock::from_bytes(&{
+                let mut b = vec![0u8; 1024];
+                disk.read_at(1024, b.as_mut_slice());
+                b
+            });
+            let old_csum = old_inode.get_inode_checksum(ino, &old_sb);
+
+            assert_eq!(
+                new_csum, old_csum,
+                "inode #{ino} csum mismatch: new {new_csum:#010x} != old {old_csum:#010x}"
+            );
+        }
+    }
+
+    /// 扩展后的 snapshot 覆盖 inode 表，能定位 inode 内单字节改动（负向测试）。
+    /// 经 `DirectMetadataWriter` 直写 inode 表所在块的一字节（与 GDT 负向测试同手法），
+    /// 快照前后必不同，且首差 offset 恰在被改字节；复原后又回到一致。
+    #[ktest]
+    fn inode_table_snapshot_catches_inode_byte() {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&disk);
+        let bs = sb.block_size();
+
+        // 定位根 inode（#2）所在块与块内偏移。
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc = RawGroupDescriptor::from_bytes(&{
+            let mut b = vec![0u8; 64];
+            disk.read_at(gdt_off, b.as_mut_slice());
+            b
+        });
+        let inode_size = sb.inode_size() as usize;
+        let itable = desc.inode_table() as usize;
+        let ino_off = itable * bs + (2 - 1) * inode_size; // inode #2 字节偏移
+        let block = (ino_off / bs) as Ext4Fsblk;
+        let off_in_block = ino_off % bs;
+
+        let before = snapshot_meta(&disk, &sb);
+
+        // 读出 inode 表所在整块，翻转 inode #2 第 0 字节再整块写回。
+        let writer = DirectMetadataWriter::new(disk.clone(), bs);
+        let mut full = vec![0u8; bs];
+        disk.read_at(block as usize * bs, full.as_mut_slice());
+        let orig = full.clone();
+        full[off_in_block] ^= 0xFF;
+        writer
+            .write_metadata_for_handle(0, block, &full)
+            .expect("direct metadata write (mutated inode byte)");
+        let after = snapshot_meta(&disk, &sb);
+
+        // 负向：snapshot 必能抓到，且首差 offset 恰是被改字节。
+        let (off, x, y) = before
+            .first_diff(&after)
+            .expect("snapshot must catch a 1-byte change inside an inode");
+        assert_eq!(off, ino_off, "first diff offset = mutated inode byte offset");
+        assert_eq!(y ^ x, 0xFF, "mutated byte differs by the flipped bits");
+
+        // 辅助定位：snapshot_inode_table_group 截的整区里也含该改动。
+        let region = snapshot_inode_table_group(&disk, &sb, 0);
+        assert_eq!(region.disk_off, itable * bs, "inode-table region offset");
+        assert_ne!(
+            region.bytes[ino_off - region.disk_off], orig[off_in_block],
+            "inode-table region reflects the mutated byte"
+        );
+
+        // 复原 → 快照又一致（闭环）。
+        writer
+            .write_metadata_for_handle(0, block, &orig)
+            .expect("direct metadata write (restore inode block)");
+        let restored = snapshot_meta(&disk, &sb);
+        assert_meta_eq(&before, &restored);
+    }
+
+    /// 最小文件映射差分样例：两张独立 `MemDisk`（同镜像），两侧各 load 同一文件 inode（根 #2）
+    /// 并经扩展 `snapshot_meta` 对拍 inode 表一致；再证扩展后的 snapshot 能抓 inode 内单字节改动。
+    ///
+    /// 注：`map_blocks`（extent 映射）是 Task 2，本样例不实现；只验证 (a) 扩展后的
+    /// `snapshot_meta` 含 inode 表且新旧一致，(b) 能抓 inode 内单字节改动（负向）。
+    #[ktest]
+    fn file_map_root_inode_parity() {
+        // 两张独立内存盘（各自 from_image 同字节，互不共享 Arc）。
+        let old_disk = MemDisk::from_image(EXT4_IMAGE);
+        let new_disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&new_disk);
+
+        // 旧侧：经 ext4_rs::Ext4::open 读根 inode 字节；新侧：直接读同 inode 字节。
+        // 两者应是同一份磁盘字节（同镜像），故两张盘的 inode 表逐字节相同。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let old_root = ext4.get_inode_ref(2).inode;
+        let new_root_bytes = read_inode_bytes(&new_disk, &sb, 2);
+        let new_root = RawInode::from_bytes(&new_root_bytes);
+        // 新侧解析的根 inode 与旧侧关键字段一致（确认两侧读的是同一 inode）。
+        assert!(new_root.is_dir(), "root inode is a directory");
+        assert_eq!(new_root.size as u64 | ((new_root.size_hi as u64) << 32), {
+            (old_root.size as u64) | ((old_root.size_hi as u64) << 32)
+        }, "root inode size new == old");
+
+        // (a) 扩展后的 snapshot 含 inode 表，两张同布局盘逐字节一致。
+        let old_snap = snapshot_meta(&old_disk, &sb);
+        let new_snap = snapshot_meta(&new_disk, &sb);
+        assert_meta_eq(&old_snap, &new_snap);
+
+        // (b) 在新侧用 DirectMetadataWriter 直写根 inode 一字节，snapshot 必不同。
+        let bs = sb.block_size();
+        let gdt_off = (sb.first_data_block as usize + 1) * bs;
+        let desc = RawGroupDescriptor::from_bytes(&{
+            let mut b = vec![0u8; 64];
+            new_disk.read_at(gdt_off, b.as_mut_slice());
+            b
+        });
+        let inode_size = sb.inode_size() as usize;
+        let ino_off = desc.inode_table() as usize * bs + (2 - 1) * inode_size;
+        let block = (ino_off / bs) as Ext4Fsblk;
+        let off_in_block = ino_off % bs;
+
+        let writer = DirectMetadataWriter::new(new_disk.clone(), bs);
+        let mut full = vec![0u8; bs];
+        new_disk.read_at(block as usize * bs, full.as_mut_slice());
+        full[off_in_block] ^= 0xFF;
+        writer
+            .write_metadata_for_handle(0, block, &full)
+            .expect("direct metadata write (mutated root inode)");
+        let new_snap_mut = snapshot_meta(&new_disk, &sb);
+
+        let (off, x, y) = old_snap
+            .first_diff(&new_snap_mut)
+            .expect("extended snapshot must catch a 1-byte inode change across two disks");
+        assert_eq!(off, ino_off, "first diff offset = mutated inode byte offset");
+        assert_eq!(y ^ x, 0xFF, "mutated byte differs by the flipped bits");
     }
 }
