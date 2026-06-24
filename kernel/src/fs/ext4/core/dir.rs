@@ -12,7 +12,8 @@ const DIR_TAIL_MARKER: u8 = 0xDE;
 /// ① 插入所需空间下界 `required_len = align4(264 + name.len())`、② 写新项时整 264 字节
 /// `copy_to_slice`（name 尾零填到 255 + 对齐）。Task 2 的切槽/写项必须逐字复刻 264。
 // PARITY: size_of::<ext4_rs Ext4DirEntry> 泄漏进磁盘布局
-// Task 2 wires the slot-split / new-entry write path against this constant.
+// 写路径消费者：dir_write_entry_bytes / try_insert_to_existing_block（264 字节零填项 + 切槽判据）。
+// allow(dead_code) 载重：core/dir 暂未接入生产 VFS（仍走 ext4_rs），消费链仅 #[cfg(ktest)] 可达。
 #[allow(dead_code)]
 pub(super) const EXT4_DIR_ENTRY_INMEM_SIZE: usize = 264;
 
@@ -125,7 +126,8 @@ const DIR_ENTRY_HEADER_SIZE: usize = 8;
 /// `block_size - DIR_TAIL_SIZE`（tail 区，复刻 ext4_rs `size_of::<Ext4DirEntryTail>()`）。
 const DIR_TAIL_SIZE: usize = size_of::<RawDirEntryTail>();
 
-/// RO-compat metadata_csum 特性位（门控目录块 csum）。
+/// RO-compat metadata_csum 特性位（仅**门控目录块 csum 的读侧校验** `dir_verify_block_csum`；
+/// **写侧 `dir_set_csum` 无条件写**，不看此位——BUG-22 复刻 ext4_rs 无门控行为）。
 /// = ext4_rs `EXT4_FEATURE_RO_COMPAT_METADATA_CSUM`（0x400），与 `extents.rs` 同值。
 const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 
