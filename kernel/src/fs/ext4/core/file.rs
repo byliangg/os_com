@@ -879,7 +879,7 @@ mod test {
     use super::{map_blocks, plan_direct_read, prepare_write_at, read_at, write_at, ReadCtx};
     use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::diff_harness::{assert_disk_eq, DirectMetadataWriter, MemDisk};
-    use crate::fs::ext4::core::extents::{get_pblock_idx_state, BlockAlloc, WriteCtx};
+    use crate::fs::ext4::core::extents::{get_pblock_idx_state, BlockAlloc, RawExtentHeader, WriteCtx};
     use crate::fs::ext4::core::inode::{load_inode, Inode};
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::superblock::RawSuperblock;
@@ -1177,7 +1177,7 @@ mod test {
             let old_ref = ext4.get_inode_ref(ino);
             // 确认确实成了 depth>0 深树（root header depth）。
             let root = new_inode.i_block_bytes();
-            let depth = u16::from_le_bytes([root[6], root[7]]);
+            let depth = RawExtentHeader::from_bytes(&root[..size_of::<RawExtentHeader>()]).depth;
             assert!(depth > 0, "expected depth>0 tree after grow_indepth, got {depth}");
 
             for lblock in 0..900u32 {

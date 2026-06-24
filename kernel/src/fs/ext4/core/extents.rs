@@ -1053,8 +1053,8 @@ fn ext_grow_indepth(
     // 第一个子项的逻辑块号（depth==0 取 extent[0].first_block，否则 index[0].first_block）。
     let first_logical_block = if old_entries_count > 0 {
         let off = EXT4_EXTENT_HEADER_SIZE; // pos 0
-        // extent 与 index 的 first_block 同在偏移 0，统一从 root[off..] 读 u32。
-        u32::from_le_bytes([root[off], root[off + 1], root[off + 2], root[off + 3]])
+        // extent 与 index 的 first_block 同在偏移 0，统一用 Pod 视图读（不用 from_le_bytes）。
+        RawExtent::from_bytes(&root[off..off + size_of::<RawExtent>()]).first_block()
     } else {
         0
     };
