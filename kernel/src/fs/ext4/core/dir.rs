@@ -1571,7 +1571,7 @@ mod test {
 
     use super::{
         dir_block_csum, dir_find_in_block, dir_verify_block_csum, parse_entry, DirEntryFileType,
-        RawDirEntryHeader, RawDirEntryTail, DIR_TAIL_MARKER, DIR_TAIL_SIZE,
+        RawDirEntryHeader, RawDirEntryTail, DIR_ENTRY_HEADER_SIZE, DIR_TAIL_MARKER, DIR_TAIL_SIZE,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::extents::{RawExtent, RawExtentHeader};
@@ -1723,6 +1723,118 @@ mod test {
         assert!(
             dir_verify_block_csum(&sb_nc, &block_nc, gen_nc),
             "metadata_csum off: verify must short-circuit to true"
+        );
+    }
+
+    // =================================================================
+    // Phase 4 Task 5：损坏块防御（块级，单侧 core 鲁棒性）。
+    //
+    // 手工构造坏 `rec_len`（0 / 越界）的目录块缓冲，断言：
+    // - 查找路径 `dir_find_in_block` / `parse_entry` → **EIO**（不 panic）；
+    // - 名字边界（name_len=255 超长名、name_len=0 空名）正确解析（不 panic）。
+    // 这些块**不**喂给 ext4_rs 的 unsafe 路径（避免 UB），故是单侧 core 鲁棒性验证（同 Phase 3
+    // 教训：损坏输入只验 core 优雅降级）。枚举路径 `dir_get_entries` 的 silent-break-不-panic
+    // 在 `diff_harness.rs` 的 `dir_get_entries_corrupted_silent_break`（需 ReadCtx）里验。
+    // =================================================================
+
+    /// 损坏块防御（单侧 core）：坏 `rec_len`（0 / 越界）→ 查找路径 EIO 不 panic；超长名
+    /// （name_len=255）/ 空名（name_len=0）边界正确解析。`#![forbid(unsafe_code)]` 杜绝 UB，
+    /// 但越界索引仍会 panic——本测保证 core 用边界检查返回 EIO 而非索引越界。
+    #[ktest]
+    fn dir_corrupted_block_defense() {
+        // 用真镜像取 block_size（4K）；损坏块就地手工构造，不回盘。
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+
+        // 写一个合法目录项头到 `block[off..]`（rec_len/name_len/name 由调用方给）。
+        let put = |block: &mut [u8], off: usize, inode: u32, rec_len: u16, name: &[u8]| {
+            let h = RawDirEntryHeader {
+                inode,
+                rec_len,
+                name_len: name.len() as u8,
+                file_type: DirEntryFileType::RegFile as u8,
+            };
+            block[off..off + DIR_ENTRY_HEADER_SIZE].copy_from_slice(h.as_bytes());
+            block[off + DIR_ENTRY_HEADER_SIZE..off + DIR_ENTRY_HEADER_SIZE + name.len()]
+                .copy_from_slice(name);
+        };
+
+        // ---- (1) rec_len == 0 → dir_find_in_block 返回 EIO（不 panic）。----
+        let mut block = vec![0u8; bs];
+        put(&mut block, 0, 12, 0, b"x"); // rec_len 故意为 0（坏）
+        let r = dir_find_in_block(&block, b"x", bs);
+        assert!(r.is_err(), "rec_len==0 must yield Err (EIO), not a hit/panic");
+        assert_eq!(
+            r.unwrap_err().error(),
+            Errno::EIO,
+            "rec_len==0 → EIO on search path"
+        );
+
+        // ---- (2) rec_len 越界（> block_size - off）→ dir_find_in_block 返回 EIO。----
+        let mut block = vec![0u8; bs];
+        put(&mut block, 0, 12, (bs + 4) as u16, b"y"); // rec_len > 整块（越界）
+        let r = dir_find_in_block(&block, b"y", bs);
+        assert!(r.is_err(), "out-of-range rec_len must yield Err (EIO)");
+        assert_eq!(
+            r.unwrap_err().error(),
+            Errno::EIO,
+            "rec_len > block_size-off → EIO on search path"
+        );
+
+        // ---- (3) name 区越过块尾（rec_len 合法但 name_len 把 name 推出块）→ parse_entry EIO。----
+        // 在块的最后 8 字节起放一个头，name_len=255 → name_end 远超 block_size。
+        let mut block = vec![0u8; bs];
+        let near_end = bs - DIR_ENTRY_HEADER_SIZE; // 头尚在块内，但 name 必越界
+        let h = RawDirEntryHeader {
+            inode: 12,
+            rec_len: 12,
+            name_len: 255,
+            file_type: DirEntryFileType::RegFile as u8,
+        };
+        block[near_end..near_end + DIR_ENTRY_HEADER_SIZE].copy_from_slice(h.as_bytes());
+        let pr = parse_entry(&block, near_end, bs);
+        assert!(
+            pr.is_err(),
+            "name running past block end must yield Err (EIO), not OOB index/panic"
+        );
+        assert_eq!(pr.unwrap_err().error(), Errno::EIO, "name out of block → EIO");
+
+        // ---- (4) 头本身越界（off 使 8B 头放不下）→ parse_entry EIO（不索引越界 panic）。----
+        let block = vec![0u8; bs];
+        let pr = parse_entry(&block, bs - 4, bs); // 仅剩 4 字节，放不下 8B 头
+        assert!(pr.is_err(), "header past block end must yield Err (EIO)");
+        assert_eq!(
+            pr.unwrap_err().error(),
+            Errno::EIO,
+            "header out of block → EIO"
+        );
+
+        // ---- (5) 超长名（name_len=255）在块内合法布局 → parse_entry 正确解出 255 字节 name。----
+        let mut block = vec![0u8; bs];
+        // 项总长 = align4(8 + 255) = 264；rec_len 给 264，name 全填 0x41('A')。
+        let name = [0x41u8; 255];
+        put(&mut block, 0, 12, 264, &name);
+        let de = parse_entry(&block, 0, bs).expect("255-byte name must parse");
+        assert_eq!(de.name_len, 255, "max name_len 255 parsed");
+        assert_eq!(de.name.len(), 255, "name slice length == 255");
+        assert!(de.name.iter().all(|&b| b == 0x41), "name bytes intact");
+
+        // ---- (6) 空名（name_len=0）边界 → parse_entry 解出零长 name（不 panic）。----
+        let mut block = vec![0u8; bs];
+        put(&mut block, 0, 13, 12, b""); // name_len=0
+        let de = parse_entry(&block, 0, bs).expect("empty-name entry must parse");
+        assert_eq!(de.name_len, 0, "empty name_len 0");
+        assert!(de.name.is_empty(), "empty name slice");
+        assert_eq!(de.inode, 13, "header fields intact on empty-name entry");
+
+        // ---- (7) 损坏块（首项 rec_len=0）查找一个不存在的名字也只返回 EIO（不 panic）。----
+        let mut block = vec![0u8; bs];
+        put(&mut block, 0, 14, 0, b"a");
+        let r = dir_find_in_block(&block, b"absent", bs);
+        assert_eq!(
+            r.unwrap_err().error(),
+            Errno::EIO,
+            "corrupted block + miss still EIO, never panic"
         );
     }
 }

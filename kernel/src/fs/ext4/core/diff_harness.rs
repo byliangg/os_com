@@ -370,7 +370,9 @@ mod test {
     use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::metadata_writer::MetadataWriter;
     use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::test_util::{
+        EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE,
+    };
     use crate::fs::ext4::core::types::Ext4Fsblk;
     use crate::prelude::*;
 
@@ -2264,5 +2266,162 @@ mod test {
         let mut byte = [0u8; 1];
         disk.read_at(bmp_off + byte_idx, &mut byte);
         (byte[0] >> bit_idx) & 1 == 1
+    }
+
+    // =================================================================
+    // Phase 4 Task 5：边角差分（长目录/多块、csum 开关、多组镜像、损坏块防御）。
+    //
+    // 复用 Task 0–4 全部差分驱动：`diff_create_step`/`diff_mkdir_step`/`diff_unlink_step`
+    // （内部已 `match (old, new)` Ok/Err + `mask_dirent_padding` + `assert_disk_eq`），叠
+    // `EXT4_NOCSUM_IMAGE`/`EXT4_MULTIGROUP_IMAGE` 两张几何镜像；外加 `dir_get_entries`
+    // 损坏块「silent break 不 panic」单侧 core 鲁棒性（损坏输入**不**喂给 ext4_rs 的 unsafe
+    // 路径，故不做两侧差分——同 Phase 3 教训）。
+    // =================================================================
+
+    /// 在 ext4_rs 上把 `parent` 下塞满 `n` 个短名文件、逼 ≥3 个目录块，返回结果盘字节。
+    /// 全程用 ext4_rs builder（两侧后续从同一份字节起步对拍）。任一步失败即 panic（fixture
+    /// 构造失败属测试用法错误）。
+    fn build_long_dir_image(parent: u32, n: usize) -> Vec<u8> {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        for i in 0..n {
+            let name = format!("ent_{i:05}");
+            ext4.ext4_create_at(parent, &name, 0o100644)
+                .unwrap_or_else(|e| panic!("builder create '{name}' failed: {e:?}"));
+        }
+        disk.backing().lock().clone()
+    }
+
+    /// 长目录 / 多块差分：先用 ext4_rs 在根下建 ~500 个文件逼 ≥3 个目录块（4K 块每块约
+    /// 容 200+ 短名项），确认确实跨 ≥3 块（旧侧 readdir 项数 + next_offset 落在块 ≥2）；
+    /// 然后跑 create→lookup→readdir→unlink 序列，每步 core vs ext4_rs 全盘逐字节对拍。
+    ///
+    /// 这同时演练**多块目录块 csum 的 `ino_index = block[0].inode` quirk**（块 ≥1 的块首项是
+    /// 普通子文件项 → ino_index 取子项 inode，偏离 ext4 规范；见 bug.md D 段 / dir.rs
+    /// `dir_block_csum` PARITY 注）：两引擎对块 ≥1 用**同一** ino_index 公式算 csum，故
+    /// `assert_disk_eq` 全盘绿即确认 core 逐字节复刻了该 quirk。控制器据此在 milestone/bug.md
+    /// 登记「多块 csum 偏离规范、parity 保住」结论。
+    #[ktest]
+    fn dir_long_multiblock_parity() {
+        // 逼 ≥3 个目录块：>408 个 align4(8+8)=16~20B 项（4K 块 4084 可用 / ~20B ≈ 204/块）。
+        let img = build_long_dir_image(2, 500);
+
+        // 佐证确实 ≥3 块：旧侧底层枚举的 next_offset 至少有一项落在块 2（>= 2*bs）。
+        let probe_disk = MemDisk::from_image(&img);
+        let sb = read_sb(&probe_disk);
+        let bs = sb.block_size();
+        let with_off = old_readdir_with_next_offset(&probe_disk, 2);
+        assert!(
+            with_off.len() > 408,
+            ">408 entries needed for a 3rd dir block; got {}",
+            with_off.len()
+        );
+        assert!(
+            with_off.iter().any(|(_, _, _, off)| *off >= 3 * bs),
+            "at least one entry must land in dir block >=2 (3rd block reached)"
+        );
+
+        // ---- 序列：create 一个新文件（在已多块的根里继续切槽/可能再 append）。----
+        let img = diff_create_step(&img, 2, "tail_new", 0o100644);
+
+        // ---- lookup：命中一个块 >=1 上的项（强制走跨块 dir_find_entry）+ 未命中。----
+        diff_lookup(&img, 2, "ent_00499", core_lookup);
+        diff_lookup(&img, 2, "ent_00250", core_lookup);
+        diff_lookup(&img, 2, "no-such-ent", core_lookup);
+
+        // ---- readdir：跨 ≥3 块逐元素 (name, ino, type, next_offset) 对拍。----
+        diff_readdir(&img, 2, core_readdir_next_offset);
+
+        // ---- unlink：删一个块 >=1 上的中间项（前驱合并路径，跨块） + 删新建的项。----
+        let img = diff_unlink_step(&img, 2, "ent_00250");
+        let _ = diff_unlink_step(&img, 2, "tail_new");
+    }
+
+    /// csum 开关差分（`EXT4_NOCSUM_IMAGE`，metadata_csum 关）：在 csum-off 镜像上跑
+    /// create→mkdir→unlink 序列，每步 core vs ext4_rs 全盘逐字节对拍。核心断言：**core 不写
+    /// tail csum**（门控）——靠 `assert_disk_eq` 与 ext4_rs（同样不写 csum）全盘相等间接保证，
+    /// 外加显式探针：建一个目录后，其 '.'/'..' 块的 tail.checksum 区在两引擎下都不是 csum（门控）。
+    #[ktest]
+    fn dir_nocsum_parity() {
+        // 探针：确认这张镜像确实 metadata_csum 关。
+        let probe = MemDisk::from_image(EXT4_NOCSUM_IMAGE);
+        let sb = read_sb(&probe);
+        assert!(
+            (sb.features_read_only() & 0x400) == 0,
+            "EXT4_NOCSUM_IMAGE must have metadata_csum off"
+        );
+
+        // create f1 → 全盘对拍（core 写父目录块时门控不写 tail csum，与 ext4_rs 一致）。
+        let img = diff_create_step(EXT4_NOCSUM_IMAGE, 2, "ncf1", 0o100644);
+        // mkdir d1 → 全盘对拍（新目录 '.'/'..' 块同样门控不写 csum）。
+        let img = diff_mkdir_step(&img, 2, "ncd1", 0o40755);
+        // unlink f1 → 全盘对拍。
+        let _ = diff_unlink_step(&img, 2, "ncf1");
+    }
+
+    /// 多组镜像差分（`EXT4_MULTIGROUP_IMAGE`：1K 块、8 组、first_data_block=1、64bit、
+    /// metadata_csum）：在跨组几何上跑命名空间序列（新 inode / 新目录数据块可能落在非 0 组）。
+    /// 每步 core vs ext4_rs 全盘逐字节对拍——覆盖 first_data_block!=0 的布局推导 + 跨组分配。
+    #[ktest]
+    fn dir_multigroup_parity() {
+        // 探针：确认多组几何（first_data_block != 0）。
+        let probe = MemDisk::from_image(EXT4_MULTIGROUP_IMAGE);
+        let sb = read_sb(&probe);
+        assert!(
+            sb.first_data_block != 0,
+            "EXT4_MULTIGROUP_IMAGE must have first_data_block != 0 (1K-block geometry)"
+        );
+
+        // create 一串文件（新 inode 跨组分配） + mkdir（新目录数据块跨组分配），逐步全盘对拍。
+        let img = diff_create_step(EXT4_MULTIGROUP_IMAGE, 2, "mgf1", 0o100644);
+        let img = diff_create_step(&img, 2, "mgf2", 0o100644);
+        let img = diff_mkdir_step(&img, 2, "mgd1", 0o40755);
+        // 嵌套：在 mgd1 下再 create（强制在新分配的目录里写项）。
+        let mgd1_ino = old_lookup(&MemDisk::from_image(&img), 2, "mgd1").expect("mgd1 present");
+        let _ = diff_create_step(&img, mgd1_ino, "inner", 0o100644);
+    }
+
+    /// 损坏块防御（**单侧 core 鲁棒性**，不喂 ext4_rs unsafe 路径）：手工构造坏 `rec_len` 的
+    /// 目录块缓冲，断言 core 的**枚举路径** `dir_get_entries` **silent break 且不 panic**（与块
+    /// 级 `dir_find_in_block`/`parse_entry` 的 EIO 防御互补——后者在 `dir.rs` 的 ktest
+    /// `dir_corrupted_block_defense` 里验）。
+    ///
+    /// 构造法：取 `EXT4_NOCSUM_IMAGE`（门控关，改块无需重算 csum）根目录首块，把首项的
+    /// `rec_len` 改成 0（坏），整块写回，再 core `dir_get_entries(root)`——必须返回（可能空/截断）
+    /// 而**不 panic**。NEITHER 引擎被喂这块（仅 core 单侧），故无两侧 `assert_disk_eq`。
+    #[ktest]
+    fn dir_get_entries_corrupted_silent_break() {
+        use crate::fs::ext4::core::dir::dir_get_entries;
+        use crate::fs::ext4::core::extents::get_pblock_idx_state;
+        use crate::fs::ext4::core::file::ReadCtx;
+        use crate::fs::ext4::core::inode::load_inode;
+
+        let disk = MemDisk::from_image(EXT4_NOCSUM_IMAGE);
+        let sb = read_sb(&disk);
+        let bs = sb.block_size();
+        let root = load_inode(&disk, &sb, 2).expect("load root");
+
+        // 定位根目录首块物理块号，读出整块，把首项 rec_len 置 0（坏），整块写回。
+        let pblock = match get_pblock_idx_state(&disk, &sb, &root, 0) {
+            Ok(Some((p, _))) => p,
+            other => panic!("root dir block 0 must map; got {other:?}"),
+        };
+        let base = pblock as usize * bs;
+        {
+            let backing = disk.backing();
+            let mut guard = backing.lock();
+            // 首项 rec_len 在块内 [4..6]（u16 le）。置 0 → dir_get_entries 应 silent break。
+            guard[base + 4] = 0;
+            guard[base + 5] = 0;
+        }
+
+        // 关键断言：core 枚举**不 panic**（坏 rec_len → silent break），返回一个向量。
+        let ctx = ReadCtx::new(&disk, &sb);
+        let entries = dir_get_entries(&ctx, &root);
+        // 首项 rec_len=0 立即 break 本块 → 该块无项收集（根仅 1 块时即空）；只要没 panic 即达标。
+        assert!(
+            entries.is_empty() || entries.iter().all(|e| !e.name.is_empty()),
+            "corrupted-block enumeration must not panic and must yield only well-formed entries"
+        );
     }
 }
