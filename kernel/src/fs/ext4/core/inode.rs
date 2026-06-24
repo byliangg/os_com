@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 use ostd::const_assert;
 
+use super::block_group::RawGroupDescriptor;
 use super::crc::{ext4_crc32c, EXT4_CRC32_INIT};
+use super::io::BlockReader;
+use super::metadata_writer::MetadataWriter;
 use super::prelude::*;
 use super::superblock::RawSuperblock;
+
+/// `i_flags` 中的 extent 标志位（INODE uses extents）。
+/// [对照] ext4_rs `EXT4_INODE_FLAG_EXTENTS`（ext4_defs/consts.rs:21）= `0x00080000`。
+/// core 自定义同值常量（`as u32`），不依赖 ext4_rs。
+pub(super) const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
 
 /// ext4 on-disk inode 的 OS-dependent #2 区（Linux 变体，12 字节）。
 #[repr(C)]
@@ -78,6 +86,23 @@ impl RawInode {
     pub fn is_dir(&self) -> bool {
         self.mode & S_IFMT == S_IFDIR
     }
+
+    /// inode 标志位（含 extent 标志）。
+    /// [对照] ext4_rs `Ext4Inode::flags`（ext4_defs/inode.rs:160）。
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+    /// inode generation（crc32c 种子之一）。
+    /// [对照] ext4_rs `Ext4Inode::generation`（ext4_defs/inode.rs:184）。
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+    /// 写文件大小（lo = size&0xffffffff，hi = size>>32）。
+    /// [对照] ext4_rs `Ext4Inode::set_size`（ext4_defs/inode.rs:94）。
+    pub fn set_size(&mut self, size: u64) {
+        self.size = (size & 0xffff_ffff) as u32;
+        self.size_hi = (size >> 32) as u32;
+    }
 }
 
 /// inode 元数据校验和（crc32c）——**纯函数**，逐字节复刻 ext4_rs
@@ -142,15 +167,186 @@ pub(super) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &
     }
 }
 
+/// inode 逻辑句柄：盘上 [`RawInode`] + inode 号。对齐 ext2 `InodeDesc`↔`RawInode` 与
+/// ext4_rs `Ext4InodeRef { inode_num, inode }`。逻辑访问器委托 [`RawInode`]，不重复定义
+/// `size()`/`blocks()` 等已有 accessor。
+pub(super) struct Inode {
+    pub raw: RawInode,
+    pub num: u32,
+}
+
+impl Inode {
+    /// inode 标志位（委托 [`RawInode::flags`]）。
+    pub(super) fn flags(&self) -> u32 {
+        self.raw.flags()
+    }
+    /// 文件大小（委托 [`RawInode::size`]）。
+    pub(super) fn size(&self) -> u64 {
+        self.raw.size()
+    }
+    /// 写文件大小（委托 [`RawInode::set_size`]）。
+    #[allow(dead_code)]
+    pub(super) fn set_size(&mut self, size: u64) {
+        self.raw.set_size(size);
+    }
+    /// inode generation（委托 [`RawInode::generation`]）。
+    #[allow(dead_code)]
+    pub(super) fn generation(&self) -> u32 {
+        self.raw.generation()
+    }
+    /// 是否 extent 映射：`(flags() & EXT4_INODE_FLAG_EXTENTS) != 0`。
+    /// [对照] ext4_rs `Ext4::inode_uses_extents`（ext4_impls/inode.rs:14）。
+    pub(super) fn uses_extents(&self) -> bool {
+        (self.flags() & EXT4_INODE_FLAG_EXTENTS) != 0
+    }
+}
+
+/// 从盘读第 `group` 组的组描述符（GDT 紧跟超级块块），与 Phase-2 分配器
+/// [`super::balloc::BlockAllocator::load_group_desc`] / `diff_harness::snapshot_inode_table_group`
+/// 同一定位逻辑：`block_id = first_data_block + group/dsc_cnt + 1`、块内偏移
+/// `(group % dsc_cnt) * desc_size`，读满 64 字节后解析（desc_size==64 的真镜像下与 ext4_rs 一致）。
+fn load_group_desc(reader: &dyn BlockReader, sb: &RawSuperblock, group: u32) -> RawGroupDescriptor {
+    let bs = sb.block_size();
+    let desc_size = sb.group_desc_size();
+    let dsc_cnt = bs / desc_size;
+    let dsc_id = group as usize / dsc_cnt;
+    let first_data_block = sb.first_data_block() as usize;
+    let block_id = first_data_block + dsc_id + 1;
+    let offset_in_block = (group as usize % dsc_cnt) * desc_size;
+    let off = block_id * bs + offset_in_block;
+    let mut buf = [0u8; 64];
+    reader.read_at(off, &mut buf);
+    RawGroupDescriptor::from_bytes(&buf)
+}
+
+/// inode `inode_num` 在盘上的字节偏移。
+/// [对照] ext4_rs `Ext4::inode_disk_pos`（ext4_impls/inode.rs:173）：
+/// 组 `(inode_num-1)/inodes_per_group`、组内序号 `(inode_num-1)%inodes_per_group`、
+/// `inode_table_blk * block_size + index * inode_size`（**inode_size 来自 SB，非
+/// `size_of::<RawInode>()`=156**——本镜像 inode_size=256）。
+///
+/// ext4_rs 读 `self.inode_table_blocks[group]`（启动期缓存）；该缓存即各组描述符的
+/// `get_inode_table_blk_num()`（ext4_impls/ext4.rs:90-98），故此处直接从盘读该组描述符
+/// 取 `inode_table()`，字节等价、且不引入全局缓存/单例。
+#[allow(dead_code)]
+pub(super) fn inode_disk_pos(
+    reader: &dyn BlockReader,
+    sb: &RawSuperblock,
+    inode_num: u32,
+) -> usize {
+    let block_size = sb.block_size();
+    let inodes_per_group = sb.inodes_per_group();
+    let inode_size = sb.inode_size() as usize;
+    let group = (inode_num - 1) / inodes_per_group;
+    let index = (inode_num - 1) % inodes_per_group;
+    let desc = load_group_desc(reader, sb, group);
+    let inode_table_blk = desc.inode_table() as usize;
+    inode_table_blk * block_size + index as usize * inode_size
+}
+
+/// inode 号合法性校验（0 或 > inodes_count → EIO）。
+/// [对照] ext4_rs `Ext4::validate_inode_number`（ext4_impls/inode.rs:205）。
+fn validate_inode_number(sb: &RawSuperblock, inode_num: u32) -> Result<()> {
+    if inode_num == 0 || inode_num > sb.inodes_count() {
+        return Err(Error::with_message(Errno::EIO, "invalid inode number"));
+    }
+    Ok(())
+}
+
+/// 从盘加载 inode `inode_num`：定位 → 读 inode 所在对齐块 → `RawInode::from_bytes`。
+/// [对照] ext4_rs `Ext4::get_inode_ref`（ext4_impls/inode.rs:213）——先 `validate_inode_number`，
+/// 再读 `inode_disk_pos` 所在对齐块、取块内偏移处的 inode 镜像。core 用注入的
+/// `&dyn BlockReader`（不持全局盘）。
+pub(super) fn load_inode(
+    reader: &dyn BlockReader,
+    sb: &RawSuperblock,
+    inode_num: u32,
+) -> Result<Inode> {
+    validate_inode_number(sb, inode_num)?;
+    let block_size = sb.block_size();
+    let pos = inode_disk_pos(reader, sb, inode_num);
+    // 读 inode 所在对齐块（与 write_back_inode 同形状）。`RawInode` 占 156 字节，
+    // inode_size 整除 block_size 时不会跨块；从块内偏移取 156 字节解析。
+    let block_offset = pos / block_size * block_size;
+    let offset_in_block = pos - block_offset;
+    let mut block = vec![0u8; block_size];
+    reader.read_at(block_offset, block.as_mut_slice());
+    let n = size_of::<RawInode>();
+    let raw = RawInode::from_bytes(&block[offset_in_block..offset_in_block + n]);
+    Ok(Inode {
+        raw,
+        num: inode_num,
+    })
+}
+
+/// 把 inode 写回盘：先算 csum 写回 lo/hi（[`write_inode_checksum_into`]），再
+/// RMW inode 所在整块——读出整块、覆盖该 inode 的 `inode_size` 字节、整块经
+/// [`MetadataWriter`] 写。
+///
+/// [对照] ext4_rs `Ext4::write_back_inode`（ext4_impls/inode.rs:242）= `set_inode_checksum`
+/// 再 `write_inode_image`（:185）。
+///
+/// **PARITY**：`RawInode` 只有 156 字节，而本镜像 `inode_size`=256，故写回时需把 inode 槽位的
+/// 156 真实字节覆盖、其余 100 字节（i_extra 区之外的 extra）以**盘上原值**保留——RMW 整块
+/// 天然保留这 100 字节。ext4_rs `write_inode_image` 把 `Ext4Inode`（其结构同样 156 字节）按
+/// `min(inode_size, sizeof)`=156 拷入，余下 `[156, inode_size)` 用 `fill(0)` 清零。
+/// 本镜像下两者一致：inode 槽的尾 100 字节盘上本就是 0（mkfs 造的真镜像），RMW 保留即等于
+/// ext4_rs 的清零。若某 inode 尾 100 字节盘上非 0，两者会分歧——见下方处理。
+pub(super) fn write_back_inode(
+    writer: &dyn MetadataWriter,
+    reader: &dyn BlockReader,
+    sb: &RawSuperblock,
+    inode: &mut Inode,
+) -> Result<()> {
+    // 1) 先算 csum 写回 lo/hi（对齐 ext4_rs set_inode_checksum 先于 write_inode_image）。
+    write_inode_checksum_into(&mut inode.raw, inode.num, sb);
+
+    let block_size = sb.block_size();
+    let inode_size = sb.inode_size() as usize;
+    let pos = inode_disk_pos(reader, sb, inode.num);
+    let block_offset = pos / block_size * block_size;
+    let offset_in_block = pos - block_offset;
+
+    // 2) RMW：读出 inode 所在整块。
+    let mut block = vec![0u8; block_size];
+    reader.read_at(block_offset, block.as_mut_slice());
+
+    // 3) 覆盖该 inode 的 inode_size 字节：前 156 = RawInode 镜像，余下 [156, inode_size) 清零。
+    //    PARITY: ext4_rs write_inode_image 拷 min(inode_size, sizeof Ext4Inode)=156 字节后，
+    //    把 [156, inode_size) `fill(0)`——故这 100 字节落盘恒为 0，不是「保留盘上原值」。
+    //    为逐字节一致，core 同样把尾部清零，而非依赖 RMW 保留原值。
+    let raw_bytes = inode.raw.as_bytes();
+    let copy_len = core::cmp::min(inode_size, raw_bytes.len());
+    block[offset_in_block..offset_in_block + copy_len].copy_from_slice(&raw_bytes[..copy_len]);
+    if inode_size > copy_len {
+        block[offset_in_block + copy_len..offset_in_block + inode_size].fill(0);
+    }
+
+    // 4) 整块经 MetadataWriter 写（handle_id 占位 0，与 Phase-2 分配器一致）。
+    let block_id = (block_offset / block_size) as Ext4Fsblk;
+    writer.write_metadata_for_handle(0, block_id, &block)
+}
+
 #[cfg(ktest)]
 mod test {
     use ostd::prelude::*;
 
-    use super::RawInode;
+    use super::{load_inode, write_back_inode, Inode, RawInode, EXT4_INODE_FLAG_EXTENTS};
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+    use crate::fs::ext4::core::diff_harness::{
+        assert_meta_eq, snapshot_meta_with_inodes, DirectMetadataWriter, MemDisk,
+    };
+    use crate::fs::ext4::core::io::BlockReader;
     use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::slice_at;
+    use crate::fs::ext4::core::test_util::{slice_at, EXT4_IMAGE};
     use crate::prelude::*;
+
+    /// 从内存盘读超级块（布局推导）。
+    fn read_sb(disk: &MemDisk) -> RawSuperblock {
+        let mut buf = vec![0u8; 1024];
+        disk.read_at(1024, buf.as_mut_slice());
+        RawSuperblock::from_bytes(&buf)
+    }
 
     #[ktest]
     fn inode_roundtrip_handcrafted() {
@@ -191,5 +387,85 @@ mod test {
         assert_eq!(raw.block, old.block, "i_block[15]");
         assert_eq!(raw.generation, old.generation, "generation");
         assert_eq!(raw.size_hi, old.size_hi, "size_hi");
+    }
+
+    /// inode load→改无害字段→write_back 后，inode 表字节（含 csum）与 ext4_rs 逐字节一致。
+    ///
+    /// 两张独立 `MemDisk`（同镜像，互不共享 Arc）：
+    /// - 旧侧：`ext4_rs::Ext4::open` → `get_inode_ref(2)` → `atime += 1` → `write_back_inode`；
+    /// - 新侧：`load_inode(2)` → `atime += 1`（同改）→ `write_back_inode`。
+    /// 两盘 `snapshot_meta_with_inodes`（含 inode 表 + csum）逐字节对拍。
+    /// 这正是 Task-0 csum parity 的下游验证：唯一盘面 delta 在 inode #2，且 csum 必须一致。
+    #[ktest]
+    fn inode_load_writeback_parity() {
+        const INO: u32 = 2;
+
+        // 两张独立内存盘（各自 from_image 同字节，互不共享 Arc）。
+        let old_disk = MemDisk::from_image(EXT4_IMAGE);
+        let new_disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&new_disk);
+
+        // 旧侧：经 ext4_rs 改 atime+1 再 write_back_inode。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(old_disk.clone()));
+        let mut old_ref = ext4.get_inode_ref(INO);
+        let old_atime = old_ref.inode.atime();
+        old_ref.inode.set_atime(old_atime.wrapping_add(1));
+        ext4.write_back_inode(&mut old_ref);
+
+        // 新侧：load_inode → 同改 atime+1 → write_back_inode（注入 reader + writer）。
+        let bs = sb.block_size();
+        let writer = DirectMetadataWriter::new(new_disk.clone(), bs);
+        let mut inode = load_inode(&new_disk, &sb, INO).expect("load_inode #2");
+        // 确认两侧读到同一初值（同镜像）。
+        assert_eq!(inode.raw.atime, old_atime, "new load atime == old initial atime");
+        inode.raw.atime = inode.raw.atime.wrapping_add(1);
+        write_back_inode(&writer, &new_disk, &sb, &mut inode).expect("write_back_inode #2");
+
+        // 两盘元数据（含 inode 表 + csum）逐字节一致。
+        let old_snap = snapshot_meta_with_inodes(&old_disk, &sb);
+        let new_snap = snapshot_meta_with_inodes(&new_disk, &sb);
+        assert_meta_eq(&old_snap, &new_snap);
+    }
+
+    /// 派发谓词 `uses_extents()` 与 ext4_rs `inode_uses_extents` 一致：
+    /// - 真镜像 inode #2（flags 含 EXTENTS）→ true，两侧一致；
+    /// - 构造的 legacy-flag inode（清 EXTENTS 位）→ false，两侧一致。
+    ///
+    /// 只验证**谓词**（不触发任一映射分支的 `unimplemented!`，按控制器歧义裁决 #1）。
+    #[ktest]
+    fn dispatch_predicate_parity() {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let sb = read_sb(&disk);
+
+        // 真镜像 inode #2：新侧 uses_extents() 应与旧侧 inode_uses_extents 一致。
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        let old_ref = ext4.get_inode_ref(2);
+        let old_uses_extents =
+            (old_ref.inode.flags() & EXT4_INODE_FLAG_EXTENTS) != 0;
+
+        let inode = load_inode(&disk, &sb, 2).expect("load_inode #2");
+        assert_eq!(
+            inode.uses_extents(),
+            old_uses_extents,
+            "uses_extents(#2) parity with ext4_rs inode_uses_extents"
+        );
+        // 真镜像（INCOMPAT_EXTENTS 开）下根 inode 应走 extent。
+        assert!(inode.uses_extents(), "real image inode #2 uses extents");
+
+        // 构造 legacy-flag inode（清 EXTENTS 位）：两侧谓词同为 false。
+        let mut legacy = Inode {
+            raw: inode.raw,
+            num: 2,
+        };
+        legacy.raw.flags &= !EXT4_INODE_FLAG_EXTENTS;
+        let mut old_legacy = old_ref.inode;
+        old_legacy.set_flags(old_legacy.flags() & !EXT4_INODE_FLAG_EXTENTS);
+        let old_legacy_uses = (old_legacy.flags() & EXT4_INODE_FLAG_EXTENTS) != 0;
+        assert_eq!(
+            legacy.uses_extents(),
+            old_legacy_uses,
+            "uses_extents(legacy) parity"
+        );
+        assert!(!legacy.uses_extents(), "legacy-flag inode does not use extents");
     }
 }
