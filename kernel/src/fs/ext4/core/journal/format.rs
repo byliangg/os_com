@@ -7,6 +7,19 @@ use crate::fs::ext4::core::prelude::*;
 /// JBD2 magic（大端存盘）。
 pub const JBD2_MAGIC: u32 = 0xC03B3998;
 
+/// journal 超级块块类型 v2（`s_header.h_blocktype`，大端解码后值）。
+/// 对应 ext4_rs `JBD2_SUPERBLOCK_V2`。
+pub const JBD2_SUPERBLOCK_V2: u32 = 4;
+
+/// journal 超级块大小（字节）；JBD2 SB 占 journal 逻辑块 0 的前 1024 字节。
+/// 对应 ext4_rs `JBD2_SUPERBLOCK_SIZE`。
+pub const JBD2_SUPERBLOCK_SIZE: usize = 1024;
+
+/// incompat 特性位：CSUM_V2（descriptor/commit/SB 用 crc32c 校验）。对应 ext4_rs 同名常量。
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V2: u32 = 0x0000_0008;
+/// incompat 特性位：CSUM_V3（64 位块号 tag + 全 32 位 tag csum）。对应 ext4_rs 同名常量。
+pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
+
 /// JBD2 块通用头（12 字节，大端）。嵌在 superblock / commit / revoke 块开头。
 ///
 /// 可见性 `pub(in crate::fs::ext4::core)`：随 [`RawJournalSuperblock::header`] 一同暴露给
@@ -92,6 +105,23 @@ impl RawJournalSuperblock {
     /// 环形写入头（下一次 commit 的起始块）。
     pub fn head(&self) -> u32 {
         u32::from_be(self.s_head)
+    }
+    /// incompat 特性位（大端解码）。
+    pub fn feature_incompat(&self) -> u32 {
+        u32::from_be(self.s_feature_incompat)
+    }
+    /// journal UUID（16 字节，原样字节序——既是 csum 种子也用于 SB UUID 校验）。
+    pub fn uuid(&self) -> [u8; 16] {
+        self.s_uuid
+    }
+    /// SB 校验和字段（偏移 0xFC，大端解码）。仅 CSUM_V2/V3 特性开时有意义。
+    pub fn checksum(&self) -> u32 {
+        u32::from_be(self.s_checksum)
+    }
+    /// 是否开启 JBD2 校验和（CSUM_V2 或 CSUM_V3 任一）。门控 SB/descriptor/commit csum 写读。
+    pub fn has_checksum_v2_or_v3(&self) -> bool {
+        (self.feature_incompat() & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3))
+            != 0
     }
 }
 

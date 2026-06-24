@@ -2836,4 +2836,161 @@ mod test {
             assert_ne!(geom_after.start, 0, "empty journal: s_start must be set to the commit's start block");
         }
     }
+
+    // =================================================================
+    // Phase 5 Task 1：journal SB load + 4 类 csum 算法差分。
+    //
+    // - `journal_sb_load_parity`：旧侧 ext4_rs 读 journal SB（经 resolve_journal_area
+    //   拿几何）vs 新侧 core `load_journal_sb` 读同一组物理块——对拍 magic/blocksize/
+    //   maxlen/first/sequence/start。
+    // - `journal_sb_csum_parity`：core `journal_sb_checksum` == 盘上 s_checksum（csum 开）；
+    //   nocsum 镜像确认门控（gate 关时 SB s_checksum 不被校验）。
+    // - `jbd2_csum_suite_parity`：descriptor-tail / per-tag data / commit 三类 csum 对拍
+    //   ext4_rs（用其 public `ext4_crc32c` 跑同一字节序列——ext4_rs 私有 csum 方法不可调，
+    //   故按其源码逐字复刻的字节序列 + 同 crc 引擎对拍；core crc 已在 crc.rs 与 ext4_rs 逐位对齐）。
+    // =================================================================
+
+    /// journal SB load 差分：旧侧 ext4_rs `JournalSuperblockState`（经 `resolve_journal_area`
+    /// 的几何）vs 新侧 core `load_journal_sb`，对拍 magic/blocksize/maxlen/first/sequence/start。
+    #[ktest]
+    fn journal_sb_load_parity() {
+        use crate::fs::ext4::core::journal::format::JBD2_MAGIC;
+        use crate::fs::ext4::core::journal::superblock::load_journal_sb;
+
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE, EXT4_NOCSUM_IMAGE] {
+            let disk = MemDisk::from_image(image);
+            // 旧侧：ext4_rs 解出物理块 + 几何（= ext4_rs JournalSuperblockState 读出的逻辑值）。
+            let (physical_blocks, geom) = resolve_journal_area(&disk);
+            let bs = geom.block_size as usize;
+
+            // 新侧：core load_journal_sb 读同一组物理块的逻辑块 0。
+            let sb = load_journal_sb(&disk, &physical_blocks, bs)
+                .expect("core load_journal_sb on a valid fixture journal");
+
+            assert_eq!(sb.header().magic(), JBD2_MAGIC, "core SB magic");
+            assert_eq!(sb.blocksize(), geom.block_size, "s_blocksize: core vs ext4_rs geom");
+            assert_eq!(sb.maxlen(), geom.maxlen, "s_maxlen: core vs ext4_rs geom");
+            assert_eq!(sb.first(), geom.first, "s_first: core vs ext4_rs geom");
+            assert_eq!(sb.sequence(), geom.sequence, "s_sequence: core vs ext4_rs geom");
+            assert_eq!(sb.start(), geom.start, "s_start: core vs ext4_rs geom");
+        }
+    }
+
+    /// journal SB csum 差分 + 门控：csum 开的镜像上 core `journal_sb_checksum` 必 == 盘上
+    /// s_checksum（大端解码）；nocsum 镜像上确认 `has_checksum_v2_or_v3()` 关（门控生效，
+    /// SB s_checksum 不参与校验）。
+    #[ktest]
+    fn journal_sb_csum_parity() {
+        use crate::fs::ext4::core::journal::superblock::{journal_sb_checksum, load_journal_sb};
+
+        // (a) csum 开的真镜像（EXT4_IMAGE / EXT4_MULTIGROUP_IMAGE）：core 算的 == 盘上 s_checksum。
+        for image in [EXT4_IMAGE, EXT4_MULTIGROUP_IMAGE] {
+            let disk = MemDisk::from_image(image);
+            let (physical_blocks, geom) = resolve_journal_area(&disk);
+            let bs = geom.block_size as usize;
+            let sb = load_journal_sb(&disk, &physical_blocks, bs).expect("load SB (csum image)");
+
+            // 仅当 SB 自身开启 CSUM_V2/V3 时校验盘上 s_checksum（与 ext4_rs validate 同门控）。
+            if sb.has_checksum_v2_or_v3() {
+                // 读 journal 逻辑块 0 的前 1024 字节作 SB 镜像，算 csum。
+                let mut sb_block = vec![0u8; bs];
+                disk.read_at((physical_blocks[0] as usize) * bs, sb_block.as_mut_slice());
+                let mut sb_image = [0u8; 1024];
+                sb_image.copy_from_slice(&sb_block[..1024]);
+                let computed = journal_sb_checksum(&sb_image);
+                assert_eq!(
+                    computed,
+                    sb.checksum(),
+                    "core journal_sb_checksum must equal on-disk s_checksum (big-endian) for {image_name}",
+                    image_name = if core::ptr::eq(image, EXT4_IMAGE) { "EXT4_IMAGE" } else { "EXT4_MULTIGROUP_IMAGE" },
+                );
+            }
+        }
+
+        // (b) nocsum 镜像：门控应关（has_checksum_v2_or_v3()==false）；s_checksum 不被校验。
+        //     对拍 ext4_rs：旧侧 validate 在此门控下不比 s_checksum——故只断门控状态一致。
+        let disk = MemDisk::from_image(EXT4_NOCSUM_IMAGE);
+        let (physical_blocks, geom) = resolve_journal_area(&disk);
+        let bs = geom.block_size as usize;
+        let sb = load_journal_sb(&disk, &physical_blocks, bs).expect("load SB (nocsum image)");
+        assert!(
+            !sb.has_checksum_v2_or_v3(),
+            "EXT4_NOCSUM_IMAGE journal SB must have CSUM_V2/V3 gate OFF"
+        );
+    }
+
+    /// JBD2 csum 套件差分：descriptor-tail / per-tag data / commit 三类 csum，core 必 ==
+    /// 按 ext4_rs 源码（mod.rs:309-323/441-447/449-457）逐字复刻的字节序列喂 ext4_rs public
+    /// `ext4_crc32c` 的结果（ext4_rs 私有 csum 方法不可外调；core crc 已与 ext4_rs crc 逐位对齐）。
+    /// 用真镜像 journal SB 的 UUID 作种子。
+    #[ktest]
+    fn jbd2_csum_suite_parity() {
+        use crate::fs::ext4::core::journal::superblock::{
+            commit_block_csum, descriptor_tail_csum, load_journal_sb, tag_data_csum,
+        };
+
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let (physical_blocks, geom) = resolve_journal_area(&disk);
+        let bs = geom.block_size as usize;
+        let sb = load_journal_sb(&disk, &physical_blocks, bs).expect("load SB for UUID");
+        let uuid = sb.uuid();
+
+        // 构造一个 descriptor 块（block_size 字节，tail csum 字段保持零）、一个 commit 块字节
+        // （64 字节，h_chksum 区保持零）、一个数据块（block_size 字节）。
+        let mut descriptor = vec![0u8; bs];
+        for (i, b) in descriptor.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31) & 0xFF) as u8;
+        }
+        // tail csum 字段在块尾 4 字节——置零（计算时为零，与 ext4_rs 一致）。
+        let tail = descriptor.len() - 4;
+        descriptor[tail..].fill(0);
+
+        let mut data_block = vec![0u8; bs];
+        for (i, b) in data_block.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(17).wrapping_add(7) & 0xFF) as u8;
+        }
+
+        let commit_bytes = {
+            // 64 字节 commit 结构镜像（h_chksum 全零，含其它字段任意——只验算法）。
+            let mut c = vec![0u8; 64];
+            // 放个大端 magic 头让它像真 commit（不影响算法，仅更接近实战）。
+            c[0..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+            c
+        };
+
+        let sequence: u32 = geom.sequence;
+
+        // 旧侧基准：按 ext4_rs 源码逐字复刻的字节序列 + ext4_rs public crc。
+        let old_desc = {
+            let mut d = Vec::with_capacity(16 + descriptor.len());
+            d.extend_from_slice(&uuid);
+            d.extend_from_slice(&descriptor);
+            ext4_rs::ext4_crc32c(ext4_rs::EXT4_CRC32_INIT, &d, d.len() as u32)
+        };
+        let old_tag = {
+            let mut d = Vec::with_capacity(16 + 4 + data_block.len());
+            d.extend_from_slice(&uuid);
+            d.extend_from_slice(&sequence.to_be_bytes());
+            d.extend_from_slice(&data_block);
+            ext4_rs::ext4_crc32c(ext4_rs::EXT4_CRC32_INIT, &d, d.len() as u32)
+        };
+        let old_commit = {
+            let mut d = Vec::with_capacity(16 + commit_bytes.len());
+            d.extend_from_slice(&uuid);
+            d.extend_from_slice(&commit_bytes);
+            ext4_rs::ext4_crc32c(ext4_rs::EXT4_CRC32_INIT, &d, d.len() as u32)
+        };
+
+        // 新侧：core 的 csum 套件。
+        let new_desc = descriptor_tail_csum(&uuid, &descriptor);
+        let new_tag = tag_data_csum(&uuid, sequence, &data_block);
+        let new_commit = commit_block_csum(&uuid, &commit_bytes);
+
+        assert_eq!(new_desc, old_desc, "descriptor-tail csum: core vs ext4_rs recipe");
+        assert_eq!(new_tag, old_tag, "per-tag data csum: core vs ext4_rs recipe");
+        assert_eq!(new_commit, old_commit, "commit-block csum: core vs ext4_rs recipe");
+
+        // v2 取低 16 位是调用方截断——这里确认截断语义与全 32 位一致。
+        assert_eq!((new_tag & 0xFFFF) as u16, (old_tag & 0xFFFF) as u16, "v2 tag low-16 truncation");
+    }
 }
