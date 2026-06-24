@@ -360,8 +360,8 @@ mod test {
     use ostd::prelude::*;
 
     use super::{
-        assert_meta_eq, snapshot_inode_table_group, snapshot_meta, snapshot_meta_with_inodes,
-        DirectMetadataWriter, MemDisk,
+        assert_disk_eq, assert_meta_eq, snapshot_inode_table_group, snapshot_meta,
+        snapshot_meta_with_inodes, DirectMetadataWriter, MemDisk,
     };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
     use crate::fs::ext4::core::inode::{inode_checksum, RawInode};
@@ -371,6 +371,133 @@ mod test {
     use crate::fs::ext4::core::test_util::EXT4_IMAGE;
     use crate::fs::ext4::core::types::Ext4Fsblk;
     use crate::prelude::*;
+
+    // =================================================================
+    // Phase 4 Task 0：目录操作差分地基。
+    //
+    // 提供：
+    // - `DirOp` + `build_dir_populated_image`：用 **ext4_rs** 在 EXT4_IMAGE 克隆盘上跑
+    //   一串 mkdir/create，把结果字节交回——后续 dir 差分两盘从同一份「已带目录项」字节起步。
+    // - 旧侧（ext4_rs）只读采集 helper：`old_readdir` / `old_lookup`，供 `diff_readdir` /
+    //   `diff_lookup` 的旧半部立刻可用。
+    // - `diff_readdir` / `diff_lookup` 骨架：旧半部（ext4_rs）现成；新半部（core）由 Task 1
+    //   以闭包注入——故 Task 0 标 `#[allow(dead_code)]`、Task 1 接上去掉。
+    // =================================================================
+
+    /// 一条建目录树的操作：在 `parent` 下以 `mode` 建子目录 / 子文件。
+    /// `mode` 含类型位（mkdir 用 `0o40000|perm`、create 用 `0o100000|perm`）。
+    /// 仅 `diff_harness.rs` 的 ktest 模块内消费（Task 1+ 的差分用例同在此模块）。
+    #[allow(dead_code)]
+    enum DirOp {
+        Mkdir {
+            parent: u32,
+            name: &'static str,
+            mode: u16,
+        },
+        Create {
+            parent: u32,
+            name: &'static str,
+            mode: u16,
+        },
+    }
+
+    /// 从 `EXT4_IMAGE` 克隆一张内存盘，用 **ext4_rs** 在其上顺序执行 `ops`
+    /// （`Mkdir` → `ext4_mkdir_at`，`Create` → `ext4_create_at`），返回结果整盘字节。
+    ///
+    /// 供后续 dir 差分用例：两侧各 `MemDisk::from_image(&bytes)` 从同一份「已带目录项」
+    /// 字节起步，再各跑新旧引擎对拍。任一 op 失败即 panic（builder 用于构造良性 fixture，
+    /// 失败属测试用法错误）。
+    #[allow(dead_code)]
+    fn build_dir_populated_image(ops: &[DirOp]) -> Vec<u8> {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        for op in ops {
+            match *op {
+                DirOp::Mkdir {
+                    parent,
+                    name,
+                    mode,
+                } => {
+                    ext4.ext4_mkdir_at(parent, name, mode)
+                        .unwrap_or_else(|e| panic!("builder mkdir '{name}' failed: {e:?}"));
+                }
+                DirOp::Create {
+                    parent,
+                    name,
+                    mode,
+                } => {
+                    ext4.ext4_create_at(parent, name, mode)
+                        .unwrap_or_else(|e| panic!("builder create '{name}' failed: {e:?}"));
+                }
+            }
+        }
+        disk.backing().lock().clone()
+    }
+
+    /// 旧侧（ext4_rs）readdir 采集：在 `disk` 上 `Ext4::open`，读 `dir_ino` 的全部目录项，
+    /// 返回 `(name, inode, file_type)` 向量（丢弃 offset——offset 对拍留 Task 1 接新半部时做）。
+    fn old_readdir(disk: &MemDisk, dir_ino: u32) -> Vec<(String, u32, u8)> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_readdir_with_offsets(dir_ino)
+            .into_iter()
+            .map(|(name, ino, _off, ftype)| (name, ino, ftype))
+            .collect()
+    }
+
+    /// 旧侧（ext4_rs）lookup 采集：在 `disk` 上 `Ext4::open`，在 `parent` 下查 `name`，
+    /// 命中返回 `Ok(inode)`，未命中/出错返回 `Err(ext4_rs::Errno)`（供 `match` 对拍错误码）。
+    fn old_lookup(disk: &MemDisk, parent: u32, name: &str) -> core::result::Result<u32, ext4_rs::Errno> {
+        let ext4 = ext4_rs::Ext4::open(Arc::new(disk.clone()));
+        ext4.ext4_lookup_at(parent, name).map_err(|e| e.error())
+    }
+
+    /// readdir 差分骨架：两张独立内存盘（同初始 `image` 字节），旧侧用 `old_readdir`
+    /// 立刻采集；新侧（core `dir_get_entries`）由 Task 1 以 `core_readdir` 闭包注入。
+    /// 两侧 `(name, inode, file_type)` 向量逐元素相等 + 全盘字节相等（只读，故应不变）。
+    // Task 1 wires the core side: pass core `dir_get_entries(_with_next_offset)`.
+    #[allow(dead_code)]
+    fn diff_readdir(
+        image: &[u8],
+        dir_ino: u32,
+        core_readdir: impl FnOnce(&MemDisk, u32) -> Vec<(String, u32, u8)>,
+    ) {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old = old_readdir(&old_disk, dir_ino);
+        let new = core_readdir(&new_disk, dir_ino);
+        assert_eq!(old, new, "readdir(dir={dir_ino}) (name,ino,type) vector mismatch");
+        // 只读操作：两盘字节应保持与初始镜像一致。
+        assert_disk_eq(&old_disk, &new_disk);
+    }
+
+    /// lookup 差分骨架：两张独立内存盘（同初始 `image` 字节），旧侧用 `old_lookup`
+    /// 立刻采集；新侧（core `dir_find_entry`/`lookup_at`）由 Task 1 以 `core_lookup`
+    /// 闭包注入。两侧成功/失败 + inode 号对齐（`match` 不 expect），再全盘字节对拍。
+    // Task 1 wires the core side: pass core `lookup_at` (mapped to its Result).
+    #[allow(dead_code)]
+    fn diff_lookup(
+        image: &[u8],
+        parent: u32,
+        name: &str,
+        core_lookup: impl FnOnce(&MemDisk, u32, &str) -> core::result::Result<u32, ext4_rs::Errno>,
+    ) {
+        let old_disk = MemDisk::from_image(image);
+        let new_disk = MemDisk::from_image(image);
+        let old = old_lookup(&old_disk, parent, name);
+        let new = core_lookup(&new_disk, parent, name);
+        match (old, new) {
+            (Ok(o), Ok(n)) => assert_eq!(o, n, "lookup(parent={parent},name='{name}') inode mismatch"),
+            (Err(o), Err(n)) => assert_eq!(
+                o, n,
+                "lookup(parent={parent},name='{name}') errno mismatch: old {o:?} new {n:?}"
+            ),
+            (o, n) => panic!(
+                "lookup(parent={parent},name='{name}') success/failure divergence: old={o:?} new={n:?}"
+            ),
+        }
+        // 只读操作：两盘字节应保持一致。
+        assert_disk_eq(&old_disk, &new_disk);
+    }
 
     /// 从内存盘按超级块布局读出 inode `ino` 的 156 字节原始字节。
     /// 组 = (ino-1)/inodes_per_group；组内序号 = (ino-1)%inodes_per_group。
@@ -609,5 +736,78 @@ mod test {
             .expect("extended snapshot must catch a 1-byte inode change across two disks");
         assert_eq!(off, ino_off, "first diff offset = mutated inode byte offset");
         assert_eq!(y ^ x, 0xFF, "mutated byte differs by the flipped bits");
+    }
+
+    /// 旧侧 readdir helper 在真实根目录上的基线：`old_readdir(2)` 必含 "." 与 ".."。
+    /// 证明 `old_readdir`（`diff_readdir` 的旧半部）对真镜像可用、采得 `(name,ino,type)`。
+    #[ktest]
+    fn dir_old_readdir_root_baseline() {
+        let disk = MemDisk::from_image(EXT4_IMAGE);
+        let entries = old_readdir(&disk, 2);
+        // '.' / '..' 必在；'.' 指向根自身 (ino 2)、类型为目录 (2)。
+        assert!(
+            entries.iter().any(|(n, ino, ft)| n == "." && *ino == 2 && *ft == 2),
+            "root readdir must contain '.' -> ino 2, type dir; got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(n, _ino, ft)| n == ".." && *ft == 2),
+            "root readdir must contain '..' (dir); got {entries:?}"
+        );
+        // 真镜像根目录预置 lost+found（ino 11）。
+        assert!(
+            entries.iter().any(|(n, ino, _ft)| n == "lost+found" && *ino == 11),
+            "root readdir must contain 'lost+found' -> ino 11; got {entries:?}"
+        );
+    }
+
+    /// builder 往返：用 ext4_rs 在克隆盘上 mkdir "d1" + create "f1"，重开结果字节，
+    /// 确认根目录 readdir 现含 "d1"（目录）与 "f1"（文件），且 "." / "lost+found" 基线仍在。
+    /// 证明 `build_dir_populated_image` 产出一张可用的「已带目录项」盘。
+    #[ktest]
+    fn dir_builder_roundtrip() {
+        let bytes = build_dir_populated_image(&[
+            DirOp::Mkdir {
+                parent: 2,
+                name: "d1",
+                mode: 0o40755,
+            },
+            DirOp::Create {
+                parent: 2,
+                name: "f1",
+                mode: 0o100644,
+            },
+        ]);
+        let disk = MemDisk::from_image(&bytes);
+        let entries = old_readdir(&disk, 2);
+
+        // 新建目录 "d1"：file_type == 2 (dir)。
+        let d1 = entries
+            .iter()
+            .find(|(n, _, _)| n == "d1")
+            .unwrap_or_else(|| panic!("builder result must contain 'd1'; got {entries:?}"));
+        assert_eq!(d1.2, 2, "'d1' must be a directory entry (file_type 2)");
+        assert!(d1.1 >= 12, "'d1' inode {} should be a freshly allocated inode", d1.1);
+
+        // 新建文件 "f1"：file_type == 1 (regular)。
+        let f1 = entries
+            .iter()
+            .find(|(n, _, _)| n == "f1")
+            .unwrap_or_else(|| panic!("builder result must contain 'f1'; got {entries:?}"));
+        assert_eq!(f1.2, 1, "'f1' must be a regular-file entry (file_type 1)");
+
+        // 基线项仍在：'.' (ino 2) 与 lost+found (ino 11)。
+        assert!(
+            entries.iter().any(|(n, ino, _)| n == "." && *ino == 2),
+            "builder result must still contain '.' -> ino 2; got {entries:?}"
+        );
+        assert!(
+            entries.iter().any(|(n, ino, _)| n == "lost+found" && *ino == 11),
+            "builder result must still contain 'lost+found'; got {entries:?}"
+        );
+
+        // lookup helper 与 readdir 一致：在 'd1'(目录) 下查 '.' 命中其自身 inode。
+        let d1_ino = d1.1;
+        let sub = old_lookup(&disk, d1_ino, ".");
+        assert_eq!(sub, Ok(d1_ino), "lookup '.' inside 'd1' must resolve to d1's inode");
     }
 }

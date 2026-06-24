@@ -6,6 +6,16 @@ use super::prelude::*;
 /// 目录项尾标识：reserved_ft == 0xDE 表示该槽是目录块尾校验和结构。
 const DIR_TAIL_MARKER: u8 = 0xDE;
 
+/// ext4_rs `size_of::<Ext4DirEntry>()` 的值（`#[repr(C)]`：u32+u16+u8+u8+`[u8;255]`
+/// → 263 → 对齐到 264）。**这是内存结构尺寸泄漏进磁盘布局的关键 parity 常量**：
+/// ext4_rs 的 `try_insert_to_existing_block` / `insert_to_new_block` 用它作
+/// ① 插入所需空间下界 `required_len = align4(264 + name.len())`、② 写新项时整 264 字节
+/// `copy_to_slice`（name 尾零填到 255 + 对齐）。Task 2 的切槽/写项必须逐字复刻 264。
+// PARITY: size_of::<ext4_rs Ext4DirEntry> 泄漏进磁盘布局
+// Task 2 wires the slot-split / new-entry write path against this constant.
+#[allow(dead_code)]
+pub(super) const EXT4_DIR_ENTRY_INMEM_SIZE: usize = 264;
+
 /// 目录项指向的 inode 类型（filetype 特性下的 file_type 字节）。
 /// 安全替换旧实现里的 `union Ext4DirEnInternal`：当成 1 字节 + 按 filetype 解释。
 #[repr(u8)]
