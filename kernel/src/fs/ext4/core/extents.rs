@@ -1503,7 +1503,7 @@ fn ext_remove_leaf(
             // 删 [from, min(end,to)]，保留前段 [first_block, from)。
             let remove_from = from;
             let remove_to = end.min(to);
-            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, remove_to);
+            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, remove_to)?;
             let unwritten = ex.is_unwritten();
             ex.block_count = (from - ex.first_block()) as u16;
             if unwritten {
@@ -1514,7 +1514,7 @@ fn ext_remove_leaf(
             // 删 [first_block, to]，保留尾段 [to+1, end]。
             let remove_from = ex.first_block();
             let remove_to = to;
-            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, remove_to);
+            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, remove_to)?;
             let unwritten = ex.is_unwritten();
             let new_start = to + 1;
             let new_pblock = ex.start() + (new_start - ex.first_block()) as u64;
@@ -1528,7 +1528,7 @@ fn ext_remove_leaf(
         } else {
             // 整 extent 被删 [first_block, end]。
             let remove_from = ex.first_block();
-            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, end);
+            ext_remove_blocks(ctx, alloc, inode, &ex, remove_from, end)?;
         }
 
         if let Some(kept_extent) = kept {
@@ -1580,12 +1580,18 @@ fn ext_remove_leaf(
 
 /// 释放某 index 项指向的 index 块（1 块）。复刻 ext4_rs `ext_remove_index_block`（:1556）。
 fn ext_remove_index_block(
+    ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
     index: &RawExtentIndex,
-) {
+) -> Result<()> {
     let block_to_free = index.leaf();
     alloc.free_blocks(inode, block_to_free, 1);
+    // PARITY: 与 `ext_remove_blocks` 同理——ext4_rs `balloc_free_blocks` 在释放后立即
+    //   write_back_inode 落 i_blocks。core `balloc_free_blocks` 不落盘，故此处补写回，
+    //   使 index 块释放的 i_blocks 递减也持久化（否则根塌路径会丢这次落盘）。
+    write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+    Ok(())
 }
 
 /// 删父 index + 释放 index 块；末根项时根塌回空叶。逐字节复刻 ext4_rs
@@ -1649,7 +1655,7 @@ fn ext_remove_idx(
             node_bytes[EXT4_EXTENT_HEADER_SIZE..60].fill(0);
             inode.set_i_block_bytes(&node_bytes[..60]);
             write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
-            ext_remove_index_block(alloc, inode, &removed_index);
+            ext_remove_index_block(ctx, alloc, inode, &removed_index)?;
             return Ok(());
         }
         inode.set_i_block_bytes(&node_bytes[..60]);
@@ -1660,7 +1666,7 @@ fn ext_remove_idx(
     }
 
     // 释放被删 index 指向的块。
-    ext_remove_index_block(alloc, inode, &removed_index);
+    ext_remove_index_block(ctx, alloc, inode, &removed_index)?;
 
     // pos==0 且仍有项 → 修正祖先 index 的 first_block 键。
     if path.path[i].position == 0 && header.entries_count > 0 {
@@ -1704,10 +1710,10 @@ fn ext_remove_blocks(
     ex: &RawExtent,
     from: Ext4Lblk,
     to: Ext4Lblk,
-) {
+) -> Result<()> {
     // PARITY: 非法区间防御（to<from / from<first_block 会下溢长度）→ 跳过（ext4_rs:1702-1708）。
     if to < from || from < ex.first_block() {
-        return;
+        return Ok(());
     }
     let len = to - from + 1;
     let num = from - ex.first_block();
@@ -1715,9 +1721,16 @@ fn ext_remove_blocks(
     let total = ctx.sb.blocks_count();
     // PARITY: 越界释放防御（start+len > blocks_count）→ 跳过（ext4_rs:1713-1719）。
     if (start as u64) + (len as u64) > total {
-        return;
+        return Ok(());
     }
     alloc.free_blocks(inode, start as Ext4Fsblk, len);
+    // PARITY: ext4_rs `balloc_free_blocks`（balloc.rs:684-687）在每次释放后**立即**
+    //   `write_back_inode`（落 i_blocks 到 inode 表）。core 的 `balloc_free_blocks` 只在
+    //   `InodeAllocCtx` 内累减、刻意不落盘（Phase-2 设计），故必须在此把递减后的 i_blocks
+    //   写回 inode 表——否则只 sync_tree_block 的非根叶删除路径会丢这次 i_blocks 落盘，
+    //   导致盘上 i_blocks 偏高（under-decrement）。这与 ext4_rs「每次 free 都 write_back」逐次对齐。
+    write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+    Ok(())
 }
 
 /// 索引层是否还有要删的子节点。逐字节复刻 ext4_rs `more_to_rm`（ext4_impls/extents.rs:1723）。
