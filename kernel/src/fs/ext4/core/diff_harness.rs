@@ -357,6 +357,8 @@ pub(super) fn assert_meta_eq(a: &MetaSnapshot, b: &MetaSnapshot) {
 
 #[cfg(ktest)]
 mod test {
+    use alloc::format;
+
     use ostd::prelude::*;
 
     use super::{
