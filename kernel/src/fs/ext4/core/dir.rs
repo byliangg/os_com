@@ -1211,13 +1211,14 @@ pub(super) fn create_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWri
     Ok((ino, dir_byte_offset))
 }
 
-/// 在 `parent_ino` 下创建子目录 `name`（mode 自动 `| S_IFDIR`），返回新目录 inode 号。
+/// 在 `parent_ino` 下创建子目录 `name`，返回新目录 inode 号。
 ///
 /// PARITY（ext4_rs `ext4_mkdir_at`，simple_interface/mod.rs:243）：先 `dir_find_entry(parent,
-/// name)` 查重——命中 → **EEXIST**；否则 `create(parent, name, mode)`——注意 ext4_rs 传给
-/// `create` 的 `mode` 由调用方带上 S_IFDIR 类型位（`ext4_dir_mk` / 集成层传 `S_IFDIR|perm`），
-/// 故 core `mkdir_at` 用 `mode | S_IFDIR` 调 `create_at`，使 `create_inode` 走目录分支、`link`
-/// 走目录分支（写 '.'/'..' + child=2 + 父 nlink++）。
+/// name)` 查重——命中 → **EEXIST**；否则 `create(parent, name, mode)`——`mode` **原样**传给
+/// `create`（ext4_rs **不**在 mkdir 里补 S_IFDIR，靠调用方提供类型位：`ext4_dir_mk` / 集成层
+/// 传 `S_IFDIR|perm`）。dir-vs-file 分支由新建 inode 的 `is_dir()`（mode 类型位）驱动，与
+/// ext4_rs 一致——正常 mkdir（mode 含 S_IFDIR）走目录分支（写 '.'/'..' + child=2 + 父 nlink++）；
+/// 仅畸形调用（mode 无类型位）才回落到常规文件，与 ext4_rs 一致（不再 core 强制建目录）。
 pub(super) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
@@ -1232,21 +1233,22 @@ pub(super) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     }
     drop(rctx);
     drop(parent);
-    // 走 create_at（mode 带 S_IFDIR 类型位 → create_inode/link 目录分支）。
-    create_at(nctx, parent_ino, name, mode | S_IFDIR_FULL)
+    // PARITY: ext4_rs ext4_mkdir_at passes mode through unchanged; caller supplies S_IFDIR.
+    create_at(nctx, parent_ino, name, mode)
 }
 
 /// 同 [`mkdir_at`] 但用 `create_unchecked`（无查重、只动父末块），返回 `(新目录 inode 号, abs byte offset)`。
 ///
 /// PARITY（ext4_rs `ext4_mkdir_unchecked_at`，simple_interface/mod.rs:258）：调用方保证 name
-/// 不存在（无查重）。
+/// 不存在（无查重）；`mode` 原样传给 `create_unchecked`（调用方提供 S_IFDIR 类型位）。
 pub(super) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
     mode: u16,
 ) -> Result<(u32, u64)> {
-    create_unchecked_at(nctx, parent_ino, name, mode | S_IFDIR_FULL)
+    // PARITY: ext4_rs ext4_mkdir_unchecked_at passes mode through unchanged; caller supplies S_IFDIR.
+    create_unchecked_at(nctx, parent_ino, name, mode)
 }
 
 /// 删除 `parent_ino` 下名为 `name` 的**文件**（目录请用 [`rmdir_at`]）。
