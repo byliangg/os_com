@@ -1872,7 +1872,7 @@ mod test {
 
     /// extent 删除 + truncate 主差分。**两棵树，避开参照侧 ext4_rs 的 panic。**
     ///
-    /// **参照侧鲁棒性约束（BUG-14 + BUG-15，已登记 bug.md）**：
+    /// **参照侧鲁棒性约束（BUG-14 + BUG-15 + BUG-16，已登记 bug.md）**：
     /// - BUG-14：ext4_rs `balloc_free_blocks`（balloc.rs:672）`inode_blocks -= free_cnt*(bs/512)`
     ///   **无符号减法不做下溢保护** → debug 下溢即 panic（不 saturate）。
     /// - BUG-15：ext4_rs `extent_remove_space` 自叶向上循环（extents.rs:1333）对**叶层**也调
@@ -1881,6 +1881,11 @@ mod test {
     ///   同一叶被**重复处理 / 重复释放** → 单次 free 的块数超过当前 i_blocks → 撞 BUG-14 panic。
     ///   **任何 depth>0 树、其叶含 >1 extent 的「清叶」删除（含 truncate-shrink-to-0）都会触发**，
     ///   与 root 索引数无关（之前以为单索引可绕开，错——触发在叶层）。
+    /// - BUG-16：ext4_rs `extent_remove_space`（extents.rs:1258/1283）对**空叶**（entries_count==0）
+    ///   做 `root_extent_at(entries_count - 1)` / `read_offset_as(...*(entries_count-1))` **无下溢守卫**
+    ///   → 缩一棵 entries==0 的树（**稀疏 grow 出来的**、或**已清空再缩**）即 panic。**故差分绝不
+    ///   shrink/remove 一棵 entries==0 的树**；要覆盖「regrow 后 shrink」改走 **write-then-shrink**
+    ///   （先写真实块使 entries>0，再缩）。「shrink 空/稀疏树」差分推迟（仅源码 review）。
     ///
     /// **core 逐字节复刻 BUG-14/15（不退）；差分只喂不会把 ext4_rs 推进 panic 的输入**：
     /// - **Tree A（depth-0，root i_block 持 ≤4 extent，盘上无 node 块）**：无 node-block 释放路径，
@@ -1929,15 +1934,26 @@ mod test {
         diff_write_step(&old_t, &new_t, ino_t, 0, &vec![0x55u8; 12 * bs]); // [0,12)
         assert_eq!(root_depth(&old_t, ino_t), 0, "T: depth-0 shallow tree");
 
-        diff_truncate_step(&old_t, &new_t, ino_t, 20 * bs as u64); // grow 稀疏
-        diff_truncate_step(&old_t, &new_t, ino_t, 8 * bs as u64); // shrink 到块边界
-        diff_truncate_step(&old_t, &new_t, ino_t, 5 * bs as u64 + 7); // shrink 块中部（written 尾 RMW）
-        diff_truncate_step(&old_t, &new_t, ino_t, 0); // shrink-to-0（清 root 叶，depth 仍 0）
+        // 此刻 entries_count==1（extent [0,12)）。下面每个 shrink 调用进入时 entries>0。
+        diff_truncate_step(&old_t, &new_t, ino_t, 20 * bs as u64); // grow 稀疏（entries 仍 1）
+        diff_truncate_step(&old_t, &new_t, ino_t, 8 * bs as u64); // shrink 到块边界（进入时 entries=1>0）
+        diff_truncate_step(&old_t, &new_t, ino_t, 5 * bs as u64 + 7); // shrink 块中部（written 尾 RMW；entries>0）
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // shrink-to-0（进入时 entries=1>0 → 安全；清后 entries=0）
         assert_eq!(root_depth(&old_t, ino_t), 0, "T: depth-0 after shrink-to-0");
-        diff_truncate_step(&old_t, &new_t, ino_t, 0); // 同尺寸 no-op
-        diff_truncate_step(&old_t, &new_t, ino_t, 3 * bs as u64); // 空树再 grow
-        diff_truncate_step(&old_t, &new_t, ino_t, bs as u64 + 3); // 再 shrink 到块中部
-        diff_truncate_step(&old_t, &new_t, ino_t, 0); // 再清零
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // 同尺寸 no-op（old==new，提前返回，不删）
+
+        // ⚠️ BUG-16（参照侧）：ext4_rs `extent_remove_space`（extents.rs:1258/1283）对空叶
+        //    （entries_count==0）做 `root_extent_at(entries_count-1)` **无下溢守卫** → 缩一棵
+        //    entries==0 的树（稀疏 grow 出来的、或已清空的）会 panic。故**绝不 shrink entries==0 树**。
+        //    要再覆盖「regrow 后 shrink」改走 **write-then-shrink**：稀疏 grow 后**先写真实块**
+        //    （entries>0），再 shrink，安全。「shrink 空/稀疏树」差分推迟（仅源码 review，见 bug.md BUG-16）。
+        diff_truncate_step(&old_t, &new_t, ino_t, 3 * bs as u64); // 空树稀疏 grow（entries 仍 0；grow 提前返回，不删 → 安全）
+        diff_truncate_step(&old_t, &new_t, ino_t, 3 * bs as u64); // 同尺寸 no-op（安全）
+        // write-then-shrink：先写真实块使 entries>0，再 shrink（进入时 entries>0 → 安全）。
+        diff_write_step(&old_t, &new_t, ino_t, 0, &vec![0x66u8; 3 * bs]); // 写 [0,3) → entries>0
+        assert_eq!(root_depth(&old_t, ino_t), 0, "T: depth-0 after regrow write");
+        diff_truncate_step(&old_t, &new_t, ino_t, bs as u64 + 3); // shrink 到块中部（进入时 entries>0 → 安全）
+        diff_truncate_step(&old_t, &new_t, ino_t, 0); // shrink-to-0（进入时 entries>0 → 安全）
 
         // =================================================================
         // Tree B — depth=1，仅 PARTIAL 删（叶永不清空 → ext_remove_idx 永不触发 → 不下溢）。
