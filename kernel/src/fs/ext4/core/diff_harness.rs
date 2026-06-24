@@ -1229,7 +1229,12 @@ mod test {
     /// 仍分叉（实测 `0x8d != 0xbb`）。所以：**某块若清零了 +263 字节、且 metadata_csum 开启**，就在
     /// 归一后的块内容上用 `dir_set_csum` 重算 tail.checksum 写回（两盘都做）。归一后 `block[..bs-12]`
     /// 两盘逐字节相同 → 重算出**同一个** csum → `assert_disk_eq` 过，且块保持 csum-valid（利于后续
-    /// e2fsck）。NOCSUM 镜像下 `dir_set_csum` 早返回、是 no-op。**仅清零过 +263 的块**重算，不碰别的块。
+    /// e2fsck）。**仅清零过 +263 的块**重算，不碰别的块。
+    ///
+    /// **BUG-22（无条件重算）**：core 的写侧 `dir_set_csum` 现**无 metadata_csum 门控**（逐字复刻
+    /// ext4_rs 无条件写 dir-block csum 的行为）。故本归一在 NOCSUM 镜像下也**必须**无条件重算
+    /// tail.csum——否则归一后的内容（+263 清零）与盘上 ext4_rs 写的 stale csum 分叉。`dir_set_csum`
+    /// 已无条件写，这里直接调用即正确（两盘归一后同内容 → 同 csum）。
     fn mask_dirent_padding(disk: &MemDisk, sb: &RawSuperblock, dir_inode: u32) {
         use crate::fs::ext4::core::dir::{dir_set_csum, parse_entry};
         use crate::fs::ext4::core::extents::get_pblock_idx_state;
@@ -2292,9 +2297,14 @@ mod test {
         disk.backing().lock().clone()
     }
 
-    /// 长目录 / 多块差分：先用 ext4_rs 在根下建 ~500 个文件逼 ≥3 个目录块（4K 块每块约
-    /// 容 200+ 短名项），确认确实跨 ≥3 块（旧侧 readdir 项数 + next_offset 落在块 ≥2）；
-    /// 然后跑 create→lookup→readdir→unlink 序列，每步 core vs ext4_rs 全盘逐字节对拍。
+    /// 长目录 / 多块差分：先用 ext4_rs 在根下建足够多文件逼 ≥3 个目录块，确认确实跨 ≥3 块
+    /// （旧侧 readdir 的 next_offset 落在块 ≥2），然后跑 create→lookup→readdir→unlink 序列，
+    /// 每步 core vs ext4_rs 全盘逐字节对拍。
+    ///
+    /// **计数从 block_size 推导（不硬编一个偏低的猜测）**：ext4_rs `dir_add_entry` 的 fast-path
+    /// 在末块剩余空间 `< required_len = align4(264 + name.len())` 时才 append 新块——故每块实际
+    /// 容量受 264-下界影响，4K 块实测约容 ~300 短名项（控制器实测）。取每块容量保守估计
+    /// `cap = (bs - 12) / align4(8 + name_len)`，文件数 `4*cap + 16` 给足余量，**可靠**跨 ≥3 块。
     ///
     /// 这同时演练**多块目录块 csum 的 `ino_index = block[0].inode` quirk**（块 ≥1 的块首项是
     /// 普通子文件项 → ino_index 取子项 inode，偏离 ext4 规范；见 bug.md D 段 / dir.rs
@@ -2303,44 +2313,58 @@ mod test {
     /// 登记「多块 csum 偏离规范、parity 保住」结论。
     #[ktest]
     fn dir_long_multiblock_parity() {
-        // 逼 ≥3 个目录块：>408 个 align4(8+8)=16~20B 项（4K 块 4084 可用 / ~20B ≈ 204/块）。
-        let img = build_long_dir_image(2, 500);
+        // 从 block_size 推导文件数，**可靠**逼 ≥3 个目录块。名字 `ent_NNNNN` 9 字符，
+        // 存储 rec_len = align4(8+9)=20；保守每块容量估 (bs-12)/20，文件数取 4*cap+16 给足余量。
+        let bs = read_sb(&MemDisk::from_image(EXT4_IMAGE)).block_size();
+        let name_slot = {
+            let l = 8 + "ent_00000".len();
+            (l + 3) & !3
+        };
+        let cap_per_block = (bs - 12) / name_slot;
+        let n_files = cap_per_block * 4 + 16; // 4K 块约 800+，远超 3 块所需
+        let img = build_long_dir_image(2, n_files);
 
-        // 佐证确实 ≥3 块：旧侧底层枚举的 next_offset 至少有一项落在块 2（>= 2*bs）。
+        // 佐证确实 ≥3 块：旧侧底层枚举的 next_offset 至少有一项落在块 ≥2（>= 3*bs 即第 3 块内）。
         let probe_disk = MemDisk::from_image(&img);
         let sb = read_sb(&probe_disk);
         let bs = sb.block_size();
         let with_off = old_readdir_with_next_offset(&probe_disk, 2);
         assert!(
-            with_off.len() > 408,
-            ">408 entries needed for a 3rd dir block; got {}",
-            with_off.len()
-        );
-        assert!(
             with_off.iter().any(|(_, _, _, off)| *off >= 3 * bs),
-            "at least one entry must land in dir block >=2 (3rd block reached)"
+            "at least one entry must land in dir block >=2 (3rd block reached); \
+             n_files={n_files} entries={} max_next_off={}",
+            with_off.len(),
+            with_off.iter().map(|(_, _, _, o)| *o).max().unwrap_or(0)
         );
+
+        // 命中目标从实际计数推导（确保存在且落在高块）：near-end / middle 各取一个。
+        let near_end = format!("ent_{:05}", n_files - 1);
+        let middle = format!("ent_{:05}", n_files / 2);
 
         // ---- 序列：create 一个新文件（在已多块的根里继续切槽/可能再 append）。----
         let img = diff_create_step(&img, 2, "tail_new", 0o100644);
 
-        // ---- lookup：命中一个块 >=1 上的项（强制走跨块 dir_find_entry）+ 未命中。----
-        diff_lookup(&img, 2, "ent_00499", core_lookup);
-        diff_lookup(&img, 2, "ent_00250", core_lookup);
+        // ---- lookup：命中块 >=1 上的项（强制走跨块 dir_find_entry）+ 未命中。----
+        diff_lookup(&img, 2, &near_end, core_lookup);
+        diff_lookup(&img, 2, &middle, core_lookup);
         diff_lookup(&img, 2, "no-such-ent", core_lookup);
 
         // ---- readdir：跨 ≥3 块逐元素 (name, ino, type, next_offset) 对拍。----
         diff_readdir(&img, 2, core_readdir_next_offset);
 
         // ---- unlink：删一个块 >=1 上的中间项（前驱合并路径，跨块） + 删新建的项。----
-        let img = diff_unlink_step(&img, 2, "ent_00250");
+        let img = diff_unlink_step(&img, 2, &middle);
         let _ = diff_unlink_step(&img, 2, "tail_new");
     }
 
     /// csum 开关差分（`EXT4_NOCSUM_IMAGE`，metadata_csum 关）：在 csum-off 镜像上跑
-    /// create→mkdir→unlink 序列，每步 core vs ext4_rs 全盘逐字节对拍。核心断言：**core 不写
-    /// tail csum**（门控）——靠 `assert_disk_eq` 与 ext4_rs（同样不写 csum）全盘相等间接保证，
-    /// 外加显式探针：建一个目录后，其 '.'/'..' 块的 tail.checksum 区在两引擎下都不是 csum（门控）。
+    /// create→mkdir→unlink 序列，每步 core vs ext4_rs 全盘逐字节对拍。
+    ///
+    /// **BUG-22 parity**：ext4_rs 的写侧 `dir_set_csum` **无 metadata_csum 门控**——即便文件系统
+    /// 关了 metadata_csum，ext4_rs 仍**无条件**把 dir-block tail.csum 写进盘（ext4_impls/dir.rs:252，
+    /// 7 个 call site 全无门控）。core 的写侧 `dir_set_csum` 据此**也已去掉门控、无条件写**（逐字
+    /// 复刻）。故本测在 NOCSUM 镜像上 `assert_disk_eq` 全盘绿，正是确认 core 复刻了这个 spec-违反
+    /// 的无条件写行为（读侧 `dir_verify_block_csum` 仍门控，与 ext4_rs 不验 dir csum 的读侧对称）。
     #[ktest]
     fn dir_nocsum_parity() {
         // 探针：确认这张镜像确实 metadata_csum 关。

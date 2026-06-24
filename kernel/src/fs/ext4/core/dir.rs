@@ -498,10 +498,11 @@ pub(super) fn dir_write_entry_bytes(
 /// （`block[block_size-4 .. block_size]`）。**门控 metadata_csum**：特性关时不写（与 Task 1
 /// `dir_verify_block_csum` 同门控；`EXT4_NOCSUM_IMAGE` 覆盖此路径）。
 pub(super) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, block_size: usize) {
-    let has_csum = (sb.features_read_only() & RO_COMPAT_METADATA_CSUM) != 0;
-    if !has_csum {
-        return;
-    }
+    // PARITY: ext4_rs dir_set_csum writes the dir-block csum unconditionally, ignoring the
+    // metadata_csum feature gate (ext4_impls/dir.rs:252 + ext4_defs/direntry.rs:185; all 7
+    // call sites un-gated) — replicate exactly, even on a metadata_csum-off filesystem; this
+    // is logged as BUG-22. (READ-side dir_verify_block_csum keeps its gate: ext4_rs never
+    // verifies dir csums on read, so that asymmetry is faithful too.)
     // PARITY: ino_index = 块首项 inode（dir_set_csum 读 block[0] 当 parent_de）。
     let ino_index = match parse_entry(block, 0, block_size) {
         Ok(de) => de.inode,
