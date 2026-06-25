@@ -378,6 +378,24 @@ impl JournalRuntime {
         None
     }
 
+    /// 某 tid 事务当前的 modified 块数（running/prev/committing 任一槽里查）。集成层 `stop_handle`
+    /// 用它复刻 ext4_rs `record_inode_tid` 的 `summary.modified_blocks > 0` 门控。
+    pub(in crate::fs::ext4) fn transaction_modified_block_count(&self, tid: u32) -> Option<usize> {
+        for slot in [
+            self.running.as_ref(),
+            self.prev_running.as_ref(),
+            self.committing.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if slot.tid() == tid {
+                return Some(slot.modified_block_count());
+            }
+        }
+        None
+    }
+
     fn active_handle_by_id(&self, handle_id: u64) -> Option<&JournalHandle> {
         self.active_handles
             .iter()

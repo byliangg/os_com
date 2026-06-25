@@ -30,21 +30,21 @@ use super::core::{
     extents::BlockAlloc,
     inode::Inode,
     io::{BlockReader, BlockWriter},
-    journal::transaction::JournalRuntime as CoreJournalRuntime,
     metadata_writer::MetadataWriter,
     superblock::RawSuperblock,
     types::Ext4Fsblk,
 };
 use super::fs::{JournalIoBridge, KernelBlockDeviceAdapter};
+use super::journal_driver::CoreJournalDriver;
 use crate::prelude::*;
 
-/// Shared, late-initialized handle to the safe-core JBD2 runtime.
+/// Shared, late-initialized handle to the integration-layer JBD2 driver (which wraps the **core**
+/// `JournalRuntime` plus the integration-owned checkpoint_list / last_committed_tid / rotation).
 ///
-/// Mirrors `fs.rs`'s `Arc<RwMutex<Option<JournalRuntime>>>` (the **ext4_rs** runtime holder), but
-/// holds the **core** `JournalRuntime`. Task 2 installs the real runtime here when journaled-write
-/// cutover lands; until then it is `None` and the metadata-writer adapter is a no-op recorder.
-// Phase 6 Task 1+ wires this into the journaled-write orchestration.
-pub(super) type CoreJournalRuntimeHandle = Arc<RwMutex<Option<CoreJournalRuntime>>>;
+/// Mirrors `fs.rs`'s old `Arc<RwMutex<Option<JournalRuntime>>>` (the **ext4_rs** runtime holder),
+/// but holds the **core-backed** [`CoreJournalDriver`]. Mount installs the real driver here; until
+/// then it is `None` and the metadata-writer adapter is a no-op recorder.
+pub(super) type CoreJournalRuntimeHandle = Arc<RwMutex<Option<CoreJournalDriver>>>;
 
 // =============================================================================================
 // 1. Read seam: core `BlockReader` over the overlay bridge (read-your-writes).
@@ -135,13 +135,11 @@ impl BlockWriter for CoreDataWriter {
 /// overlay read are NOT core-runtime responsibilities (core's runtime is the thin in-memory state
 /// machine) — they stay in the integration layer's `JournalIoBridge`, unchanged.
 // Phase 6 Task 2 wires this into `run_journaled_ext4` (replaces `JournalOperationMetadataWriter`).
-#[allow(dead_code)]
 pub(super) struct CoreMetadataWriter {
     runtime: CoreJournalRuntimeHandle,
     handle_id: u64,
 }
 
-#[allow(dead_code)]
 impl CoreMetadataWriter {
     pub(super) fn new(runtime: CoreJournalRuntimeHandle, handle_id: u64) -> Self {
         Self { runtime, handle_id }
@@ -151,16 +149,65 @@ impl CoreMetadataWriter {
 impl MetadataWriter for CoreMetadataWriter {
     fn write_metadata_for_handle(
         &self,
-        handle_id: u64,
+        _handle_id: u64,
         block: Ext4Fsblk,
         data: &[u8],
     ) -> Result<()> {
         // Record the full-block image into the active core JBD2 transaction (deferred home write).
+        //
+        // `_handle_id` (the value core passes) is **always 0** — `core/` is journal-agnostic and
+        // hard-codes 0 at every `write_metadata_for_handle` call (`write_back_inode`, the bitmap /
+        // group-descriptor / extent-tree writes, the per-op allocators). The *real* JBD2 handle is
+        // the one bound to this adapter at `ext4_with_operation_context` time (`self.handle_id`), so
+        // we substitute it. This is the integration seam that binds core's journal-agnostic metadata
+        // writes to the active transaction — equivalent to ext4_rs's `JournalOperationMetadataWriter`
+        // carrying the active `handle_id`.
+        //
         // `record_metadata_write` is a no-op when the runtime is absent / the handle is unknown,
         // matching the live bridge's behavior when no handle is active.
-        if let Some(runtime) = self.runtime.write().as_mut() {
-            runtime.record_metadata_write(handle_id, block, data);
+        if let Some(driver) = self.runtime.write().as_mut() {
+            driver.record_metadata_write(self.handle_id, block, data);
         }
+        Ok(())
+    }
+}
+
+/// Core metadata write seam for the **commit emitter + checkpoint + journal-SB store**: writes the
+/// journal-area block **straight to the device** (block number → `block * block_size` byte offset),
+/// bypassing the overlay/defer the active-op [`CoreMetadataWriter`] uses.
+///
+/// The journal commit itself is *the* durable write — `core::commit::write_commit_plan` lays the
+/// descriptor / payload / commit block / journal SB into the journal's home blocks and must reach
+/// the device (the single ordered-mode `sync()` barrier inside `write_commit_plan` then orders them
+/// before the commit block). Likewise checkpoint home-writes + the checkpoint journal-SB store go
+/// straight to the device. This is exactly what ext4_rs's commit/checkpoint did via
+/// `block_device.write_offset(...)`. Mirrors the differential harness `DirectMetadataWriter`, but
+/// over the production `KernelBlockDeviceAdapter` instead of `MemDisk`.
+// Phase 6 Task 2 wires this into `CoreJournalDriver::write_commit_plan_with_hook` / `checkpoint`.
+pub(super) struct CoreCommitMetadataWriter {
+    adapter: Arc<KernelBlockDeviceAdapter>,
+    block_size: usize,
+}
+
+impl CoreCommitMetadataWriter {
+    pub(super) fn new(adapter: Arc<KernelBlockDeviceAdapter>, block_size: usize) -> Self {
+        Self {
+            adapter,
+            block_size,
+        }
+    }
+}
+
+impl MetadataWriter for CoreCommitMetadataWriter {
+    fn write_metadata_for_handle(
+        &self,
+        _handle_id: u64,
+        block: Ext4Fsblk,
+        data: &[u8],
+    ) -> Result<()> {
+        use ext4_rs::BlockDevice as Ext4BlockDevice;
+        let off = (block as usize).saturating_mul(self.block_size);
+        self.adapter.write_offset(off, data);
         Ok(())
     }
 }

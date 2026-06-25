@@ -17,11 +17,14 @@ use aster_cmdline::{KCMDLINE, ModuleArg};
 use aster_time::read_monotonic_time;
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
-    Jbd2Journal, JournalCommitWriteStage, JournalHandle, JournalRecoveryResult, JournalRuntime,
-    LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter,
-    OperationAllocGuard as Ext4OperationAllocGuard, OperationScopedAllocGuard, SimpleBlockRange,
-    SimpleDirEntry, SimpleInodeMeta,
+    Jbd2Journal, JournalRecoveryResult, LocalOperationAllocGuard,
+    MetadataWriter as Ext4MetadataWriter, OperationAllocGuard as Ext4OperationAllocGuard,
+    OperationScopedAllocGuard, SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
 };
+// Phase 6 Task 2: the injected-crash replay hold now keys off the **core** commit-write stage enum
+// (the production commit emitter is core's `write_commit_plan`). It is variant-for-variant identical
+// to the ext4_rs stage it replaces.
+use super::core::journal::commit::JournalCommitWriteStage;
 use ostd::{
     Error as OstdError,
     mm::{
@@ -76,6 +79,29 @@ const JOURNAL_COMMIT_BATCH_BLOCKS: u32 = 128;
 // the checkpoint queue to keep memory bounded without regressing to per-fsync
 // full-filesystem sync.
 const REGULAR_FILE_FSYNC_CHECKPOINT_DEPTH: usize = 8;
+
+/// Phase 6 Task 2: zeroed stand-in for the ext4_rs `JournalRuntimeDebugStats` (debug-only counters
+/// the core-backed driver does not track). Only consumed by the diagnostic `dump_perf_summary`
+/// `warn!` line, so zeroed values keep the log shape without re-deriving instrumentation.
+#[derive(Default)]
+struct Jbd2DriverDebugStats {
+    active_handle_samples: u64,
+    active_handle_sample_sum: u64,
+    started_handles: u64,
+    finished_handles: u64,
+    max_active_handles: u32,
+    max_running_handles: u32,
+    max_running_reserved_blocks: u32,
+    max_running_metadata_blocks: u32,
+    rotated_transactions: u64,
+    prepared_commits: u64,
+    finished_commits: u64,
+    finished_checkpoints: u64,
+    overlay_reads: u64,
+    overlay_hits: u64,
+    metadata_write_records: u64,
+}
+
 const GENERIC014_PROGRESS_LOG_INTERVAL: u64 = 16;
 const GENERIC014_SLOW_OP_LOG_THRESHOLD_NS: u64 = 1_000_000_000;
 const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
@@ -1154,38 +1180,70 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
 // overlay bridge (`read_offset_into` = home + uncommitted-journal overlay = read-your-writes).
 pub(super) struct JournalIoBridge {
     adapter: Arc<KernelBlockDeviceAdapter>,
-    runtime: Arc<RwMutex<Option<JournalRuntime>>>,
+    // Phase 6 Task 2: now holds the core-backed driver. The overlay read merges core's in-flight
+    // metadata images; the metadata-write path (used by the *remaining* ext4_rs namespace / setattr
+    // ops still driven through the scoped Ext4 — Task 3) records into the **core** driver.
+    runtime: super::core_adapter::CoreJournalRuntimeHandle,
 }
 
 impl JournalIoBridge {
     fn new(
         adapter: Arc<KernelBlockDeviceAdapter>,
-        runtime: Arc<RwMutex<Option<JournalRuntime>>>,
+        runtime: super::core_adapter::CoreJournalRuntimeHandle,
     ) -> Self {
         Self { adapter, runtime }
     }
 
     fn overlay_metadata_read(&self, offset: usize, out: &mut [u8]) {
         let runtime_guard = self.runtime.read();
-        let Some(runtime) = runtime_guard.as_ref() else {
+        let Some(driver) = runtime_guard.as_ref() else {
             return;
         };
-        runtime.overlay_metadata_read(offset, out);
+        driver.overlay_metadata_read(offset, out);
     }
 
+    /// Record an ext4_rs-engine metadata write into the **core** driver's active transaction
+    /// (deferred home write), or write it straight to home when no handle is active.
+    ///
+    /// PARITY: ext4_rs `record_metadata_write_for_handle` (journal.rs:488-541) — ext4_rs accepts a
+    /// **byte offset + partial chunk** and builds the full-block image by patching the chunk onto a
+    /// base image (the newest in-memory overlay image of that block, else the home block). core's
+    /// `record_metadata_write` takes a **full block image** only, so we replicate ext4_rs's chunking
+    /// + base-image build here, then hand core the assembled full block. This keeps the remaining
+    /// ext4_rs namespace/setattr ops (Task 3) journaling byte-identically into the core transaction.
     fn write_metadata_for_handle(&self, handle_id: Option<u64>, offset: usize, data: &[u8]) {
         let mut defer_metadata_write = false;
-        if let Some(runtime) = self.runtime.write().as_mut() {
-            let block_size = runtime.block_size();
-            if let Some(handle_id) = handle_id {
-                runtime.record_metadata_write_for_handle(handle_id, offset, data, |block_nr| {
-                    let block_offset = block_nr as usize * block_size;
-                    let mut block_data = vec![0u8; block_size];
-                    self.adapter.read_offset_into(block_offset, &mut block_data);
-                    block_data
-                });
+        if let Some(handle_id) = handle_id {
+            let mut driver_guard = self.runtime.write();
+            if let Some(driver) = driver_guard.as_mut() {
+                let block_size = driver.block_size();
+                if block_size != 0 && !data.is_empty() {
+                    let mut consumed = 0usize;
+                    while consumed < data.len() {
+                        let write_offset = offset + consumed;
+                        let block_nr = (write_offset / block_size) as u64;
+                        let block_offset = write_offset % block_size;
+                        let chunk_len =
+                            core::cmp::min(block_size - block_offset, data.len() - consumed);
+                        // Build the full-block image: base = newest overlay image of this block, else
+                        // the home block read from the device; patch the chunk in.
+                        let mut block_image = vec![0u8; block_size];
+                        let base_block_offset = block_nr as usize * block_size;
+                        // Read home first, then overlay the newest in-memory image (read-your-writes),
+                        // matching ext4_rs `latest_metadata_buffer`-or-`load_block` base selection.
+                        self.adapter
+                            .read_offset_into(base_block_offset, &mut block_image);
+                        driver.overlay_metadata_read(base_block_offset, &mut block_image);
+                        block_image[block_offset..block_offset + chunk_len]
+                            .copy_from_slice(&data[consumed..consumed + chunk_len]);
+                        driver.record_metadata_write(handle_id, block_nr, &block_image);
+                        consumed += chunk_len;
+                    }
+                }
+                defer_metadata_write = driver.should_defer_metadata_write();
             }
-            defer_metadata_write = runtime.should_defer_metadata_write();
+        } else if let Some(driver) = self.runtime.read().as_ref() {
+            defer_metadata_write = driver.should_defer_metadata_write();
         }
         if defer_metadata_write {
             return;
@@ -1200,7 +1258,7 @@ impl Ext4BlockDevice for JournalIoBridge {
             .runtime
             .read()
             .as_ref()
-            .map(|runtime| runtime.block_size())
+            .map(|driver| driver.block_size())
             .unwrap_or(EXT4_BLOCK_SIZE);
         let mut data = vec![0u8; block_size];
         self.read_offset_into(offset, &mut data);
@@ -1525,8 +1583,15 @@ pub(super) struct Ext4Fs {
     // owns its own SB; this copy feeds reads only).
     core_sb: super::core::superblock::RawSuperblock,
     mount_flags_bits: AtomicU32,
+    // Phase 6 Task 4 (mount/recovery) still constructs the ext4_rs `Jbd2Journal` to resolve the
+    // journal inode's physical block vector and to drive mount-time recovery. The production
+    // commit/checkpoint engine no longer uses it — Task 2 cut that to the core-backed driver below.
     jbd2_journal: Mutex<Option<Jbd2Journal>>,
-    jbd2_runtime: Arc<RwMutex<Option<JournalRuntime>>>,
+    // Phase 6 Task 2: the integration-layer JBD2 commit/checkpoint driver, re-derived over the safe
+    // `core/` journal. Holds the core in-memory runtime + the integration-owned checkpoint_list /
+    // last_committed_tid / rotation / running ring geometry. Same `Arc<RwMutex<Option<..>>>` slot
+    // and lock the ext4_rs `JournalRuntime` used (lock order unchanged).
+    jbd2_runtime: super::core_adapter::CoreJournalRuntimeHandle,
     journal_io: Arc<JournalIoBridge>,
     alloc_guard: Arc<LocalOperationAllocGuard>,
     next_alloc_operation_id: AtomicU64,
@@ -1934,10 +1999,30 @@ impl Ext4Fs {
 
         match journal {
             Some(journal) => {
-                *self.jbd2_runtime.write() = Some(JournalRuntime::new(
-                    journal.superblock.block_size() as usize,
-                    journal.superblock.sequence(),
-                ));
+                // Phase 6 Task 2: build the core-backed JBD2 driver from the journal inode's
+                // physical block vector (resolved by the ext4_rs `Jbd2Journal` the mount path still
+                // constructs). The running ring geometry is seeded from the on-disk journal SB read
+                // through the overlay bridge — identical to `JournalSpace::from_superblock` over the
+                // same on-disk SB ext4_rs used.
+                let block_size = journal.superblock.block_size() as usize;
+                let physical_blocks = journal.device.physical_blocks().to_vec();
+                let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
+                match super::journal_driver::CoreJournalDriver::from_physical_blocks(
+                    &reader,
+                    physical_blocks,
+                    block_size,
+                ) {
+                    Ok(driver) => {
+                        *self.jbd2_runtime.write() = Some(driver);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "ext4: failed to build core JBD2 driver: {:?}; journal disabled",
+                            err
+                        );
+                        *self.jbd2_runtime.write() = None;
+                    }
+                }
                 info!(
                     "ext4: loaded JBD2 journal inode={} blocks={} mapped_blocks={} block_size={} sequence={} start={} head={} first={} free_blocks={} incompat=0x{:x}",
                     journal.device.journal_inode(),
@@ -2044,20 +2129,39 @@ impl Ext4Fs {
             .sync()
             .map_err(|_| Error::with_message(Errno::EIO, "failed to sync cleared recovery flag"))?;
 
-        let (block_size, next_sequence) = {
+        // Phase 6 Task 2: rebuild the core-backed driver from the journal inode's physical blocks
+        // reading the **post-recovery** on-disk journal SB (ext4_rs `recover` reset s_start=0 and
+        // s_sequence=last+1). `from_physical_blocks` reads s_sequence as the runtime first_tid and
+        // the ring geometry via `JournalSpace::from_superblock` — equivalent to the old
+        // `JournalRuntime::new(block_size, last_sequence+1)` plus a fresh ring from the reset SB.
+        let (block_size, physical_blocks) = {
             let journal_guard = self.jbd2_journal.lock();
             let Some(journal) = journal_guard.as_ref() else {
                 return Ok(());
             };
             (
                 journal.superblock.block_size() as usize,
-                result
-                    .last_sequence
-                    .map(|sequence| sequence.saturating_add(1))
-                    .unwrap_or(journal.superblock.sequence()),
+                journal.device.physical_blocks().to_vec(),
             )
         };
-        *self.jbd2_runtime.write() = Some(JournalRuntime::new(block_size, next_sequence));
+        let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
+        match super::journal_driver::CoreJournalDriver::from_physical_blocks(
+            &reader,
+            physical_blocks,
+            block_size,
+        ) {
+            Ok(driver) => {
+                *self.jbd2_runtime.write() = Some(driver);
+            }
+            Err(err) => {
+                warn!(
+                    "ext4: failed to rebuild core JBD2 driver after recovery: {:?}",
+                    err
+                );
+                *self.jbd2_runtime.write() = None;
+            }
+        }
+        let _ = result;
         Ok(())
     }
 
@@ -2089,18 +2193,18 @@ impl Ext4Fs {
         }
     }
 
-    fn start_jbd2_handle(&self, op: Option<&JournaledOp>) -> Option<JournalHandle> {
+    /// Start a JBD2 handle for `op`, returning its unique `handle_id`.
+    ///
+    /// PARITY: ext4_rs `start_jbd2_handle` — the `trigger_op` debug tag and the
+    /// `mark_handle_requires_data_sync` flag were debug/accounting only (data-sync was always
+    /// ordered-mode in practice); core's runtime keeps the commit-plan / rotation subset, so we
+    /// drop them. The reserved-blocks estimate (admission rotation soft credit) is unchanged.
+    fn start_jbd2_handle(&self, op: Option<&JournaledOp>) -> Option<u64> {
         let reserved_blocks = Self::estimate_jbd2_reserved_blocks(op);
-        let trigger_op = op.map(|_| Self::jbd2_handle_op_name(op));
+        let op_name = Self::jbd2_handle_op_name(op);
         let mut runtime_guard = self.jbd2_runtime.write();
-        let runtime = runtime_guard.as_mut()?;
-        let handle = runtime.start_handle(reserved_blocks, trigger_op);
-        if matches!(op, Some(JournaledOp::Write { .. })) {
-            if let Some(handle) = handle.as_ref() {
-                runtime.mark_handle_requires_data_sync(handle.handle_id());
-            }
-        }
-        handle
+        let driver = runtime_guard.as_mut()?;
+        driver.start_handle(reserved_blocks, op_name)
     }
 
     fn next_alloc_operation_id(&self) -> u64 {
@@ -2144,20 +2248,20 @@ impl Ext4Fs {
 
     fn finish_jbd2_handle(
         &self,
-        handle: Option<JournalHandle>,
+        handle: Option<u64>,
         op: Option<&JournaledOp>,
         op_name: &'static str,
         succeeded: bool,
     ) {
-        let Some(handle) = handle else {
+        let Some(handle_id) = handle else {
             return;
         };
         let summary = self
             .jbd2_runtime
             .write()
             .as_mut()
-            .and_then(|runtime| runtime.stop_handle(handle));
-        let Some(summary) = summary else {
+            .and_then(|driver| driver.stop_handle(handle_id));
+        let Some((transaction_id, has_metadata)) = summary else {
             return;
         };
 
@@ -2166,9 +2270,10 @@ impl Ext4Fs {
         // Only single-inode ops carry inode info in v1; directory ops touch
         // multiple inodes (parent + child) and rely on the Phase 2 inode
         // correctness lock to serialize fsync after the op completes.
-        if succeeded && summary.modified_blocks > 0 {
+        // PARITY: ext4_rs gated on `summary.modified_blocks > 0`.
+        if succeeded && has_metadata {
             if let Some(ino) = op.and_then(JournaledOp::affected_ino) {
-                self.record_inode_tid(ino, summary.transaction_id);
+                self.record_inode_tid(ino, transaction_id);
             }
         }
         // Wake any fsync waiter blocked on this transaction (a stop_handle on
@@ -2176,45 +2281,23 @@ impl Ext4Fs {
         self.commit_notifier.wake_all();
 
         debug!(
-            "ext4: jbd2 handle op={} handle_id={} tid={} reserved={} modified_blocks={} data_sync_required={} success={}",
-            op_name,
-            summary.handle_id,
-            summary.transaction_id,
-            summary.reserved_blocks,
-            summary.modified_blocks,
-            summary.data_sync_required,
-            succeeded,
+            "ext4: jbd2 handle op={} handle_id={} tid={} has_metadata={} success={}",
+            op_name, handle_id, transaction_id, has_metadata, succeeded,
         );
-
-        let runtime_guard = self.jbd2_runtime.read();
-        if let Some(runtime) = runtime_guard.as_ref() {
-            if runtime.commit_ready() {
-                if let Some(transaction) = runtime.running_transaction() {
-                    debug!(
-                        "ext4: jbd2 transaction ready tid={} metadata_blocks={} reserved={} data_sync_required={}",
-                        transaction.tid(),
-                        transaction.modified_block_count(),
-                        transaction.reserved_blocks(),
-                        transaction.data_sync_required(),
-                    );
-                }
-            }
-        }
-        drop(runtime_guard);
 
         if succeeded {
             let (rotated_tid, batch_commit_ready) = {
                 let mut rt = self.jbd2_runtime.write();
-                let Some(runtime) = rt.as_mut() else {
+                let Some(driver) = rt.as_mut() else {
                     return;
                 };
                 let rotated_tid =
-                    if runtime.should_rotate_running_transaction(JOURNAL_COMMIT_BATCH_BLOCKS) {
-                        runtime.rotate_running_transaction()
+                    if driver.should_rotate_running_transaction(JOURNAL_COMMIT_BATCH_BLOCKS) {
+                        driver.rotate_running_transaction()
                     } else {
                         None
                     };
-                let batch_commit_ready = runtime.batch_commit_ready(JOURNAL_COMMIT_BATCH_BLOCKS);
+                let batch_commit_ready = driver.batch_commit_ready(JOURNAL_COMMIT_BATCH_BLOCKS);
                 (rotated_tid, batch_commit_ready)
             };
             if let Some(tid) = rotated_tid {
@@ -2236,7 +2319,7 @@ impl Ext4Fs {
         self.jbd2_runtime
             .read()
             .as_ref()
-            .is_some_and(|runtime| runtime.has_active_handle())
+            .is_some_and(|driver| driver.has_active_handle())
     }
 
     /// Step 4a-2: returns the highest TID whose `finish_commit` succeeded.
@@ -2247,7 +2330,7 @@ impl Ext4Fs {
         self.jbd2_runtime
             .read()
             .as_ref()
-            .map(|runtime| runtime.last_committed_tid())
+            .map(|driver| driver.last_committed_tid())
             .unwrap_or(0)
     }
 
@@ -2304,10 +2387,10 @@ impl Ext4Fs {
         // prevents new handles from joining and lets existing ones drain.
         {
             let mut runtime_guard = self.jbd2_runtime.write();
-            if let Some(runtime) = runtime_guard.as_mut() {
-                let running_tid = runtime.running_transaction().map(|t| t.tid()).unwrap_or(0);
+            if let Some(driver) = runtime_guard.as_mut() {
+                let running_tid = driver.running_transaction_tid().unwrap_or(0);
                 if running_tid == target_tid {
-                    let _ = runtime.rotate_running_transaction();
+                    let _ = driver.rotate_running_transaction();
                 }
             }
         }
@@ -2359,24 +2442,22 @@ impl Ext4Fs {
         self.jbd2_runtime
             .read()
             .as_ref()
-            .map(|runtime| runtime.checkpoint_depth())
+            .map(|driver| driver.checkpoint_depth())
             .unwrap_or(0)
     }
 
     fn reconcile_jbd2_checkpoint_tail(&self) {
-        let current_tail = {
-            let journal_guard = self.jbd2_journal.lock();
-            let Some(journal) = journal_guard.as_ref() else {
-                return;
-            };
-            journal.space.tail()
+        // The journal tail and the checkpoint list are now owned by the SAME driver object (the
+        // core-backed `CoreJournalDriver`), so they can never drift the way the old separate ext4_rs
+        // `Jbd2Journal.space` and `JournalRuntime.checkpoint_list` could. We still call
+        // `discard_checkpointed_before_tail(tail)` against the driver's own tail for parity safety —
+        // it is a no-op when the front entry already starts at the tail (the normal case).
+        let mut runtime_guard = self.jbd2_runtime.write();
+        let Some(driver) = runtime_guard.as_mut() else {
+            return;
         };
-        let dropped = self
-            .jbd2_runtime
-            .write()
-            .as_mut()
-            .map(|runtime| runtime.discard_checkpointed_before_tail(current_tail))
-            .unwrap_or(0);
+        let current_tail = driver.space_tail();
+        let dropped = driver.discard_checkpointed_before_tail(current_tail);
         if dropped != 0 {
             debug!(
                 "ext4: reconciled {} stale JBD2 checkpoint transactions at tail={}",
@@ -2388,43 +2469,39 @@ impl Ext4Fs {
     /// Checkpoints all pending transactions with a single BioType::Flush.
     /// Each individual checkpoint still advances the journal tail and updates the
     /// superblock, but home block writes are batched and synced together.
+    ///
+    /// PARITY: ext4_rs `try_batch_checkpoint_all_jbd2_transactions` — home-write ALL plans → ONE
+    /// `block_device.sync()` → per-tx tail-advance + journal-SB `s_start` store (now via the
+    /// core-backed driver's `checkpoint_transaction`). The single sync between home writes and the
+    /// SB stores is preserved exactly.
     fn try_batch_checkpoint_all_jbd2_transactions(&self) -> bool {
         let _checkpoint_guard = self.jbd2_checkpoint_lock.lock();
         self.reconcile_jbd2_checkpoint_tail();
-        let plans = {
+        let (plans, block_size) = {
             let runtime_guard = self.jbd2_runtime.read();
-            let Some(runtime) = runtime_guard.as_ref() else {
+            let Some(driver) = runtime_guard.as_ref() else {
                 return false;
             };
-            if !runtime.checkpoint_ready() {
+            if !driver.checkpoint_ready() {
                 return false;
             }
-            runtime.all_checkpoint_plans()
+            (driver.all_checkpoint_plans(), driver.block_size())
         };
         if plans.is_empty() {
             return false;
         }
 
         // Write home blocks for ALL checkpoint transactions before syncing.
-        let block_size = {
-            self.jbd2_runtime
-                .read()
-                .as_ref()
-                .map(|rt| rt.block_size())
-                .unwrap_or(EXT4_BLOCK_SIZE)
-        };
         for plan in &plans {
-            for metadata in &plan.metadata_blocks {
-                let Some(block_offset) = (metadata.block_nr as usize).checked_mul(block_size)
-                else {
+            for (block_nr, image) in &plan.metadata_blocks {
+                let Some(block_offset) = (*block_nr as usize).checked_mul(block_size) else {
                     warn!(
                         "ext4: batch checkpoint block offset overflow block_nr={} block_size={}",
-                        metadata.block_nr, block_size
+                        block_nr, block_size
                     );
                     continue;
                 };
-                self.adapter
-                    .write_offset(block_offset, &metadata.block_data);
+                self.adapter.write_offset(block_offset, image);
             }
         }
 
@@ -2438,46 +2515,40 @@ impl Ext4Fs {
             return false;
         }
 
-        // Now finish each checkpoint individually (advances tail + updates superblock).
-        // The home blocks are already durable; these are just metadata updates.
+        // The journal-SB store for each checkpoint goes straight to the device (the home blocks are
+        // already durable above; this is just the s_start metadata update).
+        let writer =
+            super::core_adapter::CoreCommitMetadataWriter::new(self.adapter.clone(), block_size);
+
+        // Now finish each checkpoint individually (advances tail + updates journal SB).
         let mut any_checkpointed = false;
         for plan in &plans {
-            let next_start = {
-                let runtime_guard = self.jbd2_runtime.read();
-                let Some(runtime) = runtime_guard.as_ref() else {
-                    break;
-                };
-                match runtime.next_checkpoint_start_after(plan.tid) {
-                    Some(ns) => ns,
-                    None => break,
-                }
+            let mut runtime_guard = self.jbd2_runtime.write();
+            let Some(driver) = runtime_guard.as_mut() else {
+                break;
             };
-
-            let checkpoint_result = {
-                let block_device: Arc<dyn Ext4BlockDevice> = self.adapter.clone();
-                let mut journal_guard = self.jbd2_journal.lock();
-                let Some(journal) = journal_guard.as_mut() else {
-                    break;
-                };
-                if journal.space.tail() != plan.range.start_block {
-                    warn!(
-                        "ext4: batch checkpoint tail mismatch tid={} current_tail={} start={} next_head={}",
-                        plan.tid,
-                        journal.space.tail(),
-                        plan.range.start_block,
-                        plan.range.next_head
-                    );
-                }
-                journal.checkpoint_transaction(&block_device, plan, next_start)
+            let next_start = match driver.next_checkpoint_start_after(plan.tid) {
+                Some(ns) => ns,
+                None => break,
             };
-
-            match checkpoint_result {
+            if driver.space_tail() != plan.start_block {
+                warn!(
+                    "ext4: batch checkpoint tail mismatch tid={} current_tail={} start={} next_head={}",
+                    plan.tid,
+                    driver.space_tail(),
+                    plan.start_block,
+                    plan.next_head
+                );
+            }
+            match driver.checkpoint_transaction(
+                &writer,
+                0,
+                plan.tid,
+                plan.start_block,
+                plan.next_head,
+                next_start,
+            ) {
                 Ok(_) => {
-                    let _ = self
-                        .jbd2_runtime
-                        .write()
-                        .as_mut()
-                        .and_then(|runtime| runtime.finish_checkpoint(plan.tid));
                     any_checkpointed = true;
                 }
                 Err(err) => {
@@ -2499,18 +2570,27 @@ impl Ext4Fs {
         any_checkpointed
     }
 
+    /// Commit the next commit-ready JBD2 transaction to the journal via the **core** emitter.
+    ///
+    /// PARITY: the old ext4_rs-driving body. The commit step (`prepare_commit` → core
+    /// `write_commit_plan` → park-in-checkpoint-list) now drives the core-backed
+    /// [`CoreJournalDriver`]. The single ordered-mode `sync()` barrier is inside core's
+    /// `write_commit_plan` (descriptor+payload → ONE `sync()` → commit block → SB → ring) — we pass
+    /// it the same `block_device.sync()` ext4_rs issued. The pre-commit space check, the
+    /// injected-crash replay hold, the lazy checkpoint, and `mark_needs_recovery_if_needed` are
+    /// replicated 逐位.
     fn try_commit_ready_jbd2_transaction(&self) -> bool {
-        let plan = {
+        let prepared = {
             let mut runtime_guard = self.jbd2_runtime.write();
-            let Some(runtime) = runtime_guard.as_mut() else {
+            let Some(driver) = runtime_guard.as_mut() else {
                 return false;
             };
-            if !runtime.commit_ready() {
+            if !driver.commit_ready() {
                 return false;
             }
-            runtime.prepare_commit()
+            driver.prepare_commit()
         };
-        let Some(plan) = plan else {
+        let Some((plan, trigger_op)) = prepared else {
             return false;
         };
 
@@ -2518,10 +2598,10 @@ impl Ext4Fs {
         // This prevents ENOSPC failures inside write_commit_plan without busy-looping.
         let required = plan.metadata_blocks.len() as u32 + 2;
         let free_before = self
-            .jbd2_journal
-            .lock()
+            .jbd2_runtime
+            .read()
             .as_ref()
-            .map(|j| j.space.free_blocks())
+            .map(|driver| driver.space_free_blocks())
             .unwrap_or(u32::MAX);
         if free_before < required.saturating_add(JOURNAL_LOW_WATER_MARK) {
             // Batch-checkpoint all pending transactions in one sync rather than one
@@ -2529,10 +2609,10 @@ impl Ext4Fs {
             // a sync on every commit once the journal fills up (e.g. ext4/045).
             self.try_batch_checkpoint_all_jbd2_transactions();
             let free_after = self
-                .jbd2_journal
-                .lock()
+                .jbd2_runtime
+                .read()
                 .as_ref()
-                .map(|j| j.space.free_blocks())
+                .map(|driver| driver.space_free_blocks())
                 .unwrap_or(u32::MAX);
             if free_after < required {
                 warn!(
@@ -2543,7 +2623,7 @@ impl Ext4Fs {
                     .jbd2_runtime
                     .write()
                     .as_mut()
-                    .map(|runtime| runtime.abort_commit(plan.tid));
+                    .map(|driver| driver.abort_commit(plan.tid));
                 return false;
             }
         }
@@ -2554,70 +2634,71 @@ impl Ext4Fs {
         // ~50 ms per Write operation (hundreds of writes in generic/013) for no
         // benefit in guest-crash-only recovery scenarios that xfstests exercises.
 
+        // The single ordered-mode barrier: `block_device.sync()`, issued from inside the core
+        // emitter between the commit payloads and the commit block. Same point ext4_rs used.
+        let sync_fn = || -> Result<()> {
+            self.block_device
+                .sync()
+                .map(|_| ())
+                .map_err(|_| Error::with_message(Errno::EIO, "journal commit barrier sync failed"))
+        };
+        let barrier = super::journal_driver::SyncBarrier::new(&sync_fn);
+        // The commit emitter writes the journal-area home blocks straight to the device.
+        let writer = super::core_adapter::CoreCommitMetadataWriter::new(
+            self.adapter.clone(),
+            self.jbd2_runtime
+                .read()
+                .as_ref()
+                .map(|d| d.block_size())
+                .unwrap_or(EXT4_BLOCK_SIZE),
+        );
+
         let (write_result, free_after_commit) = {
-            let block_device: Arc<dyn Ext4BlockDevice> = self.adapter.clone();
-            let mut journal_guard = self.jbd2_journal.lock();
-            let Some(journal) = journal_guard.as_mut() else {
-                warn!(
-                    "ext4: JBD2 runtime prepared commit tid={} but journal state is missing",
-                    plan.tid
-                );
-                let _ = self
-                    .jbd2_runtime
-                    .write()
-                    .as_mut()
-                    .map(|runtime| runtime.abort_commit(plan.tid));
+            let mut runtime_guard = self.jbd2_runtime.write();
+            let Some(driver) = runtime_guard.as_mut() else {
                 return false;
             };
-            let trigger_op = plan.trigger_op;
-            let result = journal.write_commit_plan_with_hook(&block_device, &plan, |stage| {
-                if let Some(op_name) = trigger_op {
-                    if Self::should_hold_for_injected_crash(op_name, stage) {
-                        warn!(
-                            "ext4: replay hold point reached for op={} stage={} (kill VM now to simulate power loss)",
-                            op_name,
-                            Self::jbd2_commit_stage_name(stage),
-                        );
-                        loop {
-                            core::hint::spin_loop();
+            let result = driver.write_commit_plan_with_hook(
+                &writer,
+                Some(&barrier),
+                0,
+                &plan,
+                |stage| {
+                    if let Some(op_name) = trigger_op {
+                        if Self::should_hold_for_injected_crash(op_name, stage) {
+                            warn!(
+                                "ext4: replay hold point reached for op={} stage={} (kill VM now to simulate power loss)",
+                                op_name,
+                                Self::jbd2_commit_stage_name(stage),
+                            );
+                            loop {
+                                core::hint::spin_loop();
+                            }
                         }
                     }
-                }
-            });
-            let free = journal.space.free_blocks();
+                },
+            );
+            let free = driver.space_free_blocks();
             (result, free)
         };
 
         match write_result {
-            Ok(commit) => {
-                let _ = self.jbd2_runtime.write().as_mut().map(|runtime| {
-                    runtime.finish_commit(plan.tid, commit.start_block, commit.next_head)
-                });
+            Ok(tid) => {
                 // Step 4a-2: wake any fsync waiter that was blocked on this TID.
                 self.commit_notifier.wake_all();
                 // Step 4b: ensure on-disk superblock has the
                 // EXT4_FEATURE_INCOMPAT_RECOVER ("needs_recovery") flag set
-                // after the first commit since last clean SB.  Linux ext4
-                // sets this at mount; we set it lazily on first commit so
-                // post-replay clean unmount paths report "clean log"
-                // correctly without needing an explicit umount hook.
+                // after the first commit since last clean SB.
                 self.mark_needs_recovery_if_needed();
                 warn!(
-                    "ext4: jbd2 committed tid={} sequence={} start={} commit={} next_head={} metadata_blocks={} data_sync_required={} free_blocks={}",
-                    plan.tid,
-                    commit.sequence,
-                    commit.start_block,
-                    commit.commit_block,
-                    commit.next_head,
-                    commit.metadata_blocks,
-                    plan.data_sync_required,
+                    "ext4: jbd2 committed tid={} metadata_blocks={} free_blocks={}",
+                    tid,
+                    plan.metadata_blocks.len(),
                     free_after_commit,
                 );
                 // Lazy checkpoint: flush home blocks when journal space is tight,
                 // OR when the in-memory checkpoint list has grown deep enough to
-                // threaten the kernel heap (a long fsync-less transaction never
-                // drops journal free space below the threshold, so the list would
-                // otherwise grow unbounded). Batch to amortize the sync cost.
+                // threaten the kernel heap. Batch to amortize the sync cost.
                 if free_after_commit < JOURNAL_CHECKPOINT_THRESHOLD
                     || self.checkpoint_depth() >= JOURNAL_CHECKPOINT_MAX_DEPTH
                 {
@@ -2636,105 +2717,7 @@ impl Ext4Fs {
                     .jbd2_runtime
                     .write()
                     .as_mut()
-                    .map(|runtime| runtime.abort_commit(plan.tid));
-                false
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn try_checkpoint_ready_jbd2_transaction(&self) -> bool {
-        let _checkpoint_guard = self.jbd2_checkpoint_lock.lock();
-        self.reconcile_jbd2_checkpoint_tail();
-        let checkpoint_plan = {
-            let runtime_guard = self.jbd2_runtime.read();
-            let Some(runtime) = runtime_guard.as_ref() else {
-                return false;
-            };
-            if !runtime.checkpoint_ready() {
-                return false;
-            }
-            runtime.prepare_checkpoint()
-        };
-        let Some(checkpoint_plan) = checkpoint_plan else {
-            return false;
-        };
-
-        for metadata in &checkpoint_plan.metadata_blocks {
-            let Some(block_offset) =
-                (metadata.block_nr as usize).checked_mul(metadata.block_data.len())
-            else {
-                warn!(
-                    "ext4: checkpoint metadata block offset overflow tid={} block_nr={} block_size={}",
-                    checkpoint_plan.tid,
-                    metadata.block_nr,
-                    metadata.block_data.len(),
-                );
-                return false;
-            };
-            self.adapter
-                .write_offset(block_offset, &metadata.block_data);
-        }
-
-        if let Err(err) = self.block_device.sync() {
-            warn!(
-                "ext4: failed to sync metadata blocks before JBD2 checkpoint tid={}: {:?}",
-                checkpoint_plan.tid, err
-            );
-            return false;
-        }
-
-        let next_start = {
-            let runtime_guard = self.jbd2_runtime.read();
-            let Some(runtime) = runtime_guard.as_ref() else {
-                return false;
-            };
-            match runtime.next_checkpoint_start_after(checkpoint_plan.tid) {
-                Some(next_start) => next_start,
-                None => return false,
-            }
-        };
-
-        let checkpoint_result = {
-            let block_device: Arc<dyn Ext4BlockDevice> = self.adapter.clone();
-            let mut journal_guard = self.jbd2_journal.lock();
-            let Some(journal) = journal_guard.as_mut() else {
-                warn!(
-                    "ext4: JBD2 runtime prepared checkpoint tid={} but journal state is missing",
-                    checkpoint_plan.tid
-                );
-                return false;
-            };
-            if journal.space.tail() != checkpoint_plan.range.start_block {
-                warn!(
-                    "ext4: checkpoint tail mismatch tid={} current_tail={} start={} next_head={}",
-                    checkpoint_plan.tid,
-                    journal.space.tail(),
-                    checkpoint_plan.range.start_block,
-                    checkpoint_plan.range.next_head
-                );
-            }
-            journal.checkpoint_transaction(&block_device, &checkpoint_plan, next_start)
-        };
-
-        match checkpoint_result {
-            Ok(result) => {
-                let _ = self
-                    .jbd2_runtime
-                    .write()
-                    .as_mut()
-                    .and_then(|runtime| runtime.finish_checkpoint(checkpoint_plan.tid));
-                debug!(
-                    "ext4: jbd2 checkpointed tid={} start={} next_head={} next_start={:?}",
-                    checkpoint_plan.tid, result.start_block, result.next_head, result.next_start,
-                );
-                true
-            }
-            Err(err) => {
-                warn!(
-                    "ext4: failed to checkpoint JBD2 transaction tid={}: {:?}",
-                    checkpoint_plan.tid, err
-                );
+                    .map(|driver| driver.abort_commit(plan.tid));
                 false
             }
         }
@@ -2910,12 +2893,11 @@ impl Ext4Fs {
             .load(Ordering::Relaxed);
         let max_wait_ns = self.runtime_lock_stats.max_wait_ns.load(Ordering::Relaxed);
         let max_hold_ns = self.runtime_lock_stats.max_hold_ns.load(Ordering::Relaxed);
-        let jbd2_stats = self
-            .jbd2_runtime
-            .read()
-            .as_ref()
-            .map(|runtime| runtime.debug_stats())
-            .unwrap_or_default();
+        // Phase 6 Task 2: the core-backed driver does not track the ext4_rs `JournalRuntimeDebugStats`
+        // counters (they were debug-only accounting). The perf-summary dump below is diagnostic; we
+        // feed it zeroed counters so the log line shape is unchanged without re-deriving non-essential
+        // instrumentation. (Re-adding them in the driver is a follow-up if profiling needs them.)
+        let jbd2_stats = Jbd2DriverDebugStats::default();
         let alloc_guard_stats = self.alloc_guard.debug_stats();
         let journaled_ops = self.journaled_op_profile.op_count.load(Ordering::Relaxed);
         let avg_journaled_stage_us = |stage: &AtomicU64| {
@@ -4009,14 +3991,14 @@ impl Ext4Fs {
 
     fn revoke_jbd2_checkpoint_metadata_blocks(&self, mappings: &[SimpleBlockRange]) {
         let mut runtime_guard = self.jbd2_runtime.write();
-        let Some(runtime) = runtime_guard.as_mut() else {
+        let Some(driver) = runtime_guard.as_mut() else {
             return;
         };
 
         for mapping in mappings {
             for block in 0..mapping.len {
                 let block_nr = mapping.pblock.saturating_add(u64::from(block));
-                let revoked = runtime.revoke_checkpoint_metadata_block(block_nr);
+                let revoked = driver.revoke_checkpoint_metadata_block(block_nr);
                 if revoked > 0 {
                     debug!(
                         "ext4: revoked stale checkpoint metadata block={} count={}",
@@ -4361,11 +4343,9 @@ impl Ext4Fs {
         op: Option<JournaledOp>,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
     ) -> Result<T> {
-        let journal_enabled = self
-            .jbd2_runtime
-            .read()
-            .as_ref()
-            .is_some_and(|runtime| runtime.enabled());
+        // The core-backed driver is enabled whenever it is present (mount built it from a journal
+        // inode); a journal-less filesystem leaves the slot `None`.
+        let journal_enabled = self.jbd2_runtime.read().as_ref().is_some();
         if journal_enabled {
             self.run_journaled_ext4(op, |ext4| f(ext4).map_err(map_ext4_error))
         } else {
@@ -4721,7 +4701,8 @@ impl Ext4Fs {
         let start_handle_start_ns = Self::monotonic_nanos();
         let jbd2_handle = self.start_jbd2_handle(op.as_ref());
         let start_handle_elapsed_ns = Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
-        let handle_id = jbd2_handle.as_ref().map(|handle| handle.handle_id());
+        // `start_jbd2_handle` now returns the bare `handle_id` (core driver), not a JournalHandle.
+        let handle_id = jbd2_handle;
         let alloc_operation_id = self.begin_alloc_operation(handle_id);
 
         let apply_start_ns = Self::monotonic_nanos();

@@ -43,7 +43,7 @@
 //!
 //! `core/` stays `#![forbid(unsafe_code)]`; this integration-layer module is safe Rust.
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 
 use super::core::journal::{
     commit::{self, CommitCtx, JournalBarrier, JournalCommitWriteStage},
@@ -97,6 +97,11 @@ pub(super) struct CoreJournalDriver {
     checkpoint_list: VecDeque<CheckpointEntry>,
     /// Highest TID whose commit finished durably (== ext4_rs `last_committed_tid`). fsync fast path.
     last_committed_tid: u32,
+    /// Per-tid "what op_name filled this transaction" — test-only, drives the injected-crash replay
+    /// hold (the `replay_hold`/`replay_hold_op` cmdline). PARITY: ext4_rs carried `trigger_op` on the
+    /// transaction → commit plan; core's plan omits it (it's not on the differential write序 path), so
+    /// we track it integration-side. Cleared when the transaction commits.
+    trigger_op_by_tid: BTreeMap<u32, &'static str>,
     block_size: usize,
 }
 
@@ -124,6 +129,7 @@ impl CoreJournalDriver {
             physical_blocks,
             checkpoint_list: VecDeque::new(),
             last_committed_tid: 0,
+            trigger_op_by_tid: BTreeMap::new(),
             block_size,
         })
     }
@@ -137,10 +143,15 @@ impl CoreJournalDriver {
     // =====================================================================================
 
     /// Start a JBD2 handle, returning its unique id. PARITY: ext4_rs `JournalRuntime::start_handle`
-    /// (the `trigger_op` / `mark_handle_requires_data_sync` debug accounting is dropped — core's
-    /// runtime keeps only the commit-plan/rotation-relevant subset; behavior is identical).
-    pub(super) fn start_handle(&mut self, reserved_blocks: u32) -> Option<u64> {
-        self.runtime.start_handle(reserved_blocks)
+    /// (the `mark_handle_requires_data_sync` debug flag is dropped — data-sync was always ordered
+    /// mode). `op_name` is recorded against the resulting running transaction's tid so the
+    /// injected-crash replay hold (test-only) can fire at the matching op's commit.
+    pub(super) fn start_handle(&mut self, reserved_blocks: u32, op_name: &'static str) -> Option<u64> {
+        let handle_id = self.runtime.start_handle(reserved_blocks)?;
+        if let Some(tid) = self.runtime.running_transaction().map(|t| t.tid()) {
+            self.trigger_op_by_tid.entry(tid).or_insert(op_name);
+        }
+        Some(handle_id)
     }
 
     /// Record a full-block metadata image into the active transaction of `handle_id`.
@@ -150,14 +161,29 @@ impl CoreJournalDriver {
         self.runtime.record_metadata_write(handle_id, block, data);
     }
 
-    /// Stop a handle, returning its transaction id. PARITY: ext4_rs `stop_handle` (returns the
-    /// summary; we only need the tid for `record_inode_tid`).
-    pub(super) fn stop_handle(&mut self, handle_id: u64) -> Option<u32> {
-        self.runtime.stop_handle(handle_id)
+    /// Stop a handle, returning `(transaction_id, transaction_has_metadata)`. PARITY: ext4_rs
+    /// `stop_handle` returns a summary; we need the tid for `record_inode_tid` and the
+    /// "transaction has modified blocks" flag for the `record_inode_tid` gate (ext4_rs gates on
+    /// `summary.modified_blocks > 0`). We read the transaction's current modified-block count after
+    /// the stop (the handle's own transaction, found across running/prev/committing).
+    pub(super) fn stop_handle(&mut self, handle_id: u64) -> Option<(u32, bool)> {
+        let tid = self.runtime.stop_handle(handle_id)?;
+        let has_metadata = self
+            .runtime
+            .transaction_modified_block_count(tid)
+            .is_some_and(|count| count > 0);
+        Some((tid, has_metadata))
     }
 
-    /// Is there an active handle? PARITY: ext4_rs `has_active_handle` (overlay-defer门控).
+    /// Is there an active handle? PARITY: ext4_rs `should_defer_metadata_write` (overlay-defer门控).
     pub(super) fn should_defer_metadata_write(&self) -> bool {
+        self.runtime.should_defer_metadata_write()
+    }
+
+    /// Is there at least one open handle? PARITY: ext4_rs `has_active_handle`.
+    pub(super) fn has_active_handle(&self) -> bool {
+        // `should_defer_metadata_write` is exactly `enabled && has active handle`; enabled is always
+        // true for a constructed driver, so this is the same predicate.
         self.runtime.should_defer_metadata_write()
     }
 
@@ -314,10 +340,12 @@ impl CoreJournalDriver {
     // last_committed_tid + park in checkpoint_list with its ring range).
     // =====================================================================================
 
-    /// Prepare the next commit-ready transaction's plan (core runtime, parks it in `committing`).
-    /// Returns None if nothing is commit-ready or a commit is already in flight.
-    pub(super) fn prepare_commit(&mut self) -> Option<JournalCommitPlan> {
-        self.runtime.prepare_commit()
+    /// Prepare the next commit-ready transaction's plan + its trigger op_name (for the injected-crash
+    /// replay hold). Returns None if nothing is commit-ready or a commit is already in flight.
+    pub(super) fn prepare_commit(&mut self) -> Option<(JournalCommitPlan, Option<&'static str>)> {
+        let plan = self.runtime.prepare_commit()?;
+        let trigger_op = self.trigger_op_by_tid.get(&plan.tid).copied();
+        Some((plan, trigger_op))
     }
 
     /// Commit `plan` to the journal via the core emitter, then park it in the checkpoint list with
@@ -386,6 +414,7 @@ impl CoreJournalDriver {
         if tid > self.last_committed_tid {
             self.last_committed_tid = tid;
         }
+        self.trigger_op_by_tid.remove(&tid);
     }
 
     /// Abort a prepared-but-not-committed transaction (ENOSPC / missing journal): roll it back out
