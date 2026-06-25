@@ -5462,6 +5462,12 @@ impl Ext4Fs {
                 affected_inodes.push(ino);
             }
 
+            // The moved inode's own entry cache (if it is a directory) caches a `..` pointing at
+            // `old_parent`; a cross-directory move reparents that `..` to `new_parent` inside
+            // `core::dir::rename_at`, so its cached children become stale. Invalidate below.
+            let old_is_dir = old_de_type == 2; // DE filetype DIR
+            let cross_dir = new_parent != old_parent;
+
             self.with_inode_locks(&affected_inodes, || {
                 let op = JournaledOp::Rename;
                 self.run_journaled_namespace(Some(op), |nctx| {
@@ -5474,9 +5480,18 @@ impl Ext4Fs {
                     )
                 })?;
 
+                // Cache invalidation: drop the old entry, insert under the new parent.
                 self.cache_remove_entry(old_parent, old_name);
                 self.cache_insert_entry(new_parent, new_name, old_ino, old_de_type);
 
+                // A moved directory had its `..` rewritten (cross-dir) and changed parents; drop its
+                // own cached child set so a later readdir re-reads the reparented `..`.
+                if old_is_dir && cross_dir {
+                    self.cache_remove_dir(old_ino);
+                }
+
+                // An overwritten target: drop its cached children (if a dir) and its name entry, then
+                // restore the now-correct mapping (new_name -> old_ino) and scrub its time/page caches.
                 if let Some((ino, true)) = overwritten_is_dir {
                     self.cache_remove_dir(ino);
                 }
@@ -5489,7 +5504,7 @@ impl Ext4Fs {
                 }
 
                 self.touch_mtime_ctime(old_parent)?;
-                if new_parent != old_parent {
+                if cross_dir {
                     self.touch_mtime_ctime(new_parent)?;
                 }
                 self.touch_ctime(old_ino)?;
@@ -5497,25 +5512,39 @@ impl Ext4Fs {
                 Ok(())
             })?;
 
-            // BUG-19 (rename-overwrite): when the rename overwrote an EXISTING REGULAR FILE,
-            // `core::dir::rename_at`'s `unlink_file_branch` dropped that victim's nlink to 0 but
-            // freed nothing — unlike `Dentry::unlink`, the rename path has no VFS `cleanup_unlinked`
-            // hook for the overwritten target, so `mv a b` (b a regular file) would leak b's inode +
-            // data blocks. Reclaim it here via the same evict path used by unlink. Must be done
-            // AFTER `with_inode_locks` releases (its non-reentrant write guard on the victim ino
-            // would deadlock with `cleanup_unlinked_file`'s own inode correctness lock). The call is
-            // self-guarded: it re-checks `nlink==0 && S_IFREG && !has_open_file_handles` and consults
-            // the `freed_inodes` double-free set, so an open-across-rename target is freed only at its
-            // last close and there is no double-free.
+            // Overwrite reclamation.
             //
-            // NOTE: the directory-overwrite case (`mv dir1 dir2`, dir2 an empty dir) is a SEPARATE
-            // leak — `core::dir::rename_at` drops dir2 to nlink 0 without freeing it, and
-            // `cleanup_unlinked_file` skips non-regular files. Tracked as a follow-up in bug.md
-            // (rename-overwrite dir leak) under the Task 5 rename rework.
+            // (1) REGULAR FILE target: `core::dir::rename_at`'s `unlink_file_branch` dropped the
+            //     victim's nlink to 0 but freed nothing — the rename path has no VFS
+            //     `cleanup_unlinked` hook for the overwritten target, so `mv a b` (b a regular file)
+            //     would leak b's inode + data blocks. Reclaim it here via the same evict path used by
+            //     unlink. Must be done AFTER `with_inode_locks` releases (its non-reentrant write
+            //     guard on the victim ino would deadlock with `cleanup_unlinked_file`'s own inode
+            //     correctness lock). The call is self-guarded: it re-checks
+            //     `nlink==0 && S_IFREG && !has_open_file_handles` and consults the `freed_inodes`
+            //     double-free set, so an open-across-rename target is freed only at its last close
+            //     and there is no double-free.
+            //
+            // (2) EMPTY DIRECTORY target (`mv dir1 dir2`, dir2 an empty dir): NOW handled inside
+            //     `core::dir::rename_at` — its directory-overwrite branch calls `finalize_freed_inode`
+            //     (clears the inode bitmap bit + bumps free_inodes + decrements used_dirs), closing
+            //     the BUG-19-deferred empty-dir-overwrite leak transactionally. No post-lock cleanup
+            //     needed for the dir case; we only mark it in `freed_inodes` so a later realloc of the
+            //     number is not blocked, and scrub its caches (done above via `cache_remove_dir` +
+            //     `clear_inode_touch_cache`).
             if let Some((ino, false)) = overwritten_is_dir
                 && ino != old_ino
             {
                 self.cleanup_unlinked_file(ino)?;
+            }
+            if let Some((ino, true)) = overwritten_is_dir
+                && ino != old_ino
+            {
+                // The empty-dir target was already freed in-core; record it in the double-free guard
+                // and scrub its remaining caches (page/coverage/time) so a reallocated number starts
+                // clean. `note_inode_allocated` drops the marker when the number is handed out again.
+                self.freed_inodes.lock().insert(ino);
+                self.clear_inode_touch_cache(ino);
             }
 
             Ok(())

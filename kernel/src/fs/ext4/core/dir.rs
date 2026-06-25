@@ -6,6 +6,10 @@ use super::prelude::*;
 /// 目录项尾标识：reserved_ft == 0xDE 表示该槽是目录块尾校验和结构。
 const DIR_TAIL_MARKER: u8 = 0xDE;
 
+/// ext4 根目录 inode 号（恒为 2）。其 `".."` 指向自身，是 [`is_ancestor_or_self`] 向上走
+/// `".."` 链的终止哨兵。
+const ROOT_INODE_NUM: u32 = 2;
+
 /// ext4_rs `size_of::<Ext4DirEntry>()` 的值（`#[repr(C)]`：u32+u16+u8+u8+`[u8;255]`
 /// → 263 → 对齐到 264）。**这是内存结构尺寸泄漏进磁盘布局的关键 parity 常量**：
 /// ext4_rs 的 `try_insert_to_existing_block` / `insert_to_new_block` 用它作
@@ -1528,24 +1532,124 @@ fn unlink_file_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     Ok(())
 }
 
-/// 在 `old_parent` 下把 `old_name` 改名为 `new_name`（**仅同目录**——逐字复刻 ext4_rs
-/// `ext4_rename_at`，simple_interface/mod.rs:322）。
+/// 读出目录 `dir` 的 `".."` 项当前指向的 inode 号（即该目录的父 inode）。未找到（损坏 / 非
+/// 标准布局）→ EIO。
 ///
-/// PARITY（BUG-20，已登记 bug.md D 段）：
-/// - **仅同目录**：`old_parent != new_parent` → **EXDEV**（无 '..' 重定父——ext4_rs 在跨目录
-///   情况直接拒绝，不做父向链调整）；
+/// `".."` 在 ext4 标准目录里恒为首数据块的第二项；但为稳健，这里用全块逐项扫描定位（与
+/// [`dir_find_entry`] 同套块映射 + 块内项解析），命中名为 `".."` 的项即返回其 inode。
+fn read_dotdot_ino(ctx: &WriteCtx, dir: &Inode) -> Result<u32> {
+    let rctx = ctx.read_ctx();
+    match dir_find_entry(&rctx, dir, b"..")? {
+        Some(hit) => Ok(hit.inode),
+        None => Err(Error::with_message(
+            Errno::EIO,
+            "directory has no '..' entry",
+        )),
+    }
+}
+
+/// 把目录 `child` 的 `".."` 项**重定父**到 `new_parent_ino`：定位 `".."` 所在块 + 块内偏移，
+/// 只改该项头部的 4 字节 inode 字段（rec_len / name_len / name / 其余项原样不动），重算块尾
+/// csum，写回该块（MetadataWriter）。返回前不改 `child` 的任何 inode 字段（父 nlink 调整在
+/// 调用方做）。
+///
+/// 这是跨目录 rename 移动**目录**时的必需步骤（ext4 / ext2：被移动目录的 `".."` 必须指向新父
+/// ——参照 ext2 `set_parent_ino`，kernel/src/fs/ext2/inode.rs）。未找到 `".."` → EIO。
+fn dir_reparent_dotdot(ctx: &WriteCtx, child: &Inode, new_parent_ino: u32) -> Result<()> {
+    let ino_gen = child.raw.generation();
+    let rctx = ctx.read_ctx();
+    let hit = match dir_find_entry(&rctx, child, b"..")? {
+        Some(h) => h,
+        None => {
+            return Err(Error::with_message(
+                Errno::EIO,
+                "directory has no '..' entry to reparent",
+            ));
+        }
+    };
+    // `rctx` (a `ReadCtx` borrowing `ctx`) is no longer needed; `hit` owns its fields. Let it fall
+    // out of scope naturally before the block read/write below.
+    let mut block = read_dir_block(ctx, hit.pblock);
+    // 只改 '..' 项头部 inode 字段（[off..off+4]）——其余字节（rec_len/name_len/file_type/name/
+    // 后续项）保持不变。
+    block[hit.offset..hit.offset + 4].copy_from_slice(&new_parent_ino.to_le_bytes());
+    write_dir_block(ctx, hit.pblock, &mut block, ino_gen)?;
+    Ok(())
+}
+
+/// 判断目录 `maybe_ancestor` 是否为 `start` 自身或其某个祖先——用于跨目录 rename 的**环路防护**
+/// （禁止把目录移进它自己的子树，否则会从目录树上切断一棵子树成游离环）。
+///
+/// 从 `start` 出发沿 `".."` 链向上走到根（root inode == 2，其 `".."` 指向自身）：每一步
+/// 若当前 inode == `maybe_ancestor` → 返回 `true`（构成环路，调用方须拒 EINVAL）；走到根
+/// （`dotdot == cur`，root 自指）仍未命中 → 返回 `false`。设步数上界（`MAX_DEPTH`）防御
+/// 损坏 / 成环的 `".."` 链导致死循环——超限 → EIO。
+///
+/// [对照] ext2 `rename` 的子树环检测（kernel/src/fs/ext2/inode.rs：移动目录前禁止 dst 在 src
+/// 子树内，返回 EINVAL）；Linux `ext4_rename` 经 `ext4_check_dir_entry` + 祖先链同义。
+fn is_ancestor_or_self<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &NamespaceCtx<'_, R, W, D>,
+    maybe_ancestor: u32,
+    start: u32,
+) -> Result<bool> {
+    // 目录树深度的稳健上界——远超任何现实目录层级，仅用于拒绝成环 / 损坏的 '..' 链。
+    const MAX_DEPTH: u32 = 1 << 16;
+    let mut cur = start;
+    let mut steps = 0u32;
+    loop {
+        if cur == maybe_ancestor {
+            return Ok(true);
+        }
+        // 到根（ino 2）即停——root 的 '..' 指向自身，无更上层父。
+        if cur == ROOT_INODE_NUM {
+            return Ok(false);
+        }
+        let dir = nctx.load(cur)?;
+        let ctx = nctx.write_ctx();
+        let parent = read_dotdot_ino(&ctx, &dir)?;
+        // '..' 自指（root 之外不应出现）→ 已到链顶，停。
+        if parent == cur {
+            return Ok(false);
+        }
+        cur = parent;
+        steps += 1;
+        if steps > MAX_DEPTH {
+            return Err(Error::with_message(
+                Errno::EIO,
+                "directory ancestor chain too deep (possible cycle)",
+            ));
+        }
+    }
+}
+
+/// 在 `old_parent` 下把 `old_name` 改名 / 移动为 `new_parent` 下的 `new_name`。
+///
+/// **ext4 / POSIX-correct**（BUG-20 已修：从「仅同目录」放开为完整跨目录 rename）。语义：
 /// - **'.' / '..' 拒绝**：old / new 任一为 "." / ".." → **EISDIR**；
-/// - **同名短路**：`old_name == new_name` → Ok（无盘改动）；
+/// - **同名短路**：`old_parent == new_parent && old_name == new_name` → Ok（无盘改动）；
 /// - **同 inode 短路**：dest 已存在且 `new_ino == old_ino` → Ok；
-/// - **目录覆盖**：dest 是空目录 → `truncate_inode(new, 0)` + `unlink`(目录分支：父 nlink-1 +
-///   子 nlink=0 + write_back 子 + write_back 父) + **再显式 write_back(父)**；
-/// - **文件覆盖**：dest 是文件 → `unlink`(文件分支：仅 write_back 子) → **不** write_back(父)；
-///   （目录覆盖 write_back 父、文件覆盖不写回父——此不对称严格照搬 ext4_rs）；
-/// - **末尾不显式 write_back 父**：`dir_remove_entry(old_name)` + `dir_add_entry(new_name,
-///   old_ino, old_ftype)` 后不再 write_back 父（仅 `dir_add_entry` 分配新块时其内部写回 i_size）。
+/// - **环路防护**（跨目录 + old 是目录）：new_parent 是 old 自身或其后代 → **EINVAL**（禁止
+///   把目录移进自身子树，否则切断子树成游离环）；
+/// - **覆盖目标**（dest 已存在，`new_ino != old_ino`）：
+///   - old 是目录、dest 是普通文件 → **ENOTDIR**；old 是文件、dest 是目录 → **EISDIR**；
+///   - dest 是非空目录 → **ENOTEMPTY**；
+///   - dest 是**空目录** → truncate(0) + 从 new_parent 删项 + new_parent nlink-1 + **回收 dest
+///     inode**（[`finalize_freed_inode`]：清位图 + free_inodes++ + used_dirs--，闭合 BUG-19
+///     遗留的空目录覆盖泄漏）；
+///   - dest 是**普通文件** → 从 new_parent 删项 + nlink→0（实际 inode/块回收由集成层 evict 钩子
+///     [`free_inode_on_evict_at`] 在最后引用关闭时做，与 unlink 同语义）；
+/// - **搬移**：从 old_parent 删 old_name + 在 new_parent 加 new_name（指向 old_ino，类型
+///   old_ftype）；
+/// - **目录重定父**（跨目录 + old 是目录）：改 old 的 `".."` 指向 new_parent（[`dir_reparent_dotdot`]），
+///   并调父 nlink：`old_parent.nlink -= 1`、`new_parent.nlink += 1`（子目录给父贡献一个 `".."`
+///   反向链接；同目录 rename 不动父 nlink）；
+/// - **写回**：跨目录路径显式 write_back(old_parent) + write_back(new_parent) + write_back(old)
+///   （ctime / nlink / `".."` 已落块）。
 ///
-/// `old_ftype` = old inode 派生的目录项类型（`inode_to_dir_entry_type`）——与 ext4_rs 传
-/// `&old_inode_ref` 给 `dir_add_entry`（由 inode 派生类型）一致。
+/// `old_ftype` = old inode 派生的目录项类型（[`inode_to_dir_entry_type`]）。
+///
+/// 判据：ext4 规范 + ext2 参照（kernel/src/fs/ext2/inode.rs `rename`）+ e2fsck 干净（正确
+/// `".."` ino + 父 nlink + 无孤儿）。**不再 parity**。
 pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     old_parent: u32,
@@ -1561,20 +1665,14 @@ pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: Block
         ));
     }
 
-    // ② PARITY (BUG-20): 仅同目录 rename——跨目录 → EXDEV，无 '..' 重定父。
-    if old_parent != new_parent {
-        return Err(Error::with_message(
-            Errno::EXDEV,
-            "cross-directory rename is not supported",
-        ));
-    }
+    let cross_dir = old_parent != new_parent;
 
-    // ③ 同名短路（无盘改动）。
-    if old_name == new_name {
+    // ② 同名短路（同目录 + 同名，无盘改动）。
+    if !cross_dir && old_name == new_name {
         return Ok(());
     }
 
-    // ④ 解析 old：未命中 ENOENT 传播；记 old 是否目录。
+    // ③ 解析 old：未命中 ENOENT 传播；记 old 是否目录。
     let old_ino = {
         let parent = nctx.load(old_parent)?;
         let rctx = nctx.read_ctx();
@@ -1582,8 +1680,17 @@ pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: Block
     };
     let old_inode = nctx.load(old_ino)?;
     let old_is_dir = old_inode.is_dir();
-    // old_ftype 由 old inode 派生（与 ext4_rs 传 &old_inode_ref 给 dir_add_entry 一致）。
+    // old_ftype 由 old inode 派生（dir_add_entry 用 DE filetype）。
     let old_ftype = inode_to_dir_entry_type(&old_inode);
+
+    // ④ 跨目录 + old 是目录：环路防护——禁止把目录移进它自身子树（new_parent 是 old 自身或后代）。
+    //    （ext4 / ext2：否则会从目录树切断一棵子树成游离环。）
+    if cross_dir && old_is_dir && is_ancestor_or_self(nctx, old_ino, new_parent)? {
+        return Err(Error::with_message(
+            Errno::EINVAL,
+            "cannot move a directory into its own subtree",
+        ));
+    }
 
     // ⑤ dest 已存在？
     let dest = {
@@ -1603,7 +1710,7 @@ pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: Block
             if !new_inode.is_dir() {
                 return Err(Error::with_message(
                     Errno::ENOTDIR,
-                    "cannot overwrite non-directory",
+                    "cannot overwrite non-directory with a directory",
                 ));
             }
             {
@@ -1615,37 +1722,76 @@ pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: Block
                     ));
                 }
             }
-            // truncate dest → unlink(目录分支：父 nlink-1 + 子 nlink=0 + write_back 两者)。
+            // 空目录覆盖：truncate dest → 从 new_parent 删项 + new_parent nlink-1 + 子 nlink=0
+            // + write_back 两者。
             nctx.truncate(&mut new_inode, 0)?;
             let mut parent = nctx.load(new_parent)?;
             unlink_dir_branch(nctx, &mut parent, &mut new_inode, new_name)?;
-            // PARITY: 目录覆盖路径在 unlink 后**再显式** write_back(父)（ext4_rs mod.rs:362）。
             nctx.write_back(&mut parent)?;
+            // BUG-19 遗留闭合：回收被覆盖的空目录 inode（清位图 + free_inodes++ + used_dirs--
+            // + set i_dtime）。dest 是目录、无打开句柄语义（rename 覆盖即最后引用），与 rmdir
+            // 同路径。
+            finalize_freed_inode(nctx, &mut new_inode)?;
         } else {
             // old 是文件：dest 不能是目录。
             if new_inode.is_dir() {
                 return Err(Error::with_message(
                     Errno::EISDIR,
-                    "cannot overwrite directory",
+                    "cannot overwrite a directory with a non-directory",
                 ));
             }
-            // unlink(文件分支：仅 write_back 子)。
-            // PARITY: 文件覆盖路径**不** write_back(父)（ext4_rs mod.rs:367-368 缺该调用）。
+            // 普通文件覆盖：从 new_parent 删项 + nlink→0（实际 inode/块回收由集成层 evict
+            // 钩子在最后引用关闭时做）。
             let mut parent = nctx.load(new_parent)?;
             unlink_file_branch(nctx, &mut parent, &mut new_inode, new_name)?;
         }
     }
 
-    // ⑥ 在 old_parent（== new_parent）下删 old_name + 加 new_name（指向 old_ino，类型 old_ftype）。
-    // PARITY: 末尾**不**显式 write_back(父)——仅 dir_add_entry 分配新块时其内部写回父 i_size。
-    let mut parent = nctx.load(old_parent)?;
+    // ⑥ 搬移：从 old_parent 删 old_name + 在 new_parent 加 new_name（指向 old_ino，类型 old_ftype）。
+    let mut old_parent_inode = nctx.load(old_parent)?;
     {
         let ctx = nctx.write_ctx();
-        dir_remove_entry(&ctx, &mut parent, old_name)?;
+        dir_remove_entry(&ctx, &mut old_parent_inode, old_name)?;
     }
-    nctx.with_block_alloc(&mut parent, |ctx, alloc, parent| {
-        dir_add_entry(ctx, alloc, parent, old_ino, old_ftype, new_name)
-    })?;
+    // 在 new_parent 加项。同目录时 new_parent == old_parent：复用同一已加载 inode 以免后写覆盖
+    // 前一步删项导致的 i_size 变化；跨目录时各自独立加载。
+    if cross_dir {
+        let mut new_parent_inode = nctx.load(new_parent)?;
+        nctx.with_block_alloc(&mut new_parent_inode, |ctx, alloc, np| {
+            dir_add_entry(ctx, alloc, np, old_ino, old_ftype, new_name)
+        })?;
+
+        if old_is_dir {
+            // ⑦ 目录跨目录搬移：重定父 old 的 '..' → new_parent，调父 nlink。
+            {
+                let ctx = nctx.write_ctx();
+                dir_reparent_dotdot(&ctx, &old_inode, new_parent)?;
+            }
+            // 子目录给父贡献一个 '..' 反向链接：old_parent 失去一个、new_parent 获得一个。
+            let opl = old_parent_inode.links_count();
+            if opl > 0 {
+                old_parent_inode.set_links_count(opl - 1);
+            }
+            let npl = new_parent_inode.links_count();
+            new_parent_inode.set_links_count(npl + 1);
+        }
+
+        // ⑧ 跨目录路径显式 write_back 两个父 + 被移动 inode（ctime 由集成层 touch；这里把 nlink /
+        //    '..' 等内存改动落盘）。
+        nctx.write_back(&mut old_parent_inode)?;
+        nctx.write_back(&mut new_parent_inode)?;
+        if old_is_dir {
+            // 被移动目录的 inode 字段本身未变（'..' 在数据块里、已经 dir_reparent_dotdot 写盘），
+            // 但仍 write_back 以与跨目录写序一致、便于集成层 ctime 落盘。
+            let mut moved = nctx.load(old_ino)?;
+            nctx.write_back(&mut moved)?;
+        }
+    } else {
+        // 同目录搬移：复用已加载的 old_parent_inode（删项后 i_size 状态最新）。
+        nctx.with_block_alloc(&mut old_parent_inode, |ctx, alloc, parent| {
+            dir_add_entry(ctx, alloc, parent, old_ino, old_ftype, new_name)
+        })?;
+    }
     Ok(())
 }
 
@@ -1991,14 +2137,15 @@ mod test {
     use core::cell::RefCell;
 
     use super::{
-        create_at, free_inode_on_evict_at, mkdir_at, mkdir_unchecked_at, rmdir_at, rmdir_at_fast,
-        unlink_at, write_back_inode, NamespaceBlockAlloc, NamespaceCtx,
+        create_at, dir_find_entry, free_inode_on_evict_at, lookup_at, mkdir_at, mkdir_unchecked_at,
+        rename_at, rmdir_at, rmdir_at_fast, unlink_at, write_back_inode, NamespaceBlockAlloc,
+        NamespaceCtx,
     };
     use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::bitmap::ext4_bmap_bit_find_clr;
     use crate::fs::ext4::core::block_group::GroupGeometry;
     use crate::fs::ext4::core::extents::WriteCtx;
-    use crate::fs::ext4::core::file::write_at;
+    use crate::fs::ext4::core::file::{write_at, ReadCtx};
     use crate::fs::ext4::core::inode::load_inode;
     use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
     use crate::fs::ext4::core::metadata_writer::MetadataWriter;
@@ -2351,5 +2498,281 @@ mod test {
             "evict on nlink!=0 must not touch free_inodes_count"
         );
         let _ = ext4_bmap_bit_find_clr; // silence unused import if optimized away.
+    }
+
+    // =================================================================
+    // BUG-20 fix (Phase 7 Task 5): cross-directory rename, ext4/POSIX-correct.
+    // Standalone (NOT differential): each test builds a writable in-memory ext4
+    // image, performs a real cross-dir move, and asserts the entry moved, the
+    // `..` reparent + parent nlink adjustments, cycle rejection (EINVAL),
+    // overwrite reclamation (regular file -> nlink 0; empty dir -> freed +
+    // used_dirs--), and ENOTEMPTY on a non-empty dir target. Judged against
+    // ext4 spec + the ext2 reference (NOT parity).
+    // =================================================================
+
+    /// Read the inode number that directory `ino`'s `".."` entry currently points at (its parent).
+    fn dotdot_ino(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> u32 {
+        let dir = load_inode(disk, sb, ino).unwrap();
+        let ctx = ReadCtx::new(disk, sb);
+        dir_find_entry(&ctx, &dir, b"..").unwrap().unwrap().inode
+    }
+
+    /// Resolve `name` under directory `parent`, returning the child inode number (ENOENT -> panic).
+    fn lookup(disk: &MemDisk, sb: &RawSuperblock, parent: u32, name: &[u8]) -> u32 {
+        let dir = load_inode(disk, sb, parent).unwrap();
+        let ctx = ReadCtx::new(disk, sb);
+        lookup_at(&ctx, &dir, name).unwrap()
+    }
+
+    /// Is `name` resolvable under `parent`?
+    fn exists(disk: &MemDisk, sb: &RawSuperblock, parent: u32, name: &[u8]) -> bool {
+        let dir = load_inode(disk, sb, parent).unwrap();
+        let ctx = ReadCtx::new(disk, sb);
+        lookup_at(&ctx, &dir, name).is_ok()
+    }
+
+    fn nlink(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> u16 {
+        load_inode(disk, sb, ino).unwrap().links_count()
+    }
+
+    /// Cross-dir rename of a FILE: the entry moves from src to dst, the file inode is unchanged
+    /// (same ino, nlink stays 1), and neither parent's nlink changes (files contribute no `..` link).
+    #[ktest]
+    fn cross_dir_rename_file_moves_entry_counts_unchanged() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        // mkdir /src, /dst ; create /src/f.
+        let (src, dst, f);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            src = mkdir_at(&mut nctx, 2, b"src", S_IFDIR_TEST).unwrap();
+            dst = mkdir_at(&mut nctx, 2, b"dst", S_IFDIR_TEST).unwrap();
+            f = create_at(&mut nctx, src, b"f", S_IFREG_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        let src_nlink_before = nlink(&disk, &sb, src);
+        let dst_nlink_before = nlink(&disk, &sb, dst);
+
+        // mv /src/f -> /dst/g
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rename_at(&mut nctx, src, b"f", dst, b"g").unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(!exists(&disk, &sb, src, b"f"), "old entry must be gone from src");
+        assert_eq!(lookup(&disk, &sb, dst, b"g"), f, "new entry under dst -> same inode");
+        assert_eq!(nlink(&disk, &sb, f), 1, "moved file nlink unchanged");
+        assert_eq!(
+            nlink(&disk, &sb, src),
+            src_nlink_before,
+            "src parent nlink unchanged for a file move"
+        );
+        assert_eq!(
+            nlink(&disk, &sb, dst),
+            dst_nlink_before,
+            "dst parent nlink unchanged for a file move"
+        );
+    }
+
+    /// Cross-dir rename of a DIRECTORY: `..` must now point at the new parent, and the link counts
+    /// shift: old parent nlink -1, new parent nlink +1 (a subdir contributes one `..` to its parent).
+    #[ktest]
+    fn cross_dir_rename_dir_reparents_dotdot_and_adjusts_nlink() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        let (src, dst, child);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            src = mkdir_at(&mut nctx, 2, b"src", S_IFDIR_TEST).unwrap();
+            dst = mkdir_at(&mut nctx, 2, b"dst", S_IFDIR_TEST).unwrap();
+            child = mkdir_at(&mut nctx, src, b"child", S_IFDIR_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        // Before: child's `..` -> src; src has 3 links (self `.`, parent entry, child's `..`).
+        assert_eq!(dotdot_ino(&disk, &sb, child), src, "child `..` starts at src");
+        let src_nlink_before = nlink(&disk, &sb, src);
+        let dst_nlink_before = nlink(&disk, &sb, dst);
+
+        // mv /src/child -> /dst/moved
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rename_at(&mut nctx, src, b"child", dst, b"moved").unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(!exists(&disk, &sb, src, b"child"), "old dir entry gone from src");
+        assert_eq!(lookup(&disk, &sb, dst, b"moved"), child, "new entry under dst -> same dir inode");
+        assert_eq!(
+            dotdot_ino(&disk, &sb, child),
+            dst,
+            "moved dir `..` must be reparented to the new parent"
+        );
+        assert_eq!(
+            nlink(&disk, &sb, src),
+            src_nlink_before - 1,
+            "old parent loses one `..` backlink (nlink -1)"
+        );
+        assert_eq!(
+            nlink(&disk, &sb, dst),
+            dst_nlink_before + 1,
+            "new parent gains one `..` backlink (nlink +1)"
+        );
+        assert_eq!(nlink(&disk, &sb, child), 2, "moved dir nlink stays 2 (self + `.`)");
+    }
+
+    /// Cycle rejection: moving a directory into its own subtree must fail with EINVAL and leave the
+    /// tree untouched (entry stays where it was; `..` unchanged).
+    #[ktest]
+    fn cross_dir_rename_into_own_subtree_rejected_einval() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        // /a, /a/b, /a/b/c
+        let (a, b, c);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            a = mkdir_at(&mut nctx, 2, b"a", S_IFDIR_TEST).unwrap();
+            b = mkdir_at(&mut nctx, a, b"b", S_IFDIR_TEST).unwrap();
+            c = mkdir_at(&mut nctx, b, b"c", S_IFDIR_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        let a_nlink_before = nlink(&disk, &sb, a);
+        let c_nlink_before = nlink(&disk, &sb, c);
+
+        // Try mv /a -> /a/b/c/a (move `a` into its own descendant `c`). Must be EINVAL.
+        let err = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let r = rename_at(&mut nctx, 2, b"a", c, b"a");
+            sb = *nctx.superblock();
+            r.unwrap_err()
+        };
+        assert_eq!(err.error(), Errno::EINVAL, "moving a dir into its own subtree -> EINVAL");
+
+        // Tree untouched.
+        assert_eq!(lookup(&disk, &sb, 2, b"a"), a, "a still under root");
+        assert!(!exists(&disk, &sb, c, b"a"), "no spurious entry created under c");
+        assert_eq!(dotdot_ino(&disk, &sb, a), 2, "a `..` still points at root");
+        assert_eq!(nlink(&disk, &sb, a), a_nlink_before, "a nlink unchanged on rejection");
+        assert_eq!(nlink(&disk, &sb, c), c_nlink_before, "c nlink unchanged on rejection");
+    }
+
+    /// Overwrite a REGULAR-FILE target: the victim's entry is replaced and its nlink drops to 0
+    /// (the inode/block reclaim is the integration evict hook's job, mirrored by unlink).
+    #[ktest]
+    fn cross_dir_rename_overwrites_regular_file_target() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        let (src, dst, f, victim);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            src = mkdir_at(&mut nctx, 2, b"src", S_IFDIR_TEST).unwrap();
+            dst = mkdir_at(&mut nctx, 2, b"dst", S_IFDIR_TEST).unwrap();
+            f = create_at(&mut nctx, src, b"f", S_IFREG_TEST).unwrap();
+            victim = create_at(&mut nctx, dst, b"t", S_IFREG_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        assert_ne!(f, victim);
+
+        // mv /src/f -> /dst/t (overwrites the existing regular file t).
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rename_at(&mut nctx, src, b"f", dst, b"t").unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(!exists(&disk, &sb, src, b"f"), "old entry gone");
+        assert_eq!(lookup(&disk, &sb, dst, b"t"), f, "t now resolves to the moved file");
+        assert_eq!(
+            nlink(&disk, &sb, victim),
+            0,
+            "overwritten regular file dropped to nlink 0 (reclaimed by integration evict)"
+        );
+    }
+
+    /// Overwrite an EMPTY-DIRECTORY target: the victim dir is freed in-core (inode bitmap bit
+    /// cleared, free_inodes restored, used_dirs decremented) — closing the BUG-19-deferred
+    /// empty-dir-overwrite leak.
+    #[ktest]
+    fn cross_dir_rename_overwrites_empty_dir_target_frees_it() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        let (src, dst, moved, victim);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            src = mkdir_at(&mut nctx, 2, b"src", S_IFDIR_TEST).unwrap();
+            dst = mkdir_at(&mut nctx, 2, b"dst", S_IFDIR_TEST).unwrap();
+            moved = mkdir_at(&mut nctx, src, b"m", S_IFDIR_TEST).unwrap();
+            victim = mkdir_at(&mut nctx, dst, b"t", S_IFDIR_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        assert!(inode_bit_set(&disk, &sb, victim), "victim dir inode bit set before overwrite");
+        let free_inodes_before = sb.free_inodes_count();
+        let used_dirs_before = used_dirs_of_inode(&disk, &sb, victim);
+
+        // mv /src/m -> /dst/t (t is an empty dir -> overwrite + free).
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rename_at(&mut nctx, src, b"m", dst, b"t").unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(!exists(&disk, &sb, src, b"m"), "old entry gone");
+        assert_eq!(lookup(&disk, &sb, dst, b"t"), moved, "t now resolves to the moved dir");
+        assert_eq!(dotdot_ino(&disk, &sb, moved), dst, "moved dir `..` reparented to dst");
+        // Victim empty dir reclaimed.
+        assert!(
+            !inode_bit_set(&disk, &sb, victim),
+            "BUG-19 (empty-dir overwrite): victim dir inode bitmap bit must be cleared"
+        );
+        assert_eq!(nlink(&disk, &sb, victim), 0, "victim dir nlink dropped to 0");
+        assert_eq!(
+            sb.free_inodes_count(),
+            free_inodes_before + 1,
+            "overwriting an empty dir must free its inode (free_inodes +1)"
+        );
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, victim),
+            used_dirs_before - 1,
+            "overwriting an empty dir must decrement used_dirs_count"
+        );
+    }
+
+    /// Overwrite a NON-EMPTY directory target -> ENOTEMPTY, tree untouched.
+    #[ktest]
+    fn cross_dir_rename_over_nonempty_dir_target_enotempty() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+
+        let (src, dst, moved, victim);
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            src = mkdir_at(&mut nctx, 2, b"src", S_IFDIR_TEST).unwrap();
+            dst = mkdir_at(&mut nctx, 2, b"dst", S_IFDIR_TEST).unwrap();
+            moved = mkdir_at(&mut nctx, src, b"m", S_IFDIR_TEST).unwrap();
+            victim = mkdir_at(&mut nctx, dst, b"t", S_IFDIR_TEST).unwrap();
+            // make t NON-empty.
+            let _inner = create_at(&mut nctx, victim, b"keep", S_IFREG_TEST).unwrap();
+            sb = *nctx.superblock();
+        }
+        let moved_dotdot_before = dotdot_ino(&disk, &sb, moved);
+
+        let err = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let r = rename_at(&mut nctx, src, b"m", dst, b"t");
+            sb = *nctx.superblock();
+            r.unwrap_err()
+        };
+        assert_eq!(err.error(), Errno::ENOTEMPTY, "overwriting a non-empty dir -> ENOTEMPTY");
+
+        // Source entry untouched; moved dir `..` unchanged; victim still present.
+        assert_eq!(lookup(&disk, &sb, src, b"m"), moved, "m still under src on rejection");
+        assert_eq!(dotdot_ino(&disk, &sb, moved), moved_dotdot_before, "moved `..` unchanged");
+        assert_eq!(lookup(&disk, &sb, dst, b"t"), victim, "victim dir still present");
+        assert!(inode_bit_set(&disk, &sb, victim), "victim dir not freed on rejection");
     }
 }
