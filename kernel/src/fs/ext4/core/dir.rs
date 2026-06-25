@@ -130,8 +130,9 @@ const DIR_ENTRY_HEADER_SIZE: usize = 8;
 /// `block_size - DIR_TAIL_SIZE`（tail 区，复刻 ext4_rs `size_of::<Ext4DirEntryTail>()`）。
 const DIR_TAIL_SIZE: usize = size_of::<RawDirEntryTail>();
 
-/// RO-compat metadata_csum 特性位（仅**门控目录块 csum 的读侧校验** `dir_verify_block_csum`；
-/// **写侧 `dir_set_csum` 无条件写**，不看此位——BUG-22 复刻 ext4_rs 无门控行为）。
+/// RO-compat metadata_csum 特性位（门控目录块 csum 的**读侧**校验 `dir_verify_block_csum`
+/// 与**写侧** `dir_set_csum` / `insert_to_new_block` 的 tail 保留与 csum 写入——BUG-22 已修，
+/// 读/写对称一致）。
 /// = ext4_rs `EXT4_FEATURE_RO_COMPAT_METADATA_CSUM`（0x400），与 `extents.rs` 同值。
 const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 
@@ -519,21 +520,25 @@ pub(in crate::fs::ext4) fn dir_write_entry_bytes(
     buf[off..off + EXT4_DIR_ENTRY_INMEM_SIZE].copy_from_slice(&entry);
 }
 
-/// 在目录块字节上写 tail.checksum（**无条件写，不门控 metadata_csum**——BUG-22 parity）。
+/// 在目录块字节上写 tail.checksum（**门控 metadata_csum**——BUG-22 已修）。
 ///
-/// PARITY（ext4_rs `dir_set_csum`，dir.rs:252）：`ino_index = parse(block, 0).inode`
-/// （**块首项 inode**——块 0 是 "." = 目录自身，块 ≥1 是普通子项 inode，偏离规范但照搬）；
-/// 重算 [`dir_block_csum`]（复用 Task 1）；把结果写进 tail 的 checksum 字段
-/// （`block[block_size-4 .. block_size]`）。**写路径无条件**：ext4_rs 无视 metadata_csum 特性、
-/// 关 csum 的盘上也照写（BUG-22），故 core 写路径也无条件写以保 parity。读路径
-/// `dir_verify_block_csum` **仍门控**（ext4_rs 读不校验目录 csum，读/写非对称是忠实的）。
+/// [对照] ext4 规范：仅当 `RO_COMPAT_METADATA_CSUM` 特性开启时，目录块尾 12 字节才是
+/// `dirent_tail` 结构（保留给 csum）；特性关闭时该区域是普通项空间，不应写 csum tail。
+/// Linux `ext4_dirhash_csum_set`（fs/ext4/dir.c）与 `e2fsck` 均按此语义。
+///
+/// `ino_index = parse(block, 0).inode`（**块首项 inode**——块 0 是 "." = 目录自身，块 ≥1
+/// 是普通子项 inode，偏离规范的 parity quirk，照搬）；重算 [`dir_block_csum`]（复用 Task 1）；
+/// 把结果写进 tail 的 checksum 字段（`block[block_size-4 .. block_size]`）。
+/// 特性关：直接返回，不写任何字节——与 [`dir_verify_block_csum`] 的门控完全对称。
 pub(in crate::fs::ext4) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, block_size: usize) {
-    // PARITY: ext4_rs dir_set_csum writes the dir-block csum unconditionally, ignoring the
-    // metadata_csum feature gate (ext4_impls/dir.rs:252 + ext4_defs/direntry.rs:185; all 7
-    // call sites un-gated) — replicate exactly, even on a metadata_csum-off filesystem; this
-    // is logged as BUG-22. (READ-side dir_verify_block_csum keeps its gate: ext4_rs never
-    // verifies dir csums on read, so that asymmetry is faithful too.)
-    // PARITY: ino_index = 块首项 inode（dir_set_csum 读 block[0] 当 parent_de）。
+    // [对照] BUG-22 fix: gate on metadata_csum, mirroring the read-side dir_verify_block_csum.
+    // When metadata_csum is OFF the last 12 bytes are a usable entry region — do not overwrite
+    // them with a spurious csum tail (that would violate the ext4 spec and confuse e2fsck).
+    let has_csum = (sb.features_read_only() & RO_COMPAT_METADATA_CSUM) != 0;
+    if !has_csum {
+        return;
+    }
+    // [对照] ino_index = 块首项 inode（dir_set_csum 读 block[0] 当 parent_de）。
     let ino_index = match parse_entry(block, 0, block_size) {
         Ok(de) => de.inode,
         Err(_) => return,
@@ -604,31 +609,46 @@ pub(in crate::fs::ext4) fn try_insert_to_existing_block(
     ))
 }
 
-/// 把一个**新分配**的目录块初始化为「首项 + tail」。
+/// 把一个**新分配**的目录块初始化为「首项（+ tail，仅 metadata_csum 开时）」。
 ///
-/// PARITY（ext4_rs `insert_to_new_block`，dir.rs:567）：`el = block_size - 12`；首项写在
-/// offset 0、`rec_len = el`（占满整块除 tail），经 [`dir_write_entry_bytes`] 写满 264 字节；
-/// tail（reserved_zero1=0, rec_len=12, reserved_zero2=0, reserved_ft=0xDE, checksum=0）写在
-/// `block_size-12`；中间 `[264..block_size-12]` 保持 0。（块 csum 由调用方随后 `dir_set_csum` 写。）
+/// [对照] ext4 规范：
+/// - **metadata_csum 开**（`RO_COMPAT_METADATA_CSUM` 置位）：`el = block_size - 12`；首项写在
+///   offset 0、`rec_len = el`（占满整块除 tail），经 [`dir_write_entry_bytes`] 写满 264 字节；
+///   tail（reserved_zero1=0, rec_len=12, reserved_zero2=0, reserved_ft=0xDE, checksum=0）写在
+///   `block_size-12`；中间 `[264..block_size-12]` 保持 0。块 csum 由调用方随后 `dir_set_csum` 写。
+/// - **metadata_csum 关**：末尾 12 字节是普通项空间，不保留为 tail；`el = block_size`（首项
+///   rec_len 占满整块），不写 tail 结构——与 `mke2fs` nocsum 行为一致，e2fsck 视角无伪 tail。
+///
+/// BUG-22 已修：旧 parity 行为（ext4_rs 无视特性位、无条件 `el = block_size - 12` + 写 tail）
+/// 现已改为按特性门控，使读/写路径关于 tail 保留完全对称。
 pub(in crate::fs::ext4) fn insert_to_new_block(
     block: &mut [u8],
     inode: u32,
     name: &[u8],
     de_type: u8,
     block_size: usize,
+    sb: &RawSuperblock,
 ) {
-    let el = (block_size - DIR_TAIL_SIZE) as u16;
-    // 首项写满 264 字节，rec_len = block_size - 12。
-    dir_write_entry_bytes(block, 0, inode, el, name, de_type);
-    // tail：reserved_ft=0xDE、rec_len=12，其余 0（含 checksum，随后 dir_set_csum 覆盖）。
-    let tail = RawDirEntryTail {
-        reserved_zero1: 0,
-        rec_len: DIR_TAIL_SIZE as u16,
-        reserved_zero2: 0,
-        reserved_ft: DIR_TAIL_MARKER,
-        checksum: 0,
-    };
-    block[block_size - DIR_TAIL_SIZE..block_size].copy_from_slice(tail.as_bytes());
+    let has_csum = (sb.features_read_only() & RO_COMPAT_METADATA_CSUM) != 0;
+    if has_csum {
+        // metadata_csum 开：保留末尾 12 字节给 tail，首项 rec_len = block_size - 12。
+        let el = (block_size - DIR_TAIL_SIZE) as u16;
+        dir_write_entry_bytes(block, 0, inode, el, name, de_type);
+        // tail：reserved_ft=0xDE、rec_len=12，其余 0（含 checksum，随后 dir_set_csum 覆盖）。
+        let tail = RawDirEntryTail {
+            reserved_zero1: 0,
+            rec_len: DIR_TAIL_SIZE as u16,
+            reserved_zero2: 0,
+            reserved_ft: DIR_TAIL_MARKER,
+            checksum: 0,
+        };
+        block[block_size - DIR_TAIL_SIZE..block_size].copy_from_slice(tail.as_bytes());
+    } else {
+        // metadata_csum 关：末尾 12 字节是普通项空间，首项 rec_len = block_size（占满整块）。
+        let el = block_size as u16;
+        dir_write_entry_bytes(block, 0, inode, el, name, de_type);
+        // 不写 tail——末尾区域留作可用项空间，与 mke2fs nocsum 行为一致。
+    }
 }
 
 /// 给目录追加一个新数据块；返回 `(物理块号, 逻辑块号)`。
@@ -743,7 +763,7 @@ pub(in crate::fs::ext4) fn dir_add_entry(
     // ③ 无槽：新建块 + 首项。
     let (pblock, _new_iblock) = dir_append_block(ctx, alloc, parent)?;
     let mut block = read_dir_block(ctx, pblock);
-    insert_to_new_block(&mut block, child_ino, name, child_ftype, block_size);
+    insert_to_new_block(&mut block, child_ino, name, child_ftype, block_size, ctx.sb);
     // append 后 generation 不变；用同一 ino_gen。
     write_dir_block(ctx, pblock, &mut block, ino_gen)?;
     Ok(())
@@ -781,7 +801,7 @@ pub(in crate::fs::ext4) fn dir_add_entry_unchecked(
     let new_iblock = total_blocks;
     let (pblock, _iblk) = dir_append_block(ctx, alloc, parent)?;
     let mut block = read_dir_block(ctx, pblock);
-    insert_to_new_block(&mut block, child_ino, name, child_ftype, block_size);
+    insert_to_new_block(&mut block, child_ino, name, child_ftype, block_size, ctx.sb);
     write_dir_block(ctx, pblock, &mut block, ino_gen)?;
     Ok(new_iblock * block_size as u64)
 }
@@ -2781,5 +2801,209 @@ mod test {
         assert_eq!(dotdot_ino(&disk, &sb, moved), moved_dotdot_before, "moved `..` unchanged");
         assert_eq!(lookup(&disk, &sb, dst, b"t"), victim, "victim dir still present");
         assert!(inode_bit_set(&disk, &sb, victim), "victim dir not freed on rejection");
+    }
+
+    // =================================================================
+    // BUG-22 fix: dir-block csum write is gated on metadata_csum.
+    //
+    // Standalone (NOT differential): uses the real EXT4_NOCSUM_IMAGE fixture
+    // (metadata_csum OFF) and EXT4_IMAGE (metadata_csum ON) to verify that:
+    // (a) On a nocsum filesystem, after a directory-write operation that
+    //     allocates a new dir block, the last 12 bytes are NOT a csum tail
+    //     (reserved_ft != 0xDE) — i.e., dir_set_csum is a no-op.
+    // (b) On a csum filesystem, dir_set_csum writes a valid csum tail that
+    //     matches the recomputed value and passes dir_verify_block_csum.
+    // (c) insert_to_new_block with metadata_csum OFF gives the first entry a
+    //     rec_len equal to the full block_size (no tail reservation), whereas
+    //     with metadata_csum ON the rec_len is block_size - 12 (tail reserved).
+    // Judged against ext4 spec (NOT parity).
+    // =================================================================
+
+    use super::{dir_set_csum, insert_to_new_block, RO_COMPAT_METADATA_CSUM};
+
+    /// BUG-22 fix (write-side gate): on a nocsum filesystem, writing a directory block must NOT
+    /// place a csum tail in the last 12 bytes. On a csum filesystem, the tail must be written
+    /// and the checksum must verify. Covers `dir_set_csum` + `insert_to_new_block` gating.
+    #[ktest]
+    fn dir_csum_write_gated_by_metadata_csum() {
+        // ---- Part A: metadata_csum OFF (EXT4_NOCSUM_IMAGE) ----
+        // Confirm the fixture has metadata_csum off.
+        let sb_nc = RawSuperblock::from_bytes(&EXT4_NOCSUM_IMAGE[1024..2048]);
+        assert_eq!(
+            sb_nc.features_read_only() & RO_COMPAT_METADATA_CSUM,
+            0,
+            "EXT4_NOCSUM_IMAGE must have metadata_csum off"
+        );
+        let bs_nc = sb_nc.block_size();
+
+        // Build a synthetic dir block as if insert_to_new_block just ran on a nocsum fs.
+        // With metadata_csum OFF: rec_len of first entry must equal block_size (no tail).
+        let mut block_nc = alloc::vec![0u8; bs_nc];
+        let child_ino: u32 = 42;
+        let name = b"testfile";
+        let de_type: u8 = 1; // REG
+        insert_to_new_block(&mut block_nc, child_ino, name, de_type, bs_nc, &sb_nc);
+
+        // First entry's rec_len must equal block_size (full block, no tail reserved).
+        let first_entry = parse_entry(&block_nc, 0, bs_nc).expect("parse first entry in nocsum block");
+        assert_eq!(
+            first_entry.rec_len as usize, bs_nc,
+            "BUG-22 fix: nocsum dir block first entry rec_len must equal block_size (no tail reserved)"
+        );
+        assert_eq!(first_entry.inode, child_ino, "inode field correct");
+        assert_eq!(first_entry.name, name, "name field correct");
+
+        // The last 12 bytes must NOT be a csum tail (reserved_ft != 0xDE).
+        let tail_bytes = &block_nc[bs_nc - DIR_TAIL_SIZE..bs_nc];
+        let tail = RawDirEntryTail::from_bytes(tail_bytes);
+        assert_ne!(
+            tail.reserved_ft, DIR_TAIL_MARKER,
+            "BUG-22 fix: nocsum dir block must not have a csum tail (reserved_ft should not be 0xDE)"
+        );
+
+        // dir_set_csum on a nocsum block must be a no-op: the block bytes must not change.
+        let block_nc_before = block_nc.clone();
+        dir_set_csum(&mut block_nc, &sb_nc, /*ino_gen=*/ 0, bs_nc);
+        assert_eq!(
+            block_nc, block_nc_before,
+            "BUG-22 fix: dir_set_csum must be a no-op when metadata_csum is off"
+        );
+
+        // ---- Part B: metadata_csum ON (EXT4_IMAGE) ----
+        // Confirm the fixture has metadata_csum on.
+        let sb_cs = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        assert_ne!(
+            sb_cs.features_read_only() & RO_COMPAT_METADATA_CSUM,
+            0,
+            "EXT4_IMAGE must have metadata_csum on"
+        );
+        let bs_cs = sb_cs.block_size();
+
+        // Build a synthetic dir block with metadata_csum ON.
+        // With metadata_csum ON: rec_len of first entry must equal block_size - 12 (tail reserved).
+        let mut block_cs = alloc::vec![0u8; bs_cs];
+        insert_to_new_block(&mut block_cs, child_ino, name, de_type, bs_cs, &sb_cs);
+
+        // First entry's rec_len must equal block_size - 12 (tail reserved).
+        let first_cs = parse_entry(&block_cs, 0, bs_cs).expect("parse first entry in csum block");
+        assert_eq!(
+            first_cs.rec_len as usize,
+            bs_cs - DIR_TAIL_SIZE,
+            "csum dir block first entry rec_len must be block_size - 12 (tail slot reserved)"
+        );
+
+        // The last 12 bytes must be a valid tail structure (reserved_ft == 0xDE).
+        let tail_cs_before = RawDirEntryTail::from_bytes(&block_cs[bs_cs - DIR_TAIL_SIZE..bs_cs]);
+        assert_eq!(
+            tail_cs_before.reserved_ft, DIR_TAIL_MARKER,
+            "csum dir block must have a tail marker (reserved_ft == 0xDE)"
+        );
+
+        // After dir_set_csum the checksum field must be filled and must verify.
+        let ino_gen: u32 = 0;
+        dir_set_csum(&mut block_cs, &sb_cs, ino_gen, bs_cs);
+        assert!(
+            dir_verify_block_csum(&sb_cs, &block_cs, ino_gen),
+            "BUG-22 fix: dir_verify_block_csum must pass after dir_set_csum on a csum filesystem"
+        );
+        // The checksum field must now be non-trivial (not still 0 from the tail init).
+        let tail_cs_after = RawDirEntryTail::from_bytes(&block_cs[bs_cs - DIR_TAIL_SIZE..bs_cs]);
+        // dir_block_csum over an empty block with inode 42 should produce the same value.
+        let expected_csum = dir_block_csum(&sb_cs, &block_cs, child_ino, ino_gen);
+        assert_eq!(
+            tail_cs_after.checksum, expected_csum,
+            "csum dir block checksum must equal the recomputed dir_block_csum value"
+        );
+    }
+
+    /// BUG-22 fix (real-image round-trip): create a directory under root on EXT4_NOCSUM_IMAGE and
+    /// verify the freshly-written dir block does NOT contain a csum tail. Then do the same on
+    /// EXT4_IMAGE and confirm the tail IS present and verifies. This exercises the full write
+    /// path (mkdir_at -> dir_add_entry -> insert_to_new_block -> write_dir_block -> dir_set_csum).
+    #[ktest]
+    fn dir_write_nocsum_no_spurious_tail_real_image() {
+        // ---- nocsum: mkdir then read back the new dir's first block ----
+        let disk_nc = MemDisk::new(EXT4_NOCSUM_IMAGE);
+        let mut sb_nc = read_sb(&disk_nc);
+        assert_eq!(
+            sb_nc.features_read_only() & RO_COMPAT_METADATA_CSUM,
+            0,
+            "EXT4_NOCSUM_IMAGE must have metadata_csum off"
+        );
+        let bs = sb_nc.block_size();
+
+        let child_ino_nc = {
+            let mut nctx = NamespaceCtx::new(&disk_nc, &disk_nc, &disk_nc, sb_nc);
+            let ino = mkdir_at(&mut nctx, 2, b"newdir", S_IFDIR_TEST).unwrap();
+            sb_nc = *nctx.superblock();
+            ino
+        };
+
+        // Load the child dir's inode to find its first data block.
+        let child_inode = load_inode(&disk_nc, &sb_nc, child_ino_nc).unwrap();
+        let dir_size = child_inode.size();
+        assert!(dir_size > 0, "new dir must have at least one data block");
+
+        // Read the child dir's first data block directly.
+        use crate::fs::ext4::core::extents::get_pblock_idx_state;
+        let pblock = get_pblock_idx_state(&disk_nc, &sb_nc, &child_inode, 0)
+            .unwrap()
+            .expect("new dir must have a mapped first block")
+            .0;
+        let mut dir_block = alloc::vec![0u8; bs];
+        disk_nc.read_at(pblock as usize * bs, &mut dir_block);
+
+        // On a nocsum fs the last 12 bytes must NOT be a csum tail.
+        let tail_nc = RawDirEntryTail::from_bytes(&dir_block[bs - DIR_TAIL_SIZE..bs]);
+        assert_ne!(
+            tail_nc.reserved_ft, DIR_TAIL_MARKER,
+            "BUG-22 fix: nocsum new dir block must not have a csum tail (reserved_ft should not be 0xDE)"
+        );
+
+        // Confirm dir_verify_block_csum (which gates on metadata_csum) still returns true
+        // (short-circuits to true when feature is off — no false negative).
+        let gen_nc = child_inode.raw.generation();
+        assert!(
+            dir_verify_block_csum(&sb_nc, &dir_block, gen_nc),
+            "nocsum dir block must pass dir_verify_block_csum (short-circuit true)"
+        );
+
+        // ---- csum: same test on EXT4_IMAGE ----
+        let disk_cs = MemDisk::new(EXT4_IMAGE);
+        let mut sb_cs = read_sb(&disk_cs);
+        assert_ne!(
+            sb_cs.features_read_only() & RO_COMPAT_METADATA_CSUM,
+            0,
+            "EXT4_IMAGE must have metadata_csum on"
+        );
+
+        let child_ino_cs = {
+            let mut nctx = NamespaceCtx::new(&disk_cs, &disk_cs, &disk_cs, sb_cs);
+            let ino = mkdir_at(&mut nctx, 2, b"newdir", S_IFDIR_TEST).unwrap();
+            sb_cs = *nctx.superblock();
+            ino
+        };
+
+        let child_inode_cs = load_inode(&disk_cs, &sb_cs, child_ino_cs).unwrap();
+        let pblock_cs = get_pblock_idx_state(&disk_cs, &sb_cs, &child_inode_cs, 0)
+            .unwrap()
+            .expect("new dir must have a mapped first block")
+            .0;
+        let mut dir_block_cs = alloc::vec![0u8; bs];
+        disk_cs.read_at(pblock_cs as usize * bs, &mut dir_block_cs);
+
+        // On a csum fs the last 12 bytes MUST be a valid csum tail.
+        let tail_cs = RawDirEntryTail::from_bytes(&dir_block_cs[bs - DIR_TAIL_SIZE..bs]);
+        assert_eq!(
+            tail_cs.reserved_ft, DIR_TAIL_MARKER,
+            "csum new dir block must have a csum tail marker (reserved_ft == 0xDE)"
+        );
+
+        // And the csum must verify.
+        let gen_cs = child_inode_cs.raw.generation();
+        assert!(
+            dir_verify_block_csum(&sb_cs, &dir_block_cs, gen_cs),
+            "csum new dir block must pass dir_verify_block_csum"
+        );
     }
 }
