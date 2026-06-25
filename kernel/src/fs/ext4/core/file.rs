@@ -31,11 +31,30 @@ const SMALL_WRITE_PREALLOC_BLOCKS: u32 = 32;
 /// 多块写的预分配尾块数（无预分配）。= ext4_rs `WRITE_PREALLOC_BLOCKS`（file.rs:18）。
 const WRITE_PREALLOC_BLOCKS: u32 = 1;
 
-/// fallocate 文件大小上界（值逐字复刻 ext4_rs `EXT4_MAX_FILE_SIZE`，consts.rs:43——
-/// 字面量 `16 * 1024 * 1024 * 1024`；ext4_rs 注释写 16TB 但常量实际为 16GiB，**按值复刻**）。
-/// `allocate_range` 用它做 EFBIG 守卫——这道上界正是 BUG-12 里 write_at/prepare 缺、
-/// 唯独 allocate_range 复刻到位的那道（部分闭合 BUG-12）。
-const EXT4_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+/// extent-mapped 文件的最大逻辑块数上界 = `2^32`。
+///
+/// [对照] ext4 `struct ext4_extent.ee_block` 是 **32 位**逻辑块号（`fs/ext4/ext4_extents.h`），
+/// 故 extent 文件最多寻址 `2^32` 个逻辑块（lblock 索引 `[0, 2^32)`）。Linux
+/// `ext4_max_size()`（`fs/ext4/super.c`，extent 分支）取 `upper_limit = (1<<32)` 块、
+/// `s_maxbytes = upper_limit << blkbits`（再 clamp 到 `MAX_LFS_FILESIZE`）。
+const EXT4_MAX_LOGICAL_BLOCKS: u64 = 1u64 << 32;
+
+/// ext4 extent 文件的最大字节大小 = `2^32 * block_size`（= ext4 `s_maxbytes`）。
+///
+/// **块大小相关**（本核心支持可变块大小，`block_size = 1024 << s_log_block_size`）：
+/// - 4 KiB 块：`2^32 * 4096 = 2^44 = 16 TiB`；
+/// - 1 KiB 块：`2^32 * 1024 = 2^42 = 4 TiB`。
+///
+/// 修复 BUG-12 的「附带 ext4_rs bug」：ext4_rs `EXT4_MAX_FILE_SIZE`（consts.rs:43）写死
+/// `16 * 1024 * 1024 * 1024` = **16 GiB**（注释却写 16TB，值与注释矛盾），对 ext4 extent
+/// 文件是离谱地小、会误拒合法写。这里改为 ext4-spec-correct 的块大小相关上界。
+///
+/// 一个**恰为** `2^32 * block_size` 字节的文件需要逻辑块 `[0, 2^32)`，索引全在 32 位内、合法；
+/// 故守卫判据是 `new_size > max → EFBIG`（严格越界才拒）。三个写入口（write_at /
+/// prepare_write_at / allocate_range）与 truncate 增长分支统一用本上界。
+fn ext4_max_file_size(block_size: usize) -> u64 {
+    EXT4_MAX_LOGICAL_BLOCKS.saturating_mul(block_size as u64)
+}
 
 /// 逻辑块 → 物理块的连续映射段（读路径载体）。
 ///
@@ -645,12 +664,15 @@ pub(in crate::fs::ext4) fn write_at(
         return Ok(0);
     }
     let file_size = inode.size();
-    // PARITY/TODO(BUG-12): ext4_rs write_at (file.rs:1846) 还有 `write_end > EXT4_MAX_FILE_SIZE → EFBIG`
-    // 上界检查，core 这里只防 checked_add 溢出（allocate_range 已复刻该上界）。16GiB 阈值现实小文件
-    // 不触发，迁移后与 ext4_rs 对齐（见 bug.md BUG-12）。
+    // [对照] ext4 写路径的 EFBIG 上界（修复 BUG-12）：除防 `checked_add` 溢出外，新结尾偏移
+    // 超过 extent 文件最大字节大小（`2^32 * block_size`，见 `ext4_max_file_size`）即 EFBIG。
+    // 与 prepare_write_at / allocate_range / truncate 增长分支同一道上界。
     let write_end = offset
         .checked_add(write_buf.len())
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "write end overflow"))?;
+    if write_end as u64 > ext4_max_file_size(block_size) {
+        return Err(Error::with_message(Errno::EFBIG, "file size too large"));
+    }
     let iblock_start = offset / block_size;
     let iblock_end = (write_end - 1) / block_size + 1;
     let lblock_start =
@@ -779,11 +801,15 @@ pub(in crate::fs::ext4) fn prepare_write_at(
         return Ok((0, Vec::new()));
     }
     let file_size = inode.size();
-    // PARITY/TODO(BUG-12): ext4_rs prepare_write_at (file.rs:1298) 还有 `> EXT4_MAX_FILE_SIZE → EFBIG`
-    // 上界，core 只防溢出（见 bug.md BUG-12，迁移后对齐）。
+    // [对照] ext4 写准备路径的 EFBIG 上界（修复 BUG-12）：除防 `checked_add` 溢出外，新结尾
+    // 偏移超过 extent 文件最大字节大小（`2^32 * block_size`）即 EFBIG。与 write_at /
+    // allocate_range / truncate 增长分支同一道上界。
     let write_end = offset
         .checked_add(len)
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "write end overflow"))?;
+    if write_end as u64 > ext4_max_file_size(block_size) {
+        return Err(Error::with_message(Errno::EFBIG, "file size too large"));
+    }
     let lblock_start = u32::try_from(offset / block_size)
         .map_err(|_| Error::with_message(Errno::EFBIG, "lblock start too big"))?;
     let lblock_end = u32::try_from((write_end - 1) / block_size + 1)
@@ -924,9 +950,9 @@ pub(in crate::fs::ext4) fn allocate_range(
     let range_end = offset
         .checked_add(len)
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "fallocate range end overflow"))?;
-    // PARITY: EXT4_MAX_FILE_SIZE 上界 EFBIG（ext4_rs file.rs:1432；部分闭合 BUG-12——
-    //   唯独 allocate_range 有这道，write_at/prepare 仍缺）。
-    if range_end > EXT4_MAX_FILE_SIZE as usize {
+    // [对照] ext4 fallocate 的 EFBIG 上界（BUG-12 统一为块大小相关上限）：range_end 超过
+    //   extent 文件最大字节大小（`2^32 * block_size`）即 EFBIG。与 write_at/prepare/truncate 同。
+    if range_end as u64 > ext4_max_file_size(block_size) {
         return Err(Error::with_message(Errno::EFBIG, "file size too large"));
     }
 
@@ -1071,7 +1097,7 @@ const EXT_MAX_BLOCKS: u32 = u32::MAX;
 /// 文件截断到 `new_size`。逐字节复刻 ext4_rs `truncate_inode`（ext4_impls/file.rs:1904）。
 ///
 /// - `old == new` → 空操作（EOK）；
-/// - `old < new`（增长）→ EFBIG 守卫（`new_size > EXT4_MAX_FILE_SIZE`）+ **稀疏** set_size
+/// - `old < new`（增长）→ EFBIG 守卫（`new_size > ext4_max_file_size`）+ **稀疏** set_size
 ///   + write_back（只推进 i_size、留 hole 不映射）；
 /// - `old > new`（缩小）→ ① 算 new/old 块数与 diff；② `new_size % bs != 0` 时**零填尾分块**
 ///   （unwritten 尾不动、written 尾 RMW 零填 `[tail_offset..]`、hole 不动）；③ `diff > 0` →
@@ -1094,7 +1120,8 @@ pub(in crate::fs::ext4) fn truncate_inode(
     }
     if old_size < new_size {
         // 增长：EFBIG 守卫 + 稀疏 set_size + write_back（不分配、留 hole）。
-        if new_size > EXT4_MAX_FILE_SIZE {
+        // [对照] 块大小相关上界（`2^32 * block_size`），与写/fallocate 路径一致（BUG-12）。
+        if new_size > ext4_max_file_size(block_size as usize) {
             return Err(Error::with_message(Errno::EFBIG, "file size too large"));
         }
         inode.set_size(new_size);
@@ -1140,4 +1167,199 @@ pub(in crate::fs::ext4) fn truncate_inode(
     write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
 
     Ok(())
+}
+
+#[cfg(ktest)]
+mod test {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use ostd::prelude::*;
+
+    use super::{ext4_max_file_size, prepare_write_at, write_at, EXT4_INODE_FLAG_EXTENTS};
+    use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+    use crate::fs::ext4::core::extents::{BlockAlloc, WriteCtx};
+    use crate::fs::ext4::core::inode::{load_inode, Inode, RawInode};
+    use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::superblock::RawSuperblock;
+    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+    use crate::prelude::Result;
+    use crate::prelude::*;
+
+    /// 4 KiB 块、256B inode 的真镜像几何常量（见 EXT4_IMAGE）。
+    const EXT_MAGIC: u16 = 0xF30A;
+
+    /// 内存盘：读/数据写/元数据写都打到同一份字节。
+    struct MemImage {
+        bytes: RefCell<Vec<u8>>,
+        block_size: usize,
+    }
+    impl MemImage {
+        fn new(seed: &[u8]) -> Self {
+            let sb = RawSuperblock::from_bytes(&seed[1024..2048]);
+            MemImage {
+                bytes: RefCell::new(seed.to_vec()),
+                block_size: sb.block_size(),
+            }
+        }
+    }
+    impl BlockReader for MemImage {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl BlockWriter for MemImage {
+        fn write_at(&self, off: usize, data: &[u8]) {
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(off + i) {
+                    *slot = *byte;
+                }
+            }
+        }
+    }
+    impl MetadataWriter for MemImage {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            self.write_at(block as usize * self.block_size, data);
+            Ok(())
+        }
+    }
+
+    /// 永不分配的分配器：alloc 入口一律 ENOSPC。EFBIG 上界检查发生在分配之前，故 under-bound
+    /// 写会越过尺寸守卫、落到这个分配器（返回 ENOSPC 而非 EFBIG「file size too large」）——
+    /// 借此证明尺寸守卫**没有**误拒 under-bound 的合法写。
+    struct NoAlloc;
+    impl BlockAlloc for NoAlloc {
+        fn alloc_one(&mut self, _inode: &mut Inode) -> Result<Ext4Fsblk> {
+            Err(Error::with_message(Errno::ENOSPC, "no alloc"))
+        }
+        fn alloc_batch(
+            &mut self,
+            _inode: &mut Inode,
+            _start_bgid: &mut u32,
+            _count: usize,
+        ) -> Result<Vec<Ext4Fsblk>> {
+            Err(Error::with_message(Errno::ENOSPC, "no alloc"))
+        }
+        fn free_blocks(&mut self, _inode: &mut Inode, _start: Ext4Fsblk, _count: u32) {}
+    }
+
+    /// 定位 inode `ino` 在镜像中的字节偏移（第一组 group descriptor → inode table）。
+    fn inode_off(img: &[u8], sb: &RawSuperblock, ino: u32) -> usize {
+        let bs = sb.block_size();
+        let gd = RawGroupDescriptor::from_bytes(
+            &img[(sb.first_data_block as usize + 1) * bs
+                ..(sb.first_data_block as usize + 1) * bs + 64],
+        );
+        gd.inode_table() as usize * bs + (ino as usize - 1) * sb.inode_size() as usize
+    }
+
+    /// 在 disk 上把 inode `ino` 初始化成一个空 extent reg 文件（i_size=0），返回加载好的句柄。
+    fn seed_empty_reg_inode(disk: &MemImage, sb: &RawSuperblock, ino: u32) -> Inode {
+        let off = inode_off(EXT4_IMAGE, sb, ino);
+        let mut raw = RawInode::from_bytes(&EXT4_IMAGE[off..off + 156]);
+        raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+        raw.set_mode(0x8000); // S_IFREG
+        raw.set_size(0);
+        // i_block 前 12 字节 = 空 extent header（entries=0, max=4, depth=0）。
+        let mut iblock = [0u8; 60];
+        iblock[0] = (EXT_MAGIC & 0xff) as u8;
+        iblock[1] = (EXT_MAGIC >> 8) as u8;
+        iblock[2] = 0; // entries lo
+        iblock[3] = 0; // entries hi
+        iblock[4] = 4; // max lo
+        iblock[5] = 0; // max hi
+                       // depth=0, generation=0 已为 0。
+        let block: [u32; 15] = Pod::from_bytes(&iblock);
+        raw.block = block;
+        disk.write_at(off, raw.as_bytes());
+        load_inode(disk, sb, ino).unwrap()
+    }
+
+    #[ktest]
+    fn ext4_max_file_size_is_block_size_aware() {
+        // [对照] ext4 s_maxbytes = 2^32 * block_size：4K→16 TiB，1K→4 TiB。
+        assert_eq!(ext4_max_file_size(4096), 1u64 << 44, "4K 块上界须为 16 TiB");
+        assert_eq!(ext4_max_file_size(1024), 1u64 << 42, "1K 块上界须为 4 TiB");
+        // 旧 ext4_rs 的错误值 16 GiB 远小于真上界——确认已不再使用。
+        assert!(ext4_max_file_size(4096) > 16u64 * 1024 * 1024 * 1024);
+    }
+
+    #[ktest]
+    fn write_at_rejects_over_max_with_efbig() {
+        // BUG-12：write_at 在 new_size 超过 (2^32 * block_size) 时返回 EFBIG。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let max = ext4_max_file_size(sb.block_size());
+
+        let mut inode = seed_empty_reg_inode(&disk, &sb, 11);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = NoAlloc;
+
+        // offset 恰为 max、再写 1 字节 → new_size = max + 1 > max → EFBIG。
+        let buf = [0xABu8; 1];
+        let err = write_at(&ctx, &mut alloc, &mut inode, max as usize, &buf)
+            .expect_err("over-max write must fail");
+        assert_eq!(err.error(), Errno::EFBIG, "over-max write must be EFBIG");
+    }
+
+    #[ktest]
+    fn prepare_write_at_rejects_over_max_with_efbig() {
+        // BUG-12：prepare_write_at 同样补上 EFBIG 上界。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let max = ext4_max_file_size(sb.block_size());
+
+        let mut inode = seed_empty_reg_inode(&disk, &sb, 11);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = NoAlloc;
+
+        let err = prepare_write_at(&ctx, &mut alloc, &mut inode, max as usize + 1, 4096)
+            .expect_err("over-max prepare must fail");
+        assert_eq!(err.error(), Errno::EFBIG, "over-max prepare must be EFBIG");
+    }
+
+    #[ktest]
+    fn write_under_max_passes_size_guard() {
+        // BUG-12 反向守护：修正后的上界**不得**误拒 under-bound 的合法写。
+        // 用永不分配的 NoAlloc → 写会越过尺寸守卫、落到分配器返回 ENOSPC（而非 EFBIG）。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let max = ext4_max_file_size(sb.block_size());
+
+        // 选一个**远在上界内**的大偏移：max - 2*block_size（合法），写一整块。
+        let off = (max - 2 * sb.block_size() as u64) as usize;
+        let buf = [0xCDu8; 4096];
+
+        let mut inode = seed_empty_reg_inode(&disk, &sb, 11);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = NoAlloc;
+        let err = write_at(&ctx, &mut alloc, &mut inode, off, &buf)
+            .expect_err("NoAlloc must fail allocation");
+        assert_eq!(
+            err.error(),
+            Errno::ENOSPC,
+            "under-max write must pass size guard and fail at allocation, not EFBIG"
+        );
+
+        // prepare_write_at 同样越过尺寸守卫。
+        let mut inode2 = seed_empty_reg_inode(&disk, &sb, 12);
+        let err2 = prepare_write_at(&ctx, &mut alloc, &mut inode2, off, 4096)
+            .expect_err("NoAlloc must fail allocation");
+        assert_eq!(
+            err2.error(),
+            Errno::ENOSPC,
+            "under-max prepare must pass size guard, not EFBIG"
+        );
+    }
 }

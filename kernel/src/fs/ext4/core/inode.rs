@@ -442,13 +442,13 @@ pub(in crate::fs::ext4) fn load_inode(
 /// [对照] ext4_rs `Ext4::write_back_inode`（ext4_impls/inode.rs:242）= `set_inode_checksum`
 /// 再 `write_inode_image`（:185）。
 ///
-/// **PARITY（BUG-10）**：`RawInode` 建模 156 字节，本镜像 `inode_size`=256。ext4_rs
-/// `write_inode_image` 把 `Ext4Inode`（同样 156 字节）按 `min(inode_size, sizeof)`=156 拷入
-/// inode 槽，再把余下 `[156, inode_size)` 用 `fill(0)` **清零**——即 inode 尾 100 字节落盘恒为
-/// 0，**不是**保留盘上原值。core 逐字节复刻：覆盖 156 真实字节后同样把尾 100 字节清零（而非
-/// 依赖 RMW 保留）。整块用 RMW 是为了保留**同块内其它 inode** 的字节，不是为了保留本 inode 的
-/// 尾区。语义上这丢弃了未建模的 inode 尾字节（标准 mkfs 镜像该区本就是 0，故无感）；登记
-/// 根目录 `bug.md` BUG-10，迁移后评估。
+/// **BUG-10 已修（read-modify-write 保留尾区）**：`RawInode` 建模 inode 的前 156 字节
+/// （base 128B + extra-isize 字段直到 `i_version_hi`，`size_of::<RawInode>()==156`）；
+/// 256 字节 inode 的尾区 `[156, inode_size)` 是 core **不建模**的区域（ext4 的内联 xattr /
+/// 未来字段所在）。ext4_rs `write_inode_image` 每次写回都把该尾区 `fill(0)` **抹零**——这是数据
+/// 丢失（销毁盘上未建模的 inode 尾字节）。core 改为 ext4-correct 的 RMW：读出 inode 所在整块、
+/// **只覆盖** core 管理的 `RawInode`（156 字节）区，尾区 `[156, inode_size)` 保留盘上原值
+/// （不 own 的字节不动）。整块 RMW 同时保留同块内**其它 inode** 的字节。
 pub(in crate::fs::ext4) fn write_back_inode(
     writer: &dyn MetadataWriter,
     reader: &dyn BlockReader,
@@ -468,18 +468,113 @@ pub(in crate::fs::ext4) fn write_back_inode(
     let mut block = vec![0u8; block_size];
     reader.read_at(block_offset, block.as_mut_slice());
 
-    // 3) 覆盖该 inode 的 inode_size 字节：前 156 = RawInode 镜像，余下 [156, inode_size) 清零。
-    //    PARITY: ext4_rs write_inode_image 拷 min(inode_size, sizeof Ext4Inode)=156 字节后，
-    //    把 [156, inode_size) `fill(0)`——故这 100 字节落盘恒为 0，不是「保留盘上原值」。
-    //    为逐字节一致，core 同样把尾部清零，而非依赖 RMW 保留原值。
+    // 3) 只覆盖 core 管理的 `RawInode`（156 字节）区，尾区 `[156, inode_size)` 经 RMW 保留盘上
+    //    原值——[对照] 不抹零未建模的 inode 尾字节（ext4 内联 xattr / 未来字段），修 BUG-10。
+    //    `inode_size < 156`（128B inode，无 extra-isize）时只拷盘上容得下的字节。
     let raw_bytes = inode.raw.as_bytes();
     let copy_len = core::cmp::min(inode_size, raw_bytes.len());
     block[offset_in_block..offset_in_block + copy_len].copy_from_slice(&raw_bytes[..copy_len]);
-    if inode_size > copy_len {
-        block[offset_in_block + copy_len..offset_in_block + inode_size].fill(0);
-    }
 
     // 4) 整块经 MetadataWriter 写（handle_id 占位 0，与 Phase-2 分配器一致）。
     let block_id = (block_offset / block_size) as Ext4Fsblk;
     writer.write_metadata_for_handle(0, block_id, &block)
+}
+
+#[cfg(ktest)]
+mod test {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use ostd::prelude::*;
+
+    use super::{inode_disk_pos, load_inode, write_back_inode, RawInode};
+    use crate::fs::ext4::core::io::BlockReader;
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::superblock::RawSuperblock;
+    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+    use crate::prelude::Result;
+    use crate::prelude::*;
+
+    /// 内存盘：读 + 元数据写都打到同一份字节。
+    struct MemImage {
+        bytes: RefCell<Vec<u8>>,
+        block_size: usize,
+    }
+    impl MemImage {
+        fn new(seed: &[u8]) -> Self {
+            let sb = RawSuperblock::from_bytes(&seed[1024..2048]);
+            MemImage {
+                bytes: RefCell::new(seed.to_vec()),
+                block_size: sb.block_size(),
+            }
+        }
+        fn read_bytes(&self, off: usize, len: usize) -> Vec<u8> {
+            let b = self.bytes.borrow();
+            (0..len).map(|i| b.get(off + i).copied().unwrap_or(0)).collect()
+        }
+        fn write_bytes(&self, off: usize, data: &[u8]) {
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(off + i) {
+                    *slot = *byte;
+                }
+            }
+        }
+    }
+    impl BlockReader for MemImage {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl MetadataWriter for MemImage {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            self.write_bytes(block as usize * self.block_size, data);
+            Ok(())
+        }
+    }
+
+    #[ktest]
+    fn write_back_inode_preserves_unmanaged_tail() {
+        // BUG-10：256B inode 的尾区 [156, inode_size) 是 core 不建模区（ext4 内联 xattr / 未来字段）。
+        // write_back_inode 必须**保留**这些字节、不抹零。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let inode_size = sb.inode_size() as usize;
+        assert_eq!(inode_size, 256, "本镜像 inode_size 应为 256");
+        let raw_len = size_of::<RawInode>();
+        assert_eq!(raw_len, 156, "RawInode 应建模 156 字节");
+
+        let ino = 11u32;
+        let pos = inode_disk_pos(&disk, &sb, ino);
+
+        // 在 inode 槽的尾区 [156, 256) 播一段可辨识的非零模式（模拟盘上既存的内联 xattr）。
+        let tail_pattern: Vec<u8> =
+            (0..(inode_size - raw_len)).map(|i| (0xA0 + (i & 0x3f)) as u8).collect();
+        disk.write_bytes(pos + raw_len, &tail_pattern);
+
+        // 加载 → 改一个 core 管理的字段（i_size）→ 写回。
+        let mut inode = load_inode(&disk, &sb, ino).unwrap();
+        inode.set_size(123456);
+        write_back_inode(&disk, &disk, &sb, &mut inode).unwrap();
+
+        // 断言①：尾区字节**原封不动**（这正是 BUG-10 的抹零会破坏的）。
+        let tail_after = disk.read_bytes(pos + raw_len, inode_size - raw_len);
+        assert_eq!(
+            tail_after, tail_pattern,
+            "inode 尾区 [156,256) 必须被保留，不得抹零"
+        );
+
+        // 断言②：core 管理区确实被更新（i_size 写进盘上 RawInode）。
+        let reloaded = load_inode(&disk, &sb, ino).unwrap();
+        assert_eq!(reloaded.size(), 123456, "core 管理的 i_size 必须落盘");
+    }
 }
