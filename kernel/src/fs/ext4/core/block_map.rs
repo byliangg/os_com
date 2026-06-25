@@ -37,7 +37,7 @@ use super::superblock::RawSuperblock;
 ///
 /// [对照] ext4_rs `Ext4::get_pblock_idx_inner`（ext4_impls/inode.rs:255-261）的派发首段。
 #[allow(dead_code)]
-pub(super) fn map_block_for_read(
+pub(in crate::fs::ext4) fn map_block_for_read(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
     inode: &Inode,

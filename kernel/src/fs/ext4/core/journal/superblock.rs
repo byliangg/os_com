@@ -30,7 +30,7 @@ const SB_CHECKSUM_RANGE: core::ops::Range<usize> = 0xFC..0x100;
 /// 的前 `JBD2_SUPERBLOCK_SIZE` 字节 → 解析 → `validate` 的 magic/blocktype 两关；core 侧只做
 /// load + magic/version 两关（block_size/maxlen/first/start 等几何关由调用方/Task 2 用 geom 校验，
 /// 此处保持「能 load + 算法正确」即可）。`physical_blocks[0] * block_size` 折算字节偏移。
-pub(in crate::fs::ext4::core) fn load_journal_sb(
+pub(in crate::fs::ext4) fn load_journal_sb(
     reader: &dyn BlockReader,
     physical_blocks: &[Ext4Fsblk],
     block_size: usize,
@@ -73,7 +73,7 @@ pub(in crate::fs::ext4::core) fn load_journal_sb(
 /// 拷贝 1024 字节 SB 镜像 → 把 `[0xFC..0x100]`（s_checksum 字段）置零 →
 /// `ext4_crc32c(EXT4_CRC32_INIT, &image, image.len())`。**init 0xFFFFFFFF 不取反**。
 /// 返回值是逻辑 csum；写盘时调用方再 `.to_be()` 存入 `s_checksum`。
-pub(in crate::fs::ext4::core) fn journal_sb_checksum(sb_bytes: &[u8; JBD2_SUPERBLOCK_SIZE]) -> u32 {
+pub(in crate::fs::ext4) fn journal_sb_checksum(sb_bytes: &[u8; JBD2_SUPERBLOCK_SIZE]) -> u32 {
     let mut image = *sb_bytes;
     image[SB_CHECKSUM_RANGE].fill(0); // PARITY: 置零 s_checksum 字段再算（含其自身）
     ext4_crc32c(EXT4_CRC32_INIT, &image) // PARITY: init=0xFFFFFFFF, NOT inverted
@@ -84,7 +84,7 @@ pub(in crate::fs::ext4::core) fn journal_sb_checksum(sb_bytes: &[u8; JBD2_SUPERB
 /// PARITY: ext4_rs `build_descriptor_block` csum（mod.rs:309-323）——
 /// `crc32c(EXT4_CRC32_INIT, UUID(16) ++ 整 descriptor 块)`，其中 descriptor 块的 tail csum
 /// 字段在计算时**仍为零**（调用方先零填 tail、算完再写回）。种子=journal UUID。
-pub(in crate::fs::ext4::core) fn descriptor_tail_csum(uuid: &[u8; 16], descriptor_block: &[u8]) -> u32 {
+pub(in crate::fs::ext4) fn descriptor_tail_csum(uuid: &[u8; 16], descriptor_block: &[u8]) -> u32 {
     let mut csum_data = Vec::with_capacity(16 + descriptor_block.len());
     csum_data.extend_from_slice(uuid); // PARITY: 种子 = journal UUID（大端无关，原样 16 字节）
     csum_data.extend_from_slice(descriptor_block); // PARITY: 整块，tail csum 字段置零时算
@@ -97,7 +97,7 @@ pub(in crate::fs::ext4::core) fn descriptor_tail_csum(uuid: &[u8; 16], descripto
 /// `crc32c(EXT4_CRC32_INIT, UUID(16) ++ sequence(4 大端字节) ++ 未 escape 的原始块数据)`。
 /// `sequence.to_be_bytes()` 是标量整数的大端字节编码（**非** on-disk 结构解析，允许）。
 /// 注意喂的是**原始**块（escape 还原前）——见 ext4_rs escape 在 csum 之后才置零首 4 字节。
-pub(in crate::fs::ext4::core) fn tag_data_csum(uuid: &[u8; 16], sequence: u32, orig_block_data: &[u8]) -> u32 {
+pub(in crate::fs::ext4) fn tag_data_csum(uuid: &[u8; 16], sequence: u32, orig_block_data: &[u8]) -> u32 {
     let mut csum_data = Vec::with_capacity(16 + 4 + orig_block_data.len());
     csum_data.extend_from_slice(uuid); // PARITY: 种子 = journal UUID
     csum_data.extend_from_slice(&sequence.to_be_bytes()); // PARITY: seq 大端 4 字节
@@ -111,7 +111,7 @@ pub(in crate::fs::ext4::core) fn tag_data_csum(uuid: &[u8; 16], sequence: u32, o
 /// `crc32c(EXT4_CRC32_INIT, UUID(16) ++ CommitBlock 结构字节)`，其中 `h_chksum[0]`
 /// 在计算时**仍为零**（先建 commit、算 csum、再 `with_checksum` 写回 h_chksum[0]）。
 /// `commit_block` 应为 `size_of::<RawCommitBlock>()`（64 字节）的结构字节，**非**整块。
-pub(in crate::fs::ext4::core) fn commit_block_csum(uuid: &[u8; 16], commit_block: &[u8]) -> u32 {
+pub(in crate::fs::ext4) fn commit_block_csum(uuid: &[u8; 16], commit_block: &[u8]) -> u32 {
     let mut csum_data = Vec::with_capacity(16 + commit_block.len());
     csum_data.extend_from_slice(uuid); // PARITY: 种子 = journal UUID
     csum_data.extend_from_slice(commit_block); // PARITY: CommitBlock 字节，h_chksum[0] 置零时算

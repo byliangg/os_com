@@ -42,21 +42,21 @@ const EXT4_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 /// 字段名/序/类型逐字对齐 ext4_rs `SimpleBlockRange`（simple_interface/mod.rs:85），
 /// 集成层二分依赖：`len` 单位 = **块**，映射向量按 `lblock` **升序**。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SimpleBlockRange {
+pub(in crate::fs::ext4) struct SimpleBlockRange {
     pub lblock: u32,
     pub pblock: u64,
     pub len: u32,
 }
 
 /// 只读上下文：块设备读接缝 + 超级块 + 块大小。core 读路径全经它，**不获取全局锁**。
-pub(super) struct ReadCtx<'a> {
+pub(in crate::fs::ext4) struct ReadCtx<'a> {
     pub reader: &'a dyn BlockReader,
     pub sb: &'a RawSuperblock,
     pub block_size: usize,
 }
 
 impl<'a> ReadCtx<'a> {
-    pub(super) fn new(reader: &'a dyn BlockReader, sb: &'a RawSuperblock) -> Self {
+    pub(in crate::fs::ext4) fn new(reader: &'a dyn BlockReader, sb: &'a RawSuperblock) -> Self {
         let block_size = sb.block_size();
         Self {
             reader,
@@ -217,7 +217,7 @@ fn collect_block_ranges(
 /// `map_blocks`：解析 `[lblock_start, +lblock_count)` 为升序 coalesce 的映射向量。
 /// 逐位复刻 ext4_rs `map_blocks`（file.rs:793）= `collect_block_ranges`。
 #[allow(dead_code)]
-pub(super) fn map_blocks(
+pub(in crate::fs::ext4) fn map_blocks(
     ctx: &ReadCtx,
     inode: &Inode,
     lblock_start: u32,
@@ -229,7 +229,7 @@ pub(super) fn map_blocks(
 /// `plan_direct_read`：clamp 到 file_size、floor 到整块，返回 `(direct_len, 升序映射)`。
 /// 逐位复刻 ext4_rs `plan_direct_read`（file.rs:803）。
 #[allow(dead_code)]
-pub(super) fn plan_direct_read(
+pub(in crate::fs::ext4) fn plan_direct_read(
     ctx: &ReadCtx,
     inode: &Inode,
     offset: usize,
@@ -265,7 +265,7 @@ pub(super) fn plan_direct_read(
 /// 命中 → 读整块、取 `[inner, inner+len)`；hole/unwritten（None）→ `fill(0)`；
 /// 物理块越 usize/整块乘溢出 → EIO。
 #[allow(dead_code)]
-pub(super) fn read_at(
+pub(in crate::fs::ext4) fn read_at(
     ctx: &ReadCtx,
     inode: &Inode,
     offset: usize,
@@ -331,7 +331,7 @@ pub(super) fn read_at(
 /// 便捷入口：按 inode 号加载 inode 后 `read_at`（差分用例用，对齐 ext4_rs
 /// `read_at(inode_num, ...)` 的签名形状）。
 #[allow(dead_code)]
-pub(super) fn read_at_by_ino(
+pub(in crate::fs::ext4) fn read_at_by_ino(
     ctx: &ReadCtx,
     inode_num: u32,
     offset: usize,
@@ -633,7 +633,7 @@ fn initial_write_alloc_bgid(ctx: &WriteCtx, inode: &Inode, lblock_start: u32, lb
 ///
 /// 流程：预扫 hole/unwritten → `ensure_write_range_mapped`（分配 + 转换）→ 新映射块零填 →
 /// 不对齐头 RMW + 整块 run 写 + 尾 RMW → 长 i_size + `write_back_inode`。
-pub(super) fn write_at(
+pub(in crate::fs::ext4) fn write_at(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -767,7 +767,7 @@ pub(super) fn write_at(
 ///
 /// **全已分配快路径**：一遍探测，全已分配（含 unwritten）则转换 unwritten + 零填，跳过分配，
 /// 据探测记录直接建映射；任一 hole → fall through 走通用分配路径。
-pub(super) fn prepare_write_at(
+pub(in crate::fs::ext4) fn prepare_write_at(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -907,7 +907,7 @@ pub(super) fn prepare_write_at(
 /// `allocate_range`：为 `[offset, offset+len)` 分配/转换块，曾经 hole/unwritten 的块零填；
 /// `keep_size` 控制是否长 i_size。返回该逻辑区间的 coalesce 映射向量。
 /// 逐字节复刻 ext4_rs `allocate_range`（file.rs:1415）。
-pub(super) fn allocate_range(
+pub(in crate::fs::ext4) fn allocate_range(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -982,7 +982,7 @@ pub(super) fn allocate_range(
 
 /// `zero_range`：`allocate_range`(`keep_size`) 后零写可见区，返回零写字节数。
 /// 逐字节复刻 ext4_rs `zero_range`（file.rs:1487）。
-pub(super) fn zero_range(
+pub(in crate::fs::ext4) fn zero_range(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -1020,7 +1020,7 @@ pub(super) fn zero_range(
 ///
 /// PARITY: 刻意简化——名副其实 keep_size，只把 `[offset, min(offset+len, file_size))` 写零，
 /// **不**回收物理块（非真 FALLOC_FL_PUNCH_HOLE；登记 bug.md）。
-pub(super) fn punch_hole_keep_size(
+pub(in crate::fs::ext4) fn punch_hole_keep_size(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -1080,7 +1080,7 @@ const EXT_MAX_BLOCKS: u32 = u32::MAX;
 /// PARITY（控制器澄清）：core `truncate_inode` 本身**干净**——bug.md 的「truncate size-clamp」
 /// 实指集成层 `write_page_async` 的 PageCache 写回 clamp（C4），不在本函数内。这里只逐字节
 /// 复刻这个干净的 truncate。**仅 extent 缩路径**；legacy（间接映射）缩不在本 Phase 范围。
-pub(super) fn truncate_inode(
+pub(in crate::fs::ext4) fn truncate_inode(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,

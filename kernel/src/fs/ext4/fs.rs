@@ -875,7 +875,10 @@ struct DeviceBlockCacheStats {
     invalidations: AtomicU64,
 }
 
-struct KernelBlockDeviceAdapter {
+// Phase 6 Task 0: widened to `pub(super)` so the sibling `core_adapter` module can wrap the
+// real-device home-read/write path (`read_offset_into` / `write_offset`) behind core's
+// `BlockReader` / `BlockWriter`. No call site changed; only the type is nameable now.
+pub(super) struct KernelBlockDeviceAdapter {
     inner: Arc<dyn BlockDevice>,
     io_failure_epoch: AtomicU64,
     block_cache: Mutex<DeviceBlockCache>,
@@ -1147,7 +1150,9 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
     }
 }
 
-struct JournalIoBridge {
+// Phase 6 Task 0: widened to `pub(super)` so `core_adapter` can route core reads through the
+// overlay bridge (`read_offset_into` = home + uncommitted-journal overlay = read-your-writes).
+pub(super) struct JournalIoBridge {
     adapter: Arc<KernelBlockDeviceAdapter>,
     runtime: Arc<RwMutex<Option<JournalRuntime>>>,
 }

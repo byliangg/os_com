@@ -7,10 +7,10 @@ use super::superblock::RawSuperblock;
 
 /// 最小组描述符尺寸（32 字节，无 _hi 字段）。`desc_size > 此值` 才读写 _hi 半。
 /// [对照] ext4_rs `EXT4_MIN_BLOCK_GROUP_DESCRIPTOR_SIZE`（consts.rs:34）。
-pub(super) const EXT4_MIN_DESC_SIZE: u16 = 32;
+pub(in crate::fs::ext4) const EXT4_MIN_DESC_SIZE: u16 = 32;
 /// 最大组描述符尺寸（64 字节，含 _hi 字段）。位图 csum 高半仅在 `desc_size == 此值` 时写。
 /// [对照] ext4_rs `EXT4_MAX_BLOCK_GROUP_DESCRIPTOR_SIZE`（consts.rs:35）。
-pub(super) const EXT4_MAX_DESC_SIZE: u16 = 64;
+pub(in crate::fs::ext4) const EXT4_MAX_DESC_SIZE: u16 = 64;
 
 /// `features_read_only` 中的 metadata_csum 位（RO-compat 0x400）。门控位图 csum 写入。
 const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
@@ -25,7 +25,7 @@ const GROUP_DESC_CHECKSUM_OFFSET: usize = 0x1e;
 /// ext4 on-disk 组描述符（64 字节，小端，packed）。
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawGroupDescriptor {
+pub(in crate::fs::ext4) struct RawGroupDescriptor {
     pub block_bitmap_lo: u32,
     pub inode_bitmap_lo: u32,
     pub inode_table_first_block_lo: u32,
@@ -86,7 +86,7 @@ impl RawGroupDescriptor {
     /// 取空闲块计数（u64）。注意 set 在 bit16 拆分而 get 在 bit32 重组——**不对称怪癖**，
     /// 且仅 `hi != 0` 时才 OR hi（原样复刻）。
     /// [对照] ext4_rs `get_free_blocks_count`（block_group.rs:234-240）。
-    pub(super) fn get_free_blocks_count(&self) -> u64 {
+    pub(in crate::fs::ext4) fn get_free_blocks_count(&self) -> u64 {
         let lo = self.free_blocks_count_lo;
         let hi = self.free_blocks_count_hi;
         let mut v = lo as u64;
@@ -100,14 +100,14 @@ impl RawGroupDescriptor {
 
     /// 写空闲块计数（lo = cnt&0xffff, hi = cnt>>16）。hi 无条件写（不看 desc_size）。
     /// [对照] ext4_rs `set_free_blocks_count`（block_group.rs:243-246）。
-    pub(super) fn set_free_blocks_count(&mut self, cnt: u32) {
+    pub(in crate::fs::ext4) fn set_free_blocks_count(&mut self, cnt: u32) {
         self.free_blocks_count_lo = (cnt & 0xffff) as u16;
         self.free_blocks_count_hi = (cnt >> 16) as u16;
     }
 
     /// 取空闲 inode 计数。
     /// [对照] ext4_rs `get_free_inodes_count`（block_group.rs:131-133）。
-    pub(super) fn get_free_inodes_count(&self) -> u32 {
+    pub(in crate::fs::ext4) fn get_free_inodes_count(&self) -> u32 {
         let lo = self.free_inodes_count_lo;
         let _hi = self.free_inodes_count_hi;
         // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
@@ -117,7 +117,7 @@ impl RawGroupDescriptor {
 
     /// 写空闲 inode 计数（lo = cnt&0xffff；hi 仅 desc_size>min 时写 cnt>>16）。
     /// [对照] ext4_rs `set_free_inodes_count`（block_group.rs:123-128）。
-    pub(super) fn set_free_inodes_count(&mut self, sb: &RawSuperblock, cnt: u32) {
+    pub(in crate::fs::ext4) fn set_free_inodes_count(&mut self, sb: &RawSuperblock, cnt: u32) {
         self.free_inodes_count_lo = (cnt & 0xffff) as u16;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
             self.free_inodes_count_hi = (cnt >> 16) as u16;
@@ -126,7 +126,7 @@ impl RawGroupDescriptor {
 
     /// 取已用目录数。
     /// [对照] ext4_rs `get_used_dirs_count`（block_group.rs:98-104）。
-    pub(super) fn get_used_dirs_count(&self, sb: &RawSuperblock) -> u32 {
+    pub(in crate::fs::ext4) fn get_used_dirs_count(&self, sb: &RawSuperblock) -> u32 {
         let lo = self.used_dirs_count_lo;
         let hi = self.used_dirs_count_hi;
         let mut v = lo as u32;
@@ -140,7 +140,7 @@ impl RawGroupDescriptor {
 
     /// 写已用目录数。
     /// [对照] ext4_rs `set_used_dirs_count`（block_group.rs:107-112）。
-    pub(super) fn set_used_dirs_count(&mut self, sb: &RawSuperblock, cnt: u32) {
+    pub(in crate::fs::ext4) fn set_used_dirs_count(&mut self, sb: &RawSuperblock, cnt: u32) {
         // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
         // ext4_rs 此函数误写进 itable_unused_lo/hi，而非 used_dirs_count_lo/hi —— 原样复刻。
         self.itable_unused_lo = (cnt & 0xffff) as u16;
@@ -151,7 +151,7 @@ impl RawGroupDescriptor {
 
     /// 取未用 inode 计数（itable_unused）。
     /// [对照] ext4_rs `get_itable_unused`（block_group.rs:89-95）。
-    pub(super) fn get_itable_unused(&self, sb: &RawSuperblock) -> u32 {
+    pub(in crate::fs::ext4) fn get_itable_unused(&self, sb: &RawSuperblock) -> u32 {
         let lo = self.itable_unused_lo;
         let hi = self.itable_unused_hi;
         let mut v = lo as u32;
@@ -165,7 +165,7 @@ impl RawGroupDescriptor {
 
     /// 写未用 inode 计数（itable_unused）。
     /// [对照] ext4_rs `set_itable_unused`（block_group.rs:115-120）。
-    pub(super) fn set_itable_unused(&mut self, sb: &RawSuperblock, cnt: u32) {
+    pub(in crate::fs::ext4) fn set_itable_unused(&mut self, sb: &RawSuperblock, cnt: u32) {
         // 注：与 set_used_dirs_count 同样写 itable_unused —— ext4_rs 两个 setter 实现相同。
         self.itable_unused_lo = (cnt & 0xffff) as u16;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
@@ -174,7 +174,7 @@ impl RawGroupDescriptor {
     }
 
     /// 当前 checksum 字段（供测试/校验对拍）。
-    pub(super) fn checksum(&self) -> u16 {
+    pub(in crate::fs::ext4) fn checksum(&self) -> u16 {
         self.checksum
     }
 
@@ -186,7 +186,7 @@ impl RawGroupDescriptor {
     /// 计算组描述符 crc16：`crc32c(uuid) → crc32c(le bgid) → crc32c(desc_bytes[..desc_size])`，
     /// 取低 16 位；计算前把 checksum 字段置 0（在字节副本上操作，不改 self）。
     /// [对照] ext4_rs `get_block_group_checksum`（block_group.rs:145-176）。
-    pub(super) fn compute_checksum(&self, bgid: u32, sb: &RawSuperblock) -> u16 {
+    pub(in crate::fs::ext4) fn compute_checksum(&self, bgid: u32, sb: &RawSuperblock) -> u16 {
         // 用 clamped desc_size（ext4_rs `super_block.desc_size()` 把 <32 夹到 32）。
         let desc_size = sb.group_desc_size();
         // 在 64 字节副本上把 checksum 字段清零（ext4_rs 临时清 self.checksum 再恢复，等价）。
@@ -204,13 +204,13 @@ impl RawGroupDescriptor {
 
     /// 计算并写入组描述符校验和。
     /// [对照] ext4_rs `set_block_group_checksum`（block_group.rs:200-203）。
-    pub(super) fn set_checksum(&mut self, bgid: u32, sb: &RawSuperblock) {
+    pub(in crate::fs::ext4) fn set_checksum(&mut self, bgid: u32, sb: &RawSuperblock) {
         self.checksum = self.compute_checksum(bgid, sb);
     }
 
     /// 写块分配位图校验和。门控 RO-compat metadata_csum；高半仅 desc_size==64 时写。
     /// [对照] ext4_rs `set_block_group_balloc_bitmap_csum`（block_group.rs:217-231）。
-    pub(super) fn set_block_bitmap_csum(&mut self, sb: &RawSuperblock, bitmap: &[u8]) {
+    pub(in crate::fs::ext4) fn set_block_bitmap_csum(&mut self, sb: &RawSuperblock, bitmap: &[u8]) {
         let desc_size = sb.group_desc_size() as u16;
         let csum = sb.balloc_bitmap_csum(bitmap);
         let lo_csum = (csum & 0xFFFF) as u16;
@@ -228,7 +228,7 @@ impl RawGroupDescriptor {
 
     /// 写 inode 分配位图校验和。门控同上。
     /// [对照] ext4_rs `set_block_group_ialloc_bitmap_csum`（block_group.rs:250-264）。
-    pub(super) fn set_inode_bitmap_csum(&mut self, sb: &RawSuperblock, bitmap: &[u8]) {
+    pub(in crate::fs::ext4) fn set_inode_bitmap_csum(&mut self, sb: &RawSuperblock, bitmap: &[u8]) {
         let desc_size = sb.group_desc_size() as u16;
         let csum = sb.ialloc_bitmap_csum(bitmap);
         let lo_csum = (csum & 0xFFFF) as u16;
@@ -248,7 +248,7 @@ impl RawGroupDescriptor {
 /// 镜像 ext4_rs `SystemZone`（ext4_defs/ext4.rs:7）；alloc/free 用它判断块是否可分配。
 /// 本结构与 ext4_rs 同布局，但只承载 helper 所需字段（纯几何计算，不碰盘）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SystemZone {
+pub(in crate::fs::ext4) struct SystemZone {
     pub group: u32,
     pub start_blk: u64,
     pub end_blk: u64,
@@ -263,18 +263,18 @@ pub(super) struct SystemZone {
 /// 保持纯函数、不碰盘（保留区列表的构建在 Phase 2 后续 task 落地）。
 ///
 /// [对照来源] ext4_rs/src/ext4_impls/balloc.rs:176-257,689-1037 + inode.rs:164-170
-pub(super) struct GroupGeometry<'a> {
+pub(in crate::fs::ext4) struct GroupGeometry<'a> {
     sb: &'a RawSuperblock,
 }
 
 impl<'a> GroupGeometry<'a> {
-    pub(super) fn new(sb: &'a RawSuperblock) -> Self {
+    pub(in crate::fs::ext4) fn new(sb: &'a RawSuperblock) -> Self {
         Self { sb }
     }
 
     /// 块地址 → 组号。`first_data_block != 0 && baddr != 0` 时先减 1。
     /// [对照] ext4_rs `get_bgid_of_block`（balloc.rs:203-209）。
-    pub(super) fn get_bgid_of_block(&self, baddr: u64) -> u32 {
+    pub(in crate::fs::ext4) fn get_bgid_of_block(&self, baddr: u64) -> u32 {
         let mut baddr = baddr;
         if self.sb.first_data_block() != 0 && baddr != 0 {
             baddr -= 1;
@@ -284,7 +284,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 组号 → 组首块地址。`first_data_block != 0` 时基址 +1。
     /// [对照] ext4_rs `get_block_of_bgid`（balloc.rs:218-224）。
-    pub(super) fn get_block_of_bgid(&self, bgid: u32) -> u64 {
+    pub(in crate::fs::ext4) fn get_block_of_bgid(&self, bgid: u32) -> u64 {
         let mut baddr = 0u64;
         if self.sb.first_data_block() != 0 {
             baddr += 1;
@@ -294,7 +294,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 块地址 → 组内相对下标。`first_data_block != 0 && baddr != 0` 时先减 1。
     /// [对照] ext4_rs `addr_to_idx_bg`（balloc.rs:233-239）。
-    pub(super) fn addr_to_idx_bg(&self, baddr: u64) -> u32 {
+    pub(in crate::fs::ext4) fn addr_to_idx_bg(&self, baddr: u64) -> u32 {
         let mut baddr = baddr;
         if self.sb.first_data_block() != 0 && baddr != 0 {
             baddr -= 1;
@@ -304,7 +304,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 组内相对下标 → 绝对块地址。`first_data_block != 0` 时下标 +1。
     /// [对照] ext4_rs `bg_idx_to_addr`（balloc.rs:251-257）。
-    pub(super) fn bg_idx_to_addr(&self, index: u32, bgid: u32) -> Ext4Fsblk {
+    pub(in crate::fs::ext4) fn bg_idx_to_addr(&self, index: u32, bgid: u32) -> Ext4Fsblk {
         let mut index = index;
         if self.sb.first_data_block() != 0 {
             index += 1;
@@ -314,25 +314,25 @@ impl<'a> GroupGeometry<'a> {
 
     /// inode 号 → 组号。
     /// [对照] ext4_rs `get_bgid_of_inode`（inode.rs:164-166）。
-    pub(super) fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
+    pub(in crate::fs::ext4) fn get_bgid_of_inode(&self, inode_num: u32) -> u32 {
         inode_num.saturating_sub(1) / self.sb.inodes_per_group()
     }
 
     /// inode 号 → 组内下标。
     /// [对照] ext4_rs `inode_to_bgidx`（inode.rs:168-170）。
-    pub(super) fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
+    pub(in crate::fs::ext4) fn inode_to_bgidx(&self, inode_num: u32) -> u32 {
         inode_num.saturating_sub(1) % self.sb.inodes_per_group()
     }
 
     /// 组首块的组内下标。ext4_rs 内联为 `addr_to_idx_bg(get_block_of_bgid(bgid))`。
     /// [对照] ext4_rs balloc.rs:314-315（内联表达式）。
-    pub(super) fn first_in_bg_index(&self, bgid: u32) -> u32 {
+    pub(in crate::fs::ext4) fn first_in_bg_index(&self, bgid: u32) -> u32 {
         self.addr_to_idx_bg(self.get_block_of_bgid(bgid))
     }
 
     /// 该组是否带超级块备份（group 0 或 3/5/7 的幂）。
     /// [对照] ext4_rs `ext4_bg_has_super`（balloc.rs:996-1007）。
-    pub(super) fn ext4_bg_has_super(&self, group: u32) -> bool {
+    pub(in crate::fs::ext4) fn ext4_bg_has_super(&self, group: u32) -> bool {
         if group == 0 {
             return true;
         }
@@ -347,7 +347,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 该组的 GDT 块数。
     /// [对照] ext4_rs `ext4_bg_num_gdb`（balloc.rs:1017-1036）。
-    pub(super) fn ext4_bg_num_gdb(&self, group: u32) -> u32 {
+    pub(in crate::fs::ext4) fn ext4_bg_num_gdb(&self, group: u32) -> u32 {
         let sb = self.sb;
         let group_count = sb.block_group_count();
         let block_size = sb.block_size() as u64;
@@ -372,7 +372,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 该组的基础元数据块数（有 super 备份则 `1 + gdt`，否则 0）。
     /// [对照] ext4_rs `num_base_meta_blocks`（balloc.rs:984-993）。
-    pub(super) fn num_base_meta_blocks(&self, bgid: u32) -> u32 {
+    pub(in crate::fs::ext4) fn num_base_meta_blocks(&self, bgid: u32) -> u32 {
         let has_super = self.ext4_bg_has_super(bgid);
         let gdt_blocks = self.ext4_bg_num_gdb(bgid);
         if has_super {
@@ -384,7 +384,7 @@ impl<'a> GroupGeometry<'a> {
 
     /// 块是否落在系统保留区。`zones` 为 None（缓存未建）时一律返回 false。
     /// [对照] ext4_rs `is_system_reserved_block`（balloc.rs:689-704）。
-    pub(super) fn is_system_reserved_block(
+    pub(in crate::fs::ext4) fn is_system_reserved_block(
         &self,
         block_num: u64,
         zones: Option<&[SystemZone]>,
@@ -403,7 +403,7 @@ impl<'a> GroupGeometry<'a> {
     /// 组内首个「非保留」候选下标：从组首块下标起，越过本组各保留区尾部。
     /// `zones` 为 None 时即组首块下标（ext4_rs 在 cache 未建时同此）。
     /// [对照] ext4_rs `first_non_reserved_idx_in_group`（balloc.rs:176-193）。
-    pub(super) fn first_non_reserved_idx_in_group(
+    pub(in crate::fs::ext4) fn first_non_reserved_idx_in_group(
         &self,
         bgid: u32,
         zones: Option<&[SystemZone]>,

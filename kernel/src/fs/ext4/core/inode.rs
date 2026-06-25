@@ -11,12 +11,12 @@ use super::superblock::RawSuperblock;
 /// `i_flags` 中的 extent 标志位（INODE uses extents）。
 /// [对照] ext4_rs `EXT4_INODE_FLAG_EXTENTS`（ext4_defs/consts.rs:21）= `0x00080000`。
 /// core 自定义同值常量（`as u32`），不依赖 ext4_rs。
-pub(super) const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
+pub(in crate::fs::ext4) const EXT4_INODE_FLAG_EXTENTS: u32 = 0x0008_0000;
 
 /// ext4 on-disk inode 的 OS-dependent #2 区（Linux 变体，12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawOsd2 {
+pub(in crate::fs::ext4) struct RawOsd2 {
     pub l_i_blocks_high: u16,
     pub l_i_file_acl_high: u16,
     pub l_i_uid_high: u16,
@@ -30,7 +30,7 @@ pub(super) struct RawOsd2 {
 /// block:[u32;15] 兼作 extent 树根（接缝4，本阶段只保字节、不解释）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawInode {
+pub(in crate::fs::ext4) struct RawInode {
     pub mode: u16,
     pub uid: u16,
     pub size: u32,
@@ -144,7 +144,7 @@ impl RawInode {
 /// 5. 把 inode 的**前 0x9c = 156 字节**拷进 256 字节零缓冲（其余 100 字节保持 0）；
 /// 6. `c = crc32c(c, &raw_data[..inode_size])`（覆盖 156 真实 + 100 零字节）；
 /// 7. `if inode_size == 128 { c &= 0xFFFF }`。
-pub(super) fn inode_checksum(raw: &RawInode, inode_id: u32, sb: &RawSuperblock) -> u32 {
+pub(in crate::fs::ext4) fn inode_checksum(raw: &RawInode, inode_id: u32, sb: &RawSuperblock) -> u32 {
     let inode_size = sb.inode_size() as usize;
 
     // 1) 本地拷贝（不动入参 raw），在拷贝上清零 csum lo/hi——与 ext4_rs 在算前
@@ -183,7 +183,7 @@ pub(super) fn inode_checksum(raw: &RawInode, inode_id: u32, sb: &RawSuperblock) 
 
 /// 算出 csum 后写回 `raw` 的 lo/hi 字段，对齐 ext4_rs `set_inode_checksum`（`inode.rs:461`）：
 /// `osd2.l_i_checksum_lo = c & 0xFFFF`；`if inode_size > 128 { i_checksum_hi = c >> 16 }`。
-pub(super) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &RawSuperblock) {
+pub(in crate::fs::ext4) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &RawSuperblock) {
     let c = inode_checksum(raw, inode_id, sb);
     raw.osd2.l_i_checksum_lo = (c & 0xFFFF) as u16;
     if sb.inode_size() > 128 {
@@ -194,33 +194,33 @@ pub(super) fn write_inode_checksum_into(raw: &mut RawInode, inode_id: u32, sb: &
 /// inode 逻辑句柄：盘上 [`RawInode`] + inode 号。对齐 ext2 `InodeDesc`↔`RawInode` 与
 /// ext4_rs `Ext4InodeRef { inode_num, inode }`。逻辑访问器委托 [`RawInode`]，不重复定义
 /// `size()`/`blocks()` 等已有 accessor。
-pub(super) struct Inode {
+pub(in crate::fs::ext4) struct Inode {
     pub raw: RawInode,
     pub num: u32,
 }
 
 impl Inode {
     /// inode 标志位（委托 [`RawInode::flags`]）。
-    pub(super) fn flags(&self) -> u32 {
+    pub(in crate::fs::ext4) fn flags(&self) -> u32 {
         self.raw.flags()
     }
     /// 文件大小（委托 [`RawInode::size`]）。
-    pub(super) fn size(&self) -> u64 {
+    pub(in crate::fs::ext4) fn size(&self) -> u64 {
         self.raw.size()
     }
     /// 写文件大小（委托 [`RawInode::set_size`]）。
-    pub(super) fn set_size(&mut self, size: u64) {
+    pub(in crate::fs::ext4) fn set_size(&mut self, size: u64) {
         self.raw.set_size(size);
     }
     /// inode generation（委托 [`RawInode::generation`]）。
     /// 对称访问器，当前 core 路径用 `raw.generation()`，本包装暂无调用者（保留以备目录/属性路径）。
     #[allow(dead_code)]
-    pub(super) fn generation(&self) -> u32 {
+    pub(in crate::fs::ext4) fn generation(&self) -> u32 {
         self.raw.generation()
     }
     /// 是否 extent 映射：`(flags() & EXT4_INODE_FLAG_EXTENTS) != 0`。
     /// [对照] ext4_rs `Ext4::inode_uses_extents`（ext4_impls/inode.rs:14）。
-    pub(super) fn uses_extents(&self) -> bool {
+    pub(in crate::fs::ext4) fn uses_extents(&self) -> bool {
         (self.flags() & EXT4_INODE_FLAG_EXTENTS) != 0
     }
 
@@ -229,7 +229,7 @@ impl Inode {
     /// 安全替代 ext4_rs `find_extent` 里的 `transmute::<&[u32;15], &[u8;60]>`
     /// （ext4_impls/extents.rs:188）：`[u32;15]` 是 Pod，`as_bytes()` 给出其
     /// 60 字节小端镜像，与 transmute 逐字节等价。
-    pub(super) fn i_block_bytes(&self) -> [u8; 60] {
+    pub(in crate::fs::ext4) fn i_block_bytes(&self) -> [u8; 60] {
         let block = self.raw.i_block();
         let mut out = [0u8; 60];
         out.copy_from_slice(block.as_bytes());
@@ -237,13 +237,13 @@ impl Inode {
     }
 
     /// i_block 的 60 字节作 `Vec`（写半部要可变 buffer 做移位/改 extent）。
-    pub(super) fn i_block_bytes_vec(&self) -> Vec<u8> {
+    pub(in crate::fs::ext4) fn i_block_bytes_vec(&self) -> Vec<u8> {
         self.i_block_bytes().to_vec()
     }
 
     /// 把 60 字节写回 `raw.block: [u32;15]`（安全 Pod，替代 ext4_rs 裸指针改 i_block）。
     /// `bytes` 必须恰 60 字节（一个 [u32;15] 的字节镜像）。
-    pub(super) fn set_i_block_bytes(&mut self, bytes: &[u8]) {
+    pub(in crate::fs::ext4) fn set_i_block_bytes(&mut self, bytes: &[u8]) {
         debug_assert_eq!(bytes.len(), 60, "i_block must be 60 bytes");
         let block: [u32; 15] = Pod::from_bytes(bytes);
         self.raw.block = block;
@@ -251,30 +251,30 @@ impl Inode {
 
     /// 写 i_blocks（512B 单位）：lo = blocks & 0xffffffff，hi = blocks >> 32。
     /// [对照] ext4_rs `Ext4Inode::set_blocks_count`（i_blocks 累加用）。
-    pub(super) fn set_blocks_count(&mut self, blocks: u64) {
+    pub(in crate::fs::ext4) fn set_blocks_count(&mut self, blocks: u64) {
         self.raw.blocks = (blocks & 0xffff_ffff) as u32;
         self.raw.osd2.l_i_blocks_high = (blocks >> 32) as u16;
     }
 
     /// 读 i_blocks（512B 单位，委托 [`RawInode::blocks`]）。
-    pub(super) fn blocks_count(&self) -> u64 {
+    pub(in crate::fs::ext4) fn blocks_count(&self) -> u64 {
         self.raw.blocks()
     }
 
     /// 链接计数（委托 [`RawInode::links_count`]）。
-    pub(super) fn links_count(&self) -> u16 {
+    pub(in crate::fs::ext4) fn links_count(&self) -> u16 {
         self.raw.links_count()
     }
     /// 写链接计数（委托 [`RawInode::set_links_count`]）。
-    pub(super) fn set_links_count(&mut self, n: u16) {
+    pub(in crate::fs::ext4) fn set_links_count(&mut self, n: u16) {
         self.raw.set_links_count(n);
     }
     /// 文件类型位（mode & 0xF000，委托 [`RawInode::file_type`]）。
-    pub(super) fn file_type(&self) -> u16 {
+    pub(in crate::fs::ext4) fn file_type(&self) -> u16 {
         self.raw.file_type()
     }
     /// 是否目录（委托 [`RawInode::is_dir`]）。
-    pub(super) fn is_dir(&self) -> bool {
+    pub(in crate::fs::ext4) fn is_dir(&self) -> bool {
         self.raw.is_dir()
     }
 }
@@ -291,7 +291,7 @@ impl Inode {
 /// - extra_isize：仅 `inode_size > 128` 时设为 SB 的 `want_extra_isize`。
 /// - dir 或 reg：flags = EXTENTS(0x80000)，extent header = {magic:0xF30A, entries:0, max:4,
 ///   depth:0, generation:0} 写在 i_block 前 12 字节；其余 i_block 字节保持 0。其它类型 flags=0。
-pub(super) fn init_new_inode(inode_num: u32, inode_mode: u16, sb: &RawSuperblock) -> Inode {
+pub(in crate::fs::ext4) fn init_new_inode(inode_num: u32, inode_mode: u16, sb: &RawSuperblock) -> Inode {
     const EXT4_INODE_MODE_TYPE_MASK: u16 = 0xF000;
     const EXT4_INODE_MODE_PERM_MASK: u16 = 0x0FFF;
     const S_IFREG: u16 = 0x8000;
@@ -385,7 +385,7 @@ fn load_group_desc(reader: &dyn BlockReader, sb: &RawSuperblock, group: u32) -> 
 /// ext4_rs 读 `self.inode_table_blocks[group]`（启动期缓存）；该缓存即各组描述符的
 /// `get_inode_table_blk_num()`（ext4_impls/ext4.rs:90-98），故此处直接从盘读该组描述符
 /// 取 `inode_table()`，字节等价、且不引入全局缓存/单例。
-pub(super) fn inode_disk_pos(
+pub(in crate::fs::ext4) fn inode_disk_pos(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
     inode_num: u32,
@@ -413,7 +413,7 @@ fn validate_inode_number(sb: &RawSuperblock, inode_num: u32) -> Result<()> {
 /// [对照] ext4_rs `Ext4::get_inode_ref`（ext4_impls/inode.rs:213）——先 `validate_inode_number`，
 /// 再读 `inode_disk_pos` 所在对齐块、取块内偏移处的 inode 镜像。core 用注入的
 /// `&dyn BlockReader`（不持全局盘）。
-pub(super) fn load_inode(
+pub(in crate::fs::ext4) fn load_inode(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
     inode_num: u32,
@@ -449,7 +449,7 @@ pub(super) fn load_inode(
 /// 依赖 RMW 保留）。整块用 RMW 是为了保留**同块内其它 inode** 的字节，不是为了保留本 inode 的
 /// 尾区。语义上这丢弃了未建模的 inode 尾字节（标准 mkfs 镜像该区本就是 0，故无感）；登记
 /// 根目录 `bug.md` BUG-10，迁移后评估。
-pub(super) fn write_back_inode(
+pub(in crate::fs::ext4) fn write_back_inode(
     writer: &dyn MetadataWriter,
     reader: &dyn BlockReader,
     sb: &RawSuperblock,

@@ -51,7 +51,7 @@ use super::superblock::journal_sb_checksum;
 /// （recovery.rs:61）与 SB store `device.write_block(0, sb_bytes)`→`write_offset(physical_blocks[0]*bs, padded)`
 /// （device.rs:146-166 / superblock.rs:155-162）。**注意**：home / SB 写**不经** JBD2 `MetadataWriter`
 /// 记账接缝——recovery 是 replay 直写盘，不再记账（与 ext4_rs 一致）。
-pub(in crate::fs::ext4::core) struct RecoverCtx<'a> {
+pub(in crate::fs::ext4) struct RecoverCtx<'a> {
     /// journal inode 的物理块向量：`physical_blocks[i]` = journal 逻辑块 i 的 fs 物理块号。
     pub physical_blocks: &'a [Ext4Fsblk],
     /// journal 块读接缝（差分里 `MemDisk` 直读同一份字节）。
@@ -64,7 +64,7 @@ pub(in crate::fs::ext4::core) struct RecoverCtx<'a> {
 
 /// 恢复结果。PARITY: ext4_rs `JournalRecoveryResult`（recovery.rs:6-12）字段一一对应。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) struct RecoverResult {
+pub(in crate::fs::ext4) struct RecoverResult {
     /// 重放的有效事务数（SCAN 找到的有效事务个数）。
     pub transactions_replayed: u32,
     /// 实际写回 home 的 metadata 块数（已跳过 revoked 的）。
@@ -103,7 +103,7 @@ struct DescriptorTag {
 /// 是否需要恢复。PARITY: ext4_rs `needs_recovery`（recovery.rs:28-30）—— `s_start != 0`。
 /// **不**看 ext4 fs-超级块 RECOVER 标志（那是调用方 / 集成层 P6 的职责）。
 // PARITY: recovery.rs:28-30 —— needs_recovery == (s_start != 0)。
-pub(in crate::fs::ext4::core) fn needs_recovery(sb: &RawJournalSuperblock) -> bool {
+pub(in crate::fs::ext4) fn needs_recovery(sb: &RawJournalSuperblock) -> bool {
     sb.start() != 0
 }
 
@@ -113,7 +113,7 @@ pub(in crate::fs::ext4::core) fn needs_recovery(sb: &RawJournalSuperblock) -> bo
 /// 并 store 回 journal 逻辑块 0。`space` 与 ext4_rs 一样在重置后重建——core 这里在内部按需构造，
 /// 不要求调用方传入（ext4_rs 持有 `self.space`，core/journal 不接集成层，故 SCAN 用的环数学
 /// 由本函数从 `sb` 几何现场构造，与 ext4_rs `self.space` 同值）。
-pub(in crate::fs::ext4::core) fn recover(
+pub(in crate::fs::ext4) fn recover(
     ctx: &RecoverCtx<'_>,
     sb: &mut RawJournalSuperblock,
 ) -> Result<RecoverResult> {

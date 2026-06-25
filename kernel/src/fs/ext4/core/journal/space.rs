@@ -16,7 +16,7 @@ use super::format::RawJournalSuperblock;
 /// 字段语义与 ext4_rs `JournalSpace` 一一对应：`head` = 环写入头（下次 commit 起点），
 /// `tail` = 最老未 checkpoint 事务起点。`#[derive(..)]` 同 ext4_rs（Copy 便于差分快照）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) struct JournalSpace {
+pub(in crate::fs::ext4) struct JournalSpace {
     first: u32,
     maxlen: u32,
     head: u32,
@@ -27,7 +27,7 @@ impl JournalSpace {
     /// 构造并校验环界。PARITY: ext4_rs `JournalSpace::new`（space.rs:15-31）三关校验：
     /// `first==0 || first>=maxlen` / `head<first || head>=maxlen` / `tail<first || tail>=maxlen`
     /// 任一不满足即 `EINVAL`。
-    pub(in crate::fs::ext4::core) fn new(
+    pub(in crate::fs::ext4) fn new(
         first: u32,
         maxlen: u32,
         head: u32,
@@ -59,7 +59,7 @@ impl JournalSpace {
     /// 从 journal 超级块几何构造。
     /// PARITY: ext4_rs `JournalSpace::from_superblock`（space.rs:33-42）——
     /// `tail = if start==0 { first } else { start }`；`head = if head==0 { tail } else { head }`。
-    pub(in crate::fs::ext4::core) fn from_superblock(superblock: &RawJournalSuperblock) -> Result<Self> {
+    pub(in crate::fs::ext4) fn from_superblock(superblock: &RawJournalSuperblock) -> Result<Self> {
         let first = superblock.first();
         // PARITY: ext4_rs space.rs:35-39
         let tail = if superblock.start() == 0 {
@@ -76,30 +76,30 @@ impl JournalSpace {
         Self::new(first, superblock.maxlen(), head, tail)
     }
 
-    pub(in crate::fs::ext4::core) fn first(&self) -> u32 {
+    pub(in crate::fs::ext4) fn first(&self) -> u32 {
         self.first
     }
 
-    pub(in crate::fs::ext4::core) fn maxlen(&self) -> u32 {
+    pub(in crate::fs::ext4) fn maxlen(&self) -> u32 {
         self.maxlen
     }
 
-    pub(in crate::fs::ext4::core) fn head(&self) -> u32 {
+    pub(in crate::fs::ext4) fn head(&self) -> u32 {
         self.head
     }
 
-    pub(in crate::fs::ext4::core) fn tail(&self) -> u32 {
+    pub(in crate::fs::ext4) fn tail(&self) -> u32 {
         self.tail
     }
 
     /// 可用块数 = `maxlen - first`。PARITY: ext4_rs space.rs:60-62。
-    pub(in crate::fs::ext4::core) fn usable_blocks(&self) -> u32 {
+    pub(in crate::fs::ext4) fn usable_blocks(&self) -> u32 {
         self.maxlen - self.first
     }
 
     /// 已用块数（含回绕）。PARITY: ext4_rs space.rs:64-72——
     /// `head==tail`→0；`head>tail`→`head-tail`；否则 `(maxlen-tail)+(head-first)`。
-    pub(in crate::fs::ext4::core) fn used_blocks(&self) -> u32 {
+    pub(in crate::fs::ext4) fn used_blocks(&self) -> u32 {
         if self.head == self.tail {
             0
         } else if self.head > self.tail {
@@ -110,26 +110,26 @@ impl JournalSpace {
     }
 
     /// 空闲块数 = `usable - used`（饱和减）。PARITY: ext4_rs space.rs:74-76。
-    pub(in crate::fs::ext4::core) fn free_blocks(&self) -> u32 {
+    pub(in crate::fs::ext4) fn free_blocks(&self) -> u32 {
         self.usable_blocks().saturating_sub(self.used_blocks())
     }
 
     /// 把 head 前进 `blocks`（环内回绕），返回新 head。PARITY: ext4_rs space.rs:78-81。
-    pub(in crate::fs::ext4::core) fn advance_head(&mut self, blocks: u32) -> u32 {
+    pub(in crate::fs::ext4) fn advance_head(&mut self, blocks: u32) -> u32 {
         self.head = self.advance(self.head, blocks);
         self.head
     }
 
     /// 把 tail 前进 `blocks`（环内回绕），返回新 tail。PARITY: ext4_rs space.rs:83-86。
     #[allow(dead_code)] // ext4_rs 暴露但 Task 2 差分不直接用；保留以保接口对齐
-    pub(in crate::fs::ext4::core) fn advance_tail(&mut self, blocks: u32) -> u32 {
+    pub(in crate::fs::ext4) fn advance_tail(&mut self, blocks: u32) -> u32 {
         self.tail = self.advance(self.tail, blocks);
         self.tail
     }
 
     /// 直接置 tail（带界校验）。PARITY: ext4_rs space.rs:88-94——
     /// `tail<first || tail>=maxlen` 即 `EINVAL`，否则覆盖。
-    pub(in crate::fs::ext4::core) fn set_tail(&mut self, tail: u32) -> Result<()> {
+    pub(in crate::fs::ext4) fn set_tail(&mut self, tail: u32) -> Result<()> {
         if tail < self.first || tail >= self.maxlen {
             return Err(Error::with_message(Errno::EINVAL, "invalid journal tail"));
         }
@@ -141,7 +141,7 @@ impl JournalSpace {
     /// PARITY: ext4_rs space.rs:96-103——`usable==0`→`first`；否则
     /// `relative = (from - first + blocks % usable) % usable; first + relative`。
     /// **逐字保留算符优先级**：`blocks % usable` 先算，再与 `(from-first)` 相加，再整体 `% usable`。
-    pub(in crate::fs::ext4::core) fn advance(&self, from: u32, blocks: u32) -> u32 {
+    pub(in crate::fs::ext4) fn advance(&self, from: u32, blocks: u32) -> u32 {
         let usable = self.usable_blocks();
         if usable == 0 {
             return self.first;
@@ -153,7 +153,7 @@ impl JournalSpace {
 
     /// `from`→`to` 的环内距离。PARITY: ext4_rs space.rs:105-113——
     /// `from==to`→0；`to>from`→`to-from`；否则 `(maxlen-from)+(to-first)`。
-    pub(in crate::fs::ext4::core) fn distance(&self, from: u32, to: u32) -> u32 {
+    pub(in crate::fs::ext4) fn distance(&self, from: u32, to: u32) -> u32 {
         if from == to {
             0
         } else if to > from {

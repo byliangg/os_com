@@ -29,17 +29,17 @@ const DEFAULT_OPERATION_ID: u64 = 0;
 /// alloc_guard 的调试计数快照（5 项）。逐字段对应 ext4_rs `OperationAllocGuardDebugStats`
 /// （block.rs:31-37）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct OperationAllocGuardDebugStats {
+pub(in crate::fs::ext4) struct OperationAllocGuardDebugStats {
     /// `clear_current_operation` / `clear_operation` 调用次数。
-    pub(super) clear_calls: u64,
+    pub(in crate::fs::ext4) clear_calls: u64,
     /// `reserve_*` 调用次数（按「调用」计，批量算一次）。
-    pub(super) reserve_calls: u64,
+    pub(in crate::fs::ext4) reserve_calls: u64,
     /// 累计预留块数（批量按块数累加）。
-    pub(super) reserved_blocks: u64,
+    pub(in crate::fs::ext4) reserved_blocks: u64,
     /// `contains_*` 查询次数。
-    pub(super) contains_checks: u64,
+    pub(in crate::fs::ext4) contains_checks: u64,
     /// 任一操作槽出现过的最大块集合大小。
-    pub(super) max_operation_blocks: u64,
+    pub(in crate::fs::ext4) max_operation_blocks: u64,
 }
 
 /// 每操作块预留 guard 抽象。balloc 在扫描候选时用 [`contains_current_block`] 跳过本操作
@@ -49,7 +49,7 @@ pub(super) struct OperationAllocGuardDebugStats {
 /// [`contains_current_block`]: OperationAllocGuard::contains_current_block
 /// [`reserve_current_block`]: OperationAllocGuard::reserve_current_block
 /// [`reserve_current_blocks`]: OperationAllocGuard::reserve_current_blocks
-pub(super) trait OperationAllocGuard: Send + Sync {
+pub(in crate::fs::ext4) trait OperationAllocGuard: Send + Sync {
     /// 清空当前操作已预留的块集合（计 `clear_calls`）。
     fn clear_current_operation(&self);
     /// 把单块登记进当前操作（计 `reserve_calls` + `reserved_blocks`）。
@@ -120,13 +120,13 @@ impl OperationAllocGuardStats {
 /// 通过 [`OperationAllocGuard`] 的 `*_current_*` 方法访问时，落在 [`DEFAULT_OPERATION_ID`]
 /// 槽（与 ext4_rs `Ext4::open` 安装的默认 guard 行为一致）；多操作并发由
 /// [`OperationScopedAllocGuard`] 各持 op_id 转发到 `*_for_operation`。
-pub(super) struct LocalOperationAllocGuard {
+pub(in crate::fs::ext4) struct LocalOperationAllocGuard {
     allocated_blocks: Mutex<BTreeMap<u64, BTreeSet<Ext4Fsblk>>>,
     stats: OperationAllocGuardStats,
 }
 
 impl LocalOperationAllocGuard {
-    pub(super) fn new() -> Self {
+    pub(in crate::fs::ext4) fn new() -> Self {
         Self {
             allocated_blocks: Mutex::new(BTreeMap::new()),
             stats: OperationAllocGuardStats::new(),
@@ -134,28 +134,28 @@ impl LocalOperationAllocGuard {
     }
 
     /// 开一个操作槽（若已存在则保留）。[对照] ext4_rs `begin_operation`。
-    pub(super) fn begin_operation(&self, operation_id: u64) {
+    pub(in crate::fs::ext4) fn begin_operation(&self, operation_id: u64) {
         self.allocated_blocks.lock().entry(operation_id).or_default();
     }
 
     /// 结束并移除一个操作槽（**不计** `clear_calls`）。[对照] ext4_rs `finish_operation`。
-    pub(super) fn finish_operation(&self, operation_id: u64) {
+    pub(in crate::fs::ext4) fn finish_operation(&self, operation_id: u64) {
         self.allocated_blocks.lock().remove(&operation_id);
     }
 
     /// 取调试计数快照。
-    pub(super) fn debug_stats(&self) -> OperationAllocGuardDebugStats {
+    pub(in crate::fs::ext4) fn debug_stats(&self) -> OperationAllocGuardDebugStats {
         self.stats.snapshot()
     }
 
     /// 清空并移除一个操作槽（**计** `clear_calls`）。[对照] ext4_rs `clear_operation`。
-    pub(super) fn clear_operation(&self, operation_id: u64) {
+    pub(in crate::fs::ext4) fn clear_operation(&self, operation_id: u64) {
         self.stats.clear_calls.fetch_add(1, Ordering::Relaxed);
         self.allocated_blocks.lock().remove(&operation_id);
     }
 
     /// 把单块登记进 `operation_id` 槽。[对照] ext4_rs `reserve_block_for_operation`。
-    pub(super) fn reserve_block_for_operation(&self, operation_id: u64, block: Ext4Fsblk) {
+    pub(in crate::fs::ext4) fn reserve_block_for_operation(&self, operation_id: u64, block: Ext4Fsblk) {
         self.stats.reserve_calls.fetch_add(1, Ordering::Relaxed);
         self.stats.reserved_blocks.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.allocated_blocks.lock();
@@ -166,7 +166,7 @@ impl LocalOperationAllocGuard {
 
     /// 把一批块登记进 `operation_id` 槽（空批量直接返回、不计数）。
     /// [对照] ext4_rs `reserve_blocks_for_operation`。
-    pub(super) fn reserve_blocks_for_operation(&self, operation_id: u64, blocks: &[Ext4Fsblk]) {
+    pub(in crate::fs::ext4) fn reserve_blocks_for_operation(&self, operation_id: u64, blocks: &[Ext4Fsblk]) {
         if blocks.is_empty() {
             return;
         }
@@ -185,7 +185,7 @@ impl LocalOperationAllocGuard {
 
     /// `operation_id` 槽是否已预留 `block`（计 `contains_checks`）。
     /// [对照] ext4_rs `contains_block_for_operation`。
-    pub(super) fn contains_block_for_operation(&self, operation_id: u64, block: Ext4Fsblk) -> bool {
+    pub(in crate::fs::ext4) fn contains_block_for_operation(&self, operation_id: u64, block: Ext4Fsblk) -> bool {
         self.stats.contains_checks.fetch_add(1, Ordering::Relaxed);
         self.allocated_blocks
             .lock()
@@ -225,13 +225,13 @@ impl OperationAllocGuard for LocalOperationAllocGuard {
 /// 把「当前操作」绑定到固定 `operation_id` 的 guard 视图：所有 `*_current_*` 调用转发到
 /// 内层 [`LocalOperationAllocGuard`] 的 `*_for_operation(operation_id)`。逐位复刻 ext4_rs
 /// `OperationScopedAllocGuard`（alloc_guard.rs:59-96）。
-pub(super) struct OperationScopedAllocGuard {
+pub(in crate::fs::ext4) struct OperationScopedAllocGuard {
     inner: Arc<LocalOperationAllocGuard>,
     operation_id: u64,
 }
 
 impl OperationScopedAllocGuard {
-    pub(super) fn new(inner: Arc<LocalOperationAllocGuard>, operation_id: u64) -> Self {
+    pub(in crate::fs::ext4) fn new(inner: Arc<LocalOperationAllocGuard>, operation_id: u64) -> Self {
         Self {
             inner,
             operation_id,

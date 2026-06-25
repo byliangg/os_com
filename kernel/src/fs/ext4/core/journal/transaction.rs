@@ -20,7 +20,7 @@ const JOURNAL_TRANSACTION_CREDIT_SOFT_LIMIT: u32 = 1024;
 
 /// 事务生命周期状态。PARITY: ext4_rs transaction.rs:3-10（`JournalTransactionState`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) enum JournalTransactionState {
+pub(in crate::fs::ext4) enum JournalTransactionState {
     Running,
     Locked,
     Commit,
@@ -30,7 +30,7 @@ pub(in crate::fs::ext4::core) enum JournalTransactionState {
 /// PARITY: ext4_rs transaction.rs:18-23（`JournalBuffer`）；core 不需要 `dirty_ranges`
 /// （全块镜像由上层给定，差分只对拍 `block_nr`+`block_data`），故略去——commit plan 字段一致。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) struct JournalBuffer {
+pub(in crate::fs::ext4) struct JournalBuffer {
     pub block_nr: Ext4Fsblk,
     pub block_data: Vec<u8>,
 }
@@ -39,7 +39,7 @@ pub(in crate::fs::ext4::core) struct JournalBuffer {
 /// PARITY: ext4_rs transaction.rs:31-42（`JournalTransaction`）；core 只保留 commit plan
 /// 所需子集（tid/state/buffers/handle_count/admitted_reserved_blocks）。
 #[derive(Debug, Clone)]
-pub(in crate::fs::ext4::core) struct JournalTransaction {
+pub(in crate::fs::ext4) struct JournalTransaction {
     tid: u32,
     state: JournalTransactionState,
     /// PARITY: ext4_rs transaction.rs:35 —— **BTreeMap keyed by block_nr**：去重重复写 +
@@ -51,7 +51,7 @@ pub(in crate::fs::ext4::core) struct JournalTransaction {
 
 impl JournalTransaction {
     /// PARITY: ext4_rs transaction.rs:45-57（`new`）。初始 Running、空 buffers。
-    pub(in crate::fs::ext4::core) fn new(tid: u32) -> Self {
+    pub(in crate::fs::ext4) fn new(tid: u32) -> Self {
         Self {
             tid,
             state: JournalTransactionState::Running,
@@ -61,42 +61,42 @@ impl JournalTransaction {
         }
     }
 
-    pub(in crate::fs::ext4::core) fn tid(&self) -> u32 {
+    pub(in crate::fs::ext4) fn tid(&self) -> u32 {
         self.tid
     }
 
-    pub(in crate::fs::ext4::core) fn state(&self) -> JournalTransactionState {
+    pub(in crate::fs::ext4) fn state(&self) -> JournalTransactionState {
         self.state
     }
 
-    pub(in crate::fs::ext4::core) fn set_state(&mut self, state: JournalTransactionState) {
+    pub(in crate::fs::ext4) fn set_state(&mut self, state: JournalTransactionState) {
         self.state = state;
     }
 
-    pub(in crate::fs::ext4::core) fn handle_count(&self) -> u32 {
+    pub(in crate::fs::ext4) fn handle_count(&self) -> u32 {
         self.handle_count
     }
 
     /// PARITY: ext4_rs transaction.rs:79-81（`admitted_reserved_blocks`）——
     /// admit 时累加、**不随 unregister 递减**（用于 soft-credit 轮转判定）。
-    pub(in crate::fs::ext4::core) fn admitted_reserved_blocks(&self) -> u32 {
+    pub(in crate::fs::ext4) fn admitted_reserved_blocks(&self) -> u32 {
         self.admitted_reserved_blocks
     }
 
     /// PARITY: ext4_rs transaction.rs:95-97 —— commit plan 的 metadata 来源。
-    pub(in crate::fs::ext4::core) fn buffers(&self) -> &BTreeMap<Ext4Fsblk, JournalBuffer> {
+    pub(in crate::fs::ext4) fn buffers(&self) -> &BTreeMap<Ext4Fsblk, JournalBuffer> {
         &self.buffers
     }
 
     /// PARITY: ext4_rs transaction.rs:99-101 —— `buffers.len()`。
-    pub(in crate::fs::ext4::core) fn modified_block_count(&self) -> usize {
+    pub(in crate::fs::ext4) fn modified_block_count(&self) -> usize {
         self.buffers.len()
     }
 
     /// PARITY: ext4_rs transaction.rs:115-124（`register_handle`）——
     /// handle_count + admitted_reserved_blocks 双饱和累加。core 不跟 trigger_op/reserved_blocks
     /// 镜像（commit plan 不需要），只保 admission 轮转所需。
-    pub(in crate::fs::ext4::core) fn register_handle(&mut self, reserved_blocks: u32) {
+    pub(in crate::fs::ext4) fn register_handle(&mut self, reserved_blocks: u32) {
         self.handle_count = self.handle_count.saturating_add(1);
         self.admitted_reserved_blocks = self
             .admitted_reserved_blocks
@@ -104,7 +104,7 @@ impl JournalTransaction {
     }
 
     /// PARITY: ext4_rs transaction.rs:126-129（`unregister_handle`）——handle_count 饱和递减。
-    pub(in crate::fs::ext4::core) fn unregister_handle(&mut self) {
+    pub(in crate::fs::ext4) fn unregister_handle(&mut self) {
         self.handle_count = self.handle_count.saturating_sub(1);
     }
 
@@ -116,7 +116,7 @@ impl JournalTransaction {
     /// 做 size-clamp：`len < block_size` 则 `resize(block_size, 0)`（零填到块大小）、
     /// `len > block_size` 则 `truncate(block_size)`（截断）。core 直收全块镜像，故对 `full_image`
     /// 直接 clamp 即得同一字节序列（差分喂超/欠 block_size 镜像对拍）。fix deferred (bug.md B-08)。
-    pub(in crate::fs::ext4::core) fn record_metadata_write(
+    pub(in crate::fs::ext4) fn record_metadata_write(
         &mut self,
         block_nr: Ext4Fsblk,
         full_image: &[u8],
@@ -144,7 +144,7 @@ impl JournalTransaction {
 /// 一个 commit plan 携带的元数据块（全块镜像）。PARITY: ext4_rs journal.rs:14-18
 /// （`JournalCommitBlock { block_nr, block_data }`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) struct JournalCommitBlock {
+pub(in crate::fs::ext4) struct JournalCommitBlock {
     pub block_nr: Ext4Fsblk,
     pub block_data: Vec<u8>,
 }
@@ -157,7 +157,7 @@ pub(in crate::fs::ext4::core) struct JournalCommitBlock {
 /// （`tid` + `metadata_blocks`）；`reserved_blocks`/`data_sync_required`/`trigger_op`
 /// 是集成层 P6 才用的旁路字段，core/journal commit 写序不依赖，故略去。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) struct JournalCommitPlan {
+pub(in crate::fs::ext4) struct JournalCommitPlan {
     pub tid: u32,
     pub metadata_blocks: Vec<JournalCommitBlock>,
 }
@@ -165,7 +165,7 @@ pub(in crate::fs::ext4::core) struct JournalCommitPlan {
 /// handle 凭据：唯一 `handle_id` + 所属事务 `transaction_id` + 该 handle 的预留块数。
 /// PARITY: ext4_rs handle.rs:3-10（`JournalHandle`）；core 只保 commit plan / 轮转所需子集。
 #[derive(Debug, Clone, Copy)]
-pub(in crate::fs::ext4::core) struct JournalHandle {
+pub(in crate::fs::ext4) struct JournalHandle {
     handle_id: u64,
     transaction_id: u32,
     /// 该 handle 的预留块数。Task 2 不读（admission 轮转用事务级 admitted_reserved_blocks），
@@ -175,16 +175,16 @@ pub(in crate::fs::ext4::core) struct JournalHandle {
 }
 
 impl JournalHandle {
-    pub(in crate::fs::ext4::core) fn handle_id(&self) -> u64 {
+    pub(in crate::fs::ext4) fn handle_id(&self) -> u64 {
         self.handle_id
     }
 
-    pub(in crate::fs::ext4::core) fn transaction_id(&self) -> u32 {
+    pub(in crate::fs::ext4) fn transaction_id(&self) -> u32 {
         self.transaction_id
     }
 
     #[allow(dead_code)] // 接口对齐 ext4_rs；Task 3 stop/commit accounting 用
-    pub(in crate::fs::ext4::core) fn reserved_blocks(&self) -> u32 {
+    pub(in crate::fs::ext4) fn reserved_blocks(&self) -> u32 {
         self.reserved_blocks
     }
 }
@@ -195,7 +195,7 @@ impl JournalHandle {
 /// （start/record/stop/prepare_commit + soft-credit admission 轮转），不含 overlay/checkpoint/
 /// commit 编排（那些是 Task 3-5 / P6 集成层）。
 #[derive(Debug)]
-pub(in crate::fs::ext4::core) struct JournalRuntime {
+pub(in crate::fs::ext4) struct JournalRuntime {
     enabled: bool,
     block_size: usize,
     next_tid: u32,
@@ -211,7 +211,7 @@ pub(in crate::fs::ext4::core) struct JournalRuntime {
 
 impl JournalRuntime {
     /// PARITY: ext4_rs journal.rs:77-93（`new`）——`next_tid = first_tid.max(1)`、handle_id 从 1。
-    pub(in crate::fs::ext4::core) fn new(block_size: usize, first_tid: u32) -> Self {
+    pub(in crate::fs::ext4) fn new(block_size: usize, first_tid: u32) -> Self {
         Self {
             enabled: true,
             block_size,
@@ -225,15 +225,15 @@ impl JournalRuntime {
     }
 
     #[allow(dead_code)] // 接口对齐 ext4_rs；core/journal 差分用 new(..) 起步
-    pub(in crate::fs::ext4::core) fn block_size(&self) -> usize {
+    pub(in crate::fs::ext4) fn block_size(&self) -> usize {
         self.block_size
     }
 
-    pub(in crate::fs::ext4::core) fn running_transaction(&self) -> Option<&JournalTransaction> {
+    pub(in crate::fs::ext4) fn running_transaction(&self) -> Option<&JournalTransaction> {
         self.running.as_ref()
     }
 
-    pub(in crate::fs::ext4::core) fn prev_running_transaction(&self) -> Option<&JournalTransaction> {
+    pub(in crate::fs::ext4) fn prev_running_transaction(&self) -> Option<&JournalTransaction> {
         self.prev_running.as_ref()
     }
 
@@ -268,7 +268,7 @@ impl JournalRuntime {
     /// 开 handle，返回唯一 `handle_id`（>=1）。
     /// PARITY: ext4_rs journal.rs:394-426（`start_handle`）——先 admission 轮转 → 取 handle_id →
     /// get_or_insert running 事务（Locked 复位 Running）→ register_handle → 入 active 队列。
-    pub(in crate::fs::ext4::core) fn start_handle(&mut self, reserved_blocks: u32) -> Option<u64> {
+    pub(in crate::fs::ext4) fn start_handle(&mut self, reserved_blocks: u32) -> Option<u64> {
         if !self.enabled {
             return None;
         }
@@ -342,7 +342,7 @@ impl JournalRuntime {
     /// ext4_rs 按 byte offset 分块记录，差分驱动总以 `offset = block_nr*block_size` + 全块镜像
     /// 调用，故落进事务的 `BTreeMap<block_nr, JournalBuffer>` 结果一致；core 直收 `block` + 全块
     /// `full_image`，转交事务 `record_metadata_write`（内含 BUG-8 size-clamp）。
-    pub(in crate::fs::ext4::core) fn record_metadata_write(
+    pub(in crate::fs::ext4) fn record_metadata_write(
         &mut self,
         handle_id: u64,
         block: Ext4Fsblk,
@@ -366,7 +366,7 @@ impl JournalRuntime {
     /// 关 handle，返回其所属事务 `tid`。
     /// PARITY: ext4_rs journal.rs:543-559（`stop_handle`）——出 active 队列 → unregister_handle →
     /// `handle_count==0` 时置 Locked。core 返回 tid（差分对拍 plan.tid）。
-    pub(in crate::fs::ext4::core) fn stop_handle(&mut self, handle_id: u64) -> Option<u32> {
+    pub(in crate::fs::ext4) fn stop_handle(&mut self, handle_id: u64) -> Option<u32> {
         if !self.enabled {
             return None;
         }
@@ -387,7 +387,7 @@ impl JournalRuntime {
 
     /// 当前正在 commit 落盘的事务（committing 槽）。PARITY: ext4_rs journal.rs:129-130
     /// （`committing_transaction`）。差分用它确认 `prepare_commit` 后事务停在 committing 槽。
-    pub(in crate::fs::ext4::core) fn committing_transaction(&self) -> Option<&JournalTransaction> {
+    pub(in crate::fs::ext4) fn committing_transaction(&self) -> Option<&JournalTransaction> {
         self.committing.as_ref()
     }
 
@@ -399,7 +399,7 @@ impl JournalRuntime {
     /// → 返回 None（一次只能有一个 in-commit 事务）；取出事务置 Commit 后 `committing = Some(transaction)`
     /// 停泊（不丢弃），落盘后由 [`finish_commit`](Self::finish_commit) 清槽。`metadata_blocks` 按
     /// `buffers().values()` 序（BTreeMap 升序）收集——与停泊的事务字节一致。
-    pub(in crate::fs::ext4::core) fn prepare_commit(&mut self) -> Option<JournalCommitPlan> {
+    pub(in crate::fs::ext4) fn prepare_commit(&mut self) -> Option<JournalCommitPlan> {
         // PARITY: ext4_rs journal.rs:562 —— 幂等：已有 in-commit 事务则不再开新 commit。
         if !self.enabled || self.committing.is_some() {
             return None;
@@ -445,7 +445,7 @@ impl JournalRuntime {
     /// （`finish_commit` 子集——core/journal 不做 checkpoint_list/last_committed_tid，那是 P6 集成层；
     /// 此处只复刻「committing 槽幂等清除」语义：tid 不匹配则放回返回 false）。Task 3 的 commit 编排
     /// 在 `write_commit_plan` 成功后调它，使 runtime 可接受下一个 commit。
-    pub(in crate::fs::ext4::core) fn finish_commit(&mut self, tid: u32) -> bool {
+    pub(in crate::fs::ext4) fn finish_commit(&mut self, tid: u32) -> bool {
         let Some(transaction) = self.committing.take() else {
             return false;
         };

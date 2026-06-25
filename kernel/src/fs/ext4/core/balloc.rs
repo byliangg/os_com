@@ -50,24 +50,24 @@ const EXT4_INODE_BLOCK_SIZE: u64 = 512;
 /// - `inode_already_maps_block(inode_ref, block)`（extent 映射查询）。
 ///
 /// 本 Phase 无 extent 逻辑（Phase 3 落地），故 [`maps_block`] 恒 `false`。
-pub(super) struct InodeAllocCtx {
+pub(in crate::fs::ext4) struct InodeAllocCtx {
     /// i_blocks（512-byte 单位），与 ext4_rs `inode.blocks_count()` 同语义。
     i_blocks: u64,
 }
 
 impl InodeAllocCtx {
     /// 以给定初始 i_blocks 构造（差分两侧建议都从 0 起）。
-    pub(super) fn new(i_blocks: u64) -> Self {
+    pub(in crate::fs::ext4) fn new(i_blocks: u64) -> Self {
         Self { i_blocks }
     }
 
     /// 当前 i_blocks（512-byte 单位）。
-    pub(super) fn i_blocks(&self) -> u64 {
+    pub(in crate::fs::ext4) fn i_blocks(&self) -> u64 {
         self.i_blocks
     }
 
     /// 设置 i_blocks。
-    pub(super) fn set_i_blocks(&mut self, v: u64) {
+    pub(in crate::fs::ext4) fn set_i_blocks(&mut self, v: u64) {
         self.i_blocks = v;
     }
 
@@ -77,14 +77,14 @@ impl InodeAllocCtx {
     /// 空 extent inode 时 ext4_rs `inode_already_maps_block` 的结果一致）。
     /// [对照] ext4_rs `inode_already_maps_block`（balloc.rs:156-172）。
     #[inline]
-    pub(super) fn maps_block(&self, _block: Ext4Fsblk) -> bool {
+    pub(in crate::fs::ext4) fn maps_block(&self, _block: Ext4Fsblk) -> bool {
         false
     }
 }
 
 /// 安全块分配器。持一份可变超级块（free-blocks 计数权威）+ 读接缝 + 元数据写回 +
 /// 系统保留区 + 每操作块预留 guard。**不复制 ext4_rs 的 `Ext4` god-object**。
-pub(super) struct BlockAllocator<'a, R: BlockReader, W: MetadataWriter> {
+pub(in crate::fs::ext4) struct BlockAllocator<'a, R: BlockReader, W: MetadataWriter> {
     /// 运行期可变超级块（free-blocks 随分配递减；其余字段同盘上初值）。
     sb: RawSuperblock,
     /// 读盘接缝（每轮组迭代重读组描述符 / 位图）。
@@ -108,13 +108,13 @@ pub(super) struct BlockAllocator<'a, R: BlockReader, W: MetadataWriter> {
 impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     /// 用初始超级块字节 + 读/写接缝构造，并自算系统保留区。默认装一个空的
     /// `LocalOperationAllocGuard`（默认操作 id=0），与 ext4_rs `Ext4::open` 一致。
-    pub(super) fn new(sb: RawSuperblock, reader: &'a R, writer: &'a W) -> Self {
+    pub(in crate::fs::ext4) fn new(sb: RawSuperblock, reader: &'a R, writer: &'a W) -> Self {
         Self::with_guard(sb, reader, writer, Arc::new(LocalOperationAllocGuard::new()))
     }
 
     /// 用外部注入的共享 guard 构造（差分用：跨多步保留同一 guard 以便读 `debug_stats`、
     /// 验证 free 后块仍被预留等 guard 敏感行为）。
-    pub(super) fn with_guard(
+    pub(in crate::fs::ext4) fn with_guard(
         sb: RawSuperblock,
         reader: &'a R,
         writer: &'a W,
@@ -132,7 +132,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     }
 
     /// 当前（运行期）超级块快照——差分用例跑完后据此 `snapshot_meta`。
-    pub(super) fn superblock(&self) -> &RawSuperblock {
+    pub(in crate::fs::ext4) fn superblock(&self) -> &RawSuperblock {
         &self.sb
     }
 
@@ -264,7 +264,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     // ------------------------------------------------------------------
 
     /// 分配一个新块。`goal` 有值则从其所在组/下标起扫，无值则默认 bgid=1、idx=0。
-    pub(super) fn balloc_alloc_block(
+    pub(in crate::fs::ext4) fn balloc_alloc_block(
         &mut self,
         inode: &mut InodeAllocCtx,
         goal: Option<Ext4Fsblk>,
@@ -384,7 +384,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     // ------------------------------------------------------------------
 
     /// 从 `*start_bgid`、idx=0 起扫的无 goal 变体；命中后把组号回写 `*start_bgid`。
-    pub(super) fn balloc_alloc_block_from(
+    pub(in crate::fs::ext4) fn balloc_alloc_block_from(
         &mut self,
         inode: &mut InodeAllocCtx,
         start_bgid: &mut u32,
@@ -501,7 +501,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     // ------------------------------------------------------------------
 
     /// 跨组分配 `count` 块（允许部分成功），回写 `*start_bgid`。返回实际分到的块号。
-    pub(super) fn balloc_alloc_block_batch(
+    pub(in crate::fs::ext4) fn balloc_alloc_block_batch(
         &mut self,
         inode: &mut InodeAllocCtx,
         start_bgid: &mut u32,
@@ -663,7 +663,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
     /// 直接裸除——与 ext4_rs 字节级一致。真镜像 `first_data_block == 0`，两种算法本就重合；
     /// 在 `first_data_block != 0` 的盘上会与 alloc 侧的几何 helper 产生偏差，但这是 ext4_rs
     /// 既有行为，parity-first 原样复刻（bug 修复推迟，见 roadmap §5）。
-    pub(super) fn balloc_free_blocks(
+    pub(in crate::fs::ext4) fn balloc_free_blocks(
         &mut self,
         inode: &mut InodeAllocCtx,
         start: Ext4Fsblk,

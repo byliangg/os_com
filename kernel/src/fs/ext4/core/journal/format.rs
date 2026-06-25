@@ -47,11 +47,11 @@ pub const JBD2_FEATURE_INCOMPAT_CSUM_V3: u32 = 0x0000_0010;
 
 /// JBD2 块通用头（12 字节，大端）。嵌在 superblock / commit / revoke 块开头。
 ///
-/// 可见性 `pub(in crate::fs::ext4::core)`：随 [`RawJournalSuperblock::header`] 一同暴露给
+/// 可见性 `pub(in crate::fs::ext4)`：随 [`RawJournalSuperblock::header`] 一同暴露给
 /// core 下的 ktest 差分 harness（避免 `pub` accessor 返回更私有类型的 private-in-public）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(in crate::fs::ext4::core) struct RawJournalHeader {
+pub(in crate::fs::ext4) struct RawJournalHeader {
     pub h_magic: u32,
     pub h_blocktype: u32,
     pub h_sequence: u32,
@@ -84,12 +84,12 @@ impl RawJournalHeader {
 
 /// JBD2 日志超级块（1024 字节，大端）。含大数组，**不派生 Default**。
 ///
-/// 可见性 `pub(in crate::fs::ext4::core)`：除 `journal` 模块自身外，仅 ktest 差分 harness
+/// 可见性 `pub(in crate::fs::ext4)`：除 `journal` 模块自身外，仅 ktest 差分 harness
 /// （`super::super::diff_harness`，core 下的兄弟模块）需要直接读它来对拍 journal 超级块；
 /// 其余 `RawJournal*` 内部类型保持 `pub(super)`。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(in crate::fs::ext4::core) struct RawJournalSuperblock {
+pub(in crate::fs::ext4) struct RawJournalSuperblock {
     pub s_header: RawJournalHeader,
     pub s_blocksize: u32,
     pub s_maxlen: u32,

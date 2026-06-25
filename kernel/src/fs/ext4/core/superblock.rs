@@ -18,7 +18,7 @@ const SUPERBLOCK_CSUM_LEN: usize = 0x3fc;
 // 不派生 Default：超级块含 >32 元素数组（[u8;64]/[u32;100] 等），Rust 数组 Default 仅到 32。
 // 本阶段一律经 Pod `from_bytes` 解析，无需 Default。
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct RawSuperblock {
+pub(in crate::fs::ext4) struct RawSuperblock {
     pub inodes_count: u32,
     pub blocks_count_lo: u32,
     pub reserved_blocks_count_lo: u32,
@@ -160,33 +160,33 @@ impl RawSuperblock {
 
     /// 空闲块计数（lo | hi<<32）。
     /// [对照] ext4_rs `free_blocks_count`（super_block.rs:213）。
-    pub(super) fn free_blocks_count(&self) -> u64 {
+    pub(in crate::fs::ext4) fn free_blocks_count(&self) -> u64 {
         let (lo, hi) = (self.free_blocks_count_lo, self.free_blocks_count_hi);
         (lo as u64) | ((hi as u64) << 32)
     }
 
     /// 写空闲块计数（lo = v&0xffffffff, hi = v>>32）。
     /// [对照] ext4_rs `set_free_blocks_count`（super_block.rs:217）。
-    pub(super) fn set_free_blocks_count(&mut self, free_blocks: u64) {
+    pub(in crate::fs::ext4) fn set_free_blocks_count(&mut self, free_blocks: u64) {
         self.free_blocks_count_lo = (free_blocks & 0xffff_ffff) as u32;
         self.free_blocks_count_hi = (free_blocks >> 32) as u32;
     }
 
     /// 空闲 inode 计数。ext4_rs 超级块此处是**单 u32 字段、无 hi 半**（不同于组描述符）。
     /// [对照] ext4_rs `free_inodes_count`（super_block.rs:131）。
-    pub(super) fn free_inodes_count(&self) -> u32 {
+    pub(in crate::fs::ext4) fn free_inodes_count(&self) -> u32 {
         self.free_inodes_count
     }
 
     /// 写空闲 inode 计数（单 u32 字段）。ext4_rs 实际用 `increase/decrease_free_inodes_count`
     /// 做 ±1；此处提供直接 set 供 alloc 路径在算好新值后写回，落盘字节一致。
     /// [对照] ext4_rs `decrease_free_inodes_count`/`increase_free_inodes_count`（super_block.rs:205-211）。
-    pub(super) fn set_free_inodes_count(&mut self, free_inodes: u32) {
+    pub(in crate::fs::ext4) fn set_free_inodes_count(&mut self, free_inodes: u32) {
         self.free_inodes_count = free_inodes;
     }
 
     /// 当前 checksum 字段值（供测试/校验对拍）。
-    pub(super) fn checksum(&self) -> u32 {
+    pub(in crate::fs::ext4) fn checksum(&self) -> u32 {
         self.checksum
     }
 
@@ -195,36 +195,36 @@ impl RawSuperblock {
     // ------------------------------------------------------------------
 
     /// 卷 UUID（128 位）。crc32c 种子。
-    pub(super) fn uuid(&self) -> [u8; 16] {
+    pub(in crate::fs::ext4) fn uuid(&self) -> [u8; 16] {
         self.uuid
     }
     /// RO-compat 特性位（含 metadata_csum 0x400）。
-    pub(super) fn features_read_only(&self) -> u32 {
+    pub(in crate::fs::ext4) fn features_read_only(&self) -> u32 {
         self.features_read_only
     }
     /// INCOMPAT 特性位（含 meta_bg 0x10）。
-    pub(super) fn features_incompatible(&self) -> u32 {
+    pub(in crate::fs::ext4) fn features_incompatible(&self) -> u32 {
         self.features_incompatible
     }
     /// 首数据块号（first_data_block）。组几何 ±1 调整的判据。
-    pub(super) fn first_data_block(&self) -> u32 {
+    pub(in crate::fs::ext4) fn first_data_block(&self) -> u32 {
         self.first_data_block
     }
     /// 每组块数。
-    pub(super) fn blocks_per_group(&self) -> u32 {
+    pub(in crate::fs::ext4) fn blocks_per_group(&self) -> u32 {
         self.blocks_per_group
     }
     /// 每组 inode 数。
-    pub(super) fn inodes_per_group(&self) -> u32 {
+    pub(in crate::fs::ext4) fn inodes_per_group(&self) -> u32 {
         self.inodes_per_group
     }
     /// 在线增长保留的 GDT 块数。
-    pub(super) fn reserved_gdt_blocks(&self) -> u16 {
+    pub(in crate::fs::ext4) fn reserved_gdt_blocks(&self) -> u16 {
         self.s_reserved_gdt_blocks
     }
     /// 组总数：`ceil(blocks_count / blocks_per_group)`。
     /// [对照] ext4_rs `block_group_count`（super_block.rs:161-173）。
-    pub(super) fn block_group_count(&self) -> u32 {
+    pub(in crate::fs::ext4) fn block_group_count(&self) -> u32 {
         let blocks_count = self.blocks_count();
         let blocks_per_group = self.blocks_per_group as u64;
         let mut count = blocks_count / blocks_per_group;
@@ -241,7 +241,7 @@ impl RawSuperblock {
 
     /// 块分配位图 crc32c：`crc32c(crc32c(INIT, uuid), bitmap[..blocks_per_group/8])`。
     /// [对照] ext4_rs `ext4_balloc_bitmap_csum`（super_block.rs:290-297）。
-    pub(super) fn balloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
+    pub(in crate::fs::ext4) fn balloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
         let uuid = self.uuid;
         let len = (self.blocks_per_group / 8) as usize;
         let csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
@@ -250,7 +250,7 @@ impl RawSuperblock {
 
     /// inode 分配位图 crc32c：长度取 `(inodes_per_group + 7) / 8`。
     /// [对照] ext4_rs `ext4_ialloc_bitmap_csum`（super_block.rs:300-307）。
-    pub(super) fn ialloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
+    pub(in crate::fs::ext4) fn ialloc_bitmap_csum(&self, bitmap: &[u8]) -> u32 {
         let uuid = self.uuid;
         let len = ((self.inodes_per_group + 7) / 8) as usize;
         let csum = ext4_crc32c(EXT4_CRC32_INIT, &uuid);
@@ -260,7 +260,7 @@ impl RawSuperblock {
     /// 重算并写入超级块校验和：`crc32c(INIT, &self_bytes[0, 0x3fc))` → `checksum` 字段。
     /// 安全实现：序列化全 1024 字节、对前 0x3fc 字节求 crc，再写回 `checksum`（不取 packed 引用）。
     /// [对照] ext4_rs `sync_to_disk_with_csum`（super_block.rs:230-241）的 csum 计算半部。
-    pub(super) fn recompute_csum(&mut self) {
+    pub(in crate::fs::ext4) fn recompute_csum(&mut self) {
         let bytes = self.as_bytes();
         let csum = ext4_crc32c(EXT4_CRC32_INIT, &bytes[..SUPERBLOCK_CSUM_LEN]);
         self.checksum = csum;

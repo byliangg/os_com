@@ -8,7 +8,7 @@ use super::metadata_writer::MetadataWriter;
 use super::prelude::*;
 use super::superblock::RawSuperblock;
 
-pub(super) const EXTENT_MAGIC: u16 = 0xF30A;
+pub(in crate::fs::ext4) const EXTENT_MAGIC: u16 = 0xF30A;
 const EXT4_EXTENT_HEADER_SIZE: usize = 12;
 const EXT4_EXTENT_SIZE: usize = 12;
 /// RO-compat metadata_csum 特性位（门控 extent 块 csum）。
@@ -23,7 +23,7 @@ const UNWRITTEN_MAX_LEN: u16 = 32768;
 /// extent 树节点头（12 字节，小端）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawExtentHeader {
+pub(in crate::fs::ext4) struct RawExtentHeader {
     pub magic: u16,
     pub entries_count: u16,
     pub max_entries_count: u16,
@@ -35,7 +35,7 @@ const_assert!(size_of::<RawExtentHeader>() == 12);
 /// extent 树内部索引项（12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawExtentIndex {
+pub(in crate::fs::ext4) struct RawExtentIndex {
     pub first_block: u32,
     pub leaf_lo: u32,
     pub leaf_hi: u16,
@@ -46,7 +46,7 @@ const_assert!(size_of::<RawExtentIndex>() == 12);
 /// extent 叶子项（12 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawExtent {
+pub(in crate::fs::ext4) struct RawExtent {
     pub first_block: u32,
     pub block_count: u16,
     pub start_hi: u16,
@@ -57,7 +57,7 @@ const_assert!(size_of::<RawExtent>() == 12);
 /// 非根 extent 块尾的校验和（4 字节）。
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawExtentTail {
+pub(in crate::fs::ext4) struct RawExtentTail {
     pub et_checksum: u32,
 }
 const_assert!(size_of::<RawExtentTail>() == 4);
@@ -308,7 +308,7 @@ impl<'a> NodeView<'a> {
 /// 解析出的 `(extent, pblock)`。这里保留 `extent`/`pblock`，让三个消费者
 /// （`get_pblock_idx_state`/`map_blocks`/`read_at`）对叶节点做与 ext4_rs **同样**的
 /// 区间再校验。`pblock_of_node == 0` 表示该节点是 i_block 根（沿用 ext4_rs 约定）。
-pub(super) struct ExtentPathNode {
+pub(in crate::fs::ext4) struct ExtentPathNode {
     /// 该层节点头。
     pub header: RawExtentHeader,
     /// 内部层选中的 index（叶层为 None）。
@@ -325,7 +325,7 @@ pub(super) struct ExtentPathNode {
 
 /// extent 树搜索路径（语义对齐 ext4_rs `SearchPath`）。逐层 push 节点，
 /// 末项即 `find_extent` 的解析结果（叶层节点）。
-pub(super) struct SearchPath {
+pub(in crate::fs::ext4) struct SearchPath {
     pub path: Vec<ExtentPathNode>,
 }
 
@@ -353,7 +353,7 @@ impl SearchPath {
 /// 子节点块读：ext4_rs 走 `block_device.read_offset(blk*bs)`（返回一个块字节，
 /// 不足/超出 resize/truncate 到 block_size）；core 用 `BlockReader::read_at` 读满
 /// `block_size` 字节进缓冲，等价。
-pub(super) fn find_extent(
+pub(in crate::fs::ext4) fn find_extent(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
     inode: &Inode,
@@ -453,7 +453,7 @@ pub(super) fn find_extent(
 /// 用新视图重试一次。该重试仅在 inode 于两次查找间被并发改写时才触发；core 的读路径在
 /// 共享 guard 下、单线程差分中 inode 不会并发变更，故**有意不复刻**该 stale-inode 重载重试
 /// （控制器歧义裁决 #2）——它在 inode 未被并发改写时是 no-op，差分等价。
-pub(super) fn get_pblock_idx_state(
+pub(in crate::fs::ext4) fn get_pblock_idx_state(
     reader: &dyn BlockReader,
     sb: &RawSuperblock,
     inode: &Inode,
@@ -506,7 +506,7 @@ pub(super) fn get_pblock_idx_state(
 /// `sb` 是只读几何视图（块大小 / 块数等稳定字段）；分配的「运行期权威 SB」由注入的
 /// 分配上下文（Phase 2 `BlockAllocator`）自持。extent 树块写、inode 写回经 `writer`
 /// （[`MetadataWriter`]）；文件数据块写经 `data_writer`（[`BlockWriter`]）。
-pub(super) struct WriteCtx<'a> {
+pub(in crate::fs::ext4) struct WriteCtx<'a> {
     pub reader: &'a dyn BlockReader,
     pub writer: &'a dyn MetadataWriter,
     pub data_writer: &'a dyn BlockWriter,
@@ -515,7 +515,7 @@ pub(super) struct WriteCtx<'a> {
 }
 
 impl<'a> WriteCtx<'a> {
-    pub(super) fn new(
+    pub(in crate::fs::ext4) fn new(
         reader: &'a dyn BlockReader,
         writer: &'a dyn MetadataWriter,
         data_writer: &'a dyn BlockWriter,
@@ -532,7 +532,7 @@ impl<'a> WriteCtx<'a> {
     }
 
     /// 从写上下文借出只读上下文（读路径复用，避免重复持 reader/sb）。
-    pub(super) fn read_ctx(&self) -> super::file::ReadCtx<'_> {
+    pub(in crate::fs::ext4) fn read_ctx(&self) -> super::file::ReadCtx<'_> {
         super::file::ReadCtx {
             reader: self.reader,
             sb: self.sb,
@@ -548,7 +548,7 @@ impl<'a> WriteCtx<'a> {
 /// **关键（ambiguity #4）**：两类分配必须背靠**同一个**分配器实例（同一份运行期 SB +
 /// 位图状态），否则 tree-block 与 data-block 的 free 计数 / 位图会分叉、落盘字节不一致。
 /// 故合成单 trait、单 `&mut dyn` 传参（一个对象同持两入口），不拆两个 `&mut dyn`。
-pub(super) trait BlockAlloc {
+pub(in crate::fs::ext4) trait BlockAlloc {
     /// 分配一个块（无 goal），对应 ext4_rs `balloc_alloc_block(None)`（extent 树块用）。
     /// 入参 `inode` 让实现把 i_blocks（512B 单位）累加写回 `inode.raw.blocks`——与 ext4_rs
     /// 在共享 `Ext4InodeRef` 上累加 `blocks_count` 等价，使后续 `write_back_inode` 落对值。
@@ -719,7 +719,7 @@ fn merge_extent(
 /// 流程：find_extent 找槽 → 防御（entries > capacity → EIO）→ 空节点 → insert_new_extent
 /// → 命中 extent 且 can_merge → merge_extent（root 时写回 inode 槽）→ 否则 entries<max
 /// 移位插入、满 → create_new_leaf。**不与邻居合并（PARITY）**。
-pub(super) fn insert_extent(
+pub(in crate::fs::ext4) fn insert_extent(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -1183,7 +1183,7 @@ fn rewrite_leaf_entries(
 /// 三形态：① from==es 且左邻 written 且连续 → 左并（grow left + shrink/drop E）；
 /// ② from==es → E 原地变 written 片，余下 unwritten 尾 re-insert；
 /// ③ from>es → E 原地缩成 unwritten 头，written 片 + unwritten 尾 insert。
-pub(super) fn convert_unwritten_span(
+pub(in crate::fs::ext4) fn convert_unwritten_span(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,
@@ -1331,7 +1331,7 @@ fn read_leaf_extent_at(
 /// 把 found 截短到 `from-first_block`、构造尾段 newex(`first_block=to+1`) → `insert_extent`；
 /// ③ 否则从叶（`i=depth`）向上 `i=depth..=0` 循环：叶层 `ext_remove_leaf`（压实 + 释放），
 /// 索引层据 `more_to_rm` 决定下钻 / 上溯，空索引 → `ext_remove_idx`。
-pub(super) fn extent_remove_space(
+pub(in crate::fs::ext4) fn extent_remove_space(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     inode: &mut Inode,

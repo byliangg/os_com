@@ -14,7 +14,7 @@
 /// 越界（`bit >> 3 >= bmap.len()`）视为未置位，返回 `false`。
 ///
 /// [对照] ext4_rs `ext4_bmap_is_bit_set`
-pub(super) fn ext4_bmap_is_bit_set(bmap: &[u8], bit: u32) -> bool {
+pub(in crate::fs::ext4) fn ext4_bmap_is_bit_set(bmap: &[u8], bit: u32) -> bool {
     let byte_idx = (bit >> 3) as usize;
     if byte_idx >= bmap.len() {
         return false;
@@ -25,14 +25,14 @@ pub(super) fn ext4_bmap_is_bit_set(bmap: &[u8], bit: u32) -> bool {
 /// 检查位图中某位是否清零（`is_bit_set` 取反）。
 ///
 /// [对照] ext4_rs `ext4_bmap_is_bit_clr`
-pub(super) fn ext4_bmap_is_bit_clr(bmap: &[u8], bit: u32) -> bool {
+pub(in crate::fs::ext4) fn ext4_bmap_is_bit_clr(bmap: &[u8], bit: u32) -> bool {
     !ext4_bmap_is_bit_set(bmap, bit)
 }
 
 /// 置位图中某位。越界静默返回（不 panic）。
 ///
 /// [对照] ext4_rs `ext4_bmap_bit_set`
-pub(super) fn ext4_bmap_bit_set(bmap: &mut [u8], bit: u32) {
+pub(in crate::fs::ext4) fn ext4_bmap_bit_set(bmap: &mut [u8], bit: u32) {
     let byte_idx = (bit >> 3) as usize;
     if byte_idx >= bmap.len() {
         return;
@@ -43,7 +43,7 @@ pub(super) fn ext4_bmap_bit_set(bmap: &mut [u8], bit: u32) {
 /// 清位图中某位。越界静默返回（不 panic）。
 ///
 /// [对照] ext4_rs `ext4_bmap_bit_clr`
-pub(super) fn ext4_bmap_bit_clr(bmap: &mut [u8], bit: u32) {
+pub(in crate::fs::ext4) fn ext4_bmap_bit_clr(bmap: &mut [u8], bit: u32) {
     let byte_idx = (bit >> 3) as usize;
     if byte_idx >= bmap.len() {
         return;
@@ -61,7 +61,7 @@ pub(super) fn ext4_bmap_bit_clr(bmap: &mut [u8], bit: u32) {
 /// 找到则写 `*bit_id` 并返回 `true`，否则返回 `false`。
 ///
 /// [对照] ext4_rs `ext4_bmap_bit_find_clr`
-pub(super) fn ext4_bmap_bit_find_clr(bmap: &[u8], sbit: u32, ebit: u32, bit_id: &mut u32) -> bool {
+pub(in crate::fs::ext4) fn ext4_bmap_bit_find_clr(bmap: &[u8], sbit: u32, ebit: u32, bit_id: &mut u32) -> bool {
     let mut i: u32;
     let mut bcnt = ebit - sbit;
 
@@ -126,7 +126,7 @@ pub(super) fn ext4_bmap_bit_find_clr(bmap: &[u8], sbit: u32, ebit: u32, bit_id: 
 /// 空缓冲、`start_bit` 超界直接返回；`end_bit` 截到最大合法位。
 ///
 /// [对照] ext4_rs `ext4_bmap_bits_free`
-pub(super) fn ext4_bmap_bits_free(bmap: &mut [u8], start_bit: u32, end_bit: u32) {
+pub(in crate::fs::ext4) fn ext4_bmap_bits_free(bmap: &mut [u8], start_bit: u32, end_bit: u32) {
     if bmap.is_empty() {
         return;
     }

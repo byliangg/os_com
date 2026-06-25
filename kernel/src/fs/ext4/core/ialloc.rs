@@ -34,7 +34,7 @@ use super::superblock::RawSuperblock;
 /// 安全 inode 分配器。持一份可变超级块（free-inodes 计数权威）+ 读接缝 + 元数据写回。
 /// **不复制 ext4_rs 的 `Ext4` god-object**；锁（`lock_block_group` / `lock_superblock_counter`）
 /// 语义在集成层接入（Phase 5），本结构单线程语义等价。
-pub(super) struct InodeAllocator<'a, R: BlockReader, W: MetadataWriter> {
+pub(in crate::fs::ext4) struct InodeAllocator<'a, R: BlockReader, W: MetadataWriter> {
     /// 运行期可变超级块（free-inodes 随 alloc 递减 / free 递增；其余字段同盘上初值）。
     sb: RawSuperblock,
     /// 读盘接缝（每轮组迭代重读组描述符 / inode 位图）。
@@ -47,7 +47,7 @@ pub(super) struct InodeAllocator<'a, R: BlockReader, W: MetadataWriter> {
 
 impl<'a, R: BlockReader, W: MetadataWriter> InodeAllocator<'a, R, W> {
     /// 用初始超级块字节 + 读/写接缝构造。
-    pub(super) fn new(sb: RawSuperblock, reader: &'a R, writer: &'a W) -> Self {
+    pub(in crate::fs::ext4) fn new(sb: RawSuperblock, reader: &'a R, writer: &'a W) -> Self {
         Self {
             sb,
             reader,
@@ -57,7 +57,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> InodeAllocator<'a, R, W> {
     }
 
     /// 当前（运行期）超级块快照——差分用例跑完后据此 `snapshot_meta`。
-    pub(super) fn superblock(&self) -> &RawSuperblock {
+    pub(in crate::fs::ext4) fn superblock(&self) -> &RawSuperblock {
         &self.sb
     }
 
@@ -155,7 +155,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> InodeAllocator<'a, R, W> {
 
     /// 分配一个 inode：从 bgid 0 线性扫到首个有空闲 inode 的组，置位 + 更新计数/csum，
     /// 返回 **1-based** inode 号。无 Orlov。逐位复刻 ext4_rs `ialloc_alloc_inode`。
-    pub(super) fn ialloc_alloc_inode(&mut self, is_dir: bool) -> Result<u32> {
+    pub(in crate::fs::ext4) fn ialloc_alloc_inode(&mut self, is_dir: bool) -> Result<u32> {
         let mut bgid = 0u32;
         let bg_count = self.sb.block_group_count();
 
@@ -234,7 +234,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> InodeAllocator<'a, R, W> {
     // ------------------------------------------------------------------
 
     /// 释放 inode `index`：定位组 + 组内下标，清位 + 计数回退 + csum。逐位复刻 ext4_rs。
-    pub(super) fn ialloc_free_inode(&mut self, index: u32, is_dir: bool) {
+    pub(in crate::fs::ext4) fn ialloc_free_inode(&mut self, index: u32, is_dir: bool) {
         let geom = GroupGeometry::new(&self.sb);
         let bgid = geom.get_bgid_of_inode(index);
         // ext4_rs 此处 lock_block_group(bgid)；core 单线程，锁语义 Phase 5 接入。

@@ -35,7 +35,7 @@ use super::transaction::JournalCommitPlan;
 /// journal **逻辑块**号映射到 fs **物理块**号再写（device.rs:146-166）。core 差分里 `MetadataWriter`
 /// 按物理块号写（`DirectMetadataWriter` 折成 `block*block_size` 字节偏移），故本 ctx 用
 /// `physical_blocks[logical] = 物理块` 做同一映射——两侧打到同一组物理块（见 harness `resolve_journal_area`）。
-pub(in crate::fs::ext4::core) struct CommitCtx<'a> {
+pub(in crate::fs::ext4) struct CommitCtx<'a> {
     /// journal inode 的物理块向量：`physical_blocks[i]` = journal 逻辑块 i 的 fs 物理块号。
     pub physical_blocks: &'a [Ext4Fsblk],
     /// 元数据写回接缝（差分里 `DirectMetadataWriter` 直写同一份字节）。
@@ -51,13 +51,13 @@ pub(in crate::fs::ext4::core) struct CommitCtx<'a> {
 /// 单屏障源抽象：commit 写序里 descriptor+payload 持久后、写 commit 块前调用一次。
 /// PARITY: ext4_rs `block_device.sync()`（mod.rs:200）——ordered-mode 唯一屏障。
 /// 差分里 `MemDisk` 直写、sync no-op，但**写序位置**仍逐字复刻（供 P5/真盘）。
-pub(in crate::fs::ext4::core) trait JournalBarrier {
+pub(in crate::fs::ext4) trait JournalBarrier {
     fn sync(&self) -> Result<()>;
 }
 
 /// commit 写序的 4 个 hook 点（崩溃注入差分用）。一一对应 ext4_rs `JournalCommitWriteStage`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::fs::ext4::core) enum JournalCommitWriteStage {
+pub(in crate::fs::ext4) enum JournalCommitWriteStage {
     /// descriptor/payload 尚未写。
     BeforeDescriptor,
     /// descriptor/payload 已写、commit 块尚未写（屏障已过）。
@@ -282,7 +282,7 @@ fn store_journal_sb(ctx: &CommitCtx<'_>, sb: &RawJournalSuperblock) -> Result<()
 /// 把一个事务的 commit plan 写进 journal 环并落盘，返回写入的 tid（= plan.tid）。
 ///
 /// 见模块文档「RED LINE 写序」。`write_commit_plan_with_hook` 的 no-op hook 版。
-pub(in crate::fs::ext4::core) fn write_commit_plan(
+pub(in crate::fs::ext4) fn write_commit_plan(
     ctx: &CommitCtx<'_>,
     space: &mut JournalSpace,
     sb: &mut RawJournalSuperblock,
@@ -298,7 +298,7 @@ pub(in crate::fs::ext4::core) fn write_commit_plan(
 /// escape 收集 entries → 建 descriptor → hook(BeforeDescriptor) → 写 descriptor+payload →
 /// **sync 屏障** → hook(BeforeCommitBlock) → 写 commit 块 → hook(AfterCommitBlock) → 更新+store SB →
 /// hook(AfterSuperblock) → ring advance（空则 set_tail）。
-pub(in crate::fs::ext4::core) fn write_commit_plan_with_hook(
+pub(in crate::fs::ext4) fn write_commit_plan_with_hook(
     ctx: &CommitCtx<'_>,
     space: &mut JournalSpace,
     sb: &mut RawJournalSuperblock,

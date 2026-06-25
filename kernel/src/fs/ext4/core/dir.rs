@@ -15,7 +15,7 @@ const DIR_TAIL_MARKER: u8 = 0xDE;
 // 写路径消费者：dir_write_entry_bytes / try_insert_to_existing_block（264 字节零填项 + 切槽判据）。
 // allow(dead_code) 载重：core/dir 暂未接入生产 VFS（仍走 ext4_rs），消费链仅 #[cfg(ktest)] 可达。
 #[allow(dead_code)]
-pub(super) const EXT4_DIR_ENTRY_INMEM_SIZE: usize = 264;
+pub(in crate::fs::ext4) const EXT4_DIR_ENTRY_INMEM_SIZE: usize = 264;
 
 /// 目录项指向的 inode 类型（filetype 特性下的 file_type 字节）。
 /// 安全替换旧实现里的 `union Ext4DirEnInternal`：当成 1 字节 + 按 filetype 解释。
@@ -51,7 +51,7 @@ impl From<u8> for DirEntryFileType {
 /// 不整体 Pod 化变长结构（旧实现含 255 字节 name + union）。变长尾的解析留 Phase 4。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawDirEntryHeader {
+pub(in crate::fs::ext4) struct RawDirEntryHeader {
     pub inode: u32,
     pub rec_len: u16,
     pub name_len: u8,
@@ -62,7 +62,7 @@ const_assert!(size_of::<RawDirEntryHeader>() == 8);
 /// 目录块尾的校验和结构（12 字节）。占用一个普通目录项槽，靠 reserved_ft==0xDE 识别。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Default)]
-pub(super) struct RawDirEntryTail {
+pub(in crate::fs::ext4) struct RawDirEntryTail {
     pub reserved_zero1: u32,
     pub rec_len: u16,
     pub reserved_zero2: u8,
@@ -134,7 +134,7 @@ const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 /// 一条解析出的目录项（借用块字节，零拷贝）。`name` 是块内 `&[u8]` 切片（变长尾，
 /// 非 Pod——安全切片即可，无需 from_le_bytes）。
 #[derive(Clone, Copy, Debug)]
-pub(super) struct DirEntryRef<'a> {
+pub(in crate::fs::ext4) struct DirEntryRef<'a> {
     pub inode: u32,
     pub rec_len: u16,
     pub name_len: u8,
@@ -144,7 +144,7 @@ pub(super) struct DirEntryRef<'a> {
 
 /// readdir 返回项：拥有 name 的目录项（脱离块缓冲生命周期）。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct OwnedDirEntry {
+pub(in crate::fs::ext4) struct OwnedDirEntry {
     pub inode: u32,
     pub file_type: u8,
     pub name: Vec<u8>,
@@ -152,7 +152,7 @@ pub(super) struct OwnedDirEntry {
 
 /// 跨块查找命中：对齐 ext4_rs `Ext4DirSearchResult`（dentry.inode/pblock_id/offset/prev_offset）。
 #[derive(Clone, Copy, Debug)]
-pub(super) struct DirSearchHit {
+pub(in crate::fs::ext4) struct DirSearchHit {
     pub inode: u32,
     pub pblock: Ext4Fsblk,
     pub offset: usize,
@@ -164,7 +164,7 @@ pub(super) struct DirSearchHit {
 /// 边界检查：头需 8 字节、name 区 `[off+8, off+8+name_len)` 须落在 `block_size` 内；
 /// 越界 → EIO（损坏防御）。ext4_rs 用 `read_offset_as`（unsafe 指针读 264B 整结构）+
 /// `&self.name[..name_len]`；这里改为安全切片解析（头 Pod `from_bytes`，name 字节切片）。
-pub(super) fn parse_entry<'a>(
+pub(in crate::fs::ext4) fn parse_entry<'a>(
     block: &'a [u8],
     off: usize,
     block_size: usize,
@@ -202,7 +202,7 @@ pub(super) fn parse_entry<'a>(
 /// （查找路径与枚举路径的防御不同：枚举路径 silent break，此处返回错误）；空槽
 /// （`inode==0`）跳过；name 用 `&[u8]` 字节比较（name_len 相等且字节相等）。
 /// 末尾 ext4_rs 还调 `validate_inode_number`——core 在更上层（namespace）做，此处仅返回 inode。
-pub(super) fn dir_find_in_block(
+pub(in crate::fs::ext4) fn dir_find_in_block(
     block: &[u8],
     name: &[u8],
     block_size: usize,
@@ -241,7 +241,7 @@ pub(super) fn dir_find_in_block(
 /// `return Err(e)`（传播）；**块内查找**（`dir_find_in_block`）的结果只看 `r.is_ok()`——
 /// 命中即返回，**任何 Err（含未命中 ENOENT 与坏 rec_len 的 EIO）都吞掉、扫下一块**。
 /// 走完所有块后 ENOENT（core 用 `Ok(None)` 表达）。
-pub(super) fn dir_find_entry(
+pub(in crate::fs::ext4) fn dir_find_entry(
     ctx: &ReadCtx,
     dir: &Inode,
     name: &[u8],
@@ -288,7 +288,7 @@ pub(super) fn dir_find_entry(
 /// （跳出本块项循环，不报错，区别于 `dir_find_in_block` 的 EIO）；空槽 `inode==0` 跳过；
 /// 停于 `block_size - 12`（tail 区）；`get_pblock_idx_state` 的 Err/None **静默跳过该块**
 /// （ext4_rs `if let Ok(fblock) = get_pblock_idx`——错误/未映射都不收任何项、不报错）。
-pub(super) fn dir_get_entries(ctx: &ReadCtx, dir: &Inode) -> Vec<OwnedDirEntry> {
+pub(in crate::fs::ext4) fn dir_get_entries(ctx: &ReadCtx, dir: &Inode) -> Vec<OwnedDirEntry> {
     dir_enumerate(ctx, dir, false)
         .into_iter()
         .map(|(e, _off)| e)
@@ -299,7 +299,7 @@ pub(super) fn dir_get_entries(ctx: &ReadCtx, dir: &Inode) -> Vec<OwnedDirEntry> 
 /// `next_offset = iblock*block_size + off + rec_len`。
 ///
 /// PARITY（ext4_rs `dir_get_entries_with_next_offset`，dir.rs:205）。
-pub(super) fn dir_get_entries_with_next_offset(
+pub(in crate::fs::ext4) fn dir_get_entries_with_next_offset(
     ctx: &ReadCtx,
     dir: &Inode,
 ) -> Vec<(OwnedDirEntry, usize)> {
@@ -368,7 +368,7 @@ fn dir_enumerate(ctx: &ReadCtx, dir: &Inode, with_offset: bool) -> Vec<(OwnedDir
 ///   c = crc32c(c, ino_gen.le4)
 ///   c = crc32c(c, block[..block_size-12])   // tail 区不入校验
 /// 标量 `to_le_bytes`（ino_index/ino_gen 是喂给 crc 的整数，非磁盘结构解析）允许。
-pub(super) fn dir_block_csum(
+pub(in crate::fs::ext4) fn dir_block_csum(
     sb: &RawSuperblock,
     block: &[u8],
     ino_index: u32,
@@ -399,7 +399,7 @@ pub(super) fn dir_block_csum(
 ///
 /// `ino_index` 内部取块首项 inode（`parse_entry(block, 0)`），与 `dir_set_csum` 一致；
 /// `tail.checksum` 在块 `[block_size-4, block_size)`（tail 内 checksum 字段 @+8）。
-pub(super) fn dir_verify_block_csum(sb: &RawSuperblock, block: &[u8], ino_gen: u32) -> bool {
+pub(in crate::fs::ext4) fn dir_verify_block_csum(sb: &RawSuperblock, block: &[u8], ino_gen: u32) -> bool {
     let has_csum = (sb.features_read_only() & RO_COMPAT_METADATA_CSUM) != 0;
     if !has_csum {
         return true;
@@ -470,7 +470,7 @@ fn align4(len: usize) -> usize {
 /// `// PARITY: 写满 EXT4_DIR_ENTRY_INMEM_SIZE`（264），**不是**只写 `8+name_len`。
 ///
 /// 调用方保证 `off + 264 <= buf.len()`（切槽判据 `required_len >= 264` 已门控）。
-pub(super) fn dir_write_entry_bytes(
+pub(in crate::fs::ext4) fn dir_write_entry_bytes(
     buf: &mut [u8],
     off: usize,
     inode: u32,
@@ -500,7 +500,7 @@ pub(super) fn dir_write_entry_bytes(
 /// （`block[block_size-4 .. block_size]`）。**写路径无条件**：ext4_rs 无视 metadata_csum 特性、
 /// 关 csum 的盘上也照写（BUG-22），故 core 写路径也无条件写以保 parity。读路径
 /// `dir_verify_block_csum` **仍门控**（ext4_rs 读不校验目录 csum，读/写非对称是忠实的）。
-pub(super) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, block_size: usize) {
+pub(in crate::fs::ext4) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, block_size: usize) {
     // PARITY: ext4_rs dir_set_csum writes the dir-block csum unconditionally, ignoring the
     // metadata_csum feature gate (ext4_impls/dir.rs:252 + ext4_defs/direntry.rs:185; all 7
     // call sites un-gated) — replicate exactly, even on a metadata_csum-off filesystem; this
@@ -535,7 +535,7 @@ pub(super) fn dir_set_csum(block: &mut [u8], sb: &RawSuperblock, ino_gen: u32, b
 /// **现有项缩短的 parity**：ext4_rs 把读出的 264 字节内存结构（仅改 rec_len）整体写回，等价于
 /// 只改盘上 `[off+4..off+6]` 这 2 字节（头其余 + name + 尾填字节原样不动）——core 只写这 2 字节，
 /// 落盘逐字节一致。
-pub(super) fn try_insert_to_existing_block(
+pub(in crate::fs::ext4) fn try_insert_to_existing_block(
     block: &mut [u8],
     name: &[u8],
     child_inode: u32,
@@ -583,7 +583,7 @@ pub(super) fn try_insert_to_existing_block(
 /// offset 0、`rec_len = el`（占满整块除 tail），经 [`dir_write_entry_bytes`] 写满 264 字节；
 /// tail（reserved_zero1=0, rec_len=12, reserved_zero2=0, reserved_ft=0xDE, checksum=0）写在
 /// `block_size-12`；中间 `[264..block_size-12]` 保持 0。（块 csum 由调用方随后 `dir_set_csum` 写。）
-pub(super) fn insert_to_new_block(
+pub(in crate::fs::ext4) fn insert_to_new_block(
     block: &mut [u8],
     inode: u32,
     name: &[u8],
@@ -611,7 +611,7 @@ pub(super) fn insert_to_new_block(
 /// `newex = RawExtent{first_block:iblock, start:pblock, block_count:1}`；
 /// `insert_extent(ctx, alloc, dir, &newex)`；`dir.set_size(dir.size() + block_size)`；
 /// `write_back_inode(...)`。（core 只支持 extent 目录——真镜像目录均 extent-mapped。）
-pub(super) fn dir_append_block(
+pub(in crate::fs::ext4) fn dir_append_block(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     dir: &mut Inode,
@@ -667,7 +667,7 @@ fn write_dir_block(ctx: &WriteCtx, pblock: Ext4Fsblk, block: &mut [u8], ino_gen:
 /// 2. 慢扫：从 iblock 0 起逐块 `try_insert`，成功即写块返回；
 /// 3. 无槽：`dir_append_block` 新建块 + `insert_to_new_block` 写首项 + 写块返回。
 /// 每次写块经 [`write_dir_block`]（MetadataWriter + csum）。
-pub(super) fn dir_add_entry(
+pub(in crate::fs::ext4) fn dir_add_entry(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     parent: &mut Inode,
@@ -727,7 +727,7 @@ pub(super) fn dir_add_entry(
 /// PARITY（ext4_rs `dir_add_entry_unchecked`，dir.rs:289）：末块 `try_insert` 成功返回
 /// `last_iblock*bs + within_offset`；末块满（或目录空）→ `dir_append_block` + `insert_to_new_block`
 /// 返回 `new_iblock*bs`。**仅在名字保证不存在 + 目录 append-dominated 时用**（无早块空槽）。
-pub(super) fn dir_add_entry_unchecked(
+pub(in crate::fs::ext4) fn dir_add_entry_unchecked(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
     parent: &mut Inode,
@@ -818,7 +818,7 @@ fn remove_entry_in_block(block: &mut [u8], offset: usize, block_size: usize) -> 
 /// PARITY（ext4_rs `dir_remove_entry`，dir.rs:588）：`dir_find_entry` 定位（命中 pblock +
 /// within-block offset），在该块上 [`remove_entry_in_block`]，写块（MetadataWriter + csum）。
 /// 未命中 → 传播 `dir_find_entry` 的 ENOENT（core 用 `Err(ENOENT)`，对齐 ext4_rs `?`）。
-pub(super) fn dir_remove_entry(ctx: &WriteCtx, parent: &mut Inode, name: &[u8]) -> Result<()> {
+pub(in crate::fs::ext4) fn dir_remove_entry(ctx: &WriteCtx, parent: &mut Inode, name: &[u8]) -> Result<()> {
     let block_size = ctx.block_size;
     let ino_gen = parent.raw.generation();
     let rctx = ctx.read_ctx();
@@ -841,7 +841,7 @@ pub(super) fn dir_remove_entry(ctx: &WriteCtx, parent: &mut Inode, name: &[u8]) 
 /// PARITY（ext4_rs `dir_remove_entry_at_offset`，dir.rs:647）：`iblock = abs_off / bs`、
 /// `offset_in_block = abs_off % bs`；映射 iblock → pblock（失败传播）；在块内
 /// [`remove_entry_in_block`]；写块（MetadataWriter + csum）。
-pub(super) fn dir_remove_entry_at_offset(
+pub(in crate::fs::ext4) fn dir_remove_entry_at_offset(
     ctx: &WriteCtx,
     parent: &mut Inode,
     abs_off: u64,
@@ -863,7 +863,7 @@ pub(super) fn dir_remove_entry_at_offset(
 /// 先 `off += rec_len`（ext4_rs 在 skip 判定**前**已前进 offset）；空槽（`inode==0`）跳过；
 /// '.'/'..' 跳过；遇其它项即 `Ok(true)`；走完 `Ok(false)`。块映射失败传播（`?`）。
 /// 注意 ext4_rs 开头判 `!is_dir → ENOTDIR`（namespace 层），core 此处不判（Task 3 编排时已确保是目录）。
-pub(super) fn dir_has_entry(ctx: &ReadCtx, dir: &Inode) -> Result<bool> {
+pub(in crate::fs::ext4) fn dir_has_entry(ctx: &ReadCtx, dir: &Inode) -> Result<bool> {
     let block_size = ctx.block_size;
     let total_blocks = dir.size().div_ceil(block_size as u64);
     let mut buf = vec![0u8; block_size];
@@ -911,7 +911,7 @@ pub(super) fn dir_has_entry(ctx: &ReadCtx, dir: &Inode) -> Result<bool> {
 ///
 /// PARITY（ext4_rs `inode_to_dir_entry_type`，dir.rs:264）：按 `mode & 0xF000` 分派——
 /// DIR→2、SYMLINK→7、CHRDEV→3、BLKDEV→4、FIFO→5、SOCK→6、其它（含 REG）→1。
-pub(super) fn inode_to_dir_entry_type(inode: &Inode) -> u8 {
+pub(in crate::fs::ext4) fn inode_to_dir_entry_type(inode: &Inode) -> u8 {
     match inode.raw.mode() & S_IFMT {
         S_IFDIR_MODE => DE_DIR,
         S_IFLNK => DE_SYMLINK,
@@ -971,7 +971,7 @@ const S_IFDIR_FULL: u16 = 0x4000;
 /// free_inodes/free_blocks 覆盖前写者。复刻 ext4_rs 单一权威 `super_block` 的办法：本上下文持
 /// 一份 `sb`，**每次分配前据它构造分配器、分配后把分配器运行期 SB（`superblock()`）同步回**。
 /// 这样块分配器看到的 SB 已含 inode 分配的计数变化，最终 SB 字节与 ext4_rs 一致。
-pub(super) struct NamespaceCtx<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> {
+pub(in crate::fs::ext4) struct NamespaceCtx<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> {
     reader: &'a R,
     writer: &'a W,
     data_writer: &'a D,
@@ -1013,7 +1013,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAlloc for NamespaceBlockAlloc<'
 impl<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> NamespaceCtx<'a, R, W, D> {
     /// 用读 / 元数据写 / 数据写接缝 + 初始超级块构造。`sb` 应为操作开始时盘上 SB 的快照
     /// （差分两侧从同字节起步）。
-    pub(super) fn new(reader: &'a R, writer: &'a W, data_writer: &'a D, sb: RawSuperblock) -> Self {
+    pub(in crate::fs::ext4) fn new(reader: &'a R, writer: &'a W, data_writer: &'a D, sb: RawSuperblock) -> Self {
         Self {
             reader,
             writer,
@@ -1024,7 +1024,7 @@ impl<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> NamespaceCtx<'a, R, 
 
     /// 当前权威超级块（差分跑完据此对拍）。
     #[allow(dead_code)]
-    pub(super) fn superblock(&self) -> &RawSuperblock {
+    pub(in crate::fs::ext4) fn superblock(&self) -> &RawSuperblock {
         &self.sb
     }
 
@@ -1161,7 +1161,7 @@ impl<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> NamespaceCtx<'a, R, 
 /// PARITY（ext4_rs `ext4_lookup_at`，simple_interface/mod.rs:201）：`dir_find_entry` 命中→
 /// `search_result.dentry.inode`；未命中（ext4_rs `dir_find_entry` 走完 ENOENT）→ core 把
 /// `Ok(None)` 映射成 `Err(ENOENT)`。
-pub(super) fn lookup_at(ctx: &ReadCtx, parent: &Inode, name: &[u8]) -> Result<u32> {
+pub(in crate::fs::ext4) fn lookup_at(ctx: &ReadCtx, parent: &Inode, name: &[u8]) -> Result<u32> {
     match dir_find_entry(ctx, parent, name)? {
         Some(hit) => Ok(hit.inode),
         None => Err(Error::with_message(Errno::ENOENT, "dir search fail")),
@@ -1175,7 +1175,7 @@ pub(super) fn lookup_at(ctx: &ReadCtx, parent: &Inode, name: &[u8]) -> Result<u3
 /// write_back 父 + 子。**create 写回等价化**：ext4_rs 先 write_back_inode_without_csum(child)
 /// 再 reload 再 link，core 直接在内存里构造 child 完跑 link、末尾各 write_back 一次——最终盘
 /// 字节等价（见模块顶 PARITY 注）。
-pub(super) fn create_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn create_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1197,7 +1197,7 @@ pub(super) fn create_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
 /// 同 [`create_at`] 但用 `link_unchecked`（只动父末块、无扫描），返回 `(新 inode 号, 新项 abs byte offset)`。
 ///
 /// PARITY（ext4_rs `create_unchecked`，ext4_impls/file.rs:543）。
-pub(super) fn create_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn create_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1223,7 +1223,7 @@ pub(super) fn create_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWri
 /// 传 `S_IFDIR|perm`）。dir-vs-file 分支由新建 inode 的 `is_dir()`（mode 类型位）驱动，与
 /// ext4_rs 一致——正常 mkdir（mode 含 S_IFDIR）走目录分支（写 '.'/'..' + child=2 + 父 nlink++）；
 /// 仅畸形调用（mode 无类型位）才回落到常规文件，与 ext4_rs 一致（不再 core 强制建目录）。
-pub(super) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1245,7 +1245,7 @@ pub(super) fn mkdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
 ///
 /// PARITY（ext4_rs `ext4_mkdir_unchecked_at`，simple_interface/mod.rs:258）：调用方保证 name
 /// 不存在（无查重）；`mode` 原样传给 `create_unchecked`（调用方提供 S_IFDIR 类型位）。
-pub(super) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1263,7 +1263,7 @@ pub(super) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter, D: BlockWrit
 ///    `write_back_inode(child)`。
 /// **BUG-19**：`free_child` 写死 false——**永不** `ialloc_free_inode`；**不截块**（不调
 /// truncate_inode）。故 unlink 文件后：项删 + child nlink 调整，但 inode 位图位 + 文件数据块仍占用。
-pub(super) fn unlink_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn unlink_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1309,7 +1309,7 @@ pub(super) fn unlink_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
 /// 5. `truncate_inode(child, 0)`（释放子数据块；inode 位图 NOT free——BUG-19）；
 /// 6. `unlink(parent, child, name)` 目录分支：父 nlink-1 + 子 nlink=0 + write_back 两者；
 /// 7. `dir_remove` 末尾再 `write_back_inode(parent)` 一次（小重复写，最终字节同）。
-pub(super) fn rmdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn rmdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     name: &[u8],
@@ -1424,7 +1424,7 @@ fn unlink_file_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
 ///
 /// `old_ftype` = old inode 派生的目录项类型（`inode_to_dir_entry_type`）——与 ext4_rs 传
 /// `&old_inode_ref` 给 `dir_add_entry`（由 inode 派生类型）一致。
-pub(super) fn rename_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     old_parent: u32,
     old_name: &[u8],
@@ -1535,7 +1535,7 @@ pub(super) fn rename_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
 /// 3. `dir_remove_entry_at_offset(parent, dir_byte_offset)`（O(1) 删）；
 /// 4. 父 nlink > 0 减一 + 子 nlink = 0 → write_back(child) + write_back(parent)。
 /// 注意 ext4_rmdir_at_fast **不**判 dir_has_entry（调用方保证空）、**不**拒 '.'/'..'（按偏移删）。
-pub(super) fn rmdir_at_fast<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+pub(in crate::fs::ext4) fn rmdir_at_fast<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
     child_ino: u32,

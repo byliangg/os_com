@@ -14,6 +14,6 @@ use super::prelude::*;
 /// [对照] ext4_rs `Ext4::get_pblock_idx_legacy`（ext4_impls/inode.rs:50）：直接块 [0,12)、
 /// 一级间接 [12, 12+ppb)、二级、三级间接。后续 phase 复刻为安全实现。
 #[allow(dead_code)]
-pub(super) fn get_pblock_idx_legacy(_inode: &Inode, _lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
+pub(in crate::fs::ext4) fn get_pblock_idx_legacy(_inode: &Inode, _lblock: Ext4Lblk) -> Result<Ext4Fsblk> {
     unimplemented!("ext2 indirect map seam — Phase 3 non-goal")
 }
