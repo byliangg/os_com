@@ -8,7 +8,7 @@
 //!   - Task 3 `commit`（commit 落盘，单屏障写序），
 //!   - Task 4 `revoke`，Task 5 `recovery`（三趟 replay）。
 //!
-//! Task 0 仅扩展差分 harness（`super::diff_harness`，仅 ktest）以驱动/对拍 JBD2；
+//! Task 0 仅扩展差分 harness（ktest 专用）以驱动/对拍 JBD2；
 //! 本模块的逻辑子模块由 Task 1+ 逐个 `pub mod` 进来。
 
 pub mod commit;

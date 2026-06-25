@@ -85,7 +85,7 @@ impl RawJournalHeader {
 /// JBD2 日志超级块（1024 字节，大端）。含大数组，**不派生 Default**。
 ///
 /// 可见性 `pub(in crate::fs::ext4)`：除 `journal` 模块自身外，仅 ktest 差分 harness
-/// （`super::super::diff_harness`，core 下的兄弟模块）需要直接读它来对拍 journal 超级块；
+/// （ktest 差分 harness，core 下的兄弟模块）需要直接读它来对拍 journal 超级块；
 /// 其余 `RawJournal*` 内部类型保持 `pub(super)`。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]

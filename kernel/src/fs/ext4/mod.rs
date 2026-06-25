@@ -5,9 +5,9 @@
 // in sibling modules (`fs.rs`/`inode.rs`) — a glob would silently hijack their bare `core::`
 // paths (`core::sync`, `core::fmt`, `core::result`, ...). Reference the crate as `::core::` if needed.
 mod core;
-// Phase 6 Task 0: production adapters bridging the integration seam (device / overlay bridge /
-// JBD2 runtime) to `core/`'s traits. Built but NOT yet wired into any production call site
-// (ext4_rs stays live); Task 1+ re-points the orchestration at these.
+// Phase 6: production adapters bridging the integration seam (device / overlay bridge /
+// JBD2 runtime) to `core/`'s traits. These are the live production bridges wiring `fs.rs`
+// to core/ for all read, journaled-write, and namespace operations.
 mod core_adapter;
 mod fs;
 mod inode;

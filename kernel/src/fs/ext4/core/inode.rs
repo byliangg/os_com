@@ -359,7 +359,7 @@ fn extent_tree_init_into(raw: &mut RawInode) {
 }
 
 /// 从盘读第 `group` 组的组描述符（GDT 紧跟超级块块），与 Phase-2 分配器
-/// [`super::balloc::BlockAllocator::load_group_desc`] / `diff_harness::snapshot_inode_table_group`
+/// [`super::balloc::BlockAllocator::load_group_desc`] / the former differential harness `snapshot_inode_table_group`
 /// 同一定位逻辑：`block_id = first_data_block + group/dsc_cnt + 1`、块内偏移
 /// `(group % dsc_cnt) * desc_size`，读满 64 字节后解析（desc_size==64 的真镜像下与 ext4_rs 一致）。
 fn load_group_desc(reader: &dyn BlockReader, sb: &RawSuperblock, group: u32) -> RawGroupDescriptor {

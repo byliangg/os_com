@@ -12,7 +12,7 @@
 //! - **无 Orlov**：alloc 从 bgid 0 线性扫，取首个 `free_inodes > 0` 的组（ext4_rs 即如此）。
 //! - inode 号 **1-based**：`bgid * inodes_per_group + (idx_in_bg + 1)`。
 //! - **不写 inode 表**：alloc/free 只动 inode 位图块、组描述符、超级块三处元数据；inode 内容
-//!   由上层写。三处都在 [`super::diff_harness::snapshot_meta`] 覆盖范围内（SB + GDT + 每组
+//!   由上层写。三处都在差分 harness `snapshot_meta` 覆盖范围内（SB + GDT + 每组
 //!   inode 位图块），故差分无盲区。
 //! - is_dir 走 `set_used_dirs_count`，**命中 Task 2 复刻的 bug**（误写 `itable_unused`）——
 //!   parity-first 原样保留。

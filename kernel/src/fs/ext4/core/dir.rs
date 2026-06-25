@@ -1003,7 +1003,7 @@ pub(in crate::fs::ext4) struct NamespaceCtx<'a, R: BlockReader, W: MetadataWrite
 }
 
 /// 把 Phase-2 `BlockAllocator` + `InodeAllocCtx` 适配成写半部要的 [`BlockAlloc`]——与
-/// diff_harness / file.rs 的 `CoreAllocAdapter` 同套（分配 / 释放后把 i_blocks 同步回 inode）。
+/// 前差分 harness / file.rs 的 `CoreAllocAdapter` 同套（分配 / 释放后把 i_blocks 同步回 inode）。
 struct NamespaceBlockAlloc<'a, R: BlockReader, W: MetadataWriter> {
     alloc: BlockAllocator<'a, R, W>,
     ictx: InodeAllocCtx,
@@ -1761,7 +1761,7 @@ mod test {
     // - 名字边界（name_len=255 超长名、name_len=0 空名）正确解析（不 panic）。
     // 这些块**不**喂给 ext4_rs 的 unsafe 路径（避免 UB），故是单侧 core 鲁棒性验证（同 Phase 3
     // 教训：损坏输入只验 core 优雅降级）。枚举路径 `dir_get_entries` 的 silent-break-不-panic
-    // 在 `diff_harness.rs` 的 `dir_get_entries_corrupted_silent_break`（需 ReadCtx）里验。
+    // 在前差分 harness 的 `dir_get_entries_corrupted_silent_break`（需 ReadCtx）里验。
     // =================================================================
 
     /// 损坏块防御（单侧 core）：坏 `rec_len`（0 / 越界）→ 查找路径 EIO 不 panic；超长名

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Phase 6 Task 2 — integration-layer JBD2 commit/checkpoint driver over the **safe core** journal.
 //!
-//! The production journaled-write path (`fs.rs::run_journaled_ext4` + its commit/checkpoint driver
+//! The production journaled-write path (`fs.rs::run_journaled_core` + its commit/checkpoint driver
 //! + fsync force-commit) was historically built on the third-party `ext4_rs` **fat**
 //! `JournalRuntime` (which owns `checkpoint_list` / `last_committed_tid` / rotation /
 //! `commit_ready` / `all_checkpoint_plans` / `finish_commit`-with-checkpoint / overlay) plus the
@@ -637,6 +637,3 @@ impl JournalBarrier for SyncBarrier<'_> {
         (self.sync)()
     }
 }
-
-/// A no-op crash hook (production commit path without injected crash).
-pub(super) fn no_commit_hook(_stage: JournalCommitWriteStage) {}

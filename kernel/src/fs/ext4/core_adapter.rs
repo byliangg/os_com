@@ -9,13 +9,10 @@
 //! machinery the live `ext4_rs` adapters (`KernelBlockDeviceAdapter` / `JournalIoBridge` /
 //! `JournalOperationMetadataWriter` in `fs.rs`) already use.
 //!
-//! **Task 0 only BUILDS the bridge — it does NOT cut over.** None of these adapters is wired into
-//! a production call site yet (`run_journaled_ext4`, the `.ext4_*()` methods and mount all stay on
-//! `ext4_rs`). They are `#[allow(dead_code)]` until Task 1+ re-points the orchestration at them.
-//!
-//! Shape is copied from the differential harness (`core/diff_harness.rs`): `DirectMetadataWriter`,
-//! `CoreDirAllocAdapter` / `NamespaceBlockAlloc`, and `read_sb` are the templates — production
-//! builds the same constructs from the real device instead of `MemDisk`.
+//! These adapters ARE the production bridges wiring `fs.rs` to `core/` traits: the overlay device
+//! reader (`CoreDeviceReader`), journaled metadata writer (`CoreMetadataWriter`), direct data
+//! writer (`CoreDataWriter`), block allocator context (`CoreBlockAlloc`), and the running
+//! superblock reader (`read_superblock`). All are live call sites as of Phase 6 Task 4.
 //!
 //! NOTE (`mod core` shadows the std `core` crate, see `mod.rs`): inside this sibling module the
 //! bare path `core::` would resolve to our `super::core`. We reference our safe core as
@@ -158,7 +155,7 @@ impl BlockWriter for CoreDataWriter {
 /// byte-offset). The deferred-home-write suppression (`should_defer_metadata_write`) and the
 /// overlay read are NOT core-runtime responsibilities (core's runtime is the thin in-memory state
 /// machine) — they stay in the integration layer's `JournalIoBridge`, unchanged.
-// Phase 6 Task 2 wires this into `run_journaled_ext4` (replaces `JournalOperationMetadataWriter`).
+// Phase 6 Task 2: replaces the old `JournalOperationMetadataWriter` in the journaled write path.
 pub(super) struct CoreMetadataWriter {
     runtime: CoreJournalRuntimeHandle,
     handle_id: u64,
@@ -304,43 +301,7 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAlloc for CoreBlockAlloc<'a, R,
 // 5. Superblock parse + running copy at mount.
 // =============================================================================================
 
-/// A running copy of the on-disk superblock, mirroring the harness `read_sb` template.
-///
-/// The on-disk superblock lives at byte offset 1024 (the first 1024 bytes after the boot block),
-/// independent of block size. Core's allocators each carry a private running `RawSuperblock`
-/// (free-blocks / free-inodes authority); the orchestration holds one authoritative copy here,
-/// re-seeds each per-operation allocator from it, and syncs the allocator's running SB back after
-/// each operation (the "single authoritative super_block" pattern from `NamespaceCtx`). Wrapped in
-/// a `RefCell` so the (later) single-threaded-under-correctness-lock orchestration can mutate it.
-// Phase 6 Task 2/3 maintains this running SB across journaled operations.
-#[allow(dead_code)]
-pub(super) struct RunningSuperblock {
-    sb: RefCell<RawSuperblock>,
-}
-
-#[allow(dead_code)]
-impl RunningSuperblock {
-    /// Parse the superblock from `reader` at mount (offset 1024, 1024 bytes), holding the running
-    /// copy. Mirrors harness `read_sb`.
-    pub(super) fn parse(reader: &dyn BlockReader) -> Self {
-        Self {
-            sb: RefCell::new(read_superblock(reader)),
-        }
-    }
-
-    /// Snapshot the current running superblock (allocators are seeded from this).
-    pub(super) fn snapshot(&self) -> RawSuperblock {
-        *self.sb.borrow()
-    }
-
-    /// Replace the running superblock with the allocator's post-operation running SB (sync-back).
-    pub(super) fn store(&self, sb: RawSuperblock) {
-        *self.sb.borrow_mut() = sb;
-    }
-}
-
 /// Parse a [`RawSuperblock`] from the device via the core read seam (offset 1024, 1024 bytes).
-/// Mirrors the differential harness `read_sb`; the running copy holder is [`RunningSuperblock`].
 // Phase 6 Task 4 calls this from mount (after `verify_ext4_superblock`).
 #[allow(dead_code)]
 pub(super) fn read_superblock(reader: &dyn BlockReader) -> RawSuperblock {

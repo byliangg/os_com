@@ -4636,7 +4636,7 @@ impl Ext4Fs {
 
     /// Phase 6 Task 2: the journaled-write chokepoint, but driving **core**'s `file::*` write fns
     /// instead of the scoped ext4_rs engine. Same lock order + same JBD2 handle lifecycle + same
-    /// cache-invalidation as [`run_journaled_ext4`]; only the engine inside `apply` changes.
+    /// cache-invalidation as `run_journaled_ext4`/[`run_journaled_core`]; only the engine inside `apply` changes.
     ///
     /// `apply` receives a fully-built core write context (`WriteCtx` over the overlay reader + the
     /// active-handle metadata writer + the data writer), a single `CoreBlockAlloc` (one running
@@ -4795,7 +4795,7 @@ impl Ext4Fs {
 
     /// Phase 6 Task 3: the journaled chokepoint for **namespace** ops (create/mkdir/unlink/rmdir/
     /// rename), driving **core**'s `dir::*` over a `NamespaceCtx`. Same lock order + JBD2 handle
-    /// lifecycle + cache invalidation as [`run_journaled_ext4`]/[`run_journaled_core`]; only the
+    /// lifecycle + cache invalidation as `run_journaled_ext4`/[`run_journaled_core`]; only the
     /// engine inside `apply` differs.
     ///
     /// `apply` receives a fully-built `&mut NamespaceCtx` (overlay reader + active-handle metadata
@@ -4804,16 +4804,13 @@ impl Ext4Fs {
     /// allocates inodes/blocks (decrementing the running SB's free counts), and writes everything
     /// back through the metadata writer into the active JBD2 transaction.
     ///
-    /// **C1 two-engine free-counter coherency — namespace edition.** Namespace ops mutate BOTH
+    /// **Free-counter coherency — namespace edition.** Namespace ops mutate BOTH
     /// `s_free_inodes_count` (inode alloc via `ialloc`) and `s_free_blocks_count` (directory-block
-    /// alloc/free). Like [`run_journaled_core`], we seed the running SB's free-block AND free-inode
-    /// counts from ext4_rs's **authoritative** counter mutex (`lock_superblock_counter()` — NOT the
-    /// stale `inner.super_block`). After the op we sink BOTH post-op counts (`nctx.superblock()`)
-    /// back into that same mutex, so any still-ext4_rs path observing free counts at the mount
-    /// boundary stays coherent with what core just persisted to disk (core's `write_superblock`
-    /// rewrote the whole 1024-byte SB with both decremented counters during the op). With inode
-    /// allocation now core-owned for the namespace path, steady-state allocation is single-source
-    /// (core's running SB) and the ext4_rs mutex is only a mount-boundary mirror.
+    /// alloc/free). We seed the running SB's free-block AND free-inode counts from the core-owned
+    /// authoritative `running_sb` (the single source of truth). After the op we sink BOTH post-op
+    /// counts (`nctx.superblock()`) back into `running_sb`, so all subsequent operations see the
+    /// decremented counters that core just persisted to disk (core's `write_superblock` rewrote
+    /// the whole 1024-byte SB during the op). Steady-state allocation is single-source throughout.
     fn run_journaled_namespace<T>(
         &self,
         op: Option<JournaledOp>,
