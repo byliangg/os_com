@@ -41,6 +41,46 @@ require_file_contains() {
     grep -F -q "${needle}" "${file}" 2>/dev/null || fail "file ${file} does not contain ${needle}"
 }
 
+require_file_not_contains() {
+    file="$1"
+    needle="$2"
+    [ -f "${file}" ] || fail "missing file ${file}"
+    if grep -F -q "${needle}" "${file}" 2>/dev/null; then
+        fail "file ${file} unexpectedly contains ${needle} (stale dir-block leak)"
+    fi
+}
+
+run_e2fsck_clean() {
+    dev="$1"
+    fsck_bin=""
+    for cand in /usr/sbin/e2fsck /sbin/e2fsck /usr/bin/e2fsck; do
+        if [ -x "${cand}" ]; then
+            fsck_bin="${cand}"
+            break
+        fi
+    done
+    if [ -z "${fsck_bin}" ]; then
+        # No fsck binary injected: skip rather than fail (interop check is best-effort).
+        echo "EXT4_CRASH_E2FSCK_SKIP dev=${dev} reason=no_e2fsck_binary" >&2
+        return 0
+    fi
+    ensure_device_unmounted "${dev}"
+    # -f force full check, -n read-only (never modify), -y not needed because -n.
+    # e2fsck exit codes: 0 = clean, 1 = errors corrected (impossible with -n),
+    # >=4 = errors left uncorrected -> the filesystem is inconsistent.
+    fsck_log="/tmp/ext4_crash_e2fsck_$(basename "${dev}" | tr -c '[:alnum:]' '_').log"
+    # Guard against `set -e`: a non-zero e2fsck exit (e.g. rc=4) must not abort
+    # the script here; we inspect rc explicitly below.
+    rc=0
+    "${fsck_bin}" -f -n "${dev}" >"${fsck_log}" 2>&1 || rc=$?
+    if [ "${rc}" -ge 4 ]; then
+        echo "EXT4_CRASH_E2FSCK_FAIL dev=${dev} rc=${rc}" >&2
+        sed -n '1,80p' "${fsck_log}" >&2 || true
+        fail "e2fsck reported uncorrected inconsistency on ${dev} (rc=${rc})"
+    fi
+    echo "EXT4_CRASH_E2FSCK_CLEAN dev=${dev} rc=${rc}"
+}
+
 require_file_filled_with_byte() {
     file="$1"
     byte="$2"
@@ -227,6 +267,95 @@ verify_truncate_shrink() {
     require_file_size "${CASE_DIR}/truncate_shrink.bin" 0
 }
 
+# Validates the JBD2 REVOKE fix (Phase 7 Task 8 / BUG-5) end-to-end against a
+# real crash + real disk. Workload (see technical_report.md 附录 A-1):
+#   1. Grow a directory across MULTIPLE journaled dir-blocks, then sync so those
+#      blocks are committed to the journal and checkpointed to their home spots.
+#   2. Delete every entry and rmdir the directory. This FREES the directory's
+#      metadata blocks; with the fix the freeing transaction records REVOKE
+#      records for each freed dir-block.
+#   3. Immediately create a fresh regular file and write a LARGE distinctive
+#      data pattern (a single repeating byte 'R' = 0x52, which is NOT a valid
+#      ext4 dir-block: no leaf magic, no rec_len/name_len dirent structure, no
+#      dirent filenames), sized to reclaim roughly the just-freed blocks. fsync
+#      commits the reused-block data AND the pending revoke.
+# The host harness holds the kernel at `write:after_commit` (the file-write
+# commit, after the commit block + SB are on disk, BEFORE the freed dir-blocks
+# are checkpointed to their home location), then kills the VM. Recovery then
+# replays the journal with BOTH the stale dir-block records AND the revoke
+# present. If revoke works, recovery skips the freed dir-blocks and the file
+# keeps its 'R' payload. If revoke is broken (BUG-5), recovery replays stale
+# dir-block content (dirent bytes / leaf magic) over the reused data blocks and
+# the file is corrupted -> verify FAILS (filled-byte mismatch and/or a leaked
+# dirent filename), and e2fsck may also flag inconsistency.
+DIR_DELETE_REUSE_ENTRY_PREFIX="reuse_entry_long_name_marker_"
+DIR_DELETE_REUSE_PAYLOAD_BYTE=82   # ASCII 'R' for "REUSE"
+prepare_dir_delete_reuse() {
+    mkdir -p "${CASE_DIR}"
+    rd="${CASE_DIR}/reuse_dir"
+    rm -rf "${rd}"
+    mkdir -p "${rd}"
+
+    # Long entry names force the directory to span several 4 KiB dir-blocks
+    # well before the count gets large; a few hundred entries grows it to
+    # multiple journaled metadata blocks.
+    i=1
+    while [ "${i}" -le 400 ]; do
+        : > "${rd}/${DIR_DELETE_REUSE_ENTRY_PREFIX}${i}"
+        i=$((i + 1))
+    done
+    # Commit + checkpoint the directory metadata blocks to their home location.
+    sync
+
+    # Free every dir entry and the directory itself: this frees the directory's
+    # metadata blocks and (with the fix) records REVOKE records for them.
+    i=1
+    while [ "${i}" -le 400 ]; do
+        rm -f "${rd}/${DIR_DELETE_REUSE_ENTRY_PREFIX}${i}"
+        i=$((i + 1))
+    done
+    rmdir "${rd}"
+
+    # Immediately reclaim the freed blocks with distinctive file data. Build the
+    # payload by filling with the byte 'R' (0x52). 8 MiB comfortably exceeds the
+    # freed directory's block footprint so the realloc lands on freed space.
+    char=$(printf "\\$(printf '%03o' "${DIR_DELETE_REUSE_PAYLOAD_BYTE}")")
+    target="${CASE_DIR}/reuse_data.bin"
+    rm -f "${target}"
+    # tr emits the fill byte for every input byte; /dev/zero feeds the length.
+    dd if=/dev/zero bs=4096 count=2048 2>/dev/null | tr '\000' "${char}" > "${target}"
+
+    # fsync the file: commits the reused-block file data AND the pending revoke
+    # from the rmdir, so recovery after the crash sees the revoke.
+    if [ -x "${FSYNC_HELPER}" ]; then
+        fsync_helper fsync "${target}"
+    else
+        sync
+    fi
+}
+
+verify_dir_delete_reuse() {
+    target="${CASE_DIR}/reuse_data.bin"
+    # The reused-data file must survive recovery byte-for-byte: filled entirely
+    # with 'R' (0x52). Any other byte means stale dir-block metadata (leaf
+    # magic, rec_len/inode fields, checksum) leaked over the reused data blocks
+    # -> revoke is broken.
+    require_file_size "${target}" 8388608
+    require_file_filled_with_byte "${target}" "${DIR_DELETE_REUSE_PAYLOAD_BYTE}"
+    # Directly assert no stale dir entry name leaked into the file data.
+    require_file_not_contains "${target}" "${DIR_DELETE_REUSE_ENTRY_PREFIX}"
+    # The freed directory must stay gone after recovery.
+    [ ! -e "${CASE_DIR}/reuse_dir" ] || fail "reuse_dir reappeared after recovery"
+    # Interop check: a broken revoke can also leave e2fsck-detectable damage
+    # (e.g. blocks claimed by both the file and the stale dir inode). Unmount
+    # first, then run a read-only forced fsck.
+    sync || true
+    umount "${MNT_DIR}" >/dev/null 2>&1 || true
+    run_e2fsck_clean "${TEST_DEV}"
+    # Remount so the common verify-phase teardown (sync + umount) is a no-op.
+    mount_test_dev
+}
+
 prepare_append_concurrent() {
     mkdir -p "${CASE_DIR}"
     : > "${CASE_DIR}/append_concurrent.tmp"
@@ -317,6 +446,7 @@ prepare_scenario() {
         dir_tree_churn) prepare_dir_tree_churn ;;
         rename_across_dir) prepare_rename_across_dir ;;
         truncate_shrink) prepare_truncate_shrink ;;
+        dir_delete_reuse) prepare_dir_delete_reuse ;;
         append_concurrent) prepare_append_concurrent ;;
         host_crash_fsync_size_durability) prepare_host_crash_fsync_size_durability ;;
         host_crash_fdatasync_metadata) prepare_host_crash_fdatasync_metadata ;;
@@ -337,6 +467,7 @@ verify_scenario() {
         dir_tree_churn) verify_dir_tree_churn ;;
         rename_across_dir) verify_rename_across_dir ;;
         truncate_shrink) verify_truncate_shrink ;;
+        dir_delete_reuse) verify_dir_delete_reuse ;;
         append_concurrent) verify_append_concurrent ;;
         host_crash_fsync_size_durability) verify_host_crash_fsync_size_durability ;;
         host_crash_fdatasync_metadata) verify_host_crash_fdatasync_metadata ;;
