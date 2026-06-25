@@ -924,9 +924,11 @@ pub(in crate::fs::ext4) fn prepare_write_at(
 //   返回 `[lblock_start, lblock_end)` 的 coalesce 映射向量。
 // - `zero_range` = `allocate_range` 后再零写可见区：`zero_end = keep_size ? min(range_end,
 //   file_size) : range_end`，零写 `[offset, zero_end)`，返回 zero_len。
-// - `punch_hole_keep_size`：**只零可见字节、不释放块**（i_blocks 不变——名副其实 keep_size；
-//   这是刻意简化、非真 FALLOC_FL_PUNCH_HOLE，登记 bug.md）；零写 `[offset,
-//   min(offset+len, file_size))`，返回 zero_len。
+// - `punch_hole_keep_size`：**真 FALLOC_FL_PUNCH_HOLE | KEEP_SIZE**（Phase 7 Task 6 修 BUG-13）。
+//   释放完全落在 `[offset, min(offset+len, file_size))` 内的整块（从 extent 树删 → 物理块经
+//   `extent_remove_space` 释放、i_blocks 精确递减、留 hole 读零），只对 head/tail 的**部分覆盖**
+//   边界块零写其在范围内的字节（不释放整块——块内尚有别的数据）。i_size 不变（KEEP_SIZE）。
+//   返回被零写的字节数（边界块）。详见 §punch 设计。
 // - Collapse / Insert / Unshare 在集成层（fs.rs:5868）即 `EOPNOTSUPP`——core 不提供入口。
 // =====================================================================
 
@@ -1041,11 +1043,18 @@ pub(in crate::fs::ext4) fn zero_range(
     Ok(zero_len)
 }
 
-/// `punch_hole_keep_size`：**只零可见字节、不释放块**（i_blocks 不变），返回零写字节数。
-/// 逐字节复刻 ext4_rs `punch_hole_keep_size`（file.rs:1520）。
+/// `punch_hole_keep_size`：**真 FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE**。
+/// 返回被零写的字节数（仅部分覆盖的边界块）。Phase 7 Task 6 修 BUG-13，判据切 ext4 规范。
 ///
-/// PARITY: 刻意简化——名副其实 keep_size，只把 `[offset, min(offset+len, file_size))` 写零，
-/// **不**回收物理块（非真 FALLOC_FL_PUNCH_HOLE；登记 bug.md）。
+/// [对照] Linux `ext4_punch_hole`（fs/ext4/inode.c）：对 `[offset, offset+len)`
+/// - **完全覆盖的整块** `[align_up(offset), align_down(range_end))` → 从 extent 树删除
+///   （`extent_remove_space` 释放物理块、按 512B 单位精确递减 i_blocks、中部删自动分裂 extent）
+///   → 这些逻辑块变 hole，读回零（ext4 缺席 extent 读零）；
+/// - **部分覆盖的 head/tail 边界块** → **不释放整块**（块内尚有范围外的数据），只把其落在
+///   `[offset, range_end)` 内的字节零写（RMW；hole/unwritten 边界本就读零，跳过不分配）。
+///
+/// i_size **不变**（KEEP_SIZE，punch 永不改文件大小）。i_blocks 恰减去被释放的整块数。
+/// 范围零长 / `offset >= file_size` → no-op。只走 extent 映射；legacy 间接映射不在本 Phase 范围。
 pub(in crate::fs::ext4) fn punch_hole_keep_size(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
@@ -1061,13 +1070,92 @@ pub(in crate::fs::ext4) fn punch_hole_keep_size(
     if offset >= file_size {
         return Ok(0);
     }
+    let block_size = ctx.block_size;
+    // KEEP_SIZE：punch 不超过文件末尾——超出部分本就是 hole，无块可释放、无字节可零写。
     let range_end = offset
         .checked_add(len)
         .ok_or_else(|| Error::with_message(Errno::EFBIG, "punch range end overflow"))?
         .min(file_size);
-    let zero_len = range_end - offset;
-    write_zeros_at(ctx, alloc, inode, offset, zero_len)?;
-    Ok(zero_len)
+    if offset >= range_end {
+        return Ok(0);
+    }
+
+    // 完全覆盖的整块（逻辑块号）：[ceil(offset/bs), floor(range_end/bs))。
+    // first_full = 第一个起点 >= offset 的块；last_full_excl = 第一个起点 >= range_end 的块。
+    let first_full_lblock = offset.div_ceil(block_size);
+    let last_full_lblock_excl = range_end / block_size;
+
+    // 1) 释放完全覆盖的整块——从 extent 树删，物理块回收、i_blocks 精确递减、留 hole。
+    if first_full_lblock < last_full_lblock_excl {
+        let from = u32::try_from(first_full_lblock)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "punch lblock start too big"))?;
+        // extent_remove_space 收闭区间 [from, to]；to = 最后一个完全覆盖块。
+        let to = u32::try_from(last_full_lblock_excl - 1)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "punch lblock end too big"))?;
+        extents::extent_remove_space(ctx, alloc, inode, from, to)?;
+    }
+
+    // 2) 部分覆盖的边界块——只零写在范围内的字节，不释放整块。
+    //    head 块覆盖 [offset, min(head_block_end, range_end))；
+    //    tail 块覆盖 [max(tail_block_start, offset), range_end)，且 tail 块 != head 块时才单独零。
+    let mut zeroed = 0usize;
+
+    // head 部分块：offset 不块对齐 → head 块被部分覆盖。
+    if offset % block_size != 0 {
+        let head_block_end = (offset / block_size + 1) * block_size;
+        let head_zero_end = head_block_end.min(range_end);
+        if offset < head_zero_end {
+            zeroed += zero_partial_edge_block(ctx, inode, offset, head_zero_end - offset)?;
+        }
+    }
+
+    // tail 部分块：range_end 不块对齐、且 tail 块严格在 head 块之后（避免对单个边界块重复零写）。
+    if range_end % block_size != 0 {
+        let tail_block_start = (range_end / block_size) * block_size;
+        let tail_zero_start = tail_block_start.max(offset);
+        // 仅当 tail 块与 head 块不同（tail 块起点 >= head 块末尾，即 >= first_full 起点）才单独处理；
+        // offset 与 range_end 同块时上面 head 分支已覆盖整段，这里跳过。
+        if tail_zero_start > offset && tail_zero_start < range_end {
+            zeroed += zero_partial_edge_block(ctx, inode, tail_zero_start, range_end - tail_zero_start)?;
+        }
+    }
+
+    Ok(zeroed)
+}
+
+/// 对**单个边界块**内 `[offset, offset+len)` 的字节零写（RMW），`len` 不得跨块。
+/// 该块是 hole（缺席 extent）或 unwritten（预分配，读零）→ 跳过、**不分配**（已读零）。
+/// written 块 → 读出整块、把范围内字节清零、写回。返回实际零写的字节数（hole/unwritten 返回 0）。
+fn zero_partial_edge_block(
+    ctx: &WriteCtx,
+    inode: &Inode,
+    offset: usize,
+    len: usize,
+) -> Result<usize> {
+    if len == 0 {
+        return Ok(0);
+    }
+    let block_size = ctx.block_size;
+    let lblock = u32::try_from(offset / block_size)
+        .map_err(|_| Error::with_message(Errno::EFBIG, "edge lblock too big"))?;
+    let in_block = offset % block_size;
+
+    match extents::get_pblock_idx_state(ctx.reader, ctx.sb, inode, lblock)? {
+        // written 块：RMW 把 [in_block, in_block+len) 清零。
+        Some((pblock, false)) => {
+            let block_offset = usize::try_from(pblock)
+                .map_err(|_| Error::with_message(Errno::EFBIG, "edge pblock too big"))?
+                .checked_mul(block_size)
+                .ok_or_else(|| Error::with_message(Errno::EFBIG, "edge block offset overflow"))?;
+            let mut block_data = vec![0u8; block_size];
+            ctx.reader.read_at(block_offset, block_data.as_mut_slice());
+            block_data[in_block..in_block + len].fill(0);
+            ctx.data_writer.write_at(block_offset, block_data.as_slice());
+            Ok(len)
+        }
+        // unwritten 块（预分配、读零）或 hole（缺席 extent，读零）→ 已读零，不动、不分配。
+        Some((_, true)) | None => Ok(0),
+    }
 }
 
 /// `write_zeros_at`：按 64K chunk 循环 `write_at` 零写 `[offset, offset+len)`。
@@ -1176,9 +1264,16 @@ mod test {
 
     use ostd::prelude::*;
 
-    use super::{ext4_max_file_size, prepare_write_at, write_at, EXT4_INODE_FLAG_EXTENTS};
+    use alloc::collections::BTreeSet;
+
+    use super::{
+        ext4_max_file_size, prepare_write_at, punch_hole_keep_size, read_at, write_at,
+        EXT4_INODE_FLAG_EXTENTS,
+    };
     use crate::fs::ext4::core::block_group::RawGroupDescriptor;
-    use crate::fs::ext4::core::extents::{BlockAlloc, WriteCtx};
+    use crate::fs::ext4::core::extents::{
+        BlockAlloc, RawExtent, RawExtentHeader, WriteCtx, EXTENT_MAGIC,
+    };
     use crate::fs::ext4::core::inode::{load_inode, Inode, RawInode};
     use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
     use crate::fs::ext4::core::metadata_writer::MetadataWriter;
@@ -1361,5 +1456,289 @@ mod test {
             Errno::ENOSPC,
             "under-max prepare must pass size guard, not EFBIG"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 7 Task 6：真 FALLOC_FL_PUNCH_HOLE | KEEP_SIZE（BUG-13）standalone 测试。
+    // 判据切 ext4 规范（非差分；ext4_rs 已删）。校验：
+    //   ① 块对齐中部 punch → 完全覆盖块释放（free_blocks_count 增、i_blocks 精确减）、
+    //      范围读零、i_size 不变、周边数据完好；
+    //   ② 不对齐 punch → 部分边界块只零写在范围内的字节、不释放整块（i_blocks 只减
+    //      完全覆盖块）、边界读零；
+    //   ③ 单 extent 中部 punch → extent 分裂成两段、树仍有效、两侧读正确。
+    // ------------------------------------------------------------------
+
+    /// 真分配器：从高位空闲块池 `free` 取/还块，按 512B 当量增减 i_blocks（saturating，
+    /// 与生产 BUG-14 修复语义一致）。`free.len()` 即 free_blocks_count——punch 释放整块后必增。
+    struct TrackAlloc {
+        block_size: usize,
+        free: RefCell<BTreeSet<Ext4Fsblk>>,
+    }
+    impl TrackAlloc {
+        /// 空闲池播入 `[lo, hi)` 高位块（避开低位元数据）。
+        fn new(block_size: usize, lo: Ext4Fsblk, hi: Ext4Fsblk) -> Self {
+            let mut free = BTreeSet::new();
+            for b in lo..hi {
+                free.insert(b);
+            }
+            TrackAlloc {
+                block_size,
+                free: RefCell::new(free),
+            }
+        }
+        fn free_blocks_count(&self) -> usize {
+            self.free.borrow().len()
+        }
+        fn pop_one(&self) -> Result<Ext4Fsblk> {
+            let mut f = self.free.borrow_mut();
+            let b = *f
+                .iter()
+                .next()
+                .ok_or_else(|| Error::with_message(Errno::ENOSPC, "track pool empty"))?;
+            f.remove(&b);
+            Ok(b)
+        }
+    }
+    impl BlockAlloc for TrackAlloc {
+        fn alloc_one(&mut self, inode: &mut Inode) -> Result<Ext4Fsblk> {
+            let b = self.pop_one()?;
+            let inc = self.block_size as u64 / 512;
+            let cur = inode.blocks_count();
+            inode.set_blocks_count(cur + inc);
+            Ok(b)
+        }
+        fn alloc_batch(
+            &mut self,
+            inode: &mut Inode,
+            _start_bgid: &mut u32,
+            count: usize,
+        ) -> Result<Vec<Ext4Fsblk>> {
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                out.push(self.alloc_one(inode)?);
+            }
+            Ok(out)
+        }
+        fn free_blocks(&mut self, inode: &mut Inode, start: Ext4Fsblk, count: u32) {
+            for k in 0..count as u64 {
+                self.free.borrow_mut().insert(start + k);
+            }
+            let dec = count as u64 * (self.block_size as u64 / 512);
+            let cur = inode.blocks_count();
+            inode.set_blocks_count(cur.saturating_sub(dec));
+        }
+    }
+
+    /// 在 disk 上把 inode `ino` 初始化为「单个 `n_blocks` 块连续 extent」的 reg 文件：
+    /// 逻辑块 `[0, n_blocks)` → 物理块 `[pstart, pstart+n_blocks)`，i_size = n_blocks*bs，
+    /// i_blocks = n_blocks*(bs/512)。每个数据块填一个可辨识的字节模式（块号+1）。返回句柄。
+    fn seed_contig_extent_file(
+        disk: &MemImage,
+        sb: &RawSuperblock,
+        ino: u32,
+        n_blocks: u32,
+        pstart: Ext4Fsblk,
+    ) -> Inode {
+        let bs = sb.block_size();
+        // 根 i_block：header(entries=1, depth=0) + 单 extent。
+        let mut iblock = [0u8; 60];
+        iblock[..12]
+            .copy_from_slice(RawExtentHeader::new(EXTENT_MAGIC, 1, 4, 0, 0).as_bytes());
+        let mut e = RawExtent::default();
+        e.first_block = 0;
+        e.block_count = n_blocks as u16;
+        e.store_pblock(pstart);
+        iblock[12..24].copy_from_slice(e.as_bytes());
+
+        let off = inode_off(EXT4_IMAGE, sb, ino);
+        let mut raw = RawInode::from_bytes(&EXT4_IMAGE[off..off + 156]);
+        raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+        raw.set_mode(0x8000); // S_IFREG
+        raw.set_size(n_blocks as u64 * bs as u64);
+        let block: [u32; 15] = Pod::from_bytes(&iblock);
+        raw.block = block;
+        // i_blocks（512B 单位）= n_blocks * (bs/512)；测试规模内 hi 半位恒 0。
+        raw.blocks = (n_blocks as u64 * (bs as u64 / 512)) as u32;
+        raw.osd2.l_i_blocks_high = 0;
+        disk.write_at(off, raw.as_bytes());
+
+        // 每个数据块填可辨识模式（第 i 块全填 (i+1) as u8）。
+        for i in 0..n_blocks {
+            let pat = vec![(i + 1) as u8; bs];
+            disk.write_at((pstart as usize + i as usize) * bs, &pat);
+        }
+
+        load_inode(disk, sb, ino).unwrap()
+    }
+
+    #[ktest]
+    fn punch_aligned_middle_frees_blocks_reads_zero() {
+        // [对照] block-aligned 中部 punch → 完全覆盖块释放、范围读零、i_size 不变、周边完好。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+        let ino = 11u32;
+        let pstart: Ext4Fsblk = 6000;
+
+        // 4 块连续 extent；空闲池从 7000 起（与数据块不重叠）。
+        let mut inode = seed_contig_extent_file(&disk, &sb, ino, 4, pstart);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = TrackAlloc::new(bs, 7000, 8000);
+
+        let i_size_before = inode.size();
+        let i_blocks_before = inode.blocks_count();
+        let free_before = alloc.free_blocks_count();
+
+        // punch 中部 2 块 [bs, 3*bs)（块对齐）。
+        let zeroed = punch_hole_keep_size(&ctx, &mut alloc, &mut inode, bs, 2 * bs).unwrap();
+        // 块对齐 punch 无部分边界块 → 不零写任何字节。
+        assert_eq!(zeroed, 0, "aligned punch zeroes no edge bytes");
+
+        // i_size 不变（KEEP_SIZE）。
+        assert_eq!(inode.size(), i_size_before, "i_size must be unchanged by punch");
+        // i_blocks 精确减 2 块。
+        assert_eq!(
+            inode.blocks_count(),
+            i_blocks_before - 2 * (bs as u64 / 512),
+            "i_blocks must drop by exactly the 2 freed blocks"
+        );
+        // free_blocks_count 增 2（物理块 6001、6002 回池）。
+        assert_eq!(
+            alloc.free_blocks_count(),
+            free_before + 2,
+            "free_blocks_count must increase by exactly 2"
+        );
+        assert!(
+            alloc.free.borrow().contains(&(pstart + 1)) && alloc.free.borrow().contains(&(pstart + 2)),
+            "the two middle physical blocks must be freed"
+        );
+
+        // 读：punch 区 [bs, 3*bs) 全零；周边块 0 / 3 数据完好。
+        let read_ctx = ctx.read_ctx();
+        let mut buf = vec![0xFFu8; 4 * bs];
+        let got = read_at(&read_ctx, &inode, 0, &mut buf).unwrap();
+        assert_eq!(got, 4 * bs, "full file readable");
+        assert!(buf[0..bs].iter().all(|&b| b == 1), "block 0 intact");
+        assert!(buf[bs..3 * bs].iter().all(|&b| b == 0), "punched range reads zero");
+        assert!(buf[3 * bs..4 * bs].iter().all(|&b| b == 4), "block 3 intact");
+    }
+
+    #[ktest]
+    fn punch_unaligned_zeroes_partial_edges_frees_only_full() {
+        // [对照] 不对齐 punch：部分 head/tail 块只零写范围内字节、不释放；只完全覆盖块被释放。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+        let ino = 12u32;
+        let pstart: Ext4Fsblk = 6000;
+
+        // 4 块连续 extent。
+        let mut inode = seed_contig_extent_file(&disk, &sb, ino, 4, pstart);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = TrackAlloc::new(bs, 7000, 8000);
+
+        let i_size_before = inode.size();
+        let i_blocks_before = inode.blocks_count();
+        let free_before = alloc.free_blocks_count();
+
+        // punch 范围 [bs/2, 2.5*bs)：
+        //   head 块0 后半 [bs/2, bs) 部分覆盖、块1 完全覆盖、tail 块2 前半 [2*bs, 2.5*bs) 部分覆盖。
+        //   完全覆盖块（起点 ceil(bs/2 / bs)=1 .. 终点 floor(2.5*bs / bs)=2）= 仅块1。
+        let offset = bs / 2;
+        let range_end = 3 * bs - bs / 2; // = 2.5*bs
+
+        let zeroed = punch_hole_keep_size(&ctx, &mut alloc, &mut inode, offset, range_end - offset)
+            .unwrap();
+        // 两个部分边界块各零写 bs/2 字节。
+        assert_eq!(zeroed, bs, "two partial edges each zero bs/2 bytes");
+
+        // i_size 不变。
+        assert_eq!(inode.size(), i_size_before, "i_size unchanged");
+        // 只释放完全覆盖块（块1）→ i_blocks 减 1 块。
+        assert_eq!(
+            inode.blocks_count(),
+            i_blocks_before - (bs as u64 / 512),
+            "i_blocks must drop by exactly 1 fully-covered block"
+        );
+        assert_eq!(
+            alloc.free_blocks_count(),
+            free_before + 1,
+            "free_blocks_count must increase by exactly 1"
+        );
+        assert!(
+            alloc.free.borrow().contains(&(pstart + 1)),
+            "only the fully-covered middle block is freed"
+        );
+        assert!(
+            !alloc.free.borrow().contains(&pstart) && !alloc.free.borrow().contains(&(pstart + 2)),
+            "partial edge blocks must NOT be freed"
+        );
+
+        // 读：边界块在范围内字节读零、范围外字节保留原模式。
+        let read_ctx = ctx.read_ctx();
+        let mut buf = vec![0xFFu8; 4 * bs];
+        read_at(&read_ctx, &inode, 0, &mut buf).unwrap();
+        // 块0：前半 [0, bs/2) 保留模式 1；后半 [bs/2, bs) 读零。
+        assert!(buf[0..bs / 2].iter().all(|&b| b == 1), "head block kept prefix intact");
+        assert!(buf[bs / 2..bs].iter().all(|&b| b == 0), "head block in-range zeroed");
+        // 块1：完全覆盖（hole）读零。
+        assert!(buf[bs..2 * bs].iter().all(|&b| b == 0), "fully-covered block reads zero");
+        // 块2：前半 [2*bs, 2.5*bs) 读零；后半 [2.5*bs, 3*bs) 保留模式 3。
+        assert!(buf[2 * bs..2 * bs + bs / 2].iter().all(|&b| b == 0), "tail block in-range zeroed");
+        assert!(
+            buf[2 * bs + bs / 2..3 * bs].iter().all(|&b| b == 3),
+            "tail block kept suffix intact"
+        );
+        // 块3：完全在范围外，保留模式 4。
+        assert!(buf[3 * bs..4 * bs].iter().all(|&b| b == 4), "block 3 untouched");
+    }
+
+    #[ktest]
+    fn punch_mid_extent_split_keeps_tree_valid() {
+        // [对照] 单 extent 中部 punch → extent 分裂成两段、树仍有效、两侧读正确。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+        let ino = 13u32;
+        let pstart: Ext4Fsblk = 6000;
+
+        // 单个 5 块连续 extent，punch 严格在中部的块 2（[2*bs, 3*bs)）→ 内部分裂。
+        let mut inode = seed_contig_extent_file(&disk, &sb, ino, 5, pstart);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = TrackAlloc::new(bs, 7000, 8000);
+
+        let i_blocks_before = inode.blocks_count();
+        let free_before = alloc.free_blocks_count();
+
+        let zeroed =
+            punch_hole_keep_size(&ctx, &mut alloc, &mut inode, 2 * bs, bs).unwrap();
+        assert_eq!(zeroed, 0, "aligned single-block punch zeroes no edge bytes");
+
+        // 中部块释放：i_blocks 减 1、free +1，物理块 6002 回池。
+        assert_eq!(
+            inode.blocks_count(),
+            i_blocks_before - (bs as u64 / 512),
+            "i_blocks drops by 1 for the split-out punched block"
+        );
+        assert_eq!(alloc.free_blocks_count(), free_before + 1, "free +1");
+        assert!(alloc.free.borrow().contains(&(pstart + 2)), "middle block 2 freed");
+        // 两侧块未释放（仍映射）。
+        assert!(
+            [0u64, 1, 3, 4]
+                .iter()
+                .all(|&k| !alloc.free.borrow().contains(&(pstart + k))),
+            "both sides of the split must remain mapped"
+        );
+
+        // 树仍有效：左段 [0,2)、hole 块2、右段 [3,5) 全读正确。
+        let read_ctx = ctx.read_ctx();
+        let mut buf = vec![0xEEu8; 5 * bs];
+        let got = read_at(&read_ctx, &inode, 0, &mut buf).unwrap();
+        assert_eq!(got, 5 * bs, "extent tree still walkable after split");
+        assert!(buf[0..bs].iter().all(|&b| b == 1), "left side block 0 correct");
+        assert!(buf[bs..2 * bs].iter().all(|&b| b == 2), "left side block 1 correct");
+        assert!(buf[2 * bs..3 * bs].iter().all(|&b| b == 0), "punched middle reads zero (hole)");
+        assert!(buf[3 * bs..4 * bs].iter().all(|&b| b == 4), "right side block 3 correct");
+        assert!(buf[4 * bs..5 * bs].iter().all(|&b| b == 5), "right side block 4 correct");
     }
 }

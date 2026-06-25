@@ -1352,28 +1352,61 @@ pub(in crate::fs::ext4) fn extent_remove_space(
     from: Ext4Lblk,
     to: Ext4Lblk,
 ) -> Result<()> {
-    // ① extent 中间删（punch）：用 from 的路径判 found extent 是否严格包住 [from,to] 内侧。
+    // ① extent 中间删（punch split）：found extent 严格包住 [from,to] 内侧 → 把它分裂成
+    //    前段 [ee_block, from) + 尾段 (to, ee_block+len)，**释放**被删的中段物理块 [from,to]，
+    //    并把前段截断**写回盘**，再插入尾段。
+    //
+    // **Phase 7 Task 6 修复（不再 parity，按 ext4 规范——闭合 BUG-13 的 mid-extent split）**：
+    // ext4_rs 旧码在此分支只改本地 `ex.block_count`（**从不写回前段**）、insert 尾段、且
+    // **从不释放中段物理块 / 不减 i_blocks**——find_extent(to+1) 会重读盘上未改的原 extent，
+    // 与尾段重叠 → 树损坏，且 punch 后磁盘占用不降。core 此处：(a) 先释放中段 [from,to] 的
+    // 物理块（`ext_remove_blocks` → balloc_free_blocks 精确减 i_blocks）；(b) 把前段截断结果
+    // **持久化**到该 extent 槽（root 写 i_block + write_back；非根叶写块 + csum + sync）；
+    // (c) 再 insert 尾段。三步后：中段成 hole 读零、i_blocks 精确递减、树有效。
     {
         let search_path = find_extent(ctx.reader, ctx.sb, inode, from)?;
         let depth = search_path.path.len() - 1;
-        if let Some(mut ex) = search_path.path[depth].extent {
-            let ee_block = ex.first_block();
-            let actual_len = ex.len() as u32;
+        if let Some(found) = search_path.path[depth].extent {
+            let ee_block = found.first_block();
+            let actual_len = found.len() as u32;
             if ee_block < from && to < ee_block + actual_len - 1 {
-                let mut newex = RawExtent::default();
-                let unwritten = ex.is_unwritten();
-                let block_count = ex.block_count;
-                // 尾段物理起块 = (to+1 - ee_block) + ex.pblock。
-                let newblock = to + 1 - ee_block + ex.start() as u32;
-                ex.block_count = (from as u16).wrapping_sub(ee_block as u16);
+                let unwritten = found.is_unwritten();
+                let ext_pblock = found.start();
+
+                // (a) 释放被打洞的中段物理块 [from, to]（精确递减 i_blocks）。
+                ext_remove_blocks(ctx, alloc, inode, &found, from, to)?;
+
+                // (b) 前段截断 [ee_block, from)，写回该 extent 槽。
+                let node = &search_path.path[depth];
+                let pos = node.position;
+                let mut front = RawExtent::default();
+                front.first_block = ee_block;
+                front.set_actual_len((from - ee_block) as u16);
+                front.store_pblock(ext_pblock);
                 if unwritten {
-                    ex.mark_unwritten();
+                    front.mark_unwritten();
                 }
-                newex.first_block = to + 1;
-                newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
-                newex.start_lo = newblock;
-                newex.start_hi = ((newblock as u64) >> 32) as u16;
-                insert_extent(ctx, alloc, inode, &newex)?;
+                if node.pblock_of_node == 0 {
+                    let mut root = inode.i_block_bytes_vec();
+                    write_extent_at(&mut root, pos, &front);
+                    inode.set_i_block_bytes(&root);
+                    write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)?;
+                } else {
+                    let mut node_bytes = load_tree_block(ctx, node.pblock_of_node);
+                    write_extent_at(&mut node_bytes, pos, &front);
+                    set_extent_block_checksum_in_block(ctx, inode, &mut node_bytes)?;
+                    sync_tree_block(ctx, node.pblock_of_node, &node_bytes)?;
+                }
+
+                // (c) 插入尾段 (to, ee_block+len)：起逻辑块 to+1、物理起块 = pblock + (to+1-ee_block)。
+                let mut tail = RawExtent::default();
+                tail.first_block = to + 1;
+                tail.set_actual_len((ee_block + actual_len - 1 - to) as u16);
+                tail.store_pblock(ext_pblock + (to + 1 - ee_block) as u64);
+                if unwritten {
+                    tail.mark_unwritten();
+                }
+                insert_extent(ctx, alloc, inode, &tail)?;
                 return Ok(());
             }
         }
