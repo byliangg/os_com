@@ -1651,11 +1651,17 @@ pub(in crate::fs::ext4) fn rename_at<R: BlockReader, W: MetadataWriter, D: Block
 
 /// 用预算好的 dir-stream 字节偏移删除空目录（绕过 `dir_find_entry` 扫描）。
 ///
-/// PARITY（ext4_rs `ext4_rmdir_at_fast`，simple_interface/mod.rs:266）：
+/// [对照] ext4_rs `ext4_rmdir_at_fast`（simple_interface/mod.rs:266）+ Linux `ext4_rmdir`：
 /// 1. 载 parent + child；child 非目录 → **ENOTDIR**；
 /// 2. `truncate_inode(child, 0)`（释放子数据块）；
 /// 3. `dir_remove_entry_at_offset(parent, dir_byte_offset)`（O(1) 删）；
-/// 4. 父 nlink > 0 减一 + 子 nlink = 0 → write_back(child) + write_back(parent)。
+/// 4. 父 nlink > 0 减一 + 子 nlink = 0 → write_back(child)；
+/// 5. **BUG-19 已修**：子目录 nlink==0、目录无打开句柄语义（rmdir 即最后引用）→ 立即清 inode
+///    位图位（[`finalize_freed_inode`]，is_dir=true：used_dirs_count 自减、free_inodes++、set
+///    i_dtime）——与慢路径 [`rmdir_at`] 步⑦逐位等价。**此为生产热路径**（mkdir/readdir 后
+///    dir-entry 偏移已缓存，集成层 `rmdir_at` 优先走本快路径），故 free 必须在此而非仅慢路径；
+/// 6. write_back(parent)。
+///
 /// 注意 ext4_rmdir_at_fast **不**判 dir_has_entry（调用方保证空）、**不**拒 '.'/'..'（按偏移删）。
 pub(in crate::fs::ext4) fn rmdir_at_fast<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
@@ -1680,13 +1686,19 @@ pub(in crate::fs::ext4) fn rmdir_at_fast<R: BlockReader, W: MetadataWriter, D: B
         dir_remove_entry_at_offset(&ctx, &mut parent, dir_byte_offset)?;
     }
 
-    // ④ 父 nlink-1 + 子 nlink=0 → write_back(child) + write_back(parent)。
+    // ④ 父 nlink-1 + 子 nlink=0 → write_back(child)。
     let pl = parent.links_count();
     if pl > 0 {
         parent.set_links_count(pl - 1);
     }
     child.set_links_count(0);
     nctx.write_back(&mut child)?;
+
+    // ⑤ BUG-19 已修：立即回收子目录 inode（清位图位 + free_inodes++ + used_dirs_count 自减 +
+    //    set i_dtime）——与 rmdir_at 步⑦一致，生产热路径不漏。
+    finalize_freed_inode(nctx, &mut child)?;
+
+    // ⑥ write_back(parent)。
     nctx.write_back(&mut parent)?;
     Ok(())
 }
@@ -1979,8 +1991,8 @@ mod test {
     use core::cell::RefCell;
 
     use super::{
-        create_at, free_inode_on_evict_at, mkdir_at, rmdir_at, unlink_at, write_back_inode,
-        NamespaceBlockAlloc, NamespaceCtx,
+        create_at, free_inode_on_evict_at, mkdir_at, mkdir_unchecked_at, rmdir_at, rmdir_at_fast,
+        unlink_at, write_back_inode, NamespaceBlockAlloc, NamespaceCtx,
     };
     use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
     use crate::fs::ext4::core::bitmap::ext4_bmap_bit_find_clr;
@@ -2228,6 +2240,70 @@ mod test {
             sb.free_blocks_count(),
             base_free_blocks,
             "free_blocks_count back to baseline after rmdir (dir block released)"
+        );
+    }
+
+    /// BUG-19 (dir, FAST path): the production hot path is `rmdir_at_fast` — after `mkdir`
+    /// (`mkdir_unchecked_at` returns a cached dir-entry byte offset) or any readdir/lookup the
+    /// integration `Ext4Fs::rmdir_at` routes to `rmdir_at_fast`. This asserts the fast path frees the
+    /// directory inode exactly once (bitmap bit cleared, `used_dirs_count` + both free counts back to
+    /// baseline) — the slow-path ktest above could pass while this hot path leaked, so cover it here.
+    #[ktest]
+    fn rmdir_at_fast_frees_inode_blocks_and_used_dirs() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let base_sb = read_sb(&disk);
+        let base_free_inodes = base_sb.free_inodes_count();
+        let base_free_blocks = base_sb.free_blocks_count();
+
+        // mkdir_unchecked_at returns (ino, real dir-entry byte offset) — exactly what the integration
+        // caches and feeds to rmdir_at_fast.
+        let mut sb = base_sb;
+        let (ino, dir_byte_offset) = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let r = mkdir_unchecked_at(&mut nctx, 2, b"fastsub", S_IFDIR_TEST).unwrap();
+            sb = *nctx.superblock();
+            r
+        };
+        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, ino);
+        assert!(inode_bit_set(&disk, &sb, ino), "new dir inode bit set");
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
+            base_used_dirs + 1,
+            "mkdir must bump used_dirs_count"
+        );
+        assert!(
+            sb.free_blocks_count() < base_free_blocks,
+            "mkdir allocates a data block for './..'"
+        );
+
+        // FAST-path rmdir by cached offset.
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rmdir_at_fast(&mut nctx, 2, ino, dir_byte_offset).unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(
+            !inode_bit_set(&disk, &sb, ino),
+            "BUG-19 fix: rmdir_at_fast must clear the directory's inode bitmap bit (hot-path leak)"
+        );
+        let freed = load_inode(&disk, &sb, ino).unwrap();
+        assert_eq!(freed.links_count(), 0, "rmdir_at_fast drops dir nlink to 0");
+        assert_ne!(freed.raw.dtime, 0, "freed dir inode must have i_dtime set");
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
+            base_used_dirs,
+            "rmdir_at_fast must decrement used_dirs_count back to baseline"
+        );
+        assert_eq!(
+            sb.free_inodes_count(),
+            base_free_inodes,
+            "free_inodes_count back to baseline after rmdir_at_fast (no inode leak)"
+        );
+        assert_eq!(
+            sb.free_blocks_count(),
+            base_free_blocks,
+            "free_blocks_count back to baseline after rmdir_at_fast (dir block released)"
         );
     }
 

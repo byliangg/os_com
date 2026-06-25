@@ -5495,7 +5495,30 @@ impl Ext4Fs {
                 self.touch_ctime(old_ino)?;
 
                 Ok(())
-            })
+            })?;
+
+            // BUG-19 (rename-overwrite): when the rename overwrote an EXISTING REGULAR FILE,
+            // `core::dir::rename_at`'s `unlink_file_branch` dropped that victim's nlink to 0 but
+            // freed nothing — unlike `Dentry::unlink`, the rename path has no VFS `cleanup_unlinked`
+            // hook for the overwritten target, so `mv a b` (b a regular file) would leak b's inode +
+            // data blocks. Reclaim it here via the same evict path used by unlink. Must be done
+            // AFTER `with_inode_locks` releases (its non-reentrant write guard on the victim ino
+            // would deadlock with `cleanup_unlinked_file`'s own inode correctness lock). The call is
+            // self-guarded: it re-checks `nlink==0 && S_IFREG && !has_open_file_handles` and consults
+            // the `freed_inodes` double-free set, so an open-across-rename target is freed only at its
+            // last close and there is no double-free.
+            //
+            // NOTE: the directory-overwrite case (`mv dir1 dir2`, dir2 an empty dir) is a SEPARATE
+            // leak — `core::dir::rename_at` drops dir2 to nlink 0 without freeing it, and
+            // `cleanup_unlinked_file` skips non-regular files. Tracked as a follow-up in bug.md
+            // (rename-overwrite dir leak) under the Task 5 rename rework.
+            if let Some((ino, false)) = overwritten_is_dir
+                && ino != old_ino
+            {
+                self.cleanup_unlinked_file(ino)?;
+            }
+
+            Ok(())
         })
     }
 
