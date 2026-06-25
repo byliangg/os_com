@@ -98,9 +98,13 @@ pub(super) struct CoreJournalDriver {
     /// Highest TID whose commit finished durably (== ext4_rs `last_committed_tid`). fsync fast path.
     last_committed_tid: u32,
     /// Per-tid "what op_name filled this transaction" — test-only, drives the injected-crash replay
-    /// hold (the `replay_hold`/`replay_hold_op` cmdline). PARITY: ext4_rs carried `trigger_op` on the
-    /// transaction → commit plan; core's plan omits it (it's not on the differential write序 path), so
-    /// we track it integration-side. Cleared when the transaction commits.
+    /// hold (the `replay_hold`/`replay_hold_op` cmdline). PARITY: ext4_rs carries `trigger_op` on the
+    /// transaction (`JournalTransaction::register_handle`, transaction.rs:115-124): every handle with a
+    /// **real** op (`Some`) OVERWRITES it — **last-real-op-wins** — while an anonymous (`None`) handle
+    /// preserves the prior value. core's commit plan omits trigger_op (not on the differential write序
+    /// path), so we track it integration-side with the same last-real-op-wins semantics. Cleared when
+    /// the transaction commits. (C2: was first-op-wins `or_insert`, which mis-tagged a
+    /// create-then-write batch as "create" and broke the `replay_hold_op=write` crash hold.)
     trigger_op_by_tid: BTreeMap<u32, &'static str>,
     block_size: usize,
 }
@@ -142,14 +146,24 @@ impl CoreJournalDriver {
     // Handle lifecycle (driven by fs.rs under the jbd2_runtime write lock).
     // =====================================================================================
 
-    /// Start a JBD2 handle, returning its unique id. PARITY: ext4_rs `JournalRuntime::start_handle`
-    /// (the `mark_handle_requires_data_sync` debug flag is dropped — data-sync was always ordered
-    /// mode). `op_name` is recorded against the resulting running transaction's tid so the
-    /// injected-crash replay hold (test-only) can fire at the matching op's commit.
-    pub(super) fn start_handle(&mut self, reserved_blocks: u32, op_name: &'static str) -> Option<u64> {
+    /// Start a JBD2 handle, returning its unique id. PARITY: ext4_rs `JournalRuntime::start_handle` →
+    /// `register_handle` (the `mark_handle_requires_data_sync` debug flag is dropped — data-sync was
+    /// always ordered mode). `trigger_op` is recorded against the resulting running transaction's tid
+    /// so the injected-crash replay hold (test-only) can fire at the matching op's commit, with
+    /// **last-real-op-wins** semantics: a `Some(name)` op OVERWRITES the tid's trigger_op; a `None`
+    /// (anonymous) handle preserves the prior value — exactly ext4_rs `register_handle`'s
+    /// `if trigger_op.is_some() { self.trigger_op = trigger_op }` (transaction.rs:121-123).
+    pub(super) fn start_handle(
+        &mut self,
+        reserved_blocks: u32,
+        trigger_op: Option<&'static str>,
+    ) -> Option<u64> {
         let handle_id = self.runtime.start_handle(reserved_blocks)?;
-        if let Some(tid) = self.runtime.running_transaction().map(|t| t.tid()) {
-            self.trigger_op_by_tid.entry(tid).or_insert(op_name);
+        if let (Some(tid), Some(op_name)) =
+            (self.runtime.running_transaction().map(|t| t.tid()), trigger_op)
+        {
+            // Last-real-op-wins: overwrite on every real op (NOT `or_insert` first-wins).
+            self.trigger_op_by_tid.insert(tid, op_name);
         }
         Some(handle_id)
     }

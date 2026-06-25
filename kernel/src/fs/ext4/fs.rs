@@ -2198,16 +2198,20 @@ impl Ext4Fs {
 
     /// Start a JBD2 handle for `op`, returning its unique `handle_id`.
     ///
-    /// PARITY: ext4_rs `start_jbd2_handle` — the `trigger_op` debug tag and the
-    /// `mark_handle_requires_data_sync` flag were debug/accounting only (data-sync was always
-    /// ordered-mode in practice); core's runtime keeps the commit-plan / rotation subset, so we
-    /// drop them. The reserved-blocks estimate (admission rotation soft credit) is unchanged.
+    /// PARITY: ext4_rs `start_jbd2_handle` → `register_handle(reserved_blocks, trigger_op)`. The
+    /// `mark_handle_requires_data_sync` flag was debug/accounting only (data-sync was always
+    /// ordered-mode in practice), so it is dropped. `trigger_op` IS still tracked (it drives the
+    /// injected-crash replay hold): a real op passes `Some(name)`, an anonymous (`None`) handle passes
+    /// `None` so it preserves the transaction's prior trigger_op — mirroring ext4_rs `register_handle`
+    /// (overwrite only when `trigger_op.is_some()`). The reserved-blocks estimate is unchanged.
     fn start_jbd2_handle(&self, op: Option<&JournaledOp>) -> Option<u64> {
         let reserved_blocks = Self::estimate_jbd2_reserved_blocks(op);
-        let op_name = Self::jbd2_handle_op_name(op);
+        // `Some(name)` for a real op, `None` for the anonymous handle — matches ext4_rs's
+        // `Option<&'static str>` trigger_op (None = preserve prior, Some = overwrite, last-real-wins).
+        let trigger_op = op.map(|_| Self::jbd2_handle_op_name(op));
         let mut runtime_guard = self.jbd2_runtime.write();
         let driver = runtime_guard.as_mut()?;
-        driver.start_handle(reserved_blocks, op_name)
+        driver.start_handle(reserved_blocks, trigger_op)
     }
 
     fn next_alloc_operation_id(&self) -> u64 {
