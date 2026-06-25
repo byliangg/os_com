@@ -730,7 +730,15 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
             self.write_superblock().expect("write superblock");
 
             // inode i_blocks -= free_cnt * (block_size/512)（内存累减；core 不落 inode 表）。
-            inode_blocks -= (free_cnt * (block_size / EXT4_INODE_BLOCK_SIZE as usize)) as u64;
+            // BUG-14 fix（ext4-spec-correct，非 parity）：ext4 规范下 i_blocks 永不下溢。
+            // ext4_rs 此处用无符号 `-=`，当单次释放的 512B 当量超过当前 i_blocks 时 debug
+            // 直接 panic（`attempt to subtract with overflow`）。改用 `saturating_sub` 夹零——
+            // 正常删除（释放量 ≤ i_blocks）数值不变；异常/超额释放夹到 0 而非崩溃。
+            // [对照] Linux `ext4_free_blocks` 经 `dquot_free_block` 调 `ext4_inode_blocks`
+            //   记账，i_blocks 是 512B 单位且永不为负。BUG-15 修好后本路径不再超额释放，
+            //   此处 saturate 作纵深防御保留。
+            let dec = (free_cnt * (block_size / EXT4_INODE_BLOCK_SIZE as usize)) as u64;
+            inode_blocks = inode_blocks.saturating_sub(dec);
             any_freed = true;
 
             // 组 free_blocks += free_cnt + csum（用更新后 SB）+ 写。
@@ -811,4 +819,93 @@ fn compute_system_zones<R: BlockReader>(sb: &RawSuperblock, reader: &R) -> Vec<S
         });
     }
     zones
+}
+
+#[cfg(ktest)]
+mod test {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
+    use ostd::prelude::*;
+
+    use super::{BlockAllocator, InodeAllocCtx, RawSuperblock};
+    use crate::fs::ext4::core::io::BlockReader;
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+    // 全量带进 Pod(as_bytes/from_bytes) / vec! 等；Result 单独显式导入消歧。
+    use crate::prelude::*;
+    use crate::prelude::Result;
+
+    /// 内存盘：读 / 元数据写打到同一份字节（balloc 只需读位图 + 写位图/SB/组描述符）。
+    struct MemImage {
+        bytes: RefCell<Vec<u8>>,
+        block_size: usize,
+    }
+    impl MemImage {
+        fn new(seed: &[u8]) -> Self {
+            let sb = RawSuperblock::from_bytes(&seed[1024..2048]);
+            MemImage {
+                bytes: RefCell::new(seed.to_vec()),
+                block_size: sb.block_size(),
+            }
+        }
+    }
+    impl BlockReader for MemImage {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl MetadataWriter for MemImage {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            let base = block as usize * self.block_size;
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(base + i) {
+                    *slot = *byte;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// BUG-14 修复：单次 `balloc_free_blocks` 释放的 512B 当量超过当前 i_blocks 时，
+    /// i_blocks 必须 `saturating_sub` 夹到 0，而非无符号下溢 panic。
+    #[ktest]
+    fn balloc_free_i_blocks_saturates_no_underflow() {
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+        let per_block = (bs / 512) as u64; // 每块的 512B 当量。
+
+        let mut alloc = BlockAllocator::new(sb, &disk, &disk);
+
+        // i_blocks 只够 1 个块；却释放 4 个块（4*per_block 远超）→ 旧码 panic，新码夹零。
+        let mut inode = InodeAllocCtx::new(per_block);
+        let start: Ext4Fsblk = 5000;
+        alloc.balloc_free_blocks(&mut inode, start, 4);
+
+        assert_eq!(
+            inode.i_blocks(),
+            0,
+            "i_blocks must saturate to 0 on over-free, never underflow/panic"
+        );
+
+        // 正常释放（释放量 ≤ i_blocks）数值精确：i_blocks=10*per_block，释放 3 块 → 7*per_block。
+        let mut inode2 = InodeAllocCtx::new(10 * per_block);
+        alloc.balloc_free_blocks(&mut inode2, 5100, 3);
+        assert_eq!(
+            inode2.i_blocks(),
+            7 * per_block,
+            "normal free must decrement exactly, no saturation artifact"
+        );
+    }
 }

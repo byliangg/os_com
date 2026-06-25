@@ -1305,32 +1305,46 @@ fn read_leaf_extent_at(
 }
 
 // =====================================================================
-// extent 树删除半部（Phase 3 Task 5）。
+// extent 树删除半部（Phase 3 Task 5 复刻；Phase 7 Task 1 修 BUG-14/15/16）。
 //
-// 安全复刻 ext4_rs 删除半部（`ext4_impls/extents.rs`：extent_remove_space /
-// ext_remove_leaf / ext_remove_idx / ext_remove_index_block / ext_remove_blocks /
-// ext_correct_indexes / more_to_rm）。ext4_rs 用裸指针把 `inode.block:[u32;15]` 当
-// `*mut Ext4ExtentHeader`/`*mut Ext4Extent` 改、用 `Block::load_inode_root_block`
-// transmute 取根 60 字节、`read_offset_as_mut` 改盘块项、`copy_from_slice`/`fill(0)`
-// 压实——core 一律改 Pod `from_bytes`/`as_bytes` 在「一段字节 + 字节偏移 12 + pos*12」
-// 上读写，逐字节等价（差分 `assert_disk_eq` 全盘对拍暴露任何偏差）。
+// 安全实现 extent 删除（extent_remove_space / ext_remove_leaf / ext_remove_idx /
+// ext_remove_index_block / ext_remove_blocks / ext_correct_indexes）。core 用 Pod
+// `from_bytes`/`as_bytes` 在「一段字节 + 字节偏移 12 + pos*12」上读写，节点块经
+// `load_tree_block`/`sync_tree_block` 读写盘、根经 inode i_block 60 字节。
 //
-// **parity-first 限制（每条 `// PARITY`）：**
-// - `extent_remove_space` 只 `find_extent(from)` 一次，跨循环复用同一（渐旧的）path，
-//   节点块在 `ext_remove_leaf`/`more_to_rm` 内从盘**重读**（与 ext4_rs 一致）；
-// - extent 中间删（first_block<from && to<first_block+actual_len-1）→ 截短 + 尾段 reinsert；
+// **Phase 7 修复（不再 parity，按 ext4 规范）：**
+// - **BUG-16**：叶层进入前若 `entries_count == 0`（空叶）→ 直接返回 Ok。空叶无可删，
+//   ext4_rs 旧码无条件算 `entries_count-1` 取末项，空叶时 `0-1` 无符号下溢 panic。
+// - **BUG-15**：删除循环每处理完一片叶，**用 `find_extent` 重载整条路径**再处理下一片，
+//   绝不复用渐旧 path 重下钻到已清空的叶——根除「同一叶重复释放（double-free）→ 位图
+//   重复清位 + i_blocks 超额递减」的盘面破坏。游标 `cursor` 严格右进（跳过刚处理叶的
+//   覆盖范围），保证每片叶恰被处理一次。已删除 ext4_rs 既有 `more_to_rm`（含 `12*pos`
+//   缺头偏移怪癖）——新循环不靠它判兄弟。
+// - **BUG-14**（在 `balloc_free_blocks`）：i_blocks 递减改 `saturating_sub` 防下溢。
+//
+// 仍保留的设计点：
+// - extent 中间删（first_block<from && to<first_block+actual_len-1，仅 punch 走）→
+//   截前段 + 尾段 reinsert；
 // - 叶压实空 → `ext_remove_idx` 删父 index + 释放 index 块；末根项 → 根塌回空叶；
-// - pos==0 first_block 传播经已有 `propagate_first_block_to_ancestors`（Task 3）；
-// - `more_to_rm` 读 last_index 用 `12*pos`（缺头偏移）——ext4_rs 既有怪癖，原样复刻。
+// - pos==0 first_block 传播经 `propagate_first_block_to_ancestors`。
+//
+// [对照] Linux `ext4_ext_remove_space`（fs/ext4/extents.c）：自叶逐片删，每次经
+//   `ext4_ext_get_access` 读到的子块都是当前盘面、走 `ext4_ext_drop_refs`/重取 path，
+//   不会对已清空的叶二次释放——本实现以「每片叶 find_extent 重载」达到同一不变量
+//   （理解算法、未照抄 GPL 代码）。
 // =====================================================================
 
-/// 删除 `[from, to]`（逻辑块闭区间）覆盖的 extent 树空间。逐字节复刻 ext4_rs
-/// `extent_remove_space`（ext4_impls/extents.rs:1180）。
+/// 删除 `[from, to]`（逻辑块闭区间）覆盖的 extent 树空间。
 ///
-/// 流程：① `find_extent(from)`；② **extent 中间删**（found extent 完全包住 [from,to] 内侧）：
-/// 把 found 截短到 `from-first_block`、构造尾段 newex(`first_block=to+1`) → `insert_extent`；
-/// ③ 否则从叶（`i=depth`）向上 `i=depth..=0` 循环：叶层 `ext_remove_leaf`（压实 + 释放），
-/// 索引层据 `more_to_rm` 决定下钻 / 上溯，空索引 → `ext_remove_idx`。
+/// 流程：① 若 found extent 严格包住 `[from,to]` 内侧 → **中间删（punch）**：截前段 +
+/// 尾段 reinsert，返回。② 否则进入**逐叶删除循环**：以 `cursor`（初始 = `from`）为搜索键
+/// `find_extent` 取**新鲜路径**到含 `cursor` 的叶；空叶（BUG-16）或与 `[from,to]` 无交叠
+/// 即停；否则 `ext_remove_leaf` 压实 + 释放该叶被删块，emptied 叶由 `ext_remove_leaf` 经
+/// `ext_remove_idx` 从父删除；随后**自下而上清理**因此变空的祖先 index 节点；把 `cursor`
+/// 推到本叶覆盖上界之后，重取路径继续——直到 `cursor` 越过 `to` 或叶不再交叠。
+///
+/// **BUG-15 不变量**：每次循环都用 `find_extent` 取新鲜 path，已清空（index 项已删）的叶
+/// 不会再被命中，`cursor` 严格右进——故每个数据/node 块恰释放一次，无 double-free。
 pub(in crate::fs::ext4) fn extent_remove_space(
     ctx: &WriteCtx,
     alloc: &mut dyn BlockAlloc,
@@ -1338,95 +1352,109 @@ pub(in crate::fs::ext4) fn extent_remove_space(
     from: Ext4Lblk,
     to: Ext4Lblk,
 ) -> Result<()> {
-    let block_size = ctx.block_size;
-    let mut search_path = find_extent(ctx.reader, ctx.sb, inode, from)?;
-
-    // PARITY: ext4_rs `search_path.depth` = 下钻层数 = path.len()-1（叶在 path 中的下标）。
-    let depth = search_path.path.len() - 1;
-
-    // ② extent 中间删：found extent 严格包住 [from, to] 内侧（first_block < from
-    //    且 to < first_block + actual_len - 1）→ 截前段 + 尾段 reinsert（不释放块）。
-    if let Some(mut ex) = search_path.path[depth].extent {
-        let ee_block = ex.first_block();
-        let actual_len = ex.len() as u32;
-        if ee_block < from && to < ee_block + actual_len - 1 {
-            let mut newex = RawExtent::default();
-            let unwritten = ex.is_unwritten();
-            let block_count = ex.block_count;
-            // 尾段物理起块 = (to+1 - ee_block) + ex.pblock。
-            let newblock = to + 1 - ee_block + ex.start() as u32;
-            // PARITY: ext4_rs 直写 block_count（不经 set_actual_len 去 unwritten 标志），
-            //   随后若 unwritten 再 mark_unwritten——两步与下方一致。
-            ex.block_count = (from as u16).wrapping_sub(ee_block as u16);
-            if unwritten {
-                ex.mark_unwritten();
+    // ① extent 中间删（punch）：用 from 的路径判 found extent 是否严格包住 [from,to] 内侧。
+    {
+        let search_path = find_extent(ctx.reader, ctx.sb, inode, from)?;
+        let depth = search_path.path.len() - 1;
+        if let Some(mut ex) = search_path.path[depth].extent {
+            let ee_block = ex.first_block();
+            let actual_len = ex.len() as u32;
+            if ee_block < from && to < ee_block + actual_len - 1 {
+                let mut newex = RawExtent::default();
+                let unwritten = ex.is_unwritten();
+                let block_count = ex.block_count;
+                // 尾段物理起块 = (to+1 - ee_block) + ex.pblock。
+                let newblock = to + 1 - ee_block + ex.start() as u32;
+                ex.block_count = (from as u16).wrapping_sub(ee_block as u16);
+                if unwritten {
+                    ex.mark_unwritten();
+                }
+                newex.first_block = to + 1;
+                newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
+                newex.start_lo = newblock;
+                newex.start_hi = ((newblock as u64) >> 32) as u16;
+                insert_extent(ctx, alloc, inode, &newex)?;
+                return Ok(());
             }
-            newex.first_block = to + 1;
-            newex.block_count = (ee_block + block_count as u32 - 1 - to) as u16;
-            newex.start_lo = newblock;
-            newex.start_hi = ((newblock as u64) >> 32) as u16;
-
-            // PARITY: ext4_rs 截短后只构造 newex 再 insert_extent；前段 ex 的截短由
-            //   insert_extent 路径里对 found extent 的处理落盘？—— 否，ext4_rs **未**回写
-            //   截短后的 ex（它只改了局部 `ex`，未写回 inode/块）。复刻同一行为：不回写 ex，
-            //   仅 insert 尾段。truncate 主调路径对该分支不依赖（中间删仅 punch 才走）。
-            insert_extent(ctx, alloc, inode, &newex)?;
-            return Ok(());
         }
     }
 
-    // ③ 自叶向上逐层删。
-    let mut i = depth as isize;
-    while i >= 0 {
-        if i as usize == depth {
-            // ---- 叶层（i == depth）----
-            let node_pblock = search_path.path[i as usize].pblock_of_node;
-            let header = search_path.path[i as usize].header;
-            let entries_count = header.entries_count;
+    // ② 逐叶删除循环——每轮用 find_extent 取新鲜路径（BUG-15 核心修复）。
+    let mut cursor = from;
+    loop {
+        if cursor > to {
+            break;
+        }
+        let mut path = find_extent(ctx.reader, ctx.sb, inode, cursor)?;
+        let depth = path.path.len() - 1;
 
-            let (first_ex, last_ex) = if node_pblock == 0 {
-                // 根叶：从 inode i_block 取首/末 extent。
-                let root = inode.i_block_bytes();
-                (
-                    read_extent_at(&root, 0),
-                    read_extent_at(&root, entries_count as usize - 1),
-                )
-            } else {
-                // 非根叶：从盘块取首/末 extent。
-                let block = load_tree_block(ctx, node_pblock);
-                (
-                    read_extent_at(&block, 0),
-                    read_extent_at(&block, entries_count as usize - 1),
-                )
-            };
+        let node_pblock = path.path[depth].pblock_of_node;
+        let entries_count = path.path[depth].header.entries_count;
 
-            let mut leaf_from = first_ex.first_block();
-            let mut leaf_to = last_ex.first_block() + last_ex.len() as u32 - 1;
-            if leaf_from < from {
-                leaf_from = from;
-            }
-            if leaf_to > to {
-                leaf_to = to;
-            }
-            ext_remove_leaf(ctx, alloc, inode, &mut search_path, leaf_from, leaf_to)?;
-
-            i -= 1;
-            continue;
+        // BUG-16 修复：空叶（entries_count == 0）无可删——直接结束（ext4 规范：空叶不删）。
+        // 旧码无条件算 `entries_count - 1` 取末项，空叶时 `0 - 1` 无符号下溢 panic。
+        if entries_count == 0 {
+            break;
         }
 
-        // ---- 索引层（i < depth）----
-        let header = search_path.path[i as usize].header;
-        if more_to_rm(ctx, &search_path.path[i as usize], to) {
-            // 下钻到子节点。
-            i += 1;
+        // 叶的首/末 extent（entries_count > 0，下标安全）。
+        let (first_ex, last_ex) = if node_pblock == 0 {
+            let root = inode.i_block_bytes();
+            (
+                read_extent_at(&root, 0),
+                read_extent_at(&root, entries_count as usize - 1),
+            )
         } else {
-            if i > 0 && header.entries_count == 0 {
-                ext_remove_idx(ctx, alloc, inode, &mut search_path, i as u16 - 1)?;
-            }
-            if i - 1 < 0 {
+            let block = load_tree_block(ctx, node_pblock);
+            (
+                read_extent_at(&block, 0),
+                read_extent_at(&block, entries_count as usize - 1),
+            )
+        };
+
+        // 本叶覆盖的逻辑块上界（用于推进 cursor，避免对仅保留前缀的部分清叶死循环）。
+        let leaf_high = last_ex.first_block() + last_ex.len() as u32 - 1;
+
+        // 与 [from, to] 求交。无交叠 → 没有更多可删（部分清叶后保留的前缀全 < from 即落此）。
+        let mut leaf_from = first_ex.first_block();
+        let mut leaf_to = leaf_high;
+        if leaf_from < from {
+            leaf_from = from;
+        }
+        if leaf_to > to {
+            leaf_to = to;
+        }
+        if leaf_from > leaf_to {
+            break;
+        }
+
+        ext_remove_leaf(ctx, alloc, inode, &mut path, leaf_from, leaf_to)?;
+
+        // 自下而上清理因本叶清空而变空的祖先 index 节点（用本轮新鲜 path 的 position/index）。
+        // ext_remove_leaf 在叶清空时已 ext_remove_idx(depth-1)（从直接父删本叶项）；此处接力
+        // 把更高层因此变空的 index 节点也从其父删除（depth>=2 树需要；depth<=1 此循环不执行）。
+        let mut j = depth as isize - 1;
+        while j >= 1 {
+            let pblk = path.path[j as usize].pblock_of_node;
+            // 重读该 index 节点的当前盘面 entries_count（path 内 header 已陈旧）。
+            let cur_entries = if pblk == 0 {
+                root_extent_header(inode).entries_count
+            } else {
+                let blk = load_tree_block(ctx, pblk);
+                RawExtentHeader::from_bytes(&blk[..EXT4_EXTENT_HEADER_SIZE]).entries_count
+            };
+            if cur_entries == 0 {
+                ext_remove_idx(ctx, alloc, inode, &mut path, j as u16 - 1)?;
+                j -= 1;
+            } else {
                 break;
             }
-            i -= 1;
+        }
+
+        // 推进 cursor 到本叶覆盖上界之后；溢出（leaf_high == u32::MAX）→ 结束。
+        match leaf_high.checked_add(1) {
+            Some(next) => cursor = next,
+            None => break,
         }
     }
 
@@ -1733,50 +1761,270 @@ fn ext_remove_blocks(
     Ok(())
 }
 
-/// 索引层是否还有要删的子节点。逐字节复刻 ext4_rs `more_to_rm`（ext4_impls/extents.rs:1723）。
-fn more_to_rm(ctx: &WriteCtx, node: &ExtentPathNode, to: Ext4Lblk) -> bool {
-    let header = node.header;
-
-    // 无兄弟。
-    if header.entries_count == 1 {
-        return false;
-    }
-
-    let pos = node.position;
-    if pos > header.entries_count as usize - 1 {
-        return false;
-    }
-
-    if let Some(index) = node.index {
-        let last_index_pos = header.entries_count as usize - 1;
-        let block = load_tree_block(ctx, node.pblock_of_node);
-        // PARITY: ext4_rs 读 last_index 用 `size_of::<Ext4ExtentIndex>() * last_index_pos`
-        //   （= 12*pos，**缺 12 字节头偏移**）——既有怪癖，原样复刻（差分对拍兜底）。
-        let off = EXT4_EXTENT_SIZE * last_index_pos;
-        let last_index = if off + EXT4_EXTENT_SIZE <= block.len() {
-            RawExtentIndex::from_bytes(&block[off..off + EXT4_EXTENT_SIZE])
-        } else {
-            RawExtentIndex::default()
-        };
-
-        if node.position > last_index_pos || index.first_block() > last_index.first_block() {
-            return false;
-        }
-
-        if index.first_block() > to {
-            return false;
-        }
-    }
-
-    true
-}
-
 #[cfg(ktest)]
 mod test {
+    use alloc::vec::Vec;
+    use core::cell::RefCell;
+
     use ostd::prelude::*;
 
-    use super::{EXTENT_MAGIC, RawExtent, RawExtentHeader};
+    use super::{
+        extent_remove_space, BlockAlloc, RawExtent, RawExtentHeader, RawExtentIndex, WriteCtx,
+        EXTENT_MAGIC, EXT4_EXTENT_HEADER_SIZE,
+    };
+    use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+    use crate::fs::ext4::core::inode::{Inode, EXT4_INODE_FLAG_EXTENTS};
+    use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::superblock::RawSuperblock;
+    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+    // 全量带进 Pod(as_bytes/from_bytes) / vec! / Vec / Arc 等；Result 单独显式导入消歧。
     use crate::prelude::*;
+    use crate::prelude::Result;
+
+    // ------------------------------------------------------------------
+    // Phase 7 Task 1 standalone fixtures（非差分；ext4_rs 已删，无可对拍）。
+    // 在一份**可变 EXT4_IMAGE 拷贝**上手搓 extent 树，跑删除路径，校验
+    //   ① 空叶不 panic（BUG-16）② depth>0 多叶清树每块恰释放一次（BUG-15）。
+    // ------------------------------------------------------------------
+
+    /// 内存盘：读/数据写/元数据写都打到同一份字节（块号 * 块大小）。
+    struct MemImage {
+        bytes: RefCell<Vec<u8>>,
+        block_size: usize,
+    }
+    impl MemImage {
+        fn new(seed: &[u8]) -> Self {
+            let sb = RawSuperblock::from_bytes(&seed[1024..2048]);
+            MemImage {
+                bytes: RefCell::new(seed.to_vec()),
+                block_size: sb.block_size(),
+            }
+        }
+    }
+    impl BlockReader for MemImage {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl BlockWriter for MemImage {
+        fn write_at(&self, off: usize, data: &[u8]) {
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(off + i) {
+                    *slot = *byte;
+                }
+            }
+        }
+    }
+    impl MetadataWriter for MemImage {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            self.write_at(block as usize * self.block_size, data);
+            Ok(())
+        }
+    }
+
+    /// 仅**记录** free 的分配器：删除路径每次 `free_blocks` 落入 `freed`，并按 512B 当量
+    /// 递减 i_blocks（saturating，复刻生产侧 BUG-14 修复语义）。alloc 入口本测用不到。
+    struct LogAlloc {
+        block_size: usize,
+        freed: RefCell<Vec<(Ext4Fsblk, u32)>>,
+    }
+    impl LogAlloc {
+        fn new(block_size: usize) -> Self {
+            LogAlloc {
+                block_size,
+                freed: RefCell::new(Vec::new()),
+            }
+        }
+        /// 展平所有被释放的单块号（按出现顺序）。
+        fn freed_blocks(&self) -> Vec<Ext4Fsblk> {
+            let mut out = Vec::new();
+            for (start, count) in self.freed.borrow().iter() {
+                for k in 0..*count as u64 {
+                    out.push(*start + k);
+                }
+            }
+            out
+        }
+    }
+    impl BlockAlloc for LogAlloc {
+        fn alloc_one(&mut self, _inode: &mut Inode) -> Result<Ext4Fsblk> {
+            Err(Error::with_message(Errno::ENOSPC, "LogAlloc has no alloc"))
+        }
+        fn alloc_batch(
+            &mut self,
+            _inode: &mut Inode,
+            _start_bgid: &mut u32,
+            _count: usize,
+        ) -> Result<Vec<Ext4Fsblk>> {
+            Err(Error::with_message(Errno::ENOSPC, "LogAlloc has no alloc"))
+        }
+        fn free_blocks(&mut self, inode: &mut Inode, start: Ext4Fsblk, count: u32) {
+            self.freed.borrow_mut().push((start, count));
+            let dec = count as u64 * (self.block_size as u64 / 512);
+            let cur = inode.blocks_count();
+            inode.set_blocks_count(cur.saturating_sub(dec));
+        }
+    }
+
+    /// 把第 `pos` 个 12 字节项写进节点字节（偏移 12 + pos*12）。
+    fn put_item(buf: &mut [u8], pos: usize, item: &[u8; 12]) {
+        let off = EXT4_EXTENT_HEADER_SIZE + pos * 12;
+        buf[off..off + 12].copy_from_slice(item);
+    }
+
+    /// 定位 inode `ino` 在镜像中的字节偏移（第一组 group descriptor → inode table）。
+    fn inode_off(img: &[u8], sb: &RawSuperblock, ino: u32) -> usize {
+        let bs = sb.block_size();
+        let gd = RawGroupDescriptor::from_bytes(&img[(sb.first_data_block as usize + 1) * bs
+            ..(sb.first_data_block as usize + 1) * bs + 64]);
+        gd.inode_table() as usize * bs + (ino as usize - 1) * sb.inode_size() as usize
+    }
+
+    #[ktest]
+    fn remove_space_empty_leaf_no_panic() {
+        // BUG-16：构造一个 entries_count==0 的根叶 inode，extent_remove_space 必须早返回、不 panic。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let ino = 11u32;
+
+        // 根叶头：magic、entries=0、max=4、depth=0；写进 inode i_block（偏移 40）。
+        let mut iblock = [0u8; 60];
+        let h = RawExtentHeader::new(EXTENT_MAGIC, 0, 4, 0, 0);
+        iblock[..12].copy_from_slice(h.as_bytes());
+
+        {
+            let off = inode_off(EXT4_IMAGE, &sb, ino);
+            let mut raw = crate::fs::ext4::core::inode::RawInode::from_bytes(
+                &EXT4_IMAGE[off..off + 156],
+            );
+            raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+            raw.set_mode(0x8000); // S_IFREG
+            raw.set_size(8192); // i_size>0 但无 extent（稀疏空叶）。
+            let mut block: [u32; 15] = Pod::from_bytes(&iblock);
+            raw.block = core::mem::take(&mut block);
+            disk.write_at(off, raw.as_bytes());
+        }
+
+        let mut inode = crate::fs::ext4::core::inode::load_inode(&disk, &sb, ino).unwrap();
+        assert_eq!(inode.raw.flags() & EXT4_INODE_FLAG_EXTENTS, EXT4_INODE_FLAG_EXTENTS);
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = LogAlloc::new(sb.block_size());
+
+        // 不 panic、Ok，且没有释放任何块。
+        extent_remove_space(&ctx, &mut alloc, &mut inode, 0, u32::MAX).unwrap();
+        assert!(alloc.freed_blocks().is_empty(), "empty leaf must free nothing");
+    }
+
+    #[ktest]
+    fn remove_space_depth1_frees_each_block_once() {
+        // BUG-15：depth=1、两片叶各 2 个单块 extent 的树，extent_remove_space(0, MAX) 清空整树，
+        //   断言每个数据块 + 两个叶块恰被释放一次（无 double-free），i_blocks 归零。
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let bs = sb.block_size();
+        let ino = 12u32;
+
+        // 选高位、互不相交、在 blocks_count 内的物理块（避开低位元数据）。
+        let l0: Ext4Fsblk = 5000;
+        let l1: Ext4Fsblk = 5001;
+        let d0: Ext4Fsblk = 5002;
+        let d1: Ext4Fsblk = 5003;
+        let d2: Ext4Fsblk = 5004;
+        let d3: Ext4Fsblk = 5005;
+
+        // 叶块 L0：header(entries=2, depth=0) + ext(lblk0→d0,len1) + ext(lblk1→d1,len1)。
+        let mut leaf0 = vec![0u8; bs];
+        leaf0[..12].copy_from_slice(
+            RawExtentHeader::new(EXTENT_MAGIC, 2, ((bs - 12) / 12) as u16, 0, 0).as_bytes(),
+        );
+        let mut e = RawExtent::default();
+        e.first_block = 0;
+        e.block_count = 1;
+        e.store_pblock(d0);
+        put_item(&mut leaf0, 0, e.as_bytes().try_into().unwrap());
+        e.first_block = 1;
+        e.store_pblock(d1);
+        put_item(&mut leaf0, 1, e.as_bytes().try_into().unwrap());
+        disk.write_metadata_for_handle(0, l0, &leaf0).unwrap();
+
+        // 叶块 L1：ext(lblk2→d2) + ext(lblk3→d3)。
+        let mut leaf1 = vec![0u8; bs];
+        leaf1[..12].copy_from_slice(
+            RawExtentHeader::new(EXTENT_MAGIC, 2, ((bs - 12) / 12) as u16, 0, 0).as_bytes(),
+        );
+        e.first_block = 2;
+        e.block_count = 1;
+        e.store_pblock(d2);
+        put_item(&mut leaf1, 0, e.as_bytes().try_into().unwrap());
+        e.first_block = 3;
+        e.store_pblock(d3);
+        put_item(&mut leaf1, 1, e.as_bytes().try_into().unwrap());
+        disk.write_metadata_for_handle(0, l1, &leaf1).unwrap();
+
+        // 根：header(entries=2, depth=1) + idx(first_block0→L0) + idx(first_block2→L1)。
+        let mut iblock = [0u8; 60];
+        iblock[..12].copy_from_slice(RawExtentHeader::new(EXTENT_MAGIC, 2, 4, 1, 0).as_bytes());
+        let mut idx = RawExtentIndex::default();
+        idx.first_block = 0;
+        idx.store_pblock(l0);
+        iblock[12..24].copy_from_slice(idx.as_bytes());
+        idx.first_block = 2;
+        idx.store_pblock(l1);
+        iblock[24..36].copy_from_slice(idx.as_bytes());
+
+        {
+            let off = inode_off(EXT4_IMAGE, &sb, ino);
+            let mut raw = crate::fs::ext4::core::inode::RawInode::from_bytes(
+                &EXT4_IMAGE[off..off + 156],
+            );
+            raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+            raw.set_mode(0x8000);
+            raw.set_size(4 * bs as u64); // 4 个逻辑块。
+            let block: [u32; 15] = Pod::from_bytes(&iblock);
+            raw.block = block;
+            // i_blocks = (4 data + 2 leaf) * (bs/512)。
+            disk.write_at(off, raw.as_bytes());
+            let mut inode = crate::fs::ext4::core::inode::load_inode(&disk, &sb, ino).unwrap();
+            inode.set_blocks_count(6 * (bs as u64 / 512));
+            disk.write_at(off, inode.raw.as_bytes());
+        }
+
+        let mut inode = crate::fs::ext4::core::inode::load_inode(&disk, &sb, ino).unwrap();
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = LogAlloc::new(bs);
+
+        extent_remove_space(&ctx, &mut alloc, &mut inode, 0, u32::MAX).unwrap();
+
+        let freed = alloc.freed_blocks();
+        // 每块恰一次：无重复（double-free 会让某块出现 >1 次）。
+        let mut sorted = freed.clone();
+        sorted.sort_unstable();
+        let mut dedup = sorted.clone();
+        dedup.dedup();
+        assert_eq!(
+            sorted, dedup,
+            "double-free detected: some block freed more than once: {:?}",
+            freed
+        );
+        // 6 个块（4 data + 2 leaf）都被释放，且仅这 6 个。
+        for blk in [d0, d1, d2, d3, l0, l1] {
+            assert!(freed.contains(&blk), "block {} not freed", blk);
+        }
+        assert_eq!(freed.len(), 6, "expected exactly 6 freed blocks, got {:?}", freed);
+        // i_blocks 归零（无超额递减 / 无下溢 panic）。
+        assert_eq!(inode.blocks_count(), 0, "i_blocks must reach 0 after full clear");
+    }
 
     #[ktest]
     fn extent_header_handcrafted_roundtrip() {
