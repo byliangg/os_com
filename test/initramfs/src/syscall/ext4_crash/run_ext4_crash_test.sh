@@ -34,6 +34,15 @@ require_file_size() {
     [ "${actual}" = "${expected}" ] || fail "file size mismatch for ${file}: got ${actual}, want ${expected}"
 }
 
+require_file_min_size() {
+    file="$1"
+    floor="$2"
+    [ -f "${file}" ] || fail "missing file ${file}"
+    actual=$(wc -c < "${file}" 2>/dev/null | tr -d '[:space:]')
+    [ -n "${actual}" ] || fail "could not size ${file}"
+    [ "${actual}" -ge "${floor}" ] || fail "file ${file} too small: got ${actual}, want >= ${floor}"
+}
+
 require_file_contains() {
     file="$1"
     needle="$2"
@@ -336,13 +345,24 @@ prepare_dir_delete_reuse() {
 
 verify_dir_delete_reuse() {
     target="${CASE_DIR}/reuse_data.bin"
-    # The reused-data file must survive recovery byte-for-byte: filled entirely
-    # with 'R' (0x52). Any other byte means stale dir-block metadata (leaf
-    # magic, rec_len/inode fields, checksum) leaked over the reused data blocks
-    # -> revoke is broken.
-    require_file_size "${target}" 8388608
+    # The hold (write:after_commit) crashes the VM MID-WRITE, so reuse_data.bin
+    # is legitimately truncated after recovery (only the chunks whose write+
+    # journal commit landed before the crash survive). That truncation is
+    # expected crash behavior, NOT corruption -- so we do NOT require the full
+    # 8 MiB. The A-1 property is about CONTENT on the reused (formerly
+    # dir-metadata) blocks, not size: whatever bytes DID survive must be our
+    # 'R' (0x52) payload, never stale dir-block bytes that a broken revoke would
+    # let recovery replay over them.
+    #
+    # 1) Non-empty floor: at least one full 4 KiB block of payload must have
+    #    survived, so an empty/zero-length file cannot vacuously pass.
+    require_file_min_size "${target}" 4096
+    # 2) Byte-for-byte: every byte present must be 'R' (0x52). require_file_*
+    #    operates on the file's ACTUAL contents (no fixed size), so a truncated
+    #    but all-'R' file passes, while any leaked dir-block byte (leaf magic,
+    #    rec_len/inode fields, dirent ASCII, checksum) is non-'R' -> FAIL.
     require_file_filled_with_byte "${target}" "${DIR_DELETE_REUSE_PAYLOAD_BYTE}"
-    # Directly assert no stale dir entry name leaked into the file data.
+    # 3) Directly assert no stale dir entry name leaked into the file data.
     require_file_not_contains "${target}" "${DIR_DELETE_REUSE_ENTRY_PREFIX}"
     # The freed directory must stay gone after recovery.
     [ ! -e "${CASE_DIR}/reuse_dir" ] || fail "reuse_dir reappeared after recovery"
