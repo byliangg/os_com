@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use aster_block::{
@@ -1632,6 +1636,13 @@ pub(super) struct Ext4Fs {
     dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
     inode_page_caches: Mutex<BTreeMap<u32, Arc<Ext4PageCacheState>>>,
     open_file_handles: Mutex<BTreeMap<u32, usize>>,
+    /// BUG-19 fix: inodes whose bitmap bit has already been reclaimed by the evict path
+    /// (`cleanup_unlinked_file`). Guards against a double-free if both the last-ref drop
+    /// (`cleanup_unlinked`) and the last-handle close (`on_close_file_handle`) race to reclaim the
+    /// same inode. Cleared if the ino is reallocated (`create_at`/`mkdir_at` insert via the
+    /// namespace path do not consult this set; the entry is dropped here on the next alloc that
+    /// hands out the same number — see `note_inode_allocated`).
+    freed_inodes: Mutex<BTreeSet<u32>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     // Phase 5: metadata-only extent mapping cache for O_DIRECT reads. Distinct
     // from `inode_direct_read_cache` above (which is the retired speculative
@@ -1712,6 +1723,7 @@ impl Ext4Fs {
             dir_entry_cache: Mutex::new(BTreeMap::new()),
             inode_page_caches: Mutex::new(BTreeMap::new()),
             open_file_handles: Mutex::new(BTreeMap::new()),
+            freed_inodes: Mutex::new(BTreeSet::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_extent_map_cache: Mutex::new(BTreeMap::new()),
             inode_written_coverage: Mutex::new(BTreeMap::new()),
@@ -5208,6 +5220,7 @@ impl Ext4Fs {
         let ino = self.run_journaled_namespace(Some(op), |nctx| {
             super::core::dir::create_at(nctx, parent, name.as_bytes(), mode)
         })?;
+        self.note_inode_allocated(ino);
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _child_guard = child_lock.write();
         // A freshly allocated inode must not inherit stale VMO/PageCache state
@@ -5240,6 +5253,7 @@ impl Ext4Fs {
                     let (ino, dir_byte_offset) = self.run_journaled_namespace(Some(op), |nctx| {
                         super::core::dir::mkdir_unchecked_at(nctx, parent, name.as_bytes(), mode)
                     })?;
+                    self.note_inode_allocated(ino);
                     let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
                     let _child_guard = child_lock.write();
                     self.cache_insert_entry_with_offset(parent, name, ino, dir_byte_offset, 2);
@@ -5257,6 +5271,7 @@ impl Ext4Fs {
         let ino = self.run_journaled_namespace(Some(op), |nctx| {
             super::core::dir::mkdir_at(nctx, parent, name.as_bytes(), mode)
         })?;
+        self.note_inode_allocated(ino);
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _child_guard = child_lock.write();
         self.cache_insert_entry(parent, name, ino, 2);
@@ -5293,13 +5308,27 @@ impl Ext4Fs {
     }
 
     pub(super) fn on_close_file_handle(&self, ino: u32) -> Result<()> {
-        let mut open_file_handles = self.open_file_handles.lock();
-        let Some(count) = open_file_handles.get_mut(&ino) else {
-            return Ok(());
+        let last_handle_closed = {
+            let mut open_file_handles = self.open_file_handles.lock();
+            let Some(count) = open_file_handles.get_mut(&ino) else {
+                return Ok(());
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open_file_handles.remove(&ino);
+                true
+            } else {
+                false
+            }
         };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            open_file_handles.remove(&ino);
+        // BUG-19 (ext4-spec-correct): open-then-unlink-then-close path. When the LAST open handle
+        // closes and the file was already unlinked (nlink==0), this close IS the last reference, so
+        // the inode + its data blocks must be reclaimed now (POSIX: a file held open across unlink
+        // is freed only at close). `cleanup_unlinked_file` re-checks nlink==0 / no-open-handles
+        // under the inode correctness lock, so a benign double-call (e.g. last-ref drop already
+        // freed it) is a no-op.
+        if last_handle_closed {
+            self.cleanup_unlinked_file(ino)?;
         }
         Ok(())
     }
@@ -5311,6 +5340,26 @@ impl Ext4Fs {
             .is_some_and(|count| *count > 0)
     }
 
+    /// Drop the "already-freed" marker for `ino` (called right after a successful inode allocation
+    /// that may hand out a previously-freed number). Keeps the `freed_inodes` double-free guard from
+    /// blocking reclaim of the inode's *next* lifetime.
+    fn note_inode_allocated(&self, ino: u32) {
+        self.freed_inodes.lock().remove(&ino);
+    }
+
+    /// BUG-19 fix (ext4-spec-correct): reclaim a regular file whose last reference is gone.
+    ///
+    /// Mirrors ext2's evict model (`InodeImpl::sync_metadata` frees the inode when
+    /// `hard_links()==0`, guarded against double-free): once a regular file is unlinked (nlink==0)
+    /// and has no remaining open handles, this releases ALL of its data blocks AND clears its inode
+    /// bitmap bit, bumping `s_free_inodes_count`/`s_free_blocks_count` so repeated create/delete no
+    /// longer leaks and e2fsck reports zero orphan inodes.
+    ///
+    /// Both the data-block free (`truncate_inode(0)`) and the inode-bitmap free run inside a SINGLE
+    /// `run_journaled_namespace` transaction (`free_inode_on_evict_at`), so the reclaim is
+    /// crash-atomic and BOTH free counts are sunk back into the `running_sb` single source of truth
+    /// (the namespace chokepoint harvests `post.free_blocks_count()` + `post.free_inodes_count()`).
+    /// Lock order unchanged: inode correctness lock → RUNTIME → jbd2 → inner.
     pub(super) fn cleanup_unlinked_file(&self, ino: u32) -> Result<()> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.write();
@@ -5322,17 +5371,23 @@ impl Ext4Fs {
         if self.has_open_file_handles(ino) {
             return Ok(());
         }
+        // Double-free guard: if a prior evict (last-ref drop vs last-handle close race) already
+        // reclaimed this inode's bitmap bit, the on-disk inode table still reads nlink==0, so we
+        // must not free the bitmap bit a second time. The marker is dropped when the number is
+        // reallocated (`note_inode_allocated`).
+        if self.freed_inodes.lock().contains(&ino) {
+            return Ok(());
+        }
 
         self.reset_page_cache_after_truncate(ino, 0)?;
-        let now = Self::now_unix_seconds_u32();
-        let op = JournaledOp::Truncate { ino };
-        self.run_journaled_core(Some(op), ino, |ctx, alloc, inode| {
-            super::core::file::truncate_inode(ctx, alloc, inode, 0)?;
-            Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
-            Ok(())
+        let op = JournaledOp::Unlink;
+        self.run_journaled_namespace(Some(op), |nctx| {
+            super::core::dir::free_inode_on_evict_at(nctx, ino)
         })?;
-        self.invalidate_direct_read_cache(ino);
-        self.inode_mtime_ctime_cache.lock().insert(ino, now);
+        self.freed_inodes.lock().insert(ino);
+        // Drop every cached scrap of the now-freed inode (page cache, direct-read, coverage, time
+        // caches) so a later reallocation of this number starts clean.
+        self.clear_inode_touch_cache(ino);
         Ok(())
     }
 

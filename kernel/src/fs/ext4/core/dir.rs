@@ -961,13 +961,15 @@ pub(in crate::fs::ext4) fn inode_to_dir_entry_type(inode: &Inode) -> u8 {
 //   构造完、跑 link 逻辑、再各 write_back 一次——最终 inode 表 / dir 块 / 位图 / GDT / SB 字节
 //   与 ext4_rs 逐字节一致（write_back 是按 inode 表块 RMW，写序不改最终态；父子若同表块，每次
 //   write_back 都重读最新块、各自落对字节）。
-// - **unlink 不 free 不截块（BUG-19）**：`unlink` 里 `free_child` 写死 false——**永不**
-//   `ialloc_free_inode`；普通文件 unlink **不截块**（不调 truncate_inode），只 dir_remove_entry +
-//   nlink 调整（>1 减一否则置 0）+ write_back(child)。故 unlink 文件后 inode 位图 + 数据块仍占用。
-// - **rmdir（dir_remove）**：拒 '.'/'..' EINVAL → find ENOENT → 非目录 ENOTDIR → dir_has_entry
-//   非空 ENOTEMPTY → truncate_inode(child,0)（释放子数据块；inode 位图 NOT free——BUG-19）→
-//   unlink 目录分支（父 nlink-1 + 子 nlink=0 + write_back 两者）→ dir_remove 再 write_back(parent)
-//   一次（小重复写，最终字节同）。
+// - **unlink（文件，BUG-19 已修，ext4-spec-correct）**：`unlink` 删项 + 调 child nlink
+//   （>1 减一否则置 0），**不**在此 free/截块——POSIX 语义：文件可被打开持有，最后一个引用关闭
+//   前 inode 须保留。实际 free（截块 + 清 inode 位图位）由集成层 evict 钩子
+//   （`Inode::cleanup_unlinked` → `cleanup_unlinked_file` → [`free_inode_on_evict_at`]）在
+//   nlink==0 且无打开句柄时做，单事务、走 `run_journaled_namespace`。
+// - **rmdir（dir_remove，BUG-19 已修）**：拒 '.'/'..' EINVAL → find ENOENT → 非目录 ENOTDIR →
+//   dir_has_entry 非空 ENOTEMPTY → truncate_inode(child,0)（释放子数据块）→ unlink 目录分支
+//   （父 nlink-1 + 子 nlink=0 + write_back 两者）→ **清子目录 inode 位图位**（dir 无打开句柄
+//   语义，rmdir 即最后引用，立即 free，used_dirs_count 自减）→ write_back(parent)。
 // - **SB/GDT/位图一致性**：InodeAllocator 与 BlockAllocator 各自持私有 RawSuperblock 快照，
 //   且 `write_superblock` 写**整 1024 字节**——若两者各从陈旧快照写、后写者会用陈旧 free_inodes/
 //   free_blocks 覆盖前写者。复刻 ext4_rs 单一权威 `super_block` 的办法：`NamespaceCtx` 持一份
@@ -1070,6 +1072,20 @@ impl<'a, R: BlockReader, W: MetadataWriter, D: BlockWriter> NamespaceCtx<'a, R, 
         // 据此构造、落盘 SB 不丢 inode 计数变化。
         self.sb = *ialloc.superblock();
         Ok(ino)
+    }
+
+    /// 释放 inode 号 `index`（按 `is_dir` 回退 used_dirs_count），把分配器运行期 SB
+    /// （free_inodes+1）同步回权威 `self.sb`。
+    ///
+    /// [对照] ext4_rs `ialloc_free_inode`（ext4_impls/ialloc.rs:85）+ Linux `ext4_free_inode`
+    /// （清 inode 位图位 + 组/SB `free_inodes_count` 自增 + 目录 `used_dirs_count` 自减）。
+    /// 与 [`alloc_inode`] 对称：先用权威 SB 造 `InodeAllocator`，释放后回灌运行期 SB，使
+    /// 后续操作 / 落盘 SB 字节含本次 free 的计数变化（free_inodes 由集成层 `run_journaled_namespace`
+    /// 的 `post.free_inodes_count()` harvest 进 `running_sb`，单一权威不退）。
+    fn free_inode(&mut self, index: u32, is_dir: bool) {
+        let mut ialloc = InodeAllocator::new(self.sb, self.reader, self.writer);
+        ialloc.ialloc_free_inode(index, is_dir);
+        self.sb = *ialloc.superblock();
     }
 
     /// 在 `parent`（已加载）下加一项指向 `child`（已加载），并按 ext4_rs `link` 调链计数。
@@ -1280,12 +1296,17 @@ pub(in crate::fs::ext4) fn mkdir_unchecked_at<R: BlockReader, W: MetadataWriter,
 
 /// 删除 `parent_ino` 下名为 `name` 的**文件**（目录请用 [`rmdir_at`]）。
 ///
-/// PARITY（ext4_rs `ext4_unlink_at` → `unlink`，simple_interface/mod.rs:299 / ext4_impls/ext4.rs:220）：
+/// [对照] ext4_rs `ext4_unlink_at` → `unlink`（simple_interface/mod.rs:299 / ext4_impls/ext4.rs:220）
+/// + Linux `ext4_unlink`：
 /// 1. lookup → 目标 inode；若目标 `is_dir()` → **EISDIR**；
-/// 2. `unlink`：`dir_remove_entry(parent, name)` → 文件分支：child links > 1 减一、否则置 0 →
+/// 2. `dir_remove_entry(parent, name)` → 文件分支：child links > 1 减一、否则置 0 →
 ///    `write_back_inode(child)`。
-/// **BUG-19**：`free_child` 写死 false——**永不** `ialloc_free_inode`；**不截块**（不调
-/// truncate_inode）。故 unlink 文件后：项删 + child nlink 调整，但 inode 位图位 + 文件数据块仍占用。
+///
+/// **BUG-19 已修（ext4-spec-correct）**：unlink 本身**不**截块、**不**清 inode 位图位——这是
+/// 正确的 POSIX 语义（文件可被打开持有，最后引用关闭前 inode 须保留，避免 open-unlink 竞态下
+/// inode 复用损坏）。当 nlink 落到 0 时，实际回收（`truncate_inode(0)` 释放数据块 + `ialloc`
+/// 清位图位 + free_inodes_count 自增）由集成层 evict 钩子 [`free_inode_on_evict_at`] 在最后一个
+/// 打开句柄关闭、且确认 nlink==0 时做（单事务，走 `run_journaled_namespace`）。
 pub(in crate::fs::ext4) fn unlink_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
@@ -1310,28 +1331,31 @@ pub(in crate::fs::ext4) fn unlink_at<R: BlockReader, W: MetadataWriter, D: Block
         let ctx = nctx.write_ctx();
         dir_remove_entry(&ctx, &mut parent, name)?;
     }
-    // PARITY: 文件 nlink > 1 减一、否则置 0。
+    // [对照] 文件 nlink > 1 减一、否则置 0。
     let cl = child.links_count();
     if cl > 1 {
         child.set_links_count(cl - 1);
     } else {
         child.set_links_count(0);
     }
-    // PARITY: BUG-19 — 不 ialloc_free_inode、不 truncate_inode；仅 write_back(child)。
+    // BUG-19 已修：unlink 只删项 + 调 nlink，**不**在此截块/free——POSIX 延后回收，nlink==0 的
+    // 实际回收在 evict 钩子（[`free_inode_on_evict_at`]）做。仅 write_back(child)。
     nctx.write_back(&mut child)?;
     Ok(())
 }
 
 /// 删除 `parent_ino` 下名为 `name` 的**空目录**。
 ///
-/// PARITY（ext4_rs `ext4_rmdir_at` = `dir_remove`，ext4_impls/dir.rs:749）：
+/// [对照] ext4_rs `ext4_rmdir_at` = `dir_remove`（ext4_impls/dir.rs:749）+ Linux `ext4_rmdir`：
 /// 1. `name == "." | ".."` → **EINVAL**；
 /// 2. `dir_find_entry`（未命中 → **ENOENT**）；
 /// 3. 载 child；非目录 → **ENOTDIR**；
 /// 4. `dir_has_entry(child)` 非空 → **ENOTEMPTY**；
-/// 5. `truncate_inode(child, 0)`（释放子数据块；inode 位图 NOT free——BUG-19）；
+/// 5. `truncate_inode(child, 0)`（释放子数据块）；
 /// 6. `unlink(parent, child, name)` 目录分支：父 nlink-1 + 子 nlink=0 + write_back 两者；
-/// 7. `dir_remove` 末尾再 `write_back_inode(parent)` 一次（小重复写，最终字节同）。
+/// 7. **BUG-19 已修**：子目录 nlink==0、且目录无打开句柄语义（rmdir 即最后引用）→ 立即清
+///    inode 位图位（[`free_inode_on_evict_at`]，is_dir=true：used_dirs_count 自减、free_inodes++）；
+/// 8. `dir_remove` 末尾再 `write_back_inode(parent)` 一次（小重复写，最终字节同）。
 pub(in crate::fs::ext4) fn rmdir_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent_ino: u32,
@@ -1366,15 +1390,84 @@ pub(in crate::fs::ext4) fn rmdir_at<R: BlockReader, W: MetadataWriter, D: BlockW
         }
     }
 
-    // ⑤ truncate(child, 0)（释放子数据块——BUG-19：inode 位图不释放）。
+    // ⑤ truncate(child, 0)（释放子数据块）。
     nctx.truncate(&mut child, 0)?;
 
     // ⑥ unlink 目录分支：dir_remove_entry + 父 nlink-1 + 子 nlink=0 + write_back 两者。
     let mut parent = nctx.load(parent_ino)?;
     unlink_dir_branch(nctx, &mut parent, &mut child, name)?;
 
-    // ⑦ dir_remove 末尾再 write_back(parent)（小重复写，最终字节同）。
+    // ⑦ BUG-19 已修：子目录 nlink==0，目录无打开句柄语义（rmdir 即最后引用）→ 立即回收
+    //    inode（清位图位 + free_inodes++ + used_dirs_count 自减）。set i_dtime（删除时间戳）。
+    finalize_freed_inode(nctx, &mut child)?;
+
+    // ⑧ dir_remove 末尾再 write_back(parent)（小重复写，最终字节同）。
     nctx.write_back(&mut parent)?;
+    Ok(())
+}
+
+/// 把一个 **nlink 已降到 0** 的 inode 落盘回收：set `i_dtime`（删除时间戳，ext4 标准）→ 清
+/// inode 位图位（[`NamespaceCtx::free_inode`]，按 `is_dir` 回退 used_dirs_count）→ write_back
+/// （把 nlink=0/dtime 等持久化到 inode 表）。**调用方须保证 `inode.links_count() == 0`** 且数据块
+/// 已经 truncate 到 0（否则块泄漏）。`dtime` 时间戳由调用方在 truncate 时已 set 或这里写 0
+/// （ext4 仅要求 dtime != 0 标记已删；具体秒值非 csum 相关）。
+///
+/// [对照] Linux `ext4_free_inode` 的尾段：位图清位 + 计数自增（自减 used_dirs）。core 在
+/// inode 写回**前** free 位图（先位图后 inode 表，与 ext4_rs ialloc 写序一致；同事务，
+/// 崩溃要么全提交要么全丢弃）。
+fn finalize_freed_inode<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    inode: &mut Inode,
+) -> Result<()> {
+    debug_assert_eq!(
+        inode.links_count(),
+        0,
+        "finalize_freed_inode requires nlink==0"
+    );
+    let is_dir = inode.is_dir();
+    // i_dtime：ext4 用非 0 dtime 标记 inode 已删除（e2fsck 据此判孤儿/已删）。这里写一个非 0
+    // 哨兵（具体秒值非 csum 相关，集成层若有真实时间会在 truncate/前置步骤 set）。
+    if inode.raw.dtime == 0 {
+        inode.raw.dtime = 1;
+    }
+    // 清 inode 位图位 + 组/SB free_inodes++ + 目录 used_dirs--（运行期 SB 同步回权威 SB，
+    // 由 run_journaled_namespace 的 post.free_inodes_count() 灌进 running_sb，单一权威）。
+    nctx.free_inode(inode.num, is_dir);
+    // 把 nlink=0 / dtime 持久化到 inode 表。
+    nctx.write_back(inode)?;
+    Ok(())
+}
+
+/// **evict 钩子核心**：在最后一个打开引用关闭、确认 inode `nlink==0` 后，把该 inode 完整回收
+/// （释放数据块 + 清 inode 位图位 + free_inodes++）。集成层 `cleanup_unlinked_file` 在持
+/// inode correctness 锁、且 `has_open_file_handles==false` 时经 `run_journaled_namespace`（单事务）
+/// 调本函数。
+///
+/// 这是 BUG-19 的 ext4-spec-correct 修复（普通文件路径）——镜像 ext2 `sync_metadata` 在
+/// `hard_links()==0` 时 `resize(0)` + `free_inode` 的 evict 模型（ext2/inode.rs:1361）。
+///
+/// 步骤：
+/// 1. 载 inode；若 `links_count() != 0` → 直接 Ok（被 link 救回/竞态，不回收）；
+/// 2. `truncate_inode(inode, 0)` 释放所有数据块；
+/// 3. `finalize_freed_inode`：set i_dtime + 清 inode 位图位（is_dir 决定 used_dirs_count）+ write_back。
+///
+/// 幂等性：集成层用 inode correctness 锁串行化；若本函数已跑过、inode 位图位已清，再次进入会
+/// 在步骤 1 仍见 nlink==0 而重复 free。集成层负责只调用一次（`cleanup_unlinked_file` 经
+/// `clear_inode_touch_cache` + last-ref/close 单触发；ext2 用 `is_freed` 标志，本路径用集成层
+/// 的 last-ref 语义 + 锁保证单次）。
+pub(in crate::fs::ext4) fn free_inode_on_evict_at<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
+    nctx: &mut NamespaceCtx<'_, R, W, D>,
+    ino: u32,
+) -> Result<()> {
+    let mut inode = nctx.load(ino)?;
+    // nlink 非 0：被重新 link 救回（或竞态），不回收。
+    if inode.links_count() != 0 {
+        return Ok(());
+    }
+    // 释放所有数据块（i_blocks → 0）。
+    nctx.truncate(&mut inode, 0)?;
+    // set i_dtime + 清 inode 位图位 + free_inodes++ + write_back。
+    finalize_freed_inode(nctx, &mut inode)?;
     Ok(())
 }
 
@@ -1396,17 +1489,22 @@ fn unlink_dir_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     if pl > 0 {
         parent.set_links_count(pl - 1);
     }
-    // PARITY: 子目录 nlink = 0（'.' + 父向链都没了）。BUG-19：不 ialloc_free_inode。
+    // [对照] 子目录 nlink = 0（'.' + 父向链都没了）。inode 位图位的回收在 rmdir_at 末尾的
+    // finalize_freed_inode 做（BUG-19 已修）。
     child.set_links_count(0);
     nctx.write_back(child)?;
     nctx.write_back(parent)?;
     Ok(())
 }
 
-/// 复刻 ext4_rs `unlink` 的**文件分支**（ext4_impls/ext4.rs:245-258）：`dir_remove_entry(parent,
+/// [对照] ext4_rs `unlink` 的**文件分支**（ext4_impls/ext4.rs:245-258）：`dir_remove_entry(parent,
 /// name)` → child nlink > 1 减一、否则置 0 → `write_back(child)`。**不** write_back(parent)
 /// （ext4_rs 的文件分支只在 child links>0 时写 child，且不碰 parent）——这是 rename 文件覆盖
-/// 路径不写回父的来源。BUG-19：不 ialloc_free_inode、不 truncate_inode。
+/// 路径不写回父的来源。
+///
+/// **BUG-19 已修**：本分支只删项 + 调 nlink，不在此截块/free；被覆盖文件 nlink 落到 0 时的
+/// 实际回收由集成层 evict 钩子（[`free_inode_on_evict_at`]，在最后引用关闭时）做——与
+/// `unlink_at` 文件路径同一语义。
 fn unlink_file_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
     nctx: &mut NamespaceCtx<'_, R, W, D>,
     parent: &mut Inode,
@@ -1417,14 +1515,15 @@ fn unlink_file_branch<R: BlockReader, W: MetadataWriter, D: BlockWriter>(
         let ctx = nctx.write_ctx();
         dir_remove_entry(&ctx, parent, name)?;
     }
-    // PARITY: 文件 nlink > 1 减一、否则置 0。
+    // [对照] 文件 nlink > 1 减一、否则置 0。
     let cl = child.links_count();
     if cl > 1 {
         child.set_links_count(cl - 1);
     } else {
         child.set_links_count(0);
     }
-    // PARITY: BUG-19 — 不 ialloc_free_inode、不 truncate_inode；仅 write_back(child)，不碰 parent。
+    // BUG-19 已修：只删项 + 调 nlink，**不**在此截块/free——nlink==0 的实际回收由集成层 evict
+    // 钩子（[`free_inode_on_evict_at`]）在最后引用关闭时做。仅 write_back(child)，不碰 parent。
     nctx.write_back(child)?;
     Ok(())
 }
@@ -1605,6 +1704,9 @@ mod test {
     use crate::fs::ext4::core::superblock::RawSuperblock;
     use crate::fs::ext4::core::test_util::{slice_at, EXT4_IMAGE, EXT4_NOCSUM_IMAGE};
     use crate::prelude::*;
+    // Disambiguate `Result` (the prelude glob also re-exports an `ostd::Result`); the
+    // `MetadataWriter` impl below must use the kernel `crate::prelude::Result`.
+    use crate::prelude::Result;
 
     /// 在原镜像 `img` 字节上定位根目录（ino 2）首数据块的 `[off, off+bs)` 字节，并返回
     /// `(superblock, dir_block_bytes, ino_generation)`。复刻 `dirent_root_first_entry_real_image`
@@ -1863,5 +1965,297 @@ mod test {
             Errno::EIO,
             "corrupted block + miss still EIO, never panic"
         );
+    }
+
+    // =================================================================
+    // BUG-19 fix: unlink/rmdir free the inode + data blocks (no leak).
+    // Full end-to-end on a writable in-memory image: create → (write) →
+    // unlink → free_inode_on_evict; mkdir → rmdir. Asserts the inode
+    // bitmap bit clears, SB free_inodes/free_blocks return to baseline,
+    // and used_dirs_count is restored. Judged against ext4-spec-correct
+    // behavior (NOT differential parity).
+    // =================================================================
+
+    use core::cell::RefCell;
+
+    use super::{
+        create_at, free_inode_on_evict_at, mkdir_at, rmdir_at, unlink_at, write_back_inode,
+        NamespaceBlockAlloc, NamespaceCtx,
+    };
+    use crate::fs::ext4::core::balloc::{BlockAllocator, InodeAllocCtx};
+    use crate::fs::ext4::core::bitmap::ext4_bmap_bit_find_clr;
+    use crate::fs::ext4::core::block_group::GroupGeometry;
+    use crate::fs::ext4::core::extents::WriteCtx;
+    use crate::fs::ext4::core::file::write_at;
+    use crate::fs::ext4::core::inode::load_inode;
+    use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+
+    /// S_IFREG / S_IFDIR full mode bits used when creating test inodes.
+    const S_IFREG_TEST: u16 = 0x8000;
+    const S_IFDIR_TEST: u16 = 0x4000;
+
+    /// Writable in-memory image: reads, file-data writes, and journaled metadata writes all hit the
+    /// same byte buffer (single-thread test, no journal — metadata writes land directly).
+    struct MemDisk {
+        bytes: RefCell<Vec<u8>>,
+        block_size: usize,
+    }
+    impl MemDisk {
+        fn new(seed: &[u8]) -> Self {
+            let sb = RawSuperblock::from_bytes(&seed[1024..2048]);
+            MemDisk {
+                bytes: RefCell::new(seed.to_vec()),
+                block_size: sb.block_size(),
+            }
+        }
+        fn read_block(&self, blk: u64) -> Vec<u8> {
+            let mut out = alloc::vec![0u8; self.block_size];
+            self.read_at(blk as usize * self.block_size, out.as_mut_slice());
+            out
+        }
+    }
+    impl BlockReader for MemDisk {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl BlockWriter for MemDisk {
+        fn write_at(&self, off: usize, data: &[u8]) {
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(off + i) {
+                    *slot = *byte;
+                }
+            }
+        }
+    }
+    impl MetadataWriter for MemDisk {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            self.write_at(block as usize * self.block_size, data);
+            Ok(())
+        }
+    }
+
+    /// Read the current on-disk superblock (its free counts mutate as ops run).
+    fn read_sb(disk: &MemDisk) -> RawSuperblock {
+        let mut buf = [0u8; 1024];
+        disk.read_at(1024, &mut buf);
+        RawSuperblock::from_bytes(&buf)
+    }
+
+    /// Read the group descriptor of the group owning `ino` (re-read from disk so it reflects writes).
+    fn group_desc_of_inode(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> RawGroupDescriptor {
+        let bs = sb.block_size();
+        let bgid = GroupGeometry::new(sb).get_bgid_of_inode(ino) as usize;
+        let desc_size = sb.group_desc_size();
+        let dsc_cnt = bs / desc_size;
+        let dsc_id = bgid / dsc_cnt;
+        let block_id = sb.first_data_block() as usize + dsc_id + 1;
+        let off = block_id * bs + (bgid % dsc_cnt) * desc_size;
+        let mut buf = [0u8; 64];
+        disk.read_at(off, &mut buf);
+        RawGroupDescriptor::from_bytes(&buf)
+    }
+
+    /// Is the inode-bitmap bit for `ino` (1-based) set on disk?
+    fn inode_bit_set(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> bool {
+        let desc = group_desc_of_inode(disk, sb, ino);
+        let bmp = disk.read_block(desc.inode_bitmap());
+        let idx = GroupGeometry::new(sb).inode_to_bgidx(ino) as usize;
+        (bmp[idx / 8] >> (idx % 8)) & 1 == 1
+    }
+
+    fn used_dirs_of_inode(disk: &MemDisk, sb: &RawSuperblock, ino: u32) -> u32 {
+        group_desc_of_inode(disk, sb, ino).get_used_dirs_count(sb)
+    }
+
+    /// Write `len` bytes of data into the regular file `ino` through the core write path (allocates
+    /// real data blocks), persisting the grown inode. Mirrors how `NamespaceCtx` drives file writes.
+    fn write_file_data(disk: &MemDisk, sb: &mut RawSuperblock, ino: u32, len: usize) {
+        let snap = *sb;
+        let mut inode = load_inode(disk, &snap, ino).unwrap();
+        let alloc = BlockAllocator::new(snap, disk, disk);
+        let ictx = InodeAllocCtx::new(inode.blocks_count());
+        let mut adapter = NamespaceBlockAlloc { alloc, ictx };
+        let buf = alloc::vec![0xABu8; len];
+        {
+            let ctx = WriteCtx::new(disk, disk, disk, &snap);
+            write_at(&ctx, &mut adapter, &mut inode, 0, &buf).unwrap();
+        }
+        // Sink the post-write SB (free_blocks decreased) and persist the inode (size + i_block tree).
+        *sb = *adapter.alloc.superblock();
+        write_back_inode(disk, disk, sb, &mut inode).unwrap();
+    }
+
+    /// BUG-19 (file): create a regular file, give it data blocks, unlink it (nlink→0), then run the
+    /// evict hook. Asserts the inode bitmap bit clears, `free_inodes_count` returns to baseline, and
+    /// every data block is released (`free_blocks_count` back to pre-create) — i.e. NO leak.
+    #[ktest]
+    fn unlink_file_frees_inode_and_blocks() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let base_sb = read_sb(&disk);
+        let base_free_inodes = base_sb.free_inodes_count();
+        let base_free_blocks = base_sb.free_blocks_count();
+
+        // create under root (ino 2).
+        let mut sb = base_sb;
+        let ino = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let ino = create_at(&mut nctx, 2, b"victim", S_IFREG_TEST).unwrap();
+            sb = *nctx.superblock();
+            ino
+        };
+        assert!(inode_bit_set(&disk, &sb, ino), "created inode bit must be set");
+        assert!(
+            sb.free_inodes_count() < base_free_inodes,
+            "create must consume a free inode"
+        );
+
+        // Give the file real data blocks (two 4K blocks worth) so the block-free is meaningful.
+        let data_len = 2 * sb.block_size() + 17;
+        write_file_data(&disk, &mut sb, ino, data_len);
+        assert!(
+            sb.free_blocks_count() < base_free_blocks,
+            "writing data must consume free blocks"
+        );
+
+        // unlink: removes the entry + drops nlink to 0, but does NOT free yet (POSIX deferral).
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            unlink_at(&mut nctx, 2, b"victim").unwrap();
+            sb = *nctx.superblock();
+        }
+        let after_unlink = load_inode(&disk, &sb, ino).unwrap();
+        assert_eq!(after_unlink.links_count(), 0, "unlink drops nlink to 0");
+        assert!(
+            inode_bit_set(&disk, &sb, ino),
+            "inode bit must still be set right after unlink (freed only at evict)"
+        );
+
+        // evict hook (last reference closed): truncate data blocks + free the inode bitmap bit.
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            free_inode_on_evict_at(&mut nctx, ino).unwrap();
+            sb = *nctx.superblock();
+        }
+
+        // Inode bitmap bit cleared.
+        assert!(
+            !inode_bit_set(&disk, &sb, ino),
+            "BUG-19 fix: inode bitmap bit must be cleared after evict"
+        );
+        // i_dtime stamped (ext4 marks deleted inodes with a non-zero dtime).
+        let freed = load_inode(&disk, &sb, ino).unwrap();
+        assert_ne!(freed.raw.dtime, 0, "freed inode must have i_dtime set");
+        assert_eq!(freed.blocks_count(), 0, "all data blocks released (i_blocks==0)");
+        // Free counts returned exactly to baseline — no inode and no block leaked.
+        assert_eq!(
+            sb.free_inodes_count(),
+            base_free_inodes,
+            "free_inodes_count must return to pre-create baseline (no inode leak)"
+        );
+        assert_eq!(
+            sb.free_blocks_count(),
+            base_free_blocks,
+            "free_blocks_count must return to pre-create baseline (no block leak)"
+        );
+    }
+
+    /// BUG-19 (dir): mkdir then rmdir. mkdir consumes one inode + one data block (for `.`/`..`) and
+    /// bumps `used_dirs_count`; rmdir must release ALL of that — inode bitmap bit cleared, free
+    /// counts back to baseline, and `used_dirs_count` decremented back.
+    #[ktest]
+    fn rmdir_frees_inode_blocks_and_used_dirs() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let base_sb = read_sb(&disk);
+        let base_free_inodes = base_sb.free_inodes_count();
+        let base_free_blocks = base_sb.free_blocks_count();
+
+        let mut sb = base_sb;
+        let ino = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let ino = mkdir_at(&mut nctx, 2, b"sub", S_IFDIR_TEST).unwrap();
+            sb = *nctx.superblock();
+            ino
+        };
+        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, ino);
+        assert!(inode_bit_set(&disk, &sb, ino), "new dir inode bit set");
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
+            base_used_dirs + 1,
+            "mkdir must bump used_dirs_count"
+        );
+        assert!(
+            sb.free_blocks_count() < base_free_blocks,
+            "mkdir allocates a data block for './..'"
+        );
+
+        // rmdir: truncates the dir data block, drops nlinks, and (BUG-19 fix) frees the inode now.
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            rmdir_at(&mut nctx, 2, b"sub").unwrap();
+            sb = *nctx.superblock();
+        }
+
+        assert!(
+            !inode_bit_set(&disk, &sb, ino),
+            "BUG-19 fix: rmdir must clear the directory's inode bitmap bit"
+        );
+        let freed = load_inode(&disk, &sb, ino).unwrap();
+        assert_eq!(freed.links_count(), 0, "rmdir drops dir nlink to 0");
+        assert_ne!(freed.raw.dtime, 0, "freed dir inode must have i_dtime set");
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
+            base_used_dirs,
+            "rmdir must decrement used_dirs_count back to baseline"
+        );
+        assert_eq!(
+            sb.free_inodes_count(),
+            base_free_inodes,
+            "free_inodes_count back to baseline after rmdir (no inode leak)"
+        );
+        assert_eq!(
+            sb.free_blocks_count(),
+            base_free_blocks,
+            "free_blocks_count back to baseline after rmdir (dir block released)"
+        );
+    }
+
+    /// Belt-and-braces: the evict hook is a no-op when the inode was rescued (nlink != 0), so a file
+    /// that still has links is never freed (guards against a free-on-evict that ignores nlink).
+    #[ktest]
+    fn evict_is_noop_when_links_nonzero() {
+        let disk = MemDisk::new(EXT4_IMAGE);
+        let mut sb = read_sb(&disk);
+        let ino = {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            let ino = create_at(&mut nctx, 2, b"keep", S_IFREG_TEST).unwrap();
+            sb = *nctx.superblock();
+            ino
+        };
+        let free_inodes_before = sb.free_inodes_count();
+        // nlink is 1 (linked); evict must do nothing.
+        {
+            let mut nctx = NamespaceCtx::new(&disk, &disk, &disk, sb);
+            free_inode_on_evict_at(&mut nctx, ino).unwrap();
+            sb = *nctx.superblock();
+        }
+        assert!(inode_bit_set(&disk, &sb, ino), "evict must not free a still-linked inode");
+        assert_eq!(
+            sb.free_inodes_count(),
+            free_inodes_before,
+            "evict on nlink!=0 must not touch free_inodes_count"
+        );
+        let _ = ext4_bmap_bit_find_clr; // silence unused import if optimized away.
     }
 }
