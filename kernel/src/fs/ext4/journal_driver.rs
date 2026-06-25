@@ -366,9 +366,9 @@ impl CoreJournalDriver {
         hook: impl FnMut(JournalCommitWriteStage),
     ) -> Result<u32> {
         // Snapshot ring start before the emitter advances `space.head` so we can record the parked
-        // transaction's range. The descriptor lands at the current head; next_head = head + N + 2.
+        // transaction's range. The descriptor lands at the current head; next_head = head + N + 2
+        // (the emitter advances `space.head` by N+2 and re-validates free space itself).
         let start_block = self.space.head();
-        let required = plan.metadata_blocks.len() as u32 + 2;
         let ctx = CommitCtx {
             physical_blocks: &self.physical_blocks,
             writer,
@@ -386,7 +386,6 @@ impl CoreJournalDriver {
         // next_head == ring position one past the commit block (== space.head after advance, but the
         // emitter recomputes the same via space.advance(commit_block, 1); read it back from space).
         let next_head = self.space.head();
-        let _ = (next_head, required);
         self.finish_commit(tid, start_block, next_head, plan);
         Ok(tid)
     }

@@ -2097,7 +2097,11 @@ impl Ext4Fs {
         }
     }
 
-    fn sync_recovered_jbd2_state(&self, result: &JournalRecoveryResult) -> Result<()> {
+    // `_result` (the recovery summary) is no longer consumed here: Phase 6 Task 2 rebuilds the
+    // core-backed driver by reading the **post-recovery on-disk** journal SB (which ext4_rs `recover`
+    // already reset to s_start=0 / s_sequence=last+1), instead of deriving next_sequence from
+    // `result.last_sequence`. Kept in the signature for the caller's logging contract (Task 4).
+    fn sync_recovered_jbd2_state(&self, _result: &JournalRecoveryResult) -> Result<()> {
         self.block_device
             .sync()
             .map_err(|_| Error::with_message(Errno::EIO, "failed to sync recovered JBD2 blocks"))?;
@@ -2161,7 +2165,6 @@ impl Ext4Fs {
                 *self.jbd2_runtime.write() = None;
             }
         }
-        let _ = result;
         Ok(())
     }
 
@@ -4834,11 +4837,19 @@ impl Ext4Fs {
     /// target inode. It calls one `core::file::X` (which writes the inode + bitmaps + group descs +
     /// SB back through the metadata writer into the active JBD2 transaction).
     ///
-    /// **Two-engine free-block coherency**: the running SB is seeded from the live ext4_rs
-    /// `inner.super_block.free_blocks_count()` (the authoritative copy the still-ext4_rs namespace
-    /// ops use), and the post-op running free count is synced back into it. The block bitmaps + group
-    /// descriptors are the real truth and both engines RMW them from disk per op; the SB free count
-    /// is the cached summary, kept coherent here so neither engine clobbers the other's count.
+    /// **Two-engine free-counter coherency (C1 fix)**: ext4_rs keeps its **authoritative** free
+    /// counters in `allocator_locks.superblock` (a `Mutex<Ext4Superblock>`), NOT the plain
+    /// `Ext4.super_block` field (which is frozen at the mount value — ext4_rs alloc/free never touch
+    /// it). Every ext4_rs block alloc/free (`subtract/add_superblock_free_blocks`) and inode alloc/free
+    /// (`decrease/increase_superblock_free_inodes`) mutates that mutex copy and persists the full
+    /// 1024-byte SB. Core's `balloc::write_superblock` likewise rewrites the WHOLE 1024-byte SB on
+    /// every block alloc, so it MUST carry the correct `s_free_blocks_count` **and**
+    /// `s_free_inodes_count`, else it clobbers the on-disk counters and e2fsck reports "Free
+    /// inodes/blocks count wrong". We therefore seed BOTH counters from the authoritative mutex copy
+    /// (`lock_superblock_counter()`), and sink the post-op `free_blocks` back into that same copy so a
+    /// subsequent ext4_rs namespace op sees core's decrement. `free_inodes` is unchanged by file
+    /// writes, so it round-trips once seeded. Geometry/other fields stay from the immutable mount
+    /// snapshot `core_sb`. (ext4.rs:14-42 is the complete set of mutable SB counters ext4_rs touches.)
     fn run_journaled_core<T>(
         &self,
         op: Option<JournaledOp>,
@@ -4877,11 +4888,16 @@ impl Ext4Fs {
 
         let apply_start_ns = Self::monotonic_nanos();
         let result = {
-            let mut inner = self.lock_inner();
-            // Seed the running SB: geometry from the immutable mount snapshot, free-block count from
-            // the live ext4_rs authoritative copy (so the two engines agree on free space).
+            let inner = self.lock_inner();
+            // Seed the running SB: geometry from the immutable mount snapshot, free-block AND
+            // free-inode counts from ext4_rs's **authoritative** counter mutex (NOT the stale
+            // `inner.super_block` field). Read both, then drop the brief guard before the apply.
             let mut sb = self.core_sb;
-            sb.set_free_blocks_count(inner.super_block.free_blocks_count());
+            {
+                let auth_sb = inner.allocator_locks.lock_superblock_counter();
+                sb.set_free_blocks_count(auth_sb.free_blocks_count());
+                sb.set_free_inodes_count(auth_sb.free_inodes_count());
+            }
 
             let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
             let writer = super::core_adapter::CoreMetadataWriter::new(
@@ -4904,9 +4920,21 @@ impl Ext4Fs {
 
             match r {
                 Ok((value, new_free)) => {
-                    inner.super_block.set_free_blocks_count(new_free);
+                    // Sink the post-op free-block count back into ext4_rs's authoritative counter
+                    // copy so the next ext4_rs namespace op decrements from core's value. core's
+                    // `write_superblock` already persisted the full SB (both counters) to disk during
+                    // the op, so this only keeps the in-memory authoritative copy coherent with disk.
+                    inner
+                        .allocator_locks
+                        .lock_superblock_counter()
+                        .set_free_blocks_count(new_free);
                     Ok(value)
                 }
+                // On partial failure we do NOT roll the SB counter back: ext4_rs has the same
+                // no-rollback behavior (its alloc/free persist the SB eagerly per step), and the
+                // failed transaction's metadata images (incl. any SB write) are dropped when the
+                // handle stops without commit, so the in-memory authoritative copy and the
+                // journaled-but-uncommitted SB image disagree only until that tx is discarded.
                 Err(err) => Err(err),
             }
         };
