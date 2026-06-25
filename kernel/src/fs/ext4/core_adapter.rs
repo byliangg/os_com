@@ -27,8 +27,9 @@ use ostd::sync::RwMutex;
 
 use super::core::{
     balloc::{BlockAllocator, InodeAllocCtx},
+    block_map::map_block_for_read,
     extents::BlockAlloc,
-    inode::Inode,
+    inode::{load_inode, Inode},
     io::{BlockReader, BlockWriter},
     metadata_writer::MetadataWriter,
     superblock::RawSuperblock,
@@ -77,6 +78,32 @@ impl BlockReader for CoreDeviceReader {
         // home-read + overlay-merge. Bring the trait into scope locally to call it.
         use ext4_rs::BlockDevice as Ext4BlockDevice;
         self.bridge.read_offset_into(off, out);
+    }
+}
+
+/// Core read seam wired straight to the device adapter, **bypassing the overlay bridge**.
+///
+/// Mount-time JBD2 recovery reads the journal **log** blocks directly off the device — there is no
+/// in-memory overlay yet (the driver's checkpoint_list / running transaction are empty at mount), and
+/// PARITY with the old path requires it: ext4_rs `replay_mount_jbd2_journal` ran
+/// `journal.recover(&self.adapter)` over the RAW `KernelBlockDeviceAdapter`, not the
+/// `JournalIoBridge`. We mirror that exactly with a raw reader so recovery never sees a stale overlay
+/// image. (At mount the overlay is empty, so this is byte-identical to `CoreDeviceReader`, but the
+/// raw reader is the precise parity match and is overlay-independent.)
+pub(super) struct CoreRawDeviceReader {
+    adapter: Arc<KernelBlockDeviceAdapter>,
+}
+
+impl CoreRawDeviceReader {
+    pub(super) fn new(adapter: Arc<KernelBlockDeviceAdapter>) -> Self {
+        Self { adapter }
+    }
+}
+
+impl BlockReader for CoreRawDeviceReader {
+    fn read_at(&self, off: usize, out: &mut [u8]) {
+        use ext4_rs::BlockDevice as Ext4BlockDevice;
+        self.adapter.read_offset_into(off, out);
     }
 }
 
@@ -325,3 +352,73 @@ pub(super) fn read_superblock(reader: &dyn BlockReader) -> RawSuperblock {
     reader.read_at(1024, sb_buf.as_mut_slice());
     RawSuperblock::from_bytes(&sb_buf)
 }
+
+// =============================================================================================
+// 6. Journal inode physical-block resolution at mount (Phase 6 Task 4).
+// =============================================================================================
+
+/// Resolve the journal inode's physical (fs) block vector via **core**, replacing the ext4_rs
+/// `Jbd2Journal::load` → `JournalDevice::load` path that the mount used to build `physical_blocks`.
+///
+/// PARITY: ext4_rs `JournalDevice::load` (`jbd2/device.rs:15-47`):
+/// - journal inode number = `sb.journal_inode_number()` (`s_journal_inum`); 0 → error.
+/// - `inode_size_bytes = sb.inode_size_file(&inode)`; for a **regular file** (the journal inode is
+///   always `S_IFREG`) this folds `size_hi<<32` — identical to core `Inode::size()` for that inode
+///   (core `RawInode::size()` always folds size_hi; the journal inode being a regular file makes the
+///   two agree, see the subagent grounding). 0 → error.
+/// - `logical_blocks = ceil(inode_size_bytes / block_size)`; must be `>= 2` (a JBD2 journal has at
+///   least a superblock + one log block) else error.
+/// - for `lblock in 0..logical_blocks`: `pblock = get_pblock_idx(inode, lblock)` (extent / legacy
+///   dispatch). We use core `map_block_for_read`, which dispatches on `inode.uses_extents()`
+///   identically to ext4_rs `get_pblock_idx_inner` (the same predicate the live read path uses); a
+///   hole (`None`) inside the journal file is invalid → EINVAL, exactly as ext4_rs would fail to map.
+///
+/// Returns `(physical_blocks, fs_block_size)` so the caller can build the core JBD2 driver
+/// (`CoreJournalDriver::from_physical_blocks`, which then reads the on-disk journal SB through the
+/// same reader and seeds the running ring geometry — equivalent to ext4_rs `JournalSuperblockState`
+/// + `JournalSpace::from_superblock`).
+pub(super) fn resolve_journal_physical_blocks(
+    reader: &dyn BlockReader,
+    sb: &RawSuperblock,
+) -> Result<(Vec<Ext4Fsblk>, usize)> {
+    let journal_inode = sb.journal_inode_number();
+    if journal_inode == 0 {
+        return Err(Error::with_message(Errno::EINVAL, "journal inode is zero"));
+    }
+    let inode = load_inode(reader, sb, journal_inode)?;
+    let block_size = sb.block_size();
+    let block_size_u64 = block_size as u64;
+    let inode_size_bytes = inode.size();
+    if inode_size_bytes == 0 {
+        return Err(Error::with_message(Errno::EINVAL, "journal inode is empty"));
+    }
+    let logical_blocks_u64 = inode_size_bytes
+        .checked_add(block_size_u64 - 1)
+        .ok_or_else(|| Error::with_message(Errno::EINVAL, "journal inode size overflow"))?
+        / block_size_u64;
+    let logical_blocks = u32::try_from(logical_blocks_u64)
+        .map_err(|_| Error::with_message(Errno::EINVAL, "journal inode too large"))?;
+    if logical_blocks < 2 {
+        return Err(Error::with_message(Errno::EINVAL, "journal inode too small"));
+    }
+
+    let mut physical_blocks = Vec::with_capacity(logical_blocks as usize);
+    for lblock in 0..logical_blocks {
+        let pblock = map_block_for_read(reader, sb, &inode, lblock)?
+            .map(|(pblock, _unwritten)| pblock)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "journal inode has a hole"))?;
+        physical_blocks.push(pblock);
+    }
+    Ok((physical_blocks, block_size))
+}
+
+/// Raw home-block writer for mount-time JBD2 recovery: writes straight to the device adapter
+/// (byte offset), **bypassing** both the journal `MetadataWriter` and the overlay deferral.
+///
+/// JBD2 recovery REPLAYS committed metadata straight to its home location (`block_nr * block_size`)
+/// and stores the reset journal SB to journal logical block 0 — it does **not** re-journal anything
+/// (PARITY: ext4_rs `recover` writes home via `block_device.write_offset`, see
+/// `core/journal/recovery.rs` `RecoverCtx::writer` doc). This is exactly [`CoreDataWriter`]'s
+/// behavior (data write straight to the adapter), but named for the recovery seam so the mount path
+/// reads clearly. We reuse [`CoreDataWriter`] under the hood.
+pub(super) type CoreRecoveryWriter = CoreDataWriter;

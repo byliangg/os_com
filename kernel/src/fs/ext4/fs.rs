@@ -17,7 +17,7 @@ use aster_cmdline::{KCMDLINE, ModuleArg};
 use aster_time::read_monotonic_time;
 use ext4_rs::{
     BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
-    Jbd2Journal, JournalRecoveryResult, LocalOperationAllocGuard,
+    LocalOperationAllocGuard,
     MetadataWriter as Ext4MetadataWriter, OperationAllocGuard as Ext4OperationAllocGuard,
     OperationScopedAllocGuard, SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
 };
@@ -1569,6 +1569,14 @@ impl PageCacheBackend for Ext4PageCacheBackend {
 }
 
 pub(super) struct Ext4Fs {
+    // Phase 6 Task 4 (SB ownership transition): the production mount, journaled-write, namespace,
+    // fsync, recovery and RECOVER-flag paths are ALL off ext4_rs now. The ONLY remaining production
+    // user of this ext4_rs `Ext4` handle is `load_dir_cache_if_needed_locked` (a Phase-6 **Task 1**
+    // read-path vestige that still enumerates a directory via `ext4_stat` + `ext4_readdir_with_offsets`
+    // to seed the dir-entry cache). It is kept MINIMAL and reported for Task 5 (cutting it is read-path
+    // work — matching ext4_rs's per-entry byte offsets via core `dir_enumerate` — not mount/recovery).
+    // Mount still calls `Ext4::open` purely to construct this handle for that one vestige; once Task 5
+    // cuts the dir-cache populate to core, this field + `Ext4::open` can be removed outright.
     inner: Mutex<Ext4>,
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
@@ -1582,11 +1590,27 @@ pub(super) struct Ext4Fs {
     // avoids an extra 1024-byte device read per read op (the write path stays on ext4_rs, which
     // owns its own SB; this copy feeds reads only).
     core_sb: super::core::superblock::RawSuperblock,
+    // Phase 6 Task 4 (★SB ownership transition): the **running** authoritative superblock — holds the
+    // live free-block / free-inode counts. Replaces ext4_rs's `inner.allocator_locks.superblock`
+    // (`lock_superblock_counter()`) as the single source of truth for free counts. Seeded once at
+    // mount from `core_sb` (which parsed the same on-disk SB ext4_rs would have); the journaled-write
+    // / namespace chokepoints (`run_journaled_core` / `run_journaled_namespace`) read its free counts
+    // to seed each per-op core allocator, then sink the post-op counts back. Core's `write_superblock`
+    // persists the full 1024-byte SB to disk per op, so this is the in-memory mirror of disk. The C1
+    // two-engine seed/sink is gone — this is the sole running-SB owner.
+    //
+    // NOTE on geometry: only the free counts ever change here; geometry stays at mount values. Read
+    // paths + statfs (`sb()`) keep reading the FROZEN `core_sb` (statfs reports mount-time free counts,
+    // byte-frozen behavior preserved — ext4_rs `inner.super_block` was likewise frozen).
+    running_sb: Mutex<super::core::superblock::RawSuperblock>,
+    // Phase 6 Task 4: the in-memory `EXT4_FEATURE_INCOMPAT_RECOVER` (needs_recovery / dirty-log) flag.
+    // Replaces the only mutable part of ext4_rs's frozen `inner.super_block` (its RECOVER bit). The
+    // lazy first-commit set (`mark_needs_recovery_if_needed`), the shutdown set
+    // (`mark_needs_recovery_for_shutdown`) and the mount-time clear (after recovery) toggle this and
+    // persist a `core_sb`-based SB image (mount-time free counts, RECOVER bit set/clear, csum
+    // recomputed) to disk — byte-frozen vs ext4_rs's `inner.super_block.sync_to_disk_with_csum`.
+    recover_flag: AtomicBool,
     mount_flags_bits: AtomicU32,
-    // Phase 6 Task 4 (mount/recovery) still constructs the ext4_rs `Jbd2Journal` to resolve the
-    // journal inode's physical block vector and to drive mount-time recovery. The production
-    // commit/checkpoint engine no longer uses it — Task 2 cut that to the core-backed driver below.
-    jbd2_journal: Mutex<Option<Jbd2Journal>>,
     // Phase 6 Task 2: the integration-layer JBD2 commit/checkpoint driver, re-derived over the safe
     // `core/` journal. Holds the core in-memory runtime + the integration-owned checkpoint_list /
     // last_committed_tid / rotation / running ring geometry. Same `Arc<RwMutex<Option<..>>>` slot
@@ -1678,13 +1702,21 @@ impl Ext4Fs {
         let core_sb = super::core_adapter::read_superblock(&super::core_adapter::CoreDeviceReader::new(
             journal_io.clone(),
         ));
+        // Phase 6 Task 4: seed the running authoritative SB + in-memory RECOVER flag from the
+        // mount-time on-disk SB snapshot. `running_sb` carries the live free counts (replacing the
+        // ext4_rs `allocator_locks` mutex); `recover_flag` carries the RECOVER incompat bit (replacing
+        // the mutable part of ext4_rs `inner.super_block`). Both start exactly at the on-disk values,
+        // identical to ext4_rs's `Ext4::open` seeding both its SB copies from the same on-disk SB.
+        let running_sb = Mutex::new(core_sb);
+        let recover_flag = AtomicBool::new(core_sb.needs_recovery());
         let fs = Arc::new_cyclic(|weak_ref| Self {
             inner: Mutex::new(ext4),
             block_device,
             adapter,
             core_sb,
+            running_sb,
+            recover_flag,
             mount_flags_bits: AtomicU32::new(PerMountFlags::default().bits()),
-            jbd2_journal: Mutex::new(None),
             jbd2_runtime: jbd2_runtime.clone(),
             journal_io: journal_io.clone(),
             alloc_guard: alloc_guard.clone(),
@@ -1988,95 +2020,108 @@ impl Ext4Fs {
     }
 
     fn initialize_jbd2_journal(&self) {
-        let journal = match self.run_ext4(|ext4| ext4.load_journal()) {
-            Ok(journal) => journal,
-            Err(err) => {
-                warn!("ext4: failed to initialize JBD2 journal: {:?}", err);
-                *self.jbd2_runtime.write() = None;
-                return;
-            }
-        };
+        // Phase 6 Task 4: build the JBD2 journal entirely via `core/`, off ext4_rs.
+        //
+        // PARITY: this replaces `ext4_rs Ext4::load_journal` → `Jbd2Journal::load` → `JournalDevice::
+        // load`. The journal-feature gate (`COMPAT_HAS_JOURNAL`) is the same one ext4_rs `load_journal`
+        // checked; the journal inode's physical block vector is resolved by core
+        // (`resolve_journal_physical_blocks`, byte-for-byte the same walk as `JournalDevice::load`);
+        // the running ring geometry is seeded from the on-disk journal SB read through the overlay
+        // bridge (`CoreJournalDriver::from_physical_blocks` → `load_journal_sb` +
+        // `JournalSpace::from_superblock`) — identical to what ext4_rs built.
+        if !self.core_sb.has_journal() {
+            info!("ext4: filesystem has no JBD2 journal feature; using non-journal path");
+            *self.jbd2_runtime.write() = None;
+            return;
+        }
 
-        match journal {
-            Some(journal) => {
-                // Phase 6 Task 2: build the core-backed JBD2 driver from the journal inode's
-                // physical block vector (resolved by the ext4_rs `Jbd2Journal` the mount path still
-                // constructs). The running ring geometry is seeded from the on-disk journal SB read
-                // through the overlay bridge — identical to `JournalSpace::from_superblock` over the
-                // same on-disk SB ext4_rs used.
-                let block_size = journal.superblock.block_size() as usize;
-                let physical_blocks = journal.device.physical_blocks().to_vec();
-                let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
-                match super::journal_driver::CoreJournalDriver::from_physical_blocks(
-                    &reader,
-                    physical_blocks,
-                    block_size,
-                ) {
-                    Ok(driver) => {
-                        *self.jbd2_runtime.write() = Some(driver);
-                    }
-                    Err(err) => {
-                        warn!(
-                            "ext4: failed to build core JBD2 driver: {:?}; journal disabled",
-                            err
-                        );
-                        *self.jbd2_runtime.write() = None;
-                    }
+        // Mount bootstrap reads go straight to the device (raw), like ext4_rs `JournalDevice::load` /
+        // `JournalSuperblockState::load` — the overlay is empty at mount, so this is overlay-
+        // independent and the exact parity match.
+        let reader = super::core_adapter::CoreRawDeviceReader::new(self.adapter.clone());
+        let (physical_blocks, block_size) =
+            match super::core_adapter::resolve_journal_physical_blocks(&reader, &self.core_sb) {
+                Ok(result) => result,
+                Err(err) => {
+                    warn!("ext4: failed to resolve journal physical blocks: {:?}", err);
+                    *self.jbd2_runtime.write() = None;
+                    return;
                 }
+            };
+        let journal_inode = self.core_sb.journal_inode_number();
+        match super::journal_driver::CoreJournalDriver::from_physical_blocks(
+            &reader,
+            physical_blocks,
+            block_size,
+        ) {
+            Ok(driver) => {
                 info!(
                     "ext4: loaded JBD2 journal inode={} blocks={} mapped_blocks={} block_size={} sequence={} start={} head={} first={} free_blocks={} incompat=0x{:x}",
-                    journal.device.journal_inode(),
-                    journal.superblock.maxlen(),
-                    journal.device.logical_blocks(),
-                    journal.superblock.block_size(),
-                    journal.superblock.sequence(),
-                    journal.superblock.start(),
-                    journal.superblock.head(),
-                    journal.superblock.first(),
-                    journal.space.free_blocks(),
-                    journal.superblock.feature_incompat(),
+                    journal_inode,
+                    driver.journal_maxlen(),
+                    driver.journal_logical_blocks(),
+                    driver.block_size(),
+                    driver.journal_sequence(),
+                    driver.journal_start(),
+                    driver.journal_head(),
+                    driver.journal_first(),
+                    driver.space_free_blocks(),
+                    driver.journal_feature_incompat(),
                 );
-                *self.jbd2_journal.lock() = Some(journal);
+                *self.jbd2_runtime.write() = Some(driver);
             }
-            None => {
-                info!("ext4: filesystem has no JBD2 journal feature; using non-journal path");
+            Err(err) => {
+                warn!(
+                    "ext4: failed to build core JBD2 driver: {:?}; journal disabled",
+                    err
+                );
                 *self.jbd2_runtime.write() = None;
-                *self.jbd2_journal.lock() = None;
             }
         }
     }
 
     fn replay_mount_jbd2_journal(&self) {
-        let needs_recovery = {
-            let journal_guard = self.jbd2_journal.lock();
-            let journal_needs_recovery = journal_guard
-                .as_ref()
-                .is_some_and(|journal| journal.needs_recovery());
-            drop(journal_guard);
-
-            if journal_needs_recovery {
-                true
-            } else {
-                let inner = self.lock_inner();
-                inner.super_block.needs_recovery()
-            }
-        };
+        // Phase 6 Task 4: mount-time recovery via `core/`, off ext4_rs.
+        //
+        // PARITY: the needs-recovery gate is (journal SB `s_start != 0`) OR (fs-SB RECOVER flag) —
+        // exactly the old `journal.needs_recovery() || inner.super_block.needs_recovery()`. The first
+        // term is now `CoreJournalDriver::journal_needs_recovery` (→ `recovery::needs_recovery`); the
+        // second is the core-owned `recover_flag` (the in-memory fs-SB RECOVER bit, seeded at mount).
+        let journal_needs_recovery = self
+            .jbd2_runtime
+            .read()
+            .as_ref()
+            .is_some_and(|driver| driver.journal_needs_recovery());
+        let needs_recovery =
+            journal_needs_recovery || self.recover_flag.load(Ordering::Acquire);
         if !needs_recovery {
             return;
         }
 
+        // Drive the three-pass replay over the core driver. `reader` reads journal log blocks straight
+        // off the device (raw, no overlay — PARITY with ext4_rs `journal.recover(&self.adapter)`);
+        // `writer` is a RAW home writer (bypasses the journal `MetadataWriter` — recovery replays
+        // committed metadata straight to home, see `RecoverCtx::writer` doc). The driver resets +
+        // stores the journal SB and re-seeds its own runtime/ring from the reset SB.
         let recovery_result = {
-            let block_device: Arc<dyn Ext4BlockDevice> = self.adapter.clone();
-            let mut journal_guard = self.jbd2_journal.lock();
-            let Some(journal) = journal_guard.as_mut() else {
+            let reader = super::core_adapter::CoreRawDeviceReader::new(self.adapter.clone());
+            let writer = super::core_adapter::CoreRecoveryWriter::new(self.adapter.clone());
+            let mut driver_guard = self.jbd2_runtime.write();
+            let Some(driver) = driver_guard.as_mut() else {
+                // PARITY: ext4_rs `replay_mount_jbd2_journal` returned WITHOUT clearing the flag when
+                // `jbd2_journal` was `None` (`let Some(journal) = .. else { return; }`). Replicate
+                // exactly — do NOT clear the RECOVER flag on the no-journal path (byte-frozen).
                 return;
             };
-            journal.recover(&block_device)
+            driver.recover_at_mount(&reader, &writer)
         };
 
         match recovery_result {
             Ok(result) => {
-                if let Err(err) = self.sync_recovered_jbd2_state(&result) {
+                // RED LINE write order (PARITY: old `sync_recovered_jbd2_state`): the replay already
+                // wrote home blocks + the reset journal SB; now sync them, clear the fs-SB RECOVER
+                // flag, sync again. `finalize_recovered_superblock` owns that sequence.
+                if let Err(err) = self.finalize_recovered_superblock() {
                     warn!(
                         "ext4: JBD2 recovery replayed transactions but failed to finalize superblock state: {:?}",
                         err
@@ -2097,11 +2142,18 @@ impl Ext4Fs {
         }
     }
 
-    // `_result` (the recovery summary) is no longer consumed here: Phase 6 Task 2 rebuilds the
-    // core-backed driver by reading the **post-recovery on-disk** journal SB (which ext4_rs `recover`
-    // already reset to s_start=0 / s_sequence=last+1), instead of deriving next_sequence from
-    // `result.last_sequence`. Kept in the signature for the caller's logging contract (Task 4).
-    fn sync_recovered_jbd2_state(&self, _result: &JournalRecoveryResult) -> Result<()> {
+    /// Finalize the on-disk superblock state after a mount-time replay: flush the replayed home
+    /// blocks + reset journal SB, clear the fs-superblock `EXT4_FEATURE_INCOMPAT_RECOVER` flag, then
+    /// flush the cleared flag. The journal driver's runtime/ring was already re-seeded from the reset
+    /// SB inside `recover_at_mount`.
+    ///
+    /// PARITY: ext4_rs `sync_recovered_jbd2_state` write order — `block_device.sync()` →
+    /// `super_block.set_needs_recovery(false) + sync_to_disk_with_csum` → `block_device.sync()`. The
+    /// RECOVER-flag clear writes a `core_sb`-based SB image (mount-time free counts, RECOVER bit
+    /// cleared, csum recomputed) through the journal bridge metadata writer; with no active handle at
+    /// mount, that bridge write goes straight to the home superblock — byte-frozen vs ext4_rs's
+    /// `inner.super_block.sync_to_disk_with_csum(&inner.metadata_writer)`.
+    fn finalize_recovered_superblock(&self) -> Result<()> {
         self.block_device
             .sync()
             .map_err(|_| Error::with_message(Errno::EIO, "failed to sync recovered JBD2 blocks"))?;
@@ -2114,11 +2166,9 @@ impl Ext4Fs {
                 Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
             );
             let runtime_hold_start_ns = Self::monotonic_nanos();
-            let mut inner = self.lock_inner();
-            let metadata_writer = inner.metadata_writer.clone();
-            inner.super_block.set_needs_recovery(false);
-            inner.super_block.sync_to_disk_with_csum(&metadata_writer);
-            drop(inner);
+            // Clear the in-memory RECOVER flag + persist the cleared SB through the journal bridge.
+            let writer: Arc<dyn Ext4MetadataWriter> = self.journal_io.clone();
+            self.persist_recover_flag(false, writer.as_ref());
             drop(runtime_guard);
             self.record_ext4_rs_runtime_lock_hold(
                 Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
@@ -2132,40 +2182,25 @@ impl Ext4Fs {
         self.block_device
             .sync()
             .map_err(|_| Error::with_message(Errno::EIO, "failed to sync cleared recovery flag"))?;
-
-        // Phase 6 Task 2: rebuild the core-backed driver from the journal inode's physical blocks
-        // reading the **post-recovery** on-disk journal SB (ext4_rs `recover` reset s_start=0 and
-        // s_sequence=last+1). `from_physical_blocks` reads s_sequence as the runtime first_tid and
-        // the ring geometry via `JournalSpace::from_superblock` — equivalent to the old
-        // `JournalRuntime::new(block_size, last_sequence+1)` plus a fresh ring from the reset SB.
-        let (block_size, physical_blocks) = {
-            let journal_guard = self.jbd2_journal.lock();
-            let Some(journal) = journal_guard.as_ref() else {
-                return Ok(());
-            };
-            (
-                journal.superblock.block_size() as usize,
-                journal.device.physical_blocks().to_vec(),
-            )
-        };
-        let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
-        match super::journal_driver::CoreJournalDriver::from_physical_blocks(
-            &reader,
-            physical_blocks,
-            block_size,
-        ) {
-            Ok(driver) => {
-                *self.jbd2_runtime.write() = Some(driver);
-            }
-            Err(err) => {
-                warn!(
-                    "ext4: failed to rebuild core JBD2 driver after recovery: {:?}",
-                    err
-                );
-                *self.jbd2_runtime.write() = None;
-            }
-        }
         Ok(())
+    }
+
+    /// Set / clear the in-memory `recover_flag` and persist a `core_sb`-based superblock image (the
+    /// frozen mount snapshot with mount-time free counts) carrying the toggled RECOVER bit and a
+    /// recomputed checksum, written via `writer`.
+    ///
+    /// PARITY: ext4_rs `inner.super_block.set_needs_recovery(enabled) +
+    /// sync_to_disk_with_csum(&metadata_writer)`. ext4_rs's `inner.super_block` is the FROZEN mount
+    /// snapshot (alloc/free never touch it), so the persisted SB carries mount-time free counts; we
+    /// replicate that exactly by starting from `core_sb`. The `recover_flag` atomic mirrors ext4_rs's
+    /// in-memory RECOVER bit so the lazy first-commit fast path can short-circuit.
+    fn persist_recover_flag(&self, enabled: bool, writer: &dyn Ext4MetadataWriter) {
+        self.recover_flag.store(enabled, Ordering::Release);
+        let mut sb = self.core_sb;
+        sb.set_needs_recovery(enabled);
+        sb.recompute_csum();
+        // PARITY: ext4_rs writes the full 1024-byte SB to byte offset 1024 (`SUPERBLOCK_OFFSET`).
+        writer.write_metadata(EXT4_SUPERBLOCK_OFFSET, sb.as_bytes());
     }
 
     fn estimate_jbd2_reserved_blocks(op: Option<&JournaledOp>) -> u32 {
@@ -4952,16 +4987,12 @@ impl Ext4Fs {
 
         let apply_start_ns = Self::monotonic_nanos();
         let result = {
-            let inner = self.lock_inner();
-            // Seed the running SB: geometry from the immutable mount snapshot, free-block AND
-            // free-inode counts from ext4_rs's **authoritative** counter mutex (NOT the stale
-            // `inner.super_block` field). Read both, then drop the brief guard before the apply.
-            let mut sb = self.core_sb;
-            {
-                let auth_sb = inner.allocator_locks.lock_superblock_counter();
-                sb.set_free_blocks_count(auth_sb.free_blocks_count());
-                sb.set_free_inodes_count(auth_sb.free_inodes_count());
-            }
+            // Phase 6 Task 4 (★SB ownership): seed the per-op running SB from the **core-owned**
+            // authoritative running SB (`running_sb` — the single source of truth for free counts,
+            // replacing ext4_rs's `allocator_locks` mutex). Geometry stays at the immutable mount
+            // values (`running_sb` only ever has its free counts mutated). The C1 two-engine
+            // seed/sink is gone: there is no ext4_rs mirror to read from or write back to.
+            let mut sb = *self.running_sb.lock();
 
             let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
             let writer = super::core_adapter::CoreMetadataWriter::new(
@@ -4977,24 +5008,21 @@ impl Ext4Fs {
                     super::core_adapter::CoreBlockAlloc::new(block_alloc, inode.blocks_count());
                 let ctx = super::core::extents::WriteCtx::new(&reader, &writer, &data_writer, &sb);
                 let value = apply(&ctx, &mut alloc, &mut inode)?;
-                // Sync the post-op running free-block count back into the ext4_rs authoritative SB.
+                // Harvest the post-op running free-block count from the per-op allocator's SB.
                 let new_free = alloc.superblock().free_blocks_count();
                 Ok((value, new_free))
             })();
 
             match r {
                 Ok((value, new_free)) => {
-                    // Sink the post-op free-block count back into ext4_rs's authoritative counter
-                    // copy so the next ext4_rs namespace op decrements from core's value. core's
+                    // Sink the post-op free-block count back into the core-owned running SB so the
+                    // next journaled/namespace op seeds from core's decrement. core's
                     // `write_superblock` already persisted the full SB (both counters) to disk during
-                    // the op, so this only keeps the in-memory authoritative copy coherent with disk.
-                    inner
-                        .allocator_locks
-                        .lock_superblock_counter()
-                        .set_free_blocks_count(new_free);
+                    // the op; this keeps the in-memory authoritative copy coherent with disk.
+                    self.running_sb.lock().set_free_blocks_count(new_free);
                     Ok(value)
                 }
-                // On partial failure we do NOT roll the SB counter back: ext4_rs has the same
+                // On partial failure we do NOT roll the running SB counter back: ext4_rs had the same
                 // no-rollback behavior (its alloc/free persist the SB eagerly per step), and the
                 // failed transaction's metadata images (incl. any SB write) are dropped when the
                 // handle stops without commit, so the in-memory authoritative copy and the
@@ -5109,16 +5137,11 @@ impl Ext4Fs {
 
         let apply_start_ns = Self::monotonic_nanos();
         let result = {
-            let inner = self.lock_inner();
-            // Seed the running SB: geometry from the immutable mount snapshot, free-block AND
-            // free-inode counts from ext4_rs's authoritative counter mutex (NOT the stale
-            // `inner.super_block` field). Read both, then drop the brief guard before the apply.
-            let mut sb = self.core_sb;
-            {
-                let auth_sb = inner.allocator_locks.lock_superblock_counter();
-                sb.set_free_blocks_count(auth_sb.free_blocks_count());
-                sb.set_free_inodes_count(auth_sb.free_inodes_count());
-            }
+            // Phase 6 Task 4 (★SB ownership): seed the running SB from the **core-owned**
+            // authoritative running SB (`running_sb`). Namespace ops mutate BOTH free counts (inode
+            // alloc via `ialloc` + directory-block alloc/free), so we snapshot both. The C1
+            // two-engine seed/sink is gone — `running_sb` is the single source of truth.
+            let sb = *self.running_sb.lock();
 
             let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
             let writer = super::core_adapter::CoreMetadataWriter::new(
@@ -5133,16 +5156,16 @@ impl Ext4Fs {
                 let value = apply(&mut nctx)?;
                 // Harvest the post-op running SB: BOTH free counts may have changed (inode alloc +
                 // directory-block alloc/free). Core already persisted the full SB to disk; this sinks
-                // the in-memory authoritative copy so it stays coherent at the mount boundary.
+                // the in-memory authoritative copy so it stays coherent for the next op.
                 let post = nctx.superblock();
                 Ok((value, post.free_blocks_count(), post.free_inodes_count()))
             })();
 
             match r {
                 Ok((value, new_free_blocks, new_free_inodes)) => {
-                    let mut auth_sb = inner.allocator_locks.lock_superblock_counter();
+                    let mut auth_sb = self.running_sb.lock();
                     auth_sb.set_free_blocks_count(new_free_blocks);
-                    auth_sb.set_free_inodes_for_diff(new_free_inodes);
+                    auth_sb.set_free_inodes_count(new_free_inodes);
                     Ok(value)
                 }
                 // On partial failure we do NOT roll the SB counters back — same no-rollback behavior
@@ -6730,13 +6753,13 @@ impl Ext4Fs {
                 self.0.write_offset(offset, data);
             }
         }
-        let raw_writer: Arc<dyn Ext4MetadataWriter> =
-            Arc::new(RawAdapterWriter(self.adapter.clone()));
+        let raw_writer = RawAdapterWriter(self.adapter.clone());
 
-        let mut inner = self.lock_inner();
-        inner.super_block.set_needs_recovery(true);
-        inner.super_block.sync_to_disk_with_csum(&raw_writer);
-        drop(inner);
+        // Phase 6 Task 4: set the core-owned RECOVER flag + persist a `core_sb`-based SB image
+        // (mount-time free counts, RECOVER bit set, csum recomputed) straight to the home superblock
+        // via the raw adapter writer. PARITY: ext4_rs `inner.super_block.set_needs_recovery(true) +
+        // sync_to_disk_with_csum(&RawAdapterWriter)`.
+        self.persist_recover_flag(true, &raw_writer);
         // Flush so dumpe2fs / next mount sees the updated superblock.
         let _ = self.block_device.sync();
     }
@@ -6756,20 +6779,16 @@ impl Ext4Fs {
     /// the FS as "dirty log" until the next clean shutdown / replay clears
     /// the flag.  No-op if the flag is already set (cheap fast path).
     fn mark_needs_recovery_if_needed(&self) {
-        let need_persist = {
-            let inner = self.lock_inner();
-            !inner.super_block.needs_recovery()
-        };
-        if !need_persist {
+        // Phase 6 Task 4: fast path on the core-owned in-memory RECOVER flag. PARITY: ext4_rs
+        // checked `!inner.super_block.needs_recovery()` (the in-memory bit) before persisting.
+        if self.recover_flag.load(Ordering::Acquire) {
             return;
         }
-        let mut inner = self.lock_inner();
-        if inner.super_block.needs_recovery() {
-            return;
-        }
-        let metadata_writer = inner.metadata_writer.clone();
-        inner.super_block.set_needs_recovery(true);
-        inner.super_block.sync_to_disk_with_csum(&metadata_writer);
+        // Persist the SB with RECOVER set through the journal bridge metadata writer. This is called
+        // post-commit with no active handle, so the bridge write goes straight to the home superblock
+        // — byte-frozen vs ext4_rs `inner.super_block.sync_to_disk_with_csum(&inner.metadata_writer)`.
+        let writer: Arc<dyn Ext4MetadataWriter> = self.journal_io.clone();
+        self.persist_recover_flag(true, writer.as_ref());
     }
 
     pub(super) fn fsync_regular_file(&self, ino: u32) -> Result<()> {
@@ -6859,13 +6878,18 @@ impl FileSystem for Ext4Fs {
     }
 
     fn sb(&self) -> SuperBlock {
-        let ext4_sb = self.lock_inner().super_block;
-        let block_size = ext4_sb.block_size() as usize;
+        // Phase 6 Task 4: read the FROZEN mount-time snapshot `core_sb` (byte-frozen behavior — the
+        // old `inner.super_block` was likewise the frozen mount snapshot, so statfs reports mount-time
+        // free counts, NOT the live `running_sb` counts). All fields here are immutable geometry or
+        // the frozen free counts; identical to what ext4_rs `inner.super_block` returned.
+        let ext4_sb = &self.core_sb;
+        let block_size = ext4_sb.block_size();
         let blocks = ext4_sb.blocks_count() as usize;
         let bfree = ext4_sb.free_blocks_count().min(usize::MAX as u64) as usize;
-        let files = ext4_sb.total_inodes() as usize;
+        let files = ext4_sb.inodes_count() as usize;
         let ffree = ext4_sb.free_inodes_count() as usize;
-        let fsid = u64::from_le_bytes(ext4_sb.uuid[..8].try_into().unwrap_or([0u8; 8]));
+        let uuid = ext4_sb.uuid();
+        let fsid = u64::from_le_bytes(uuid[..8].try_into().unwrap_or([0u8; 8]));
 
         SuperBlock {
             magic: EXT4_MAGIC,

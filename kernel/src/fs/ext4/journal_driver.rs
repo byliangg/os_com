@@ -47,12 +47,13 @@ use alloc::collections::{BTreeMap, VecDeque};
 
 use super::core::journal::{
     commit::{self, CommitCtx, JournalBarrier, JournalCommitWriteStage},
+    recovery::{self, RecoverCtx, RecoverResult},
     space::JournalSpace,
     superblock::load_journal_sb,
     transaction::{JournalCommitPlan, JournalRuntime as CoreJournalRuntime},
 };
 use super::core::{
-    io::BlockReader, metadata_writer::MetadataWriter, types::Ext4Fsblk,
+    io::{BlockReader, BlockWriter}, metadata_writer::MetadataWriter, types::Ext4Fsblk,
     journal::format::RawJournalSuperblock,
 };
 use crate::prelude::*;
@@ -140,6 +141,77 @@ impl CoreJournalDriver {
 
     pub(super) fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    // =====================================================================================
+    // Mount-time recovery (Phase 6 Task 4). PARITY: ext4_rs `Jbd2Journal::needs_recovery` +
+    // `recover` + the post-recovery driver rebuild that `fs.rs::sync_recovered_jbd2_state` did.
+    // =====================================================================================
+
+    /// Does the journal need replay? PARITY: ext4_rs `Jbd2Journal::needs_recovery` →
+    /// `recovery::needs_recovery` (`s_start != 0`). The fs-superblock RECOVER flag is the
+    /// integration layer's separate gate (see `fs.rs::replay_mount_jbd2_journal`).
+    pub(super) fn journal_needs_recovery(&self) -> bool {
+        recovery::needs_recovery(&self.sb)
+    }
+
+    /// Run mount-time JBD2 recovery: replay committed transactions straight to their home blocks
+    /// (via `writer`, bypassing the journal), reset + store the journal SB, then **re-seed** the
+    /// running runtime + ring geometry from the reset SB.
+    ///
+    /// PARITY: ext4_rs `replay_mount_jbd2_journal` (`journal.recover(&block_device)`) + the
+    /// `sync_recovered_jbd2_state` post-recovery driver rebuild. `recovery::recover` resets
+    /// `self.sb` in place (`s_start=0`, `s_sequence=last+1`, `s_head=s_first`, csum recomputed) AND
+    /// stores it to journal logical block 0; the old code then **re-read** that reset SB from disk to
+    /// rebuild the driver. Here the reset SB already lives in `self.sb`, so we re-seed the runtime
+    /// (`first_tid = sb.sequence()`) and `JournalSpace::from_superblock(&sb)` directly — byte- and
+    /// value-equivalent to re-reading from disk (`load_journal_sb` would return the same bytes), but
+    /// without a second device read. `reader` reads the journal log blocks (overlay bridge);
+    /// `writer` writes home blocks + the reset journal SB straight to the device.
+    pub(super) fn recover_at_mount(
+        &mut self,
+        reader: &dyn BlockReader,
+        writer: &dyn BlockWriter,
+    ) -> Result<RecoverResult> {
+        let ctx = RecoverCtx {
+            physical_blocks: &self.physical_blocks,
+            reader,
+            writer,
+            block_size: self.block_size,
+        };
+        let result = recovery::recover(&ctx, &mut self.sb)?;
+        // Re-seed the running runtime + ring geometry from the (now reset) journal SB, exactly as the
+        // old `sync_recovered_jbd2_state` rebuilt the driver from the post-recovery on-disk SB.
+        self.space = JournalSpace::from_superblock(&self.sb)?;
+        self.runtime = CoreJournalRuntime::new(self.block_size, self.sb.sequence());
+        self.checkpoint_list.clear();
+        self.last_committed_tid = 0;
+        self.trigger_op_by_tid.clear();
+        Ok(result)
+    }
+
+    /// Journal SB geometry accessors for the mount-time `info!` log (PARITY: the
+    /// `initialize_jbd2_journal` log line fields). Read-only views of the running journal SB / ring.
+    pub(super) fn journal_maxlen(&self) -> u32 {
+        self.sb.maxlen()
+    }
+    pub(super) fn journal_logical_blocks(&self) -> usize {
+        self.physical_blocks.len()
+    }
+    pub(super) fn journal_sequence(&self) -> u32 {
+        self.sb.sequence()
+    }
+    pub(super) fn journal_start(&self) -> u32 {
+        self.sb.start()
+    }
+    pub(super) fn journal_head(&self) -> u32 {
+        self.sb.head()
+    }
+    pub(super) fn journal_first(&self) -> u32 {
+        self.sb.first()
+    }
+    pub(super) fn journal_feature_incompat(&self) -> u32 {
+        self.sb.feature_incompat()
     }
 
     // =====================================================================================

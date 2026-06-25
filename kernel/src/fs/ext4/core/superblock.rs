@@ -8,6 +8,9 @@ const SUPERBLOCK_SIZE: usize = 1024;
 const EXT4_MAGIC: u16 = 0xEF53;
 const INCOMPAT_EXTENTS: u32 = 0x40;
 const COMPAT_HAS_JOURNAL: u32 = 0x4;
+/// `EXT4_FEATURE_INCOMPAT_RECOVER`（journal "needs_recovery" / dirty-log 标志）。
+/// [对照] ext4_rs `EXT4_FEATURE_INCOMPAT_RECOVER`（consts.rs:40 == 0x0004）。
+const INCOMPAT_RECOVER: u32 = 0x0004;
 
 /// crc32c 覆盖范围上界（与 ext4_rs `sync_to_disk_with_csum` 的 0x3fc 一致）。
 /// 超级块 `checksum` 字段位于偏移 0x3fc，校验和覆盖 `[0, 0x3fc)`，恰好排除自身。
@@ -140,6 +143,28 @@ impl RawSuperblock {
     }
     pub fn has_journal(&self) -> bool {
         self.features_compatible & COMPAT_HAS_JOURNAL != 0
+    }
+
+    /// journal `needs_recovery` / dirty-log 标志（`EXT4_FEATURE_INCOMPAT_RECOVER`，incompat 位 0x4）。
+    /// [对照] ext4_rs `Ext4Superblock::needs_recovery`（super_block.rs:268）。
+    pub(in crate::fs::ext4) fn needs_recovery(&self) -> bool {
+        self.features_incompatible & INCOMPAT_RECOVER != 0
+    }
+
+    /// 置 / 清 `needs_recovery` 标志（toggle incompat 位 0x4）。
+    /// [对照] ext4_rs `Ext4Superblock::set_needs_recovery`（super_block.rs:288-294）。
+    pub(in crate::fs::ext4) fn set_needs_recovery(&mut self, enabled: bool) {
+        if enabled {
+            self.features_incompatible |= INCOMPAT_RECOVER;
+        } else {
+            self.features_incompatible &= !INCOMPAT_RECOVER;
+        }
+    }
+
+    /// journal inode 号（`s_journal_inum`）。挂载时解析 journal 文件物理块向量用。
+    /// [对照] ext4_rs `Ext4Superblock::journal_inode_number`（super_block.rs:276）。
+    pub(in crate::fs::ext4) fn journal_inode_number(&self) -> u32 {
+        self.journal_inode_number
     }
     /// 组描述符尺寸：有 desc_size 用之（64bit），否则 32。
     pub fn group_desc_size(&self) -> usize {
