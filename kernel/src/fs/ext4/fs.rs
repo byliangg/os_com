@@ -4784,6 +4784,187 @@ impl Ext4Fs {
         }
     }
 
+    /// Map core `file::SimpleBlockRange`s to the integration (ext4_rs) `SimpleBlockRange` DTO.
+    /// Field-for-field copy (lblock / pblock / len) — the core type is a byte-parity reimplementation
+    /// of ext4_rs's, so the vector contract (ascending by lblock, `len` in blocks) is preserved.
+    fn core_to_integration_ranges(
+        ranges: &[super::core::file::SimpleBlockRange],
+    ) -> Vec<SimpleBlockRange> {
+        ranges
+            .iter()
+            .map(|r| SimpleBlockRange {
+                lblock: r.lblock,
+                pblock: r.pblock,
+                len: r.len,
+            })
+            .collect()
+    }
+
+    /// Set second-granularity atime/mtime/ctime on a loaded core inode and write it back.
+    ///
+    /// PARITY: ext4_rs `ext4_set_inode_times` (set the provided fields, `None` = leave unchanged,
+    /// then `write_back_inode`). The write apply closures call this after the data/alloc write, just
+    /// as the ext4_rs closures called `ext4_set_inode_times(ino, None, Some(now), Some(now))`.
+    fn core_set_inode_times(
+        ctx: &super::core::extents::WriteCtx,
+        inode: &mut super::core::inode::Inode,
+        atime: Option<u32>,
+        mtime: Option<u32>,
+        ctime: Option<u32>,
+    ) -> Result<()> {
+        if let Some(v) = atime {
+            inode.raw.atime = v;
+        }
+        if let Some(v) = mtime {
+            inode.raw.mtime = v;
+        }
+        if let Some(v) = ctime {
+            inode.raw.ctime = v;
+        }
+        super::core::inode::write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)
+    }
+
+    /// Phase 6 Task 2: the journaled-write chokepoint, but driving **core**'s `file::*` write fns
+    /// instead of the scoped ext4_rs engine. Same lock order + same JBD2 handle lifecycle + same
+    /// cache-invalidation as [`run_journaled_ext4`]; only the engine inside `apply` changes.
+    ///
+    /// `apply` receives a fully-built core write context (`WriteCtx` over the overlay reader + the
+    /// active-handle metadata writer + the data writer), a single `CoreBlockAlloc` (one running
+    /// superblock + bitmap state, so tree/data block allocation stay consistent), and the loaded
+    /// target inode. It calls one `core::file::X` (which writes the inode + bitmaps + group descs +
+    /// SB back through the metadata writer into the active JBD2 transaction).
+    ///
+    /// **Two-engine free-block coherency**: the running SB is seeded from the live ext4_rs
+    /// `inner.super_block.free_blocks_count()` (the authoritative copy the still-ext4_rs namespace
+    /// ops use), and the post-op running free count is synced back into it. The block bitmaps + group
+    /// descriptors are the real truth and both engines RMW them from disk per op; the SB free count
+    /// is the cached summary, kept coherent here so neither engine clobbers the other's count.
+    fn run_journaled_core<T>(
+        &self,
+        op: Option<JournaledOp>,
+        ino: u32,
+        apply: impl FnOnce(
+            &super::core::extents::WriteCtx,
+            &mut super::core_adapter::CoreBlockAlloc<
+                super::core_adapter::CoreDeviceReader,
+                super::core_adapter::CoreMetadataWriter,
+            >,
+            &mut super::core::inode::Inode,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        use super::core::balloc::BlockAllocator;
+
+        self.check_not_shutdown()?;
+
+        let generic014_like_write = matches!(
+            op.as_ref(),
+            Some(JournaledOp::Write { len, .. }) if *len == 512
+        );
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let profile_start_ns = Self::monotonic_nanos();
+        let op_name = Self::jbd2_handle_op_name(op.as_ref());
+
+        let start_handle_start_ns = Self::monotonic_nanos();
+        let handle_id = self.start_jbd2_handle(op.as_ref());
+        let start_handle_elapsed_ns = Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
+        let alloc_operation_id = self.begin_alloc_operation(handle_id);
+
+        let apply_start_ns = Self::monotonic_nanos();
+        let result = {
+            let mut inner = self.lock_inner();
+            // Seed the running SB: geometry from the immutable mount snapshot, free-block count from
+            // the live ext4_rs authoritative copy (so the two engines agree on free space).
+            let mut sb = self.core_sb;
+            sb.set_free_blocks_count(inner.super_block.free_blocks_count());
+
+            let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
+            let writer = super::core_adapter::CoreMetadataWriter::new(
+                self.jbd2_runtime.clone(),
+                handle_id.unwrap_or(0),
+            );
+            let data_writer = super::core_adapter::CoreDataWriter::new(self.adapter.clone());
+
+            let r = (|| -> Result<(T, u64)> {
+                let mut inode = super::core::inode::load_inode(&reader, &sb, ino)?;
+                let block_alloc = BlockAllocator::new(sb, &reader, &writer);
+                let mut alloc =
+                    super::core_adapter::CoreBlockAlloc::new(block_alloc, inode.blocks_count());
+                let ctx = super::core::extents::WriteCtx::new(&reader, &writer, &data_writer, &sb);
+                let value = apply(&ctx, &mut alloc, &mut inode)?;
+                // Sync the post-op running free-block count back into the ext4_rs authoritative SB.
+                let new_free = alloc.superblock().free_blocks_count();
+                Ok((value, new_free))
+            })();
+
+            match r {
+                Ok((value, new_free)) => {
+                    inner.super_block.set_free_blocks_count(new_free);
+                    Ok(value)
+                }
+                Err(err) => Err(err),
+            }
+        };
+        let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
+
+        // Same inode-meta / coverage cache invalidation as `run_journaled_ext4`.
+        self.meta_cache_generation.fetch_add(1, Ordering::Release);
+        match op.as_ref() {
+            Some(JournaledOp::Write { ino, .. }) | Some(JournaledOp::InodeMetadata { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+            }
+            Some(JournaledOp::Truncate { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+                self.coverage_invalidate(*ino);
+            }
+            _ => {
+                self.inode_meta_cache.lock().clear();
+            }
+        }
+
+        let finish_handle_start_ns = Self::monotonic_nanos();
+        self.finish_jbd2_handle(handle_id, op.as_ref(), op_name, result.is_ok());
+        let finish_handle_elapsed_ns =
+            Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
+        self.finish_alloc_operation(Some(alloc_operation_id));
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+
+        let io_result = self.finish_ext4_io(io_epoch);
+        let total_elapsed_ns = Self::monotonic_nanos().saturating_sub(profile_start_ns);
+        if self.phase2_profile_enabled {
+            self.journaled_op_profile.record(
+                op.as_ref(),
+                start_handle_elapsed_ns,
+                apply_elapsed_ns,
+                finish_handle_elapsed_ns,
+                0,
+                0,
+                total_elapsed_ns,
+            );
+        }
+        if generic014_like_write && total_elapsed_ns >= GENERIC014_SLOW_OP_LOG_THRESHOLD_NS {
+            debug!(
+                "ext4: generic014-like journaled(core) profile apply_ms={} finish_handle_ms={} total_ms={}",
+                apply_elapsed_ns / 1_000_000,
+                finish_handle_elapsed_ns / 1_000_000,
+                total_elapsed_ns / 1_000_000
+            );
+        }
+        match (result, io_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
         // Fast path: serve from the in-memory metadata cache.
         let gen_before = self.meta_cache_generation.load(Ordering::Acquire);
@@ -5158,10 +5339,9 @@ impl Ext4Fs {
         self.reset_page_cache_after_truncate(ino, 0)?;
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Truncate { ino };
-        self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_truncate(ino, 0).map_err(map_ext4_error)?;
-            ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                .map_err(map_ext4_error)?;
+        self.run_journaled_core(Some(op), ino, |ctx, alloc, inode| {
+            super::core::file::truncate_inode(ctx, alloc, inode, 0)?;
+            Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
             Ok(())
         })?;
         self.invalidate_direct_read_cache(ino);
@@ -5445,16 +5625,13 @@ impl Ext4Fs {
         let mut ext4_write_elapsed_ns = 0u64;
         let mut inode_time_elapsed_ns = 0u64;
         let write_result = self
-            .run_journaled_ext4(op, |ext4| {
+            .run_journaled_core(op, ino, |ctx, alloc, inode| {
                 let ext4_write_start_ns = Self::monotonic_nanos();
-                let written = ext4
-                    .ext4_write_at(ino, offset, data)
-                    .map_err(map_ext4_error)?;
+                let written = super::core::file::write_at(ctx, alloc, inode, offset, data)?;
                 ext4_write_elapsed_ns = Self::monotonic_nanos().saturating_sub(ext4_write_start_ns);
                 if written > 0 {
                     let inode_time_start_ns = Self::monotonic_nanos();
-                    ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                        .map_err(map_ext4_error)?;
+                    Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
                     inode_time_elapsed_ns =
                         Self::monotonic_nanos().saturating_sub(inode_time_start_ns);
                 }
@@ -5574,13 +5751,11 @@ impl Ext4Fs {
             0
         };
         let mappings = self
-            .run_journaled_ext4(op, |ext4| {
-                let mappings = ext4
-                    .ext4_prepare_write_at(ino, offset, write_len)
-                    .map_err(map_ext4_error)?;
-                ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                    .map_err(map_ext4_error)?;
-                Ok(mappings)
+            .run_journaled_core(op, ino, |ctx, alloc, inode| {
+                let (_lblock_start, ranges) =
+                    super::core::file::prepare_write_at(ctx, alloc, inode, offset, write_len)?;
+                Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
+                Ok(Self::core_to_integration_ranges(&ranges))
             })
             .map_err(|err| {
                 if err.error() == Errno::ENOSPC {
@@ -5767,9 +5942,8 @@ impl Ext4Fs {
             ino,
             len: data.len(),
         };
-        let written = self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_write_at(ino, offset, data)
-                .map_err(map_ext4_error)
+        let written = self.run_journaled_core(Some(op), ino, |ctx, alloc, inode| {
+            super::core::file::write_at(ctx, alloc, inode, offset, data)
         })?;
         if self.phase2_profile_enabled {
             self.buffered_write_profile
@@ -5935,29 +6109,29 @@ impl Ext4Fs {
                 if profile_enabled {
                     plan_elapsed_ns = Self::monotonic_nanos().saturating_sub(plan_start_ns);
                 }
-                self.run_journaled_ext4(
+                self.run_journaled_core(
                     Some(JournaledOp::Write {
                         len: write_len,
                         ino,
                     }),
-                    |ext4| {
+                    ino,
+                    |ctx, alloc, inode| {
                         let prepare_start_ns = if profile_enabled {
                             Self::monotonic_nanos()
                         } else {
                             0
                         };
-                        let mappings = ext4
-                            .ext4_prepare_write_at(ino, offset, write_len)
-                            .map_err(map_ext4_error)?;
-                        ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                            .map_err(map_ext4_error)?;
+                        let (_lblock_start, ranges) = super::core::file::prepare_write_at(
+                            ctx, alloc, inode, offset, write_len,
+                        )?;
+                        Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
                         touched_inside_write_handle = true;
                         if profile_enabled {
                             prepare_elapsed_ns =
                                 Self::monotonic_nanos().saturating_sub(prepare_start_ns);
                         }
 
-                        Ok(mappings)
+                        Ok(Self::core_to_integration_ranges(&ranges))
                     },
                 )?
             };
@@ -6062,10 +6236,9 @@ impl Ext4Fs {
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Truncate { ino };
         let truncate_result = self
-            .run_journaled_ext4(Some(op), |ext4| {
-                ext4.ext4_truncate(ino, new_size).map_err(map_ext4_error)?;
-                ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                    .map_err(map_ext4_error)?;
+            .run_journaled_core(Some(op), ino, |ctx, alloc, inode| {
+                super::core::file::truncate_inode(ctx, alloc, inode, new_size)?;
+                Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
                 Ok(())
             })
             .map_err(|err| {
@@ -6099,27 +6272,22 @@ impl Ext4Fs {
 
         let now = Self::now_unix_seconds_u32();
         let op = JournaledOp::Write { ino, len };
-        self.run_journaled_ext4(Some(op), |ext4| {
+        self.run_journaled_core(Some(op), ino, |ctx, alloc, inode| {
             match mode {
                 FallocMode::Allocate => {
-                    ext4.ext4_allocate_range(ino, offset, len, false)
-                        .map_err(map_ext4_error)?;
+                    super::core::file::allocate_range(ctx, alloc, inode, offset, len, false)?;
                 }
                 FallocMode::AllocateKeepSize => {
-                    ext4.ext4_allocate_range(ino, offset, len, true)
-                        .map_err(map_ext4_error)?;
+                    super::core::file::allocate_range(ctx, alloc, inode, offset, len, true)?;
                 }
                 FallocMode::ZeroRange => {
-                    ext4.ext4_zero_range(ino, offset, len, false)
-                        .map_err(map_ext4_error)?;
+                    super::core::file::zero_range(ctx, alloc, inode, offset, len, false)?;
                 }
                 FallocMode::ZeroRangeKeepSize => {
-                    ext4.ext4_zero_range(ino, offset, len, true)
-                        .map_err(map_ext4_error)?;
+                    super::core::file::zero_range(ctx, alloc, inode, offset, len, true)?;
                 }
                 FallocMode::PunchHoleKeepSize => {
-                    ext4.ext4_punch_hole_keep_size(ino, offset, len)
-                        .map_err(map_ext4_error)?;
+                    super::core::file::punch_hole_keep_size(ctx, alloc, inode, offset, len)?;
                 }
                 FallocMode::CollapseRange
                 | FallocMode::InsertRange
@@ -6130,8 +6298,7 @@ impl Ext4Fs {
                     );
                 }
             }
-            ext4.ext4_set_inode_times(ino, None, Some(now), Some(now))
-                .map_err(map_ext4_error)?;
+            Self::core_set_inode_times(ctx, inode, None, Some(now), Some(now))?;
             Ok(())
         })
         .map_err(|err| {
