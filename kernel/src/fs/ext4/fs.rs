@@ -3436,15 +3436,26 @@ impl Ext4Fs {
         mtime: Option<u32>,
         ctime: Option<u32>,
     ) -> Result<()> {
-        self.run_inode_metadata_update(ino, |ext4| {
-            ext4.ext4_set_inode_times(ino, atime, mtime, ctime)
-                .map(|_| ())
+        // PARITY (ext4_rs `ext4_set_inode_times`): set each provided field, `None` leaves unchanged.
+        self.run_inode_metadata_core(ino, |inode| {
+            if let Some(v) = atime {
+                inode.raw.atime = v;
+            }
+            if let Some(v) = mtime {
+                inode.raw.mtime = v;
+            }
+            if let Some(v) = ctime {
+                inode.raw.ctime = v;
+            }
         })
     }
 
     pub(super) fn set_inode_mode(&self, ino: u32, mode: u16) -> Result<()> {
-        self.run_inode_metadata_update(ino, |ext4| {
-            ext4.ext4_set_inode_mode(ino, mode).map(|_| ())
+        // PARITY (ext4_rs `ext4_set_inode_mode`): keep the type bits (0xF000), replace only the
+        // permission bits (0x0FFF) — `(current & 0xF000) | (mode & 0x0FFF)`.
+        self.run_inode_metadata_core(ino, |inode| {
+            let next = (inode.raw.mode & 0xF000) | (mode & 0x0FFF);
+            inode.raw.mode = next;
         })?;
         self.touch_ctime(ino)
     }
@@ -3452,22 +3463,30 @@ impl Ext4Fs {
     pub(super) fn set_inode_uid(&self, ino: u32, uid: u32) -> Result<()> {
         let uid = u16::try_from(uid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "uid exceeds ext4 uid width"))?;
-        self.run_inode_metadata_update(ino, |ext4| ext4.ext4_set_inode_uid(ino, uid).map(|_| ()))?;
+        // PARITY (ext4_rs `ext4_set_inode_uid`): direct set of the low-16 uid field.
+        self.run_inode_metadata_core(ino, |inode| {
+            inode.raw.uid = uid;
+        })?;
         self.touch_ctime(ino)
     }
 
     pub(super) fn set_inode_gid(&self, ino: u32, gid: u32) -> Result<()> {
         let gid = u16::try_from(gid)
             .map_err(|_| Error::with_message(Errno::EINVAL, "gid exceeds ext4 gid width"))?;
-        self.run_inode_metadata_update(ino, |ext4| ext4.ext4_set_inode_gid(ino, gid).map(|_| ()))?;
+        // PARITY (ext4_rs `ext4_set_inode_gid`): direct set of the low-16 gid field.
+        self.run_inode_metadata_core(ino, |inode| {
+            inode.raw.gid = gid;
+        })?;
         self.touch_ctime(ino)
     }
 
     pub(super) fn set_inode_rdev(&self, ino: u32, rdev: u64) -> Result<()> {
         let rdev = u32::try_from(rdev)
             .map_err(|_| Error::with_message(Errno::EINVAL, "rdev exceeds ext4 rdev width"))?;
-        self.run_inode_metadata_update(ino, |ext4| {
-            ext4.ext4_set_inode_rdev(ino, rdev).map(|_| ())
+        // PARITY (ext4_rs `ext4_set_inode_rdev` → `set_faddr`): device id is stored in the
+        // (deprecated) i_faddr field, not i_block.
+        self.run_inode_metadata_core(ino, |inode| {
+            inode.raw.faddr = rdev;
         })?;
         self.touch_ctime(ino)
     }
@@ -4337,31 +4356,67 @@ impl Ext4Fs {
         Ok(result)
     }
 
-    fn run_inode_metadata_update<T>(
+    /// Phase 6 Task 3: setattr cutover. Drive an inode-field mutation through **core** instead of
+    /// ext4_rs. `mutate` receives the loaded core [`Inode`]; the caller sets the fields it owns
+    /// (mode/uid/gid/rdev/times) and this helper writes the inode back + invalidates the meta cache.
+    ///
+    /// PARITY with the retired `run_inode_metadata_update_with_op`: when a journal driver is present
+    /// (`jbd2_runtime` installed at mount), the write goes through the journaled chokepoint
+    /// ([`run_journaled_core`] — same lock order, JBD2 handle, `InodeMetadata` op, cache
+    /// invalidation as the old `run_journaled_ext4` path). When journal-less, the inode is written
+    /// straight to the device via [`CoreCommitMetadataWriter`] (mirroring ext4_rs's no-journal
+    /// `write_back_inode` → `write_offset`), then the meta cache is invalidated with the same
+    /// generation-bump + clear protocol.
+    fn run_inode_metadata_core(
         &self,
         ino: u32,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        self.run_inode_metadata_update_with_op(Some(JournaledOp::InodeMetadata { ino }), f)
-    }
-
-    fn run_inode_metadata_update_with_op<T>(
-        &self,
-        op: Option<JournaledOp>,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        // The core-backed driver is enabled whenever it is present (mount built it from a journal
-        // inode); a journal-less filesystem leaves the slot `None`.
+        mutate: impl FnOnce(&mut super::core::inode::Inode),
+    ) -> Result<()> {
         let journal_enabled = self.jbd2_runtime.read().as_ref().is_some();
         if journal_enabled {
-            self.run_journaled_ext4(op, |ext4| f(ext4).map_err(map_ext4_error))
+            // Journaled: load → mutate → write_back inside the journaled-core chokepoint, which
+            // records the inode block image into the active JBD2 transaction (the allocator is
+            // unused by setattr but threaded for signature compatibility). The `InodeMetadata { ino }`
+            // op drops just this inode from the meta cache (parity with the old path).
+            let op = JournaledOp::InodeMetadata { ino };
+            self.run_journaled_core(Some(op), ino, |ctx, _alloc, inode| {
+                mutate(inode);
+                super::core::inode::write_back_inode(ctx.writer, ctx.reader, ctx.sb, inode)
+            })
         } else {
-            // No-journal setattr bypasses run_journaled_ext4, so invalidate the
-            // inode meta cache here too (same generation-bump + clear protocol).
-            let result = self.run_ext4(f);
+            // No-journal: write the inode straight to the device (CoreCommitMetadataWriter does the
+            // block-number → device write, bypassing the overlay/defer logic, exactly like ext4_rs's
+            // no-journal `write_back_inode`). Same IO-epoch + runtime-lock lifecycle as the old path.
+            let io_epoch = self.prepare_ext4_io();
+            let runtime_wait_start_ns = Self::monotonic_nanos();
+            let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+            self.record_ext4_rs_runtime_lock_wait(
+                Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+            );
+            let runtime_hold_start_ns = Self::monotonic_nanos();
+            let block_size = self.core_sb.block_size();
+            let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
+            let writer =
+                super::core_adapter::CoreCommitMetadataWriter::new(self.adapter.clone(), block_size);
+            let result = (|| -> Result<()> {
+                let mut inode = super::core::inode::load_inode(&reader, &self.core_sb, ino)?;
+                mutate(&mut inode);
+                super::core::inode::write_back_inode(&writer, &reader, &self.core_sb, &mut inode)
+            })();
+            drop(runtime_guard);
+            self.record_ext4_rs_runtime_lock_hold(
+                Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+            );
+            let io_result = self.finish_ext4_io(io_epoch);
+            // No-journal setattr bypasses run_journaled_*, so invalidate the inode meta cache here
+            // too (same generation-bump + clear protocol as the retired path).
             self.meta_cache_generation.fetch_add(1, Ordering::Release);
             self.inode_meta_cache.lock().clear();
-            result
+            match (result, io_result) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(err), _) => Err(err),
+                (Ok(()), Err(err)) => Err(err),
+            }
         }
     }
 
@@ -4681,6 +4736,11 @@ impl Ext4Fs {
         Self::replay_hold_request(op_name).is_some_and(|requested| requested == stage)
     }
 
+    // Phase 6 Task 3: all namespace/setattr call sites are now cut to the core-driven chokepoints
+    // (`run_journaled_namespace` / `run_journaled_core` / `run_inode_metadata_core`); the write
+    // path was cut in Task 2. No production caller remains for the ext4_rs-driven chokepoint. Kept
+    // (dead) until Task 5 deletes ext4_rs and this helper with it.
+    #[allow(dead_code)]
     fn run_journaled_ext4<T>(
         &self,
         op: Option<JournaledOp>,
@@ -4997,6 +5057,149 @@ impl Ext4Fs {
         }
     }
 
+    /// Phase 6 Task 3: the journaled chokepoint for **namespace** ops (create/mkdir/unlink/rmdir/
+    /// rename), driving **core**'s `dir::*` over a `NamespaceCtx`. Same lock order + JBD2 handle
+    /// lifecycle + cache invalidation as [`run_journaled_ext4`]/[`run_journaled_core`]; only the
+    /// engine inside `apply` differs.
+    ///
+    /// `apply` receives a fully-built `&mut NamespaceCtx` (overlay reader + active-handle metadata
+    /// writer + data writer + a running superblock seeded from the authoritative free counts). The
+    /// closure calls one `core::dir::X`, which internally loads/mutates parent + child inodes,
+    /// allocates inodes/blocks (decrementing the running SB's free counts), and writes everything
+    /// back through the metadata writer into the active JBD2 transaction.
+    ///
+    /// **C1 two-engine free-counter coherency — namespace edition.** Namespace ops mutate BOTH
+    /// `s_free_inodes_count` (inode alloc via `ialloc`) and `s_free_blocks_count` (directory-block
+    /// alloc/free). Like [`run_journaled_core`], we seed the running SB's free-block AND free-inode
+    /// counts from ext4_rs's **authoritative** counter mutex (`lock_superblock_counter()` — NOT the
+    /// stale `inner.super_block`). After the op we sink BOTH post-op counts (`nctx.superblock()`)
+    /// back into that same mutex, so any still-ext4_rs path observing free counts at the mount
+    /// boundary stays coherent with what core just persisted to disk (core's `write_superblock`
+    /// rewrote the whole 1024-byte SB with both decremented counters during the op). With inode
+    /// allocation now core-owned for the namespace path, steady-state allocation is single-source
+    /// (core's running SB) and the ext4_rs mutex is only a mount-boundary mirror.
+    fn run_journaled_namespace<T>(
+        &self,
+        op: Option<JournaledOp>,
+        apply: impl FnOnce(
+            &mut super::core::dir::NamespaceCtx<
+                '_,
+                super::core_adapter::CoreDeviceReader,
+                super::core_adapter::CoreMetadataWriter,
+                super::core_adapter::CoreDataWriter,
+            >,
+        ) -> Result<T>,
+    ) -> Result<T> {
+        self.check_not_shutdown()?;
+
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let profile_start_ns = Self::monotonic_nanos();
+        let op_name = Self::jbd2_handle_op_name(op.as_ref());
+
+        let start_handle_start_ns = Self::monotonic_nanos();
+        let handle_id = self.start_jbd2_handle(op.as_ref());
+        let start_handle_elapsed_ns = Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
+        let alloc_operation_id = self.begin_alloc_operation(handle_id);
+
+        let apply_start_ns = Self::monotonic_nanos();
+        let result = {
+            let inner = self.lock_inner();
+            // Seed the running SB: geometry from the immutable mount snapshot, free-block AND
+            // free-inode counts from ext4_rs's authoritative counter mutex (NOT the stale
+            // `inner.super_block` field). Read both, then drop the brief guard before the apply.
+            let mut sb = self.core_sb;
+            {
+                let auth_sb = inner.allocator_locks.lock_superblock_counter();
+                sb.set_free_blocks_count(auth_sb.free_blocks_count());
+                sb.set_free_inodes_count(auth_sb.free_inodes_count());
+            }
+
+            let reader = super::core_adapter::CoreDeviceReader::new(self.journal_io.clone());
+            let writer = super::core_adapter::CoreMetadataWriter::new(
+                self.jbd2_runtime.clone(),
+                handle_id.unwrap_or(0),
+            );
+            let data_writer = super::core_adapter::CoreDataWriter::new(self.adapter.clone());
+
+            let r = (|| -> Result<(T, u64, u32)> {
+                let mut nctx =
+                    super::core::dir::NamespaceCtx::new(&reader, &writer, &data_writer, sb);
+                let value = apply(&mut nctx)?;
+                // Harvest the post-op running SB: BOTH free counts may have changed (inode alloc +
+                // directory-block alloc/free). Core already persisted the full SB to disk; this sinks
+                // the in-memory authoritative copy so it stays coherent at the mount boundary.
+                let post = nctx.superblock();
+                Ok((value, post.free_blocks_count(), post.free_inodes_count()))
+            })();
+
+            match r {
+                Ok((value, new_free_blocks, new_free_inodes)) => {
+                    let mut auth_sb = inner.allocator_locks.lock_superblock_counter();
+                    auth_sb.set_free_blocks_count(new_free_blocks);
+                    auth_sb.set_free_inodes_for_diff(new_free_inodes);
+                    Ok(value)
+                }
+                // On partial failure we do NOT roll the SB counters back — same no-rollback behavior
+                // as `run_journaled_core` and ext4_rs (allocators persist the SB eagerly per step;
+                // the failed transaction's metadata images are dropped when the handle stops without
+                // commit, so the in-memory authoritative copy reconverges once that tx is discarded).
+                Err(err) => Err(err),
+            }
+        };
+        let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
+
+        // Same inode-meta / coverage cache invalidation as `run_journaled_ext4` / `run_journaled_core`.
+        // All namespace ops fall through to the conservative clear-all (parent + child inodes touched).
+        self.meta_cache_generation.fetch_add(1, Ordering::Release);
+        match op.as_ref() {
+            Some(JournaledOp::Write { ino, .. }) | Some(JournaledOp::InodeMetadata { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+            }
+            Some(JournaledOp::Truncate { ino }) => {
+                self.inode_meta_cache.lock().remove(ino);
+                self.coverage_invalidate(*ino);
+            }
+            _ => {
+                self.inode_meta_cache.lock().clear();
+            }
+        }
+
+        let finish_handle_start_ns = Self::monotonic_nanos();
+        self.finish_jbd2_handle(handle_id, op.as_ref(), op_name, result.is_ok());
+        let finish_handle_elapsed_ns =
+            Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
+        self.finish_alloc_operation(Some(alloc_operation_id));
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+
+        let io_result = self.finish_ext4_io(io_epoch);
+        let total_elapsed_ns = Self::monotonic_nanos().saturating_sub(profile_start_ns);
+        if self.phase2_profile_enabled {
+            self.journaled_op_profile.record(
+                op.as_ref(),
+                start_handle_elapsed_ns,
+                apply_elapsed_ns,
+                finish_handle_elapsed_ns,
+                0,
+                0,
+                total_elapsed_ns,
+            );
+        }
+        match (result, io_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
     pub(super) fn stat(&self, ino: u32) -> Result<SimpleInodeMeta> {
         // Fast path: serve from the in-memory metadata cache.
         let gen_before = self.meta_cache_generation.load(Ordering::Acquire);
@@ -5247,9 +5450,8 @@ impl Ext4Fs {
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
         let _parent_guard = parent_lock.write();
         let op = JournaledOp::Create;
-        let ino = self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_create_at(parent, name, mode)
-                .map_err(map_ext4_error)
+        let ino = self.run_journaled_namespace(Some(op), |nctx| {
+            super::core::dir::create_at(nctx, parent, name.as_bytes(), mode)
         })?;
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _child_guard = child_lock.write();
@@ -5280,9 +5482,8 @@ impl Ext4Fs {
                 DirLookupCacheResult::Miss => {
                     // Cache is complete and confirms the name is absent — skip disk scan.
                     let op = JournaledOp::Mkdir;
-                    let (ino, dir_byte_offset) = self.run_journaled_ext4(Some(op), |ext4| {
-                        ext4.ext4_mkdir_unchecked_at(parent, name, mode)
-                            .map_err(map_ext4_error)
+                    let (ino, dir_byte_offset) = self.run_journaled_namespace(Some(op), |nctx| {
+                        super::core::dir::mkdir_unchecked_at(nctx, parent, name.as_bytes(), mode)
                     })?;
                     let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
                     let _child_guard = child_lock.write();
@@ -5298,9 +5499,8 @@ impl Ext4Fs {
 
         // Fallback: cache unavailable — use disk-based existence check.
         let op = JournaledOp::Mkdir;
-        let ino = self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_mkdir_at(parent, name, mode)
-                .map_err(map_ext4_error)
+        let ino = self.run_journaled_namespace(Some(op), |nctx| {
+            super::core::dir::mkdir_at(nctx, parent, name.as_bytes(), mode)
         })?;
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _child_guard = child_lock.write();
@@ -5323,8 +5523,8 @@ impl Ext4Fs {
         let _target_guard = target_lock.write();
 
         let op = JournaledOp::Unlink;
-        self.run_journaled_ext4(Some(op), |ext4| {
-            ext4.ext4_unlink_at(parent, name).map_err(map_ext4_error)
+        self.run_journaled_namespace(Some(op), |nctx| {
+            super::core::dir::unlink_at(nctx, parent, name.as_bytes())
         })?;
         self.cache_remove_entry(parent, name);
         self.clear_inode_touch_cache(target_ino);
@@ -5408,13 +5608,12 @@ impl Ext4Fs {
 
         let op = JournaledOp::Rmdir;
         if dir_byte_offset != u64::MAX {
-            self.run_journaled_ext4(Some(op), |ext4| {
-                ext4.ext4_rmdir_at_fast(parent, child_ino, dir_byte_offset)
-                    .map_err(map_ext4_error)
+            self.run_journaled_namespace(Some(op), |nctx| {
+                super::core::dir::rmdir_at_fast(nctx, parent, child_ino, dir_byte_offset)
             })?;
         } else {
-            self.run_journaled_ext4(Some(op), |ext4| {
-                ext4.ext4_rmdir_at(parent, name).map_err(map_ext4_error)
+            self.run_journaled_namespace(Some(op), |nctx| {
+                super::core::dir::rmdir_at(nctx, parent, name.as_bytes())
             })?;
         }
         self.cache_remove_entry(parent, name);
@@ -5455,9 +5654,14 @@ impl Ext4Fs {
 
             self.with_inode_locks(&affected_inodes, || {
                 let op = JournaledOp::Rename;
-                self.run_journaled_ext4(Some(op), |ext4| {
-                    ext4.ext4_rename_at(old_parent, old_name, new_parent, new_name)
-                        .map_err(map_ext4_error)
+                self.run_journaled_namespace(Some(op), |nctx| {
+                    super::core::dir::rename_at(
+                        nctx,
+                        old_parent,
+                        old_name.as_bytes(),
+                        new_parent,
+                        new_name.as_bytes(),
+                    )
                 })?;
 
                 self.cache_remove_entry(old_parent, old_name);
