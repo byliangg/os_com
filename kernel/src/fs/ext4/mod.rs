@@ -11,6 +11,10 @@ mod core;
 mod core_adapter;
 mod fs;
 mod inode;
+// Phase 6 Task 2: integration-layer JBD2 commit/checkpoint driver re-derived over the safe `core/`
+// journal (core's runtime is deliberately thinner — checkpoint_list / last_committed_tid / rotation
+// / overlay live here). Drives the journaled WRITE path's commit + the single sync barrier.
+mod journal_driver;
 
 use fs::Ext4Type;
 

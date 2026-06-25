@@ -88,6 +88,14 @@ impl JournalTransaction {
         &self.buffers
     }
 
+    /// 查该事务持有的某 home 块的全块镜像（overlay read 用）。
+    /// PARITY: ext4_rs transaction.rs `JournalTransaction::buffer`（journal.rs:204-229 经 `buffer`
+    /// 在 running/prev/committing/checkpoint 各事务里查最新镜像）。core 这里只给单事务查询，
+    /// 跨事务的 newest-wins 顺序由调用方（集成层 overlay）按 ext4_rs 的 latest_metadata_buffer 序拼。
+    pub(in crate::fs::ext4) fn buffer(&self, block_nr: Ext4Fsblk) -> Option<&JournalBuffer> {
+        self.buffers.get(&block_nr)
+    }
+
     /// PARITY: ext4_rs transaction.rs:99-101 —— `buffers.len()`。
     pub(in crate::fs::ext4) fn modified_block_count(&self) -> usize {
         self.buffers.len()
@@ -265,6 +273,46 @@ impl JournalRuntime {
         Some(tid)
     }
 
+    /// force-commit / batch 轮转：把 running（仍有活动 handle 且已有 buffer）锁定移到 prev_running，
+    /// 使其后续可独立 commit、且不再接受新 handle。返回被轮转事务 tid。
+    /// PARITY: ext4_rs `rotate_running_transaction`（journal.rs:341-353，门控 = `should_rotate_
+    /// running_transaction(0)`：`prev_running.is_none && running.handle_count!=0 && modified!=0`）。
+    /// `threshold_blocks` 由集成层在 batch 路径用 `should_rotate_running_transaction` 判定后再调；
+    /// 此入口只做 threshold-0 force 轮转（fsync force-commit + batch 已判定后）。
+    pub(in crate::fs::ext4) fn rotate_running_for_force(&mut self) -> Option<u32> {
+        let should = self.prev_running.is_none()
+            && self.running.as_ref().is_some_and(|t| {
+                t.handle_count() != 0 && t.modified_block_count() != 0
+            });
+        if !should {
+            return None;
+        }
+        let mut transaction = self.running.take()?;
+        transaction.set_state(JournalTransactionState::Locked);
+        let tid = transaction.tid();
+        self.prev_running = Some(transaction);
+        Some(tid)
+    }
+
+    /// 把 prepared 但未落盘的事务（committing 槽）回滚到 running/prev_running 重试。
+    /// PARITY: ext4_rs `abort_commit`（journal.rs:621-637）——state→Running，按 running 是否空回 prev/running。
+    pub(in crate::fs::ext4) fn abort_commit(&mut self, tid: u32) -> bool {
+        let Some(mut transaction) = self.committing.take() else {
+            return false;
+        };
+        if transaction.tid() != tid {
+            self.committing = Some(transaction);
+            return false;
+        }
+        transaction.set_state(JournalTransactionState::Running);
+        if self.running.is_some() {
+            self.prev_running = Some(transaction);
+        } else {
+            self.running = Some(transaction);
+        }
+        true
+    }
+
     /// 开 handle，返回唯一 `handle_id`（>=1）。
     /// PARITY: ext4_rs journal.rs:394-426（`start_handle`）——先 admission 轮转 → 取 handle_id →
     /// get_or_insert running 事务（Locked 复位 Running）→ register_handle → 入 active 队列。
@@ -389,6 +437,38 @@ impl JournalRuntime {
     /// （`committing_transaction`）。差分用它确认 `prepare_commit` 后事务停在 committing 槽。
     pub(in crate::fs::ext4) fn committing_transaction(&self) -> Option<&JournalTransaction> {
         self.committing.as_ref()
+    }
+
+    /// 查该 home `block_nr` 的**内存最新全块镜像**，按 newest-wins 序在 running → prev_running →
+    /// committing 三槽里找（**不含 checkpoint_list**——core 薄 runtime 不持 checkpoint_list，那由
+    /// P6 集成层维护并叠加在本结果之上）。给集成层 overlay read（read-your-writes）用。
+    ///
+    /// PARITY: ext4_rs `JournalRuntime::latest_metadata_buffer`（journal.rs:204-230）的「内存事务」
+    /// 子集——ext4_rs 顺序是 running → prev_running → committing → checkpoint_list(rev)；本访问器复刻
+    /// 前三槽，checkpoint_list 部分由集成层在其后查（与 ext4_rs 同序）。
+    pub(in crate::fs::ext4) fn running_metadata_image(&self, block_nr: Ext4Fsblk) -> Option<&[u8]> {
+        if let Some(transaction) = self.running.as_ref() {
+            if let Some(buffer) = transaction.buffer(block_nr) {
+                return Some(&buffer.block_data);
+            }
+        }
+        if let Some(transaction) = self.prev_running.as_ref() {
+            if let Some(buffer) = transaction.buffer(block_nr) {
+                return Some(&buffer.block_data);
+            }
+        }
+        if let Some(transaction) = self.committing.as_ref() {
+            if let Some(buffer) = transaction.buffer(block_nr) {
+                return Some(&buffer.block_data);
+            }
+        }
+        None
+    }
+
+    /// 是否有活动 handle（延迟 home 写门控用）。PARITY: ext4_rs journal.rs:161-163
+    /// （`has_active_handle`）+ `should_defer_metadata_write`（172-174：`enabled && 有活动 handle`）。
+    pub(in crate::fs::ext4) fn should_defer_metadata_write(&self) -> bool {
+        self.enabled && !self.active_handles.is_empty()
     }
 
     /// 产 commit plan（纯内存）：取 prev_running（无则 running），若仍有未关 handle 则放回返回 None；

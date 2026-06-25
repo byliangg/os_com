@@ -279,6 +279,26 @@ fn store_journal_sb(ctx: &CommitCtx<'_>, sb: &RawJournalSuperblock) -> Result<()
     write_journal_block(ctx, 0, &block)
 }
 
+/// 集成层 checkpoint 用：重算 journal SB csum 后把 SB store 回 journal 逻辑块 0（经独立 writer +
+/// physical_blocks，不要求一个完整 `CommitCtx`）。PARITY: ext4_rs `JournalSuperblockState::store`
+/// （checkpoint 路径 `update_start` 后 store）——store 前 `update_checksum`，再写整块 0（前 1024 = SB，
+/// 余零）。P6 集成层 `CoreJournalDriver::checkpoint_transaction` 更新 `s_start` 后调它落盘。
+pub(in crate::fs::ext4) fn store_journal_sb_via_writer(
+    writer: &dyn MetadataWriter,
+    handle_id: u64,
+    physical_blocks: &[Ext4Fsblk],
+    block_size: usize,
+    sb: &mut RawJournalSuperblock,
+) -> Result<()> {
+    recompute_sb_checksum(sb);
+    let physical = *physical_blocks.first().ok_or_else(|| {
+        Error::with_message(Errno::EINVAL, "journal has no physical blocks")
+    })?;
+    let mut block = vec![0u8; block_size];
+    block[..JBD2_SUPERBLOCK_SIZE].copy_from_slice(sb.as_bytes());
+    writer.write_metadata_for_handle(handle_id, physical, &block)
+}
+
 /// 把一个事务的 commit plan 写进 journal 环并落盘，返回写入的 tid（= plan.tid）。
 ///
 /// 见模块文档「RED LINE 写序」。`write_commit_plan_with_hook` 的 no-op hook 版。
