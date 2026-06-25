@@ -49,8 +49,6 @@ pub(in crate::fs::ext4) mod ialloc;
 
 #[cfg(ktest)]
 mod test_util;
-#[cfg(ktest)]
-mod diff_harness;
 
 pub mod superblock;
 pub mod block_group;

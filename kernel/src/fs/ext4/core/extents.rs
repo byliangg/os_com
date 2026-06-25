@@ -1776,9 +1776,6 @@ mod test {
     use ostd::prelude::*;
 
     use super::{EXTENT_MAGIC, RawExtent, RawExtentHeader};
-    use crate::fs::ext4::core::block_group::RawGroupDescriptor;
-    use crate::fs::ext4::core::superblock::RawSuperblock;
-    use crate::fs::ext4::core::test_util::slice_at;
     use crate::prelude::*;
 
     #[ktest]
@@ -1803,22 +1800,7 @@ mod test {
         assert!(!e.is_unwritten());
         assert_eq!(e.len(), 10);
     }
-
-    #[ktest]
-    fn extent_root_header_real_image() {
-        // 根 inode（ino=2）的 i_block 前 12 字节是 extent 头（根目录 extent-mapped）。
-        let sb = RawSuperblock::from_bytes(slice_at(1024, 1024));
-        let bs = sb.block_size();
-        let gd = RawGroupDescriptor::from_bytes(slice_at((sb.first_data_block as usize + 1) * bs, 64));
-        let inode_off = gd.inode_table() as usize * bs + (2 - 1) * sb.inode_size() as usize;
-        // i_block 位于 inode 内偏移 40 起。
-        let h_bytes = slice_at(inode_off + 40, 12);
-        let h = RawExtentHeader::from_bytes(h_bytes);
-        assert_eq!(h.as_bytes(), h_bytes);
-        assert!(h.is_valid(), "root i_block must start with extent header magic 0xF30A");
-        let old = ext4_rs::Ext4ExtentHeader::from_bytes(h_bytes);
-        assert_eq!(h.magic, old.magic);
-        assert_eq!(h.entries_count, old.entries_count);
-        assert_eq!(h.depth, old.depth);
-    }
+    // Phase 6 Task 5b: `extent_root_header_real_image` compared the parsed root extent header against
+    // `ext4_rs::Ext4ExtentHeader` and was retired with `ext4_rs`. The handcrafted roundtrip +
+    // unwritten-flag checks above keep core's extent-header parsing covered standalone.
 }

@@ -45,27 +45,10 @@ mod test {
     use ostd::prelude::*;
 
     use super::{EXT4_CRC32_INIT, ext4_crc32c};
-    use crate::fs::ext4::core::test_util::slice_at;
     use crate::prelude::*;
 
-    /// 与旧 ext4_rs 实现对拍同一输入。
-    fn diff(data: &[u8]) {
-        let mine = ext4_crc32c(EXT4_CRC32_INIT, data);
-        let old = ext4_rs::ext4_crc32c(EXT4_CRC32_INIT, data, data.len() as u32);
-        assert_eq!(mine, old, "crc32c mismatch vs ext4_rs");
-    }
-
-    #[ktest]
-    fn crc32c_matches_ext4_rs() {
-        diff(&[]);
-        diff(b"123456789");
-        diff(b"The quick brown fox jumps over the lazy dog");
-        // 真镜像超级块的若干片段。
-        diff(slice_at(1024, 512));
-        diff(slice_at(2048, 256));
-        diff(slice_at(0, 1024));
-    }
-
+    // Phase 6 Task 5b: the old-vs-ext4_rs differential case (`crc32c_matches_ext4_rs`) was retired
+    // with `ext4_rs`. The standalone identity check below stays.
     #[ktest]
     fn crc32c_empty_is_init() {
         assert_eq!(ext4_crc32c(EXT4_CRC32_INIT, &[]), EXT4_CRC32_INIT);
