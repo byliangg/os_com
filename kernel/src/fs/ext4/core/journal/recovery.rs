@@ -337,64 +337,100 @@ fn scan_committed_transactions(
     Ok(transactions)
 }
 
-/// 尝试读一个落在 `descriptor_block` 的有效已 commit 事务。无效 / 缺失 commit 返回 `None`。
-/// PARITY: ext4_rs `try_read_committed_transaction`（recovery.rs:128-174）逐字复刻。
+/// 尝试读一个落在 `ring_start` 的有效已 commit 事务。无效 / 缺失 commit 返回 `None`。
 ///
-/// **判定有效仅靠：descriptor magic + blocktype==DESCRIPTOR + 至少一个 tag；commit magic +
-/// blocktype==COMMIT + commit.sequence == descriptor.sequence。NO csum 校验。**（坏 csum 不停。）
+/// **环内事务布局**（与 commit emitter `write_commit_plan` 逐字对齐，commit.rs:454-491）：
+/// `[descriptor]?[payload × tag 数][JBD2_REVOKE_BLOCK × R][commit]`。
+/// - 有 metadata → `ring_start` 是 descriptor 块；revoke-only 事务（无 metadata，仅 revoke）→
+///   `ring_start` 是首个 `JBD2_REVOKE_BLOCK`（emitter 不写 descriptor，commit.rs:459/483）。
+/// - **revoke 块（type=5）落在 payload 之后、commit 之前**（BUG-5 fix，commit.rs:504-506）。
+///
+/// **判定有效仅靠：descriptor magic + blocktype==DESCRIPTOR + 至少一个 tag（或 revoke-only 时
+/// 首块 type==REVOKE）；中间的 REVOKE 块按本事务 sequence 跳过；commit magic + blocktype==COMMIT +
+/// commit.sequence == 本事务 sequence。NO csum 校验。**（坏 csum 不停。）
 fn try_read_committed_transaction(
     ctx: &RecoverCtx<'_>,
     sb: &RawJournalSuperblock,
     space: &JournalSpace,
-    descriptor_block: u32,
+    ring_start: u32,
 ) -> Result<Option<RecoveryTransaction>> {
-    // PARITY: recovery.rs:133-139 —— 读 descriptor 块头：magic 错 / 非 DESCRIPTOR → None。
-    let descriptor_raw = read_journal_block(ctx, descriptor_block)?;
-    let Some(header) = read_header(&descriptor_raw) else {
+    // 读环起点块头：magic 错 → None。
+    let head_raw = read_journal_block(ctx, ring_start)?;
+    let Some(header) = read_header(&head_raw) else {
         return Ok(None);
     };
-    if header.blocktype() != JBD2_DESCRIPTOR_BLOCK {
-        return Ok(None);
-    }
 
-    // PARITY: recovery.rs:141-144 —— 解析 tag 串；空 / 无 LAST_TAG → None。
-    let descriptor_tags = match parse_descriptor_tags(sb, &descriptor_raw, ctx.block_size) {
-        Some(tags) if !tags.is_empty() => tags,
-        _ => return Ok(None),
-    };
+    // 本事务的 sequence + payload 后的游标 + metadata 镜像，按起点块类型分两路：
+    // (a) DESCRIPTOR：解析 tag → 逐 tag 读 payload；本事务 seq = descriptor.sequence；
+    // (b) REVOKE（revoke-only 事务，无 descriptor/payload）：本事务 seq = 首 revoke 块 sequence，
+    //     游标停在 ring_start（从这里开始跳 revoke 块），metadata 为空。
+    let (tx_sequence, mut data_cursor, metadata_blocks): (u32, u32, Vec<RecoveryBlock>) =
+        if header.blocktype() == JBD2_DESCRIPTOR_BLOCK {
+            // 解析 tag 串；空 / 无 LAST_TAG → None。
+            let descriptor_tags = match parse_descriptor_tags(sb, &head_raw, ctx.block_size) {
+                Some(tags) if !tags.is_empty() => tags,
+                _ => return Ok(None),
+            };
+            // 逐 tag 读 payload（escape 还原），cursor 顺序前进。
+            let mut cursor = space.advance(ring_start, 1);
+            let mut metadata_blocks = Vec::with_capacity(descriptor_tags.len());
+            for tag in &descriptor_tags {
+                let mut block_data = read_journal_block(ctx, cursor)?;
+                // escape 还原：首 4 字节恢复成大端 JBD2 magic。
+                if (tag.flags & JBD2_FLAG_ESCAPE) != 0 && block_data.len() >= size_of::<u32>() {
+                    block_data[..size_of::<u32>()].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+                }
+                metadata_blocks.push(RecoveryBlock {
+                    block_nr: tag.target_fs_block,
+                    block_data,
+                });
+                cursor = space.advance(cursor, 1);
+            }
+            (header.sequence(), cursor, metadata_blocks)
+        } else if header.blocktype() == JBD2_REVOKE_BLOCK {
+            // revoke-only 事务：无 descriptor/payload；本事务 seq = 首 revoke 块 sequence。
+            // 游标停在 ring_start，下面的 revoke-skip 循环从这里开始消费 revoke 块。
+            (header.sequence(), ring_start, Vec::new())
+        } else {
+            return Ok(None);
+        };
 
-    // PARITY: recovery.rs:146-158 —— 逐 tag 读 payload（escape 还原），cursor 顺序前进。
-    let mut data_cursor = space.advance(descriptor_block, 1);
-    let mut metadata_blocks = Vec::with_capacity(descriptor_tags.len());
-    for tag in &descriptor_tags {
-        let mut block_data = read_journal_block(ctx, data_cursor)?;
-        // PARITY: recovery.rs:150-152 —— escape 还原：首 4 字节恢复成大端 JBD2 magic。
-        if (tag.flags & JBD2_FLAG_ESCAPE) != 0 && block_data.len() >= size_of::<u32>() {
-            block_data[..size_of::<u32>()].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+    // BUG-5 fix（关键修复，与 commit emitter 写序对齐）：跳过本事务的 `JBD2_REVOKE_BLOCK`——它们落在
+    // payload 之后、commit 之前（commit.rs:504-506）。只跳「magic 合法 + type==REVOKE + sequence==本
+    // 事务 seq」的块（恰好消费 emitter 写的那些 revoke 块，不多吞 commit、不少跳第 2 个 revoke 块）。
+    // 用环可用块数兜底防御坏镜像死循环（正常路径在首个非 revoke 块即停 = commit 块）。
+    let max_skip = space.usable_blocks().max(1);
+    let mut skipped = 0u32;
+    loop {
+        let raw = read_journal_block(ctx, data_cursor)?;
+        match read_header(&raw) {
+            Some(h) if h.blocktype() == JBD2_REVOKE_BLOCK && h.sequence() == tx_sequence => {
+                data_cursor = space.advance(data_cursor, 1);
+                skipped = skipped.saturating_add(1);
+                if skipped >= max_skip {
+                    // 环内全是「本事务 seq 的 revoke 块」——坏镜像，按缺 commit 处理。
+                    return Ok(None);
+                }
+            }
+            _ => break, // 首个非（本事务 revoke）块——应是 commit 块。
         }
-        metadata_blocks.push(RecoveryBlock {
-            block_nr: tag.target_fs_block,
-            block_data,
-        });
-        data_cursor = space.advance(data_cursor, 1);
     }
 
-    // PARITY: recovery.rs:160-166 —— 读 commit 块：magic 错 / 非 COMMIT / seq 不匹配 → None。
+    // 读 commit 块：magic 错 / 非 COMMIT / seq 不匹配 → None。
     // **这是唯一的「事务是否落盘」判据**——坏 commit-magic / type / seq 才停（坏 csum 不停）。
     let commit_raw = read_journal_block(ctx, data_cursor)?;
     let Some(commit_header) = read_header(&commit_raw) else {
         return Ok(None);
     };
-    if commit_header.blocktype() != JBD2_COMMIT_BLOCK
-        || commit_header.sequence() != header.sequence()
-    {
+    if commit_header.blocktype() != JBD2_COMMIT_BLOCK || commit_header.sequence() != tx_sequence {
         return Ok(None);
     }
 
-    // PARITY: recovery.rs:168-173 —— next_head = commit 后一块。
+    // next_head = commit 后一块（已在 revoke 块之后——故 SCAN 的 cursor / 末事务 `end` 正确，
+    // 喂给 scan_revoke_blocks(start, end) 的范围把本事务的 revoke 块也覆盖在内）。
     let next_head = space.advance(data_cursor, 1);
     Ok(Some(RecoveryTransaction {
-        sequence: header.sequence(),
+        sequence: tx_sequence,
         next_head,
         metadata_blocks,
     }))
