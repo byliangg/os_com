@@ -1514,6 +1514,16 @@ pub(super) struct Ext4Fs {
     inner: Mutex<Ext4>,
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
+    // Phase 6 Task 1: a mount-time snapshot of the on-disk superblock, parsed once via the core
+    // read seam (`read_superblock` over the overlay bridge). The production READ path is now driven
+    // by `core/` (stateless free fns over an injected `ReadCtx`), and every core read fn only
+    // consumes immutable geometry/feature fields of the superblock (`block_size`, `inode_size`,
+    // `inodes_per_group`, `uuid`, `features_read_only`, `blocks_count`, `group_desc_size`,
+    // `inodes_count`, `first_data_block`) — never the mutable free counters. Those fields are fixed
+    // by mkfs and never change after mount, so a single snapshot is correct for all reads and
+    // avoids an extra 1024-byte device read per read op (the write path stays on ext4_rs, which
+    // owns its own SB; this copy feeds reads only).
+    core_sb: super::core::superblock::RawSuperblock,
     mount_flags_bits: AtomicU32,
     jbd2_journal: Mutex<Option<Jbd2Journal>>,
     jbd2_runtime: Arc<RwMutex<Option<JournalRuntime>>>,
@@ -1597,10 +1607,17 @@ impl Ext4Fs {
         ext4.metadata_writer = metadata_writer;
         let operation_alloc_guard: Arc<dyn Ext4OperationAllocGuard> = alloc_guard.clone();
         ext4.alloc_guard = operation_alloc_guard;
+        // Phase 6 Task 1: parse the on-disk superblock once via the core read seam (over the same
+        // overlay bridge the live read path uses) and hold a running snapshot for the core read
+        // path. Reads only consume immutable geometry/feature fields (see the `core_sb` field doc).
+        let core_sb = super::core_adapter::read_superblock(&super::core_adapter::CoreDeviceReader::new(
+            journal_io.clone(),
+        ));
         let fs = Arc::new_cyclic(|weak_ref| Self {
             inner: Mutex::new(ext4),
             block_device,
             adapter,
+            core_sb,
             mount_flags_bits: AtomicU32::new(PerMountFlags::default().bits()),
             jbd2_journal: Mutex::new(None),
             jbd2_runtime: jbd2_runtime.clone(),
@@ -3675,8 +3692,8 @@ impl Ext4Fs {
 
         if !cache_allowed {
             self.direct_read_profile.record_cache_miss();
-            return self.run_ext4_file_read_only(|ext4| {
-                ext4.ext4_plan_direct_read(ino, offset, requested_len)
+            return self.run_io_file_read_only(|ctx| {
+                Self::core_plan_direct_read(ctx, ino, offset, requested_len)
             });
         }
 
@@ -3716,8 +3733,8 @@ impl Ext4Fs {
         }
 
         self.direct_read_profile.record_cache_miss();
-        let (cached_len, cached_mappings) = self.run_ext4_file_read_only(|ext4| {
-            ext4.ext4_plan_direct_read(ino, offset, next_plan_window)
+        let (cached_len, cached_mappings) = self.run_io_file_read_only(|ctx| {
+            Self::core_plan_direct_read(ctx, ino, offset, next_plan_window)
         })?;
         if cached_len == 0 {
             return Ok((0, Vec::new()));
@@ -3803,7 +3820,7 @@ impl Ext4Fs {
         self.direct_read_profile.record_cache_miss();
         let plan_window = requested_len.max(EXTENT_MAP_PLAN_WINDOW_BYTES);
         let (resolved_len, resolved_mappings) = self
-            .run_ext4_file_read_only(|ext4| ext4.ext4_plan_direct_read(ino, offset, plan_window))?;
+            .run_io_file_read_only(|ctx| Self::core_plan_direct_read(ctx, ino, offset, plan_window))?;
         if resolved_len == 0 {
             return Ok((0, Vec::new()));
         }
@@ -4251,6 +4268,10 @@ impl Ext4Fs {
         result
     }
 
+    // Phase 6 Task 1 retired this ext4_rs read wrapper from all call sites (READ path now drives
+    // `core/` via the `run_io_*_read_only*` siblings below). Kept during two-engine coexistence as
+    // the structural template / fallback; removed in Task 5 with the rest of ext4_rs.
+    #[allow(dead_code)]
     fn run_ext4_read_only<T>(
         &self,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
@@ -4276,6 +4297,9 @@ impl Ext4Fs {
         result
     }
 
+    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
+    // coexistence; removed in Task 5.
+    #[allow(dead_code)]
     fn run_ext4_file_read_only<T>(
         &self,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
@@ -4291,6 +4315,9 @@ impl Ext4Fs {
         result
     }
 
+    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
+    // coexistence; removed in Task 5.
+    #[allow(dead_code)]
     fn run_ext4_dir_read_only<T>(
         &self,
         f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
@@ -4306,6 +4333,9 @@ impl Ext4Fs {
         result
     }
 
+    // Still used by `load_dir_cache_if_needed_locked` (dir-cache population stays on ext4_rs in
+    // Task 1 — core exposes only after-entry offsets, but the cache needs entry-start offsets for
+    // O(1) rmdir-fast; see the Task 1 report). Cut over with the namespace path in Task 3.
     fn run_ext4_dir_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
         let io_epoch = self.prepare_ext4_io();
         let result = {
@@ -4348,6 +4378,9 @@ impl Ext4Fs {
         }
     }
 
+    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
+    // coexistence; removed in Task 5.
+    #[allow(dead_code)]
     fn run_ext4_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
         let io_epoch = self.prepare_ext4_io();
         let runtime_wait_start_ns = Self::monotonic_nanos();
@@ -4360,6 +4393,207 @@ impl Ext4Fs {
             let inner = self.lock_inner();
             let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
             f(&scoped_ext4)
+        };
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        Ok(result)
+    }
+
+    // =====================================================================================
+    // Phase 6 Task 1: engine-agnostic read orchestration over `core/`.
+    //
+    // The READ path is cut from third-party `ext4_rs` to the in-tree safe `core/`. `core/` reads
+    // are stateless free functions over an injected `ReadCtx { reader, sb, block_size }`. The
+    // reader is `CoreDeviceReader`, wired to the SAME `JournalIoBridge` overlay the live read path
+    // used, so core reads see read-your-writes against uncommitted journaled metadata while the
+    // write path is still ext4_rs. The superblock is the mount-time snapshot `self.core_sb`
+    // (immutable geometry; see the field doc).
+    //
+    // These `run_io_*_read_only*` wrappers replicate the IO-epoch + (where applicable) runtime-lock
+    // lifecycle of their `run_ext4_*_read_only*` siblings one-for-one, so the integration's locking
+    // structure is unchanged; only the engine driven inside the closure differs. The closure takes
+    // a freshly built `ReadCtx` instead of `&Ext4`.
+    // =====================================================================================
+
+    /// Build a core read seam wired to the overlay bridge (read-your-writes).
+    fn core_reader(&self) -> super::core_adapter::CoreDeviceReader {
+        super::core_adapter::CoreDeviceReader::new(self.journal_io.clone())
+    }
+
+    /// Map a logical block range to physical ranges via core, returning the integration DTO.
+    ///
+    /// `core::SimpleBlockRange` is a field-for-field copy of ext4_rs's `SimpleBlockRange`
+    /// (`{ lblock, pblock, len }`), so the mapping-vector contract is preserved verbatim. The
+    /// caller-supplied `ctx` is the core read context built by a `run_io_*` wrapper.
+    fn core_map_blocks(
+        ctx: &super::core::file::ReadCtx,
+        ino: u32,
+        lblock_start: u32,
+        lblock_count: u32,
+    ) -> Result<Vec<SimpleBlockRange>> {
+        let inode = super::core::inode::load_inode(ctx.reader, ctx.sb, ino)?;
+        let ranges = super::core::file::map_blocks(ctx, &inode, lblock_start, lblock_count)?;
+        Ok(ranges
+            .into_iter()
+            .map(|r| SimpleBlockRange {
+                lblock: r.lblock,
+                pblock: r.pblock,
+                len: r.len,
+            })
+            .collect())
+    }
+
+    /// Build a direct-read plan via core, returning `(direct_len, mappings)` as integration DTOs.
+    ///
+    /// Byte-parity with ext4_rs `ext4_plan_direct_read`: `direct_len` is the byte count floored to
+    /// block alignment; `mappings` are the resolved logical->physical ranges. `core::SimpleBlockRange`
+    /// is a field-for-field copy of ext4_rs's, so the vector contract is preserved.
+    fn core_plan_direct_read(
+        ctx: &super::core::file::ReadCtx,
+        ino: u32,
+        offset: usize,
+        len: usize,
+    ) -> Result<(usize, Vec<SimpleBlockRange>)> {
+        let inode = super::core::inode::load_inode(ctx.reader, ctx.sb, ino)?;
+        let (direct_len, ranges) = super::core::file::plan_direct_read(ctx, &inode, offset, len)?;
+        let mappings = ranges
+            .into_iter()
+            .map(|r| SimpleBlockRange {
+                lblock: r.lblock,
+                pblock: r.pblock,
+                len: r.len,
+            })
+            .collect();
+        Ok((direct_len, mappings))
+    }
+
+    /// Build the integration `SimpleInodeMeta` DTO from a core `Inode`, byte-identically to ext4_rs
+    /// `ext4_stat`.
+    ///
+    /// Field-by-field mapping (each verified against ext4_rs `Ext4Inode` accessors):
+    /// `ino`=`inode.num`; `mode`=`raw.mode()`; `file_type`=`raw.file_type()` (`mode & 0xF000`, same
+    /// as ext4_rs `file_type().bits()`); `uid`/`gid`/`atime`/`mtime`/`ctime`/`faddr` are the raw
+    /// fields; `nlink`=`raw.links_count()`; `size`=`raw.size()` (`size|size_hi<<32`);
+    /// `blocks`=`raw.blocks()` (`blocks|l_i_blocks_high<<32`, equal to ext4_rs `blocks_count()`);
+    /// `rdev`=`raw.faddr()`; `flags`=`raw.flags()`.
+    fn core_inode_meta(inode: &super::core::inode::Inode) -> SimpleInodeMeta {
+        let raw = &inode.raw;
+        SimpleInodeMeta {
+            ino: inode.num,
+            mode: raw.mode(),
+            file_type: raw.file_type(),
+            uid: raw.uid,
+            gid: raw.gid,
+            nlink: raw.links_count(),
+            size: raw.size(),
+            blocks: raw.blocks(),
+            atime: raw.atime,
+            mtime: raw.mtime,
+            ctime: raw.ctime,
+            rdev: raw.faddr,
+            flags: raw.flags(),
+        }
+    }
+
+    /// File-read variant: IO-epoch only (no runtime lock), mirroring `run_ext4_file_read_only`.
+    fn run_io_file_read_only<T>(
+        &self,
+        f: impl FnOnce(&super::core::file::ReadCtx) -> Result<T>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let reader = self.core_reader();
+        let result = {
+            let ctx = super::core::file::ReadCtx::new(&reader, &self.core_sb);
+            f(&ctx)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    /// Dir-read variant: IO-epoch only (no runtime lock), mirroring `run_ext4_dir_read_only`.
+    fn run_io_dir_read_only<T>(
+        &self,
+        f: impl FnOnce(&super::core::file::ReadCtx) -> Result<T>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let reader = self.core_reader();
+        let result = {
+            let ctx = super::core::file::ReadCtx::new(&reader, &self.core_sb);
+            f(&ctx)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    /// Dir-read non-fallible variant: IO-epoch only, mirroring `run_ext4_dir_read_only_noerr`.
+    fn run_io_dir_read_only_noerr<T>(
+        &self,
+        f: impl FnOnce(&super::core::file::ReadCtx) -> T,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let reader = self.core_reader();
+        let result = {
+            let ctx = super::core::file::ReadCtx::new(&reader, &self.core_sb);
+            f(&ctx)
+        };
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        Ok(result)
+    }
+
+    /// IO-epoch + runtime-lock variant, mirroring `run_ext4_read_only`.
+    fn run_io_read_only<T>(
+        &self,
+        f: impl FnOnce(&super::core::file::ReadCtx) -> Result<T>,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let reader = self.core_reader();
+        let result = {
+            let ctx = super::core::file::ReadCtx::new(&reader, &self.core_sb);
+            f(&ctx)
+        };
+        drop(runtime_guard);
+        self.record_ext4_rs_runtime_lock_hold(
+            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
+        );
+        let io_result = self.finish_ext4_io(io_epoch);
+        io_result?;
+        result
+    }
+
+    /// IO-epoch + runtime-lock non-fallible variant, mirroring `run_ext4_read_only_noerr`.
+    ///
+    /// Provided for completeness alongside the fallible `run_io_read_only` (Task 1's `stat` uses
+    /// the fallible variant because `load_inode` validates the inode number). Reserved for
+    /// later-task read sites that drive a non-fallible core op.
+    #[allow(dead_code)]
+    fn run_io_read_only_noerr<T>(
+        &self,
+        f: impl FnOnce(&super::core::file::ReadCtx) -> T,
+    ) -> Result<T> {
+        let io_epoch = self.prepare_ext4_io();
+        let runtime_wait_start_ns = Self::monotonic_nanos();
+        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
+        self.record_ext4_rs_runtime_lock_wait(
+            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
+        );
+        let runtime_hold_start_ns = Self::monotonic_nanos();
+        let reader = self.core_reader();
+        let result = {
+            let ctx = super::core::file::ReadCtx::new(&reader, &self.core_sb);
+            f(&ctx)
         };
         drop(runtime_guard);
         self.record_ext4_rs_runtime_lock_hold(
@@ -4576,8 +4810,14 @@ impl Ext4Fs {
             return Ok(meta);
         }
 
-        // Miss: read the inode from the device once.
-        let meta = self.run_ext4_read_only_noerr(|ext4| ext4.ext4_stat(ino))?;
+        // Miss: read the inode from the device once via core and build the same DTO ext4_rs
+        // `ext4_stat` returned. `load_inode` validates the inode number (ext4_rs `get_inode_ref`
+        // does not), so a structurally-invalid inode now surfaces an error instead of garbage
+        // metadata; valid inodes (all the VFS layer ever passes) are byte-identical.
+        let meta = self.run_io_read_only(|ctx| {
+            let inode = super::core::inode::load_inode(ctx.reader, ctx.sb, ino)?;
+            Ok(Self::core_inode_meta(&inode))
+        })?;
 
         // Only cache if no journaled mutation raced our read (generation
         // unchanged), so we never insert a value read across a mutation.
@@ -4770,7 +5010,13 @@ impl Ext4Fs {
             }
         }
 
-        let ino = self.run_ext4_dir_read_only(|ext4| ext4.ext4_lookup_at(parent, name))?;
+        // Phase 6 Task 1: single-level directory lookup via core. `core::dir::lookup_at` is a
+        // byte-parity reimplementation of ext4_rs `ext4_lookup_at` (cross-block linear scan,
+        // ENOENT on miss).
+        let ino = self.run_io_dir_read_only(|ctx| {
+            let parent_inode = super::core::inode::load_inode(ctx.reader, ctx.sb, parent)?;
+            super::core::dir::lookup_at(ctx, &parent_inode, name.as_bytes())
+        })?;
         self.cache_insert_entry(parent, name, ino, 0);
         Ok((ino, 0))
     }
@@ -4782,7 +5028,25 @@ impl Ext4Fs {
     }
 
     pub(super) fn dir_open(&self, path: &str) -> Result<u32> {
-        self.run_ext4_read_only(|ext4| ext4.ext4_dir_open(path))
+        // Phase 6 Task 1: resolve a path to its inode via core, replicating ext4_rs
+        // `ext4_dir_open` == `generic_open(path, root, create=false)`. `generic_open` walks the
+        // path from the root inode component-by-component (skipping empty components from
+        // consecutive '/'), failing the whole lookup with ENOENT on the first missing component
+        // (create=false). We reproduce that exactly with a per-component `core::dir::lookup_at`,
+        // re-loading the descended-into directory inode each step. `dir_open` is only called from
+        // inode.rs's `..` branch with a well-formed relative parent path (no leading/trailing
+        // slash, empty path handled before the call).
+        self.run_io_read_only(|ctx| {
+            let mut current = EXT4_ROOT_INODE;
+            for component in path.split('/') {
+                if component.is_empty() {
+                    continue;
+                }
+                let dir = super::core::inode::load_inode(ctx.reader, ctx.sb, current)?;
+                current = super::core::dir::lookup_at(ctx, &dir, component.as_bytes())?;
+            }
+            Ok(current)
+        })
     }
 
     pub(super) fn create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
@@ -5037,7 +5301,13 @@ impl Ext4Fs {
     ) -> Result<usize> {
         let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
         let _inode_guard = inode_lock.write();
-        let read_len = self.run_ext4_file_read_only(|ext4| ext4.ext4_read_at(ino, offset, data))?;
+        // Phase 6 Task 1: drive the core read path. `core::file::read_at` is a byte-parity
+        // reimplementation of ext4_rs `ext4_read_at` (clamp to size, holes/unwritten zero-filled),
+        // returning the byte count read.
+        let read_len = self.run_io_file_read_only(|ctx| {
+            let inode = super::core::inode::load_inode(ctx.reader, ctx.sb, ino)?;
+            super::core::file::read_at(ctx, &inode, offset, data)
+        })?;
         if read_len > 0 {
             self.touch_atime(ino, status_flags)?;
         }
@@ -5429,7 +5699,7 @@ impl Ext4Fs {
         let mappings = if lblock_count == 0 {
             Vec::new()
         } else {
-            self.run_ext4_file_read_only(|ext4| ext4.ext4_map_blocks(ino, 0, lblock_count))?
+            self.run_io_file_read_only(|ctx| Self::core_map_blocks(ctx, ino, 0, lblock_count))?
         };
 
         let mut entry = WrittenCoverage::Ranges(BTreeMap::new());
@@ -5482,8 +5752,8 @@ impl Ext4Fs {
             .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
         let lblock_count_u32 = u32::try_from(lblock_count)
             .map_err(|_| Error::with_message(Errno::EFBIG, "write lblock overflow"))?;
-        let mappings = self.run_ext4_file_read_only(|ext4| {
-            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        let mappings = self.run_io_file_read_only(|ctx| {
+            Self::core_map_blocks(ctx, ino, lblock_start_u32, lblock_count_u32)
         })?;
         let mapped_blocks: u64 = mappings.iter().map(|m| m.len as u64).sum();
         Ok(mapped_blocks == lblock_count as u64)
@@ -5507,8 +5777,8 @@ impl Ext4Fs {
             .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache write lblock overflow"))?;
         let lblock_count_u32 = u32::try_from(lblock_count)
             .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache write lblock overflow"))?;
-        let mappings = self.run_ext4_file_read_only(|ext4| {
-            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        let mappings = self.run_io_file_read_only(|ctx| {
+            Self::core_map_blocks(ctx, ino, lblock_start_u32, lblock_count_u32)
         })?;
         self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
 
@@ -5555,8 +5825,8 @@ impl Ext4Fs {
         let lblock_count_u32 = u32::try_from(lblock_count)
             .map_err(|_| Error::with_message(Errno::EFBIG, "page-cache read lblock overflow"))?;
 
-        let mappings = self.run_ext4_file_read_only(|ext4| {
-            ext4.ext4_map_blocks(ino, lblock_start_u32, lblock_count_u32)
+        let mappings = self.run_io_file_read_only(|ctx| {
+            Self::core_map_blocks(ctx, ino, lblock_start_u32, lblock_count_u32)
         })?;
 
         for mapping in mappings {
@@ -5919,7 +6189,32 @@ impl Ext4Fs {
             }
         }
 
-        self.run_ext4_dir_read_only_noerr(|ext4| ext4.ext4_readdir(ino))
+        // Phase 6 Task 1: enumerate directory entries via core, byte-identically to ext4_rs
+        // `ext4_readdir`. ext4_rs returns an empty vec for a non-directory inode (`!is_dir`); core's
+        // `dir_get_entries_with_next_offset` does not gate on type, so we replicate the guard here.
+        // Each `SimpleDirEntry` mirrors the ext4_rs build one-for-one:
+        //   - `inode`     = entry inode (unused/inode==0 slots are skipped by core, matching ext4_rs)
+        //   - `de_type`   = dirent file-type byte (core `OwnedDirEntry.file_type` == ext4_rs
+        //                   `get_de_type()`, the same union byte)
+        //   - `name`      = `String::from_utf8_lossy(name)` (exactly ext4_rs `get_name()`)
+        //   - `next_offset` = `iblock*bs + off + rec_len` (core computes the identical cookie)
+        self.run_io_dir_read_only_noerr(|ctx| {
+            let Ok(dir) = super::core::inode::load_inode(ctx.reader, ctx.sb, ino) else {
+                return Vec::new();
+            };
+            if !dir.is_dir() {
+                return Vec::new();
+            }
+            super::core::dir::dir_get_entries_with_next_offset(ctx, &dir)
+                .into_iter()
+                .map(|(entry, next_offset)| SimpleDirEntry {
+                    inode: entry.inode,
+                    de_type: entry.file_type,
+                    name: String::from_utf8_lossy(&entry.name).into_owned(),
+                    next_offset,
+                })
+                .collect()
+        })
     }
 
     pub(super) fn readdir(&self, ino: u32) -> Result<Vec<SimpleDirEntry>> {
