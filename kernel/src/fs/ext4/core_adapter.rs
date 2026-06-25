@@ -74,9 +74,8 @@ impl CoreDeviceReader {
 
 impl BlockReader for CoreDeviceReader {
     fn read_at(&self, off: usize, out: &mut [u8]) {
-        // `Ext4BlockDevice` (== ext4_rs `BlockDevice`) provides `read_offset_into`, which is
-        // home-read + overlay-merge. Bring the trait into scope locally to call it.
-        use ext4_rs::BlockDevice as Ext4BlockDevice;
+        // `read_offset_into` (home-read + overlay-merge) is an inherent method on the bridge
+        // (Task 5b converted the former `ext4_rs::BlockDevice` impl to an inherent one).
         self.bridge.read_offset_into(off, out);
     }
 }
@@ -102,7 +101,6 @@ impl CoreRawDeviceReader {
 
 impl BlockReader for CoreRawDeviceReader {
     fn read_at(&self, off: usize, out: &mut [u8]) {
-        use ext4_rs::BlockDevice as Ext4BlockDevice;
         self.adapter.read_offset_into(off, out);
     }
 }
@@ -132,7 +130,6 @@ impl CoreDataWriter {
 
 impl BlockWriter for CoreDataWriter {
     fn write_at(&self, off: usize, data: &[u8]) {
-        use ext4_rs::BlockDevice as Ext4BlockDevice;
         self.adapter.write_offset(off, data);
     }
 }
@@ -232,7 +229,6 @@ impl MetadataWriter for CoreCommitMetadataWriter {
         block: Ext4Fsblk,
         data: &[u8],
     ) -> Result<()> {
-        use ext4_rs::BlockDevice as Ext4BlockDevice;
         let off = (block as usize).saturating_mul(self.block_size);
         self.adapter.write_offset(off, data);
         Ok(())

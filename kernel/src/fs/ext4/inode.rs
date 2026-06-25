@@ -4,7 +4,11 @@ use alloc::format;
 use core::time::Duration;
 
 use device_id::DeviceId;
-use ext4_rs::{EXT4_ROOT_INODE, InodeFileType, SimpleInodeMeta};
+// Phase 6 Task 5b: integration-layer ext4 types (root inode, block size, mode bits, the
+// `SimpleInodeMeta` DTO) now come from the in-tree `super::types` module instead of the deleted
+// `ext4_rs` crate. `mode_bits` aliases the mode-bit constants to avoid clashing with the local
+// `mode` parameters/bindings in `ext4_mode` / `fallocate`.
+use super::types::{EXT4_BLOCK_SIZE, EXT4_ROOT_INODE, SimpleInodeMeta, mode as mode_bits};
 use ostd::mm::VmIo;
 
 use super::fs::Ext4Fs;
@@ -75,8 +79,8 @@ impl Ext4Inode {
         let Ok(fs) = self.ext4_fs() else {
             return SimpleInodeMeta {
                 ino: self.ino,
-                mode: InodeFileType::S_IFREG.bits(),
-                file_type: InodeFileType::S_IFREG.bits(),
+                mode: mode_bits::S_IFREG,
+                file_type: mode_bits::S_IFREG,
                 uid: 0,
                 gid: 0,
                 nlink: 1,
@@ -91,8 +95,8 @@ impl Ext4Inode {
         };
         fs.stat(self.ino).unwrap_or(SimpleInodeMeta {
             ino: self.ino,
-            mode: InodeFileType::S_IFREG.bits(),
-            file_type: InodeFileType::S_IFREG.bits(),
+            mode: mode_bits::S_IFREG,
+            file_type: mode_bits::S_IFREG,
             uid: 0,
             gid: 0,
             nlink: 1,
@@ -125,13 +129,13 @@ impl Ext4Inode {
 
     fn ext4_mode(type_: InodeType, mode: InodeMode) -> Result<u16> {
         let type_bits = match type_ {
-            InodeType::File => InodeFileType::S_IFREG.bits(),
-            InodeType::Dir => InodeFileType::S_IFDIR.bits(),
-            InodeType::SymLink => InodeFileType::S_IFLNK.bits(),
-            InodeType::CharDevice => InodeFileType::S_IFCHR.bits(),
-            InodeType::BlockDevice => InodeFileType::S_IFBLK.bits(),
-            InodeType::NamedPipe => InodeFileType::S_IFIFO.bits(),
-            InodeType::Socket => InodeFileType::S_IFSOCK.bits(),
+            InodeType::File => mode_bits::S_IFREG,
+            InodeType::Dir => mode_bits::S_IFDIR,
+            InodeType::SymLink => mode_bits::S_IFLNK,
+            InodeType::CharDevice => mode_bits::S_IFCHR,
+            InodeType::BlockDevice => mode_bits::S_IFBLK,
+            InodeType::NamedPipe => mode_bits::S_IFIFO,
+            InodeType::Socket => mode_bits::S_IFSOCK,
             InodeType::Unknown => {
                 return_errno_with_message!(Errno::EINVAL, "unsupported inode type")
             }
@@ -156,7 +160,7 @@ impl InodeIo for Ext4Inode {
 
         let fs = self.ext4_fs()?;
         if status_flags.contains(StatusFlags::O_DIRECT) {
-            if offset % ext4_rs::BLOCK_SIZE != 0 || writer.avail() % ext4_rs::BLOCK_SIZE != 0 {
+            if offset % EXT4_BLOCK_SIZE != 0 || writer.avail() % EXT4_BLOCK_SIZE != 0 {
                 return_errno_with_message!(Errno::EINVAL, "not block-aligned");
             }
             return fs.read_direct_at(self.ino, offset, writer, status_flags);
@@ -187,7 +191,7 @@ impl InodeIo for Ext4Inode {
 
         let fs = self.ext4_fs()?;
         if status_flags.contains(StatusFlags::O_DIRECT) {
-            if offset % ext4_rs::BLOCK_SIZE != 0 || reader.remain() % ext4_rs::BLOCK_SIZE != 0 {
+            if offset % EXT4_BLOCK_SIZE != 0 || reader.remain() % EXT4_BLOCK_SIZE != 0 {
                 return_errno_with_message!(Errno::EINVAL, "not block-aligned");
             }
             return fs.write_direct_at(self.ino, offset, reader);
@@ -228,7 +232,7 @@ impl Inode for Ext4Inode {
             dev,
             ino: meta.ino as u64,
             size: meta.size as usize,
-            blk_size: ext4_rs::BLOCK_SIZE,
+            blk_size: EXT4_BLOCK_SIZE,
             blocks: meta.blocks as usize,
             atime: Duration::from_secs(meta.atime as u64),
             mtime: Duration::from_secs(meta.mtime as u64),

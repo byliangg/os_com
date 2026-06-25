@@ -11,6 +11,10 @@ mod core;
 mod core_adapter;
 mod fs;
 mod inode;
+// Phase 6 Task 5b: in-tree replacements for the integration-layer types that used to be imported
+// from the third-party `ext4_rs` crate (mode bits, root inode, block size, the `Simple*` DTOs and
+// the metadata-writer seam trait). Byte-identical to the `ext4_rs` items they replace.
+mod types;
 // Phase 6 Task 2: integration-layer JBD2 commit/checkpoint driver re-derived over the safe `core/`
 // journal (core's runtime is deliberately thinner — checkpoint_list / last_committed_tid / rotation
 // / overlay live here). Drives the journaled WRITE path's commit + the single sync barrier.

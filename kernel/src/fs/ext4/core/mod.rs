@@ -40,7 +40,10 @@ pub mod types;
 // stay private to core (no integration-layer caller names them directly).
 pub(in crate::fs::ext4) mod io;
 mod bitmap;
-mod alloc_guard;
+// Phase 6 Task 5b: `fs.rs` imports `LocalOperationAllocGuard` from here (it replaced the
+// `ext4_rs::LocalOperationAllocGuard` the integration layer used), so the module path must be
+// reachable from `crate::fs::ext4`.
+pub(in crate::fs::ext4) mod alloc_guard;
 pub(in crate::fs::ext4) mod balloc;
 pub(in crate::fs::ext4) mod ialloc;
 

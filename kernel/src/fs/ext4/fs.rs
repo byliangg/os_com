@@ -15,10 +15,14 @@ use aster_block::{
 };
 use aster_cmdline::{KCMDLINE, ModuleArg};
 use aster_time::read_monotonic_time;
-use ext4_rs::{
-    BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE,
-    LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter, SimpleBlockRange,
-    SimpleDirEntry, SimpleInodeMeta,
+// Phase 6 Task 5b: the integration-layer ext4 types (mode bits, root inode, block size, `Simple*`
+// DTOs, metadata-writer seam trait) now come from the in-tree `super::types` module and `core/`
+// instead of the deleted third-party `ext4_rs` crate. Byte-identical replacements throughout.
+use super::core::alloc_guard::LocalOperationAllocGuard;
+use super::core::file::SimpleBlockRange;
+use super::types::{
+    DeviceMetadataWriter as Ext4MetadataWriter, EXT4_BLOCK_SIZE, EXT4_ROOT_INODE, SimpleDirEntry,
+    SimpleInodeMeta, mode,
 };
 // Phase 6 Task 2: the injected-crash replay hold now keys off the **core** commit-write stage enum
 // (the production commit emitter is core's `write_commit_plan`). It is variant-for-variant identical
@@ -997,14 +1001,17 @@ impl KernelBlockDeviceAdapter {
     }
 }
 
-impl Ext4BlockDevice for KernelBlockDeviceAdapter {
+// Phase 6 Task 5b: the device-read/write seam (formerly `impl ext4_rs::BlockDevice`) is now an
+// inherent impl — `ext4_rs` is deleted and the only callers are in-tree (`JournalIoBridge`,
+// `core_adapter`), which call these methods by name. Byte-for-byte the same bodies.
+impl KernelBlockDeviceAdapter {
     fn read_offset(&self, offset: usize) -> Vec<u8> {
         let mut data = vec![0u8; EXT4_BLOCK_SIZE];
         self.read_offset_into(offset, data.as_mut_slice());
         data
     }
 
-    fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
+    pub(super) fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
         if out.is_empty() {
             return;
         }
@@ -1080,7 +1087,7 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         out.copy_from_slice(&aligned[start..start + read_len]);
     }
 
-    fn write_offset(&self, offset: usize, data: &[u8]) {
+    pub(super) fn write_offset(&self, offset: usize, data: &[u8]) {
         if data.is_empty() {
             return;
         }
@@ -1152,22 +1159,22 @@ impl Ext4BlockDevice for KernelBlockDeviceAdapter {
         self.mirror_write_to_cache(aligned_start, aligned.as_slice());
     }
 
-    fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
+    fn sync(&self) -> Result<()> {
         match self.inner.sync() {
             Ok(BioStatus::Complete) => Ok(()),
             Ok(status) => {
                 self.mark_io_failure();
                 error!("ext4 block sync completed with status {:?}", status);
-                Err(ext4_rs::Ext4Error::with_message(
-                    ext4_rs::Errno::EIO,
+                Err(Error::with_message(
+                    Errno::EIO,
                     "block device sync did not complete",
                 ))
             }
             Err(err) => {
                 self.mark_io_failure();
                 error!("ext4 block sync failed: {:?}", err);
-                Err(ext4_rs::Ext4Error::with_message(
-                    ext4_rs::Errno::EIO,
+                Err(Error::with_message(
+                    Errno::EIO,
                     "block device sync failed",
                 ))
             }
@@ -1251,7 +1258,10 @@ impl JournalIoBridge {
     }
 }
 
-impl Ext4BlockDevice for JournalIoBridge {
+// Phase 6 Task 5b: the overlay device-read/write seam (formerly `impl ext4_rs::BlockDevice`) is now
+// an inherent impl; `core_adapter`'s `CoreDeviceReader` calls `read_offset_into` by name. Same bodies.
+impl JournalIoBridge {
+    #[allow(dead_code)]
     fn read_offset(&self, offset: usize) -> Vec<u8> {
         let block_size = self
             .runtime
@@ -1264,16 +1274,17 @@ impl Ext4BlockDevice for JournalIoBridge {
         data
     }
 
-    fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
+    pub(super) fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
         self.adapter.read_offset_into(offset, out);
         self.overlay_metadata_read(offset, out);
     }
 
-    fn write_offset(&self, offset: usize, data: &[u8]) {
+    pub(super) fn write_offset(&self, offset: usize, data: &[u8]) {
         self.adapter.write_offset(offset, data);
     }
 
-    fn sync(&self) -> core::result::Result<(), ext4_rs::Ext4Error> {
+    #[allow(dead_code)]
+    fn sync(&self) -> Result<()> {
         self.adapter.sync()
     }
 }
@@ -5074,20 +5085,23 @@ impl Ext4Fs {
     }
 
     fn dirent_type_from_inode_mode(mode: u16) -> u8 {
+        // NOTE: the `mode` parameter shadows the imported `mode` module here, so reference the
+        // mode-bit constants through their full path `super::types::mode::*`.
+        use super::types::mode as ext4_mode;
         let file_type = mode & 0xF000;
-        if file_type == ext4_rs::InodeFileType::S_IFREG.bits() {
+        if file_type == ext4_mode::S_IFREG {
             1
-        } else if file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
+        } else if file_type == ext4_mode::S_IFDIR {
             2
-        } else if file_type == ext4_rs::InodeFileType::S_IFCHR.bits() {
+        } else if file_type == ext4_mode::S_IFCHR {
             3
-        } else if file_type == ext4_rs::InodeFileType::S_IFBLK.bits() {
+        } else if file_type == ext4_mode::S_IFBLK {
             4
-        } else if file_type == ext4_rs::InodeFileType::S_IFIFO.bits() {
+        } else if file_type == ext4_mode::S_IFIFO {
             5
-        } else if file_type == ext4_rs::InodeFileType::S_IFSOCK.bits() {
+        } else if file_type == ext4_mode::S_IFSOCK {
             6
-        } else if file_type == ext4_rs::InodeFileType::S_IFLNK.bits() {
+        } else if file_type == ext4_mode::S_IFLNK {
             7
         } else {
             0
@@ -5260,7 +5274,7 @@ impl Ext4Fs {
         let _parent_guard = parent_lock.write();
         let target_ino = self.lookup_at_locked(parent, name)?;
         let target_meta = self.stat(target_ino)?;
-        if target_meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits() {
+        if target_meta.file_type == mode::S_IFDIR {
             return_errno!(Errno::EISDIR);
         }
         let target_lock = Self::correctness_lock_for(&self.inode_correctness_locks, target_ino);
@@ -5305,7 +5319,7 @@ impl Ext4Fs {
         let _inode_guard = inode_lock.write();
 
         let meta = self.stat(ino)?;
-        if meta.nlink != 0 || meta.file_type != ext4_rs::InodeFileType::S_IFREG.bits() {
+        if meta.nlink != 0 || meta.file_type != mode::S_IFREG {
             return Ok(());
         }
         if self.has_open_file_handles(ino) {
@@ -5330,7 +5344,7 @@ impl Ext4Fs {
         let _parent_guard = parent_lock.write();
         let child_ino = self.lookup_at_locked(parent, name)?;
         let child_meta = self.stat(child_ino)?;
-        if child_meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+        if child_meta.file_type != mode::S_IFDIR {
             return_errno!(Errno::ENOTDIR);
         }
         let child_lock = Self::correctness_lock_for(&self.inode_correctness_locks, child_ino);
@@ -5386,7 +5400,7 @@ impl Ext4Fs {
                 .map(|(ino, meta)| {
                     (
                         ino,
-                        meta.file_type == ext4_rs::InodeFileType::S_IFDIR.bits(),
+                        meta.file_type == mode::S_IFDIR,
                     )
                 });
 
