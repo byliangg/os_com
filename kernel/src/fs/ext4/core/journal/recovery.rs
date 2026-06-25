@@ -283,39 +283,36 @@ fn scan_committed_transactions(
     // 事务的 descriptor.sequence == `next_commit_ID`，逐事务 +1；序号不连续即停。SCAN 从 log tail
     // （`s_start`）起，**第一个**事务的序号即基线，其后严格 +1。
     //
-    // **基线锚定（Concern #4 — 与 Linux `do_one_pass` 对齐的论证）**：本仓的 on-disk 语义是
-    // commit 后 `s_sequence = 已 commit 的最高 seq + 1`（commit.rs `set_sequence(sequence+1)`），即
-    // `s_sequence` 是**下一个空闲 commit ID**。`s_start` 只在 journal 由空转非空时被置成首事务的环
-    // 起点（commit.rs `set_start(ring_start)`），且只被 recovery / checkpoint 清/推——故 `s_start`
-    // **始终指向一个真实已 commit 的、最老未 checkpoint 事务的首块**（权威 tail 指针）。因此「从
-    // `s_start` 处首事务取基线」锚的是一个真正落盘的事务，不是任意残留：replay 窗口被 `[s_start, head)`
-    // 收口（`head` = 写头，紧跟最后一个已 commit 事务之后），SCAN 不会越过最后一个真实 commit 进入
-    // 陈旧环内容。Linux 的「从 `sb->s_sequence` 取 `next_commit_ID`」在本布局下**不直接适用**——
-    // 这里 `s_sequence` 是 last+1（tail 的序号是更小的 F），故用「首事务序号 + 严格 +1」等价达成
-    // Linux 的逐事务连续校验。
+    // **基线锚定与上界（Concern #4 — 论证为什么用「首事务基线 + 严格 +1 + head 收口」而 **不** 叠
+    // `s_sequence` 显式上界）**：
     //
-    // **纵深防御（Concern #4 fix）**：再叠一道显式上界——任何被 replay 的有效事务，其序号必须
-    // **严格小于** `s_sequence`（= 下一个空闲 commit ID）。这直接对齐 Linux 不变量「不存在序号
-    // >= `s_sequence` 的已 commit 事务」。它挡住一种刁钻情形：一个**陈旧回绕残留**事务恰好落在
-    // 期望的连续序号上（descriptor+commit+seq 连续都"看似有效"），但其序号已**追平或越过**
-    // 下一个空闲 ID —— 那必是上一轮回绕的残骸（真正的 commit 绝不会写出 >= s_sequence 的序号），
-    // 必须停在它之前，杜绝过度 replay。
+    // 1. on-disk 语义：commit 后 `s_sequence = 已 commit 的最高 seq + 1`（commit.rs `set_sequence`），
+    //    `s_start` 只在 journal 由空转非空时置成首事务环起点（commit.rs `set_start`），`s_head = next_head`。
+    //    `s_start` 只被 recovery / checkpoint 清/推——故 `s_start` 始终指向一个真实已 commit 的、最老
+    //    未 checkpoint 事务的首块（权威 tail 指针），SCAN 由此锚定到一个真正落盘的事务，不是残留。
     //
-    // 注：`s_start != 0` 才会进 SCAN（`needs_recovery`），故进到这里时至少发生过一次 commit，
-    // `s_sequence == last_committed + 1 >= 1`，下界 `expected_max` 恒有意义（非 0 退化）。
+    // 2. **为何不能用 `s_sequence` 作严格上界（关键安全论证）**：commit 写序里 **commit 块写完后没有
+    //    第二道屏障**（commit.rs：唯一屏障在 descriptor/payload→commit 之间；commit 块、`s_sequence`
+    //    的 SB 写、ring advance 都在屏障**之后**、彼此无序）。崩溃可能落在「commit 块已持久、SB 的
+    //    `s_sequence` 写丢失」之间——此时盘上 `s_sequence` 比真实最后一个已 commit 事务**滞后一笔**：
+    //    一个**真正已 commit** 的事务 L 其 `seq == 盘上 s_sequence`（上一笔 L-1 把它设成 L）。若叠
+    //    `seq >= s_sequence` 上界，会把这笔合法已 commit 事务**误丢**（under-replay = 元数据丢失 =
+    //    损坏）。故 `s_sequence` 不是可靠的严格上界，**不**叠它。
+    //
+    // 3. **over-replay 由 head 收口 + 严格连续校验封死，无需 `s_sequence`**：replay 窗口是
+    //    `[s_start, head)`，`head` 紧跟最后一个已 commit 事务之后（commit 把 `s_head = next_head`）。
+    //    SCAN 沿 `cursor = tx.next_head` 前进，`cursor == head` 即停（line below）——绝不读 `head`
+    //    之后的陈旧回绕内容（那才是"残留"所在）。窗口内若有半写/撕裂事务，commit-magic/type/seq
+    //    校验（`try_read_committed_transaction`）或严格 +1 连续校验在第一处不连续即停。两者合起来
+    //    把 over-replay 完全封死：陈旧回绕残骸物理上在 `head` 之后、不被扫到；窗口内异常被连续校验
+    //    挡住。故安全上界 = head 收口 + 严格连续，`s_sequence` 显式上界是冗余且不安全的（见 #2）。
     let mut next_commit_id: Option<u32> = None;
-    let next_free_sequence = sb.sequence();
 
-    // 逐事务读，advance/cursor/head 收口（叠加 sequence 单调上界 + s_sequence 显式上界）。
+    // 逐事务读，advance/cursor/head 收口（叠加 sequence 严格连续上界）。
     while walked_blocks < max_walk {
         let Some(transaction) = try_read_committed_transaction(ctx, sb, space, cursor)? else {
             break;
         };
-        // Concern #4 纵深防御：序号必须 < s_sequence（下一个空闲 commit ID）。>= 即陈旧回绕残骸，停。
-        // （`next_free_sequence == 0` 理论不可达——进 SCAN 必有过 commit；防御性地不在 0 上误停。）
-        if next_free_sequence != 0 && transaction.sequence >= next_free_sequence {
-            break;
-        }
         // BUG-6 fix：序号必须严格等于期望的下一个 commit ID（第一个事务确立基线），否则停。
         match next_commit_id {
             None => next_commit_id = Some(transaction.sequence.wrapping_add(1)),
