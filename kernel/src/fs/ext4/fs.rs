@@ -1643,6 +1643,17 @@ pub(super) struct Ext4Fs {
     /// namespace path do not consult this set; the entry is dropped here on the next alloc that
     /// hands out the same number — see `note_inode_allocated`).
     freed_inodes: Mutex<BTreeSet<u32>>,
+    /// BUG-19 fix (atomic-context safety): inodes whose LAST open handle has closed while they were
+    /// already unlinked (nlink==0), but whose actual reclaim (blocking journaled I/O) must be
+    /// deferred out of the close path. `on_close_file_handle` can run inside `InodeHandle::drop` in
+    /// an ATOMIC context (e.g. `dup2`/`dup3` drops the replaced fd while holding the file-table
+    /// write lock with preempt disabled), where the blocking disk read of `cleanup_unlinked_file`
+    /// would panic on a task switch. So the close path only RECORDS the ino here (cheap, no I/O,
+    /// like the uncontended `open_file_handles` insert); the real free is drained lazily by
+    /// `reclaim_pending_inode_frees` from the next SLEEPABLE fs op (namespace ops + `sync`). This
+    /// mirrors ext2, which never frees in close/Drop — it frees lazily in the sleepable
+    /// `sync_metadata` path. The `freed_inodes` guard keeps the eventual free idempotent.
+    pending_inode_free: Mutex<BTreeSet<u32>>,
     inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     // Phase 5: metadata-only extent mapping cache for O_DIRECT reads. Distinct
     // from `inode_direct_read_cache` above (which is the retired speculative
@@ -1724,6 +1735,7 @@ impl Ext4Fs {
             inode_page_caches: Mutex::new(BTreeMap::new()),
             open_file_handles: Mutex::new(BTreeMap::new()),
             freed_inodes: Mutex::new(BTreeSet::new()),
+            pending_inode_free: Mutex::new(BTreeSet::new()),
             inode_direct_read_cache: Mutex::new(BTreeMap::new()),
             inode_extent_map_cache: Mutex::new(BTreeMap::new()),
             inode_written_coverage: Mutex::new(BTreeMap::new()),
@@ -5214,6 +5226,9 @@ impl Ext4Fs {
     }
 
     pub(super) fn create_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
+        // Drain any inode frees deferred by an atomic-context close (BUG-19). Done before taking any
+        // lock so the drain acquires only its own per-ino correctness lock.
+        self.reclaim_pending_inode_frees();
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
         let _parent_guard = parent_lock.write();
         let op = JournaledOp::Create;
@@ -5237,6 +5252,7 @@ impl Ext4Fs {
     }
 
     pub(super) fn mkdir_at(&self, parent: u32, name: &str, mode: u16) -> Result<u32> {
+        self.reclaim_pending_inode_frees();
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
         let _parent_guard = parent_lock.write();
         // Ensure the parent directory cache is fully loaded so subsequent existence
@@ -5282,6 +5298,7 @@ impl Ext4Fs {
     }
 
     pub(super) fn unlink_at(&self, parent: u32, name: &str) -> Result<()> {
+        self.reclaim_pending_inode_frees();
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
         let _parent_guard = parent_lock.write();
         let target_ino = self.lookup_at_locked(parent, name)?;
@@ -5321,14 +5338,22 @@ impl Ext4Fs {
                 false
             }
         };
-        // BUG-19 (ext4-spec-correct): open-then-unlink-then-close path. When the LAST open handle
-        // closes and the file was already unlinked (nlink==0), this close IS the last reference, so
-        // the inode + its data blocks must be reclaimed now (POSIX: a file held open across unlink
-        // is freed only at close). `cleanup_unlinked_file` re-checks nlink==0 / no-open-handles
-        // under the inode correctness lock, so a benign double-call (e.g. last-ref drop already
-        // freed it) is a no-op.
+        // BUG-19 (ext4-spec-correct + atomic-context safe): open-then-unlink-then-close path. When
+        // the LAST open handle closes and the file was already unlinked (nlink==0), this close IS the
+        // last reference, so the inode + its data blocks must be reclaimed (POSIX: a file held open
+        // across unlink is freed only at close).
+        //
+        // BUT `on_close_file_handle` runs inside `InodeHandle::drop`, which can fire in an ATOMIC
+        // context: `dup2`/`dup3` (`do_dup3`) drops the replaced fd's handle while holding the
+        // file-table write lock (preempt disabled). The reclaim needs blocking journaled disk I/O
+        // (read the inode, truncate blocks, free the bitmap bit) whose task switch would panic there.
+        // So we DEFER: only record the ino in `pending_inode_free` here (a cheap, non-blocking insert
+        // — uncontended `Mutex::lock` does not sleep, same as the `open_file_handles` insert above),
+        // and let `reclaim_pending_inode_frees` perform the real free from the next SLEEPABLE fs op
+        // (namespace ops + `sync`). The actual free still re-checks nlink==0 / no-open-handles under
+        // the inode correctness lock and is idempotent via the `freed_inodes` guard.
         if last_handle_closed {
-            self.cleanup_unlinked_file(ino)?;
+            self.pending_inode_free.lock().insert(ino);
         }
         Ok(())
     }
@@ -5342,9 +5367,13 @@ impl Ext4Fs {
 
     /// Drop the "already-freed" marker for `ino` (called right after a successful inode allocation
     /// that may hand out a previously-freed number). Keeps the `freed_inodes` double-free guard from
-    /// blocking reclaim of the inode's *next* lifetime.
+    /// blocking reclaim of the inode's *next* lifetime. Also drops any stale `pending_inode_free`
+    /// entry for the reused number so a deferred free from the inode's PREVIOUS lifetime can never
+    /// target the freshly allocated owner (the `nlink != 0` re-check in `cleanup_unlinked_file`
+    /// already protects this; clearing here just avoids a wasted reclaim attempt).
     fn note_inode_allocated(&self, ino: u32) {
         self.freed_inodes.lock().remove(&ino);
+        self.pending_inode_free.lock().remove(&ino);
     }
 
     /// BUG-19 fix (ext4-spec-correct): reclaim a regular file whose last reference is gone.
@@ -5391,7 +5420,39 @@ impl Ext4Fs {
         Ok(())
     }
 
+    /// Drain the `pending_inode_free` set, reclaiming each inode whose last open handle closed in an
+    /// atomic context (see `on_close_file_handle`). MUST be called only from a SLEEPABLE context —
+    /// the per-inode `cleanup_unlinked_file` does blocking journaled disk I/O. Invoked at the head of
+    /// every sleepable namespace op (`create_at`/`unlink_at`/`rmdir_at`/`rename_at`/`mkdir_at`) and
+    /// from `FileSystem::sync`, so the deferred frees are reclaimed promptly under continued fs
+    /// activity — closing the steady-state create/delete leak (e2fsck sees zero orphans) without ever
+    /// blocking in the close path.
+    ///
+    /// Re-entrancy: a pending ino that was already reclaimed (via `cleanup_unlinked`'s sleepable
+    /// last-ref path, or a prior drain) is a no-op — `cleanup_unlinked_file` re-checks nlink/handles
+    /// and the `freed_inodes` guard. A pending ino that was rescued (relinked, or reused after free)
+    /// is likewise skipped by those checks. Errors from one inode do not abort the rest.
+    fn reclaim_pending_inode_frees(&self) {
+        // Snapshot + clear under the lock so the (blocking) frees run without holding it.
+        let pending: Vec<u32> = {
+            let mut set = self.pending_inode_free.lock();
+            if set.is_empty() {
+                return;
+            }
+            core::mem::take(&mut *set).into_iter().collect()
+        };
+        for ino in pending {
+            if let Err(err) = self.cleanup_unlinked_file(ino) {
+                warn!(
+                    "ext4: deferred reclaim of unlinked inode {} failed: {:?}",
+                    ino, err
+                );
+            }
+        }
+    }
+
     pub(super) fn rmdir_at(&self, parent: u32, name: &str) -> Result<()> {
+        self.reclaim_pending_inode_frees();
         let parent_lock = Self::correctness_lock_for(&self.dir_correctness_locks, parent);
         let _parent_guard = parent_lock.write();
         let child_ino = self.lookup_at_locked(parent, name)?;
@@ -5440,6 +5501,7 @@ impl Ext4Fs {
         new_parent: u32,
         new_name: &str,
     ) -> Result<()> {
+        self.reclaim_pending_inode_frees();
         self.with_dir_locks(&[old_parent, new_parent], || {
             if old_parent == new_parent && old_name == new_name {
                 return Ok(());
@@ -6702,6 +6764,10 @@ impl FileSystem for Ext4Fs {
         if self.is_shutdown() {
             return Ok(());
         }
+        // BUG-19: reclaim inodes whose last handle closed in an atomic context (deferred by
+        // `on_close_file_handle`) before flushing, so their frees are journaled + committed by this
+        // sync. `sync()` is sleepable, so the blocking reclaim is safe here.
+        self.reclaim_pending_inode_frees();
         self.sync_all_page_caches()?;
         self.flush_pending_jbd2_transactions();
         self.block_device.sync()?;

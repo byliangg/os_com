@@ -2132,6 +2132,13 @@ mod test {
     // bitmap bit clears, SB free_inodes/free_blocks return to baseline,
     // and used_dirs_count is restored. Judged against ext4-spec-correct
     // behavior (NOT differential parity).
+    //
+    // These cover the core free LOGIC. The integration-layer deferral that
+    // moves the free out of the atomic `on_close_file_handle`/Drop context
+    // (the `pending_inode_free` set + `reclaim_pending_inode_frees` drain in
+    // `fs.rs`) has no unit harness — `Ext4Fs` needs a real block device /
+    // journal runtime — and is exercised by the fsync_durability crash 守底
+    // (the `write; sync; mv` / dup2-close path that originally panicked).
     // =================================================================
 
     use core::cell::RefCell;
