@@ -1497,6 +1497,14 @@ impl PageCacheBackend for Ext4PageCacheBackend {
         let fs = self.fs()?;
         let offset = Self::page_offset(idx)?;
         let file_size = fs.stat(self.ino)?.size as usize;
+        // BUG-8 / C4 (writeback size-clamp invariant, made explicit): a dirty page whose start is at
+        // or past the on-disk file size is wholly beyond EOF — it can only arise from a truncate that
+        // shrank the file below this page. Dropping it is the correct ext4 behavior (those bytes no
+        // longer exist on disk), NOT silent data loss. The load-bearing invariant is "a dirty page's
+        // VALID content never extends past the current on-disk inode size" — the slow append path
+        // updates i_size (prepare) BEFORE dirtying the page, so writeback never persists past-EOF
+        // bytes. Any future delalloc change that dirties before updating size MUST re-establish this
+        // invariant (or it will corrupt — technical_report C4); the clamp below is its enforcement.
         if offset >= file_size {
             return Ok(BioWaiter::new());
         }
@@ -2288,6 +2296,37 @@ impl Ext4Fs {
         let Some((transaction_id, has_metadata)) = summary else {
             return;
         };
+
+        // BUG-7 fix: a journaled op that errored mid-handle must NOT leave its partial / inconsistent
+        // metadata in the running transaction to be committed by a later commit. Abort (discard) the
+        // transaction's uncommitted buffers + revokes now. Discarding uncommitted, never-fsync'd
+        // metadata is always crash-consistent (equivalent to those ops crashing before commit), so no
+        // FS shutdown is required — only the durable, committed prior transactions survive. The
+        // RUNTIME lock held across the whole op serializes ops, so this drops only this op's (and any
+        // batched-but-unsynced prior op's) uncommitted work, never a concurrent op's. [对照] Linux
+        // `jbd2_journal_abort` discards the transaction; we drop the in-memory tx and keep the FS
+        // writable since nothing durable is lost.
+        if !succeeded {
+            let aborted = self
+                .jbd2_runtime
+                .write()
+                .as_mut()
+                .map(|driver| driver.abort_transaction(transaction_id))
+                .unwrap_or(false);
+            if aborted {
+                warn!(
+                    "ext4: aborted JBD2 transaction tid={} after failed op={} (uncommitted metadata discarded)",
+                    transaction_id, op_name,
+                );
+                // Drop any inode→tid mapping that targeted the now-discarded tid so a later
+                // fsync(ino) does not block forever waiting for a transaction that will never commit.
+                // (The aborted tid's metadata is gone; the next write re-derives a fresh tid.)
+                let mut tids = self.inode_tids.write();
+                tids.retain(|_, t| *t != transaction_id);
+            }
+            self.commit_notifier.wake_all();
+            return;
+        }
 
         // Step 4a-2: record (ino → handle's TID) so a subsequent fsync(ino)
         // can force-commit exactly the TID containing this inode's metadata.
@@ -4030,26 +4069,6 @@ impl Ext4Fs {
         // every existing invalidation call site (write/truncate/fallocate/
         // unlink/rename/shutdown).
         self.inode_extent_map_cache.lock().remove(&ino);
-    }
-
-    fn revoke_jbd2_checkpoint_metadata_blocks(&self, mappings: &[SimpleBlockRange]) {
-        let mut runtime_guard = self.jbd2_runtime.write();
-        let Some(driver) = runtime_guard.as_mut() else {
-            return;
-        };
-
-        for mapping in mappings {
-            for block in 0..mapping.len {
-                let block_nr = mapping.pblock.saturating_add(u64::from(block));
-                let revoked = driver.revoke_checkpoint_metadata_block(block_nr);
-                if revoked > 0 {
-                    debug!(
-                        "ext4: revoked stale checkpoint metadata block={} count={}",
-                        block_nr, revoked
-                    );
-                }
-            }
-        }
     }
 
     fn clear_pending_direct_read(&self, ino: u32) {
@@ -5936,7 +5955,11 @@ impl Ext4Fs {
         } else {
             0
         };
-        self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+        // BUG-5 (Task 8): no per-written-block revoke here. These `mappings` are freshly
+        // (re)mapped **data** blocks of a regular-file write; data blocks are not journaled, so
+        // revoking them would be both a perf write-amplification (a revoke record per data block)
+        // and architecturally wrong. The revoke is now driven on the metadata-block FREE path
+        // (Linux `ext4_forget` model) inside core, not on the write/reuse path.
         // P2: the prepare made the whole write range written; extend the
         // coverage so subsequent overwrites of it take the fast path.
         self.coverage_insert_ranges(ino, &mappings);
@@ -6096,7 +6119,9 @@ impl Ext4Fs {
         let mappings = self.run_io_file_read_only(|ctx| {
             Self::core_map_blocks(ctx, ino, lblock_start_u32, lblock_count_u32)
         })?;
-        self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+        // BUG-5 (Task 8): write-path revoke removed — see `write_page_cache_data_at_for_inode`.
+        // The mapped blocks are regular-file data (not journaled); the revoke is now driven on the
+        // metadata-block FREE path inside core.
 
         let op = JournaledOp::Write {
             ino,
@@ -6304,7 +6329,9 @@ impl Ext4Fs {
             } else {
                 0
             };
-            self.revoke_jbd2_checkpoint_metadata_blocks(&mappings);
+            // BUG-5 (Task 8): write-path revoke removed (see the slow-path write above). These are
+            // regular-file data blocks (not journaled); the revoke is driven on the metadata-block
+            // FREE path inside core, not here on the write/reuse path.
             // P2: the prepare (or the verified overwrite plan) covers a fully
             // written range; extend coverage for later buffered overwrites.
             self.coverage_insert_ranges(ino, &mappings);

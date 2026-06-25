@@ -45,6 +45,11 @@ pub(in crate::fs::ext4) struct JournalTransaction {
     /// PARITY: ext4_rs transaction.rs:35 —— **BTreeMap keyed by block_nr**：去重重复写 +
     /// 迭代序固定按 block_nr 升序（commit plan 的 tag 序据此固定，差分必须同序）。
     buffers: BTreeMap<Ext4Fsblk, JournalBuffer>,
+    /// 本事务撤销（revoke）的 fs 块号集合（升序去重）。BUG-5 fix：这些块在本事务被释放并复用为
+    /// 数据/其它用途，commit 时写成 `JBD2_REVOKE_BLOCK`，使 recovery 跳过更早事务对它们的陈旧
+    /// 元数据 replay。[对照] Linux `jbd2_journal_revoke` 把块记进 `transaction->t_revoke`（写时
+    /// 哈希、commit 时落 revoke 块）；core 用按块号排序的集合（commit plan 序固定，便于 ktest）。
+    revoked_blocks: BTreeSet<Ext4Fsblk>,
     handle_count: u32,
     admitted_reserved_blocks: u32,
 }
@@ -56,6 +61,7 @@ impl JournalTransaction {
             tid,
             state: JournalTransactionState::Running,
             buffers: BTreeMap::new(),
+            revoked_blocks: BTreeSet::new(),
             handle_count: 0,
             admitted_reserved_blocks: 0,
         }
@@ -88,6 +94,20 @@ impl JournalTransaction {
         &self.buffers
     }
 
+    /// 本事务的 revoke 块号集合（升序）。commit plan 据此写 `JBD2_REVOKE_BLOCK`。
+    pub(in crate::fs::ext4) fn revoked_blocks(&self) -> &BTreeSet<Ext4Fsblk> {
+        &self.revoked_blocks
+    }
+
+    /// 记录一次 revoke：`block` 在本事务被释放/复用，commit 时落 revoke 块。
+    ///
+    /// [对照] Linux `jbd2_journal_revoke` 把块加入当前事务的 revoke 表。注意：若该块此前已在本事务
+    /// 作为 metadata 写入（在 `buffers`），按 JBD2 语义 `jbd2_journal_revoke` 仍记 revoke（块即将被
+    /// 释放，本事务对它的写也作废）——core 这里直接记入集合，commit 侧据集合写 revoke 块。
+    pub(in crate::fs::ext4) fn record_revoke(&mut self, block: Ext4Fsblk) {
+        self.revoked_blocks.insert(block);
+    }
+
     /// 查该事务持有的某 home 块的全块镜像（overlay read 用）。
     /// PARITY: ext4_rs transaction.rs `JournalTransaction::buffer`（journal.rs:204-229 经 `buffer`
     /// 在 running/prev/committing/checkpoint 各事务里查最新镜像）。core 这里只给单事务查询，
@@ -99,6 +119,12 @@ impl JournalTransaction {
     /// PARITY: ext4_rs transaction.rs:99-101 —— `buffers.len()`。
     pub(in crate::fs::ext4) fn modified_block_count(&self) -> usize {
         self.buffers.len()
+    }
+
+    /// 待持久化的工作量 = metadata 块数 + revoke 块号数。BUG-5 fix：commit-readiness 须把 revoke-only
+    /// 事务也算上（它必须落盘以持久化 revoke），否则只有 revoke 没 metadata 的事务永不 commit。
+    pub(in crate::fs::ext4) fn pending_block_count(&self) -> usize {
+        self.buffers.len().saturating_add(self.revoked_blocks.len())
     }
 
     /// PARITY: ext4_rs transaction.rs:115-124（`register_handle`）——
@@ -116,14 +142,14 @@ impl JournalTransaction {
         self.handle_count = self.handle_count.saturating_sub(1);
     }
 
-    /// 记录一个 journaled 元数据块的全块镜像（去重 + size-clamp）。
+    /// 记录一个 journaled 元数据块的全块镜像（去重 + 归一到整块大小）。
     ///
     /// `full_image` 是该块的全块镜像（上层给定）。重复写同一 `block_nr` 覆盖为最新镜像。
     ///
-    /// PARITY: BUG-8 —— ext4_rs transaction.rs:152-178 在首次 insert 时对 `load_block()` 的结果
-    /// 做 size-clamp：`len < block_size` 则 `resize(block_size, 0)`（零填到块大小）、
-    /// `len > block_size` 则 `truncate(block_size)`（截断）。core 直收全块镜像，故对 `full_image`
-    /// 直接 clamp 即得同一字节序列（差分喂超/欠 block_size 镜像对拍）。fix deferred (bug.md B-08)。
+    /// [对照] 把镜像归一到 `block_size`：`len < block_size` → `resize(block_size, 0)`（零填到块大小）、
+    /// `len > block_size` → `truncate(block_size)`。journal payload 永远是整块，这步保证 commit 写出
+    /// 的 tag payload 恰好一个块——是正确的规整，非缺陷（BUG-8 的真实 locus 是集成层 writeback 的
+    /// C4 size-clamp，已在 `fs.rs::write_page_async` 显式化该不变量，见 bug.md B-08）。
     pub(in crate::fs::ext4) fn record_metadata_write(
         &mut self,
         block_nr: Ext4Fsblk,
@@ -146,6 +172,9 @@ impl JournalTransaction {
                 block_data,
             },
         );
+        // [对照] Linux `jbd2_journal_cancel_revoke`：一个块被（重新）作为 metadata journal 后，
+        // 取消本事务对它的 revoke——它的新镜像要被 replay，不能被自身的 revoke 跳过。
+        self.revoked_blocks.remove(&block_nr);
     }
 }
 
@@ -168,6 +197,9 @@ pub(in crate::fs::ext4) struct JournalCommitBlock {
 pub(in crate::fs::ext4) struct JournalCommitPlan {
     pub tid: u32,
     pub metadata_blocks: Vec<JournalCommitBlock>,
+    /// BUG-5 fix：本事务撤销的 fs 块号（升序去重）。commit emitter 据此在 commit 块前写
+    /// `JBD2_REVOKE_BLOCK`，使 recovery 跳过更早事务对它们的陈旧 metadata replay。
+    pub revoked_blocks: Vec<Ext4Fsblk>,
 }
 
 /// handle 凭据：唯一 `handle_id` + 所属事务 `transaction_id` + 该 handle 的预留块数。
@@ -429,6 +461,50 @@ impl JournalRuntime {
         }
     }
 
+    /// 中止（abort）含 `tid` 的事务（BUG-7 fix）：把该事务从 running/prev_running/committing 任一槽
+    /// 取出**丢弃**（其累积的 uncommitted 元数据镜像 + revoke 一并作废，绝不 commit）。返回是否丢弃到。
+    ///
+    /// [对照] Linux `jbd2_journal_abort`：一个 handle 出错（无法干净回滚部分元数据）时整笔事务作废、
+    /// 日志转 abort 态。core 这里只负责把内存事务丢弃；FS 转只读（shutdown）由集成层 `finish_jbd2_handle`
+    /// 在 `succeeded == false` 时一并触发（见 fs.rs）。**只在持 RUNTIME 锁、单 op 串行时调用**——
+    /// 故丢弃当前事务不会误删并发 op 的元数据（同锁下一次只有一笔 op 在写）。
+    pub(in crate::fs::ext4) fn abort_transaction(&mut self, tid: u32) -> bool {
+        for slot in [
+            &mut self.running,
+            &mut self.prev_running,
+            &mut self.committing,
+        ] {
+            if slot.as_ref().is_some_and(|t| t.tid() == tid) {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 把一个块 revoke 进**当前 running 事务**（BUG-5 fix）：该块（journaled 元数据）刚在本事务被
+    /// **释放**（Task 8 free-path trigger，Linux `ext4_forget` 模型），commit 时落 `JBD2_REVOKE_BLOCK`
+    /// （sequence = 本事务）。无 running 事务（无活动 handle）时按需新建一个（revoke 自身就是一笔需要
+    /// 持久化的元数据变更）。返回承载该 revoke 的事务 tid。
+    ///
+    /// [对照] Linux `jbd2_journal_revoke` 在当前 handle 的事务上记 revoke。集成层在 core 的元数据块
+    /// **释放**处（extent 树 index/leaf 块；目录数据块——持 running 锁、handle 仍开）经
+    /// `MetadataWriter::record_journaled_metadata_freed` → `revoke_checkpoint_metadata_block` 调它，
+    /// 使 revoke 与执行释放的本事务同 commit。**普通文件数据块不经 journal，释放它们不调本方法。**
+    pub(in crate::fs::ext4) fn record_revoke(&mut self, block: Ext4Fsblk) -> Option<u32> {
+        if !self.enabled {
+            return None;
+        }
+        let next_tid = &mut self.next_tid;
+        let transaction = self.running.get_or_insert_with(|| {
+            let tid = *next_tid;
+            *next_tid = next_tid.saturating_add(1);
+            JournalTransaction::new(tid)
+        });
+        transaction.record_revoke(block);
+        Some(transaction.tid())
+    }
+
     /// 关 handle，返回其所属事务 `tid`。
     /// PARITY: ext4_rs journal.rs:543-559（`stop_handle`）——出 active 队列 → unregister_handle →
     /// `handle_count==0` 时置 Locked。core 返回 tid（差分对拍 plan.tid）。
@@ -530,9 +606,13 @@ impl JournalRuntime {
                 block_data: buffer.block_data.clone(),
             })
             .collect();
+        // BUG-5 fix：收集本事务的 revoke 块号（升序）；commit emitter 据此写 revoke 块。
+        // metadata 写时已 cancel 掉重新 journal 的块的 revoke，故此处集合与 buffers 不相交。
+        let revoked_blocks = transaction.revoked_blocks().iter().copied().collect();
         let plan = JournalCommitPlan {
             tid: transaction.tid(),
             metadata_blocks,
+            revoked_blocks,
         };
         // PARITY: ext4_rs journal.rs:596 —— 事务停进 committing 槽（不丢弃）。
         self.committing = Some(transaction);

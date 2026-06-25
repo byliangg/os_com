@@ -191,6 +191,19 @@ impl MetadataWriter for CoreMetadataWriter {
         }
         Ok(())
     }
+
+    fn record_journaled_metadata_freed(&self, block: Ext4Fsblk) {
+        // BUG-5 free-path trigger (Linux `ext4_forget`): core calls this from the metadata-block
+        // free sites (extent tree index/leaf blocks; directory data blocks). Record the revoke on
+        // the running transaction — it commits as a `JBD2_REVOKE_BLOCK` carrying this tx's sequence
+        // ahead of the commit block — AND drop the block's stale in-memory checkpoint image so a
+        // parked (committed-but-not-yet-checkpointed) transaction never writes the stale metadata
+        // image back to the block's home location after the block is freed/reused.
+        // `revoke_checkpoint_metadata_block` does both (record_revoke + in-memory checkpoint drop).
+        if let Some(driver) = self.runtime.write().as_mut() {
+            driver.revoke_checkpoint_metadata_block(block);
+        }
+    }
 }
 
 /// Core metadata write seam for the **commit emitter + checkpoint + journal-SB store**: writes the

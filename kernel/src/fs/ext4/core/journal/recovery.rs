@@ -39,7 +39,7 @@ use super::format::{
     JBD2_FEATURE_INCOMPAT_CSUM_V3, JBD2_FLAG_ESCAPE, JBD2_FLAG_LAST_TAG, JBD2_MAGIC,
     JBD2_REVOKE_BLOCK, JBD2_SUPERBLOCK_SIZE,
 };
-use super::revoke::parse_revoke_block;
+use super::revoke::{parse_revoke_block_into_table, RevokeTable};
 use super::space::JournalSpace;
 use super::superblock::journal_sb_checksum;
 
@@ -141,26 +141,29 @@ pub(in crate::fs::ext4) fn recover(
         .map(|tx| tx.next_head)
         .unwrap_or_else(|| sb.start());
 
-    // ===== 趟 2：REVOKE —— 扫 [start, end) 建扁平 revoke 集合 =====
-    // PARITY: recovery.rs:48 —— self.scan_revoke_blocks(start, end)。BUG-5 下真镜像恒空。
+    // ===== 趟 2：REVOKE —— 扫 [start, end) 建带序列号的 revoke 表（BUG-5/6 fix） =====
+    // [对照] Linux PASS_REVOKE：把每条 revoke 记录连同其所在事务序号记进 revoke 表（block→最高
+    // 撤销 seq）。BUG-5 fix 后真镜像不再恒空——释放/复用块的事务会写出 revoke 块。
     let revoked = scan_revoke_blocks(ctx, sb, &space, sb.start(), end)?;
 
-    // ===== 趟 3：REPLAY —— 逐事务、逐块写回 home（跳过 revoked，escape 已在 SCAN 还原） =====
-    // PARITY: recovery.rs:50-64。
+    // ===== 趟 3：REPLAY —— 逐事务、逐块写回 home（按序列号规则跳过 revoked，escape 已在 SCAN 还原） =====
+    // [对照] Linux PASS_REPLAY + `jbd2_journal_test_revoke`。
     let mut metadata_blocks_replayed = 0u32;
     for transaction in &transactions {
         for metadata in &transaction.metadata_blocks {
-            // PARITY: recovery.rs:53-55 —— 扁平包含（无 sequence 上界比较）；revoked 则跳过。
-            if revoked.contains(&metadata.block_nr) {
+            // BUG-5/6 fix（JBD2 revoke 规则）：仅当存在一条**序号 >= 本事务序号**的 revoke 记录时
+            // 才跳过该块。否则（块在更早事务被 revoke、之后又被本事务重新 journal）必须 replay 新镜像。
+            // [对照] Linux `jbd2_journal_test_revoke`：`record->sequence >= sequence` 才 revoked。
+            if revoked.is_revoked_as_of(metadata.block_nr, transaction.sequence) {
                 continue;
             }
-            // PARITY: recovery.rs:56-61 —— home 偏移 = block_nr * block_size（溢出即 EINVAL）。
+            // [对照] home 偏移 = block_nr * block_size（溢出即 EINVAL）。
             let offset = (metadata.block_nr as usize)
                 .checked_mul(ctx.block_size)
                 .ok_or_else(|| {
                     Error::with_message(Errno::EINVAL, "recovery block offset overflow")
                 })?;
-            // PARITY: recovery.rs:61 —— block_device.write_offset(offset, &block_data)（raw home 写）。
+            // [对照] block_device.write_offset(offset, &block_data)（raw home 写）。
             ctx.writer.write_at(offset, &metadata.block_data);
             metadata_blocks_replayed = metadata_blocks_replayed.saturating_add(1);
         }
@@ -179,6 +182,8 @@ pub(in crate::fs::ext4) fn recover(
         last_sequence,
     })
 }
+
+// (revoke 表由 `scan_revoke_blocks` 建，REPLAY 趟据 `is_revoked_as_of` 按序列号过滤。)
 
 /// SB 重置：恢复完成后把 journal 标记为「空 / 已 checkpoint」。
 /// PARITY: ext4_rs `reset_recovered_state`（recovery.rs:79-91）——
@@ -267,26 +272,66 @@ fn scan_committed_transactions(
         return Ok(Vec::new());
     }
 
-    // PARITY: recovery.rs:102-106 —— head: s_head==0 时退回 start。
+    // head: s_head==0 时退回 start。
     let head = if sb.head() == 0 { start } else { sb.head() };
     let mut cursor = start;
     let mut walked_blocks = 0u32;
     let mut transactions = Vec::new();
-    // PARITY: recovery.rs:110 —— max_walk = usable_blocks().max(1)（BUG-6：无 s_sequence 上界，
-    // 仅靠环可用块数 + head 收口）。
     let max_walk = space.usable_blocks().max(1);
 
-    // PARITY: recovery.rs:112-123 —— 逐事务读，advance/cursor/head 收口。
+    // BUG-6 fix（sequence 上界）：[对照] Linux `do_one_pass` 维护 `next_commit_ID`，要求每个有效
+    // 事务的 descriptor.sequence == `next_commit_ID`，逐事务 +1；序号不连续即停。SCAN 从 log tail
+    // （`s_start`）起，**第一个**事务的序号即基线，其后严格 +1。
+    //
+    // **基线锚定（Concern #4 — 与 Linux `do_one_pass` 对齐的论证）**：本仓的 on-disk 语义是
+    // commit 后 `s_sequence = 已 commit 的最高 seq + 1`（commit.rs `set_sequence(sequence+1)`），即
+    // `s_sequence` 是**下一个空闲 commit ID**。`s_start` 只在 journal 由空转非空时被置成首事务的环
+    // 起点（commit.rs `set_start(ring_start)`），且只被 recovery / checkpoint 清/推——故 `s_start`
+    // **始终指向一个真实已 commit 的、最老未 checkpoint 事务的首块**（权威 tail 指针）。因此「从
+    // `s_start` 处首事务取基线」锚的是一个真正落盘的事务，不是任意残留：replay 窗口被 `[s_start, head)`
+    // 收口（`head` = 写头，紧跟最后一个已 commit 事务之后），SCAN 不会越过最后一个真实 commit 进入
+    // 陈旧环内容。Linux 的「从 `sb->s_sequence` 取 `next_commit_ID`」在本布局下**不直接适用**——
+    // 这里 `s_sequence` 是 last+1（tail 的序号是更小的 F），故用「首事务序号 + 严格 +1」等价达成
+    // Linux 的逐事务连续校验。
+    //
+    // **纵深防御（Concern #4 fix）**：再叠一道显式上界——任何被 replay 的有效事务，其序号必须
+    // **严格小于** `s_sequence`（= 下一个空闲 commit ID）。这直接对齐 Linux 不变量「不存在序号
+    // >= `s_sequence` 的已 commit 事务」。它挡住一种刁钻情形：一个**陈旧回绕残留**事务恰好落在
+    // 期望的连续序号上（descriptor+commit+seq 连续都"看似有效"），但其序号已**追平或越过**
+    // 下一个空闲 ID —— 那必是上一轮回绕的残骸（真正的 commit 绝不会写出 >= s_sequence 的序号），
+    // 必须停在它之前，杜绝过度 replay。
+    //
+    // 注：`s_start != 0` 才会进 SCAN（`needs_recovery`），故进到这里时至少发生过一次 commit，
+    // `s_sequence == last_committed + 1 >= 1`，下界 `expected_max` 恒有意义（非 0 退化）。
+    let mut next_commit_id: Option<u32> = None;
+    let next_free_sequence = sb.sequence();
+
+    // 逐事务读，advance/cursor/head 收口（叠加 sequence 单调上界 + s_sequence 显式上界）。
     while walked_blocks < max_walk {
         let Some(transaction) = try_read_committed_transaction(ctx, sb, space, cursor)? else {
             break;
         };
-        // PARITY: recovery.rs:116 —— advanced = distance(cursor, next_head).max(1)。
+        // Concern #4 纵深防御：序号必须 < s_sequence（下一个空闲 commit ID）。>= 即陈旧回绕残骸，停。
+        // （`next_free_sequence == 0` 理论不可达——进 SCAN 必有过 commit；防御性地不在 0 上误停。）
+        if next_free_sequence != 0 && transaction.sequence >= next_free_sequence {
+            break;
+        }
+        // BUG-6 fix：序号必须严格等于期望的下一个 commit ID（第一个事务确立基线），否则停。
+        match next_commit_id {
+            None => next_commit_id = Some(transaction.sequence.wrapping_add(1)),
+            Some(expected) => {
+                if transaction.sequence != expected {
+                    break;
+                }
+                next_commit_id = Some(expected.wrapping_add(1));
+            }
+        }
+        // advanced = distance(cursor, next_head).max(1)。
         let advanced = space.distance(cursor, transaction.next_head).max(1);
         walked_blocks = walked_blocks.saturating_add(advanced);
         cursor = transaction.next_head;
         transactions.push(transaction);
-        // PARITY: recovery.rs:120-122 —— 回到 head 即停。
+        // 回到 head 即停。
         if cursor == head {
             break;
         }
@@ -441,46 +486,381 @@ fn tag_length(sb: &RawJournalSuperblock) -> usize {
     }
 }
 
-/// REVOKE 趟：扫 `[start, end)` 内所有 `JBD2_REVOKE_BLOCK`，解析成扁平 `BTreeSet<u64>`。
-/// PARITY: ext4_rs `scan_revoke_blocks`（recovery.rs:176-205）逐字复刻——
-/// `start==end` 早返空集；逐块读头，blocktype==REVOKE 则 `parse_revoke_block` 追加；
-/// cursor 环内前进，回到 end 即停。**BUG-5 下真镜像无 revoke 块，恒解出空集。**
+/// REVOKE 趟：扫 `[start, end)` 内所有 `JBD2_REVOKE_BLOCK`，建带序列号的 [`RevokeTable`]
+/// （block → 撤销它的最高 sequence，取自各 revoke 块头的 `h_sequence`）。
+///
+/// [对照] Linux PASS_REVOKE：`start==end` 早返空表；逐块读头，blocktype==REVOKE 则
+/// `parse_revoke_block_into_table` 追加（携带块头 sequence）；cursor 环内前进，回到 end 即停。
+/// BUG-5 fix 后真镜像会含 revoke 块（释放/复用块的事务写出）；REPLAY 趟据 `is_revoked_as_of`
+/// 按序列号规则过滤（BUG-6）。
 fn scan_revoke_blocks(
     ctx: &RecoverCtx<'_>,
     sb: &RawJournalSuperblock,
     space: &JournalSpace,
     start: u32,
     end: u32,
-) -> Result<BTreeSet<Ext4Fsblk>> {
-    let mut revoked = BTreeSet::new();
-    // PARITY: recovery.rs:182-185 —— start==end 即空集。
+) -> Result<RevokeTable> {
+    let mut revoked = RevokeTable::new();
+    // start==end 即空表。
     if start == end {
         return Ok(revoked);
     }
 
-    // PARITY: recovery.rs:217 —— entry_size 由 64BIT 特性决定（8/4）；parse_revoke_block 取 is_64bit。
+    // entry_size 由 64BIT 特性决定（8/4）；parse_revoke_block_into_table 取 is_64bit。
     let is_64bit = sb.has_incompat_feature(JBD2_FEATURE_INCOMPAT_64BIT);
 
     let mut cursor = start;
-    // PARITY: recovery.rs:188 —— max_walk = distance(start, end).max(1)。
+    // max_walk = distance(start, end).max(1)。
     let max_walk = space.distance(start, end).max(1);
     let mut walked = 0u32;
     while walked < max_walk {
         let raw = read_journal_block(ctx, cursor)?;
-        // PARITY: recovery.rs:192-195 —— 块头 magic + blocktype==REVOKE 门控后解析。
+        // 块头 magic + blocktype==REVOKE 门控后解析（携带块头 sequence 入表）。
         if let Some(header) = read_header(&raw) {
             if header.blocktype() == JBD2_REVOKE_BLOCK {
-                // PARITY: recovery.rs:207-230 —— parse_revoke_entries（Task 4 `parse_revoke_block`）。
-                parse_revoke_block(&raw, is_64bit, &mut revoked);
+                parse_revoke_block_into_table(&raw, is_64bit, &mut revoked);
             }
         }
         cursor = space.advance(cursor, 1);
         walked = walked.saturating_add(1);
-        // PARITY: recovery.rs:199-201 —— 回到 end 即停。
+        // 回到 end 即停。
         if cursor == end {
             break;
         }
     }
 
     Ok(revoked)
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::cell::RefCell;
+
+    use ostd::prelude::*;
+
+    use super::super::commit::{write_commit_plan, CommitCtx};
+    use super::super::format::{RawJournalSuperblock, JBD2_MAGIC, JBD2_SUPERBLOCK_V2};
+    use super::super::space::JournalSpace;
+    use super::super::transaction::{JournalCommitBlock, JournalCommitPlan, JournalRuntime};
+    use super::{recover, RecoverCtx};
+    use crate::fs::ext4::core::io::{BlockReader, BlockWriter};
+    use crate::fs::ext4::core::metadata_writer::MetadataWriter;
+    use crate::fs::ext4::core::types::Ext4Fsblk;
+    // 全量带进 Pod / Vec / BTreeSet 等；`Result` 单独显式导入消歧（避免 `ostd::prelude::Result`
+    // 与 `crate::prelude::Result` 二义——`MetadataWriter` trait 要求 crate 的 error::Error Result）。
+    use crate::prelude::*;
+    use crate::prelude::Result;
+
+    const BS: usize = 4096;
+    /// 盘总块数：journal 区 [0, JMAX) + home 区（home 块号 >= 64，远离 journal 区）。
+    const JMAX: u32 = 32;
+    const DISK_BLOCKS: usize = 256;
+
+    /// 内存盘：journal 写（commit 的 MetadataWriter）/ home 写（recovery 的 BlockWriter）/ 读
+    /// 都打到同一份字节。home 块用高块号（>= 64）避免落进 journal 区。
+    struct MemDisk {
+        bytes: RefCell<Vec<u8>>,
+    }
+    impl MemDisk {
+        fn new() -> Self {
+            Self {
+                bytes: RefCell::new(vec![0u8; DISK_BLOCKS * BS]),
+            }
+        }
+        fn block_first_byte(&self, block_nr: usize) -> u8 {
+            self.bytes.borrow()[block_nr * BS]
+        }
+        fn set_block(&self, block_nr: usize, fill: u8) {
+            let mut b = self.bytes.borrow_mut();
+            for slot in &mut b[block_nr * BS..(block_nr + 1) * BS] {
+                *slot = fill;
+            }
+        }
+    }
+    impl BlockReader for MemDisk {
+        fn read_at(&self, off: usize, out: &mut [u8]) {
+            let b = self.bytes.borrow();
+            for (i, slot) in out.iter_mut().enumerate() {
+                *slot = b.get(off + i).copied().unwrap_or(0);
+            }
+        }
+    }
+    impl BlockWriter for MemDisk {
+        fn write_at(&self, off: usize, data: &[u8]) {
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(off + i) {
+                    *slot = *byte;
+                }
+            }
+        }
+    }
+    impl MetadataWriter for MemDisk {
+        fn write_metadata_for_handle(
+            &self,
+            _handle_id: u64,
+            block: Ext4Fsblk,
+            data: &[u8],
+        ) -> Result<()> {
+            let mut b = self.bytes.borrow_mut();
+            let off = block as usize * BS;
+            b[off..off + data.len()].copy_from_slice(data);
+            Ok(())
+        }
+    }
+
+    fn synth_journal_sb(first_sequence: u32) -> RawJournalSuperblock {
+        let mut raw = [0u8; super::JBD2_SUPERBLOCK_SIZE];
+        raw[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        raw[4..8].copy_from_slice(&JBD2_SUPERBLOCK_V2.to_be_bytes());
+        raw[8..12].copy_from_slice(&first_sequence.to_be_bytes());
+        raw[12..16].copy_from_slice(&(BS as u32).to_be_bytes()); // s_blocksize
+        raw[16..20].copy_from_slice(&JMAX.to_be_bytes()); // s_maxlen
+        raw[20..24].copy_from_slice(&1u32.to_be_bytes()); // s_first
+        raw[24..28].copy_from_slice(&first_sequence.to_be_bytes()); // s_sequence
+        raw[28..32].copy_from_slice(&0u32.to_be_bytes()); // s_start = 0
+        RawJournalSuperblock::from_bytes(&raw)
+    }
+
+    fn identity_physical() -> Vec<Ext4Fsblk> {
+        (0..JMAX as u64).collect()
+    }
+
+    /// 在 journal 里 commit 一个事务（驱动真实 commit emitter，含 revoke 块）。
+    fn commit_tx(
+        disk: &MemDisk,
+        physical: &[Ext4Fsblk],
+        sb: &mut RawJournalSuperblock,
+        space: &mut JournalSpace,
+        tid: u32,
+        metadata: Vec<(Ext4Fsblk, u8)>,
+        revoked: Vec<Ext4Fsblk>,
+    ) {
+        let ctx = CommitCtx {
+            physical_blocks: physical,
+            writer: disk,
+            barrier: None,
+            handle_id: 0,
+            block_size: BS,
+        };
+        let plan = JournalCommitPlan {
+            tid,
+            metadata_blocks: metadata
+                .into_iter()
+                .map(|(block_nr, fill)| JournalCommitBlock {
+                    block_nr,
+                    block_data: vec![fill; BS],
+                })
+                .collect(),
+            revoked_blocks: revoked,
+        };
+        write_commit_plan(&ctx, space, sb, &plan).unwrap();
+    }
+
+    /// ★ BUG-5/6 crux：tx N 把 home 块 B 作为 metadata journal；tx N+1 revoke B（B 已被复用为
+    /// 数据）。recovery 的 REPLAY 趟必须**跳过** B 的 tx-N 陈旧镜像——不能覆盖已复用的数据块。
+    #[ktest]
+    fn recovery_skips_replay_of_revoked_block() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(10);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+
+        const B: Ext4Fsblk = 100; // home 块 B（>= 64，在 journal 区外）
+        // home 块 B 的「当前数据」= 0x77（复用为数据后的真实内容）。
+        disk.set_block(B as usize, 0x77);
+
+        // tx 10：把 B 作为 metadata 写（陈旧目录/extent 镜像 = 0x11）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 10, vec![(B, 0x11)], vec![]);
+        // tx 11：revoke B（B 被释放并复用为数据）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 11, vec![(150, 0x22)], vec![B]);
+
+        // 复用为数据后，home B 的真实内容（崩溃前已直写 home）。
+        disk.set_block(B as usize, 0x77);
+
+        // 崩溃 + remount：s_start != 0（未 checkpoint），跑 recovery。
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        let result = recover(&ctx, &mut sb).unwrap();
+        assert_eq!(result.transactions_replayed, 2, "both committed txs scanned");
+        assert!(result.revoked_blocks >= 1, "revoke table built from revoke block");
+
+        // ★ B 必须仍是复用后的数据 0x77——tx-10 的陈旧镜像 0x11 被 revoke 跳过，未 replay。
+        assert_eq!(
+            disk.block_first_byte(B as usize),
+            0x77,
+            "revoked block must NOT be overwritten by its stale tx-10 metadata image"
+        );
+        // 非 revoke 的块 150 正常 replay（= 0x22）。
+        assert_eq!(disk.block_first_byte(150), 0x22, "non-revoked block replayed normally");
+    }
+
+    /// BUG-6：一个块在更早事务被 revoke、之后又被**更新**事务重新 journal → 必须 replay 新镜像
+    /// （`is_revoked_as_of` 的 seq 规则：撤销它的 seq < 重放它的 tx seq → 不跳过）。
+    #[ktest]
+    fn recovery_replays_block_rejournaled_after_revoke() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(20);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+
+        const B: Ext4Fsblk = 120;
+        // tx 20：revoke B（B 此时被释放）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 20, vec![(150, 0x01)], vec![B]);
+        // tx 21：B 又被分配为 metadata 并 journal（新镜像 0x33，seq 21 > revoke 的 20）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 21, vec![(B, 0x33)], vec![]);
+
+        disk.set_block(B as usize, 0x00); // home 初值
+
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        recover(&ctx, &mut sb).unwrap();
+
+        // B 的新镜像（tx 21，seq > revoke seq）必须 replay → 0x33（不被 revoke 误跳过）。
+        assert_eq!(
+            disk.block_first_byte(B as usize),
+            0x33,
+            "block re-journaled in a later tx must be replayed (revoke seq < replay tx seq)"
+        );
+    }
+
+    /// BUG-6：sequence 上界——一个序号跳变（非期望下一个 commit ID）的事务即使有合法 commit 块
+    /// 也不被 replay（SCAN 在序号不连续处停）。这里把 tx 30 后**手动**写一个 seq=99 的有效事务，
+    /// 断言它不被 replay。
+    #[ktest]
+    fn recovery_sequence_upper_bound_stops_at_non_consecutive() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(30);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+
+        const B1: Ext4Fsblk = 130;
+        const B2: Ext4Fsblk = 131;
+        // tx 30：合法连续（期望首序号 == s_sequence == 30）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 30, vec![(B1, 0xAA)], vec![]);
+        // tx 99：序号跳变（应被 sequence 上界挡住，不 replay）。
+        commit_tx(&disk, &physical, &mut sb, &mut space, 99, vec![(B2, 0xBB)], vec![]);
+
+        disk.set_block(B1 as usize, 0x00);
+        disk.set_block(B2 as usize, 0x00);
+
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        let result = recover(&ctx, &mut sb).unwrap();
+
+        // 只 replay tx 30（seq==30==期望）；tx 99（seq 跳变）被上界挡住。
+        assert_eq!(result.transactions_replayed, 1, "only the consecutive-sequence tx replayed");
+        assert_eq!(result.last_sequence, Some(30));
+        assert_eq!(disk.block_first_byte(B1 as usize), 0xAA, "consecutive tx replayed");
+        assert_eq!(
+            disk.block_first_byte(B2 as usize),
+            0x00,
+            "sequence-jumped tx NOT replayed (BUG-6 upper bound)"
+        );
+    }
+
+    /// Drive a commit plan out of the in-memory [`JournalRuntime`] (one handle per tx), so the test
+    /// exercises the **real** record_metadata_write / record_revoke data flow, not a hand-built plan.
+    fn commit_runtime_tx(
+        disk: &MemDisk,
+        physical: &[Ext4Fsblk],
+        sb: &mut RawJournalSuperblock,
+        space: &mut JournalSpace,
+        rt: &mut JournalRuntime,
+        metadata: &[(Ext4Fsblk, u8)],
+        revoked: &[Ext4Fsblk],
+    ) {
+        let h = rt.start_handle(1).expect("start handle");
+        for (block, fill) in metadata {
+            rt.record_metadata_write(h, *block, &alloc::vec![*fill; BS]);
+        }
+        // Free-path trigger: the integration's `record_journaled_metadata_freed` lands here.
+        for block in revoked {
+            rt.record_revoke(*block);
+        }
+        rt.stop_handle(h);
+        let plan = rt.prepare_commit().expect("prepare commit");
+        let ctx = CommitCtx {
+            physical_blocks: physical,
+            writer: disk,
+            barrier: None,
+            handle_id: 0,
+            block_size: BS,
+        };
+        write_commit_plan(&ctx, space, sb, &plan).unwrap();
+        rt.finish_commit(plan.tid);
+    }
+
+    /// ★ BUG-5 free-path trigger end-to-end through the runtime: a metadata block B is journaled in
+    /// tx N; in tx N+1 the integration FREES B and records a revoke via `JournalRuntime::record_revoke`
+    /// (the seam the new `MetadataWriter::record_journaled_metadata_freed` drives). On crash + recovery
+    /// the REPLAY pass must SKIP B's stale tx-N image (B has been freed/reused), and a later re-journal
+    /// of B (tx N+2, seq > revoke seq) must replay normally.
+    #[ktest]
+    fn recovery_free_path_revoke_skips_then_rejournal_replays() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(1);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+        // Runtime first_tid must match the journal SB's first sequence so plan.tid == descriptor seq.
+        let mut rt = JournalRuntime::new(BS, 1);
+
+        const B: Ext4Fsblk = 110; // home block B (>= 64, outside journal area)
+
+        // tx 1: B journaled as metadata (stale tree/dir image 0x11).
+        commit_runtime_tx(&disk, &physical, &mut sb, &mut space, &mut rt, &[(B, 0x11)], &[]);
+        // tx 2: B is FREED → record_revoke(B). (Also touch an unrelated block so the tx is non-empty.)
+        commit_runtime_tx(&disk, &physical, &mut sb, &mut space, &mut rt, &[(160, 0x22)], &[B]);
+
+        // After the free, B's home holds the reused content (e.g. freshly written file data 0x77).
+        disk.set_block(B as usize, 0x77);
+
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        let result = recover(&ctx, &mut sb).unwrap();
+        assert_eq!(result.transactions_replayed, 2, "both runtime-committed txs scanned");
+        assert!(result.revoked_blocks >= 1, "revoke persisted from the free-path record_revoke");
+        // ★ B keeps the reused content — its tx-1 stale image was revoked and skipped on replay.
+        assert_eq!(
+            disk.block_first_byte(B as usize),
+            0x77,
+            "freed+reused block must NOT be overwritten by its stale tx-1 metadata image"
+        );
+
+        // Now re-journal B as fresh metadata in a later tx (seq 3 > revoke seq 2) and crash again.
+        // Reset s_start so recovery runs over the new window only.
+        let mut sb2 = sb;
+        let mut space2 = JournalSpace::from_superblock(&sb2).unwrap();
+        commit_runtime_tx(&disk, &physical, &mut sb2, &mut space2, &mut rt, &[(B, 0x33)], &[]);
+        disk.set_block(B as usize, 0x00);
+        let ctx2 = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        recover(&ctx2, &mut sb2).unwrap();
+        // B re-journaled in a later tx (seq > the revoke's seq) must be replayed (cancel/seq rule).
+        assert_eq!(
+            disk.block_first_byte(B as usize),
+            0x33,
+            "block re-journaled after the revoke (higher seq) must be replayed"
+        );
+    }
 }

@@ -329,11 +329,34 @@ impl CoreJournalDriver {
         None
     }
 
-    /// Drop the in-memory checkpoint image of a metadata block being rewritten in place (the data
-    /// path is about to home-write it directly, so its stale journaled image must not overlay).
-    /// PARITY: ext4_rs `revoke_checkpoint_metadata_block` (BUG-5: in-memory only — never writes a
-    /// JBD2 revoke block; replicated to keep byte-frozen behavior). Returns count removed.
+    /// A **journaled metadata** block is being FREED (Task 8 / BUG-5, Linux `ext4_forget` model):
+    /// driven from core's metadata-block free sites (extent-tree index/leaf blocks via
+    /// `ext_remove_index_block`; directory data blocks via `ext_remove_blocks` when the inode is a
+    /// directory) through `MetadataWriter::record_journaled_metadata_freed`. The block may later be
+    /// reused (e.g. as file data). Two things must happen so a later crash + replay does not write
+    /// the stale journaled metadata image over the new content:
+    ///
+    /// 1. **In-memory (no-crash) coherency**: drop the block's image from the in-memory
+    ///    `checkpoint_list` so the read overlay never returns the stale image, and so a later
+    ///    checkpoint home-write does not write it back to the (now-freed/reused) home block.
+    /// 2. **On-disk (crash) coherency — BUG-5 fix**: record the block as **revoked** in the current
+    ///    running transaction (the tx performing the free) so its commit persists a
+    ///    `JBD2_REVOKE_BLOCK` carrying that tx's sequence. Recovery's REPLAY pass then skips any
+    ///    *earlier-or-equal-sequence* journaled image of this block (BUG-6 sequence rule), and
+    ///    replays a *later* re-journaled image normally.
+    ///
+    /// NOTE (trigger side, Task 8): this is now called on the **free** path, NOT on the file-write/
+    /// reuse path. Regular-file data blocks are never journaled, so freeing them records no revoke —
+    /// no per-data-block revoke write-amplification.
+    ///
+    /// [对照] Linux `jbd2_journal_revoke` (record the revoke on the running transaction) +
+    /// `__jbd2_journal_unfile_buffer` (drop stale buffers). Returns the count of checkpoint
+    /// transactions the block's image was dropped from.
     pub(super) fn revoke_checkpoint_metadata_block(&mut self, block_nr: u64) -> usize {
+        // BUG-5 fix: persist the revoke by recording it on the running transaction; it commits as a
+        // JBD2_REVOKE_BLOCK ahead of that transaction's commit block.
+        self.runtime.record_revoke(block_nr);
+        // In-memory coherency: drop the stale image from any parked checkpoint transaction.
         let mut revoked = 0usize;
         for entry in self.checkpoint_list.iter_mut() {
             let before = entry.metadata_blocks.len();
@@ -350,10 +373,13 @@ impl CoreJournalDriver {
     // =====================================================================================
 
     pub(super) fn commit_ready(&self) -> bool {
+        // BUG-5 fix: a revoke-only transaction (no metadata buffers, only revokes) is still
+        // commit-ready — it must commit to persist its JBD2_REVOKE_BLOCK. Gate on the combined
+        // pending count (metadata + revoke) rather than metadata alone.
         if self
             .runtime
             .prev_running_transaction()
-            .is_some_and(|t| t.handle_count() == 0 && t.modified_block_count() != 0)
+            .is_some_and(|t| t.handle_count() == 0 && t.pending_block_count() != 0)
         {
             return true;
         }
@@ -362,7 +388,7 @@ impl CoreJournalDriver {
         }
         self.runtime
             .running_transaction()
-            .is_some_and(|t| t.handle_count() == 0 && t.modified_block_count() != 0)
+            .is_some_and(|t| t.handle_count() == 0 && t.pending_block_count() != 0)
     }
 
     pub(super) fn batch_commit_ready(&self, threshold_blocks: u32) -> bool {
@@ -506,6 +532,16 @@ impl CoreJournalDriver {
     /// of `committing` into running/prev_running so it retries. PARITY: ext4_rs `abort_commit`.
     pub(super) fn abort_commit(&mut self, tid: u32) {
         self.runtime.abort_commit(tid);
+    }
+
+    /// BUG-7 fix: abort (discard) the transaction `tid` because a journaled op errored mid-handle.
+    /// Its accumulated uncommitted metadata + revokes are dropped — never committed — so partial /
+    /// inconsistent metadata from the failed op cannot reach disk. The caller (`finish_jbd2_handle`
+    /// on `succeeded == false`) also shuts the FS down (read-only), matching Linux `jbd2_journal_abort`.
+    /// Returns true if a transaction was discarded. Also drops the per-tid trigger_op bookkeeping.
+    pub(super) fn abort_transaction(&mut self, tid: u32) -> bool {
+        self.trigger_op_by_tid.remove(&tid);
+        self.runtime.abort_transaction(tid)
     }
 
     // =====================================================================================

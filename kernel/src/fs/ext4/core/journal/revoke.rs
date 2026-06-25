@@ -253,9 +253,9 @@ impl RevokeRuntime {
 ///
 /// `raw` 是一整个 journal 块的字节（长度 >= block_size）。`is_64bit` = journal SB 是否带
 /// `JBD2_FEATURE_INCOMPAT_64BIT`（决定每条 revoke 记录是 8B 还是 4B 块号）。块不是合法 revoke
-/// 块（magic 错 / blocktype != 5 / count 越界）时**静默不动**（与 ext4_rs 防御一致）。
+/// 块（magic 错 / blocktype != 5 / count 越界）时**静默不动**（防御坏块不 panic）。
 ///
-/// PARITY: ext4_rs `Jbd2Journal::parse_revoke_entries`（recovery.rs:207-230）逐字复刻：
+/// [对照] Linux `scan_revoke_records`：
 /// - `raw.len() < size_of::<RevokeBlockHeader>()`（16）→ 返回；
 /// - 读 16B header，`used = header.count()`（已用字节数，**含 16B 头**，大端）；
 /// - `used < 16 || used > raw.len()` → 返回（防御越界 count）；
@@ -263,37 +263,66 @@ impl RevokeRuntime {
 /// - 从 offset=16 起，`while offset + entry_size <= used`：读大端块号（8B→u64 / 4B→u32 as u64）、
 ///   `insert`、`offset += entry_size`。
 ///
-/// 调用方（Task 5 的 REVOKE 趟）须先经块头 `blocktype() == JBD2_REVOKE_BLOCK` 门控再调本函数；
+/// 调用方（recovery 的 REVOKE 趟）须先经块头 `blocktype() == JBD2_REVOKE_BLOCK` 门控再调本函数；
 /// 本函数自身也再校验一遍 magic + blocktype，双重防御坏块不 panic。
 pub(in crate::fs::ext4::core) fn parse_revoke_block(
     raw: &[u8],
     is_64bit: bool,
     revoked: &mut BTreeSet<Ext4Fsblk>,
 ) {
-    // PARITY: recovery.rs:208-210 —— 不足一个 header 即返回。
+    for_each_revoke_record(raw, is_64bit, |block_nr| {
+        revoked.insert(block_nr);
+    });
+}
+
+/// 同 [`parse_revoke_block`]，但把每条块号连同**该 revoke 块自身的 sequence**记进 [`RevokeTable`]
+/// （block → 撤销它的最高 sequence）。BUG-6 fix 的 recovery REVOKE 趟用它建带序列号的 revoke 表，
+/// REPLAY 趟据「撤销它的 seq >= 重放它的 tx seq」规则跳过（见 [`RevokeTable::is_revoked_as_of`]）。
+///
+/// [对照] Linux `jbd2_journal_revoke_records` 用 revoke 块头的 `r_header.h_sequence` 作为该批
+/// revoke 记录的事务序号填入 `jbd2_revoke_record_s::sequence`；恢复时 `jbd2_journal_test_revoke`
+/// 按 `record->sequence >= sequence`（待重放事务）判跳过。
+pub(in crate::fs::ext4::core) fn parse_revoke_block_into_table(
+    raw: &[u8],
+    is_64bit: bool,
+    table: &mut RevokeTable,
+) {
+    // 块头的 sequence 即这批 revoke 记录的事务序号。
     if raw.len() < size_of::<RawRevokeBlockHeader>() {
         return;
     }
     let header = RawRevokeBlockHeader::from_bytes(&raw[..size_of::<RawRevokeBlockHeader>()]);
-    // 双重防御：magic + blocktype（ext4_rs 调用方在 recovery.rs:192-194 已门控，这里再校验）。
+    let sequence = header.header().sequence();
+    for_each_revoke_record(raw, is_64bit, |block_nr| {
+        table.record(block_nr, sequence);
+    });
+}
+
+/// 内部：逐条解析一个 revoke 块的块号，对每条调 `f`。坏块（magic/type/count）静默不动。
+fn for_each_revoke_record(raw: &[u8], is_64bit: bool, mut f: impl FnMut(Ext4Fsblk)) {
+    // 不足一个 header 即返回。
+    if raw.len() < size_of::<RawRevokeBlockHeader>() {
+        return;
+    }
+    let header = RawRevokeBlockHeader::from_bytes(&raw[..size_of::<RawRevokeBlockHeader>()]);
+    // 双重防御：magic + blocktype。
     if !header.header().is_valid_magic() || header.header().blocktype() != JBD2_REVOKE_BLOCK {
         return;
     }
 
-    // PARITY: recovery.rs:212-215 —— used = count()（含 16B 头）；越界即返回。
+    // used = count()（含 16B 头）；越界即返回。
     let used = header.count() as usize;
     if used < size_of::<RawRevokeBlockHeader>() || used > raw.len() {
         return;
     }
 
-    // PARITY: recovery.rs:217 —— entry_size = blocknr_size()（64BIT→8 / 否则 4）。
     let entry_size = if is_64bit {
         size_of::<u64>()
     } else {
         size_of::<u32>()
     };
 
-    // PARITY: recovery.rs:218-229 —— 从 16 起逐条读大端块号。
+    // 从 16 起逐条读大端块号。
     let mut offset = size_of::<RawRevokeBlockHeader>();
     while offset + entry_size <= used {
         let block_nr = if entry_size == size_of::<u64>() {
@@ -305,7 +334,7 @@ pub(in crate::fs::ext4::core) fn parse_revoke_block(
             bytes.copy_from_slice(&raw[offset..offset + 4]);
             u32::from_be_bytes(bytes) as u64
         };
-        revoked.insert(block_nr);
+        f(block_nr);
         offset += entry_size;
     }
 }

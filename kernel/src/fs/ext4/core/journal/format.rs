@@ -299,6 +299,15 @@ pub(super) struct RawRevokeBlockHeader {
 const_assert!(size_of::<RawRevokeBlockHeader>() == 16);
 
 impl RawRevokeBlockHeader {
+    /// 构造大端 revoke 块头：`blocktype = JBD2_REVOKE_BLOCK(5)`、给定 `sequence`、`r_count = used`
+    /// （已用字节数，**含 16B 头**，大端）。
+    /// [对照] Linux `jbd2_journal_write_revoke_records` 写 `r_header`（type=REVOKE、seq）+ `r_count`。
+    pub fn new(sequence: u32, used: u32) -> Self {
+        Self {
+            r_header: RawJournalHeader::new(JBD2_REVOKE_BLOCK, sequence),
+            r_count: used.to_be(),
+        }
+    }
     pub fn header(&self) -> RawJournalHeader {
         self.r_header
     }

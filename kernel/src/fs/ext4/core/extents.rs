@@ -1648,6 +1648,12 @@ fn ext_remove_index_block(
 ) -> Result<()> {
     let block_to_free = index.leaf();
     alloc.free_blocks(inode, block_to_free, 1);
+    // BUG-5 fix（Linux `ext4_forget` 模型）：extent 树的 index/leaf 块**是** journaled 元数据
+    //   （经 `MetadataWriter` 写盘、进 JBD2）。它被释放后可能被复用为别的块（含文件数据）——必须在
+    //   本事务记一条 revoke，使 commit 持久化 `JBD2_REVOKE_BLOCK`，recovery 跳过任何更早 sequence
+    //   对该块的陈旧 tree-block 镜像（不会用旧 extent/index 节点覆盖复用后的内容）。**总是** revoke
+    //   （tree 块无条件 journaled，与 inode 类型无关）。
+    ctx.writer.record_journaled_metadata_freed(block_to_free);
     // PARITY: 与 `ext_remove_blocks` 同理——ext4_rs `balloc_free_blocks` 在释放后立即
     //   write_back_inode 落 i_blocks。core `balloc_free_blocks` 不落盘，故此处补写回，
     //   使 index 块释放的 i_blocks 递减也持久化（否则根塌路径会丢这次落盘）。
@@ -1785,6 +1791,21 @@ fn ext_remove_blocks(
         return Ok(());
     }
     alloc.free_blocks(inode, start as Ext4Fsblk, len);
+    // BUG-5 fix（Linux `ext4_forget` 模型）：这里释放的是 extent **指向的"数据"块**。是否 journaled
+    //   元数据，取决于 inode 类型：
+    //   - **目录** inode 的"数据"块在 ext4 里是元数据（dir 块经 `MetadataWriter` 进 JBD2，见
+    //     `core/dir.rs::write_dir_block`）。rmdir / 目录截断释放它们后，块可被复用为别的用途——必须
+    //     revoke，防 recovery 用陈旧目录块镜像覆盖复用后的内容（A-1 块复用损坏）。
+    //   - **普通文件** 的数据块**不**经 journal（走 data_writer，ordered/writeback 模式），故释放它们
+    //     **绝不** revoke——否则每个被删的文件数据块都进 revoke 块（写放大 + 误占 journal 环空间）。
+    //   [对照] Linux `ext4_free_blocks` 的 `metadata` 标志：目录块走 `ext4_forget(.., is_metadata=1)`
+    //   → revoke；常规文件数据块 `is_metadata=0` → 不 revoke。
+    if inode.is_dir() {
+        for i in 0..len {
+            ctx.writer
+                .record_journaled_metadata_freed((start as Ext4Fsblk).saturating_add(i as u64));
+        }
+    }
     // PARITY: ext4_rs `balloc_free_blocks`（balloc.rs:684-687）在每次释放后**立即**
     //   `write_back_inode`（落 i_blocks 到 inode 表）。core 的 `balloc_free_blocks` 只在
     //   `InodeAllocCtx` 内累减、刻意不落盘（Phase-2 设计），故必须在此把递减后的 i_blocks
@@ -1823,9 +1844,13 @@ mod test {
     // ------------------------------------------------------------------
 
     /// 内存盘：读/数据写/元数据写都打到同一份字节（块号 * 块大小）。
+    /// `revoked` 记录 [`MetadataWriter::record_journaled_metadata_freed`] 被调到的块号——
+    /// Task 8 用它验证 BUG-5 free-path revoke trigger 的门控（tree 块总 revoke；目录数据块 revoke；
+    /// 普通文件数据块不 revoke）。
     struct MemImage {
         bytes: RefCell<Vec<u8>>,
         block_size: usize,
+        revoked: RefCell<Vec<Ext4Fsblk>>,
     }
     impl MemImage {
         fn new(seed: &[u8]) -> Self {
@@ -1833,7 +1858,12 @@ mod test {
             MemImage {
                 bytes: RefCell::new(seed.to_vec()),
                 block_size: sb.block_size(),
+                revoked: RefCell::new(Vec::new()),
             }
+        }
+        /// 被记为 journaled-metadata-freed 的块号（按出现序）。
+        fn revoked_blocks(&self) -> Vec<Ext4Fsblk> {
+            self.revoked.borrow().clone()
         }
     }
     impl BlockReader for MemImage {
@@ -1863,6 +1893,9 @@ mod test {
         ) -> Result<()> {
             self.write_at(block as usize * self.block_size, data);
             Ok(())
+        }
+        fn record_journaled_metadata_freed(&self, block: Ext4Fsblk) {
+            self.revoked.borrow_mut().push(block);
         }
     }
 
@@ -2057,6 +2090,139 @@ mod test {
         assert_eq!(freed.len(), 6, "expected exactly 6 freed blocks, got {:?}", freed);
         // i_blocks 归零（无超额递减 / 无下溢 panic）。
         assert_eq!(inode.blocks_count(), 0, "i_blocks must reach 0 after full clear");
+    }
+
+    /// 在镜像上手搓一棵 depth=1、两叶各 2 单块 extent 的树，inode `ino` 的 mode = `mode`。
+    /// 返回 (leaf0, leaf1, [d0..d3]) 物理块号，供 free-path revoke 门控测试断言。
+    #[allow(clippy::type_complexity)]
+    fn build_depth1_tree(
+        disk: &MemImage,
+        sb: &RawSuperblock,
+        ino: u32,
+        mode: u16,
+        l0: Ext4Fsblk,
+        l1: Ext4Fsblk,
+        data: [Ext4Fsblk; 4],
+    ) {
+        let bs = sb.block_size();
+        let [d0, d1, d2, d3] = data;
+
+        let mut leaf0 = vec![0u8; bs];
+        leaf0[..12].copy_from_slice(
+            RawExtentHeader::new(EXTENT_MAGIC, 2, ((bs - 12) / 12) as u16, 0, 0).as_bytes(),
+        );
+        let mut e = RawExtent::default();
+        e.first_block = 0;
+        e.block_count = 1;
+        e.store_pblock(d0);
+        put_item(&mut leaf0, 0, e.as_bytes().try_into().unwrap());
+        e.first_block = 1;
+        e.store_pblock(d1);
+        put_item(&mut leaf0, 1, e.as_bytes().try_into().unwrap());
+        disk.write_metadata_for_handle(0, l0, &leaf0).unwrap();
+
+        let mut leaf1 = vec![0u8; bs];
+        leaf1[..12].copy_from_slice(
+            RawExtentHeader::new(EXTENT_MAGIC, 2, ((bs - 12) / 12) as u16, 0, 0).as_bytes(),
+        );
+        e.first_block = 2;
+        e.block_count = 1;
+        e.store_pblock(d2);
+        put_item(&mut leaf1, 0, e.as_bytes().try_into().unwrap());
+        e.first_block = 3;
+        e.store_pblock(d3);
+        put_item(&mut leaf1, 1, e.as_bytes().try_into().unwrap());
+        disk.write_metadata_for_handle(0, l1, &leaf1).unwrap();
+
+        let mut iblock = [0u8; 60];
+        iblock[..12].copy_from_slice(RawExtentHeader::new(EXTENT_MAGIC, 2, 4, 1, 0).as_bytes());
+        let mut idx = RawExtentIndex::default();
+        idx.first_block = 0;
+        idx.store_pblock(l0);
+        iblock[12..24].copy_from_slice(idx.as_bytes());
+        idx.first_block = 2;
+        idx.store_pblock(l1);
+        iblock[24..36].copy_from_slice(idx.as_bytes());
+
+        let off = inode_off(EXT4_IMAGE, sb, ino);
+        let mut raw =
+            crate::fs::ext4::core::inode::RawInode::from_bytes(&EXT4_IMAGE[off..off + 156]);
+        raw.set_flags(EXT4_INODE_FLAG_EXTENTS);
+        raw.set_mode(mode);
+        raw.set_size(4 * bs as u64);
+        let block: [u32; 15] = Pod::from_bytes(&iblock);
+        raw.block = block;
+        disk.write_at(off, raw.as_bytes());
+        let mut inode = crate::fs::ext4::core::inode::load_inode(disk, sb, ino).unwrap();
+        inode.set_blocks_count(6 * (bs as u64 / 512)); // 4 data + 2 leaf
+        disk.write_at(off, inode.raw.as_bytes());
+    }
+
+    /// ★ BUG-5 free-path revoke trigger（Task 8）—— **普通文件**清树：extent **树块**（两叶）
+    /// 是 journaled 元数据 → 必须 revoke；extent 指向的 **数据块** 不经 journal → **绝不** revoke。
+    #[ktest]
+    fn remove_space_revokes_tree_blocks_not_file_data() {
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let ino = 13u32;
+        let (l0, l1) = (6000u64, 6001u64);
+        let data = [6002u64, 6003, 6004, 6005];
+        build_depth1_tree(&disk, &sb, ino, 0x8000 /* S_IFREG */, l0, l1, data);
+
+        let mut inode = crate::fs::ext4::core::inode::load_inode(&disk, &sb, ino).unwrap();
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = LogAlloc::new(sb.block_size());
+        extent_remove_space(&ctx, &mut alloc, &mut inode, 0, u32::MAX).unwrap();
+
+        // 全部 6 块被释放（盘面回收正确，与既有 depth1 测试一致）。
+        let freed = alloc.freed_blocks();
+        assert_eq!(freed.len(), 6, "all 6 blocks freed: {:?}", freed);
+
+        // revoke 集合 == 恰两个**叶/树块**，不含任何数据块。
+        let mut revoked = disk.revoked_blocks();
+        revoked.sort_unstable();
+        assert_eq!(
+            revoked,
+            alloc::vec![l0, l1],
+            "file: only extent tree blocks revoked, never the file data blocks ({:?})",
+            disk.revoked_blocks()
+        );
+        for d in data {
+            assert!(
+                !disk.revoked_blocks().contains(&d),
+                "regular-file data block {} must NOT be revoked (not journaled)",
+                d
+            );
+        }
+    }
+
+    /// ★ BUG-5 free-path revoke trigger（Task 8）—— **目录**清树（rmdir/dir-truncate 路径）：目录
+    /// 数据块在 ext4 里**是**元数据（经 MetadataWriter 进 JBD2）→ 与 extent 树块一并 revoke。
+    #[ktest]
+    fn remove_space_revokes_dir_data_blocks_and_tree_blocks() {
+        let disk = MemImage::new(EXT4_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        let ino = 14u32;
+        let (l0, l1) = (6100u64, 6101u64);
+        let data = [6102u64, 6103, 6104, 6105];
+        build_depth1_tree(&disk, &sb, ino, 0x4000 /* S_IFDIR */, l0, l1, data);
+
+        let mut inode = crate::fs::ext4::core::inode::load_inode(&disk, &sb, ino).unwrap();
+        assert!(inode.is_dir(), "fixture inode must be a directory");
+        let ctx = WriteCtx::new(&disk, &disk, &disk, &sb);
+        let mut alloc = LogAlloc::new(sb.block_size());
+        extent_remove_space(&ctx, &mut alloc, &mut inode, 0, u32::MAX).unwrap();
+
+        // 目录：两叶（树块）+ 四数据块全部 revoke（dir 数据块是 journaled 元数据）。
+        let mut revoked = disk.revoked_blocks();
+        revoked.sort_unstable();
+        let mut want = alloc::vec![l0, l1, data[0], data[1], data[2], data[3]];
+        want.sort_unstable();
+        assert_eq!(
+            revoked, want,
+            "directory: extent tree blocks AND directory data blocks all revoked ({:?})",
+            disk.revoked_blocks()
+        );
     }
 
     #[ktest]
