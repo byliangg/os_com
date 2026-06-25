@@ -8,7 +8,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "kernel/libs/ext4_rs",
     "osdk/deps/frame-allocator",
     "osdk/deps/heap-allocator",
     "osdk/deps/test-kernel",
@@ -135,7 +134,6 @@ controlled = { path = "kernel/libs/comp-sys/controlled" }
 # Crates under osdk/deps
 osdk-frame-allocator = { path = "osdk/deps/frame-allocator" }
 osdk-heap-allocator = { path = "osdk/deps/heap-allocator" }
-ext4_rs = { path = "kernel/libs/ext4_rs" }
 
 # External dependencies only for unsafe crates (i.e., crates under ostd directory)
 bit_field = "0.10.1"
