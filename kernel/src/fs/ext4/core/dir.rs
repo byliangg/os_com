@@ -2192,6 +2192,10 @@ mod test {
         let base_sb = read_sb(&disk);
         let base_free_inodes = base_sb.free_inodes_count();
         let base_free_blocks = base_sb.free_blocks_count();
+        // used_dirs baseline must be sampled BEFORE mkdir, from the SAME group the test dir will land
+        // in. The new dir lands in group 0 alongside root (ino 2), so root's group descriptor is the
+        // right pre-mkdir reference (sampling after mkdir would already include its +1 → N==N+1).
+        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, 2);
 
         let mut sb = base_sb;
         let ino = {
@@ -2200,12 +2204,13 @@ mod test {
             sb = *nctx.superblock();
             ino
         };
-        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, ino);
         assert!(inode_bit_set(&disk, &sb, ino), "new dir inode bit set");
+        // ialloc bumps used_dirs_count for directory allocations.
+        let used_dirs_after_mkdir = used_dirs_of_inode(&disk, &sb, ino);
         assert_eq!(
-            used_dirs_of_inode(&disk, &sb, ino),
+            used_dirs_after_mkdir,
             base_used_dirs + 1,
-            "mkdir must bump used_dirs_count"
+            "mkdir must bump used_dirs_count (and the test dir must land in group 0 with root)"
         );
         assert!(
             sb.free_blocks_count() < base_free_blocks,
@@ -2228,8 +2233,13 @@ mod test {
         assert_ne!(freed.raw.dtime, 0, "freed dir inode must have i_dtime set");
         assert_eq!(
             used_dirs_of_inode(&disk, &sb, ino),
+            used_dirs_after_mkdir - 1,
+            "rmdir must decrement used_dirs_count by 1 (back to the pre-mkdir baseline)"
+        );
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
             base_used_dirs,
-            "rmdir must decrement used_dirs_count back to baseline"
+            "used_dirs_count back to the pre-mkdir baseline after rmdir"
         );
         assert_eq!(
             sb.free_inodes_count(),
@@ -2254,6 +2264,9 @@ mod test {
         let base_sb = read_sb(&disk);
         let base_free_inodes = base_sb.free_inodes_count();
         let base_free_blocks = base_sb.free_blocks_count();
+        // used_dirs baseline sampled BEFORE mkdir from root's group (group 0), where the new dir lands
+        // — sampling after mkdir would already include its +1.
+        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, 2);
 
         // mkdir_unchecked_at returns (ino, real dir-entry byte offset) — exactly what the integration
         // caches and feeds to rmdir_at_fast.
@@ -2264,12 +2277,12 @@ mod test {
             sb = *nctx.superblock();
             r
         };
-        let base_used_dirs = used_dirs_of_inode(&disk, &base_sb, ino);
         assert!(inode_bit_set(&disk, &sb, ino), "new dir inode bit set");
+        let used_dirs_after_mkdir = used_dirs_of_inode(&disk, &sb, ino);
         assert_eq!(
-            used_dirs_of_inode(&disk, &sb, ino),
+            used_dirs_after_mkdir,
             base_used_dirs + 1,
-            "mkdir must bump used_dirs_count"
+            "mkdir must bump used_dirs_count (and the test dir must land in group 0 with root)"
         );
         assert!(
             sb.free_blocks_count() < base_free_blocks,
@@ -2292,8 +2305,13 @@ mod test {
         assert_ne!(freed.raw.dtime, 0, "freed dir inode must have i_dtime set");
         assert_eq!(
             used_dirs_of_inode(&disk, &sb, ino),
+            used_dirs_after_mkdir - 1,
+            "rmdir_at_fast must decrement used_dirs_count by 1 (back to the pre-mkdir baseline)"
+        );
+        assert_eq!(
+            used_dirs_of_inode(&disk, &sb, ino),
             base_used_dirs,
-            "rmdir_at_fast must decrement used_dirs_count back to baseline"
+            "used_dirs_count back to the pre-mkdir baseline after rmdir_at_fast"
         );
         assert_eq!(
             sb.free_inodes_count(),
