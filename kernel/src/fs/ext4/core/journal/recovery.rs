@@ -259,61 +259,54 @@ fn read_header(raw: &[u8]) -> Option<RawJournalHeader> {
     header.is_valid_magic().then_some(header)
 }
 
-/// SCAN：从 `s_start` 起逐事务读，直到第一个无效 / 缺失 commit 或回到 `head`。
-/// PARITY: ext4_rs `scan_committed_transactions`（recovery.rs:93-126）逐字复刻。
+/// SCAN：从 `s_start` 起逐事务读，直到第一个**序号不连续 / 无效 / 缺失 commit** 的块。
+/// [对照] Linux `do_one_pass`：终止条件是 `sequence != next_commit_ID` 或块无效——**不**靠
+/// 存储的 head 指针收口（见下方 over-replay 论证）。
 fn scan_committed_transactions(
     ctx: &RecoverCtx<'_>,
     sb: &RawJournalSuperblock,
     space: &JournalSpace,
 ) -> Result<Vec<RecoveryTransaction>> {
-    // PARITY: recovery.rs:97-100 —— start==0 早返（needs_recovery 已挡，这里防御）。
+    // start==0 早返（needs_recovery 已挡，这里防御）。
     let start = sb.start();
     if start == 0 {
         return Ok(Vec::new());
     }
 
-    // head: s_head==0 时退回 start。
-    let head = if sb.head() == 0 { start } else { sb.head() };
     let mut cursor = start;
     let mut walked_blocks = 0u32;
     let mut transactions = Vec::new();
+    // `max_walk` = 环可用块数，仅作**死循环软护栏**（绝不能比环还长），**不是**正确性终止条件。
     let max_walk = space.usable_blocks().max(1);
 
-    // BUG-6 fix（sequence 上界）：[对照] Linux `do_one_pass` 维护 `next_commit_ID`，要求每个有效
-    // 事务的 descriptor.sequence == `next_commit_ID`，逐事务 +1；序号不连续即停。SCAN 从 log tail
-    // （`s_start`）起，**第一个**事务的序号即基线，其后严格 +1。
+    // 终止条件（[对照] Linux `do_one_pass`）：逐事务 `try_read_committed_transaction` 返回有效已 commit
+    // 事务、且其序号 == 期望的下一个 commit ID（首事务确立基线，其后严格 +1）。第一个**非连续** /
+    // **无效 / 缺 commit** 的块即停。
     //
-    // **基线锚定与上界（Concern #4 — 论证为什么用「首事务基线 + 严格 +1 + head 收口」而 **不** 叠
-    // `s_sequence` 显式上界）**：
+    // **为何 **不能** 用存储的 `s_head`（`s_sequence` 同款 under-replay 漏洞，本次修复）**：commit 写序
+    // 里 commit 块写完后**没有第二道屏障**（commit.rs 唯一屏障在 descriptor/payload→commit 之间；commit
+    // 块、SB 的 `s_head`/`s_sequence` 写、ring advance 都在屏障**之后**、彼此无序）。崩溃可能落在「最后
+    // 一笔事务 L 的 commit 块已持久、推进 `s_head` 的 SB 写丢失」之间——此时盘上 `s_head` **滞后一笔**，
+    // 指向 L 的起点而非 L 之后。旧码 `cursor == head` 硬停会在读 L **之前**停下 → 真正已 commit 的 L 不
+    // replay = 丢元数据 = 损坏（与已删的 `s_sequence` 上界同类）。故 `s_head` 不作终止条件。
     //
-    // 1. on-disk 语义：commit 后 `s_sequence = 已 commit 的最高 seq + 1`（commit.rs `set_sequence`），
-    //    `s_start` 只在 journal 由空转非空时置成首事务环起点（commit.rs `set_start`），`s_head = next_head`。
-    //    `s_start` 只被 recovery / checkpoint 清/推——故 `s_start` 始终指向一个真实已 commit 的、最老
-    //    未 checkpoint 事务的首块（权威 tail 指针），SCAN 由此锚定到一个真正落盘的事务，不是残留。
-    //
-    // 2. **为何不能用 `s_sequence` 作严格上界（关键安全论证）**：commit 写序里 **commit 块写完后没有
-    //    第二道屏障**（commit.rs：唯一屏障在 descriptor/payload→commit 之间；commit 块、`s_sequence`
-    //    的 SB 写、ring advance 都在屏障**之后**、彼此无序）。崩溃可能落在「commit 块已持久、SB 的
-    //    `s_sequence` 写丢失」之间——此时盘上 `s_sequence` 比真实最后一个已 commit 事务**滞后一笔**：
-    //    一个**真正已 commit** 的事务 L 其 `seq == 盘上 s_sequence`（上一笔 L-1 把它设成 L）。若叠
-    //    `seq >= s_sequence` 上界，会把这笔合法已 commit 事务**误丢**（under-replay = 元数据丢失 =
-    //    损坏）。故 `s_sequence` 不是可靠的严格上界，**不**叠它。
-    //
-    // 3. **over-replay 由 head 收口 + 严格连续校验封死，无需 `s_sequence`**：replay 窗口是
-    //    `[s_start, head)`，`head` 紧跟最后一个已 commit 事务之后（commit 把 `s_head = next_head`）。
-    //    SCAN 沿 `cursor = tx.next_head` 前进，`cursor == head` 即停（line below）——绝不读 `head`
-    //    之后的陈旧回绕内容（那才是"残留"所在）。窗口内若有半写/撕裂事务，commit-magic/type/seq
-    //    校验（`try_read_committed_transaction`）或严格 +1 连续校验在第一处不连续即停。两者合起来
-    //    把 over-replay 完全封死：陈旧回绕残骸物理上在 `head` 之后、不被扫到；窗口内异常被连续校验
-    //    挡住。故安全上界 = head 收口 + 严格连续，`s_sequence` 显式上界是冗余且不安全的（见 #2）。
+    // **over-replay 边界（关键安全论证——无 head 收口时什么挡住越界 replay）**：日志序号**全局单调、
+    // 永不复用**。活动窗口 `[s_start, head_true)` 持最近、序号最高的事务。越过真实末事务 M 之后，
+    // `cursor` 落进 free 区，那里的块只能是：(a) 从未写过 → 全零 → `read_header` magic 校验失败 →
+    // `try_read` 返回 None → 停；或 (b) **前一轮回绕**写下的陈旧事务 → 它写于更早一轮，序号必 **< M+1**
+    // （M+1 是下一个待分配序号，尚未存在；任何已落盘块只能携带历史上某个 <= M 的序号）→ 严格连续校验
+    // `seq != expected(M+1)` 命中 → 停。唯一能在 `cursor` 处出现序号 == M+1 的块，是 M+1 **真被 commit**
+    // 过——那本就该 replay（正是 stale-head 会误丢的真实事务）。序号按**值**比较，与环位置 / 回绕无关
+    // （`space.advance` 只算物理块号，不动序号）→ 回绕场景同样成立。故 strict-consecutive + commit 有效性
+    // **充分**封死 over-replay，无需 head。
     let mut next_commit_id: Option<u32> = None;
 
-    // 逐事务读，advance/cursor/head 收口（叠加 sequence 严格连续上界）。
+    // 逐事务读；终止 = 序号不连续 / 无效 / 缺 commit。`max_walk` 仅防死循环（软护栏）。
     while walked_blocks < max_walk {
         let Some(transaction) = try_read_committed_transaction(ctx, sb, space, cursor)? else {
             break;
         };
-        // BUG-6 fix：序号必须严格等于期望的下一个 commit ID（第一个事务确立基线），否则停。
+        // 序号必须严格等于期望的下一个 commit ID（首事务确立基线），否则停。
         match next_commit_id {
             None => next_commit_id = Some(transaction.sequence.wrapping_add(1)),
             Some(expected) => {
@@ -323,15 +316,13 @@ fn scan_committed_transactions(
                 next_commit_id = Some(expected.wrapping_add(1));
             }
         }
-        // advanced = distance(cursor, next_head).max(1)。
+        // advanced = distance(cursor, next_head).max(1)（推进软护栏计数）。
         let advanced = space.distance(cursor, transaction.next_head).max(1);
         walked_blocks = walked_blocks.saturating_add(advanced);
         cursor = transaction.next_head;
         transactions.push(transaction);
-        // 回到 head 即停。
-        if cursor == head {
-            break;
-        }
+        // 注：**不再** 用 `cursor == sb.head()` 硬停——存储 head 可能 stale-by-one（见上），
+        // 硬停会丢真正已 commit 的末事务。终止全靠 strict-consecutive + commit 有效性。
     }
 
     Ok(transactions)
@@ -894,6 +885,101 @@ mod test {
             disk.block_first_byte(B as usize),
             0x33,
             "block re-journaled after the revoke (higher seq) must be replayed"
+        );
+    }
+
+    /// ★ stale-`s_head` (same lost-metadata class as the dropped `s_sequence` bound): two consecutive
+    /// committed txs, but the on-disk `s_head` is rewound by one (points at tx2's start, as if tx2's
+    /// commit block is durable but the unordered post-barrier SB store that would advance `s_head` was
+    /// lost in a crash). Recovery MUST still scan + replay BOTH txs — the terminator is
+    /// strict-consecutive + commit-validity, NOT the stored head pointer.
+    #[ktest]
+    fn recovery_replays_past_stale_head() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(40);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+
+        const B1: Ext4Fsblk = 140;
+        const B2: Ext4Fsblk = 141;
+        // tx 40 (consecutive baseline).
+        commit_tx(&disk, &physical, &mut sb, &mut space, 40, vec![(B1, 0xAA)], vec![]);
+        // Capture tx2's ring start (= current head) BEFORE committing tx2 — this is the stale head.
+        let stale_head = space.head();
+        // tx 41 (genuinely committed: descriptor + payload + commit all durable).
+        commit_tx(&disk, &physical, &mut sb, &mut space, 41, vec![(B2, 0xBB)], vec![]);
+
+        // Simulate the lost SB store: rewind s_head by one tx (to tx2's start). tx2 IS on disk.
+        sb.set_head(stale_head);
+
+        disk.set_block(B1 as usize, 0x00);
+        disk.set_block(B2 as usize, 0x00);
+
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        let result = recover(&ctx, &mut sb).unwrap();
+
+        // BOTH txs must replay despite the stale head (old `cursor==head` break would stop after tx1).
+        assert_eq!(
+            result.transactions_replayed, 2,
+            "stale s_head must NOT drop the genuinely-committed last tx"
+        );
+        assert_eq!(result.last_sequence, Some(41));
+        assert_eq!(disk.block_first_byte(B1 as usize), 0xAA, "tx40 replayed");
+        assert_eq!(
+            disk.block_first_byte(B2 as usize),
+            0xBB,
+            "tx41 (past stale head) replayed — no lost metadata"
+        );
+    }
+
+    /// Counterpart to the stale-head test: a genuinely-torn tx2 (commit block clobbered so it is
+    /// missing/invalid) MUST stop the SCAN after tx1 — the commit-validity terminator still works
+    /// once the head hard-break is gone. Guards against turning the under-replay fix into over-replay.
+    #[ktest]
+    fn recovery_stops_at_torn_tx_after_valid_one() {
+        let disk = MemDisk::new();
+        let physical = identity_physical();
+        let mut sb = synth_journal_sb(50);
+        let mut space = JournalSpace::from_superblock(&sb).unwrap();
+
+        const B1: Ext4Fsblk = 150;
+        const B2: Ext4Fsblk = 151;
+        // tx 50 (valid, consecutive baseline). Layout: descriptor@start, payload@+1, commit@+2.
+        commit_tx(&disk, &physical, &mut sb, &mut space, 50, vec![(B1, 0xAA)], vec![]);
+        // tx 51 written, but tear it: clobber its commit block so the SCAN sees no valid commit.
+        let tx2_start = space.head();
+        commit_tx(&disk, &physical, &mut sb, &mut space, 51, vec![(B2, 0xBB)], vec![]);
+        // tx2 = [descriptor@tx2_start, payload@tx2_start+1, commit@tx2_start+2]; clobber the commit.
+        let tx2_commit_logical = (tx2_start + 2) as usize;
+        disk.set_block(tx2_commit_logical, 0x00); // zero the commit block -> invalid magic.
+
+        disk.set_block(B1 as usize, 0x00);
+        disk.set_block(B2 as usize, 0x00);
+
+        let ctx = RecoverCtx {
+            physical_blocks: &physical,
+            reader: &disk,
+            writer: &disk,
+            block_size: BS,
+        };
+        let result = recover(&ctx, &mut sb).unwrap();
+
+        // Only tx50 replays — tx51 has no valid commit block, so the SCAN stops there.
+        assert_eq!(
+            result.transactions_replayed, 1,
+            "torn tx (missing commit) must stop the scan after the last valid tx"
+        );
+        assert_eq!(result.last_sequence, Some(50));
+        assert_eq!(disk.block_first_byte(B1 as usize), 0xAA, "valid tx50 replayed");
+        assert_eq!(
+            disk.block_first_byte(B2 as usize),
+            0x00,
+            "torn tx51 NOT replayed (no over-replay)"
         );
     }
 }
