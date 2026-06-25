@@ -73,29 +73,27 @@ impl RawGroupDescriptor {
     }
 
     // ------------------------------------------------------------------
-    // 分配器路径计数 get/set —— 与 ext4_rs `Ext4BlockGroup` **逐位一致**（含其磁盘 bug）。
+    // 分配器路径计数 get/set —— ext4 组描述符 lo/hi 字段编码（ext4-spec-correct）。
     //
-    // ⚠️ parity 陷阱：差分比落盘字节，但 alloc「读计数→±→写回」。若 getter 用干净
-    // `lo|hi<<16`，则在 64bit/大 fs 上算出的新值与 ext4_rs 不同 → 写回字节不同 → 差分失败。
-    // 故此处刻意复刻 ext4_rs 的位级语义（含两处 bug）。phase1 曾有干净版 getter
-    // (`free_blocks_count`/`free_inodes_count` = lo|hi<<16)，已移除以免与本 parity 版混淆；
-    // 当前无外部消费者（fs.rs 用的是 ext4_rs 的 Ext4Superblock，不是本结构）。
-    // [对照来源] ext4_rs/src/ext4_defs/block_group.rs:107-264
+    // 64BIT 特性下，free_blocks/free_inodes/used_dirs/itable_unused 计数都分
+    // `_lo`（低 16 位）+ `_hi`（高 16 位，仅 desc_size>32 / 64BIT 时有效）两半，
+    // 有效值 = `lo | (hi << 16)`。getter/setter 必须在 **bit 16** 处对称拆/拼。
+    // Phase 7 Task 2 已修复 BUG-1/2/3（旧 ext4_rs getter 在 bit32 处错误重组 → hi 被丢；
+    // set_used_dirs_count 误写 itable_unused 字段）。
+    // [对照] Linux fs/ext4/ext4.h 的 ext4_free_inodes_count / ext4_free_group_clusters /
+    //   ext4_used_dirs_count / ext4_itable_unused_count（lo | hi<<16）。
     // ------------------------------------------------------------------
 
-    /// 取空闲块计数（u64）。注意 set 在 bit16 拆分而 get 在 bit32 重组——**不对称怪癖**，
-    /// 且仅 `hi != 0` 时才 OR hi（原样复刻）。
-    /// [对照] ext4_rs `get_free_blocks_count`（block_group.rs:234-240）。
+    /// 取空闲块计数（u64）。lo/hi 在 **bit 16** 处拼接，与 [`set_free_blocks_count`] 的
+    /// `hi = cnt >> 16` 拆分对称。
+    /// [对照] ext4 组描述符 `bg_free_blocks_count_lo`（低 16 位）+ `bg_free_blocks_count_hi`
+    ///   （高 16 位，64BIT 特性下有效），有效计数 = `lo | (hi << 16)`（Linux `ext4_free_group_clusters`）。
+    ///   修复 BUG-2：旧 ext4_rs getter 在 bit32 处重组且仅 hi!=0 才并入，与 setter 的 >>16 拆分
+    ///   不对称——hi!=0 的大 fs 上读数错乱。此处统一 bit16 拼接。
     pub(in crate::fs::ext4) fn get_free_blocks_count(&self) -> u64 {
         let lo = self.free_blocks_count_lo;
         let hi = self.free_blocks_count_hi;
-        let mut v = lo as u64;
-        // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
-        // set 写 hi = cnt>>16，get 却在 <<32 处重组，且仅 hi!=0 才并入 —— 与 set 不对称。
-        if hi != 0 {
-            v |= (hi as u64) << 32;
-        }
-        v
+        (lo as u64) | ((hi as u64) << 16)
     }
 
     /// 写空闲块计数（lo = cnt&0xffff, hi = cnt>>16）。hi 无条件写（不看 desc_size）。
@@ -105,14 +103,15 @@ impl RawGroupDescriptor {
         self.free_blocks_count_hi = (cnt >> 16) as u16;
     }
 
-    /// 取空闲 inode 计数。
-    /// [对照] ext4_rs `get_free_inodes_count`（block_group.rs:131-133）。
+    /// 取空闲 inode 计数。lo/hi 在 **bit 16** 处拼接（`lo | (hi << 16)`），与
+    /// [`set_free_inodes_count`] 的 `hi = cnt >> 16` 拆分对称。
+    /// [对照] ext4 组描述符 `bg_free_inodes_count_lo/hi`（Linux `ext4_free_inodes_count`）。
+    ///   修复 BUG-1：旧 ext4_rs getter 用 `((hi as u64)<<32) as u32`，该子表达式恒为 0 → hi
+    ///   高 16 位被整段丢弃，只返回 lo。此处按规范 bit16 拼接。
     pub(in crate::fs::ext4) fn get_free_inodes_count(&self) -> u32 {
         let lo = self.free_inodes_count_lo;
-        let _hi = self.free_inodes_count_hi;
-        // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
-        // ext4_rs 原式 `((hi as u64)<<32) as u32 | lo`：`(hi<<32) as u32` 恒为 0 → hi 被丢，只返回 lo。
-        ((_hi as u64) << 32) as u32 | lo as u32
+        let hi = self.free_inodes_count_hi;
+        (lo as u32) | ((hi as u32) << 16)
     }
 
     /// 写空闲 inode 计数（lo = cnt&0xffff；hi 仅 desc_size>min 时写 cnt>>16）。
@@ -124,49 +123,47 @@ impl RawGroupDescriptor {
         }
     }
 
-    /// 取已用目录数。
-    /// [对照] ext4_rs `get_used_dirs_count`（block_group.rs:98-104）。
+    /// 取已用目录数。lo/hi 在 **bit 16** 处拼接（仅 desc_size>min 时并入 hi）。
+    /// [对照] ext4 组描述符 `bg_used_dirs_count_lo/hi`（Linux `ext4_used_dirs_count`）。
+    ///   修复 BUG-1：旧 ext4_rs 用 `((hi as u64)<<32) as u32` 恒 0 → hi 被丢。
     pub(in crate::fs::ext4) fn get_used_dirs_count(&self, sb: &RawSuperblock) -> u32 {
         let lo = self.used_dirs_count_lo;
         let hi = self.used_dirs_count_hi;
         let mut v = lo as u32;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
-            // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
-            // 同 free_inodes：`((hi as u64)<<32) as u32` 恒为 0，hi 实际被丢。
-            v |= ((hi as u64) << 32) as u32;
+            v |= (hi as u32) << 16;
         }
         v
     }
 
-    /// 写已用目录数。
-    /// [对照] ext4_rs `set_used_dirs_count`（block_group.rs:107-112）。
+    /// 写已用目录数（lo = cnt&0xffff；hi 仅 desc_size>min 时写 cnt>>16，**bit16 拆分**）。
+    /// [对照] ext4 组描述符 `bg_used_dirs_count_lo/hi`（Linux `ext4_used_dirs_set`）。
+    ///   修复 BUG-3：旧 ext4_rs 此函数误写进 `itable_unused_lo/hi` → 盘上 `used_dirs_count`
+    ///   永不更新、且污染 `itable_unused`。此处写正确的 `used_dirs_count_lo/hi` 字段。
     pub(in crate::fs::ext4) fn set_used_dirs_count(&mut self, sb: &RawSuperblock, cnt: u32) {
-        // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
-        // ext4_rs 此函数误写进 itable_unused_lo/hi，而非 used_dirs_count_lo/hi —— 原样复刻。
-        self.itable_unused_lo = (cnt & 0xffff) as u16;
+        self.used_dirs_count_lo = (cnt & 0xffff) as u16;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
-            self.itable_unused_hi = (cnt >> 16) as u16;
+            self.used_dirs_count_hi = (cnt >> 16) as u16;
         }
     }
 
-    /// 取未用 inode 计数（itable_unused）。
-    /// [对照] ext4_rs `get_itable_unused`（block_group.rs:89-95）。
+    /// 取未用 inode 计数（itable_unused）。lo/hi 在 **bit 16** 处拼接（仅 desc_size>min 时并入 hi）。
+    /// [对照] ext4 组描述符 `bg_itable_unused_lo/hi`（Linux `ext4_itable_unused_count`）。
+    ///   修复 BUG-1：旧 ext4_rs 用 `((hi as u64)<<32) as u32` 恒 0 → hi 被丢。
     pub(in crate::fs::ext4) fn get_itable_unused(&self, sb: &RawSuperblock) -> u32 {
         let lo = self.itable_unused_lo;
         let hi = self.itable_unused_hi;
         let mut v = lo as u32;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
-            // PARITY: replicate ext4_rs bug, fix deferred (roadmap §5)
-            // 同样 `((hi as u64)<<32) as u32` 恒 0，hi 被丢。
-            v |= ((hi as u64) << 32) as u32;
+            v |= (hi as u32) << 16;
         }
         v
     }
 
-    /// 写未用 inode 计数（itable_unused）。
-    /// [对照] ext4_rs `set_itable_unused`（block_group.rs:115-120）。
+    /// 写未用 inode 计数（itable_unused，lo = cnt&0xffff；hi 仅 desc_size>min 时写 cnt>>16）。
+    /// [对照] ext4 组描述符 `bg_itable_unused_lo/hi`（Linux `ext4_itable_unused_set`）。
+    ///   正确写 `itable_unused_lo/hi`（BUG-3 修复后已与 `set_used_dirs_count` 写不同字段）。
     pub(in crate::fs::ext4) fn set_itable_unused(&mut self, sb: &RawSuperblock, cnt: u32) {
-        // 注：与 set_used_dirs_count 同样写 itable_unused —— ext4_rs 两个 setter 实现相同。
         self.itable_unused_lo = (cnt & 0xffff) as u16;
         if sb.group_desc_size() as u16 > EXT4_MIN_DESC_SIZE {
             self.itable_unused_hi = (cnt >> 16) as u16;
@@ -435,4 +432,96 @@ fn is_power_of(mut n: u32, base: u32) -> bool {
         n /= base;
     }
     n == 1
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::*;
+
+    use super::{RawGroupDescriptor, RawSuperblock};
+    use crate::fs::ext4::core::test_util::EXT4_IMAGE;
+    // 带进 Pod 的 from_bytes / as_bytes。
+    use crate::prelude::*;
+
+    /// 真镜像超级块（desc_size==64 > min，开 hi 半位写/读路径）。
+    fn sb_with_hi() -> RawSuperblock {
+        let sb = RawSuperblock::from_bytes(&EXT4_IMAGE[1024..2048]);
+        assert!(
+            sb.group_desc_size() > 32,
+            "fixture must have 64-byte descriptors so hi halves are live"
+        );
+        sb
+    }
+
+    /// BUG-1/2 修复：计数 lo/hi 在 bit16 处拆/拼，set→get 必须往返完整 32 位值（含 hi != 0）。
+    /// 旧 ext4_rs getter 丢 hi → 大于 0xFFFF 的值读回只剩低 16 位，断言会失败。
+    #[ktest]
+    fn counter_lo_hi_roundtrip_full_32bit() {
+        let sb = sb_with_hi();
+        let mut desc = RawGroupDescriptor::default();
+
+        // hi != 0 的代表值：0x0003_4567 → lo=0x4567, hi=0x0003。
+        let val: u32 = 0x0003_4567;
+        assert_eq!(val >> 16, 0x0003, "test value must exercise the hi half");
+
+        // BUG-1: free_inodes
+        desc.set_free_inodes_count(&sb, val);
+        assert_eq!(desc.get_free_inodes_count(), val, "free_inodes hi dropped (BUG-1)");
+        assert_eq!(
+            { desc.free_inodes_count_lo },
+            0x4567,
+            "free_inodes lo must hold low 16 bits"
+        );
+        assert_eq!(
+            { desc.free_inodes_count_hi },
+            0x0003,
+            "free_inodes hi must hold high 16 bits (bit16 split)"
+        );
+
+        // BUG-1: itable_unused
+        desc.set_itable_unused(&sb, val);
+        assert_eq!(desc.get_itable_unused(&sb), val, "itable_unused hi dropped (BUG-1)");
+
+        // BUG-2: free_blocks (u64 path, set splits at bit16, get must reassemble at bit16)
+        desc.set_free_blocks_count(val);
+        assert_eq!(
+            desc.get_free_blocks_count(),
+            val as u64,
+            "free_blocks get/set asymmetric (BUG-2)"
+        );
+        assert_eq!(
+            { desc.free_blocks_count_hi },
+            0x0003,
+            "free_blocks hi must hold high 16 bits"
+        );
+    }
+
+    /// BUG-3 修复：`set_used_dirs_count` 写 `used_dirs_count_*` 字段（非 `itable_unused_*`）。
+    /// 设 used_dirs 后：get_used_dirs 取回该值，且 itable_unused 不被污染（保持先前写入值）。
+    #[ktest]
+    fn used_dirs_writes_own_field_not_itable_unused() {
+        let sb = sb_with_hi();
+        let mut desc = RawGroupDescriptor::default();
+
+        // 先给 itable_unused 一个独立标记值。
+        desc.set_itable_unused(&sb, 0x0002_1111);
+        assert_eq!(desc.get_itable_unused(&sb), 0x0002_1111);
+
+        // 写 used_dirs（hi != 0），随后核对：used_dirs 取回正确 + itable_unused 不变。
+        let dirs: u32 = 0x0001_ABCD;
+        desc.set_used_dirs_count(&sb, dirs);
+        assert_eq!(
+            desc.get_used_dirs_count(&sb),
+            dirs,
+            "used_dirs_count not stored in its own field (BUG-3)"
+        );
+        assert_eq!(
+            desc.get_itable_unused(&sb),
+            0x0002_1111,
+            "set_used_dirs_count clobbered itable_unused (BUG-3)"
+        );
+        // 直接核对底层字段：used_dirs_count_lo/hi 被写、itable_unused_lo/hi 未被 used_dirs 触碰。
+        assert_eq!({ desc.used_dirs_count_lo }, 0xABCD);
+        assert_eq!({ desc.used_dirs_count_hi }, 0x0001);
+    }
 }

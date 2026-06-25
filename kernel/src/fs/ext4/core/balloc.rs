@@ -654,15 +654,17 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
 
     /// 释放从 `start` 起的连续 `count` 个块：逐组定位区间 → `ext4_bmap_bits_free`（闭区间）
     /// 清位 → 位图 csum + 写 → 超级块 free_blocks += → inode i_blocks -= → 组 free_blocks += +
-    /// csum + 写。逐位复刻 ext4_rs `balloc_free_blocks`（含 §3.1 怪癖，见下）。
+    /// csum + 写。
     ///
-    /// **§3.1 first_data_block 怪癖（PARITY）**：ext4_rs free 路径用裸除法
-    /// `bg = start / blocks_per_group`、`idx_in_bg = start % blocks_per_group` 定位组与组内
-    /// 下标，**不**像几何 helper `get_bgid_of_block`/`addr_to_idx_bg` 那样在
-    /// `first_data_block != 0 && baddr != 0` 时先减 1。故此处**刻意不走** [`GroupGeometry`]，
-    /// 直接裸除——与 ext4_rs 字节级一致。真镜像 `first_data_block == 0`，两种算法本就重合；
-    /// 在 `first_data_block != 0` 的盘上会与 alloc 侧的几何 helper 产生偏差，但这是 ext4_rs
-    /// 既有行为，parity-first 原样复刻（bug 修复推迟，见 roadmap §5）。
+    /// **first_data_block 几何（BUG-4 修复，ext4-spec-correct）**：组号 / 组内下标必须经
+    /// [`GroupGeometry::get_bgid_of_block`] / [`GroupGeometry::addr_to_idx_bg`]——它们在
+    /// `first_data_block != 0 && baddr != 0` 时先减 1，与 alloc 侧（`balloc_alloc_block` 等）
+    /// 完全一致。旧 ext4_rs free 路径用裸除法 `start / blocks_per_group`、`start %
+    /// blocks_per_group`，**不减** first_data_block → 在 `first_data_block == 1`（1K 块 fs，
+    /// 如 `ext4_multigroup.img`）上组定位偏移一个块、清错位图位 + 记错组计数。`first_data_block
+    /// == 0`（4K 默认）下两种算法重合。
+    /// [对照] ext4 中块号 `baddr` 的组号 = `(baddr - first_data_block) / blocks_per_group`、
+    ///   组内下标 = `(baddr - first_data_block) % blocks_per_group`（Linux `ext4_get_group_no_and_offset`）。
     pub(in crate::fs::ext4) fn balloc_free_blocks(
         &mut self,
         inode: &mut InodeAllocCtx,
@@ -680,12 +682,19 @@ impl<'a, R: BlockReader, W: MetadataWriter> BlockAllocator<'a, R, W> {
         let max_bits_per_bitmap = block_size * 8;
         let max_bits_per_group = min(blocks_per_group as usize, max_bits_per_bitmap);
 
-        // §3.1 怪癖：裸除法定位组（不减 first_data_block）。
-        let mut bg_first = start / blocks_per_group as u64;
-        let bg_last = (start + count as u64 - 1) / blocks_per_group as u64;
+        // BUG-4 修复：用几何 helper 定位组（减 first_data_block），与 alloc 侧一致。
+        // first_data_block / blocks_per_group 在释放过程中不变，故每轮新建 geom 等价
+        // （与本文件其它 entry 一致：循环内 `GroupGeometry::new(&self.sb)`），避免跨可变借用持有。
+        let (mut bg_first, bg_last) = {
+            let geom = GroupGeometry::new(&self.sb);
+            (
+                geom.get_bgid_of_block(start) as u64,
+                geom.get_bgid_of_block(start + count as u64 - 1) as u64,
+            )
+        };
 
         while bg_first <= bg_last {
-            let idx_in_bg = (start % blocks_per_group as u64) as usize;
+            let idx_in_bg = GroupGeometry::new(&self.sb).addr_to_idx_bg(start) as usize;
             if idx_in_bg >= max_bits_per_group {
                 // 防御越界位图偏移：跳到下一组（与 ext4_rs 一致：仅 bg_first += 1，不动 start/count）。
                 bg_first += 1;
@@ -850,6 +859,40 @@ mod test {
                 block_size: sb.block_size(),
             }
         }
+
+        /// 读第 `bgid` 组的组描述符（与 [`BlockAllocator::load_group_desc`] 同几何）。
+        fn read_group_desc(&self, sb: &RawSuperblock, bgid: u32) -> super::RawGroupDescriptor {
+            use crate::fs::ext4::core::block_group::RawGroupDescriptor;
+            let bs = self.block_size;
+            let desc_size = sb.group_desc_size();
+            let dsc_cnt = bs / desc_size;
+            let dsc_id = bgid as usize / dsc_cnt;
+            let first_data_block = sb.first_data_block() as usize;
+            let block_id = first_data_block + dsc_id + 1;
+            let offset_in_block = (bgid as usize % dsc_cnt) * desc_size;
+            let off = block_id * bs + offset_in_block;
+            let mut buf = [0u8; 64];
+            self.read_at(off, &mut buf);
+            RawGroupDescriptor::from_bytes(&buf)
+        }
+
+        /// 读绝对块号 `blk` 的整块字节。
+        fn read_block(&self, blk: u64) -> Vec<u8> {
+            let mut out = vec![0u8; self.block_size];
+            self.read_at(blk as usize * self.block_size, out.as_mut_slice());
+            out
+        }
+
+        /// 直接写绝对块号 `blk` 的整块字节（测试用，绕过 handle）。
+        fn poke_block(&self, blk: u64, data: &[u8]) {
+            let base = blk as usize * self.block_size;
+            let mut b = self.bytes.borrow_mut();
+            for (i, byte) in data.iter().enumerate() {
+                if let Some(slot) = b.get_mut(base + i) {
+                    *slot = *byte;
+                }
+            }
+        }
     }
     impl BlockReader for MemImage {
         fn read_at(&self, off: usize, out: &mut [u8]) {
@@ -906,6 +949,74 @@ mod test {
             inode2.i_blocks(),
             7 * per_block,
             "normal free must decrement exactly, no saturation artifact"
+        );
+    }
+
+    /// BUG-4 修复：`balloc_free_blocks` 用 `get_bgid_of_block`/`addr_to_idx_bg` 定位组（减
+    /// first_data_block），对 `first_data_block == 1`（1K 块多组镜像）正确。
+    ///
+    /// 取 `block == blocks_per_group`（= 8192）：first_data_block=1 下属 **组 0**
+    /// （`(8192-1)/8192 == 0`，组内下标 8191）；旧裸除法 `8192/8192 == 1` 会误判为组 1。
+    /// 先在组 0 块位图把该块标为已分配，free 后断言：组 0 位图该位被清、组 0 free_blocks
+    /// 计数 +1；组 1 完全不受影响——证明组定位减了 first_data_block。
+    #[ktest]
+    fn balloc_free_uses_first_data_block_geometry() {
+        use crate::fs::ext4::core::bitmap::{ext4_bmap_bit_set, ext4_bmap_is_bit_clr};
+        use crate::fs::ext4::core::test_util::EXT4_MULTIGROUP_IMAGE;
+
+        let disk = MemImage::new(EXT4_MULTIGROUP_IMAGE);
+        let sb = RawSuperblock::from_bytes(&EXT4_MULTIGROUP_IMAGE[1024..2048]);
+        assert_eq!(sb.first_data_block(), 1, "fixture must have first_data_block=1");
+        let bpg = sb.blocks_per_group();
+        assert_eq!(bpg, 8192);
+
+        let block_to_free: Ext4Fsblk = bpg as u64; // 8192 → 组 0、组内下标 8191（正确几何）。
+        let idx_in_g0: u32 = bpg - 1; // (8192-1) % 8192
+
+        // 组 0 / 组 1 的初始描述符 + 块位图块号。
+        let g0 = disk.read_group_desc(&sb, 0);
+        let g1 = disk.read_group_desc(&sb, 1);
+        let g0_bmp_blk = g0.block_bitmap();
+        let g1_bmp_blk = g1.block_bitmap();
+        let g0_free_before = g0.get_free_blocks_count();
+        let g1_free_before = g1.get_free_blocks_count();
+
+        // 在组 0 块位图把 idx_in_g0 置为已分配（这样 free 才有可观察的「清位」效果）。
+        let mut g0_bmp = disk.read_block(g0_bmp_blk);
+        ext4_bmap_bit_set(&mut g0_bmp, idx_in_g0);
+        disk.poke_block(g0_bmp_blk, &g0_bmp);
+        // 快照组 1 位图（应保持不变）。
+        let g1_bmp_before = disk.read_block(g1_bmp_blk);
+
+        let mut alloc = BlockAllocator::new(sb, &disk, &disk);
+        let mut inode = InodeAllocCtx::new(1_000_000); // 足够大，避免 i_blocks 干扰。
+        alloc.balloc_free_blocks(&mut inode, block_to_free, 1);
+
+        // 组 0：该位被清。
+        let g0_bmp_after = disk.read_block(g0_bmp_blk);
+        assert!(
+            ext4_bmap_is_bit_clr(&g0_bmp_after, idx_in_g0),
+            "freed bit must clear in group 0 bitmap (BUG-4 geometry)"
+        );
+        // 组 0 free_blocks 计数 +1。
+        let g0_after = disk.read_group_desc(&sb, 0);
+        assert_eq!(
+            g0_after.get_free_blocks_count(),
+            g0_free_before + 1,
+            "group 0 free_blocks must increment (BUG-4 geometry)"
+        );
+
+        // 组 1：位图与 free 计数都不受影响（旧裸除法会误动组 1）。
+        let g1_bmp_after = disk.read_block(g1_bmp_blk);
+        assert_eq!(
+            g1_bmp_after, g1_bmp_before,
+            "group 1 bitmap must be untouched (BUG-4: raw divide would wrongly hit group 1)"
+        );
+        let g1_after = disk.read_group_desc(&sb, 1);
+        assert_eq!(
+            g1_after.get_free_blocks_count(),
+            g1_free_before,
+            "group 1 free_blocks must be unchanged (BUG-4 geometry)"
         );
     }
 }
