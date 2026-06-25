@@ -16,10 +16,9 @@ use aster_block::{
 use aster_cmdline::{KCMDLINE, ModuleArg};
 use aster_time::read_monotonic_time;
 use ext4_rs::{
-    BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE, Ext4,
-    LocalOperationAllocGuard,
-    MetadataWriter as Ext4MetadataWriter, OperationAllocGuard as Ext4OperationAllocGuard,
-    OperationScopedAllocGuard, SimpleBlockRange, SimpleDirEntry, SimpleInodeMeta,
+    BLOCK_SIZE as EXT4_BLOCK_SIZE, BlockDevice as Ext4BlockDevice, EXT4_ROOT_INODE,
+    LocalOperationAllocGuard, MetadataWriter as Ext4MetadataWriter, SimpleBlockRange,
+    SimpleDirEntry, SimpleInodeMeta,
 };
 // Phase 6 Task 2: the injected-crash replay hold now keys off the **core** commit-write stage enum
 // (the production commit emitter is core's `write_commit_plan`). It is variant-for-variant identical
@@ -1289,24 +1288,6 @@ impl Ext4MetadataWriter for JournalIoBridge {
     }
 }
 
-struct JournalOperationMetadataWriter {
-    bridge: Arc<JournalIoBridge>,
-    handle_id: Option<u64>,
-}
-
-impl JournalOperationMetadataWriter {
-    fn new(bridge: Arc<JournalIoBridge>, handle_id: Option<u64>) -> Self {
-        Self { bridge, handle_id }
-    }
-}
-
-impl Ext4MetadataWriter for JournalOperationMetadataWriter {
-    fn write_metadata(&self, offset: usize, data: &[u8]) {
-        self.bridge
-            .write_metadata_for_jbd2_handle(self.handle_id, offset, data);
-    }
-}
-
 /// P2 (Phase 6): per-inode in-memory coverage of *written* extents, so the
 /// buffered overwrite fast path can answer "is this range fully written?"
 /// with one BTreeMap lookup instead of an extent-tree walk per write().
@@ -1569,15 +1550,11 @@ impl PageCacheBackend for Ext4PageCacheBackend {
 }
 
 pub(super) struct Ext4Fs {
-    // Phase 6 Task 4 (SB ownership transition): the production mount, journaled-write, namespace,
-    // fsync, recovery and RECOVER-flag paths are ALL off ext4_rs now. The ONLY remaining production
-    // user of this ext4_rs `Ext4` handle is `load_dir_cache_if_needed_locked` (a Phase-6 **Task 1**
-    // read-path vestige that still enumerates a directory via `ext4_stat` + `ext4_readdir_with_offsets`
-    // to seed the dir-entry cache). It is kept MINIMAL and reported for Task 5 (cutting it is read-path
-    // work — matching ext4_rs's per-entry byte offsets via core `dir_enumerate` — not mount/recovery).
-    // Mount still calls `Ext4::open` purely to construct this handle for that one vestige; once Task 5
-    // cuts the dir-cache populate to core, this field + `Ext4::open` can be removed outright.
-    inner: Mutex<Ext4>,
+    // Phase 6 Task 5a: the ext4_rs `Ext4` handle has been removed. EVERY production path — mount,
+    // read, journaled write, namespace, setattr, fsync, recovery, RECOVER-flag, and the last
+    // vestige `load_dir_cache_if_needed_locked` (dir-entry cache seed) — is now driven by `core/`
+    // over the overlay read seam + journal driver. ext4_rs is referenced only by the `#[cfg(ktest)]`
+    // differential tests (slated for Task 5b deletion).
     block_device: Arc<dyn BlockDevice>,
     adapter: Arc<KernelBlockDeviceAdapter>,
     // Phase 6 Task 1: a mount-time snapshot of the on-disk superblock, parsed once via the core
@@ -1691,11 +1668,6 @@ impl Ext4Fs {
         let jbd2_runtime = Arc::new(RwMutex::new(None));
         let alloc_guard = Arc::new(LocalOperationAllocGuard::new());
         let journal_io = Arc::new(JournalIoBridge::new(adapter.clone(), jbd2_runtime.clone()));
-        let mut ext4 = Ext4::open(journal_io.clone());
-        let metadata_writer: Arc<dyn Ext4MetadataWriter> = journal_io.clone();
-        ext4.metadata_writer = metadata_writer;
-        let operation_alloc_guard: Arc<dyn Ext4OperationAllocGuard> = alloc_guard.clone();
-        ext4.alloc_guard = operation_alloc_guard;
         // Phase 6 Task 1: parse the on-disk superblock once via the core read seam (over the same
         // overlay bridge the live read path uses) and hold a running snapshot for the core read
         // path. Reads only consume immutable geometry/feature fields (see the `core_sb` field doc).
@@ -1710,7 +1682,6 @@ impl Ext4Fs {
         let running_sb = Mutex::new(core_sb);
         let recover_flag = AtomicBool::new(core_sb.needs_recovery());
         let fs = Arc::new_cyclic(|weak_ref| Self {
-            inner: Mutex::new(ext4),
             block_device,
             adapter,
             core_sb,
@@ -2015,10 +1986,6 @@ impl Ext4Fs {
         f()
     }
 
-    pub(super) fn lock_inner(&self) -> MutexGuard<'_, Ext4> {
-        self.inner.lock()
-    }
-
     fn initialize_jbd2_journal(&self) {
         // Phase 6 Task 4: build the JBD2 journal entirely via `core/`, off ext4_rs.
         //
@@ -2266,26 +2233,6 @@ impl Ext4Fs {
         if let Some(operation_id) = operation_id {
             self.alloc_guard.finish_operation(operation_id);
         }
-    }
-
-    fn ext4_with_operation_context(
-        &self,
-        ext4: &Ext4,
-        handle_id: Option<u64>,
-        operation_id: Option<u64>,
-    ) -> Ext4 {
-        let mut scoped = ext4.clone();
-        let metadata_writer: Arc<dyn Ext4MetadataWriter> = Arc::new(
-            JournalOperationMetadataWriter::new(self.journal_io.clone(), handle_id),
-        );
-        scoped.metadata_writer = metadata_writer;
-        if let Some(operation_id) = operation_id {
-            let alloc_guard: Arc<dyn Ext4OperationAllocGuard> = Arc::new(
-                OperationScopedAllocGuard::new(self.alloc_guard.clone(), operation_id),
-            );
-            scoped.alloc_guard = alloc_guard;
-        }
-        scoped
     }
 
     fn finish_jbd2_handle(
@@ -4280,117 +4227,6 @@ impl Ext4Fs {
         Ok(())
     }
 
-    pub(super) fn run_ext4<T>(
-        &self,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let runtime_wait_start_ns = Self::monotonic_nanos();
-        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-        self.record_ext4_rs_runtime_lock_wait(
-            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
-        );
-        let runtime_hold_start_ns = Self::monotonic_nanos();
-        let preserve_alloc_guard = self.has_active_jbd2_handle();
-        let alloc_operation_id = if preserve_alloc_guard {
-            None
-        } else {
-            Some(self.begin_alloc_operation(None))
-        };
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, alloc_operation_id);
-            f(&scoped_ext4).map_err(map_ext4_error)
-        };
-        self.finish_alloc_operation(alloc_operation_id);
-        drop(runtime_guard);
-        self.record_ext4_rs_runtime_lock_hold(
-            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
-        );
-        self.finish_ext4_io(io_epoch)?;
-        result
-    }
-
-    // Phase 6 Task 1 retired this ext4_rs read wrapper from all call sites (READ path now drives
-    // `core/` via the `run_io_*_read_only*` siblings below). Kept during two-engine coexistence as
-    // the structural template / fallback; removed in Task 5 with the rest of ext4_rs.
-    #[allow(dead_code)]
-    fn run_ext4_read_only<T>(
-        &self,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let runtime_wait_start_ns = Self::monotonic_nanos();
-        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-        self.record_ext4_rs_runtime_lock_wait(
-            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
-        );
-        let runtime_hold_start_ns = Self::monotonic_nanos();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
-            f(&scoped_ext4).map_err(map_ext4_error)
-        };
-        drop(runtime_guard);
-        self.record_ext4_rs_runtime_lock_hold(
-            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
-        );
-        let io_result = self.finish_ext4_io(io_epoch);
-        io_result?;
-        result
-    }
-
-    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
-    // coexistence; removed in Task 5.
-    #[allow(dead_code)]
-    fn run_ext4_file_read_only<T>(
-        &self,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
-            f(&scoped_ext4).map_err(map_ext4_error)
-        };
-        let io_result = self.finish_ext4_io(io_epoch);
-        io_result?;
-        result
-    }
-
-    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
-    // coexistence; removed in Task 5.
-    #[allow(dead_code)]
-    fn run_ext4_dir_read_only<T>(
-        &self,
-        f: impl FnOnce(&Ext4) -> core::result::Result<T, ext4_rs::Ext4Error>,
-    ) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
-            f(&scoped_ext4).map_err(map_ext4_error)
-        };
-        let io_result = self.finish_ext4_io(io_epoch);
-        io_result?;
-        result
-    }
-
-    // Still used by `load_dir_cache_if_needed_locked` (dir-cache population stays on ext4_rs in
-    // Task 1 — core exposes only after-entry offsets, but the cache needs entry-start offsets for
-    // O(1) rmdir-fast; see the Task 1 report). Cut over with the namespace path in Task 3.
-    fn run_ext4_dir_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
-            f(&scoped_ext4)
-        };
-        let io_result = self.finish_ext4_io(io_epoch);
-        io_result?;
-        Ok(result)
-    }
-
     /// Phase 6 Task 3: setattr cutover. Drive an inode-field mutation through **core** instead of
     /// ext4_rs. `mutate` receives the loaded core [`Inode`]; the caller sets the fields it owns
     /// (mode/uid/gid/rdev/times) and this helper writes the inode back + invalidates the meta cache.
@@ -4455,30 +4291,6 @@ impl Ext4Fs {
         }
     }
 
-    // Phase 6 Task 1: retired from all call sites (see `run_ext4_read_only` note). Kept for
-    // coexistence; removed in Task 5.
-    #[allow(dead_code)]
-    fn run_ext4_read_only_noerr<T>(&self, f: impl FnOnce(&Ext4) -> T) -> Result<T> {
-        let io_epoch = self.prepare_ext4_io();
-        let runtime_wait_start_ns = Self::monotonic_nanos();
-        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-        self.record_ext4_rs_runtime_lock_wait(
-            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
-        );
-        let runtime_hold_start_ns = Self::monotonic_nanos();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 = self.ext4_with_operation_context(&inner, None, None);
-            f(&scoped_ext4)
-        };
-        drop(runtime_guard);
-        self.record_ext4_rs_runtime_lock_hold(
-            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
-        );
-        let io_result = self.finish_ext4_io(io_epoch);
-        io_result?;
-        Ok(result)
-    }
 
     // =====================================================================================
     // Phase 6 Task 1: engine-agnostic read orchestration over `core/`.
@@ -4769,121 +4581,6 @@ impl Ext4Fs {
 
     fn should_hold_for_injected_crash(op_name: &str, stage: JournalCommitWriteStage) -> bool {
         Self::replay_hold_request(op_name).is_some_and(|requested| requested == stage)
-    }
-
-    // Phase 6 Task 3: all namespace/setattr call sites are now cut to the core-driven chokepoints
-    // (`run_journaled_namespace` / `run_journaled_core` / `run_inode_metadata_core`); the write
-    // path was cut in Task 2. No production caller remains for the ext4_rs-driven chokepoint. Kept
-    // (dead) until Task 5 deletes ext4_rs and this helper with it.
-    #[allow(dead_code)]
-    fn run_journaled_ext4<T>(
-        &self,
-        op: Option<JournaledOp>,
-        apply: impl FnOnce(&Ext4) -> Result<T>,
-    ) -> Result<T> {
-        // Step 4b: gate at the entry of journaled operations.  All
-        // create/mkdir/unlink/rmdir/rename/write/truncate paths flow
-        // through this helper, so a single check here is sufficient.
-        self.check_not_shutdown()?;
-
-        let generic014_like_write = matches!(
-            op.as_ref(),
-            Some(JournaledOp::Write { len, .. }) if *len == 512
-        );
-        let io_epoch = self.prepare_ext4_io();
-        let runtime_wait_start_ns = Self::monotonic_nanos();
-        let runtime_guard = EXT4_RS_RUNTIME_LOCK.lock();
-        self.record_ext4_rs_runtime_lock_wait(
-            Self::monotonic_nanos().saturating_sub(runtime_wait_start_ns),
-        );
-        let runtime_hold_start_ns = Self::monotonic_nanos();
-        let profile_start_ns = Self::monotonic_nanos();
-        let op_name = Self::jbd2_handle_op_name(op.as_ref());
-
-        let start_handle_start_ns = Self::monotonic_nanos();
-        let jbd2_handle = self.start_jbd2_handle(op.as_ref());
-        let start_handle_elapsed_ns = Self::monotonic_nanos().saturating_sub(start_handle_start_ns);
-        // `start_jbd2_handle` now returns the bare `handle_id` (core driver), not a JournalHandle.
-        let handle_id = jbd2_handle;
-        let alloc_operation_id = self.begin_alloc_operation(handle_id);
-
-        let apply_start_ns = Self::monotonic_nanos();
-        let result = {
-            let inner = self.lock_inner();
-            let scoped_ext4 =
-                self.ext4_with_operation_context(&inner, handle_id, Some(alloc_operation_id));
-            apply(&scoped_ext4)
-        };
-        let apply_elapsed_ns = Self::monotonic_nanos().saturating_sub(apply_start_ns);
-
-        // Phase 5 (inode meta cache): this journaled op may have changed inode
-        // metadata (size/mtime/nlink/mode/...). Bump the generation and drop
-        // the affected cached stats so the next stat re-reads. The generation
-        // guard in `stat` prevents a racing stat from re-inserting a value it
-        // read across this mutation.
-        //
-        // P2 (Phase 6): single-inode ops (the overwhelming majority — SQLite's
-        // journal-file writes) only touch their own inode's metadata, so only
-        // that entry is dropped; directory ops touch parent + child inodes and
-        // keep the conservative clear-all. Truncate is the only journaled op
-        // that can *remove* written mappings, so it also drops the written
-        // coverage (unlink/rmdir/rename-overwrite go through
-        // `clear_inode_touch_cache`).
-        self.meta_cache_generation.fetch_add(1, Ordering::Release);
-        match op.as_ref() {
-            Some(JournaledOp::Write { ino, .. }) | Some(JournaledOp::InodeMetadata { ino }) => {
-                self.inode_meta_cache.lock().remove(ino);
-            }
-            Some(JournaledOp::Truncate { ino }) => {
-                self.inode_meta_cache.lock().remove(ino);
-                self.coverage_invalidate(*ino);
-            }
-            _ => {
-                self.inode_meta_cache.lock().clear();
-            }
-        }
-
-        let finish_handle_start_ns = Self::monotonic_nanos();
-        self.finish_jbd2_handle(jbd2_handle, op.as_ref(), op_name, result.is_ok());
-        let finish_handle_elapsed_ns =
-            Self::monotonic_nanos().saturating_sub(finish_handle_start_ns);
-        let finish_alloc_start_ns = Self::monotonic_nanos();
-        self.finish_alloc_operation(Some(alloc_operation_id));
-        let finish_alloc_elapsed_ns = Self::monotonic_nanos().saturating_sub(finish_alloc_start_ns);
-        drop(runtime_guard);
-        self.record_ext4_rs_runtime_lock_hold(
-            Self::monotonic_nanos().saturating_sub(runtime_hold_start_ns),
-        );
-
-        let finish_io_start_ns = Self::monotonic_nanos();
-        let io_result = self.finish_ext4_io(io_epoch);
-        let finish_io_elapsed_ns = Self::monotonic_nanos().saturating_sub(finish_io_start_ns);
-        let total_elapsed_ns = Self::monotonic_nanos().saturating_sub(profile_start_ns);
-        if self.phase2_profile_enabled {
-            self.journaled_op_profile.record(
-                op.as_ref(),
-                start_handle_elapsed_ns,
-                apply_elapsed_ns,
-                finish_handle_elapsed_ns,
-                finish_alloc_elapsed_ns,
-                finish_io_elapsed_ns,
-                total_elapsed_ns,
-            );
-        }
-        if generic014_like_write && total_elapsed_ns >= GENERIC014_SLOW_OP_LOG_THRESHOLD_NS {
-            debug!(
-                "ext4: generic014-like journaled profile apply_ms={} finish_handle_ms={} finish_io_ms={} total_ms={}",
-                apply_elapsed_ns / 1_000_000,
-                finish_handle_elapsed_ns / 1_000_000,
-                finish_io_elapsed_ns / 1_000_000,
-                total_elapsed_ns / 1_000_000
-            );
-        }
-        match (result, io_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
     }
 
     /// Map core `file::SimpleBlockRange`s to the integration (ext4_rs) `SimpleBlockRange` DTO.
@@ -5271,14 +4968,38 @@ impl Ext4Fs {
             }
         }
 
-        let (is_dir, entries_with_offsets) = self.run_ext4_dir_read_only_noerr(|ext4| {
-            let meta = ext4.ext4_stat(parent);
-            if meta.file_type != ext4_rs::InodeFileType::S_IFDIR.bits() {
+        // Phase 6 Task 5a: seed the dir-entry cache via **core**, byte-identically to the retired
+        // ext4_rs `ext4_stat` + `ext4_readdir_with_offsets` pair. ext4_rs `ext4_readdir_with_offsets`
+        // returns an empty vec for a non-directory inode (`!is_dir`) — the old code gated on
+        // `ext4_stat().file_type != S_IFDIR` and raised ENOTDIR; we replicate that guard with the
+        // core inode's `is_dir()`. The captured offset is each entry's **own** start byte offset
+        // (`iblock*bs + off`), which feeds O(1) rmdir via `dir_remove_entry_at_offset`; core's
+        // `dir_get_entries_with_start_offset` computes the identical offset (it differs from the
+        // readdir `next_offset` cookie — see that function's PARITY note). DTO mapping mirrors the
+        // Task 1 `readdir_locked` cutover exactly:
+        //   - name    = `String::from_utf8_lossy(name)` (== ext4_rs `get_name()`)
+        //   - ino     = entry inode (unused/inode==0 slots skipped by core, matching ext4_rs)
+        //   - offset  = entry-start abs byte offset (== ext4_rs `entry_offset`)
+        //   - de_type = dirent file-type byte (core `OwnedDirEntry.file_type` == ext4_rs `get_de_type()`)
+        let (is_dir, entries_with_offsets) = self.run_io_dir_read_only_noerr(|ctx| {
+            let Ok(dir) = super::core::inode::load_inode(ctx.reader, ctx.sb, parent) else {
+                return (false, Vec::new());
+            };
+            if !dir.is_dir() {
                 return (false, Vec::new());
             }
-            // Use ext4_readdir_with_offsets so we capture each entry's byte offset,
-            // enabling O(1) rmdir via ext4_rmdir_at_fast later.
-            (true, ext4.ext4_readdir_with_offsets(parent))
+            let entries = super::core::dir::dir_get_entries_with_start_offset(ctx, &dir)
+                .into_iter()
+                .map(|(entry, start_offset)| {
+                    (
+                        String::from_utf8_lossy(&entry.name).into_owned(),
+                        entry.inode,
+                        start_offset as u64,
+                        entry.file_type,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (true, entries)
         })?;
         if !is_dir {
             return_errno_with_message!(Errno::ENOTDIR, "parent inode is not a directory");
@@ -6941,47 +6662,6 @@ impl FsType for Ext4Type {
 
     fn sysnode(&self) -> Option<Arc<dyn aster_systree::SysNode>> {
         None
-    }
-}
-
-pub(super) fn map_ext4_error(err: ext4_rs::Ext4Error) -> Error {
-    Error::new(map_ext4_errno(err.error()))
-}
-
-fn map_ext4_errno(errno: ext4_rs::Errno) -> Errno {
-    match errno {
-        ext4_rs::Errno::EPERM => Errno::EPERM,
-        ext4_rs::Errno::ENOENT => Errno::ENOENT,
-        ext4_rs::Errno::EINTR => Errno::EINTR,
-        ext4_rs::Errno::EIO => Errno::EIO,
-        ext4_rs::Errno::ENXIO => Errno::ENXIO,
-        ext4_rs::Errno::E2BIG => Errno::E2BIG,
-        ext4_rs::Errno::EBADF => Errno::EBADF,
-        ext4_rs::Errno::EAGAIN => Errno::EAGAIN,
-        ext4_rs::Errno::ENOMEM => Errno::ENOMEM,
-        ext4_rs::Errno::EACCES => Errno::EACCES,
-        ext4_rs::Errno::EFAULT => Errno::EFAULT,
-        ext4_rs::Errno::ENOTBLK => Errno::ENOTBLK,
-        ext4_rs::Errno::EBUSY => Errno::EBUSY,
-        ext4_rs::Errno::EEXIST => Errno::EEXIST,
-        ext4_rs::Errno::EXDEV => Errno::EXDEV,
-        ext4_rs::Errno::ENODEV => Errno::ENODEV,
-        ext4_rs::Errno::ENOTDIR => Errno::ENOTDIR,
-        ext4_rs::Errno::EISDIR => Errno::EISDIR,
-        ext4_rs::Errno::EINVAL => Errno::EINVAL,
-        ext4_rs::Errno::ENFILE => Errno::ENFILE,
-        ext4_rs::Errno::EMFILE => Errno::EMFILE,
-        ext4_rs::Errno::ENOTTY => Errno::ENOTTY,
-        ext4_rs::Errno::ETXTBSY => Errno::ETXTBSY,
-        ext4_rs::Errno::EFBIG => Errno::EFBIG,
-        ext4_rs::Errno::ENOSPC => Errno::ENOSPC,
-        ext4_rs::Errno::ESPIPE => Errno::ESPIPE,
-        ext4_rs::Errno::EROFS => Errno::EROFS,
-        ext4_rs::Errno::EMLINK => Errno::EMLINK,
-        ext4_rs::Errno::EPIPE => Errno::EPIPE,
-        ext4_rs::Errno::ENAMETOOLONG => Errno::ENAMETOOLONG,
-        ext4_rs::Errno::ENOTEMPTY => Errno::ENOTEMPTY,
-        ext4_rs::Errno::ENOTSUP => Errno::EOPNOTSUPP,
     }
 }
 

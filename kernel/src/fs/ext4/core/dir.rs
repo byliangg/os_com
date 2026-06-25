@@ -289,9 +289,9 @@ pub(in crate::fs::ext4) fn dir_find_entry(
 /// 停于 `block_size - 12`（tail 区）；`get_pblock_idx_state` 的 Err/None **静默跳过该块**
 /// （ext4_rs `if let Ok(fblock) = get_pblock_idx`——错误/未映射都不收任何项、不报错）。
 pub(in crate::fs::ext4) fn dir_get_entries(ctx: &ReadCtx, dir: &Inode) -> Vec<OwnedDirEntry> {
-    dir_enumerate(ctx, dir, false)
+    dir_enumerate(ctx, dir)
         .into_iter()
-        .map(|(e, _off)| e)
+        .map(|(e, _next, _start)| e)
         .collect()
 }
 
@@ -303,13 +303,38 @@ pub(in crate::fs::ext4) fn dir_get_entries_with_next_offset(
     ctx: &ReadCtx,
     dir: &Inode,
 ) -> Vec<(OwnedDirEntry, usize)> {
-    dir_enumerate(ctx, dir, true)
+    dir_enumerate(ctx, dir)
+        .into_iter()
+        .map(|(e, next_off, _start)| (e, next_off))
+        .collect()
 }
 
-/// 枚举的公共实现：`with_offset=false` 时 next_offset 占位 0（调用方丢弃）。
-fn dir_enumerate(ctx: &ReadCtx, dir: &Inode, with_offset: bool) -> Vec<(OwnedDirEntry, usize)> {
+/// 同 [`dir_get_entries`]，但每项附带**项自身**起始绝对字节偏移
+/// `start_offset = iblock*block_size + off`。
+///
+/// 区别于 [`dir_get_entries_with_next_offset`]（那是**下一项**偏移，readdir 续读 cookie 用）：
+/// 这里给的是该项头部所在的 abs offset，正是 [`dir_remove_entry_at_offset`] 删项所需的偏移。
+///
+/// PARITY（ext4_rs `ext4_readdir_with_offsets`，simple_interface/mod.rs:591：
+/// `entry_offset = iblock*block_size + offset`，项自身偏移）。`dir_get_entries_with_next_offset`
+/// 与 `ext4_readdir_with_offsets` 同一遍历、同一 skip/break 规则，仅采集偏移语义不同。
+pub(in crate::fs::ext4) fn dir_get_entries_with_start_offset(
+    ctx: &ReadCtx,
+    dir: &Inode,
+) -> Vec<(OwnedDirEntry, usize)> {
+    dir_enumerate(ctx, dir)
+        .into_iter()
+        .map(|(e, _next, start_off)| (e, start_off))
+        .collect()
+}
+
+/// 枚举的公共实现：每项产出 `(项, next_offset, start_offset)`。
+/// `next_offset = iblock*bs + off + rec_len`（下一项偏移，readdir 续读 cookie）；
+/// `start_offset = iblock*bs + off`（项自身偏移，删项用）。两者均 O(0) 由游标算出，
+/// 始终计算、调用方各取所需。
+fn dir_enumerate(ctx: &ReadCtx, dir: &Inode) -> Vec<(OwnedDirEntry, usize, usize)> {
     let block_size = ctx.block_size;
-    let mut entries: Vec<(OwnedDirEntry, usize)> = Vec::new();
+    let mut entries: Vec<(OwnedDirEntry, usize, usize)> = Vec::new();
     // PARITY: ext4_rs dir_get_entries 不判 is_dir（namespace 层判）；非目录其 size 仍按
     // 块遍历——这里同样直接按 size 遍历（差分对拍仅传目录 inode）。
     let total_blocks = dir.size().div_ceil(block_size as u64);
@@ -335,11 +360,8 @@ fn dir_enumerate(ctx: &ReadCtx, dir: &Inode, with_offset: bool) -> Vec<(OwnedDir
                     break;
                 }
                 if de.inode != 0 {
-                    let next_offset = if with_offset {
-                        iblock as usize * block_size + off + rec_len
-                    } else {
-                        0
-                    };
+                    let start_offset = iblock as usize * block_size + off;
+                    let next_offset = start_offset + rec_len;
                     entries.push((
                         OwnedDirEntry {
                             inode: de.inode,
@@ -347,6 +369,7 @@ fn dir_enumerate(ctx: &ReadCtx, dir: &Inode, with_offset: bool) -> Vec<(OwnedDir
                             name: de.name.to_vec(),
                         },
                         next_offset,
+                        start_offset,
                     ));
                 }
                 off += rec_len;
