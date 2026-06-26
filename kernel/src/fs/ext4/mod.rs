@@ -10,7 +10,10 @@ mod core;
 // to core/ for all read, journaled-write, and namespace operations.
 mod core_adapter;
 mod fs;
-mod inode;
+// Phase 8 move-only split (increment 6): the VFS-trait impls (`impl FileSystem for Ext4Fs` +
+// the `Ext4Inode` integration type and its `impl Inode`) folded into `impl_for_vfs/`, mirroring
+// `kernel/src/fs/ext2/impl_for_vfs/`. Replaces the former top-level `mod inode;`.
+mod impl_for_vfs;
 // Phase 8 move-only split: leaf modules extracted verbatim from `fs.rs` (no behavior change).
 mod buffered_io;
 mod caches;

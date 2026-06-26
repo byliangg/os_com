@@ -5,13 +5,13 @@ use core::time::Duration;
 
 use device_id::DeviceId;
 // Phase 6 Task 5b: integration-layer ext4 types (root inode, block size, mode bits, the
-// `SimpleInodeMeta` DTO) now come from the in-tree `super::types` module instead of the deleted
+// `SimpleInodeMeta` DTO) now come from the in-tree `super::super::types` module instead of the deleted
 // `ext4_rs` crate. `mode_bits` aliases the mode-bit constants to avoid clashing with the local
 // `mode` parameters/bindings in `ext4_mode` / `fallocate`.
-use super::types::{EXT4_BLOCK_SIZE, EXT4_ROOT_INODE, SimpleInodeMeta, mode as mode_bits};
+use super::super::types::{EXT4_BLOCK_SIZE, EXT4_ROOT_INODE, SimpleInodeMeta, mode as mode_bits};
 use ostd::mm::VmIo;
 
-use super::fs::Ext4Fs;
+use super::super::fs::Ext4Fs;
 use crate::{
     current_userspace, device,
     fs::{
@@ -37,7 +37,7 @@ use crate::{
 const EXT4_IOC_SHUTDOWN: u32 = 0x8004_587d;
 
 #[derive(Debug)]
-pub(super) struct Ext4Inode {
+pub(crate) struct Ext4Inode {
     fs: Weak<Ext4Fs>,
     ino: u32,
     path: String,
