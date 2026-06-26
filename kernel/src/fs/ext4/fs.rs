@@ -1578,8 +1578,8 @@ pub(super) struct Ext4Fs {
     // vestige `load_dir_cache_if_needed_locked` (dir-entry cache seed) — is now driven by `core/`
     // over the overlay read seam + journal driver. ext4_rs is referenced only by the `#[cfg(ktest)]`
     // differential tests (slated for Task 5b deletion).
-    block_device: Arc<dyn BlockDevice>,
-    adapter: Arc<KernelBlockDeviceAdapter>,
+    pub(super) block_device: Arc<dyn BlockDevice>,
+    pub(super) adapter: Arc<KernelBlockDeviceAdapter>,
     // Phase 6 Task 1: a mount-time snapshot of the on-disk superblock, parsed once via the core
     // read seam (`read_superblock` over the overlay bridge). The production READ path is now driven
     // by `core/` (stateless free fns over an injected `ReadCtx`), and every core read fn only
@@ -1589,7 +1589,7 @@ pub(super) struct Ext4Fs {
     // by mkfs and never change after mount, so a single snapshot is correct for all reads and
     // avoids an extra 1024-byte device read per read op (the write path stays on ext4_rs, which
     // owns its own SB; this copy feeds reads only).
-    core_sb: super::core::superblock::RawSuperblock,
+    pub(super) core_sb: super::core::superblock::RawSuperblock,
     // Phase 6 Task 4 (★SB ownership transition): the **running** authoritative superblock — holds the
     // live free-block / free-inode counts. Replaces ext4_rs's `inner.allocator_locks.superblock`
     // (`lock_superblock_counter()`) as the single source of truth for free counts. Seeded once at
@@ -1602,26 +1602,26 @@ pub(super) struct Ext4Fs {
     // NOTE on geometry: only the free counts ever change here; geometry stays at mount values. Read
     // paths + statfs (`sb()`) keep reading the FROZEN `core_sb` (statfs reports mount-time free counts,
     // byte-frozen behavior preserved — ext4_rs `inner.super_block` was likewise frozen).
-    running_sb: Mutex<super::core::superblock::RawSuperblock>,
+    pub(super) running_sb: Mutex<super::core::superblock::RawSuperblock>,
     // Phase 6 Task 4: the in-memory `EXT4_FEATURE_INCOMPAT_RECOVER` (needs_recovery / dirty-log) flag.
     // Replaces the only mutable part of ext4_rs's frozen `inner.super_block` (its RECOVER bit). The
     // lazy first-commit set (`mark_needs_recovery_if_needed`), the shutdown set
     // (`mark_needs_recovery_for_shutdown`) and the mount-time clear (after recovery) toggle this and
     // persist a `core_sb`-based SB image (mount-time free counts, RECOVER bit set/clear, csum
     // recomputed) to disk — byte-frozen vs ext4_rs's `inner.super_block.sync_to_disk_with_csum`.
-    recover_flag: AtomicBool,
-    mount_flags_bits: AtomicU32,
+    pub(super) recover_flag: AtomicBool,
+    pub(super) mount_flags_bits: AtomicU32,
     // Phase 6 Task 2: the integration-layer JBD2 commit/checkpoint driver, re-derived over the safe
     // `core/` journal. Holds the core in-memory runtime + the integration-owned checkpoint_list /
     // last_committed_tid / rotation / running ring geometry. Same `Arc<RwMutex<Option<..>>>` slot
     // and lock the ext4_rs `JournalRuntime` used (lock order unchanged).
-    jbd2_runtime: super::core_adapter::CoreJournalRuntimeHandle,
-    journal_io: Arc<JournalIoBridge>,
-    alloc_guard: Arc<LocalOperationAllocGuard>,
-    next_alloc_operation_id: AtomicU64,
-    jbd2_checkpoint_lock: Mutex<()>,
-    inode_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
-    dir_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
+    pub(super) jbd2_runtime: super::core_adapter::CoreJournalRuntimeHandle,
+    pub(super) journal_io: Arc<JournalIoBridge>,
+    pub(super) alloc_guard: Arc<LocalOperationAllocGuard>,
+    pub(super) next_alloc_operation_id: AtomicU64,
+    pub(super) jbd2_checkpoint_lock: Mutex<()>,
+    pub(super) inode_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
+    pub(super) dir_correctness_locks: Mutex<BTreeMap<u32, Arc<RwMutex<()>>>>,
     /// Step 4a-2: per-ino "highest TID containing a metadata change for this
     /// inode" map.  Equivalent to Linux `EXT4_I(inode)->i_sync_tid`.
     /// Updated by `finish_jbd2_handle` after a Write/Truncate handle stops;
@@ -1630,27 +1630,27 @@ pub(super) struct Ext4Fs {
     /// fast path in `force_commit_for_tid` filters them).  We do not actively
     /// evict to keep the lock granularity simple; eviction can be added later
     /// when memory pressure arises.
-    inode_tids: RwMutex<BTreeMap<u32, u32>>,
+    pub(super) inode_tids: RwMutex<BTreeMap<u32, u32>>,
     /// Step 4a-2: WaitQueue for fsync force-commit waiters.  Woken after
     /// every successful `finish_commit` (i.e. `last_committed_tid` advances)
     /// and after every `stop_handle` (which may make a prev_running TX
     /// commit-ready).  Waiters re-check `last_committed_tid >= target_tid`.
-    commit_notifier: WaitQueue,
+    pub(super) commit_notifier: WaitQueue,
     /// Step 4b: shutdown state set by `EXT4_IOC_SHUTDOWN` ioctl.
     /// `0` = active, `1` = shutdown.  Once shutdown, `run_journaled_ext4`
     /// and `fsync_regular_file` return EIO.  Cleared automatically on
     /// remount + recovery (Phase 1 path).
-    shutdown_state: AtomicU32,
-    dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
-    inode_page_caches: Mutex<BTreeMap<u32, Arc<Ext4PageCacheState>>>,
-    open_file_handles: Mutex<BTreeMap<u32, usize>>,
+    pub(super) shutdown_state: AtomicU32,
+    pub(super) dir_entry_cache: Mutex<BTreeMap<u32, DirEntryCache>>,
+    pub(super) inode_page_caches: Mutex<BTreeMap<u32, Arc<Ext4PageCacheState>>>,
+    pub(super) open_file_handles: Mutex<BTreeMap<u32, usize>>,
     /// BUG-19 fix: inodes whose bitmap bit has already been reclaimed by the evict path
     /// (`cleanup_unlinked_file`). Guards against a double-free if both the last-ref drop
     /// (`cleanup_unlinked`) and the last-handle close (`on_close_file_handle`) race to reclaim the
     /// same inode. Cleared if the ino is reallocated (`create_at`/`mkdir_at` insert via the
     /// namespace path do not consult this set; the entry is dropped here on the next alloc that
     /// hands out the same number — see `note_inode_allocated`).
-    freed_inodes: Mutex<BTreeSet<u32>>,
+    pub(super) freed_inodes: Mutex<BTreeSet<u32>>,
     /// BUG-19 fix (atomic-context safety): inodes whose LAST open handle has closed while they were
     /// already unlinked (nlink==0), but whose actual reclaim (blocking journaled I/O) must be
     /// deferred out of the close path. `on_close_file_handle` can run inside `InodeHandle::drop` in
@@ -1661,19 +1661,19 @@ pub(super) struct Ext4Fs {
     /// `reclaim_pending_inode_frees` from the next SLEEPABLE fs op (namespace ops + `sync`). This
     /// mirrors ext2, which never frees in close/Drop — it frees lazily in the sleepable
     /// `sync_metadata` path. The `freed_inodes` guard keeps the eventual free idempotent.
-    pending_inode_free: Mutex<BTreeSet<u32>>,
-    inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
+    pub(super) pending_inode_free: Mutex<BTreeSet<u32>>,
+    pub(super) inode_direct_read_cache: Mutex<BTreeMap<u32, DirectReadCache>>,
     // Phase 5: metadata-only extent mapping cache for O_DIRECT reads. Distinct
     // from `inode_direct_read_cache` above (which is the retired speculative
     // *data* read cache): this caches only the logical->physical extent mapping
     // (a few integers per extent) so sequential reads skip the per-read
     // `find_extent` walk. Holds no file data and does no speculative readahead.
-    inode_extent_map_cache: Mutex<BTreeMap<u32, ExtentMapCacheEntry>>,
+    pub(super) inode_extent_map_cache: Mutex<BTreeMap<u32, ExtentMapCacheEntry>>,
     // P2 (Phase 6): per-inode written-extent coverage for the buffered
     // overwrite fast path. See `WrittenCoverage` for the ⊆-truth invariant
     // and the invalidation sites.
-    inode_written_coverage: Mutex<BTreeMap<u32, WrittenCoverage>>,
-    fsync_profile: FsyncProfileStats,
+    pub(super) inode_written_coverage: Mutex<BTreeMap<u32, WrittenCoverage>>,
+    pub(super) fsync_profile: FsyncProfileStats,
     // Phase 5: in-memory inode metadata (stat) cache. ext4_rs `get_inode_ref`
     // re-reads the inode block from the device on every stat, and the read path
     // stats several times per read (type check, size, atime), so small reads
@@ -1683,24 +1683,24 @@ pub(super) struct Ext4Fs {
     // create/write/truncate/setattr/dir ops); `stat` only inserts when the
     // generation did not advance across its disk read, closing the read-vs-write
     // TOCTOU.
-    inode_meta_cache: Mutex<BTreeMap<u32, SimpleInodeMeta>>,
-    meta_cache_generation: AtomicU64,
-    inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
-    inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
-    inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
-    page_cache_enabled: bool,
-    direct_read_cache_enabled: bool,
-    extent_map_cache_enabled: bool,
-    phase2_profile_enabled: bool,
-    direct_read_profile_started: AtomicBool,
-    direct_write_profile_started: AtomicBool,
-    direct_read_profile: DirectReadProfileStats,
-    direct_write_profile: DirectWriteProfileStats,
-    buffered_write_profile: BufferedWriteProfileStats,
-    runtime_lock_stats: Ext4RsRuntimeLockStats,
-    journaled_op_profile: JournaledOpProfileStats,
-    fs_event_subscriber_stats: FsEventSubscriberStats,
-    self_ref: Weak<Self>,
+    pub(super) inode_meta_cache: Mutex<BTreeMap<u32, SimpleInodeMeta>>,
+    pub(super) meta_cache_generation: AtomicU64,
+    pub(super) inode_atime_cache: Mutex<BTreeMap<u32, u32>>,
+    pub(super) inode_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    pub(super) inode_mtime_ctime_cache: Mutex<BTreeMap<u32, u32>>,
+    pub(super) page_cache_enabled: bool,
+    pub(super) direct_read_cache_enabled: bool,
+    pub(super) extent_map_cache_enabled: bool,
+    pub(super) phase2_profile_enabled: bool,
+    pub(super) direct_read_profile_started: AtomicBool,
+    pub(super) direct_write_profile_started: AtomicBool,
+    pub(super) direct_read_profile: DirectReadProfileStats,
+    pub(super) direct_write_profile: DirectWriteProfileStats,
+    pub(super) buffered_write_profile: BufferedWriteProfileStats,
+    pub(super) runtime_lock_stats: Ext4RsRuntimeLockStats,
+    pub(super) journaled_op_profile: JournaledOpProfileStats,
+    pub(super) fs_event_subscriber_stats: FsEventSubscriberStats,
+    pub(super) self_ref: Weak<Self>,
 }
 
 impl Ext4Fs {
@@ -2798,7 +2798,7 @@ impl Ext4Fs {
     }
 
     #[inline]
-    fn now_unix_seconds_u32() -> u32 {
+    pub(super) fn now_unix_seconds_u32() -> u32 {
         let secs = crate::time::clocks::RealTimeClock::get()
             .read_time()
             .as_secs();
@@ -2806,7 +2806,7 @@ impl Ext4Fs {
     }
 
     #[inline]
-    fn monotonic_nanos() -> u64 {
+    pub(super) fn monotonic_nanos() -> u64 {
         let duration = read_monotonic_time();
         duration
             .as_secs()
@@ -3666,12 +3666,12 @@ impl Ext4Fs {
         self.set_inode_times(ino, Some(now), Some(now), Some(now))
     }
 
-    fn vm_io_error(err: OstdError) -> Error {
+    pub(super) fn vm_io_error(err: OstdError) -> Error {
         let _ = err;
         Error::with_message(Errno::EFAULT, "vm I/O failed")
     }
 
-    fn write_zeros(writer: &mut VmWriter, len: usize) -> Result<()> {
+    pub(super) fn write_zeros(writer: &mut VmWriter, len: usize) -> Result<()> {
         debug_assert!(len <= writer.avail());
         let zeroed = writer
             .fill_zeros(len)
@@ -4363,7 +4363,7 @@ impl Ext4Fs {
     // =====================================================================================
 
     /// Build a core read seam wired to the overlay bridge (read-your-writes).
-    fn core_reader(&self) -> super::core_adapter::CoreDeviceReader {
+    pub(super) fn core_reader(&self) -> super::core_adapter::CoreDeviceReader {
         super::core_adapter::CoreDeviceReader::new(self.journal_io.clone())
     }
 
@@ -4372,7 +4372,7 @@ impl Ext4Fs {
     /// `core::SimpleBlockRange` is a field-for-field copy of ext4_rs's `SimpleBlockRange`
     /// (`{ lblock, pblock, len }`), so the mapping-vector contract is preserved verbatim. The
     /// caller-supplied `ctx` is the core read context built by a `run_io_*` wrapper.
-    fn core_map_blocks(
+    pub(super) fn core_map_blocks(
         ctx: &super::core::file::ReadCtx,
         ino: u32,
         lblock_start: u32,
@@ -6581,7 +6581,7 @@ impl Ext4Fs {
         self.shutdown_state.load(Ordering::Acquire) != 0
     }
 
-    fn check_not_shutdown(&self) -> Result<()> {
+    pub(super) fn check_not_shutdown(&self) -> Result<()> {
         if self.is_shutdown() {
             return_errno_with_message!(Errno::EIO, "ext4: filesystem is shutdown");
         }
