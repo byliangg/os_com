@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! Phase 8 move-only split: the page-cache backend relocated verbatim from `fs.rs` —
-//! `Ext4PageCacheState` and `Ext4PageCacheBackend` plus its `PageCacheBackend` impl. The
-//! `impl Ext4Fs` page-cache method group stays in `fs.rs` for now (later increment). No behavior change.
+//! `Ext4PageCacheState` and `Ext4PageCacheBackend` plus its `PageCacheBackend` impl, and (inc-7)
+//! the `impl Ext4Fs` page-cache method group that manages `inode_page_caches` /
+//! `Ext4PageCacheState`. No behavior change.
 
 use aster_block::bio::BioWaiter;
 
@@ -200,5 +201,129 @@ impl PageCacheBackend for Ext4PageCacheBackend {
         fs.stat(self.ino)
             .map(|meta| (meta.size as usize).div_ceil(PAGE_SIZE))
             .unwrap_or(0)
+    }
+}
+
+// Phase 8 move-only split (inc-7): the `impl Ext4Fs` page-cache method group relocated verbatim
+// from `fs.rs` — every method whose dominant concern is `inode_page_caches` /
+// `Ext4PageCacheState` management. No behavior change; only `use` imports + the module location
+// differ.
+impl Ext4Fs {
+    pub(super) fn page_cache_enabled(&self) -> bool {
+        self.page_cache_enabled
+    }
+
+    pub(super) fn page_cache_state_for_inode(
+        self: &Arc<Self>,
+        ino: u32,
+        capacity: usize,
+    ) -> Result<Arc<Ext4PageCacheState>> {
+        if let Some(state) = self.inode_page_caches.lock().get(&ino).cloned() {
+            state.resize(capacity)?;
+            return Ok(state);
+        }
+
+        let new_state = Arc::new(Ext4PageCacheState::new(
+            Arc::downgrade(self),
+            ino,
+            capacity,
+        )?);
+        let state = self
+            .inode_page_caches
+            .lock()
+            .entry(ino)
+            .or_insert(new_state)
+            .clone();
+        state.resize(capacity)?;
+        Ok(state)
+    }
+
+    pub(super) fn page_cache_for_inode(self: &Arc<Self>, ino: u32) -> Result<Arc<Vmo>> {
+        let capacity = self.stat(ino)?.size as usize;
+        Ok(self.page_cache_state_for_inode(ino, capacity)?.pages())
+    }
+
+    pub(super) fn page_cache_state_if_present(&self, ino: u32) -> Option<Arc<Ext4PageCacheState>> {
+        self.inode_page_caches.lock().get(&ino).cloned()
+    }
+
+    pub(super) fn discard_page_cache_range(&self, ino: u32, start: usize, len: usize) {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.discard_range(start, len);
+        }
+    }
+
+    pub(super) fn evict_page_cache_range(&self, ino: u32, start: usize, len: usize) -> Result<()> {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.evict_range(start, len)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn sync_page_cache_for_inode_locked(&self, ino: u32) -> Result<()> {
+        let Some(state) = self.page_cache_state_if_present(ino) else {
+            return Ok(());
+        };
+        let file_size = self.stat(ino)?.size as usize;
+        // S3 (Phase 6): fsync writes dirty pages back but keeps them resident as
+        // clean, instead of decommitting the whole file on every COMMIT. Keeps
+        // the working set warm and removes the "clear-on-fsync -> per-4KB sync
+        // refill" loop that made even in-place UPDATE 15-35x slower than ext2.
+        state.flush_all(file_size)
+    }
+
+    pub(super) fn sync_page_cache_for_inode(&self, ino: u32) -> Result<()> {
+        let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+        let _inode_guard = inode_lock.write();
+        self.sync_page_cache_for_inode_locked(ino)
+    }
+
+    pub(super) fn sync_all_page_caches(&self) -> Result<()> {
+        let states: Vec<(u32, Arc<Ext4PageCacheState>)> = self
+            .inode_page_caches
+            .lock()
+            .iter()
+            .map(|(ino, state)| (*ino, state.clone()))
+            .collect();
+
+        for (ino, state) in states {
+            let inode_lock = Self::correctness_lock_for(&self.inode_correctness_locks, ino);
+            let _inode_guard = inode_lock.write();
+            let file_size = self.stat(ino)?.size as usize;
+            state.evict_all(file_size)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reset_page_cache_after_truncate(&self, ino: u32, new_size: usize) -> Result<()> {
+        if let Some(state) = self.page_cache_state_if_present(ino) {
+            state.discard_all();
+            state.resize(new_size)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn drop_page_cache_state(&self, ino: u32) {
+        let Some(state) = self.inode_page_caches.lock().remove(&ino) else {
+            return;
+        };
+        let file_size = self
+            .stat(ino)
+            .map(|meta| meta.size as usize)
+            .unwrap_or_else(|_| state.cached_size());
+        if let Err(err) = state.evict_all(file_size) {
+            warn!(
+                "ext4: failed to evict page cache while dropping inode state ino={} err={:?}",
+                ino, err
+            );
+            state.discard_all();
+        }
+    }
+
+    pub(super) fn discard_page_cache_state(&self, ino: u32) {
+        let Some(state) = self.inode_page_caches.lock().remove(&ino) else {
+            return;
+        };
+        state.discard_all();
     }
 }
