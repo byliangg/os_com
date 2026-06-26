@@ -12,8 +12,10 @@ mod core_adapter;
 mod fs;
 mod inode;
 // Phase 8 move-only split: leaf modules extracted verbatim from `fs.rs` (no behavior change).
+mod buffered_io;
 mod caches;
 mod device_adapter;
+mod direct_io;
 // Phase 8 move-only split: the per-inode/per-dir correctness-lock helpers.
 mod locks;
 mod page_cache;
