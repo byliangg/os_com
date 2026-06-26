@@ -57,6 +57,8 @@ use super::core::{
     journal::format::RawJournalSuperblock,
 };
 use crate::prelude::*;
+use super::device_adapter::KernelBlockDeviceAdapter;
+use super::types::{DeviceMetadataWriter as Ext4MetadataWriter, EXT4_BLOCK_SIZE};
 
 /// A committed transaction parked in the checkpoint list: its ring range (for tail reconciliation)
 /// + the full metadata block images (home block number → full-block image), in `block_nr` order.
@@ -671,5 +673,125 @@ impl<'a> SyncBarrier<'a> {
 impl JournalBarrier for SyncBarrier<'_> {
     fn sync(&self) -> Result<()> {
         (self.sync)()
+    }
+}
+
+// Phase 8 move-only split: the JBD2 overlay I/O bridge (`JournalIoBridge`) relocated verbatim
+// from `fs.rs`. It pairs the `KernelBlockDeviceAdapter` home read/write with the core journal
+// overlay (read-your-writes) and records deferred metadata writes into the active transaction.
+// Phase 6 Task 0: widened to `pub(super)` so `core_adapter` can route core reads through the
+// overlay bridge (`read_offset_into` = home + uncommitted-journal overlay = read-your-writes).
+pub(super) struct JournalIoBridge {
+    adapter: Arc<KernelBlockDeviceAdapter>,
+    // Phase 6 Task 2: now holds the core-backed driver. The overlay read merges core's in-flight
+    // metadata images; the metadata-write path (used by the *remaining* ext4_rs namespace / setattr
+    // ops still driven through the scoped Ext4 — Task 3) records into the **core** driver.
+    runtime: super::core_adapter::CoreJournalRuntimeHandle,
+}
+
+impl JournalIoBridge {
+    pub(super) fn new(
+        adapter: Arc<KernelBlockDeviceAdapter>,
+        runtime: super::core_adapter::CoreJournalRuntimeHandle,
+    ) -> Self {
+        Self { adapter, runtime }
+    }
+
+    fn overlay_metadata_read(&self, offset: usize, out: &mut [u8]) {
+        let runtime_guard = self.runtime.read();
+        let Some(driver) = runtime_guard.as_ref() else {
+            return;
+        };
+        driver.overlay_metadata_read(offset, out);
+    }
+
+    /// Record an ext4_rs-engine metadata write into the **core** driver's active transaction
+    /// (deferred home write), or write it straight to home when no handle is active.
+    ///
+    /// PARITY: ext4_rs `record_metadata_write_for_handle` (journal.rs:488-541) — ext4_rs accepts a
+    /// **byte offset + partial chunk** and builds the full-block image by patching the chunk onto a
+    /// base image (the newest in-memory overlay image of that block, else the home block). core's
+    /// `record_metadata_write` takes a **full block image** only, so we replicate ext4_rs's chunking
+    /// + base-image build here, then hand core the assembled full block. This keeps the remaining
+    /// ext4_rs namespace/setattr ops (Task 3) journaling byte-identically into the core transaction.
+    fn write_metadata_for_handle(&self, handle_id: Option<u64>, offset: usize, data: &[u8]) {
+        let mut defer_metadata_write = false;
+        if let Some(handle_id) = handle_id {
+            let mut driver_guard = self.runtime.write();
+            if let Some(driver) = driver_guard.as_mut() {
+                let block_size = driver.block_size();
+                if block_size != 0 && !data.is_empty() {
+                    let mut consumed = 0usize;
+                    while consumed < data.len() {
+                        let write_offset = offset + consumed;
+                        let block_nr = (write_offset / block_size) as u64;
+                        let block_offset = write_offset % block_size;
+                        let chunk_len =
+                            core::cmp::min(block_size - block_offset, data.len() - consumed);
+                        // Build the full-block image: base = newest overlay image of this block, else
+                        // the home block read from the device; patch the chunk in.
+                        let mut block_image = vec![0u8; block_size];
+                        let base_block_offset = block_nr as usize * block_size;
+                        // Read home first, then overlay the newest in-memory image (read-your-writes),
+                        // matching ext4_rs `latest_metadata_buffer`-or-`load_block` base selection.
+                        self.adapter
+                            .read_offset_into(base_block_offset, &mut block_image);
+                        driver.overlay_metadata_read(base_block_offset, &mut block_image);
+                        block_image[block_offset..block_offset + chunk_len]
+                            .copy_from_slice(&data[consumed..consumed + chunk_len]);
+                        driver.record_metadata_write(handle_id, block_nr, &block_image);
+                        consumed += chunk_len;
+                    }
+                }
+                defer_metadata_write = driver.should_defer_metadata_write();
+            }
+        } else if let Some(driver) = self.runtime.read().as_ref() {
+            defer_metadata_write = driver.should_defer_metadata_write();
+        }
+        if defer_metadata_write {
+            return;
+        }
+        self.adapter.write_offset(offset, data);
+    }
+}
+
+// Phase 6 Task 5b: the overlay device-read/write seam (formerly `impl ext4_rs::BlockDevice`) is now
+// an inherent impl; `core_adapter`'s `CoreDeviceReader` calls `read_offset_into` by name. Same bodies.
+impl JournalIoBridge {
+    #[allow(dead_code)]
+    fn read_offset(&self, offset: usize) -> Vec<u8> {
+        let block_size = self
+            .runtime
+            .read()
+            .as_ref()
+            .map(|driver| driver.block_size())
+            .unwrap_or(EXT4_BLOCK_SIZE);
+        let mut data = vec![0u8; block_size];
+        self.read_offset_into(offset, &mut data);
+        data
+    }
+
+    pub(super) fn read_offset_into(&self, offset: usize, out: &mut [u8]) {
+        self.adapter.read_offset_into(offset, out);
+        self.overlay_metadata_read(offset, out);
+    }
+
+    pub(super) fn write_offset(&self, offset: usize, data: &[u8]) {
+        self.adapter.write_offset(offset, data);
+    }
+
+    #[allow(dead_code)]
+    fn sync(&self) -> Result<()> {
+        self.adapter.sync()
+    }
+}
+
+impl Ext4MetadataWriter for JournalIoBridge {
+    fn write_metadata(&self, offset: usize, data: &[u8]) {
+        self.write_metadata_for_handle(None, offset, data);
+    }
+
+    fn write_metadata_for_jbd2_handle(&self, handle_id: Option<u64>, offset: usize, data: &[u8]) {
+        self.write_metadata_for_handle(handle_id, offset, data);
     }
 }

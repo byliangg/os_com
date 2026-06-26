@@ -32,8 +32,8 @@ use super::core::{
     superblock::RawSuperblock,
     types::Ext4Fsblk,
 };
-use super::fs::{JournalIoBridge, KernelBlockDeviceAdapter};
-use super::journal_driver::CoreJournalDriver;
+use super::device_adapter::KernelBlockDeviceAdapter;
+use super::journal_driver::{CoreJournalDriver, JournalIoBridge};
 use crate::prelude::*;
 
 /// Shared, late-initialized handle to the integration-layer JBD2 driver (which wraps the **core**
