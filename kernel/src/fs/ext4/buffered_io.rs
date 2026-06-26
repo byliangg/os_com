@@ -13,7 +13,7 @@ use super::profile::{
     GENERIC014_TRUNCATE_PROGRESS, GENERIC014_WRITE_PROGRESS,
 };
 use super::run::JournaledOp;
-use super::types::{EXT4_BLOCK_SIZE, mode};
+use super::types::EXT4_BLOCK_SIZE;
 use crate::fs::utils::{FallocMode, StatusFlags};
 use crate::prelude::*;
 

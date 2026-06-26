@@ -16,6 +16,9 @@ mod buffered_io;
 mod caches;
 mod device_adapter;
 mod direct_io;
+mod inode_meta;
+mod namespace;
+mod sync;
 // Phase 8 move-only split: the per-inode/per-dir correctness-lock helpers.
 mod locks;
 mod page_cache;
