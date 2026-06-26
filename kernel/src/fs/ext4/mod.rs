@@ -14,6 +14,8 @@ mod inode;
 // Phase 8 move-only split: leaf modules extracted verbatim from `fs.rs` (no behavior change).
 mod caches;
 mod device_adapter;
+// Phase 8 move-only split: the per-inode/per-dir correctness-lock helpers.
+mod locks;
 mod page_cache;
 mod profile;
 // Phase 8 move-only split: the journaled-write / read execution hub (JournaledOp, runtime lock,
