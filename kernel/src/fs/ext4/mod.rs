@@ -16,6 +16,9 @@ mod caches;
 mod device_adapter;
 mod page_cache;
 mod profile;
+// Phase 8 move-only split: the journaled-write / read execution hub (JournaledOp, runtime lock,
+// JBD2 handle/commit/checkpoint state machine, run_io_*/run_journaled_* wrappers).
+mod run;
 // Phase 6 Task 5b: in-tree replacements for the integration-layer types that used to be imported
 // from the third-party `ext4_rs` crate (mode bits, root inode, block size, the `Simple*` DTOs and
 // the metadata-writer seam trait). Byte-identical to the `ext4_rs` items they replace.

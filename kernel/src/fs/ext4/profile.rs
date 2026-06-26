@@ -5,7 +5,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::fs::JournaledOp;
+use super::run::JournaledOp;
 
 /// Phase 6 Task 2: zeroed stand-in for the ext4_rs `JournalRuntimeDebugStats` (debug-only counters
 /// the core-backed driver does not track). Only consumed by the diagnostic `dump_perf_summary`
