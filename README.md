@@ -1,8 +1,6 @@
-# Asterinas EXT4 + JBD2 赛题版本
+# Asterinas EXT4 
 
-本仓库是基于 Asterinas 的 EXT4 文件系统赛题工程版本。当前主线已经完成 **JBD2 Phase 3 功能收口**，并进入 **PageCache Phase 4 收口/性能 hardening**：在 Phase 2 的完整事务管理、崩溃恢复与多文件并发 correctness baseline 之上，补齐了 `fsync` / `fdatasync` / block flush / Linux 持久化语义对齐，并已将 ext4 regular-file buffered I/O / mmap 接入 Asterinas `PageCache` / `Vmo`。Phase 4 correctness 验收集当前为 `9 PASS / 0 FAIL / 4 NOTRUN`，新增 PageCache benchmark A-E 已完成首轮记录。
-
-当前日期口径：2026-05-14（Asia/Shanghai）；最新 Phase 4 证据链见 `docs/feature_pagecache_phase4_plan.md` / `docs/feature_pagecache_phase4_milestone.md` / `benchmark/benchmark.md`。
+本仓库是基于全国大学生操作系统功能赛proj8赛题
 
 ## 当前状态
 
@@ -92,7 +90,7 @@ Phase 4 新增 A-E 口径：A 为 `lmbench_only`，B/C 为官方 fio `direct=0` 
 | E. O_DIRECT read cache-off | `2570 MB/s` | `2643 MB/s` | `97.24%` |
 | E. O_DIRECT write cache-off | `1706 MB/s` | `3158 MB/s` | `54.02%`，仍为 hardening blocker |
 
-结论：PageCache-on 的 warm read 已能体现缓存命中收益；cold read 与 buffered write 暴露出当前 PageCache backend / dirty writeback 的性能成本，转入 Phase 4 Step 7 hardening。
+
 
 ## 复现命令
 
@@ -262,9 +260,6 @@ EXT4_PHASE2_ROUNDS=8 \
 bash tools/ext4/run_phase4_in_docker.sh
 ```
 
-该模式运行自研多文件并发 baseline，并执行严格关键词扫描；case 列表可通过 `EXT4_PHASE2_CASES=multi_file_write_verify,rename_churn` 缩小。
-
-Phase 2 最终收口证据：完整功能大全量已复跑通过，包含 crash 18/18、phase3 10 PASS + 6 NOTRUN、phase4 12 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency 7/7；严格关键词扫描为空。
 
 ### Crash 测试
 
@@ -336,41 +331,7 @@ bash test/initramfs/src/benchmark/fio/run_ext4_summary.sh
 | `benchmark/logs/` | 最新验证日志与 crash summary |
 | `benchmark/benchmark.md` | 当前 benchmark 快照，含 Phase 4 PageCache A-E benchmark |
 
-## 文档索引
 
-本仓库的 `docs/` 目录与 benchmark 文档保留了本赛题阶段记录：
-
-| 文档 | 作用 |
-| --- | --- |
-| `docs/feature_jbd2_phase1_analysis.md` | JBD2 Phase 1 问题分析 |
-| `docs/feature_jbd2_phase1_plan.md` | JBD2 Phase 1 实现计划 |
-| `docs/feature_jbd2_phase1_milestone.md` | JBD2 Phase 1 进度与验证记录 |
-| `docs/feature_jbd2_phase2_analysis.md` | JBD2 Phase 2 并发正确性问题分析 |
-| `docs/feature_jbd2_phase2_plan.md` | JBD2 Phase 2 实现计划（先 correctness，再性能） |
-| `docs/feature_jbd2_phase2_lock_order.md` | JBD2 Phase 2 锁顺序、同步原语与回退约定 |
-| `docs/feature_jbd2_phase2_milestone.md` | JBD2 Phase 2 进度跟踪模板 |
-| `docs/feature_jbd2_phase3_pretest.md` | JBD2 Phase 3 预研测试，记录 fsync/flush 语义风险与 fsync-heavy fio 现象 |
-| `docs/feature_jbd2_phase3_plan.md` | JBD2 Phase 3 实现计划与完成口径，覆盖环境固化、raw/virtio/ext4 fsync/flush 语义收口 |
-| `docs/feature_jbd2_phase3_milestone.md` | JBD2 Phase 3 进度、验证证据与后续性能 hardening 记录 |
-| `docs/feature_pagecache_phase4_plan.md` | PageCache Phase 4 实现计划，覆盖 ext4 buffered I/O / mmap / writeback、自研 cache 退役边界与 A-E benchmark 口径 |
-| `docs/feature_pagecache_phase4_milestone.md` | PageCache Phase 4 进度、代码审计、`pagecache_phase4` 回归与 PageCache benchmark A-E 记录 |
-| `docs/analysis_phase1.md` | fio 性能 Phase 1 诊断报告 |
-| `docs/optimize_plan_phase1.md` | fio 性能 Phase 1 计划 |
-| `docs/optimize_phase1_milestone.md` | fio 性能 Phase 1 里程碑 |
-| `docs/benchmark.md` | docs 目录 benchmark 快照，与 `benchmark/benchmark.md` 和根目录 `benchmark.md` 同步 |
-| `benchmark/benchmark.md` | 仓库内 benchmark 快照，含 Phase 4 PageCache A-E benchmark 与最近 PageCache correctness 测试结果 |
-| `docs/environment.md` | Docker、KVM、代理、benchmark 环境说明 |
-| `docs/赛题要求.md` | 比赛评审标准 |
-
-## 当前边界
-
-- Phase 1 为同步 commit/checkpoint 模型，没有引入后台 JBD2 commit 线程。
-- Revoke 机制已有结构与扫描骨架，当前 crash/recovery 验证覆盖的是本实现实际写出的 descriptor/data/commit 事务格式。
-- `rename_across_dir` crash 场景函数已保留，但 marker 触发不稳定，未纳入默认 crash matrix；默认矩阵每轮 9 个场景，最新收口复跑两轮共 18/18 PASS。
-- `STATIC_BLOCKED` 用例主要来自当前阶段未覆盖的 Linux ext4 语义或环境能力，例如 hardlink/symlink、AIO、xattr/chacl、renameat2、部分 fallocate/fiemap/collapse-range、device-mapper crash tests。
-- 多文件并发基本读写 correctness、Phase 3 fsync/flush 持久化语义与 Phase 4 PageCache correctness 已完成；PageCache cold read / buffered write、fio write >= 90%、更激进拆锁和更高并发吞吐属于后续性能 hardening。
-- Phase 4 中 PageCache 只服务 buffered I/O / mmap / writeback；O_DIRECT 继续绕过 PageCache，并通过 cache-off 守底单独统计。
-- Phase 3 已确认：`bs=16K fsync=4` 修复后触发真实 flush，旧的纳秒级/微秒级高吞吐结果不能作为性能宣传；fsync-heavy 与普通顺序吞吐分开统计。
 
 ## 来源说明
 
