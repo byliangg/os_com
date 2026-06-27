@@ -6,7 +6,7 @@
 
 Phase 5 是 **性能优化主线**，承接已收口的 feature_pagecache_phase4（PageCache buffered I/O / mmap 接入，守底回归全绿）。Phase 4 已经把"PageCache 只是 buffered/mmap 一支、不解释 O_DIRECT fio"这件事用数据钉死，本阶段把优化目标拉回 **O_DIRECT / raw block / ext4 direct I/O 路径的端到端延迟**。
 
-核心方法论（学长指导 + DeepSeek V4 Pro + Claude Code 三方对齐结论）：
+核心方法论（人工讨论 + AI 辅助分析后形成的阶段结论）：
 
 > **先做延迟归因（latency attribution），再做优化。** 不靠猜——统计读写操作端到端延迟，拆解各阶段在端到端延迟中的占比，定位真正的瓶颈段，再针对性优化。
 
@@ -84,7 +84,7 @@ Phase 5 是 **性能优化主线**，承接已收口的 feature_pagecache_phase4
 **状态：** ✅ 完成
 - 诚实基线见 §1；三瓶颈分解见 §2；profile 盘点见 §3；
 - 完整 sweep 报告：`fio_direct_parameter_sweep_report.md`；
-- 学长反馈与三方对齐：`fio_direct_senior_feedback_response.md`。
+- 人工反馈与 AI 辅助分析记录：`fio_direct_senior_feedback_response.md`。
 
 ## Step 1：收尾 dump + 收割阶段占比表
 
