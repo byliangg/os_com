@@ -443,23 +443,23 @@ cargo check -p aster-kernel --target x86_64-unknown-none
 
 | 日期 | Step | 作者 | 变更 |
 |------|------|------|------|
-| 2026-05-11 | Step 0 | DeepSeek | 新建 Phase 4 PageCache plan/milestone；完成 ext2/ext4 代码审计锚点与阶段边界记录 |
-| 2026-05-11 | Step 1 | DeepSeek | 接入默认关闭的 ext4 per-inode PageCache state 骨架与 gated `Ext4Inode::page_cache()`；`cargo check` 通过 |
-| 2026-05-11 | Step 3 | DeepSeek | `ext4_rs::prepare_write_at()` 支持非对齐 range；ext4 buffered write 改为 journaled metadata prepare + dirty PageCache，writeback 不再更新时间戳；`ext4_rs` / `aster-kernel` cargo check 通过 |
-| 2026-05-11 | Step 6 | DeepSeek | 建立 `pagecache_phase4` upstream xfstests 验收集，明确 Phase 4 不维护自研 PageCache smoke/coherency 测试集 |
-| 2026-05-11 | Step 6 | DeepSeek | `pagecache_phase4` runner 自动传入 `ext4fs.page_cache=1`，守底回归继续默认关闭 PageCache |
-| 2026-05-11 | Step 3-4 | DeepSeek | 修复 `generic/130` partial EOF stale data、`generic/418` sparse direct allocation metadata 持久化；补齐 dirty PageCache syncfs/truncate drain 与 minimal fallocate，`generic/247` / `generic/469` 已 PASS，`generic/749` 缩小到 VM SIGBUS 边界问题 |
-| 2026-05-12 | Step 4 | DeepSeek | 补齐 shared VMO mmap EOF 越界 `SIGBUS` 语义与同步 fault 不可静默忽略处理；`generic/749` 单例 PASS |
-| 2026-05-12 | Step 3-4 | DeepSeek | 禁止 ext4_rs write path 额外预分配未写块并对新分配块先清零；zero/punch 改为复用 `write_at` 分块写零；`generic/091` 单例 PASS |
-| 2026-05-12 | Step 3-5 | DeepSeek | 修复 `generic/133` ENOSPC：VFS zero-link cleanup 钩子触发 ext4 unlinked regular-file truncate，释放数据块但仍不复用 inode；`generic/133` 单例 PASS |
-| 2026-05-12 | Step 4-5 | DeepSeek | shared VMO 写缺页补 dirty tracking；fallocate/zero/punch 后改为保守 evict；fsync PageCache drain 纳入 inode correctness lock；`generic/263` / `generic/418` 单例 PASS，但 full list 仍在这两项复现 stale data |
-| 2026-05-12 | Step 6 | DeepSeek | 最新 `pagecache_phase4` full list：`7 PASS / 2 FAIL / 4 NOTRUN`，剩余 blocker 为 direct/buffered/mmap coherency 非确定性失败（`generic/263`, `generic/418`） |
-| 2026-05-12 | Step 4-6 | DeepSeek | PageCache full-list evict 改为写回所有 present non-Uninit pages，并在 PageCache 模式禁用 self-developed direct-read mapping cache；`generic/263` full list PASS，最新 `pagecache_phase4` 为 `8 PASS / 1 FAIL / 4 NOTRUN`，仅剩 `generic/418` |
-| 2026-05-12 | Step 5-6 | DeepSeek | 继续排查 `generic/418`：单例 `benchmark/logs/pagecache_phase4_20260512_160633.log` PASS；full list `benchmark/logs/pagecache_phase4_20260512_160858.log` 仍 `8 PASS / 1 FAIL / 4 NOTRUN`。已排除 pending/speculative direct-read cache、write-through dirty retention、inode PageCache state 生命周期单点问题；extent-aware PageCache backend 试验导致 `generic/418` 单例 timeout（`benchmark/logs/pagecache_phase4_20260512_162304.log`），已回退 |
-| 2026-05-13 | Step 5-6 | DeepSeek | 修复 stale JBD2 checkpoint metadata home-write 覆盖复用后 regular-file data block：PageCache writeback、buffered write 与 O_DIRECT write 均 revoke 对应 mapped data block 的 checkpoint metadata；同时避免空 metadata transaction TID 阻塞 fsync。clean `generic/263`、clean `generic/247,generic/418` 与 full `pagecache_phase4` 已通过，最新 full list `9 PASS / 0 FAIL / 4 NOTRUN` |
-| 2026-05-14 | Step 6 | DeepSeek | 接手守底回归：记录 `phase3_base_guard`、`phase4_good`、`phase6_good`、`jbd_phase1` 通过；标记 Phase 2 concurrency `unlink_while_open` 稳定 FAIL 与 `jbd_phase3_fsync_flush` NOTRUN 退化为当前 blocker |
-| 2026-05-14 | Step 6 | DeepSeek | 修复 open-unlinked regular-file cleanup：新增 VFS open/close 通知与 ext4 per-ino open handle 计数，避免 cleanup 提前 truncate 仍 open 的 unlinked inode；Phase 2 concurrency 已恢复 `7/7 PASS` |
-| 2026-05-14 | Step 6 | DeepSeek | 修复 `jbd_phase3_fsync_flush` NOTRUN 退化：含 `fiemap` 的 `xfs_io` 命令固定走 shim emulation，避免真实 `xfs_io` 因缺 native FIEMAP ioctl 将 `generic/043-049` 判为 NOTRUN；复跑恢复 `11 PASS / 1 NOTRUN / 0 FAIL` |
-| 2026-05-14 | Step 6 | DeepSeek | 修正 `truncate_append` crash 场景初始化，避免 `write` hold 命中 setup `dd`；JBD2 crash matrix 恢复 `18/18 PASS`，Phase 3 host-crash fsync matrix 恢复 `4/4 PASS` |
-| 2026-05-14 | Step 6 | DeepSeek | 确认 Phase 4 benchmark A-E 最小闭环：`lmbench_only`、buffered fio cold/warm read、buffered fio write、O_DIRECT fio cache-off 守底；新增官方 fio `direct=0` buffered A/B runner，并接入 `EXT4_PAGE_CACHE` benchmark 开关 |
-| 2026-05-14 | Step 6 | DeepSeek | 完成 Phase 4 benchmark A-E 实测：lmbench `8/8 PASS`；PageCache-on warm read 4022.0 MB/s（Linux 7457.0 MB/s，page_cache=0 warm 122.0 MB/s）；buffered write 仍慢（10.8 MB/s）；O_DIRECT cache-off read/write 为 97.24% / 54.02% |
+| 2026-05-11 | Step 0 | DeepSeek V4 Pro | 新建 Phase 4 PageCache plan/milestone；完成 ext2/ext4 代码审计锚点与阶段边界记录 |
+| 2026-05-11 | Step 1 | DeepSeek V4 Pro | 接入默认关闭的 ext4 per-inode PageCache state 骨架与 gated `Ext4Inode::page_cache()`；`cargo check` 通过 |
+| 2026-05-11 | Step 3 | DeepSeek V4 Pro | `ext4_rs::prepare_write_at()` 支持非对齐 range；ext4 buffered write 改为 journaled metadata prepare + dirty PageCache，writeback 不再更新时间戳；`ext4_rs` / `aster-kernel` cargo check 通过 |
+| 2026-05-11 | Step 6 | DeepSeek V4 Pro | 建立 `pagecache_phase4` upstream xfstests 验收集，明确 Phase 4 不维护自研 PageCache smoke/coherency 测试集 |
+| 2026-05-11 | Step 6 | DeepSeek V4 Pro | `pagecache_phase4` runner 自动传入 `ext4fs.page_cache=1`，守底回归继续默认关闭 PageCache |
+| 2026-05-11 | Step 3-4 | DeepSeek V4 Pro | 修复 `generic/130` partial EOF stale data、`generic/418` sparse direct allocation metadata 持久化；补齐 dirty PageCache syncfs/truncate drain 与 minimal fallocate，`generic/247` / `generic/469` 已 PASS，`generic/749` 缩小到 VM SIGBUS 边界问题 |
+| 2026-05-12 | Step 4 | DeepSeek V4 Pro | 补齐 shared VMO mmap EOF 越界 `SIGBUS` 语义与同步 fault 不可静默忽略处理；`generic/749` 单例 PASS |
+| 2026-05-12 | Step 3-4 | DeepSeek V4 Pro | 禁止 ext4_rs write path 额外预分配未写块并对新分配块先清零；zero/punch 改为复用 `write_at` 分块写零；`generic/091` 单例 PASS |
+| 2026-05-12 | Step 3-5 | DeepSeek V4 Pro | 修复 `generic/133` ENOSPC：VFS zero-link cleanup 钩子触发 ext4 unlinked regular-file truncate，释放数据块但仍不复用 inode；`generic/133` 单例 PASS |
+| 2026-05-12 | Step 4-5 | DeepSeek V4 Pro | shared VMO 写缺页补 dirty tracking；fallocate/zero/punch 后改为保守 evict；fsync PageCache drain 纳入 inode correctness lock；`generic/263` / `generic/418` 单例 PASS，但 full list 仍在这两项复现 stale data |
+| 2026-05-12 | Step 6 | DeepSeek V4 Pro | 最新 `pagecache_phase4` full list：`7 PASS / 2 FAIL / 4 NOTRUN`，剩余 blocker 为 direct/buffered/mmap coherency 非确定性失败（`generic/263`, `generic/418`） |
+| 2026-05-12 | Step 4-6 | DeepSeek V4 Pro | PageCache full-list evict 改为写回所有 present non-Uninit pages，并在 PageCache 模式禁用 self-developed direct-read mapping cache；`generic/263` full list PASS，最新 `pagecache_phase4` 为 `8 PASS / 1 FAIL / 4 NOTRUN`，仅剩 `generic/418` |
+| 2026-05-12 | Step 5-6 | DeepSeek V4 Pro | 继续排查 `generic/418`：单例 `benchmark/logs/pagecache_phase4_20260512_160633.log` PASS；full list `benchmark/logs/pagecache_phase4_20260512_160858.log` 仍 `8 PASS / 1 FAIL / 4 NOTRUN`。已排除 pending/speculative direct-read cache、write-through dirty retention、inode PageCache state 生命周期单点问题；extent-aware PageCache backend 试验导致 `generic/418` 单例 timeout（`benchmark/logs/pagecache_phase4_20260512_162304.log`），已回退 |
+| 2026-05-13 | Step 5-6 | DeepSeek V4 Pro | 修复 stale JBD2 checkpoint metadata home-write 覆盖复用后 regular-file data block：PageCache writeback、buffered write 与 O_DIRECT write 均 revoke 对应 mapped data block 的 checkpoint metadata；同时避免空 metadata transaction TID 阻塞 fsync。clean `generic/263`、clean `generic/247,generic/418` 与 full `pagecache_phase4` 已通过，最新 full list `9 PASS / 0 FAIL / 4 NOTRUN` |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 接手守底回归：记录 `phase3_base_guard`、`phase4_good`、`phase6_good`、`jbd_phase1` 通过；标记 Phase 2 concurrency `unlink_while_open` 稳定 FAIL 与 `jbd_phase3_fsync_flush` NOTRUN 退化为当前 blocker |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 修复 open-unlinked regular-file cleanup：新增 VFS open/close 通知与 ext4 per-ino open handle 计数，避免 cleanup 提前 truncate 仍 open 的 unlinked inode；Phase 2 concurrency 已恢复 `7/7 PASS` |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 修复 `jbd_phase3_fsync_flush` NOTRUN 退化：含 `fiemap` 的 `xfs_io` 命令固定走 shim emulation，避免真实 `xfs_io` 因缺 native FIEMAP ioctl 将 `generic/043-049` 判为 NOTRUN；复跑恢复 `11 PASS / 1 NOTRUN / 0 FAIL` |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 修正 `truncate_append` crash 场景初始化，避免 `write` hold 命中 setup `dd`；JBD2 crash matrix 恢复 `18/18 PASS`，Phase 3 host-crash fsync matrix 恢复 `4/4 PASS` |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 确认 Phase 4 benchmark A-E 最小闭环：`lmbench_only`、buffered fio cold/warm read、buffered fio write、O_DIRECT fio cache-off 守底；新增官方 fio `direct=0` buffered A/B runner，并接入 `EXT4_PAGE_CACHE` benchmark 开关 |
+| 2026-05-14 | Step 6 | DeepSeek V4 Pro | 完成 Phase 4 benchmark A-E 实测：lmbench `8/8 PASS`；PageCache-on warm read 4022.0 MB/s（Linux 7457.0 MB/s，page_cache=0 warm 122.0 MB/s）；buffered write 仍慢（10.8 MB/s）；O_DIRECT cache-off read/write 为 97.24% / 54.02% |

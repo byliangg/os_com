@@ -1348,20 +1348,20 @@ docker run --rm --privileged --network=host --device=/dev/kvm \
 
 | 日期 | Step | 作者 | 摘要 |
 |------|------|------|------|
-| 2026-05-06 | Plan | DeepSeek | 新建 Phase 3 plan 与 milestone 模板，聚焦 fsync/flush 持久化语义收口 |
-| 2026-05-06 | Plan review | DeepSeek | 按代码审计补强 force commit/TID 追踪、ordered flush 顺序、virtio flush 等待闭环、host/device persistence 方法学与普通 fio 性能红线 |
-| 2026-05-06 | Plan review | DeepSeek | 将 xfstests 按 Tier 1/2/3 对齐 Phase 3 两条线；补入 `EXT4_IOC_SHUTDOWN` 前置、godown shim 口径更正、4 个自研 host-crash 补位与 Step 6 分栏统计 |
-| 2026-05-06 | Plan review | DeepSeek | 按 ext2 代码参考收口 VFS final flush、两次 flush 屏障、per-ino TID 状态位置、非 PageCache 现状与 ext2 fdatasync 反例 |
-| 2026-05-08 | 4c | DeepSeek | `BlockDevice::sync()` 改为必选真实实现，JBD2 commit block 前新增 PREFLUSH 等价 barrier，并按 `environment.md` 用 Docker `jbd_phase3_fsync_flush` 回归 |
-| 2026-05-08 | 5 | DeepSeek | 新增 `jbd_phase3_host_crash` Docker mode 与 4 个自研 fsync/fdatasync/rename/concurrent crash 场景，Docker 验证 4/4 PASS |
-| 2026-05-08 | 6 | DeepSeek | 修正 `bs=16K fsync=4` summary 单位解析，记录 Step 4c 后真实 fsync-heavy 结果与 Phase 3 报告口径 |
-| 2026-05-08 | 6 | DeepSeek | 修复 `generic/392` inode metadata TID 追踪与 `generic/049` xfs_io `-rxc syncfs` shim，Docker `jbd_phase3_fsync_flush` 达到 11 PASS / 1 NOTRUN / 0 FAIL |
-| 2026-05-08 | 6 | DeepSeek | 补齐 Docker wrapper 对 `XFSTESTS_*_IMG_SIZE` 的透传，12G scratch 单跑 `generic/048` PASS |
-| 2026-05-08 | 6 | DeepSeek | 复跑普通 ext4 fio：read 5179/4076=127.06% PASS，write 1189/3035=39.18% FAIL；简单 journal credit cap 实验无效并已回退 |
-| 2026-05-08 | 7 | DeepSeek | 启动普通 O_DIRECT write hardening，记录 ext2/ext4/nojournal profile 基线并建立 Step 7 实验模板 |
-| 2026-05-08 | 7b | DeepSeek | 临时实现 virtio write fast-submit 并跑 ext4 write：1593MiB/s，较基线无收益，实验代码已回退 |
-| 2026-05-08 | 7c-1 | DeepSeek | 临时实现 ext4 direct-write 用户页零拷贝，copy 降为 0 但 1MiB 被拆成约 5 个多 segment bio，实时吞吐约 1224MiB/s，确认无收益并回退 |
-| 2026-05-08 | 7d-1 | DeepSeek | 增加 ext4 direct-write hit/miss profile，确认 miss 平均 21.9ms、prepare/apply 是首次布局长尾主因 |
-| 2026-05-08 | 7d-2 | DeepSeek | 临时实现 allocator physical goal 实验，ext4 write 降至 1237MiB/s，确认无收益并回退 |
-| 2026-05-08 | 7e-1 | DeepSeek | 临时将 JBD2 soft limit 提到 4096，rotations 降至 68 但 ext4 write 降至 1422MiB/s，确认无收益并回退 |
-| 2026-05-11 | Close | DeepSeek | Phase 3 功能线收口；普通 O_DIRECT write 转后续性能 hardening，不再阻塞 fsync/flush 阶段退场 |
+| 2026-05-06 | Plan | DeepSeek V4 Pro | 新建 Phase 3 plan 与 milestone 模板，聚焦 fsync/flush 持久化语义收口 |
+| 2026-05-06 | Plan review | DeepSeek V4 Pro | 按代码审计补强 force commit/TID 追踪、ordered flush 顺序、virtio flush 等待闭环、host/device persistence 方法学与普通 fio 性能红线 |
+| 2026-05-06 | Plan review | DeepSeek V4 Pro | 将 xfstests 按 Tier 1/2/3 对齐 Phase 3 两条线；补入 `EXT4_IOC_SHUTDOWN` 前置、godown shim 口径更正、4 个自研 host-crash 补位与 Step 6 分栏统计 |
+| 2026-05-06 | Plan review | DeepSeek V4 Pro | 按 ext2 代码参考收口 VFS final flush、两次 flush 屏障、per-ino TID 状态位置、非 PageCache 现状与 ext2 fdatasync 反例 |
+| 2026-05-08 | 4c | DeepSeek V4 Pro | `BlockDevice::sync()` 改为必选真实实现，JBD2 commit block 前新增 PREFLUSH 等价 barrier，并按 `environment.md` 用 Docker `jbd_phase3_fsync_flush` 回归 |
+| 2026-05-08 | 5 | DeepSeek V4 Pro | 新增 `jbd_phase3_host_crash` Docker mode 与 4 个自研 fsync/fdatasync/rename/concurrent crash 场景，Docker 验证 4/4 PASS |
+| 2026-05-08 | 6 | DeepSeek V4 Pro | 修正 `bs=16K fsync=4` summary 单位解析，记录 Step 4c 后真实 fsync-heavy 结果与 Phase 3 报告口径 |
+| 2026-05-08 | 6 | DeepSeek V4 Pro | 修复 `generic/392` inode metadata TID 追踪与 `generic/049` xfs_io `-rxc syncfs` shim，Docker `jbd_phase3_fsync_flush` 达到 11 PASS / 1 NOTRUN / 0 FAIL |
+| 2026-05-08 | 6 | DeepSeek V4 Pro | 补齐 Docker wrapper 对 `XFSTESTS_*_IMG_SIZE` 的透传，12G scratch 单跑 `generic/048` PASS |
+| 2026-05-08 | 6 | DeepSeek V4 Pro | 复跑普通 ext4 fio：read 5179/4076=127.06% PASS，write 1189/3035=39.18% FAIL；简单 journal credit cap 实验无效并已回退 |
+| 2026-05-08 | 7 | DeepSeek V4 Pro | 启动普通 O_DIRECT write hardening，记录 ext2/ext4/nojournal profile 基线并建立 Step 7 实验模板 |
+| 2026-05-08 | 7b | DeepSeek V4 Pro | 临时实现 virtio write fast-submit 并跑 ext4 write：1593MiB/s，较基线无收益，实验代码已回退 |
+| 2026-05-08 | 7c-1 | DeepSeek V4 Pro | 临时实现 ext4 direct-write 用户页零拷贝，copy 降为 0 但 1MiB 被拆成约 5 个多 segment bio，实时吞吐约 1224MiB/s，确认无收益并回退 |
+| 2026-05-08 | 7d-1 | DeepSeek V4 Pro | 增加 ext4 direct-write hit/miss profile，确认 miss 平均 21.9ms、prepare/apply 是首次布局长尾主因 |
+| 2026-05-08 | 7d-2 | DeepSeek V4 Pro | 临时实现 allocator physical goal 实验，ext4 write 降至 1237MiB/s，确认无收益并回退 |
+| 2026-05-08 | 7e-1 | DeepSeek V4 Pro | 临时将 JBD2 soft limit 提到 4096，rotations 降至 68 但 ext4 write 降至 1422MiB/s，确认无收益并回退 |
+| 2026-05-11 | Close | DeepSeek V4 Pro | Phase 3 功能线收口；普通 O_DIRECT write 转后续性能 hardening，不再阻塞 fsync/flush 阶段退场 |

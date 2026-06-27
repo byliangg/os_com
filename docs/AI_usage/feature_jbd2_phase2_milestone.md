@@ -637,30 +637,30 @@
 
 | 日期 | 变更 | 负责人 | 备注 |
 |------|------|--------|------|
-| 2026-04-24 | 创建 Phase 2 milestone 模板 | DeepSeek | 依据 Phase 1 模板与赛题优秀档要求 |
-| 2026-04-24 | 建立 Step 0 并发测试资产与 `jbd_phase2_concurrency` runner mode | DeepSeek | host smoke 与 Asterinas baseline 均已通过 |
-| 2026-04-24 | 完成 Step 0 固定回归 | DeepSeek | phase3/phase4/phase6/jbd_phase1/crash 均不回退，严格扫描为空 |
-| 2026-04-24 | 完成 Step 1 锁顺序与低噪声观测点 | DeepSeek | JBD2 runtime、alloc guard、EXT4_RS_RUNTIME_LOCK 统计已接入，Phase 2 smoke 通过 |
-| 2026-04-24 | 完成 Step 2 `runtime_block_size` 显式化 | DeepSeek | 全局 block size 状态已移除，phase3/phase4/phase6/jbd_phase1/crash/phase2 baseline 均不回退 |
-| 2026-04-25 | 完成 Step 3 JBD2 handle-local operation context | DeepSeek | handle id、显式 metadata context、按 handle id data-sync、credit admission 已接入，固定回归不回退 |
-| 2026-04-25 | 完成 Step 4 operation allocated block guard 本地化 | DeepSeek | 全局 `OP_ALLOCATED_BLOCKS` 已移除，handle/operation-local guard 已接入，phase2/phase3/phase4/phase6/jbd_phase1/crash 均不回退 |
-| 2026-04-25 | 新增 Step 4.5 修补计划与 milestone 模板 | DeepSeek | 暂缓 Step 5，先补齐 Step 3/4 的真实并发上下文语义 |
-| 2026-04-25 | Step 4.5 P0 代码修补 | DeepSeek | 去除 `jbd2_current_handle_id` 与 `LocalOperationAllocGuard.current_operation` single-slot；overlay read 改共享读；ext4_rs 与 aster-kernel check 通过 |
-| 2026-04-25 | Step 4.5 active credit admission 修补 | DeepSeek | over-soft-limit 时 active running TX 可 rotate 到 `prev_running`，新增 active-handle credit 单测，`cargo test -p ext4_rs --lib` 27/27 |
-| 2026-04-25 | Step 4.5 Docker 固定回归 | DeepSeek | Phase 2 baseline、phase3、phase4、phase6、jbd_phase1、crash matrix 均通过；严格关键词扫描为空 |
-| 2026-04-25 | 完成 Step 4.5 nested wrapper 验证 | DeepSeek | `OperationScopedAllocGuard` 下沉到 ext4_rs 并新增 nested scoped guard 单测，`cargo test -p ext4_rs --lib` 28/28 |
-| 2026-04-26 | Step 5A correctness 锁骨架 | DeepSeek | per-inode/per-dir 保守锁、rename 固定锁序、direct read cache 写侧失效；ext4_rs/aster-kernel check 通过，Phase 2 smoke 5/5 |
-| 2026-04-26 | Step 5A unlink-while-open 专项 | DeepSeek | 新增 `unlink_while_open` case 并加入默认 Phase 2 concurrency；单项 smoke 1/1，默认 6-case smoke 6/6，baseline 6/6，严格关键词扫描为空 |
-| 2026-04-26 | Step 5A 固定 correctness 回归 | DeepSeek | crash matrix 18/18、phase4/phase3/phase6/jbd_phase1 均 100%；lmbench 7/8，`ext4_vfs_open_lat` 超时留待 Step 8 性能复核 |
-| 2026-04-30 | 完成 Step 6A allocator/block-group correctness 协议 | DeepSeek | per-block-group allocator locks、superblock counter state、`allocator_churn` 已接入；Phase 2 7/7、crash 18/18、phase3/phase4/phase6/jbd_phase1 均通过，`ext4/045` 600s 边界留待 Step 8 复核 |
-| 2026-05-01 | Step 7A/7B/7C 拆锁尝试与回退 | DeepSeek | 全只读绕开 runtime fence、只读锁外 snapshot、journaled 写绕开 runtime fence 均在 `generic/011` 下暴露目录 cleanup mismatch；恢复目录/metadata 读与 journaled 写 fence |
-| 2026-05-01 | Step 7A' 文件读窄化拆锁 | DeepSeek | 仅 buffered file read 与 direct-read extent plan 绕开 `EXT4_RS_RUNTIME_LOCK`；`generic/011` 单测 PASS，Phase 2 smoke 7/7 |
-| 2026-05-02 | Step 7A' 固定回归收口 | DeepSeek | phase6/phase4/phase3/crash 均通过；jbd_phase1 仅 `ext4/045` 1200s timeout、2400s 单项 PASS，记录为 Step 8 性能预算项 |
-| 2026-05-02 | Step 8 `ext4/045` profile | DeepSeek | 新增 `EXT4_PHASE2_PROFILE` 开关；profile run `jbd_phase1_20260501_233951.log` 显示 timeout 主因是目录 metadata read/遍历仍受 runtime fence 保护，checkpoint inline 约 1.2s 尾延迟为次要项，allocator 等待不是主因 |
-| 2026-05-02 | Step 8 cache-backed directory read | DeepSeek | 已加载目录 cache 可直接服务 readdir；lookup/readdir/cache load 在 dir correctness lock 下绕开 runtime fence；`ext4/045` 1200s PASS、完整 `jbd_phase1` 100%、`generic/011` PASS、Phase 2 smoke 7/7 |
-| 2026-05-02 | Step 8 direct overwrite mapping cache 修补 | DeepSeek | 纯 overwrite direct write 成功时保留 mapping cache、只清 pending read；fio 双边 run 波动大不作为验收，Asterinas-only write `2071 MiB/s`；`generic/011` PASS、Phase 2 smoke seed=75 7/7 |
-| 2026-05-02 | Step 8 direct write profile 与 write fast-submit 试验 | DeepSeek | direct write profile 显示 data bio wait/copy 为主瓶颈；write-side fast-submit 小幅降低 wait，但正式 fio write 仍 `63.44%` 且 smoke 出现 hash mismatch，试验未保留；下一步转向 multi-segment/zero-copy data bio 设计 |
-| 2026-05-05 | Step 8 write bio 分段 profile | DeepSeek | 新增独立 write bio profile 与 per-call mapping/bio/segment/merge 统计；profile 显示当前 fio 稳态为 1 mapping / 1 bio / 1 segment、request queue merge `0`，SG/multi-segment 路线不再作为主线；Phase 2 concurrency seed=76 与 `generic/011` 复跑通过 |
-| 2026-05-05 | Step 8 zero-copy 审计与 user-buffer profile | DeepSeek | block/DMA 生命周期支持 `USegment` 写 bio，但 fio 1MiB user buffer 实测为 256 pages / 256 physical runs / max run 1 page；naive page-SG zero-copy 会增加 virtio request 数，不作为下一步实现主线；`generic/011` 与 Phase 2 concurrency seed=76 复跑通过 |
-| 2026-05-05 | Step 9 Phase 2 功能收口 | DeepSeek | Phase 2 concurrency final baseline `workers=4 rounds=8 seed=78` 7/7 PASS；fio write 作为性能遗留项，高压 `8x64` 偶发失败记录为后续 hardening |
-| 2026-05-05 | Step 9 完整大全量复跑 | DeepSeek | crash 18/18、phase4 12 PASS + 6 NOTRUN、phase3 10 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency seed=78 7/7 均 PASS；strict scan 为空 |
+| 2026-04-24 | 创建 Phase 2 milestone 模板 | DeepSeek V4 Pro | 依据 Phase 1 模板与赛题优秀档要求 |
+| 2026-04-24 | 建立 Step 0 并发测试资产与 `jbd_phase2_concurrency` runner mode | DeepSeek V4 Pro | host smoke 与 Asterinas baseline 均已通过 |
+| 2026-04-24 | 完成 Step 0 固定回归 | DeepSeek V4 Pro | phase3/phase4/phase6/jbd_phase1/crash 均不回退，严格扫描为空 |
+| 2026-04-24 | 完成 Step 1 锁顺序与低噪声观测点 | DeepSeek V4 Pro | JBD2 runtime、alloc guard、EXT4_RS_RUNTIME_LOCK 统计已接入，Phase 2 smoke 通过 |
+| 2026-04-24 | 完成 Step 2 `runtime_block_size` 显式化 | DeepSeek V4 Pro | 全局 block size 状态已移除，phase3/phase4/phase6/jbd_phase1/crash/phase2 baseline 均不回退 |
+| 2026-04-25 | 完成 Step 3 JBD2 handle-local operation context | DeepSeek V4 Pro | handle id、显式 metadata context、按 handle id data-sync、credit admission 已接入，固定回归不回退 |
+| 2026-04-25 | 完成 Step 4 operation allocated block guard 本地化 | DeepSeek V4 Pro | 全局 `OP_ALLOCATED_BLOCKS` 已移除，handle/operation-local guard 已接入，phase2/phase3/phase4/phase6/jbd_phase1/crash 均不回退 |
+| 2026-04-25 | 新增 Step 4.5 修补计划与 milestone 模板 | DeepSeek V4 Pro | 暂缓 Step 5，先补齐 Step 3/4 的真实并发上下文语义 |
+| 2026-04-25 | Step 4.5 P0 代码修补 | DeepSeek V4 Pro | 去除 `jbd2_current_handle_id` 与 `LocalOperationAllocGuard.current_operation` single-slot；overlay read 改共享读；ext4_rs 与 aster-kernel check 通过 |
+| 2026-04-25 | Step 4.5 active credit admission 修补 | DeepSeek V4 Pro | over-soft-limit 时 active running TX 可 rotate 到 `prev_running`，新增 active-handle credit 单测，`cargo test -p ext4_rs --lib` 27/27 |
+| 2026-04-25 | Step 4.5 Docker 固定回归 | DeepSeek V4 Pro | Phase 2 baseline、phase3、phase4、phase6、jbd_phase1、crash matrix 均通过；严格关键词扫描为空 |
+| 2026-04-25 | 完成 Step 4.5 nested wrapper 验证 | DeepSeek V4 Pro | `OperationScopedAllocGuard` 下沉到 ext4_rs 并新增 nested scoped guard 单测，`cargo test -p ext4_rs --lib` 28/28 |
+| 2026-04-26 | Step 5A correctness 锁骨架 | DeepSeek V4 Pro | per-inode/per-dir 保守锁、rename 固定锁序、direct read cache 写侧失效；ext4_rs/aster-kernel check 通过，Phase 2 smoke 5/5 |
+| 2026-04-26 | Step 5A unlink-while-open 专项 | DeepSeek V4 Pro | 新增 `unlink_while_open` case 并加入默认 Phase 2 concurrency；单项 smoke 1/1，默认 6-case smoke 6/6，baseline 6/6，严格关键词扫描为空 |
+| 2026-04-26 | Step 5A 固定 correctness 回归 | DeepSeek V4 Pro | crash matrix 18/18、phase4/phase3/phase6/jbd_phase1 均 100%；lmbench 7/8，`ext4_vfs_open_lat` 超时留待 Step 8 性能复核 |
+| 2026-04-30 | 完成 Step 6A allocator/block-group correctness 协议 | DeepSeek V4 Pro | per-block-group allocator locks、superblock counter state、`allocator_churn` 已接入；Phase 2 7/7、crash 18/18、phase3/phase4/phase6/jbd_phase1 均通过，`ext4/045` 600s 边界留待 Step 8 复核 |
+| 2026-05-01 | Step 7A/7B/7C 拆锁尝试与回退 | DeepSeek V4 Pro | 全只读绕开 runtime fence、只读锁外 snapshot、journaled 写绕开 runtime fence 均在 `generic/011` 下暴露目录 cleanup mismatch；恢复目录/metadata 读与 journaled 写 fence |
+| 2026-05-01 | Step 7A' 文件读窄化拆锁 | DeepSeek V4 Pro | 仅 buffered file read 与 direct-read extent plan 绕开 `EXT4_RS_RUNTIME_LOCK`；`generic/011` 单测 PASS，Phase 2 smoke 7/7 |
+| 2026-05-02 | Step 7A' 固定回归收口 | DeepSeek V4 Pro | phase6/phase4/phase3/crash 均通过；jbd_phase1 仅 `ext4/045` 1200s timeout、2400s 单项 PASS，记录为 Step 8 性能预算项 |
+| 2026-05-02 | Step 8 `ext4/045` profile | DeepSeek V4 Pro | 新增 `EXT4_PHASE2_PROFILE` 开关；profile run `jbd_phase1_20260501_233951.log` 显示 timeout 主因是目录 metadata read/遍历仍受 runtime fence 保护，checkpoint inline 约 1.2s 尾延迟为次要项，allocator 等待不是主因 |
+| 2026-05-02 | Step 8 cache-backed directory read | DeepSeek V4 Pro | 已加载目录 cache 可直接服务 readdir；lookup/readdir/cache load 在 dir correctness lock 下绕开 runtime fence；`ext4/045` 1200s PASS、完整 `jbd_phase1` 100%、`generic/011` PASS、Phase 2 smoke 7/7 |
+| 2026-05-02 | Step 8 direct overwrite mapping cache 修补 | DeepSeek V4 Pro | 纯 overwrite direct write 成功时保留 mapping cache、只清 pending read；fio 双边 run 波动大不作为验收，Asterinas-only write `2071 MiB/s`；`generic/011` PASS、Phase 2 smoke seed=75 7/7 |
+| 2026-05-02 | Step 8 direct write profile 与 write fast-submit 试验 | DeepSeek V4 Pro | direct write profile 显示 data bio wait/copy 为主瓶颈；write-side fast-submit 小幅降低 wait，但正式 fio write 仍 `63.44%` 且 smoke 出现 hash mismatch，试验未保留；下一步转向 multi-segment/zero-copy data bio 设计 |
+| 2026-05-05 | Step 8 write bio 分段 profile | DeepSeek V4 Pro | 新增独立 write bio profile 与 per-call mapping/bio/segment/merge 统计；profile 显示当前 fio 稳态为 1 mapping / 1 bio / 1 segment、request queue merge `0`，SG/multi-segment 路线不再作为主线；Phase 2 concurrency seed=76 与 `generic/011` 复跑通过 |
+| 2026-05-05 | Step 8 zero-copy 审计与 user-buffer profile | DeepSeek V4 Pro | block/DMA 生命周期支持 `USegment` 写 bio，但 fio 1MiB user buffer 实测为 256 pages / 256 physical runs / max run 1 page；naive page-SG zero-copy 会增加 virtio request 数，不作为下一步实现主线；`generic/011` 与 Phase 2 concurrency seed=76 复跑通过 |
+| 2026-05-05 | Step 9 Phase 2 功能收口 | DeepSeek V4 Pro | Phase 2 concurrency final baseline `workers=4 rounds=8 seed=78` 7/7 PASS；fio write 作为性能遗留项，高压 `8x64` 偶发失败记录为后续 hardening |
+| 2026-05-05 | Step 9 完整大全量复跑 | DeepSeek V4 Pro | crash 18/18、phase4 12 PASS + 6 NOTRUN、phase3 10 PASS + 6 NOTRUN、phase6 25/25、jbd_phase1 6 PASS + 6 NOTRUN、lmbench 8/8、Phase 2 concurrency seed=78 7/7 均 PASS；strict scan 为空 |

@@ -77,7 +77,7 @@
 
 三瓶颈分解结论见 plan §2。
 
-## 三方对齐结论（学长 + DeepSeek + Claude Code）
+## 三方对齐结论（学长 + DeepSeek V4 Pro + Claude Code）
 
 1. 优化主线拉回 O_DIRECT write，**不是 PageCache**；
 2. JBD2 与大块 ext4 路径数据上已洗清嫌疑，单 job 写天花板在 block/virtio；

@@ -11,9 +11,9 @@
 
 ## 1. 概述与披露范围
 
-本项目的开发使用了 **DeepSeek 大模型 + Claude Code 命令行交互工具** 的协作方式。除此之外没有使用其他 AI 工具链。
+本项目的开发使用了 **DeepSeek V4 Pro 大模型 + Claude Code 命令行交互与执行 harness** 的协作方式。除此之外没有使用其他 AI 工具链。
 
-需要先界定披露的范围。项目以开源的 Asterinas 内核为上游基线，上游本身由 Asterinas 社区维护，不在本次披露之列。**本团队在上游之上新增的全部 EXT4 文件系统相关工作**（核心库 `kernel/libs/ext4_rs/`、内核集成层 `kernel/src/fs/ext4/`、配套测试与全部过程文档），是在 DeepSeek 大模型辅助、并通过 Claude Code 交互完成的，也是本文件披露的对象。
+需要先界定披露的范围。项目以开源的 Asterinas 内核为上游基线，上游本身由 Asterinas 社区维护，不在本次披露之列。**本团队在上游之上新增的全部 EXT4 文件系统相关工作**（核心库 `kernel/libs/ext4_rs/`、内核集成层 `kernel/src/fs/ext4/`、配套测试与全部过程文档），是在 DeepSeek V4 Pro 大模型辅助、并通过 Claude Code 的命令行交互与执行 harness 完成的，也是本文件披露的对象。
 
 协作方式可以一句话概括：人类负责目标设定、技术路线裁决、诚实口径把关和最终验收，AI 负责在既定目标下做代码实现、问题诊断、性能分析和文档撰写。每个阶段都有人工确认的节点，下文第 3 节会展开。
 
@@ -23,9 +23,10 @@
 
 | 项 | 内容 |
 |---|---|
-| 交互工具 | Claude Code（命令行 AI 编程交互工具） |
+| 交互与执行工具 | Claude Code（命令行交互与执行 harness） |
 | 模型厂商 | DeepSeek |
-| 使用的大模型 | DeepSeek（通过 Claude Code 交互调用） |
+| 使用的大模型 | DeepSeek V4 Pro |
+| 协作方式 | 人类通过 Claude Code 与 DeepSeek V4 Pro 交互，AI 辅助完成实现、诊断、测试与文档工作 |
 | 使用周期 | 2026-03 至今，覆盖 ext4 基础集成到当前 official xfstests 修复的全过程 |
 | 运行方式 | 本地终端交互，人类下达任务并审阅每一步产出，再由人工提交代码 |
 
