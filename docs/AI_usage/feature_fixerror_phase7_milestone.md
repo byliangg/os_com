@@ -1,6 +1,5 @@
 # ext4 功能正确性 Phase 7 Milestone 记录（Official xfstests 错误修复主线）
 
-配套计划：`feature_fixerror_phase7_plan.md`
 工作分支：`feature-fixerror-phase-7`
 起点日期：2026-06-12
 
@@ -39,7 +38,7 @@ Phase 7 已立项，目标是修复 official xfstests 暴露出的错误，并�
 
 ## 2. FAIL case 跟踪表
 
-分类依据：plan §3 根因分析报告（2026-06-12），按根因簇（R/A/B/C/D/E/F/G）记账。
+分类依据：前期根因分析记录（2026-06-12），按根因簇（R/A/B/C/D/E/F/G）记账。
 
 | Case | 起点状态 | 分类（簇） | 当前状态 | 根因摘要 | 修复提交/文件 | 验证 |
 |------|----------|------|----------|----------|----------------|------|
@@ -74,7 +73,7 @@ Phase 7 已立项，目标是修复 official xfstests 暴露出的错误，并�
 
 改动概要：
 
-- 创建 `feature_fixerror_phase7_plan.md`
+- 整理 Phase 7 修复主线记录
 - 创建 `feature_fixerror_phase7_milestone.md`
 - 同步 `CLAUDE.md` / `AGENTS.md` 当前阶段索引
 - 同步 `asterinas/CLAUDE.md` / `asterinas/AGENTS.md` 仓库内入口
@@ -82,11 +81,9 @@ Phase 7 已立项，目标是修复 official xfstests 暴露出的错误，并�
 
 涉及文件：
 
-- `feature_fixerror_phase7_plan.md`
 - `feature_fixerror_phase7_milestone.md`
 - `CLAUDE.md`
 - `AGENTS.md`
-- `asterinas/docs/feature_fixerror_phase7_plan.md`
 - `asterinas/docs/feature_fixerror_phase7_milestone.md`
 - `asterinas/CLAUDE.md`
 - `asterinas/AGENTS.md`
@@ -179,7 +176,7 @@ Phase 7 已立项，目标是修复 official xfstests 暴露出的错误，并�
 |------|------|----------|----------|----------|------|
 | 2026-06-12 | Step 0 | Phase 7 立项，创建 plan/milestone 模板并同步根目录与仓库内索引 | `feature_fixerror_phase7_*`、`AGENTS.md`、`CLAUDE.md`、`asterinas/AGENTS.md`、`asterinas/CLAUDE.md`、`asterinas/docs/feature_fixerror_phase7_*` | 文档改动，无内核测试；模板副本一致性检查通过 | 起点来自 `official_20260612_082930.log` |
 | 2026-06-12 | Step 2 | 修复 statfs 口径、official PageCache 开关、`od -t x1z` shim、truncate/mmap dirty 保持 | `kernel/src/fs/ext4/fs.rs`、`kernel/libs/ext4_rs/src/ext4_impls/ext4.rs`、`tools/ext4/run_phase4_part3.sh`、`test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | `ext4/042` PASS、`generic/030` PASS、`generic/141` PASS；`cargo check -p ext4_rs` PASS；`git diff --check` PASS | `generic/074` 已从 mmap ENODEV 变为 timeout/perf 类，仍待修 |
-| 2026-06-13 | Step 3 | 撤销 official 全局 PageCache，改为安全 mmap case 局部 mount option；修正 `MOUNT_OPTIONS` quoting；避免 close/drop atomic 路径阻塞 cleanup | `test/initramfs/src/syscall/xfstests/run_xfstests_test.sh`、`kernel/src/fs/ext4/inode.rs`、`feature_fixerror_phase7_plan.md`、`feature_fixerror_phase7_milestone.md`、`asterinas/docs/feature_fixerror_phase7_*` | `014/027/030` 小集合 PASS：`official_20260613_005333.log`；mmap 子集 PASS：`official_20260613_052453.log`、`official_20260613_052915.log`；`558` 不再 panic 但 timeout：`official_20260613_050405.log` | `074/345/346` PageCache-on 会触发更底层风险，已隔离并记录为需确认项 |
+| 2026-06-13 | Step 3 | 撤销 official 全局 PageCache，改为安全 mmap case 局部 mount option；修正 `MOUNT_OPTIONS` quoting；避免 close/drop atomic 路径阻塞 cleanup | xfstests runner、ext4 inode 逻辑与 Phase 7 阶段记录 | `014/027/030` 小集合 PASS：`official_20260613_005333.log`；mmap 子集 PASS：`official_20260613_052453.log`、`official_20260613_052915.log`；`558` 不再 panic 但 timeout：`official_20260613_050405.log` | `074/345/346` PageCache-on 会触发更底层风险，已隔离并记录为需确认项 |
 | 2026-06-17 | Step 3 | 按 DeepSeek V4 Pro review 去掉 per-case PageCache 白名单，改为 official 统一 `page_cache=1,page_cache_io=0`；修复 mmap/普通 read coherency、mmap dirty close/sync 写回、PageCache update_page atomic panic | `kernel/src/fs/ext4/fs.rs`、`kernel/src/fs/ext4/inode.rs`、`kernel/src/fs/utils/page_cache.rs`、`tools/ext4/run_phase4_part3.sh`、`tools/ext4/run_phase4_in_docker.sh`、`test/initramfs/src/syscall/xfstests/run_xfstests_test.sh` | `014/027/030` 3/3 PASS：`official_20260617_071904.log`；mmap 9-case 9/9 PASS：`official_20260617_072559.log`；`345`/`346` PASS：`official_20260617_073309.log`/`073603.log`；`074` no panic but FAIL：`official_20260617_073751.log` | 已消除 per-case PageCache 绕测嫌疑；`074` 转入洞文件/并发数据损坏调查 |
 | 2026-06-17 | Step 3 | 修复 `074` 中 O_TRUNC 后 extent tree 残留/元数据块读作数据的风险；新增 truncate-to-empty 整树释放、批量 free runs，并将 nlink=0 unlink/close 的 PageCache 处理改为 discard；`flush_all` 不再强制全文件标脏 | `kernel/libs/ext4_rs/src/ext4_impls/balloc.rs`、`kernel/libs/ext4_rs/src/ext4_impls/extents.rs`、`kernel/libs/ext4_rs/src/ext4_impls/file.rs`、`kernel/src/fs/ext4/fs.rs`、`tools/ext4/run_phase4_part3.sh`、`tools/ext4/run_phase4_in_docker.sh` | `030` PASS：`official_20260617_100520.log`；`074` 1800s 诊断跑 PASS：`official_20260617_102211.log` | 当前 `074` correctness 收口；95% 收敛恢复 600s case timeout，仍需跑 full official 和 PageCache/Phase6/crash/fsync 守底 |
 | 2026-06-18 | Step 4 | 满盘 fs-wide sync ENOSPC 降级，避免 `generic/269` 后 umount 失败导致 scratch 残留挂载并污染后续 case | `kernel/src/fs/ext4/fs.rs` | `generic/269` 单测 PASS：`official_20260617_121256.log`；partial full：`official_20260617_121742.log` 中 `269/273/275/308/309/313/320/...` 恢复 PASS/NOTRUN 正常分类 | `cargo check -p aster-kernel --target x86_64-unknown-none` PASS；full 未生成最终 summary（outer timeout） |

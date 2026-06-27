@@ -2,12 +2,11 @@
 
 首次创建时间：2026-06-09（Asia/Shanghai）
 
-配套计划：`feature_sqlite_phase6_plan.md`
 起点证据：`sqlite_benchmark_report.md`（speedtest1 报告）、`feature_perf_phase5_milestone.md`（Phase 5 收口）
 
 ## 当前状态（2026-06-11 收口）
 
-**性能线最终战绩：SQLite speedtest1 2010.7s → 234.9s（ratio 2.97% → 21.92%，7.4×），integrity 全程 PASS，守底全绿，HEAD 干净（bc883375a）。** 路线、上限理论依据与 delalloc 解锁链见 plan §P 系列。
+**性能线最终战绩：SQLite speedtest1 2010.7s → 234.9s（ratio 2.97% → 21.92%，7.4×），integrity 全程 PASS，守底全绿，HEAD 干净（bc883375a）。** 路线、上限理论依据与 delalloc 解锁链见本 milestone 的阶段记录。
 
 | 阶段 | 内容 | 状态 | SQLite |
 |------|------|------|-------:|
@@ -15,10 +14,10 @@
 | S 系列 | S3 fsync 保留 clean 页（−7%）→ S4 批量写回（−5%）→ S6 unwritten extent + 写时预分配（−25%）| ✅ | 1332.2s（3.86%）|
 | P 系列 | P1 设备块缓存（−66%）→ P2 写快路径 ext2 化（−46%）→ P3b journal 合并写（中性）→ P5a lean prepare（−4%）；P3-1/P4 实测出局（负结果已记录）| ✅ | **234.9s（21.92%）** |
 | C 系列 | C1 dio overwrite 共享锁：并发墙拆除——**write nj2/4 = 6024/5139 MB/s（165%/187%，反超 Linux 与 raw）**，read nj4 3640→13200；C2 守底全绿（并发双层专属把关 + fio nj1 三轮裁决无伤）| ✅（C3 残余串行点按需）| 并发维度收口 |
-| 收敛评估 | 曲线趋平（−66→−46→−4%）；类别内现实可达 ~24-27%（P5b 脏页索引 ~12-15s 为最后机械项）；90% 需 delalloc 解锁链（赛期外，见 plan）| 已与理论对齐 | — |
+| 收敛评估 | 曲线趋平（−66→−46→−4%）；类别内现实可达 ~24-27%（P5b 脏页索引 ~12-15s 为最后机械项）；90% 需 delalloc 解锁链（赛期外，见阶段记录）| 已与理论对齐 | — |
 | 并行（待执行）| revoke 正确性修复（F1，保答辩；S6/P2 块复用加大暴露面）；476/388 压力垃圾节点共同根因追踪（现有防御已保证降级 EIO 不 panic）| ⏳ | — |
 
-### Step 2 分阶段（详见 `feature_sqlite_phase6_plan.md` §Step 2）
+### Step 2 分阶段
 
 | Stage | 目标 | 攻哪个桶 | 门控 |
 |-------|------|---------|------|

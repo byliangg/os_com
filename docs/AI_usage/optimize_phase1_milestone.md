@@ -466,7 +466,7 @@ API 链已全部验证可行，不需要新增 ostd API：
 
 | 日期 | Step | 操作 | 结果 |
 |------|------|------|------|
-| 2026-04-16 | - | 建立 Phase 1 基线、完成瓶颈分析、制定优化方案 | 见 analysis_phase1.md / optimize_plan_phase1.md |
+| 2026-04-16 | - | 建立 Phase 1 基线、完成瓶颈分析、制定优化方案 | 见 analysis_phase1.md 与本 milestone 记录 |
 | 2026-04-16 | Step 0 | 完成 ext4 direct-read 聚合打点并跑通带日志 benchmark | 确认 wait 才是主瓶颈，Step 1 不再是默认主线 |
 | 2026-04-16 | Step 0.5 | 完成 block / virtio 分层打点，并补充 ext4 mapping 画像 | 确认 queue/dispatch 很轻，request split 优先级下降，下一步隔离大 read bio 重算 device wait |
 | 2026-04-16 | Step 0.5 | 继续拆分 completion wait 到 IRQ delivery / reap / 响应头同步 | 确认 `device_wait` 几乎全是 IRQ delivery，guest completion bookkeeping 收益空间极小 |

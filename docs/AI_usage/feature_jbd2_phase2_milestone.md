@@ -102,9 +102,6 @@
 
 ### 涉及文件
 
-- `feature_jbd2_phase2_lock_order.md`
-- `asterinas/docs/feature_jbd2_phase2_lock_order.md`
-- `feature_jbd2_phase2_plan.md`
 - `feature_jbd2_phase2_milestone.md`
 - `asterinas/kernel/libs/ext4_rs/src/ext4_impls/alloc_guard.rs`
 - `asterinas/kernel/libs/ext4_rs/src/ext4_impls/jbd2/journal.rs`
@@ -318,12 +315,8 @@
 - `asterinas/kernel/libs/ext4_rs/src/ext4_impls/balloc.rs`
 - `asterinas/kernel/libs/ext4_rs/src/ext4_impls/jbd2/journal.rs`
 - `asterinas/kernel/libs/ext4_rs/src/ext4_impls/jbd2/transaction.rs`
-- `feature_jbd2_phase2_plan.md`
 - `feature_jbd2_phase2_milestone.md`
-- `feature_jbd2_phase2_lock_order.md`
-- `asterinas/docs/feature_jbd2_phase2_plan.md`
 - `asterinas/docs/feature_jbd2_phase2_milestone.md`
-- `asterinas/docs/feature_jbd2_phase2_lock_order.md`
 
 ### 功能回归
 
@@ -382,8 +375,6 @@
 - `asterinas/test/initramfs/src/syscall/ext4_phase2/run_ext4_phase2_concurrency.sh`
 - `asterinas/tools/ext4/run_phase4_in_docker.sh`
 - `asterinas/tools/ext4/run_phase4_part3.sh`
-- `feature_jbd2_phase2_plan.md`
-- `asterinas/docs/feature_jbd2_phase2_plan.md`
 - `feature_jbd2_phase2_milestone.md`
 - `asterinas/docs/feature_jbd2_phase2_milestone.md`
 
@@ -620,10 +611,8 @@
 ### 涉及文件
 
 - `feature_jbd2_phase2_milestone.md`
-- `feature_jbd2_phase2_plan.md`
 - `benchmark.md`
 - `asterinas/docs/feature_jbd2_phase2_milestone.md`
-- `asterinas/docs/feature_jbd2_phase2_plan.md`
 - `asterinas/benchmark/benchmark.md`
 
 ### 验收项

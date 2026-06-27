@@ -111,13 +111,12 @@
 
 ### 改动概要
 
-本 step 已新增 Phase 4 plan/milestone 文档，并完成后续 Step 1 的代码审计准备。benchmark baseline 尚未复跑。
+本 step 已整理 Phase 4 milestone 文档，并完成后续 Step 1 的代码审计准备。benchmark baseline 尚未复跑。
 
 ### 涉及文件
 
 | 文件 | 类型 |
 |------|------|
-| `docs/feature_pagecache_phase4_plan.md` | 新建 |
 | `docs/feature_pagecache_phase4_milestone.md` | 新建 |
 | `README.md` | 更新阶段说明与文档索引 |
 | `AGENTS.md` / `CLAUDE.md` | 更新当前阶段指引 |

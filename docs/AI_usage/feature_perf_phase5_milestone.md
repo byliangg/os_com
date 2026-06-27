@@ -2,7 +2,6 @@
 
 首次创建时间：2026-06-02（Asia/Shanghai）
 
-配套计划：`feature_perf_phase5_plan.md`
 基线证据：`fio_direct_parameter_sweep_report.md`、`fio_direct_senior_feedback_response.md`
 
 ## 当前状态（2026-06-03）
@@ -75,7 +74,7 @@
 | O_DIRECT write `bs=4K nj=1`（ext4j） | 45.1 MB/s | 219 MB/s | 20.59%（小块 ext4 自身弱） |
 | O_DIRECT read `bs=4K nj=1`（ext4j） | 22.3 MB/s | 196 MB/s | 11.38%（小块 ext4 自身弱） |
 
-三瓶颈分解结论见 plan §2。
+三瓶颈分解结论见本 milestone 的阶段分析记录。
 
 ## 阶段分析结论（人工讨论 + AI 辅助分析）
 
@@ -91,12 +90,11 @@
 **状态：** ✅ 完成（2026-06-02）
 
 ### 改动概要
-- 新建 `feature_perf_phase5_plan.md` / `feature_perf_phase5_milestone.md`；
+- 整理 Phase 5 阶段记录与 `feature_perf_phase5_milestone.md`；
 - 索引文档（根 `CLAUDE.md` / `AGENTS.md`、`asterinas/AGENTS.md` / `asterinas/CLAUDE.md`）由 phase4 切换指向 phase5；
 - 完整 sweep 报告与学长反馈纳入 Phase 5 基线证据。
 
 ### 涉及文件
-- `feature_perf_phase5_plan.md`（新建）
 - `feature_perf_phase5_milestone.md`（新建）
 - `CLAUDE.md`、`AGENTS.md`、`asterinas/AGENTS.md`、`asterinas/CLAUDE.md`（索引更新）
 
