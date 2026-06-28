@@ -32,10 +32,8 @@
 | 所属高校 | 哈尔滨工业大学（深圳） |
 | 队伍成员 | 俞杰、梁丙煜、王毅航 |
 | 指导老师 | 夏文、李诗逸 |
-| 主要语言 | Rust、C、Shell |
-| 代码分支 | `feature-sqlite-phase-6` |
-| 项目仓库 | [github.com/byliangg/os_com](https://github.com/byliangg/os_com/tree/feature-sqlite-phase-6) |
-| 参考基础 | Asterinas、开源 EXT4 库 `ext4_rs` |
+| 主要语言 | Rust |
+
 
 ### 1.2 项目简介
 
@@ -43,7 +41,7 @@
 
 在实现功能的基础上，项目重点关注两个问题。第一，文件系统在异常退出或主机崩溃后能否保持磁盘一致性；第二，在保留 EXT4/JBD2 一致性语义的前提下，能否在 RustOS 和 virtio-blk 环境中获得接近 Linux EXT4 的性能。围绕这两个问题，项目补齐了 JBD2 transaction、handle、commit、checkpoint、recovery、journal space 等模块，并通过 xfstests、Crash Matrix、fio、SQLite speedtest1 和自研并发 hash 校验进行验证。
 
-当前版本已经完成 EXT4 主体功能和主要性能优化。合成 O_DIRECT 顺序读写已经接近或部分超过 Linux EXT4，同文件并发覆盖写在 numjobs=2/4 场景下超过 Linux EXT4；SQLite speedtest1 从初始版本的 2022s 优化到 234.9s，整体提升约 7.4 倍，并通过 `PRAGMA integrity_check` 校验。
+当前版本已经完成 EXT4 主体功能和主要性能优化。合成 O_DIRECT 顺序读写已经接近或部分超过 Linux EXT4，同文件并发覆盖写在 numjobs=2/4 场景下超过 Linux EXT4；SQLite speedtest1 从初始版本的 2022s 优化到 234.9s，整体提升约 8.6 倍。
 
 ### 1.3 项目亮点
 
@@ -52,7 +50,7 @@
 - **多路径 I/O 接入**：在 Asterinas 中打通 buffered I/O、PageCache、mmap、O_DIRECT 和 bio 提交链路。
 - **强一致性验证闭环**：Crash Matrix 18/18 PASS，host-crash fsync 4/4 PASS，并结合 xfstests 和 SQLite integrity 检查验证。
 - **性能优化主线清晰**：通过四层 profiling 归因，围绕元数据读盘、Extent 映射、覆盖写判定、锁粒度和 fsync 路径持续优化。
-- **真实应用负载可运行**：SQLite speedtest1 能稳定运行并通过完整性校验，性能从初始版本提升约 7.4 倍。
+- **真实应用负载可运行**：SQLite speedtest1 能稳定运行并通过完整性校验，性能从初始版本提升约 8.6 倍。
 
 ### 1.4 完成情况概览
 
@@ -69,13 +67,11 @@
 
 ### 1.5 分工说明
 
-> 这里先按模块写一个可提交版本，后续可以按你们真实分工再人工微调。
-
 | 成员 | 主要工作 |
 | --- | --- |
-| 俞杰 | EXT4/JBD2 核心设计、崩溃一致性测试、README 与比赛材料整理 |
-| 梁丙煜 | Asterinas VFS 接入、PageCache/mmap/O_DIRECT 路径、性能优化与 benchmark |
-| 王毅航 | xfstests 适配、自研并发测试、SQLite/fio 测试脚本与结果分析 |
+| 俞杰 | EXT4/JBD2 核心设计、崩溃一致性测试与比赛材料整理 |
+| 梁丙煜 | Asterinas VFS 接入、PageCache/mmap/O_DIRECT 路径、性能优化 |
+| 王毅航 | xfstests 适配、并发测试、SQLite/fio 测试脚本与结果分析 |
 
 ### 1.6 文档索引
 
@@ -85,9 +81,7 @@
 - [benchmark/README.md](benchmark/README.md)：benchmark 目录说明、常用测试入口和结果资产说明。
 - [benchmark/environment.md](benchmark/environment.md)：测试环境、依赖资产和运行约束说明。
 - [docs/AI_usage/README.md](docs/AI_usage/README.md)：AI 使用记录目录。
-- [docs/AI_usage/AI使用说明.md](docs/AI_usage/AI使用说明.md)：比赛材料中的 AI 使用披露说明。
-- [docs/image/](docs/image/)：README、文档和答辩材料使用的图片资源。
-- `work/sqlite_ext4_performance_simple.md`、`work/ext4_fio_read_simple.md`：本地性能分析草稿，若需要公开引用可后续整理后提交。
+
 
 ## 二、项目背景与目标
 
@@ -97,9 +91,8 @@ Asterinas 是基于 Rust 的 framekernel 操作系统，目标是兼容 Linux AB
 
 EXT4 是 Linux 生态中长期使用的文件系统，涉及普通文件和目录操作、Extent 连续块管理、日志提交、fsync 持久化、mmap、O_DIRECT、并发读写和崩溃恢复等复杂语义。实现 EXT4 不是简单完成块读写，而是要把磁盘格式、内核缓存、事务日志、设备刷盘和并发控制连接在一起。
 
-因此，本项目的目标不是实现一个教学型文件系统，而是在 Asterinas 上补齐主流磁盘文件系统能力，使 RustOS 能够支撑更真实的应用负载和测试环境。
+因此，本项目的目标是在 Asterinas 上补齐主流磁盘文件系统能力，使 RustOS 能够支撑更真实的应用负载和测试环境。
 
-![赛题需求图](./docs/image/赛题需求图.png)
 
 ### 2.2 项目目标
 
@@ -112,6 +105,7 @@ EXT4 是 Linux 生态中长期使用的文件系统，涉及普通文件和目�
 3. 支持 JBD2 ordered 日志语义，完成事务提交、检查点写回和挂载时恢复。
 4. 接入 Asterinas 的 PageCache、Vmo、bio 和块设备接口，打通 buffered I/O、mmap、fsync、O_DIRECT 和并发读写路径。
 5. 在 QEMU/KVM + virtio-blk 环境下，与 Linux EXT4 进行同口径对照测试，并给出可复现的性能优化过程。
+![赛题需求图](./docs/image/赛题需求图.png)
 
 ### 2.3 核心挑战
 
@@ -123,7 +117,6 @@ EXT4 是 Linux 生态中长期使用的文件系统，涉及普通文件和目�
 - **性能和一致性互相影响**：fsync、flush 和日志提交会增加 I/O 延迟，但直接省略这些步骤会破坏崩溃一致性。项目需要在保证正确性的前提下减少重复元数据读取、重复映射查询和不必要的锁串行化。
 - **并发路径容易出错**：多线程同时读写文件、rename、truncate 或 fsync 时，需要明确锁序和事务边界，避免死锁、数据错乱和元数据状态不一致。
 
-![项目开发流程图](./docs/image/项目开发流程图.png)
 
 ## 三、系统设计与实现
 
@@ -143,7 +136,6 @@ EXT4 是 Linux 生态中长期使用的文件系统，涉及普通文件和目�
 
 从调用链看，应用程序通过 Linux ABI 发起系统调用，Asterinas VFS 将请求分发到 EXT4 inode/file 操作。普通读写优先进入 PageCache 和 Vmo 路径，O_DIRECT 则绕过 PageCache，直接准备 Extent 映射并向 block layer 提交 bio。涉及元数据变更的操作会进入统一事务入口，由 JBD2 handle 记录元数据块并在提交阶段写入 journal。
 
-![Ext4Fs结构体字段定义](./docs/image/Ext4Fs结构体字段定义代码.png)
 
 ### 3.2 主要模块
 
@@ -159,7 +151,7 @@ EXT4 是 Linux 生态中长期使用的文件系统，涉及普通文件和目�
 
 ### 3.3 EXT4 核心功能
 
-EXT4 核心结构部分主要基于开源 `ext4_rs` 的磁盘格式解析能力扩展而来。本项目在其基础上补齐了内核文件系统运行时需要的路径，包括 inode 生命周期、目录项更新、Extent 插入和合并、块分配、文件扩容、truncate、fsync 和并发读写等逻辑。
+EXT4 基本功能部分主要参考开源 `ext4_rs` 的磁盘格式解析能力扩展而来。本项目在其基础上补齐了内核文件系统运行时需要的路径，包括 inode 生命周期、目录项更新、Extent 插入和合并、块分配、文件扩容、truncate、fsync 和并发读写等逻辑。
 
 Extent 是项目中的重点实现之一。相比直接块映射，Extent 以连续区间描述文件逻辑块到物理块的关系，更适合大文件和顺序 I/O。项目实现了 Extent Header、Extent Index、Extent Leaf 的解析和更新，并支持在文件扩展时插入、合并和必要时分裂 Extent。对于 SQLite 和 fio 这类负载，Extent 路径的性能直接影响读写吞吐和 fsync 延迟。
 
@@ -169,7 +161,7 @@ Extent 是项目中的重点实现之一。相比直接块映射，Extent 以连
 
 ### 3.4 JBD2 日志与崩溃恢复
 
-JBD2 是本项目一致性实现的核心。开源 `ext4_rs` 原本没有完整日志机制，元数据变更可以直接写入磁盘。本项目新增 transaction、handle、commit、checkpoint、recovery、journal space 等模块，使元数据更新先写入日志，再通过检查点写回 home 位置。
+JBD2 是本项目一致性实现的核心。本项目新增 transaction、handle、commit、checkpoint、recovery、journal space 等模块，使元数据更新先写入日志，再通过检查点写回 home 位置。
 
 项目采用 ordered 模式。数据块不进入日志，元数据进入日志；提交时先写 descriptor 和 metadata payload，再执行设备同步，最后写 commit block。恢复阶段扫描 journal，只重放已经写入完整 commit block 的事务。这样可以保证系统在崩溃后不会重放半提交事务。
 
@@ -233,7 +225,7 @@ JBD2 路径的实现重点包括：
 
 ### 4.2 xfstests 功能与兼容性测试
 
-项目没有声称已经通过 official xfstests 全量测试，而是围绕当前功能完成度选择了重点子集。当前阶段的结论是：项目通过了赛题核心路径相关的 xfstests 重点子集，并且这些子集当前均为 0 FAIL。
+项目目前还没有通过 official xfstests 全量测试，而是围绕当前功能完成度选择了大量重点的测试子集。当前阶段的结果是：项目通过了赛题核心路径相关的 xfstests 重点子集。
 
 | 测试集合 | 结果 | 主要覆盖内容 |
 | --- | --- | --- |
@@ -245,7 +237,7 @@ JBD2 路径的实现重点包括：
 | fsync durability tier1 | 11 PASS / 0 FAIL / 1 NOTRUN | fsync/fdatasync 持久化语义 |
 | concurrency | 10 PASS / 0 FAIL | 多线程读写、fsstress 和并发压力场景 |
 
-部分用例标记为 NOTRUN，主要原因是当前项目尚未实现或暂不覆盖 hardlink、symlink、debugfs、device-mapper、quota、AIO、特殊挂载选项等能力。这些不属于当前版本已经声明完成的范围，后续会随着 POSIX 边界补齐继续推进。
+部分用例标记为 NOTRUN，主要原因是当前项目尚未实现或暂不覆盖 hardlink、symlink、debugfs、device-mapper、quota、AIO、特殊挂载选项等能力。后续会随着 POSIX 边界补齐继续推进。
 
 ### 4.3 崩溃一致性测试
 
@@ -270,11 +262,10 @@ JBD2 路径的实现重点包括：
 
 第一类是项目自研的确定性 hash 测试。测试程序启动多个 worker 并发创建文件、写入固定模式数据、执行同文件覆盖写或多文件写入，结束后重新读取文件并计算 hash。期望 hash 由 seed、worker 编号和 round 决定，因此只要并发过程中出现覆盖错乱、丢写或顺序错误，最终 hash 就会不一致。当前自研并发测试 7/7 PASS。
 
-第二类是 xfstests concurrency 子集。该集合覆盖 fsstress、并发读写、rename/unlink 压力和多线程目录操作等场景，当前结果为 10/10 PASS。它的作用是提供更接近 Linux 文件系统测试习惯的标准压力验证。
+第二类是 xfstests concurrency 测试。该集合覆盖 fsstress、并发读写、rename/unlink 压力和多线程目录操作等场景，当前结果为 10/10 PASS。它的作用是提供更接近 Linux 文件系统测试习惯的标准压力验证。
 
 因此，本项目的并发结论不是只依赖单一测试。自研测试重点验证数据正确性，xfstests concurrency 重点验证标准压力场景，两者共同说明当前锁序设计、共享锁覆盖写路径和 PageCache/direct I/O 一致性协议在重点并发场景下能够保持正确。
 
-![并发写入测试与确定性hash校验](./docs/image/并发写入测试与确定性%20hash%20校验逻辑代码.png)
 
 ### 4.5 性能测试结果
 
@@ -284,15 +275,14 @@ fio O_DIRECT 测试用于评估文件系统基础 I/O 能力。当前版本在 4
 
 | 块大小 | 读取相对 Linux EXT4 | 写入相对 Linux EXT4 |
 | --- | --- | --- |
-| 4 KiB | 约 82%-86% | 约 75%-76% |
-| 16 KiB | 约 84%-86% | 约 75%-76% |
-| 64 KiB | 约 87%-88% | 约 81%-84% |
-| 256 KiB | 约 90%-95% | 约 121% |
-| 1 MiB | 约 122%-140% | 约 82%-88% |
+| 4 KiB | 约 101.3% | 约 97.3% |
+| 16 KiB | 约 97.0% | 约 91.0% |
+| 64 KiB | 约 92.9% | 约 91.7% |
+| 256 KiB | 约 96.0% | 约 113.1% |
+| 1 MiB | 约 92.0% | 约 108.9% |
 
 这些结果说明，在顺序 direct I/O 场景下，当前系统的 bio 提交、大块 I/O 和 Extent 映射路径已经具备较好的性能基础。
 
-![fio O_DIRECT顺序读写性能](./docs/image/fio%20O_DIRECT%20顺序读写性能.png)
 
 ![读取性能比例](./docs/image/q_读性能比例.png)
 
@@ -321,9 +311,8 @@ SQLite speedtest1 是更接近真实应用的数据库负载，包含大量小�
 | WrittenCoverage 写快路径 | 约 243.9s | 覆盖写减少重复 Extent 查询 |
 | 当前版本 | 约 234.9s | lean prepare 等细化优化后结果 |
 
-当前 SQLite 性能约为 Linux EXT4 的 21.92%。该结果相比初始版本有明显提升，但距离 Linux EXT4 仍有差距。主要原因是 SQLite 属于 fsync 密集型真实负载，频繁触发小写入、元数据更新、日志提交和同步刷盘；Linux EXT4 在 delayed allocation、background writeback、journal group commit 和块层调度方面积累了大量优化，而当前实现为了保证一致性采取了较保守的提交与写回策略。后续优化会重点围绕延迟分配、后台写回和日志合并提交继续推进。
+当前 SQLite 性能约为耗时235s。该结果相比初始版本有明显提升，但距离 Linux EXT4 仍有差距。主要原因是 SQLite 属于 fsync 密集型真实负载，频繁触发小写入、元数据更新、日志提交和同步刷盘；Linux EXT4 在 delayed allocation、background writeback、journal group commit 和块层调度方面积累了大量优化，而当前实现为了保证一致性采取了较保守的提交与写回策略。后续优化会重点围绕延迟分配、后台写回和日志合并提交继续推进。
 
-![SQLite speedtest1优化效果](./docs/image/SQLite%20speedtest1%20优化效果.png)
 
 ![SQLite性能比例](./docs/image/q_sqlite.png)
 
@@ -381,7 +370,6 @@ fio 和 SQLite 中存在大量“文件块已经分配，只是覆盖写已有�
 
 初始实现中，同一 inode 的写路径被互斥锁串行化。对于同文件 O_DIRECT 覆盖写，这种串行化并没有必要，因为测量阶段不改变文件大小，也不改变 Extent 映射。项目将该路径拆成“共享锁验证 + 并行 bio 提交”的 fast path，仅在写入会改变映射或文件大小时退回独占路径。
 
-![O_DIRECT覆盖写共享锁fastpath](./docs/image/O_DIRECT%20覆盖写共享锁%20fast%20path代码.png)
 
 这些优化有一个共同原则：不以破坏一致性换性能。只要路径会修改元数据、改变文件大小、分配新块或影响 fsync 语义，就必须进入 JBD2 和独占保护；只有能证明是纯覆盖、纯读取或缓存命中的场景，才使用 fast path。
 
@@ -443,7 +431,7 @@ FS_LIST=ext4 PAGE_CACHE_LIST=1 JBD2_LIST=1 \
 │   ├── ext4_crash/               # 崩溃一致性测试程序
 │   └── ext4_phase2/              # 自研并发正确性测试
 ├── tools/ext4/                   # 构建、运行、crash、fio、SQLite、xfstests 测试脚本
-├── docs/                         # 性能报告、技术报告和比赛文档
+├── docs/                         # AI使用情况说明
 └── benchmark/                    # 测试日志和结果汇总
 ```
 
