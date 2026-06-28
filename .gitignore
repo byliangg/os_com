@@ -51,3 +51,12 @@ distro/etc_nixos/_config_for_test.nix
 benchmark/logs/
 test/initramfs/src/benchmark/aster_output.txt
 test/initramfs/src/benchmark/linux_output.txt
+
+# Local agent notes and temporary repro docs
+AGENTS.md
+CLAUDE.md
+EXT4_PHASE2_REPRO.md
+EXT4_PHASE3_PART1_SUMMARY.md
+EXT4_PHASE3_REPRO.md
+asterinas_ext4_phase2_manual_test_commands.md
+environment.md
