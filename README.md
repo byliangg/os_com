@@ -79,7 +79,6 @@
 
 - [benchmark/benchmark.md](benchmark/benchmark.md)：benchmark 最新结果快照、环境准备、复现命令和测试口径。
 - [benchmark/README.md](benchmark/README.md)：benchmark 目录说明、常用测试入口和结果资产说明。
-- [benchmark/environment.md](benchmark/environment.md)：测试环境、依赖资产和运行约束说明。
 - [docs/AI_usage/README.md](docs/AI_usage/README.md)：AI 使用记录目录。
 
 
