@@ -1,17 +1,6 @@
 # Asterinas EXT4 Benchmark 
-
-## 结果
-
-| 维度 | 最新值 |
-|---|---|---|
-| fio O_DIRECT 顺序（`direct=1 nj=1`，cache-off + drop）| read 82–140% / write 75–121%（bs=4K–4M 全档 ≥ 红线 75%）|  
-| fio 并发（numjobs 同文件 1M，C1 共享锁后）| **write nj2/4 = 6024/5139 MB/s（165%/187%，反超 Linux 与 raw）** |  
-| fio buffered（D 组）| write 7.9–29.3%（Phase 6 前仅 1.2–6.3%，绝对值 ×4.3–13.2）|  |
-| SQLite speedtest1（page_cache=1，--size 1000）| **234.9s = Linux 的 21.92%**（起点 2.97%，7.4×），integrity PASS |  
-| 守底回归 | crash 18/18、host-crash 4/4、并发双层 7/7+10/10、xfstests 四包 0 FAIL | 
-
-
-## 1. 本文用途与环境准备
+ 
+## 1. 环境准备
 
 ### 1.1 快速复现（拿到仓库即可执行）
 
