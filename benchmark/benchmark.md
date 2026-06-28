@@ -34,7 +34,6 @@ FS_LIST=ext4 PAGE_CACHE_LIST=1 LOG_LEVEL=error bash test/initramfs/src/benchmark
 
 | 目录 | 说明 |
 |---|---|
-| `target_lby/`、`.target_bench/` | 构建产物 |
 | `benchmark/logs/` | 本地 run 产物（已 gitignore；需版本化的证据用 `git add -f`）|
 | `.local/linux_vdso`、`.local/xfstests-*` | VDSO 与 xfstests 预构建（缺失时 `tools/ext4/prepare_xfstests_prebuilt.sh` 重建）|
 | `.cache/linux_binary_cache/vmlinuz` | fio Linux 对照侧内核（~24MB；缺失时 `prepare_host.sh` 自动从 `asterinas/linux_binary_cache` 下载，离线环境手工预置同名文件）|
