@@ -5,13 +5,12 @@
 ## 目录内容
 
 - `benchmark.md`：当前测试结果汇总。
-- `benchmark.md`（仓库根/docs）：环境准备、复现命令与 benchmark 口径的唯一指引。
+- `benchmark.md`：环境准备、复现命令与 benchmark 口径的唯一指引。
 - `assets/`：运行测试所需依赖资产（initramfs、xfstests、vDSO 等）。
 - `datasets/xfstests/`：用例清单、静态排除原因、样例脚本副本。
 - `logs/`：ext4 测试脚本默认日志输出目录。
 - `datasets/results/`：用于 git 归档的稳定结果快照。
 
-如需刷新数据集快照，请执行 `benchmark/sync_dataset.sh`。
 
 ## 常用测试入口
 
@@ -25,18 +24,5 @@
 | `test/initramfs/src/benchmark/fio/run_phase5_profile_probe.sh` | Phase 5 四层延迟 profile（FS/virtio/锁/JBD2，门控 `ext4fs.phase2_profile=1`）|
 | `tools/ext4/run_phase5_regression.sh` | Phase 5 守底回归（`FULL_SUITE=1` 完整套 / `FULL_GUARD=1` 三模式，drc=0 激活 extent+inode 缓存）|
 
-## Phase 5 读写优化结果（O_DIRECT，nj=1，drop 公平口径，中位数）
-
-四个 ext4 优化（extent 映射缓存 / 全文件覆盖 / atime 节流 / **inode 元数据缓存**）把读写从 16–63% 拉到 75–123%：
-
-| bs | read | write |
-|----|-----:|------:|
-| 4K | 86.38% | 75.54% |
-| 16K | 84.42% | 75.78% |
-| 64K | 86.89% | 84.09% |
-| 256K | 94.81% | 121.07% |
-| 1M | 122.94% | 88.28% |
-
-ext4 域内固定开销已榨干，剩余瓶颈在 Asterinas virtio 设备往返（跨 FS 通用）。完整守底全绿（crash 18/18、concurrency 7/7、xfstests 全 100%）。详见 `feature_perf_phase5_milestone.md`。
 
 > 日志提示：profile 默认 `LOG_LEVEL=error`（profile probe 显式用 `warn`）；不要用 verbose/trace 跑（会产生数百 MB 的单文件日志，超 GitHub 100MB 上限且无分析价值）。
