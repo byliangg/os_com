@@ -9,7 +9,7 @@
 
 use core::{
     fmt,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use aster_block::{
@@ -31,6 +31,9 @@ use super::{
 pub(super) struct Ext4MemoryDisk {
     segment: Segment<()>,
     flush_count: AtomicUsize,
+    /// When set, every write bio fails with `IoError`. Lets tests force a
+    /// metadata writeback failure (e.g. to exercise `create_inode` rollback).
+    fail_writes: AtomicBool,
 }
 
 impl Ext4MemoryDisk {
@@ -43,11 +46,17 @@ impl Ext4MemoryDisk {
         Self {
             segment,
             flush_count: AtomicUsize::new(0),
+            fail_writes: AtomicBool::new(false),
         }
     }
 
     pub(super) fn segment(&self) -> &Segment<()> {
         &self.segment
+    }
+
+    /// Makes every subsequent write bio fail (or stops failing them).
+    pub(super) fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes.store(fail, Ordering::Relaxed);
     }
 }
 
@@ -64,6 +73,11 @@ impl BlockDevice for Ext4MemoryDisk {
         if bio.type_() == BioType::Flush {
             self.flush_count.fetch_add(1, Ordering::Relaxed);
             bio.complete(BioStatus::Complete);
+            return Ok(());
+        }
+
+        if bio.type_() == BioType::Write && self.fail_writes.load(Ordering::Relaxed) {
+            bio.complete(BioStatus::IoError);
             return Ok(());
         }
 
@@ -159,6 +173,14 @@ pub(super) struct Ext4FixtureBuilder {
     /// by marking all but the top `n` data blocks allocated. For
     /// ENOSPC-mid-operation tests.
     free_block_cap: Option<u32>,
+    /// When set, mark the reserved inodes (1..`first_ino`) of group 0 as
+    /// allocated in the inode bitmap and seed the matching free-inode counters.
+    /// Off by default so the read-only fixtures keep their all-zero inode
+    /// bitmap and zero counters.
+    mark_inode_metadata: bool,
+    /// When set, override the free-inode counters to zero (for inode-ENOSPC
+    /// tests). Implies the inode metadata is marked.
+    no_free_inodes: bool,
 }
 
 impl Ext4FixtureBuilder {
@@ -170,6 +192,8 @@ impl Ext4FixtureBuilder {
             mark_metadata: false,
             no_free_blocks: false,
             free_block_cap: None,
+            mark_inode_metadata: false,
+            no_free_inodes: false,
         }
     }
 
@@ -195,6 +219,22 @@ impl Ext4FixtureBuilder {
     pub(super) fn with_free_blocks(mut self, n: u32) -> Self {
         self.free_block_cap = Some(n);
         self.mark_metadata = true;
+        self
+    }
+
+    /// Marks the reserved inodes (1..`first_ino`) of group 0 as allocated in the
+    /// inode bitmap and seeds the free-inode counters accordingly, giving inode
+    /// allocator tests a realistic starting image.
+    pub(super) fn with_inode_bitmap_metadata_marked(mut self) -> Self {
+        self.mark_inode_metadata = true;
+        self
+    }
+
+    /// Forces all free-inode counters to zero (for inode-ENOSPC tests). Implies
+    /// the inode bitmap is marked, so an inode allocation cannot succeed.
+    pub(super) fn with_no_free_inodes(mut self) -> Self {
+        self.no_free_inodes = true;
+        self.mark_inode_metadata = true;
         self
     }
 
@@ -228,10 +268,33 @@ impl Ext4FixtureBuilder {
                 .sum()
         };
 
+        // Reserved inodes (1..first_ino) occupy the low bits of group 0's inode
+        // bitmap; `first_ino` is 11 in this fixture, so bits 0..10 are reserved.
+        const FIRST_INO: u32 = 11;
+        let reserved_inodes = FIRST_INO - 1;
+
+        // Per-group free-inode counts, summed for the superblock counter. Only
+        // group 0 carries the reserved inodes; the zero override applies to the
+        // single-group fixtures used by the inode-ENOSPC test.
+        let total_free_inodes: u32 = if self.no_free_inodes || !self.mark_inode_metadata {
+            0
+        } else {
+            (0..nr_groups)
+                .map(|g| {
+                    if g == 0 {
+                        self.inodes_per_group - reserved_inodes
+                    } else {
+                        self.inodes_per_group
+                    }
+                })
+                .sum()
+        };
+
         let raw_sb = RawSuperBlock {
             inodes_count,
             blocks_count: self.nblocks as u32,
             free_blocks_count: total_free,
+            free_inodes_count: total_free_inodes,
             first_data_block: 0,
             log_block_size: 2,
             log_frag_size: 2,
@@ -278,11 +341,23 @@ impl Ext4FixtureBuilder {
                 (0, metadata_end_block)
             };
 
+            // Per-group inode bookkeeping. `inode_mark_end` is the exclusive bit
+            // up to which group `g`'s inode bitmap is marked allocated.
+            let reserved_in_group = if g == 0 { reserved_inodes } else { 0 };
+            let (free_inodes, inode_mark_end) = if self.no_free_inodes {
+                (0, self.inodes_per_group)
+            } else if self.mark_inode_metadata {
+                (self.inodes_per_group - reserved_in_group, reserved_in_group)
+            } else {
+                (0, 0)
+            };
+
             let raw_gd = RawBlockGroup {
                 block_bitmap_lo: group_first + 2,
                 inode_bitmap_lo: group_first + 3,
                 inode_table_lo: group_first + INODE_TABLE_BID,
                 free_blocks_count_lo: free as u16,
+                free_inodes_count_lo: free_inodes as u16,
                 ..Default::default()
             };
             disk.segment()
@@ -301,6 +376,18 @@ impl Ext4FixtureBuilder {
                 }
                 disk.segment()
                     .write_bytes((group_first as usize + 2) * BLOCK_SIZE, &bitmap)
+                    .unwrap();
+            }
+
+            if self.mark_inode_metadata {
+                // Mark the in-group reserved/capped inode bits (0..inode_mark_end)
+                // allocated in this group's inode bitmap. LSB-first.
+                let mut inode_bitmap = vec![0u8; BLOCK_SIZE];
+                for bit in 0..inode_mark_end as usize {
+                    inode_bitmap[bit / 8] |= 1 << (bit % 8);
+                }
+                disk.segment()
+                    .write_bytes((group_first as usize + 3) * BLOCK_SIZE, &inode_bitmap)
                     .unwrap();
             }
         }

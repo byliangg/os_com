@@ -127,13 +127,70 @@ pub(super) struct InodeDesc {
     flags: FileFlags,
     #[expect(dead_code)]
     file_acl: u64,
-    #[expect(dead_code)]
     generation: u32,
     /// Raw `i_block` (60 bytes) — the inline extent-tree root.
     block: [u32; RAW_BLOCK_PTRS_LEN],
 }
 
+/// `eh_magic` of an `ext4_extent_header` (Linux `EXT4_EXT_MAGIC`).
+const EXTENT_MAGIC: u16 = 0xF30A;
+
+/// Maximum extents the 60-byte inline root can hold past its 12-byte header
+/// (`(60 - 12) / 12`).
+const EXTENT_MAX_INLINE: u16 = 4;
+
+/// Builds the inline extent-tree root for a freshly created inode: a valid empty
+/// `ext4_extent_header` (magic `0xF30A`, 0 entries, max 4, depth 0) followed by
+/// zeros. New regular files and directories carry this so the extent reader sees
+/// a well-formed (empty) tree from the first byte — unlike ext2, whose new
+/// inodes start with zeroed indirect-block pointers.
+fn empty_extent_root() -> [u32; RAW_BLOCK_PTRS_LEN] {
+    let mut block = [0u32; RAW_BLOCK_PTRS_LEN];
+    // Each `i_block` word packs two 16-bit fields, little-endian: word 0 is
+    // `eh_magic | eh_entries(=0)`, word 1 is `eh_max(=4) | eh_depth(=0)`.
+    block[0] = EXTENT_MAGIC as u32;
+    block[1] = EXTENT_MAX_INLINE as u32;
+    block[2] = 0; // eh_generation
+    block
+}
+
 impl InodeDesc {
+    /// Builds a fresh inode descriptor for a newly created file or directory.
+    ///
+    /// Size and `i_blocks` start at zero; all timestamps are `now`; the inline
+    /// `i_block` holds a valid empty extent root and the `EXTENTS` flag is set
+    /// (ext4-specific — the data of every regular file/directory is extent
+    /// mapped). Mirrors ext2 `InodeDesc::new`, diverging only in the extent
+    /// root + flag (ext2 leaves zeroed indirect pointers and no flag).
+    pub(super) fn new(
+        type_: InodeType,
+        perm: FilePerm,
+        uid: u32,
+        gid: u32,
+        link_count: u16,
+        generation: u32,
+        now: Duration,
+    ) -> Self {
+        Self {
+            type_,
+            perm,
+            uid,
+            gid,
+            size: 0,
+            atime: now,
+            ctime: now,
+            mtime: now,
+            crtime: now,
+            dtime: Duration::ZERO,
+            link_count,
+            sector_count: 0,
+            flags: FileFlags::EXTENTS,
+            file_acl: 0,
+            generation,
+            block: empty_extent_root(),
+        }
+    }
+
     pub(super) const fn type_(&self) -> InodeType {
         self.type_
     }
@@ -221,6 +278,11 @@ impl InodeDesc {
 
     pub(super) const fn crtime(&self) -> Duration {
         self.crtime
+    }
+
+    /// Returns the inode generation (`i_generation`).
+    pub(super) const fn generation(&self) -> u32 {
+        self.generation
     }
 
     /// Returns the raw `i_block` bytes holding the extent-tree root.

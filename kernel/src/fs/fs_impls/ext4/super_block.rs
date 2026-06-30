@@ -185,7 +185,6 @@ impl SuperBlock {
         self.inode_size
     }
 
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn first_ino(&self) -> u32 {
         self.first_ino
     }
@@ -221,6 +220,32 @@ impl SuperBlock {
             return_errno_with_message!(Errno::EIO, "free block counter exceeds total blocks");
         }
         self.free_blocks_count = new_count;
+        Ok(())
+    }
+
+    /// Decreases the free-inode counter by one, erroring on underflow.
+    ///
+    /// Takes `&mut self` so that a write guard over `RwMutex<Dirty<SuperBlock>>`
+    /// marks the superblock dirty for writeback.
+    pub(super) fn dec_free_inodes(&mut self) -> Result<()> {
+        self.free_inodes_count = self
+            .free_inodes_count
+            .checked_sub(1)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free inode counter underflow"))?;
+        Ok(())
+    }
+
+    /// Increases the free-inode counter by one, erroring on overflow past the
+    /// total inode count.
+    pub(super) fn inc_free_inodes(&mut self) -> Result<()> {
+        let new_count = self
+            .free_inodes_count
+            .checked_add(1)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free inode counter overflow"))?;
+        if new_count > self.inodes_count {
+            return_errno_with_message!(Errno::EIO, "free inode counter exceeds total inodes");
+        }
+        self.free_inodes_count = new_count;
         Ok(())
     }
 
