@@ -11,6 +11,11 @@
 use super::super::super::prelude::*;
 use crate::fs::utils::NAME_MAX;
 
+/// Name bytes of the `.` (self) directory entry.
+pub(super) const DOT_BYTE: &[u8] = b".";
+/// Name bytes of the `..` (parent) directory entry.
+pub(super) const DOT_DOT_BYTE: &[u8] = b"..";
+
 const_assert!(size_of::<DirEntryHeader>() == 8);
 
 /// On-disk fixed part of a directory entry (`ext4_dir_entry_2`).
@@ -24,6 +29,7 @@ pub(super) struct DirEntryHeader {
 }
 
 impl DirEntryHeader {
+    const REC_LEN_OFFSET: usize = core::mem::offset_of!(DirEntryHeader, rec_len);
     const ALIGN_MASK: usize = 3;
 
     /// The minimal record length that can hold a name of `name_len` bytes.
@@ -77,6 +83,8 @@ pub(super) struct DirBlockView<'a> {
 }
 
 impl<'a> DirBlockView<'a> {
+    const HEADER_LEN: usize = size_of::<DirEntryHeader>();
+
     pub(super) fn from_index(
         page_cache: &'a PageCache,
         block_idx: usize,
@@ -88,6 +96,20 @@ impl<'a> DirBlockView<'a> {
             page_cache,
             offset,
             limit,
+        }
+    }
+
+    /// Creates a non-aligned temporary view for writing a single entry. The
+    /// view is clamped to the remainder of the block, since directory entries
+    /// cannot cross a block boundary.
+    pub(super) fn create_view(page_cache: &'a PageCache, offset: usize, limit: usize) -> Self {
+        let block_remaining = BLOCK_SIZE - offset % BLOCK_SIZE;
+        debug_assert!(limit <= block_remaining);
+
+        Self {
+            page_cache,
+            offset,
+            limit: limit.min(block_remaining),
         }
     }
 
@@ -126,6 +148,87 @@ impl<'a> DirBlockView<'a> {
             name_buf: [0u8; NAME_MAX],
         }
     }
+
+    /// Writes a complete directory entry (header + name) at `entry_offset`
+    /// within this view.
+    pub(super) fn write_entry(
+        &self,
+        entry_offset: usize,
+        header: DirEntryHeader,
+        name: &[u8],
+    ) -> Result<()> {
+        debug_assert_eq!(header.name_len as usize, name.len());
+        debug_assert!(entry_offset + header.rec_len as usize <= self.limit);
+
+        let entry_abs_offset = self.offset + entry_offset;
+        self.page_cache.write_val(entry_abs_offset, &header)?;
+        if !name.is_empty() {
+            self.page_cache
+                .write_bytes(entry_abs_offset + Self::HEADER_LEN, name)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes an entry and merges its `rec_len` into the predecessor if one
+    /// exists. The first entry in a block has no predecessor, so its space is
+    /// reclaimed by zeroing its inode only (it is never the `.` entry, which is
+    /// never deleted).
+    pub(super) fn delete_entry(&self, entry_offset: usize, entry_rec_len: usize) -> Result<()> {
+        let entry_end_offset = entry_offset + entry_rec_len;
+        if entry_rec_len == 0 || entry_end_offset > self.limit {
+            return_errno_with_message!(Errno::EIO, "invalid dir entry rec_len for delete");
+        }
+
+        // Walk from the block-aligned start to find the predecessor entry.
+        let chunk_mask = !(BLOCK_SIZE - 1);
+        let chunk_start_offset = entry_offset & chunk_mask;
+        let mut current_entry_offset = chunk_start_offset;
+        let mut prev_offset = None;
+
+        while current_entry_offset < entry_offset {
+            let header: DirEntryHeader = self
+                .page_cache
+                .read_val(self.offset + current_entry_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "dir entry header out of bounds"))?;
+            let rec_len = header.rec_len as usize;
+            if rec_len == 0 {
+                return_errno_with_message!(Errno::EIO, "zero rec_len in dir entry chain");
+            }
+            let next_entry_offset = current_entry_offset + rec_len;
+            if next_entry_offset > self.limit {
+                return_errno_with_message!(Errno::EIO, "dir entry chain exceeds block limit");
+            }
+            prev_offset = Some(current_entry_offset);
+            current_entry_offset = next_entry_offset;
+        }
+
+        if current_entry_offset != entry_offset {
+            return_errno_with_message!(Errno::EIO, "dir entry chain offset mismatch");
+        }
+
+        if let Some(prev_entry_offset) = prev_offset {
+            let merged_rec_len = (entry_end_offset - prev_entry_offset) as u16;
+            self.set_rec_len(prev_entry_offset, merged_rec_len)?;
+        }
+
+        self.set_inode(entry_offset, 0)?;
+        Ok(())
+    }
+
+    /// Overwrites the inode-number field at `entry_offset`.
+    pub(super) fn set_inode(&self, entry_offset: usize, ino: Ext4Ino) -> Result<()> {
+        let entry_abs_offset = self.offset + entry_offset;
+        self.page_cache.write_val(entry_abs_offset, &ino.to_le())?;
+        Ok(())
+    }
+
+    /// Overwrites the `rec_len` field at `entry_offset`.
+    pub(super) fn set_rec_len(&self, entry_offset: usize, rec_len: u16) -> Result<()> {
+        let rec_len_abs_offset = self.offset + entry_offset + DirEntryHeader::REC_LEN_OFFSET;
+        self.page_cache
+            .write_val(rec_len_abs_offset, &rec_len.to_le())?;
+        Ok(())
+    }
 }
 
 /// Iterates the entries of a [`DirBlockView`].
@@ -140,9 +243,9 @@ pub(super) struct DirBlockViewIter<'a> {
 impl DirBlockViewIter<'_> {
     const HEADER_LEN: usize = size_of::<DirEntryHeader>();
 
-    /// Reads the next entry and advances. Returns the entry's offset within the
-    /// block and the entry. Deleted entries (`ino == 0`) yield an empty name.
-    pub(super) fn next_entry(&mut self) -> Result<Option<(usize, DirEntry<'_>)>> {
+    /// Reads the next entry header and advances. Returns the entry's offset
+    /// within the block and the validated header.
+    pub(super) fn next_entry_header(&mut self) -> Result<Option<(usize, DirEntryHeader)>> {
         let end = self.block.offset + self.block.limit;
         if self.cursor >= end {
             return Ok(None);
@@ -152,6 +255,16 @@ impl DirBlockViewIter<'_> {
         let rec_len = header.rec_len as usize;
         let entry_offset = self.cursor - self.block.offset;
         self.cursor += rec_len;
+
+        Ok(Some((entry_offset, header)))
+    }
+
+    /// Reads the next entry and advances. Returns the entry's offset within the
+    /// block and the entry. Deleted entries (`ino == 0`) yield an empty name.
+    pub(super) fn next_entry(&mut self) -> Result<Option<(usize, DirEntry<'_>)>> {
+        let Some((entry_offset, header)) = self.next_entry_header()? else {
+            return Ok(None);
+        };
 
         let name: &[u8] = if header.ino != 0 {
             let name_len = header.name_len as usize;
