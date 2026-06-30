@@ -9,9 +9,11 @@
 
 mod dir_entry;
 
+use ostd::sync::RwMutexWriteGuard;
+
 use self::dir_entry::{DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader};
 use super::{
-    super::{fs::Ext4, prelude::*, utils},
+    super::{fs::Ext4, journal, prelude::*, utils},
     FilePerm, Inode, InodeInner,
 };
 
@@ -33,10 +35,9 @@ struct DirSlotInfo {
 /// describing where it sits so it can be deleted.
 #[derive(Clone, Copy, Debug)]
 struct DirEntryInfo {
-    /// Inode number of the located entry. Read by the unlink/rmdir path
-    /// (Task 4) to fetch the child inode; the delete primitive itself only
-    /// needs the offset and record length.
-    #[expect(dead_code)]
+    /// Inode number of the located entry. Read by the unlink/rmdir path to
+    /// fetch the child inode; the delete primitive itself only needs the offset
+    /// and record length.
     ino: Ext4Ino,
     /// Byte offset of the entry within the directory.
     dir_offset: usize,
@@ -297,7 +298,6 @@ impl InodeInner {
     }
 
     /// Locates a live entry by name, recording where it sits for deletion.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     fn find_entry_info(&self, name: &str) -> Result<DirEntryInfo> {
         if self.desc.type_() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
@@ -330,7 +330,6 @@ impl InodeInner {
     /// Deletes a located entry by zeroing its inode and merging its space into
     /// the predecessor entry. The first entry in a block (always `.`) has no
     /// predecessor and is never the delete target.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     fn delete_entry(&mut self, target: &DirEntryInfo) -> Result<()> {
         let block_idx = target.dir_offset / BLOCK_SIZE;
         let entry_offset = target.dir_offset - block_idx * BLOCK_SIZE;
@@ -380,7 +379,6 @@ impl InodeInner {
     }
 
     /// Returns whether this directory holds only the `.` and `..` entries.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     fn empty_dir(&self, self_ino: Ext4Ino) -> bool {
         if self.desc.type_() != InodeType::Dir {
             return false;
@@ -515,6 +513,171 @@ impl Inode {
         fs.insert_inode(child.clone());
         Ok(child)
     }
+
+    /// Removes a non-directory entry from this directory.
+    ///
+    /// On the link count reaching 0 the inode is dropped from the cache and
+    /// reclaimed by the last surviving `Arc` (see the drop-order note below).
+    /// Mirrors ext2 `Inode::unlink`.
+    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
+    pub(in crate::fs::fs_impls::ext4) fn unlink(&self, name: &str) -> Result<()> {
+        let entry_info = {
+            let parent_inner = self.inner.read();
+            parent_inner.find_entry_info(name)?
+        };
+        let fs = self.fs()?;
+
+        // CRITICAL drop ordering (mirrors ext2): `child` is declared *before*
+        // `guards`, so at scope end Rust drops `guards` first (reverse
+        // declaration order), releasing `child.inner.write()` before `child`
+        // itself drops. If `child` is the last `Arc` (no fd holds it open) its
+        // `Drop` runs `try_reclaim_deleted_inode`, which takes
+        // `child.inner.write()`; were the guard still held this would self-
+        // deadlock. Do NOT reorder these two locals.
+        let child = fs.read_inode(entry_info.ino)?;
+
+        // The `DirDentry.children` lock in the VFS layer keeps the parent
+        // directory entry stable during this operation, so we only need to lock
+        // all related inodes in order, without rechecking the lookup result.
+        let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+
+        let child_inner = guards.inner_mut(child.ino());
+        if child_inner.inode_type() == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+
+        let parent_inner = guards.inner_mut(self.ino());
+        parent_inner.delete_entry(&entry_info)?;
+        parent_inner.set_mtime_ctime(utils::now());
+
+        // Update timestamps before dropping the target link count.
+        let child_inner = guards.inner_mut(child.ino());
+        child_inner.set_ctime(utils::now());
+        child_inner.dec_link_count(1);
+        if child_inner.link_count() == 0 {
+            // Orphan-list seam (Phase-3 no-op; Phase 4 journals the add so crash
+            // recovery can finish a deletion interrupted past this point).
+            journal::orphan_add(None, child.ino())?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
+            // Drop the cache's `Arc`; if an fd still holds one the inode stays
+            // alive until that last `Arc` drops, then `Drop` reclaims it. We do
+            // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
+            let _ = fs.remove_inode(entry_info.ino);
+        }
+        Ok(())
+    }
+
+    /// Removes an empty sub-directory.
+    ///
+    /// Mirrors ext2 `Inode::rmdir`. The same `child`-before-`guards` drop
+    /// ordering as [`unlink`](Self::unlink) is required and observed here.
+    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
+    pub(in crate::fs::fs_impls::ext4) fn rmdir(&self, name: &str) -> Result<()> {
+        let entry_info = {
+            let parent_inner = self.inner.read();
+            parent_inner.find_entry_info(name)?
+        };
+        let fs = self.fs()?;
+
+        // CRITICAL drop ordering: `child` declared before `guards` so the multi-
+        // inode lock is released before `child` drops and its `Drop` reclaim
+        // re-takes `child.inner.write()`. See `unlink` for the full rationale.
+        let child = fs.read_inode(entry_info.ino)?;
+
+        // The `DirDentry.children` lock in the VFS layer keeps the parent
+        // directory entry stable during this operation, so we only need to lock
+        // all related inodes in order, without rechecking the lookup result.
+        let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+
+        let child_inner = guards.inner_mut(child.ino());
+        if child_inner.inode_type() != InodeType::Dir {
+            return_errno!(Errno::ENOTDIR);
+        }
+        if !child_inner.empty_dir(child.ino()) {
+            return_errno!(Errno::ENOTEMPTY);
+        }
+
+        child_inner.set_ctime(utils::now());
+        // The child loses its own `.` self-link and the parent's directory entry.
+        child_inner.dec_link_count(2);
+        if child_inner.link_count() == 0 {
+            // Orphan-list seam (Phase-3 no-op; see `unlink`).
+            journal::orphan_add(None, child.ino())?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
+            let _ = fs.remove_inode(entry_info.ino);
+        }
+
+        let parent_inner = guards.inner_mut(self.ino());
+        parent_inner.delete_entry(&entry_info)?;
+        // The parent loses the `..` reference the removed child held back to it.
+        parent_inner.dec_link_count(1);
+        parent_inner.set_mtime_ctime(utils::now());
+
+        Ok(())
+    }
+}
+
+const MAX_MULTI_INODE_LOCKS: usize = 4;
+
+/// A guard holding up to [`MAX_MULTI_INODE_LOCKS`] inodes' `inner.write()` locks
+/// at once, acquired in ascending ino order with duplicates removed.
+///
+/// This is the global multi-inode locking primitive (report §5.1): operations
+/// that touch several inodes (rmdir/unlink now; rename in Task 5) take their
+/// `inner` write locks through here so every path acquires them in the same
+/// order, preventing deadlock. Mirrors ext2 `MultiInodeInnerGuards`.
+struct MultiInodeInnerGuards<'a> {
+    entries: [Option<(Ext4Ino, RwMutexWriteGuard<'a, InodeInner>)>; MAX_MULTI_INODE_LOCKS],
+    len: usize,
+}
+
+impl<'a> MultiInodeInnerGuards<'a> {
+    /// Acquires `inner.write()` locks on deduplicated inodes in ascending ino
+    /// order.
+    fn lock(inodes: &[&'a Inode]) -> Self {
+        let mut sorted_inodes: [Option<&'a Inode>; MAX_MULTI_INODE_LOCKS] =
+            [None; MAX_MULTI_INODE_LOCKS];
+        let count = inodes.len().min(MAX_MULTI_INODE_LOCKS);
+        for (i, inode) in inodes.iter().take(count).enumerate() {
+            sorted_inodes[i] = Some(*inode);
+        }
+        sorted_inodes[..count].sort_by_key(|opt| opt.unwrap().ino);
+
+        let mut entries: [Option<(Ext4Ino, RwMutexWriteGuard<'a, InodeInner>)>;
+            MAX_MULTI_INODE_LOCKS] = [None, None, None, None];
+        let mut len = 0;
+        let mut prev_ino = None;
+        for slot in sorted_inodes.iter().take(count).flatten() {
+            if prev_ino == Some(slot.ino) {
+                continue;
+            }
+            prev_ino = Some(slot.ino);
+            entries[len] = Some((slot.ino, slot.inner.write()));
+            len += 1;
+        }
+        Self { entries, len }
+    }
+
+    /// Returns a shared reference to the held `inner` of inode `ino`.
+    #[expect(dead_code)] // Used by rename (Task 5); unlink/rmdir use `inner_mut`.
+    fn inner(&self, ino: Ext4Ino) -> &InodeInner {
+        let (_, guard) = self.entries[..self.len]
+            .iter()
+            .flatten()
+            .find(|(entry_ino, _)| *entry_ino == ino)
+            .expect("requested inode inner lock must be held");
+        guard
+    }
+
+    /// Returns a mutable reference to the held `inner` of inode `ino`.
+    fn inner_mut(&mut self, ino: Ext4Ino) -> &mut InodeInner {
+        let (_, guard) = self.entries[..self.len]
+            .iter_mut()
+            .flatten()
+            .find(|(entry_ino, _)| *entry_ino == ino)
+            .expect("requested inode inner lock must be held");
+        guard
+    }
 }
 
 #[cfg(ktest)]
@@ -527,7 +690,7 @@ mod tests {
     };
 
     use aster_block::BLOCK_SIZE;
-    use ostd::prelude::*;
+    use ostd::{mm::VmReader, prelude::*};
 
     use super::{
         super::super::test_utils::{
@@ -1022,5 +1185,223 @@ mod tests {
         );
         assert_eq!(dir.link_count(), parent_links_before);
         assert_eq!(readdir_names(&dir), [".", ".."]);
+    }
+
+    /// `unlink` of a regular file with no open handle: the name disappears, the
+    /// parent's mtime advances, and the child inode *and* its data blocks are
+    /// reclaimed — free-inode and free-block counts return to their pre-create
+    /// values and the inode's bitmap bit is cleared.
+    #[ktest]
+    fn unlink_frees_inode_and_blocks() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let free_inodes_before = f.ext4.block_group(0).free_inodes_count();
+        let free_blocks_before = f.ext4.block_group(0).free_blocks_count();
+
+        // Create a file and write a block of data so reclaim must free a block.
+        let child = dir.create("victim.txt", InodeType::File, perm()).unwrap();
+        let child_ino = child.ino();
+        let mut reader = VmReader::from(&[7u8; 16][..]).to_fallible();
+        child.write_at(0, &mut reader).unwrap();
+        assert!(child.sector_count() > 0);
+        assert!(f.ext4.is_inode_allocated(child_ino));
+        // Drop our handle so unlink holds the only remaining reference.
+        drop(child);
+
+        let mtime_before = dir.mtime();
+        dir.unlink("victim.txt").unwrap();
+
+        // The name is gone, the parent's mtime advanced, and the inode + its
+        // data block were reclaimed (counts restored, bitmap bit cleared).
+        assert!(dir.lookup("victim.txt").is_err());
+        assert_eq!(readdir_names(&dir), [".", ".."]);
+        assert!(dir.mtime() >= mtime_before);
+        assert!(!f.ext4.is_inode_allocated(child_ino));
+        assert_eq!(
+            f.ext4.block_group(0).free_inodes_count(),
+            free_inodes_before
+        );
+        assert_eq!(
+            f.ext4.block_group(0).free_blocks_count(),
+            free_blocks_before
+        );
+    }
+
+    /// Unlink-of-open: while an `Arc` to the child is held, `unlink` removes the
+    /// name but does NOT free the inode (it stays allocated). Dropping the held
+    /// `Arc` then reclaims it via `Drop`, restoring the free counts. This is the
+    /// key refcount/reclaim test.
+    #[ktest]
+    fn unlink_of_open_defers_reclaim() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let free_inodes_before = f.ext4.block_group(0).free_inodes_count();
+        let free_blocks_before = f.ext4.block_group(0).free_blocks_count();
+
+        // Create a file with data, and keep an `Arc` open across the unlink.
+        let open = dir.create("open.txt", InodeType::File, perm()).unwrap();
+        let child_ino = open.ino();
+        let mut reader = VmReader::from(&[3u8; 32][..]).to_fallible();
+        open.write_at(0, &mut reader).unwrap();
+
+        dir.unlink("open.txt").unwrap();
+
+        // Name gone, but the inode is still allocated: an fd holds it open.
+        assert!(dir.lookup("open.txt").is_err());
+        assert!(
+            f.ext4.is_inode_allocated(child_ino),
+            "inode freed while still open"
+        );
+        assert_eq!(open.link_count(), 0);
+
+        // Releasing the last `Arc` triggers `Drop` reclaim.
+        drop(open);
+        assert!(!f.ext4.is_inode_allocated(child_ino));
+        assert_eq!(
+            f.ext4.block_group(0).free_inodes_count(),
+            free_inodes_before
+        );
+        assert_eq!(
+            f.ext4.block_group(0).free_blocks_count(),
+            free_blocks_before
+        );
+    }
+
+    /// `unlink` on a directory is rejected with `EISDIR`; the entry survives.
+    #[ktest]
+    fn unlink_directory_rejected() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.create("subdir", InodeType::Dir, perm()).unwrap();
+
+        assert_eq!(
+            dir.unlink("subdir").unwrap_err().error(),
+            Errno::EISDIR,
+            "unlink of a directory must fail with EISDIR"
+        );
+        assert!(dir.lookup("subdir").is_ok());
+    }
+
+    /// `rmdir` on a non-empty directory is rejected with `ENOTEMPTY`.
+    #[ktest]
+    fn rmdir_non_empty_rejected() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let sub = dir.create("full", InodeType::Dir, perm()).unwrap();
+        sub.create("inhabitant", InodeType::File, perm()).unwrap();
+
+        assert_eq!(
+            dir.rmdir("full").unwrap_err().error(),
+            Errno::ENOTEMPTY,
+            "rmdir of a non-empty directory must fail with ENOTEMPTY"
+        );
+        assert!(dir.lookup("full").is_ok());
+    }
+
+    /// `rmdir` on a regular file is rejected with `ENOTDIR`.
+    #[ktest]
+    fn rmdir_file_rejected() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.create("plain.txt", InodeType::File, perm()).unwrap();
+
+        assert_eq!(
+            dir.rmdir("plain.txt").unwrap_err().error(),
+            Errno::ENOTDIR,
+            "rmdir of a regular file must fail with ENOTDIR"
+        );
+        assert!(dir.lookup("plain.txt").is_ok());
+    }
+
+    /// `rmdir` of an empty directory: the name disappears, the parent loses one
+    /// link (for the removed child's `..`), the child inode is freed, and its
+    /// `.`/`..` data block is freed.
+    #[ktest]
+    fn rmdir_empty_directory() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let free_inodes_before = f.ext4.block_group(0).free_inodes_count();
+        let free_blocks_before = f.ext4.block_group(0).free_blocks_count();
+        let parent_links_before = dir.link_count();
+
+        let sub = dir.create("gone", InodeType::Dir, perm()).unwrap();
+        let sub_ino = sub.ino();
+        // A fresh directory has one data block (its `.`/`..`).
+        assert!(sub.sector_count() > 0);
+        assert_eq!(dir.link_count(), parent_links_before + 1);
+        drop(sub);
+
+        dir.rmdir("gone").unwrap();
+
+        assert!(dir.lookup("gone").is_err());
+        assert_eq!(readdir_names(&dir), [".", ".."]);
+        // The parent dropped the `..` back-reference link it gained on create.
+        assert_eq!(dir.link_count(), parent_links_before);
+        assert!(!f.ext4.is_inode_allocated(sub_ino));
+        assert_eq!(
+            f.ext4.block_group(0).free_inodes_count(),
+            free_inodes_before
+        );
+        assert_eq!(
+            f.ext4.block_group(0).free_blocks_count(),
+            free_blocks_before
+        );
+    }
+
+    /// Creating and unlinking a file in a loop reuses inode and block numbers,
+    /// proving reclaim returns resources to the allocator (no leak).
+    #[ktest]
+    fn create_unlink_loop_reuses_resources() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let free_inodes_before = f.ext4.block_group(0).free_inodes_count();
+        let free_blocks_before = f.ext4.block_group(0).free_blocks_count();
+
+        let mut first_ino = None;
+        for _ in 0..8 {
+            let child = dir.create("churn", InodeType::File, perm()).unwrap();
+            let mut reader = VmReader::from(&[1u8; 8][..]).to_fallible();
+            child.write_at(0, &mut reader).unwrap();
+            let ino = child.ino();
+            match first_ino {
+                None => first_ino = Some(ino),
+                // Each iteration frees the inode before the next allocates, so
+                // the same number is handed back out.
+                Some(expected) => assert_eq!(ino, expected, "inode number not reused"),
+            }
+            drop(child);
+            dir.unlink("churn").unwrap();
+        }
+
+        // No drift in the free counts after a full create/unlink cycle.
+        assert_eq!(
+            f.ext4.block_group(0).free_inodes_count(),
+            free_inodes_before
+        );
+        assert_eq!(
+            f.ext4.block_group(0).free_blocks_count(),
+            free_blocks_before
+        );
+    }
+
+    /// The orphan-list seam is exercised on the nlink-0 path (it is a Phase-3
+    /// no-op, so unlink simply succeeds — this asserts the call site compiles and
+    /// runs without observable effect).
+    #[ktest]
+    fn orphan_seam_no_op_on_reclaim() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let child = dir.create("seam", InodeType::File, perm()).unwrap();
+        let child_ino = child.ino();
+        drop(child);
+
+        // `unlink` calls `orphan_add` (no-op) at nlink 0 and reclaim calls
+        // `orphan_del` (no-op); both must succeed and leave the inode freed.
+        dir.unlink("seam").unwrap();
+        assert!(!f.ext4.is_inode_allocated(child_ino));
     }
 }

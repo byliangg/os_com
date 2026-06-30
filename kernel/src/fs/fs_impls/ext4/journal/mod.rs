@@ -103,3 +103,30 @@ pub(super) fn forget(
 ) -> Result<()> {
     Ok(())
 }
+
+/// Adds an inode to the on-disk orphan list. **Phase 3: no-op.**
+///
+/// Phase 4 will journal-link the inode onto the superblock orphan chain
+/// (`s_last_orphan` head + `i_dtime` "next" pointers) under
+/// [`Ext4::s_orphan_lock`](super::fs::Ext4), so crash recovery (SCAN/REPLAY) can
+/// finish a deletion that was interrupted after the link count hit 0 but before
+/// the blocks/inode were freed. The call sites in `unlink`/`rmdir` (and Task 6's
+/// `truncate`) are baked in now so Phase 4 fills only this body, not the
+/// namespace operations.
+pub(super) fn orphan_add(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
+    // Phase-4 fill point: acquire `s_orphan_lock`, then journal the orphan-list
+    // head/chain update (handle locked *after* `s_orphan_lock`, superblock
+    // *before*). Do not acquire the lock here — taking it to do nothing would be
+    // flagged.
+    Ok(())
+}
+
+/// Removes an inode from the on-disk orphan list. **Phase 3: no-op.**
+///
+/// The mirror of [`orphan_add`]: Phase 4 unlinks the inode from the orphan chain
+/// once its blocks and inode have been freed. Called from
+/// `try_reclaim_deleted_inode` after `free_inode`.
+pub(super) fn orphan_del(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
+    // Phase-4 fill point: see `orphan_add`.
+    Ok(())
+}

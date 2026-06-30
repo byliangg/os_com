@@ -325,6 +325,16 @@ impl BlockGroup {
         InodeDesc::try_from(&raw)
     }
 
+    /// Returns whether `ino` is marked allocated in this group's inode bitmap.
+    ///
+    /// Used by the reclaim path (`Inode::try_reclaim_deleted_inode`) to avoid
+    /// double-freeing an inode whose bitmap bit is already clear. Mirrors ext2
+    /// `BlockGroup::is_inode_allocated`.
+    pub(super) fn is_inode_allocated(&self, ino: Ext4Ino) -> bool {
+        let inode_idx = self.inode_idx_in_group(ino);
+        self.metadata.read().inode_bitmap.is_allocated(inode_idx)
+    }
+
     /// Returns the 0-based group-local inode index for `ino`.
     fn inode_idx_in_group(&self, ino: Ext4Ino) -> u16 {
         debug_assert!(ino > 0);

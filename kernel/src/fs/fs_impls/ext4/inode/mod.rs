@@ -30,7 +30,7 @@
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
 
-use super::{fs::Ext4, journal::Tid, prelude::*};
+use super::{fs::Ext4, journal, journal::Tid, prelude::*};
 
 mod dir;
 mod extent_manager;
@@ -126,7 +126,6 @@ pub(super) struct InodeDesc {
     ctime: Duration,
     mtime: Duration,
     crtime: Duration,
-    #[expect(dead_code)]
     dtime: Duration,
     link_count: u16,
     /// `i_blocks` in 512-byte sectors (48-bit: low 32 + high 16).
@@ -234,6 +233,19 @@ impl InodeDesc {
         self.link_count += delta;
     }
 
+    /// Subtracts `delta` from the link count (saturating). Mutates through
+    /// `Dirty`; used by the unlink/rmdir path to drop a name's reference.
+    pub(super) fn dec_link_count(&mut self, delta: u16) {
+        debug_assert!(self.link_count >= delta);
+        self.link_count = self.link_count.saturating_sub(delta);
+    }
+
+    /// Sets the deletion time (`i_dtime`). Mutates through `Dirty`; stamped when
+    /// a fully unlinked inode is reclaimed.
+    pub(super) fn set_dtime(&mut self, time: Duration) {
+        self.dtime = time;
+    }
+
     /// Clears the given inode flags. Mutates through `Dirty`; used to drop the
     /// `EXTENTS` flag when an inode switches to inline (fast-symlink) storage.
     pub(super) fn remove_flags(&mut self, flags: FileFlags) {
@@ -309,6 +321,11 @@ impl InodeDesc {
 
     pub(super) const fn crtime(&self) -> Duration {
         self.crtime
+    }
+
+    /// Returns the deletion time (`i_dtime`).
+    pub(super) const fn dtime(&self) -> Duration {
+        self.dtime
     }
 
     /// Returns the inode generation (`i_generation`).
@@ -569,6 +586,56 @@ impl Inode {
         Ok(())
     }
 
+    /// Reclaims a fully unlinked inode: frees its data blocks and inode bit.
+    ///
+    /// Runs from `Drop` when the last `Arc<Inode>` is released. A no-op (returns
+    /// `Ok(false)`) unless the inode's link count is 0 *and* its bitmap bit is
+    /// still allocated — the latter guards against double-freeing an inode an
+    /// earlier reclaim already released. On reclaim it stamps `i_dtime`, drops
+    /// the data (page cache + extent-mapped blocks, only for data-backed
+    /// inodes — a fast symlink has no data block), persists the descriptor, and
+    /// frees the inode. Mirrors ext2 `try_reclaim_deleted_inode`, minus the
+    /// xattr-block deletion (ext4 has no xattr support yet; `file_acl` is unused).
+    pub(super) fn try_reclaim_deleted_inode(&self) -> Result<bool> {
+        if self.link_count() != 0 {
+            return Ok(false);
+        }
+
+        let fs = self.fs()?;
+        if !fs.is_inode_allocated(self.ino) {
+            return Ok(false);
+        }
+
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        // Only data-backed inodes (files, directories, slow symlinks) own a page
+        // cache and extent-mapped blocks. A fast symlink stores its target inline
+        // in `i_block` with no data block, so it skips both the page-cache resize
+        // and the block truncate below.
+        let block_manager = inner.block_manager().ok().cloned();
+        if block_manager.is_some() {
+            inner.resize_page_cache(0, old_size)?;
+        }
+        inner.set_dtime(super::utils::now());
+        inner.set_file_size(0);
+        // Gate on the extent manager's live `sector_count`, not the descriptor's
+        // copy (which ext2 uses): the extent manager is the authority and the
+        // descriptor may be stale until writeback. This divergence from the ext2
+        // template is intentional — do not "fix" it back to `inner.desc`.
+        if let Some(block_manager) = block_manager
+            && block_manager.sector_count() > 0
+        {
+            block_manager.truncate_to_byte_len(0)?;
+        }
+        inner.write_back_inode_desc(&fs, self.ino)?;
+
+        fs.free_inode(self.ino, self.type_)?;
+        // Orphan-list seam (Phase-3 no-op): Phase 4 unlinks the inode from the
+        // on-disk orphan chain now that its blocks and inode are freed.
+        journal::orphan_del(None, self.ino)?;
+        Ok(true)
+    }
+
     /// Updates the permission bits (chmod) and bumps ctime. Persists on fsync.
     pub(super) fn set_mode(&self, mode: InodeMode) {
         let mut inner = self.inner.write();
@@ -670,6 +737,17 @@ impl Inode {
     }
 }
 
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if let Err(err) = self.try_reclaim_deleted_inode() {
+            debug!(
+                "failed to reclaim deleted inode {} during drop: {:?}",
+                self.ino, err
+            );
+        }
+    }
+}
+
 struct InodeInner {
     desc: Dirty<InodeDesc>,
     payload: InodePayload,
@@ -734,6 +812,27 @@ impl InodeInner {
         self.desc.set_ctime(time);
     }
 
+    /// Sets the last-metadata-change time. Used by the unlink/rmdir path to bump
+    /// the child's ctime when a link is dropped.
+    fn set_ctime(&mut self, time: Duration) {
+        self.desc.set_ctime(time);
+    }
+
+    /// Sets the deletion time (`i_dtime`). Used by the reclaim path.
+    fn set_dtime(&mut self, time: Duration) {
+        self.desc.set_dtime(time);
+    }
+
+    /// Returns the inode's type.
+    fn inode_type(&self) -> InodeType {
+        self.desc.type_()
+    }
+
+    /// Returns the current link count.
+    fn link_count(&self) -> u16 {
+        self.desc.link_count()
+    }
+
     /// Overwrites the link count. Used by the create error path to set it to 0
     /// so `Drop` (Task 4) reclaims the half-built inode.
     fn set_link_count(&mut self, count: u16) {
@@ -744,6 +843,12 @@ impl InodeInner {
     /// parent directory's count for a new subdirectory's `..` reference.
     fn inc_link_count(&mut self, delta: u16) {
         self.desc.inc_link_count(delta);
+    }
+
+    /// Subtracts `delta` from the link count. Used by the unlink/rmdir path to
+    /// drop a name's reference; reaching 0 triggers reclaim on the last `Drop`.
+    fn dec_link_count(&mut self, delta: u16) {
+        self.desc.dec_link_count(delta);
     }
 
     /// Rejects growth beyond the maximum representable file size.

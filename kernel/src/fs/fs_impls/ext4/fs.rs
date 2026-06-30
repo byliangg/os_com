@@ -48,6 +48,14 @@ pub struct Ext4 {
     /// Monotonic source for the `i_generation` stamped onto each newly created
     /// inode. Seeded from the mount time, like ext2.
     next_generation: AtomicU32,
+    /// Guards the on-disk orphan list (jbd2 `s_orphan_lock`). **Phase 3
+    /// scaffolding:** the orphan-list operations are no-ops
+    /// ([`journal::orphan_add`](super::journal)/`orphan_del`), so this lock is
+    /// declared but never taken. Phase 4 acquires it around the orphan-chain
+    /// update — ordered as a leaf taken *after* the journal handle and *before*
+    /// the superblock (report §5.1) — when it fills the no-op bodies.
+    #[expect(dead_code)] // Phase 4 acquires this; see `journal::orphan_add`.
+    s_orphan_lock: Mutex<()>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Ext4>,
 }
@@ -67,6 +75,7 @@ impl Ext4 {
             block_groups,
             nr_inodes_per_group,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
+            s_orphan_lock: Mutex::new(()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak.clone(),
         }))
@@ -357,14 +366,22 @@ impl Ext4 {
     }
 
     /// Removes one inode from the live block-group cache. Mirrors ext2
-    /// `Ext2::remove_inode`. No caller until the Phase 3 unlink/reclaim path
-    /// (Task 4); marking this root reachable keeps `BlockGroup::remove_inode`
-    /// reachable too.
-    #[expect(dead_code)]
+    /// `Ext2::remove_inode`. Called by the unlink/rmdir path once a child's link
+    /// count reaches 0, dropping the cache's reference so the last surviving
+    /// `Arc` reclaims the inode on `Drop`.
     pub(super) fn remove_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
         self.find_group(ino)
             .ok()
             .and_then(|group| group.remove_inode(ino))
+    }
+
+    /// Returns whether `ino` is marked allocated in its owning group's inode
+    /// bitmap. Used by the reclaim path to skip an already-freed inode. Mirrors
+    /// ext2 routing through the owning block group.
+    pub(super) fn is_inode_allocated(&self, ino: Ext4Ino) -> bool {
+        self.find_group(ino)
+            .map(|group| group.is_inode_allocated(ino))
+            .unwrap_or(false)
     }
 
     /// Writes back the superblock and every dirty group descriptor/bitmap.
@@ -506,6 +523,11 @@ impl Ext4 {
         raw.block = *root;
         raw.flags = desc.flags().bits();
         raw.link_count = desc.link_count();
+
+        // Deletion time (`i_dtime`, whole seconds). Zero for live inodes; the
+        // reclaim path stamps it before the final writeback so a freed inode
+        // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
+        raw.dtime = desc.dtime().as_secs() as u32;
 
         self.block_device
             .write_val(offset, &raw)
