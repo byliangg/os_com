@@ -3,16 +3,13 @@
 //! Re-exports used throughout the ext4 module.
 
 pub(super) use core::{
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Range},
     time::Duration,
 };
 
 pub(super) use align_ext::AlignExt;
-// Re-exports used only by the in-module kernel tests (memory disk + fixtures).
-#[cfg(ktest)]
-pub(super) use aster_block::SECTOR_SIZE;
 pub(super) use aster_block::{
-    BLOCK_SIZE, BlockDevice,
+    BLOCK_SIZE, BlockDevice, SECTOR_SIZE,
     bio::{BioCompleteFn, BioSegment, BioStatus},
     id::Bid,
 };
@@ -22,7 +19,7 @@ pub(super) use ostd::mm::{FrameAllocOptions, Segment};
 pub(super) use ostd::{
     const_assert,
     mm::{PAGE_SIZE, VmIo, VmWriter},
-    sync::RwMutex,
+    sync::{RwMutex, RwMutexReadGuard},
 };
 
 pub(super) use super::{
@@ -32,7 +29,7 @@ pub(super) use super::{
 pub(super) use crate::{
     fs::{
         file::InodeType,
-        utils::{DirentVisitor, Str16, Str64},
+        utils::{DirentVisitor, IdBitmap, Str16, Str64},
     },
     prelude::*,
     time::UnixTime,

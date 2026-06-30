@@ -1,14 +1,36 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Ext4 inodes: shared type aliases, the on-disk inode, and its validated
-//! in-memory form.
+//! Ext4 inodes: shared type aliases, the on-disk inode, its validated in-memory
+//! form, and the buffered write path.
 //!
-//! Phase 1 decodes inode metadata (type, permissions, owners, size, times,
-//! flags) and keeps the raw `i_block` bytes for the extent reader (Task 3) to
-//! interpret. The inode object, payload, and read paths build on `InodeDesc`
-//! in later tasks.
+//! An inode decodes its on-disk metadata (type, permissions, owners, size,
+//! times, flags) into `InodeDesc` and maps its data through an extent tree
+//! (`extent_manager`). Reads, buffered writes, truncation, and attribute changes
+//! all go through `Inode`.
+//!
+//! # Locking
+//!
+//! Data-backed inodes nest the extent tree under `inner`:
+//!
+//! ```text
+//! Inode::inner → ExtentManager::state
+//! ```
+//!
+//! Operations that allocate or free blocks call filesystem-level methods
+//! (`Ext4::alloc_blocks` / `Ext4::free_blocks`); the full cross-layer lock order
+//! is:
+//!
+//! ```text
+//! Inode::inner → ExtentManager::state → Ext4::super_block → BlockGroup::metadata
+//! ```
+//!
+//! The journal handle (Phase 4) sits between `inner` and the extent tree; the
+//! Phase-2 `journal` wrappers are no-ops and take no lock. `BlockGroup::inode_cache`
+//! is independent: it is never held while acquiring `super_block`/`metadata`, nor
+//! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
+//! lock first).
 
-use super::{fs::Ext4, prelude::*};
+use super::{fs::Ext4, journal::Tid, prelude::*};
 
 mod dir;
 mod extent_manager;
@@ -124,13 +146,53 @@ impl InodeDesc {
         self.link_count
     }
 
-    #[expect(dead_code)]
     pub(super) const fn flags(&self) -> FileFlags {
         self.flags
     }
 
     pub(super) const fn sector_count(&self) -> u64 {
         self.sector_count
+    }
+
+    /// Sets the logical file size (in bytes). Mutates through `Dirty`.
+    pub(super) fn set_size(&mut self, size: u64) {
+        self.size = size;
+    }
+
+    /// Sets the last-modification time. Mutates through `Dirty`.
+    pub(super) fn set_mtime(&mut self, time: Duration) {
+        self.mtime = time;
+    }
+
+    /// Sets the last-metadata-change time. Mutates through `Dirty`.
+    pub(super) fn set_ctime(&mut self, time: Duration) {
+        self.ctime = time;
+    }
+
+    /// Sets the `i_blocks` accounting (512-byte sectors). Mutates through
+    /// `Dirty`; used to mirror the block manager's authoritative count.
+    pub(super) fn set_sector_count(&mut self, sectors: u64) {
+        self.sector_count = sectors;
+    }
+
+    /// Sets the permission bits (chmod). Mutates through `Dirty`.
+    pub(super) fn set_perm(&mut self, perm: FilePerm) {
+        self.perm = perm;
+    }
+
+    /// Sets the owning user id (chown). Mutates through `Dirty`.
+    pub(super) fn set_uid(&mut self, uid: u32) {
+        self.uid = uid;
+    }
+
+    /// Sets the owning group id (chgrp). Mutates through `Dirty`.
+    pub(super) fn set_gid(&mut self, gid: u32) {
+        self.gid = gid;
+    }
+
+    /// Sets the last-access time. Mutates through `Dirty`.
+    pub(super) fn set_atime(&mut self, time: Duration) {
+        self.atime = time;
     }
 
     pub(super) const fn perm(&self) -> FilePerm {
@@ -320,7 +382,12 @@ impl Inode {
         Arc::new(Self {
             ino,
             type_,
-            inner: RwMutex::new(InodeInner { desc, payload }),
+            inner: RwMutex::new(InodeInner {
+                desc,
+                payload,
+                sync_tid: 0,
+                datasync_tid: 0,
+            }),
             block_group_idx,
             fs,
             extension: Extension::new(),
@@ -342,6 +409,110 @@ impl Inode {
     /// Reads file data at `offset` through the inode's page cache.
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
         self.inner.read().read_at(offset, writer)
+    }
+
+    /// Writes file data at `offset` through the inode's page cache.
+    ///
+    /// Allocates blocks for any holes the write covers, fills the page cache,
+    /// and updates size and timestamps. Data and the inode become durable on a
+    /// later `sync` / writeback.
+    pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        if reader.remain() == 0 {
+            return Ok(0);
+        }
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        inner.write_at(&fs, offset, reader)
+    }
+
+    /// Truncates or extends a regular file to `new_size` bytes.
+    ///
+    /// Shrinking frees the trailing data/metadata blocks and zeroes the kept
+    /// partial last block; expanding is sparse (the gap is a hole that reads as
+    /// zeros). Directories are rejected with `EISDIR` (P2 resizes only files).
+    pub(super) fn resize(&self, new_size: usize) -> Result<()> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        inner.resize(&fs, new_size)
+    }
+
+    /// Persists the inode's mutable metadata (size, `i_blocks`, extent root,
+    /// timestamps) to disk if dirty. Data pages are flushed by
+    /// [`sync_data_and_meta`](Self::sync_data_and_meta).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn sync_metadata(&self) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        inner.write_back_inode_desc(&fs, self.ino)
+    }
+
+    /// Flushes dirty data pages, then the inode metadata, then issues a device
+    /// sync — leaving a consistent on-disk image (data → inode → barrier; mirrors
+    /// ext2 `sync.rs` ordering).
+    pub(super) fn sync_data_and_meta(&self) -> Result<()> {
+        self.sync_data_and_meta_no_barrier()?;
+        let fs = self.fs()?;
+        if fs.block_device().sync()? != BioStatus::Complete {
+            return_errno_with_message!(Errno::EIO, "failed to flush block device");
+        }
+        Ok(())
+    }
+
+    /// Flushes dirty data pages and then the inode metadata, *without* a device
+    /// barrier. Used by the filesystem-level sync, which flushes every cached
+    /// inode and the block-side metadata before issuing a single barrier — so a
+    /// per-inode barrier here would be redundant. Mirrors ext2 `Inode::sync_all`,
+    /// where the barrier lives at the `FileSystem::sync` boundary.
+    pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        inner.sync_data_pages()?;
+        inner.write_back_inode_desc(&fs, self.ino)?;
+        Ok(())
+    }
+
+    /// Updates the permission bits (chmod) and bumps ctime. Persists on fsync.
+    pub(super) fn set_mode(&self, mode: InodeMode) {
+        let mut inner = self.inner.write();
+        inner
+            .desc
+            .set_perm(FilePerm::from_bits_truncate(mode.bits()));
+        inner.desc.set_ctime(super::utils::now());
+    }
+
+    /// Updates the owning uid (chown) and bumps ctime. Persists on fsync.
+    pub(super) fn set_owner(&self, uid: u32) {
+        let mut inner = self.inner.write();
+        inner.desc.set_uid(uid);
+        inner.desc.set_ctime(super::utils::now());
+    }
+
+    /// Updates the owning gid (chgrp) and bumps ctime. Persists on fsync.
+    pub(super) fn set_group(&self, gid: u32) {
+        let mut inner = self.inner.write();
+        inner.desc.set_gid(gid);
+        inner.desc.set_ctime(super::utils::now());
+    }
+
+    /// Sets the last-access time. Persists on fsync.
+    pub(super) fn set_atime(&self, time: Duration) {
+        self.inner.write().desc.set_atime(time);
+    }
+
+    /// Sets the last-modification time. Persists on fsync.
+    pub(super) fn set_mtime(&self, time: Duration) {
+        self.inner.write().desc.set_mtime(time);
+    }
+
+    /// Sets the last-metadata-change time. Persists on fsync.
+    pub(super) fn set_ctime(&self, time: Duration) {
+        self.inner.write().desc.set_ctime(time);
     }
 
     pub(super) fn perm(&self) -> FilePerm {
@@ -366,7 +537,7 @@ impl Inode {
     }
 
     pub(super) fn sector_count(&self) -> u64 {
-        self.inner.read().desc.sector_count()
+        self.inner.read().sector_count()
     }
 
     pub(super) fn atime(&self) -> Duration {
@@ -410,6 +581,14 @@ impl Inode {
 struct InodeInner {
     desc: Dirty<InodeDesc>,
     payload: InodePayload,
+    /// Last transaction that modified this inode (jbd2 `i_sync_tid`), and the
+    /// subset needed for `fdatasync` (`i_datasync_tid`). Phase 2 has no journal
+    /// and leaves these at 0; `fsync` degrades to a direct writeback. Phase 4
+    /// sets them on commit and `fsync` waits on the recorded transaction.
+    #[expect(dead_code)]
+    sync_tid: Tid,
+    #[expect(dead_code)]
+    datasync_tid: Tid,
 }
 
 impl InodeInner {
@@ -421,6 +600,22 @@ impl InodeInner {
         match &self.payload {
             InodePayload::DataBacked { page_cache, .. } => Ok(page_cache),
             _ => return_errno_with_message!(Errno::EINVAL, "inode has no page cache"),
+        }
+    }
+
+    fn block_manager(&self) -> Result<&Arc<ExtentManager>> {
+        match &self.payload {
+            InodePayload::DataBacked { block_manager, .. } => Ok(block_manager),
+            _ => return_errno_with_message!(Errno::EINVAL, "inode has no block manager"),
+        }
+    }
+
+    /// Returns `i_blocks` (512-byte sectors). For data-backed inodes the block
+    /// manager owns the authoritative count; otherwise the descriptor's value.
+    fn sector_count(&self) -> u64 {
+        match self.block_manager() {
+            Ok(bm) => bm.sector_count(),
+            Err(_) => self.desc.sector_count(),
         }
     }
 
@@ -437,6 +632,203 @@ impl InodeInner {
         self.page_cache()?.read(offset, writer)?;
         Ok(read_len)
     }
+
+    fn set_file_size(&mut self, new_size: usize) {
+        self.desc.set_size(new_size as u64);
+    }
+
+    fn set_mtime_ctime(&mut self, time: Duration) {
+        self.desc.set_mtime(time);
+        self.desc.set_ctime(time);
+    }
+
+    /// Rejects growth beyond the maximum representable file size.
+    fn ensure_size_within_limit(&self, fs: &Ext4, new_size: usize) -> Result<()> {
+        let max = match self.desc.type_() {
+            InodeType::File => fs.max_file_size(),
+            _ => u32::MAX as usize,
+        };
+        if new_size > max {
+            return_errno_with_message!(Errno::EFBIG, "inode size exceeds ext4 maximum");
+        }
+        Ok(())
+    }
+
+    /// Resizes the page cache and keeps the backend's `npages` bound in sync.
+    ///
+    /// Ordering (report §5.2 rule 4): on grow the file size is published before
+    /// the VMO grows; on shrink the VMO shrinks before the size drops. The page
+    /// cache's `resize` takes `(new, old)`; mirroring ext2, the caller passes
+    /// the captured sizes so this stays correct in both directions.
+    fn resize_page_cache(&mut self, new_size: usize, old_size: usize) -> Result<()> {
+        let InodePayload::DataBacked {
+            page_cache,
+            block_manager,
+        } = &self.payload
+        else {
+            return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
+        };
+        page_cache.resize(new_size, old_size)?;
+        block_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
+        Ok(())
+    }
+
+    /// Prepares the inode for a write spanning `[offset, end)`: grows the page
+    /// cache if extending, then allocates data blocks for any holes covered.
+    ///
+    /// On failure the caller must invoke `rollback_write` to restore page-cache
+    /// capacity and free the partially allocated blocks.
+    fn prepare_write(&mut self, fs: &Ext4, offset: usize, end: usize) -> Result<()> {
+        let old_size = self.file_size();
+        if end > old_size {
+            self.ensure_size_within_limit(fs, end)?;
+            self.resize_page_cache(end, old_size)?;
+        }
+        let start_block = (offset / BLOCK_SIZE) as Iblock;
+        let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        self.block_manager()?
+            .ensure_allocated(start_block, end_block)
+    }
+
+    /// Restores page-cache capacity and frees blocks allocated past `old_size`
+    /// after a failed write.
+    fn rollback_write(&mut self, old_size: usize, end: usize) {
+        if end <= old_size {
+            return;
+        }
+        if let Err(err) = self.resize_page_cache(old_size, end) {
+            error!(
+                "write_at: cleanup page cache resize failed: old_size={}, err={:?}",
+                old_size, err
+            );
+        }
+        if let Ok(block_manager) = self.block_manager()
+            && let Err(err) = block_manager.truncate_to_byte_len(old_size)
+        {
+            error!("write_at: cleanup block truncate failed: {:?}", err);
+        }
+    }
+
+    /// Truncates or extends the file to `new_size` bytes, updating the page
+    /// cache, block mappings, and size. Mirrors ext2 `inode/file.rs:resize`.
+    ///
+    /// Shrinking zeroes the partial tail (in the page cache, via
+    /// `resize_page_cache`) before freeing the trailing data/metadata blocks;
+    /// expanding is sparse (no allocation — the gap stays a hole that reads as
+    /// zeros). The caller updates timestamps and holds the `inner` write lock.
+    fn resize(&mut self, fs: &Ext4, new_size: usize) -> Result<()> {
+        let old_size = self.file_size();
+        if new_size == old_size {
+            return Ok(());
+        }
+        if new_size < old_size {
+            self.shrink(new_size)?;
+        } else {
+            self.expand(fs, new_size)?;
+        }
+        self.set_mtime_ctime(super::utils::now());
+        Ok(())
+    }
+
+    /// Shrinks the file: zeroes the kept partial last block in the page cache,
+    /// frees every data/metadata block past `new_size`, then publishes the size.
+    fn shrink(&mut self, new_size: usize) -> Result<()> {
+        let old_size = self.file_size();
+        // Order (report §5.2 rule 4, shrink): zero + shrink the VMO before the
+        // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
+        // kept partial block (BLOCK_SIZE == PAGE_SIZE), so stale tail bytes do
+        // not reappear if the file is later extended.
+        self.resize_page_cache(new_size, old_size)?;
+        self.block_manager()?.truncate_to_byte_len(new_size)?;
+        self.set_file_size(new_size);
+        Ok(())
+    }
+
+    /// Expands the file sparsely: grows the page cache and publishes the new
+    /// size without allocating any data block — the gap stays a hole.
+    fn expand(&mut self, fs: &Ext4, new_size: usize) -> Result<()> {
+        let old_size = self.file_size();
+        if new_size <= old_size {
+            return Ok(());
+        }
+        self.ensure_size_within_limit(fs, new_size)?;
+        // Order (report §5.2 rule 4, grow): publish the size before the VMO
+        // grows; `resize_page_cache` keeps the backend's `npages` bound in sync.
+        self.set_file_size(new_size);
+        self.resize_page_cache(new_size, old_size)?;
+        Ok(())
+    }
+
+    /// Writes file data at `offset` through the page cache.
+    fn write_at(&mut self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        let write_len = reader.remain();
+        if write_len == 0 {
+            return Ok(0);
+        }
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let old_size = self.file_size();
+
+        if let Err(err) = self.prepare_write(fs, offset, end) {
+            self.rollback_write(old_size, end);
+            return Err(err);
+        }
+        if let Err(err) = self.page_cache()?.write(offset, reader) {
+            self.rollback_write(old_size, end);
+            return Err(err.into());
+        }
+
+        self.set_mtime_ctime(super::utils::now());
+        if end > old_size {
+            self.set_file_size(end);
+        }
+        Ok(write_len)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.desc.is_dirty()
+            || self
+                .block_manager()
+                .is_ok_and(|block_manager| block_manager.is_dirty())
+    }
+
+    fn clear_dirty(&mut self) {
+        self.desc.clear_dirty();
+        if let Ok(block_manager) = self.block_manager() {
+            block_manager.clear_dirty();
+        }
+    }
+
+    /// Persists the inode's mutable metadata to its on-disk `RawInode` if dirty,
+    /// pulling the extent root and `i_blocks` from the block manager, and clears
+    /// the dirty flags.
+    fn write_back_inode_desc(&mut self, fs: &Ext4, ino: Ext4Ino) -> Result<()> {
+        if !self.is_dirty() {
+            return Ok(());
+        }
+        let (root, sector_count) = match self.block_manager() {
+            Ok(bm) => (bm.root_snapshot(), bm.sector_count()),
+            Err(_) => (*self.desc.raw_block(), self.desc.sector_count()),
+        };
+        // Mirror the authoritative `i_blocks` into the descriptor before writing.
+        self.desc.set_sector_count(sector_count);
+        fs.write_back_inode_desc(ino, &self.desc, &root)?;
+        self.clear_dirty();
+        Ok(())
+    }
+
+    /// Flushes dirty data pages in `[0, file_size)`.
+    fn sync_data_pages(&self) -> Result<()> {
+        let file_size = self.file_size();
+        if file_size == 0 {
+            return Ok(());
+        }
+        match &self.payload {
+            InodePayload::DataBacked { page_cache, .. } => page_cache.flush_range(0..file_size),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Type-specific inode contents.
@@ -444,8 +836,8 @@ enum InodePayload {
     /// Regular files and directories: page-cached data mapped by extents.
     DataBacked {
         page_cache: PageCache,
-        /// Kept alive so the page-cache backend's `Weak` stays valid.
-        #[expect(dead_code)]
+        /// The authoritative extent tree + `i_blocks`, and the page-cache
+        /// backend (the page cache holds only a `Weak` to it).
         block_manager: Arc<ExtentManager>,
     },
     /// Inline data (small files stored in the inode); unsupported in Phase 1.
@@ -458,18 +850,26 @@ enum InodePayload {
 impl InodePayload {
     fn new(desc: &InodeDesc, fs: Weak<Ext4>) -> Self {
         match desc.type_() {
-            InodeType::File | InodeType::Dir => {
-                Self::new_data_backed(desc.size() as usize, *desc.raw_block(), fs)
-            }
+            InodeType::File | InodeType::Dir => Self::new_data_backed(
+                desc.size() as usize,
+                *desc.raw_block(),
+                desc.sector_count(),
+                fs,
+            ),
             // Symlinks, devices, and special files are handled by later tasks.
             _ => Self::NoPayload,
         }
     }
 
-    fn new_data_backed(size: usize, root: [u32; RAW_BLOCK_PTRS_LEN], fs: Weak<Ext4>) -> Self {
+    fn new_data_backed(
+        size: usize,
+        root: [u32; RAW_BLOCK_PTRS_LEN],
+        sector_count: u64,
+        fs: Weak<Ext4>,
+    ) -> Self {
         let page_cache_size = size.align_up(PAGE_SIZE);
         let page_count = page_cache_size / PAGE_SIZE;
-        let extent_manager = Arc::new(ExtentManager::new(root, fs, page_count));
+        let extent_manager = Arc::new(ExtentManager::new(root, sector_count, fs, page_count));
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
         let page_cache = PageCache::new_with_backend(page_cache_size, backend)
             .expect("ext4 inode page cache allocation failed");
@@ -549,5 +949,389 @@ mod tests {
         let mut raw = raw_root_dir();
         raw.link_count = 0;
         assert!(InodeDesc::try_from(&raw).is_err());
+    }
+}
+
+#[cfg(ktest)]
+mod write_tests {
+    use ostd::prelude::*;
+
+    use super::{
+        super::test_utils::{
+            Ext4Fixture, Ext4FixtureBuilder, make_empty_file_inode, make_unwritten_file_inode,
+        },
+        extent_manager::MapState,
+        *,
+    };
+    use crate::time::clocks;
+
+    const FILE_INO: u32 = 11;
+    const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
+
+    /// A fixture with a realistic bitmap and an empty regular file at `FILE_INO`.
+    fn fixture_with_empty_file() -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        f
+    }
+
+    fn write_all(inode: &Inode, offset: usize, data: &[u8]) -> usize {
+        let mut reader = VmReader::from(data).to_fallible();
+        inode.write_at(offset, &mut reader).unwrap()
+    }
+
+    fn read_back(inode: &Inode, offset: usize, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode.read_at(offset, &mut writer).unwrap();
+        buf.truncate(read);
+        buf
+    }
+
+    #[ktest]
+    fn write_fresh_file_all_holes_round_trip() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = b"hello ext4 buffered write path, this is task 3!";
+        assert_eq!(write_all(&inode, 0, content), content.len());
+        assert_eq!(inode.size(), content.len());
+        assert_eq!(read_back(&inode, 0, content.len()), content);
+
+        // One data block allocated => i_blocks grew by one block of sectors.
+        assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);
+
+        // The extent tree maps logical block 0 to a real written extent.
+        let bm = inode.inner.read();
+        let bm = bm.block_manager().unwrap();
+        let mapping = bm.map_blocks(0).unwrap();
+        assert_eq!(mapping.state(), MapState::Written);
+    }
+
+    #[ktest]
+    fn append_past_eof_extends_file() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &[0xAA; BLOCK_SIZE]);
+        let sc_after_first = inode.sector_count();
+        assert_eq!(sc_after_first, SECTORS_PER_BLOCK);
+
+        // Append a second block past EOF.
+        let appended = vec![0xBBu8; BLOCK_SIZE];
+        write_all(&inode, BLOCK_SIZE, &appended);
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), appended);
+    }
+
+    #[ktest]
+    fn sparse_write_leaves_zero_gap() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Write one block at a high offset, leaving a multi-block hole before it.
+        let high_off = 5 * BLOCK_SIZE;
+        let payload = vec![0xCDu8; BLOCK_SIZE];
+        write_all(&inode, high_off, &payload);
+
+        assert_eq!(inode.size(), high_off + BLOCK_SIZE);
+        // Only the single written block is backed; the gap stays a hole.
+        assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);
+
+        // The gap reads as zeros; the written region reads back the payload.
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0u8; BLOCK_SIZE]);
+        assert_eq!(read_back(&inode, high_off, BLOCK_SIZE), payload);
+    }
+
+    #[ktest]
+    fn overwrite_existing_data_no_new_allocation() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &[0x11; BLOCK_SIZE]);
+        let sc_before = inode.sector_count();
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        // Overwrite the same block: no allocation, sector_count unchanged.
+        let new_data = vec![0x22u8; BLOCK_SIZE];
+        write_all(&inode, 0, &new_data);
+        assert_eq!(inode.sector_count(), sc_before);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), new_data);
+    }
+
+    #[ktest]
+    fn scattered_writes_grow_tree_to_depth1() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Five non-contiguous single blocks overflow the 4-entry inline root,
+        // forcing a depth-1 tree with an external leaf block.
+        for k in 0..5usize {
+            let off = k * 2 * BLOCK_SIZE; // gaps keep extents non-mergeable
+            write_all(&inode, off, &[(0x30 + k as u8); BLOCK_SIZE]);
+        }
+
+        // i_blocks counts 5 data blocks + 1 extent-tree leaf block.
+        assert_eq!(inode.sector_count(), 6 * SECTORS_PER_BLOCK);
+
+        // All five logical blocks read back correctly through the external leaf.
+        for k in 0..5usize {
+            let off = k * 2 * BLOCK_SIZE;
+            assert_eq!(
+                read_back(&inode, off, BLOCK_SIZE),
+                vec![0x30 + k as u8; BLOCK_SIZE]
+            );
+        }
+
+        // The root is now a depth-1 index tree.
+        let depth = inode
+            .inner
+            .read()
+            .block_manager()
+            .unwrap()
+            .root_depth()
+            .unwrap();
+        assert_eq!(depth, 1);
+    }
+
+    #[ktest]
+    fn write_back_inode_desc_is_lossless() {
+        let f = fixture_with_empty_file();
+
+        // Seed a few distinctive immutable fields the RMW must preserve.
+        let mut raw = make_empty_file_inode();
+        raw.generation = 0xDEAD_BEEF;
+        raw.checksum_lo = 0x1234;
+        raw.extra_isize = 32;
+        raw.uid = 0x1111;
+        raw.uid_high = 0x2222;
+        f.write_raw_inode(FILE_INO, &raw);
+        let before = f.read_raw_inode(FILE_INO);
+
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&inode, 0, b"persisted");
+        inode.sync_metadata().unwrap();
+
+        let after = f.read_raw_inode(FILE_INO);
+
+        // Mutated fields changed.
+        assert_eq!(after.size_lo, b"persisted".len() as u32);
+        assert!(after.sector_count > 0);
+        assert_ne!(after.block, before.block); // extent root rewritten
+
+        // Untouched fields preserved.
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.checksum_lo, before.checksum_lo);
+        assert_eq!(after.extra_isize, before.extra_isize);
+        assert_eq!(after.uid, before.uid);
+        assert_eq!(after.uid_high, before.uid_high);
+        assert_eq!(after.crtime, before.crtime);
+        assert_eq!(after.crtime_extra, before.crtime_extra);
+    }
+
+    #[ktest]
+    fn remount_persistence_round_trip() {
+        let f = fixture_with_empty_file();
+        let content = b"survives a remount of the same disk image";
+
+        {
+            let inode = f.ext4.read_inode(FILE_INO).unwrap();
+            write_all(&inode, 0, content);
+            // Full sync: data pages + inode metadata + block-side metadata.
+            inode.sync_data_and_meta().unwrap();
+            f.ext4.sync_metadata().unwrap();
+        }
+
+        // Re-open the filesystem from the same on-disk image and read it back.
+        let ext4 = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let inode = ext4.read_inode(FILE_INO).unwrap();
+        assert_eq!(inode.size(), content.len());
+        assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);
+        let mut buf = vec![0u8; content.len()];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        inode.read_at(0, &mut writer).unwrap();
+        assert_eq!(&buf[..], content);
+    }
+
+    /// Returns whether physical block `pblock` is marked allocated in group 0.
+    fn block_is_allocated(f: &Ext4Fixture, pblock: Ext4Bid) -> bool {
+        let group = f.ext4.block_group(0);
+        group
+            .metadata()
+            .block_bitmap
+            .is_allocated((pblock - group.first_block()) as u16)
+    }
+
+    #[ktest]
+    fn shrink_frees_blocks_and_zeroes_partial_tail() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A 3-block file (contiguous extent, blocks 0..3).
+        let old_size = 3 * BLOCK_SIZE;
+        write_all(&inode, 0, &vec![0xEE; old_size]);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+
+        // Record the physical blocks for block 2 (freed) and block 1 (the kept
+        // partial block whose tail must be zeroed).
+        let (b1, b2) = {
+            let inner = inode.inner.read();
+            let bm = inner.block_manager().unwrap();
+            (
+                bm.map_blocks(1).unwrap().pblock(),
+                bm.map_blocks(2).unwrap().pblock(),
+            )
+        };
+        assert!(block_is_allocated(&f, b1));
+        assert!(block_is_allocated(&f, b2));
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        // Shrink to a non-block-aligned size landing inside block 1. Blocks 0 and
+        // 1 are kept (1 is the partial last block); block 2 is freed.
+        let new_size = BLOCK_SIZE + 100;
+        inode.resize(new_size).unwrap();
+
+        assert_eq!(inode.size(), new_size);
+        // One data block freed: sector_count dropped by one block of sectors.
+        assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before + 1);
+        assert!(block_is_allocated(&f, b1)); // kept partial block stays allocated
+        assert!(!block_is_allocated(&f, b2)); // trailing block freed
+
+        // The retained head bytes of block 1 are unchanged.
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 100), vec![0xEE; 100]);
+
+        // Re-expand to expose the kept partial block's tail: it must read as
+        // zeros (stale 0xEE bytes beyond `new_size` were zeroed before shrink),
+        // proving the partial block was zeroed and stale data did not reappear.
+        let tail_len = 2 * BLOCK_SIZE - new_size;
+        inode.resize(2 * BLOCK_SIZE).unwrap();
+        assert_eq!(read_back(&inode, new_size, tail_len), vec![0u8; tail_len]);
+        // The head bytes are still intact after the round trip.
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 100), vec![0xEE; 100]);
+    }
+
+    #[ktest]
+    fn shrink_to_zero_frees_everything() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Five scattered single blocks force a depth-1 tree with an external leaf.
+        for k in 0..5usize {
+            write_all(&inode, k * 2 * BLOCK_SIZE, &[(0x40 + k as u8); BLOCK_SIZE]);
+        }
+        // 5 data blocks + 1 external leaf block.
+        assert_eq!(inode.sector_count(), 6 * SECTORS_PER_BLOCK);
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        inode.resize(0).unwrap();
+
+        assert_eq!(inode.size(), 0);
+        assert_eq!(inode.sector_count(), 0);
+        // All 5 data blocks + the leaf block returned to the allocator.
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before + 6);
+
+        // The tree is back to an empty inline depth-0 root.
+        let inner = inode.inner.read();
+        let bm = inner.block_manager().unwrap();
+        assert_eq!(bm.root_depth().unwrap(), 0);
+        assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Hole);
+    }
+
+    #[ktest]
+    fn expand_is_sparse_and_reads_zeros() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = b"sparse expand";
+        write_all(&inode, 0, payload);
+        let sc_before = inode.sector_count();
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        // Expand far past EOF: no allocation, the gap is a hole.
+        let new_size = 4 * BLOCK_SIZE;
+        inode.resize(new_size).unwrap();
+
+        assert_eq!(inode.size(), new_size);
+        assert_eq!(inode.sector_count(), sc_before);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+
+        // The original bytes survive; the rest of the file reads as zeros.
+        assert_eq!(read_back(&inode, 0, payload.len()), payload);
+        assert_eq!(
+            read_back(&inode, payload.len(), new_size - payload.len()),
+            vec![0u8; new_size - payload.len()]
+        );
+    }
+
+    #[ktest]
+    fn write_into_unwritten_extent_converts_and_reads_back() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // A file with a single 4-block unwritten (preallocated) extent at pblock
+        // 200, logical size 4 blocks. The blocks are already in i_blocks.
+        let len = 4u16;
+        f.write_raw_inode(
+            FILE_INO,
+            &make_unwritten_file_inode(200, len, (len as u32) * BLOCK_SIZE as u32),
+        );
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        let sc_before = inode.sector_count();
+        assert_eq!(sc_before, len as u64 * SECTORS_PER_BLOCK);
+        let free_before = f.ext4.super_block().free_blocks_count();
+
+        // The whole extent reads as zeros while unwritten.
+        assert_eq!(
+            read_back(&inode, 0, len as usize * BLOCK_SIZE),
+            vec![0u8; len as usize * BLOCK_SIZE]
+        );
+
+        // Write into the middle block (logical block 1) only.
+        let payload = vec![0x77u8; BLOCK_SIZE];
+        write_all(&inode, BLOCK_SIZE, &payload);
+
+        // The written block now reads back the real bytes...
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), payload);
+        // ...while the still-unwritten blocks read as zeros.
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0u8; BLOCK_SIZE]);
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE, 2 * BLOCK_SIZE),
+            vec![0u8; 2 * BLOCK_SIZE]
+        );
+
+        // The extent split: block 1 is Written at the preserved physical block
+        // (200 + 1 = 201); blocks 0 and 2 remain Unwritten.
+        let inner = inode.inner.read();
+        let bm = inner.block_manager().unwrap();
+        let m0 = bm.map_blocks(0).unwrap();
+        let m1 = bm.map_blocks(1).unwrap();
+        let m2 = bm.map_blocks(2).unwrap();
+        assert_eq!(m0.state(), MapState::Unwritten);
+        assert_eq!(m1.state(), MapState::Written);
+        assert_eq!(m1.pblock(), 201);
+        assert_eq!(m2.state(), MapState::Unwritten);
+
+        // No data block allocated or freed: the inline split fits the root, so
+        // i_blocks is unchanged (conversion is metadata-only, no extra leaf).
+        assert_eq!(inode.sector_count(), sc_before);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+    }
+
+    #[ktest]
+    fn resize_on_directory_is_eisdir() {
+        let f = fixture_with_empty_file();
+        // ROOT_INO (2) is a directory in the fixture image.
+        let dir = f.ext4.read_inode(2).unwrap();
+        assert_eq!(dir.inode_type(), InodeType::Dir);
+        assert_eq!(dir.resize(0).unwrap_err().error(), Errno::EISDIR);
     }
 }

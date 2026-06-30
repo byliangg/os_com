@@ -72,7 +72,6 @@ impl<T: Debug> Dirty<T> {
     }
 
     /// Clears the dirty flag.
-    #[expect(dead_code)]
     pub(super) fn clear_dirty(&mut self) {
         self.dirty = false;
     }
@@ -109,7 +108,6 @@ impl<T: Debug> Debug for Dirty<T> {
 }
 
 /// Returns the current time.
-#[expect(dead_code)]
 pub(super) fn now() -> Duration {
     crate::time::clocks::RealTimeCoarseClock::get().read_time()
 }

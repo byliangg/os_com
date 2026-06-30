@@ -22,6 +22,11 @@ impl FileSystem for Ext4 {
     }
 
     fn sync(&self) -> Result<()> {
+        // Flush every cached inode together with the block-side metadata, then
+        // issue a single device barrier. Unmount drives durability through this
+        // hook (`Path::unmount` -> `Mount::sync` -> `FileSystem::sync`), so a
+        // clean unmount flushes every dirty inode and the bitmap consistently.
+        self.sync_all()?;
         if self.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }

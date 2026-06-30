@@ -194,12 +194,36 @@ impl SuperBlock {
         self.nr_inodes_per_group
     }
 
-    #[expect(dead_code)]
     pub(super) const fn nr_blocks_per_group(&self) -> u32 {
         self.nr_blocks_per_group
     }
 
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    /// Decreases the free-block counter by `n`, erroring on underflow.
+    ///
+    /// Takes `&mut self` so that a write guard over `RwMutex<Dirty<SuperBlock>>`
+    /// marks the superblock dirty for writeback.
+    pub(super) fn dec_free_blocks(&mut self, n: u64) -> Result<()> {
+        self.free_blocks_count = self
+            .free_blocks_count
+            .checked_sub(n)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free block counter underflow"))?;
+        Ok(())
+    }
+
+    /// Increases the free-block counter by `n`, erroring on overflow past the
+    /// total block count.
+    pub(super) fn inc_free_blocks(&mut self, n: u64) -> Result<()> {
+        let new_count = self
+            .free_blocks_count
+            .checked_add(n)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free block counter overflow"))?;
+        if new_count > self.blocks_count {
+            return_errno_with_message!(Errno::EIO, "free block counter exceeds total blocks");
+        }
+        self.free_blocks_count = new_count;
+        Ok(())
+    }
+
     pub(super) const fn nr_inode_table_blocks_per_group(&self) -> u32 {
         self.nr_inode_table_blocks_per_group
     }

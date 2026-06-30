@@ -13,7 +13,7 @@ pub(super) const EXTENT_MAGIC: u16 = 0xF30A;
 
 /// Maximum logical length encodable in a single extent. A length above this
 /// marks the extent as unwritten (preallocated but not yet written).
-const MAX_WRITTEN_LEN: u16 = 32768;
+pub(super) const MAX_WRITTEN_LEN: u16 = 32768;
 
 const_assert!(size_of::<RawExtentHeader>() == 12);
 const_assert!(size_of::<RawExtentIdx>() == 12);
@@ -77,7 +77,6 @@ impl ExtentHeader {
 
     /// Returns the node depth: 0 is a leaf (holds `RawExtent`), greater is an
     /// interior node (holds `RawExtentIdx`).
-    #[expect(dead_code)]
     pub(super) const fn depth(&self) -> u16 {
         self.depth
     }
@@ -138,15 +137,46 @@ impl From<&RawExtentIdx> for ExtentIdx {
 
 /// A decoded leaf extent: a contiguous run mapping `len` logical blocks starting
 /// at logical `block` to physical `start`.
+/// Whether an extent is backed by written data, or is preallocated but
+/// unwritten (reads as zeros until written).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExtentKind {
+    Written,
+    Unwritten,
+}
+
+impl ExtentKind {
+    /// Returns whether this is an unwritten (preallocated) extent.
+    pub(super) const fn is_unwritten(self) -> bool {
+        matches!(self, ExtentKind::Unwritten)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Extent {
     block: Iblock,
     len: u16,
     start: Ext4Bid,
-    unwritten: bool,
+    kind: ExtentKind,
 }
 
 impl Extent {
+    /// Builds a leaf extent mapping `len` logical blocks from logical `block` to
+    /// physical `start`, written or unwritten per `kind`.
+    pub(super) const fn new(block: Iblock, len: u16, start: Ext4Bid, kind: ExtentKind) -> Self {
+        Self {
+            block,
+            len,
+            start,
+            kind,
+        }
+    }
+
+    /// Returns whether this extent is written or unwritten.
+    pub(super) const fn kind(&self) -> ExtentKind {
+        self.kind
+    }
+
     /// Returns the first logical block this extent covers.
     pub(super) const fn block(&self) -> Iblock {
         self.block
@@ -164,7 +194,7 @@ impl Extent {
 
     /// Returns whether this extent is unwritten (allocated, reads as zeros).
     pub(super) const fn is_unwritten(&self) -> bool {
-        self.unwritten
+        self.kind.is_unwritten()
     }
 
     /// Returns whether `iblock` falls within this extent.
@@ -185,7 +215,34 @@ impl From<&RawExtent> for Extent {
             block: raw.block,
             len,
             start: (raw.start_lo as Ext4Bid) | ((raw.start_hi as Ext4Bid) << 32),
-            unwritten,
+            kind: if unwritten {
+                ExtentKind::Unwritten
+            } else {
+                ExtentKind::Written
+            },
+        }
+    }
+}
+
+impl From<&Extent> for RawExtent {
+    fn from(ext: &Extent) -> Self {
+        // Unwritten extents encode their length biased by `MAX_WRITTEN_LEN`; the
+        // physical block splits into a 32-bit low half and a 16-bit high half.
+        let unwritten = ext.kind.is_unwritten();
+        debug_assert!(
+            !unwritten || ext.len < MAX_WRITTEN_LEN,
+            "unwritten extent length must be < MAX_WRITTEN_LEN to bias-encode"
+        );
+        let len = if unwritten {
+            ext.len + MAX_WRITTEN_LEN
+        } else {
+            ext.len
+        };
+        Self {
+            block: ext.block,
+            len,
+            start_hi: (ext.start >> 32) as u16,
+            start_lo: ext.start as u32,
         }
     }
 }

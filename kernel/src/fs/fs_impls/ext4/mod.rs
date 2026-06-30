@@ -31,6 +31,7 @@ mod fs;
 mod fs_type;
 mod impl_for_vfs;
 mod inode;
+mod journal;
 mod prelude;
 mod super_block;
 mod utils;

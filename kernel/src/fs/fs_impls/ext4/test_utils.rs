@@ -134,6 +134,12 @@ impl Ext4Fixture {
         let offset = INODE_TABLE_BID as usize * BLOCK_SIZE + (ino - 1) as usize * INODE_SIZE;
         self.disk.segment().write_val(offset, raw).unwrap();
     }
+
+    /// Reads back the raw inode at inode number `ino` from the group-0 table.
+    pub(super) fn read_raw_inode(&self, ino: u32) -> RawInode {
+        let offset = INODE_TABLE_BID as usize * BLOCK_SIZE + (ino - 1) as usize * INODE_SIZE;
+        self.disk.segment().read_val(offset).unwrap()
+    }
 }
 
 /// Builds a minimal single-purpose ext4 image with a fixed group-0 layout:
@@ -143,6 +149,16 @@ pub(super) struct Ext4FixtureBuilder {
     blocks_per_group: u32,
     inodes_per_group: u32,
     nblocks: usize,
+    /// When set, mark the group-0 system/reserved blocks as allocated in the
+    /// block bitmap and seed the matching free-block counters. Off by default so
+    /// the read-only fixtures keep their all-zero bitmap.
+    mark_metadata: bool,
+    /// When set, override the free-block counters to zero (for ENOSPC tests).
+    no_free_blocks: bool,
+    /// When set, cap the (single-group) fixture to exactly this many free blocks
+    /// by marking all but the top `n` data blocks allocated. For
+    /// ENOSPC-mid-operation tests.
+    free_block_cap: Option<u32>,
 }
 
 impl Ext4FixtureBuilder {
@@ -151,16 +167,71 @@ impl Ext4FixtureBuilder {
             blocks_per_group,
             inodes_per_group,
             nblocks,
+            mark_metadata: false,
+            no_free_blocks: false,
+            free_block_cap: None,
         }
+    }
+
+    /// Marks the group-0 metadata + reserved blocks as allocated in the block
+    /// bitmap and seeds free-block counters accordingly, giving allocator tests
+    /// a realistic starting image.
+    pub(super) fn with_block_bitmap_metadata_marked(mut self) -> Self {
+        self.mark_metadata = true;
+        self
+    }
+
+    /// Forces all free-block counters to zero (for ENOSPC tests). Implies that
+    /// the bitmap is marked, so an allocation cannot succeed.
+    pub(super) fn with_no_free_blocks(mut self) -> Self {
+        self.no_free_blocks = true;
+        self.mark_metadata = true;
+        self
+    }
+
+    /// Caps the single-group fixture to exactly `n` free blocks (marking all but
+    /// the top `n` data blocks allocated). For tests that must run the allocator
+    /// out of space partway through a multi-block operation.
+    pub(super) fn with_free_blocks(mut self, n: u32) -> Self {
+        self.free_block_cap = Some(n);
+        self.mark_metadata = true;
+        self
     }
 
     pub(super) fn build(self) -> Result<Ext4Fixture> {
         let nr_groups = (self.nblocks as u32 - 1) / self.blocks_per_group + 1;
         let inodes_count = nr_groups * self.inodes_per_group;
+        let inode_table_blocks = self.inodes_per_group / (BLOCK_SIZE / INODE_SIZE) as u32;
+
+        // Each group's system zone spans, from its first block: the superblock
+        // region (block 0 in group 0), the GDT block, block bitmap, inode bitmap,
+        // and the inode-table blocks. first_data_block is 0 in this fixture.
+        let metadata_end_block = INODE_TABLE_BID + inode_table_blocks; // exclusive
+
+        // Sum the free blocks across all groups so the superblock counter matches
+        // the per-group descriptors.
+        let total_free: u32 = if let Some(n) = self.free_block_cap {
+            n
+        } else if self.no_free_blocks || !self.mark_metadata {
+            0
+        } else {
+            (0..nr_groups)
+                .map(|g| {
+                    let group_first = g * self.blocks_per_group;
+                    let group_size = if g == nr_groups - 1 {
+                        self.nblocks as u32 - group_first
+                    } else {
+                        self.blocks_per_group
+                    };
+                    group_size - metadata_end_block
+                })
+                .sum()
+        };
 
         let raw_sb = RawSuperBlock {
             inodes_count,
             blocks_count: self.nblocks as u32,
+            free_blocks_count: total_free,
             first_data_block: 0,
             log_block_size: 2,
             log_frag_size: 2,
@@ -180,18 +251,59 @@ impl Ext4FixtureBuilder {
         };
         let sb = SuperBlock::try_from(raw_sb)?;
 
-        let raw_gd = RawBlockGroup {
-            block_bitmap_lo: 2,
-            inode_bitmap_lo: 3,
-            inode_table_lo: INODE_TABLE_BID,
-            ..Default::default()
-        };
-
         let disk = Arc::new(Ext4MemoryDisk::new(self.nblocks));
         disk.segment()
             .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
             .unwrap();
-        disk.segment().write_val(BLOCK_SIZE, &raw_gd).unwrap();
+
+        // Lay out a descriptor (and, when marking, a block bitmap) per group.
+        // Each group `g` keeps its metadata at fixed in-group offsets: block
+        // bitmap at +2, inode bitmap at +3, inode table at +4.
+        for g in 0..nr_groups {
+            let group_first = g * self.blocks_per_group; // first_data_block == 0
+            let group_size = if g == nr_groups - 1 {
+                self.nblocks as u32 - group_first
+            } else {
+                self.blocks_per_group
+            };
+            // `mark_end` is the exclusive bit up to which the bitmap is marked
+            // allocated; capping leaves only the top `n` blocks free.
+            let (free, mark_end) = if let Some(n) = self.free_block_cap {
+                (n, group_size - n)
+            } else if self.no_free_blocks {
+                (0, metadata_end_block)
+            } else if self.mark_metadata {
+                (group_size - metadata_end_block, metadata_end_block)
+            } else {
+                (0, metadata_end_block)
+            };
+
+            let raw_gd = RawBlockGroup {
+                block_bitmap_lo: group_first + 2,
+                inode_bitmap_lo: group_first + 3,
+                inode_table_lo: group_first + INODE_TABLE_BID,
+                free_blocks_count_lo: free as u16,
+                ..Default::default()
+            };
+            disk.segment()
+                .write_val(
+                    BLOCK_SIZE + g as usize * size_of::<RawBlockGroup>(),
+                    &raw_gd,
+                )
+                .unwrap();
+
+            if self.mark_metadata {
+                // Mark the in-group allocated zone (bits 0..mark_end) — the system
+                // zone, plus extra blocks when capping free space. LSB-first.
+                let mut bitmap = vec![0u8; BLOCK_SIZE];
+                for bit in 0..mark_end as usize {
+                    bitmap[bit / 8] |= 1 << (bit % 8);
+                }
+                disk.segment()
+                    .write_bytes((group_first as usize + 2) * BLOCK_SIZE, &bitmap)
+                    .unwrap();
+            }
+        }
 
         let root = make_root_dir_inode();
         let root_offset =
@@ -238,6 +350,54 @@ pub(super) fn make_file_inode(data_block: u32, size: u32) -> RawInode {
     raw.block[2] = 0; // eh_generation
     raw.block[3] = 0; // ee_block = 0
     raw.block[4] = 1; // ee_len=1, ee_start_hi=0
+    raw.block[5] = data_block; // ee_start_lo
+    raw
+}
+
+/// Builds an empty regular-file inode: size 0, `i_blocks` 0, and an empty
+/// inline extent root (header with 0 entries). Suitable as the target of a
+/// fresh buffered write whose allocation/extents come from the write path.
+pub(super) fn make_empty_file_inode() -> RawInode {
+    let mut raw = RawInode {
+        mode: 0o100644, // S_IFREG | 0644
+        size_lo: 0,
+        link_count: 1,
+        sector_count: 0,
+        flags: EXTENTS_FL,
+        extra_isize: 32,
+        ..Default::default()
+    };
+    // Empty extent root: 12-byte header (magic 0xF30A, 0 entries, max 4, depth
+    // 0), no extents. Each `i_block` word packs two 16-bit fields.
+    raw.block[0] = 0xF30A; // eh_magic | eh_entries(=0)
+    raw.block[1] = 4; // eh_max=4, eh_depth=0
+    raw.block[2] = 0; // eh_generation
+    raw
+}
+
+/// Builds a regular-file inode whose `i_block` holds a single *unwritten*
+/// (preallocated) inline extent mapping logical blocks `[0, len)` to physical
+/// `[data_block, data_block + len)`. The blocks count toward `i_blocks` (they
+/// were allocated at fallocate time) but read as zeros until written. `size` is
+/// the logical file size in bytes.
+pub(super) fn make_unwritten_file_inode(data_block: u32, len: u16, size: u32) -> RawInode {
+    let mut raw = RawInode {
+        mode: 0o100644, // S_IFREG | 0644
+        size_lo: size,
+        link_count: 1,
+        sector_count: (len as u32) * (BLOCK_SIZE / SECTOR_SIZE) as u32,
+        flags: EXTENTS_FL,
+        extra_isize: 32,
+        ..Default::default()
+    };
+    // Inline extent root: header (magic, 1 entry, max 4, depth 0) + one extent.
+    // An unwritten extent encodes its length biased by 32768 (`MAX_WRITTEN_LEN`).
+    raw.block[0] = 0xF30A | (1 << 16); // eh_magic | eh_entries
+    raw.block[1] = 4; // eh_max=4, eh_depth=0
+    raw.block[2] = 0; // eh_generation
+    raw.block[3] = 0; // ee_block = 0
+    // ee_len (low 16, biased for unwritten) | ee_start_hi (high 16, = 0).
+    raw.block[4] = (len + 32768) as u32;
     raw.block[5] = data_block; // ee_start_lo
     raw
 }

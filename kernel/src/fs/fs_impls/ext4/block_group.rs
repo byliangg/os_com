@@ -1,12 +1,39 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Ext4 block-group descriptors.
+//! Ext4 block-group descriptors and the block-side allocation domain.
 //!
-//! Phase 1 reads the 32-byte descriptors (the `64BIT` feature is off, so the
-//! high halves are absent) to locate each group's inode table. Per-group
-//! bitmaps, allocation, and the inode-table page cache arrive in later phases.
+//! Each block group is an independent allocation domain owning its own block
+//! bitmap. Phase 2 brings the block side to life: the per-group block bitmap is
+//! loaded at mount, blocks are allocated/freed against it, and dirty metadata is
+//! written back via read-modify-write (RMW) so the many on-disk fields the
+//! decoded descriptor drops are preserved losslessly.
+//!
+//! Phase 2 also adds a per-group **inode cache** giving live inodes a stable
+//! identity (the same `Arc<Inode>` for a given inode number) so the filesystem
+//! can enumerate and flush every dirty inode together with the block-side
+//! metadata. The inode bitmap and inode-table page cache still arrive in Phase 3;
+//! inode-table writeback stays a direct read-modify-write via
+//! `Ext4::write_back_inode_desc`.
+//!
+//! # Locking
+//!
+//! `BlockGroup` uses two independent locks:
+//!
+//! - `metadata` — protects the group descriptor and block bitmap. Held briefly
+//!   during alloc/free operations.
+//! - `inode_cache` — protects the per-group live inode map. Uses double-checked
+//!   locking (read then promote to write on miss). Never held while syncing an
+//!   inode (see [`BlockGroup::sync_inodes`]).
 
-use super::prelude::*;
+use core::fmt;
+
+use super::{
+    fs::Ext4,
+    inode::{Inode, InodeDesc, RawInode},
+    journal,
+    prelude::*,
+    super_block::SuperBlock,
+};
 
 const_assert!(size_of::<RawBlockGroup>() == 32);
 
@@ -32,7 +59,7 @@ pub(super) struct RawBlockGroup {
 /// Validated, Rust-typed block-group descriptor.
 ///
 /// Block numbers are `Ext4Bid` (`u64`) so the `64BIT` high halves slot in later
-/// without widening; in Phase 1 they are the 32-bit low halves.
+/// without widening; in Phase 2 they are the 32-bit low halves.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BlockGroupDesc {
     block_bitmap_bid: Ext4Bid,
@@ -49,17 +76,14 @@ impl BlockGroupDesc {
         self.inode_table_bid
     }
 
-    #[expect(dead_code)]
     pub(super) const fn block_bitmap_bid(&self) -> Ext4Bid {
         self.block_bitmap_bid
     }
 
-    #[expect(dead_code)]
     pub(super) const fn inode_bitmap_bid(&self) -> Ext4Bid {
         self.inode_bitmap_bid
     }
 
-    #[expect(dead_code)]
     pub(super) const fn free_blocks_count(&self) -> u32 {
         self.free_blocks_count
     }
@@ -85,5 +109,449 @@ impl From<&RawBlockGroup> for BlockGroupDesc {
             free_inodes_count: raw.free_inodes_count_lo as u32,
             used_dirs_count: raw.used_dirs_count_lo as u32,
         }
+    }
+}
+
+/// One block group's block-side metadata: the descriptor and its block bitmap.
+///
+/// Phase 2 omits the inode bitmap (loaded in Phase 3). Both members carry
+/// dirty tracking; writeback is deferred to [`BlockGroup::sync_metadata`].
+pub(super) struct BlockGroupMetadata {
+    /// Group descriptor with dirty tracking.
+    pub desc: Dirty<BlockGroupDesc>,
+    /// Block bitmap cached in memory.
+    pub block_bitmap: Dirty<IdBitmap>,
+}
+
+impl Debug for BlockGroupMetadata {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockGroupMetadata")
+            .field("desc", &self.desc)
+            .field("block_bitmap_dirty", &self.block_bitmap.is_dirty())
+            .finish()
+    }
+}
+
+/// A block group's block-side allocation domain.
+///
+/// Owns the cached block bitmap and group descriptor behind a single lock, plus
+/// the geometry needed to allocate/free blocks and write metadata back to disk.
+pub(super) struct BlockGroup {
+    /// Block group index (0-based).
+    group_idx: usize,
+    /// Group descriptor and block bitmap, protected by a single lock.
+    metadata: RwMutex<BlockGroupMetadata>,
+    /// Backing block device (shared with `Ext4` and other groups).
+    block_device: Arc<dyn BlockDevice>,
+    /// Cached geometry: first filesystem-wide block number of this group.
+    first_block: Ext4Bid,
+    /// Cached geometry: last filesystem-wide block number of this group.
+    last_block: Ext4Bid,
+    /// Cached geometry: inode table blocks per group.
+    nr_inode_table_blocks_per_group: u32,
+    /// Cached geometry: inodes per group.
+    nr_inodes_per_group: u32,
+    /// Cached geometry: inode size in bytes.
+    inode_size: usize,
+    /// Cached geometry: filesystem block size in bytes.
+    block_size: usize,
+    /// Absolute byte offset of this group's `RawBlockGroup` in the GDT.
+    desc_offset: usize,
+    /// Per-group live inode cache keyed by group-local inode index.
+    ///
+    /// Ext4 keeps this cache locally because the VFS layer does not provide a
+    /// shared inode cache for filesystem implementations. It gives inodes a
+    /// stable identity and lets the filesystem enumerate every dirty inode for a
+    /// consistent flush at sync/unmount time.
+    inode_cache: RwMutex<BTreeMap<u16, Arc<Inode>>>,
+}
+
+impl Debug for BlockGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlockGroup")
+            .field("group_idx", &self.group_idx)
+            .finish()
+    }
+}
+
+impl BlockGroup {
+    /// Loads a block group from the descriptor table.
+    ///
+    /// Reads and decodes the group's `RawBlockGroup` at
+    /// `gdt_base_offset + group_idx * size_of::<RawBlockGroup>()`, caches the
+    /// group's geometry from `sb`, and loads the block bitmap.
+    ///
+    /// Loading is lenient: strict validation that the system-metadata blocks are
+    /// marked allocated in the bitmap is deferred (the read-only fixtures carry
+    /// an all-zero bitmap and must still mount).
+    pub(super) fn load(
+        device: Arc<dyn BlockDevice>,
+        group_idx: usize,
+        sb: &SuperBlock,
+        gdt_base_offset: usize,
+    ) -> Result<Self> {
+        let desc_offset = gdt_base_offset + group_idx * size_of::<RawBlockGroup>();
+        let raw_group = device
+            .read_val::<RawBlockGroup>(desc_offset)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+        let desc = BlockGroupDesc::from(&raw_group);
+
+        // Cache geometry from `SuperBlock` at load time.
+        let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
+        let first_block = sb.first_data_block() + (group_idx as Ext4Bid) * nr_blocks_per_group;
+        let nr_block_groups = sb.nr_block_groups() as usize;
+        let last_block = if group_idx == nr_block_groups - 1 {
+            sb.total_blocks() - 1
+        } else {
+            first_block + nr_blocks_per_group - 1
+        };
+        let nr_inode_table_blocks_per_group = sb.nr_inode_table_blocks_per_group();
+        let nr_inodes_per_group = sb.nr_inodes_per_group();
+        let inode_size = sb.inode_size();
+        let block_size = sb.block_size();
+
+        // Load the block bitmap (block side only; the inode bitmap is Phase 3).
+        let block_bitmap =
+            Self::load_block_bitmap(device.as_ref(), first_block, last_block, &desc)?;
+
+        Ok(Self {
+            group_idx,
+            metadata: RwMutex::new(BlockGroupMetadata {
+                desc: Dirty::new(desc),
+                block_bitmap: Dirty::new(block_bitmap),
+            }),
+            block_device: device,
+            first_block,
+            last_block,
+            nr_inode_table_blocks_per_group,
+            nr_inodes_per_group,
+            inode_size,
+            block_size,
+            desc_offset,
+            inode_cache: RwMutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Returns the block group index.
+    #[expect(dead_code)] // Phase 3 inode-cache routing keys on this.
+    pub(super) fn group_idx(&self) -> usize {
+        self.group_idx
+    }
+
+    /// Returns the starting block of this group's inode table.
+    pub(super) fn inode_table_bid(&self) -> Ext4Bid {
+        self.metadata.read().desc.inode_table_bid()
+    }
+
+    /// Looks up an inode by inode number through this group's inode cache.
+    ///
+    /// Returns the same `Arc<Inode>` for repeated lookups of one inode number,
+    /// so concurrent users share one in-memory inode (and one set of dirty
+    /// state). The fast path hits the cache under the read lock; the slow path
+    /// promotes to the write lock, re-checks (another thread may have inserted
+    /// the inode in the gap), then loads the descriptor from disk and inserts it.
+    pub(super) fn lookup_inode(&self, ino: Ext4Ino, fs: Weak<Ext4>) -> Result<Arc<Inode>> {
+        let inode_idx = self.inode_idx_in_group(ino);
+
+        // Fast path: cache hit under the read lock.
+        if let Some(inode) = self.inode_cache.read().get(&inode_idx) {
+            return Ok(inode.clone());
+        }
+
+        // Slow path: revalidate under the write lock, since another thread may
+        // have inserted the inode between the read and write lock acquisition.
+        let mut inode_cache = self.inode_cache.write();
+        if let Some(inode) = inode_cache.get(&inode_idx) {
+            return Ok(inode.clone());
+        }
+
+        let desc = self.read_inode_desc(ino)?;
+        let type_ = desc.type_();
+        let inode = Inode::new(ino, type_, Dirty::new(desc), self.group_idx, fs);
+        inode_cache.insert(inode_idx, inode.clone());
+        Ok(inode)
+    }
+
+    /// Inserts a newly created inode into this group's live cache.
+    #[expect(dead_code)] // Phase 3 inode creation uses this.
+    pub(super) fn insert_inode(&self, inode: Arc<Inode>) {
+        let inode_idx = self.inode_idx_in_group(inode.ino());
+        self.inode_cache.write().insert(inode_idx, inode);
+    }
+
+    /// Removes one inode from this group's live cache.
+    #[expect(dead_code)] // Phase 3 unlink/reclaim uses this.
+    pub(super) fn remove_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
+        let inode_idx = self.inode_idx_in_group(ino);
+        self.inode_cache.write().remove(&inode_idx)
+    }
+
+    /// Flushes every cached inode's data pages and metadata back to disk.
+    ///
+    /// The `Arc<Inode>` handles are cloned out under the read lock, which is then
+    /// dropped *before* any inode is synced. This drop-before-sync ordering is
+    /// required: `Inode::sync_data_and_meta` acquires `inner.write()`, so holding
+    /// `inode_cache.read()` across the sync would invert the lock order against
+    /// create/unlink paths that take `inner.write()` first and `inode_cache`
+    /// after.
+    pub(super) fn sync_inodes(&self) -> Result<()> {
+        let inodes: Vec<Arc<Inode>> = self.inode_cache.read().values().cloned().collect();
+        for inode in inodes {
+            inode.sync_data_and_meta_no_barrier()?;
+        }
+        Ok(())
+    }
+
+    /// Loads and decodes an inode's on-disk descriptor from the inode table.
+    ///
+    /// The inode-table read stays a direct device read (no page cache in
+    /// Phase 2); the cache built on top is only for inode identity and
+    /// enumeration.
+    pub(super) fn read_inode_desc(&self, ino: Ext4Ino) -> Result<InodeDesc> {
+        let idx_in_group = self.inode_idx_in_group(ino) as usize;
+        let offset =
+            self.inode_table_bid() as usize * self.block_size + idx_in_group * self.inode_size;
+        let raw = self.block_device.read_val::<RawInode>(offset)?;
+        InodeDesc::try_from(&raw)
+    }
+
+    /// Returns the 0-based group-local inode index for `ino`.
+    fn inode_idx_in_group(&self, ino: Ext4Ino) -> u16 {
+        debug_assert!(ino > 0);
+        debug_assert_eq!(
+            ((ino - 1) / self.nr_inodes_per_group) as usize,
+            self.group_idx
+        );
+        ((ino - 1) % self.nr_inodes_per_group) as u16
+    }
+
+    /// Returns the first filesystem-wide block number of this group.
+    pub(super) fn first_block(&self) -> Ext4Bid {
+        self.first_block
+    }
+
+    /// Returns the last filesystem-wide block number of this group.
+    pub(super) fn last_block(&self) -> Ext4Bid {
+        self.last_block
+    }
+
+    /// Returns the number of free blocks in this group.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn free_blocks_count(&self) -> u32 {
+        self.metadata.read().desc.free_blocks_count()
+    }
+
+    /// Returns whether the group descriptor has been modified since the last
+    /// writeback.
+    #[expect(dead_code)] // Phase 3 filesystem-level sync checks this before writeback.
+    pub(super) fn is_desc_dirty(&self) -> bool {
+        self.metadata.read().desc.is_dirty()
+    }
+
+    /// Returns a read guard over the combined group metadata.
+    #[cfg(ktest)]
+    pub(super) fn metadata(&self) -> RwMutexReadGuard<'_, BlockGroupMetadata> {
+        self.metadata.read()
+    }
+
+    /// Attempts to allocate up to `count` contiguous blocks within this group.
+    ///
+    /// Returns `Ok(range)` with filesystem-wide block numbers on success, or an
+    /// empty range (`Ok(0..0)`) if the group has no allocatable blocks. Returns
+    /// `Err(EIO)` on bitmap/counter corruption.
+    pub(super) fn alloc_blocks(&self, count: u32, sb_free_blocks: u64) -> Result<Range<Ext4Bid>> {
+        let group_size = (self.last_block - self.first_block + 1) as u32;
+        debug_assert!(group_size <= IdBitmap::capacity() as u32);
+
+        let mut metadata = self.metadata.write();
+
+        let mut requested_count = count
+            .min(group_size)
+            .min(metadata.desc.free_blocks_count())
+            .min(sb_free_blocks.min(u32::MAX as u64) as u32)
+            as u16;
+
+        let block_bitmap_bid = metadata.desc.block_bitmap_bid();
+        journal::get_write_access(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+
+        // TODO: Improve bitmap allocation to reduce fragmentation (e.g., find the
+        // first free block directly instead of retrying with smaller counts).
+        let mut allocated_range = None;
+        while requested_count > 0 {
+            let candidate_range = metadata.block_bitmap.alloc_consecutive(requested_count);
+            if candidate_range.is_some() {
+                allocated_range = candidate_range;
+                break;
+            }
+            requested_count /= 2;
+        }
+
+        let Some(range) = allocated_range else {
+            if metadata.desc.free_blocks_count() > 0 {
+                return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
+            }
+            return Ok(0..0);
+        };
+
+        let range_start = range.start as Ext4Bid;
+        let alloc_count = range.len() as u32;
+
+        let abs_range = (self.first_block + range_start)
+            ..(self.first_block + range_start + alloc_count as Ext4Bid);
+        if self.overlaps_system_zone_with(&metadata.desc, abs_range)
+            || metadata.desc.free_blocks_count() < alloc_count
+            || sb_free_blocks < alloc_count as u64
+        {
+            metadata.block_bitmap.free_consecutive(range);
+            return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
+        }
+
+        let new_free = metadata.desc.free_blocks_count() - alloc_count;
+        metadata.desc.free_blocks_count = new_free;
+
+        let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
+        journal::dirty_metadata(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+
+        let range_start_block = self.first_block + range.start as Ext4Bid;
+        let range_end_block = self.first_block + range.end as Ext4Bid;
+        Ok(range_start_block..range_end_block)
+    }
+
+    /// Frees a contiguous range of group-relative block bits.
+    ///
+    /// Returns the number of blocks actually freed (allocated-to-free
+    /// transitions). Returns `Err(EIO)` when the range overlaps the group's
+    /// system zone.
+    pub(super) fn free_blocks(&self, bit_range: Range<u32>) -> Result<u32> {
+        let start_bit = bit_range.start;
+        let group_count = bit_range.len() as u32;
+        // Validate system zone overlap using filesystem-wide coordinates.
+        let abs_range = (self.first_block + start_bit as Ext4Bid)
+            ..(self.first_block + bit_range.end as Ext4Bid);
+
+        let mut metadata = self.metadata.write();
+
+        if self.overlaps_system_zone_with(&metadata.desc, abs_range) {
+            return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
+        }
+
+        let block_bitmap_bid = metadata.desc.block_bitmap_bid();
+        journal::get_write_access(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+
+        // Clear bits one by one and count only allocated-to-free transitions.
+        let range_start = start_bit as u16;
+        let range_end = (start_bit + group_count) as u16;
+        let mut actually_freed: u32 = 0;
+        for block_bit in range_start..range_end {
+            if !metadata.block_bitmap.is_allocated(block_bit) {
+                warn!(
+                    "free_blocks: bit already cleared for block {}",
+                    self.first_block + start_bit as Ext4Bid + (block_bit - range_start) as Ext4Bid
+                );
+            } else {
+                metadata.block_bitmap.free(block_bit);
+                actually_freed += 1;
+            }
+        }
+
+        let new_free = metadata
+            .desc
+            .free_blocks_count()
+            .checked_add(actually_freed)
+            .ok_or_else(|| Error::with_message(Errno::EIO, "free block count overflow in group"))?;
+        metadata.desc.free_blocks_count = new_free;
+
+        let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
+        journal::dirty_metadata(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+
+        Ok(actually_freed)
+    }
+
+    /// Writes dirty metadata back to disk under a single lock.
+    ///
+    /// The block bitmap is written in full. The group descriptor is updated via
+    /// read-modify-write: the raw descriptor is read, only the mutated
+    /// `free_blocks_count_lo` is patched, and the result is written back so every
+    /// other on-disk field (flags, csum, exclude, itable_unused) is preserved.
+    pub(super) fn sync_metadata(&self) -> Result<()> {
+        let mut metadata = self.metadata.write();
+
+        if metadata.block_bitmap.is_dirty() {
+            let block_bitmap_bid = metadata.desc.block_bitmap_bid();
+            if self
+                .block_device
+                .write_bytes(
+                    Bid::new(block_bitmap_bid).to_offset(),
+                    metadata.block_bitmap.as_bytes(),
+                )
+                .is_err()
+            {
+                // Keep the dirty bit set on writeback failure for retry.
+                return_errno_with_message!(Errno::EIO, "failed to write block bitmap");
+            }
+            metadata.block_bitmap.clear_dirty();
+        }
+
+        if metadata.desc.is_dirty() {
+            let mut raw = self
+                .block_device
+                .read_val::<RawBlockGroup>(self.desc_offset)
+                .map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to read group descriptor for sync")
+                })?;
+            raw.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
+            self.block_device
+                .write_val(self.desc_offset, &raw)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write group descriptor"))?;
+            metadata.desc.clear_dirty();
+        }
+
+        Ok(())
+    }
+
+    /// Loads the block bitmap for this group.
+    fn load_block_bitmap(
+        block_device: &dyn BlockDevice,
+        first_block: Ext4Bid,
+        last_block: Ext4Bid,
+        desc: &BlockGroupDesc,
+    ) -> Result<IdBitmap> {
+        let bitmap_bid = desc.block_bitmap_bid();
+
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        if block_device
+            .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
+        }
+
+        let capacity = (last_block - first_block + 1) as u16;
+        debug_assert!(capacity <= IdBitmap::capacity());
+        Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity))
+    }
+
+    /// Checks whether `range` (filesystem-wide block numbers) overlaps any
+    /// system-metadata block of this group: the block bitmap, the inode bitmap,
+    /// or the inode-table blocks.
+    fn overlaps_system_zone_with(&self, desc: &BlockGroupDesc, range: Range<Ext4Bid>) -> bool {
+        if range.is_empty() {
+            return false;
+        }
+
+        let block_bitmap = desc.block_bitmap_bid()..(desc.block_bitmap_bid() + 1);
+        let inode_bitmap = desc.inode_bitmap_bid()..(desc.inode_bitmap_bid() + 1);
+        let inode_table = desc.inode_table_bid()
+            ..(desc.inode_table_bid() + self.nr_inode_table_blocks_per_group as Ext4Bid);
+
+        Self::ranges_overlap(&range, &block_bitmap)
+            || Self::ranges_overlap(&range, &inode_bitmap)
+            || Self::ranges_overlap(&range, &inode_table)
+    }
+
+    fn ranges_overlap(a: &Range<Ext4Bid>, b: &Range<Ext4Bid>) -> bool {
+        !a.is_empty() && !b.is_empty() && a.start < b.end && b.start < a.end
     }
 }
