@@ -30,6 +30,7 @@ pub(super) struct DirEntryHeader {
 
 impl DirEntryHeader {
     const REC_LEN_OFFSET: usize = core::mem::offset_of!(DirEntryHeader, rec_len);
+    const FILE_TYPE_OFFSET: usize = core::mem::offset_of!(DirEntryHeader, file_type);
     const ALIGN_MASK: usize = 3;
 
     /// The minimal record length that can hold a name of `name_len` bytes.
@@ -242,6 +243,20 @@ impl<'a> DirBlockView<'a> {
         let rec_len_abs_offset = self.offset + entry_offset + DirEntryHeader::REC_LEN_OFFSET;
         self.page_cache
             .write_val(rec_len_abs_offset, &rec_len.to_le())?;
+        Ok(())
+    }
+
+    /// Overwrites the `file_type` byte at `entry_offset`. Used by rename to
+    /// repoint an existing entry at a different inode of a possibly different
+    /// type.
+    pub(super) fn set_file_type(
+        &self,
+        entry_offset: usize,
+        file_type: DirEntryFileType,
+    ) -> Result<()> {
+        let file_type_abs_offset = self.offset + entry_offset + DirEntryHeader::FILE_TYPE_OFFSET;
+        self.page_cache
+            .write_val(file_type_abs_offset, &(file_type as u8))?;
         Ok(())
     }
 }

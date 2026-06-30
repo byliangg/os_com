@@ -51,6 +51,10 @@ pub(super) const RAW_BLOCK_PTRS_LEN: usize = 15;
 /// one is stored in an extent-mapped data block (a slow symlink).
 pub(super) const MAX_FAST_SYMLINK_LEN: usize = RAW_BLOCK_PTRS_LEN * 4;
 
+/// Maximum hard-link count for an inode (Linux `EXT4_LINK_MAX`). `link` rejects
+/// a request that would exceed this. Mirrors ext2 `MAX_LINK_COUNT`.
+pub(super) const MAX_LINK_COUNT: u16 = 32000;
+
 /// Logical (file-relative) block index (Linux `ext4_lblk_t`, 32-bit).
 pub(super) type Iblock = u32;
 
@@ -821,6 +825,12 @@ impl InodeInner {
     /// Sets the deletion time (`i_dtime`). Used by the reclaim path.
     fn set_dtime(&mut self, time: Duration) {
         self.desc.set_dtime(time);
+    }
+
+    /// Clears the given inode flags. Used by rename to drop a moved directory's
+    /// stale htree `INDEX` flag.
+    fn remove_flags(&mut self, flags: FileFlags) {
+        self.desc.remove_flags(flags);
     }
 
     /// Returns the inode's type.

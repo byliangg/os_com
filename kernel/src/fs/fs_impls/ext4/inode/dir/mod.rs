@@ -14,7 +14,7 @@ use ostd::sync::RwMutexWriteGuard;
 use self::dir_entry::{DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader};
 use super::{
     super::{fs::Ext4, journal, prelude::*, utils},
-    FilePerm, Inode, InodeInner,
+    FileFlags, FilePerm, Inode, InodeInner, MAX_LINK_COUNT,
 };
 
 /// A candidate slot found by [`InodeInner::find_dir_slot`] or freshly created
@@ -282,7 +282,6 @@ impl InodeInner {
 
     /// Inserts a new directory entry, growing the directory by one block when no
     /// existing block has a reusable slot.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     fn add_new_entry(
         &mut self,
         fs: &Ext4,
@@ -295,6 +294,37 @@ impl InodeInner {
             None => self.grow_dir_block(fs)?,
         };
         self.add_entry(&slot, name, ino, file_type)
+    }
+
+    /// Repoints the live entry named `name` at a new inode and file type in
+    /// place. Used by rename to replace an existing destination name rather than
+    /// adding a second entry. Mirrors ext2 `InodeInner::overwrite_entry`.
+    fn overwrite_entry(
+        &mut self,
+        name: &str,
+        new_ino: Ext4Ino,
+        new_file_type: DirEntryFileType,
+    ) -> Result<()> {
+        let entry_info = self.find_entry_info(name)?;
+        self.set_entry_target(&entry_info, new_ino, new_file_type)
+    }
+
+    /// Repoints a located entry at a new inode and file type. Used by rename to
+    /// overwrite a destination name and to update a moved directory's `..` so it
+    /// points at its new parent. Mirrors ext2 `InodeInner::set_entry_target`.
+    fn set_entry_target(
+        &mut self,
+        entry: &DirEntryInfo,
+        new_ino: Ext4Ino,
+        new_file_type: DirEntryFileType,
+    ) -> Result<()> {
+        let block_idx = entry.dir_offset / BLOCK_SIZE;
+        let entry_offset = entry.dir_offset - block_idx * BLOCK_SIZE;
+
+        let block = DirBlockView::from_index(self.page_cache()?, block_idx, self.file_size());
+        block.set_inode(entry_offset, new_ino)?;
+        block.set_file_type(entry_offset, new_file_type)?;
+        Ok(())
     }
 
     /// Locates a live entry by name, recording where it sits for deletion.
@@ -615,6 +645,277 @@ impl Inode {
 
         Ok(())
     }
+
+    /// Adds a hard link in this directory to an existing inode.
+    ///
+    /// The VFS layer rejects hard links to directories (with `EPERM`) before
+    /// reaching here, so — like ext2 — this does not re-check the type. It
+    /// rejects only an overflowing link count (`EOVERFLOW`), mirroring ext2
+    /// `Inode::link`. The two inodes (`self` and `old`) are locked through
+    /// [`MultiInodeInnerGuards`] in ino order.
+    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
+    pub(in crate::fs::fs_impls::ext4) fn link(&self, old: &Inode, name: &str) -> Result<()> {
+        let fs = self.fs()?;
+        let dir_entry_file_type = DirEntryFileType::from(old.inode_type());
+        let mut guards = MultiInodeInnerGuards::lock(&[self, old]);
+
+        if guards.inner(old.ino()).link_count() >= MAX_LINK_COUNT {
+            return_errno!(Errno::EOVERFLOW);
+        }
+
+        let dir_inner = guards.inner_mut(self.ino());
+        let slot = match dir_inner.find_dir_slot(name.len())? {
+            Some(slot) => slot,
+            None => dir_inner.grow_dir_block(&fs)?,
+        };
+        dir_inner.add_entry(&slot, name, old.ino(), dir_entry_file_type)?;
+        dir_inner.set_mtime_ctime(utils::now());
+
+        let old_inner = guards.inner_mut(old.ino());
+        old_inner.set_ctime(utils::now());
+        old_inner.inc_link_count(1);
+        Ok(())
+    }
+
+    /// Renames or moves the entry `old_name` in this directory to `new_name` in
+    /// the `target` directory (`target` may be `self`).
+    ///
+    /// The four-phase algorithm mirrors ext2 `Inode::rename`:
+    ///
+    /// 1. Resolve, under read locks, the inode of `old_name` (must exist) and of
+    ///    `new_name` if it is being replaced.
+    /// 2. Take the participating inodes' `inner` write locks in ino order through
+    ///    [`MultiInodeInnerGuards`].
+    /// 3. Validate the rename invariants ([`validate_rename_invariants`]).
+    /// 4. Apply the directory-entry and link-count mutations
+    ///    ([`apply_dir_mutations`]).
+    ///
+    /// Loop prevention (a directory moved inside its own subtree) is enforced by
+    /// the syscall layer, so it is not re-checked here (P3 plan §10.3).
+    ///
+    /// [`validate_rename_invariants`]: Self::validate_rename_invariants
+    /// [`apply_dir_mutations`]: Self::apply_dir_mutations
+    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
+    pub(in crate::fs::fs_impls::ext4) fn rename(
+        &self,
+        old_name: &str,
+        target: &Inode,
+        new_name: &str,
+    ) -> Result<()> {
+        let fs = self.fs()?;
+        let is_same_dir = self.ino() == target.ino();
+        if is_same_dir && old_name == new_name {
+            return Ok(());
+        }
+
+        // Step 1: read the inode numbers without write locks so we know which
+        // inodes to lock in step 2.
+        let old_ino = self.inner.read().find_entry_info(old_name)?.ino;
+
+        // CRITICAL drop ordering (mirrors ext2; same hazard as unlink/rmdir):
+        // `old_inode` and `replaced_inode` are declared *before* `guards`, so at
+        // scope end Rust drops `guards` first (reverse declaration order),
+        // releasing every held `inner.write()` before these `Arc`s drop. If the
+        // replaced inode's link count hit 0 below and its last `Arc` is here, its
+        // `Drop` reclaim re-takes `inner.write()`; were a guard still held this
+        // would self-deadlock. Do NOT reorder these locals after `guards`.
+        let old_inode = fs.read_inode(old_ino)?;
+        let replaced_inode = {
+            let target_inner = target.inner.read();
+            target_inner
+                .find_entry_info(new_name)
+                .ok()
+                .map(|entry_info| fs.read_inode(entry_info.ino))
+                .transpose()?
+        };
+
+        // The `DirDentry.children` lock in the VFS layer keeps both directory
+        // entries stable during this operation, so we only need to lock all
+        // related inodes in order, without rechecking the lookup results.
+        // Step 2: lock all participating inodes in global ino order. A duplicate
+        // (e.g. same-dir rename where `self == target`, or `replaced_inode`
+        // absent) is deduplicated by `MultiInodeInnerGuards::lock`.
+        let mut guards = MultiInodeInnerGuards::lock(&[
+            self as &Inode,
+            target,
+            old_inode.as_ref(),
+            replaced_inode.as_deref().unwrap_or(old_inode.as_ref()),
+        ]);
+
+        // Step 3: validate invariants under lock.
+        self.validate_rename_invariants(&guards, &old_inode, replaced_inode.as_deref())?;
+
+        // Step 4: apply directory mutations and metadata updates.
+        self.apply_dir_mutations(
+            &mut guards,
+            target,
+            old_name,
+            &old_inode,
+            replaced_inode.as_deref(),
+            new_name,
+        )?;
+
+        Ok(())
+    }
+
+    /// Validates the rename invariants under the locks taken by [`rename`].
+    ///
+    /// Mirrors ext2 `validate_rename_invariants`:
+    /// - if the moved inode is a directory, its `..` must still point at the
+    ///   source parent (`self`), else the on-disk state is corrupt (`EIO`);
+    /// - overwrite constraints when `new_name` already exists: directory onto a
+    ///   non-directory is `ENOTDIR`, non-directory onto a directory is `EISDIR`,
+    ///   and directory onto a non-empty directory is `ENOTEMPTY`.
+    ///
+    /// [`rename`]: Self::rename
+    fn validate_rename_invariants(
+        &self,
+        guards: &MultiInodeInnerGuards,
+        old_inode: &Inode,
+        replaced_inode: Option<&Inode>,
+    ) -> Result<()> {
+        // Step 3.1: sanity-check that the moved directory's `..` still points at
+        // the source parent. A mismatch indicates on-disk corruption; bail out
+        // before we silently write a wrong `..` update.
+        if old_inode.inode_type() == InodeType::Dir {
+            let old_inner = guards.inner(old_inode.ino());
+            let parent_ino = old_inner.find_entry_info("..")?.ino;
+            if parent_ino != self.ino() {
+                return_errno_with_message!(Errno::EIO, "dotdot entry inconsistent with source dir");
+            }
+        }
+
+        // Step 3.2: validate the overwrite constraints.
+        if let Some(replaced) = replaced_inode {
+            let replaced_is_dir = replaced.inode_type() == InodeType::Dir;
+            let old_is_dir = old_inode.inode_type() == InodeType::Dir;
+            if old_is_dir && !replaced_is_dir {
+                return_errno!(Errno::ENOTDIR);
+            }
+            if !old_is_dir && replaced_is_dir {
+                return_errno!(Errno::EISDIR);
+            }
+            if replaced_is_dir {
+                let replaced_inner = guards.inner(replaced.ino());
+                if !replaced_inner.empty_dir(replaced.ino()) {
+                    return_errno!(Errno::ENOTEMPTY);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Applies the directory-entry and link-count mutations for [`rename`].
+    ///
+    /// Mirrors ext2 `apply_dir_mutations`. The directory-entry mutation differs
+    /// between the same-directory and cross-directory cases; the moved
+    /// directory's `..` is repointed at `target` on a cross-directory directory
+    /// move; the replaced inode's link count is dropped (by 2 if it is a
+    /// directory — losing its own `.` and the entry — else by 1) and the inode
+    /// reclaimed if it reaches 0.
+    ///
+    /// [`rename`]: Self::rename
+    fn apply_dir_mutations(
+        &self,
+        guards: &mut MultiInodeInnerGuards,
+        target: &Inode,
+        old_name: &str,
+        old_inode: &Inode,
+        replaced_inode: Option<&Inode>,
+        new_name: &str,
+    ) -> Result<()> {
+        let old_is_dir = old_inode.inode_type() == InodeType::Dir;
+        let has_replaced = replaced_inode.is_some();
+        let old_ino = old_inode.ino();
+        let is_same_dir = self.ino() == target.ino();
+        let moved_file_type = DirEntryFileType::from(old_inode.inode_type());
+        let fs = self.fs()?;
+
+        // Step 4.1: apply the directory-entry mutations.
+        if is_same_dir {
+            let dir_inner = guards.inner_mut(self.ino());
+            if has_replaced {
+                dir_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
+            } else {
+                dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type)?;
+            }
+            // Re-read the source entry: `add_new_entry` may have split it
+            // (shrinking its `rec_len`), making any earlier `DirEntryInfo` stale.
+            let old_info = dir_inner.find_entry_info(old_name)?;
+            dir_inner.delete_entry(&old_info)?;
+            // Replacing a directory with a directory in the same parent: the
+            // parent loses the replaced directory's `..` back-reference.
+            if old_is_dir && has_replaced {
+                dir_inner.dec_link_count(1);
+            }
+            dir_inner.set_mtime_ctime(utils::now());
+        } else {
+            let target_inner = guards.inner_mut(target.ino());
+            if has_replaced {
+                target_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
+            } else {
+                target_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type)?;
+            }
+            // Moving a directory into a fresh name in `target`: `target` gains the
+            // moved directory's new `..` back-reference. When replacing, the slot
+            // already counted that reference, so `target`'s count is unchanged.
+            if old_is_dir && !has_replaced {
+                target_inner.inc_link_count(1);
+            }
+            target_inner.set_mtime_ctime(utils::now());
+
+            let source_inner = guards.inner_mut(self.ino());
+            // Re-read the source entry (same staleness reason as above, though
+            // here only the target was mutated; kept symmetric with ext2).
+            let old_info = source_inner.find_entry_info(old_name)?;
+            source_inner.delete_entry(&old_info)?;
+            // Moving a directory out of `self`: `self` loses the moved
+            // directory's `..` back-reference.
+            if old_is_dir {
+                source_inner.dec_link_count(1);
+            }
+            source_inner.set_mtime_ctime(utils::now());
+        }
+
+        // Step 4.2: drop the replaced inode's link count and reclaim it if it
+        // reaches 0.
+        if let Some(replaced) = replaced_inode {
+            let replaced_inner = guards.inner_mut(replaced.ino());
+            replaced_inner.set_ctime(utils::now());
+            // A replaced directory loses both its own `.` self-link and the
+            // entry; a replaced non-directory loses only the entry.
+            if old_is_dir {
+                replaced_inner.dec_link_count(1);
+            }
+            replaced_inner.dec_link_count(1);
+
+            if replaced_inner.link_count() == 0 {
+                // Orphan-list seam (Phase-3 no-op; see `unlink`).
+                journal::orphan_add(None, replaced.ino())?;
+                replaced_inner.write_back_inode_desc(&fs, replaced.ino())?;
+                // Drop the cache's `Arc`. If an fd still holds one the inode stays
+                // alive until that last `Arc` (here in the caller's locals, dropped
+                // after `guards`) drops, then `Drop` reclaims it.
+                let _ = fs.remove_inode(replaced.ino());
+            }
+        }
+
+        // Step 4.3: repoint a moved directory's `..` at its new parent.
+        let old_inner = guards.inner_mut(old_ino);
+        if old_is_dir && !is_same_dir {
+            let dotdot_entry_info = old_inner.find_entry_info("..")?;
+            old_inner.set_entry_target(&dotdot_entry_info, target.ino(), DirEntryFileType::Dir)?;
+            // The htree index would describe the now-stale block layout; the
+            // moved directory must be re-indexed on its next insert (P6).
+            old_inner.remove_flags(FileFlags::INDEX);
+            old_inner.set_mtime_ctime(utils::now());
+        } else {
+            old_inner.set_ctime(utils::now());
+        }
+
+        Ok(())
+    }
 }
 
 const MAX_MULTI_INODE_LOCKS: usize = 4;
@@ -659,7 +960,6 @@ impl<'a> MultiInodeInnerGuards<'a> {
     }
 
     /// Returns a shared reference to the held `inner` of inode `ino`.
-    #[expect(dead_code)] // Used by rename (Task 5); unlink/rmdir use `inner_mut`.
     fn inner(&self, ino: Ext4Ino) -> &InodeInner {
         let (_, guard) = self.entries[..self.len]
             .iter()
@@ -1026,6 +1326,9 @@ mod tests {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
             .with_inode_bitmap_metadata_marked()
+            // Reserve the pre-placed directory's inode so a created child never
+            // gets handed `DIR_INO` back (which would alias the directory).
+            .with_reserved_inode(DIR_INO)
             .build()
             .unwrap();
         let mut raw = make_empty_file_inode();
@@ -1403,5 +1706,283 @@ mod tests {
         // `orphan_del` (no-op); both must succeed and leave the inode freed.
         dir.unlink("seam").unwrap();
         assert!(!f.ext4.is_inode_allocated(child_ino));
+    }
+
+    // ── link ────────────────────────────────────────────────────────────────
+
+    /// A hard link makes a second name resolve to the same inode and bumps its
+    /// link count; unlinking one name leaves the other live with the count back
+    /// at 1.
+    #[ktest]
+    fn link_hardlinks_a_file() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let original = dir.create("a", InodeType::File, perm()).unwrap();
+        let ino = original.ino();
+        assert_eq!(original.link_count(), 1);
+
+        // Add a second name "b" linking the same inode.
+        dir.link(&original, "b").unwrap();
+        assert_eq!(original.link_count(), 2);
+        assert_eq!(dir.lookup("a").unwrap().ino(), ino);
+        assert_eq!(dir.lookup("b").unwrap().ino(), ino);
+        assert!(Arc::ptr_eq(
+            &dir.lookup("a").unwrap(),
+            &dir.lookup("b").unwrap()
+        ));
+
+        // Unlinking one name leaves the other live; the inode is not reclaimed.
+        dir.unlink("a").unwrap();
+        assert!(dir.lookup("a").is_err());
+        assert_eq!(dir.lookup("b").unwrap().ino(), ino);
+        assert_eq!(original.link_count(), 1);
+        assert!(f.ext4.is_inode_allocated(ino));
+    }
+
+    /// Hard-linking a directory is rejected above ext4: the VFS/syscall layer
+    /// returns `EPERM` before `Inode::link` is reached (see `syscall/link.rs`),
+    /// so — like ext2 — ext4's `link` performs no inode-level type check. This
+    /// test documents that the primitive itself only governs the supported
+    /// (non-directory) path; the directory guard lives in the caller.
+    #[ktest]
+    fn link_directory_guard_is_in_caller() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let file = dir.create("f", InodeType::File, perm()).unwrap();
+        dir.link(&file, "g").unwrap();
+        assert_eq!(dir.lookup("g").unwrap().ino(), file.ino());
+        assert_eq!(file.link_count(), 2);
+    }
+
+    // ── rename within one directory ──────────────────────────────────────────
+
+    /// Renaming `a` to a non-existent `b` in the same directory: `b` resolves to
+    /// the old inode and `a` is gone.
+    #[ktest]
+    fn rename_same_dir_no_replace() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let a = dir.create("a", InodeType::File, perm()).unwrap();
+        let a_ino = a.ino();
+
+        dir.rename("a", &dir, "b").unwrap();
+        assert!(dir.lookup("a").is_err());
+        assert_eq!(dir.lookup("b").unwrap().ino(), a_ino);
+        assert_eq!(readdir_names(&dir), [".", "..", "b"]);
+        // The moved inode kept its single link.
+        assert_eq!(a.link_count(), 1);
+    }
+
+    /// Renaming a no-op onto itself (`a` -> `a`) succeeds and changes nothing.
+    #[ktest]
+    fn rename_same_name_is_noop() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let a = dir.create("a", InodeType::File, perm()).unwrap();
+
+        dir.rename("a", &dir, "a").unwrap();
+        assert_eq!(dir.lookup("a").unwrap().ino(), a.ino());
+        assert_eq!(readdir_names(&dir), [".", "..", "a"]);
+    }
+
+    /// Renaming `a` onto an existing `b` (file onto file) in the same directory:
+    /// `b` now resolves to `a`'s inode, and `b`'s old inode (link count 1) is
+    /// reclaimed, restoring the free counts.
+    #[ktest]
+    fn rename_same_dir_replaces_file() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let free_inodes_before = f.ext4.block_group(0).free_inodes_count();
+        let free_blocks_before = f.ext4.block_group(0).free_blocks_count();
+
+        let a = dir.create("a", InodeType::File, perm()).unwrap();
+        let a_ino = a.ino();
+        let b = dir.create("b", InodeType::File, perm()).unwrap();
+        let b_ino = b.ino();
+        // Give `b` a data block so reclaim must free it.
+        let mut reader = VmReader::from(&[9u8; 16][..]).to_fallible();
+        b.write_at(0, &mut reader).unwrap();
+        assert!(b.sector_count() > 0);
+        drop(b);
+
+        dir.rename("a", &dir, "b").unwrap();
+
+        assert!(dir.lookup("a").is_err());
+        assert_eq!(dir.lookup("b").unwrap().ino(), a_ino);
+        assert_eq!(a.link_count(), 1);
+        // `b`'s old inode and its data block were reclaimed.
+        assert!(!f.ext4.is_inode_allocated(b_ino));
+        assert_eq!(readdir_names(&dir), [".", "..", "b"]);
+        // Net effect: only `a` survives, so exactly one inode and the blocks it
+        // does not use are back; counts match a single surviving empty file.
+        let a_alive = f.ext4.read_inode(a_ino).unwrap();
+        assert_eq!(a_alive.size(), 0);
+        // `a` (no data) plus the reclaimed `b` restore both counts to one
+        // allocated inode below the pre-create baseline.
+        assert_eq!(
+            f.ext4.block_group(0).free_inodes_count(),
+            free_inodes_before - 1
+        );
+        assert_eq!(
+            f.ext4.block_group(0).free_blocks_count(),
+            free_blocks_before
+        );
+    }
+
+    /// Renaming onto an existing name whose inode is also hard-linked elsewhere
+    /// (link count 2): the replaced name's inode survives with link count 1.
+    #[ktest]
+    fn rename_replace_hardlinked_target_survives() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let a = dir.create("a", InodeType::File, perm()).unwrap();
+        let a_ino = a.ino();
+        let b = dir.create("b", InodeType::File, perm()).unwrap();
+        let b_ino = b.ino();
+        // `b` is also reachable as "b_alias", so its link count is 2.
+        dir.link(&b, "b_alias").unwrap();
+        assert_eq!(b.link_count(), 2);
+
+        dir.rename("a", &dir, "b").unwrap();
+
+        // "b" now points at `a`; the old `b` inode survives via "b_alias".
+        assert_eq!(dir.lookup("b").unwrap().ino(), a_ino);
+        assert!(f.ext4.is_inode_allocated(b_ino));
+        assert_eq!(dir.lookup("b_alias").unwrap().ino(), b_ino);
+        assert_eq!(b.link_count(), 1);
+    }
+
+    // ── rename across directories ────────────────────────────────────────────
+
+    /// Creates two sibling subdirectories `dir1` and `dir2` under `DIR_INO` and
+    /// returns them.
+    fn two_subdirs(f: &Ext4Fixture) -> (Arc<Inode>, Arc<Inode>) {
+        let root = f.ext4.read_inode(DIR_INO).unwrap();
+        let dir1 = root.create("dir1", InodeType::Dir, perm()).unwrap();
+        let dir2 = root.create("dir2", InodeType::Dir, perm()).unwrap();
+        (dir1, dir2)
+    }
+
+    /// Moving a file from `dir1` to `dir2`: gone from `dir1`, present in `dir2`,
+    /// same inode.
+    #[ktest]
+    fn rename_moves_file_across_dirs() {
+        let f = fixture_for_create();
+        let (dir1, dir2) = two_subdirs(&f);
+
+        let file = dir1.create("f", InodeType::File, perm()).unwrap();
+        let ino = file.ino();
+
+        dir1.rename("f", &dir2, "g").unwrap();
+        assert!(dir1.lookup("f").is_err());
+        assert_eq!(dir2.lookup("g").unwrap().ino(), ino);
+        assert_eq!(file.link_count(), 1);
+        assert_eq!(readdir_names(&dir1), [".", ".."]);
+        assert_eq!(readdir_names(&dir2), [".", "..", "g"]);
+    }
+
+    /// Moving a directory across directories: its `..` now points at the new
+    /// parent, the old parent loses a link, and the new parent gains one.
+    #[ktest]
+    fn rename_moves_dir_across_dirs_repoints_dotdot() {
+        let f = fixture_for_create();
+        let (dir1, dir2) = two_subdirs(&f);
+
+        let moved = dir1.create("sub", InodeType::Dir, perm()).unwrap();
+        let moved_ino = moved.ino();
+        // dir1 gained a link for `sub`'s `..`; dir2 has only its own.
+        let dir1_links_before = dir1.link_count();
+        let dir2_links_before = dir2.link_count();
+        // `sub`'s `..` points at dir1.
+        assert_eq!(
+            moved.inner.read().find_entry_info("..").unwrap().ino,
+            dir1.ino()
+        );
+
+        dir1.rename("sub", &dir2, "sub").unwrap();
+
+        assert!(dir1.lookup("sub").is_err());
+        assert_eq!(dir2.lookup("sub").unwrap().ino(), moved_ino);
+        // `..` now points at dir2.
+        assert_eq!(
+            moved.inner.read().find_entry_info("..").unwrap().ino,
+            dir2.ino()
+        );
+        // Old parent lost the back-link, new parent gained one.
+        assert_eq!(dir1.link_count(), dir1_links_before - 1);
+        assert_eq!(dir2.link_count(), dir2_links_before + 1);
+        // The moved directory's own link count is unchanged (still `.` + entry).
+        assert_eq!(moved.link_count(), 2);
+    }
+
+    // ── rename invariant rejections ──────────────────────────────────────────
+
+    /// Renaming a directory onto a non-empty directory is rejected with
+    /// `ENOTEMPTY`, leaving both names intact.
+    #[ktest]
+    fn rename_dir_onto_nonempty_dir_enotempty() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let src = dir.create("src", InodeType::Dir, perm()).unwrap();
+        let dst = dir.create("dst", InodeType::Dir, perm()).unwrap();
+        // Make `dst` non-empty.
+        dst.create("inhabitant", InodeType::File, perm()).unwrap();
+
+        assert_eq!(
+            dir.rename("src", &dir, "dst").unwrap_err().error(),
+            Errno::ENOTEMPTY
+        );
+        assert_eq!(dir.lookup("src").unwrap().ino(), src.ino());
+        assert_eq!(dir.lookup("dst").unwrap().ino(), dst.ino());
+    }
+
+    /// Renaming a directory onto a regular file is rejected with `ENOTDIR`.
+    #[ktest]
+    fn rename_dir_onto_file_enotdir() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        dir.create("src", InodeType::Dir, perm()).unwrap();
+        dir.create("dst", InodeType::File, perm()).unwrap();
+
+        assert_eq!(
+            dir.rename("src", &dir, "dst").unwrap_err().error(),
+            Errno::ENOTDIR
+        );
+        assert!(dir.lookup("src").is_ok());
+        assert!(dir.lookup("dst").is_ok());
+    }
+
+    /// Renaming a regular file onto a directory is rejected with `EISDIR`.
+    #[ktest]
+    fn rename_file_onto_dir_eisdir() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        dir.create("src", InodeType::File, perm()).unwrap();
+        dir.create("dst", InodeType::Dir, perm()).unwrap();
+
+        assert_eq!(
+            dir.rename("src", &dir, "dst").unwrap_err().error(),
+            Errno::EISDIR
+        );
+        assert!(dir.lookup("src").is_ok());
+        assert!(dir.lookup("dst").is_ok());
+    }
+
+    /// Renaming a missing source is `ENOENT`.
+    #[ktest]
+    fn rename_missing_source_enoent() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        assert_eq!(
+            dir.rename("nope", &dir, "x").unwrap_err().error(),
+            Errno::ENOENT
+        );
     }
 }

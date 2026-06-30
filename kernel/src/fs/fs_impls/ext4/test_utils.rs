@@ -181,6 +181,11 @@ pub(super) struct Ext4FixtureBuilder {
     /// When set, override the free-inode counters to zero (for inode-ENOSPC
     /// tests). Implies the inode metadata is marked.
     no_free_inodes: bool,
+    /// When set, additionally mark this group-0 inode allocated in the inode
+    /// bitmap and decrement the free-inode counters by one. Used to reserve a
+    /// pre-placed test directory inode so the allocator does not hand its number
+    /// back out to a freshly created child. Requires `mark_inode_metadata`.
+    reserved_inode: Option<u32>,
 }
 
 impl Ext4FixtureBuilder {
@@ -194,7 +199,18 @@ impl Ext4FixtureBuilder {
             free_block_cap: None,
             mark_inode_metadata: false,
             no_free_inodes: false,
+            reserved_inode: None,
         }
+    }
+
+    /// Reserves an extra group-0 inode (beyond the reserved 1..`first_ino`): its
+    /// bitmap bit is marked allocated and the free-inode counters are reduced by
+    /// one, so the allocator skips it. Used by directory fixtures whose
+    /// pre-placed directory inode would otherwise be re-handed-out as a child.
+    pub(super) fn with_reserved_inode(mut self, ino: u32) -> Self {
+        self.mark_inode_metadata = true;
+        self.reserved_inode = Some(ino);
+        self
     }
 
     /// Marks the group-0 metadata + reserved blocks as allocated in the block
@@ -276,13 +292,16 @@ impl Ext4FixtureBuilder {
         // Per-group free-inode counts, summed for the superblock counter. Only
         // group 0 carries the reserved inodes; the zero override applies to the
         // single-group fixtures used by the inode-ENOSPC test.
+        // An extra reserved inode (a pre-placed test directory) lives in group 0
+        // and removes one free inode from group 0's count.
+        let extra_reserved = self.reserved_inode.is_some() as u32;
         let total_free_inodes: u32 = if self.no_free_inodes || !self.mark_inode_metadata {
             0
         } else {
             (0..nr_groups)
                 .map(|g| {
                     if g == 0 {
-                        self.inodes_per_group - reserved_inodes
+                        self.inodes_per_group - reserved_inodes - extra_reserved
                     } else {
                         self.inodes_per_group
                     }
@@ -344,10 +363,14 @@ impl Ext4FixtureBuilder {
             // Per-group inode bookkeeping. `inode_mark_end` is the exclusive bit
             // up to which group `g`'s inode bitmap is marked allocated.
             let reserved_in_group = if g == 0 { reserved_inodes } else { 0 };
+            let extra_reserved_in_group = if g == 0 { extra_reserved } else { 0 };
             let (free_inodes, inode_mark_end) = if self.no_free_inodes {
                 (0, self.inodes_per_group)
             } else if self.mark_inode_metadata {
-                (self.inodes_per_group - reserved_in_group, reserved_in_group)
+                (
+                    self.inodes_per_group - reserved_in_group - extra_reserved_in_group,
+                    reserved_in_group,
+                )
             } else {
                 (0, 0)
             };
@@ -384,6 +407,14 @@ impl Ext4FixtureBuilder {
                 // allocated in this group's inode bitmap. LSB-first.
                 let mut inode_bitmap = vec![0u8; BLOCK_SIZE];
                 for bit in 0..inode_mark_end as usize {
+                    inode_bitmap[bit / 8] |= 1 << (bit % 8);
+                }
+                // Mark the extra reserved inode (a pre-placed test directory) so
+                // the allocator skips its number.
+                if g == 0
+                    && let Some(ino) = self.reserved_inode
+                {
+                    let bit = (ino - 1) as usize;
                     inode_bitmap[bit / 8] |= 1 << (bit % 8);
                 }
                 disk.segment()
