@@ -2,8 +2,11 @@
 
 //! VFS `FileOps` and `Inode` trait implementations for the ext4 `Inode`.
 //!
-//! Phase 1 is read-only: read/lookup/readdir translate to ext4-internal
-//! operations; mutating methods return `EROFS`; timestamp setters are no-ops.
+//! Translates VFS requests into ext4-internal operations: data I/O through the
+//! page cache, attribute getters/setters, and the directory namespace
+//! (create/link/unlink/rmdir/rename and symlink read/write). Special files
+//! (devices, FIFOs, sockets) are deferred to a later phase: `mknod` returns
+//! `EOPNOTSUPP`.
 
 use core::time::Duration;
 
@@ -13,11 +16,11 @@ use device_id::DeviceId;
 use crate::{
     fs::{
         file::{InodeMode, InodeType, StatusFlags},
-        fs_impls::ext4::Inode as Ext4Inode,
+        fs_impls::ext4::{FilePerm, Inode as Ext4Inode},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
-            inode::{Extension, FileOps, Inode, Metadata},
+            inode::{Extension, FileOps, Inode, Metadata, MknodType, SymbolicLink},
         },
     },
     prelude::*,
@@ -168,12 +171,61 @@ impl Inode for Ext4Inode {
         Ok(self.lookup(name)?)
     }
 
+    fn create(&self, name: &str, type_: InodeType, mode: InodeMode) -> Result<Arc<dyn Inode>> {
+        Ok(self.create(name, type_, mode.into())?)
+    }
+
+    fn mknod(&self, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn Inode>> {
+        // Special files (devices, FIFOs, sockets) are deferred to a later phase;
+        // the internal `create` rejects them, so we do not even attempt it here.
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "ext4 mknod (special files) unimplemented"
+        );
+    }
+
+    fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
+        let old = old
+            .downcast_ref::<Ext4Inode>()
+            .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
+        self.link(old, name)
+    }
+
+    fn unlink(&self, name: &str) -> Result<()> {
+        self.unlink(name)
+    }
+
+    fn rmdir(&self, name: &str) -> Result<()> {
+        self.rmdir(name)
+    }
+
+    fn rename(&self, old_name: &str, target: &Arc<dyn Inode>, new_name: &str) -> Result<()> {
+        let target = target
+            .downcast_ref::<Ext4Inode>()
+            .ok_or_else(|| Error::with_message(Errno::EXDEV, "not same fs"))?;
+        self.rename(old_name, target, new_name)
+    }
+
+    fn read_link(&self) -> Result<SymbolicLink> {
+        self.read_link().map(SymbolicLink::Plain)
+    }
+
+    fn write_link(&self, target: &str) -> Result<()> {
+        self.write_link(target)
+    }
+
     fn fs(&self) -> Arc<dyn FileSystem> {
         self.fs().unwrap()
     }
 
     fn extension(&self) -> &Extension {
         self.extension()
+    }
+}
+
+impl From<InodeMode> for FilePerm {
+    fn from(mode: InodeMode) -> Self {
+        Self::from_bits_truncate(mode.bits() as _)
     }
 }
 

@@ -481,7 +481,6 @@ impl Inode {
     /// extent-flagged; `write_link` later adjusts its payload/flag.
     ///
     /// Mirrors ext2 `Inode::create`.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn create(
         &self,
         name: &str,
@@ -549,7 +548,6 @@ impl Inode {
     /// On the link count reaching 0 the inode is dropped from the cache and
     /// reclaimed by the last surviving `Arc` (see the drop-order note below).
     /// Mirrors ext2 `Inode::unlink`.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn unlink(&self, name: &str) -> Result<()> {
         let entry_info = {
             let parent_inner = self.inner.read();
@@ -601,7 +599,6 @@ impl Inode {
     ///
     /// Mirrors ext2 `Inode::rmdir`. The same `child`-before-`guards` drop
     /// ordering as [`unlink`](Self::unlink) is required and observed here.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn rmdir(&self, name: &str) -> Result<()> {
         let entry_info = {
             let parent_inner = self.inner.read();
@@ -653,7 +650,6 @@ impl Inode {
     /// rejects only an overflowing link count (`EOVERFLOW`), mirroring ext2
     /// `Inode::link`. The two inodes (`self` and `old`) are locked through
     /// [`MultiInodeInnerGuards`] in ino order.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn link(&self, old: &Inode, name: &str) -> Result<()> {
         let fs = self.fs()?;
         let dir_entry_file_type = DirEntryFileType::from(old.inode_type());
@@ -695,7 +691,6 @@ impl Inode {
     ///
     /// [`validate_rename_invariants`]: Self::validate_rename_invariants
     /// [`apply_dir_mutations`]: Self::apply_dir_mutations
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn rename(
         &self,
         old_name: &str,

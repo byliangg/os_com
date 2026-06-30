@@ -78,7 +78,7 @@ pub(super) const INLINE_DATA_FL: u32 = 0x1000_0000;
 
 /// File permission bits (the low 12 bits of `i_mode`).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct FilePerm(u16);
+pub struct FilePerm(u16);
 
 impl FilePerm {
     /// Constructs a `FilePerm` from raw mode bits, keeping only the low 12.
@@ -552,7 +552,18 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.resize(&fs, new_size)
+        // Orphan-list seam for shrinking truncates (Phase-3 no-op; Phase 4 will
+        // journal a large truncate onto the orphan list so crash recovery can
+        // finish freeing the trailing blocks if interrupted mid-shrink).
+        let is_shrink = new_size < inner.file_size();
+        if is_shrink {
+            journal::orphan_add(None, self.ino)?;
+        }
+        inner.resize(&fs, new_size)?;
+        if is_shrink {
+            journal::orphan_del(None, self.ino)?;
+        }
+        Ok(())
     }
 
     /// Persists the inode's mutable metadata (size, `i_blocks`, extent root,

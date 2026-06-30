@@ -20,7 +20,7 @@ macro_rules! __log_prefix {
 }
 
 pub use fs::Ext4;
-pub use inode::Inode;
+pub use inode::{FilePerm, Inode};
 
 use self::fs_type::Ext4Type;
 use crate::fs::vfs::registry;

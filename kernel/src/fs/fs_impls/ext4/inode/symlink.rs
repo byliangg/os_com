@@ -54,7 +54,6 @@ impl FastSymlinkTarget {
 
 impl Inode {
     /// Reads symbolic link target bytes and decodes them as UTF-8.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn read_link(&self) -> Result<String> {
         if self.type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
@@ -64,7 +63,6 @@ impl Inode {
 
     /// Writes symbolic link target bytes into either fast-inline or slow
     /// (extent-mapped) storage.
-    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
     pub(in crate::fs::fs_impls::ext4) fn write_link(&self, target: &str) -> Result<()> {
         if self.type_ != InodeType::SymLink {
             return_errno!(Errno::EINVAL);
