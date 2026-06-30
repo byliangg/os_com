@@ -34,8 +34,9 @@ use super::{fs::Ext4, journal::Tid, prelude::*};
 
 mod dir;
 mod extent_manager;
+mod symlink;
 
-use self::extent_manager::ExtentManager;
+use self::{extent_manager::ExtentManager, symlink::FastSymlinkTarget};
 use crate::fs::{file::InodeMode, vfs::inode::Extension};
 
 /// Number of 32-bit slots in `i_block` (60 bytes total).
@@ -43,6 +44,12 @@ use crate::fs::{file::InodeMode, vfs::inode::Extension};
 /// In ext4 these 60 bytes hold the inline extent-tree root rather than the
 /// direct/indirect block pointers of ext2.
 pub(super) const RAW_BLOCK_PTRS_LEN: usize = 15;
+
+/// Byte capacity of the inline `i_block` area used to store a fast symlink
+/// target (`RAW_BLOCK_PTRS_LEN * 4` = 60). A target strictly shorter than this
+/// is stored inline (one byte is reserved for the Linux trailing NUL); a longer
+/// one is stored in an extent-mapped data block (a slow symlink).
+pub(super) const MAX_FAST_SYMLINK_LEN: usize = RAW_BLOCK_PTRS_LEN * 4;
 
 /// Logical (file-relative) block index (Linux `ext4_lblk_t`, 32-bit).
 pub(super) type Iblock = u32;
@@ -216,6 +223,30 @@ impl InodeDesc {
         self.size = size;
     }
 
+    /// Overwrites the link count outright. Mutates through `Dirty`.
+    pub(super) fn set_link_count(&mut self, count: u16) {
+        self.link_count = count;
+    }
+
+    /// Adds `delta` to the link count. Mutates through `Dirty`.
+    pub(super) fn inc_link_count(&mut self, delta: u16) {
+        debug_assert!(self.link_count <= u16::MAX - delta);
+        self.link_count += delta;
+    }
+
+    /// Clears the given inode flags. Mutates through `Dirty`; used to drop the
+    /// `EXTENTS` flag when an inode switches to inline (fast-symlink) storage.
+    pub(super) fn remove_flags(&mut self, flags: FileFlags) {
+        self.flags.remove(flags);
+    }
+
+    /// Overwrites the raw `i_block` words. Mutates through `Dirty`; used to store
+    /// a fast-symlink target inline so writeback persists it (a fast symlink has
+    /// no block manager to snapshot the `i_block` from).
+    pub(super) fn set_raw_block(&mut self, block: [u32; RAW_BLOCK_PTRS_LEN]) {
+        self.block = block;
+    }
+
     /// Sets the last-modification time. Mutates through `Dirty`.
     pub(super) fn set_mtime(&mut self, time: Duration) {
         self.mtime = time;
@@ -291,7 +322,6 @@ impl InodeDesc {
     }
 
     /// Returns whether this inode's data is mapped by an extent tree.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn is_extent_based(&self) -> bool {
         self.flags.contains(FileFlags::EXTENTS)
     }
@@ -704,6 +734,18 @@ impl InodeInner {
         self.desc.set_ctime(time);
     }
 
+    /// Overwrites the link count. Used by the create error path to set it to 0
+    /// so `Drop` (Task 4) reclaims the half-built inode.
+    fn set_link_count(&mut self, count: u16) {
+        self.desc.set_link_count(count);
+    }
+
+    /// Adds `delta` to the link count. Used by the create path to bump the
+    /// parent directory's count for a new subdirectory's `..` reference.
+    fn inc_link_count(&mut self, delta: u16) {
+        self.desc.inc_link_count(delta);
+    }
+
     /// Rejects growth beyond the maximum representable file size.
     fn ensure_size_within_limit(&self, fs: &Ext4, new_size: usize) -> Result<()> {
         let max = match self.desc.type_() {
@@ -895,17 +937,21 @@ impl InodeInner {
 
 /// Type-specific inode contents.
 enum InodePayload {
-    /// Regular files and directories: page-cached data mapped by extents.
+    /// Regular files and directories: page-cached data mapped by extents. Also
+    /// slow (block-backed) symlinks, whose target lives in a data block.
     DataBacked {
         page_cache: PageCache,
         /// The authoritative extent tree + `i_blocks`, and the page-cache
         /// backend (the page cache holds only a `Weak` to it).
         block_manager: Arc<ExtentManager>,
     },
+    /// Fast (inline) symlinks: the target bytes sit in the 60-byte `i_block`
+    /// area without any data block, and the `EXTENTS` flag is cleared.
+    FastSymlink { target: FastSymlinkTarget },
     /// Inline data (small files stored in the inode); unsupported in Phase 1.
     #[expect(dead_code)]
     Inline,
-    /// Symlinks, devices, and special files (filled in by later tasks).
+    /// Devices and special files (filled in by later tasks).
     NoPayload,
 }
 
@@ -918,7 +964,23 @@ impl InodePayload {
                 desc.sector_count(),
                 fs,
             ),
-            // Symlinks, devices, and special files are handled by later tasks.
+            // A symlink is fast (inline) when it is not extent-based and its
+            // target fits in the `i_block` area; otherwise it is a slow,
+            // extent-mapped data block. A freshly created symlink (before
+            // `write_link`) starts extent-flagged and size 0, so it decodes as
+            // `DataBacked` here and `write_link` later flips it to a fast
+            // symlink if the target is short.
+            InodeType::SymLink => {
+                let size = desc.size() as usize;
+                if !desc.is_extent_based() && size <= MAX_FAST_SYMLINK_LEN {
+                    Self::FastSymlink {
+                        target: FastSymlinkTarget::new(*desc.raw_block()),
+                    }
+                } else {
+                    Self::new_data_backed(size, *desc.raw_block(), desc.sector_count(), fs)
+                }
+            }
+            // Devices and special files are handled by later tasks.
             _ => Self::NoPayload,
         }
     }

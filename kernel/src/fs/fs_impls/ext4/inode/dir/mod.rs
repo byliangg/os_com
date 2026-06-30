@@ -11,8 +11,8 @@ mod dir_entry;
 
 use self::dir_entry::{DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader};
 use super::{
-    super::{fs::Ext4, prelude::*},
-    Inode, InodeInner,
+    super::{fs::Ext4, prelude::*, utils},
+    FilePerm, Inode, InodeInner,
 };
 
 /// A candidate slot found by [`InodeInner::find_dir_slot`] or freshly created
@@ -345,7 +345,6 @@ impl InodeInner {
     /// `.` points to the directory itself (`ino`) and `..` to its parent
     /// (`parent_ino`); `..` spans the rest of the block. The parent's link
     /// count bump lives in the create path (Task 3), not here.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     fn make_empty(&mut self, fs: &Ext4, ino: Ext4Ino, parent_ino: Ext4Ino) -> Result<()> {
         // Grow the empty directory by its first block; this maps and allocates
         // the block (rolling back on its own failure) and initializes it as one
@@ -445,6 +444,77 @@ impl Inode {
     ) -> Result<usize> {
         self.inner.read().readdir_at(offset, visitor)
     }
+
+    /// Creates a child inode and directory entry under this directory.
+    ///
+    /// Only regular files, directories, and symlinks are supported; special
+    /// files (devices, FIFOs, sockets) are deferred to a later phase and rejected
+    /// with `EINVAL` (P3 plan §10.4). A freshly created symlink starts empty and
+    /// extent-flagged; `write_link` later adjusts its payload/flag.
+    ///
+    /// Mirrors ext2 `Inode::create`.
+    #[cfg_attr(not(ktest), expect(dead_code))] // Wired into the VFS in Task 6.
+    pub(in crate::fs::fs_impls::ext4) fn create(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+    ) -> Result<Arc<Inode>> {
+        if !matches!(type_, InodeType::File | InodeType::Dir | InodeType::SymLink) {
+            return_errno!(Errno::EINVAL);
+        }
+
+        let is_dir = type_ == InodeType::Dir;
+        let dir_entry_file_type = DirEntryFileType::from(type_);
+
+        // Find a slot before creating the child inode to avoid wasting an inode
+        // allocation if the directory cannot accept a new entry. The VFS dentry
+        // layer has already validated that `name` is absent.
+        let fs = self.fs()?;
+        let mut parent_inner = self.inner.write();
+        let slot = match parent_inner.find_dir_slot(name.len())? {
+            Some(slot) => slot,
+            None => parent_inner.grow_dir_block(&fs)?,
+        };
+
+        // The new inode is not yet visible in the inode cache until
+        // `insert_inode` below. This is safe because the VFS dentry layer holds
+        // an `upread` guard on the children set, preventing concurrent `create` /
+        // `lookup_via_fs` on this directory, so a concurrent `lookup_via_fs`
+        // won't build a second `Arc<Inode>` from the on-disk desc and insert it.
+        let child = fs.create_inode(self.ino, type_, perm)?;
+        let child_ino = child.ino();
+
+        // Taking `child.inner.write()` while holding `parent_inner.write()` does
+        // not need ino-ordering: the child is brand-new and unpublished (absent
+        // from the inode cache, invisible to other threads), so no other thread
+        // can hold or contend its `inner` lock.
+        let result = if is_dir {
+            child
+                .inner
+                .write()
+                .make_empty(&fs, child_ino, self.ino)
+                .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type))
+        } else {
+            parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type)
+        };
+
+        if let Err(err) = result {
+            // Clear the link count so other resources are reclaimed by `Drop`
+            // (Task 4). The half-built inode is never inserted into the cache.
+            let mut child_inner = child.inner.write();
+            child_inner.set_link_count(0);
+            return Err(err);
+        }
+
+        // Link the child dir's `..` back to this parent.
+        if is_dir {
+            parent_inner.inc_link_count(1);
+        }
+        parent_inner.set_mtime_ctime(utils::now());
+        fs.insert_inode(child.clone());
+        Ok(child)
+    }
 }
 
 #[cfg(ktest)]
@@ -452,6 +522,7 @@ mod tests {
     use alloc::{
         format,
         string::{String, ToString},
+        sync::Arc,
         vec::Vec,
     };
 
@@ -780,5 +851,176 @@ mod tests {
                 .unwrap();
         }
         assert!(!dir.inner.read().empty_dir(DIR_INO));
+    }
+
+    use super::super::FilePerm;
+
+    /// A fixture whose block *and* inode bitmaps are marked, with a `.`/`..`
+    /// directory at `DIR_INO` ready to receive `create`d children. `DIR_INO`'s
+    /// `..` points to the root inode (2).
+    fn fixture_for_create() -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner.write().make_empty(&f.ext4, DIR_INO, 2).unwrap();
+        f
+    }
+
+    fn perm() -> FilePerm {
+        FilePerm::from_bits_truncate(0o644)
+    }
+
+    /// `create` of a regular file: `lookup` finds it (type File, link count 1),
+    /// the parent's mtime advances, and the child has a valid empty extent root
+    /// with the `EXTENTS` flag (from the inode allocator).
+    #[ktest]
+    fn create_regular_file() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let mtime_before = dir.mtime();
+
+        let child = dir.create("file.txt", InodeType::File, perm()).unwrap();
+        assert_eq!(child.inode_type(), InodeType::File);
+        assert_eq!(child.link_count(), 1);
+        assert_eq!(child.size(), 0);
+        // A fresh extent-mapped file: extent flag set, no data block yet.
+        assert!(child.inner.read().desc.is_extent_based());
+        assert_eq!(child.sector_count(), 0);
+
+        // The name resolves to the child, and the cached child is identity-equal.
+        let looked_up = dir.lookup("file.txt").unwrap();
+        assert_eq!(looked_up.ino(), child.ino());
+        assert!(Arc::ptr_eq(&looked_up, &child));
+        assert_eq!(readdir_names(&dir), [".", "..", "file.txt"]);
+
+        // The parent's mtime/ctime advanced.
+        assert!(dir.mtime() >= mtime_before);
+        // The directory itself did not gain a link (only subdir creation does).
+        assert_eq!(dir.link_count(), 2);
+    }
+
+    /// `create` of a subdirectory: it has `.`/`..` (empty_dir true, `..` -> the
+    /// parent), child link count 2, and the parent's link count gains one.
+    #[ktest]
+    fn create_subdirectory() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let parent_links_before = dir.link_count();
+
+        let child = dir.create("sub", InodeType::Dir, perm()).unwrap();
+        assert_eq!(child.inode_type(), InodeType::Dir);
+        assert_eq!(child.link_count(), 2); // `.` and the parent's entry.
+
+        // The new directory has only `.`/`..`, and `..` points back to DIR_INO.
+        assert!(child.inner.read().empty_dir(child.ino()));
+        assert_eq!(child.inner.read().find_entry_ino(".").unwrap(), child.ino());
+        assert_eq!(child.inner.read().find_entry_ino("..").unwrap(), DIR_INO);
+
+        // The parent gained one link for the child's `..` reference.
+        assert_eq!(dir.link_count(), parent_links_before + 1);
+        assert_eq!(dir.lookup("sub").unwrap().ino(), child.ino());
+    }
+
+    /// Creating many children forces the parent directory to grow a second
+    /// block; every name remains resolvable afterwards.
+    #[ktest]
+    fn create_grows_parent_into_second_block() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        // 16-byte names => 24-byte records; ~169 fit in the first block after
+        // `.`/`..`, so 200 overflow into a second block.
+        let count = 200usize;
+        for i in 0..count {
+            let name = format!("child_file_{i:05}"); // 16 bytes
+            assert_eq!(name.len(), 16);
+            dir.create(&name, InodeType::File, perm()).unwrap();
+        }
+
+        assert!(dir.size() > BLOCK_SIZE, "parent directory did not grow");
+        assert_eq!(dir.size() % BLOCK_SIZE, 0, "size not block-aligned");
+        for i in 0..count {
+            let name = format!("child_file_{i:05}");
+            assert!(dir.lookup(&name).is_ok(), "missing {name}");
+        }
+        assert_eq!(readdir_names(&dir).len(), count + 2);
+    }
+
+    /// Special files are deferred: `create` rejects them with `EINVAL` and adds
+    /// no entry.
+    #[ktest]
+    fn create_rejects_special_files() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        for type_ in [
+            InodeType::CharDevice,
+            InodeType::BlockDevice,
+            InodeType::NamedPipe,
+            InodeType::Socket,
+        ] {
+            assert_eq!(
+                dir.create("special", type_, perm())
+                    .map(|_| ())
+                    .unwrap_err()
+                    .error(),
+                Errno::EINVAL
+            );
+        }
+        // No half-built entry was left behind.
+        assert_eq!(readdir_names(&dir), [".", ".."]);
+    }
+
+    /// When the child inode is allocated but the directory write fails — here a
+    /// subdirectory whose `make_empty` cannot allocate its first block because
+    /// free blocks are exhausted — `create` leaves the child link count at 0
+    /// (ready for reclaim) and the name absent.
+    #[ktest]
+    fn create_error_path_clears_link_count() {
+        clocks::init_for_ktest();
+        // Cap the image to exactly one free block, which the parent directory's
+        // `make_empty` then consumes — leaving zero for the child's.
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(1)
+            .with_inode_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        // Consumes the one free block for the parent's first directory block.
+        dir.inner.write().make_empty(&f.ext4, DIR_INO, 2).unwrap();
+        let parent_links_before = dir.link_count();
+
+        // The child inode is allocated and its on-disk desc written, but its
+        // `make_empty` block allocation fails (no free blocks left).
+        let err = dir
+            .create("doomed", InodeType::Dir, perm())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+
+        // The name was never published, the parent did not gain a link, and no
+        // live inode for "doomed" lingers in the cache.
+        assert_eq!(
+            dir.inner
+                .read()
+                .find_entry_ino("doomed")
+                .unwrap_err()
+                .error(),
+            Errno::ENOENT
+        );
+        assert_eq!(dir.link_count(), parent_links_before);
+        assert_eq!(readdir_names(&dir), [".", ".."]);
     }
 }

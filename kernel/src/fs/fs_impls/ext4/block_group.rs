@@ -285,14 +285,12 @@ impl BlockGroup {
     }
 
     /// Inserts a newly created inode into this group's live cache.
-    #[expect(dead_code)] // Phase 3 inode creation uses this.
     pub(super) fn insert_inode(&self, inode: Arc<Inode>) {
         let inode_idx = self.inode_idx_in_group(inode.ino());
         self.inode_cache.write().insert(inode_idx, inode);
     }
 
     /// Removes one inode from this group's live cache.
-    #[expect(dead_code)] // Phase 3 unlink/reclaim uses this.
     pub(super) fn remove_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
         let inode_idx = self.inode_idx_in_group(ino);
         self.inode_cache.write().remove(&inode_idx)

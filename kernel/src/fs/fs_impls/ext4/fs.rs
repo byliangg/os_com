@@ -298,13 +298,11 @@ impl Ext4 {
     /// caller's fsuid/fsgid, `now` timestamps, and a monotonic generation), and
     /// writes the full on-disk inode. On a writeback failure the inode bit is
     /// freed and the superblock counter restored. Mirrors ext2 `create_inode`.
-    // The sole inode-allocation entry point without a production caller yet; the
-    // namespace operations (create/mkdir/symlink) that drive it land in Phase 3
-    // Task 3. Marking this root reachable keeps every helper below it
-    // (`alloc_ino`/`free_inode`/`write_new_inode_desc`/`InodeDesc::new` and their
-    // callees) reachable too, so none of those need their own marker. Exercised
-    // today by ktests.
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    //
+    // Reached from `Inode::create` (the namespace entry point not yet wired into
+    // the VFS); that root's `expect(dead_code)` marker keeps this helper and
+    // everything below it (`alloc_ino`/`free_inode`/`write_new_inode_desc`/
+    // `InodeDesc::new`) reachable, so none of those need their own marker.
     pub(super) fn create_inode(
         &self,
         parent_ino: Ext4Ino,
@@ -348,6 +346,25 @@ impl Ext4 {
             block_group_idx,
             self.self_ref.clone(),
         ))
+    }
+
+    /// Inserts a newly created inode into the live block-group cache, routing it
+    /// to its owning group. Mirrors ext2 `Ext2::insert_inode`.
+    pub(super) fn insert_inode(&self, inode: Arc<Inode>) {
+        if let Ok(group) = self.find_group(inode.ino()) {
+            group.insert_inode(inode);
+        }
+    }
+
+    /// Removes one inode from the live block-group cache. Mirrors ext2
+    /// `Ext2::remove_inode`. No caller until the Phase 3 unlink/reclaim path
+    /// (Task 4); marking this root reachable keeps `BlockGroup::remove_inode`
+    /// reachable too.
+    #[expect(dead_code)]
+    pub(super) fn remove_inode(&self, ino: Ext4Ino) -> Option<Arc<Inode>> {
+        self.find_group(ino)
+            .ok()
+            .and_then(|group| group.remove_inode(ino))
     }
 
     /// Writes back the superblock and every dirty group descriptor/bitmap.

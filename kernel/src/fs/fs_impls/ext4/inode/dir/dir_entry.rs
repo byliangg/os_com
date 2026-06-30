@@ -67,6 +67,21 @@ impl From<DirEntryFileType> for InodeType {
     }
 }
 
+impl From<InodeType> for DirEntryFileType {
+    fn from(type_: InodeType) -> Self {
+        match type_ {
+            InodeType::File => Self::File,
+            InodeType::Dir => Self::Dir,
+            InodeType::CharDevice => Self::CharDevice,
+            InodeType::BlockDevice => Self::BlockDevice,
+            InodeType::NamedPipe => Self::NamedPipe,
+            InodeType::Socket => Self::Socket,
+            InodeType::SymLink => Self::SymLink,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A parsed directory entry; `name` borrows the iterator's reusable buffer.
 pub(super) struct DirEntry<'a> {
     pub header: DirEntryHeader,
