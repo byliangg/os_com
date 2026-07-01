@@ -27,26 +27,32 @@
 //! (the fsync primitive), [`Tid`]/[`tid_geq`], and the metadata-access seam
 //! below.
 //!
-//! # Metadata-access seam (still no-ops — op-journaling is deferred)
+//! # Metadata-access seam
 //!
 //! Every metadata modification is routed through four access wrappers so that
-//! journaling of the filesystem's *own* writes can be turned on by filling in
-//! their bodies without touching a call site. **Currently these are no-ops**:
-//! Phase 4 ships the journal mechanisms + recovery, but wiring our writes into
-//! transactions (op-journaling) is a follow-up; the wrappers keep their final,
-//! Phase-4-ready signatures now:
+//! journaling of the filesystem's *own* writes turns on per call site by
+//! threading a live [`Handle`] in, with no change to the wrappers:
 //!
-//! - [`get_write_access`] — about to modify an existing metadata block.
+//! - [`get_write_access`] — about to modify an existing metadata block; under a
+//!   handle it seeds the block's after-image from the device.
 //! - [`get_create_access`] — about to populate a freshly allocated metadata
-//!   block (extent index/leaf blocks, new directory blocks, new bitmaps).
-//! - [`dirty_metadata`] — the metadata block has been modified.
+//!   block (extent index/leaf blocks, new directory blocks, new bitmaps); under
+//!   a handle it seeds a zeroed after-image.
+//! - [`dirty_metadata`] — the metadata block has been modified; under a handle
+//!   its `patch` closure writes the modification into the captured after-image,
+//!   so sub-objects sharing a block accumulate onto one buffer.
 //! - [`forget`] — a previously journaled metadata block is being freed (the
-//!   sole insertion point for Phase 7 revoke records).
+//!   sole insertion point for Phase 7 revoke records); still a no-op.
 //!
-//! While these are no-ops, persistence is ext2-style: metadata objects carry a
-//! [`Dirty`](super::utils::Dirty) flag written back by `sync`. Callers must
-//! **never assume [`dirty_metadata`] makes a block persistent** — it merely
-//! marks it for writeback; "write through immediately" would bake in a
+//! **Without a handle (`None`) every wrapper is inert** and persistence stays
+//! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
+//! written back by `sync`. Phase 4 builds the capture machinery and recovery but
+//! **no metadata operation opens a handle yet** (op-journaling — reshaping the
+//! ordered-mode writes into write-ahead logging — is the Int-B follow-up), so
+//! every production call site currently passes `None` and behaviour is unchanged
+//! from Phase 3. Callers must **never assume [`dirty_metadata`] makes a block
+//! persistent** — it marks the block for writeback (and, under a handle,
+//! captures its after-image); "write through immediately" would bake in a
 //! flush-timing assumption the ordered-mode journal breaks.
 //!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
@@ -681,32 +687,79 @@ pub(super) enum TriggerType {
     DirBlock,
 }
 
-/// Records intent to modify an existing metadata block. Phase 2: no-op.
+/// Returns the journal's running transaction, verifying it still matches the
+/// handle's transaction id.
+///
+/// A mismatch means the handle outlived its transaction — impossible while the
+/// handle holds an open update (the transaction cannot commit until its last
+/// handle closes), but checked so a stale patch can never land on the wrong
+/// transaction's after-image.
+fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a mut Transaction> {
+    match state.running.as_mut() {
+        Some(running) if running.tid() == handle.tid() => Ok(running),
+        _ => return_errno_with_message!(Errno::EIO, "journal handle outlived its transaction"),
+    }
+}
+
+/// Seeds an existing metadata block's after-image from the device so later
+/// [`dirty_metadata`] patches accumulate onto its committed content (jbd2
+/// `get_write_access`).
+///
+/// Without a handle (a non-journaled volume, or a caller that opened no
+/// transaction) this is a no-op: writeback stays driven by the block's own
+/// `Dirty` flag, exactly as in Phases 1–3.
 pub(super) fn get_write_access(
-    _handle: Option<&Handle>,
-    _blocknr: Ext4Bid,
+    handle: Option<&Handle>,
+    blocknr: Ext4Bid,
     _trigger: TriggerType,
 ) -> Result<()> {
-    Ok(())
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let journal = handle.journal()?;
+    let device = journal.device.clone();
+    let mut state = journal.state_write();
+    running_for(&mut state, handle)?.capture_write(blocknr, device.as_ref())
 }
 
-/// Records intent to populate a freshly allocated metadata block. Phase 2: no-op.
+/// Seeds a freshly allocated metadata block's after-image as zeroes — its prior
+/// device content is meaningless, so no read is issued (jbd2
+/// `get_create_access`). No-op without a handle (see [`get_write_access`]).
 pub(super) fn get_create_access(
-    _handle: Option<&Handle>,
-    _blocknr: Ext4Bid,
+    handle: Option<&Handle>,
+    blocknr: Ext4Bid,
     _trigger: TriggerType,
 ) -> Result<()> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let journal = handle.journal()?;
+    let mut state = journal.state_write();
+    running_for(&mut state, handle)?.capture_create(blocknr);
     Ok(())
 }
 
-/// Marks a metadata block as modified. Phase 2: no-op (writeback is driven by
-/// the block's own `Dirty` flag; see the module-level no-op contract).
+/// Patches a metadata block's captured after-image via `patch` (jbd2
+/// `dirty_metadata`): `patch` writes this site's modification into the seeded
+/// block buffer, so sub-objects sharing one block accumulate onto the same
+/// image (see [`Transaction::apply_patch`]).
+///
+/// Without a handle this is a no-op and `patch` is **not** invoked: writeback
+/// stays on the block's own `Dirty` flag, so Phases 1–3 behaviour is unchanged.
+/// A `dirty_metadata` under a handle requires a prior `get_*_access` on the same
+/// block (else `EIO`).
 pub(super) fn dirty_metadata(
-    _handle: Option<&Handle>,
-    _blocknr: Ext4Bid,
+    handle: Option<&Handle>,
+    blocknr: Ext4Bid,
     _trigger: TriggerType,
+    patch: impl FnOnce(&mut [u8]),
 ) -> Result<()> {
-    Ok(())
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let journal = handle.journal()?;
+    let mut state = journal.state_write();
+    running_for(&mut state, handle)?.apply_patch(blocknr, patch)
 }
 
 /// Records that a previously journaled metadata block is being freed. Phase 2:
@@ -1042,5 +1095,141 @@ mod tests {
         f.journal.stop_commit_thread();
         // Idempotent: a second stop is a no-op (handle already taken).
         f.journal.stop_commit_thread();
+    }
+
+    // --- Int-B B1: metadata-capture funnels (get_*_access / dirty_metadata). ---
+
+    /// A physical block used to exercise capture, clear of the log region.
+    const CAPTURE_BLOCK: Ext4Bid = 300;
+
+    /// `get_write_access` seeds the after-image from the device, then
+    /// `dirty_metadata` patches it in place (the sub-block RMW pattern): the
+    /// seeded device bytes survive everywhere the patch does not touch.
+    #[ktest]
+    fn funnel_write_access_seeds_from_device_then_patches() {
+        let f = journaled_fixture(16, 1, 1);
+
+        let mut on_disk = [0u8; BLOCK_SIZE];
+        on_disk[0] = 0x11;
+        on_disk[BLOCK_SIZE - 1] = 0x22;
+        f.fixture
+            .disk
+            .segment()
+            .write_val(CAPTURE_BLOCK as usize * BLOCK_SIZE, &on_disk)
+            .unwrap();
+
+        let handle = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
+        dirty_metadata(
+            Some(&handle),
+            CAPTURE_BLOCK,
+            TriggerType::BlockBitmap,
+            |buf| {
+                buf[4] = 0xAB;
+            },
+        )
+        .unwrap();
+
+        let st = f.journal.state_read();
+        let captured = st
+            .running
+            .as_ref()
+            .unwrap()
+            .buffer_bytes(CAPTURE_BLOCK)
+            .unwrap();
+        assert_eq!(captured[0], 0x11, "seeded device byte survives");
+        assert_eq!(
+            captured[BLOCK_SIZE - 1],
+            0x22,
+            "seeded device byte survives"
+        );
+        assert_eq!(captured[4], 0xAB, "patch landed on the after-image");
+        drop(st);
+        journal_stop(handle).unwrap();
+    }
+
+    /// `get_create_access` seeds a *zeroed* after-image (the device content is
+    /// ignored), and repeated `dirty_metadata` patches on the same block
+    /// accumulate onto that one buffer.
+    #[ktest]
+    fn funnel_create_access_zeroes_and_accumulates() {
+        let f = journaled_fixture(16, 1, 1);
+
+        // Fill the device block with garbage to prove create-access ignores it.
+        let garbage = [0xFFu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_val(CAPTURE_BLOCK as usize * BLOCK_SIZE, &garbage)
+            .unwrap();
+
+        let handle = journal_start(&f.journal, 4).unwrap();
+        get_create_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock).unwrap();
+        dirty_metadata(
+            Some(&handle),
+            CAPTURE_BLOCK,
+            TriggerType::ExtentBlock,
+            |buf| buf[0] = 1,
+        )
+        .unwrap();
+        dirty_metadata(
+            Some(&handle),
+            CAPTURE_BLOCK,
+            TriggerType::ExtentBlock,
+            |buf| buf[1] = 2,
+        )
+        .unwrap();
+
+        let st = f.journal.state_read();
+        let captured = st
+            .running
+            .as_ref()
+            .unwrap()
+            .buffer_bytes(CAPTURE_BLOCK)
+            .unwrap();
+        assert_eq!(captured[0], 1, "first patch");
+        assert_eq!(captured[1], 2, "second patch accumulates");
+        assert_eq!(captured[2], 0, "zeroed seed, not device garbage");
+        drop(st);
+        journal_stop(handle).unwrap();
+    }
+
+    /// Without a handle the funnels are inert: no transaction is created and the
+    /// `dirty_metadata` patch is never invoked (Phases 1–3 behaviour).
+    #[ktest]
+    fn funnel_without_handle_is_inert() {
+        let f = journaled_fixture(16, 1, 1);
+
+        let mut patched = false;
+        get_write_access(None, CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
+        dirty_metadata(None, CAPTURE_BLOCK, TriggerType::BlockBitmap, |_| {
+            patched = true
+        })
+        .unwrap();
+
+        assert!(!patched, "patch must not run without a handle");
+        assert!(
+            f.journal.state_read().running.is_none(),
+            "no transaction created without a handle"
+        );
+    }
+
+    /// A `dirty_metadata` under a handle but without a prior `get_*_access` on
+    /// that block errors: nothing seeded the after-image to patch.
+    #[ktest]
+    fn funnel_dirty_without_access_errors() {
+        let f = journaled_fixture(16, 1, 1);
+        let handle = journal_start(&f.journal, 4).unwrap();
+        assert!(
+            dirty_metadata(
+                Some(&handle),
+                CAPTURE_BLOCK,
+                TriggerType::BlockBitmap,
+                |_| {}
+            )
+            .is_err(),
+            "dirty_metadata without get_*_access must fail"
+        );
+        journal_stop(handle).unwrap();
     }
 }

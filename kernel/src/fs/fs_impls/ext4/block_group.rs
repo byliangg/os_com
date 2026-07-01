@@ -76,6 +76,27 @@ pub(super) struct BlockGroupDesc {
     used_dirs_count: u32,
 }
 
+/// Patches this group's mutable descriptor counters into the after-image of the
+/// descriptor block, for op-time journaling.
+///
+/// The descriptor block holds many group descriptors; this group's lives at
+/// `desc_offset % BLOCK_SIZE` within the block. It is a read-modify-write on the
+/// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): only
+/// `free_blocks_count_lo` / `free_inodes_count_lo` / `used_dirs_count_lo` are
+/// overwritten, so every field the device held (flags, csum, itable_unused, …)
+/// and every *other* group's descriptor in the same block are preserved. Because
+/// the after-image carries the absolute in-memory counters, repeated captures of
+/// the same block within a transaction converge on the final value.
+fn patch_group_desc(buf: &mut [u8], desc_offset: usize, desc: &BlockGroupDesc) {
+    let off = desc_offset % BLOCK_SIZE;
+    let raw_bytes = &mut buf[off..off + size_of::<RawBlockGroup>()];
+    let mut raw = RawBlockGroup::from_bytes(raw_bytes);
+    raw.free_blocks_count_lo = desc.free_blocks_count() as u16;
+    raw.free_inodes_count_lo = desc.free_inodes_count() as u16;
+    raw.used_dirs_count_lo = desc.used_dirs_count() as u16;
+    raw_bytes.copy_from_slice(raw.as_bytes());
+}
+
 impl BlockGroupDesc {
     /// Returns the starting block of this group's inode table.
     pub(super) const fn inode_table_bid(&self) -> Ext4Bid {
@@ -442,8 +463,19 @@ impl BlockGroup {
         metadata.desc.free_blocks_count = new_free;
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
-        journal::dirty_metadata(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
-        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            block_bitmap_bid,
+            journal::TriggerType::BlockBitmap,
+            |buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()),
+        )?;
+        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            desc_block_bid,
+            journal::TriggerType::GroupDesc,
+            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+        )?;
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
@@ -495,8 +527,19 @@ impl BlockGroup {
         metadata.desc.free_blocks_count = new_free;
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
-        journal::dirty_metadata(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
-        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            block_bitmap_bid,
+            journal::TriggerType::BlockBitmap,
+            |buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()),
+        )?;
+        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            desc_block_bid,
+            journal::TriggerType::GroupDesc,
+            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+        )?;
 
         Ok(actually_freed)
     }
@@ -534,8 +577,19 @@ impl BlockGroup {
         }
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
-        journal::dirty_metadata(None, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
-        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            inode_bitmap_bid,
+            journal::TriggerType::InodeBitmap,
+            |buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()),
+        )?;
+        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            desc_block_bid,
+            journal::TriggerType::GroupDesc,
+            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+        )?;
 
         Ok(Some(inode_idx))
     }
@@ -587,8 +641,19 @@ impl BlockGroup {
         }
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
-        journal::dirty_metadata(None, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
-        journal::dirty_metadata(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            inode_bitmap_bid,
+            journal::TriggerType::InodeBitmap,
+            |buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()),
+        )?;
+        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::dirty_metadata(
+            None,
+            desc_block_bid,
+            journal::TriggerType::GroupDesc,
+            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+        )?;
 
         Ok(true)
     }

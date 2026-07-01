@@ -475,7 +475,9 @@ fn write_leaf_node(device: &dyn BlockDevice, bid: Ext4Bid, extents: &[Extent]) -
         block[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(ext).as_bytes());
     }
     device.write_val(bid as usize * BLOCK_SIZE, &block)?;
-    journal::dirty_metadata(None, bid, journal::TriggerType::ExtentBlock)?;
+    journal::dirty_metadata(None, bid, journal::TriggerType::ExtentBlock, |buf| {
+        buf.copy_from_slice(&block)
+    })?;
     Ok(())
 }
 

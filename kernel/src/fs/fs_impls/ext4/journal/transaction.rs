@@ -46,13 +46,16 @@
 //! other filesystem lock, so this note only fixes the intended order for the
 //! later task that threads a live [`Handle`] through the metadata operations.
 
-// The whole module is staged-but-unwired: every item is reachable only through
-// the test-only `Journal` (the four funnels in `journal/mod.rs` are still
-// no-ops), except the `Handle` *type name*, which the funnels' `Option<&Handle>`
-// signatures mention. So in non-ktest builds nearly everything here is dead;
-// this one module-level expectation absorbs all of it, avoiding a marker on
-// every field/method/function. Fulfilled by the dead code below in non-ktest,
-// and absent in ktest (where all of it is exercised).
+// The transaction *lifecycle* half of this module is staged-but-unwired: no
+// production metadata operation opens a handle yet (op-journaling is the Int-B
+// follow-up), so `journal_start`/`journal_stop`/`journal_extend`/
+// `journal_restart`, the credit/handle bookkeeping, and the non-`Running`
+// `TransactionState` variants are reachable only through ktest. The *capture*
+// half — `capture_write`/`capture_create`/`apply_patch` and [`MetaBuffer`] — is
+// already live in non-ktest via the metadata-access funnels' handle path. This
+// one module-level expectation absorbs the still-dead lifecycle items in
+// non-ktest (avoiding a marker on each); it is absent in ktest, where all of it
+// is exercised.
 #![cfg_attr(not(ktest), expect(dead_code))]
 
 use super::{
@@ -311,6 +314,18 @@ impl Handle {
     /// The blocks this handle has reserved.
     pub(super) fn credits(&self) -> usize {
         self.credits
+    }
+
+    /// Upgrades this handle's weak back-reference to its owning [`Journal`].
+    ///
+    /// Errors `EIO` if the journal has been dropped — impossible while an
+    /// operation holds an open handle (the filesystem owns the journal), but
+    /// checked so the metadata-capture funnels never dereference a dangling
+    /// weak.
+    pub(super) fn journal(&self) -> Result<Arc<Journal>> {
+        self.journal.upgrade().ok_or_else(|| {
+            Error::with_message(Errno::EIO, "journal dropped while a handle was open")
+        })
     }
 }
 
