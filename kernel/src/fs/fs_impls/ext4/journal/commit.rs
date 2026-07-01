@@ -465,9 +465,17 @@ mod tests {
     fn journaled_fixture(maxlen: u32, first: u32, sequence: u32) -> JournaledFixture {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
-            .with_has_journal()
+            // A `maxlen`-block journal (not the 2-block `with_has_journal` default)
+            // so operations run against the fixture's Ext4 can open journal handles
+            // (a 2-block log admits zero credits).
+            .with_journal_inode(maxlen)
             .build()
             .unwrap();
+        // The fixture's Ext4 auto-started a commit thread on mount. These tests
+        // drive commits manually through `journal` below (and some run operations
+        // that now open handles against the fixture's Ext4), so stop that
+        // background committer to keep this test's on-disk log deterministic.
+        f.ext4.journal().unwrap().stop_commit_thread();
 
         let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, maxlen as u16);
         f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
@@ -703,7 +711,8 @@ mod tests {
         use super::super::super::test_utils::make_empty_file_inode;
         crate::time::clocks::init_for_ktest();
 
-        let f = journaled_fixture(16, 1, 1);
+        // A 32-block log so the write's handle (WRITE_CREDITS) fits.
+        let f = journaled_fixture(32, 1, 1);
         let device = f.fixture.ext4.block_device();
 
         // A regular file (ino 11) whose data we will dirty in the page cache.

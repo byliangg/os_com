@@ -95,6 +95,54 @@ pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
 /// this module; callers only borrow a handle for capture.
 pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
 
+/// An operation's journal handle, scoped so [`journal_stop`](transaction::journal_stop)
+/// runs on **every** exit path (an early `?`, an error, or the normal return),
+/// not just the happy one.
+///
+/// A metadata operation opens one via [`Ext4::begin_op`](super::fs::Ext4) right
+/// after taking its inode `inner` lock (lock order: `inner` ① → handle ②), holds
+/// it for the operation, and threads [`get`](OpHandle::get) into the metadata
+/// funnels. On drop it closes the handle, which — when it is the transaction's
+/// last — signals the commit thread (asynchronously; durability is `fsync`'s
+/// job). A non-journaled volume yields [`none`](OpHandle::none), whose `get()` is
+/// `None`, so every funnel stays inert.
+pub(in crate::fs::fs_impls::ext4) struct OpHandle {
+    handle: Option<Handle>,
+}
+
+impl OpHandle {
+    /// A handle for a non-journaled volume: `get()` yields `None`.
+    pub(in crate::fs::fs_impls::ext4) fn none() -> Self {
+        Self { handle: None }
+    }
+
+    /// Opens a handle on `journal`'s running transaction, reserving `credits`
+    /// metadata blocks (jbd2 `jbd2_journal_start`).
+    pub(in crate::fs::fs_impls::ext4) fn start(
+        journal: &Arc<Journal>,
+        credits: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            handle: Some(transaction::journal_start(journal, credits)?),
+        })
+    }
+
+    /// Borrows the handle for threading into the metadata funnels.
+    pub(in crate::fs::fs_impls::ext4) fn get(&self) -> Option<&Handle> {
+        self.handle.as_ref()
+    }
+}
+
+impl Drop for OpHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take()
+            && let Err(e) = transaction::journal_stop(handle)
+        {
+            error!("ext4 journal_stop at operation end failed: {:?}", e);
+        }
+    }
+}
+
 /// Journal transaction id (jbd2 `tid_t`).
 pub(super) type Tid = u32;
 
@@ -435,6 +483,18 @@ impl Journal {
     /// discipline (the state lock is never held across device I/O).
     pub(super) fn state_read(&self) -> RwMutexReadGuard<'_, JournalState> {
         self.state.read()
+    }
+
+    /// The number of metadata blocks the running transaction has captured, or 0
+    /// if none is running. Inspection accessor for op-journaling tests outside the
+    /// journal module.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn running_nr_metadata_blocks(&self) -> usize {
+        self.state
+            .read()
+            .running
+            .as_ref()
+            .map_or(0, Transaction::nr_metadata_blocks)
     }
 
     /// The parsed on-disk geometry (log block map + journal superblock).

@@ -169,13 +169,36 @@ impl Ext4 {
     }
 
     /// Returns a clone of the loaded journal, or `None` on a non-journaled volume.
-    ///
-    /// The later fsync/op integration uses this to open handles and wait on
-    /// commits; Int-A only loads and starts the journal, so nothing live calls
-    /// this yet (hence the gate, dropped when fsync is wired to the journal).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn journal(&self) -> Option<Arc<journal::Journal>> {
         self.journal.read().clone()
+    }
+
+    /// Journal credits (an upper bound on the distinct metadata blocks the
+    /// operation may dirty) reserved per operation type.
+    ///
+    /// Phase 4 uses generous fixed estimates; a real `mke2fs` journal admits
+    /// hundreds of credits, so these never bind (and the tiny ktest journals
+    /// never run operations). Precise per-op credit accounting and `extend`/
+    /// `restart` for unbounded writes are a P7 refinement.
+    pub(super) const CREATE_CREDITS: usize = 16;
+    pub(super) const WRITE_CREDITS: usize = 16;
+    pub(super) const TRUNCATE_CREDITS: usize = 16;
+    pub(super) const RECLAIM_CREDITS: usize = 16;
+
+    /// Opens a journal handle for a metadata operation, reserving `credits`
+    /// metadata blocks (jbd2 `jbd2_journal_start`), or a no-op handle on a
+    /// non-journaled volume.
+    ///
+    /// The operation opens this **after** taking its inode `inner` lock (lock
+    /// order: `inner` ① → handle ②), threads [`OpHandle::get`](journal::OpHandle::get)
+    /// into the metadata funnels, and lets the returned [`OpHandle`](journal::OpHandle)
+    /// drop at the end of the operation to close the handle (and, when it is the
+    /// transaction's last, signal a commit — asynchronously).
+    pub(super) fn begin_op(&self, credits: usize) -> Result<journal::OpHandle> {
+        match self.journal() {
+            Some(journal) => journal::OpHandle::start(&journal, credits),
+            None => Ok(journal::OpHandle::none()),
+        }
     }
 
     /// Returns the maximum byte size of a regular file.
@@ -1481,6 +1504,43 @@ mod tests {
 
         // Drop the `Ext4` explicitly: `stop_commit_thread` must run and join the
         // idle commit thread without hanging. Only the fixture's `disk` Arc lingers.
+        drop(f);
+    }
+
+    /// Int-B B2.3: an operation on a journaled volume opens a handle and captures
+    /// the metadata it dirties. Allocating a block captures the block-bitmap and
+    /// group-descriptor after-images into the running transaction.
+    #[ktest]
+    fn journaled_op_captures_allocation_metadata() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        // Stop the background committer so the running transaction stays
+        // inspectable — no async commit races the assertion.
+        journal.stop_commit_thread();
+
+        {
+            // `begin_op` reserves a few credits (< the 16-block log's capacity);
+            // `alloc_blocks` then dirties the block bitmap + group descriptor.
+            let op = f.ext4.begin_op(4).unwrap();
+            let range = f.ext4.alloc_blocks(1, 0, op.get()).unwrap();
+            assert_eq!(range.end - range.start, 1);
+
+            let captured = journal.running_nr_metadata_blocks();
+            assert!(
+                captured >= 2,
+                "block bitmap + group descriptor captured, got {captured}"
+            );
+            // `op` drops here: journal_stop (its request_commit wakes the stopped
+            // thread, a no-op).
+        }
+
+        // Drop the fs: Ext4::drop stops (idempotent) then flush_on_unmount commits
+        // and checkpoints the captured transaction, leaving the journal clean.
         drop(f);
     }
 

@@ -572,7 +572,11 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.write_at(&fs, offset, reader, None)
+        // Journal handle after the inner lock (inner ① → handle ②): captures the
+        // block-bitmap / group-descriptor / extent after-images this write's
+        // allocations dirty. Dropped at return, closing the handle.
+        let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
+        inner.write_at(&fs, offset, reader, op.get())
     }
 
     /// Truncates or extends a regular file to `new_size` bytes.
@@ -586,16 +590,19 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        // Orphan-list seam for shrinking truncates (Phase-3 no-op; Phase 4 will
+        // Journal handle after the inner lock (inner ① → handle ②): captures the
+        // block-bitmap / group-descriptor / extent after-images a shrink frees.
+        let op = fs.begin_op(Ext4::TRUNCATE_CREDITS)?;
+        // Orphan-list seam for shrinking truncates (Phase-3 no-op; Task 8 will
         // journal a large truncate onto the orphan list so crash recovery can
         // finish freeing the trailing blocks if interrupted mid-shrink).
         let is_shrink = new_size < inner.file_size();
         if is_shrink {
-            journal::orphan_add(None, self.ino)?;
+            journal::orphan_add(op.get(), self.ino)?;
         }
-        inner.resize(&fs, new_size, None)?;
+        inner.resize(&fs, new_size, op.get())?;
         if is_shrink {
-            journal::orphan_del(None, self.ino)?;
+            journal::orphan_del(op.get(), self.ino)?;
         }
         Ok(())
     }
@@ -689,6 +696,10 @@ impl Inode {
         }
 
         let mut inner = self.inner.write();
+        // Journal handle after the inner lock (inner ① → handle ②): captures the
+        // block-bitmap / group-descriptor / inode-bitmap after-images freeing the
+        // inode's blocks and the inode itself dirty.
+        let op = fs.begin_op(Ext4::RECLAIM_CREDITS)?;
         let old_size = inner.file_size();
         // Only data-backed inodes (files, directories, slow symlinks) own a page
         // cache and extent-mapped blocks. A fast symlink stores its target inline
@@ -707,14 +718,14 @@ impl Inode {
         if let Some(block_manager) = block_manager
             && block_manager.sector_count() > 0
         {
-            block_manager.truncate_to_byte_len(0, None)?;
+            block_manager.truncate_to_byte_len(0, op.get())?;
         }
         inner.write_back_inode_desc(&fs, self.ino)?;
 
-        fs.free_inode(self.ino, self.type_, None)?;
-        // Orphan-list seam (Phase-3 no-op): Phase 4 unlinks the inode from the
+        fs.free_inode(self.ino, self.type_, op.get())?;
+        // Orphan-list seam (Phase-3 no-op): Task 8 unlinks the inode from the
         // on-disk orphan chain now that its blocks and inode are freed.
-        journal::orphan_del(None, self.ino)?;
+        journal::orphan_del(op.get(), self.ino)?;
         Ok(true)
     }
 

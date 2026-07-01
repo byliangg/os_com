@@ -510,9 +510,13 @@ impl Inode {
         // layer has already validated that `name` is absent.
         let fs = self.fs()?;
         let mut parent_inner = self.inner.write();
+        // Open the journal handle after the inner lock (lock order: inner ① →
+        // handle ②); it captures the inode/block-bitmap, group-descriptor and
+        // extent after-images the allocations below dirty, and closes on drop.
+        let op = fs.begin_op(Ext4::CREATE_CREDITS)?;
         let slot = match parent_inner.find_dir_slot(name.len())? {
             Some(slot) => slot,
-            None => parent_inner.grow_dir_block(&fs, None)?,
+            None => parent_inner.grow_dir_block(&fs, op.get())?,
         };
 
         // The new inode is not yet visible in the inode cache until
@@ -520,7 +524,7 @@ impl Inode {
         // an `upread` guard on the children set, preventing concurrent `create` /
         // `lookup_via_fs` on this directory, so a concurrent `lookup_via_fs`
         // won't build a second `Arc<Inode>` from the on-disk desc and insert it.
-        let child = fs.create_inode(self.ino, type_, perm, None)?;
+        let child = fs.create_inode(self.ino, type_, perm, op.get())?;
         let child_ino = child.ino();
 
         // Taking `child.inner.write()` while holding `parent_inner.write()` does
@@ -531,7 +535,7 @@ impl Inode {
             child
                 .inner
                 .write()
-                .make_empty(&fs, child_ino, self.ino, None)
+                .make_empty(&fs, child_ino, self.ino, op.get())
                 .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type))
         } else {
             parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type)
