@@ -110,7 +110,6 @@ pub(super) enum TransactionState {
     #[expect(dead_code)]
     CommitJFlush,
     /// Fully committed; awaiting checkpoint (`T_FINISHED`).
-    #[expect(dead_code)]
     Finished,
 }
 
@@ -228,6 +227,25 @@ impl Transaction {
     /// Inspection/test accessor.
     pub(super) fn buffer_bytes(&self, bid: Ext4Bid) -> Option<&[u8]> {
         self.metadata.get(&bid).map(MetaBuffer::as_bytes)
+    }
+
+    /// Iterates the captured metadata blocks as `(destination block#,
+    /// after-image bytes)` pairs, in ascending block-number order.
+    ///
+    /// The order is the [`BTreeMap`] key order, so the commit pipeline writes
+    /// descriptor tags and their logged blocks in a single deterministic order
+    /// (jbd2 walks `t_buffers` in insertion order; block order is equally valid
+    /// and lets recovery apply each after-image to its final location).
+    pub(super) fn metadata_blocks(&self) -> impl Iterator<Item = (Ext4Bid, &[u8])> {
+        self.metadata
+            .iter()
+            .map(|(&bid, buffer)| (bid, buffer.as_bytes()))
+    }
+
+    /// Moves this transaction to `state` (jbd2 `t_state` transitions driven by
+    /// the commit pipeline).
+    pub(super) fn set_state(&mut self, state: TransactionState) {
+        self.state = state;
     }
 }
 

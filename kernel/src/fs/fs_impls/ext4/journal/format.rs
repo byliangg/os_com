@@ -45,7 +45,6 @@ pub(super) struct Be16([u8; 2]);
 
 impl Be16 {
     /// Wraps a host-order value for on-disk storage (converts to big-endian).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn new(v: u16) -> Self {
         Self(v.to_be_bytes())
     }
@@ -73,7 +72,6 @@ pub(super) struct Be32([u8; 4]);
 
 impl Be32 {
     /// Wraps a host-order value for on-disk storage (converts to big-endian).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn new(v: u32) -> Self {
         Self(v.to_be_bytes())
     }
@@ -102,7 +100,6 @@ pub(super) struct Be64([u8; 8]);
 
 impl Be64 {
     /// Wraps a host-order value for on-disk storage (converts to big-endian).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn new(v: u64) -> Self {
         Self(v.to_be_bytes())
     }
@@ -125,10 +122,8 @@ pub(super) const JBD2_MAGIC: u32 = 0xC03B_3998;
 
 /// Descriptor block: lists the filesystem blocks that follow in this
 /// transaction (`JBD2_DESCRIPTOR_BLOCK`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const BLOCKTYPE_DESCRIPTOR: u32 = 1;
 /// Commit block: seals a transaction (`JBD2_COMMIT_BLOCK`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const BLOCKTYPE_COMMIT: u32 = 2;
 /// Version-1 journal superblock (`JBD2_SUPERBLOCK_V1`).
 pub(super) const BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
@@ -140,16 +135,13 @@ pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 
 /// The journaled block was escaped because it began with [`JBD2_MAGIC`]
 /// (`JBD2_FLAG_ESCAPE`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const TAG_FLAG_ESCAPE: u16 = 1;
 /// This tag reuses the UUID of the previous tag (`JBD2_FLAG_SAME_UUID`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const TAG_FLAG_SAME_UUID: u16 = 2;
 /// The tagged block was deleted (`JBD2_FLAG_DELETED`).
 #[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
 
 /// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Tolerated by

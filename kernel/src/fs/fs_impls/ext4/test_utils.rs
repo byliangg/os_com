@@ -58,6 +58,13 @@ impl Ext4MemoryDisk {
     pub(super) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes.store(fail, Ordering::Relaxed);
     }
+
+    /// The number of Flush bios issued so far (each [`BlockDevice::sync`] barrier
+    /// is one). Lets the journal commit tests assert the crash-safe barriers
+    /// fired.
+    pub(super) fn flush_count(&self) -> usize {
+        self.flush_count.load(Ordering::Relaxed)
+    }
 }
 
 impl Debug for Ext4MemoryDisk {

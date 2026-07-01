@@ -35,6 +35,8 @@
 //! affected block to these wrappers by its block number. Phase 4 introduces the
 //! buffer-based journaling the block number is a handle for.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use ostd::sync::RwMutexWriteGuard;
 
 use self::format::{JournalSuperblock, RawJournalSuperblock};
@@ -46,6 +48,7 @@ use super::{
     prelude::*,
 };
 
+mod commit;
 mod format;
 mod transaction;
 
@@ -86,8 +89,25 @@ impl JournalGeometry {
         self.superblock.sequence()
     }
 
+    /// The number of block tags that fit in a single descriptor block.
+    ///
+    /// A descriptor block holds a 12-byte [`RawJournalHeader`](format::RawJournalHeader)
+    /// then a tag array of 8-byte [`RawBlockTag`](format::RawBlockTag)s. The first
+    /// tag is followed by a 16-byte journal UUID, so the conservative capacity
+    /// (charging every tag the 16-byte UUID cost) is `(blocksize - 12 - 16) / 8`.
+    /// Phase 4 writes one descriptor per transaction, so this bounds a single
+    /// transaction's metadata blocks; used by [`Journal::max_credits`], hence live
+    /// in non-ktest builds.
+    pub(super) fn tags_per_descriptor(&self) -> usize {
+        const HEADER_LEN: usize = 12;
+        const UUID_LEN: usize = 16;
+        const TAG_LEN: usize = 8;
+        (BLOCK_SIZE - HEADER_LEN - UUID_LEN) / TAG_LEN
+    }
+
     /// Returns the log block where recovery starts; 0 means clean (`s_start`).
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    ///
+    /// Used by [`Journal::new`] to seed the tail, so it is live in non-ktest.
     pub(super) fn start(&self) -> u32 {
         self.superblock.start()
     }
@@ -100,7 +120,8 @@ impl JournalGeometry {
 
     /// Maps a log block index to its physical device block, or `None` if the
     /// index is past the end of the log.
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    ///
+    /// Referenced by the commit pipeline, so it is live in non-ktest.
     pub(super) fn log_block_to_physical(&self, log: u32) -> Option<Ext4Bid> {
         self.block_map.get(log as usize).copied()
     }
@@ -179,6 +200,13 @@ pub(super) struct Journal {
     geometry: JournalGeometry,
     /// The running-transaction state, guarded for the lifecycle operations.
     state: RwMutex<JournalState>,
+    /// The id of the most recently committed transaction (jbd2
+    /// `journal_t.j_commit_sequence`).
+    ///
+    /// An atomic, not part of [`JournalState`], so a later task's
+    /// `fsync`/`log_wait_commit` can observe commit progress without contending
+    /// on the state lock.
+    committed_tid: AtomicU32,
 }
 
 /// The mutable running-transaction state of a [`Journal`].
@@ -194,6 +222,16 @@ pub(super) struct JournalState {
     /// The tid to assign to the next transaction created
     /// (`journal_t.j_transaction_sequence`).
     pub(super) next_tid: Tid,
+    /// The next free log block to write, i.e. the current log head (jbd2
+    /// `journal_t.j_head`). Wraps within `[first, maxlen)`.
+    pub(super) head: u32,
+    /// The oldest un-checkpointed transaction's start log block — the on-disk
+    /// `s_start` (jbd2 `journal_t.j_tail`). `0` means the journal is clean (no
+    /// transaction awaits checkpoint).
+    pub(super) tail_block: u32,
+    /// The oldest un-checkpointed transaction's id — the on-disk `s_sequence`
+    /// (jbd2 `journal_t.j_tail_sequence`).
+    pub(super) tail_tid: Tid,
 }
 
 #[cfg_attr(not(ktest), expect(dead_code))]
@@ -203,24 +241,49 @@ impl Journal {
     ///
     /// The next tid is seeded from `s_sequence` — the first tid recovery expects
     /// (a fresh `mke2fs` journal has `s_sequence == 1`).
+    ///
+    /// The log-position state is seeded for a **clean** journal (Phase 4's
+    /// current assumption — a later task re-seeds it after recovery replays an
+    /// existing log):
+    /// - `head = s_first`: the first writable log block.
+    /// - `tail_block = s_start`: `0` when clean, so nothing awaits checkpoint.
+    /// - `tail_tid = s_sequence`.
+    /// - `committed_tid = s_sequence - 1`: nothing is committed yet, and the
+    ///   first commit will bear `s_sequence`.
     pub(super) fn new(geometry: JournalGeometry) -> Arc<Self> {
         let next_tid = geometry.sequence();
+        let head = geometry.first();
+        let tail_block = geometry.start();
+        let tail_tid = geometry.sequence();
         Arc::new(Self {
-            geometry,
             state: RwMutex::new(JournalState {
                 running: None,
                 next_tid,
+                head,
+                tail_block,
+                tail_tid,
             }),
+            committed_tid: AtomicU32::new(geometry.sequence().wrapping_sub(1)),
+            geometry,
         })
     }
 
     /// The maximum metadata blocks a single transaction may reserve.
     ///
-    /// A coarse but safe bound: the usable log blocks (`s_maxlen - s_first`)
-    /// minus a descriptor + commit block of per-transaction overhead. Precise
-    /// per-transaction credit accounting is a later task.
+    /// The bound is the smaller of two limits:
+    /// - The usable log blocks (`s_maxlen - s_first`) minus a descriptor + commit
+    ///   block of per-transaction overhead.
+    /// - The tags that fit in a **single** descriptor block
+    ///   ([`JournalGeometry::tags_per_descriptor`]). Phase 4's commit pipeline
+    ///   writes one descriptor block per transaction, so admitting more blocks
+    ///   than fit its tag array would make the transaction uncommittable.
+    ///   Multi-descriptor transactions are a later/perf extension.
+    ///
+    /// Precise per-transaction credit accounting is a later task.
     pub(super) fn max_credits(&self) -> usize {
-        (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize
+        let log_bound =
+            (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
+        log_bound.min(self.geometry.tags_per_descriptor())
     }
 
     /// Acquires the running-transaction state for writing.
@@ -230,6 +293,15 @@ impl Journal {
     /// [`transaction`] module's locking note.
     pub(super) fn state_write(&self) -> RwMutexWriteGuard<'_, JournalState> {
         self.state.write()
+    }
+
+    /// The id of the most recently committed transaction (jbd2
+    /// `journal_t.j_commit_sequence`).
+    ///
+    /// Read with `Acquire` so a later task's `fsync`/`log_wait_commit` sees the
+    /// commit pipeline's writes to this counter without the state lock.
+    pub(super) fn committed_tid(&self) -> Tid {
+        self.committed_tid.load(Ordering::Acquire)
     }
 }
 
