@@ -1635,6 +1635,58 @@ mod tests {
         drop(f);
     }
 
+    /// Int-B B3: under a handle, an inode writeback is *suppressed* (the direct
+    /// write to its final location does not happen), the after-image is captured,
+    /// and only checkpoint writes it to the final location — write-ahead logging.
+    /// This is the correctness B2's clean-unmount could not show, since B2's
+    /// direct writes masked whether the captured bytes were right.
+    #[ktest]
+    fn journaled_inode_writeback_is_suppressed_until_checkpoint() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let ino = ROOT_INO;
+        let mut desc = f.ext4.read_inode_desc(ino).unwrap();
+        let new_link = desc.link_count() + 7;
+        desc.set_link_count(new_link);
+        let root = *desc.raw_block();
+        let offset = f.ext4.inode_table_offset(ino).unwrap();
+        let before: RawInode = f.disk.segment().read_val(offset).unwrap();
+
+        let op = f.ext4.begin_op(4).unwrap();
+        f.ext4
+            .write_back_inode_desc(ino, &desc, &root, op.get())
+            .unwrap();
+
+        // Suppressed: the on-disk inode is UNCHANGED — the write went only to the
+        // running transaction, not to its final location.
+        let after_op: RawInode = f.disk.segment().read_val(offset).unwrap();
+        assert_eq!(
+            after_op.link_count, before.link_count,
+            "the direct write is suppressed under a handle"
+        );
+        assert!(
+            journal.running_nr_metadata_blocks() >= 1,
+            "the inode block was captured"
+        );
+        drop(op);
+
+        // Checkpoint (via the unmount flush) applies the captured after-image to
+        // the final location — so the captured bytes were correct.
+        journal.flush_on_unmount().unwrap();
+        let after_ckpt: RawInode = f.disk.segment().read_val(offset).unwrap();
+        assert_eq!(
+            after_ckpt.link_count, new_link,
+            "checkpoint wrote the captured inode to its final location"
+        );
+    }
+
     /// A non-journaled volume has no journal — the Phase 1–3 mount path is
     /// unchanged (the `load_geometry -> None` no-op branch).
     #[ktest]
