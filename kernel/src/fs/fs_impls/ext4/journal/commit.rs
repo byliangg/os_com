@@ -90,12 +90,13 @@
 // The whole commit pipeline is reachable only through the test-only `Journal`
 // until a later task wires it into `journal_stop`/`fsync`; in non-ktest builds
 // `commit_transaction` and its helpers form a closed, unreferenced cluster. One
-// module-level expectation absorbs all of it (mirroring `transaction.rs`),
-// rather than a marker on every helper — and, crucially, it keeps the format
-// constants and geometry methods the cluster references from tripping their own
-// dead-code expectations. Fulfilled by the dead cluster below in non-ktest,
-// absent in ktest (where the tests exercise everything).
-#![cfg_attr(not(ktest), expect(dead_code))]
+// module-level attribute absorbs all of it (mirroring `transaction.rs`), rather
+// than a marker on every helper. `allow` (not `expect`): once sibling modules
+// (`checkpoint`, later `recovery`) reference this module's `pub(super)` helpers,
+// a module-level `expect(dead_code)` flips to "unfulfilled"; `allow` is stable
+// under that churn. The integration task drops this attribute wholesale once the
+// pipeline is wired into a live path.
+#![cfg_attr(not(ktest), allow(dead_code))]
 
 use super::{
     super::prelude::*,
@@ -115,7 +116,11 @@ const JBD2_MAGIC_BYTES: [u8; 4] = JBD2_MAGIC.to_be_bytes();
 ///
 /// The usable log is the ring `[first, maxlen)`; block 0 holds the journal
 /// superblock and is never a log-data block, so wrapping returns to `first`.
-fn next_log_block(cur: u32, first: u32, maxlen: u32) -> u32 {
+///
+/// Shared with [`checkpoint`](super::checkpoint): the checkpoint's
+/// log-transaction reader walks the same ring as this writer, so both use one
+/// definition of the wrap rule to stay byte-for-byte consistent.
+pub(super) fn next_log_block(cur: u32, first: u32, maxlen: u32) -> u32 {
     let next = cur + 1;
     if next >= maxlen {
         first
@@ -143,7 +148,11 @@ fn write_log_block(
 
 /// Issues a durability barrier (jbd2's `blkdev_issue_flush` after a phase): a
 /// Flush that waits for all prior writes to reach the platter.
-fn barrier(device: &dyn BlockDevice) -> Result<()> {
+///
+/// Shared with [`checkpoint`](super::checkpoint), which needs the identical
+/// "make prior writes durable" semantics between its final-location writes and
+/// clearing `s_start`.
+pub(super) fn barrier(device: &dyn BlockDevice) -> Result<()> {
     match device
         .sync()
         .map_err(|_| Error::with_message(Errno::EIO, "failed to enqueue journal flush"))?

@@ -49,6 +49,7 @@ use super::{
     prelude::*,
 };
 
+mod checkpoint;
 mod commit;
 mod format;
 mod transaction;
@@ -65,7 +66,6 @@ pub(super) type Tid = u32;
 /// `i32`, is `>= 0` exactly when `a` is within half the id space *ahead of* `b`.
 /// This is the comparison [`Journal::log_wait_commit`] uses to decide whether the
 /// target transaction has already committed.
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) fn tid_geq(a: Tid, b: Tid) -> bool {
     (a.wrapping_sub(b) as i32) >= 0
 }
@@ -378,6 +378,24 @@ impl Journal {
         self.state.write()
     }
 
+    /// Acquires the running-transaction state for reading.
+    ///
+    /// [`checkpoint`](checkpoint::checkpoint) uses this to snapshot the tail /
+    /// committed-tid / head under the lock before doing its (lock-free) device
+    /// I/O, mirroring the commit pipeline's "read state, release lock, do I/O"
+    /// discipline (the state lock is never held across device I/O).
+    pub(super) fn state_read(&self) -> RwMutexReadGuard<'_, JournalState> {
+        self.state.read()
+    }
+
+    /// The parsed on-disk geometry (log block map + journal superblock).
+    ///
+    /// [`checkpoint`](checkpoint::checkpoint) needs it to resolve log blocks to
+    /// physical device blocks outside the commit pipeline.
+    pub(super) fn geometry(&self) -> &JournalGeometry {
+        &self.geometry
+    }
+
     /// The id of the most recently committed transaction (jbd2
     /// `journal_t.j_commit_sequence`).
     ///
@@ -578,7 +596,11 @@ impl Journal {
 
 /// What the commit thread should do after a wake (the decision made by
 /// [`Journal::poll_commit_action`]).
-#[cfg_attr(not(ktest), expect(dead_code))]
+//
+// `allow` (not `expect`): the enum is referenced by the commit-thread cluster,
+// whose reachability in non-ktest shifts as the journal grows, so an `expect`
+// here flips to "unfulfilled". Dropped when the thread is wired into a live path.
+#[cfg_attr(not(ktest), allow(dead_code))]
 enum CommitAction {
     /// Teardown requested (or the journal is gone): leave the loop.
     Exit,
