@@ -32,7 +32,6 @@ use crate::{
 pub(super) const ROOT_INO: Ext4Ino = 2;
 
 /// Reserved inode holding the journal.
-#[expect(dead_code)]
 pub(super) const JOURNAL_INO: Ext4Ino = 8;
 
 /// An ext4 filesystem instance.
@@ -160,7 +159,6 @@ impl Ext4 {
         Ok(())
     }
 
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn this(&self) -> Weak<Ext4> {
         self.self_ref.clone()
     }

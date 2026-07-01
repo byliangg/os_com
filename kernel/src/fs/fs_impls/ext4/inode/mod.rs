@@ -348,6 +348,40 @@ impl InodeDesc {
     }
 }
 
+/// Resolves the physical device block backing each of the first `nblocks`
+/// logical blocks of an extent-mapped inode.
+///
+/// This keeps the extent engine encapsulated in the `inode` module while handing
+/// callers a plain, fully resolved block map. The journal uses it to build its
+/// log block map from the journal inode (ino 8), whose data blocks hold the log;
+/// every log block must be a real allocated, written block, so a hole or
+/// unwritten block is an error rather than a zero-filled read.
+pub(in crate::fs::fs_impls::ext4) fn map_all_blocks(
+    fs: Weak<Ext4>,
+    root: [u32; RAW_BLOCK_PTRS_LEN],
+    sector_count: u64,
+    nblocks: u32,
+) -> Result<Vec<Ext4Bid>> {
+    let em = ExtentManager::new(root, sector_count, fs, nblocks as usize);
+    let mut map = Vec::with_capacity(nblocks as usize);
+    let mut i: Iblock = 0;
+    while i < nblocks {
+        let m = em.map_blocks(i)?;
+        if m.reads_as_zeros() {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal inode has an unmapped (hole/unwritten) block"
+            );
+        }
+        let run = m.len().min(nblocks - i);
+        for k in 0..run {
+            map.push(m.pblock() + k as Ext4Bid);
+        }
+        i += run;
+    }
+    Ok(map)
+}
+
 /// Decodes an ext4 timestamp from its seconds field and the `*_extra` field.
 ///
 /// The extra field packs a 2-bit epoch (extending seconds past 2038) in its low

@@ -35,10 +35,125 @@
 //! affected block to these wrappers by its block number. Phase 4 introduces the
 //! buffer-based journaling the block number is a handle for.
 
-use super::prelude::*;
+use self::format::{JournalSuperblock, RawJournalSuperblock};
+use super::{
+    feature::FeatureCompatSet,
+    fs::{Ext4, JOURNAL_INO},
+    inode,
+    prelude::*,
+};
+
+mod format;
 
 /// Journal transaction id (jbd2 `tid_t`).
 pub(super) type Tid = u32;
+
+/// The parsed geometry of the on-disk journal.
+///
+/// It resolves each log block to its physical device block and holds the
+/// validated journal superblock. Later tasks read and write the log through this
+/// map; Task 1 only builds and validates it.
+pub(super) struct JournalGeometry {
+    /// Log block index → physical device block; `len() == maxlen`.
+    block_map: Vec<Ext4Bid>,
+    /// The validated journal superblock (log block 0).
+    superblock: JournalSuperblock,
+}
+
+impl JournalGeometry {
+    /// Returns the total number of log blocks (`s_maxlen`).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn maxlen(&self) -> u32 {
+        self.superblock.maxlen()
+    }
+
+    /// Returns the first log block that holds log data (`s_first`).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn first(&self) -> u32 {
+        self.superblock.first()
+    }
+
+    /// Returns the first transaction id expected on recovery (`s_sequence`).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn sequence(&self) -> Tid {
+        self.superblock.sequence()
+    }
+
+    /// Returns the log block where recovery starts; 0 means clean (`s_start`).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn start(&self) -> u32 {
+        self.superblock.start()
+    }
+
+    /// Returns the journal block size in bytes (`s_blocksize`).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn blocksize(&self) -> u32 {
+        self.superblock.blocksize()
+    }
+
+    /// Maps a log block index to its physical device block, or `None` if the
+    /// index is past the end of the log.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn log_block_to_physical(&self, log: u32) -> Option<Ext4Bid> {
+        self.block_map.get(log as usize).copied()
+    }
+}
+
+/// Loads the journal geometry: reads the journal inode (ino 8), maps its blocks,
+/// and parses and validates the on-disk journal superblock (log block 0).
+///
+/// Returns `Ok(None)` when the volume has no journal (the `has_journal` compat
+/// feature is clear). Otherwise the returned [`JournalGeometry`] resolves every
+/// log block to its physical device block.
+#[cfg_attr(not(ktest), expect(dead_code))]
+pub(super) fn load_geometry(fs: &Arc<Ext4>) -> Result<Option<JournalGeometry>> {
+    // No journal: nothing to load. The recovery/commit machinery simply stays
+    // disabled for this volume.
+    if !fs
+        .super_block()
+        .feature_compat()
+        .contains(FeatureCompatSet::HAS_JOURNAL)
+    {
+        return Ok(None);
+    }
+
+    let desc = fs.read_inode_desc(JOURNAL_INO)?;
+    if !desc.is_extent_based() {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "journal inode is not extent-mapped (Phase 4 requires an extents journal)"
+        );
+    }
+
+    // The journal file spans this many blocks; its log data starts at block 0.
+    let nblocks = desc.size().div_ceil(BLOCK_SIZE as u64) as u32;
+    if nblocks < 2 {
+        return_errno_with_message!(Errno::EUCLEAN, "journal inode is too small");
+    }
+
+    let block_map = inode::map_all_blocks(fs.this(), *desc.raw_block(), desc.sector_count(), nblocks)?;
+
+    // Log block 0 holds the journal superblock.
+    let raw: RawJournalSuperblock = fs
+        .block_device()
+        .read_val(block_map[0] as usize * BLOCK_SIZE)
+        .map_err(|_| Error::with_message(Errno::EIO, "failed to read the journal superblock"))?;
+    let superblock = JournalSuperblock::try_from(raw)?;
+
+    // The superblock's declared length must fit within the blocks the inode
+    // actually maps, or the log map would be short.
+    if superblock.maxlen() as usize > block_map.len() {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "journal s_maxlen exceeds the mapped journal inode size"
+        );
+    }
+
+    Ok(Some(JournalGeometry {
+        block_map,
+        superblock,
+    }))
+}
 
 /// A handle to an open journal transaction (jbd2 `handle_t`).
 ///
@@ -129,4 +244,83 @@ pub(super) fn orphan_add(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Resul
 pub(super) fn orphan_del(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
     // Phase-4 fill point: see `orphan_add`.
     Ok(())
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::{
+        super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
+        format::{Be32, RawJournalHeader, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC},
+        *,
+    };
+
+    /// The physical block holding the journal superblock and the first log block.
+    const JOURNAL_START_BLOCK: u32 = 200;
+
+    /// Builds an on-disk journal superblock with the given geometry.
+    fn journal_super(maxlen: u32, first: u32, sequence: u32, start: u32) -> RawJournalSuperblock {
+        RawJournalSuperblock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_SUPERBLOCK_V2),
+                h_sequence: Be32::new(0),
+            },
+            s_blocksize: Be32::new(BLOCK_SIZE as u32),
+            s_maxlen: Be32::new(maxlen),
+            s_first: Be32::new(first),
+            s_sequence: Be32::new(sequence),
+            s_start: Be32::new(start),
+            s_nr_users: Be32::new(1),
+            ..Default::default()
+        }
+    }
+
+    #[ktest]
+    fn load_geometry_end_to_end() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_has_journal()
+            .build()
+            .unwrap();
+
+        // The journal inode (ino 8) maps log blocks [0, 2) to physical
+        // [200, 202); log block 0 (physical 200) holds the journal superblock.
+        let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, 2);
+        f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
+
+        // Write a valid journal superblock into physical block 200.
+        f.disk
+            .segment()
+            .write_val(
+                JOURNAL_START_BLOCK as usize * BLOCK_SIZE,
+                &journal_super(2, 1, 1, 0),
+            )
+            .unwrap();
+
+        let geo = load_geometry(&f.ext4).unwrap().unwrap();
+        assert_eq!(geo.maxlen(), 2);
+        assert_eq!(geo.first(), 1);
+        assert_eq!(geo.sequence(), 1);
+        assert_eq!(geo.start(), 0);
+        assert_eq!(geo.blocksize(), BLOCK_SIZE as u32);
+        assert_eq!(geo.log_block_to_physical(0), Some(JOURNAL_START_BLOCK as Ext4Bid));
+        assert_eq!(
+            geo.log_block_to_physical(1),
+            Some(JOURNAL_START_BLOCK as Ext4Bid + 1)
+        );
+        // Past the end of the log.
+        assert_eq!(geo.log_block_to_physical(2), None);
+    }
+
+    #[ktest]
+    fn load_geometry_without_journal_is_none() {
+        // Same fixture but without the HAS_JOURNAL compat bit.
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        assert!(load_geometry(&f.ext4).unwrap().is_none());
+    }
 }

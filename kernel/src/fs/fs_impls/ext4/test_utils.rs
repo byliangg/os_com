@@ -186,6 +186,9 @@ pub(super) struct Ext4FixtureBuilder {
     /// pre-placed test directory inode so the allocator does not hand its number
     /// back out to a freshly created child. Requires `mark_inode_metadata`.
     reserved_inode: Option<u32>,
+    /// When set, OR the `HAS_JOURNAL` compat feature bit into the superblock so
+    /// the journal geometry loader treats the volume as journaled.
+    has_journal: bool,
 }
 
 impl Ext4FixtureBuilder {
@@ -200,7 +203,16 @@ impl Ext4FixtureBuilder {
             mark_inode_metadata: false,
             no_free_inodes: false,
             reserved_inode: None,
+            has_journal: false,
         }
+    }
+
+    /// Sets the `HAS_JOURNAL` compat feature bit in the superblock, so
+    /// `journal::load_geometry` treats the volume as journaled and parses the
+    /// journal inode (ino 8).
+    pub(super) fn with_has_journal(mut self) -> Self {
+        self.has_journal = true;
+        self
     }
 
     /// Reserves an extra group-0 inode (beyond the reserved 1..`first_ino`): its
@@ -329,6 +341,9 @@ impl Ext4FixtureBuilder {
             inode_size: INODE_SIZE as u16,
             feature_incompat: 0x2 | 0x40, // FILETYPE | EXTENTS
             feature_ro_compat: 0x1,       // SPARSE_SUPER
+            // HAS_JOURNAL (0x4) when the volume is journaled; else no compat
+            // features.
+            feature_compat: if self.has_journal { 0x4 } else { 0 },
             ..Default::default()
         };
         let sb = SuperBlock::try_from(raw_sb)?;
@@ -468,6 +483,32 @@ pub(super) fn make_file_inode(data_block: u32, size: u32) -> RawInode {
     raw.block[2] = 0; // eh_generation
     raw.block[3] = 0; // ee_block = 0
     raw.block[4] = 1; // ee_len=1, ee_start_hi=0
+    raw.block[5] = data_block; // ee_start_lo
+    raw
+}
+
+/// Builds an extent-mapped inode whose `i_block` holds a single inline extent
+/// mapping logical blocks `[0, len)` to physical `[data_block, data_block +
+/// len)`, sized to exactly `len` blocks. Used for the journal inode (ino 8),
+/// whose data blocks hold the log and which must map more than one block.
+pub(super) fn make_multi_block_file_inode(data_block: u32, len: u16) -> RawInode {
+    let mut raw = RawInode {
+        mode: 0o100644, // S_IFREG | 0644
+        size_lo: len as u32 * BLOCK_SIZE as u32,
+        link_count: 1,
+        sector_count: (len as u32) * (BLOCK_SIZE / SECTOR_SIZE) as u32,
+        flags: EXTENTS_FL,
+        extra_isize: 32,
+        ..Default::default()
+    };
+    // Inline extent root: 12-byte header (magic 0xF30A, 1 entry, max 4, depth 0)
+    // followed by one written extent of `len` blocks. Each `i_block` word packs
+    // two 16-bit fields.
+    raw.block[0] = 0xF30A | (1 << 16); // eh_magic | eh_entries
+    raw.block[1] = 4; // eh_max=4, eh_depth=0
+    raw.block[2] = 0; // eh_generation
+    raw.block[3] = 0; // ee_block = 0
+    raw.block[4] = len as u32; // ee_len (low 16) | ee_start_hi (high 16, = 0)
     raw.block[5] = data_block; // ee_start_lo
     raw
 }

@@ -300,7 +300,6 @@ impl SuperBlock {
         &self.uuid
     }
 
-    #[expect(dead_code)]
     pub(super) const fn feature_compat(&self) -> FeatureCompatSet {
         self.feature_compat
     }

@@ -47,7 +47,6 @@ impl Mapping {
     }
 
     /// Returns the number of contiguous logical blocks this mapping describes.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn len(&self) -> u32 {
         self.len
     }
