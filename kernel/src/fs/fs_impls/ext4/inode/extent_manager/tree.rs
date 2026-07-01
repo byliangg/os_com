@@ -483,10 +483,15 @@ fn write_leaf_node(
         let off = ENTRY_SIZE * (1 + i);
         block[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(ext).as_bytes());
     }
-    device.write_val(bid as usize * BLOCK_SIZE, &block)?;
     journal::dirty_metadata(handle, bid, journal::TriggerType::ExtentBlock, |buf| {
         buf.copy_from_slice(&block)
     })?;
+    // Under a handle the extent block reaches its final location via checkpoint
+    // after the transaction commits; suppress the direct write so metadata never
+    // precedes its commit (WAL). See `fs::Ext4::write_back_inode_desc`.
+    if handle.is_none() {
+        device.write_val(bid as usize * BLOCK_SIZE, &block)?;
+    }
     Ok(())
 }
 

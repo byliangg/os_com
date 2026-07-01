@@ -609,6 +609,14 @@ impl Inode {
             parent_inner.inc_link_count(1);
         }
         parent_inner.set_mtime_ctime(utils::now());
+        // Journaled: persist the parent's link-count (for a subdir) and timestamp
+        // change in *this* operation's transaction, atomically with the new entry
+        // and the child inode — otherwise a crash after commit but before the
+        // deferred fsync would leave the parent's link count too low (e2fsck
+        // "link count wrong"). Non-journaled keeps the buffered writeback.
+        if op.get().is_some() {
+            parent_inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        }
         fs.insert_inode(child.clone());
         Ok(child)
     }
@@ -657,11 +665,20 @@ impl Inode {
         let child_inner = guards.inner_mut(child.ino());
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
+        // Journaled: persist the child's link-count change in this transaction,
+        // atomically with the entry removal (a crash-consistent link count, even
+        // for a surviving hard link). Non-journaled defers to the link==0 case /
+        // fsync as before.
+        if op.get().is_some() {
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
+        }
         if child_inner.link_count() == 0 {
             // Orphan-list seam (Phase-3 no-op; Task 8 journals the add so crash
             // recovery can finish a deletion interrupted past this point).
             journal::orphan_add(op.get(), child.ino())?;
-            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
+            if op.get().is_none() {
+                child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
+            }
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
@@ -716,6 +733,11 @@ impl Inode {
         // The parent loses the `..` reference the removed child held back to it.
         parent_inner.dec_link_count(1);
         parent_inner.set_mtime_ctime(utils::now());
+        // Journaled: persist the parent's link-count drop in this transaction (see
+        // `create`).
+        if op.get().is_some() {
+            parent_inner.write_back_inode_desc(&fs, self.ino(), op.get())?;
+        }
 
         Ok(())
     }
@@ -745,13 +767,20 @@ impl Inode {
         };
         dir_inner.add_entry(&slot, name, old.ino(), dir_entry_file_type, op.get())?;
         dir_inner.set_mtime_ctime(utils::now());
+        // Journaled: persist the directory inode (its size/i_blocks change if the
+        // entry grew a new block) atomically with the entry.
+        if op.get().is_some() {
+            dir_inner.write_back_inode_desc(&fs, self.ino(), op.get())?;
+        }
 
         let old_inner = guards.inner_mut(old.ino());
         old_inner.set_ctime(utils::now());
         old_inner.inc_link_count(1);
-        // `old_inner`'s link-count change is persisted by fsync/sync (its inode is
-        // marked dirty); the directory-entry + dir-block changes above are the
-        // journaled part of this operation.
+        // Journaled: persist the linked inode's incremented link count in this
+        // transaction (crash-consistent). Non-journaled defers to fsync.
+        if op.get().is_some() {
+            old_inner.write_back_inode_desc(&fs, old.ino(), op.get())?;
+        }
         Ok(())
     }
 
@@ -937,6 +966,11 @@ impl Inode {
                 dir_inner.dec_link_count(1);
             }
             dir_inner.set_mtime_ctime(utils::now());
+            // Journaled: persist the directory inode (link count / size) in this
+            // transaction, atomically with its entry mutations.
+            if handle.is_some() {
+                dir_inner.write_back_inode_desc(&fs, self.ino(), handle)?;
+            }
         } else {
             let target_inner = guards.inner_mut(target.ino());
             if has_replaced {
@@ -951,6 +985,10 @@ impl Inode {
                 target_inner.inc_link_count(1);
             }
             target_inner.set_mtime_ctime(utils::now());
+            // Journaled: persist the destination directory (link count / size).
+            if handle.is_some() {
+                target_inner.write_back_inode_desc(&fs, target.ino(), handle)?;
+            }
 
             let source_inner = guards.inner_mut(self.ino());
             // Re-read the source entry (same staleness reason as above, though
@@ -963,6 +1001,10 @@ impl Inode {
                 source_inner.dec_link_count(1);
             }
             source_inner.set_mtime_ctime(utils::now());
+            // Journaled: persist the source directory's link-count drop.
+            if handle.is_some() {
+                source_inner.write_back_inode_desc(&fs, self.ino(), handle)?;
+            }
         }
 
         // Step 4.2: drop the replaced inode's link count and reclaim it if it

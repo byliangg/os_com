@@ -641,14 +641,19 @@ impl Ext4 {
         raw.dtime = desc.dtime().as_secs() as u32;
 
         // Capture the inode block's after-image (sub-block RMW at the inode's
-        // offset within its inode-table block), then direct-write as before (B2
-        // keeps direct writes; B3 suppresses them). Only `size_of::<RawInode>()`
+        // offset within its inode-table block). Only `size_of::<RawInode>()`
         // bytes are patched — exactly what the direct write below persists — so
         // the tail (`extra_isize` region) survives from the seeded block.
         journal_inode_block(handle, offset, raw.as_bytes())?;
-        self.block_device
-            .write_val(offset, &raw)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
+        // Under a handle the after-image reaches its final location via checkpoint
+        // *after* the transaction commits; suppress the direct write so metadata
+        // never precedes its commit (write-ahead logging). Without a handle (a
+        // non-journaled volume, or the sync path) write through as before.
+        if handle.is_none() {
+            self.block_device
+                .write_val(offset, &raw)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
+        }
         Ok(())
     }
 
@@ -708,9 +713,13 @@ impl Ext4 {
         };
 
         journal_inode_block(handle, offset, raw.as_bytes())?;
-        self.block_device
-            .write_val(offset, &raw)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to write new inode"))?;
+        // See `write_back_inode_desc`: suppress the direct write under a handle so
+        // the inode reaches its final location only via checkpoint (WAL).
+        if handle.is_none() {
+            self.block_device
+                .write_val(offset, &raw)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to write new inode"))?;
+        }
         Ok(())
     }
 
