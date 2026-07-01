@@ -52,6 +52,7 @@ use super::{
 mod checkpoint;
 mod commit;
 mod format;
+mod recovery;
 mod transaction;
 
 /// Journal transaction id (jbd2 `tid_t`).

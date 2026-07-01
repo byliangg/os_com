@@ -130,7 +130,11 @@ pub(super) const BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
 /// Version-2 journal superblock (`JBD2_SUPERBLOCK_V2`).
 pub(super) const BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
 /// Revoke block: lists blocks that must not be replayed (`JBD2_REVOKE_BLOCK`).
-#[cfg_attr(not(ktest), expect(dead_code))]
+///
+/// Referenced by [`recovery`](super::recovery)'s SCAN pass, which treats a
+/// revoke block found where a descriptor is expected as the log boundary (Phase
+/// 4 writes none and ignores them on recovery; full PASS_REVOKE is Phase 7), so
+/// it is live even in non-ktest builds.
 pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 
 /// The journaled block was escaped because it began with [`JBD2_MAGIC`]
