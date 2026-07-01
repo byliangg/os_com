@@ -84,28 +84,19 @@
 //!   rejected. [`Journal::max_credits`] enforces the same bound up front.
 //! - **No checksums** (the commit block's csum fields are zero) — Phase 6/7.
 //! - **No revoke records** — Phase 7.
-//! - **Synchronous, no commit thread**: commit is driven inline by the caller
-//!   (here, tests); the background commit thread is a later task.
-
-// The whole commit pipeline is reachable only through the test-only `Journal`
-// until a later task wires it into `journal_stop`/`fsync`; in non-ktest builds
-// `commit_transaction` and its helpers form a closed, unreferenced cluster. One
-// module-level attribute absorbs all of it (mirroring `transaction.rs`), rather
-// than a marker on every helper. `allow` (not `expect`): once sibling modules
-// (`checkpoint`, later `recovery`) reference this module's `pub(super)` helpers,
-// a module-level `expect(dead_code)` flips to "unfulfilled"; `allow` is stable
-// under that churn. The integration task drops this attribute wholesale once the
-// pipeline is wired into a live path.
-#![cfg_attr(not(ktest), allow(dead_code))]
+//! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
+//!   called by the background commit thread ([`Journal::start_commit_thread`],
+//!   the sole production caller); ordered-data flushing is synchronous in that
+//!   thread's task context, with no interrupt handoff (a Phase-7 optimization).
 
 use super::{
     super::prelude::*,
+    Journal, Tid, Transaction,
     format::{
-        Be16, Be32, Be64, RawBlockTag, RawCommitBlock, RawJournalHeader, BLOCKTYPE_COMMIT,
-        BLOCKTYPE_DESCRIPTOR, JBD2_MAGIC, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be16, Be32, Be64, JBD2_MAGIC, RawBlockTag,
+        RawCommitBlock, RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
     },
     transaction::TransactionState,
-    Journal, Tid, Transaction,
 };
 
 /// The four bytes a metadata block must start with to require escaping: the
@@ -122,11 +113,7 @@ const JBD2_MAGIC_BYTES: [u8; 4] = JBD2_MAGIC.to_be_bytes();
 /// definition of the wrap rule to stay byte-for-byte consistent.
 pub(super) fn next_log_block(cur: u32, first: u32, maxlen: u32) -> u32 {
     let next = cur + 1;
-    if next >= maxlen {
-        first
-    } else {
-        next
-    }
+    if next >= maxlen { first } else { next }
 }
 
 /// Writes a full [`BLOCK_SIZE`] log block: resolves log block `log` to its
@@ -437,9 +424,10 @@ mod tests {
         // `BLOCKTYPE_COMMIT`, `BLOCKTYPE_DESCRIPTOR`, `JBD2_MAGIC`, the tag
         // flags). Only items the parent does not import are named explicitly.
         super::{
-            super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
-            format::{RawJournalSuperblock, BLOCKTYPE_SUPERBLOCK_V2},
-            load_geometry, JOURNAL_INO,
+            super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
+            JOURNAL_INO,
+            format::{BLOCKTYPE_SUPERBLOCK_V2, RawJournalSuperblock},
+            load_geometry,
         },
         *,
     };
@@ -538,7 +526,8 @@ mod tests {
         let mut txn = Transaction::new(tid);
         for (bid, content) in blocks {
             txn.capture_create(*bid);
-            txn.apply_patch(*bid, |b| b.copy_from_slice(content)).unwrap();
+            txn.apply_patch(*bid, |b| b.copy_from_slice(content))
+                .unwrap();
         }
         txn
     }
@@ -652,13 +641,19 @@ mod tests {
 
         // T1's descriptor and commit still carry tid 1.
         assert_eq!(read_log_header(&f, 1).h_sequence.get(), 1);
-        assert_eq!(read_log_header(&f, 1).h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(
+            read_log_header(&f, 1).h_blocktype.get(),
+            BLOCKTYPE_DESCRIPTOR
+        );
         assert_eq!(read_log_header(&f, 4).h_sequence.get(), 1);
         assert_eq!(read_log_header(&f, 4).h_blocktype.get(), BLOCKTYPE_COMMIT);
 
         // T2's descriptor lands right after T1, at log block 5, with tid 2.
         assert_eq!(read_log_header(&f, 5).h_sequence.get(), 2);
-        assert_eq!(read_log_header(&f, 5).h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(
+            read_log_header(&f, 5).h_blocktype.get(),
+            BLOCKTYPE_DESCRIPTOR
+        );
         assert_eq!(read_log_header(&f, 7).h_sequence.get(), 2);
         assert_eq!(read_log_header(&f, 7).h_blocktype.get(), BLOCKTYPE_COMMIT);
 
@@ -739,8 +734,7 @@ mod tests {
             .read_bytes(pblock as usize * BLOCK_SIZE, &mut on_disk)
             .unwrap();
         assert_eq!(
-            on_disk,
-            [0u8; BLOCK_SIZE],
+            on_disk, [0u8; BLOCK_SIZE],
             "data must not be on disk before commit"
         );
 

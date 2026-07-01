@@ -55,7 +55,10 @@
 // and absent in ktest (where all of it is exercised).
 #![cfg_attr(not(ktest), expect(dead_code))]
 
-use super::{super::inode::Inode, super::prelude::*, Journal, Tid};
+use super::{
+    super::{inode::Inode, prelude::*},
+    Journal, Tid,
+};
 
 /// A captured whole-block after-image for one metadata block, held in a running
 /// transaction until commit writes it to the log. Model A (op-time capture):
@@ -223,10 +226,7 @@ impl Transaction {
         patch: impl FnOnce(&mut [u8]),
     ) -> Result<()> {
         let Some(buffer) = self.metadata.get_mut(&bid) else {
-            return_errno_with_message!(
-                Errno::EIO,
-                "dirty_metadata without prior get_*_access"
-            );
+            return_errno_with_message!(Errno::EIO, "dirty_metadata without prior get_*_access");
         };
         patch(buffer.as_mut());
         Ok(())
@@ -437,9 +437,12 @@ mod tests {
 
     use super::{
         super::{
-            super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
-            format::{Be32, RawJournalHeader, RawJournalSuperblock, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC},
-            load_geometry, JOURNAL_INO,
+            super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
+            JOURNAL_INO,
+            format::{
+                BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader, RawJournalSuperblock,
+            },
+            load_geometry,
         },
         // `*` also re-exports the parent module's `Journal`, `Transaction`, etc.
         *,

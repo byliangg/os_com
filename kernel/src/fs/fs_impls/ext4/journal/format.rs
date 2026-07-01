@@ -143,7 +143,10 @@ pub(super) const TAG_FLAG_ESCAPE: u16 = 1;
 /// This tag reuses the UUID of the previous tag (`JBD2_FLAG_SAME_UUID`).
 pub(super) const TAG_FLAG_SAME_UUID: u16 = 2;
 /// The tagged block was deleted (`JBD2_FLAG_DELETED`).
-#[cfg_attr(not(ktest), expect(dead_code))]
+// Defined for jbd2 completeness; unused in Phase 4 (no revoke). Unconditional
+// `expect` (not `cfg_attr(not(ktest), ...)`) because it is dead in the ktest
+// build too, where the tests do not reference it.
+#[expect(dead_code)]
 pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
 pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
@@ -156,16 +159,18 @@ pub(super) const INCOMPAT_REVOKE: u32 = 0x1;
 pub(super) const INCOMPAT_64BIT: u32 = 0x2;
 /// Commit blocks may be written before their data is durable
 /// (`JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT`).
-#[cfg_attr(not(ktest), expect(dead_code))]
+// Defined for jbd2 completeness; dead in both builds (Phase 4 rejects it via
+// the INCOMPAT_SUPP mask rather than naming it), so an unconditional `expect`.
+#[expect(dead_code)]
 pub(super) const INCOMPAT_ASYNC_COMMIT: u32 = 0x4;
 /// Version-2 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V2`).
-#[cfg_attr(not(ktest), expect(dead_code))]
+#[expect(dead_code)]
 pub(super) const INCOMPAT_CSUM_V2: u32 = 0x8;
 /// Version-3 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V3`).
 #[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const INCOMPAT_CSUM_V3: u32 = 0x10;
 /// Fast-commit area is present (`JBD2_FEATURE_INCOMPAT_FAST_COMMIT`).
-#[cfg_attr(not(ktest), expect(dead_code))]
+#[expect(dead_code)]
 pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 
 /// The jbd2 INCOMPAT features Phase 4 supports.
@@ -447,7 +452,10 @@ mod tests {
     fn be_newtypes_round_trip() {
         assert_eq!(Be16::new(0x1234).get(), 0x1234);
         assert_eq!(Be32::new(0xC03B_3998).get(), 0xC03B_3998);
-        assert_eq!(Be64::new(0x0123_4567_89AB_CDEF).get(), 0x0123_4567_89AB_CDEF);
+        assert_eq!(
+            Be64::new(0x0123_4567_89AB_CDEF).get(),
+            0x0123_4567_89AB_CDEF
+        );
         // The stored bytes are byte-swapped relative to host order.
         assert_eq!(Be32::new(0xC03B_3998).as_bytes(), &[0xC0, 0x3B, 0x39, 0x98]);
     }

@@ -377,11 +377,12 @@ impl Ext4FixtureBuilder {
             rev_level: 1,  // Dynamic
             first_ino: 11,
             inode_size: INODE_SIZE as u16,
+            // HAS_JOURNAL (0x4) when the volume is journaled; else no compat
+            // features. (Listed before the incompat/ro_compat fields to match the
+            // struct declaration order — clippy `inconsistent_struct_constructor`.)
+            feature_compat: if self.has_journal { 0x4 } else { 0 },
             feature_incompat: 0x2 | 0x40, // FILETYPE | EXTENTS
             feature_ro_compat: 0x1,       // SPARSE_SUPER
-            // HAS_JOURNAL (0x4) when the volume is journaled; else no compat
-            // features.
-            feature_compat: if self.has_journal { 0x4 } else { 0 },
             ..Default::default()
         };
         let sb = SuperBlock::try_from(raw_sb)?;

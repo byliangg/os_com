@@ -87,13 +87,13 @@ use core::sync::atomic::Ordering;
 
 use super::{
     super::prelude::*,
+    Journal, Tid,
     checkpoint::apply_log_transaction,
     commit::{barrier, next_log_block},
     format::{
-        Be32, RawBlockTag, RawJournalHeader, RawJournalSuperblock, BLOCKTYPE_COMMIT,
-        BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, JBD2_MAGIC, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC, RawBlockTag,
+        RawJournalHeader, RawJournalSuperblock, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
     },
-    Journal, Tid,
 };
 
 /// The 12-byte jbd2 block header size (`size_of::<RawJournalHeader>()`), the
@@ -407,10 +407,11 @@ mod tests {
 
     use super::{
         super::{
-            super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
+            super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
+            JOURNAL_INO, Transaction,
             commit::commit_transaction,
-            format::{RawCommitBlock, BLOCKTYPE_SUPERBLOCK_V2},
-            load_geometry, Transaction, JOURNAL_INO,
+            format::{BLOCKTYPE_SUPERBLOCK_V2, RawCommitBlock},
+            load_geometry,
         },
         *,
     };
@@ -540,7 +541,8 @@ mod tests {
         let mut txn = Transaction::new(tid);
         for (bid, content) in blocks {
             txn.capture_create(*bid);
-            txn.apply_patch(*bid, |b| b.copy_from_slice(content)).unwrap();
+            txn.apply_patch(*bid, |b| b.copy_from_slice(content))
+                .unwrap();
         }
         txn
     }
@@ -699,9 +701,15 @@ mod tests {
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
 
         // Sanity: T2's descriptor is at log 4, its metadata at 5, its commit at 6.
-        assert_eq!(parse_header(&read_log_block_at(&f, 4)).h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(
+            parse_header(&read_log_block_at(&f, 4)).h_blocktype.get(),
+            BLOCKTYPE_DESCRIPTOR
+        );
         assert_eq!(parse_header(&read_log_block_at(&f, 4)).h_sequence.get(), 2);
-        assert_eq!(parse_header(&read_log_block_at(&f, 6)).h_blocktype.get(), BLOCKTYPE_COMMIT);
+        assert_eq!(
+            parse_header(&read_log_block_at(&f, 6)).h_blocktype.get(),
+            BLOCKTYPE_COMMIT
+        );
 
         // "Interrupt" T2's commit: zero its commit block. Now T2 has a valid
         // descriptor + metadata but no valid commit — the crash-torn tail.
@@ -709,7 +717,10 @@ mod tests {
 
         // Point the on-disk s_start at the tail (T1) so recovery scans from there.
         // (commit left it at T1's start already; assert then keep it explicit.)
-        assert_eq!(read_journal_super(&f).s_start.get(), f.journal.geometry().first());
+        assert_eq!(
+            read_journal_super(&f).s_start.get(),
+            f.journal.geometry().first()
+        );
 
         recover(f.journal.as_ref(), device.as_ref()).unwrap();
 
@@ -748,9 +759,11 @@ mod tests {
 
         // The block after T1 was never written for tid 2, so scanning it as tid 2
         // hits the boundary.
-        assert!(scan_transaction(f.journal.as_ref(), device.as_ref(), next, 2)
-            .unwrap()
-            .is_none());
+        assert!(
+            scan_transaction(f.journal.as_ref(), device.as_ref(), next, 2)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Test 5: recovery on an already-clean journal (`s_start == 0`) is a no-op —
@@ -806,9 +819,11 @@ mod tests {
         write_log_block_at(&f, 3, &commit);
 
         let first = f.journal.geometry().first();
-        assert!(scan_transaction(f.journal.as_ref(), device.as_ref(), first, 1)
-            .unwrap()
-            .is_none());
+        assert!(
+            scan_transaction(f.journal.as_ref(), device.as_ref(), first, 1)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// A second descriptor where the commit block should be (a multi-descriptor

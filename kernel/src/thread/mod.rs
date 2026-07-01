@@ -153,10 +153,9 @@ impl Thread {
     /// Joins the execution of the thread.
     ///
     /// This method will return after the thread exits.
-    // `allow` (not `expect`): the ext4 journal's commit-thread teardown
-    // (`Journal::stop_commit_thread`) is the first non-ktest user of `join`, so
-    // the previous `expect(dead_code)` is now unfulfilled in non-ktest builds.
-    #[cfg_attr(not(ktest), allow(dead_code))]
+    // No dead-code marker: the ext4 journal's commit-thread teardown
+    // (`Journal::stop_commit_thread`, reached from `Ext4::drop`) is a non-ktest
+    // user of `join`, so it is no longer dead in any build.
     #[track_caller]
     pub fn join(&self) {
         while !self.is_exited() {

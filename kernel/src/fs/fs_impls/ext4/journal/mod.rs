@@ -1,47 +1,69 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! The journaling seam (JBD2 wrappers).
+//! The JBD2 journal (crash-consistency subsystem).
 //!
-//! Phase 2 runs **without** a journal, but every metadata modification is
-//! already routed through the four access wrappers below so that Phase 4 can
-//! turn journaling on by filling in their bodies — without touching a single
-//! call site. The wrappers are deliberately given their final, Phase-4-ready
-//! signatures here:
+//! The journal gives ext4 crash consistency via write-ahead logging, jbd2's
+//! on-disk format (byte-for-byte compatible with Linux, so `e2fsck` and a stock
+//! kernel interoperate with our images). [`Journal`] is the in-memory core,
+//! loaded at mount by [`load_geometry`] + [`Journal::new`] from the journal
+//! inode (ino 8); [`Ext4::open`](super::fs::Ext4) recovers a dirty log with
+//! [`recover`] and starts the background commit thread
+//! ([`Journal::start_commit_thread`], jbd2's `kjournald`), which
+//! [`Ext4::drop`](super::fs::Ext4) stops.
+//!
+//! # Sub-modules
+//!
+//! - [`format`] — the jbd2 on-disk layout (big-endian header / superblock / tag
+//!   / commit block) and the validated [`JournalSuperblock`].
+//! - [`transaction`] — [`Transaction`] (the op-time metadata after-image
+//!   capture) and [`Handle`] (`journal_start`/`journal_stop`).
+//! - [`commit`] — the commit pipeline: a transaction's after-images →
+//!   descriptor + metadata log blocks → barrier → commit block → barrier.
+//! - [`checkpoint`] — copies committed after-images from the log to their final
+//!   locations and reclaims log space.
+//! - [`recovery`] — mount-time SCAN/REPLAY of a dirty log.
+//!
+//! This module root additionally hosts the commit thread + `log_wait_commit`
+//! (the fsync primitive), [`Tid`]/[`tid_geq`], and the metadata-access seam
+//! below.
+//!
+//! # Metadata-access seam (still no-ops — op-journaling is deferred)
+//!
+//! Every metadata modification is routed through four access wrappers so that
+//! journaling of the filesystem's *own* writes can be turned on by filling in
+//! their bodies without touching a call site. **Currently these are no-ops**:
+//! Phase 4 ships the journal mechanisms + recovery, but wiring our writes into
+//! transactions (op-journaling) is a follow-up; the wrappers keep their final,
+//! Phase-4-ready signatures now:
 //!
 //! - [`get_write_access`] — about to modify an existing metadata block.
 //! - [`get_create_access`] — about to populate a freshly allocated metadata
 //!   block (extent index/leaf blocks, new directory blocks, new bitmaps).
-//!   Missing this fourth wrapper in the first cut would force every
-//!   "newly created metadata block" path to be retrofitted when Phase 4 lands.
 //! - [`dirty_metadata`] — the metadata block has been modified.
 //! - [`forget`] — a previously journaled metadata block is being freed (the
 //!   sole insertion point for Phase 7 revoke records).
 //!
-//! # No-op contract (must hold for Phase 4 to slot in cleanly)
-//!
-//! In Phase 2 these wrappers are no-ops; the real persistence is ext2-style:
-//! metadata objects carry a [`Dirty`](super::utils::Dirty) flag and are written
-//! back by `sync`, with synchronous flushing happening **only** on
-//! `fsync`/`fdatasync`. Callers must therefore **never assume that
-//! [`dirty_metadata`] makes a block persistent**; it merely marks it for
-//! writeback. Implementing it as "write through to the device immediately"
-//! would bake in a flush-timing assumption that Phase 4's ordered-mode journal
-//! breaks.
+//! While these are no-ops, persistence is ext2-style: metadata objects carry a
+//! [`Dirty`](super::utils::Dirty) flag written back by `sync`. Callers must
+//! **never assume [`dirty_metadata`] makes a block persistent** — it merely
+//! marks it for writeback; "write through immediately" would bake in a
+//! flush-timing assumption the ordered-mode journal breaks.
 //!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
-//! `MetaBuffer` handle that owns the raw metadata block bytes. Phase 2 instead
-//! reuses ext2's proven typed-and-dirty-tracked metadata (`Dirty<IdBitmap>`,
-//! `Dirty<BlockGroupDesc>`, the inode-table page cache), and identifies the
-//! affected block to these wrappers by its block number. Phase 4 introduces the
-//! buffer-based journaling the block number is a handle for.
+//! `MetaBuffer` handle owning the raw block bytes. We instead reuse ext2's
+//! typed-and-dirty-tracked metadata (`Dirty<IdBitmap>`, `Dirty<BlockGroupDesc>`,
+//! the inode-table page cache) and identify the affected block by its number;
+//! op-journaling captures the block's after-image into a [`Transaction`] buffer.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
-use self::commit::commit_transaction;
-use self::format::{JournalSuperblock, RawJournalSuperblock};
-use self::transaction::{Handle, Transaction};
+use self::{
+    commit::commit_transaction,
+    format::{JournalSuperblock, RawJournalSuperblock},
+    transaction::{Handle, Transaction},
+};
 use super::{
     feature::FeatureCompatSet,
     fs::{Ext4, JOURNAL_INO},
@@ -186,7 +208,8 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         return_errno_with_message!(Errno::EUCLEAN, "journal inode is too small");
     }
 
-    let block_map = inode::map_all_blocks(fs.this(), *desc.raw_block(), desc.sector_count(), nblocks)?;
+    let block_map =
+        inode::map_all_blocks(fs.this(), *desc.raw_block(), desc.sector_count(), nblocks)?;
 
     // Log block 0 holds the journal superblock.
     let raw: RawJournalSuperblock = fs
@@ -210,17 +233,14 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
     }))
 }
 
-/// The in-memory journal: the parsed geometry plus the running-transaction
-/// state (jbd2 `journal_t`).
+/// The in-memory journal: the parsed geometry, the running-transaction state,
+/// the committed-tid counter, and the background commit thread (jbd2
+/// `journal_t`).
 ///
-/// Task 5 adds the background commit thread (jbd2 `kjournald`) and its wait
-/// queues; the checkpoint machinery is a later task.
-///
-/// Constructed by [`Journal::new`], which a later task calls from
-/// [`Ext4::open`]; for now it is reachable only from tests. The transaction
-/// lifecycle functions in [`transaction`] reference it, so the type itself
-/// counts as used in non-ktest builds even though nothing constructs it there
-/// yet (`Journal::new` stays gated `dead_code`).
+/// Constructed by [`Journal::new`] from [`Ext4::open`](super::fs::Ext4) on a
+/// journaled mount (after the `Ext4` `Arc` exists, since `load_geometry` reads
+/// the journal inode through the fs). `Ext4::open` recovers a dirty log, starts
+/// the commit thread, and holds the journal; `Ext4::drop` stops the thread.
 ///
 /// # Commit-thread model (jbd2 `kjournald`)
 ///
@@ -347,7 +367,13 @@ impl Journal {
         let head = geometry.first();
         let tail_block = geometry.start();
         let tail_tid = geometry.sequence();
+        // Nothing is committed yet; the first commit will bear `s_sequence`.
+        let committed_tid = geometry.sequence().wrapping_sub(1);
+        // Fields are listed in struct-declaration order (clippy
+        // `inconsistent_struct_constructor`); the geometry-derived values above
+        // are pulled into locals so `geometry` can be moved in first.
         Arc::new(Self {
+            geometry,
             device,
             state: RwMutex::new(JournalState {
                 running: None,
@@ -356,12 +382,11 @@ impl Journal {
                 tail_block,
                 tail_tid,
             }),
-            committed_tid: AtomicU32::new(geometry.sequence().wrapping_sub(1)),
+            committed_tid: AtomicU32::new(committed_tid),
             commit_trigger: WaitQueue::new(),
             commit_wait_queue: WaitQueue::new(),
             stop: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
-            geometry,
         })
     }
 
@@ -378,8 +403,7 @@ impl Journal {
     ///
     /// Precise per-transaction credit accounting is a later task.
     pub(super) fn max_credits(&self) -> usize {
-        let log_bound =
-            (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
+        let log_bound = (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
         log_bound.min(self.geometry.tags_per_descriptor())
     }
 
@@ -453,7 +477,8 @@ impl Journal {
             // strong reference, so `stop_commit_thread`'s strong count can drain.
             let action = {
                 let Some(j) = weak.upgrade() else { break };
-                j.commit_trigger.wait_until(|| Self::poll_commit_action(weak))
+                j.commit_trigger
+                    .wait_until(|| Self::poll_commit_action(weak))
             };
 
             match action {
@@ -617,10 +642,9 @@ impl Journal {
 /// What the commit thread should do after a wake (the decision made by
 /// [`Journal::poll_commit_action`]).
 //
-// `allow` (not `expect`): the enum is referenced by the commit-thread cluster,
-// whose reachability in non-ktest shifts as the journal grows, so an `expect`
-// here flips to "unfulfilled". Dropped when the thread is wired into a live path.
-#[cfg_attr(not(ktest), allow(dead_code))]
+// No dead-code marker: `Ext4::open` starts the commit thread on a journaled
+// mount, so the whole commit-thread cluster (and this enum) is live in every
+// build.
 enum CommitAction {
     /// Teardown requested (or the journal is gone): leave the loop.
     Exit,
@@ -736,7 +760,7 @@ pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
     first: u32,
     sequence: Tid,
 ) -> Result<()> {
-    use self::format::{Be32, RawJournalHeader, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC};
+    use self::format::{BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader};
     let raw = RawJournalSuperblock {
         header: RawJournalHeader {
             h_magic: Be32::new(JBD2_MAGIC),
@@ -782,8 +806,8 @@ mod tests {
     use ostd::prelude::*;
 
     use super::{
-        super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
-        format::{Be32, RawJournalHeader, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC},
+        super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
+        format::{BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader},
         *,
     };
 
@@ -836,7 +860,10 @@ mod tests {
         assert_eq!(geo.sequence(), 1);
         assert_eq!(geo.start(), 0);
         assert_eq!(geo.blocksize(), BLOCK_SIZE as u32);
-        assert_eq!(geo.log_block_to_physical(0), Some(JOURNAL_START_BLOCK as Ext4Bid));
+        assert_eq!(
+            geo.log_block_to_physical(0),
+            Some(JOURNAL_START_BLOCK as Ext4Bid)
+        );
         assert_eq!(
             geo.log_block_to_physical(1),
             Some(JOURNAL_START_BLOCK as Ext4Bid + 1)
@@ -857,9 +884,11 @@ mod tests {
 
     // --- Task 5: commit thread, log_wait_commit, teardown, tid_geq. ---
 
-    use super::super::test_utils::Ext4Fixture;
-    use super::format::{RawBlockTag, BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR};
-    use super::transaction::{journal_start, journal_stop};
+    use super::{
+        super::test_utils::Ext4Fixture,
+        format::{BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, RawBlockTag},
+        transaction::{journal_start, journal_stop},
+    };
 
     /// A journaled fixture that keeps the disk-owning [`Ext4Fixture`] alive so a
     /// test can read the on-disk log, plus the in-memory [`Journal`] with its
@@ -892,7 +921,10 @@ mod tests {
 
         let geometry = load_geometry(&f.ext4).unwrap().unwrap();
         let journal = Journal::new(geometry, f.ext4.block_device().clone());
-        JournaledFixture { journal, fixture: f }
+        JournaledFixture {
+            journal,
+            fixture: f,
+        }
     }
 
     /// Reads the jbd2 header of a log block by its log index.
@@ -905,7 +937,11 @@ mod tests {
     fn read_first_tag(f: &JournaledFixture, log: u32) -> RawBlockTag {
         let base = (JOURNAL_START_BLOCK + log) as usize * BLOCK_SIZE;
         let header_len = size_of::<RawJournalHeader>();
-        f.fixture.disk.segment().read_val(base + header_len).unwrap()
+        f.fixture
+            .disk
+            .segment()
+            .read_val(base + header_len)
+            .unwrap()
     }
 
     #[ktest]

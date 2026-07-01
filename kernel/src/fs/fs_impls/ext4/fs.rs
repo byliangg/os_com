@@ -1428,8 +1428,7 @@ mod tests {
 
     // --- Int-A: journal mount lifecycle (load / recover / start / stop). ---
 
-    use super::super::feature::FeatureIncompatSet;
-    use super::super::test_utils::JOURNAL_START_BLOCK;
+    use super::super::{feature::FeatureIncompatSet, test_utils::JOURNAL_START_BLOCK};
 
     /// The on-disk `RECOVER` incompatible feature bit.
     const RECOVER_BIT: u32 = FeatureIncompatSet::RECOVER.bits();
@@ -1505,7 +1504,10 @@ mod tests {
             b
         };
         // s_start is bytes [20..24] of the journal superblock (big-endian), nonzero.
-        assert_ne!(u32::from_be_bytes([raw_jsb[20], raw_jsb[21], raw_jsb[22], raw_jsb[23]]), 0);
+        assert_ne!(
+            u32::from_be_bytes([raw_jsb[20], raw_jsb[21], raw_jsb[22], raw_jsb[23]]),
+            0
+        );
 
         // Set the ext4 superblock's RECOVER incompat bit on disk so the next mount
         // treats the volume as needing recovery.
@@ -1514,7 +1516,9 @@ mod tests {
             .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
             .unwrap();
         raw_sb.feature_incompat |= RECOVER_BIT;
-        disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw_sb).unwrap();
+        disk.segment()
+            .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
+            .unwrap();
 
         // Tear down the first mount (stops its commit thread) before re-mounting.
         drop(journal);

@@ -84,12 +84,13 @@
 
 use super::{
     super::prelude::*,
+    Journal, Tid,
     commit::{barrier, next_log_block},
     format::{
-        Be32, RawBlockTag, RawJournalHeader, RawJournalSuperblock, BLOCKTYPE_COMMIT,
-        BLOCKTYPE_DESCRIPTOR, JBD2_MAGIC, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawBlockTag, RawJournalHeader,
+        RawJournalSuperblock, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
     },
-    tid_geq, Journal, Tid,
+    tid_geq,
 };
 
 /// The 12-byte jbd2 block header size, the offset at which a descriptor block's
@@ -205,7 +206,10 @@ pub(super) fn apply_log_transaction(
     loop {
         // The tag must fit wholly within the descriptor block.
         if offset + TAG_LEN > BLOCK_SIZE {
-            return_errno_with_message!(Errno::EUCLEAN, "journal descriptor tag runs past the block");
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal descriptor tag runs past the block"
+            );
         }
         let tag = RawBlockTag::from_bytes(&descriptor[offset..offset + TAG_LEN]);
         let dest = tag.t_blocknr.get() as Ext4Bid;
@@ -279,12 +283,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // checkpoint, so a consistent snapshot is enough.
     let (tail_block, tail_tid, committed_tid, head) = {
         let st = journal.state_read();
-        (
-            st.tail_block,
-            st.tail_tid,
-            journal.committed_tid(),
-            st.head,
-        )
+        (st.tail_block, st.tail_tid, journal.committed_tid(), st.head)
     };
 
     // A clean journal (tail_block == 0) has nothing un-checkpointed.
@@ -358,10 +357,11 @@ mod tests {
 
     use super::{
         super::{
-            super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
+            super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
+            JOURNAL_INO, Transaction,
             commit::commit_transaction,
             format::BLOCKTYPE_SUPERBLOCK_V2,
-            load_geometry, Transaction, JOURNAL_INO,
+            load_geometry,
         },
         *,
     };
@@ -447,7 +447,8 @@ mod tests {
         let mut txn = Transaction::new(tid);
         for (bid, content) in blocks {
             txn.capture_create(*bid);
-            txn.apply_patch(*bid, |b| b.copy_from_slice(content)).unwrap();
+            txn.apply_patch(*bid, |b| b.copy_from_slice(content))
+                .unwrap();
         }
         txn
     }
@@ -608,8 +609,8 @@ mod tests {
         let start_log = f.journal.geometry().first();
 
         // First apply.
-        let next1 = apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1)
-            .unwrap();
+        let next1 =
+            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1).unwrap();
         assert_eq!(read_final_block(&f, dest), after);
 
         // Clobber the final location, then re-apply the SAME committed transaction:
@@ -620,8 +621,8 @@ mod tests {
             .write_val(dest as usize * BLOCK_SIZE, &[0u8; BLOCK_SIZE])
             .unwrap();
         assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
-        let next2 = apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1)
-            .unwrap();
+        let next2 =
+            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1).unwrap();
         assert_eq!(read_final_block(&f, dest), after);
         assert_eq!(next1, next2);
     }
