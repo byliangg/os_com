@@ -483,7 +483,7 @@ mod tests {
             .unwrap();
 
         let geometry = load_geometry(&f.ext4).unwrap().unwrap();
-        let journal = Journal::new(geometry);
+        let journal = Journal::new(geometry, f.ext4.block_device().clone());
         JournaledFixture {
             journal,
             fixture: f,

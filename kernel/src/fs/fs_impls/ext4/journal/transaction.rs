@@ -487,7 +487,7 @@ mod tests {
             .unwrap();
 
         let geometry = load_geometry(&f.ext4).unwrap().unwrap();
-        Journal::new(geometry)
+        Journal::new(geometry, f.ext4.block_device().clone())
     }
 
     #[ktest]
