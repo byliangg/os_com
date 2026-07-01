@@ -86,7 +86,25 @@ pub(super) struct BlockGroupDesc {
 /// overwritten, so every field the device held (flags, csum, itable_unused, …)
 /// and every *other* group's descriptor in the same block are preserved. Because
 /// the after-image carries the absolute in-memory counters, repeated captures of
-/// the same block within a transaction converge on the final value.
+/// the same block *within one transaction* converge on the final value.
+///
+/// # P4 limitation (concurrency, → P7 hardening)
+///
+/// The seed comes from the **device**, which under WAL can lag a
+/// committed-but-not-yet-checkpointed transaction (checkpoint is asynchronous on
+/// the commit thread). If two operations on **different groups sharing this
+/// descriptor block** land in **separate** transactions and the second re-seeds
+/// from the device inside the window between the first's `commit` and its
+/// `checkpoint`, the second's after-image resurrects the first's *old* counters
+/// for the other group and its checkpoint clobbers them — an accounting
+/// lost-update (`e2fsck` "free count wrong", `-p` fixable; not structural). It
+/// cannot happen within a single transaction (idempotent seed + absolute patch)
+/// and is not reachable single-threaded in the current tests, but a concurrent
+/// multi-group workload can hit it. P7 (JBD2 完整 / concurrency hardening) closes
+/// it by seeding the descriptor block from the in-memory group descriptors (as
+/// `write_back_inode_desc` was made to rebuild from memory), or by serializing a
+/// re-seed against the pending checkpoint. The superblock counters are unaffected
+/// (a single object, always patched from the in-memory absolute value).
 fn patch_group_desc(buf: &mut [u8], desc_offset: usize, desc: &BlockGroupDesc) {
     let off = desc_offset % BLOCK_SIZE;
     let raw_bytes = &mut buf[off..off + size_of::<RawBlockGroup>()];

@@ -575,6 +575,16 @@ impl Inode {
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images this write's
         // allocations dirty. Dropped at return, closing the handle.
+        //
+        // P4 limitation (data=ordered not wired, → follow-up): this write's data
+        // pages are NOT registered as ordered data of the transaction
+        // (`Transaction::add_ordered_inode`), so they are not flushed before the
+        // extent metadata commits. On a clean unmount the fs-level sync flushes
+        // them; but a crash after this transaction commits (or checkpoints) yet
+        // before the data pages reach the platter can leave the committed extents
+        // covering stale blocks. File **metadata** is crash-safe; file **data**
+        // ordering is a follow-up (registering ordered inodes needs the write path
+        // to reach the `Arc<Inode>`).
         let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
         inner.write_at(&fs, offset, reader, op.get())
     }

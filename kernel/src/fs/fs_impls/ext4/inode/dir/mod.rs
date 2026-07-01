@@ -1047,6 +1047,15 @@ impl Inode {
         } else {
             old_inner.set_ctime(utils::now());
         }
+        // Journaled: persist the moved inode's descriptor change in this
+        // transaction — the cleared INDEX flag on a cross-directory directory
+        // move (else its ctime). Otherwise a crash after commit but before the
+        // deferred fsync would leave `EXT4_INDEX_FL` set on a directory whose
+        // block was rewritten linear (e2fsck "htree corrupted"). This is the last
+        // rename participant; every other one is already written back above.
+        if handle.is_some() {
+            old_inner.write_back_inode_desc(&fs, old_ino, handle)?;
+        }
 
         Ok(())
     }
