@@ -383,13 +383,27 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
         .journal
         .upgrade()
         .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
-    let mut st = journal.state_write();
 
-    if let Some(running) = st.running.as_mut()
-        && running.tid == handle.tid
-    {
-        running.t_updates = running.t_updates.saturating_sub(1);
-        running.outstanding_credits = running.outstanding_credits.saturating_sub(handle.credits);
+    let should_commit = {
+        let mut st = journal.state_write();
+        if let Some(running) = st.running.as_mut()
+            && running.tid == handle.tid
+        {
+            running.t_updates = running.t_updates.saturating_sub(1);
+            running.outstanding_credits =
+                running.outstanding_credits.saturating_sub(handle.credits);
+            // Once the last handle closes and the transaction has captured
+            // metadata, it is committable. Phase 4 is commit-per-op: signal the
+            // commit thread now. This is asynchronous — the operation does not wait
+            // for the commit (durability is `fsync`'s job, via `log_wait_commit`).
+            running.t_updates == 0 && running.nr_metadata_blocks() > 0
+        } else {
+            false
+        }
+    };
+
+    if should_commit {
+        journal.request_commit();
     }
     Ok(())
 }

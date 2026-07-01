@@ -72,16 +72,6 @@
 //! - Synchronous, driven inline by the caller (here, tests); no background
 //!   checkpoint thread yet.
 
-// Like the commit pipeline, the whole checkpoint cluster is reachable only
-// through the test-only `Journal` until a later task wires it into unmount /
-// space-pressure. In non-ktest builds `checkpoint` and `apply_log_transaction`
-// form a closed, unreferenced cluster; one module-level attribute absorbs it
-// (mirroring `commit.rs`). `allow` (not `expect`): once Task 7 recovery
-// references `apply_log_transaction`, a module-level `expect(dead_code)` would
-// flip to "unfulfilled"; `allow` is stable. The integration task drops it once
-// checkpoint is wired into a live path.
-#![cfg_attr(not(ktest), allow(dead_code))]
-
 use super::{
     super::prelude::*,
     Journal, Tid,

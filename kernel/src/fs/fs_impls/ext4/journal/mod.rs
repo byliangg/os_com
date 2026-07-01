@@ -492,6 +492,17 @@ impl Journal {
                 CommitAction::Commit => {
                     let Some(j) = weak.upgrade() else { break };
                     j.commit_one();
+                    // Reclaim the log right after committing: Phase 4 is
+                    // commit-per-op, so without eager checkpointing a stream of
+                    // small transactions would fill the log. Checkpoint copies the
+                    // committed after-images to their final locations and clears
+                    // `s_start`. Failure is non-fatal — the log stays dirty and the
+                    // next commit (or the unmount flush) retries. Batching commits
+                    // with lazy, space-pressure-driven checkpoint is a P7
+                    // optimization.
+                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
+                        error!("ext4 journal checkpoint failed: {:?}", e);
+                    }
                 }
             }
         }
@@ -642,6 +653,32 @@ impl Journal {
         if let Some(thread) = thread {
             thread.join();
         }
+    }
+
+    /// Flushes the journal at unmount so the on-disk log is left clean.
+    ///
+    /// MUST be called by the owner (`Ext4::drop`) **after**
+    /// [`stop_commit_thread`](Journal::stop_commit_thread): with the commit thread
+    /// gone, this thread is the sole committer, so it commits the final running
+    /// transaction and checkpoints synchronously without racing the background
+    /// committer. It commits any running transaction that captured metadata, then
+    /// checkpoints every committed transaction to its final location and clears
+    /// `s_start` — leaving the on-disk journal clean (`s_start == 0`) so the next
+    /// mount sees an empty log and skips recovery.
+    ///
+    /// A no-op on a journal that never ran a transaction (nothing captured,
+    /// already-clean tail): the take yields `None` and [`checkpoint`] returns early.
+    pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
+        let txn = {
+            let mut st = self.state_write();
+            st.running.take()
+        };
+        if let Some(txn) = txn
+            && txn.nr_metadata_blocks() > 0
+        {
+            commit_transaction(self, self.device.as_ref(), txn)?;
+        }
+        checkpoint::checkpoint(self, self.device.as_ref())
     }
 }
 
@@ -1231,5 +1268,62 @@ mod tests {
             "dirty_metadata without get_*_access must fail"
         );
         journal_stop(handle).unwrap();
+    }
+
+    // --- Int-B B2.1: commit/checkpoint triggering (unmount flush). ---
+
+    /// `flush_on_unmount` commits the running transaction and checkpoints it, so
+    /// the after-image reaches its final location and the on-disk journal is left
+    /// clean (`s_start == 0`). Driven synchronously here (no commit thread), the
+    /// deterministic mirror of the unmount path.
+    #[ktest]
+    fn flush_on_unmount_commits_running_and_cleans_journal() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let bid: Ext4Bid = 500;
+        let handle = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&handle), bid, TriggerType::BlockBitmap).unwrap();
+        dirty_metadata(Some(&handle), bid, TriggerType::BlockBitmap, |buf| {
+            buf[..8].copy_from_slice(b"UNMOUNT!")
+        })
+        .unwrap();
+        // Closing the last handle marks the transaction committable (and pings the
+        // — here unstarted — commit thread); the running transaction survives for
+        // the synchronous flush below.
+        journal_stop(handle).unwrap();
+
+        f.journal.flush_on_unmount().unwrap();
+
+        // The after-image reached its final location.
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(&final_block[..8], b"UNMOUNT!");
+
+        // The on-disk journal is clean and the in-memory tail cleared, so the next
+        // mount skips recovery.
+        let sb: RawJournalSuperblock = f
+            .fixture
+            .disk
+            .segment()
+            .read_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(f.journal.state_read().tail_block, 0);
+        assert!(f.journal.state_read().running.is_none());
+    }
+
+    /// `flush_on_unmount` on a journal that never ran a transaction is a clean
+    /// no-op (nothing captured, tail already clean).
+    #[ktest]
+    fn flush_on_unmount_with_no_work_is_noop() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        f.journal.flush_on_unmount().unwrap();
+        assert_eq!(f.journal.state_read().tail_block, 0);
     }
 }

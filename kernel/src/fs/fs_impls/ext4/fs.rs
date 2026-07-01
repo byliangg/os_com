@@ -683,6 +683,14 @@ impl Drop for Ext4 {
         // the sole owner, so there is no contention to guard against.
         if let Some(journal) = self.journal.get_mut().take() {
             journal.stop_commit_thread();
+            // With the commit thread stopped we are the sole committer: flush the
+            // final running transaction and checkpoint so the on-disk journal is
+            // left clean (`s_start == 0`) for the next mount. A failure here cannot
+            // be propagated out of `drop`; log it (the un-checkpointed log stays
+            // replay-safe — a later mount would recover it).
+            if let Err(e) = journal.flush_on_unmount() {
+                error!("ext4 journal unmount flush failed: {:?}", e);
+            }
         }
     }
 }
