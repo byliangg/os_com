@@ -136,12 +136,13 @@ pub(super) fn insert_extent(
     pblock: Ext4Bid,
     len: u16,
     kind: ExtentKind,
+    handle: Option<&journal::Handle>,
 ) -> Result<TreeDelta> {
     let device = fs.block_device().as_ref();
     let (mut extents, old_external) = flatten(root, device)?;
     extents.push(Extent::new(iblock, len, pblock, kind));
     merge_extents(&mut extents);
-    reserialize(root, fs, &extents, &old_external)
+    reserialize(root, fs, &extents, &old_external, handle)
 }
 
 /// Parses the whole extent tree into a list of leaf extents sorted by logical
@@ -183,6 +184,7 @@ pub(super) fn rebuild_from_extents(
     root: &mut [u32; super::super::RAW_BLOCK_PTRS_LEN],
     fs: &Ext4,
     extents: &[(Iblock, u16, Ext4Bid, ExtentKind)],
+    handle: Option<&journal::Handle>,
 ) -> Result<u32> {
     let device = fs.block_device().as_ref();
     let (_old, old_external) = flatten(root, device)?;
@@ -190,7 +192,7 @@ pub(super) fn rebuild_from_extents(
         .iter()
         .map(|&(block, len, start, kind)| Extent::new(block, len, start, kind))
         .collect();
-    reserialize(root, fs, &extents, &old_external)?;
+    reserialize(root, fs, &extents, &old_external, handle)?;
     // After reserialization, count the external leaves the new root references.
     let (_new, new_external) = flatten(root, device)?;
     Ok(new_external.len() as u32)
@@ -214,6 +216,7 @@ pub(super) fn convert_unwritten(
     fs: &Ext4,
     iblock: Iblock,
     len: u32,
+    handle: Option<&journal::Handle>,
 ) -> Result<TreeDelta> {
     let device = fs.block_device().as_ref();
     let (extents, old_external) = flatten(root, device)?;
@@ -264,7 +267,7 @@ pub(super) fn convert_unwritten(
     }
 
     merge_extents(&mut converted);
-    reserialize(root, fs, &converted, &old_external)
+    reserialize(root, fs, &converted, &old_external, handle)
 }
 
 /// Parses the whole extent tree into a sorted list of leaf extents, also
@@ -367,6 +370,7 @@ fn reserialize(
     fs: &Ext4,
     extents: &[Extent],
     old_external: &[Ext4Bid],
+    handle: Option<&journal::Handle>,
 ) -> Result<TreeDelta> {
     let device = fs.block_device().as_ref();
 
@@ -375,7 +379,7 @@ fn reserialize(
         // The root no longer references any external block; free them all.
         let mut meta_freed = 0;
         for &bid in old_external {
-            free_meta_block(fs, bid)?;
+            free_meta_block(fs, bid, handle)?;
             meta_freed += 1;
         }
         return Ok(TreeDelta {
@@ -396,11 +400,11 @@ fn reserialize(
     let mut newly_allocated: Vec<Ext4Bid> = Vec::new();
     let goal = extents.first().map(|e| e.start()).unwrap_or(0);
     for _ in reuse..nr_leaves {
-        match alloc_meta_block(fs, goal) {
+        match alloc_meta_block(fs, goal, handle) {
             Ok(bid) => newly_allocated.push(bid),
             Err(err) => {
                 for &bid in &newly_allocated {
-                    let _ = free_meta_block(fs, bid);
+                    let _ = free_meta_block(fs, bid, handle);
                 }
                 return Err(err);
             }
@@ -411,9 +415,9 @@ fn reserialize(
     // Write each leaf node. On failure, roll back the freshly allocated blocks
     // (the in-memory root is not yet updated, so the old tree stays referenced).
     for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
-        if let Err(err) = write_leaf_node(device, leaf_bid, chunk) {
+        if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle) {
             for &bid in &newly_allocated {
-                let _ = free_meta_block(fs, bid);
+                let _ = free_meta_block(fs, bid, handle);
             }
             return Err(err);
         }
@@ -435,7 +439,7 @@ fn reserialize(
     // Free surplus old external blocks the root no longer references.
     let mut meta_freed = 0;
     for &bid in &old_external[reuse..] {
-        free_meta_block(fs, bid)?;
+        free_meta_block(fs, bid, handle)?;
         meta_freed += 1;
     }
 
@@ -446,21 +450,26 @@ fn reserialize(
 }
 
 /// Allocates one metadata block for an external extent-tree node.
-fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid) -> Result<Ext4Bid> {
-    let range = fs.alloc_blocks(1, goal)?;
+fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) -> Result<Ext4Bid> {
+    let range = fs.alloc_blocks(1, goal, handle)?;
     let bid = range.start;
-    journal::get_create_access(None, bid, journal::TriggerType::ExtentBlock)?;
+    journal::get_create_access(handle, bid, journal::TriggerType::ExtentBlock)?;
     Ok(bid)
 }
 
 /// Frees one external extent-tree metadata block.
-fn free_meta_block(fs: &Ext4, bid: Ext4Bid) -> Result<()> {
-    journal::forget(None, true, bid)?;
-    fs.free_blocks(bid, 1)
+fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) -> Result<()> {
+    journal::forget(handle, true, bid)?;
+    fs.free_blocks(bid, 1, handle)
 }
 
 /// Serializes `extents` into a full-block external leaf node at `bid`.
-fn write_leaf_node(device: &dyn BlockDevice, bid: Ext4Bid, extents: &[Extent]) -> Result<()> {
+fn write_leaf_node(
+    device: &dyn BlockDevice,
+    bid: Ext4Bid,
+    extents: &[Extent],
+    handle: Option<&journal::Handle>,
+) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
         magic: EXTENT_MAGIC,
@@ -475,7 +484,7 @@ fn write_leaf_node(device: &dyn BlockDevice, bid: Ext4Bid, extents: &[Extent]) -
         block[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(ext).as_bytes());
     }
     device.write_val(bid as usize * BLOCK_SIZE, &block)?;
-    journal::dirty_metadata(None, bid, journal::TriggerType::ExtentBlock, |buf| {
+    journal::dirty_metadata(handle, bid, journal::TriggerType::ExtentBlock, |buf| {
         buf.copy_from_slice(&block)
     })?;
     Ok(())
@@ -698,9 +707,9 @@ mod tests {
         let mut root = inline_root(&[]);
 
         // [0,2) -> 100, then contiguous [2,2) -> 102 must coalesce into [0,4).
-        let d0 = insert_extent(&mut root, &f.ext4, 0, 100, 2, ExtentKind::Written).unwrap();
+        let d0 = insert_extent(&mut root, &f.ext4, 0, 100, 2, ExtentKind::Written, None).unwrap();
         assert_eq!((d0.meta_allocated, d0.meta_freed), (0, 0));
-        insert_extent(&mut root, &f.ext4, 2, 102, 2, ExtentKind::Written).unwrap();
+        insert_extent(&mut root, &f.ext4, 2, 102, 2, ExtentKind::Written, None).unwrap();
 
         // Still inline depth-0 with a single merged extent.
         assert_eq!(root_header(&root), (0, 1));
@@ -717,8 +726,8 @@ mod tests {
             .unwrap();
         let mut root = inline_root(&[]);
 
-        insert_extent(&mut root, &f.ext4, 0, 100, 1, ExtentKind::Written).unwrap();
-        insert_extent(&mut root, &f.ext4, 5, 200, 1, ExtentKind::Written).unwrap();
+        insert_extent(&mut root, &f.ext4, 0, 100, 1, ExtentKind::Written, None).unwrap();
+        insert_extent(&mut root, &f.ext4, 5, 200, 1, ExtentKind::Written, None).unwrap();
 
         assert_eq!(root_header(&root), (0, 2));
         let device = f.ext4.block_device().as_ref();
@@ -745,6 +754,7 @@ mod tests {
                 100 + k as u64 * 10,
                 1,
                 ExtentKind::Written,
+                None,
             )
             .unwrap();
             total_allocated += d.meta_allocated;
@@ -790,13 +800,14 @@ mod tests {
                 100 + k as u64 * 10,
                 1,
                 ExtentKind::Written,
+                None,
             )
             .unwrap();
         }
         assert_eq!(root_header(&root).0, 1);
 
         // A sixth extent fits the existing leaf: no new metadata block.
-        let d = insert_extent(&mut root, &f.ext4, 20, 500, 1, ExtentKind::Written).unwrap();
+        let d = insert_extent(&mut root, &f.ext4, 20, 500, 1, ExtentKind::Written, None).unwrap();
         assert_eq!((d.meta_allocated, d.meta_freed), (0, 0));
 
         let device = f.ext4.block_device().as_ref();

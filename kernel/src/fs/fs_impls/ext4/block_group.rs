@@ -412,7 +412,12 @@ impl BlockGroup {
     /// Returns `Ok(range)` with filesystem-wide block numbers on success, or an
     /// empty range (`Ok(0..0)`) if the group has no allocatable blocks. Returns
     /// `Err(EIO)` on bitmap/counter corruption.
-    pub(super) fn alloc_blocks(&self, count: u32, sb_free_blocks: u64) -> Result<Range<Ext4Bid>> {
+    pub(super) fn alloc_blocks(
+        &self,
+        count: u32,
+        sb_free_blocks: u64,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Range<Ext4Bid>> {
         let group_size = (self.last_block - self.first_block + 1) as u32;
         debug_assert!(group_size <= IdBitmap::capacity() as u32);
 
@@ -425,7 +430,7 @@ impl BlockGroup {
             as u16;
 
         let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-        journal::get_write_access(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        journal::get_write_access(handle, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
 
         // TODO: Improve bitmap allocation to reduce fragmentation (e.g., find the
         // first free block directly instead of retrying with smaller counts).
@@ -464,14 +469,14 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         journal::dirty_metadata(
-            None,
+            handle,
             block_bitmap_bid,
             journal::TriggerType::BlockBitmap,
             |buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()),
         )?;
-        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?;
         journal::dirty_metadata(
-            None,
+            handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
             |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
@@ -487,7 +492,11 @@ impl BlockGroup {
     /// Returns the number of blocks actually freed (allocated-to-free
     /// transitions). Returns `Err(EIO)` when the range overlaps the group's
     /// system zone.
-    pub(super) fn free_blocks(&self, bit_range: Range<u32>) -> Result<u32> {
+    pub(super) fn free_blocks(
+        &self,
+        bit_range: Range<u32>,
+        handle: Option<&journal::Handle>,
+    ) -> Result<u32> {
         let start_bit = bit_range.start;
         let group_count = bit_range.len() as u32;
         // Validate system zone overlap using filesystem-wide coordinates.
@@ -501,7 +510,7 @@ impl BlockGroup {
         }
 
         let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-        journal::get_write_access(None, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        journal::get_write_access(handle, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
 
         // Clear bits one by one and count only allocated-to-free transitions.
         let range_start = start_bit as u16;
@@ -528,14 +537,14 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         journal::dirty_metadata(
-            None,
+            handle,
             block_bitmap_bid,
             journal::TriggerType::BlockBitmap,
             |buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()),
         )?;
-        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?;
         journal::dirty_metadata(
-            None,
+            handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
             |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
@@ -551,7 +560,11 @@ impl BlockGroup {
     /// Returns `Some(inode_idx)` with the 0-based group-local inode index, or
     /// `None` if this group has no free inode. Mirrors [`alloc_blocks`] on the
     /// block side, threading the same journal seam.
-    pub(super) fn alloc_ino(&self, type_: InodeType) -> Result<Option<u32>> {
+    pub(super) fn alloc_ino(
+        &self,
+        type_: InodeType,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Option<u32>> {
         let mut metadata = self.metadata.write();
 
         if metadata.desc.free_inodes_count() == 0 {
@@ -562,7 +575,7 @@ impl BlockGroup {
         }
 
         let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
-        journal::get_write_access(None, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
+        journal::get_write_access(handle, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
 
         // Allocate exactly one free inode bit.
         let Some(range) = metadata.inode_bitmap.alloc_consecutive(1) else {
@@ -578,14 +591,14 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         journal::dirty_metadata(
-            None,
+            handle,
             inode_bitmap_bid,
             journal::TriggerType::InodeBitmap,
             |buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()),
         )?;
-        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?;
         journal::dirty_metadata(
-            None,
+            handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
             |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
@@ -600,7 +613,12 @@ impl BlockGroup {
     /// and (for directories) decrements `used_dirs_count`. Returns `true` if the
     /// bit transitioned allocated-to-free, `false` if it was already clear (logs
     /// a warning, mirroring [`free_blocks`]).
-    pub(super) fn free_inode(&self, group_local_idx: u32, type_: InodeType) -> Result<bool> {
+    pub(super) fn free_inode(
+        &self,
+        group_local_idx: u32,
+        type_: InodeType,
+        handle: Option<&journal::Handle>,
+    ) -> Result<bool> {
         let mut metadata = self.metadata.write();
 
         let inode_bit = group_local_idx as u16;
@@ -613,7 +631,7 @@ impl BlockGroup {
         }
 
         let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
-        journal::get_write_access(None, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
+        journal::get_write_access(handle, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
 
         let new_free = metadata
             .desc
@@ -642,14 +660,14 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         journal::dirty_metadata(
-            None,
+            handle,
             inode_bitmap_bid,
             journal::TriggerType::InodeBitmap,
             |buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()),
         )?;
-        journal::get_write_access(None, desc_block_bid, journal::TriggerType::GroupDesc)?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?;
         journal::dirty_metadata(
-            None,
+            handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
             |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),

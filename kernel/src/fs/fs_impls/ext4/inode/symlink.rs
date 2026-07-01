@@ -94,7 +94,7 @@ impl InodeInner {
             // Fast path: store the target inline in the `i_block` area. Free any
             // data block held by a previous slow target first.
             if let InodePayload::DataBacked { block_manager, .. } = &self.payload {
-                block_manager.truncate_to_byte_len(0)?;
+                block_manager.truncate_to_byte_len(0, None)?;
             }
             let mut fast_target = FastSymlinkTarget::new_zeros();
             fast_target.write(target.as_bytes());
@@ -115,7 +115,7 @@ impl InodeInner {
                 self.payload =
                     InodePayload::new_data_backed(0, empty_extent_root(), 0, Arc::downgrade(fs));
             }
-            self.prepare_write(fs, 0, target_len)?;
+            self.prepare_write(fs, 0, target_len, None)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();
             self.page_cache()?.write(0, &mut reader)?;
         }

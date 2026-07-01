@@ -225,7 +225,12 @@ impl Ext4 {
     /// Searches groups in a ring starting from the goal group. Returns
     /// `Err(ENOSPC)` if no group can satisfy the request, `Err(EINVAL)` if
     /// `count` is zero.
-    pub(super) fn alloc_blocks(&self, count: u32, goal: Ext4Bid) -> Result<Range<Ext4Bid>> {
+    pub(super) fn alloc_blocks(
+        &self,
+        count: u32,
+        goal: Ext4Bid,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Range<Ext4Bid>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -250,7 +255,7 @@ impl Ext4 {
             let group_idx = (goal_group + group_search_offset) % nr_block_groups;
             let group = &self.block_groups[group_idx];
 
-            let range = group.alloc_blocks(count, sb_free_blocks)?;
+            let range = group.alloc_blocks(count, sb_free_blocks, handle)?;
             if !range.is_empty() {
                 let allocated_count = range.end - range.start;
                 sb.dec_free_blocks(allocated_count)?;
@@ -262,7 +267,12 @@ impl Ext4 {
     }
 
     /// Frees `count` blocks starting at `start`, splitting across groups.
-    pub(super) fn free_blocks(&self, start: Ext4Bid, count: u32) -> Result<()> {
+    pub(super) fn free_blocks(
+        &self,
+        start: Ext4Bid,
+        count: u32,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         if count == 0 {
             return Ok(());
         }
@@ -284,7 +294,7 @@ impl Ext4 {
             let group_start_bit = (current_block - group_first_block) as u32;
             let blocks_in_group = remaining_blocks.min(group_size - group_start_bit);
             let freed_count =
-                group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group))?;
+                group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
             if freed_count > 0 {
                 sb.inc_free_blocks(freed_count as u64)?;
             }
@@ -301,7 +311,12 @@ impl Ext4 {
     /// the Orlov spreading policy is deferred to Phase 9). Returns the global
     /// inode number on success, `Err(ENOSPC)` if no group has a free inode.
     /// Mirrors [`alloc_blocks`] on the block side.
-    pub(super) fn alloc_ino(&self, parent_ino: Ext4Ino, type_: InodeType) -> Result<Ext4Ino> {
+    pub(super) fn alloc_ino(
+        &self,
+        parent_ino: Ext4Ino,
+        type_: InodeType,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Ext4Ino> {
         if type_ == InodeType::Unknown {
             return_errno_with_message!(Errno::EINVAL, "cannot allocate inode with unknown type");
         }
@@ -322,14 +337,14 @@ impl Ext4 {
             let group_idx = (parent_group + group_search_offset) % nr_block_groups;
             let group = &self.block_groups[group_idx];
 
-            let Some(local_idx) = group.alloc_ino(type_)? else {
+            let Some(local_idx) = group.alloc_ino(type_, handle)? else {
                 continue;
             };
 
             let ino = (group_idx as u32) * nr_inodes_per_group + local_idx + 1;
             if ino < sb.first_ino() || ino > total_inodes {
                 // Roll back the group-level allocation before erroring out.
-                let _ = group.free_inode(local_idx, type_);
+                let _ = group.free_inode(local_idx, type_, handle);
                 return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
             sb.dec_free_inodes()?;
@@ -341,12 +356,17 @@ impl Ext4 {
     }
 
     /// Frees an inode by number, mirroring [`free_blocks`] on the block side.
-    pub(super) fn free_inode(&self, ino: Ext4Ino, type_: InodeType) -> Result<()> {
+    pub(super) fn free_inode(
+        &self,
+        ino: Ext4Ino,
+        type_: InodeType,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let mut sb = self.super_block.write();
         let group = self.find_group(ino)?;
         let local_idx = (ino - 1) % self.nr_inodes_per_group;
 
-        let was_allocated = group.free_inode(local_idx, type_)?;
+        let was_allocated = group.free_inode(local_idx, type_, handle)?;
         if was_allocated {
             sb.inc_free_inodes()?;
         }
@@ -371,8 +391,9 @@ impl Ext4 {
         parent_ino: Ext4Ino,
         type_: InodeType,
         perm: FilePerm,
+        handle: Option<&journal::Handle>,
     ) -> Result<Arc<Inode>> {
-        let ino = self.alloc_ino(parent_ino, type_)?;
+        let ino = self.alloc_ino(parent_ino, type_, handle)?;
 
         let link_count = if type_.is_directory() { 2 } else { 1 };
         let (uid, gid) = Thread::current()
@@ -395,7 +416,7 @@ impl Ext4 {
         if let Err(err) = self.write_new_inode_desc(ino, &inode_desc) {
             // Roll back the inode allocation: clear the bitmap bit and restore
             // the superblock free-inode counter.
-            if let Err(free_err) = self.free_inode(ino, type_) {
+            if let Err(free_err) = self.free_inode(ino, type_, handle) {
                 error!("create_inode: rollback free_inode failed: {:?}", free_err);
             }
             return Err(err);
@@ -750,7 +771,7 @@ impl Drop for BlockAllocGuard<'_> {
         }
         for range in self.ranges.iter() {
             let count = (range.end - range.start) as u32;
-            if let Err(err) = self.fs.free_blocks(range.start, count) {
+            if let Err(err) = self.fs.free_blocks(range.start, count, None) {
                 error!(
                     "BlockAllocGuard: failed to free range {:?} in rollback: {:?}",
                     range, err
@@ -818,7 +839,7 @@ mod tests {
         let before_group_free = f.ext4.block_group(0).free_blocks_count();
 
         let goal = f.ext4.block_group(0).first_block();
-        let range = f.ext4.alloc_blocks(8, goal).unwrap();
+        let range = f.ext4.alloc_blocks(8, goal, None).unwrap();
         let alloc_len = (range.end - range.start) as u32;
         assert!((1..=8).contains(&alloc_len));
 
@@ -836,7 +857,7 @@ mod tests {
             before_sb_free - alloc_len as u64
         );
 
-        f.ext4.free_blocks(range.start, alloc_len).unwrap();
+        f.ext4.free_blocks(range.start, alloc_len, None).unwrap();
         assert_eq!(f.ext4.block_group(0).free_blocks_count(), before_group_free);
         assert_eq!(f.ext4.super_block().free_blocks_count(), before_sb_free);
     }
@@ -850,7 +871,7 @@ mod tests {
             .unwrap();
         let group1_first = f.ext4.block_group(1).first_block();
 
-        let range = f.ext4.alloc_blocks(4, group1_first).unwrap();
+        let range = f.ext4.alloc_blocks(4, group1_first, None).unwrap();
         assert!(!range.is_empty());
         // Allocation lands in group 1 (at or after its first block).
         assert!(range.start >= group1_first);
@@ -867,7 +888,7 @@ mod tests {
         assert_eq!(
             f_full
                 .ext4
-                .alloc_blocks(1, f_full.ext4.block_group(0).first_block())
+                .alloc_blocks(1, f_full.ext4.block_group(0).first_block(), None)
                 .unwrap_err()
                 .error(),
             Errno::ENOSPC
@@ -880,7 +901,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             f.ext4
-                .alloc_blocks(0, f.ext4.block_group(0).first_block())
+                .alloc_blocks(0, f.ext4.block_group(0).first_block(), None)
                 .unwrap_err()
                 .error(),
             Errno::EINVAL
@@ -898,7 +919,7 @@ mod tests {
 
         let range = f
             .ext4
-            .alloc_blocks(4, f.ext4.block_group(0).first_block())
+            .alloc_blocks(4, f.ext4.block_group(0).first_block(), None)
             .unwrap();
         let alloc_len = (range.end - range.start) as u32;
         assert!(alloc_len > 0);
@@ -930,7 +951,7 @@ mod tests {
 
         let range = f
             .ext4
-            .alloc_blocks(4, f.ext4.block_group(0).first_block())
+            .alloc_blocks(4, f.ext4.block_group(0).first_block(), None)
             .unwrap();
         let alloc_len = (range.end - range.start) as u32;
 
@@ -975,7 +996,7 @@ mod tests {
 
         let range = f
             .ext4
-            .alloc_blocks(4, f.ext4.block_group(0).first_block())
+            .alloc_blocks(4, f.ext4.block_group(0).first_block(), None)
             .unwrap();
         let alloc_len = (range.end - range.start) as u32;
         f.ext4.sync_metadata().unwrap();
@@ -1181,12 +1202,12 @@ mod tests {
         let before_sb = f.ext4.super_block().free_inodes_count();
         let before_group = f.ext4.block_group(0).free_inodes_count();
 
-        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File).unwrap();
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
         assert_eq!(ino, 11); // first free inode after the 10 reserved ones
         assert_eq!(f.ext4.super_block().free_inodes_count(), before_sb - 1);
         assert_eq!(f.ext4.block_group(0).free_inodes_count(), before_group - 1);
 
-        f.ext4.free_inode(ino, InodeType::File).unwrap();
+        f.ext4.free_inode(ino, InodeType::File, None).unwrap();
         assert_eq!(f.ext4.super_block().free_inodes_count(), before_sb);
         assert_eq!(f.ext4.block_group(0).free_inodes_count(), before_group);
     }
@@ -1205,13 +1226,13 @@ mod tests {
         // Group 0 has 32 inodes, 10 reserved -> 22 free. Allocate all 22 so the
         // next allocation must ring into group 1.
         for _ in 0..22 {
-            let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File).unwrap();
+            let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
             assert!(ino <= 32, "ino {} should land in group 0", ino);
         }
         assert_eq!(f.ext4.block_group(0).free_inodes_count(), 0);
 
         // The 23rd allocation, with parent in group 0, rings to group 1.
-        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File).unwrap();
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
         assert!(ino > 32, "ino {} should ring into group 1", ino);
         assert_eq!(((ino - 1) / 32) as usize, 1);
     }
@@ -1225,10 +1246,10 @@ mod tests {
             .unwrap();
 
         let before = f.ext4.block_group(0).used_dirs_count();
-        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::Dir).unwrap();
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::Dir, None).unwrap();
         assert_eq!(f.ext4.block_group(0).used_dirs_count(), before + 1);
 
-        f.ext4.free_inode(ino, InodeType::Dir).unwrap();
+        f.ext4.free_inode(ino, InodeType::Dir, None).unwrap();
         assert_eq!(f.ext4.block_group(0).used_dirs_count(), before);
     }
 
@@ -1241,9 +1262,9 @@ mod tests {
             .unwrap();
 
         let before = f.ext4.block_group(0).used_dirs_count();
-        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File).unwrap();
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
         assert_eq!(f.ext4.block_group(0).used_dirs_count(), before);
-        f.ext4.free_inode(ino, InodeType::File).unwrap();
+        f.ext4.free_inode(ino, InodeType::File, None).unwrap();
         assert_eq!(f.ext4.block_group(0).used_dirs_count(), before);
     }
 
@@ -1256,7 +1277,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             f.ext4
-                .alloc_ino(ROOT_INO, InodeType::File)
+                .alloc_ino(ROOT_INO, InodeType::File, None)
                 .unwrap_err()
                 .error(),
             Errno::ENOSPC
@@ -1276,7 +1297,7 @@ mod tests {
         let perm = FilePerm::from_bits_truncate(0o644);
         let inode = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm)
+            .create_inode(ROOT_INO, InodeType::File, perm, None)
             .unwrap();
         assert_eq!(inode.inode_type(), InodeType::File);
         assert_eq!(inode.size(), 0);
@@ -1308,7 +1329,10 @@ mod tests {
             .unwrap();
 
         let perm = FilePerm::from_bits_truncate(0o755);
-        let inode = f.ext4.create_inode(ROOT_INO, InodeType::Dir, perm).unwrap();
+        let inode = f
+            .ext4
+            .create_inode(ROOT_INO, InodeType::Dir, perm, None)
+            .unwrap();
         assert_eq!(inode.inode_type(), InodeType::Dir);
         assert_eq!(inode.link_count(), 2);
 
@@ -1332,11 +1356,11 @@ mod tests {
         let perm = FilePerm::from_bits_truncate(0o644);
         let a = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm)
+            .create_inode(ROOT_INO, InodeType::File, perm, None)
             .unwrap();
         let b = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm)
+            .create_inode(ROOT_INO, InodeType::File, perm, None)
             .unwrap();
 
         let gen_a = f.read_raw_inode(a.ino()).generation;
@@ -1361,7 +1385,7 @@ mod tests {
         f.disk.set_fail_writes(true);
         let perm = FilePerm::from_bits_truncate(0o644);
         // `Arc<Inode>` is not `Debug`, so match instead of `unwrap_err`.
-        let err = match f.ext4.create_inode(ROOT_INO, InodeType::File, perm) {
+        let err = match f.ext4.create_inode(ROOT_INO, InodeType::File, perm, None) {
             Ok(_) => panic!("create_inode unexpectedly succeeded despite write failure"),
             Err(err) => err,
         };
@@ -1396,7 +1420,7 @@ mod tests {
             .unwrap();
 
         // Allocate a directory inode (touches both free_inodes and used_dirs).
-        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::Dir).unwrap();
+        let ino = f.ext4.alloc_ino(ROOT_INO, InodeType::Dir, None).unwrap();
         f.ext4.sync_metadata().unwrap();
 
         let raw_after = f

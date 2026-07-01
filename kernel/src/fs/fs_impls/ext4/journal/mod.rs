@@ -68,7 +68,7 @@ use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 use self::{
     commit::commit_transaction,
     format::{JournalSuperblock, RawJournalSuperblock},
-    transaction::{Handle, Transaction},
+    transaction::Transaction,
 };
 use super::{
     feature::FeatureCompatSet,
@@ -89,6 +89,11 @@ mod transaction;
 /// mount-time recovery; the pass machinery lives in [`recovery`]. A no-op when the
 /// on-disk journal superblock is already clean (`s_start == 0`).
 pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
+/// Re-exported at the `ext4` level so allocation/extent paths can thread an
+/// `Option<&Handle>` through to the [`get_write_access`]/[`dirty_metadata`]
+/// funnels. The handle lifecycle (`journal_start`/`journal_stop`) stays inside
+/// this module; callers only borrow a handle for capture.
+pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
 
 /// Journal transaction id (jbd2 `tid_t`).
 pub(super) type Tid = u32;

@@ -198,7 +198,11 @@ impl InodeInner {
     /// The new block must not be left zeroed: a zero `rec_len` would make the
     /// entry iterator spin forever. It is therefore initialized as a single
     /// empty entry (`ino == 0`, `rec_len == BLOCK_SIZE`) spanning the block.
-    fn grow_dir_block(&mut self, fs: &Ext4) -> Result<DirSlotInfo> {
+    fn grow_dir_block(
+        &mut self,
+        fs: &Ext4,
+        handle: Option<&journal::Handle>,
+    ) -> Result<DirSlotInfo> {
         if self.desc.type_() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
@@ -207,7 +211,7 @@ impl InodeInner {
         let new_size = old_size + BLOCK_SIZE;
 
         // Map and allocate the new logical block through the extent engine.
-        self.prepare_write(fs, old_size, new_size)?;
+        self.prepare_write(fs, old_size, new_size, handle)?;
 
         // Initialize the new block as one empty entry spanning the whole block
         // before publishing the new size, so any reader that observes the grown
@@ -226,7 +230,7 @@ impl InodeInner {
         })();
 
         if let Err(err) = init_result {
-            self.rollback_write(old_size, new_size);
+            self.rollback_write(old_size, new_size, handle);
             return Err(err);
         }
 
@@ -288,10 +292,11 @@ impl InodeInner {
         name: &str,
         ino: Ext4Ino,
         file_type: DirEntryFileType,
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let slot = match self.find_dir_slot(name.len())? {
             Some(slot) => slot,
-            None => self.grow_dir_block(fs)?,
+            None => self.grow_dir_block(fs, handle)?,
         };
         self.add_entry(&slot, name, ino, file_type)
     }
@@ -374,11 +379,17 @@ impl InodeInner {
     /// `.` points to the directory itself (`ino`) and `..` to its parent
     /// (`parent_ino`); `..` spans the rest of the block. The parent's link
     /// count bump lives in the create path (Task 3), not here.
-    fn make_empty(&mut self, fs: &Ext4, ino: Ext4Ino, parent_ino: Ext4Ino) -> Result<()> {
+    fn make_empty(
+        &mut self,
+        fs: &Ext4,
+        ino: Ext4Ino,
+        parent_ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         // Grow the empty directory by its first block; this maps and allocates
         // the block (rolling back on its own failure) and initializes it as one
         // empty entry spanning the block.
-        let slot = self.grow_dir_block(fs)?;
+        let slot = self.grow_dir_block(fs, handle)?;
         debug_assert_eq!(slot.dir_offset, 0);
 
         // Overwrite the empty entry with `.` (this dir) followed by `..` (the
@@ -501,7 +512,7 @@ impl Inode {
         let mut parent_inner = self.inner.write();
         let slot = match parent_inner.find_dir_slot(name.len())? {
             Some(slot) => slot,
-            None => parent_inner.grow_dir_block(&fs)?,
+            None => parent_inner.grow_dir_block(&fs, None)?,
         };
 
         // The new inode is not yet visible in the inode cache until
@@ -509,7 +520,7 @@ impl Inode {
         // an `upread` guard on the children set, preventing concurrent `create` /
         // `lookup_via_fs` on this directory, so a concurrent `lookup_via_fs`
         // won't build a second `Arc<Inode>` from the on-disk desc and insert it.
-        let child = fs.create_inode(self.ino, type_, perm)?;
+        let child = fs.create_inode(self.ino, type_, perm, None)?;
         let child_ino = child.ino();
 
         // Taking `child.inner.write()` while holding `parent_inner.write()` does
@@ -520,7 +531,7 @@ impl Inode {
             child
                 .inner
                 .write()
-                .make_empty(&fs, child_ino, self.ino)
+                .make_empty(&fs, child_ino, self.ino, None)
                 .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type))
         } else {
             parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type)
@@ -662,7 +673,7 @@ impl Inode {
         let dir_inner = guards.inner_mut(self.ino());
         let slot = match dir_inner.find_dir_slot(name.len())? {
             Some(slot) => slot,
-            None => dir_inner.grow_dir_block(&fs)?,
+            None => dir_inner.grow_dir_block(&fs, None)?,
         };
         dir_inner.add_entry(&slot, name, old.ino(), dir_entry_file_type)?;
         dir_inner.set_mtime_ctime(utils::now());
@@ -833,7 +844,7 @@ impl Inode {
             if has_replaced {
                 dir_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
             } else {
-                dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type)?;
+                dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, None)?;
             }
             // Re-read the source entry: `add_new_entry` may have split it
             // (shrinking its `rec_len`), making any earlier `DirEntryInfo` stale.
@@ -850,7 +861,7 @@ impl Inode {
             if has_replaced {
                 target_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
             } else {
-                target_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type)?;
+                target_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, None)?;
             }
             // Moving a directory into a fresh name in `target`: `target` gains the
             // moved directory's new `..` back-reference. When replacing, the slot
@@ -1136,15 +1147,15 @@ mod tests {
 
         {
             let mut inner = dir.inner.write();
-            inner.make_empty(&f.ext4, DIR_INO, 2).unwrap();
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
             inner
-                .add_new_entry(&f.ext4, "alpha", 21, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "alpha", 21, DirEntryFileType::File, None)
                 .unwrap();
             inner
-                .add_new_entry(&f.ext4, "beta", 22, DirEntryFileType::Dir)
+                .add_new_entry(&f.ext4, "beta", 22, DirEntryFileType::Dir, None)
                 .unwrap();
             inner
-                .add_new_entry(&f.ext4, "gamma", 23, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "gamma", 23, DirEntryFileType::File, None)
                 .unwrap();
         }
 
@@ -1177,9 +1188,9 @@ mod tests {
         // name must split that slack rather than grow the directory.
         {
             let mut inner = dir.inner.write();
-            inner.make_empty(&f.ext4, DIR_INO, 2).unwrap();
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
             inner
-                .add_new_entry(&f.ext4, "split-me", 31, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "split-me", 31, DirEntryFileType::File, None)
                 .unwrap();
         }
 
@@ -1203,12 +1214,18 @@ mod tests {
         let count = 200usize;
         {
             let mut inner = dir.inner.write();
-            inner.make_empty(&f.ext4, DIR_INO, 2).unwrap();
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
             for i in 0..count {
                 let name = format!("entry_file_{i:05}"); // 16 bytes
                 assert_eq!(name.len(), 16);
                 inner
-                    .add_new_entry(&f.ext4, &name, 1000 + i as u32, DirEntryFileType::File)
+                    .add_new_entry(
+                        &f.ext4,
+                        &name,
+                        1000 + i as u32,
+                        DirEntryFileType::File,
+                        None,
+                    )
                     .unwrap();
             }
         }
@@ -1238,15 +1255,15 @@ mod tests {
 
         {
             let mut inner = dir.inner.write();
-            inner.make_empty(&f.ext4, DIR_INO, 2).unwrap();
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
             inner
-                .add_new_entry(&f.ext4, "keep", 41, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "keep", 41, DirEntryFileType::File, None)
                 .unwrap();
             inner
-                .add_new_entry(&f.ext4, "victim", 42, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "victim", 42, DirEntryFileType::File, None)
                 .unwrap();
             inner
-                .add_new_entry(&f.ext4, "tail", 43, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "tail", 43, DirEntryFileType::File, None)
                 .unwrap();
         }
         assert_eq!(readdir_names(&dir).len(), 5); // . .. keep victim tail
@@ -1273,7 +1290,7 @@ mod tests {
         {
             let mut inner = dir.inner.write();
             inner
-                .add_new_entry(&f.ext4, "reuse", 44, DirEntryFileType::File)
+                .add_new_entry(&f.ext4, "reuse", 44, DirEntryFileType::File, None)
                 .unwrap();
         }
         assert_eq!(dir.size(), size_after_delete, "re-add should not grow dir");
@@ -1290,7 +1307,7 @@ mod tests {
 
         {
             let mut inner = dir.inner.write();
-            inner.make_empty(&f.ext4, DIR_INO, 2).unwrap();
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
         }
 
         // `.` points to self, `..` to the parent (ino 2).
@@ -1305,7 +1322,7 @@ mod tests {
         {
             let mut inner = dir.inner.write();
             inner
-                .add_new_entry(&f.ext4, "child", 51, DirEntryFileType::Dir)
+                .add_new_entry(&f.ext4, "child", 51, DirEntryFileType::Dir, None)
                 .unwrap();
         }
         assert!(!dir.inner.read().empty_dir(DIR_INO));
@@ -1331,7 +1348,10 @@ mod tests {
         raw.link_count = 2;
         f.write_raw_inode(DIR_INO, &raw);
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
-        dir.inner.write().make_empty(&f.ext4, DIR_INO, 2).unwrap();
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
         f
     }
 
@@ -1460,7 +1480,10 @@ mod tests {
         f.write_raw_inode(DIR_INO, &raw);
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
         // Consumes the one free block for the parent's first directory block.
-        dir.inner.write().make_empty(&f.ext4, DIR_INO, 2).unwrap();
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
         let parent_links_before = dir.link_count();
 
         // The child inode is allocated and its on-disk desc written, but its

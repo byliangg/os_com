@@ -572,7 +572,7 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.write_at(&fs, offset, reader)
+        inner.write_at(&fs, offset, reader, None)
     }
 
     /// Truncates or extends a regular file to `new_size` bytes.
@@ -593,7 +593,7 @@ impl Inode {
         if is_shrink {
             journal::orphan_add(None, self.ino)?;
         }
-        inner.resize(&fs, new_size)?;
+        inner.resize(&fs, new_size, None)?;
         if is_shrink {
             journal::orphan_del(None, self.ino)?;
         }
@@ -707,11 +707,11 @@ impl Inode {
         if let Some(block_manager) = block_manager
             && block_manager.sector_count() > 0
         {
-            block_manager.truncate_to_byte_len(0)?;
+            block_manager.truncate_to_byte_len(0, None)?;
         }
         inner.write_back_inode_desc(&fs, self.ino)?;
 
-        fs.free_inode(self.ino, self.type_)?;
+        fs.free_inode(self.ino, self.type_, None)?;
         // Orphan-list seam (Phase-3 no-op): Phase 4 unlinks the inode from the
         // on-disk orphan chain now that its blocks and inode are freed.
         journal::orphan_del(None, self.ino)?;
@@ -975,7 +975,13 @@ impl InodeInner {
     ///
     /// On failure the caller must invoke `rollback_write` to restore page-cache
     /// capacity and free the partially allocated blocks.
-    fn prepare_write(&mut self, fs: &Ext4, offset: usize, end: usize) -> Result<()> {
+    fn prepare_write(
+        &mut self,
+        fs: &Ext4,
+        offset: usize,
+        end: usize,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let old_size = self.file_size();
         if end > old_size {
             self.ensure_size_within_limit(fs, end)?;
@@ -984,12 +990,12 @@ impl InodeInner {
         let start_block = (offset / BLOCK_SIZE) as Iblock;
         let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
         self.block_manager()?
-            .ensure_allocated(start_block, end_block)
+            .ensure_allocated(start_block, end_block, handle)
     }
 
     /// Restores page-cache capacity and frees blocks allocated past `old_size`
     /// after a failed write.
-    fn rollback_write(&mut self, old_size: usize, end: usize) {
+    fn rollback_write(&mut self, old_size: usize, end: usize, handle: Option<&journal::Handle>) {
         if end <= old_size {
             return;
         }
@@ -1000,7 +1006,7 @@ impl InodeInner {
             );
         }
         if let Ok(block_manager) = self.block_manager()
-            && let Err(err) = block_manager.truncate_to_byte_len(old_size)
+            && let Err(err) = block_manager.truncate_to_byte_len(old_size, handle)
         {
             error!("write_at: cleanup block truncate failed: {:?}", err);
         }
@@ -1013,13 +1019,18 @@ impl InodeInner {
     /// `resize_page_cache`) before freeing the trailing data/metadata blocks;
     /// expanding is sparse (no allocation — the gap stays a hole that reads as
     /// zeros). The caller updates timestamps and holds the `inner` write lock.
-    fn resize(&mut self, fs: &Ext4, new_size: usize) -> Result<()> {
+    fn resize(
+        &mut self,
+        fs: &Ext4,
+        new_size: usize,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let old_size = self.file_size();
         if new_size == old_size {
             return Ok(());
         }
         if new_size < old_size {
-            self.shrink(new_size)?;
+            self.shrink(new_size, handle)?;
         } else {
             self.expand(fs, new_size)?;
         }
@@ -1029,14 +1040,15 @@ impl InodeInner {
 
     /// Shrinks the file: zeroes the kept partial last block in the page cache,
     /// frees every data/metadata block past `new_size`, then publishes the size.
-    fn shrink(&mut self, new_size: usize) -> Result<()> {
+    fn shrink(&mut self, new_size: usize, handle: Option<&journal::Handle>) -> Result<()> {
         let old_size = self.file_size();
         // Order (report §5.2 rule 4, shrink): zero + shrink the VMO before the
         // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
         // kept partial block (BLOCK_SIZE == PAGE_SIZE), so stale tail bytes do
         // not reappear if the file is later extended.
         self.resize_page_cache(new_size, old_size)?;
-        self.block_manager()?.truncate_to_byte_len(new_size)?;
+        self.block_manager()?
+            .truncate_to_byte_len(new_size, handle)?;
         self.set_file_size(new_size);
         Ok(())
     }
@@ -1057,7 +1069,13 @@ impl InodeInner {
     }
 
     /// Writes file data at `offset` through the page cache.
-    fn write_at(&mut self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
+    fn write_at(
+        &mut self,
+        fs: &Ext4,
+        offset: usize,
+        reader: &mut VmReader,
+        handle: Option<&journal::Handle>,
+    ) -> Result<usize> {
         let write_len = reader.remain();
         if write_len == 0 {
             return Ok(0);
@@ -1067,12 +1085,12 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(fs, offset, end) {
-            self.rollback_write(old_size, end);
+        if let Err(err) = self.prepare_write(fs, offset, end, handle) {
+            self.rollback_write(old_size, end, handle);
             return Err(err);
         }
         if let Err(err) = self.page_cache()?.write(offset, reader) {
-            self.rollback_write(old_size, end);
+            self.rollback_write(old_size, end, handle);
             return Err(err.into());
         }
 

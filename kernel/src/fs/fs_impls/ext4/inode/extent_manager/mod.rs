@@ -13,7 +13,10 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{super::prelude::*, RAW_BLOCK_PTRS_LEN};
+use super::{
+    super::{journal, prelude::*},
+    RAW_BLOCK_PTRS_LEN,
+};
 
 mod node;
 mod tree;
@@ -186,7 +189,12 @@ impl ExtentManager {
     /// the caller's `rollback_write` truncates it away. A successful conversion
     /// that precedes a failed page-cache write also stays (the blocks were
     /// already allocated, so nothing leaks): leaving them written is benign.
-    pub(super) fn ensure_allocated(&self, start_iblock: Iblock, end_iblock: Iblock) -> Result<()> {
+    pub(super) fn ensure_allocated(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         if start_iblock >= end_iblock {
             return Ok(());
         }
@@ -207,8 +215,13 @@ impl ExtentManager {
                 && e.block() < end_iblock
                 && e.block() as u64 + e.len() as u64 > start_iblock as u64
         }) {
-            let delta =
-                tree::convert_unwritten(&mut s.root, &fs, start_iblock, end_iblock - start_iblock)?;
+            let delta = tree::convert_unwritten(
+                &mut s.root,
+                &fs,
+                start_iblock,
+                end_iblock - start_iblock,
+                handle,
+            )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             s.sector_count =
                 (s.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -232,7 +245,7 @@ impl ExtentManager {
                 .unwrap_or(0);
             while ib < hole.end {
                 let want = hole.end - ib;
-                let range = fs.alloc_blocks(want, goal)?;
+                let range = fs.alloc_blocks(want, goal, handle)?;
                 let got = (range.end - range.start) as u32;
                 debug_assert!(got > 0 && got <= want);
                 // If recording the extent fails, the just-allocated data blocks
@@ -246,10 +259,11 @@ impl ExtentManager {
                     range.start,
                     got as u16,
                     node::ExtentKind::Written,
+                    handle,
                 ) {
                     Ok(delta) => delta,
                     Err(err) => {
-                        let _ = fs.free_blocks(range.start, got);
+                        let _ = fs.free_blocks(range.start, got, handle);
                         return Err(err);
                     }
                 };
@@ -269,7 +283,8 @@ impl ExtentManager {
     fn allocate_one(&self, iblock: Iblock) -> Result<Ext4Bid> {
         let fs = self.fs()?;
         let mut s = self.state.write();
-        let range = fs.alloc_blocks(1, 0)?;
+        // The page-cache writeback fallback has no open handle to thread.
+        let range = fs.alloc_blocks(1, 0, None)?;
         let pblock = range.start;
         let delta = match tree::insert_extent(
             &mut s.root,
@@ -278,11 +293,12 @@ impl ExtentManager {
             pblock,
             1,
             node::ExtentKind::Written,
+            None,
         ) {
             Ok(delta) => delta,
             Err(err) => {
                 // Free the just-allocated block rather than leak it.
-                let _ = fs.free_blocks(pblock, 1);
+                let _ = fs.free_blocks(pblock, 1, None);
                 return Err(err);
             }
         };
@@ -297,7 +313,11 @@ impl ExtentManager {
     /// region at or beyond `new_size` bytes, rewriting the tree and updating
     /// `i_blocks`. Used by `rollback_write`; Phase 4 extends it (partial-block
     /// zeroing, the public `resize`).
-    pub(super) fn truncate_to_byte_len(&self, new_size: usize) -> Result<()> {
+    pub(super) fn truncate_to_byte_len(
+        &self,
+        new_size: usize,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let fs = self.fs()?;
         let device = fs.block_device().as_ref();
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
@@ -318,19 +338,19 @@ impl ExtentManager {
             }
             if e_start >= keep_blocks {
                 // Entire extent is beyond the new size; free all its blocks.
-                fs.free_blocks(e.start(), e.len() as u32)?;
+                fs.free_blocks(e.start(), e.len() as u32, handle)?;
                 freed_data += e.len() as u64;
                 continue;
             }
             // The extent straddles `keep_blocks`: keep the head, free the tail.
             let head_len = (keep_blocks - e_start) as u16;
             let tail_len = e.len() - head_len;
-            fs.free_blocks(e.start() + head_len as Ext4Bid, tail_len as u32)?;
+            fs.free_blocks(e.start() + head_len as Ext4Bid, tail_len as u32, handle)?;
             freed_data += tail_len as u64;
             kept.push((e.block(), head_len, e.start(), e.kind()));
         }
 
-        let new_meta = tree::rebuild_from_extents(&mut s.root, &fs, &kept)?;
+        let new_meta = tree::rebuild_from_extents(&mut s.root, &fs, &kept, handle)?;
         let net_meta = new_meta as i64 - old_meta as i64;
         let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
         // `i_blocks` must never drop below zero; `max(0)` saturates, the assert
