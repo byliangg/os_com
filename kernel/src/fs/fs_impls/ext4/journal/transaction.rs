@@ -55,7 +55,7 @@
 // and absent in ktest (where all of it is exercised).
 #![cfg_attr(not(ktest), expect(dead_code))]
 
-use super::{super::prelude::*, Journal, Tid};
+use super::{super::inode::Inode, super::prelude::*, Journal, Tid};
 
 /// A captured whole-block after-image for one metadata block, held in a running
 /// transaction until commit writes it to the log. Model A (op-time capture):
@@ -136,6 +136,14 @@ pub(in crate::fs::fs_impls::ext4) struct Transaction {
     /// The captured after-images, keyed by physical block number. An ordered map
     /// so commit writes tags in a deterministic block order.
     metadata: BTreeMap<Ext4Bid, MetaBuffer>,
+    /// The inodes whose **data** was dirtied under this transaction, for
+    /// ordered-data mode (jbd2 `t_inode_list`). Keyed by ino so an inode dirtied
+    /// several times in one transaction is flushed once; the value is a [`Weak`]
+    /// so a running transaction never keeps an inode alive (a dropped inode's
+    /// data is no longer this transaction's concern). At commit each is upgraded
+    /// and its dirty data flushed to its final location before any log block is
+    /// written.
+    ordered_inodes: BTreeMap<Ext4Ino, Weak<Inode>>,
 }
 
 impl Transaction {
@@ -147,6 +155,7 @@ impl Transaction {
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
+            ordered_inodes: BTreeMap::new(),
         }
     }
 
@@ -240,6 +249,31 @@ impl Transaction {
         self.metadata
             .iter()
             .map(|(&bid, buffer)| (bid, buffer.as_bytes()))
+    }
+
+    /// Registers `inode` as an ordered-data inode of this transaction (jbd2
+    /// `jbd2_journal_inode_ranges_write` / `t_inode_list`): its dirty data will be
+    /// flushed to its final location before this transaction's metadata is
+    /// committed. Keyed by ino, so a repeat registration of the same inode is a
+    /// no-op beyond refreshing the `Weak`. Held weakly — the transaction never
+    /// keeps the inode alive.
+    pub(super) fn add_ordered_inode(&mut self, inode: &Arc<Inode>) {
+        self.ordered_inodes
+            .insert(inode.ino(), Arc::downgrade(inode));
+    }
+
+    /// Iterates the live ordered-data inodes, upgrading each [`Weak`] and skipping
+    /// any inode that has since been dropped (its data is no longer this
+    /// transaction's concern). The commit pipeline flushes each yielded inode's
+    /// data before writing any log block.
+    pub(super) fn ordered_inodes(&self) -> impl Iterator<Item = Arc<Inode>> + '_ {
+        self.ordered_inodes.values().filter_map(Weak::upgrade)
+    }
+
+    /// The number of registered ordered-data inodes (including any whose inode may
+    /// since have been dropped). Inspection/test accessor.
+    pub(super) fn nr_ordered_inodes(&self) -> usize {
+        self.ordered_inodes.len()
     }
 
     /// Moves this transaction to `state` (jbd2 `t_state` transitions driven by
@@ -620,5 +654,44 @@ mod tests {
         // maxlen 64, first 1: usable = 64 - 1, minus 2 overhead = 61.
         let j = journaled_fixture(64, 1, 1);
         assert_eq!(j.max_credits(), 61);
+    }
+
+    #[ktest]
+    fn ordered_inodes_dedup_and_iterate() {
+        use super::super::super::test_utils::make_empty_file_inode;
+
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // Two distinct regular-file inodes, both read through the block-group
+        // cache (which keeps a strong ref while cached).
+        f.write_raw_inode(11, &make_empty_file_inode());
+        f.write_raw_inode(12, &make_empty_file_inode());
+        let a = f.ext4.read_inode(11).unwrap();
+        let b = f.ext4.read_inode(12).unwrap();
+
+        let mut txn = Transaction::new(1);
+        assert_eq!(txn.nr_ordered_inodes(), 0);
+
+        // Register `a` twice (dedups by ino) and `b` once.
+        txn.add_ordered_inode(&a);
+        txn.add_ordered_inode(&a);
+        txn.add_ordered_inode(&b);
+        assert_eq!(txn.nr_ordered_inodes(), 2);
+
+        // Both live inodes are yielded.
+        let mut inos: Vec<_> = txn.ordered_inodes().map(|i| i.ino()).collect();
+        inos.sort_unstable();
+        assert_eq!(inos, vec![11, 12]);
+
+        // Evict `b` from the cache and drop our only remaining strong ref: its
+        // `Weak` then no longer upgrades, so the iterator skips it (but the key
+        // remains counted).
+        f.ext4.remove_inode(12);
+        drop(b);
+        let live: Vec<_> = txn.ordered_inodes().map(|i| i.ino()).collect();
+        assert_eq!(live, vec![11]);
+        assert_eq!(txn.nr_ordered_inodes(), 2);
     }
 }

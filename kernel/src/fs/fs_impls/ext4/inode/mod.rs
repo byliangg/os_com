@@ -635,6 +635,39 @@ impl Inode {
         Ok(())
     }
 
+    /// Flushes this inode's dirty **data** pages to their final on-disk locations,
+    /// for journaling's ordered-data mode (jbd2 `data=ordered`): a file's data
+    /// must be durable before the metadata referencing it is committed to the log,
+    /// so recovery never replays metadata (size/extents) that points at a block
+    /// whose data never reached the platter. Does not touch inode/extent metadata
+    /// (that goes through the journal). Called by the commit pipeline for each
+    /// ordered inode.
+    ///
+    /// A `read()` guard suffices: `sync_data_pages` takes `&self` on
+    /// [`InodeInner`] and only reads the page cache to flush its dirty pages
+    /// through the extent-mapped backend to their final device blocks — it mutates
+    /// no `InodeInner` field. In the global lock order this holds only
+    /// `inner.read()` (a leaf here) and no journal state lock.
+    pub(in crate::fs::fs_impls::ext4) fn flush_ordered_data(&self) -> Result<()> {
+        self.inner.read().sync_data_pages()
+    }
+
+    /// Maps logical block `iblock` to its physical block, or `None` for a hole.
+    /// Test-only inspection used to read a file's data straight off the device
+    /// (e.g. to prove the ordered flush reached the final location).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn data_block_of(&self, iblock: Iblock) -> Option<Ext4Bid> {
+        use self::extent_manager::MapState;
+
+        let inner = self.inner.read();
+        let block_manager = inner.block_manager().ok()?;
+        let mapping = block_manager.map_blocks(iblock).ok()?;
+        match mapping.state() {
+            MapState::Written | MapState::Unwritten => Some(mapping.pblock()),
+            MapState::Hole => None,
+        }
+    }
+
     /// Reclaims a fully unlinked inode: frees its data blocks and inode bit.
     ///
     /// Runs from `Drop` when the last `Arc<Inode>` is released. A no-op (returns

@@ -41,6 +41,17 @@
 //! barrier ([`BlockDevice::sync`], a Flush that waits) sits where it does for a
 //! specific reason:
 //!
+//! 0. **Ordered data first (jbd2 `data=ordered`).** Flush every ordered inode's
+//!    dirty **data** to its final on-disk location, then **barrier**. A file's
+//!    data must be durable *before* the metadata that references it is committed
+//!    to the log; otherwise recovery could replay an inode whose size/extents now
+//!    cover a block whose data never reached the platter, exposing stale/garbage
+//!    bytes or leaking. This is a *separate* barrier from step 2 on purpose: it
+//!    makes "data durable before metadata" hold regardless of `flush_range`'s
+//!    submit-vs-complete timing, matching jbd2's explicit wait-for-data step
+//!    before the journal write. Skipped (no barrier) when the transaction has no
+//!    ordered inodes. (Merging this barrier with step 2 is a valid Phase-7 perf
+//!    optimization once `flush_dirty_pages` completion semantics are pinned down.)
 //! 1. Write the descriptor + all N metadata blocks to the log.
 //! 2. **Barrier.** The descriptor and data must be durable *before* the commit
 //!    block; otherwise a crash could leave a commit record pointing at data that
@@ -295,8 +306,9 @@ fn advance_head(head: u32, count: u32, first: u32, maxlen: u32) -> u32 {
 /// recoverable. Consumes the transaction. Returns its tid.
 ///
 /// Implements the log layout and crash-safe write ordering documented at the
-/// module level: data → barrier → commit → barrier → (superblock → barrier if
-/// the journal was clean) → in-memory state.
+/// module level: ordered data → barrier → log (descriptor + metadata) → barrier
+/// → commit → barrier → (superblock → barrier if the journal was clean) →
+/// in-memory state.
 pub(super) fn commit_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
@@ -305,6 +317,32 @@ pub(super) fn commit_transaction(
     let tid = txn.tid();
     let first = journal.geometry.first();
     let maxlen = journal.geometry.maxlen();
+
+    // --- Step 0: ordered-data mode. Every ordered inode's dirty data must reach
+    // its final location and be durable BEFORE any log block (and thus the commit
+    // record) is written, so recovery never replays metadata (an inode whose
+    // size/extents now cover a block) that references data which never hit the
+    // platter — which would expose stale/garbage bytes or leak. This mirrors
+    // jbd2's `data=ordered` step, which flushes and waits on the transaction's
+    // ordered inodes (`journal_submit_inode_data_buffers` /
+    // `journal_finish_inode_data_buffers`) before the commit phase.
+    //
+    // This is a SEPARATE barrier, not merged with the pre-commit metadata barrier
+    // in step 2: `flush_range`'s exact submit-vs-complete timing is not something
+    // we depend on here — an explicit barrier right after the data flush makes
+    // "data durable before metadata" unconditionally correct regardless of when
+    // `flush_dirty_pages` completes. (Merging it with the step-2 metadata barrier
+    // is a valid Phase-7 perf optimization once `flush_dirty_pages` completion
+    // semantics are pinned down.) The flush takes `inode.inner.read()` and holds
+    // no journal state lock — a leaf in the global order.
+    let mut flushed_any = false;
+    for inode in txn.ordered_inodes() {
+        inode.flush_ordered_data()?;
+        flushed_any = true;
+    }
+    if flushed_any {
+        barrier(device)?;
+    }
 
     // The head to write at, and whether the journal is clean, are read under the
     // state lock; the writes themselves happen without holding it (Phase 4 is
@@ -651,5 +689,96 @@ mod tests {
         // adds a third for the superblock update).
         let issued = f.fixture.disk.flush_count() - before;
         assert!(issued >= 2, "expected >= 2 barriers, got {issued}");
+    }
+
+    /// The money test for ordered-data mode: a file's data reaches its final
+    /// on-disk location during commit (not before), because it was registered as
+    /// an ordered inode of the committed transaction.
+    #[ktest]
+    fn commit_flushes_ordered_data_to_disk() {
+        use super::super::super::test_utils::make_empty_file_inode;
+        crate::time::clocks::init_for_ktest();
+
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        // A regular file (ino 11) whose data we will dirty in the page cache.
+        const FILE_INO: u32 = 11;
+        f.fixture
+            .write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.fixture.ext4.read_inode(FILE_INO).unwrap();
+
+        // Write known data: this dirties the page cache and allocates a data
+        // block, but leaves the data in the cache (no flush yet).
+        let mut data = [0u8; BLOCK_SIZE];
+        data[..8].copy_from_slice(b"ORDERED!");
+        data[BLOCK_SIZE - 4..].copy_from_slice(b"TAIL");
+        let mut reader = VmReader::from(data.as_slice()).to_fallible();
+        assert_eq!(inode.write_at(0, &mut reader).unwrap(), BLOCK_SIZE);
+
+        // The data block's final physical location (logical block 0).
+        let pblock = inode
+            .data_block_of(0)
+            .expect("logical block 0 must be allocated after the write");
+
+        // BEFORE commit the final location still holds the fixture's zeroed disk:
+        // the write left the data only in the page cache.
+        let mut on_disk = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(pblock as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(
+            on_disk,
+            [0u8; BLOCK_SIZE],
+            "data must not be on disk before commit"
+        );
+
+        // Build a transaction that captures a metadata block (so the commit has
+        // something to log) AND registers the inode as ordered data.
+        let mut txn = Transaction::new(1);
+        let mut meta = [0u8; BLOCK_SIZE];
+        meta[..4].copy_from_slice(b"META");
+        txn.capture_create(500);
+        txn.apply_patch(500, |b| b.copy_from_slice(&meta)).unwrap();
+        txn.add_ordered_inode(&inode);
+
+        let before = f.fixture.disk.flush_count();
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // AFTER commit the ordered flush wrote the file's data to its final block.
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(pblock as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, data, "ordered data must be on disk after commit");
+
+        // Barriers: data + metadata + commit = 3, plus the superblock barrier
+        // (this is a clean-journal commit) = 4.
+        let issued = f.fixture.disk.flush_count() - before;
+        assert!(issued >= 3, "expected >= 3 barriers, got {issued}");
+    }
+
+    /// An empty ordered set issues no data barrier: only the metadata + commit
+    /// barriers (2), plus the superblock barrier on a clean-journal commit (3).
+    #[ktest]
+    fn commit_without_ordered_inodes_skips_data_barrier() {
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let before = f.fixture.disk.flush_count();
+
+        let mut content = [0u8; BLOCK_SIZE];
+        content[..4].copy_from_slice(b"META");
+        let txn = make_txn(1, &[(500u64, content)]);
+        assert_eq!(txn.nr_ordered_inodes(), 0);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // No ordered inodes => no data barrier: exactly the metadata + commit +
+        // (clean-journal) superblock barriers, i.e. 3.
+        let issued = f.fixture.disk.flush_count() - before;
+        assert_eq!(issued, 3, "expected exactly 3 barriers (no data barrier)");
     }
 }
