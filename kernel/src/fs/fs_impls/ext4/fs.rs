@@ -595,6 +595,26 @@ impl Ext4 {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let offset = self.inode_table_offset(ino)?;
+
+        // Journaled path: the on-disk inode may be **stale** — a prior write to it
+        // was suppressed (WAL) and has not yet been checkpointed — so a
+        // read-modify-write from the device would resurrect that block's zeroed
+        // `i_mode` type bits / `extra_isize` / `generation` (exactly the
+        // corruption the guest e2fsck caught after a rename touched a
+        // not-yet-checkpointed directory). Encode the whole inode from the
+        // in-memory descriptor instead and capture it; checkpoint applies it to
+        // the final location after the transaction commits.
+        if handle.is_some() {
+            let raw = build_raw_inode(desc, root);
+            return journal_inode_block(handle, offset, raw.as_bytes());
+        }
+
+        // Non-journaled (or the sync path): read-modify-write the on-disk inode,
+        // patching only the fields buffered writes mutate (size, `i_blocks`, the
+        // extent root, timestamps, flags, link count, dtime) and preserving
+        // everything else (`extra_isize`, checksums, generation, xattr tail, osd
+        // fields) losslessly, then write it through. The device is authoritative
+        // here, so the RMW is safe.
         let mut raw = self
             .block_device
             .read_val::<RawInode>(offset)
@@ -640,20 +660,9 @@ impl Ext4 {
         // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
         raw.dtime = desc.dtime().as_secs() as u32;
 
-        // Capture the inode block's after-image (sub-block RMW at the inode's
-        // offset within its inode-table block). Only `size_of::<RawInode>()`
-        // bytes are patched — exactly what the direct write below persists — so
-        // the tail (`extra_isize` region) survives from the seeded block.
-        journal_inode_block(handle, offset, raw.as_bytes())?;
-        // Under a handle the after-image reaches its final location via checkpoint
-        // *after* the transaction commits; suppress the direct write so metadata
-        // never precedes its commit (write-ahead logging). Without a handle (a
-        // non-journaled volume, or the sync path) write through as before.
-        if handle.is_none() {
-            self.block_device
-                .write_val(offset, &raw)
-                .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
-        }
+        self.block_device
+            .write_val(offset, &raw)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
         Ok(())
     }
 
@@ -674,43 +683,7 @@ impl Ext4 {
     ) -> Result<()> {
         let offset = self.inode_table_offset(ino)?;
 
-        let (mtime_secs, mtime_extra) = encode_time(desc.mtime());
-        let (ctime_secs, ctime_extra) = encode_time(desc.ctime());
-        let (atime_secs, atime_extra) = encode_time(desc.atime());
-        let (crtime_secs, crtime_extra) = encode_time(desc.crtime());
-
-        let raw = RawInode {
-            mode: (desc.type_() as u16) | (desc.perm().bits() & 0o7777),
-            uid: desc.uid() as u16,
-            size_lo: desc.size() as u32,
-            atime: atime_secs,
-            ctime: ctime_secs,
-            mtime: mtime_secs,
-            gid: desc.gid() as u16,
-            link_count: desc.link_count(),
-            sector_count: desc.sector_count() as u32,
-            flags: desc.flags().bits(),
-            block: *desc.raw_block(),
-            generation: desc.generation(),
-            size_high: if desc.type_() == InodeType::File {
-                (desc.size() >> 32) as u32
-            } else {
-                0
-            },
-            blocks_high: (desc.sector_count() >> 32) as u16,
-            uid_high: (desc.uid() >> 16) as u16,
-            gid_high: (desc.gid() >> 16) as u16,
-            // Match the `extra_isize` the fixtures and `mke2fs` write for a
-            // 256-byte inode (32 bytes of ext4 extra area past the 128-byte
-            // base) so the nanosecond timestamps above are honored on read.
-            extra_isize: 32,
-            ctime_extra,
-            mtime_extra,
-            atime_extra,
-            crtime: crtime_secs,
-            crtime_extra,
-            ..Default::default()
-        };
+        let raw = build_raw_inode(desc, desc.raw_block());
 
         journal_inode_block(handle, offset, raw.as_bytes())?;
         // See `write_back_inode_desc`: suppress the direct write under a handle so
@@ -778,6 +751,59 @@ fn encode_time(time: Duration) -> (u32, u32) {
     let secs_lo = secs as u32;
     let extra = (epoch as u32) | (nsec << 2);
     (secs_lo, extra)
+}
+
+/// Builds the complete on-disk [`RawInode`] for `desc` with `root` as its inline
+/// extent-tree root — every field from the in-memory descriptor, never from the
+/// device.
+///
+/// This is the authoritative encoding used by both the new-inode write and the
+/// *journaled* writeback. Under a handle the on-disk inode may be **stale** (its
+/// previous write was suppressed and not yet checkpointed), so a read-modify-write
+/// from the device would resurrect zeroed `i_mode` type bits, `extra_isize`,
+/// `generation`, and nanosecond timestamps — the corruption the guest e2fsck
+/// caught after a rename touched a directory whose creation had not yet
+/// checkpointed. Encoding straight from `desc` (which `InodeDesc::try_from` loads
+/// in full: type, generation, crtime, …) sidesteps that entirely.
+fn build_raw_inode(desc: &InodeDesc, root: &[u32; super::inode::RAW_BLOCK_PTRS_LEN]) -> RawInode {
+    let (mtime_secs, mtime_extra) = encode_time(desc.mtime());
+    let (ctime_secs, ctime_extra) = encode_time(desc.ctime());
+    let (atime_secs, atime_extra) = encode_time(desc.atime());
+    let (crtime_secs, crtime_extra) = encode_time(desc.crtime());
+    RawInode {
+        // The full mode comes from `desc.type_()`, not the (possibly stale) device
+        // — this is what preserves the `S_IFMT` type bits under journaling.
+        mode: (desc.type_() as u16) | (desc.perm().bits() & 0o7777),
+        uid: desc.uid() as u16,
+        size_lo: desc.size() as u32,
+        atime: atime_secs,
+        ctime: ctime_secs,
+        mtime: mtime_secs,
+        dtime: desc.dtime().as_secs() as u32,
+        gid: desc.gid() as u16,
+        link_count: desc.link_count(),
+        sector_count: desc.sector_count() as u32,
+        flags: desc.flags().bits(),
+        block: *root,
+        generation: desc.generation(),
+        size_high: if desc.type_() == InodeType::File {
+            (desc.size() >> 32) as u32
+        } else {
+            0
+        },
+        blocks_high: (desc.sector_count() >> 32) as u16,
+        uid_high: (desc.uid() >> 16) as u16,
+        gid_high: (desc.gid() >> 16) as u16,
+        // The `extra_isize` a 256-byte inode carries (32 bytes past the 128-byte
+        // base), so the nanosecond timestamps are honored on read.
+        extra_isize: 32,
+        ctime_extra,
+        mtime_extra,
+        atime_extra,
+        crtime: crtime_secs,
+        crtime_extra,
+        ..Default::default()
+    }
 }
 
 /// The device block that holds the primary superblock. With 4 KiB blocks the
@@ -1685,6 +1711,56 @@ mod tests {
             after_ckpt.link_count, new_link,
             "checkpoint wrote the captured inode to its final location"
         );
+    }
+
+    /// Int-B B3 regression (the bug the guest e2fsck caught): a journaled inode
+    /// writeback must rebuild the inode from the in-memory descriptor, NOT
+    /// read-modify-write the on-disk block — which under WAL can be stale (a prior
+    /// write suppressed, not yet checkpointed). Here the on-disk slot is zeroed to
+    /// stand in for that stale block; the writeback must still preserve the type
+    /// bits, `extra_isize`, and generation from the descriptor.
+    #[ktest]
+    fn journaled_inode_writeback_rebuilds_from_desc_not_stale_disk() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let ino = ROOT_INO;
+        let desc = f.ext4.read_inode_desc(ino).unwrap();
+        let type_bits = (desc.type_() as u16) & 0xF000;
+        assert_ne!(type_bits, 0, "root is a directory (S_IFDIR)");
+        let generation = desc.generation();
+        let root = *desc.raw_block();
+        let offset = f.ext4.inode_table_offset(ino).unwrap();
+
+        // Simulate the stale/suppressed on-disk inode: zero its slot.
+        f.disk
+            .segment()
+            .write_val(offset, &RawInode::default())
+            .unwrap();
+
+        // Journaled writeback + checkpoint.
+        let op = f.ext4.begin_op(4).unwrap();
+        f.ext4
+            .write_back_inode_desc(ino, &desc, &root, op.get())
+            .unwrap();
+        drop(op);
+        journal.flush_on_unmount().unwrap();
+
+        // Despite the zeroed on-disk block, the inode was rebuilt from the
+        // descriptor: type bits, extra_isize and generation are intact (a
+        // RMW-from-the-zeroed-disk would have lost all three — the guest e2fsck
+        // "unknown file type" / "i_blocks wrong" corruption).
+        let after: RawInode = f.disk.segment().read_val(offset).unwrap();
+        assert_eq!(after.mode & 0xF000, type_bits, "S_IFMT type bits preserved");
+        assert_eq!(after.extra_isize, 32, "extra_isize preserved");
+        assert_eq!(after.generation, generation, "generation preserved");
+        assert_eq!(after.link_count, desc.link_count(), "link count written");
     }
 
     /// A non-journaled volume has no journal — the Phase 1–3 mount path is
