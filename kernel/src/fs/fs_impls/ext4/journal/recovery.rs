@@ -77,14 +77,11 @@
 //! flush uses [`barrier`](super::commit::barrier) — one definition each, shared
 //! with commit/checkpoint.
 
-// Recovery is reachable only through the test-only `Journal` until the later
-// integration task wires it into `Ext4::open` (which owns the mount-path RECOVER
-// bit). In non-ktest builds `recover` + `scan_transaction` form a closed,
-// unreferenced cluster; one module-level attribute absorbs it (mirroring
-// `checkpoint`/`commit`). `allow` (not `expect`): the integration task will
-// reference `recover` from a live path, at which point a module-level
-// `expect(dead_code)` would flip to "unfulfilled"; `allow` is stable.
-#![cfg_attr(not(ktest), allow(dead_code))]
+// Recovery is now live in all builds: `Ext4::open` calls [`recover`] at mount
+// time to replay a dirty journal, which pulls in the whole SCAN/REPLAY cluster
+// (`scan_transaction`, `read_log_block`, `parse_header`). No dead-code gate is
+// needed anymore (the earlier module-level `allow(dead_code)` was a placeholder
+// for exactly this integration).
 
 use core::sync::atomic::Ordering;
 
@@ -311,7 +308,10 @@ fn scan_transaction(
 /// block SCAN's k-th step did and consumes the same tid. Replaying exactly
 /// `count` transactions therefore stops precisely at the boundary SCAN found — no
 /// interrupted-tail transaction is ever replayed.
-pub(super) fn recover(journal: &Journal, device: &dyn BlockDevice) -> Result<()> {
+pub(in crate::fs::fs_impls::ext4) fn recover(
+    journal: &Journal,
+    device: &dyn BlockDevice,
+) -> Result<()> {
     // --- Read the on-disk journal superblock (log block 0). ---
     let sb_pblock = journal
         .geometry()

@@ -21,7 +21,7 @@ use ostd::mm::{HasSize, io::util::HasVmReaderWriter};
 
 use super::{
     block_group::RawBlockGroup,
-    fs::{Ext4, ROOT_INO},
+    fs::{Ext4, JOURNAL_INO, ROOT_INO},
     inode::{EXTENTS_FL, RawInode},
     prelude::*,
     super_block::{MAGIC_NUM, RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
@@ -196,7 +196,16 @@ pub(super) struct Ext4FixtureBuilder {
     /// When set, OR the `HAS_JOURNAL` compat feature bit into the superblock so
     /// the journal geometry loader treats the volume as journaled.
     has_journal: bool,
+    /// When set to `Some(maxlen)`, lay down the journal inode (ino 8) and a clean
+    /// journal superblock on disk *before* `Ext4::open`, so the mount path itself
+    /// loads the journal. The log occupies `maxlen` physical blocks starting at
+    /// [`JOURNAL_START_BLOCK`]. Implies `has_journal`.
+    journal_inode: Option<u32>,
 }
+
+/// The physical block where the fixture places the journal (log block 0 → this
+/// device block). Matches the constant the `journal` module's own tests use.
+pub(super) const JOURNAL_START_BLOCK: u32 = 200;
 
 impl Ext4FixtureBuilder {
     pub(super) fn new(blocks_per_group: u32, inodes_per_group: u32, nblocks: usize) -> Self {
@@ -211,14 +220,36 @@ impl Ext4FixtureBuilder {
             no_free_inodes: false,
             reserved_inode: None,
             has_journal: false,
+            journal_inode: None,
         }
+    }
+
+    /// Lays down the journal inode (ino 8) and a *clean* journal superblock
+    /// (`s_start == 0`, `s_sequence == 1`) on disk before `Ext4::open`, so the
+    /// mount path loads and starts the journal. The log spans `maxlen` physical
+    /// blocks at [`JOURNAL_START_BLOCK`]. Sets `HAS_JOURNAL` too.
+    pub(super) fn with_journal_inode(mut self, maxlen: u32) -> Self {
+        self.has_journal = true;
+        self.journal_inode = Some(maxlen);
+        self
     }
 
     /// Sets the `HAS_JOURNAL` compat feature bit in the superblock, so
     /// `journal::load_geometry` treats the volume as journaled and parses the
     /// journal inode (ino 8).
+    ///
+    /// Also lays down a *minimal* valid journal (a 2-block inode + clean
+    /// superblock) so `Ext4::open` — which now loads the journal at mount time —
+    /// succeeds. The journal-module tests that use this then overwrite ino 8 and
+    /// the journal superblock with their own geometry after `build()` and drive a
+    /// separately constructed `Journal`; the mount-time journal that `Ext4::open`
+    /// loads sits idle (it never receives a running transaction) and is torn down
+    /// when the fixture's `Ext4` drops.
     pub(super) fn with_has_journal(mut self) -> Self {
         self.has_journal = true;
+        if self.journal_inode.is_none() {
+            self.journal_inode = Some(2);
+        }
         self
     }
 
@@ -449,6 +480,24 @@ impl Ext4FixtureBuilder {
         let root_offset =
             INODE_TABLE_BID as usize * BLOCK_SIZE + (ROOT_INO - 1) as usize * INODE_SIZE;
         disk.segment().write_val(root_offset, &root).unwrap();
+
+        // Lay down the journal inode (ino 8) and a clean journal superblock BEFORE
+        // `Ext4::open`, so the mount path itself loads and starts the journal.
+        if let Some(maxlen) = self.journal_inode {
+            let journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, maxlen as u16);
+            let journal_offset =
+                INODE_TABLE_BID as usize * BLOCK_SIZE + (JOURNAL_INO - 1) as usize * INODE_SIZE;
+            disk.segment()
+                .write_val(journal_offset, &journal_inode)
+                .unwrap();
+            super::journal::write_clean_journal_superblock_for_test(
+                disk.as_ref(),
+                JOURNAL_START_BLOCK as Ext4Bid,
+                maxlen,
+                1, // s_first: first log-data block
+                1, // s_sequence: fresh journal starts at tid 1
+            )?;
+        }
 
         let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>)?;
         Ok(Ext4Fixture { disk, ext4, sb })

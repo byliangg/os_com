@@ -101,13 +101,18 @@ bitflags! {
 
 /// Incompatible features this implementation supports.
 ///
-/// Phase 1 is a read-only, extent-only reader: it understands typed directory
-/// entries (`FILETYPE`) and extent block mapping (`EXTENTS`). Other incompatible
-/// features (64-bit, flex_bg, csum_seed, recover, ...) are added in later phases
-/// and must stay out of this mask until then, so an image needing them is
-/// rejected rather than silently misread.
-pub(super) const INCOMPAT_SUPP: FeatureIncompatSet =
-    FeatureIncompatSet::FILETYPE.union(FeatureIncompatSet::EXTENTS);
+/// The reader understands typed directory entries (`FILETYPE`) and extent block
+/// mapping (`EXTENTS`). Phase 4 adds `RECOVER`: a volume left with the journal
+/// needing replay is now *mounted and recovered* (`Ext4::open` runs
+/// [`journal::recover`](super::journal) and clears the bit), not rejected as it
+/// was in Phases 1–3 when there was no journal machinery. Other incompatible
+/// features (64-bit, flex_bg, csum_seed, ...) are added in later phases and must
+/// stay out of this mask until then, so an image needing them is rejected rather
+/// than silently misread. (`HAS_JOURNAL` is a *compat* feature, handled by the
+/// journal loader, so it does not belong in this incompat mask.)
+pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYPE
+    .union(FeatureIncompatSet::EXTENTS)
+    .union(FeatureIncompatSet::RECOVER);
 
 /// Read-only compatible features this implementation handles.
 ///

@@ -19,6 +19,7 @@ use device_id::DeviceId;
 use super::{
     block_group::BlockGroup,
     inode::{FilePerm, Inode, InodeDesc, RawInode},
+    journal,
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
     utils,
@@ -55,6 +56,18 @@ pub struct Ext4 {
     /// the superblock (report §5.1) — when it fills the no-op bodies.
     #[expect(dead_code)] // Phase 4 acquires this; see `journal::orphan_add`.
     s_orphan_lock: Mutex<()>,
+    /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
+    /// feature (jbd2 `journal_t`).
+    ///
+    /// A settable cell, not a plain field, because the journal can only be built
+    /// *after* the `Ext4` `Arc` exists: [`journal::load_geometry`] reads the
+    /// journal inode (ino 8) *through* the filesystem, so the fs must already be
+    /// live. [`Ext4::open`] therefore constructs `Ext4` with `journal: None`, then
+    /// loads/recovers/starts the journal and stores it here exactly once. A
+    /// non-journaled volume leaves this `None` forever — the Phase 1–3 behavior is
+    /// preserved byte-for-byte. It is set once and only read thereafter, so a plain
+    /// `RwMutex<Option<_>>` (no interior invariants to uphold) suffices.
+    journal: RwMutex<Option<Arc<journal::Journal>>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
     self_ref: Weak<Ext4>,
 }
@@ -68,16 +81,49 @@ impl Ext4 {
 
         let block_groups = Self::load_block_groups(device.clone(), &super_block)?;
 
-        Ok(Arc::new_cyclic(|weak| Ext4 {
+        let ext4 = Arc::new_cyclic(|weak| Ext4 {
             block_device: device,
             super_block: RwMutex::new(Dirty::new(super_block)),
             block_groups,
             nr_inodes_per_group,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
             s_orphan_lock: Mutex::new(()),
+            journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak.clone(),
-        }))
+        });
+
+        // Journal mount lifecycle (jbd2 `jbd2_journal_load` + recovery + start of
+        // `kjournald`). Done here, after the `Ext4` `Arc` exists, because
+        // `load_geometry` resolves the journal inode's blocks *through* the fs.
+        //
+        // For a non-journaled volume `load_geometry` returns `None` and this whole
+        // block is a pure no-op — the Phase 1–3 mount path is unchanged.
+        if let Some(geometry) = journal::load_geometry(&ext4)? {
+            let journal = journal::Journal::new(geometry, ext4.block_device().clone());
+
+            // Recover a dirty journal (crashed mount) BEFORE any normal operation,
+            // so the filesystem is consistent before the commit thread or any op
+            // touches it. `needs_recovery()` is true when the on-disk `RECOVER`
+            // incompat bit is set (or an orphan chain is pending). `recover` is a
+            // no-op if the journal superblock is already clean (`s_start == 0`).
+            if ext4.super_block().needs_recovery() {
+                journal::recover(&journal, ext4.block_device().as_ref())?;
+                // jbd2 clears the on-disk `INCOMPAT_RECOVER` bit once the log has
+                // been replayed, so a subsequent clean mount does not re-recover.
+                ext4.super_block.write().clear_recover();
+                ext4.sync_metadata()?;
+            }
+
+            // Start `kjournald` and publish the journal. Storing it only *after*
+            // the thread is running means every error path above drops the `Ext4`
+            // `Arc` while `journal` is still `None`, so `Ext4::drop` finds nothing
+            // to stop — no half-started thread is ever leaked.
+            journal.start_commit_thread();
+            *ext4.journal.write() = Some(journal);
+        }
+
+        Ok(ext4)
     }
 
     pub(super) fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
@@ -120,6 +166,16 @@ impl Ext4 {
 
     pub(super) fn block_device(&self) -> &Arc<dyn BlockDevice> {
         &self.block_device
+    }
+
+    /// Returns a clone of the loaded journal, or `None` on a non-journaled volume.
+    ///
+    /// The later fsync/op integration uses this to open handles and wait on
+    /// commits; Int-A only loads and starts the journal, so nothing live calls
+    /// this yet (hence the gate, dropped when fsync is wired to the journal).
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn journal(&self) -> Option<Arc<journal::Journal>> {
+        self.journal.read().clone()
     }
 
     /// Returns the maximum byte size of a regular file.
@@ -391,8 +447,12 @@ impl Ext4 {
         let mut sb = self.super_block.write();
         if sb.is_dirty() {
             // RMW the on-disk superblock: patch only the free-block and
-            // free-inode counters so every other on-disk field is preserved
-            // losslessly.
+            // free-inode counters and the incompatible-feature bits so every
+            // other on-disk field is preserved losslessly. `feature_incompat` is
+            // lossless to write back — in memory it only ever changes via
+            // `SuperBlock::clear_recover` (jbd2 clearing `INCOMPAT_RECOVER` after
+            // a mount-time recovery), so persisting it here is what makes a
+            // recovered volume mount clean next time.
             let mut raw = self
                 .block_device
                 .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
@@ -401,6 +461,7 @@ impl Ext4 {
                 })?;
             raw.free_blocks_count = sb.free_blocks_count() as u32;
             raw.free_inodes_count = sb.free_inodes_count();
+            raw.feature_incompat = sb.feature_incompat().bits();
             self.block_device
                 .write_val(SUPER_BLOCK_OFFSET, &raw)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to write superblock"))?;
@@ -602,6 +663,27 @@ impl Ext4 {
     /// Reads the root directory inode.
     pub(super) fn root_inode(&self) -> Result<Arc<Inode>> {
         self.read_inode(ROOT_INO)
+    }
+}
+
+/// Stops the journal's commit thread on unmount (jbd2 journal teardown, the
+/// `jbd2_journal_destroy` step that halts `kjournald`).
+///
+/// This MUST run here, on the unmounting thread — never on the commit thread
+/// itself, or [`Journal::stop_commit_thread`](journal::Journal::stop_commit_thread)
+/// would join on itself and spin forever. It is structurally impossible for the
+/// commit thread to reach this: that thread holds only a `Weak<Journal>` (see the
+/// commit-thread model in [`journal`]), so it never contributes to the `Ext4`
+/// strong count and can never be the last owner whose drop runs this. `Ext4::drop`
+/// therefore always runs on a real owner's thread. For a non-journaled volume the
+/// cell is `None` and this is a no-op.
+impl Drop for Ext4 {
+    fn drop(&mut self) {
+        // `get_mut` on the `RwMutex` is lock-free here — `&mut self` proves we are
+        // the sole owner, so there is no contention to guard against.
+        if let Some(journal) = self.journal.get_mut().take() {
+            journal.stop_commit_thread();
+        }
     }
 }
 
@@ -1342,5 +1424,121 @@ mod tests {
             raw_sb.free_inodes_count,
             f.ext4.super_block().free_inodes_count()
         );
+    }
+
+    // --- Int-A: journal mount lifecycle (load / recover / start / stop). ---
+
+    use super::super::feature::FeatureIncompatSet;
+    use super::super::test_utils::JOURNAL_START_BLOCK;
+
+    /// The on-disk `RECOVER` incompatible feature bit.
+    const RECOVER_BIT: u32 = FeatureIncompatSet::RECOVER.bits();
+
+    /// A journaled volume (clean journal) loads the journal at mount time and the
+    /// commit thread starts; dropping the `Ext4` stops it cleanly (no panic/hang).
+    #[ktest]
+    fn journaled_mount_loads_journal_and_drops_cleanly() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+
+        // The journal was loaded and its commit thread started.
+        assert!(f.ext4.journal().is_some());
+
+        // Drop the `Ext4` explicitly: `stop_commit_thread` must run and join the
+        // idle commit thread without hanging. Only the fixture's `disk` Arc lingers.
+        drop(f);
+    }
+
+    /// A non-journaled volume has no journal — the Phase 1–3 mount path is
+    /// unchanged (the `load_geometry -> None` no-op branch).
+    #[ktest]
+    fn non_journaled_mount_has_no_journal() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        assert!(f.ext4.journal().is_none());
+    }
+
+    /// The mount-recovery path in miniature: a fixture whose on-disk journal holds
+    /// a committed-but-un-checkpointed transaction (and whose ext4 superblock has
+    /// the `RECOVER` bit set) is *recovered by `Ext4::open`* — the after-image
+    /// reaches its final location and the on-disk `RECOVER` bit is cleared.
+    #[ktest]
+    fn dirty_journaled_mount_recovers_and_clears_recover_bit() {
+        crate::time::clocks::init_for_ktest();
+
+        // Build a fixture with a clean journal already loaded (this first mount
+        // starts a commit thread we tear down by dropping `first` below).
+        let first = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let disk = first.disk.clone();
+
+        // Commit a single-block transaction into the on-disk log via the loaded
+        // journal. This writes the after-image to the log and flips the on-disk
+        // journal superblock to dirty (`s_start != 0`); it does NOT checkpoint, so
+        // the destination block still holds the fixture's zeroed disk.
+        let dest = 500u64;
+        let mut after = [0u8; BLOCK_SIZE];
+        after[..8].copy_from_slice(b"RECOVER!");
+        let journal = first.ext4.journal().unwrap();
+        journal::commit_single_block_for_test(journal.as_ref(), disk.as_ref(), dest, after)
+            .unwrap();
+        // The dirty journal is on disk; the final location is still zeroed.
+        let mut before = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(dest as usize * BLOCK_SIZE, &mut before)
+            .unwrap();
+        assert_eq!(before, [0u8; BLOCK_SIZE]);
+        let raw_jsb: [u8; 24] = {
+            let mut b = [0u8; 24];
+            disk.segment()
+                .read_bytes(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &mut b)
+                .unwrap();
+            b
+        };
+        // s_start is bytes [20..24] of the journal superblock (big-endian), nonzero.
+        assert_ne!(u32::from_be_bytes([raw_jsb[20], raw_jsb[21], raw_jsb[22], raw_jsb[23]]), 0);
+
+        // Set the ext4 superblock's RECOVER incompat bit on disk so the next mount
+        // treats the volume as needing recovery.
+        let mut raw_sb = disk
+            .segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap();
+        raw_sb.feature_incompat |= RECOVER_BIT;
+        disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw_sb).unwrap();
+
+        // Tear down the first mount (stops its commit thread) before re-mounting.
+        drop(journal);
+        drop(first);
+
+        // Re-mount: `Ext4::open` must recover the dirty journal.
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        // Recovery replayed the after-image to its final location.
+        let mut recovered = [0u8; BLOCK_SIZE];
+        disk.segment()
+            .read_bytes(dest as usize * BLOCK_SIZE, &mut recovered)
+            .unwrap();
+        assert_eq!(recovered, after);
+
+        // The on-disk RECOVER bit was cleared (persisted by `sync_metadata`).
+        let raw_sb_after = disk
+            .segment()
+            .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+            .unwrap();
+        assert_eq!(raw_sb_after.feature_incompat & RECOVER_BIT, 0);
+
+        // The journal is loaded on the recovered mount too.
+        assert!(ext4.journal().is_some());
+        drop(ext4);
     }
 }

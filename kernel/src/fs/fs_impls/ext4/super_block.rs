@@ -304,9 +304,19 @@ impl SuperBlock {
         self.feature_compat
     }
 
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn feature_incompat(&self) -> FeatureIncompatSet {
         self.feature_incompat
+    }
+
+    /// Clears the `RECOVER` incompatible flag after the journal has been replayed.
+    ///
+    /// jbd2 recovery clears the on-disk `INCOMPAT_RECOVER` bit once it has replayed
+    /// the log, so a subsequent clean mount sees a consistent volume and does not
+    /// re-recover. Takes `&mut self` so a write guard over
+    /// `RwMutex<Dirty<SuperBlock>>` marks the superblock dirty for writeback; the
+    /// cleared bit reaches disk through [`Ext4::sync_metadata`](super::fs::Ext4).
+    pub(super) fn clear_recover(&mut self) {
+        self.feature_incompat.remove(FeatureIncompatSet::RECOVER);
     }
 
     #[expect(dead_code)]

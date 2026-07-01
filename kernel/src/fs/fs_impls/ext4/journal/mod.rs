@@ -55,6 +55,13 @@ mod format;
 mod recovery;
 mod transaction;
 
+/// Replays a dirty journal at mount time (jbd2 `jbd2_journal_recover`).
+///
+/// Re-exported at the `ext4` level so [`Ext4::open`](super::fs::Ext4) can drive
+/// mount-time recovery; the pass machinery lives in [`recovery`]. A no-op when the
+/// on-disk journal superblock is already clean (`s_start == 0`).
+pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
+
 /// Journal transaction id (jbd2 `tid_t`).
 pub(super) type Tid = u32;
 
@@ -149,8 +156,12 @@ impl JournalGeometry {
 /// Returns `Ok(None)` when the volume has no journal (the `has_journal` compat
 /// feature is clear). Otherwise the returned [`JournalGeometry`] resolves every
 /// log block to its physical device block.
-#[cfg_attr(not(ktest), expect(dead_code))]
-pub(super) fn load_geometry(fs: &Arc<Ext4>) -> Result<Option<JournalGeometry>> {
+///
+/// Called from [`Ext4::open`](super::fs::Ext4) at mount time (the integration
+/// point), so it is `pub(in crate::fs::fs_impls::ext4)` and live in all builds.
+pub(in crate::fs::fs_impls::ext4) fn load_geometry(
+    fs: &Arc<Ext4>,
+) -> Result<Option<JournalGeometry>> {
     // No journal: nothing to load. The recovery/commit machinery simply stays
     // disabled for this volume.
     if !fs
@@ -308,7 +319,6 @@ pub(super) struct JournalState {
     pub(super) tail_tid: Tid,
 }
 
-#[cfg_attr(not(ktest), expect(dead_code))]
 impl Journal {
     /// Builds an in-memory journal over a parsed [`JournalGeometry`], with no
     /// running transaction.
@@ -329,7 +339,10 @@ impl Journal {
     /// [`start_commit_thread`](Journal::start_commit_thread) once it holds the
     /// `Arc<Journal>` (and must later pair it with
     /// [`stop_commit_thread`](Journal::stop_commit_thread)).
-    pub(super) fn new(geometry: JournalGeometry, device: Arc<dyn BlockDevice>) -> Arc<Self> {
+    pub(in crate::fs::fs_impls::ext4) fn new(
+        geometry: JournalGeometry,
+        device: Arc<dyn BlockDevice>,
+    ) -> Arc<Self> {
         let next_tid = geometry.sequence();
         let head = geometry.first();
         let tail_block = geometry.start();
@@ -418,7 +431,7 @@ impl Journal {
     ///
     /// Must be called once per journal, by the owner, right after construction;
     /// pair it with exactly one [`stop_commit_thread`](Journal::stop_commit_thread).
-    pub(super) fn start_commit_thread(self: &Arc<Journal>) {
+    pub(in crate::fs::fs_impls::ext4) fn start_commit_thread(self: &Arc<Journal>) {
         let weak: Weak<Journal> = Arc::downgrade(self);
         let thread = crate::thread::kernel_thread::ThreadOptions::new(move || {
             Self::commit_thread_loop(&weak);
@@ -549,6 +562,12 @@ impl Journal {
     /// handles to drain first — is a Phase-7 refinement; a production integration
     /// should also wake [`commit_trigger`](Journal::commit_trigger) from
     /// `journal_stop` when the last handle of a transaction closes.
+    // Still dead in non-ktest builds: nothing live waits on a commit yet. The
+    // fsync/op integration that calls this (recording its handle's tid, releasing
+    // locks, then waiting) is a later Phase-4 task; Int-A only loads + recovers +
+    // starts the journal, so the wrappers still pass `None` and no transaction is
+    // ever waited on. Drop this gate when fsync is wired to the journal.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn log_wait_commit(&self, target: Tid) -> Result<()> {
         if tid_geq(self.committed_tid(), target) {
             return Ok(());
@@ -582,7 +601,7 @@ impl Journal {
     ///
     /// There is deliberately **no `join()` in a `Drop` impl** — a Drop-time join
     /// could, in principle, run on the commit thread and self-deadlock.
-    pub(super) fn stop_commit_thread(&self) {
+    pub(in crate::fs::fs_impls::ext4) fn stop_commit_thread(&self) {
         self.stop.store(true, Ordering::Release);
         self.commit_trigger.wake_all();
         // Take the handle out (so a second call is a no-op) and join outside the
@@ -700,6 +719,61 @@ pub(super) fn orphan_add(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Resul
 /// `try_reclaim_deleted_inode` after `free_inode`.
 pub(super) fn orphan_del(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
     // Phase-4 fill point: see `orphan_add`.
+    Ok(())
+}
+
+/// Test helper: writes a clean [`RawJournalSuperblock`] (`s_start == 0`) at the
+/// given physical block, mirroring what `mke2fs` lays down for a fresh journal.
+///
+/// Lets the ext4-level fixture builder place a valid journal superblock on disk
+/// before `Ext4::open` without naming the journal-internal on-disk format. Only
+/// compiled for ktest.
+#[cfg(ktest)]
+pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
+    device: &dyn BlockDevice,
+    pblock: Ext4Bid,
+    maxlen: u32,
+    first: u32,
+    sequence: Tid,
+) -> Result<()> {
+    use self::format::{Be32, RawJournalHeader, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC};
+    let raw = RawJournalSuperblock {
+        header: RawJournalHeader {
+            h_magic: Be32::new(JBD2_MAGIC),
+            h_blocktype: Be32::new(BLOCKTYPE_SUPERBLOCK_V2),
+            h_sequence: Be32::new(0),
+        },
+        s_blocksize: Be32::new(BLOCK_SIZE as u32),
+        s_maxlen: Be32::new(maxlen),
+        s_first: Be32::new(first),
+        s_sequence: Be32::new(sequence),
+        s_start: Be32::new(0),
+        s_nr_users: Be32::new(1),
+        ..Default::default()
+    };
+    device
+        .write_val(pblock as usize * BLOCK_SIZE, &raw)
+        .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))
+}
+
+/// Test helper: commits a single-block transaction (`dest` ← `after`) to `journal`,
+/// leaving the on-disk log dirty (`s_start != 0`) so a subsequent mount recovers it.
+///
+/// Encapsulates the journal-internal commit machinery ([`Transaction`],
+/// [`commit_transaction`]) so the `fs.rs` mount-lifecycle tests can lay down a
+/// crashed (committed-but-un-checkpointed) journal on the fixture disk without
+/// reaching into those internals themselves. Only compiled for ktest.
+#[cfg(ktest)]
+pub(in crate::fs::fs_impls::ext4) fn commit_single_block_for_test(
+    journal: &Journal,
+    device: &dyn BlockDevice,
+    dest: Ext4Bid,
+    after: [u8; BLOCK_SIZE],
+) -> Result<()> {
+    let mut txn = Transaction::new(journal.state_read().next_tid);
+    txn.capture_create(dest);
+    txn.apply_patch(dest, |b| b.copy_from_slice(&after))?;
+    commit_transaction(journal, device, txn)?;
     Ok(())
 }
 
