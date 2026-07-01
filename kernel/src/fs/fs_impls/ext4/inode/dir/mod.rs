@@ -601,7 +601,7 @@ impl Inode {
             // Orphan-list seam (Phase-3 no-op; Phase 4 journals the add so crash
             // recovery can finish a deletion interrupted past this point).
             journal::orphan_add(None, child.ino())?;
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
@@ -645,7 +645,7 @@ impl Inode {
         if child_inner.link_count() == 0 {
             // Orphan-list seam (Phase-3 no-op; see `unlink`).
             journal::orphan_add(None, child.ino())?;
-            child_inner.write_back_inode_desc(&fs, entry_info.ino)?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
             let _ = fs.remove_inode(entry_info.ino);
         }
 
@@ -903,7 +903,7 @@ impl Inode {
             if replaced_inner.link_count() == 0 {
                 // Orphan-list seam (Phase-3 no-op; see `unlink`).
                 journal::orphan_add(None, replaced.ino())?;
-                replaced_inner.write_back_inode_desc(&fs, replaced.ino())?;
+                replaced_inner.write_back_inode_desc(&fs, replaced.ino(), None)?;
                 // Drop the cache's `Arc`. If an fd still holds one the inode stays
                 // alive until that last `Arc` (here in the caller's locals, dropped
                 // after `guards`) drops, then `Drop` reclaims it.

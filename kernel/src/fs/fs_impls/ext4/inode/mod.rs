@@ -614,7 +614,10 @@ impl Inode {
     pub(super) fn sync_metadata(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.write_back_inode_desc(&fs, self.ino)
+        // No handle: the sync path writes back existing dirty state (Phase-3
+        // behaviour). Journaling the metadata a sync flushes is B3's job, where
+        // sync becomes commit + checkpoint.
+        inner.write_back_inode_desc(&fs, self.ino, None)
     }
 
     /// Flushes dirty data pages, then the inode metadata, then issues a device
@@ -638,7 +641,9 @@ impl Inode {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
         inner.sync_data_pages()?;
-        inner.write_back_inode_desc(&fs, self.ino)?;
+        // No handle: sync-path writeback (see `sync_metadata`); B3 routes sync
+        // through the journal.
+        inner.write_back_inode_desc(&fs, self.ino, None)?;
         Ok(())
     }
 
@@ -720,7 +725,7 @@ impl Inode {
         {
             block_manager.truncate_to_byte_len(0, op.get())?;
         }
-        inner.write_back_inode_desc(&fs, self.ino)?;
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
 
         fs.free_inode(self.ino, self.type_, op.get())?;
         // Orphan-list seam (Phase-3 no-op): Task 8 unlinks the inode from the
@@ -1129,7 +1134,12 @@ impl InodeInner {
     /// Persists the inode's mutable metadata to its on-disk `RawInode` if dirty,
     /// pulling the extent root and `i_blocks` from the block manager, and clears
     /// the dirty flags.
-    fn write_back_inode_desc(&mut self, fs: &Ext4, ino: Ext4Ino) -> Result<()> {
+    fn write_back_inode_desc(
+        &mut self,
+        fs: &Ext4,
+        ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         if !self.is_dirty() {
             return Ok(());
         }
@@ -1139,7 +1149,7 @@ impl InodeInner {
         };
         // Mirror the authoritative `i_blocks` into the descriptor before writing.
         self.desc.set_sector_count(sector_count);
-        fs.write_back_inode_desc(ino, &self.desc, &root)?;
+        fs.write_back_inode_desc(ino, &self.desc, &root, handle)?;
         self.clear_dirty();
         Ok(())
     }

@@ -282,6 +282,7 @@ impl Ext4 {
             if !range.is_empty() {
                 let allocated_count = range.end - range.start;
                 sb.dec_free_blocks(allocated_count)?;
+                journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
                 return Ok(range);
             }
         }
@@ -320,6 +321,7 @@ impl Ext4 {
                 group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
             if freed_count > 0 {
                 sb.inc_free_blocks(freed_count as u64)?;
+                journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
             }
             current_block += blocks_in_group as Ext4Bid;
             remaining_blocks -= blocks_in_group;
@@ -371,6 +373,7 @@ impl Ext4 {
                 return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
             sb.dec_free_inodes()?;
+            journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
 
             return Ok(ino);
         }
@@ -392,6 +395,7 @@ impl Ext4 {
         let was_allocated = group.free_inode(local_idx, type_, handle)?;
         if was_allocated {
             sb.inc_free_inodes()?;
+            journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
         }
 
         Ok(())
@@ -436,7 +440,7 @@ impl Ext4 {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let inode_desc = InodeDesc::new(type_, perm, uid, gid, link_count, generation, now);
 
-        if let Err(err) = self.write_new_inode_desc(ino, &inode_desc) {
+        if let Err(err) = self.write_new_inode_desc(ino, &inode_desc, handle) {
             // Roll back the inode allocation: clear the bitmap bit and restore
             // the superblock free-inode counter.
             if let Err(free_err) = self.free_inode(ino, type_, handle) {
@@ -585,6 +589,7 @@ impl Ext4 {
         ino: Ext4Ino,
         desc: &InodeDesc,
         root: &[u32; super::inode::RAW_BLOCK_PTRS_LEN],
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let offset = self.inode_table_offset(ino)?;
         let mut raw = self
@@ -632,6 +637,12 @@ impl Ext4 {
         // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
         raw.dtime = desc.dtime().as_secs() as u32;
 
+        // Capture the inode block's after-image (sub-block RMW at the inode's
+        // offset within its inode-table block), then direct-write as before (B2
+        // keeps direct writes; B3 suppresses them). Only `size_of::<RawInode>()`
+        // bytes are patched — exactly what the direct write below persists — so
+        // the tail (`extra_isize` region) survives from the seeded block.
+        journal_inode_block(handle, offset, raw.as_bytes())?;
         self.block_device
             .write_val(offset, &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
@@ -647,7 +658,12 @@ impl Ext4 {
     /// timestamps, generation, the inline extent root, flags, link count, and
     /// `extra_isize`. The previous slot contents (a deleted inode or zeros) are
     /// fully overwritten.
-    fn write_new_inode_desc(&self, ino: Ext4Ino, desc: &InodeDesc) -> Result<()> {
+    fn write_new_inode_desc(
+        &self,
+        ino: Ext4Ino,
+        desc: &InodeDesc,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let offset = self.inode_table_offset(ino)?;
 
         let (mtime_secs, mtime_extra) = encode_time(desc.mtime());
@@ -688,6 +704,7 @@ impl Ext4 {
             ..Default::default()
         };
 
+        journal_inode_block(handle, offset, raw.as_bytes())?;
         self.block_device
             .write_val(offset, &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write new inode"))?;
@@ -749,6 +766,68 @@ fn encode_time(time: Duration) -> (u32, u32) {
     let secs_lo = secs as u32;
     let extra = (epoch as u32) | (nsec << 2);
     (secs_lo, extra)
+}
+
+/// The device block that holds the primary superblock. With 4 KiB blocks the
+/// superblock lives at byte [`SUPER_BLOCK_OFFSET`] (1024) inside block 0, so
+/// journaling it means capturing block 0.
+const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
+
+/// Captures the superblock's after-image — its `free_blocks_count` /
+/// `free_inodes_count` — into the operation's transaction (block 0, RMW at
+/// [`SUPER_BLOCK_OFFSET`]), for op-time journaling. A no-op without a handle.
+///
+/// Mirrors the RMW in [`Ext4::sync_metadata`]: only the two counters are
+/// overwritten (the on-disk `feature_incompat` changes only via `clear_recover`
+/// at mount, never under an allocation), so the boot area and every untracked
+/// field the device held survive. The counters are absolute, so repeated
+/// captures within a transaction converge on the final value.
+fn journal_superblock_counts(
+    handle: Option<&journal::Handle>,
+    free_blocks: u64,
+    free_inodes: u32,
+) -> Result<()> {
+    journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?;
+    journal::dirty_metadata(
+        handle,
+        SUPERBLOCK_BID,
+        journal::TriggerType::Superblock,
+        |buf| {
+            let off = SUPER_BLOCK_OFFSET;
+            let mut raw = RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
+            raw.free_blocks_count = free_blocks as u32;
+            raw.free_inodes_count = free_inodes;
+            buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
+        },
+    )
+}
+
+/// Captures an inode's after-image into the operation's transaction, a sub-block
+/// RMW of its inode-table block (the inode lives at byte `offset`, i.e. at
+/// `offset % BLOCK_SIZE` within block `offset / BLOCK_SIZE`), for op-time
+/// journaling. A no-op without a handle.
+///
+/// `inode_bytes` is exactly the `size_of::<RawInode>()` bytes the direct write
+/// persists; patching only those preserves the rest of the block — the other
+/// inodes sharing it and this inode's `extra_isize` tail — from the seeded device
+/// content. (Inode-table blocks are inode-size aligned, so an inode never
+/// straddles a block boundary.)
+fn journal_inode_block(
+    handle: Option<&journal::Handle>,
+    offset: usize,
+    inode_bytes: &[u8],
+) -> Result<()> {
+    let inode_block = (offset / BLOCK_SIZE) as Ext4Bid;
+    let in_block_off = offset % BLOCK_SIZE;
+    journal::get_write_access(handle, inode_block, journal::TriggerType::InodeTable)?;
+    journal::dirty_metadata(
+        handle,
+        inode_block,
+        journal::TriggerType::InodeTable,
+        |buf| {
+            buf[in_block_off..in_block_off + inode_bytes.len()].copy_from_slice(inode_bytes);
+        },
+    )
 }
 
 /// Rollback guard for blocks allocated through [`Ext4::alloc_blocks`].
