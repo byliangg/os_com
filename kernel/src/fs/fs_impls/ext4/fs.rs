@@ -184,6 +184,9 @@ impl Ext4 {
     pub(super) const WRITE_CREDITS: usize = 16;
     pub(super) const TRUNCATE_CREDITS: usize = 16;
     pub(super) const RECLAIM_CREDITS: usize = 16;
+    pub(super) const UNLINK_CREDITS: usize = 16;
+    pub(super) const LINK_CREDITS: usize = 16;
+    pub(super) const RENAME_CREDITS: usize = 24;
 
     /// Opens a journal handle for a metadata operation, reserving `credits`
     /// metadata blocks (jbd2 `jbd2_journal_start`), or a no-op handle on a

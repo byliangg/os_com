@@ -243,6 +243,45 @@ impl InodeInner {
         })
     }
 
+    /// Captures a directory block's after-image into the operation's transaction
+    /// after it has been modified in the page cache.
+    ///
+    /// Directory blocks are metadata in ext4, so a namespace operation must
+    /// journal the block it edits atomically with the inode / bitmap changes it
+    /// makes — otherwise a crash could leave a committed inode allocation with a
+    /// torn or missing directory entry (a dangling or lost name). `dir_offset` is
+    /// any byte offset within the modified block. A no-op without a handle.
+    ///
+    /// A whole-block capture: `get_create_access` seeds zeros (irrelevant, since
+    /// the `dirty_metadata` closure overwrites the whole block with the page
+    /// cache's current content), so no device read is issued for a block we fully
+    /// replace.
+    fn journal_dir_block(&self, dir_offset: usize, handle: Option<&journal::Handle>) -> Result<()> {
+        use super::extent_manager::MapState;
+
+        if handle.is_none() {
+            return Ok(());
+        }
+        let logical = (dir_offset / BLOCK_SIZE) as Iblock;
+        let mapping = self.block_manager()?.map_blocks(logical)?;
+        let phys = match mapping.state() {
+            MapState::Written | MapState::Unwritten => mapping.pblock(),
+            MapState::Hole => {
+                return_errno_with_message!(Errno::EIO, "directory block not mapped for journaling");
+            }
+        };
+        let block: [u8; BLOCK_SIZE] = self
+            .page_cache()?
+            .read_val(logical as usize * BLOCK_SIZE)
+            .map_err(|_| {
+                Error::with_message(Errno::EIO, "failed to read directory block for journaling")
+            })?;
+        journal::get_create_access(handle, phys, journal::TriggerType::DirBlock)?;
+        journal::dirty_metadata(handle, phys, journal::TriggerType::DirBlock, |buf| {
+            buf.copy_from_slice(&block)
+        })
+    }
+
     /// Writes a new entry into the selected slot, splitting the predecessor's
     /// `rec_len` first when reusing the spare tail of a live entry.
     fn add_entry(
@@ -251,6 +290,7 @@ impl InodeInner {
         name: &str,
         ino: Ext4Ino,
         file_type: DirEntryFileType,
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         debug_assert_ne!(ino, 0);
 
@@ -281,6 +321,9 @@ impl InodeInner {
             file_type: file_type as u8,
         };
         view.write_entry(0, header, name_bytes)?;
+        // The predecessor split (if any) and the new entry both land in the slot's
+        // block; journal that one block's after-image.
+        self.journal_dir_block(slot.dir_offset, handle)?;
         Ok(())
     }
 
@@ -298,7 +341,7 @@ impl InodeInner {
             Some(slot) => slot,
             None => self.grow_dir_block(fs, handle)?,
         };
-        self.add_entry(&slot, name, ino, file_type)
+        self.add_entry(&slot, name, ino, file_type, handle)
     }
 
     /// Repoints the live entry named `name` at a new inode and file type in
@@ -309,9 +352,10 @@ impl InodeInner {
         name: &str,
         new_ino: Ext4Ino,
         new_file_type: DirEntryFileType,
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let entry_info = self.find_entry_info(name)?;
-        self.set_entry_target(&entry_info, new_ino, new_file_type)
+        self.set_entry_target(&entry_info, new_ino, new_file_type, handle)
     }
 
     /// Repoints a located entry at a new inode and file type. Used by rename to
@@ -322,6 +366,7 @@ impl InodeInner {
         entry: &DirEntryInfo,
         new_ino: Ext4Ino,
         new_file_type: DirEntryFileType,
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let block_idx = entry.dir_offset / BLOCK_SIZE;
         let entry_offset = entry.dir_offset - block_idx * BLOCK_SIZE;
@@ -329,6 +374,7 @@ impl InodeInner {
         let block = DirBlockView::from_index(self.page_cache()?, block_idx, self.file_size());
         block.set_inode(entry_offset, new_ino)?;
         block.set_file_type(entry_offset, new_file_type)?;
+        self.journal_dir_block(entry.dir_offset, handle)?;
         Ok(())
     }
 
@@ -365,12 +411,17 @@ impl InodeInner {
     /// Deletes a located entry by zeroing its inode and merging its space into
     /// the predecessor entry. The first entry in a block (always `.`) has no
     /// predecessor and is never the delete target.
-    fn delete_entry(&mut self, target: &DirEntryInfo) -> Result<()> {
+    fn delete_entry(
+        &mut self,
+        target: &DirEntryInfo,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
         let block_idx = target.dir_offset / BLOCK_SIZE;
         let entry_offset = target.dir_offset - block_idx * BLOCK_SIZE;
 
         let block = DirBlockView::from_index(self.page_cache()?, block_idx, self.file_size());
         block.delete_entry(entry_offset, target.entry_rec_len)?;
+        self.journal_dir_block(target.dir_offset, handle)?;
         Ok(())
     }
 
@@ -416,6 +467,8 @@ impl InodeInner {
         };
         block.write_entry(dot_len, dot_dot_header, DOT_DOT_BYTE)?;
 
+        // Journal the initialized first block (`.`/`..`).
+        self.journal_dir_block(0, handle)?;
         Ok(())
     }
 
@@ -536,9 +589,11 @@ impl Inode {
                 .inner
                 .write()
                 .make_empty(&fs, child_ino, self.ino, op.get())
-                .and_then(|_| parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type))
+                .and_then(|_| {
+                    parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type, op.get())
+                })
         } else {
-            parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type)
+            parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type, op.get())
         };
 
         if let Err(err) = result {
@@ -583,6 +638,11 @@ impl Inode {
         // directory entry stable during this operation, so we only need to lock
         // all related inodes in order, without rechecking the lookup result.
         let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+        // Handle after the inner locks (inner ① → handle ②), and declared *after*
+        // `guards` so it drops first — this operation's transaction closes before
+        // `guards` releases and before `child`'s Drop opens its own reclaim
+        // transaction (keeping the two transactions separate).
+        let op = fs.begin_op(Ext4::UNLINK_CREDITS)?;
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() == InodeType::Dir {
@@ -590,7 +650,7 @@ impl Inode {
         }
 
         let parent_inner = guards.inner_mut(self.ino());
-        parent_inner.delete_entry(&entry_info)?;
+        parent_inner.delete_entry(&entry_info, op.get())?;
         parent_inner.set_mtime_ctime(utils::now());
 
         // Update timestamps before dropping the target link count.
@@ -598,10 +658,10 @@ impl Inode {
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
         if child_inner.link_count() == 0 {
-            // Orphan-list seam (Phase-3 no-op; Phase 4 journals the add so crash
+            // Orphan-list seam (Phase-3 no-op; Task 8 journals the add so crash
             // recovery can finish a deletion interrupted past this point).
-            journal::orphan_add(None, child.ino())?;
-            child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
+            journal::orphan_add(op.get(), child.ino())?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
@@ -630,6 +690,8 @@ impl Inode {
         // directory entry stable during this operation, so we only need to lock
         // all related inodes in order, without rechecking the lookup result.
         let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
+        // Handle after the inner locks; declared after `guards` (see `unlink`).
+        let op = fs.begin_op(Ext4::UNLINK_CREDITS)?;
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() != InodeType::Dir {
@@ -644,13 +706,13 @@ impl Inode {
         child_inner.dec_link_count(2);
         if child_inner.link_count() == 0 {
             // Orphan-list seam (Phase-3 no-op; see `unlink`).
-            journal::orphan_add(None, child.ino())?;
-            child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
+            journal::orphan_add(op.get(), child.ino())?;
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
             let _ = fs.remove_inode(entry_info.ino);
         }
 
         let parent_inner = guards.inner_mut(self.ino());
-        parent_inner.delete_entry(&entry_info)?;
+        parent_inner.delete_entry(&entry_info, op.get())?;
         // The parent loses the `..` reference the removed child held back to it.
         parent_inner.dec_link_count(1);
         parent_inner.set_mtime_ctime(utils::now());
@@ -669,6 +731,8 @@ impl Inode {
         let fs = self.fs()?;
         let dir_entry_file_type = DirEntryFileType::from(old.inode_type());
         let mut guards = MultiInodeInnerGuards::lock(&[self, old]);
+        // Handle after the inner locks (inner ① → handle ②).
+        let op = fs.begin_op(Ext4::LINK_CREDITS)?;
 
         if guards.inner(old.ino()).link_count() >= MAX_LINK_COUNT {
             return_errno!(Errno::EOVERFLOW);
@@ -677,14 +741,17 @@ impl Inode {
         let dir_inner = guards.inner_mut(self.ino());
         let slot = match dir_inner.find_dir_slot(name.len())? {
             Some(slot) => slot,
-            None => dir_inner.grow_dir_block(&fs, None)?,
+            None => dir_inner.grow_dir_block(&fs, op.get())?,
         };
-        dir_inner.add_entry(&slot, name, old.ino(), dir_entry_file_type)?;
+        dir_inner.add_entry(&slot, name, old.ino(), dir_entry_file_type, op.get())?;
         dir_inner.set_mtime_ctime(utils::now());
 
         let old_inner = guards.inner_mut(old.ino());
         old_inner.set_ctime(utils::now());
         old_inner.inc_link_count(1);
+        // `old_inner`'s link-count change is persisted by fsync/sync (its inode is
+        // marked dirty); the directory-entry + dir-block changes above are the
+        // journaled part of this operation.
         Ok(())
     }
 
@@ -751,6 +818,10 @@ impl Inode {
             old_inode.as_ref(),
             replaced_inode.as_deref().unwrap_or(old_inode.as_ref()),
         ]);
+        // Handle after the inner locks; declared after `guards` so it drops first,
+        // before `guards` releases and before a replaced inode's Drop reclaim (see
+        // unlink).
+        let op = fs.begin_op(Ext4::RENAME_CREDITS)?;
 
         // Step 3: validate invariants under lock.
         self.validate_rename_invariants(&guards, &old_inode, replaced_inode.as_deref())?;
@@ -763,6 +834,7 @@ impl Inode {
             &old_inode,
             replaced_inode.as_deref(),
             new_name,
+            op.get(),
         )?;
 
         Ok(())
@@ -826,6 +898,10 @@ impl Inode {
     /// reclaimed if it reaches 0.
     ///
     /// [`rename`]: Self::rename
+    // The rename mutation genuinely involves this many distinct participants (the
+    // lock set, both directories, the moved and replaced inodes, the names, and
+    // the journal handle); bundling them into a struct would only obscure the flow.
+    #[expect(clippy::too_many_arguments)]
     fn apply_dir_mutations(
         &self,
         guards: &mut MultiInodeInnerGuards,
@@ -834,6 +910,7 @@ impl Inode {
         old_inode: &Inode,
         replaced_inode: Option<&Inode>,
         new_name: &str,
+        handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let old_is_dir = old_inode.inode_type() == InodeType::Dir;
         let has_replaced = replaced_inode.is_some();
@@ -846,14 +923,14 @@ impl Inode {
         if is_same_dir {
             let dir_inner = guards.inner_mut(self.ino());
             if has_replaced {
-                dir_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
+                dir_inner.overwrite_entry(new_name, old_ino, moved_file_type, handle)?;
             } else {
-                dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, None)?;
+                dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, handle)?;
             }
             // Re-read the source entry: `add_new_entry` may have split it
             // (shrinking its `rec_len`), making any earlier `DirEntryInfo` stale.
             let old_info = dir_inner.find_entry_info(old_name)?;
-            dir_inner.delete_entry(&old_info)?;
+            dir_inner.delete_entry(&old_info, handle)?;
             // Replacing a directory with a directory in the same parent: the
             // parent loses the replaced directory's `..` back-reference.
             if old_is_dir && has_replaced {
@@ -863,9 +940,9 @@ impl Inode {
         } else {
             let target_inner = guards.inner_mut(target.ino());
             if has_replaced {
-                target_inner.overwrite_entry(new_name, old_ino, moved_file_type)?;
+                target_inner.overwrite_entry(new_name, old_ino, moved_file_type, handle)?;
             } else {
-                target_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, None)?;
+                target_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, handle)?;
             }
             // Moving a directory into a fresh name in `target`: `target` gains the
             // moved directory's new `..` back-reference. When replacing, the slot
@@ -879,7 +956,7 @@ impl Inode {
             // Re-read the source entry (same staleness reason as above, though
             // here only the target was mutated; kept symmetric with ext2).
             let old_info = source_inner.find_entry_info(old_name)?;
-            source_inner.delete_entry(&old_info)?;
+            source_inner.delete_entry(&old_info, handle)?;
             // Moving a directory out of `self`: `self` loses the moved
             // directory's `..` back-reference.
             if old_is_dir {
@@ -902,8 +979,8 @@ impl Inode {
 
             if replaced_inner.link_count() == 0 {
                 // Orphan-list seam (Phase-3 no-op; see `unlink`).
-                journal::orphan_add(None, replaced.ino())?;
-                replaced_inner.write_back_inode_desc(&fs, replaced.ino(), None)?;
+                journal::orphan_add(handle, replaced.ino())?;
+                replaced_inner.write_back_inode_desc(&fs, replaced.ino(), handle)?;
                 // Drop the cache's `Arc`. If an fd still holds one the inode stays
                 // alive until that last `Arc` (here in the caller's locals, dropped
                 // after `guards`) drops, then `Drop` reclaims it.
@@ -915,7 +992,12 @@ impl Inode {
         let old_inner = guards.inner_mut(old_ino);
         if old_is_dir && !is_same_dir {
             let dotdot_entry_info = old_inner.find_entry_info("..")?;
-            old_inner.set_entry_target(&dotdot_entry_info, target.ino(), DirEntryFileType::Dir)?;
+            old_inner.set_entry_target(
+                &dotdot_entry_info,
+                target.ino(),
+                DirEntryFileType::Dir,
+                handle,
+            )?;
             // The htree index would describe the now-stale block layout; the
             // moved directory must be re-indexed on its next insert (P6).
             old_inner.remove_flags(FileFlags::INDEX);
@@ -1276,7 +1358,7 @@ mod tests {
         {
             let mut inner = dir.inner.write();
             let info = inner.find_entry_info("victim").unwrap();
-            inner.delete_entry(&info).unwrap();
+            inner.delete_entry(&info, None).unwrap();
         }
         assert_eq!(
             dir.inner

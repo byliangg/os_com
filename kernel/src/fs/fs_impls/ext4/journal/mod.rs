@@ -775,10 +775,10 @@ impl Drop for Journal {
 
 /// Identifies the kind of metadata block being accessed.
 ///
-/// Phase 2 ignores it; it is the hook where Phase 6 attaches the right checksum
-/// computation when a metadata block is dirtied.
+/// Every variant is now constructed at a metadata-access call site. The funnels
+/// still ignore the value; it is the hook where Phase 6 attaches the right
+/// checksum computation when a metadata block is dirtied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(dead_code)]
 pub(super) enum TriggerType {
     Superblock,
     GroupDesc,
