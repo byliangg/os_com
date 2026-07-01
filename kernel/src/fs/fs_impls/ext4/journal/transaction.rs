@@ -1,0 +1,606 @@
+// SPDX-License-Identifier: MPL-2.0
+
+//! In-memory transaction machinery (jbd2 `transaction_t` / `handle_t`).
+//!
+//! Phase 4 journals metadata. Linux jbd2 keeps one buffer per metadata block —
+//! the working copy *is* the logged copy — but our ext4 has no metadata buffer
+//! cache: it serializes typed [`Dirty`](super::super::utils::Dirty) objects
+//! (`Dirty<IdBitmap/BlockGroupDesc/SuperBlock/RawInode>`) lazily at sync time.
+//! To journal, each modified metadata block's whole-block **after-image** must
+//! be captured into the running transaction so the commit pipeline (a later
+//! task) can write it to the log.
+//!
+//! # Model A: op-time capture
+//!
+//! Each running [`Transaction`] holds a map `physical block# → after-image
+//! buffer`. The flow, mirroring jbd2's `get_write_access` / `get_create_access`
+//! / `dirty_metadata`:
+//!
+//! 1. Before touching an *existing* metadata block, [`Transaction::capture_write`]
+//!    seeds its buffer from the device (jbd2 `get_write_access`).
+//! 2. Before populating a *freshly allocated* metadata block,
+//!    [`Transaction::capture_create`] seeds a zeroed buffer — no device read is
+//!    needed (jbd2 `get_create_access`).
+//! 3. After the operation mutates its typed object, [`Transaction::apply_patch`]
+//!    patches the modified bytes into the captured buffer (jbd2
+//!    `dirty_metadata`). Because sub-objects sharing one block patch the *same*
+//!    buffer, their after-images accumulate correctly.
+//!
+//! # jbd2 correspondence
+//!
+//! - [`Transaction`] ≈ `transaction_t`: an in-memory transaction accumulating
+//!   the metadata blocks it will commit, with the 7-state [`TransactionState`]
+//!   lifecycle (`t_state`) and the open-handle / credit bookkeeping
+//!   (`t_updates` / `t_outstanding_credits`).
+//! - [`Handle`] ≈ `handle_t`: one open unit of work against a transaction,
+//!   holding a credit reservation, obtained from [`journal_start`] and released
+//!   by [`journal_stop`].
+//! - [`MetaBuffer`] ≈ the per-block `journal_head` after-image bytes.
+//!
+//! # Locking
+//!
+//! [`journal_start`] / [`journal_stop`] / [`journal_extend`] / [`journal_restart`]
+//! take the journal state lock (`Journal::state`) for the whole operation. In the
+//! global lock order this is the jbd2 handle — position ②, taken after the inode
+//! inner lock ① and before the ExtentTree lock ③. Task 2a itself acquires no
+//! other filesystem lock, so this note only fixes the intended order for the
+//! later task that threads a live [`Handle`] through the metadata operations.
+
+// The whole module is staged-but-unwired: every item is reachable only through
+// the test-only `Journal` (the four funnels in `journal/mod.rs` are still
+// no-ops), except the `Handle` *type name*, which the funnels' `Option<&Handle>`
+// signatures mention. So in non-ktest builds nearly everything here is dead;
+// this one module-level expectation absorbs all of it, avoiding a marker on
+// every field/method/function. Fulfilled by the dead code below in non-ktest,
+// and absent in ktest (where all of it is exercised).
+#![cfg_attr(not(ktest), expect(dead_code))]
+
+use super::{super::prelude::*, Journal, Tid};
+
+/// A captured whole-block after-image for one metadata block, held in a running
+/// transaction until commit writes it to the log. Model A (op-time capture):
+/// seeded by `get_write_access` (from the device) or `get_create_access`
+/// (zeros), then patched in place as the operation modifies its typed metadata.
+pub(super) struct MetaBuffer {
+    data: Box<[u8; BLOCK_SIZE]>,
+}
+
+impl MetaBuffer {
+    /// A freshly captured buffer of all zeros (a newly allocated metadata block,
+    /// whose prior device content is meaningless).
+    fn zeroed() -> Self {
+        Self {
+            data: Box::new([0u8; BLOCK_SIZE]),
+        }
+    }
+
+    /// The captured after-image bytes.
+    fn as_bytes(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    /// The after-image bytes, for seeding from the device or patching in place.
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.data.as_mut_slice()
+    }
+}
+
+/// The jbd2 transaction lifecycle (`transaction_t.t_state`).
+///
+/// Phase 4 (Task 2a) drives only [`Running`](TransactionState::Running); the
+/// remaining states belong to the commit pipeline and later phases. All seven
+/// are defined up front so wiring the commit path later does not churn the enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TransactionState {
+    /// Accepting new handles and metadata (`T_RUNNING`).
+    Running,
+    /// Closed to new handles, draining outstanding ones (`T_LOCKED`).
+    #[expect(dead_code)]
+    Locked,
+    /// Flushing data buffers before the commit record (`T_FLUSH`).
+    #[expect(dead_code)]
+    Flush,
+    /// Writing the log (`T_COMMIT`).
+    #[expect(dead_code)]
+    Commit,
+    /// Flushing the commit record to the data device (`T_COMMIT_DFLUSH`).
+    #[expect(dead_code)]
+    CommitDFlush,
+    /// Flushing the commit record to the journal device (`T_COMMIT_JFLUSH`).
+    #[expect(dead_code)]
+    CommitJFlush,
+    /// Fully committed; awaiting checkpoint (`T_FINISHED`).
+    #[expect(dead_code)]
+    Finished,
+}
+
+/// An in-memory transaction accumulating metadata after-images (jbd2
+/// `transaction_t`).
+///
+/// Phase 4 is single-transaction: the [`Journal`] holds at most one of these as
+/// its running transaction. It records the captured after-images plus the
+/// open-handle and credit bookkeeping used to bound its size.
+//
+// Visible at the `ext4` level (`pub(in crate::fs::fs_impls::ext4)`) so it can be
+// a field of the equally-visible `JournalState`.
+pub(in crate::fs::fs_impls::ext4) struct Transaction {
+    /// This transaction's id (`t_tid`).
+    tid: Tid,
+    /// The lifecycle state (`t_state`); Task 2a leaves it [`Running`](TransactionState::Running).
+    state: TransactionState,
+    /// Number of open handles (`journal_start` not yet `journal_stop`'d;
+    /// `t_updates`).
+    t_updates: usize,
+    /// Sum of live handles' reserved credits — the max blocks they may dirty
+    /// (`t_outstanding_credits`).
+    outstanding_credits: usize,
+    /// The captured after-images, keyed by physical block number. An ordered map
+    /// so commit writes tags in a deterministic block order.
+    metadata: BTreeMap<Ext4Bid, MetaBuffer>,
+}
+
+impl Transaction {
+    /// Creates a fresh running transaction with id `tid` and no captured blocks.
+    pub(super) fn new(tid: Tid) -> Self {
+        Self {
+            tid,
+            state: TransactionState::Running,
+            t_updates: 0,
+            outstanding_credits: 0,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    /// This transaction's id.
+    pub(super) fn tid(&self) -> Tid {
+        self.tid
+    }
+
+    /// This transaction's lifecycle state.
+    pub(super) fn state(&self) -> TransactionState {
+        self.state
+    }
+
+    /// The number of open handles against this transaction.
+    pub(super) fn nr_updates(&self) -> usize {
+        self.t_updates
+    }
+
+    /// The number of distinct metadata blocks captured so far.
+    pub(super) fn nr_metadata_blocks(&self) -> usize {
+        self.metadata.len()
+    }
+
+    /// Captures a freshly allocated metadata block as a zeroed after-image
+    /// (jbd2 `get_create_access`): its prior device content is meaningless, so
+    /// no read is needed. Idempotent — a block already captured (possibly with
+    /// patches applied) is left untouched.
+    pub(super) fn capture_create(&mut self, bid: Ext4Bid) {
+        self.metadata.entry(bid).or_insert_with(MetaBuffer::zeroed);
+    }
+
+    /// Captures an existing metadata block's current content as its after-image
+    /// (jbd2 `get_write_access`): reads the block from `device` into a new
+    /// buffer. Idempotent — if the block is already captured, does nothing (it
+    /// is *not* re-read, so any patches already applied survive).
+    pub(super) fn capture_write(&mut self, bid: Ext4Bid, device: &dyn BlockDevice) -> Result<()> {
+        if self.metadata.contains_key(&bid) {
+            return Ok(());
+        }
+        let mut buffer = MetaBuffer::zeroed();
+        if device
+            .read_bytes(Bid::new(bid).to_offset(), buffer.as_mut())
+            .is_err()
+        {
+            return_errno_with_message!(Errno::EIO, "failed to read metadata block for journaling");
+        }
+        self.metadata.insert(bid, buffer);
+        Ok(())
+    }
+
+    /// Patches a captured block's after-image in place (jbd2 `dirty_metadata`):
+    /// looks up `bid`'s buffer and hands its bytes to `patch`.
+    ///
+    /// This is how a whole-block object (a bitmap:
+    /// `|b| b.copy_from_slice(bitmap.as_bytes())`) or a sub-block object (a group
+    /// descriptor / inode: patch only its field bytes at its offset within the
+    /// block) writes its after-image. Multiple sub-objects sharing one block
+    /// patch the *same* buffer, so their images accumulate correctly.
+    ///
+    /// Errors with `EIO` if the block was not captured first (a
+    /// `dirty_metadata` without a prior `get_*_access`).
+    pub(super) fn apply_patch(
+        &mut self,
+        bid: Ext4Bid,
+        patch: impl FnOnce(&mut [u8]),
+    ) -> Result<()> {
+        let Some(buffer) = self.metadata.get_mut(&bid) else {
+            return_errno_with_message!(
+                Errno::EIO,
+                "dirty_metadata without prior get_*_access"
+            );
+        };
+        patch(buffer.as_mut());
+        Ok(())
+    }
+
+    /// The captured after-image bytes for `bid`, or `None` if not captured.
+    /// Inspection/test accessor.
+    pub(super) fn buffer_bytes(&self, bid: Ext4Bid) -> Option<&[u8]> {
+        self.metadata.get(&bid).map(MetaBuffer::as_bytes)
+    }
+}
+
+/// An open handle against the running transaction (jbd2 `handle_t`).
+///
+/// Obtained from [`journal_start`] and released by [`journal_stop`]. It holds a
+/// credit reservation (the max metadata blocks the caller may dirty) and a weak
+/// back-reference to its [`Journal`]; the reference is weak to avoid a refcount
+/// cycle once the `Journal` owns the commit thread (a later task).
+//
+// The type is named by the (still no-op) funnels' `Option<&Handle>` signatures,
+// so the struct itself is live; its fields and accessors are unused until the
+// funnels are wired up (covered by the module-level dead-code expectation).
+pub(in crate::fs::fs_impls::ext4) struct Handle {
+    /// The transaction this handle joined (`h_transaction->t_tid`).
+    tid: Tid,
+    /// Blocks reserved for this handle (`h_buffer_credits`).
+    credits: usize,
+    /// Weak back-reference to the owning journal.
+    journal: Weak<Journal>,
+}
+
+impl Handle {
+    /// The id of the transaction this handle joined.
+    pub(super) fn tid(&self) -> Tid {
+        self.tid
+    }
+
+    /// The blocks this handle has reserved.
+    pub(super) fn credits(&self) -> usize {
+        self.credits
+    }
+}
+
+/// Ensures adding `extra` credits keeps the running transaction within the
+/// journal's capacity, erroring `ENOSPC` otherwise. `running` must be the
+/// journal's running transaction.
+fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Result<()> {
+    let needed = running.nr_metadata_blocks() + running.outstanding_credits + extra;
+    if needed > journal.max_credits() {
+        return_errno_with_message!(Errno::ENOSPC, "journal transaction is full");
+    }
+    Ok(())
+}
+
+/// Opens a handle on the journal's running transaction, reserving `credits`
+/// metadata blocks (jbd2 `jbd2_journal_start`).
+///
+/// If no transaction is running, a fresh one is created with the next tid. The
+/// capacity check here is basic — Phase 4 does not yet block or trigger a commit
+/// under space pressure (a later task); it simply refuses to over-commit a
+/// single transaction.
+pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
+    let mut st = journal.state_write();
+
+    if st.running.is_none() {
+        let tid = st.next_tid;
+        st.next_tid = st.next_tid.wrapping_add(1);
+        st.running = Some(Transaction::new(tid));
+    }
+
+    // Split the borrow: read the capacity bound off `journal`, then mutate the
+    // running transaction. `running` is `Some` by construction above.
+    let running = st.running.as_mut().unwrap();
+    let tid = running.tid;
+
+    check_capacity(journal, running, credits)?;
+
+    running.t_updates += 1;
+    running.outstanding_credits += credits;
+
+    Ok(Handle {
+        tid,
+        credits,
+        journal: Arc::downgrade(journal),
+    })
+}
+
+/// Closes a handle, releasing its credit reservation (jbd2 `jbd2_journal_stop`).
+///
+/// Triggering a commit when the last handle of a transaction closes
+/// (`t_updates` reaches 0) is wired to the commit pipeline in a later task; this
+/// only releases the reservation.
+pub(super) fn journal_stop(handle: Handle) -> Result<()> {
+    let journal = handle
+        .journal
+        .upgrade()
+        .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
+    let mut st = journal.state_write();
+
+    if let Some(running) = st.running.as_mut()
+        && running.tid == handle.tid
+    {
+        running.t_updates = running.t_updates.saturating_sub(1);
+        running.outstanding_credits = running.outstanding_credits.saturating_sub(handle.credits);
+    }
+    Ok(())
+}
+
+/// Grows a handle's reservation by `extra` blocks (jbd2 `jbd2_journal_extend`).
+///
+/// Fails `ENOSPC` if the transaction cannot fit the extra credits. (jbd2 returns
+/// a distinct "cannot extend" signal so the caller can restart; `ENOSPC` is
+/// adequate for Phase 4.)
+pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
+    let journal = handle
+        .journal
+        .upgrade()
+        .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
+    let mut st = journal.state_write();
+
+    let Some(running) = st.running.as_mut() else {
+        return_errno_with_message!(Errno::EIO, "journal_extend without a running transaction");
+    };
+    check_capacity(&journal, running, extra)?;
+
+    running.outstanding_credits += extra;
+    handle.credits += extra;
+    Ok(())
+}
+
+/// Re-reserves `credits` on this handle, dropping its old reservation (jbd2
+/// `jbd2_journal_restart`).
+///
+/// Phase-4 note: a real restart forces a commit boundary — it commits the
+/// current transaction and starts a fresh one so an unbounded operation (write /
+/// truncate) never overflows a single transaction. The commit pipeline does not
+/// exist yet, so this Task-2a skeleton only releases the old reservation and
+/// re-reserves on the *still-running* transaction; it is wired to the commit
+/// pipeline in a later task.
+pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()> {
+    let journal = handle
+        .journal
+        .upgrade()
+        .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
+    let mut st = journal.state_write();
+
+    let Some(running) = st.running.as_mut() else {
+        return_errno_with_message!(Errno::EIO, "journal_restart without a running transaction");
+    };
+
+    // Release the old reservation first, so the capacity check for the new one
+    // does not double-count this handle's credits.
+    running.outstanding_credits = running.outstanding_credits.saturating_sub(handle.credits);
+    check_capacity(&journal, running, credits)?;
+
+    running.outstanding_credits += credits;
+    handle.credits = credits;
+    Ok(())
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::{
+        super::{
+            super::test_utils::{make_multi_block_file_inode, Ext4FixtureBuilder},
+            format::{Be32, RawJournalHeader, RawJournalSuperblock, BLOCKTYPE_SUPERBLOCK_V2, JBD2_MAGIC},
+            load_geometry, JOURNAL_INO,
+        },
+        // `*` also re-exports the parent module's `Journal`, `Transaction`, etc.
+        *,
+    };
+
+    /// The physical block holding the journal superblock and the first log block.
+    const JOURNAL_START_BLOCK: u32 = 200;
+
+    /// Builds an on-disk journal superblock with the given geometry.
+    fn journal_super(maxlen: u32, first: u32, sequence: u32, start: u32) -> RawJournalSuperblock {
+        RawJournalSuperblock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_SUPERBLOCK_V2),
+                h_sequence: Be32::new(0),
+            },
+            s_blocksize: Be32::new(BLOCK_SIZE as u32),
+            s_maxlen: Be32::new(maxlen),
+            s_first: Be32::new(first),
+            s_sequence: Be32::new(sequence),
+            s_start: Be32::new(start),
+            s_nr_users: Be32::new(1),
+            ..Default::default()
+        }
+    }
+
+    /// Builds a journaled fixture and its parsed geometry: writes the journal
+    /// inode (ino 8) mapping `maxlen` log blocks at [200, 200+maxlen) and a valid
+    /// journal superblock (with the given `sequence`) at physical block 200.
+    fn journaled_fixture(maxlen: u32, first: u32, sequence: u32) -> Arc<Journal> {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_has_journal()
+            .build()
+            .unwrap();
+
+        let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, maxlen as u16);
+        f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
+        f.disk
+            .segment()
+            .write_val(
+                JOURNAL_START_BLOCK as usize * BLOCK_SIZE,
+                &journal_super(maxlen, first, sequence, 0),
+            )
+            .unwrap();
+
+        let geometry = load_geometry(&f.ext4).unwrap().unwrap();
+        Journal::new(geometry)
+    }
+
+    #[ktest]
+    fn transaction_new_starts_running_and_empty() {
+        let txn = Transaction::new(7);
+        assert_eq!(txn.tid(), 7);
+        assert_eq!(txn.state(), TransactionState::Running);
+        assert_eq!(txn.nr_updates(), 0);
+        assert_eq!(txn.nr_metadata_blocks(), 0);
+    }
+
+    #[ktest]
+    fn transaction_capture_create_is_idempotent() {
+        let mut txn = Transaction::new(1);
+        txn.capture_create(42);
+        assert_eq!(txn.nr_metadata_blocks(), 1);
+        // A freshly created block is all zeros.
+        assert_eq!(txn.buffer_bytes(42), Some([0u8; BLOCK_SIZE].as_slice()));
+
+        // Patch it, then a second `capture_create` must NOT wipe the patch.
+        txn.apply_patch(42, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
+            .unwrap();
+        txn.capture_create(42);
+        assert_eq!(txn.nr_metadata_blocks(), 1);
+        assert_eq!(&txn.buffer_bytes(42).unwrap()[0..4], &[1, 2, 3, 4]);
+    }
+
+    #[ktest]
+    fn transaction_capture_write_seeds_from_device_once() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+
+        // Known content in a data block.
+        let first = [0xABu8; BLOCK_SIZE];
+        f.write_data_block(300, &first);
+
+        let mut txn = Transaction::new(1);
+        txn.capture_write(300, f.ext4.block_device().as_ref())
+            .unwrap();
+        assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
+
+        // Change the device, then capture again: a no-op, so the buffer keeps the
+        // FIRST content.
+        let second = [0xCDu8; BLOCK_SIZE];
+        f.write_data_block(300, &second);
+        txn.capture_write(300, f.ext4.block_device().as_ref())
+            .unwrap();
+        assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
+    }
+
+    #[ktest]
+    fn transaction_apply_patch_accumulates_sub_objects() {
+        let mut txn = Transaction::new(1);
+        txn.capture_create(7);
+
+        // Two sub-object patches at different offsets in the SAME block: both
+        // persist (the Model-A correctness property for group descriptors /
+        // inodes packed into one metadata block).
+        txn.apply_patch(7, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
+            .unwrap();
+        txn.apply_patch(7, |b| b[64..68].copy_from_slice(&[5, 6, 7, 8]))
+            .unwrap();
+
+        let bytes = txn.buffer_bytes(7).unwrap();
+        assert_eq!(&bytes[0..4], &[1, 2, 3, 4]);
+        assert_eq!(&bytes[64..68], &[5, 6, 7, 8]);
+        // Untouched bytes stay zero.
+        assert_eq!(&bytes[4..64], &[0u8; 60]);
+    }
+
+    #[ktest]
+    fn transaction_apply_patch_uncaptured_errors() {
+        let mut txn = Transaction::new(1);
+        assert!(txn.apply_patch(99, |_| {}).is_err());
+    }
+
+    #[ktest]
+    fn journal_start_creates_and_shares_running_transaction() {
+        let j = journaled_fixture(64, 1, 1);
+
+        let h1 = journal_start(&j, 4).unwrap();
+        {
+            let st = j.state_write();
+            let running = st.running.as_ref().unwrap();
+            assert_eq!(running.tid(), 1); // == geometry.sequence()
+            assert_eq!(running.nr_updates(), 1);
+            assert_eq!(running.outstanding_credits, 4);
+        }
+        assert_eq!(h1.tid(), 1);
+        assert_eq!(h1.credits(), 4);
+
+        // A second start shares the same running transaction.
+        let h2 = journal_start(&j, 2).unwrap();
+        {
+            let st = j.state_write();
+            let running = st.running.as_ref().unwrap();
+            assert_eq!(running.tid(), 1);
+            assert_eq!(running.nr_updates(), 2);
+            assert_eq!(running.outstanding_credits, 6);
+        }
+        assert_eq!(h2.tid(), 1);
+
+        // Stopping one handle releases its reservation.
+        journal_stop(h1).unwrap();
+        {
+            let st = j.state_write();
+            let running = st.running.as_ref().unwrap();
+            assert_eq!(running.nr_updates(), 1);
+            assert_eq!(running.outstanding_credits, 2);
+        }
+        journal_stop(h2).unwrap();
+    }
+
+    #[ktest]
+    fn journal_start_over_capacity_errors() {
+        let j = journaled_fixture(64, 1, 1);
+        let over = j.max_credits() + 1;
+        assert!(journal_start(&j, over).is_err());
+    }
+
+    #[ktest]
+    fn journal_extend_grows_and_caps_credits() {
+        let j = journaled_fixture(64, 1, 1);
+        let mut h = journal_start(&j, 4).unwrap();
+
+        journal_extend(&mut h, 3).unwrap();
+        assert_eq!(h.credits(), 7);
+        {
+            let st = j.state_write();
+            assert_eq!(st.running.as_ref().unwrap().outstanding_credits, 7);
+        }
+
+        // Extending past capacity fails and does not change the reservation.
+        let over = j.max_credits();
+        assert!(journal_extend(&mut h, over).is_err());
+        assert_eq!(h.credits(), 7);
+
+        journal_stop(h).unwrap();
+    }
+
+    #[ktest]
+    fn journal_restart_re_reserves_credits() {
+        let j = journaled_fixture(64, 1, 1);
+        let mut h = journal_start(&j, 10).unwrap();
+
+        journal_restart(&mut h, 3).unwrap();
+        assert_eq!(h.credits(), 3);
+        {
+            let st = j.state_write();
+            let running = st.running.as_ref().unwrap();
+            // The old 10-credit reservation was released, only 3 remain.
+            assert_eq!(running.outstanding_credits, 3);
+            // Still the same running transaction (no commit boundary yet).
+            assert_eq!(running.tid(), 1);
+        }
+
+        journal_stop(h).unwrap();
+    }
+
+    #[ktest]
+    fn max_credits_matches_geometry() {
+        // maxlen 64, first 1: usable = 64 - 1, minus 2 overhead = 61.
+        let j = journaled_fixture(64, 1, 1);
+        assert_eq!(j.max_credits(), 61);
+    }
+}

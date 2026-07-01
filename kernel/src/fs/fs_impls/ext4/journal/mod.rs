@@ -35,7 +35,10 @@
 //! affected block to these wrappers by its block number. Phase 4 introduces the
 //! buffer-based journaling the block number is a handle for.
 
+use ostd::sync::RwMutexWriteGuard;
+
 use self::format::{JournalSuperblock, RawJournalSuperblock};
+use self::transaction::{Handle, Transaction};
 use super::{
     feature::FeatureCompatSet,
     fs::{Ext4, JOURNAL_INO},
@@ -44,6 +47,7 @@ use super::{
 };
 
 mod format;
+mod transaction;
 
 /// Journal transaction id (jbd2 `tid_t`).
 pub(super) type Tid = u32;
@@ -62,19 +66,22 @@ pub(super) struct JournalGeometry {
 
 impl JournalGeometry {
     /// Returns the total number of log blocks (`s_maxlen`).
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    ///
+    /// Used by [`Journal::max_credits`], so it is live even in non-ktest builds.
     pub(super) fn maxlen(&self) -> u32 {
         self.superblock.maxlen()
     }
 
     /// Returns the first log block that holds log data (`s_first`).
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    ///
+    /// Used by [`Journal::max_credits`], so it is live even in non-ktest builds.
     pub(super) fn first(&self) -> u32 {
         self.superblock.first()
     }
 
     /// Returns the first transaction id expected on recovery (`s_sequence`).
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    ///
+    /// Used by [`Journal::new`], so it is live even in non-ktest builds.
     pub(super) fn sequence(&self) -> Tid {
         self.superblock.sequence()
     }
@@ -155,14 +162,75 @@ pub(super) fn load_geometry(fs: &Arc<Ext4>) -> Result<Option<JournalGeometry>> {
     }))
 }
 
-/// A handle to an open journal transaction (jbd2 `handle_t`).
+/// The in-memory journal: the parsed geometry plus the running-transaction
+/// state (jbd2 `journal_t`).
 ///
-/// Phase 2 has no journal, so callers always pass `None`; the type exists only
-/// to fix the wrapper signatures. Phase 4 makes it a real transaction obtained
-/// from `journal_start(credits)` and threaded through the metadata wrappers in
-/// inner → handle → ExtentTree lock order (report §5.2 rule 1).
-pub(super) struct Handle {
-    _private: (),
+/// Later tasks add the committed-tid counter, wait queues, the commit thread,
+/// and the checkpoint machinery. Task 2a holds only enough to open, size, and
+/// close transactions.
+///
+/// Constructed by [`Journal::new`], which a later task calls from
+/// [`Ext4::open`]; for now it is reachable only from tests. The transaction
+/// lifecycle functions in [`transaction`] reference it, so the type itself
+/// counts as used in non-ktest builds even though nothing constructs it there
+/// yet (`Journal::new` stays gated `dead_code`).
+pub(super) struct Journal {
+    /// The parsed on-disk geometry (the log block map + journal superblock).
+    geometry: JournalGeometry,
+    /// The running-transaction state, guarded for the lifecycle operations.
+    state: RwMutex<JournalState>,
+}
+
+/// The mutable running-transaction state of a [`Journal`].
+///
+/// Phase 4 is single-transaction: there is at most one running transaction and
+/// no pipelined committing transaction yet.
+//
+// Referenced by the transaction lifecycle functions (via `Journal::state_write`),
+// so it counts as used in non-ktest builds.
+pub(super) struct JournalState {
+    /// The single running transaction, if any (`journal_t.j_running_transaction`).
+    pub(super) running: Option<Transaction>,
+    /// The tid to assign to the next transaction created
+    /// (`journal_t.j_transaction_sequence`).
+    pub(super) next_tid: Tid,
+}
+
+#[cfg_attr(not(ktest), expect(dead_code))]
+impl Journal {
+    /// Builds an in-memory journal over a parsed [`JournalGeometry`], with no
+    /// running transaction.
+    ///
+    /// The next tid is seeded from `s_sequence` — the first tid recovery expects
+    /// (a fresh `mke2fs` journal has `s_sequence == 1`).
+    pub(super) fn new(geometry: JournalGeometry) -> Arc<Self> {
+        let next_tid = geometry.sequence();
+        Arc::new(Self {
+            geometry,
+            state: RwMutex::new(JournalState {
+                running: None,
+                next_tid,
+            }),
+        })
+    }
+
+    /// The maximum metadata blocks a single transaction may reserve.
+    ///
+    /// A coarse but safe bound: the usable log blocks (`s_maxlen - s_first`)
+    /// minus a descriptor + commit block of per-transaction overhead. Precise
+    /// per-transaction credit accounting is a later task.
+    pub(super) fn max_credits(&self) -> usize {
+        (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize
+    }
+
+    /// Acquires the running-transaction state for writing.
+    ///
+    /// The transaction lifecycle operations ([`journal_start`](transaction::journal_start)
+    /// and friends) hold this guard for their whole duration; see the
+    /// [`transaction`] module's locking note.
+    pub(super) fn state_write(&self) -> RwMutexWriteGuard<'_, JournalState> {
+        self.state.write()
+    }
 }
 
 /// Identifies the kind of metadata block being accessed.
