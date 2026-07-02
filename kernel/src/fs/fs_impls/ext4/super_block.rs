@@ -275,12 +275,24 @@ impl SuperBlock {
 
     /// The head of the on-disk orphan list (`s_last_orphan`), `0` when empty.
     ///
-    /// Phase 4's orphan machinery (Task 8) links inodes here; until it does, the
-    /// value stays whatever mount parsed. Exposed so the superblock capture can
-    /// patch **every** mutable field from memory (see `journal_superblock` in
-    /// `fs.rs`).
+    /// The orphan list threads inodes whose link count reached 0 but whose
+    /// deletion has not yet completed (they still hold blocks / a bitmap bit).
+    /// Crash recovery walks it from this head, following each inode's `i_dtime`
+    /// (reused as the "next" pointer while an inode is on the list), to finish
+    /// every interrupted deletion.
     pub(super) const fn last_orphan(&self) -> u32 {
         self.last_orphan
+    }
+
+    /// Sets the head of the on-disk orphan list (`s_last_orphan`).
+    ///
+    /// Takes `&mut self` so a write guard over `RwMutex<Dirty<SuperBlock>>` marks
+    /// the superblock dirty for writeback; the orphan-list add/remove and the
+    /// mount-time recovery scan set it, and it reaches disk through the captured
+    /// superblock after-image (`journal_superblock` in `fs.rs` patches it from
+    /// memory on every capture) or [`Ext4::sync_metadata`](super::fs::Ext4).
+    pub(super) fn set_last_orphan(&mut self, ino: u32) {
+        self.last_orphan = ino;
     }
 
     /// Returns the number of block groups, rounding up the last partial group.

@@ -332,6 +332,22 @@ impl InodeDesc {
         self.dtime
     }
 
+    /// Sets `i_dtime` to encode this inode's successor on the orphan list (ext4
+    /// reuses `i_dtime` as the orphan "next" pointer while an inode is linked
+    /// onto `s_last_orphan`). `0` marks the list tail.
+    ///
+    /// This is the same on-disk field as [`set_dtime`](Self::set_dtime); the two
+    /// uses are disjoint in time — an inode carries a next-pointer only while it
+    /// is on the orphan list, and a real deletion time only once it is freed.
+    /// The authoritative successor of a *cached* on-list inode lives in the
+    /// filesystem's in-memory orphan chain (`Ext4::s_orphan_lock`) — a non-head
+    /// removal splices the on-disk pointer without reaching this descriptor —
+    /// so the journaled writeback overrides `i_dtime` from that chain; this
+    /// setter records the value known at add time.
+    pub(super) fn set_orphan_next(&mut self, next: u32) {
+        self.dtime = Duration::from_secs(next as u64);
+    }
+
     /// Returns the inode generation (`i_generation`).
     pub(super) const fn generation(&self) -> u32 {
         self.generation
@@ -541,6 +557,30 @@ impl Inode {
         })
     }
 
+    /// Builds a live inode for a crash-recovery orphan reclaim from its raw
+    /// on-disk inode, whose link count is 0 (the orphan state that
+    /// `InodeDesc::try_from` rejects for normal reads).
+    ///
+    /// Decodes the descriptor with the link count temporarily forced to 1 so the
+    /// extent tree / payload build succeeds, then resets the in-memory link
+    /// count to 0 so [`try_reclaim_deleted_inode`](Self::try_reclaim_deleted_inode)
+    /// — run by the caller by dropping the returned `Arc` — frees it. Used only
+    /// by the mount-time orphan scan (`Ext4::recover_orphan_list`).
+    pub(super) fn from_raw_for_recovery(
+        ino: Ext4Ino,
+        raw: &RawInode,
+        block_group_idx: usize,
+        fs: Weak<Ext4>,
+    ) -> Result<Arc<Self>> {
+        let mut probe = *raw;
+        probe.link_count = 1;
+        let mut desc = InodeDesc::try_from(&probe)?;
+        // Restore the true (0) link count so the reclaim on drop fires.
+        desc.set_link_count(0);
+        let type_ = desc.type_();
+        Ok(Self::new(ino, type_, Dirty::new(desc), block_group_idx, fs))
+    }
+
     pub(super) fn ino(&self) -> Ext4Ino {
         self.ino
     }
@@ -603,9 +643,15 @@ impl Inode {
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images a shrink frees.
         let op = fs.begin_op(Ext4::TRUNCATE_CREDITS)?;
-        // Orphan-list seam for shrinking truncates (Phase-3 no-op; Task 8 will
-        // journal a large truncate onto the orphan list so crash recovery can
-        // finish freeing the trailing blocks if interrupted mid-shrink).
+        // Orphan-list seam for shrinking truncates — deliberately still the
+        // funnel no-op, NOT the fs-level `orphan_add`/`orphan_del` the delete
+        // path uses. A truncated inode stays live (link count > 0), whereas the
+        // mount-time orphan scan *frees* every inode it finds on the list;
+        // putting a live inode there would lose it. And under commit-per-op a
+        // whole truncate is one transaction — atomic across a crash — so it
+        // needs no orphan protection yet; crash-safe multi-transaction truncate
+        // (recovery re-truncates rather than frees, a distinct recovery mode)
+        // arrives with P7's `journal_restart`.
         let is_shrink = new_size < inner.file_size();
         if is_shrink {
             journal::orphan_add(op.get(), self.ino)?;
@@ -746,6 +792,17 @@ impl Inode {
         // block-bitmap / group-descriptor / inode-bitmap after-images freeing the
         // inode's blocks and the inode itself dirty.
         let op = fs.begin_op(Ext4::RECLAIM_CREDITS)?;
+
+        // Unlink this inode from the on-disk orphan list BEFORE stamping the
+        // real deletion time below — while on the list, `i_dtime` doubles as the
+        // orphan-next pointer, and this reclaim transaction must atomically both
+        // splice the chain and free the inode (crash before its commit leaves
+        // the inode chained and allocated, so recovery finishes the deletion;
+        // crash after leaves it fully freed and off the chain). The successor
+        // comes from the filesystem's in-memory chain; `orphan_del` of an inode
+        // that was never added (a non-journaled volume) is a no-op.
+        fs.orphan_del(self.ino, op.get())?;
+
         let old_size = inner.file_size();
         // Only data-backed inodes (files, directories, slow symlinks) own a page
         // cache and extent-mapped blocks. A fast symlink stores its target inline
@@ -769,9 +826,6 @@ impl Inode {
         inner.write_back_inode_desc(&fs, self.ino, op.get())?;
 
         fs.free_inode(self.ino, self.type_, op.get())?;
-        // Orphan-list seam (Phase-3 no-op): Task 8 unlinks the inode from the
-        // on-disk orphan chain now that its blocks and inode are freed.
-        journal::orphan_del(op.get(), self.ino)?;
         Ok(true)
     }
 
@@ -960,6 +1014,14 @@ impl InodeInner {
     /// Sets the deletion time (`i_dtime`). Used by the reclaim path.
     fn set_dtime(&mut self, time: Duration) {
         self.desc.set_dtime(time);
+    }
+
+    /// Encodes this inode's successor on the orphan list into `i_dtime` (ext4's
+    /// dual use of that field). Used by the orphan-list add path; the
+    /// authoritative successor lives in `Ext4::s_orphan_lock`'s in-memory chain
+    /// (see [`InodeDesc::set_orphan_next`]).
+    pub(super) fn set_orphan_next(&mut self, next: u32) {
+        self.desc.set_orphan_next(next);
     }
 
     /// Clears the given inode flags. Used by rename to drop a moved directory's

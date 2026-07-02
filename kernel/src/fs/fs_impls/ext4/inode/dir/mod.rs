@@ -665,20 +665,26 @@ impl Inode {
         let child_inner = guards.inner_mut(child.ino());
         child_inner.set_ctime(utils::now());
         child_inner.dec_link_count(1);
-        // Journaled: persist the child's link-count change in this transaction,
-        // atomically with the entry removal (a crash-consistent link count, even
-        // for a surviving hard link). Non-journaled defers to the link==0 case /
-        // fsync as before.
-        if op.get().is_some() {
+        let reached_zero = child_inner.link_count() == 0;
+        if reached_zero {
+            // Link the fully unlinked inode onto the on-disk orphan list,
+            // recording the previous head in its `i_dtime`, so a crash between
+            // this transaction and the (separate) reclaim transaction leaves a
+            // chain recovery can finish. Ordered handle ② → `s_orphan_lock` →
+            // superblock ⑤; a no-op (returning 0) without a journal.
+            let old_head = fs.orphan_add(child.ino(), op.get())?;
+            let child_inner = guards.inner_mut(child.ino());
+            child_inner.set_orphan_next(old_head);
+        }
+        // Persist the child's inode in this transaction: for a surviving hard
+        // link its (crash-consistent) link count; for the last link its zeroed
+        // link count + orphan-next pointer. Non-journaled writes back only on
+        // the link==0 case (a surviving link defers to fsync, as before).
+        let child_inner = guards.inner_mut(child.ino());
+        if op.get().is_some() || reached_zero {
             child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
         }
-        if child_inner.link_count() == 0 {
-            // Orphan-list seam (Phase-3 no-op; Task 8 journals the add so crash
-            // recovery can finish a deletion interrupted past this point).
-            journal::orphan_add(op.get(), child.ino())?;
-            if op.get().is_none() {
-                child_inner.write_back_inode_desc(&fs, entry_info.ino, None)?;
-            }
+        if reached_zero {
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
@@ -722,8 +728,11 @@ impl Inode {
         // The child loses its own `.` self-link and the parent's directory entry.
         child_inner.dec_link_count(2);
         if child_inner.link_count() == 0 {
-            // Orphan-list seam (Phase-3 no-op; see `unlink`).
-            journal::orphan_add(op.get(), child.ino())?;
+            // Link onto the orphan list before writing the child back, so its
+            // `i_dtime` carries the orphan-next pointer (see `unlink`).
+            let old_head = fs.orphan_add(child.ino(), op.get())?;
+            let child_inner = guards.inner_mut(child.ino());
+            child_inner.set_orphan_next(old_head);
             child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
             let _ = fs.remove_inode(entry_info.ino);
         }
@@ -1020,8 +1029,12 @@ impl Inode {
             replaced_inner.dec_link_count(1);
 
             if replaced_inner.link_count() == 0 {
-                // Orphan-list seam (Phase-3 no-op; see `unlink`).
-                journal::orphan_add(handle, replaced.ino())?;
+                // Link onto the orphan list before writing the replaced inode
+                // back, so its `i_dtime` carries the orphan-next pointer (see
+                // `unlink`).
+                let old_head = fs.orphan_add(replaced.ino(), handle)?;
+                let replaced_inner = guards.inner_mut(replaced.ino());
+                replaced_inner.set_orphan_next(old_head);
                 replaced_inner.write_back_inode_desc(&fs, replaced.ino(), handle)?;
                 // Drop the cache's `Arc`. If an fd still holds one the inode stays
                 // alive until that last `Arc` (here in the caller's locals, dropped
@@ -1133,7 +1146,10 @@ mod tests {
     };
 
     use aster_block::BLOCK_SIZE;
-    use ostd::{mm::VmReader, prelude::*};
+    use ostd::{
+        mm::{VmIo, VmReader},
+        prelude::*,
+    };
 
     use super::{
         super::super::test_utils::{
@@ -1246,7 +1262,10 @@ mod tests {
         }
     }
 
-    use super::super::super::test_utils::{Ext4Fixture, make_empty_file_inode};
+    use super::super::super::{
+        super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET},
+        test_utils::{Ext4Fixture, make_empty_file_inode},
+    };
     use crate::time::clocks;
 
     const DIR_INO: u32 = 12;
@@ -1846,21 +1865,105 @@ mod tests {
         );
     }
 
-    /// The orphan-list seam is exercised on the nlink-0 path (it is a Phase-3
-    /// no-op, so unlink simply succeeds — this asserts the call site compiles and
-    /// runs without observable effect).
+    /// On a non-journaled volume the orphan machinery is inert (journal-only,
+    /// Linux parity): unlink + reclaim succeed, the inode is freed, and the
+    /// superblock's orphan head never budges.
     #[ktest]
-    fn orphan_seam_no_op_on_reclaim() {
+    fn orphan_machinery_inert_without_journal() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
         let child = dir.create("seam", InodeType::File, perm()).unwrap();
         let child_ino = child.ino();
         drop(child);
 
-        // `unlink` calls `orphan_add` (no-op) at nlink 0 and reclaim calls
-        // `orphan_del` (no-op); both must succeed and leave the inode freed.
         dir.unlink("seam").unwrap();
         assert!(!f.ext4.is_inode_allocated(child_ino));
+        assert_eq!(f.ext4.super_block().last_orphan(), 0);
+    }
+
+    /// `fixture_for_create` plus a journal, for the orphan-list flow tests. The
+    /// commit thread is stopped so every assertion window is deterministic; the
+    /// 64-block log comfortably fits the accumulated transactions.
+    fn journaled_fixture_for_create() -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        f.ext4.journal().unwrap().stop_commit_thread();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
+        f
+    }
+
+    /// The Task 8 story end to end: unlink-of-open chains both inodes onto the
+    /// orphan list (head = the newest, `i_dtime` = the successor, all
+    /// journaled); reclaiming the *tail* first exercises the non-head splice
+    /// (the predecessor's on-disk pointer skips it); reclaiming the head drains
+    /// the list. Every intermediate on-disk state a crash could expose is a
+    /// well-formed chain of exactly the still-allocated orphans.
+    #[ktest]
+    fn unlink_of_open_chains_then_reclaims_drain() {
+        let f = journaled_fixture_for_create();
+        let journal = f.ext4.journal().unwrap();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let a = dir.create("a", InodeType::File, perm()).unwrap();
+        let b = dir.create("b", InodeType::File, perm()).unwrap();
+        let (a_ino, b_ino) = (a.ino(), b.ino());
+        journal.commit_now_for_test();
+
+        // Unlink both while "open" (our Arcs stand in for fds): reclaim defers,
+        // the chain grows at the head: b → a.
+        dir.unlink("a").unwrap();
+        assert_eq!(f.ext4.super_block().last_orphan(), a_ino, "a is the head");
+        assert!(f.ext4.is_inode_allocated(a_ino), "reclaim deferred (open)");
+        dir.unlink("b").unwrap();
+        assert_eq!(f.ext4.super_block().last_orphan(), b_ino, "b is the head");
+
+        // The chain is durable: commit + checkpoint, then read it off the disk —
+        // this is the state a crash would hand to the next mount's orphan scan.
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let sb_disk: RawSuperBlock = f.disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        assert_eq!(sb_disk.last_orphan, b_ino, "on-disk head");
+        assert_eq!(
+            f.read_raw_inode(b_ino).dtime,
+            a_ino,
+            "b's on-disk i_dtime chains to a"
+        );
+
+        // Reclaim the TAIL first (a): the non-head case — b's on-disk pointer is
+        // spliced to a's successor (0), the head stays b.
+        drop(a);
+        assert!(!f.ext4.is_inode_allocated(a_ino), "a freed");
+        assert_eq!(f.ext4.super_block().last_orphan(), b_ino, "head unchanged");
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        assert_eq!(
+            f.read_raw_inode(b_ino).dtime,
+            0,
+            "b's on-disk pointer spliced past the reclaimed a"
+        );
+
+        // Reclaim the head (b): the list drains, on disk too.
+        drop(b);
+        assert!(!f.ext4.is_inode_allocated(b_ino), "b freed");
+        assert_eq!(f.ext4.super_block().last_orphan(), 0, "list drained");
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let sb_disk: RawSuperBlock = f.disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        assert_eq!(sb_disk.last_orphan, 0, "drained head persisted");
     }
 
     // ── link ────────────────────────────────────────────────────────────────

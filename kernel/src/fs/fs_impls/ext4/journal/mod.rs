@@ -951,30 +951,26 @@ pub(super) fn forget(
     Ok(())
 }
 
-/// Adds an inode to the on-disk orphan list. **Phase 3: no-op.**
+/// Truncate-orphan seam. **Still a no-op.**
 ///
-/// Phase 4 will journal-link the inode onto the superblock orphan chain
-/// (`s_last_orphan` head + `i_dtime` "next" pointers) under
-/// [`Ext4::s_orphan_lock`](super::fs::Ext4), so crash recovery (SCAN/REPLAY) can
-/// finish a deletion that was interrupted after the link count hit 0 but before
-/// the blocks/inode were freed. The call sites in `unlink`/`rmdir` (and Task 6's
-/// `truncate`) are baked in now so Phase 4 fills only this body, not the
-/// namespace operations.
+/// The *delete* orphan list (an unlinked inode whose deletion recovery must
+/// *finish* by freeing it) is handled by [`Ext4::orphan_add`](super::fs::Ext4) /
+/// [`orphan_del`](super::fs::Ext4::orphan_del) — Task 8 wired the
+/// `unlink`/`rmdir`/`rename` call sites and the reclaim path to those fs-level
+/// methods, which touch the superblock head and the inode `i_dtime` chain (data
+/// this journal funnel cannot reach).
+///
+/// This funnel remains only for the *shrinking-truncate* seam, whose recovery
+/// mode differs (recovery must *re-truncate* a still-live inode, not free it —
+/// and under commit-per-op a whole truncate is one atomic transaction anyway),
+/// so it stays a no-op until the P7 `journal_restart` follow-up.
 pub(super) fn orphan_add(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
-    // Phase-4 fill point: acquire `s_orphan_lock`, then journal the orphan-list
-    // head/chain update (handle locked *after* `s_orphan_lock`, superblock
-    // *before*). Do not acquire the lock here — taking it to do nothing would be
-    // flagged.
     Ok(())
 }
 
-/// Removes an inode from the on-disk orphan list. **Phase 3: no-op.**
-///
-/// The mirror of [`orphan_add`]: Phase 4 unlinks the inode from the orphan chain
-/// once its blocks and inode have been freed. Called from
-/// `try_reclaim_deleted_inode` after `free_inode`.
+/// The mirror of [`orphan_add`] for the shrinking-truncate seam. **Still a
+/// no-op** (see [`orphan_add`]).
 pub(super) fn orphan_del(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
-    // Phase-4 fill point: see `orphan_add`.
     Ok(())
 }
 
