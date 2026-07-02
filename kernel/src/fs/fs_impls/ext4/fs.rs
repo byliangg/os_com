@@ -12,14 +12,14 @@
 //! by [`Ext4::read_inode_desc`]. The inode bitmap, inode-table page cache, and
 //! inode allocation arrive in Phase 3.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use device_id::DeviceId;
 
 use super::{
     block_group::BlockGroup,
     inode,
-    inode::{FilePerm, Inode, InodeDesc, RawInode},
+    inode::{FilePerm, Inode, InodeDesc, InodeSeed, RawInode},
     journal,
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
@@ -37,6 +37,37 @@ pub(super) const ROOT_INO: Ext4Ino = 2;
 pub(super) const JOURNAL_INO: Ext4Ino = 8;
 
 /// An ext4 filesystem instance.
+/// How `EXT4_IOC_SHUTDOWN` takes the filesystem down — the parse-once form of
+/// the ioctl's `EXT4_GOING_FLAGS_*` argument (Linux `ext4_ioctl_shutdown`).
+#[derive(Debug)]
+pub(super) enum GoingDown {
+    /// `EXT4_GOING_FLAGS_DEFAULT` (0): flush everything, then freeze. The
+    /// mildest form — nothing is lost, the device just stops accepting work.
+    Default,
+    /// `EXT4_GOING_FLAGS_LOGFLUSH` (1): commit the running transaction, then
+    /// kill the journal. Committed operations survive the "crash".
+    LogFlush,
+    /// `EXT4_GOING_FLAGS_NOLOGFLUSH` (2): kill the journal immediately; the
+    /// running transaction vanishes, like a power cut mid-operation.
+    NoLogFlush,
+}
+
+impl TryFrom<u32> for GoingDown {
+    type Error = Error;
+
+    fn try_from(flags: u32) -> Result<Self> {
+        match flags {
+            0 => Ok(Self::Default),
+            1 => Ok(Self::LogFlush),
+            2 => Ok(Self::NoLogFlush),
+            _ => Err(Error::with_message(
+                Errno::EINVAL,
+                "unknown EXT4_GOING_FLAGS value",
+            )),
+        }
+    }
+}
+
 pub struct Ext4 {
     block_device: Arc<dyn BlockDevice>,
     /// Superblock with dirty tracking.
@@ -49,6 +80,12 @@ pub struct Ext4 {
     /// Monotonic source for the `i_generation` stamped onto each newly created
     /// inode. Seeded from the mount time, like ext2.
     next_generation: AtomicU32,
+    /// Raised by `EXT4_IOC_SHUTDOWN` (Linux `EXT4_FLAGS_SHUTDOWN`): the
+    /// filesystem is "dead" — new operations fail `EIO` at `begin_op`, the
+    /// sync/writeback paths refuse to touch the device, and unmount performs
+    /// no clean-shutdown writes, freezing the on-disk state the way a power
+    /// cut would.
+    shutdown: AtomicBool,
     /// The orphan list: the guarded [`OrphanChain`] is the **in-memory mirror
     /// of the on-disk chain** (the position invariant lives on the type), and
     /// the lock is jbd2's `s_orphan_lock`.
@@ -97,6 +134,7 @@ impl Ext4 {
             block_groups,
             nr_inodes_per_group,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
+            shutdown: AtomicBool::new(false),
             s_orphan_lock: Mutex::new(OrphanChain::new()),
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -257,10 +295,64 @@ impl Ext4 {
     /// drop at the end of the operation to close the handle (and, when it is the
     /// transaction's last, signal a commit — asynchronously).
     pub(super) fn begin_op(&self, credits: usize) -> Result<journal::OpHandle> {
+        // The single gate every metadata operation passes (Linux
+        // `ext4_journal_check_start`): a shut-down filesystem accepts no new
+        // work, journaled or not.
+        self.ensure_not_shutdown()?;
         match self.journal() {
             Some(journal) => journal::OpHandle::start(&journal, credits),
             None => Ok(journal::OpHandle::none()),
         }
+    }
+
+    /// Whether `EXT4_IOC_SHUTDOWN` has killed this filesystem.
+    pub(super) fn is_shutdown(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Errors `EIO` once the filesystem has been shut down (Linux
+    /// `ext4_forced_shutdown` checks).
+    pub(super) fn ensure_not_shutdown(&self) -> Result<()> {
+        if self.is_shutdown() {
+            return_errno_with_message!(Errno::EIO, "filesystem is shut down");
+        }
+        Ok(())
+    }
+
+    /// Shuts the filesystem down (`EXT4_IOC_SHUTDOWN`, Linux
+    /// `ext4_force_shutdown`): after this, new operations fail `EIO` and the
+    /// on-disk state is frozen as-is — the controlled "crash right here" the
+    /// crash tests are built on. Idempotent: a second call is a no-op.
+    pub(super) fn shutdown(&self, going: GoingDown) -> Result<()> {
+        if self.is_shutdown() {
+            return Ok(());
+        }
+        match going {
+            GoingDown::Default => {
+                // Flush everything (data, metadata, journal commit), then
+                // raise the flag. Linux freezes the fs around the flag so no
+                // write can slip in between; we have no freeze — the unfrozen
+                // window is a recorded deviation, fine for a test hook.
+                <Self as crate::fs::vfs::file_system::FileSystem>::sync(self)?;
+                self.shutdown.store(true, Ordering::Release);
+            }
+            GoingDown::LogFlush => {
+                self.shutdown.store(true, Ordering::Release);
+                if let Some(journal) = self.journal() {
+                    // Commit what is running, then kill the journal: committed
+                    // operations survive the "crash", in-flight ones vanish.
+                    journal.commit_and_wait_running()?;
+                    journal.abort_for_shutdown();
+                }
+            }
+            GoingDown::NoLogFlush => {
+                self.shutdown.store(true, Ordering::Release);
+                if let Some(journal) = self.journal() {
+                    journal.abort_for_shutdown();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Returns the maximum byte size of a regular file.
@@ -484,6 +576,7 @@ impl Ext4 {
         parent_ino: Ext4Ino,
         type_: InodeType,
         perm: FilePerm,
+        seed: InodeSeed,
         handle: Option<&journal::Handle>,
     ) -> Result<Arc<Inode>> {
         let ino = self.alloc_ino(parent_ino, type_, handle)?;
@@ -504,7 +597,7 @@ impl Ext4 {
             .unwrap_or((0, 0));
         let now = utils::now();
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        let inode_desc = InodeDesc::new(type_, perm, uid, gid, link_count, generation, now);
+        let inode_desc = InodeDesc::new(type_, perm, uid, gid, link_count, generation, now, seed);
 
         if let Err(err) = self.write_new_inode_desc(ino, &inode_desc, handle) {
             // Roll back the inode allocation: clear the bitmap bit and restore
@@ -851,6 +944,10 @@ impl Ext4 {
 
     /// Writes back the superblock and every dirty group descriptor/bitmap.
     pub(super) fn sync_metadata(&self) -> Result<()> {
+        // A shut-down filesystem writes nothing more (Linux: writeback paths
+        // bail on `ext4_forced_shutdown`); fsync of a dirty inode reports the
+        // death as `EIO` through this same gate.
+        self.ensure_not_shutdown()?;
         for group in &self.block_groups {
             group.sync_metadata()?;
         }
@@ -905,6 +1002,7 @@ impl Ext4 {
     /// `inode.inner.write()` then, later, `super_block.write()` + per-group
     /// `metadata.write()` — no inversion.
     pub(super) fn sync_all(&self) -> Result<()> {
+        self.ensure_not_shutdown()?;
         for group in &self.block_groups {
             group.sync_inodes()?;
         }
@@ -1123,6 +1221,16 @@ impl Ext4 {
 /// cell is `None` and this is a no-op.
 impl Drop for Ext4 {
     fn drop(&mut self) {
+        // A shut-down filesystem unmounts without touching the device: no
+        // journal flush, no RECOVER clear — the disk stays exactly as the
+        // "crash" left it, and the next mount replays (Linux `ext4_put_super`
+        // parity under forced shutdown).
+        if self.is_shutdown() {
+            if let Some(journal) = self.journal.get_mut().take() {
+                journal.stop_commit_thread();
+            }
+            return;
+        }
         // `get_mut` on the `RwMutex` is lock-free here — `&mut self` proves we are
         // the sole owner, so there is no contention to guard against.
         if let Some(journal) = self.journal.get_mut().take() {
@@ -1779,7 +1887,7 @@ mod tests {
         let perm = FilePerm::from_bits_truncate(0o644);
         let inode = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm, None)
+            .create_inode(ROOT_INO, InodeType::File, perm, InodeSeed::ExtentRoot, None)
             .unwrap();
         assert_eq!(inode.inode_type(), InodeType::File);
         assert_eq!(inode.size(), 0);
@@ -1813,7 +1921,7 @@ mod tests {
         let perm = FilePerm::from_bits_truncate(0o755);
         let inode = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::Dir, perm, None)
+            .create_inode(ROOT_INO, InodeType::Dir, perm, InodeSeed::ExtentRoot, None)
             .unwrap();
         assert_eq!(inode.inode_type(), InodeType::Dir);
         assert_eq!(inode.link_count(), 2);
@@ -1838,11 +1946,11 @@ mod tests {
         let perm = FilePerm::from_bits_truncate(0o644);
         let a = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm, None)
+            .create_inode(ROOT_INO, InodeType::File, perm, InodeSeed::ExtentRoot, None)
             .unwrap();
         let b = f
             .ext4
-            .create_inode(ROOT_INO, InodeType::File, perm, None)
+            .create_inode(ROOT_INO, InodeType::File, perm, InodeSeed::ExtentRoot, None)
             .unwrap();
 
         let gen_a = f.read_raw_inode(a.ino()).generation;
@@ -1867,10 +1975,14 @@ mod tests {
         f.disk.set_fail_writes(true);
         let perm = FilePerm::from_bits_truncate(0o644);
         // `Arc<Inode>` is not `Debug`, so match instead of `unwrap_err`.
-        let err = match f.ext4.create_inode(ROOT_INO, InodeType::File, perm, None) {
-            Ok(_) => panic!("create_inode unexpectedly succeeded despite write failure"),
-            Err(err) => err,
-        };
+        let err =
+            match f
+                .ext4
+                .create_inode(ROOT_INO, InodeType::File, perm, InodeSeed::ExtentRoot, None)
+            {
+                Ok(_) => panic!("create_inode unexpectedly succeeded despite write failure"),
+                Err(err) => err,
+            };
         assert_eq!(err.error(), Errno::EIO);
         f.disk.set_fail_writes(false);
 
@@ -2425,6 +2537,34 @@ mod tests {
     /// Mount contract (report §4.5): a superblock whose `s_journal_inum` names
     /// anything but the reserved ino 8 must fail the mount — silently parsing
     /// some other inode as the journal would "replay" unrelated file content.
+    #[ktest]
+    fn shutdown_freezes_the_filesystem() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        // Unknown EXT4_GOING_FLAGS values are rejected.
+        assert_eq!(GoingDown::try_from(3).unwrap_err().error(), Errno::EINVAL);
+
+        f.ext4.shutdown(GoingDown::NoLogFlush).unwrap();
+        assert!(f.ext4.is_shutdown());
+        assert!(journal.is_aborted());
+        // New operations and writeback die with EIO...
+        assert_eq!(
+            f.ext4.begin_op(4).map(|_| ()).unwrap_err().error(),
+            Errno::EIO
+        );
+        assert_eq!(f.ext4.sync_all().unwrap_err().error(), Errno::EIO);
+        // ...while sync(2) succeeds as a no-op (Linux parity), and a repeat
+        // shutdown is idempotent.
+        crate::fs::vfs::file_system::FileSystem::sync(f.ext4.as_ref()).unwrap();
+        f.ext4.shutdown(GoingDown::NoLogFlush).unwrap();
+    }
+
     #[ktest]
     fn mount_rejects_nonstandard_journal_inum() {
         crate::time::clocks::init_for_ktest();

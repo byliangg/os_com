@@ -3,20 +3,24 @@
 //! VFS `FileOps` and `Inode` trait implementations for the ext4 `Inode`.
 //!
 //! Translates VFS requests into ext4-internal operations: data I/O through the
-//! page cache, attribute getters/setters, and the directory namespace
-//! (create/link/unlink/rmdir/rename and symlink read/write). Special files
-//! (devices, FIFOs, sockets) are deferred to a later phase: `mknod` returns
-//! `EOPNOTSUPP`.
+//! page cache, attribute getters/setters, the directory namespace
+//! (create/mknod/link/unlink/rmdir/rename and symlink read/write), and the
+//! per-open layer — special files open into their live kernel objects, and
+//! directory fds get a thin [`Ext4DirFile`] shim so ioctls
+//! (`EXT4_IOC_SHUTDOWN` first) can reach the filesystem.
 
 use core::time::Duration;
 
 use aster_block::BLOCK_SIZE;
 use device_id::DeviceId;
+use ostd::{mm::VmIo, task::Task};
 
 use crate::{
+    device,
+    events::IoEvents,
     fs::{
-        file::{InodeMode, InodeType, StatusFlags},
-        fs_impls::ext4::{FilePerm, Inode as Ext4Inode},
+        file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags},
+        fs_impls::ext4::{FilePerm, Inode as Ext4Inode, fs::GoingDown},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
@@ -24,7 +28,14 @@ use crate::{
         },
     },
     prelude::*,
-    process::{Gid, Uid},
+    process::{
+        Gid, Uid,
+        credentials::capabilities::CapSet,
+        posix_thread::AsPosixThread,
+        signal::{PollHandle, Pollable},
+    },
+    security::lsm::hooks as lsm_hooks,
+    util::ioctl::{RawIoctl, dispatch_ioctl},
     vm::page_cache::PageCache,
 };
 
@@ -121,7 +132,7 @@ impl Inode for Ext4Inode {
             uid: Uid::new(self.uid()),
             gid: Gid::new(self.gid()),
             container_dev_id,
-            self_dev_id: None,
+            self_dev_id: self.device_id().and_then(DeviceId::from_encoded_u64),
             birth_at: self.crtime(),
         }
     }
@@ -203,6 +214,53 @@ impl Inode for Ext4Inode {
         self.page_cache()
     }
 
+    fn open(
+        &self,
+        access_mode: AccessMode,
+        status_flags: StatusFlags,
+    ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
+        match self.inode_type() {
+            // Special files route to their live kernel objects, like ext2.
+            inode_type @ (InodeType::BlockDevice | InodeType::CharDevice) => {
+                let Some(device_id) = self.device_id().and_then(DeviceId::from_encoded_u64) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the device ID is invalid",
+                    )));
+                };
+                let device_type = inode_type
+                    .device_type()
+                    .expect("BlockDevice and CharDevice always have a device type");
+                let Some(device) = device::lookup(device_type, device_id) else {
+                    return Some(Err(Error::with_message(
+                        Errno::ENODEV,
+                        "the required device ID does not exist",
+                    )));
+                };
+                Some(device.open())
+            }
+            InodeType::NamedPipe => {
+                let pipe = self.pipe().expect("NamedPipe inode must have a pipe");
+                Some(pipe.open_named(access_mode, status_flags))
+            }
+            // Directories get a thin per-open shim so ioctls (EXT4_IOC_SHUTDOWN
+            // first — xfstests' godown fires it at the mountpoint fd) can reach
+            // the filesystem; regular files stay on the direct inode path (a
+            // per-open object would bypass the handle layer's O_APPEND offset
+            // repositioning — a known VFS limitation).
+            InodeType::Dir => {
+                let Some(inode) = self.self_arc() else {
+                    return Some(Err(Error::with_message(
+                        Errno::EIO,
+                        "inode is being dropped",
+                    )));
+                };
+                Some(Ok(Box::new(Ext4DirFile { inode })))
+            }
+            _ => None,
+        }
+    }
+
     fn lookup(&self, name: &str) -> Result<Arc<dyn Inode>> {
         Ok(self.lookup(name)?)
     }
@@ -211,13 +269,17 @@ impl Inode for Ext4Inode {
         Ok(self.create(name, type_, mode.into())?)
     }
 
-    fn mknod(&self, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn Inode>> {
-        // Special files (devices, FIFOs, sockets) are deferred to a later phase;
-        // the internal `create` rejects them, so we do not even attempt it here.
-        return_errno_with_message!(
-            Errno::EOPNOTSUPP,
-            "ext4 mknod (special files) unimplemented"
-        );
+    fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
+        let new_inode = match type_ {
+            MknodType::CharDevice(device_id) => {
+                self.create_with_device(name, InodeType::CharDevice, mode.into(), device_id)?
+            }
+            MknodType::BlockDevice(device_id) => {
+                self.create_with_device(name, InodeType::BlockDevice, mode.into(), device_id)?
+            }
+            MknodType::NamedPipe => self.create(name, InodeType::NamedPipe, mode.into())?,
+        };
+        Ok(new_inode)
     }
 
     fn link(&self, old: &Arc<dyn Inode>, name: &str) -> Result<()> {
@@ -263,6 +325,106 @@ impl From<InodeMode> for FilePerm {
     fn from(mode: InodeMode) -> Self {
         Self::from_bits_truncate(mode.bits() as _)
     }
+}
+
+/// The per-open shim for ext4 **directory** fds.
+///
+/// Its only reason to exist is `ioctl`: the handle layer dispatches ioctls
+/// exclusively to a per-open object, and ext4 previously provided none, so
+/// every ioctl died `ENOTTY` before reaching the filesystem. Data paths
+/// forward straight back to the inode's `FileOps`, keeping directory reads
+/// and `readdir` byte-identical to the shim-less behavior.
+struct Ext4DirFile {
+    inode: Arc<Ext4Inode>,
+}
+
+impl FileOps for Ext4DirFile {
+    fn read_at(
+        &self,
+        offset: usize,
+        writer: &mut VmWriter,
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        FileOps::read_at(self.inode.as_ref(), offset, writer, status_flags)
+    }
+
+    fn write_at(
+        &self,
+        offset: usize,
+        reader: &mut VmReader,
+        status_flags: StatusFlags,
+    ) -> Result<usize> {
+        FileOps::write_at(self.inode.as_ref(), offset, reader, status_flags)
+    }
+
+    fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
+        FileOps::readdir_at(self.inode.as_ref(), offset, visitor)
+    }
+}
+
+impl Pollable for Ext4DirFile {
+    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
+        // Same readiness the handle layer reports without a per-open object.
+        (IoEvents::IN | IoEvents::OUT) & mask
+    }
+}
+
+impl PerOpenFileOps for Ext4DirFile {
+    fn check_seekable(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_offset_aware(&self) -> bool {
+        true
+    }
+
+    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
+        use ioctl_defs::*;
+
+        dispatch_ioctl!(match raw_ioctl {
+            _cmd @ Shutdown => {
+                // Linux gates the shutdown ioctl on CAP_SYS_ADMIN.
+                ensure_sys_admin()?;
+                // The `_IOR`-encoded argument is *read* from userspace — an
+                // XFS-inherited quirk of this ioctl's encoding (Linux uses
+                // `get_user` despite the "read" direction).
+                let flags: u32 = crate::context::current_userspace!().read_val(raw_ioctl.arg())?;
+                let fs = self.inode.fs()?;
+                fs.shutdown(GoingDown::try_from(flags)?)?;
+                Ok(0)
+            }
+            _ => return_errno_with_message!(Errno::ENOTTY, "the ioctl command is unknown"),
+        })
+    }
+}
+
+/// Errors `EPERM` unless the current thread holds `CAP_SYS_ADMIN` in its user
+/// namespace (the gate Linux applies to `EXT4_IOC_SHUTDOWN`).
+fn ensure_sys_admin() -> Result<()> {
+    let Some(task) = Task::current() else {
+        return_errno_with_message!(Errno::EPERM, "no current task");
+    };
+    let Some(posix_thread) = task.as_posix_thread() else {
+        return_errno_with_message!(Errno::EPERM, "not a POSIX thread");
+    };
+    let thread_local = task.as_thread_local().unwrap();
+    let user_ns = thread_local.borrow_user_ns();
+    lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+        user_ns.as_ref(),
+        posix_thread,
+        CapSet::SYS_ADMIN,
+    ))
+}
+
+mod ioctl_defs {
+    use crate::util::ioctl::{OutData, ioc};
+
+    /// `EXT4_IOC_SHUTDOWN`: `_IOR('X', 125, __u32)` — the same wire value as
+    /// `XFS_IOC_GOINGDOWN` (0x8004587d), which is what xfstests' `godown`
+    /// sends. The direction says "read" but the flag argument is fetched
+    /// *from* userspace (an XFS-inherited encoding quirk), so the handler
+    /// reads it via the raw pointer instead of this type's `write`.
+    pub type Shutdown = ioc!(EXT4_IOC_SHUTDOWN, b'X', 125, OutData<u32>);
 }
 
 #[cfg(ktest)]

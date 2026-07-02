@@ -14,7 +14,7 @@ use ostd::sync::RwMutexWriteGuard;
 use self::dir_entry::{DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader};
 use super::{
     super::{fs::Ext4, journal, prelude::*, utils},
-    FileFlags, FilePerm, Inode, InodeInner, MAX_LINK_COUNT,
+    FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
 };
 use crate::fs::utils::NAME_MAX;
 
@@ -527,10 +527,43 @@ impl Inode {
         type_: InodeType,
         perm: FilePerm,
     ) -> Result<Arc<Inode>> {
-        if !matches!(type_, InodeType::File | InodeType::Dir | InodeType::SymLink) {
+        let seed = match type_ {
+            InodeType::File | InodeType::Dir | InodeType::SymLink => InodeSeed::ExtentRoot,
+            // FIFOs and sockets (a Unix socket bind arrives here as a plain
+            // `create`) carry no data and no device number.
+            InodeType::NamedPipe | InodeType::Socket => InodeSeed::Nothing,
+            // Devices need a device number; they arrive via `mknod` →
+            // `create_with_device`.
+            _ => return_errno!(Errno::EINVAL),
+        };
+        self.create_with_seed(name, type_, perm, seed)
+    }
+
+    /// [`create`](Self::create) for character/block device nodes: the device
+    /// number is encoded into the fresh inode's `i_block` inside the creating
+    /// transaction, so no crash window can leave a device node with rdev 0
+    /// (ext2 sets the id in a second step; Linux ext4 initializes it under the
+    /// same handle, like this).
+    pub(in crate::fs::fs_impls::ext4) fn create_with_device(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+        device_id: u64,
+    ) -> Result<Arc<Inode>> {
+        if !matches!(type_, InodeType::CharDevice | InodeType::BlockDevice) {
             return_errno!(Errno::EINVAL);
         }
+        self.create_with_seed(name, type_, perm, InodeSeed::Device(device_id))
+    }
 
+    fn create_with_seed(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+        seed: InodeSeed,
+    ) -> Result<Arc<Inode>> {
         let is_dir = type_ == InodeType::Dir;
         let dir_entry_file_type = DirEntryFileType::from(type_);
 
@@ -553,7 +586,7 @@ impl Inode {
         // an `upread` guard on the children set, preventing concurrent `create` /
         // `lookup_via_fs` on this directory, so a concurrent `lookup_via_fs`
         // won't build a second `Arc<Inode>` from the on-disk desc and insert it.
-        let child = fs.create_inode(self.ino, type_, perm, op.get())?;
+        let child = fs.create_inode(self.ino, type_, perm, seed, op.get())?;
         let child_ino = child.ino();
 
         // Taking `child.inner.write()` while holding `parent_inner.write()` does
@@ -1565,19 +1598,15 @@ mod tests {
         assert_eq!(readdir_names(&dir).len(), count + 2);
     }
 
-    /// Special files are deferred: `create` rejects them with `EINVAL` and adds
-    /// no entry.
+    /// Devices cannot come through plain `create` (they need a device number,
+    /// via `mknod` → `create_with_device`); FIFOs and sockets can — a Unix
+    /// socket bind arrives here as a plain `create`.
     #[ktest]
-    fn create_rejects_special_files() {
+    fn create_routes_special_files() {
         let f = fixture_for_create();
         let dir = f.ext4.read_inode(DIR_INO).unwrap();
 
-        for type_ in [
-            InodeType::CharDevice,
-            InodeType::BlockDevice,
-            InodeType::NamedPipe,
-            InodeType::Socket,
-        ] {
+        for type_ in [InodeType::CharDevice, InodeType::BlockDevice] {
             assert_eq!(
                 dir.create("special", type_, perm())
                     .map(|_| ())
@@ -1588,6 +1617,54 @@ mod tests {
         }
         // No half-built entry was left behind.
         assert_eq!(readdir_names(&dir), [".", ".."]);
+
+        let fifo = dir.create("fifo", InodeType::NamedPipe, perm()).unwrap();
+        assert_eq!(fifo.inode_type(), InodeType::NamedPipe);
+        assert!(fifo.pipe().is_some());
+        // Special files carry no extent tree.
+        assert!(!fifo.inner.read().desc.is_extent_based());
+
+        let sock = dir.create("sock", InodeType::Socket, perm()).unwrap();
+        assert_eq!(sock.inode_type(), InodeType::Socket);
+        assert!(sock.pipe().is_none());
+
+        assert_eq!(readdir_names(&dir), [".", "..", "fifo", "sock"]);
+    }
+
+    /// `mknod` devices: the device number is encoded into `i_block` inside the
+    /// creating transaction (no rdev-0 crash window) and survives the on-disk
+    /// round-trip, in both the old (8-bit) and wide encodings.
+    #[ktest]
+    fn create_with_device_encodes_rdev() {
+        let f = fixture_for_create();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let small = device_id::encode_device_numbers(8, 1);
+        let chr = dir
+            .create_with_device("chr", InodeType::CharDevice, perm(), small)
+            .unwrap();
+        assert_eq!(chr.device_id(), Some(small));
+
+        let wide = device_id::encode_device_numbers(300, 70000);
+        let blk = dir
+            .create_with_device("blk", InodeType::BlockDevice, perm(), wide)
+            .unwrap();
+        assert_eq!(blk.device_id(), Some(wide));
+
+        // Non-device types are rejected.
+        assert_eq!(
+            dir.create_with_device("f", InodeType::File, perm(), small)
+                .map(|_| ())
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        // Round-trip through the on-disk inode table.
+        chr.sync_metadata().unwrap();
+        let desc = f.ext4.read_inode_desc(chr.ino()).unwrap();
+        assert_eq!(desc.type_(), InodeType::CharDevice);
+        assert_eq!(desc.device_id(), Some(small));
     }
 
     /// When the child inode is allocated but the directory write fails — here a

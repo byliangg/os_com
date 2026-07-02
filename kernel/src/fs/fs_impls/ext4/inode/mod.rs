@@ -189,14 +189,54 @@ impl Dtime {
     }
 }
 
+/// What a fresh inode's type-specific `i_block` area holds.
+pub(super) enum InodeSeed {
+    /// Files, directories, symlinks: a valid empty extent root, `EXTENTS` set.
+    ExtentRoot,
+    /// Character/block devices: the Linux special-file device-number encoding
+    /// (the glibc-encoded id from `mknod(2)`), no `EXTENTS`.
+    Device(u64),
+    /// FIFOs and sockets: an all-zero `i_block`, no `EXTENTS`.
+    Nothing,
+}
+
+/// Encodes a device id into the ext4 special-file `i_block` layout (Linux
+/// `ext4_iget`/`ext4_do_update_inode`): 8-bit major/minor pairs use the old
+/// `(major << 8) | minor` form in word 0, anything wider the `new_encode_dev`
+/// form in word 1.
+fn encode_device_block(device_id: u64) -> [u32; RAW_BLOCK_PTRS_LEN] {
+    let (major, minor) = device_id::decode_device_numbers(device_id);
+    let mut block = [0u32; RAW_BLOCK_PTRS_LEN];
+    if major < 256 && minor < 256 {
+        block[0] = (major << 8) | minor;
+    } else {
+        block[1] = (minor & 0xFF) | (major << 8) | ((minor & !0xFF) << 12);
+    }
+    block
+}
+
+/// Decodes the ext4 special-file device encoding stored in `i_block` (the
+/// inverse of [`encode_device_block`]).
+fn decode_device_block(block: &[u32; RAW_BLOCK_PTRS_LEN]) -> u64 {
+    let (major, minor) = if block[0] != 0 {
+        ((block[0] >> 8) & 0xFF, block[0] & 0xFF)
+    } else {
+        let dev = block[1];
+        ((dev & 0xFFF00) >> 8, (dev & 0xFF) | ((dev >> 12) & 0xFFF00))
+    };
+    device_id::encode_device_numbers(major, minor)
+}
+
 impl InodeDesc {
-    /// Builds a fresh inode descriptor for a newly created file or directory.
+    /// Builds a fresh inode descriptor for a newly created inode.
     ///
-    /// Size and `i_blocks` start at zero; all timestamps are `now`; the inline
-    /// `i_block` holds a valid empty extent root and the `EXTENTS` flag is set
-    /// (ext4-specific — the data of every regular file/directory is extent
-    /// mapped). Mirrors ext2 `InodeDesc::new`, diverging only in the extent
-    /// root + flag (ext2 leaves zeroed indirect pointers and no flag).
+    /// Size and `i_blocks` start at zero and all timestamps are `now`; `seed`
+    /// decides the type-specific `i_block` area — a valid empty extent root
+    /// with `EXTENTS` set for files/directories/symlinks, the device-number
+    /// encoding for device nodes, nothing for FIFOs/sockets. Mirrors ext2
+    /// `InodeDesc::new`, diverging only in the extent root + flag (ext2
+    /// leaves zeroed indirect pointers and no flag).
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
         type_: InodeType,
         perm: FilePerm,
@@ -205,7 +245,19 @@ impl InodeDesc {
         link_count: u16,
         generation: u32,
         now: Duration,
+        seed: InodeSeed,
     ) -> Self {
+        let (flags, block) = match seed {
+            // A valid empty extent root, so the extent reader sees a
+            // well-formed tree from the first byte — unlike ext2, whose new
+            // inodes start with zeroed indirect-block pointers.
+            InodeSeed::ExtentRoot => (FileFlags::EXTENTS, *ExtentTree::empty().root_bytes()),
+            // Special files carry no extent tree: devices hold the Linux
+            // device-number encoding in `i_block`, FIFOs/sockets hold nothing.
+            // Neither sets `EXTENTS`, so the extent reader never parses them.
+            InodeSeed::Device(device_id) => (FileFlags::empty(), encode_device_block(device_id)),
+            InodeSeed::Nothing => (FileFlags::empty(), [0u32; RAW_BLOCK_PTRS_LEN]),
+        };
         Self {
             type_,
             perm,
@@ -219,13 +271,22 @@ impl InodeDesc {
             dtime: Dtime::Time(Duration::ZERO),
             link_count,
             sector_count: 0,
-            flags: FileFlags::EXTENTS,
+            flags,
             file_acl: 0,
             generation,
-            // A valid empty extent root, so the extent reader sees a
-            // well-formed tree from the first byte — unlike ext2, whose new
-            // inodes start with zeroed indirect-block pointers.
-            block: *ExtentTree::empty().root_bytes(),
+            block,
+        }
+    }
+
+    /// The device id encoded in `i_block`, for character/block device inodes
+    /// (`None` for every other type — their `i_block` is not a device
+    /// encoding).
+    pub(super) fn device_id(&self) -> Option<u64> {
+        match self.type_ {
+            InodeType::CharDevice | InodeType::BlockDevice => {
+                Some(decode_device_block(&self.block))
+            }
+            _ => None,
         }
     }
 
@@ -644,6 +705,9 @@ pub struct Inode {
     /// ordered-data table (jbd2 `data=ordered`) without the `Arc` in hand.
     /// Never used on the `Drop`/reclaim path, where upgrading would fail.
     self_weak: Weak<Inode>,
+    /// The in-memory pipe object backing a named-pipe (FIFO) inode; `None`
+    /// for every other type. Created with the inode, like ext2's.
+    pipe: Option<crate::fs::pipe::Pipe>,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -660,6 +724,10 @@ impl Inode {
         fs: Weak<Ext4>,
     ) -> Result<Arc<Self>> {
         let payload = InodePayload::new(&desc, fs.clone())?;
+        let pipe = match type_ {
+            InodeType::NamedPipe => Some(crate::fs::pipe::Pipe::new()),
+            _ => None,
+        };
         // `new_cyclic` so the write paths can hand `self_weak` to the journal's
         // ordered-inode registration; the only fallible step (payload parsing)
         // runs before the closure, which just assembles.
@@ -675,6 +743,7 @@ impl Inode {
             block_group_idx,
             fs,
             self_weak: self_weak.clone(),
+            pipe,
             extension: Extension::new(),
         }))
     }
@@ -1077,6 +1146,22 @@ impl Inode {
     /// Returns a clone of the inode's page cache, if it is data-backed.
     pub(super) fn page_cache(&self) -> Option<PageCache> {
         self.inner.read().page_cache().ok().cloned()
+    }
+
+    /// Returns the pipe object backing a named-pipe (FIFO) inode.
+    pub(super) fn pipe(&self) -> Option<&crate::fs::pipe::Pipe> {
+        self.pipe.as_ref()
+    }
+
+    /// Upgrades `self_weak` back to an `Arc` (for handing the inode to a
+    /// per-open object). `None` only while the last `Arc` is mid-drop.
+    pub(super) fn self_arc(&self) -> Option<Arc<Inode>> {
+        self.self_weak.upgrade()
+    }
+
+    /// The device id of a character/block device inode (`None` otherwise).
+    pub(super) fn device_id(&self) -> Option<u64> {
+        self.inner.read().desc.device_id()
     }
 
     /// Returns the owning filesystem, or an error if it has been dropped.
@@ -1983,6 +2068,22 @@ mod write_tests {
         let dir = f.ext4.read_inode(2).unwrap();
         assert_eq!(dir.inode_type(), InodeType::Dir);
         assert_eq!(dir.resize(0).unwrap_err().error(), Errno::EISDIR);
+    }
+
+    /// The special-file device encoding round-trips through `i_block` in both
+    /// the old (8-bit major/minor, word 0) and wide (`new_encode_dev`, word 1)
+    /// layouts.
+    #[ktest]
+    fn device_block_encoding_roundtrip() {
+        for (major, minor) in [(8, 1), (255, 255), (300, 7), (1, 70000), (4095, 1048575)] {
+            let id = device_id::encode_device_numbers(major, minor);
+            let block = encode_device_block(id);
+            assert_eq!(
+                decode_device_block(&block),
+                id,
+                "major={major} minor={minor}"
+            );
+        }
     }
 
     /// P5-T0: allocating writes and shrinking truncates must register the

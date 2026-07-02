@@ -22,6 +22,12 @@ impl FileSystem for Ext4 {
     }
 
     fn sync(&self) -> Result<()> {
+        // After EXT4_IOC_SHUTDOWN, sync(2) succeeds as a no-op (Linux
+        // `ext4_sync_fs` parity): the device is frozen, there is nothing left
+        // to promise.
+        if self.is_shutdown() {
+            return Ok(());
+        }
         // Flush every cached inode together with the block-side metadata, then
         // issue a single device barrier. Unmount drives durability through this
         // hook (`Path::unmount` -> `Mount::sync` -> `FileSystem::sync`), so a

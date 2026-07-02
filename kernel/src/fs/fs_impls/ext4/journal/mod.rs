@@ -843,6 +843,15 @@ impl Journal {
         self.commit_wait_queue.wake_all();
     }
 
+    /// Aborts the journal on `EXT4_IOC_SHUTDOWN` (jbd2_journal_abort from
+    /// `ext4_force_shutdown`): the running transaction is never committed and
+    /// the log is left as-is — with `RECOVER` still stamped, the next mount
+    /// replays exactly what had committed before the shutdown, which is the
+    /// "crash here" semantics the ioctl exists to simulate.
+    pub(in crate::fs::fs_impls::ext4) fn abort_for_shutdown(&self) {
+        self.abort();
+    }
+
     /// Blocks until transaction `target` (and thus everything up to it) is
     /// committed to the log — the primitive `fsync`/`fdatasync` use (jbd2
     /// `jbd2_log_wait_commit`).
