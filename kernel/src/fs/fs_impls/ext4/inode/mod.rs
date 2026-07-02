@@ -624,18 +624,44 @@ impl Inode {
     pub(super) fn sync_metadata(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        // No handle: the sync path writes back existing dirty state (Phase-3
-        // behaviour). Journaling the metadata a sync flushes is B3's job, where
-        // sync becomes commit + checkpoint.
-        inner.write_back_inode_desc(&fs, self.ino, None)
+        // Journaled: capture under a handle like every other metadata write (the
+        // direct RMW below in `write_back_inode_desc` reads the on-disk slot,
+        // which lags a suppressed-but-not-yet-checkpointed write — stale — and
+        // writing the final location outside the journal breaks WAL ordering).
+        // Non-journaled volumes get the no-op handle and the Phase-3 direct RMW.
+        let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
+        inner.write_back_inode_desc(&fs, self.ino, op.get())
     }
 
-    /// Flushes dirty data pages, then the inode metadata, then issues a device
-    /// sync — leaving a consistent on-disk image (data → inode → barrier; mirrors
-    /// ext2 `sync.rs` ordering).
+    /// Flushes dirty data pages, journals/writes the inode metadata, waits for
+    /// the transaction to commit (journaled volumes), then issues a device sync
+    /// — the `fsync` contract: data first (ordered-data semantics — the data is
+    /// durable before the metadata referencing it can commit), metadata
+    /// recoverable from the log on return.
     pub(super) fn sync_data_and_meta(&self) -> Result<()> {
-        self.sync_data_and_meta_no_barrier()?;
         let fs = self.fs()?;
+        let wait_tid = {
+            let mut inner = self.inner.write();
+            inner.sync_data_pages()?;
+            // Journaled: capture instead of direct-writing (see
+            // `sync_metadata`). Only wait below if this writeback actually
+            // captured something: a clean inode contributes no metadata, and a
+            // transaction with no captured blocks never becomes committable —
+            // waiting on its tid would sleep forever.
+            let was_dirty = inner.is_dirty();
+            let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            if was_dirty { op.tid() } else { None }
+            // `op` closes here, then `inner` unlocks — the reverse of the
+            // inner ① → handle ② acquisition order.
+        };
+        // Wait with NO filesystem locks held (the commit thread takes
+        // `inode.inner` for the ordered-data flush).
+        if let Some(target) = wait_tid
+            && let Some(journal) = fs.journal()
+        {
+            journal.log_wait_commit(target)?;
+        }
         if fs.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }
@@ -643,17 +669,22 @@ impl Inode {
     }
 
     /// Flushes dirty data pages and then the inode metadata, *without* a device
-    /// barrier. Used by the filesystem-level sync, which flushes every cached
-    /// inode and the block-side metadata before issuing a single barrier — so a
-    /// per-inode barrier here would be redundant. Mirrors ext2 `Inode::sync_all`,
-    /// where the barrier lives at the `FileSystem::sync` boundary.
+    /// barrier or a commit wait. Used by the filesystem-level sync, which
+    /// flushes every cached inode and the block-side metadata before issuing a
+    /// single barrier — so a per-inode barrier here would be redundant. Mirrors
+    /// ext2 `Inode::sync_all`, where the barrier lives at the `FileSystem::sync`
+    /// boundary.
+    ///
+    /// On a journaled volume the writeback is captured under a handle (see
+    /// [`sync_metadata`](Self::sync_metadata)); its commit is asynchronous — the
+    /// filesystem-level sync's log durability is a documented P4 limitation
+    /// (unmount reaches durability via `flush_on_unmount`).
     pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
         inner.sync_data_pages()?;
-        // No handle: sync-path writeback (see `sync_metadata`); B3 routes sync
-        // through the journal.
-        inner.write_back_inode_desc(&fs, self.ino, None)?;
+        let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         Ok(())
     }
 

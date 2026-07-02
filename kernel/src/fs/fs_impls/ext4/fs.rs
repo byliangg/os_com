@@ -187,6 +187,9 @@ impl Ext4 {
     pub(super) const UNLINK_CREDITS: usize = 16;
     pub(super) const LINK_CREDITS: usize = 16;
     pub(super) const RENAME_CREDITS: usize = 24;
+    /// An `fsync`/sync inode writeback captures exactly one inode-table block;
+    /// kept small so it also fits the deliberately tiny ktest journals.
+    pub(super) const FSYNC_CREDITS: usize = 4;
 
     /// Opens a journal handle for a metadata operation, reserving `credits`
     /// metadata blocks (jbd2 `jbd2_journal_start`), or a no-op handle on a
@@ -1924,6 +1927,40 @@ mod tests {
             after.last_orphan, 0,
             "last_orphan patched from memory, not left at the (doctored) seed"
         );
+    }
+
+    /// T2 (fsync WAL): on a journaled volume, `fsync` journals the inode
+    /// writeback (no direct stale-RMW of the on-disk slot) and does not return
+    /// until the transaction is committed to the log — and an `fsync` of a
+    /// clean inode returns immediately instead of waiting on a transaction
+    /// that will never become committable.
+    #[ktest]
+    fn fsync_on_journaled_volume_commits_before_returning() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        // The commit thread stays RUNNING: `log_wait_commit` sleeps on it.
+
+        let inode = f.ext4.read_inode(ROOT_INO).unwrap();
+        inode.set_atime(Duration::from_secs(12345));
+
+        let committed_before = journal.committed_tid();
+        inode.sync_data_and_meta().unwrap();
+        // `fsync` returned only after its transaction committed.
+        let committed_after = journal.committed_tid();
+        assert!(
+            journal::tid_geq(committed_after, committed_before.wrapping_add(1)),
+            "fsync must wait for its commit (before={committed_before}, after={committed_after})"
+        );
+
+        // A second fsync with nothing dirty must not hang (nothing to commit).
+        inode.sync_data_and_meta().unwrap();
+        assert_eq!(journal.committed_tid(), committed_after);
+        drop(inode);
     }
 
     /// A non-journaled volume has no journal — the Phase 1–3 mount path is

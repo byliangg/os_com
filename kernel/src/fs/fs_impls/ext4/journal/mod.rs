@@ -135,6 +135,15 @@ impl OpHandle {
     pub(in crate::fs::fs_impls::ext4) fn get(&self) -> Option<&Handle> {
         self.handle.as_ref()
     }
+
+    /// The transaction id this handle joined, or `None` for the no-op handle of
+    /// a non-journaled volume. An `fsync` records this before closing the
+    /// handle, releases every filesystem lock, and then waits for the tid via
+    /// [`Journal::log_wait_commit`] — commits are serial, so waiting on it also
+    /// covers every earlier transaction that touched the inode.
+    pub(in crate::fs::fs_impls::ext4) fn tid(&self) -> Option<Tid> {
+        self.handle.as_ref().map(Handle::tid)
+    }
 }
 
 impl Drop for OpHandle {
@@ -698,13 +707,13 @@ impl Journal {
     /// handles to drain first — is a Phase-7 refinement; a production integration
     /// should also wake [`commit_trigger`](Journal::commit_trigger) from
     /// `journal_stop` when the last handle of a transaction closes.
-    // Still dead in non-ktest builds: nothing live waits on a commit yet. The
-    // fsync/op integration that calls this (recording its handle's tid, releasing
-    // locks, then waiting) is a later Phase-4 task; Int-A only loads + recovers +
-    // starts the journal, so the wrappers still pass `None` and no transaction is
-    // ever waited on. Drop this gate when fsync is wired to the journal.
-    #[cfg_attr(not(ktest), expect(dead_code))]
-    pub(super) fn log_wait_commit(&self, target: Tid) -> Result<()> {
+    ///
+    /// The caller must additionally have contributed (or observed) captured
+    /// metadata for `target`'s transaction: a transaction that never captures a
+    /// block is not committable, so waiting on its tid would sleep forever.
+    /// `fsync` guards this by only waiting when the inode writeback actually
+    /// wrote (see `Inode::sync_data_and_meta`).
+    pub(in crate::fs::fs_impls::ext4) fn log_wait_commit(&self, target: Tid) -> Result<()> {
         if tid_geq(self.committed_tid(), target) {
             return Ok(());
         }
