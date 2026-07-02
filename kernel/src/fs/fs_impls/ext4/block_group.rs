@@ -287,6 +287,32 @@ impl BlockGroup {
         self.group_idx
     }
 
+    /// Re-reads this group's descriptor and both bitmaps from the device,
+    /// replacing the cached copies.
+    ///
+    /// Used once per mount, right after journal replay: the cached copies were
+    /// parsed from the pre-replay device, and replay rewrote their on-disk
+    /// locations. Without the reload the allocators would work off stale
+    /// bitmaps (re-handing out blocks/inodes the replayed transactions
+    /// allocated — cross-links) and the next sync would write stale counters
+    /// back over the replayed values. The group's cached geometry is immutable
+    /// and untouched; the inode cache is empty this early in the mount.
+    pub(super) fn reload_metadata(&self, device: &dyn BlockDevice) -> Result<()> {
+        let raw_group = device
+            .read_val::<RawBlockGroup>(self.desc_offset)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to re-read group descriptor"))?;
+        let desc = BlockGroupDesc::from(&raw_group);
+        let block_bitmap =
+            Self::load_block_bitmap(device, self.first_block, self.last_block, &desc)?;
+        let inode_bitmap = Self::load_inode_bitmap(device, self.nr_inodes_per_group, &desc)?;
+
+        let mut metadata = self.metadata.write();
+        metadata.desc = Dirty::new(desc);
+        metadata.block_bitmap = Dirty::new(block_bitmap);
+        metadata.inode_bitmap = Dirty::new(inode_bitmap);
+        Ok(())
+    }
+
     /// Returns the starting block of this group's inode table.
     pub(super) fn inode_table_bid(&self) -> Ext4Bid {
         self.metadata.read().desc.inode_table_bid()

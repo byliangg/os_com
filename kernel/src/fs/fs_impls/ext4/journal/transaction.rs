@@ -397,8 +397,10 @@ pub(in crate::fs::fs_impls::ext4) struct Handle {
 }
 
 impl Handle {
-    /// The id of the transaction this handle joined.
-    pub(super) fn tid(&self) -> Tid {
+    /// The id of the transaction this handle joined. Exposed at the `ext4`
+    /// level so the inode writeback can record it as the inode's `sync_tid`
+    /// (what `fsync` waits on).
+    pub(in crate::fs::fs_impls::ext4) fn tid(&self) -> Tid {
         self.tid
     }
 
@@ -439,6 +441,11 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 /// under space pressure (a later task); it simply refuses to over-commit a
 /// single transaction.
 pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
+    // An aborted journal (a commit failed and was lost) accepts no new work:
+    // capturing into it would publish fragments of the lost transaction.
+    if journal.is_aborted() {
+        return_errno_with_message!(Errno::EIO, "journal aborted");
+    }
     let mut st = journal.state_write();
 
     if st.running.is_none() {

@@ -378,6 +378,17 @@ pub(super) struct Journal {
     /// Set by [`stop_commit_thread`](Journal::stop_commit_thread) to make the
     /// commit thread exit its loop on the next wake.
     stop: AtomicBool,
+    /// Set when a commit fails (jbd2 journal abort, minimal form).
+    ///
+    /// A failed `commit_transaction` consumed its transaction: the in-memory
+    /// metadata is ahead of both the log and the device, and the retained
+    /// after-images seeded from it can never be checkpointed — continuing to
+    /// journal would publish fragments of the lost transaction through later
+    /// commits. So the journal refuses further work: `journal_start` returns
+    /// `EIO`, `log_wait_commit` sleepers wake with `EIO` (instead of hanging
+    /// forever on a tid that will never commit), and the commit thread stops
+    /// checkpointing. The full jbd2 abort/errno machinery is Phase 7.
+    aborted: AtomicBool,
     /// The commit-thread handle, taken and joined by
     /// [`stop_commit_thread`](Journal::stop_commit_thread). A `Mutex<Option<_>>`
     /// so start/stop can move it in and out; it is **not** held while the thread
@@ -474,6 +485,7 @@ impl Journal {
             commit_trigger: WaitQueue::new(),
             commit_wait_queue: WaitQueue::new(),
             stop: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
         })
     }
@@ -586,6 +598,12 @@ impl Journal {
                 CommitAction::Commit => {
                     let Some(j) = weak.upgrade() else { break };
                     j.commit_one();
+                    if j.is_aborted() {
+                        // A failed commit aborted the journal: the device state
+                        // no longer matches the log; checkpointing would make it
+                        // worse. Idle until teardown.
+                        continue;
+                    }
                     // Reclaim the log right after committing: Phase 4 is
                     // commit-per-op, so without eager checkpointing a stream of
                     // small transactions would fill the log. Checkpoint copies the
@@ -614,6 +632,11 @@ impl Journal {
         let j = weak.upgrade()?;
         if j.stop.load(Ordering::Acquire) {
             return Some(CommitAction::Exit);
+        }
+        // An aborted journal commits nothing more; the thread idles until
+        // teardown so `stop_commit_thread` still joins it normally.
+        if j.is_aborted() {
+            return None;
         }
         // A running transaction with no open handles and some captured metadata
         // is committable.
@@ -663,11 +686,13 @@ impl Journal {
         // `commit_transaction`, so no commit lock is needed. `commit_transaction`
         // publishes `committed_tid` (Release) before returning.
         if let Err(e) = commit_transaction(self, self.device.as_ref(), txn) {
-            // Phase 4's abort-journal handling is minimal: log and continue.
-            // `committed_tid` is not advanced on error, so `log_wait_commit`
-            // sleepers keep waiting (a Phase-7 abort path will wake them with an
-            // error). The next `request_commit` will retry the new running txn.
-            error!("ext4 journal commit failed: {:?}", e);
+            // The transaction was consumed: memory is ahead of the log and the
+            // device, unrecoverably. Abort the journal (refuse further work and
+            // wake sleepers with an error) rather than continue and publish
+            // fragments of the lost transaction through later commits. The full
+            // jbd2 abort/errno machinery is Phase 7.
+            error!("ext4 journal commit failed, aborting the journal: {:?}", e);
+            self.abort();
         }
         // Wake `log_wait_commit` sleepers to re-check `committed_tid`.
         self.commit_wait_queue.wake_all();
@@ -678,6 +703,20 @@ impl Journal {
     /// transaction's committability in its `wait_until` closure.
     pub(super) fn request_commit(&self) {
         self.commit_trigger.wake_one();
+    }
+
+    /// Whether the journal has been aborted by a failed commit (see the
+    /// [`aborted`](Journal::aborted) field).
+    pub(super) fn is_aborted(&self) -> bool {
+        self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Aborts the journal after a failed commit: further `journal_start`s are
+    /// refused with `EIO`, and `log_wait_commit` sleepers are woken to fail
+    /// instead of waiting forever on a tid that will never commit.
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.commit_wait_queue.wake_all();
     }
 
     /// Blocks until transaction `target` (and thus everything up to it) is
@@ -720,12 +759,18 @@ impl Journal {
         self.request_commit();
         self.commit_wait_queue.wait_until(|| {
             if tid_geq(self.committed_tid(), target) {
-                Some(())
-            } else {
-                None
+                return Some(Ok(()));
             }
-        });
-        Ok(())
+            if self.is_aborted() {
+                // The commit that would have carried `target` failed and the
+                // journal is aborted: fail instead of sleeping forever.
+                return Some(Err(Error::with_message(
+                    Errno::EIO,
+                    "journal aborted; the transaction will never commit",
+                )));
+            }
+            None
+        })
     }
 
     /// Stops and joins the commit thread (jbd2 journal teardown).
@@ -785,8 +830,15 @@ impl Journal {
         };
         if let Some(txn) = txn
             && txn.nr_metadata_blocks() > 0
+            && let Err(e) = commit_transaction(self, self.device.as_ref(), txn)
         {
-            commit_transaction(self, self.device.as_ref(), txn)?;
+            // Same as `commit_one`: the transaction is lost, abort rather than
+            // checkpoint device state that no longer matches the log.
+            self.abort();
+            return Err(e);
+        }
+        if self.is_aborted() {
+            return_errno_with_message!(Errno::EIO, "journal aborted; not checkpointing");
         }
         checkpoint::checkpoint(self, self.device.as_ref())
     }

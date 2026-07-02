@@ -341,6 +341,19 @@ impl SuperBlock {
         self.feature_incompat.remove(FeatureIncompatSet::RECOVER);
     }
 
+    /// Sets the `RECOVER` incompatible flag for the lifetime of a writable
+    /// journaled mount (Linux sets it in `ext4_load_journal` and clears it at
+    /// clean unmount).
+    ///
+    /// This is what makes a crash of OUR OWN session recoverable: the bit forces
+    /// the next mount to replay the (dirty) log. Without it, a crash while the
+    /// device `s_last_orphan` happens to be 0 would skip recovery entirely, and
+    /// the first commit of the new session would overwrite the old log —
+    /// silently discarding every committed (fsync-acknowledged) transaction.
+    pub(super) fn set_recover(&mut self) {
+        self.feature_incompat.insert(FeatureIncompatSet::RECOVER);
+    }
+
     #[expect(dead_code)]
     pub(super) const fn feature_ro_compat(&self) -> FeatureRoCompatSet {
         self.feature_ro_compat

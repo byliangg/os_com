@@ -585,6 +585,16 @@ impl Inode {
         self.ino
     }
 
+    /// Records the journal transaction that captured this inode's descriptor
+    /// (see `InodeInner::sync_tid`). Used by `Ext4::create_inode`, whose fresh
+    /// descriptor was written under the creating op's handle before this
+    /// `Inode` existed. A no-op without a handle.
+    pub(super) fn record_sync_tid(&self, handle: Option<&journal::Handle>) {
+        if let Some(handle) = handle {
+            self.inner.write().sync_tid = handle.tid();
+        }
+    }
+
     pub(super) fn inode_type(&self) -> InodeType {
         self.type_
     }
@@ -690,14 +700,25 @@ impl Inode {
             let mut inner = self.inner.write();
             inner.sync_data_pages()?;
             // Journaled: capture instead of direct-writing (see
-            // `sync_metadata`). Only wait below if this writeback actually
-            // captured something: a clean inode contributes no metadata, and a
-            // transaction with no captured blocks never becomes committable —
-            // waiting on its tid would sleep forever.
+            // `sync_metadata`). Wait below on whichever transaction carries
+            // this inode's newest capture: the one this writeback just made
+            // (dirty inode), else the recorded `sync_tid` of an earlier
+            // journaled capture — the dirty flag clears at capture time while
+            // the commit is asynchronous, so a "clean" inode may still sit in
+            // an uncommitted transaction. A clean inode with no recorded tid
+            // has nothing pending, and its fresh op captured nothing — a
+            // transaction with no captured blocks never becomes committable,
+            // so waiting on it would sleep forever.
             let was_dirty = inner.is_dirty();
             let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
-            if was_dirty { op.tid() } else { None }
+            if was_dirty {
+                op.tid()
+            } else if inner.sync_tid != 0 {
+                Some(inner.sync_tid)
+            } else {
+                None
+            }
             // `op` closes here, then `inner` unlocks — the reverse of the
             // inner ① → handle ② acquisition order.
         };
@@ -944,12 +965,16 @@ impl Drop for Inode {
 struct InodeInner {
     desc: Dirty<InodeDesc>,
     payload: InodePayload,
-    /// Last transaction that modified this inode (jbd2 `i_sync_tid`), and the
-    /// subset needed for `fdatasync` (`i_datasync_tid`). Phase 2 has no journal
-    /// and leaves these at 0; `fsync` degrades to a direct writeback. Phase 4
-    /// sets them on commit and `fsync` waits on the recorded transaction.
-    #[expect(dead_code)]
+    /// The transaction that captured this inode's most recent journaled
+    /// writeback (jbd2 `i_sync_tid`), `0` if none. `fsync` waits on it even
+    /// when the inode looks clean: the dirty flag clears at *capture* time
+    /// while the commit is asynchronous, so "clean" does not imply "committed"
+    /// — an earlier op or fs-level sync may have captured this inode into a
+    /// transaction that is still only in memory. Non-journaled volumes leave
+    /// it at 0 (`fsync` degrades to the direct writeback + barrier).
     sync_tid: Tid,
+    /// The `fdatasync` subset (jbd2 `i_datasync_tid`). Phase 4 routes
+    /// `fdatasync` through the same full-sync path, so this stays unused.
     #[expect(dead_code)]
     datasync_tid: Tid,
 }
@@ -1253,6 +1278,12 @@ impl InodeInner {
         // Mirror the authoritative `i_blocks` into the descriptor before writing.
         self.desc.set_sector_count(sector_count);
         fs.write_back_inode_desc(ino, &self.desc, &root, handle)?;
+        if let Some(handle) = handle {
+            // Record the transaction carrying this capture BEFORE clearing the
+            // dirty flag: the flag clears now but the commit is asynchronous,
+            // so `fsync` needs this tid to wait on (clean != committed).
+            self.sync_tid = handle.tid();
+        }
         self.clear_dirty();
         Ok(())
     }
