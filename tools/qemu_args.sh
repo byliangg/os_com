@@ -145,11 +145,35 @@ COMMON_QEMU_ARGS="\
 "
 
 # Add xfstests drives when the selected conformance suite is `xfstests`.
+#
+# With BLKLOG=on, the *test* disk (x2) is wrapped in QEMU's `blklogwrites`
+# filter: every guest write plus each FLUSH barrier is appended to
+# $BLKLOG_FILE in the dm-log-writes format, which test/crash/sweep.sh replays
+# prefix-by-prefix to reconstruct — and judge — every possible power-cut
+# state of the run (see test/crash/). The `-device drive=x2` lines below
+# accept a blockdev node name just as well as a `-drive id`, so they stay
+# unchanged. `log-super-update-interval=1` keeps the log superblock current;
+# the log is still only guaranteed complete after a graceful QEMU exit, so
+# the harness never SIGKILLs QEMU — "power loss" is reconstructed offline.
 if [ "$ATTACH_XFSTESTS_IMAGES" = "true" ]; then
-    COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
+    if [ "${BLKLOG:-off}" = "on" ]; then
+        BLKLOG_FILE="${BLKLOG_FILE:-./test/initramfs/build/xfstests_test.logwrites.img}"
+        if [ ! -f "$BLKLOG_FILE" ]; then
+            truncate -s 4G "$BLKLOG_FILE"
+        fi
+        COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
+    -blockdev driver=file,node-name=x2-file,filename=./test/initramfs/build/xfstests_test.img \
+    -blockdev driver=raw,node-name=x2-fmt,file=x2-file \
+    -blockdev driver=file,node-name=x2-log,filename=$BLKLOG_FILE \
+    -blockdev driver=blklogwrites,node-name=x2,file=x2-fmt,log=x2-log,log-super-update-interval=1 \
+    -drive if=none,format=raw,id=x3,file=./test/initramfs/build/xfstests_scratch.img \
+"
+    else
+        COMMON_QEMU_ARGS="$COMMON_QEMU_ARGS \
     -drive if=none,format=raw,id=x2,file=./test/initramfs/build/xfstests_test.img \
     -drive if=none,format=raw,id=x3,file=./test/initramfs/build/xfstests_scratch.img \
 "
+    fi
 fi
 
 if [ "$1" = "iommu" ]; then
