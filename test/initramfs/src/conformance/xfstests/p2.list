@@ -1,0 +1,20 @@
+# P2 single-file-write runlist (test.md §4 P2): write/truncate/fsync/allocation
+# paths. Owed since P2 (the harness only landed in P5), repaid on the P5
+# harness. O_DIRECT/xattr-dependent cases are expected to notrun/fail and are
+# triaged into the ledger rather than pre-filtered.
+generic/006
+generic/013
+generic/028
+generic/036
+generic/047
+generic/062
+generic/068
+generic/084
+generic/090
+generic/091
+generic/093
+generic/130
+generic/133
+generic/209
+generic/412
+generic/469
