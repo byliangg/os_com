@@ -273,6 +273,16 @@ impl SuperBlock {
         self.free_inodes_count
     }
 
+    /// The head of the on-disk orphan list (`s_last_orphan`), `0` when empty.
+    ///
+    /// Phase 4's orphan machinery (Task 8) links inodes here; until it does, the
+    /// value stays whatever mount parsed. Exposed so the superblock capture can
+    /// patch **every** mutable field from memory (see `journal_superblock` in
+    /// `fs.rs`).
+    pub(super) const fn last_orphan(&self) -> u32 {
+        self.last_orphan
+    }
+
     /// Returns the number of block groups, rounding up the last partial group.
     pub(super) fn nr_block_groups(&self) -> u32 {
         ((self.blocks_count - self.first_data_block - 1) / self.nr_blocks_per_group as u64 + 1)

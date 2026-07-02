@@ -332,10 +332,18 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // to the next expected. `head` is left as-is — the ring continues from where
     // commit left it; the next commit sees `tail_block == 0` (clean) and
     // re-establishes `s_start` at its own start block.
+    //
+    // The same critical section evicts the retained after-images this pass made
+    // durable (their final-location writes are behind the barrier above, so the
+    // device is authoritative for them again). The tid comparison keeps an image
+    // from a commit NEWER than this pass's snapshot: evicting it would hand a
+    // later capture the device's still-lagging bytes.
     {
         let mut st = journal.state_write();
         st.tail_block = 0;
         st.tail_tid = committed_tid.wrapping_add(1);
+        st.uncheckpointed
+            .retain(|_, image| !image.is_checkpointed_by(committed_tid));
     }
 
     Ok(())

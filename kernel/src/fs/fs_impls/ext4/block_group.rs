@@ -88,23 +88,21 @@ pub(super) struct BlockGroupDesc {
 /// the after-image carries the absolute in-memory counters, repeated captures of
 /// the same block *within one transaction* converge on the final value.
 ///
-/// # P4 limitation (concurrency, → P7 hardening)
+/// # Cross-transaction seed correctness (B-1)
 ///
-/// The seed comes from the **device**, which under WAL can lag a
-/// committed-but-not-yet-checkpointed transaction (checkpoint is asynchronous on
-/// the commit thread). If two operations on **different groups sharing this
-/// descriptor block** land in **separate** transactions and the second re-seeds
-/// from the device inside the window between the first's `commit` and its
-/// `checkpoint`, the second's after-image resurrects the first's *old* counters
-/// for the other group and its checkpoint clobbers them — an accounting
-/// lost-update (`e2fsck` "free count wrong", `-p` fixable; not structural). It
-/// cannot happen within a single transaction (idempotent seed + absolute patch)
-/// and is not reachable single-threaded in the current tests, but a concurrent
-/// multi-group workload can hit it. P7 (JBD2 完整 / concurrency hardening) closes
-/// it by seeding the descriptor block from the in-memory group descriptors (as
-/// `write_back_inode_desc` was made to rebuild from memory), or by serializing a
-/// re-seed against the pending checkpoint. The superblock counters are unaffected
-/// (a single object, always patched from the in-memory absolute value).
+/// A partial patch like this is only sound because the capture's seed is
+/// guaranteed current: `get_write_access` seeds from the newest
+/// committed-but-un-checkpointed after-image of the block when the journal
+/// retains one, and from the device only once checkpoint has made it
+/// authoritative again (see `UncheckpointedImage` in `journal/transaction.rs`).
+/// Seeding straight from the device — which lags until checkpoint, and the
+/// commit thread runs asynchronously even under a single-threaded workload —
+/// would resurrect the *other* groups' stale counters in this block whenever
+/// two operations landed in separate transactions, and checkpoint (tid order,
+/// newest wins) would clobber the first transaction's committed counts. The
+/// same guarantee covers the other shared sub-block captures: inode-table
+/// blocks (where the clobber is silent neighbor-inode data loss) and the
+/// superblock.
 fn patch_group_desc(buf: &mut [u8], desc_offset: usize, desc: &BlockGroupDesc) {
     let off = desc_offset % BLOCK_SIZE;
     let raw_bytes = &mut buf[off..off + size_of::<RawBlockGroup>()];

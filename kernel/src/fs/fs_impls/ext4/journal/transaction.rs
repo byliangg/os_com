@@ -17,7 +17,9 @@
 //! / `dirty_metadata`:
 //!
 //! 1. Before touching an *existing* metadata block, [`Transaction::capture_write`]
-//!    seeds its buffer from the device (jbd2 `get_write_access`).
+//!    seeds its buffer from the block's newest committed-but-un-checkpointed
+//!    after-image if one is retained (see [`UncheckpointedImage`]), else from
+//!    the device (jbd2 `get_write_access`).
 //! 2. Before populating a *freshly allocated* metadata block,
 //!    [`Transaction::capture_create`] seeds a zeroed buffer — no device read is
 //!    needed (jbd2 `get_create_access`).
@@ -88,6 +90,54 @@ impl MetaBuffer {
     /// The after-image bytes, for seeding from the device or patching in place.
     fn as_mut(&mut self) -> &mut [u8] {
         self.data.as_mut_slice()
+    }
+
+    /// An owned copy of this after-image, for retaining a committing
+    /// transaction's images past its consumption (see [`UncheckpointedImage`]).
+    fn duplicate(&self) -> Self {
+        Self {
+            data: Box::new(*self.data),
+        }
+    }
+}
+
+/// A committed transaction's after-image of one metadata block, retained in
+/// [`JournalState::uncheckpointed`](super::JournalState) until the checkpoint
+/// that writes it to its final location completes.
+///
+/// While a block has such an image, the image — not the device — is the block's
+/// newest content: the device lags until checkpoint. A later transaction's
+/// `get_write_access` therefore seeds from it (see
+/// [`Transaction::capture_write`]); seeding from the device inside that window
+/// would resurrect the pre-image for every sub-block object the new transaction
+/// does not itself patch, and checkpoint (tid order, newest wins) would clobber
+/// the neighbors' committed writes — the B-1 shared-block stale-seed class
+/// (inode-table blocks: silent neighbor-inode data loss). This is the invariant
+/// jbd2 gets for free from the kernel buffer cache (one canonical `buffer_head`
+/// per block); Model A's capture buffers are per-transaction, so the journal
+/// retains the newest committed image itself.
+//
+// Visible at the `ext4` level for the same reason as [`Transaction`]: it is a
+// value of the equally-visible `JournalState`'s map.
+pub(in crate::fs::fs_impls::ext4) struct UncheckpointedImage {
+    /// The committing transaction's tid — compared against the checkpointed-up-to
+    /// tid to decide eviction (a newer commit's image must survive an older
+    /// checkpoint pass).
+    tid: Tid,
+    /// The committed after-image bytes.
+    image: MetaBuffer,
+}
+
+impl UncheckpointedImage {
+    /// The retained after-image bytes (the seed for a later capture).
+    pub(super) fn image_bytes(&self) -> &[u8] {
+        self.image.as_bytes()
+    }
+
+    /// Whether this image is checkpointed once everything up to `committed_tid`
+    /// has been applied to its final location — i.e. whether eviction is due.
+    pub(super) fn is_checkpointed_by(&self, committed_tid: Tid) -> bool {
+        super::tid_geq(committed_tid, self.tid)
     }
 }
 
@@ -194,15 +244,31 @@ impl Transaction {
     }
 
     /// Captures an existing metadata block's current content as its after-image
-    /// (jbd2 `get_write_access`): reads the block from `device` into a new
-    /// buffer. Idempotent — if the block is already captured, does nothing (it
-    /// is *not* re-read, so any patches already applied survive).
-    pub(super) fn capture_write(&mut self, bid: Ext4Bid, device: &dyn BlockDevice) -> Result<()> {
+    /// (jbd2 `get_write_access`).
+    ///
+    /// The content comes from `seed` — the block's newest
+    /// committed-but-un-checkpointed after-image — when one exists, because the
+    /// device lags a committed transaction until its checkpoint completes;
+    /// reading the device inside that window would capture stale bytes for every
+    /// sub-block neighbor this transaction does not patch (see
+    /// [`UncheckpointedImage`]). Without a retained image the device is
+    /// authoritative and is read directly.
+    ///
+    /// Idempotent — if the block is already captured, does nothing (it is *not*
+    /// re-seeded, so any patches already applied survive).
+    pub(super) fn capture_write(
+        &mut self,
+        bid: Ext4Bid,
+        seed: Option<&[u8]>,
+        device: &dyn BlockDevice,
+    ) -> Result<()> {
         if self.metadata.contains_key(&bid) {
             return Ok(());
         }
         let mut buffer = MetaBuffer::zeroed();
-        if device
+        if let Some(seed) = seed {
+            buffer.as_mut().copy_from_slice(seed);
+        } else if device
             .read_bytes(Bid::new(bid).to_offset(), buffer.as_mut())
             .is_err()
         {
@@ -210,6 +276,31 @@ impl Transaction {
         }
         self.metadata.insert(bid, buffer);
         Ok(())
+    }
+
+    /// Retains a copy of every captured after-image in `retained`, keyed by
+    /// block and tagged with this transaction's tid — called (under the journal
+    /// state lock) at the moment this transaction leaves `running` to commit,
+    /// so that from the very first instant a *new* transaction can exist, a
+    /// capture of one of these blocks seeds from these bytes and never from the
+    /// (lagging) device. Checkpoint evicts the entries once the device has
+    /// caught up (see [`UncheckpointedImage`]).
+    ///
+    /// An entry for a block this transaction re-captured simply overwrites the
+    /// older image: this transaction's is the newest.
+    pub(super) fn stash_uncheckpointed(
+        &self,
+        retained: &mut BTreeMap<Ext4Bid, UncheckpointedImage>,
+    ) {
+        for (bid, buffer) in &self.metadata {
+            retained.insert(
+                *bid,
+                UncheckpointedImage {
+                    tid: self.tid,
+                    image: buffer.duplicate(),
+                },
+            );
+        }
     }
 
     /// Patches a captured block's after-image in place (jbd2 `dirty_metadata`):
@@ -559,7 +650,7 @@ mod tests {
         f.write_data_block(300, &first);
 
         let mut txn = Transaction::new(1);
-        txn.capture_write(300, f.ext4.block_device().as_ref())
+        txn.capture_write(300, None, f.ext4.block_device().as_ref())
             .unwrap();
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
 
@@ -567,7 +658,7 @@ mod tests {
         // FIRST content.
         let second = [0xCDu8; BLOCK_SIZE];
         f.write_data_block(300, &second);
-        txn.capture_write(300, f.ext4.block_device().as_ref())
+        txn.capture_write(300, None, f.ext4.block_device().as_ref())
             .unwrap();
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
     }

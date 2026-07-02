@@ -285,7 +285,12 @@ impl Ext4 {
             if !range.is_empty() {
                 let allocated_count = range.end - range.start;
                 sb.dec_free_blocks(allocated_count)?;
-                journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
+                journal_superblock(
+                    handle,
+                    sb.free_blocks_count(),
+                    sb.free_inodes_count(),
+                    sb.last_orphan(),
+                )?;
                 return Ok(range);
             }
         }
@@ -324,7 +329,12 @@ impl Ext4 {
                 group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
             if freed_count > 0 {
                 sb.inc_free_blocks(freed_count as u64)?;
-                journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
+                journal_superblock(
+                    handle,
+                    sb.free_blocks_count(),
+                    sb.free_inodes_count(),
+                    sb.last_orphan(),
+                )?;
             }
             current_block += blocks_in_group as Ext4Bid;
             remaining_blocks -= blocks_in_group;
@@ -376,7 +386,12 @@ impl Ext4 {
                 return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
             }
             sb.dec_free_inodes()?;
-            journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
+            journal_superblock(
+                handle,
+                sb.free_blocks_count(),
+                sb.free_inodes_count(),
+                sb.last_orphan(),
+            )?;
 
             return Ok(ino);
         }
@@ -398,7 +413,12 @@ impl Ext4 {
         let was_allocated = group.free_inode(local_idx, type_, handle)?;
         if was_allocated {
             sb.inc_free_inodes()?;
-            journal_superblock_counts(handle, sb.free_blocks_count(), sb.free_inodes_count())?;
+            journal_superblock(
+                handle,
+                sb.free_blocks_count(),
+                sb.free_inodes_count(),
+                sb.last_orphan(),
+            )?;
         }
 
         Ok(())
@@ -811,19 +831,26 @@ fn build_raw_inode(desc: &InodeDesc, root: &[u32; super::inode::RAW_BLOCK_PTRS_L
 /// journaling it means capturing block 0.
 const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
 
-/// Captures the superblock's after-image — its `free_blocks_count` /
-/// `free_inodes_count` — into the operation's transaction (block 0, RMW at
-/// [`SUPER_BLOCK_OFFSET`]), for op-time journaling. A no-op without a handle.
+/// Captures the superblock's after-image into the operation's transaction
+/// (block 0, RMW at [`SUPER_BLOCK_OFFSET`]), for op-time journaling. A no-op
+/// without a handle.
 ///
-/// Mirrors the RMW in [`Ext4::sync_metadata`]: only the two counters are
-/// overwritten (the on-disk `feature_incompat` changes only via `clear_recover`
-/// at mount, never under an allocation), so the boot area and every untracked
-/// field the device held survive. The counters are absolute, so repeated
-/// captures within a transaction converge on the final value.
-fn journal_superblock_counts(
+/// Patches **every field the filesystem mutates after mount** —
+/// `free_blocks_count`, `free_inodes_count`, and `s_last_orphan` — from the
+/// caller's in-memory values, every capture. This is a single-writer rule, not a
+/// convenience: a capture that patched only "its own" field would leave the
+/// others at the seed value, so two captures patching disjoint fields in
+/// different transactions would clobber each other's committed writes (the B-1
+/// stale-seed class; the Task 8 first attempt hit exactly this with a
+/// counts-only vs. orphan-only pair). Every untracked field (label, feature
+/// words, mount counters — changed only at mount time, never under an
+/// operation) survives from the seed. The values are absolute, so repeated
+/// captures converge on the final state.
+fn journal_superblock(
     handle: Option<&journal::Handle>,
     free_blocks: u64,
     free_inodes: u32,
+    last_orphan: u32,
 ) -> Result<()> {
     journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?;
     journal::dirty_metadata(
@@ -835,6 +862,7 @@ fn journal_superblock_counts(
             let mut raw = RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
             raw.free_blocks_count = free_blocks as u32;
             raw.free_inodes_count = free_inodes;
+            raw.last_orphan = last_orphan;
             buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
         },
     )
@@ -847,9 +875,14 @@ fn journal_superblock_counts(
 ///
 /// `inode_bytes` is exactly the `size_of::<RawInode>()` bytes the direct write
 /// persists; patching only those preserves the rest of the block — the other
-/// inodes sharing it and this inode's `extra_isize` tail — from the seeded device
-/// content. (Inode-table blocks are inode-size aligned, so an inode never
-/// straddles a block boundary.)
+/// inodes sharing it and the slot bytes past the written `RawInode` prefix —
+/// from the seed. The partial patch is sound only because the seed is current:
+/// `get_write_access` seeds from the newest committed-but-un-checkpointed image
+/// of the block when one is retained, falling back to the device (see
+/// `UncheckpointedImage` in `journal/transaction.rs`; a raw device seed would
+/// lag pending checkpoints and silently clobber the neighboring inodes — the
+/// Task 8 guest data loss). (Inode-table blocks are inode-size aligned, so an
+/// inode never straddles a block boundary.)
 fn journal_inode_block(
     handle: Option<&journal::Handle>,
     offset: usize,
@@ -1761,6 +1794,136 @@ mod tests {
         assert_eq!(after.extra_isize, 32, "extra_isize preserved");
         assert_eq!(after.generation, generation, "generation preserved");
         assert_eq!(after.link_count, desc.link_count(), "link count written");
+    }
+
+    /// T1 regression (the Task-8 guest silent data loss, B-1 class): an inode
+    /// written back in transaction 1 must survive a *neighbor* inode's writeback
+    /// in transaction 2 while txn 1 is committed but not yet checkpointed.
+    ///
+    /// Inodes 2 (root) and 8 (journal) share one inode-table block (16 × 256 B
+    /// per 4 KiB block). Txn 2's capture of that block must seed from txn 1's
+    /// retained after-image — seeding from the device (which lags until
+    /// checkpoint) resurrects inode 2's old bytes, and checkpoint (tid order,
+    /// newest wins) clobbers txn 1's write: exactly how the guest's `rm f2`
+    /// emptied the unrelated f1.
+    #[ktest]
+    fn journaled_neighbor_inode_survives_cross_transaction_capture() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Txn 1: inode A (root) gets a new link count.
+        let ino_a = ROOT_INO;
+        let mut desc_a = f.ext4.read_inode_desc(ino_a).unwrap();
+        let new_link_a = desc_a.link_count() + 7;
+        desc_a.set_link_count(new_link_a);
+        let root_a = *desc_a.raw_block();
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            f.ext4
+                .write_back_inode_desc(ino_a, &desc_a, &root_a, op.get())
+                .unwrap();
+        }
+        // Commit txn 1 but do NOT checkpoint: the on-disk inode table still holds
+        // A's OLD link count — the async-commit window between two ops.
+        journal.commit_now_for_test();
+
+        // Txn 2: neighbor inode B (the journal inode, same table block).
+        let ino_b = JOURNAL_INO;
+        let mut desc_b = f.ext4.read_inode_desc(ino_b).unwrap();
+        let new_link_b = desc_b.link_count() + 3;
+        desc_b.set_link_count(new_link_b);
+        let root_b = *desc_b.raw_block();
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            f.ext4
+                .write_back_inode_desc(ino_b, &desc_b, &root_b, op.get())
+                .unwrap();
+        }
+        journal.commit_now_for_test();
+
+        // Checkpoint everything (txn 1 then txn 2; the newest applies last).
+        journal.flush_on_unmount().unwrap();
+
+        // BOTH inodes carry their writes: txn 2's capture did not resurrect A's
+        // pre-txn-1 bytes from the lagging device.
+        let raw_a: RawInode = f
+            .disk
+            .segment()
+            .read_val(f.ext4.inode_table_offset(ino_a).unwrap())
+            .unwrap();
+        let raw_b: RawInode = f
+            .disk
+            .segment()
+            .read_val(f.ext4.inode_table_offset(ino_b).unwrap())
+            .unwrap();
+        assert_eq!(
+            raw_a.link_count, new_link_a,
+            "neighbor capture must not clobber inode A (B-1 stale seed)"
+        );
+        assert_eq!(raw_b.link_count, new_link_b, "inode B's own write applied");
+    }
+
+    /// T1 (superblock capture hygiene, B-1 class): the superblock capture must
+    /// patch EVERY mutable field from memory — a capture that patches only "its
+    /// own" field leaves the others at the seed value, so two captures patching
+    /// disjoint fields across transactions clobber each other. The on-disk
+    /// `last_orphan` here stands in for any stale seed byte: after a journaled
+    /// op captures the superblock and checkpoint applies it, the field must hold
+    /// the in-memory value, not the doctored device value.
+    #[ktest]
+    fn journaled_superblock_capture_patches_all_mutable_fields() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Doctor the DEVICE superblock's `last_orphan` (the in-memory superblock
+        // still holds 0) — a stand-in for any device byte lagging memory.
+        let mut raw_sb: RawSuperBlock = f.disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        raw_sb.last_orphan = 99;
+        f.disk
+            .segment()
+            .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
+            .unwrap();
+
+        // A journaled op that allocates a block captures the superblock counters.
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            let range = f.ext4.alloc_blocks(1, 0, op.get()).unwrap();
+            assert_eq!(range.end - range.start, 1);
+        }
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+
+        // The checkpointed superblock carries the IN-MEMORY state for every
+        // mutable field: the counters (changed by the alloc) AND `last_orphan`
+        // (unchanged in memory, so 0 — not the doctored 99).
+        let after: RawSuperBlock = f.disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        let sb = f.ext4.super_block.read();
+        assert_eq!(
+            u64::from(after.free_blocks_count),
+            sb.free_blocks_count(),
+            "free block count patched from memory"
+        );
+        assert_eq!(
+            after.free_inodes_count,
+            sb.free_inodes_count(),
+            "free inode count patched from memory"
+        );
+        assert_eq!(
+            after.last_orphan, 0,
+            "last_orphan patched from memory, not left at the (doctored) seed"
+        );
     }
 
     /// A non-journaled volume has no journal — the Phase 1–3 mount path is

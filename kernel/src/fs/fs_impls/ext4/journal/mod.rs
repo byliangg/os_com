@@ -34,7 +34,12 @@
 //! threading a live [`Handle`] in, with no change to the wrappers:
 //!
 //! - [`get_write_access`] — about to modify an existing metadata block; under a
-//!   handle it seeds the block's after-image from the device.
+//!   handle it seeds the block's after-image from the newest
+//!   committed-but-un-checkpointed image when the journal retains one
+//!   ([`JournalState::uncheckpointed`]), else from the device — the device lags
+//!   a committed transaction until checkpoint, so it must never be the seed
+//!   inside that window (see
+//!   [`UncheckpointedImage`](transaction::UncheckpointedImage)).
 //! - [`get_create_access`] — about to populate a freshly allocated metadata
 //!   block (extent index/leaf blocks, new directory blocks, new bitmaps); under
 //!   a handle it seeds a zeroed after-image.
@@ -46,14 +51,13 @@
 //!
 //! **Without a handle (`None`) every wrapper is inert** and persistence stays
 //! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
-//! written back by `sync`. Phase 4 builds the capture machinery and recovery but
-//! **no metadata operation opens a handle yet** (op-journaling — reshaping the
-//! ordered-mode writes into write-ahead logging — is the Int-B follow-up), so
-//! every production call site currently passes `None` and behaviour is unchanged
-//! from Phase 3. Callers must **never assume [`dirty_metadata`] makes a block
-//! persistent** — it marks the block for writeback (and, under a handle,
-//! captures its after-image); "write through immediately" would bake in a
-//! flush-timing assumption the ordered-mode journal breaks.
+//! written back by `sync` — the Phase 1–3 behaviour, still what a non-journaled
+//! volume does. On a journaled volume every metadata operation opens a handle
+//! via `Ext4::begin_op` (Int-B) and threads it through these wrappers. Callers
+//! must **never assume [`dirty_metadata`] makes a block persistent** — it marks
+//! the block for writeback (and, under a handle, captures its after-image);
+//! "write through immediately" would bake in a flush-timing assumption the
+//! ordered-mode journal breaks.
 //!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
 //! `MetaBuffer` handle owning the raw block bytes. We instead reuse ext2's
@@ -396,6 +400,21 @@ pub(super) struct JournalState {
     /// The oldest un-checkpointed transaction's id — the on-disk `s_sequence`
     /// (jbd2 `journal_t.j_tail_sequence`).
     pub(super) tail_tid: Tid,
+    /// The newest committed-but-un-checkpointed after-image of each metadata
+    /// block, retained from the moment a transaction leaves `running` to commit
+    /// until checkpoint writes the block to its final location.
+    ///
+    /// This is what makes [`get_write_access`] seeding stale-free: inside the
+    /// commit→checkpoint window the device lags these images, so a new
+    /// transaction's capture must seed from here (see
+    /// [`UncheckpointedImage`](transaction::UncheckpointedImage) for the failure
+    /// this prevents — the B-1 shared-block clobber). Entries are inserted by
+    /// the commit path under this state lock, atomically with `running.take()`
+    /// (no instant exists where a new transaction can start but the images are
+    /// missing), and evicted by [`checkpoint`](checkpoint::checkpoint) once the
+    /// device is authoritative again. Bounded by the blocks of the transactions
+    /// in flight — one transaction deep under Phase 4's eager checkpoint.
+    pub(super) uncheckpointed: BTreeMap<Ext4Bid, transaction::UncheckpointedImage>,
 }
 
 impl Journal {
@@ -440,6 +459,7 @@ impl Journal {
                 head,
                 tail_block,
                 tail_tid,
+                uncheckpointed: BTreeMap::new(),
             }),
             committed_tid: AtomicU32::new(committed_tid),
             commit_trigger: WaitQueue::new(),
@@ -605,21 +625,30 @@ impl Journal {
     /// `inode.inner` (the ordered-data flush), which must never happen under the
     /// journal state lock. A fresh running transaction is created lazily by the
     /// next [`journal_start`](transaction::journal_start).
+    ///
+    /// Committability is checked and the transaction taken under ONE lock hold
+    /// (between `poll_commit_action` and here a new handle could have joined, so
+    /// the poll's answer is stale); the same critical section stashes the
+    /// transaction's after-images into [`JournalState::uncheckpointed`] — the
+    /// take is the instant from which the next `journal_start` opens a NEW
+    /// transaction, so the images must already be in place for its captures to
+    /// seed from (the device lags this commit until its checkpoint).
     fn commit_one(&self) {
         let txn = {
             let mut st = self.state_write();
-            st.running.take()
+            let committable = st
+                .running
+                .as_ref()
+                .is_some_and(|txn| txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0);
+            if !committable {
+                return;
+            }
+            let Some(txn) = st.running.take() else {
+                return;
+            };
+            txn.stash_uncheckpointed(&mut st.uncheckpointed);
+            txn
         };
-        let Some(txn) = txn else { return };
-
-        // Re-check committability after taking: between `poll_commit_action` and
-        // this take, a new handle could have joined (raising `nr_updates`), so we
-        // must not commit a still-open transaction. If it is not committable, put
-        // it back untouched.
-        if txn.nr_updates() != 0 || txn.nr_metadata_blocks() == 0 {
-            self.state_write().running = Some(txn);
-            return;
-        }
 
         // Single-committer: this thread is the only production caller of
         // `commit_transaction`, so no commit lock is needed. `commit_transaction`
@@ -736,7 +765,14 @@ impl Journal {
     pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
         let txn = {
             let mut st = self.state_write();
-            st.running.take()
+            let txn = st.running.take();
+            // Mirror `commit_one`: the images must be retained atomically with
+            // the take (nothing races at unmount, but the invariant is cheap and
+            // uniform — every commit path stashes what it is about to commit).
+            if let Some(txn) = &txn {
+                txn.stash_uncheckpointed(&mut st.uncheckpointed);
+            }
+            txn
         };
         if let Some(txn) = txn
             && txn.nr_metadata_blocks() > 0
@@ -789,23 +825,44 @@ pub(super) enum TriggerType {
     DirBlock,
 }
 
-/// Returns the journal's running transaction, verifying it still matches the
-/// handle's transaction id.
+/// Returns `running`'s transaction, verifying it still matches the handle's
+/// transaction id.
 ///
 /// A mismatch means the handle outlived its transaction — impossible while the
 /// handle holds an open update (the transaction cannot commit until its last
 /// handle closes), but checked so a stale patch can never land on the wrong
 /// transaction's after-image.
-fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a mut Transaction> {
-    match state.running.as_mut() {
+///
+/// Takes the `running` slot rather than the whole [`JournalState`] so a caller
+/// can keep disjoint borrows of the state's other fields (the seed lookup in
+/// [`get_write_access`] reads `uncheckpointed` alongside the returned
+/// transaction).
+fn verify_running<'a>(
+    running: &'a mut Option<Transaction>,
+    handle: &Handle,
+) -> Result<&'a mut Transaction> {
+    match running.as_mut() {
         Some(running) if running.tid() == handle.tid() => Ok(running),
         _ => return_errno_with_message!(Errno::EIO, "journal handle outlived its transaction"),
     }
 }
 
-/// Seeds an existing metadata block's after-image from the device so later
-/// [`dirty_metadata`] patches accumulate onto its committed content (jbd2
+/// [`verify_running`] over the whole state, for the funnels that need no other
+/// state field.
+fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a mut Transaction> {
+    verify_running(&mut state.running, handle)
+}
+
+/// Seeds an existing metadata block's after-image so later [`dirty_metadata`]
+/// patches accumulate onto its newest committed content (jbd2
 /// `get_write_access`).
+///
+/// The seed is the block's retained committed-but-un-checkpointed image when one
+/// exists ([`JournalState::uncheckpointed`]) and the device content otherwise:
+/// between a transaction's commit and its checkpoint the device lags, and a
+/// device seed taken in that window would hand this transaction stale bytes for
+/// every neighbor object it does not patch itself (the B-1 clobber — see
+/// [`UncheckpointedImage`](transaction::UncheckpointedImage)).
 ///
 /// Without a handle (a non-journaled volume, or a caller that opened no
 /// transaction) this is a no-op: writeback stays driven by the block's own
@@ -821,7 +878,18 @@ pub(super) fn get_write_access(
     let journal = handle.journal()?;
     let device = journal.device.clone();
     let mut state = journal.state_write();
-    running_for(&mut state, handle)?.capture_write(blocknr, device.as_ref())
+    // Disjoint field borrows: the running transaction (mutated by the capture)
+    // and the retained-image map (read for the seed).
+    let JournalState {
+        running,
+        uncheckpointed,
+        ..
+    } = &mut *state;
+    let txn = verify_running(running, handle)?;
+    let seed = uncheckpointed
+        .get(&blocknr)
+        .map(transaction::UncheckpointedImage::image_bytes);
+    txn.capture_write(blocknr, seed, device.as_ref())
 }
 
 /// Seeds a freshly allocated metadata block's after-image as zeroes — its prior
@@ -933,6 +1001,18 @@ pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
     device
         .write_val(pblock as usize * BLOCK_SIZE, &raw)
         .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))
+}
+
+impl Journal {
+    /// Test helper: runs one commit pass (the commit thread's
+    /// [`commit_one`](Journal::commit_one)) **without** the eager checkpoint that
+    /// normally follows it, so a test can hold the journal in the
+    /// committed-but-un-checkpointed window deterministically — the window in
+    /// which the device lags the log and a capture's seed provenance matters.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn commit_now_for_test(&self) {
+        self.commit_one();
+    }
 }
 
 /// Test helper: commits a single-block transaction (`dest` ← `after`) to `journal`,
@@ -1390,5 +1470,140 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
         f.journal.flush_on_unmount().unwrap();
         assert_eq!(f.journal.state_read().tail_block, 0);
+    }
+
+    /// T1 regression (the B-1 shared-block stale-seed class — the Task-8 guest
+    /// silent data loss): a capture in a NEW transaction must seed the block from
+    /// the newest committed-but-un-checkpointed after-image, NOT from the device,
+    /// which lags until checkpoint completes.
+    ///
+    /// Two sub-block writers share block 500 (as two inodes share an inode-table
+    /// block): txn 1 patches bytes [0..4] and is committed but NOT checkpointed —
+    /// the exact window the async commit thread creates between two back-to-back
+    /// ops. Txn 2 then captures the same block and patches bytes [8..12]. If its
+    /// seed comes from the device (stale: txn 1 not applied yet), txn 2's
+    /// after-image resurrects the pre-txn-1 bytes and — checkpoint applying in
+    /// tid order, newest last — clobbers txn 1's write at the final location.
+    #[ktest]
+    fn capture_after_commit_seeds_from_uncheckpointed_image() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device().clone();
+
+        // Known device content for the shared block.
+        let bid: Ext4Bid = 500;
+        let base = [0xAAu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(bid as usize * BLOCK_SIZE, &base)
+            .unwrap();
+
+        // Txn 1: "slot A" writes bytes [0..4].
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h1), bid, TriggerType::InodeTable).unwrap();
+        dirty_metadata(Some(&h1), bid, TriggerType::InodeTable, |buf| {
+            buf[..4].copy_from_slice(&[0x11; 4])
+        })
+        .unwrap();
+        journal_stop(h1).unwrap();
+        // Commit WITHOUT checkpoint: the device still holds the pre-txn-1 bytes.
+        f.journal.commit_now_for_test();
+
+        // Txn 2 (a fresh transaction): "slot B" writes bytes [8..12]. Its capture
+        // of the shared block must see txn 1's [0..4] == 0x11.
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h2), bid, TriggerType::InodeTable).unwrap();
+        dirty_metadata(Some(&h2), bid, TriggerType::InodeTable, |buf| {
+            buf[8..12].copy_from_slice(&[0x22; 4])
+        })
+        .unwrap();
+        journal_stop(h2).unwrap();
+        f.journal.commit_now_for_test();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        // Both writers' bytes reach the final location; untouched bytes keep the
+        // device content.
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(
+            &final_block[..4],
+            &[0x11; 4],
+            "txn 1's bytes survive txn 2's capture (stale-seed clobber)"
+        );
+        assert_eq!(&final_block[8..12], &[0x22; 4], "txn 2's own bytes applied");
+        assert_eq!(
+            final_block[100], 0xAA,
+            "unpatched bytes keep device content"
+        );
+    }
+
+    /// After checkpoint, the retained after-images are dropped and the device —
+    /// now up to date — is the seed source again: a doctored device byte shows up
+    /// in the next capture (proving the fallback), and the stash does not grow
+    /// without bound.
+    #[ktest]
+    fn capture_after_checkpoint_seeds_from_device_again() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device().clone();
+
+        let bid: Ext4Bid = 501;
+        // Txn 1 writes [0..4]; commit + checkpoint make the device authoritative.
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h1), bid, TriggerType::InodeTable).unwrap();
+        dirty_metadata(Some(&h1), bid, TriggerType::InodeTable, |buf| {
+            buf[..4].copy_from_slice(&[0x11; 4])
+        })
+        .unwrap();
+        journal_stop(h1).unwrap();
+        f.journal.commit_now_for_test();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        // Doctor a byte on the device — a capture that seeds from the device (and
+        // only such a capture) will see it.
+        let mut doctored = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut doctored)
+            .unwrap();
+        doctored[100] = 0x77;
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(bid as usize * BLOCK_SIZE, &doctored)
+            .unwrap();
+
+        // Txn 2 captures the block again: post-checkpoint there is no retained
+        // image, so the seed is the (current) device content.
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h2), bid, TriggerType::InodeTable).unwrap();
+        dirty_metadata(Some(&h2), bid, TriggerType::InodeTable, |buf| {
+            assert_eq!(buf[100], 0x77, "post-checkpoint capture seeds from device");
+            assert_eq!(
+                &buf[..4],
+                &[0x11; 4],
+                "and the device carries txn 1's write"
+            );
+            buf[8..12].copy_from_slice(&[0x22; 4])
+        })
+        .unwrap();
+        journal_stop(h2).unwrap();
+        f.journal.commit_now_for_test();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(&final_block[8..12], &[0x22; 4]);
+        assert_eq!(final_block[100], 0x77);
     }
 }
