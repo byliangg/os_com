@@ -43,7 +43,7 @@
 //! - [`get_create_access`] — about to populate a freshly allocated metadata
 //!   block (extent index/leaf blocks, new directory blocks, new bitmaps); under
 //!   a handle it seeds a zeroed after-image.
-//! - [`dirty_metadata`] — the metadata block has been modified; under a handle
+//! - [`WriteAccess::patch`] — the metadata block has been modified; live,
 //!   its `patch` closure writes the modification into the captured after-image,
 //!   so sub-objects sharing a block accumulate onto one buffer.
 //! - [`forget`] — a previously journaled metadata block is being freed (the
@@ -54,7 +54,7 @@
 //! written back by `sync` — the Phase 1–3 behaviour, still what a non-journaled
 //! volume does. On a journaled volume every metadata operation opens a handle
 //! via `Ext4::begin_op` (Int-B) and threads it through these wrappers. Callers
-//! must **never assume [`dirty_metadata`] makes a block persistent** — it marks
+//! must **never assume [`WriteAccess::patch`] makes a block persistent** — it marks
 //! the block for writeback (and, under a handle, captures its after-image);
 //! "write through immediately" would bake in a flush-timing assumption the
 //! ordered-mode journal breaks.
@@ -94,7 +94,7 @@ mod transaction;
 /// on-disk journal superblock is already clean (`s_start == 0`).
 pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
 /// Re-exported at the `ext4` level so allocation/extent paths can thread an
-/// `Option<&Handle>` through to the [`get_write_access`]/[`dirty_metadata`]
+/// `Option<&Handle>` through to the [`get_write_access`]/[`WriteAccess::patch`]
 /// funnels. The handle lifecycle (`journal_start`/`journal_stop`) stays inside
 /// this module; callers only borrow a handle for capture.
 pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
@@ -980,9 +980,9 @@ fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a m
     verify_running(&mut state.running, handle)
 }
 
-/// Seeds an existing metadata block's after-image so later [`dirty_metadata`]
-/// patches accumulate onto its newest committed content (jbd2
-/// `get_write_access`).
+/// Seeds an existing metadata block's after-image and mints the
+/// [`WriteAccess`] credential whose [`patch`](WriteAccess::patch) calls
+/// accumulate onto its newest committed content (jbd2 `get_write_access`).
 ///
 /// The seed is the block's retained committed-but-un-checkpointed image when one
 /// exists ([`JournalState::uncheckpointed`]) and the device content otherwise:
@@ -992,15 +992,16 @@ fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a m
 /// [`UncheckpointedImage`](transaction::UncheckpointedImage)).
 ///
 /// Without a handle (a non-journaled volume, or a caller that opened no
-/// transaction) this is a no-op: writeback stays driven by the block's own
-/// `Dirty` flag, exactly as in Phases 1–3.
-pub(super) fn get_write_access(
-    handle: Option<&Handle>,
+/// transaction) the returned credential is inert: nothing is captured and
+/// writeback stays driven by the block's own `Dirty` flag, exactly as in
+/// Phases 1–3.
+pub(super) fn get_write_access<'h>(
+    handle: Option<&'h Handle>,
     blocknr: Ext4Bid,
-    _trigger: TriggerType,
-) -> Result<()> {
+    trigger: TriggerType,
+) -> Result<WriteAccess<'h>> {
     let Some(handle) = handle else {
-        return Ok(());
+        return Ok(WriteAccess { live: None });
     };
     let journal = handle.journal()?;
     let device = journal.device.clone();
@@ -1016,47 +1017,98 @@ pub(super) fn get_write_access(
     let seed = uncheckpointed
         .get(&blocknr)
         .map(transaction::UncheckpointedImage::image_bytes);
-    txn.capture_write(blocknr, seed, device.as_ref())
+    txn.capture_write(blocknr, seed, device.as_ref())?;
+    Ok(WriteAccess {
+        live: Some(LiveAccess {
+            handle,
+            bid: blocknr,
+            trigger,
+        }),
+    })
 }
 
 /// Seeds a freshly allocated metadata block's after-image as zeroes — its prior
 /// device content is meaningless, so no read is issued (jbd2
-/// `get_create_access`). No-op without a handle (see [`get_write_access`]).
-pub(super) fn get_create_access(
-    handle: Option<&Handle>,
+/// `get_create_access`) — and mints the block's [`WriteAccess`]. Inert without
+/// a handle (see [`get_write_access`]).
+pub(super) fn get_create_access<'h>(
+    handle: Option<&'h Handle>,
     blocknr: Ext4Bid,
-    _trigger: TriggerType,
-) -> Result<()> {
+    trigger: TriggerType,
+) -> Result<WriteAccess<'h>> {
     let Some(handle) = handle else {
-        return Ok(());
+        return Ok(WriteAccess { live: None });
     };
     let journal = handle.journal()?;
     let mut state = journal.state_write();
     running_for(&mut state, handle)?.capture_create(blocknr);
-    Ok(())
+    Ok(WriteAccess {
+        live: Some(LiveAccess {
+            handle,
+            bid: blocknr,
+            trigger,
+        }),
+    })
 }
 
-/// Patches a metadata block's captured after-image via `patch` (jbd2
-/// `dirty_metadata`): `patch` writes this site's modification into the seeded
-/// block buffer, so sub-objects sharing one block accumulate onto the same
-/// image (see [`Transaction::apply_patch`]).
+/// A capture credential for one metadata block — jbd2's "write access" made a
+/// value: proof that [`get_write_access`] / [`get_create_access`] captured
+/// this block's after-image into the running transaction. [`patch`](Self::patch)
+/// (jbd2 `dirty_metadata`) is the only way to modify a captured image, so
+/// patch-without-capture is unrepresentable, and the block number and
+/// [`TriggerType`] travel inside the credential — a wrong-bid patch landing on
+/// a neighbor's capture in the shared running transaction, or a get/dirty
+/// trigger divergence (live corruption once P6 checksums key off it), can no
+/// longer be written.
 ///
-/// Without a handle this is a no-op and `patch` is **not** invoked: writeback
-/// stays on the block's own `Dirty` flag, so Phases 1–3 behaviour is unchanged.
-/// A `dirty_metadata` under a handle requires a prior `get_*_access` on the same
-/// block (else `EIO`).
-pub(super) fn dirty_metadata(
-    handle: Option<&Handle>,
-    blocknr: Ext4Bid,
-    _trigger: TriggerType,
-    patch: impl FnOnce(&mut [u8]),
-) -> Result<()> {
-    let Some(handle) = handle else {
-        return Ok(());
-    };
-    let journal = handle.journal()?;
-    let mut state = journal.state_write();
-    running_for(&mut state, handle)?.apply_patch(blocknr, patch)
+/// On a non-journaled volume — or from a caller with no open transaction —
+/// the credential is **inert**: `patch` succeeds without invoking the closure
+/// (writeback stays on the block's own `Dirty` flag, the Phase 1–3 semantics
+/// verbatim), and [`is_live`](Self::is_live) lets a writer keep its
+/// direct-write fallback in one place.
+///
+/// The credential holds only `&'h Handle`, never a journal state guard: the
+/// block-group methods keep two credentials live at once, and pinning the
+/// state lock across a capture's device I/O is forbidden — `patch` re-takes
+/// the state lock transiently, exactly like the old free `dirty_metadata`.
+/// Because it immutably borrows the `Handle`, borrowck statically drains all
+/// live credentials before P7's `journal_restart(&mut Handle)` can run — the
+/// stale-capture-across-restart hazard, checked at compile time.
+#[must_use = "a capture without a patch (or is_live check) is almost always a bug"]
+pub(super) struct WriteAccess<'h> {
+    live: Option<LiveAccess<'h>>,
+}
+
+/// The live half of a [`WriteAccess`]: which block of which transaction.
+struct LiveAccess<'h> {
+    handle: &'h Handle,
+    bid: Ext4Bid,
+    /// Carried so the P6 checksum hook sees the same kind at capture and
+    /// patch time by construction.
+    #[expect(dead_code)]
+    trigger: TriggerType,
+}
+
+impl WriteAccess<'_> {
+    /// Whether this credential carries a real capture (a journaled volume with
+    /// an open transaction). The writer's direct-write fallback keys off this
+    /// instead of re-deriving "journaled?" from the handle.
+    pub(super) fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Patches the captured after-image via `patch`: writes this site's
+    /// modification into the seeded block buffer, so sub-objects sharing one
+    /// block accumulate onto the same image (see [`Transaction::apply_patch`]).
+    /// Inert credential: succeeds **without** invoking `patch`.
+    pub(super) fn patch(&self, patch: impl FnOnce(&mut [u8])) -> Result<()> {
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
+        let journal = live.handle.journal()?;
+        let mut state = journal.state_write();
+        running_for(&mut state, live.handle)?.apply_patch(live.bid, patch)
+    }
 }
 
 /// Reads a metadata block through the journal's retained after-images: the
@@ -1089,7 +1141,7 @@ pub(super) fn read_metadata_block(
         let newest = state
             .running
             .as_ref()
-            .and_then(|txn| txn.metadata_bytes(blocknr))
+            .and_then(|txn| txn.buffer_bytes(blocknr))
             .or_else(|| {
                 state
                     .uncheckpointed
@@ -1105,13 +1157,21 @@ pub(super) fn read_metadata_block(
     Ok(device.read_val(blocknr as usize * BLOCK_SIZE)?)
 }
 
+/// What kind of block a [`forget`] covers — the revoke record P7 writes
+/// differs per kind, and a bare `bool` at the call sites said nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ForgetKind {
+    /// A journaled metadata block (extent-tree node, directory block, …).
+    Metadata,
+    /// File data (ordered-mode bookkeeping) — constructed once P7's revoke
+    /// machinery covers data blocks.
+    #[expect(dead_code)]
+    Data,
+}
+
 /// Records that a previously journaled metadata block is being freed. Phase 2:
-/// no-op. `is_metadata`/`blocknr` are the Phase-7 revoke insertion point.
-pub(super) fn forget(
-    _handle: Option<&Handle>,
-    _is_metadata: bool,
-    _blocknr: Ext4Bid,
-) -> Result<()> {
+/// no-op. `kind`/`blocknr` are the Phase-7 revoke insertion point.
+pub(super) fn forget(_handle: Option<&Handle>, _kind: ForgetKind, _blocknr: Ext4Bid) -> Result<()> {
     Ok(())
 }
 
@@ -1447,16 +1507,12 @@ mod tests {
             .unwrap();
 
         let handle = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
-        dirty_metadata(
-            Some(&handle),
-            CAPTURE_BLOCK,
-            TriggerType::BlockBitmap,
-            |buf| {
+        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::BlockBitmap)
+            .unwrap()
+            .patch(|buf| {
                 buf[4] = 0xAB;
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
 
         let st = f.journal.state_read();
         let captured = st
@@ -1492,21 +1548,14 @@ mod tests {
             .unwrap();
 
         let handle = journal_start(&f.journal, 4).unwrap();
-        get_create_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock).unwrap();
-        dirty_metadata(
-            Some(&handle),
-            CAPTURE_BLOCK,
-            TriggerType::ExtentBlock,
-            |buf| buf[0] = 1,
-        )
-        .unwrap();
-        dirty_metadata(
-            Some(&handle),
-            CAPTURE_BLOCK,
-            TriggerType::ExtentBlock,
-            |buf| buf[1] = 2,
-        )
-        .unwrap();
+        let access =
+            get_create_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock).unwrap();
+        access.patch(|buf| buf[0] = 1).unwrap();
+        // A re-minted credential patches the SAME capture (idempotent access).
+        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock)
+            .unwrap()
+            .patch(|buf| buf[1] = 2)
+            .unwrap();
 
         let st = f.journal.state_read();
         let captured = st
@@ -1529,11 +1578,9 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
 
         let mut patched = false;
-        get_write_access(None, CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
-        dirty_metadata(None, CAPTURE_BLOCK, TriggerType::BlockBitmap, |_| {
-            patched = true
-        })
-        .unwrap();
+        let access = get_write_access(None, CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
+        assert!(!access.is_live());
+        access.patch(|_| patched = true).unwrap();
 
         assert!(!patched, "patch must not run without a handle");
         assert!(
@@ -1542,22 +1589,23 @@ mod tests {
         );
     }
 
-    /// A `dirty_metadata` under a handle but without a prior `get_*_access` on
-    /// that block errors: nothing seeded the after-image to patch.
+    /// Patch-without-capture is unrepresentable through [`WriteAccess`] (the
+    /// old free `dirty_metadata` could be called without a prior access); the
+    /// transaction-level defensive check underneath still errors if reached.
     #[ktest]
-    fn funnel_dirty_without_access_errors() {
+    fn apply_patch_without_capture_errors_defensively() {
         let f = journaled_fixture(16, 1, 1);
         let handle = journal_start(&f.journal, 4).unwrap();
+        let mut st = f.journal.state_write();
         assert!(
-            dirty_metadata(
-                Some(&handle),
-                CAPTURE_BLOCK,
-                TriggerType::BlockBitmap,
-                |_| {}
-            )
-            .is_err(),
-            "dirty_metadata without get_*_access must fail"
+            st.running
+                .as_mut()
+                .unwrap()
+                .apply_patch(CAPTURE_BLOCK, |_| {})
+                .is_err(),
+            "apply_patch without a capture must fail"
         );
+        drop(st);
         journal_stop(handle).unwrap();
     }
 
@@ -1574,11 +1622,10 @@ mod tests {
 
         let bid: Ext4Bid = 500;
         let handle = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&handle), bid, TriggerType::BlockBitmap).unwrap();
-        dirty_metadata(Some(&handle), bid, TriggerType::BlockBitmap, |buf| {
-            buf[..8].copy_from_slice(b"UNMOUNT!")
-        })
-        .unwrap();
+        get_write_access(Some(&handle), bid, TriggerType::BlockBitmap)
+            .unwrap()
+            .patch(|buf| buf[..8].copy_from_slice(b"UNMOUNT!"))
+            .unwrap();
         // Closing the last handle marks the transaction committable (and pings the
         // — here unstarted — commit thread); the running transaction survives for
         // the synchronous flush below.
@@ -1647,11 +1694,10 @@ mod tests {
 
         // Txn 1: "slot A" writes bytes [0..4].
         let h1 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h1), bid, TriggerType::InodeTable).unwrap();
-        dirty_metadata(Some(&h1), bid, TriggerType::InodeTable, |buf| {
-            buf[..4].copy_from_slice(&[0x11; 4])
-        })
-        .unwrap();
+        get_write_access(Some(&h1), bid, TriggerType::InodeTable)
+            .unwrap()
+            .patch(|buf| buf[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
         journal_stop(h1).unwrap();
         // Commit WITHOUT checkpoint: the device still holds the pre-txn-1 bytes.
         f.journal.commit_now_for_test();
@@ -1659,11 +1705,10 @@ mod tests {
         // Txn 2 (a fresh transaction): "slot B" writes bytes [8..12]. Its capture
         // of the shared block must see txn 1's [0..4] == 0x11.
         let h2 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h2), bid, TriggerType::InodeTable).unwrap();
-        dirty_metadata(Some(&h2), bid, TriggerType::InodeTable, |buf| {
-            buf[8..12].copy_from_slice(&[0x22; 4])
-        })
-        .unwrap();
+        get_write_access(Some(&h2), bid, TriggerType::InodeTable)
+            .unwrap()
+            .patch(|buf| buf[8..12].copy_from_slice(&[0x22; 4]))
+            .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
         checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
@@ -1701,11 +1746,10 @@ mod tests {
         let bid: Ext4Bid = 501;
         // Txn 1 writes [0..4]; commit + checkpoint make the device authoritative.
         let h1 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h1), bid, TriggerType::InodeTable).unwrap();
-        dirty_metadata(Some(&h1), bid, TriggerType::InodeTable, |buf| {
-            buf[..4].copy_from_slice(&[0x11; 4])
-        })
-        .unwrap();
+        get_write_access(Some(&h1), bid, TriggerType::InodeTable)
+            .unwrap()
+            .patch(|buf| buf[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
         journal_stop(h1).unwrap();
         f.journal.commit_now_for_test();
         checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
@@ -1728,17 +1772,18 @@ mod tests {
         // Txn 2 captures the block again: post-checkpoint there is no retained
         // image, so the seed is the (current) device content.
         let h2 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h2), bid, TriggerType::InodeTable).unwrap();
-        dirty_metadata(Some(&h2), bid, TriggerType::InodeTable, |buf| {
-            assert_eq!(buf[100], 0x77, "post-checkpoint capture seeds from device");
-            assert_eq!(
-                &buf[..4],
-                &[0x11; 4],
-                "and the device carries txn 1's write"
-            );
-            buf[8..12].copy_from_slice(&[0x22; 4])
-        })
-        .unwrap();
+        get_write_access(Some(&h2), bid, TriggerType::InodeTable)
+            .unwrap()
+            .patch(|buf| {
+                assert_eq!(buf[100], 0x77, "post-checkpoint capture seeds from device");
+                assert_eq!(
+                    &buf[..4],
+                    &[0x11; 4],
+                    "and the device carries txn 1's write"
+                );
+                buf[8..12].copy_from_slice(&[0x22; 4])
+            })
+            .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
         checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();

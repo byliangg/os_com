@@ -398,11 +398,7 @@ impl SuperBlock {
     ) -> Result<()> {
         let free_blocks = self.free_blocks_count();
         let free_inodes = self.free_inodes_count();
-        journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?;
-        journal::dirty_metadata(
-            handle,
-            SUPERBLOCK_BID,
-            journal::TriggerType::Superblock,
+        journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?.patch(
             |buf| {
                 let off = SUPER_BLOCK_OFFSET;
                 let mut raw =

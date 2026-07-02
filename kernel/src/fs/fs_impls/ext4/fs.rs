@@ -1288,11 +1288,12 @@ impl InodeSlot {
     /// checkpoints and silently clobber the neighboring inodes — the Task 8
     /// guest data loss).
     fn journal_write(&self, handle: Option<&journal::Handle>, raw: &RawInode) -> Result<()> {
-        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?;
         let off = self.offset_in_block;
-        journal::dirty_metadata(handle, self.bid, journal::TriggerType::InodeTable, |buf| {
-            buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
-        })
+        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
+            |buf| {
+                buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
+            },
+        )
     }
 
     /// Splices the slot's on-disk `i_dtime` (its orphan-next pointer) to
@@ -1303,11 +1304,12 @@ impl InodeSlot {
     /// only the 4 `i_dtime` bytes are overwritten, so every other field — and
     /// every neighboring inode — keeps its committed content.
     fn journal_patch_dtime(&self, handle: Option<&journal::Handle>, next: u32) -> Result<()> {
-        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?;
         let dtime_off = self.offset_in_block + core::mem::offset_of!(RawInode, dtime);
-        journal::dirty_metadata(handle, self.bid, journal::TriggerType::InodeTable, |buf| {
-            buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
-        })
+        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
+            |buf| {
+                buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
+            },
+        )
     }
 }
 

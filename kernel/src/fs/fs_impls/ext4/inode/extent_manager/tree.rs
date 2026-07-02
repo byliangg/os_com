@@ -594,13 +594,16 @@ struct TreeDelta {
 fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) -> Result<Ext4Bid> {
     let range = fs.alloc_blocks(1, goal, handle)?;
     let bid = range.start;
-    journal::get_create_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    // Zero-seed the fresh block's capture now; the capture lives in the
+    // running transaction (the credential is proof, not owner), and
+    // `write_leaf_node` re-mints its own when it fills the block.
+    let _create = journal::get_create_access(handle, bid, journal::TriggerType::ExtentBlock)?;
     Ok(bid)
 }
 
 /// Frees one external extent-tree metadata block.
 fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) -> Result<()> {
-    journal::forget(handle, true, bid)?;
+    journal::forget(handle, journal::ForgetKind::Metadata, bid)?;
     fs.free_blocks(bid, 1, handle)
 }
 
@@ -628,16 +631,14 @@ fn write_leaf_node(
     // re-fills surviving external leaves in place); only freshly allocated
     // leaves were captured by `alloc_meta_block`. Capture idempotently so the
     // reuse path is journaled too — a fresh leaf's zero-seeded capture is left
-    // untouched, a reused leaf gets one here (without it the patch below is
-    // dirty-without-access, `EIO`).
-    journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
-    journal::dirty_metadata(handle, bid, journal::TriggerType::ExtentBlock, |buf| {
-        buf.copy_from_slice(&block)
-    })?;
-    // Under a handle the extent block reaches its final location via checkpoint
-    // after the transaction commits; suppress the direct write so metadata never
-    // precedes its commit (WAL). See `fs::Ext4::write_back_inode_desc`.
-    if handle.is_none() {
+    // untouched, a reused leaf gets one here.
+    let access = journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    access.patch(|buf| buf.copy_from_slice(&block))?;
+    // Under a live capture the extent block reaches its final location via
+    // checkpoint after the transaction commits; suppress the direct write so
+    // metadata never precedes its commit (WAL). See
+    // `fs::Ext4::write_back_inode_desc`.
+    if !access.is_live() {
         device.write_val(bid as usize * BLOCK_SIZE, &block)?;
     }
     Ok(())

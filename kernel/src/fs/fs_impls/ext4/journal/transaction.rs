@@ -236,16 +236,6 @@ impl Transaction {
         self.metadata.len()
     }
 
-    /// The captured after-image bytes of `bid`, when this transaction holds one.
-    ///
-    /// This backs the read side of the WAL suppression
-    /// ([`read_metadata_block`](super::read_metadata_block)): while a block is
-    /// captured here its newest bytes exist only in this buffer, so metadata
-    /// readers must be served from it, never from the (lagging) device.
-    pub(super) fn metadata_bytes(&self, bid: Ext4Bid) -> Option<&[u8]> {
-        self.metadata.get(&bid).map(MetaBuffer::as_bytes)
-    }
-
     /// Captures a freshly allocated metadata block as a zeroed after-image
     /// (jbd2 `get_create_access`): its prior device content is meaningless, so
     /// no read is needed. Idempotent — a block already captured (possibly with
@@ -338,7 +328,12 @@ impl Transaction {
     }
 
     /// The captured after-image bytes for `bid`, or `None` if not captured.
-    /// Inspection/test accessor.
+    ///
+    /// Backs the read side of the WAL suppression
+    /// ([`read_metadata_block`](super::read_metadata_block)): while a block is
+    /// captured here its newest bytes exist only in this buffer, so metadata
+    /// readers must be served from it, never from the (lagging) device. Also
+    /// the inspection accessor tests use.
     pub(super) fn buffer_bytes(&self, bid: Ext4Bid) -> Option<&[u8]> {
         self.metadata.get(&bid).map(MetaBuffer::as_bytes)
     }

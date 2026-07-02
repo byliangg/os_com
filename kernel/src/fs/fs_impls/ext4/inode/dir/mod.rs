@@ -246,10 +246,8 @@ impl InodeInner {
             .map_err(|_| {
                 Error::with_message(Errno::EIO, "failed to read directory block for journaling")
             })?;
-        journal::get_create_access(handle, phys, journal::TriggerType::DirBlock)?;
-        journal::dirty_metadata(handle, phys, journal::TriggerType::DirBlock, |buf| {
-            buf.copy_from_slice(&block)
-        })
+        journal::get_create_access(handle, phys, journal::TriggerType::DirBlock)?
+            .patch(|buf| buf.copy_from_slice(&block))
     }
 
     /// Writes a new entry into the selected slot, splitting the predecessor's
