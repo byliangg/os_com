@@ -1,0 +1,29 @@
+# P4 journal runlist (test.md §4 P4): JBD2 commit/recovery specials, mount/
+# umount replay + metadata pressure, fsync/fdatasync durability. Owed since P4
+# (hard gate there was the guest mount-recovery matrix), repaid on the P5
+# harness. The _scratch_shutdown crash cases (generic/052 054 055 388) NOTRUN
+# until the EXT4_IOC_SHUTDOWN ioctl lands (P5 T2/T3).
+ext4/021
+ext4/022
+ext4/030
+ext4/031
+ext4/032
+ext4/033
+ext4/045
+generic/043
+generic/044
+generic/045
+generic/046
+generic/047
+generic/048
+generic/049
+generic/052
+generic/054
+generic/055
+generic/068
+generic/076
+generic/083
+generic/192
+generic/388
+generic/392
+generic/530

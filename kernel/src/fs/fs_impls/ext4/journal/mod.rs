@@ -65,7 +65,7 @@
 //! the inode-table page cache) and identify the affected block by its number;
 //! op-journaling captures the block's after-image into a [`Transaction`] buffer.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
@@ -436,8 +436,18 @@ pub(super) struct Journal {
     commit_trigger: WaitQueue,
     /// Where [`log_wait_commit`](Journal::log_wait_commit) sleepers wait for
     /// `committed_tid` to advance (jbd2 `j_wait_done_commit`). Woken by the commit
-    /// thread after each successful commit.
+    /// thread after each successful commit, and by
+    /// [`note_credits_released`](Journal::note_credits_released) so
+    /// capacity-blocked `journal_start`s re-check room that opened up without a
+    /// commit.
     commit_wait_queue: WaitQueue,
+    /// Bumped whenever a handle releases its credit reservation
+    /// (`journal_stop`), so a `journal_start` blocked on a full transaction can
+    /// tell "room may have opened up" apart from a spurious wake — a full
+    /// transaction whose reservations were never captured is not committable,
+    /// so waiting on its commit alone could sleep forever while the space it
+    /// held was already released.
+    credit_release_epoch: AtomicU64,
     /// Set by [`stop_commit_thread`](Journal::stop_commit_thread) to make the
     /// commit thread exit its loop on the next wake.
     stop: AtomicBool,
@@ -548,6 +558,7 @@ impl Journal {
             committed_tid: AtomicU32::new(committed_tid),
             commit_trigger: WaitQueue::new(),
             commit_wait_queue: WaitQueue::new(),
+            credit_release_epoch: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
@@ -767,6 +778,55 @@ impl Journal {
     /// transaction's committability in its `wait_until` closure.
     pub(super) fn request_commit(&self) {
         self.commit_trigger.wake_one();
+    }
+
+    /// The current credit-release epoch (see
+    /// [`credit_release_epoch`](Journal::credit_release_epoch)). Snapshot it
+    /// under the state lock that just observed "transaction full": any release
+    /// after that observation bumps the epoch, so a waiter comparing against
+    /// the snapshot cannot miss the wakeup.
+    pub(super) fn credit_release_epoch(&self) -> u64 {
+        self.credit_release_epoch.load(Ordering::Acquire)
+    }
+
+    /// Records that a handle released its credit reservation and wakes
+    /// capacity-blocked `journal_start` sleepers to re-check for room.
+    pub(super) fn note_credits_released(&self) {
+        self.credit_release_epoch.fetch_add(1, Ordering::Release);
+        self.commit_wait_queue.wake_all();
+    }
+
+    /// Blocks until the reservation pressure that kept a `journal_start` out of
+    /// transaction `tid` may have eased: `tid` committed, some handle released
+    /// credits (the epoch moved past `epoch`), or the journal aborted (error).
+    /// The caller re-checks capacity and retries — this is the sleeping half of
+    /// jbd2 `add_transaction_credits`' wait loop.
+    ///
+    /// # Locking
+    ///
+    /// Callers hold no journal lock (the state lock is dropped before waiting)
+    /// but typically **do** hold inode `inner` locks — that is safe because the
+    /// wait only needs other handles to close or the commit thread to run, and
+    /// neither takes `inner`: operations acquire all their inode locks *before*
+    /// `journal_start` (lock order `inner` ① → handle ②), and the commit
+    /// thread's ordered flush snapshots the page cache instead of pinning
+    /// `inner` across IO (see `Inode::flush_ordered_data`).
+    pub(super) fn wait_for_transaction_room(&self, tid: Tid, epoch: u64) -> Result<()> {
+        self.request_commit();
+        self.commit_wait_queue.wait_until(|| {
+            if self.is_aborted() {
+                // The journal died while we waited; surface it rather than
+                // retrying against a journal that accepts no work.
+                return Some(Err(Error::with_message(
+                    Errno::EIO,
+                    "journal aborted while waiting for transaction room",
+                )));
+            }
+            if tid_geq(self.committed_tid(), tid) || self.credit_release_epoch() != epoch {
+                return Some(Ok(()));
+            }
+            None
+        })
     }
 
     /// Returns whether the journal has been aborted by a failed commit (see the

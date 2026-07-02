@@ -1,0 +1,22 @@
+# P3 namespace runlist (test.md §4 P3): rename/hardlink/symlink/nametest/
+# dirstress + directory hierarchy, permissions, atime, enospc. Owed since P3
+# (hard gate there was the guest namespace matrix + e2fsck), repaid on the P5
+# harness.
+generic/001
+generic/002
+generic/003
+generic/005
+generic/007
+generic/010
+generic/011
+generic/015
+generic/023
+generic/024
+generic/035
+generic/083
+generic/087
+generic/100
+generic/124
+generic/126
+generic/184
+generic/192

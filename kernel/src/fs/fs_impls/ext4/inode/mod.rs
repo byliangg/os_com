@@ -869,13 +869,31 @@ impl Inode {
     /// (that goes through the journal). Called by the commit pipeline for each
     /// ordered inode.
     ///
-    /// A `read()` guard suffices: `sync_data_pages` takes `&self` on
-    /// [`InodeInner`] and only reads the page cache to flush its dirty pages
-    /// through the extent-mapped backend to their final device blocks — it mutates
-    /// no `InodeInner` field. In the global lock order this holds only
-    /// `inner.read()` (a leaf here) and no journal state lock.
+    /// # Locking: must not pin `inner` across the flush IO
+    ///
+    /// This runs on the **commit thread**. An operation may be sleeping in
+    /// `journal_start`'s capacity wait while holding its `inner.write()` —
+    /// waiting for this very commit — so holding `inner` here for the flush
+    /// duration would deadlock the two. Instead the page cache handle and the
+    /// size are snapshotted under a transient `inner.read()` and the flush runs
+    /// with no inode lock held; the page cache and its extent-mapped backend
+    /// are internally synchronized, and `flush_range` only writes pages that
+    /// are still dirty when it reaches them (a racing writer's new dirty pages
+    /// belong to a later transaction — they could not have joined the
+    /// committing one).
     pub(in crate::fs::fs_impls::ext4) fn flush_ordered_data(&self) -> Result<()> {
-        self.inner.read().sync_data_pages()
+        let (page_cache, file_size) = {
+            let inner = self.inner.read();
+            let Ok(page_cache) = inner.page_cache() else {
+                // Not data-backed (fast symlink): nothing ordered to flush.
+                return Ok(());
+            };
+            (page_cache.clone(), inner.file_size())
+        };
+        if file_size == 0 {
+            return Ok(());
+        }
+        page_cache.flush_range(0..file_size)
     }
 
     /// Maps logical block `iblock` to its physical block, or `None` for a hole.

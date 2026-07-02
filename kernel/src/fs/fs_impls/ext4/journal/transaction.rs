@@ -439,39 +439,66 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 /// Opens a handle on the journal's running transaction, reserving `credits`
 /// metadata blocks (jbd2 `jbd2_journal_start`).
 ///
-/// If no transaction is running, a fresh one is created with the next tid. The
-/// capacity check here is basic — Phase 4 does not block or trigger a commit
-/// under space pressure (P7, with precise credit accounting); it simply refuses
-/// to over-commit a single transaction.
+/// If no transaction is running, a fresh one is created with the next tid. When
+/// the running transaction cannot fit the reservation, this blocks until it
+/// commits or another handle releases credits, then retries — the minimal form
+/// of jbd2 `add_transaction_credits`' wait loop. (Precise credit accounting and
+/// commit *batching* under pressure remain P7; this only stops a full
+/// transaction from surfacing as `ENOSPC` to unlink/write under load.)
 pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
-    // An aborted journal (a commit failed and was lost) accepts no new work:
-    // capturing into it would publish fragments of the lost transaction.
-    if journal.is_aborted() {
-        return_errno_with_message!(Errno::EIO, "journal aborted");
+    // A reservation that exceeds an *empty* transaction's capacity can never
+    // succeed no matter how many commits retire; refuse it outright so the
+    // wait loop below always terminates.
+    if credits > journal.max_credits() {
+        return_errno_with_message!(Errno::ENOSPC, "reservation exceeds journal capacity");
     }
-    let mut st = journal.state_write();
+    loop {
+        // An aborted journal (a commit failed and was lost) accepts no new
+        // work: capturing into it would publish fragments of the lost
+        // transaction. Re-checked every retry — the wait below also ends on
+        // abort.
+        if journal.is_aborted() {
+            return_errno_with_message!(Errno::EIO, "journal aborted");
+        }
 
-    if st.running.is_none() {
-        let tid = st.next_tid;
-        st.next_tid = st.next_tid.wrapping_add(1);
-        st.running = Some(Transaction::new(tid));
+        let (tid, epoch) = {
+            let mut st = journal.state_write();
+
+            if st.running.is_none() {
+                let tid = st.next_tid;
+                st.next_tid = st.next_tid.wrapping_add(1);
+                st.running = Some(Transaction::new(tid));
+            }
+
+            // Split the borrow: read the capacity bound off `journal`, then
+            // mutate the running transaction. `running` is `Some` by
+            // construction above.
+            let running = st.running.as_mut().unwrap();
+            let tid = running.tid;
+
+            if check_capacity(journal, running, credits).is_ok() {
+                running.t_updates += 1;
+                running.outstanding_credits += credits;
+
+                return Ok(Handle {
+                    tid,
+                    credits,
+                    journal: Arc::downgrade(journal),
+                });
+            }
+
+            // Full. Snapshot the release epoch under the same lock that
+            // observed fullness so a release between dropping the lock and
+            // sleeping still wakes us (it must bump the epoch after this).
+            (tid, journal.credit_release_epoch())
+        };
+
+        // Sleeping here can hold the caller's inode locks; see
+        // `wait_for_transaction_room`'s locking contract for why that cannot
+        // deadlock (open handles drain without our locks, and the commit
+        // thread takes no `inner`).
+        journal.wait_for_transaction_room(tid, epoch)?;
     }
-
-    // Split the borrow: read the capacity bound off `journal`, then mutate the
-    // running transaction. `running` is `Some` by construction above.
-    let running = st.running.as_mut().unwrap();
-    let tid = running.tid;
-
-    check_capacity(journal, running, credits)?;
-
-    running.t_updates += 1;
-    running.outstanding_credits += credits;
-
-    Ok(Handle {
-        tid,
-        credits,
-        journal: Arc::downgrade(journal),
-    })
 }
 
 /// Closes a handle, releasing its credit reservation (jbd2 `jbd2_journal_stop`).
@@ -485,7 +512,7 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
         .upgrade()
         .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
 
-    let should_commit = {
+    let released = {
         let mut st = journal.state_write();
         if let Some(running) = st.running.as_mut()
             && running.tid == handle.tid
@@ -497,14 +524,19 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
             // metadata, it is committable. Phase 4 is commit-per-op: signal the
             // commit thread now. This is asynchronous — the operation does not wait
             // for the commit (durability is `fsync`'s job, via `log_wait_commit`).
-            running.t_updates == 0 && running.nr_metadata_blocks() > 0
+            Some(running.t_updates == 0 && running.nr_metadata_blocks() > 0)
         } else {
-            false
+            None
         }
     };
 
-    if should_commit {
-        journal.request_commit();
+    if let Some(should_commit) = released {
+        // Wake capacity-blocked `journal_start`s: this handle's reservation is
+        // back in the pool even if the transaction is not committable.
+        journal.note_credits_released();
+        if should_commit {
+            journal.request_commit();
+        }
     }
     Ok(())
 }
@@ -741,6 +773,27 @@ mod tests {
         let j = journaled_fixture(64, 1, 1);
         let over = j.max_credits() + 1;
         assert!(journal_start(&j, over).is_err());
+    }
+
+    #[ktest]
+    fn journal_start_waits_for_credit_release() {
+        let j = journaled_fixture(64, 1, 1);
+        let h1 = journal_start(&j, j.max_credits()).unwrap();
+
+        // A second start cannot fit until `h1` releases its reservation. Hand
+        // `h1` to another thread to release it: the main thread blocks in
+        // `journal_start` and must be woken by the release itself — the fixture
+        // runs no commit thread, and the full transaction captured nothing, so
+        // no commit will ever carry its tid.
+        let releaser = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            crate::thread::Thread::yield_now();
+            journal_stop(h1).unwrap();
+        })
+        .spawn();
+
+        let h2 = journal_start(&j, 4).unwrap();
+        journal_stop(h2).unwrap();
+        releaser.join();
     }
 
     #[ktest]

@@ -28,6 +28,24 @@ use crate::{
     vm::page_cache::PageCache,
 };
 
+/// Applies Linux's default `relatime` policy on access: bump atime only when
+/// it is not newer than mtime/ctime, or is at least a day stale.
+///
+/// The VFS mount layer models the per-mount atime options
+/// (noatime/relatime/strictatime/nodiratime) but nothing plumbs them down to
+/// filesystem implementations yet, so ext4 applies the default-mount policy
+/// itself (exfat likewise updates times fs-locally). `<=` instead of Linux's
+/// strict `<` tolerates second-granularity timestamps: a file created and
+/// written within one second must still get its first-access update.
+fn touch_atime_relatime(inode: &Ext4Inode) {
+    const A_DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let atime = inode.atime();
+    let now = crate::fs::fs_impls::ext4::utils::now();
+    if atime <= inode.mtime() || atime <= inode.ctime() || now.saturating_sub(atime) >= A_DAY {
+        inode.set_atime(now);
+    }
+}
+
 impl FileOps for Ext4Inode {
     fn read_at(
         &self,
@@ -36,7 +54,9 @@ impl FileOps for Ext4Inode {
         _status_flags: StatusFlags,
     ) -> Result<usize> {
         // Phase 1 serves O_DIRECT reads through the page cache as well.
-        self.read_at(offset, writer)
+        let len = self.read_at(offset, writer)?;
+        touch_atime_relatime(self);
+        Ok(len)
     }
 
     fn write_at(
@@ -55,7 +75,9 @@ impl FileOps for Ext4Inode {
     }
 
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
-        self.readdir_at(offset, visitor)
+        let count = self.readdir_at(offset, visitor)?;
+        touch_atime_relatime(self);
+        Ok(count)
     }
 }
 

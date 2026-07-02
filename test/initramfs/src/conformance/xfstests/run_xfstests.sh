@@ -14,24 +14,33 @@ TEST_DEV=${XFSTESTS_TEST_DEV:-/dev/vdc}
 SCRATCH_DEV=${XFSTESTS_SCRATCH_DEV:-/dev/vdd}
 export TEST_DEV SCRATCH_DEV
 
-# Mount xfstests images with explicit error checking so a mount failure is not
+# FSTYP comes from local.config — the same file ./check reads — so the mounts
+# below always use the filesystem the suite is configured for.
+. "$XFSTESTS_DIR/local.config"
+
+# Mount the test image with explicit error checking so a mount failure is not
 # silently skipped (which would cause ./check to run against empty directories
 # and still print the "all passed" success line).
-for entry in "$TEST_DEV:$XFSTESTS_DIR/test:test" "$SCRATCH_DEV:$XFSTESTS_DIR/scratch:scratch"; do
-    dev="${entry%%:*}"; rest="${entry#*:}"; mnt="${rest%%:*}"; role="${rest##*:}"
+#
+# The scratch device is deliberately NOT pre-mounted: xfstests wants
+# SCRATCH_DEV unmounted between tests (./check re-mkfses it per test via
+# _scratch_mkfs), and pre-mounting couples every run to whatever filesystem the
+# previous run's last scratch test left on the image — e.g. a sized-down
+# _scratch_mkfs_sized leftover that the kernel under test may rightly refuse.
+for dev in "$TEST_DEV" "$SCRATCH_DEV"; do
     if [ ! -b "$dev" ]; then
-        echo "Expected $dev to be a block device for xfstests $role" >&2
-        exit 1
-    fi
-    if ! mount -t ext2 "$dev" "$mnt"; then
-        echo "Failed to mount $dev on $mnt ($role)" >&2
-        exit 1
-    fi
-    if ! mountpoint -q "$mnt"; then
-        echo "$mnt is not a mountpoint after mount(8) succeeded ($role)" >&2
+        echo "Expected $dev to be a block device for xfstests" >&2
         exit 1
     fi
 done
+if ! mount -t "$FSTYP" "$TEST_DEV" "$XFSTESTS_DIR/test"; then
+    echo "Failed to mount $TEST_DEV on $XFSTESTS_DIR/test (test)" >&2
+    exit 1
+fi
+if ! mountpoint -q "$XFSTESTS_DIR/test"; then
+    echo "test dir is not a mountpoint after mount(8) succeeded" >&2
+    exit 1
+fi
 
 RUNLIST_FILE=""
 TEST_ARGS=""

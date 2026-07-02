@@ -181,15 +181,21 @@ $(SSD_IMAGE):
 	@dd if=/dev/zero of=$(SSD_IMAGE) bs=256M count=1
 	@mke2fs -t ext2 -F $(SSD_IMAGE)
 
+# Must match MKFS_OPTIONS in src/conformance/xfstests/local.config: the test
+# device is created once here (check never re-mkfses it), while the scratch
+# device gets re-mkfsed by check with local.config's MKFS_OPTIONS.
+XFSTESTS_MKFS := mke2fs -t ext4 -F -q -b 4096 -I 256 \
+	-O has_journal,extent,filetype,^metadata_csum,^dir_index,^64bit,^flex_bg,^inline_data,^resize_inode,^uninit_bg
+
 $(XFSTESTS_TEST_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@truncate -s $(XFSTESTS_DISK_SIZE) $(XFSTESTS_TEST_IMAGE)
-	@mkfs.ext2 $(XFSTESTS_TEST_IMAGE)
+	@$(XFSTESTS_MKFS) $(XFSTESTS_TEST_IMAGE)
 
 $(XFSTESTS_SCRATCH_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@truncate -s $(XFSTESTS_DISK_SIZE) $(XFSTESTS_SCRATCH_IMAGE)
-	@mkfs.ext2 $(XFSTESTS_SCRATCH_IMAGE)
+	@$(XFSTESTS_MKFS) $(XFSTESTS_SCRATCH_IMAGE)
 
 .PHONY: format
 format:
