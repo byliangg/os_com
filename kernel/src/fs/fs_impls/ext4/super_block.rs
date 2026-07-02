@@ -4,9 +4,9 @@
 //!
 //! The ext4 superblock shares its first 264 bytes of layout with ext2; the
 //! ext4-specific fields (64-bit counts, descriptor size, checksum) live in the
-//! trailing reserved area and are parsed in later phases. Phase 1 mounts only
-//! minimal-feature images (64-bit, flex_bg, and checksums disabled), so the
-//! shared layout suffices.
+//! trailing reserved area and are parsed when P6 brings the features that need
+//! them. Until then only minimal-feature images (64-bit, flex_bg, and
+//! checksums disabled) mount, so the shared layout suffices.
 
 use super::{
     feature::{
@@ -27,7 +27,7 @@ const SUPER_BLOCK_SIZE: usize = 1024;
 ///
 /// Counts that the `64BIT` feature would widen are stored as `u64` from the
 /// start so enabling that feature later (Phase 6) reads the high halves without
-/// changing this type; in Phase 1 the high halves are zero.
+/// changing this type; until then the high halves are zero.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     inodes_count: u32,
@@ -65,8 +65,8 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "bad ext4 magic number");
         }
 
-        // Phase 1 supports only the 4 KiB block size that the page-cache model
-        // assumes (page index == logical block).
+        // Only the 4 KiB block size the page-cache model assumes (page index ==
+        // logical block) is supported.
         if sb.log_block_size != 2 {
             return_errno_with_message!(Errno::EINVAL, "unsupported block size (4 KiB only)");
         }
@@ -113,6 +113,20 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "ext4 image without the extents feature");
         }
         let feature_compat = FeatureCompatSet::from_bits_truncate(sb.feature_compat);
+
+        // A ro_compat feature we cannot safely *write* (e.g. `METADATA_CSUM`
+        // before P6) must not mount writable — our writes would corrupt that
+        // feature's invariants for every other implementation. Linux falls
+        // back to a read-only mount and refuses `MS_RDWR` with `EROFS`
+        // (`ext4_setup_super`); with no read-only mode here yet, refuse the
+        // mount the same way. Checked on the raw bits so bits unknown to
+        // `FeatureRoCompatSet` are caught too.
+        if sb.feature_ro_compat & !RO_COMPAT_SUPP.bits() != 0 {
+            return_errno_with_message!(
+                Errno::EROFS,
+                "unsupported read-only-compatible feature on a writable mount"
+            );
+        }
         let feature_ro_compat = FeatureRoCompatSet::from_bits_truncate(sb.feature_ro_compat);
 
         let nr_inodes_per_group = sb.inodes_per_group;
@@ -383,19 +397,10 @@ impl SuperBlock {
     }
 
     /// Returns whether the volume has a journal that must be replayed before it
-    /// can be written. Phase 1 is read-only, so a recovering volume is simply
-    /// mounted read-only.
+    /// can be written (the `RECOVER` bit is set or an orphan list is pending).
+    /// `Ext4::open` runs that recovery at mount, before any write.
     pub(super) fn needs_recovery(&self) -> bool {
         self.feature_incompat.contains(FeatureIncompatSet::RECOVER) || self.last_orphan != 0
-    }
-
-    /// Returns whether the volume can be mounted writable: it carries no
-    /// read-only-compatible feature outside the supported set, and needs no
-    /// journal recovery. Phase 1 never writes, but this drives the read-only
-    /// gate wired up in Task 6.
-    #[cfg_attr(not(ktest), expect(dead_code))]
-    pub(super) fn is_writable(&self) -> bool {
-        RO_COMPAT_SUPP.contains(self.feature_ro_compat) && !self.needs_recovery()
     }
 }
 
@@ -568,7 +573,7 @@ mod tests {
         assert_eq!(sb.nr_inode_table_blocks_per_group(), 16);
         assert_eq!(sb.nr_block_groups(), 1);
         assert!(sb.feature_incompat().contains(FeatureIncompatSet::EXTENTS));
-        assert!(sb.is_writable());
+        assert!(!sb.needs_recovery());
     }
 
     #[ktest]
@@ -589,6 +594,24 @@ mod tests {
     fn reject_unsupported_incompat() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.feature_incompat |= FeatureIncompatSet::IS_64BIT.bits();
+        assert!(SuperBlock::try_from(raw).is_err());
+    }
+
+    /// A ro_compat feature outside `RO_COMPAT_SUPP` must refuse the (writable)
+    /// mount with `EROFS` — writing such a volume would corrupt the feature's
+    /// invariants (Linux `ext4_setup_super` parity).
+    #[ktest]
+    fn reject_unsupported_ro_compat_for_writable_mount() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.feature_ro_compat |= FeatureRoCompatSet::METADATA_CSUM.bits();
+        let Err(err) = SuperBlock::try_from(raw) else {
+            panic!("unsupported ro_compat must not mount writable");
+        };
+        assert_eq!(err.error(), Errno::EROFS);
+
+        // A bit unknown to `FeatureRoCompatSet` entirely (raw-bits check).
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.feature_ro_compat |= 1 << 12; // RO_COMPAT_READONLY
         assert!(SuperBlock::try_from(raw).is_err());
     }
 

@@ -71,8 +71,8 @@ bitflags! {
 }
 
 bitflags! {
-    /// Read-only compatible features. An unknown bit not in `RO_COMPAT_SUPP`
-    /// forces a read-only mount.
+    /// Read-only compatible features. A bit not in [`RO_COMPAT_SUPP`] refuses
+    /// the (writable) mount — see the constant's doc.
     pub(super) struct FeatureRoCompatSet: u32 {
         /// `RO_COMPAT_SPARSE_SUPER`: sparse superblock and GDT backups.
         const SPARSE_SUPER = 1 << 0;
@@ -103,8 +103,10 @@ bitflags! {
 ///
 /// The reader understands typed directory entries (`FILETYPE`) and extent block
 /// mapping (`EXTENTS`). Phase 4 adds `RECOVER`: a volume left with the journal
-/// needing replay is now *mounted and recovered* (`Ext4::open` runs
-/// [`journal::recover`](super::journal) and clears the bit), not rejected as it
+/// needing replay is now *mounted and recovered* — `Ext4::open` replays the
+/// dirty log, then *stamps* the bit for its own writable session (cleared only
+/// at clean unmount, so a crash of our session forces the next mount to
+/// replay), not rejected as it
 /// was in Phases 1–3 when there was no journal machinery. Other incompatible
 /// features (64-bit, flex_bg, csum_seed, ...) are added in later phases and must
 /// stay out of this mask until then, so an image needing them is rejected rather
@@ -117,8 +119,9 @@ pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYP
 /// Read-only compatible features this implementation handles.
 ///
 /// These need no extra code to read correctly. A volume carrying any other
-/// `ro_compat` bit (e.g. `METADATA_CSUM`, added in Phase 6) is mounted
-/// read-only rather than rejected.
+/// `ro_compat` bit (e.g. `METADATA_CSUM`, added in Phase 6) must not be
+/// written; with no read-only mount mode yet, `SuperBlock::try_from` refuses
+/// the mount with `EROFS` (Linux `ext4_setup_super` parity).
 pub(super) const RO_COMPAT_SUPP: FeatureRoCompatSet = FeatureRoCompatSet::SPARSE_SUPER
     .union(FeatureRoCompatSet::LARGE_FILE)
     .union(FeatureRoCompatSet::HUGE_FILE)
