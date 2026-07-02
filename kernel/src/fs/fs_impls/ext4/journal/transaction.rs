@@ -44,20 +44,18 @@
 //! [`journal_start`] / [`journal_stop`] / [`journal_extend`] / [`journal_restart`]
 //! take the journal state lock (`Journal::state`) for the whole operation. In the
 //! global lock order this is the jbd2 handle — position ②, taken after the inode
-//! inner lock ① and before the ExtentTree lock ③. Task 2a itself acquires no
-//! other filesystem lock, so this note only fixes the intended order for the
-//! later task that threads a live [`Handle`] through the metadata operations.
+//! inner lock ① and before the ExtentTree lock ③ (every journaled operation
+//! now threads a live [`Handle`] through the metadata funnels in this order).
 
-// The transaction *lifecycle* half of this module is staged-but-unwired: no
-// production metadata operation opens a handle yet (op-journaling is the Int-B
-// follow-up), so `journal_start`/`journal_stop`/`journal_extend`/
-// `journal_restart`, the credit/handle bookkeeping, and the non-`Running`
-// `TransactionState` variants are reachable only through ktest. The *capture*
-// half — `capture_write`/`capture_create`/`apply_patch` and [`MetaBuffer`] — is
-// already live in non-ktest via the metadata-access funnels' handle path. This
-// one module-level expectation absorbs the still-dead lifecycle items in
-// non-ktest (avoiding a marker on each); it is absent in ktest, where all of it
-// is exercised.
+// Most of this module is live in non-ktest since Int-B: every journaled
+// metadata operation opens a handle (`Ext4::begin_op` → `journal_start`,
+// closed by `OpHandle::drop` → `journal_stop`), the capture half feeds the
+// metadata funnels, and `Handle::tid` backs fsync's `sync_tid`. Still dead in
+// non-ktest builds: `journal_extend`/`journal_restart` (mid-op credit growth —
+// ops use fixed conservative credits until P7's precise accounting) and the
+// non-`Running`/`Finished` `TransactionState` variants (the staged commit
+// pipeline states). This one module-level expectation absorbs those (avoiding
+// a marker on each); it is absent in ktest, where all of it is exercised.
 #![cfg_attr(not(ktest), expect(dead_code))]
 
 use super::{
@@ -67,8 +65,9 @@ use super::{
 
 /// A captured whole-block after-image for one metadata block, held in a running
 /// transaction until commit writes it to the log. Model A (op-time capture):
-/// seeded by `get_write_access` (from the device) or `get_create_access`
-/// (zeros), then patched in place as the operation modifies its typed metadata.
+/// seeded by `get_write_access` (from the newest retained un-checkpointed
+/// image, else the device) or `get_create_access` (zeros), then patched in
+/// place as the operation modifies its typed metadata.
 pub(super) struct MetaBuffer {
     data: Box<[u8; BLOCK_SIZE]>,
 }

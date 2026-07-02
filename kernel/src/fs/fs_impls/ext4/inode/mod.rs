@@ -21,11 +21,14 @@
 //! is:
 //!
 //! ```text
-//! Inode::inner → ExtentManager::state → Ext4::super_block → BlockGroup::metadata
+//! Inode::inner → journal handle → ExtentManager::state
+//!     → Ext4::s_orphan_lock → Ext4::super_block → BlockGroup::metadata
 //! ```
 //!
-//! The journal handle (Phase 4) sits between `inner` and the extent tree; the
-//! Phase-2 `journal` wrappers are no-ops and take no lock. `BlockGroup::inode_cache`
+//! The journal handle (`Ext4::begin_op` → `journal_start`, position ②) is taken
+//! right after `inner`; `s_orphan_lock` (the orphan chain) sits after the handle
+//! and before the superblock; the journal *state* lock is a leaf the metadata
+//! funnels take last (never across a wait). `BlockGroup::inode_cache`
 //! is independent: it is never held while acquiring `super_block`/`metadata`, nor
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
@@ -589,6 +592,11 @@ impl Inode {
     /// (see `InodeInner::sync_tid`). Used by `Ext4::create_inode`, whose fresh
     /// descriptor was written under the creating op's handle before this
     /// `Inode` existed. A no-op without a handle.
+    ///
+    /// Taking `inner` here while the caller holds the op handle formally
+    /// reverses the inner ① → handle ② order, but cannot deadlock: the inode
+    /// is not yet published (no cache entry, no second reference), so this
+    /// write lock is uncontended and participates in no cycle.
     pub(super) fn record_sync_tid(&self, handle: Option<&journal::Handle>) {
         if let Some(handle) = handle {
             self.inner.write().sync_tid = handle.tid();

@@ -603,20 +603,17 @@ impl Ext4 {
             warn!("ext4: inode {ino} is already on the orphan list");
             return Ok(chain.get(idx + 1).copied().unwrap_or(0));
         }
-        // Capture first (fallible), then mutate memory (infallible), so an
-        // error leaves head, mirror, and transaction mutually consistent. The
-        // head mutations are serialized by `s_orphan_lock`, so the values read
-        // here cannot go stale before the write below.
-        let (free_blocks, free_inodes, old_head) = {
-            let sb = self.super_block.read();
-            (
-                sb.free_blocks_count(),
-                sb.free_inodes_count(),
-                sb.last_orphan(),
-            )
-        };
-        journal_superblock(handle, free_blocks, free_inodes, ino)?;
-        self.super_block.write().set_last_orphan(ino);
+        // One superblock WRITE guard across both the capture and the mutation:
+        // the counters are guarded by the superblock lock (a concurrent
+        // alloc/free holds it across its own capture), so snapshotting them
+        // outside it could patch stale values over a newer capture. Capture
+        // first (fallible), then mutate (infallible), so an error leaves head,
+        // mirror, and transaction mutually consistent.
+        let mut sb = self.super_block.write();
+        let old_head = sb.last_orphan();
+        journal_superblock(handle, sb.free_blocks_count(), sb.free_inodes_count(), ino)?;
+        sb.set_last_orphan(ino);
+        drop(sb);
         chain.insert(0, ino);
         Ok(old_head)
     }
@@ -644,13 +641,11 @@ impl Ext4 {
         };
         let next = chain.get(idx + 1).copied().unwrap_or(0);
         if idx == 0 {
-            // Capture first, then mutate (see `orphan_add`).
-            let (free_blocks, free_inodes) = {
-                let sb = self.super_block.read();
-                (sb.free_blocks_count(), sb.free_inodes_count())
-            };
-            journal_superblock(handle, free_blocks, free_inodes, next)?;
-            self.super_block.write().set_last_orphan(next);
+            // One superblock write guard across capture + mutation, capture
+            // first (see `orphan_add`).
+            let mut sb = self.super_block.write();
+            journal_superblock(handle, sb.free_blocks_count(), sb.free_inodes_count(), next)?;
+            sb.set_last_orphan(next);
         } else {
             self.patch_orphan_next_on_disk(chain[idx - 1], next, handle)?;
         }
@@ -806,15 +801,17 @@ impl Ext4 {
                 }
             };
             let mut chain = self.s_orphan_lock.lock();
-            let sb = self.super_block.read();
+            // One superblock write guard across capture + mutation (see
+            // `orphan_add`).
+            let mut sb = self.super_block.write();
             if let Err(e) =
                 journal_superblock(op.get(), sb.free_blocks_count(), sb.free_inodes_count(), 0)
             {
                 warn!("ext4: could not journal the cleared orphan head: {e:?}");
                 return;
             }
+            sb.set_last_orphan(0);
             drop(sb);
-            self.super_block.write().set_last_orphan(0);
             chain.clear();
         }
     }
@@ -1113,8 +1110,8 @@ impl Drop for Ext4 {
                             "ext4 unmount could not persist the cleared RECOVER flag: {:?}",
                             e
                         );
-                    } else if let Err(e) = self.block_device.sync() {
-                        error!("ext4 unmount barrier failed: {:?}", e);
+                    } else if !matches!(self.block_device.sync(), Ok(BioStatus::Complete)) {
+                        error!("ext4 unmount barrier failed");
                     }
                 }
                 Err(e) => error!("ext4 journal unmount flush failed: {:?}", e),
