@@ -269,6 +269,13 @@ impl Inode for Ext4Inode {
         Ok(self.create(name, type_, mode.into())?)
     }
 
+    fn create_symlink(&self, name: &str, mode: InodeMode, target: &str) -> Result<Arc<dyn Inode>> {
+        // One transaction for inode + target (Linux ext4_symlink) — the VFS
+        // default's create-then-write_link window persists a target-less
+        // symlink on a crash, which fsck rejects.
+        Ok(self.create_symlink(name, mode.into(), target)?)
+    }
+
     fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
         let new_inode = match type_ {
             MknodType::CharDevice(device_id) => {

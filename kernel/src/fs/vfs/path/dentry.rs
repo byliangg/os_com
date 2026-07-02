@@ -407,6 +407,26 @@ impl DirDentry<'_> {
         Ok(self.insert_positive_child(&mut children, name, new_child))
     }
 
+    /// Creates a `Dentry` for a new symbolic link to `target` (see
+    /// [`Inode::create_symlink`] for why this is one filesystem call rather
+    /// than `create` + `write_link`).
+    pub(super) fn create_symlink(
+        &self,
+        name: &str,
+        mode: InodeMode,
+        target: &str,
+    ) -> Result<Arc<Dentry>> {
+        let children = self.validate_child_absent(name)?;
+        let new_inode = self.inode.create_symlink(name, mode, target)?;
+        let mut children = children.upgrade();
+        let new_child = Dentry::new(
+            new_inode,
+            DentryOptions::Named((String::from(name), self.this())),
+        );
+
+        Ok(self.insert_positive_child(&mut children, name, new_child))
+    }
+
     /// Validates that `name` is absent and keeps that result stable for creation.
     fn validate_child_absent<'a>(
         &'a self,

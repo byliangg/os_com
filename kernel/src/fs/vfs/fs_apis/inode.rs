@@ -407,6 +407,20 @@ pub trait Inode: Any + FileOps + Send + Sync {
         Err(Error::new(Errno::ENOTDIR))
     }
 
+    /// Creates a symbolic link `name` pointing at `target`.
+    ///
+    /// The default composes `create` + `write_link`, which is **not
+    /// crash-atomic** on a journaled filesystem: a commit boundary between
+    /// the two steps can persist a symlink inode that has no target yet — a
+    /// state fsck rejects (Linux instead creates the inode and writes its
+    /// target under one transaction, `ext4_symlink`). Journaled filesystems
+    /// should override this to do both in a single transaction.
+    fn create_symlink(&self, name: &str, mode: InodeMode, target: &str) -> Result<Arc<dyn Inode>> {
+        let new_inode = self.create(name, InodeType::SymLink, mode)?;
+        new_inode.write_link(target)?;
+        Ok(new_inode)
+    }
+
     fn open(
         &self,
         access_mode: AccessMode,

@@ -557,12 +557,56 @@ impl Inode {
         self.create_with_seed(name, type_, perm, InodeSeed::Device(device_id))
     }
 
+    /// Creates a symlink together with its target in **one transaction**
+    /// (Linux `ext4_symlink`): the crash harness proved the two-step VFS
+    /// default (`create` + `write_link`) persists a target-less symlink —
+    /// a state fsck rejects — whenever a commit boundary lands between the
+    /// steps.
+    pub(in crate::fs::fs_impls::ext4) fn create_symlink(
+        &self,
+        name: &str,
+        perm: FilePerm,
+        target: &str,
+    ) -> Result<Arc<Inode>> {
+        // Same bound `write_link` enforces; checked before allocating anything.
+        if target.len() >= BLOCK_SIZE {
+            return_errno!(Errno::ENAMETOOLONG);
+        }
+        self.create_with_seed_and_init(
+            name,
+            InodeType::SymLink,
+            perm,
+            InodeSeed::ExtentRoot,
+            |child, fs, handle| {
+                let mut child_inner = child.inner.write();
+                let wrote_slow_target = child_inner.write_link(fs, target, handle)?;
+                drop(child_inner);
+                // data=ordered for a slow target (see `Inode::write_link`).
+                if wrote_slow_target && let Some(handle) = handle {
+                    handle.register_ordered_inode(child.ino(), Arc::downgrade(child))?;
+                }
+                Ok(())
+            },
+        )
+    }
+
     fn create_with_seed(
         &self,
         name: &str,
         type_: InodeType,
         perm: FilePerm,
         seed: InodeSeed,
+    ) -> Result<Arc<Inode>> {
+        self.create_with_seed_and_init(name, type_, perm, seed, |_, _, _| Ok(()))
+    }
+
+    fn create_with_seed_and_init(
+        &self,
+        name: &str,
+        type_: InodeType,
+        perm: FilePerm,
+        seed: InodeSeed,
+        init_child: impl FnOnce(&Arc<Inode>, &Arc<Ext4>, Option<&journal::Handle>) -> Result<()>,
     ) -> Result<Arc<Inode>> {
         let is_dir = type_ == InodeType::Dir;
         let dir_entry_file_type = DirEntryFileType::from(type_);
@@ -602,7 +646,12 @@ impl Inode {
                     parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type, op.get())
                 })
         } else {
-            parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type, op.get())
+            // Type-specific initialization (a symlink's target) runs inside
+            // this same transaction, *before* the name goes live: the entry
+            // must never point at a half-built inode, in memory or on disk.
+            init_child(&child, &fs, op.get()).and_then(|_| {
+                parent_inner.add_entry(&slot, name, child_ino, dir_entry_file_type, op.get())
+            })
         };
 
         if let Err(err) = result {

@@ -99,8 +99,10 @@ impl InodeInner {
     }
 
     /// Returns whether the target went to slow (extent-mapped data block)
-    /// storage — the case the caller must register as ordered data.
-    fn write_link(
+    /// storage — the case the caller must register as ordered data. Also
+    /// called by the atomic `create_symlink` (dir module) under the creating
+    /// transaction's handle.
+    pub(super) fn write_link(
         &mut self,
         fs: &Arc<Ext4>,
         target: &str,

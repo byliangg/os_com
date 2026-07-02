@@ -76,6 +76,26 @@ impl Path {
         Ok(Self::new(self.mount.clone(), new_child_dentry))
     }
 
+    /// Creates a new `Path` for a new symbolic link `name` → `target`.
+    ///
+    /// One filesystem call, not `new_fs_child` + `write_link`: a journaled
+    /// filesystem makes the two crash-atomic in a single transaction (see
+    /// [`Inode::create_symlink`]).
+    pub fn new_fs_symlink(&self, name: &str, mode: InodeMode, target: &str) -> Result<Self> {
+        if self
+            .inode()
+            .check_permission(Permission::MAY_WRITE)
+            .is_err()
+        {
+            return_errno!(Errno::EACCES);
+        }
+        let new_child_dentry = self
+            .dentry
+            .as_dir_dentry_or_err()?
+            .create_symlink(name, mode, target)?;
+        Ok(Self::new(self.mount.clone(), new_child_dentry))
+    }
+
     /// Creates a new `Path` to represent an unnamed temporary file.
     ///
     /// The returned inode has no directory entry and is invisible to `readdir`.
