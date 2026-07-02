@@ -12,6 +12,7 @@ use super::{
     feature::{
         FeatureCompatSet, FeatureIncompatSet, FeatureRoCompatSet, INCOMPAT_SUPP, RO_COMPAT_SUPP,
     },
+    journal,
     prelude::*,
 };
 
@@ -20,6 +21,11 @@ pub(super) const MAGIC_NUM: u16 = 0xef53;
 
 /// The main superblock is located at byte 1024 from the start of the device.
 pub(super) const SUPER_BLOCK_OFFSET: usize = 1024;
+
+/// The device block that holds the primary superblock. With 4 KiB blocks the
+/// superblock lives at byte [`SUPER_BLOCK_OFFSET`] (1024) inside block 0, so
+/// journaling it means capturing block 0.
+const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
 
 const SUPER_BLOCK_SIZE: usize = 1024;
 
@@ -357,6 +363,54 @@ impl SuperBlock {
     /// contract accepts only `0` (internal journal).
     pub(super) const fn journal_dev(&self) -> u32 {
         self.journal_dev
+    }
+
+    /// Captures this superblock's after-image into the operation's transaction
+    /// (block 0, RMW at [`SUPER_BLOCK_OFFSET`]), for op-time journaling. A
+    /// no-op without a handle.
+    ///
+    /// Patches **every field the filesystem mutates after mount** — the free
+    /// counters straight from `self`, plus `s_last_orphan` — every capture.
+    /// This is a single-writer rule, not a convenience: a capture that patched
+    /// only "its own" field would leave the others at the seed value, so two
+    /// captures patching disjoint fields in different transactions would
+    /// clobber each other's committed writes (the B-1 stale-seed class; the
+    /// Task 8 first attempt hit exactly this with a counts-only vs.
+    /// orphan-only pair). Taking the counters from `&self` makes a
+    /// stale/mixed pair unrepresentable — but the caller must hold the
+    /// superblock **write** guard across this call and the mutation it
+    /// precedes (every call site does; a snapshot taken outside the guard
+    /// could patch stale values over a newer capture).
+    ///
+    /// `last_orphan` stays an explicit parameter: `orphan_add`/`orphan_del`
+    /// deliberately capture the *new* head first (capture-fallible) and only
+    /// then mutate `self` (infallible), so at capture time `self.last_orphan`
+    /// still holds the old value. Every untracked field (label, feature
+    /// words, mount counters — changed only at mount time, never under an
+    /// operation) survives from the seed. The values are absolute, so
+    /// repeated captures converge on the final state.
+    pub(super) fn journal_capture(
+        &self,
+        handle: Option<&journal::Handle>,
+        last_orphan: u32,
+    ) -> Result<()> {
+        let free_blocks = self.free_blocks_count();
+        let free_inodes = self.free_inodes_count();
+        journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?;
+        journal::dirty_metadata(
+            handle,
+            SUPERBLOCK_BID,
+            journal::TriggerType::Superblock,
+            |buf| {
+                let off = SUPER_BLOCK_OFFSET;
+                let mut raw =
+                    RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
+                raw.free_blocks_count = free_blocks as u32;
+                raw.free_inodes_count = free_inodes;
+                raw.last_orphan = last_orphan;
+                buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
+            },
+        )
     }
 
     pub(super) const fn feature_compat(&self) -> FeatureCompatSet {

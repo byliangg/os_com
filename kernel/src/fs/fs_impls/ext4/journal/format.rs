@@ -194,6 +194,17 @@ pub(super) struct RawJournalHeader {
     pub(super) h_sequence: Be32,
 }
 
+impl RawJournalHeader {
+    /// Parses the 12-byte header from the head of a log-block buffer.
+    ///
+    /// The header lives at byte offset 0 of every jbd2 log block; this
+    /// reinterprets the first bytes with no device read. The recovery scanner
+    /// and the checkpoint reader parse headers through this one definition.
+    pub(super) fn parse(block: &[u8; BLOCK_SIZE]) -> Self {
+        Self::from_bytes(&block[..size_of::<Self>()])
+    }
+}
+
 const JOURNAL_HEADER_SIZE: usize = 12;
 const_assert!(size_of::<RawJournalHeader>() == JOURNAL_HEADER_SIZE);
 

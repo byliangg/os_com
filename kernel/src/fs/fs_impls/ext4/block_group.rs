@@ -84,44 +84,44 @@ pub(super) struct BlockGroupDesc {
     used_dirs_count: u32,
 }
 
-/// Patches this group's mutable descriptor counters into the after-image of the
-/// descriptor block, for op-time journaling.
-///
-/// The descriptor block holds many group descriptors; this group's lives at
-/// `desc_offset % BLOCK_SIZE` within the block. It is a read-modify-write on the
-/// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): only
-/// `free_blocks_count_lo` / `free_inodes_count_lo` / `used_dirs_count_lo` are
-/// overwritten, so every field the device held (flags, csum, itable_unused, …)
-/// and every *other* group's descriptor in the same block are preserved. Because
-/// the after-image carries the absolute in-memory counters, repeated captures of
-/// the same block *within one transaction* converge on the final value.
-///
-/// # Cross-transaction seed correctness (B-1)
-///
-/// A partial patch like this is only sound because the capture's seed is
-/// guaranteed current: `get_write_access` seeds from the newest
-/// committed-but-un-checkpointed after-image of the block when the journal
-/// retains one, and from the device only once checkpoint has made it
-/// authoritative again (see `UncheckpointedImage` in `journal/transaction.rs`).
-/// Seeding straight from the device — which lags until checkpoint, and the
-/// commit thread runs asynchronously even under a single-threaded workload —
-/// would resurrect the *other* groups' stale counters in this block whenever
-/// two operations landed in separate transactions, and checkpoint (tid order,
-/// newest wins) would clobber the first transaction's committed counts. The
-/// same guarantee covers the other shared sub-block captures: inode-table
-/// blocks (where the clobber is silent neighbor-inode data loss) and the
-/// superblock.
-fn patch_group_desc(buf: &mut [u8], desc_offset: usize, desc: &BlockGroupDesc) {
-    let off = desc_offset % BLOCK_SIZE;
-    let raw_bytes = &mut buf[off..off + size_of::<RawBlockGroup>()];
-    let mut raw = RawBlockGroup::from_bytes(raw_bytes);
-    raw.free_blocks_count_lo = desc.free_blocks_count() as u16;
-    raw.free_inodes_count_lo = desc.free_inodes_count() as u16;
-    raw.used_dirs_count_lo = desc.used_dirs_count() as u16;
-    raw_bytes.copy_from_slice(raw.as_bytes());
-}
-
 impl BlockGroupDesc {
+    /// Patches this group's mutable descriptor counters into the after-image of the
+    /// descriptor block, for op-time journaling.
+    ///
+    /// The descriptor block holds many group descriptors; this group's lives at
+    /// `desc_offset % BLOCK_SIZE` within the block. It is a read-modify-write on the
+    /// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): only
+    /// `free_blocks_count_lo` / `free_inodes_count_lo` / `used_dirs_count_lo` are
+    /// overwritten, so every field the device held (flags, csum, itable_unused, …)
+    /// and every *other* group's descriptor in the same block are preserved. Because
+    /// the after-image carries the absolute in-memory counters, repeated captures of
+    /// the same block *within one transaction* converge on the final value.
+    ///
+    /// # Cross-transaction seed correctness (B-1)
+    ///
+    /// A partial patch like this is only sound because the capture's seed is
+    /// guaranteed current: `get_write_access` seeds from the newest
+    /// committed-but-un-checkpointed after-image of the block when the journal
+    /// retains one, and from the device only once checkpoint has made it
+    /// authoritative again (see `UncheckpointedImage` in `journal/transaction.rs`).
+    /// Seeding straight from the device — which lags until checkpoint, and the
+    /// commit thread runs asynchronously even under a single-threaded workload —
+    /// would resurrect the *other* groups' stale counters in this block whenever
+    /// two operations landed in separate transactions, and checkpoint (tid order,
+    /// newest wins) would clobber the first transaction's committed counts. The
+    /// same guarantee covers the other shared sub-block captures: inode-table
+    /// blocks (where the clobber is silent neighbor-inode data loss) and the
+    /// superblock.
+    fn patch_into(&self, buf: &mut [u8], desc_offset: usize) {
+        let off = desc_offset % BLOCK_SIZE;
+        let raw_bytes = &mut buf[off..off + size_of::<RawBlockGroup>()];
+        let mut raw = RawBlockGroup::from_bytes(raw_bytes);
+        raw.free_blocks_count_lo = self.free_blocks_count() as u16;
+        raw.free_inodes_count_lo = self.free_inodes_count() as u16;
+        raw.used_dirs_count_lo = self.used_dirs_count() as u16;
+        raw_bytes.copy_from_slice(raw.as_bytes());
+    }
+
     /// Returns the starting block of this group's inode table.
     pub(super) const fn inode_table_bid(&self) -> Ext4Bid {
         self.inode_table_bid
@@ -517,7 +517,7 @@ impl BlockGroup {
             handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
-            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+            |buf| metadata.desc.patch_into(buf, self.desc_offset),
         )?;
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
@@ -585,7 +585,7 @@ impl BlockGroup {
             handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
-            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+            |buf| metadata.desc.patch_into(buf, self.desc_offset),
         )?;
 
         Ok(actually_freed)
@@ -639,7 +639,7 @@ impl BlockGroup {
             handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
-            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+            |buf| metadata.desc.patch_into(buf, self.desc_offset),
         )?;
 
         Ok(Some(inode_idx))
@@ -708,7 +708,7 @@ impl BlockGroup {
             handle,
             desc_block_bid,
             journal::TriggerType::GroupDesc,
-            |buf| patch_group_desc(buf, self.desc_offset, &metadata.desc),
+            |buf| metadata.desc.patch_into(buf, self.desc_offset),
         )?;
 
         Ok(true)

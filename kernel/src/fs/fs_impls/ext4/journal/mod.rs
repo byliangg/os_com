@@ -242,6 +242,52 @@ impl JournalGeometry {
     pub(super) fn log_block_to_physical(&self, log: u32) -> Option<Ext4Bid> {
         self.block_map.get(log as usize).copied()
     }
+
+    /// The next log block after `cur`, wrapping to `first` at the end of the
+    /// log.
+    ///
+    /// The usable log is the ring `[first, maxlen)`; block 0 holds the journal
+    /// superblock and is never a log-data block, so wrapping returns to
+    /// `first`. The commit writer, the recovery scanner, and the checkpoint
+    /// reader all walk the ring through this one definition, so the wrap rule
+    /// stays byte-for-byte consistent.
+    pub(super) fn next_log_block(&self, cur: u32) -> u32 {
+        let next = cur + 1;
+        if next >= self.maxlen() {
+            self.first()
+        } else {
+            next
+        }
+    }
+
+    /// Advances a log position past `count` blocks, wrapping within the ring.
+    pub(super) fn advance(&self, mut pos: u32, count: u32) -> u32 {
+        for _ in 0..count {
+            pos = self.next_log_block(pos);
+        }
+        pos
+    }
+
+    /// Reads a full [`BLOCK_SIZE`] log block by its log index into `buf`.
+    ///
+    /// Resolves log block `log` to its physical device block via the block
+    /// map, then reads the whole block. Errors `EUCLEAN` if the index is past
+    /// the log, `EIO` on a device failure. The recovery scanner and the
+    /// checkpoint reader are sibling readers of the same log, so both resolve
+    /// and read blocks through this one definition.
+    pub(super) fn read_log_block(
+        &self,
+        device: &dyn BlockDevice,
+        log: u32,
+        buf: &mut [u8; BLOCK_SIZE],
+    ) -> Result<()> {
+        let pblock = self
+            .log_block_to_physical(log)
+            .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "log block out of range"))?;
+        device
+            .read_bytes(Bid::new(pblock).to_offset(), buf.as_mut_slice())
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal log block"))
+    }
 }
 
 /// Loads the journal geometry: reads the journal inode (ino 8), maps its blocks,

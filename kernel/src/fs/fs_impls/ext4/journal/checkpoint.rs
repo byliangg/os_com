@@ -75,7 +75,7 @@
 use super::{
     super::prelude::*,
     Journal, Tid,
-    commit::{barrier, next_log_block},
+    commit::barrier,
     format::{
         BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawBlockTag, RawJournalHeader,
         RawJournalSuperblock, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
@@ -92,38 +92,6 @@ const TAG_LEN: usize = size_of::<RawBlockTag>();
 /// (the writer emits it once; every later tag reuses it via `TAG_FLAG_SAME_UUID`
 /// and carries no UUID of its own).
 const UUID_LEN: usize = 16;
-
-/// Reads a full [`BLOCK_SIZE`] log block by its log index into `buf`.
-///
-/// Resolves log block `log` to its physical device block via the geometry, then
-/// reads the whole block. Errors `EUCLEAN` if the index is past the log,
-/// `EIO` on a device failure.
-fn read_log_block(
-    journal: &Journal,
-    device: &dyn BlockDevice,
-    log: u32,
-    buf: &mut [u8; BLOCK_SIZE],
-) -> Result<()> {
-    let pblock = journal
-        .geometry()
-        .log_block_to_physical(log)
-        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "log block out of range"))?;
-    device
-        .read_bytes(Bid::new(pblock).to_offset(), buf.as_mut_slice())
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal log block"))
-}
-
-/// Parses the 12-byte [`RawJournalHeader`] from the head of a log-block buffer.
-///
-/// The header lives at byte offset 0 of every jbd2 log block (descriptor,
-/// commit, superblock), so this simply reinterprets the first 12 bytes — no
-/// device read.
-fn parse_header(block: &[u8; BLOCK_SIZE]) -> RawJournalHeader {
-    // `RawJournalHeader` is `Pod`; `from_bytes` reinterprets exactly its 12-byte
-    // slice (never panics: the slice is exactly `HEADER_LEN`). Reading from the
-    // in-memory block avoids a second device round-trip.
-    RawJournalHeader::from_bytes(&block[..HEADER_LEN])
-}
 
 /// Applies one committed transaction from the log to its final locations, the
 /// mirror of [`commit.rs`](super::commit)'s writer.
@@ -167,13 +135,12 @@ pub(super) fn apply_log_transaction(
     start_log: u32,
     expected_tid: Tid,
 ) -> Result<u32> {
-    let first = journal.geometry().first();
-    let maxlen = journal.geometry().maxlen();
-
     // --- Descriptor block. ---
     let mut descriptor = [0u8; BLOCK_SIZE];
-    read_log_block(journal, device, start_log, &mut descriptor)?;
-    let header = parse_header(&descriptor);
+    journal
+        .geometry()
+        .read_log_block(device, start_log, &mut descriptor)?;
+    let header = RawJournalHeader::parse(&descriptor);
     if header.h_magic.get() != JBD2_MAGIC {
         return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has bad magic");
     }
@@ -206,9 +173,9 @@ pub(super) fn apply_log_transaction(
         let flags = tag.t_flags.get();
 
         // This tag's metadata is the next log block after the previous one.
-        log = next_log_block(log, first, maxlen);
+        log = journal.geometry().next_log_block(log);
         let mut block = [0u8; BLOCK_SIZE];
-        read_log_block(journal, device, log, &mut block)?;
+        journal.geometry().read_log_block(device, log, &mut block)?;
 
         // Restore the escaped head: the writer zeroed the first 4 bytes of a
         // block that began with JBD2_MAGIC so a recovery scan would not mistake
@@ -235,10 +202,12 @@ pub(super) fn apply_log_transaction(
     }
 
     // --- Commit block: the next log block after the last metadata block. ---
-    let commit_log = next_log_block(log, first, maxlen);
+    let commit_log = journal.geometry().next_log_block(log);
     let mut commit = [0u8; BLOCK_SIZE];
-    read_log_block(journal, device, commit_log, &mut commit)?;
-    let commit_header = parse_header(&commit);
+    journal
+        .geometry()
+        .read_log_block(device, commit_log, &mut commit)?;
+    let commit_header = RawJournalHeader::parse(&commit);
     if commit_header.h_magic.get() != JBD2_MAGIC
         || commit_header.h_blocktype.get() != BLOCKTYPE_COMMIT
         || commit_header.h_sequence.get() != expected_tid
@@ -247,7 +216,7 @@ pub(super) fn apply_log_transaction(
     }
 
     // The next transaction starts right after this commit block.
-    Ok(next_log_block(commit_log, first, maxlen))
+    Ok(journal.geometry().next_log_block(commit_log))
 }
 
 /// Checkpoints ALL committed-but-un-checkpointed transactions

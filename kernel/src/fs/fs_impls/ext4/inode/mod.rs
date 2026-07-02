@@ -344,6 +344,63 @@ impl InodeDesc {
     pub(super) fn is_extent_based(&self) -> bool {
         self.flags.contains(FileFlags::EXTENTS)
     }
+
+    /// Builds the complete on-disk [`RawInode`] for this descriptor with `root`
+    /// as its inline extent-tree root — every field from the in-memory
+    /// descriptor, never from the device. The encode counterpart of
+    /// [`InodeDesc::try_from`], kept beside it so the lossless-writeback
+    /// invariant is reviewable in one place.
+    ///
+    /// This is the authoritative encoding used by both the new-inode write and
+    /// the *journaled* writeback. Under a handle the on-disk inode may be
+    /// **stale** (its previous write was suppressed and not yet checkpointed),
+    /// so a read-modify-write from the device would resurrect zeroed `i_mode`
+    /// type bits, `extra_isize`, `generation`, and nanosecond timestamps — the
+    /// corruption the guest e2fsck caught after a rename touched a directory
+    /// whose creation had not yet checkpointed. Encoding straight from `self`
+    /// (which `try_from` loads in full: type, generation, crtime, …) sidesteps
+    /// that entirely.
+    pub(super) fn to_raw_inode(&self, root: &[u32; RAW_BLOCK_PTRS_LEN]) -> RawInode {
+        let (mtime_secs, mtime_extra) = encode_time(self.mtime());
+        let (ctime_secs, ctime_extra) = encode_time(self.ctime());
+        let (atime_secs, atime_extra) = encode_time(self.atime());
+        let (crtime_secs, crtime_extra) = encode_time(self.crtime());
+        RawInode {
+            // The full mode comes from `self.type_()`, not the (possibly stale)
+            // device — this is what preserves the `S_IFMT` type bits under
+            // journaling.
+            mode: (self.type_() as u16) | (self.perm().bits() & 0o7777),
+            uid: self.uid() as u16,
+            size_lo: self.size() as u32,
+            atime: atime_secs,
+            ctime: ctime_secs,
+            mtime: mtime_secs,
+            dtime: self.dtime().as_secs() as u32,
+            gid: self.gid() as u16,
+            link_count: self.link_count(),
+            sector_count: self.sector_count() as u32,
+            flags: self.flags().bits(),
+            block: *root,
+            generation: self.generation(),
+            size_high: if self.type_() == InodeType::File {
+                (self.size() >> 32) as u32
+            } else {
+                0
+            },
+            blocks_high: (self.sector_count() >> 32) as u16,
+            uid_high: (self.uid() >> 16) as u16,
+            gid_high: (self.gid() >> 16) as u16,
+            // The `extra_isize` a 256-byte inode carries (32 bytes past the
+            // 128-byte base), so the nanosecond timestamps are honored on read.
+            extra_isize: 32,
+            ctime_extra,
+            mtime_extra,
+            atime_extra,
+            crtime: crtime_secs,
+            crtime_extra,
+            ..Default::default()
+        }
+    }
 }
 
 /// Resolves the physical device block backing each of the first `nblocks`
@@ -388,6 +445,23 @@ fn decode_time(secs: u32, extra: u32) -> Duration {
     let epoch = (extra & 0x3) as u64;
     let nsec = extra >> 2;
     Duration::new((secs as u64) | (epoch << 32), nsec)
+}
+
+/// Encodes a timestamp into its on-disk `(seconds, *_extra)` pair — the
+/// reverse of [`decode_time`]. Also used by the sync path's raw-inode RMW in
+/// `fs.rs`.
+///
+/// The 2-bit epoch encodes seconds only up to 2^34 - 1 (~year 2514). Clamp
+/// rather than wrap: `secs` can come straight from `utimensat`, and a wrapped
+/// value would read back as an unrelated timestamp (Linux truncates to the
+/// filesystem's range at the VFS layer, `timestamp_truncate`).
+pub(super) fn encode_time(time: Duration) -> (u32, u32) {
+    let secs = time.as_secs().min((1 << 34) - 1);
+    let nsec = time.subsec_nanos();
+    let epoch = (secs >> 32) & 0x3;
+    let secs_lo = secs as u32;
+    let extra = (epoch as u32) | (nsec << 2);
+    (secs_lo, extra)
 }
 
 impl TryFrom<&RawInode> for InodeDesc {

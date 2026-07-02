@@ -18,7 +18,7 @@ use device_id::DeviceId;
 
 use super::{
     block_group::BlockGroup,
-    inode::{FilePerm, Inode, InodeDesc, RawInode},
+    inode::{FilePerm, Inode, InodeDesc, RawInode, encode_time},
     journal,
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
@@ -48,9 +48,9 @@ pub struct Ext4 {
     /// Monotonic source for the `i_generation` stamped onto each newly created
     /// inode. Seeded from the mount time, like ext2.
     next_generation: AtomicU32,
-    /// The orphan list: the guarded `Vec` is the **in-memory mirror of the
-    /// on-disk chain** (index 0 = `s_last_orphan` head; each entry's successor
-    /// is the next element), and the lock is jbd2's `s_orphan_lock`.
+    /// The orphan list: the guarded [`OrphanChain`] is the **in-memory mirror
+    /// of the on-disk chain** (the position invariant lives on the type), and
+    /// the lock is jbd2's `s_orphan_lock`.
     ///
     /// The mirror is the authoritative chain at runtime: a non-head removal
     /// finds the predecessor here (never by walking on-disk `i_dtime` pointers,
@@ -64,7 +64,7 @@ pub struct Ext4 {
     /// superblock (⑤), never while acquiring an inode `inner` (report §5.1).
     /// Empty on a non-journaled volume (the orphan machinery is journal-only,
     /// matching Linux).
-    s_orphan_lock: Mutex<Vec<Ext4Ino>>,
+    s_orphan_lock: Mutex<OrphanChain>,
     /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
     /// feature (jbd2 `journal_t`).
     ///
@@ -96,7 +96,7 @@ impl Ext4 {
             block_groups,
             nr_inodes_per_group,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
-            s_orphan_lock: Mutex::new(Vec::new()),
+            s_orphan_lock: Mutex::new(OrphanChain::new()),
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak.clone(),
@@ -343,12 +343,7 @@ impl Ext4 {
             if !range.is_empty() {
                 let allocated_count = range.end - range.start;
                 sb.dec_free_blocks(allocated_count)?;
-                journal_superblock(
-                    handle,
-                    sb.free_blocks_count(),
-                    sb.free_inodes_count(),
-                    sb.last_orphan(),
-                )?;
+                sb.journal_capture(handle, sb.last_orphan())?;
                 return Ok(range);
             }
         }
@@ -387,12 +382,7 @@ impl Ext4 {
                 group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
             if freed_count > 0 {
                 sb.inc_free_blocks(freed_count as u64)?;
-                journal_superblock(
-                    handle,
-                    sb.free_blocks_count(),
-                    sb.free_inodes_count(),
-                    sb.last_orphan(),
-                )?;
+                sb.journal_capture(handle, sb.last_orphan())?;
             }
             current_block += blocks_in_group as Ext4Bid;
             remaining_blocks -= blocks_in_group;
@@ -453,12 +443,7 @@ impl Ext4 {
                 }
             };
             sb.dec_free_inodes()?;
-            journal_superblock(
-                handle,
-                sb.free_blocks_count(),
-                sb.free_inodes_count(),
-                sb.last_orphan(),
-            )?;
+            sb.journal_capture(handle, sb.last_orphan())?;
 
             return Ok(ino);
         }
@@ -480,12 +465,7 @@ impl Ext4 {
         let was_allocated = group.free_inode(local_idx, type_, handle)?;
         if was_allocated {
             sb.inc_free_inodes()?;
-            journal_superblock(
-                handle,
-                sb.free_blocks_count(),
-                sb.free_inodes_count(),
-                sb.last_orphan(),
-            )?;
+            sb.journal_capture(handle, sb.last_orphan())?;
         }
 
         Ok(())
@@ -614,9 +594,9 @@ impl Ext4 {
         let mut chain = self.s_orphan_lock.lock();
         // Already listed (defensive — no current call site can re-add a listed
         // inode; Linux guards the same way): keep the existing successor.
-        if let Some(idx) = chain.iter().position(|&i| i == ino) {
+        if let Some(next) = chain.successor_of(ino) {
             warn!("ext4: inode {ino} is already on the orphan list");
-            return Ok(chain.get(idx + 1).copied().unwrap_or(0));
+            return Ok(next);
         }
         // One superblock WRITE guard across both the capture and the mutation:
         // the counters are guarded by the superblock lock (a concurrent
@@ -626,10 +606,10 @@ impl Ext4 {
         // mirror, and transaction mutually consistent.
         let mut sb = self.super_block.write();
         let old_head = sb.last_orphan();
-        journal_superblock(handle, sb.free_blocks_count(), sb.free_inodes_count(), ino)?;
+        sb.journal_capture(handle, ino)?;
         sb.set_last_orphan(ino);
         drop(sb);
-        chain.insert(0, ino);
+        chain.push_head(ino);
         Ok(old_head)
     }
 
@@ -651,20 +631,25 @@ impl Ext4 {
     /// an inode that was never added). Locking as in [`orphan_add`](Self::orphan_add).
     pub(super) fn orphan_del(&self, ino: Ext4Ino, handle: Option<&journal::Handle>) -> Result<()> {
         let mut chain = self.s_orphan_lock.lock();
-        let Some(idx) = chain.iter().position(|&i| i == ino) else {
+        let Some(splice) = chain.splice_for(ino) else {
             return Ok(());
         };
-        let next = chain.get(idx + 1).copied().unwrap_or(0);
-        if idx == 0 {
-            // One superblock write guard across capture + mutation, capture
-            // first (see `orphan_add`).
-            let mut sb = self.super_block.write();
-            journal_superblock(handle, sb.free_blocks_count(), sb.free_inodes_count(), next)?;
-            sb.set_last_orphan(next);
-        } else {
-            self.patch_orphan_next_on_disk(chain[idx - 1], next, handle)?;
+        match splice {
+            OrphanSplice::Head { successor } => {
+                // One superblock write guard across capture + mutation, capture
+                // first (see `orphan_add`).
+                let mut sb = self.super_block.write();
+                sb.journal_capture(handle, successor)?;
+                sb.set_last_orphan(successor);
+            }
+            OrphanSplice::Middle {
+                predecessor,
+                successor,
+            } => {
+                self.patch_orphan_next_on_disk(predecessor, successor, handle)?;
+            }
         }
-        chain.remove(idx);
+        chain.commit_remove(ino);
         Ok(())
     }
 
@@ -683,13 +668,7 @@ impl Ext4 {
         next: u32,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        let offset = self.inode_table_offset(ino)?;
-        let block = (offset / BLOCK_SIZE) as Ext4Bid;
-        let dtime_off = offset % BLOCK_SIZE + core::mem::offset_of!(RawInode, dtime);
-        journal::get_write_access(handle, block, journal::TriggerType::InodeTable)?;
-        journal::dirty_metadata(handle, block, journal::TriggerType::InodeTable, |buf| {
-            buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
-        })
+        self.inode_slot(ino)?.journal_patch_dtime(handle, next)
     }
 
     /// Finishes deletions interrupted by a crash, by walking the on-disk orphan
@@ -765,7 +744,7 @@ impl Ext4 {
         // chain order. Every reclaim opens its own journaled transaction and its
         // `orphan_del` advances/splices the on-disk chain, so the state after
         // every step is a well-formed shorter chain.
-        *self.s_orphan_lock.lock() = chain.clone();
+        self.s_orphan_lock.lock().replace(chain.clone());
         for &ino in &to_free {
             let raw = match self.read_raw_inode(ino) {
                 Ok(raw) => raw,
@@ -819,9 +798,7 @@ impl Ext4 {
             // One superblock write guard across capture + mutation (see
             // `orphan_add`).
             let mut sb = self.super_block.write();
-            if let Err(e) =
-                journal_superblock(op.get(), sb.free_blocks_count(), sb.free_inodes_count(), 0)
-            {
+            if let Err(e) = sb.journal_capture(op.get(), 0) {
                 warn!("ext4: could not journal the cleared orphan head: {e:?}");
                 return;
             }
@@ -837,10 +814,7 @@ impl Ext4 {
     /// (and whose device bytes are authoritative — recovery has replayed the
     /// log and nothing is in flight).
     fn read_raw_inode(&self, ino: Ext4Ino) -> Result<RawInode> {
-        let offset = self.inode_table_offset(ino)?;
-        self.block_device
-            .read_val::<RawInode>(offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read raw inode"))
+        self.inode_slot(ino)?.read_raw(self.block_device.as_ref())
     }
 
     /// Writes back the superblock and every dirty group descriptor/bitmap.
@@ -930,8 +904,8 @@ impl Ext4 {
         self.read_inode_desc(ROOT_INO)
     }
 
-    /// Computes the device byte offset of the on-disk `RawInode` for `ino`.
-    fn inode_table_offset(&self, ino: Ext4Ino) -> Result<usize> {
+    /// Locates the on-disk `RawInode` slot for `ino`.
+    fn inode_slot(&self, ino: Ext4Ino) -> Result<InodeSlot> {
         if ino == 0 {
             return_errno_with_message!(Errno::ENOENT, "invalid inode number 0");
         }
@@ -942,7 +916,19 @@ impl Ext4 {
             .get(group_idx)
             .ok_or_else(|| Error::with_message(Errno::ENOENT, "inode block group out of range"))?;
         let sb = self.super_block.read();
-        Ok(group.inode_table_bid() as usize * sb.block_size() + idx_in_group * sb.inode_size())
+        let byte =
+            group.inode_table_bid() as usize * sb.block_size() + idx_in_group * sb.inode_size();
+        Ok(InodeSlot {
+            bid: (byte / BLOCK_SIZE) as Ext4Bid,
+            offset_in_block: byte % BLOCK_SIZE,
+        })
+    }
+
+    /// The device byte offset of `ino`'s `RawInode` slot; tests peek and doctor
+    /// raw slots through it.
+    #[cfg(ktest)]
+    pub(super) fn inode_table_offset(&self, ino: Ext4Ino) -> Result<usize> {
+        Ok(self.inode_slot(ino)?.device_offset())
     }
 
     /// Read-modify-writes the on-disk `RawInode` for `ino`, patching only the
@@ -956,7 +942,7 @@ impl Ext4 {
         root: &[u32; super::inode::RAW_BLOCK_PTRS_LEN],
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        let offset = self.inode_table_offset(ino)?;
+        let slot = self.inode_slot(ino)?;
 
         // Journaled path: the on-disk inode may be **stale** — a prior write to it
         // was suppressed (WAL) and has not yet been checkpointed — so a
@@ -967,7 +953,7 @@ impl Ext4 {
         // in-memory descriptor instead and capture it; checkpoint applies it to
         // the final location after the transaction commits.
         if handle.is_some() {
-            let mut raw = build_raw_inode(desc, root);
+            let mut raw = desc.to_raw_inode(root);
             // An on-orphan-list inode carries its chain successor in `i_dtime`,
             // and the authoritative successor is the in-memory chain — a
             // non-head splice repoints the on-disk chain without reaching this
@@ -982,10 +968,10 @@ impl Ext4 {
             // → `s_orphan_lock` → journal state (leaf), the same nesting as
             // `patch_orphan_next_on_disk`.
             let chain = self.s_orphan_lock.lock();
-            if let Some(idx) = chain.iter().position(|&i| i == ino) {
-                raw.dtime = chain.get(idx + 1).copied().unwrap_or(0);
+            if let Some(next) = chain.successor_of(ino) {
+                raw.dtime = next;
             }
-            return journal_inode_block(handle, offset, raw.as_bytes());
+            return slot.journal_write(handle, &raw);
         }
 
         // Non-journaled (or the sync path): read-modify-write the on-disk inode,
@@ -996,7 +982,7 @@ impl Ext4 {
         // here, so the RMW is safe.
         let mut raw = self
             .block_device
-            .read_val::<RawInode>(offset)
+            .read_val::<RawInode>(slot.device_offset())
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read inode for writeback"))?;
 
         // Size (size_high only carries the high 32 bits for regular files).
@@ -1040,7 +1026,7 @@ impl Ext4 {
         raw.dtime = desc.dtime().as_secs() as u32;
 
         self.block_device
-            .write_val(offset, &raw)
+            .write_val(slot.device_offset(), &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
         Ok(())
     }
@@ -1060,16 +1046,16 @@ impl Ext4 {
         desc: &InodeDesc,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        let offset = self.inode_table_offset(ino)?;
+        let slot = self.inode_slot(ino)?;
 
-        let raw = build_raw_inode(desc, desc.raw_block());
+        let raw = desc.to_raw_inode(desc.raw_block());
 
-        journal_inode_block(handle, offset, raw.as_bytes())?;
+        slot.journal_write(handle, &raw)?;
         // See `write_back_inode_desc`: suppress the direct write under a handle so
         // the inode reaches its final location only via checkpoint (WAL).
         if handle.is_none() {
             self.block_device
-                .write_val(offset, &raw)
+                .write_val(slot.device_offset(), &raw)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to write new inode"))?;
         }
         Ok(())
@@ -1135,148 +1121,150 @@ impl Drop for Ext4 {
     }
 }
 
-/// Encodes a timestamp into its on-disk `(seconds, *_extra)` pair: the extra
-/// field packs a 2-bit epoch (the seconds bits past 2038) in its low bits and
-/// nanoseconds in the upper bits. Reverse of `decode_time` in `inode`.
-fn encode_time(time: Duration) -> (u32, u32) {
-    // The 2-bit epoch encodes seconds only up to 2^34 - 1 (~year 2514). Clamp
-    // rather than wrap: `secs` can come straight from `utimensat`, and a wrapped
-    // value would read back as an unrelated timestamp (Linux truncates to the
-    // filesystem's range at the VFS layer, `timestamp_truncate`).
-    let secs = time.as_secs().min((1 << 34) - 1);
-    let nsec = time.subsec_nanos();
-    let epoch = (secs >> 32) & 0x3;
-    let secs_lo = secs as u32;
-    let extra = (epoch as u32) | (nsec << 2);
-    (secs_lo, extra)
+/// The in-memory mirror of the on-disk orphan chain (jbd2 `sbi->s_orphan`).
+///
+/// Position IS the on-disk topology — entry 0 mirrors the superblock's
+/// `s_last_orphan` head, and entry `i`'s on-disk successor (its `i_dtime`
+/// pointer) is entry `i + 1`, with `0` marking the end — and this type owns
+/// that invariant: callers ask for successors and splices instead of
+/// re-deriving the `idx ± 1` arithmetic at every touch point (one wrong index
+/// would silently corrupt the on-disk chain a crash recovery walks).
+///
+/// Removal is two-phase, mirroring its callers' capture-fallible-then-
+/// mutate-infallible discipline: [`splice_for`](Self::splice_for) reports what
+/// a removal must persist (journaled, fallible) without mutating, and only
+/// after that succeeds does [`commit_remove`](Self::commit_remove) update the
+/// mirror — an error leaves mirror, head, and transaction mutually consistent.
+struct OrphanChain(Vec<Ext4Ino>);
+
+/// What removing an inode from the [`OrphanChain`] must persist.
+enum OrphanSplice {
+    /// The inode is the head: the superblock's `s_last_orphan` must advance to
+    /// `successor` (`0` = the list becomes empty).
+    Head { successor: u32 },
+    /// A middle/tail member: `predecessor`'s on-disk `i_dtime` must be
+    /// repointed to `successor`.
+    Middle {
+        predecessor: Ext4Ino,
+        successor: u32,
+    },
 }
 
-/// Builds the complete on-disk [`RawInode`] for `desc` with `root` as its inline
-/// extent-tree root — every field from the in-memory descriptor, never from the
-/// device.
-///
-/// This is the authoritative encoding used by both the new-inode write and the
-/// *journaled* writeback. Under a handle the on-disk inode may be **stale** (its
-/// previous write was suppressed and not yet checkpointed), so a read-modify-write
-/// from the device would resurrect zeroed `i_mode` type bits, `extra_isize`,
-/// `generation`, and nanosecond timestamps — the corruption the guest e2fsck
-/// caught after a rename touched a directory whose creation had not yet
-/// checkpointed. Encoding straight from `desc` (which `InodeDesc::try_from` loads
-/// in full: type, generation, crtime, …) sidesteps that entirely.
-fn build_raw_inode(desc: &InodeDesc, root: &[u32; super::inode::RAW_BLOCK_PTRS_LEN]) -> RawInode {
-    let (mtime_secs, mtime_extra) = encode_time(desc.mtime());
-    let (ctime_secs, ctime_extra) = encode_time(desc.ctime());
-    let (atime_secs, atime_extra) = encode_time(desc.atime());
-    let (crtime_secs, crtime_extra) = encode_time(desc.crtime());
-    RawInode {
-        // The full mode comes from `desc.type_()`, not the (possibly stale) device
-        // — this is what preserves the `S_IFMT` type bits under journaling.
-        mode: (desc.type_() as u16) | (desc.perm().bits() & 0o7777),
-        uid: desc.uid() as u16,
-        size_lo: desc.size() as u32,
-        atime: atime_secs,
-        ctime: ctime_secs,
-        mtime: mtime_secs,
-        dtime: desc.dtime().as_secs() as u32,
-        gid: desc.gid() as u16,
-        link_count: desc.link_count(),
-        sector_count: desc.sector_count() as u32,
-        flags: desc.flags().bits(),
-        block: *root,
-        generation: desc.generation(),
-        size_high: if desc.type_() == InodeType::File {
-            (desc.size() >> 32) as u32
+impl OrphanChain {
+    const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The on-disk successor of `ino` (`0` = `ino` is the last member), or
+    /// `None` when `ino` is not on the chain.
+    fn successor_of(&self, ino: Ext4Ino) -> Option<u32> {
+        let idx = self.0.iter().position(|&i| i == ino)?;
+        Some(self.0.get(idx + 1).copied().unwrap_or(0))
+    }
+
+    /// Prepends a new head. The caller has already persisted it as
+    /// `s_last_orphan` (journaled) — see the two-phase note on the type.
+    fn push_head(&mut self, ino: Ext4Ino) {
+        self.0.insert(0, ino);
+    }
+
+    /// What removing `ino` must persist, or `None` when it is not listed.
+    /// Read-only; pair with [`commit_remove`](Self::commit_remove) once the
+    /// persist step succeeded.
+    fn splice_for(&self, ino: Ext4Ino) -> Option<OrphanSplice> {
+        let idx = self.0.iter().position(|&i| i == ino)?;
+        let successor = self.0.get(idx + 1).copied().unwrap_or(0);
+        Some(if idx == 0 {
+            OrphanSplice::Head { successor }
         } else {
-            0
-        },
-        blocks_high: (desc.sector_count() >> 32) as u16,
-        uid_high: (desc.uid() >> 16) as u16,
-        gid_high: (desc.gid() >> 16) as u16,
-        // The `extra_isize` a 256-byte inode carries (32 bytes past the 128-byte
-        // base), so the nanosecond timestamps are honored on read.
-        extra_isize: 32,
-        ctime_extra,
-        mtime_extra,
-        atime_extra,
-        crtime: crtime_secs,
-        crtime_extra,
-        ..Default::default()
+            OrphanSplice::Middle {
+                predecessor: self.0[idx - 1],
+                successor,
+            }
+        })
+    }
+
+    /// Removes `ino` from the mirror after its splice was persisted.
+    fn commit_remove(&mut self, ino: Ext4Ino) {
+        let Some(idx) = self.0.iter().position(|&i| i == ino) else {
+            debug_assert!(false, "commit_remove of an unlisted orphan inode");
+            return;
+        };
+        self.0.remove(idx);
+    }
+
+    /// Replaces the whole mirror with a freshly walked on-disk chain (the
+    /// mount-time orphan scan).
+    fn replace(&mut self, chain: Vec<Ext4Ino>) {
+        self.0 = chain;
+    }
+
+    /// Empties the mirror (the on-disk head was cleared).
+    fn clear(&mut self) {
+        self.0.clear();
     }
 }
 
-/// The device block that holds the primary superblock. With 4 KiB blocks the
-/// superblock lives at byte [`SUPER_BLOCK_OFFSET`] (1024) inside block 0, so
-/// journaling it means capturing block 0.
-const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
-
-/// Captures the superblock's after-image into the operation's transaction
-/// (block 0, RMW at [`SUPER_BLOCK_OFFSET`]), for op-time journaling. A no-op
-/// without a handle.
-///
-/// Patches **every field the filesystem mutates after mount** —
-/// `free_blocks_count`, `free_inodes_count`, and `s_last_orphan` — from the
-/// caller's in-memory values, every capture. This is a single-writer rule, not a
-/// convenience: a capture that patched only "its own" field would leave the
-/// others at the seed value, so two captures patching disjoint fields in
-/// different transactions would clobber each other's committed writes (the B-1
-/// stale-seed class; the Task 8 first attempt hit exactly this with a
-/// counts-only vs. orphan-only pair). Every untracked field (label, feature
-/// words, mount counters — changed only at mount time, never under an
-/// operation) survives from the seed. The values are absolute, so repeated
-/// captures converge on the final state.
-fn journal_superblock(
-    handle: Option<&journal::Handle>,
-    free_blocks: u64,
-    free_inodes: u32,
-    last_orphan: u32,
-) -> Result<()> {
-    journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?;
-    journal::dirty_metadata(
-        handle,
-        SUPERBLOCK_BID,
-        journal::TriggerType::Superblock,
-        |buf| {
-            let off = SUPER_BLOCK_OFFSET;
-            let mut raw = RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
-            raw.free_blocks_count = free_blocks as u32;
-            raw.free_inodes_count = free_inodes;
-            raw.last_orphan = last_orphan;
-            buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
-        },
-    )
+/// The device location of one on-disk `RawInode` slot: its inode-table block
+/// plus the byte offset inside that block. Built by [`Ext4::inode_slot`]; the
+/// journaled writers and the raw reader hang off it, so the block/offset
+/// decomposition exists exactly once. (Inode-table blocks are inode-size
+/// aligned, so a slot never straddles a block boundary.)
+struct InodeSlot {
+    bid: Ext4Bid,
+    offset_in_block: usize,
 }
 
-/// Captures an inode's after-image into the operation's transaction, a sub-block
-/// RMW of its inode-table block (the inode lives at byte `offset`, i.e. at
-/// `offset % BLOCK_SIZE` within block `offset / BLOCK_SIZE`), for op-time
-/// journaling. A no-op without a handle.
-///
-/// `inode_bytes` is exactly the `size_of::<RawInode>()` bytes the direct write
-/// persists; patching only those preserves the rest of the block — the other
-/// inodes sharing it and the slot bytes past the written `RawInode` prefix —
-/// from the seed. The partial patch is sound only because the seed is current:
-/// `get_write_access` seeds from the newest committed-but-un-checkpointed image
-/// of the block when one is retained, falling back to the device (see
-/// `UncheckpointedImage` in `journal/transaction.rs`; a raw device seed would
-/// lag pending checkpoints and silently clobber the neighboring inodes — the
-/// Task 8 guest data loss). (Inode-table blocks are inode-size aligned, so an
-/// inode never straddles a block boundary.)
-fn journal_inode_block(
-    handle: Option<&journal::Handle>,
-    offset: usize,
-    inode_bytes: &[u8],
-) -> Result<()> {
-    let inode_block = (offset / BLOCK_SIZE) as Ext4Bid;
-    let in_block_off = offset % BLOCK_SIZE;
-    journal::get_write_access(handle, inode_block, journal::TriggerType::InodeTable)?;
-    journal::dirty_metadata(
-        handle,
-        inode_block,
-        journal::TriggerType::InodeTable,
-        |buf| {
-            buf[in_block_off..in_block_off + inode_bytes.len()].copy_from_slice(inode_bytes);
-        },
-    )
+impl InodeSlot {
+    /// The absolute device byte offset of the slot, for direct reads/writes.
+    const fn device_offset(&self) -> usize {
+        self.bid as usize * BLOCK_SIZE + self.offset_in_block
+    }
+
+    /// Reads the slot's on-disk bytes. The caller owns the judgement that the
+    /// device is authoritative here (e.g. the mount-time orphan scan, which
+    /// runs after replay with nothing in flight).
+    fn read_raw(&self, device: &dyn BlockDevice) -> Result<RawInode> {
+        device
+            .read_val::<RawInode>(self.device_offset())
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read raw inode"))
+    }
+
+    /// Captures the slot's after-image into the operation's transaction, a
+    /// sub-block RMW of its inode-table block, for op-time journaling. A no-op
+    /// without a handle.
+    ///
+    /// Only the slot's `RawInode` bytes are patched, preserving the rest of
+    /// the block — the other inodes sharing it and the slot bytes past the
+    /// written `RawInode` prefix — from the seed. The partial patch is sound
+    /// only because the seed is current: `get_write_access` seeds from the
+    /// newest committed-but-un-checkpointed image of the block when one is
+    /// retained, falling back to the device (see `UncheckpointedImage` in
+    /// `journal/transaction.rs`; a raw device seed would lag pending
+    /// checkpoints and silently clobber the neighboring inodes — the Task 8
+    /// guest data loss).
+    fn journal_write(&self, handle: Option<&journal::Handle>, raw: &RawInode) -> Result<()> {
+        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?;
+        let off = self.offset_in_block;
+        journal::dirty_metadata(handle, self.bid, journal::TriggerType::InodeTable, |buf| {
+            buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
+        })
+    }
+
+    /// Splices the slot's on-disk `i_dtime` (its orphan-next pointer) to
+    /// `next` with a journaled 4-byte patch. A no-op without a handle.
+    ///
+    /// The patch is sound without decoding or locking the inode: the capture's
+    /// seed is the block's newest committed image (see `journal_write`), and
+    /// only the 4 `i_dtime` bytes are overwritten, so every other field — and
+    /// every neighboring inode — keeps its committed content.
+    fn journal_patch_dtime(&self, handle: Option<&journal::Handle>, next: u32) -> Result<()> {
+        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?;
+        let dtime_off = self.offset_in_block + core::mem::offset_of!(RawInode, dtime);
+        journal::dirty_metadata(handle, self.bid, journal::TriggerType::InodeTable, |buf| {
+            buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
+        })
+    }
 }
 
 #[cfg(ktest)]

@@ -79,7 +79,7 @@
 
 // Recovery is now live in all builds: `Ext4::open` calls [`recover`] at mount
 // time to replay a dirty journal, which pulls in the whole SCAN/REPLAY cluster
-// (`scan_transaction`, `read_log_block`, `parse_header`). No dead-code gate is
+// (`scan_transaction` and the geometry's log readers). No dead-code gate is
 // needed anymore (the earlier module-level `allow(dead_code)` was a placeholder
 // for exactly this integration).
 
@@ -89,7 +89,7 @@ use super::{
     super::prelude::*,
     Journal, Tid,
     checkpoint::apply_log_transaction,
-    commit::{barrier, next_log_block},
+    commit::barrier,
     format::{
         BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC, RawBlockTag,
         RawJournalHeader, RawJournalSuperblock, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
@@ -107,37 +107,6 @@ const TAG_LEN: usize = size_of::<RawBlockTag>();
 /// (the writer emits it once; later tags reuse it via `TAG_FLAG_SAME_UUID`).
 /// Mirrors [`checkpoint`](super::checkpoint)'s `UUID_LEN`.
 const UUID_LEN: usize = 16;
-
-/// Reads a full [`BLOCK_SIZE`] log block by its log index into `buf`.
-///
-/// Resolves log block `log` to its physical device block via the geometry, then
-/// reads the whole block. Errors `EUCLEAN` if the index is past the log, `EIO`
-/// on a device failure. The read-only twin of
-/// [`checkpoint`](super::checkpoint)'s `read_log_block` (SCAN is a sibling reader
-/// of the same log, so it resolves and reads blocks identically).
-fn read_log_block(
-    journal: &Journal,
-    device: &dyn BlockDevice,
-    log: u32,
-    buf: &mut [u8; BLOCK_SIZE],
-) -> Result<()> {
-    let pblock = journal
-        .geometry()
-        .log_block_to_physical(log)
-        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "log block out of range"))?;
-    device
-        .read_bytes(Bid::new(pblock).to_offset(), buf.as_mut_slice())
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal log block"))
-}
-
-/// Parses the 12-byte [`RawJournalHeader`] from the head of a log-block buffer.
-///
-/// The header lives at byte offset 0 of every jbd2 log block; this reinterprets
-/// the first 12 bytes with no device read. Mirrors
-/// [`checkpoint`](super::checkpoint)'s `parse_header`.
-fn parse_header(block: &[u8; BLOCK_SIZE]) -> RawJournalHeader {
-    RawJournalHeader::from_bytes(&block[..HEADER_LEN])
-}
 
 /// Scans one transaction at `start_log` expecting tid `expected_tid`, WITHOUT
 /// writing anything (jbd2 `do_one_pass` in `PASS_SCAN`).
@@ -182,13 +151,12 @@ fn scan_transaction(
     start_log: u32,
     expected_tid: Tid,
 ) -> Result<Option<u32>> {
-    let first = journal.geometry().first();
-    let maxlen = journal.geometry().maxlen();
-
     // --- Descriptor block. ---
     let mut descriptor = [0u8; BLOCK_SIZE];
-    read_log_block(journal, device, start_log, &mut descriptor)?;
-    let header = parse_header(&descriptor);
+    journal
+        .geometry()
+        .read_log_block(device, start_log, &mut descriptor)?;
+    let header = RawJournalHeader::parse(&descriptor);
     let blocktype = header.h_blocktype.get();
     // Phase-4 revoke gap: a revoke block where a descriptor is expected is the log
     // boundary, not a transaction to process (full PASS_REVOKE is Phase 7). It is
@@ -226,7 +194,7 @@ fn scan_transaction(
         let flags = tag.t_flags.get();
 
         // This tag's metadata is the next log block after the previous one.
-        log = next_log_block(log, first, maxlen);
+        log = journal.geometry().next_log_block(log);
 
         // Advance past this 8-byte tag; the first tag (the one lacking SAME_UUID)
         // is additionally followed by its 16-byte UUID — identical to the reader.
@@ -241,16 +209,18 @@ fn scan_transaction(
     }
 
     // --- Commit block: the next log block after the last metadata block. ---
-    let commit_log = next_log_block(log, first, maxlen);
+    let commit_log = journal.geometry().next_log_block(log);
     let mut commit = [0u8; BLOCK_SIZE];
-    read_log_block(journal, device, commit_log, &mut commit)?;
-    let commit_header = parse_header(&commit);
+    journal
+        .geometry()
+        .read_log_block(device, commit_log, &mut commit)?;
+    let commit_header = RawJournalHeader::parse(&commit);
     if commit_header.h_magic.get() == JBD2_MAGIC {
         let commit_blocktype = commit_header.h_blocktype.get();
         if commit_blocktype == BLOCKTYPE_COMMIT && commit_header.h_sequence.get() == expected_tid {
             // A complete committed transaction: the next one starts right after
             // this commit block.
-            return Ok(Some(next_log_block(commit_log, first, maxlen)));
+            return Ok(Some(journal.geometry().next_log_block(commit_log)));
         }
         if commit_blocktype == BLOCKTYPE_DESCRIPTOR {
             // A *second* descriptor where the commit block should be: this
@@ -702,12 +672,21 @@ mod tests {
 
         // Sanity: T2's descriptor is at log 4, its metadata at 5, its commit at 6.
         assert_eq!(
-            parse_header(&read_log_block_at(&f, 4)).h_blocktype.get(),
+            RawJournalHeader::parse(&read_log_block_at(&f, 4))
+                .h_blocktype
+                .get(),
             BLOCKTYPE_DESCRIPTOR
         );
-        assert_eq!(parse_header(&read_log_block_at(&f, 4)).h_sequence.get(), 2);
         assert_eq!(
-            parse_header(&read_log_block_at(&f, 6)).h_blocktype.get(),
+            RawJournalHeader::parse(&read_log_block_at(&f, 4))
+                .h_sequence
+                .get(),
+            2
+        );
+        assert_eq!(
+            RawJournalHeader::parse(&read_log_block_at(&f, 6))
+                .h_blocktype
+                .get(),
             BLOCKTYPE_COMMIT
         );
 

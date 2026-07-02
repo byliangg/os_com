@@ -103,19 +103,6 @@ use super::{
 /// big-endian on-disk encoding of [`JBD2_MAGIC`].
 const JBD2_MAGIC_BYTES: [u8; 4] = JBD2_MAGIC.to_be_bytes();
 
-/// The next log block after `cur`, wrapping to `first` at the end of the log.
-///
-/// The usable log is the ring `[first, maxlen)`; block 0 holds the journal
-/// superblock and is never a log-data block, so wrapping returns to `first`.
-///
-/// Shared with [`checkpoint`](super::checkpoint): the checkpoint's
-/// log-transaction reader walks the same ring as this writer, so both use one
-/// definition of the wrap rule to stay byte-for-byte consistent.
-pub(super) fn next_log_block(cur: u32, first: u32, maxlen: u32) -> u32 {
-    let next = cur + 1;
-    if next >= maxlen { first } else { next }
-}
-
 /// Writes a full [`BLOCK_SIZE`] log block: resolves log block `log` to its
 /// physical device block and writes `block_buf` there.
 fn write_log_block(
@@ -149,83 +136,86 @@ pub(super) fn barrier(device: &dyn BlockDevice) -> Result<()> {
     }
 }
 
-/// Builds the descriptor block for `txn` into a fresh [`BLOCK_SIZE`] buffer.
-///
-/// Lays down the 12-byte header then one 8-byte tag per captured block (in
-/// block order), with the first tag's 16-byte UUID region zeroed. Returns the
-/// buffer plus, for each captured block in the same order, whether that block
-/// must be escaped when written into the log (`escape[i] == true`).
-fn build_descriptor_block(txn: &Transaction) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
-    let n = txn.metadata_blocks().count();
-    if n == 0 {
-        return_errno_with_message!(Errno::EINVAL, "cannot commit an empty transaction");
-    }
-
-    let mut block = Box::new([0u8; BLOCK_SIZE]);
-
-    // Header: magic + descriptor block type + this transaction's tid.
-    let header = RawJournalHeader {
-        h_magic: Be32::new(JBD2_MAGIC),
-        h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
-        h_sequence: Be32::new(txn.tid()),
-    };
-    let header_len = size_of::<RawJournalHeader>();
-    block[..header_len].copy_from_slice(header.as_bytes());
-
-    // The tag array starts right after the header. Each tag is 8 bytes; the
-    // first tag is additionally followed by a 16-byte UUID (left zeroed).
-    let tag_len = size_of::<RawBlockTag>();
-    let uuid_len = 16;
-    let mut offset = header_len;
-    let mut escape = Vec::with_capacity(n);
-
-    for (i, (bid, bytes)) in txn.metadata_blocks().enumerate() {
-        let is_first = i == 0;
-        let is_last = i == n - 1;
-
-        let mut flags = 0u16;
-        if !is_first {
-            // Only the first tag carries a UUID; every later tag reuses it.
-            flags |= TAG_FLAG_SAME_UUID;
+impl Transaction {
+    /// Builds this transaction's descriptor block into a fresh [`BLOCK_SIZE`]
+    /// buffer.
+    ///
+    /// Lays down the 12-byte header then one 8-byte tag per captured block (in
+    /// block order), with the first tag's 16-byte UUID region zeroed. Returns the
+    /// buffer plus, for each captured block in the same order, whether that block
+    /// must be escaped when written into the log (`escape[i] == true`).
+    fn build_descriptor_block(&self) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
+        let n = self.metadata_blocks().count();
+        if n == 0 {
+            return_errno_with_message!(Errno::EINVAL, "cannot commit an empty transaction");
         }
-        if is_last {
-            flags |= TAG_FLAG_LAST_TAG;
-        }
-        // Escape a block whose on-disk head would look like a jbd2 header.
-        let needs_escape = bytes[..4] == JBD2_MAGIC_BYTES;
-        if needs_escape {
-            flags |= TAG_FLAG_ESCAPE;
-        }
-        escape.push(needs_escape);
 
-        // Bids stay below 2^32 until INCOMPAT_64BIT (P6): the mount rejects the
-        // feature and reads only the 32-bit blocks_count. P6 needs v3 journal
-        // tags (t_blocknr_high) here.
-        debug_assert!(bid <= u32::MAX as u64);
-        let tag = RawBlockTag {
-            // Only the low 32 bits: 64-bit tags (INCOMPAT_64BIT) are rejected.
-            t_blocknr: Be32::new(bid as u32),
-            t_checksum: Be16::new(0),
-            t_flags: Be16::new(flags),
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+
+        // Header: magic + descriptor block type + this transaction's tid.
+        let header = RawJournalHeader {
+            h_magic: Be32::new(JBD2_MAGIC),
+            h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
+            h_sequence: Be32::new(self.tid()),
         };
+        let header_len = size_of::<RawJournalHeader>();
+        block[..header_len].copy_from_slice(header.as_bytes());
 
-        // The tag region (tags + the first tag's UUID) must fit the block. This
-        // is the single-descriptor bound; `max_credits` refuses over-large
-        // transactions up front, but re-check here so a directly built
-        // transaction cannot overflow the descriptor.
-        let tag_end = offset + tag_len + if is_first { uuid_len } else { 0 };
-        if tag_end > BLOCK_SIZE {
-            return_errno_with_message!(
-                Errno::ENOSPC,
-                "transaction needs more than one descriptor block (unsupported in Phase 4)"
-            );
+        // The tag array starts right after the header. Each tag is 8 bytes; the
+        // first tag is additionally followed by a 16-byte UUID (left zeroed).
+        let tag_len = size_of::<RawBlockTag>();
+        let uuid_len = 16;
+        let mut offset = header_len;
+        let mut escape = Vec::with_capacity(n);
+
+        for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
+            let is_first = i == 0;
+            let is_last = i == n - 1;
+
+            let mut flags = 0u16;
+            if !is_first {
+                // Only the first tag carries a UUID; every later tag reuses it.
+                flags |= TAG_FLAG_SAME_UUID;
+            }
+            if is_last {
+                flags |= TAG_FLAG_LAST_TAG;
+            }
+            // Escape a block whose on-disk head would look like a jbd2 header.
+            let needs_escape = bytes[..4] == JBD2_MAGIC_BYTES;
+            if needs_escape {
+                flags |= TAG_FLAG_ESCAPE;
+            }
+            escape.push(needs_escape);
+
+            // Bids stay below 2^32 until INCOMPAT_64BIT (P6): the mount rejects the
+            // feature and reads only the 32-bit blocks_count. P6 needs v3 journal
+            // tags (t_blocknr_high) here.
+            debug_assert!(bid <= u32::MAX as u64);
+            let tag = RawBlockTag {
+                // Only the low 32 bits: 64-bit tags (INCOMPAT_64BIT) are rejected.
+                t_blocknr: Be32::new(bid as u32),
+                t_checksum: Be16::new(0),
+                t_flags: Be16::new(flags),
+            };
+
+            // The tag region (tags + the first tag's UUID) must fit the block. This
+            // is the single-descriptor bound; `max_credits` refuses over-large
+            // transactions up front, but re-check here so a directly built
+            // transaction cannot overflow the descriptor.
+            let tag_end = offset + tag_len + if is_first { uuid_len } else { 0 };
+            if tag_end > BLOCK_SIZE {
+                return_errno_with_message!(
+                    Errno::ENOSPC,
+                    "transaction needs more than one descriptor block (unsupported in Phase 4)"
+                );
+            }
+
+            block[offset..offset + tag_len].copy_from_slice(tag.as_bytes());
+            offset = tag_end;
         }
 
-        block[offset..offset + tag_len].copy_from_slice(tag.as_bytes());
-        offset = tag_end;
+        Ok((block, escape))
     }
-
-    Ok((block, escape))
 }
 
 /// Builds the commit block into a fresh [`BLOCK_SIZE`] buffer: header +
@@ -252,54 +242,45 @@ fn build_commit_block(tid: Tid) -> Box<[u8; BLOCK_SIZE]> {
     block
 }
 
-/// Points the on-disk journal superblock at `txn_start`/`tid` as the oldest
-/// un-checkpointed transaction (jbd2 updates `s_start`/`s_sequence` when the
-/// journal transitions from clean to dirty), then barriers.
-///
-/// Called only when the journal was clean before this commit; a dirty journal
-/// already records an older transaction that must be preserved.
-///
-/// Does NOT touch `s_head`: Linux only reads `s_head` on the clean-unmount fast
-/// path (`recovery.c`, when `s_start == 0`), which Phase 4 never produces — our
-/// commits always leave `s_start != 0` until a checkpoint clears it. **Task 6
-/// (checkpoint / clean unmount) owns `s_head`: when it zeroes `s_start` on a
-/// clean unmount it MUST also write a correct `s_head`, or Linux would resume
-/// the log at a stale offset.** (Adversarial-review finding, Phase 4 Task 3.)
-fn update_superblock_tail(
-    journal: &Journal,
-    device: &dyn BlockDevice,
-    txn_start: u32,
-    tid: Tid,
-) -> Result<()> {
-    use super::format::RawJournalSuperblock;
+impl Journal {
+    /// Points the on-disk journal superblock at `txn_start`/`tid` as the oldest
+    /// un-checkpointed transaction (jbd2 updates `s_start`/`s_sequence` when the
+    /// journal transitions from clean to dirty), then barriers.
+    ///
+    /// Called only when the journal was clean before this commit; a dirty journal
+    /// already records an older transaction that must be preserved.
+    ///
+    /// Does NOT touch `s_head`: Linux only reads `s_head` on the clean-unmount fast
+    /// path (`recovery.c`, when `s_start == 0`), which Phase 4 never produces — our
+    /// commits always leave `s_start != 0` until a checkpoint clears it. **Task 6
+    /// (checkpoint / clean unmount) owns `s_head`: when it zeroes `s_start` on a
+    /// clean unmount it MUST also write a correct `s_head`, or Linux would resume
+    /// the log at a stale offset.** (Adversarial-review finding, Phase 4 Task 3.)
+    fn update_superblock_tail(
+        &self,
+        device: &dyn BlockDevice,
+        txn_start: u32,
+        tid: Tid,
+    ) -> Result<()> {
+        use super::format::RawJournalSuperblock;
 
-    let sb_pblock = journal
-        .geometry
-        .log_block_to_physical(0)
-        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped"))?;
-    let sb_offset = Bid::new(sb_pblock).to_offset();
+        let sb_pblock = self.geometry.log_block_to_physical(0).ok_or_else(|| {
+            Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped")
+        })?;
+        let sb_offset = Bid::new(sb_pblock).to_offset();
 
-    let mut raw: RawJournalSuperblock = device
-        .read_val(sb_offset)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
-    raw.s_start = Be32::new(txn_start);
-    raw.s_sequence = Be32::new(tid);
-    device
-        .write_val(sb_offset, &raw)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
+        let mut raw: RawJournalSuperblock = device
+            .read_val(sb_offset)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
+        raw.s_start = Be32::new(txn_start);
+        raw.s_sequence = Be32::new(tid);
+        device
+            .write_val(sb_offset, &raw)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
 
-    // The recoverability pointer must itself be durable.
-    barrier(device)
-}
-
-/// Advances the in-memory log head past `count` written log blocks, wrapping
-/// within `[first, maxlen)`.
-fn advance_head(head: u32, count: u32, first: u32, maxlen: u32) -> u32 {
-    let mut h = head;
-    for _ in 0..count {
-        h = next_log_block(h, first, maxlen);
+        // The recoverability pointer must itself be durable.
+        barrier(device)
     }
-    h
 }
 
 /// Commits `txn` to the on-disk log as a jbd2 transaction and makes it
@@ -315,8 +296,6 @@ pub(super) fn commit_transaction(
     mut txn: Transaction,
 ) -> Result<Tid> {
     let tid = txn.tid();
-    let first = journal.geometry.first();
-    let maxlen = journal.geometry.maxlen();
 
     // --- Step 0: ordered-data mode. Every ordered inode's dirty data must reach
     // its final location and be durable BEFORE any log block (and thus the commit
@@ -353,7 +332,7 @@ pub(super) fn commit_transaction(
         (st.head, st.tail_block == 0)
     };
 
-    let (descriptor, escape) = build_descriptor_block(&txn)?;
+    let (descriptor, escape) = txn.build_descriptor_block()?;
     let n = escape.len() as u32;
 
     // --- Step 1: write the descriptor and every metadata after-image. ---
@@ -361,7 +340,7 @@ pub(super) fn commit_transaction(
     write_log_block(journal, device, log, &descriptor)?;
 
     for ((_, bytes), needs_escape) in txn.metadata_blocks().zip(escape.iter()) {
-        log = next_log_block(log, first, maxlen);
+        log = journal.geometry.next_log_block(log);
         let mut buf = Box::new([0u8; BLOCK_SIZE]);
         buf.copy_from_slice(bytes);
         if *needs_escape {
@@ -377,7 +356,7 @@ pub(super) fn commit_transaction(
     barrier(device)?;
 
     // --- Step 3: write the commit block, sealing the transaction. ---
-    let commit_log = next_log_block(log, first, maxlen);
+    let commit_log = journal.geometry.next_log_block(log);
     let commit = build_commit_block(tid);
     write_log_block(journal, device, commit_log, &commit)?;
 
@@ -392,12 +371,12 @@ pub(super) fn commit_transaction(
     // final locations still hold the pre-transaction bytes, i.e. a consistent
     // pre-transaction state.
     if was_clean {
-        update_superblock_tail(journal, device, start_head, tid)?;
+        journal.update_superblock_tail(device, start_head, tid)?;
     }
 
     // --- Step 6: publish the new log position and commit id in memory. ---
     // Blocks written: 1 descriptor + N metadata + 1 commit = N + 2.
-    let new_head = advance_head(start_head, n + 2, first, maxlen);
+    let new_head = journal.geometry.advance(start_head, n + 2);
     {
         let mut st = journal.state_write();
         st.head = new_head;
