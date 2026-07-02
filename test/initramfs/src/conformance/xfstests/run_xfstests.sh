@@ -42,6 +42,26 @@ if ! mountpoint -q "$XFSTESTS_DIR/test"; then
     exit 1
 fi
 
+# Crash-workload mode (test/crash/run_matrix.sh): the recorded test disk
+# arrives pre-populated with workload scripts under /.crash (mke2fs -d); run
+# each in its own directory and exit — the crash states are reconstructed and
+# judged on the host from the blklogwrites log, not in here.
+if [ -n "${CRASH_WORKLOADS:-}" ]; then
+    cd "$XFSTESTS_DIR/test"
+    for w in .crash/*.sh; do
+        [ -f "$w" ] || continue
+        wd="wd_$(basename "$w" .sh)"
+        mkdir "$wd"
+        if ! (cd "$wd" && sh "../$w"); then
+            echo "crash workload $w failed" >&2
+            exit 1
+        fi
+    done
+    cd /
+    echo "crash workloads done"
+    exit 0
+fi
+
 RUNLIST_FILE=""
 TEST_ARGS=""
 

@@ -115,6 +115,11 @@ ifeq ($(CONFORMANCE_TEST_SUITE), xfstests)
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_RUNLIST=$(XFSTESTS_RUNLIST)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_TEST_DEV=$(XFSTESTS_TEST_DEV)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="XFSTESTS_SCRATCH_DEV=$(XFSTESTS_SCRATCH_DEV)"
+# Crash-workload mode: run pre-baked scripts off the (recorded) test disk
+# instead of ./check — see test/crash/run_matrix.sh.
+ifneq ($(CRASH_WORKLOADS),)
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="CRASH_WORKLOADS=$(CRASH_WORKLOADS)"
+endif
 endif
 CARGO_OSDK_BUILD_ARGS += --init-args="/opt/run_conformance_test.sh"
 else ifeq ($(AUTO_TEST), regression)
