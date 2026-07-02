@@ -897,6 +897,39 @@ impl Journal {
         })
     }
 
+    /// Commits whatever the running transaction has captured and waits for it
+    /// — the `sync(2)` durability point (jbd2's
+    /// `jbd2_journal_force_commit`-lite). A no-op when nothing is captured
+    /// (an empty transaction is not committable, so waiting on its tid would
+    /// sleep forever — see [`log_wait_commit`](Self::log_wait_commit)).
+    ///
+    /// # Locking
+    ///
+    /// Same contract as [`log_wait_commit`](Self::log_wait_commit): the caller
+    /// must hold no filesystem locks.
+    pub(in crate::fs::fs_impls::ext4) fn commit_and_wait_running(&self) -> Result<()> {
+        let target = {
+            let st = self.state_write();
+            match st.running.as_ref() {
+                Some(txn) if txn.nr_metadata_blocks() > 0 => txn.tid(),
+                _ => return Ok(()),
+            }
+        };
+        self.log_wait_commit(target)
+    }
+
+    /// The number of ordered-data inodes registered with the running
+    /// transaction. Test-only inspection for the write-path registration
+    /// wiring; call with the commit thread stopped, or the transaction may be
+    /// consumed between the operation and the assertion.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn running_nr_ordered_inodes_for_test(&self) -> usize {
+        self.state_write()
+            .running
+            .as_ref()
+            .map_or(0, |txn| txn.nr_ordered_inodes())
+    }
+
     /// Stops and joins the commit thread (jbd2 journal teardown).
     ///
     /// Sets [`stop`](Journal::stop), wakes the thread out of its `wait_until`, and

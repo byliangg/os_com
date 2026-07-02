@@ -71,7 +71,19 @@ impl FileOps for Ext4Inode {
             // requirements. P5's xfstests runs exclude the direct-IO groups.
             return_errno_with_message!(Errno::EOPNOTSUPP, "ext4 O_DIRECT write unimplemented");
         }
-        self.write_at(offset, reader)
+        let len = self.write_at(offset, reader)?;
+        // O_SYNC/O_DSYNC: write(2) on such an fd must not return before the
+        // data (and for O_SYNC, the metadata) is durable — silently ignoring
+        // the flags turns every O_SYNC write into a durability lie that a
+        // crash harness immediately exposes. Linux opens O_SYNC as
+        // __O_SYNC|O_DSYNC, so the O_SYNC check must come first. (sync_data
+        // currently equals sync_all; it narrows when P7 enables datasync_tid.)
+        if status_flags.contains(StatusFlags::O_SYNC) {
+            Inode::sync_all(self)?;
+        } else if status_flags.contains(StatusFlags::O_DSYNC) {
+            Inode::sync_data(self)?;
+        }
+        Ok(len)
     }
 
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {

@@ -27,6 +27,16 @@ impl FileSystem for Ext4 {
         // hook (`Path::unmount` -> `Mount::sync` -> `FileSystem::sync`), so a
         // clean unmount flushes every dirty inode and the bitmap consistently.
         self.sync_all()?;
+        // sync(2) is a durability point: the inode writebacks above captured
+        // into the running transaction, and returning before that transaction
+        // reaches the log would silently drop the metadata on a crash — the
+        // sync-then-cut-power baseline every crash harness builds on. No fs
+        // lock is held here, as `commit_and_wait_running` requires. (The
+        // free-count direct writes inside `sync_metadata` remain the known P7
+        // WAL-inversion debt; this closes only the "sync does not wait" half.)
+        if let Some(journal) = self.journal() {
+            journal.commit_and_wait_running()?;
+        }
         if self.block_device().sync()? != BioStatus::Complete {
             return_errno_with_message!(Errno::EIO, "failed to flush block device");
         }

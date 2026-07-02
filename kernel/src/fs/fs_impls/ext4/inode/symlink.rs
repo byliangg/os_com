@@ -14,7 +14,7 @@
 //!   block through the normal page-cache path, exactly like a small file.
 
 use super::{
-    super::{fs::Ext4, prelude::*, utils},
+    super::{fs::Ext4, journal, prelude::*, utils},
     FileFlags, Inode, InodeInner, InodePayload, MAX_FAST_SYMLINK_LEN, RAW_BLOCK_PTRS_LEN,
     extent_manager::ExtentTree,
 };
@@ -73,8 +73,20 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.write_link(&fs, target)?;
+        // Journal handle after the inner lock (inner ① → handle ②): the fast
+        // path may free a previous slow target's block, the slow path
+        // allocates one — both mutate bitmaps/GDT/extents, which must be
+        // captured like every other metadata write. (This path historically
+        // ran handle-less; on a journaled volume that left the allocation
+        // unjournaled.)
+        let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
+        let wrote_slow_target = inner.write_link(&fs, target, op.get())?;
         inner.set_mtime_ctime(utils::now());
+        // data=ordered: a slow target lives in a data block; it must reach the
+        // device before the extent metadata that points at it commits.
+        if wrote_slow_target && let Some(handle) = op.get() {
+            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+        }
         Ok(())
     }
 }
@@ -86,7 +98,14 @@ impl InodeInner {
         matches!(self.payload, InodePayload::FastSymlink { .. })
     }
 
-    fn write_link(&mut self, fs: &Arc<Ext4>, target: &str) -> Result<()> {
+    /// Returns whether the target went to slow (extent-mapped data block)
+    /// storage — the case the caller must register as ordered data.
+    fn write_link(
+        &mut self,
+        fs: &Arc<Ext4>,
+        target: &str,
+        handle: Option<&journal::Handle>,
+    ) -> Result<bool> {
         let target_len = target.len();
 
         // Linux reserves one byte in `i_block` for a trailing NUL.
@@ -94,7 +113,7 @@ impl InodeInner {
             // Fast path: store the target inline in the `i_block` area. Free any
             // data block held by a previous slow target first.
             if let InodePayload::DataBacked { extent_manager, .. } = &self.payload {
-                extent_manager.truncate_to_byte_len(0, None)?;
+                extent_manager.truncate_to_byte_len(0, handle)?;
             }
             let mut fast_target = FastSymlinkTarget::new_zeros();
             fast_target.write(target.as_bytes());
@@ -107,6 +126,8 @@ impl InodeInner {
             self.payload = InodePayload::FastSymlink {
                 target: fast_target,
             };
+            self.set_file_size(target_len);
+            Ok(false)
         } else {
             // Slow path: write through an extent-mapped data block. A symlink
             // created by `create_inode` already arrives `DataBacked` (extent
@@ -119,13 +140,12 @@ impl InodeInner {
                     Arc::downgrade(fs),
                 )?;
             }
-            self.prepare_write(fs, 0, target_len, None)?;
+            self.prepare_write(fs, 0, target_len, handle)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();
             self.page_cache()?.write(0, &mut reader)?;
+            self.set_file_size(target_len);
+            Ok(true)
         }
-
-        self.set_file_size(target_len);
-        Ok(())
     }
 
     fn read_link(&self) -> Result<String> {

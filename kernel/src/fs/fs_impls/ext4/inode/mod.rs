@@ -639,6 +639,11 @@ pub struct Inode {
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext4>,
+    /// This inode's own `Weak` (minted by `Arc::new_cyclic`), so the write
+    /// paths can register the inode with the running transaction's
+    /// ordered-data table (jbd2 `data=ordered`) without the `Arc` in hand.
+    /// Never used on the `Drop`/reclaim path, where upgrading would fail.
+    self_weak: Weak<Inode>,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -655,7 +660,10 @@ impl Inode {
         fs: Weak<Ext4>,
     ) -> Result<Arc<Self>> {
         let payload = InodePayload::new(&desc, fs.clone())?;
-        Ok(Arc::new(Self {
+        // `new_cyclic` so the write paths can hand `self_weak` to the journal's
+        // ordered-inode registration; the only fallible step (payload parsing)
+        // runs before the closure, which just assembles.
+        Ok(Arc::new_cyclic(|self_weak| Self {
             ino,
             type_,
             inner: RwMutex::new(InodeInner {
@@ -666,6 +674,7 @@ impl Inode {
             }),
             block_group_idx,
             fs,
+            self_weak: self_weak.clone(),
             extension: Extension::new(),
         }))
     }
@@ -743,19 +752,20 @@ impl Inode {
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images this write's
         // allocations dirty. Dropped at return, closing the handle.
-        //
-        // P4 limitation (data=ordered not wired; owner: P5-T0, before the
-        // crash harness runs): this write's data pages are NOT registered as
-        // ordered data of the transaction (`Transaction::add_ordered_inode`),
-        // so they are not flushed before the extent metadata commits. On a
-        // clean unmount the fs-level sync flushes them; but a crash after this
-        // transaction commits (or checkpoints) yet before the data pages reach
-        // the platter can leave the committed extents covering stale blocks.
-        // File **metadata** is crash-safe; file **data** ordering is not
-        // (registering ordered inodes needs the write path to reach the
-        // `Arc<Inode>`).
         let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
-        inner.write_at(&fs, offset, reader, op.get())
+        let len = inner.write_at(&fs, offset, reader, op.get())?;
+        // data=ordered: this write's dirty pages must reach their final blocks
+        // before the transaction's commit block, or recovery could replay
+        // extents that point at blocks whose data never hit the platter.
+        // Registered unconditionally rather than only for allocating writes —
+        // a pure overwrite's extra registration costs one idempotent flush of
+        // pages that are usually clean by commit time (Linux registers only
+        // newly-mapped ranges; that precision needs `ensure_allocated` to
+        // report whether it allocated, a P7/P9 refinement).
+        if let Some(handle) = op.get() {
+            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+        }
+        Ok(len)
     }
 
     /// Truncates or extends a regular file to `new_size` bytes.
@@ -780,7 +790,18 @@ impl Inode {
         // commit-per-op a whole truncate is one transaction — atomic across a
         // crash — so nothing is needed yet; P7's multi-transaction truncate
         // brings the fs-level re-truncate orphan machinery with it.
+        let old_size = inner.file_size();
         inner.resize(&fs, new_size, op.get())?;
+        // data=ordered on shrink: the kept partial block is re-zeroed in the
+        // page cache, and that zeroing must reach the device before this
+        // transaction's commit — otherwise a later sparse extend over the tail
+        // could expose the pre-truncate bytes after a replay (Linux registers
+        // the same case in __ext4_block_zero_page_range).
+        if new_size < old_size
+            && let Some(handle) = op.get()
+        {
+            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+        }
         Ok(())
     }
 
@@ -1317,6 +1338,18 @@ impl InodeInner {
     /// frees every data/metadata block past `new_size`, then publishes the size.
     fn shrink(&mut self, new_size: usize, handle: Option<&journal::Handle>) -> Result<()> {
         let old_size = self.file_size();
+        // Ordered-data vs. truncate: discarding the doomed tail pages would
+        // orphan the flush obligation of an *earlier committing* transaction
+        // whose extents still reference them (its ordered flush only writes
+        // pages that are still dirty — a discarded page is silently gone, and
+        // replaying that transaction would then expose whatever the device
+        // holds). Flush the affected span to its final blocks first; rare and
+        // bounded (shrinks only), where Linux instead orders the truncate
+        // against the committing transaction (jbd2_journal_begin_ordered_truncate).
+        if let Ok(page_cache) = self.page_cache() {
+            let doomed_start = (new_size / BLOCK_SIZE) * BLOCK_SIZE;
+            page_cache.flush_range(doomed_start..old_size)?;
+        }
         // Order (report §5.2 rule 4, shrink): zero + shrink the VMO before the
         // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
         // kept partial block (BLOCK_SIZE == PAGE_SIZE), so stale tail bytes do
@@ -1950,5 +1983,38 @@ mod write_tests {
         let dir = f.ext4.read_inode(2).unwrap();
         assert_eq!(dir.inode_type(), InodeType::Dir);
         assert_eq!(dir.resize(0).unwrap_err().error(), Errno::EISDIR);
+    }
+
+    /// P5-T0: allocating writes and shrinking truncates must register the
+    /// inode as ordered data of the running transaction (jbd2 `data=ordered`),
+    /// so the commit pipeline flushes its pages before the commit block.
+    #[ktest]
+    fn journaled_write_and_shrink_register_ordered_data() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let journal = f.ext4.journal().unwrap();
+        // Keep the running transaction inspectable: without the commit thread
+        // nothing consumes it between the operation and the assertion.
+        journal.stop_commit_thread();
+
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 0);
+
+        // An allocating write registers the inode (keyed by ino — repeats stay
+        // one entry).
+        write_all(&inode, 0, &[0x5au8; 2 * BLOCK_SIZE]);
+        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
+        write_all(&inode, 2 * BLOCK_SIZE, &[0xa5u8; BLOCK_SIZE]);
+        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
+
+        // A shrink to a non-block-aligned size re-zeroes the kept tail in the
+        // page cache and must (re-)register too.
+        inode.resize(BLOCK_SIZE / 2).unwrap();
+        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
     }
 }

@@ -359,8 +359,14 @@ impl Transaction {
     /// no-op beyond refreshing the `Weak`. Held weakly — the transaction never
     /// keeps the inode alive.
     pub(super) fn add_ordered_inode(&mut self, inode: &Arc<Inode>) {
-        self.ordered_inodes
-            .insert(inode.ino(), Arc::downgrade(inode));
+        self.add_ordered_inode_weak(inode.ino(), Arc::downgrade(inode));
+    }
+
+    /// [`add_ordered_inode`](Self::add_ordered_inode) for callers that hold the
+    /// inode's own `Weak` instead of an `Arc` (the write paths, via
+    /// `Inode::self_weak`).
+    pub(super) fn add_ordered_inode_weak(&mut self, ino: Ext4Ino, inode: Weak<Inode>) {
+        self.ordered_inodes.insert(ino, inode);
     }
 
     /// Iterates the live ordered-data inodes, upgrading each [`Weak`] and skipping
@@ -422,6 +428,29 @@ impl Handle {
         self.journal.upgrade().ok_or_else(|| {
             Error::with_message(Errno::EIO, "journal dropped while a handle was open")
         })
+    }
+
+    /// Registers `inode` as **ordered data** of this handle's transaction
+    /// (jbd2 `data=ordered`): its dirty file pages are flushed to their final
+    /// locations before the transaction's commit block is written, so recovery
+    /// never replays metadata that points at blocks whose data missed the
+    /// platter. Every operation that makes committed metadata reference new
+    /// data blocks (allocating writes, tail-zeroing truncates, slow-symlink
+    /// targets) must call this before its handle closes.
+    ///
+    /// Requiring the open handle pins the running transaction, so the
+    /// registration cannot land in a different transaction than the
+    /// operation's own metadata captures. Takes the journal state lock
+    /// transiently, exactly like the capture funnels (lock order unchanged).
+    pub(in crate::fs::fs_impls::ext4) fn register_ordered_inode(
+        &self,
+        ino: Ext4Ino,
+        inode: Weak<Inode>,
+    ) -> Result<()> {
+        let journal = self.journal()?;
+        let mut st = journal.state_write();
+        super::verify_running(&mut st.running, self)?.add_ordered_inode_weak(ino, inode);
+        Ok(())
     }
 }
 
