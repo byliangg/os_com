@@ -948,6 +948,22 @@ impl Ext4 {
         // bail on `ext4_forced_shutdown`); fsync of a dirty inode reports the
         // death as `EIO` through this same gate.
         self.ensure_not_shutdown()?;
+        // While the journal is live, these direct RMWs are pure WAL hazard:
+        // every bitmap/GDT/superblock mutation is already captured at op time
+        // (the write-access credentials + `journal_capture`) and reaches its
+        // final location via checkpoint, whereas a direct write here can land
+        // *ahead* of a still-uncommitted transaction — the crash harness
+        // reconstructed exactly that (bitmap/counts ahead of the journal at a
+        // sync-then-crash boundary). Durability for sync(2) comes from
+        // waiting on the commit instead (`commit_and_wait_running`). Only the
+        // unmount path, after `stop_commit_thread` + `flush_on_unmount`
+        // emptied the log, may write directly again (nothing uncommitted
+        // remains — that is where the cleared `RECOVER` flag goes out).
+        if let Some(journal) = self.journal()
+            && !journal.is_stopped()
+        {
+            return Ok(());
+        }
         for group in &self.block_groups {
             group.sync_metadata()?;
         }

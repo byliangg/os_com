@@ -899,7 +899,7 @@ impl Inode {
         let fs = self.fs()?;
         let wait_tid = {
             let mut inner = self.inner.write();
-            inner.sync_data_pages()?;
+            inner.sync_data_pages(&fs)?;
             // Journaled: capture instead of direct-writing (see
             // `sync_metadata`). Wait below on whichever transaction carries
             // this inode's newest capture: the one this writeback just made
@@ -945,7 +945,7 @@ impl Inode {
     pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
-        inner.sync_data_pages()?;
+        inner.sync_data_pages(&fs)?;
         let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
         inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         Ok(())
@@ -1538,7 +1538,19 @@ impl InodeInner {
     }
 
     /// Flushes dirty data pages in `[0, file_size)`.
-    fn sync_data_pages(&self) -> Result<()> {
+    fn sync_data_pages(&self, fs: &Ext4) -> Result<()> {
+        // Journaled DIRECTORY blocks are metadata: every edit is captured
+        // into the journal (`journal_dir_block`) and reaches its final
+        // location only via checkpoint. Flushing the page-cache copy directly
+        // races WAL — the crash harness reconstructed a state where a
+        // concurrent sync flushed a dir page carrying a still-uncommitted
+        // unlink (dirent gone on disk, the inode update never committed →
+        // unattached inode after replay). The journal owns directory
+        // persistence end to end on journaled volumes; the page cache is a
+        // read/edit cache only.
+        if self.desc.type_() == InodeType::Dir && fs.journal().is_some() {
+            return Ok(());
+        }
         let file_size = self.file_size();
         if file_size == 0 {
             return Ok(());

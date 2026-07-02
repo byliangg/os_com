@@ -831,8 +831,16 @@ impl Journal {
 
     /// Returns whether the journal has been aborted by a failed commit (see the
     /// [`aborted`](Journal::aborted) field).
-    pub(super) fn is_aborted(&self) -> bool {
+    pub(in crate::fs::fs_impls::ext4) fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::Acquire)
+    }
+
+    /// Returns whether [`stop_commit_thread`](Journal::stop_commit_thread) has
+    /// been requested — the unmount quiesce point. Once true (and after
+    /// `flush_on_unmount` empties the log), direct metadata writes are safe
+    /// again: nothing is uncommitted, so there is no WAL left to invert.
+    pub(in crate::fs::fs_impls::ext4) fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
     }
 
     /// Aborts the journal after a failed commit: further `journal_start`s are
