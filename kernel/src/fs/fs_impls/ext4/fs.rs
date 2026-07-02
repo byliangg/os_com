@@ -498,11 +498,6 @@ impl Ext4 {
     /// caller's fsuid/fsgid, `now` timestamps, and a monotonic generation), and
     /// writes the full on-disk inode. On a writeback failure the inode bit is
     /// freed and the superblock counter restored. Mirrors ext2 `create_inode`.
-    //
-    // Reached from `Inode::create` (the namespace entry point not yet wired into
-    // the VFS); that root's `expect(dead_code)` marker keeps this helper and
-    // everything below it (`alloc_ino`/`free_inode`/`write_new_inode_desc`/
-    // `InodeDesc::new`) reachable, so none of those need their own marker.
     pub(super) fn create_inode(
         &self,
         parent_ino: Ext4Ino,
@@ -1273,59 +1268,6 @@ fn journal_inode_block(
     )
 }
 
-/// Rollback guard for blocks allocated through [`Ext4::alloc_blocks`].
-///
-/// Tracks every allocated range and, unless [`commit`](Self::commit) is called,
-/// frees them all on drop. This is the allocation-rollback primitive that later
-/// tasks (e.g. extent insertion) use to undo block allocations when a multi-step
-/// operation fails partway through.
-pub(super) struct BlockAllocGuard<'a> {
-    fs: &'a Ext4,
-    ranges: Vec<Range<Ext4Bid>>,
-    committed: bool,
-}
-
-#[cfg_attr(not(ktest), expect(dead_code))]
-impl<'a> BlockAllocGuard<'a> {
-    /// Creates a guard tracking no ranges yet.
-    pub(super) fn new(fs: &'a Ext4) -> Self {
-        Self {
-            fs,
-            ranges: Vec::new(),
-            committed: false,
-        }
-    }
-
-    /// Records an allocated range to be rolled back on drop.
-    pub(super) fn extend(&mut self, range: Range<Ext4Bid>) {
-        if !range.is_empty() {
-            self.ranges.push(range);
-        }
-    }
-
-    /// Commits the allocation; the tracked ranges are kept on drop.
-    pub(super) fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for BlockAllocGuard<'_> {
-    fn drop(&mut self) {
-        if self.committed {
-            return;
-        }
-        for range in self.ranges.iter() {
-            let count = (range.end - range.start) as u32;
-            if let Err(err) = self.fs.free_blocks(range.start, count, None) {
-                error!(
-                    "BlockAllocGuard: failed to free range {:?} in rollback: {:?}",
-                    range, err
-                );
-            }
-        }
-    }
-}
-
 #[cfg(ktest)]
 mod tests {
     use ostd::prelude::*;
@@ -1453,72 +1395,6 @@ mod tests {
                 .error(),
             Errno::EINVAL
         );
-    }
-
-    #[ktest]
-    fn block_alloc_guard_rolls_back_on_drop() {
-        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
-            .with_block_bitmap_metadata_marked()
-            .build()
-            .unwrap();
-        let before_sb_free = f.ext4.super_block().free_blocks_count();
-        let before_group_free = f.ext4.block_group(0).free_blocks_count();
-
-        let range = f
-            .ext4
-            .alloc_blocks(4, f.ext4.block_group(0).first_block(), None)
-            .unwrap();
-        let alloc_len = (range.end - range.start) as u32;
-        assert!(alloc_len > 0);
-
-        {
-            let mut guard = BlockAllocGuard::new(&f.ext4);
-            guard.extend(range.clone());
-            // Drop without commit -> rollback.
-        }
-
-        // Counts restored and bitmap bits cleared.
-        assert_eq!(f.ext4.super_block().free_blocks_count(), before_sb_free);
-        assert_eq!(f.ext4.block_group(0).free_blocks_count(), before_group_free);
-        let group = f.ext4.block_group(0);
-        let metadata = group.metadata();
-        for bid in range.clone() {
-            let bit = (bid - group.first_block()) as u16;
-            assert!(!metadata.block_bitmap.is_allocated(bit));
-        }
-    }
-
-    #[ktest]
-    fn block_alloc_guard_commit_keeps_blocks() {
-        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
-            .with_block_bitmap_metadata_marked()
-            .build()
-            .unwrap();
-        let before_sb_free = f.ext4.super_block().free_blocks_count();
-
-        let range = f
-            .ext4
-            .alloc_blocks(4, f.ext4.block_group(0).first_block(), None)
-            .unwrap();
-        let alloc_len = (range.end - range.start) as u32;
-
-        {
-            let mut guard = BlockAllocGuard::new(&f.ext4);
-            guard.extend(range.clone());
-            guard.commit();
-        }
-
-        // Allocation persists.
-        assert_eq!(
-            f.ext4.super_block().free_blocks_count(),
-            before_sb_free - alloc_len as u64
-        );
-        let group = f.ext4.block_group(0);
-        let metadata = group.metadata();
-        for bid in range {
-            let bit = (bid - group.first_block()) as u16;
-            assert!(metadata.block_bitmap.is_allocated(bit));
-        }
     }
 
     #[ktest]

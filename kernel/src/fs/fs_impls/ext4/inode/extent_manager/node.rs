@@ -238,6 +238,10 @@ impl From<&Extent> for RawExtent {
         } else {
             ext.len
         };
+        // The on-disk format caps physical blocks at 48 bits (16-bit hi +
+        // 32-bit lo); today every allocator-returned bid is < 2^32 (no-64bit
+        // mount invariant), so the split below is lossless.
+        debug_assert!(ext.start < 1 << 48);
         Self {
             block: ext.block,
             len,

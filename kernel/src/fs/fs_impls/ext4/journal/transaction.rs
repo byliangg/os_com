@@ -142,9 +142,11 @@ impl UncheckpointedImage {
 
 /// The jbd2 transaction lifecycle (`transaction_t.t_state`).
 ///
-/// Phase 4 (Task 2a) drives only [`Running`](TransactionState::Running); the
-/// remaining states belong to the commit pipeline and later phases. All seven
-/// are defined up front so wiring the commit path later does not churn the enum.
+/// Phase 4's commit pipeline drives only
+/// [`Running`](TransactionState::Running) → [`Finished`](TransactionState::Finished)
+/// (a single committer thread needs no intermediate states). The five
+/// in-between states are reserved for P7's staged/group commit; they are
+/// defined up front to keep the jbd2 lifecycle visible and avoid enum churn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TransactionState {
     /// Accepting new handles and metadata (`T_RUNNING`).
@@ -391,11 +393,7 @@ impl Transaction {
 /// Obtained from [`journal_start`] and released by [`journal_stop`]. It holds a
 /// credit reservation (the max metadata blocks the caller may dirty) and a weak
 /// back-reference to its [`Journal`]; the reference is weak to avoid a refcount
-/// cycle once the `Journal` owns the commit thread (a later task).
-//
-// The type is named by the (still no-op) funnels' `Option<&Handle>` signatures,
-// so the struct itself is live; its fields and accessors are unused until the
-// funnels are wired up (covered by the module-level dead-code expectation).
+/// cycle with the commit thread the `Journal` owns.
 pub(in crate::fs::fs_impls::ext4) struct Handle {
     /// The transaction this handle joined (`h_transaction->t_tid`).
     tid: Tid,
@@ -446,9 +444,9 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 /// metadata blocks (jbd2 `jbd2_journal_start`).
 ///
 /// If no transaction is running, a fresh one is created with the next tid. The
-/// capacity check here is basic — Phase 4 does not yet block or trigger a commit
-/// under space pressure (a later task); it simply refuses to over-commit a
-/// single transaction.
+/// capacity check here is basic — Phase 4 does not block or trigger a commit
+/// under space pressure (P7, with precise credit accounting); it simply refuses
+/// to over-commit a single transaction.
 pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
     // An aborted journal (a commit failed and was lost) accepts no new work:
     // capturing into it would publish fragments of the lost transaction.
@@ -482,9 +480,9 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
 
 /// Closes a handle, releasing its credit reservation (jbd2 `jbd2_journal_stop`).
 ///
-/// Triggering a commit when the last handle of a transaction closes
-/// (`t_updates` reaches 0) is wired to the commit pipeline in a later task; this
-/// only releases the reservation.
+/// When the last handle of a transaction closes (`t_updates` reaches 0) and the
+/// transaction captured metadata, this signals the commit thread — Phase 4's
+/// commit-per-op. The signal is asynchronous; durability is `fsync`'s job.
 pub(super) fn journal_stop(handle: Handle) -> Result<()> {
     let journal = handle
         .journal
@@ -542,10 +540,10 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
 ///
 /// Phase-4 note: a real restart forces a commit boundary — it commits the
 /// current transaction and starts a fresh one so an unbounded operation (write /
-/// truncate) never overflows a single transaction. The commit pipeline does not
-/// exist yet, so this Task-2a skeleton only releases the old reservation and
-/// re-reserves on the *still-running* transaction; it is wired to the commit
-/// pipeline in a later task.
+/// truncate) never overflows a single transaction. That needs multi-transaction
+/// operations (re-capture after the boundary, re-truncate orphan recovery),
+/// which are P7's journal_restart work; this skeleton only releases the old
+/// reservation and re-reserves on the *still-running* transaction.
 pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()> {
     let journal = handle
         .journal

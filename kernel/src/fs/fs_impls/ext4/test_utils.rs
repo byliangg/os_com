@@ -22,7 +22,7 @@ use ostd::mm::{HasSize, io::util::HasVmReaderWriter};
 use super::{
     block_group::RawBlockGroup,
     fs::{Ext4, JOURNAL_INO, ROOT_INO},
-    inode::{EXTENTS_FL, RawInode},
+    inode::{FileFlags, RawInode},
     prelude::*,
     super_block::{MAGIC_NUM, RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
 };
@@ -517,7 +517,7 @@ fn make_root_dir_inode() -> RawInode {
         size_lo: BLOCK_SIZE as u32,
         link_count: 2,
         sector_count: (BLOCK_SIZE / SECTOR_SIZE) as u32,
-        flags: EXTENTS_FL,
+        flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
     }
@@ -531,7 +531,7 @@ pub(super) fn make_file_inode(data_block: u32, size: u32) -> RawInode {
         size_lo: size,
         link_count: 1,
         sector_count: (BLOCK_SIZE / SECTOR_SIZE) as u32,
-        flags: EXTENTS_FL,
+        flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
     };
@@ -557,7 +557,7 @@ pub(super) fn make_multi_block_file_inode(data_block: u32, len: u16) -> RawInode
         size_lo: len as u32 * BLOCK_SIZE as u32,
         link_count: 1,
         sector_count: (len as u32) * (BLOCK_SIZE / SECTOR_SIZE) as u32,
-        flags: EXTENTS_FL,
+        flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
     };
@@ -582,7 +582,7 @@ pub(super) fn make_empty_file_inode() -> RawInode {
         size_lo: 0,
         link_count: 1,
         sector_count: 0,
-        flags: EXTENTS_FL,
+        flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
     };
@@ -605,7 +605,7 @@ pub(super) fn make_unwritten_file_inode(data_block: u32, len: u16, size: u32) ->
         size_lo: size,
         link_count: 1,
         sector_count: (len as u32) * (BLOCK_SIZE / SECTOR_SIZE) as u32,
-        flags: EXTENTS_FL,
+        flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
     };

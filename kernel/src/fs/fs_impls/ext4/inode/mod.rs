@@ -69,11 +69,6 @@ pub(super) type Ext4Bid = u64;
 /// Inode number.
 pub(super) type Ext4Ino = u32;
 
-/// `i_flags` value marking an inode whose `i_block` holds an extent tree
-/// (Linux `EXT4_EXTENTS_FL`). Phase 1 only reads extent-mapped data inodes.
-#[cfg_attr(not(ktest), expect(dead_code))]
-pub(super) const EXTENTS_FL: u32 = 0x0008_0000;
-
 /// `i_flags` value marking an inode with inline data (Linux
 /// `EXT4_INLINE_DATA_FL`); unsupported in Phase 1.
 #[expect(dead_code)]
@@ -634,15 +629,16 @@ impl Inode {
         // block-bitmap / group-descriptor / extent after-images this write's
         // allocations dirty. Dropped at return, closing the handle.
         //
-        // P4 limitation (data=ordered not wired, → follow-up): this write's data
-        // pages are NOT registered as ordered data of the transaction
-        // (`Transaction::add_ordered_inode`), so they are not flushed before the
-        // extent metadata commits. On a clean unmount the fs-level sync flushes
-        // them; but a crash after this transaction commits (or checkpoints) yet
-        // before the data pages reach the platter can leave the committed extents
-        // covering stale blocks. File **metadata** is crash-safe; file **data**
-        // ordering is a follow-up (registering ordered inodes needs the write path
-        // to reach the `Arc<Inode>`).
+        // P4 limitation (data=ordered not wired; owner: P5-T0, before the
+        // crash harness runs): this write's data pages are NOT registered as
+        // ordered data of the transaction (`Transaction::add_ordered_inode`),
+        // so they are not flushed before the extent metadata commits. On a
+        // clean unmount the fs-level sync flushes them; but a crash after this
+        // transaction commits (or checkpoints) yet before the data pages reach
+        // the platter can leave the committed extents covering stale blocks.
+        // File **metadata** is crash-safe; file **data** ordering is not
+        // (registering ordered inodes needs the write path to reach the
+        // `Arc<Inode>`).
         let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
         inner.write_at(&fs, offset, reader, op.get())
     }
@@ -661,23 +657,15 @@ impl Inode {
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images a shrink frees.
         let op = fs.begin_op(Ext4::TRUNCATE_CREDITS)?;
-        // Orphan-list seam for shrinking truncates — deliberately still the
-        // funnel no-op, NOT the fs-level `orphan_add`/`orphan_del` the delete
-        // path uses. A truncated inode stays live (link count > 0), whereas the
-        // mount-time orphan scan *frees* every inode it finds on the list;
-        // putting a live inode there would lose it. And under commit-per-op a
-        // whole truncate is one transaction — atomic across a crash — so it
-        // needs no orphan protection yet; crash-safe multi-transaction truncate
-        // (recovery re-truncates rather than frees, a distinct recovery mode)
-        // arrives with P7's `journal_restart`.
-        let is_shrink = new_size < inner.file_size();
-        if is_shrink {
-            journal::orphan_add(op.get(), self.ino)?;
-        }
+        // Truncate-orphan protection is deliberately absent (owner: P7
+        // `journal_restart`). It must NOT reuse the delete path's fs-level
+        // `orphan_add`/`orphan_del`: a truncated inode stays live (link count
+        // > 0) while the mount-time orphan scan *frees* everything on the list
+        // — recovery must *re-truncate* instead, a distinct mode. Under
+        // commit-per-op a whole truncate is one transaction — atomic across a
+        // crash — so nothing is needed yet; P7's multi-transaction truncate
+        // brings the fs-level re-truncate orphan machinery with it.
         inner.resize(&fs, new_size, op.get())?;
-        if is_shrink {
-            journal::orphan_del(op.get(), self.ino)?;
-        }
         Ok(())
     }
 
@@ -753,7 +741,8 @@ impl Inode {
     /// On a journaled volume the writeback is captured under a handle (see
     /// [`sync_metadata`](Self::sync_metadata)); its commit is asynchronous — the
     /// filesystem-level sync's log durability is a documented P4 limitation
-    /// (unmount reaches durability via `flush_on_unmount`).
+    /// (unmount reaches durability via `flush_on_unmount`; owner: P7, a
+    /// `log_wait_commit` at the `FileSystem::sync` boundary).
     pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();
@@ -1392,7 +1381,7 @@ mod tests {
             size_lo: BLOCK_SIZE as u32,
             link_count: 2,
             sector_count: (BLOCK_SIZE / SECTOR_SIZE) as u32,
-            flags: EXTENTS_FL,
+            flags: FileFlags::EXTENTS.bits(),
             extra_isize: 32,
             ..Default::default()
         }

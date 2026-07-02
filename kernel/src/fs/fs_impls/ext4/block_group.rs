@@ -19,6 +19,14 @@
 //! the same read-modify-write. The inode-table page cache still arrives later;
 //! inode-table writeback stays a direct RMW via `Ext4::write_back_inode_desc`.
 //!
+//! # Width invariant
+//!
+//! Group-relative bit indices and per-group counters are narrowed to `u16`
+//! throughout this file. That leans on one parse-time invariant: a group holds
+//! at most `block_size * 8 = 32768 < u16::MAX` blocks/inodes
+//! (`SuperBlock::try_from` rejects larger `s_{blocks,inodes}_per_group`), and
+//! counters never exceed the group capacity.
+//!
 //! # Locking
 //!
 //! `BlockGroup` uses two independent locks:
@@ -281,12 +289,6 @@ impl BlockGroup {
         })
     }
 
-    /// Returns the block group index.
-    #[expect(dead_code)] // Phase 3 inode-cache routing keys on this.
-    pub(super) fn group_idx(&self) -> usize {
-        self.group_idx
-    }
-
     /// Re-reads this group's descriptor and both bitmaps from the device,
     /// replacing the cached copies.
     ///
@@ -436,13 +438,6 @@ impl BlockGroup {
         self.metadata.read().desc.used_dirs_count()
     }
 
-    /// Returns whether the group descriptor has been modified since the last
-    /// writeback.
-    #[expect(dead_code)] // Phase 3 filesystem-level sync checks this before writeback.
-    pub(super) fn is_desc_dirty(&self) -> bool {
-        self.metadata.read().desc.is_dirty()
-    }
-
     /// Returns a read guard over the combined group metadata.
     #[cfg(ktest)]
     pub(super) fn metadata(&self) -> RwMutexReadGuard<'_, BlockGroupMetadata> {
@@ -474,8 +469,9 @@ impl BlockGroup {
         let block_bitmap_bid = metadata.desc.block_bitmap_bid();
         journal::get_write_access(handle, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
 
-        // TODO: Improve bitmap allocation to reduce fragmentation (e.g., find the
-        // first free block directly instead of retrying with smaller counts).
+        // TODO(P9, allocator work): improve bitmap allocation to reduce
+        // fragmentation (e.g. find the first free run directly instead of
+        // retrying with halved counts).
         let mut allocated_range = None;
         while requested_count > 0 {
             let candidate_range = metadata.block_bitmap.alloc_consecutive(requested_count);

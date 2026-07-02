@@ -350,7 +350,7 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
 ///
 /// # Teardown contract
 ///
-/// The journal's owner ([`Ext4`], in the later integration task) MUST call
+/// The journal's owner ([`Ext4`]) MUST call
 /// [`Journal::stop_commit_thread`] exactly once, from a thread **other than the
 /// commit thread** (i.e. from `Ext4::drop`), before the last strong reference to
 /// the journal goes away. Because the commit thread holds only a `Weak`, it can
@@ -463,9 +463,10 @@ impl Journal {
     /// The next tid is seeded from `s_sequence` — the first tid recovery expects
     /// (a fresh `mke2fs` journal has `s_sequence == 1`).
     ///
-    /// The log-position state is seeded for a **clean** journal (Phase 4's
-    /// current assumption — a later task re-seeds it after recovery replays an
-    /// existing log):
+    /// The log-position state is seeded for a **clean** journal (when a dirty
+    /// log was replayed, [`recover`](recovery::recover) re-seeds
+    /// head/tail/tids in memory from the replayed log before `Ext4::open`
+    /// publishes the journal):
     /// - `head = s_first`: the first writable log block.
     /// - `tail_block = s_start`: `0` when clean, so nothing awaits checkpoint.
     /// - `tail_tid = s_sequence`.
@@ -520,7 +521,7 @@ impl Journal {
     ///   than fit its tag array would make the transaction uncommittable.
     ///   Multi-descriptor transactions are a later/perf extension.
     ///
-    /// Precise per-transaction credit accounting is a later task.
+    /// Precise per-transaction credit accounting is P7's.
     pub(super) fn max_credits(&self) -> usize {
         let log_bound = (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
         log_bound.min(self.geometry.tags_per_descriptor())
@@ -1065,29 +1066,6 @@ pub(super) fn forget(
     _is_metadata: bool,
     _blocknr: Ext4Bid,
 ) -> Result<()> {
-    Ok(())
-}
-
-/// Truncate-orphan seam. **Still a no-op.**
-///
-/// The *delete* orphan list (an unlinked inode whose deletion recovery must
-/// *finish* by freeing it) is handled by [`Ext4::orphan_add`](super::fs::Ext4) /
-/// [`orphan_del`](super::fs::Ext4::orphan_del) — Task 8 wired the
-/// `unlink`/`rmdir`/`rename` call sites and the reclaim path to those fs-level
-/// methods, which touch the superblock head and the inode `i_dtime` chain (data
-/// this journal funnel cannot reach).
-///
-/// This funnel remains only for the *shrinking-truncate* seam, whose recovery
-/// mode differs (recovery must *re-truncate* a still-live inode, not free it —
-/// and under commit-per-op a whole truncate is one atomic transaction anyway),
-/// so it stays a no-op until the P7 `journal_restart` follow-up.
-pub(super) fn orphan_add(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
-    Ok(())
-}
-
-/// The mirror of [`orphan_add`] for the shrinking-truncate seam. **Still a
-/// no-op** (see [`orphan_add`]).
-pub(super) fn orphan_del(_handle: Option<&Handle>, _inode_ino: Ext4Ino) -> Result<()> {
     Ok(())
 }
 

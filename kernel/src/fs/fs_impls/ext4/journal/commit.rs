@@ -198,6 +198,10 @@ fn build_descriptor_block(txn: &Transaction) -> Result<(Box<[u8; BLOCK_SIZE]>, V
         }
         escape.push(needs_escape);
 
+        // Bids stay below 2^32 until INCOMPAT_64BIT (P6): the mount rejects the
+        // feature and reads only the 32-bit blocks_count. P6 needs v3 journal
+        // tags (t_blocknr_high) here.
+        debug_assert!(bid <= u32::MAX as u64);
         let tag = RawBlockTag {
             // Only the low 32 bits: 64-bit tags (INCOMPAT_64BIT) are rejected.
             t_blocknr: Be32::new(bid as u32),

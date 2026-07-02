@@ -4,20 +4,17 @@
 //!
 //! - `Dirty` — a wrapper that tracks whether its inner value has been mutated,
 //!   for writeback scheduling.
-//! - `IsPowerOf` — a trait for testing whether a number is a power of another
-//!   (used by sparse-superblock backup-group selection).
+//! - `IsPowerOf` — a trait for testing whether a number is a power of another;
+//!   dormant until P6's sparse-superblock backup-group selection (backup
+//!   superblocks live in groups that are powers of 3/5/7).
 //! - `now` — reads the real-time coarse clock.
-//!
-//! Ext4 timestamp encoding (epoch + nanoseconds in the inode `*_extra`
-//! fields) differs from ext2's truncated seconds; that helper lands with the
-//! inode code in a later task.
 
 use core::ops::MulAssign;
 
 use super::prelude::*;
 use crate::prelude::warn;
 
-#[expect(dead_code)]
+#[expect(dead_code)] // Dormant until P6's sparse-superblock backup-group selection.
 pub(super) trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
     /// Returns whether `self` equals `x^k` for some `k > 0`.
     ///
@@ -54,15 +51,6 @@ impl<T: Debug> Dirty<T> {
         Dirty {
             value: val,
             dirty: false,
-        }
-    }
-
-    /// Creates a new `Dirty` value with the dirty flag set.
-    #[expect(dead_code)]
-    pub(super) fn new_dirty(val: T) -> Dirty<T> {
-        Dirty {
-            value: val,
-            dirty: true,
         }
     }
 

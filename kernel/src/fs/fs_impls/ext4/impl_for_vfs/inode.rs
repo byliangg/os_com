@@ -46,7 +46,9 @@ impl FileOps for Ext4Inode {
         status_flags: StatusFlags,
     ) -> Result<usize> {
         if status_flags.contains(StatusFlags::O_DIRECT) {
-            // Buffered-only in Phase 2; O_DIRECT writes arrive with a later task.
+            // Buffered-only: real O_DIRECT (bypassing the page cache) is P9
+            // performance work at the earliest, and outside the current
+            // requirements. P5's xfstests runs exclude the direct-IO groups.
             return_errno_with_message!(Errno::EOPNOTSUPP, "ext4 O_DIRECT write unimplemented");
         }
         self.write_at(offset, reader)

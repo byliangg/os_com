@@ -436,11 +436,16 @@ fn reserialize(
     let index_entries: Vec<RawExtentIdx> = extents
         .chunks(LEAF_MAX)
         .zip(leaf_bids.iter())
-        .map(|(chunk, &leaf_bid)| RawExtentIdx {
-            block: chunk[0].block(),
-            leaf_lo: leaf_bid as u32,
-            leaf_hi: (leaf_bid >> 32) as u16,
-            unused: 0,
+        .map(|(chunk, &leaf_bid)| {
+            // 48-bit on-disk cap (see `RawExtent::from`); lossless while the
+            // no-64bit mount invariant bounds bids below 2^32.
+            debug_assert!(leaf_bid < 1 << 48);
+            RawExtentIdx {
+                block: chunk[0].block(),
+                leaf_lo: leaf_bid as u32,
+                leaf_hi: (leaf_bid >> 32) as u16,
+                unused: 0,
+            }
         })
         .collect();
     write_index_root(root, &index_entries);
