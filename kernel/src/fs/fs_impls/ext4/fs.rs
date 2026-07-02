@@ -18,7 +18,8 @@ use device_id::DeviceId;
 
 use super::{
     block_group::BlockGroup,
-    inode::{FilePerm, Inode, InodeDesc, RawInode, encode_time},
+    inode,
+    inode::{FilePerm, Inode, InodeDesc, RawInode},
     journal,
     prelude::*,
     super_block::{RawSuperBlock, SUPER_BLOCK_OFFSET, SuperBlock},
@@ -601,11 +602,9 @@ impl Ext4 {
         let mut chain = self.s_orphan_lock.lock();
         // Already listed (defensive — no current call site can re-add a listed
         // inode; Linux guards the same way): keep the existing successor.
-        if chain.listed(ino) {
-            warn!("ext4: inode {ino} is already on the orphan list");
-            return Ok(OrphanLink {
-                old_head: chain.successor_of(ino),
-            });
+        if let Some(next) = chain.successor_of(ino) {
+            warn!("inode {ino} is already on the orphan list");
+            return Ok(OrphanLink { old_head: next });
         }
         // One superblock WRITE guard across both the capture and the mutation:
         // the counters are guarded by the superblock lock (a concurrent
@@ -710,8 +709,38 @@ impl Ext4 {
             return;
         }
 
-        // Walk the on-disk chain into a defensive snapshot: `chain` mirrors the
-        // full on-disk list; `to_free` is the subset the scan may delete.
+        let (chain, to_free, mut suspect) = self.walk_orphan_chain();
+
+        // Prime the in-memory mirror, then finish each interrupted deletion in
+        // chain order. Every reclaim opens its own journaled transaction and its
+        // `orphan_del` advances/splices the on-disk chain, so the state after
+        // every step is a well-formed shorter chain.
+        self.s_orphan_lock.lock().replace(chain);
+        for &ino in &to_free {
+            suspect |= !self.reclaim_scanned_orphan(ino);
+        }
+
+        // A truncated walk, a skipped (live or undecodable) member, or a failed
+        // reclaim can leave the on-disk head referring to inodes the scan did
+        // not free: clear it, journaled, so the next mount does not rewalk
+        // garbage. Best-effort: on failure the head stays and the next mount
+        // retries the scan.
+        let head_after = self.super_block.read().last_orphan();
+        if suspect || head_after.is_some() {
+            if let Some(head) = head_after
+                && !suspect
+            {
+                warn!("orphan cleanup left an unexpected nonzero head {head}");
+            }
+            self.clear_orphan_head();
+        }
+    }
+
+    /// Walks the on-disk orphan chain into a defensive snapshot (the walk half
+    /// of [`recover_orphan_list`](Self::recover_orphan_list)): returns the
+    /// full mirrored chain, the subset the scan may delete, and whether
+    /// anything looked suspect (truncated walk / live member).
+    fn walk_orphan_chain(&self) -> (Vec<Ext4Ino>, Vec<Ext4Ino>, bool) {
         let (first_ino, total_inodes) = {
             let sb = self.super_block.read();
             (sb.first_ino(), sb.total_inodes())
@@ -732,7 +761,7 @@ impl Ext4 {
             let raw = match self.read_raw_inode(cur) {
                 Ok(raw) => raw,
                 Err(e) => {
-                    warn!("ext4: orphan walk could not read inode {cur}: {e:?}");
+                    warn!("orphan walk could not read inode {cur}: {e:?}");
                     suspect = true;
                     break;
                 }
@@ -742,7 +771,7 @@ impl Ext4 {
                 to_free.push(cur);
             } else {
                 warn!(
-                    "ext4: orphan inode {cur} has link count {}; skipping (crash-mid-truncate \
+                    "orphan inode {cur} has link count {}; skipping (crash-mid-truncate \
                      recovery is not supported yet)",
                     raw.link_count
                 );
@@ -751,75 +780,64 @@ impl Ext4 {
             // On disk `0` terminates the chain (decode boundary).
             cursor = (raw.dtime != 0).then_some(raw.dtime);
         }
+        (chain, to_free, suspect)
+    }
 
-        // Prime the in-memory mirror, then finish each interrupted deletion in
-        // chain order. Every reclaim opens its own journaled transaction and its
-        // `orphan_del` advances/splices the on-disk chain, so the state after
-        // every step is a well-formed shorter chain.
-        self.s_orphan_lock.lock().replace(chain.clone());
-        for &ino in &to_free {
-            let raw = match self.read_raw_inode(ino) {
-                Ok(raw) => raw,
+    /// Finishes one scanned orphan's interrupted deletion (truncate + free +
+    /// `orphan_del`, one journaled transaction). Returns `false` when anything
+    /// degraded to a warning — the caller then clears the on-disk head.
+    fn reclaim_scanned_orphan(self: &Arc<Self>, ino: Ext4Ino) -> bool {
+        let raw = match self.read_raw_inode(ino) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!("orphan cleanup could not re-read inode {ino}: {e:?}");
+                return false;
+            }
+        };
+        let block_group_idx = ((ino - 1) / self.nr_inodes_per_group) as usize;
+        match Inode::from_raw_for_recovery(ino, &raw, block_group_idx, self.self_ref.clone()) {
+            // (`Drop` would run the same reclaim, but calling it directly
+            // surfaces an error instead of logging it from a destructor.)
+            Ok(orphan) => match orphan.try_reclaim_deleted_inode() {
+                Ok(_) => true,
                 Err(e) => {
-                    warn!("ext4: orphan cleanup could not re-read inode {ino}: {e:?}");
-                    suspect = true;
-                    continue;
+                    warn!("orphan cleanup could not reclaim inode {ino}: {e:?}");
+                    false
                 }
-            };
-            let block_group_idx = ((ino - 1) / self.nr_inodes_per_group) as usize;
-            match Inode::from_raw_for_recovery(ino, &raw, block_group_idx, self.self_ref.clone()) {
-                // Finish the deletion: truncate + free + orphan_del, one
-                // journaled transaction. (`Drop` would run the same reclaim,
-                // but calling it directly surfaces an error instead of logging
-                // it from a destructor.)
-                Ok(orphan) => {
-                    if let Err(e) = orphan.try_reclaim_deleted_inode() {
-                        warn!("ext4: orphan cleanup could not reclaim inode {ino}: {e:?}");
-                        suspect = true;
-                    }
+            },
+            Err(e) => {
+                warn!("skipping undecodable orphan inode {ino}: {e:?}");
+                if let Err(e) = self.orphan_del(ino, None) {
+                    warn!("could not unlist orphan inode {ino}: {e:?}");
                 }
-                Err(e) => {
-                    warn!("ext4: skipping undecodable orphan inode {ino}: {e:?}");
-                    suspect = true;
-                    if let Err(e) = self.orphan_del(ino, None) {
-                        warn!("ext4: could not unlist orphan inode {ino}: {e:?}");
-                    }
-                }
+                false
             }
         }
+    }
 
-        // A truncated walk, a skipped (live or undecodable) member, or a failed
-        // reclaim can leave the on-disk head referring to inodes the scan did
-        // not free: clear it, journaled, so the next mount does not rewalk
-        // garbage. Lock order: handle (②, `begin_op`) → `s_orphan_lock` →
-        // superblock (⑤), as everywhere. Best-effort: on failure the head
-        // stays and the next mount retries the scan.
-        let head_after = self.super_block.read().last_orphan();
-        if suspect || head_after.is_some() {
-            if let Some(head) = head_after
-                && !suspect
-            {
-                warn!("ext4: orphan cleanup left an unexpected nonzero head {head}");
-            }
-            let op = match self.begin_op(Self::FSYNC_CREDITS) {
-                Ok(op) => op,
-                Err(e) => {
-                    warn!("ext4: could not clear the orphan head: {e:?}");
-                    return;
-                }
-            };
-            let mut chain = self.s_orphan_lock.lock();
-            // One superblock write guard across capture + mutation (see
-            // `orphan_add`).
-            let mut sb = self.super_block.write();
-            if let Err(e) = sb.journal_capture(op.get(), None) {
-                warn!("ext4: could not journal the cleared orphan head: {e:?}");
+    /// Clears the on-disk orphan head and empties the mirror, journaled (the
+    /// close half of [`recover_orphan_list`](Self::recover_orphan_list)).
+    /// Lock order: handle (②, `begin_op`) → `s_orphan_lock` → superblock (⑤),
+    /// as everywhere. Best-effort: every failure degrades to a warning.
+    fn clear_orphan_head(&self) {
+        let op = match self.begin_op(Self::FSYNC_CREDITS) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!("could not clear the orphan head: {e:?}");
                 return;
             }
-            sb.set_last_orphan(None);
-            drop(sb);
-            chain.clear();
+        };
+        let mut chain = self.s_orphan_lock.lock();
+        // One superblock write guard across capture + mutation (see
+        // `orphan_add`).
+        let mut sb = self.super_block.write();
+        if let Err(e) = sb.journal_capture(op.get(), None) {
+            warn!("could not journal the cleared orphan head: {e:?}");
+            return;
         }
+        sb.set_last_orphan(None);
+        drop(sb);
+        chain.clear();
     }
 
     /// Reads an inode's raw on-disk bytes, bypassing the link-count-0 gate that
@@ -938,8 +956,8 @@ impl Ext4 {
         })
     }
 
-    /// The device byte offset of `ino`'s `RawInode` slot; tests peek and doctor
-    /// raw slots through it.
+    /// Returns the device byte offset of `ino`'s `RawInode` slot; tests peek
+    /// and doctor raw slots through it.
     #[cfg(ktest)]
     pub(super) fn inode_table_offset(&self, ino: Ext4Ino) -> Result<usize> {
         Ok(self.inode_slot(ino)?.device_offset())
@@ -953,7 +971,7 @@ impl Ext4 {
         &self,
         ino: Ext4Ino,
         desc: &InodeDesc,
-        root: &[u32; super::inode::RAW_BLOCK_PTRS_LEN],
+        root: &[u32; inode::RAW_BLOCK_PTRS_LEN],
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let slot = self.inode_slot(ino)?;
@@ -982,9 +1000,9 @@ impl Ext4 {
             // → `s_orphan_lock` → journal state (leaf), the same nesting as
             // `patch_orphan_next_on_disk`.
             let chain = self.s_orphan_lock.lock();
-            if chain.listed(ino) {
+            if let Some(next) = chain.successor_of(ino) {
                 // `0 = end of chain` is the on-disk convention (encode boundary).
-                raw.dtime = chain.successor_of(ino).unwrap_or(0);
+                raw.dtime = next.unwrap_or(0);
             }
             return slot.journal_write(handle, &raw);
         }
@@ -1012,10 +1030,10 @@ impl Ext4 {
         raw.blocks_high = (sectors >> 32) as u16;
 
         // Timestamps (epoch + nanoseconds) — reverse of `decode_time`.
-        let (mtime_secs, mtime_extra) = encode_time(desc.mtime());
+        let (mtime_secs, mtime_extra) = inode::encode_time(desc.mtime());
         raw.mtime = mtime_secs;
         raw.mtime_extra = mtime_extra;
-        let (ctime_secs, ctime_extra) = encode_time(desc.ctime());
+        let (ctime_secs, ctime_extra) = inode::encode_time(desc.ctime());
         raw.ctime = ctime_secs;
         raw.ctime_extra = ctime_extra;
 
@@ -1026,7 +1044,7 @@ impl Ext4 {
         raw.uid_high = (desc.uid() >> 16) as u16;
         raw.gid = desc.gid() as u16;
         raw.gid_high = (desc.gid() >> 16) as u16;
-        let (atime_secs, atime_extra) = encode_time(desc.atime());
+        let (atime_secs, atime_extra) = inode::encode_time(desc.atime());
         raw.atime = atime_secs;
         raw.atime_extra = atime_extra;
 
@@ -1123,14 +1141,14 @@ impl Drop for Ext4 {
                     self.super_block.get_mut().clear_recover();
                     if let Err(e) = self.sync_metadata() {
                         error!(
-                            "ext4 unmount could not persist the cleared RECOVER flag: {:?}",
+                            "unmount could not persist the cleared RECOVER flag: {:?}",
                             e
                         );
                     } else if !matches!(self.block_device.sync(), Ok(BioStatus::Complete)) {
-                        error!("ext4 unmount barrier failed");
+                        error!("unmount barrier failed");
                     }
                 }
-                Err(e) => error!("ext4 journal unmount flush failed: {:?}", e),
+                Err(e) => error!("journal unmount flush failed: {:?}", e),
             }
         }
     }
@@ -1193,17 +1211,13 @@ impl OrphanChain {
         Self(Vec::new())
     }
 
-    /// Whether `ino` is on the chain.
-    fn listed(&self, ino: Ext4Ino) -> bool {
-        self.0.contains(&ino)
-    }
-
-    /// The chain successor of `ino`: `None` when `ino` is the last member —
-    /// or not listed at all (gate with [`listed`](Self::listed) where the
-    /// difference matters).
-    fn successor_of(&self, ino: Ext4Ino) -> Option<Ext4Ino> {
+    /// Returns whether `ino` is on the chain and, if listed, its successor —
+    /// `Some(None)` = listed as the last member, outer `None` = not listed.
+    /// One query, so the two states cannot be conflated by a missed
+    /// pre-check.
+    fn successor_of(&self, ino: Ext4Ino) -> Option<Option<Ext4Ino>> {
         let idx = self.0.iter().position(|&i| i == ino)?;
-        self.0.get(idx + 1).copied()
+        Some(self.0.get(idx + 1).copied())
     }
 
     /// Prepends a new head. The caller has already persisted it as
@@ -1212,7 +1226,8 @@ impl OrphanChain {
         self.0.insert(0, ino);
     }
 
-    /// What removing `ino` must persist, or `None` when it is not listed.
+    /// Returns what removing `ino` must persist, or `None` when it is not
+    /// listed.
     /// Read-only; pair with [`commit_remove`](Self::commit_remove) once the
     /// persist step succeeded.
     fn splice_for(&self, ino: Ext4Ino) -> Option<OrphanSplice> {
@@ -1260,9 +1275,10 @@ struct InodeSlot {
 }
 
 impl InodeSlot {
-    /// The absolute device byte offset of the slot, for direct reads/writes.
-    const fn device_offset(&self) -> usize {
-        self.bid as usize * BLOCK_SIZE + self.offset_in_block
+    /// Returns the absolute device byte offset of the slot, for direct
+    /// reads/writes.
+    fn device_offset(&self) -> usize {
+        Bid::new(self.bid).to_offset() + self.offset_in_block
     }
 
     /// Reads the slot's on-disk bytes. The caller owns the judgement that the

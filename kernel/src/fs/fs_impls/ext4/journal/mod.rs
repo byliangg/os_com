@@ -77,7 +77,6 @@ use self::{
 use super::{
     feature::FeatureCompatSet,
     fs::{Ext4, JOURNAL_INO},
-    inode,
     prelude::*,
 };
 
@@ -136,8 +135,8 @@ impl OpHandle {
         self.handle.as_ref()
     }
 
-    /// The transaction id this handle joined, or `None` for the no-op handle of
-    /// a non-journaled volume. An `fsync` records this before closing the
+    /// Returns the transaction id this handle joined, or `None` for the no-op
+    /// handle of a non-journaled volume. An `fsync` records this before closing the
     /// handle, releases every filesystem lock, and then waits for the tid via
     /// [`Journal::log_wait_commit`] — commits are serial, so waiting on it also
     /// covers every earlier transaction that touched the inode.
@@ -243,8 +242,8 @@ impl JournalGeometry {
         self.block_map.get(log as usize).copied()
     }
 
-    /// The next log block after `cur`, wrapping to `first` at the end of the
-    /// log.
+    /// Returns the next log block after `cur`, wrapping to `first` at the end
+    /// of the log.
     ///
     /// The usable log is the ring `[first, maxlen)`; block 0 holds the journal
     /// superblock and is never a log-data block, so wrapping returns to
@@ -345,8 +344,7 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         return_errno_with_message!(Errno::EUCLEAN, "journal inode is too small");
     }
 
-    let block_map =
-        inode::map_all_blocks(fs.this(), *desc.raw_block(), desc.sector_count(), nblocks)?;
+    let block_map = desc.map_all_blocks(fs.this(), nblocks)?;
 
     // Log block 0 holds the journal superblock.
     let raw: RawJournalSuperblock = fs
@@ -771,7 +769,7 @@ impl Journal {
         self.commit_trigger.wake_one();
     }
 
-    /// Whether the journal has been aborted by a failed commit (see the
+    /// Returns whether the journal has been aborted by a failed commit (see the
     /// [`aborted`](Journal::aborted) field).
     pub(super) fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::Acquire)
@@ -1090,8 +1088,8 @@ struct LiveAccess<'h> {
 }
 
 impl WriteAccess<'_> {
-    /// Whether this credential carries a real capture (a journaled volume with
-    /// an open transaction). The writer's direct-write fallback keys off this
+    /// Returns whether this credential carries a real capture (a journaled
+    /// volume with an open transaction). The writer's direct-write fallback keys off this
     /// instead of re-deriving "journaled?" from the handle.
     pub(super) fn is_live(&self) -> bool {
         self.live.is_some()
@@ -1154,12 +1152,12 @@ pub(super) fn read_metadata_block(
             return Ok(block);
         }
     }
-    Ok(device.read_val(blocknr as usize * BLOCK_SIZE)?)
+    Ok(device.read_val(Bid::new(blocknr).to_offset())?)
 }
 
 /// What kind of block a [`forget`] covers — the revoke record P7 writes
 /// differs per kind, and a bare `bool` at the call sites said nothing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ForgetKind {
     /// A journaled metadata block (extent-tree node, directory block, …).
     Metadata,

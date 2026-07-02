@@ -61,7 +61,7 @@ pub(super) enum Mapping {
 }
 
 impl Mapping {
-    /// The three-way state view (see [`MapState`]).
+    /// Returns the three-way state view (see [`MapState`]).
     #[cfg(ktest)]
     pub(super) const fn state(&self) -> MapState {
         match self {
@@ -79,7 +79,7 @@ impl Mapping {
         }
     }
 
-    /// The physical block backing the run, `None` for a hole.
+    /// Returns the physical block backing the run, `None` for a hole.
     pub(super) const fn mapped_pblock(&self) -> Option<Ext4Bid> {
         match self {
             Mapping::Mapped { pblock, .. } => Some(*pblock),

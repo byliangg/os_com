@@ -128,13 +128,14 @@ pub(in crate::fs::fs_impls::ext4) struct UncheckpointedImage {
 }
 
 impl UncheckpointedImage {
-    /// The retained after-image bytes (the seed for a later capture).
+    /// Returns the retained after-image bytes (the seed for a later capture).
     pub(super) fn image_bytes(&self) -> &[u8] {
         self.image.as_bytes()
     }
 
-    /// Whether this image is checkpointed once everything up to `committed_tid`
-    /// has been applied to its final location — i.e. whether eviction is due.
+    /// Returns whether this image is checkpointed once everything up to
+    /// `committed_tid` has been applied to its final location — i.e. whether
+    /// eviction is due.
     pub(super) fn is_checkpointed_by(&self, committed_tid: Tid) -> bool {
         super::tid_geq(committed_tid, self.tid)
     }

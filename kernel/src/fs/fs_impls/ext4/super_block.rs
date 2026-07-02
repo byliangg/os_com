@@ -301,7 +301,7 @@ impl SuperBlock {
         self.free_inodes_count
     }
 
-    /// The head of the on-disk orphan list (`s_last_orphan`), `0` when empty.
+    /// Returns the head of the on-disk orphan list (`s_last_orphan`), `0` when empty.
     ///
     /// The orphan list threads inodes whose link count reached 0 but whose
     /// deletion has not yet completed (they still hold blocks / a bitmap bit).
@@ -316,9 +316,9 @@ impl SuperBlock {
     ///
     /// Takes `&mut self` so a write guard over `RwMutex<Dirty<SuperBlock>>` marks
     /// the superblock dirty for writeback; the orphan-list add/remove and the
-    /// mount-time recovery scan set it, and it reaches disk through the captured
-    /// superblock after-image (`journal_superblock` in `fs.rs` patches it from
-    /// memory on every capture) or [`Ext4::sync_metadata`](super::fs::Ext4).
+    /// mount-time recovery scan set it, and it reaches disk through the
+    /// captured superblock after-image ([`Self::journal_capture`] patches it
+    /// from memory on every capture) or [`Ext4::sync_metadata`](super::fs::Ext4).
     pub(super) fn set_last_orphan(&mut self, head: Option<Ext4Ino>) {
         self.last_orphan = head;
     }
@@ -349,20 +349,21 @@ impl SuperBlock {
         &self.uuid
     }
 
-    /// Blocks reserved for privileged processes (`s_r_blocks_count`); `statfs`
-    /// subtracts them from `bfree` to report `bavail`.
+    /// Returns the blocks reserved for privileged processes
+    /// (`s_r_blocks_count`); `statfs` subtracts them from `bfree` to report
+    /// `bavail`.
     pub(super) const fn reserved_blocks_count(&self) -> u32 {
         self.reserved_blocks_count
     }
 
-    /// The inode number of the internal journal (`s_journal_inum`); the mount
-    /// contract accepts only the reserved ino 8.
+    /// Returns the inode number of the internal journal (`s_journal_inum`);
+    /// the mount contract accepts only the reserved ino 8.
     pub(super) const fn journal_ino(&self) -> u32 {
         self.journal_ino
     }
 
-    /// The external journal's device number (`s_journal_dev`); the mount
-    /// contract accepts only `0` (internal journal).
+    /// Returns the external journal's device number (`s_journal_dev`); the
+    /// mount contract accepts only `0` (internal journal).
     pub(super) const fn journal_dev(&self) -> u32 {
         self.journal_dev
     }

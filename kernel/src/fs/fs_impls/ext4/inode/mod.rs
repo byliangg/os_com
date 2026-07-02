@@ -166,11 +166,21 @@ pub(super) enum Dtime {
 }
 
 impl Dtime {
-    /// The on-disk `i_dtime` encoding (`0` = live / end-of-chain — the
-    /// on-disk convention; the sentinel exists only past this boundary).
+    /// Returns the on-disk `i_dtime` encoding (`0` = live / end-of-chain —
+    /// the on-disk convention; the sentinel exists only past this boundary).
     pub(super) const fn to_raw(self) -> u32 {
         match self {
-            Dtime::Time(time) => time.as_secs() as u32,
+            // Clamp rather than wrap a post-2106 timestamp: 2^32 seconds
+            // would even encode as 0 = "live" (same rationale as
+            // `encode_time`).
+            Dtime::Time(time) => {
+                let secs = time.as_secs();
+                if secs > u32::MAX as u64 {
+                    u32::MAX
+                } else {
+                    secs as u32
+                }
+            }
             Dtime::OrphanNext(next) => match next {
                 Some(ino) => ino,
                 None => 0,
@@ -345,8 +355,8 @@ impl InodeDesc {
         self.crtime
     }
 
-    /// The on-disk `i_dtime` encoding of the current state — the one place
-    /// both meanings collapse to the shared u32 (encode boundary).
+    /// Returns the on-disk `i_dtime` encoding of the current state — the one
+    /// place both meanings collapse to the shared u32 (encode boundary).
     pub(super) const fn raw_dtime(&self) -> u32 {
         self.dtime.to_raw()
     }
@@ -380,6 +390,45 @@ impl InodeDesc {
     /// Returns whether this inode's data is mapped by an extent tree.
     pub(super) fn is_extent_based(&self) -> bool {
         self.flags.contains(FileFlags::EXTENTS)
+    }
+
+    /// Resolves the physical device block backing each of this descriptor's
+    /// first `nblocks` logical blocks.
+    ///
+    /// This keeps the extent engine encapsulated in the `inode` module while
+    /// handing callers a plain, fully resolved block map. The journal uses it
+    /// to build its log block map from the journal inode (ino 8), whose data
+    /// blocks hold the log; every log block must be a real allocated, written
+    /// block, so a hole or unwritten block is an error rather than a
+    /// zero-filled read.
+    pub(in crate::fs::fs_impls::ext4) fn map_all_blocks(
+        &self,
+        fs: Weak<Ext4>,
+        nblocks: u32,
+    ) -> Result<Vec<Ext4Bid>> {
+        let em =
+            ExtentManager::try_new(*self.raw_block(), self.sector_count(), fs, nblocks as usize)?;
+        let mut map = Vec::with_capacity(nblocks as usize);
+        let mut i: Iblock = 0;
+        while i < nblocks {
+            let extent_manager::Mapping::Mapped {
+                pblock,
+                len,
+                written: true,
+            } = em.map_blocks(i)?
+            else {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal inode has an unmapped (hole/unwritten) block"
+                );
+            };
+            let run = len.min(nblocks - i);
+            for k in 0..run {
+                map.push(pblock + k as Ext4Bid);
+            }
+            i += run;
+        }
+        Ok(map)
     }
 
     /// Builds the complete on-disk [`RawInode`] for this descriptor with `root`
@@ -438,44 +487,6 @@ impl InodeDesc {
             ..Default::default()
         }
     }
-}
-
-/// Resolves the physical device block backing each of the first `nblocks`
-/// logical blocks of an extent-mapped inode.
-///
-/// This keeps the extent engine encapsulated in the `inode` module while handing
-/// callers a plain, fully resolved block map. The journal uses it to build its
-/// log block map from the journal inode (ino 8), whose data blocks hold the log;
-/// every log block must be a real allocated, written block, so a hole or
-/// unwritten block is an error rather than a zero-filled read.
-pub(in crate::fs::fs_impls::ext4) fn map_all_blocks(
-    fs: Weak<Ext4>,
-    root: [u32; RAW_BLOCK_PTRS_LEN],
-    sector_count: u64,
-    nblocks: u32,
-) -> Result<Vec<Ext4Bid>> {
-    let em = ExtentManager::try_new(root, sector_count, fs, nblocks as usize)?;
-    let mut map = Vec::with_capacity(nblocks as usize);
-    let mut i: Iblock = 0;
-    while i < nblocks {
-        let extent_manager::Mapping::Mapped {
-            pblock,
-            len,
-            written: true,
-        } = em.map_blocks(i)?
-        else {
-            return_errno_with_message!(
-                Errno::EUCLEAN,
-                "journal inode has an unmapped (hole/unwritten) block"
-            );
-        };
-        let run = len.min(nblocks - i);
-        for k in 0..run {
-            map.push(pblock + k as Ext4Bid);
-        }
-        i += run;
-    }
-    Ok(map)
 }
 
 /// Decodes an ext4 timestamp from its seconds field and the `*_extra` field.

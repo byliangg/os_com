@@ -50,7 +50,7 @@ const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
 /// This struct is the "ExtentTree" lock content at position ③ in the global
 /// lock order (report §5.1); [`ExtentManager`](super::ExtentManager) wraps it
 /// in the `RwMutex` and delegates.
-pub(in crate::fs::fs_impls::ext4) struct ExtentTree {
+pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     root: [u32; RAW_BLOCK_PTRS_LEN],
     sector_count: u64,
     dirty: bool,
@@ -75,7 +75,7 @@ impl ExtentTree {
     /// A valid empty tree: a depth-0 header (magic, 0 entries, max 4) followed
     /// by zeros — what a freshly created regular file or directory carries, so
     /// the extent reader sees a well-formed (empty) tree from the first byte.
-    pub(in crate::fs::fs_impls::ext4) const fn empty() -> Self {
+    pub(in crate::fs::fs_impls::ext4::inode) const fn empty() -> Self {
         let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
         // Each `i_block` word packs two 16-bit fields, little-endian: word 0 is
         // `eh_magic | eh_entries(=0)`, word 1 is `eh_max(=4) | eh_depth(=0)`.
@@ -88,18 +88,21 @@ impl ExtentTree {
         }
     }
 
-    /// The root in its on-disk 60-byte layout — the serialization boundary for
-    /// the inode writeback (`i_block`).
-    pub(in crate::fs::fs_impls::ext4) const fn root_bytes(&self) -> &[u32; RAW_BLOCK_PTRS_LEN] {
+    /// Returns the root in its on-disk 60-byte layout — the serialization
+    /// boundary for the inode writeback (`i_block`).
+    pub(in crate::fs::fs_impls::ext4::inode) const fn root_bytes(
+        &self,
+    ) -> &[u32; RAW_BLOCK_PTRS_LEN] {
         &self.root
     }
 
-    /// The inode's `i_blocks` (512-byte sectors) accounting.
+    /// Returns the inode's `i_blocks` (512-byte sectors) accounting.
     pub(super) const fn sector_count(&self) -> u64 {
         self.sector_count
     }
 
-    /// Whether the tree or `i_blocks` has changed since the last writeback.
+    /// Returns whether the tree or `i_blocks` has changed since the last
+    /// writeback.
     pub(super) const fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -109,16 +112,16 @@ impl ExtentTree {
         self.dirty = false;
     }
 
-    /// The tree depth (0 = inline leaf, 1 = one level of index blocks).
-    /// Infallible: the root was validated at construction. Used by tests to
-    /// assert tree shape.
+    /// Returns the tree depth (0 = inline leaf, 1 = one level of index
+    /// blocks). Infallible: the root was validated at construction. Used by
+    /// tests to assert tree shape.
     #[cfg(ktest)]
     pub(super) fn depth(&self) -> u16 {
         self.header().depth()
     }
 
-    /// The root's header, decoded from the trusted (construction-validated)
-    /// bytes.
+    /// Returns the root's header, decoded from the trusted
+    /// (construction-validated) bytes.
     fn header(&self) -> ExtentHeader {
         ExtentHeader::from_trusted(&RawExtentHeader::from_bytes(
             &self.root.as_bytes()[0..ENTRY_SIZE],
@@ -227,6 +230,9 @@ impl ExtentTree {
 
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
+        // The `as u16` narrowings on the three split lengths below are
+        // lossless: each split lies inside one extent, whose length is a u16
+        // (`ee_len` on disk, biased below `MAX_WRITTEN_LEN`).
 
         let mut converted: Vec<Extent> = Vec::with_capacity(extents.len() + 2);
         for e in &extents {
@@ -289,6 +295,8 @@ impl ExtentTree {
         new_size: usize,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
+        // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
 
         let (mut extents, old_external) = self.flatten(fs)?;
@@ -310,6 +318,7 @@ impl ExtentTree {
                 continue;
             }
             // The extent straddles `keep_blocks`: keep the head, free the tail.
+            // Lossless: the head lies inside this extent, whose length is u16.
             let head_len = (keep_blocks - e_start) as u16;
             let tail_len = e.len() - head_len;
             fs.free_blocks(e.start() + head_len as Ext4Bid, tail_len as u32, handle)?;
@@ -639,7 +648,7 @@ fn write_leaf_node(
     // metadata never precedes its commit (WAL). See
     // `fs::Ext4::write_back_inode_desc`.
     if !access.is_live() {
-        device.write_val(bid as usize * BLOCK_SIZE, &block)?;
+        device.write_val(Bid::new(bid).to_offset(), &block)?;
     }
     Ok(())
 }
