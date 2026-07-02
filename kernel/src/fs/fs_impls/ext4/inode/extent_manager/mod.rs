@@ -25,7 +25,9 @@ mod tree;
 
 pub(super) use self::tree::ExtentTree;
 
-/// State of a mapped logical block.
+/// State of a mapped logical block — the three-way view tests assert against
+/// (production code pattern-matches [`Mapping`] directly).
+#[cfg(ktest)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MapState {
     /// Backed by written data on disk.
@@ -36,32 +38,59 @@ pub(super) enum MapState {
     Hole,
 }
 
-/// The result of mapping a logical block: a contiguous physical run.
+/// The result of mapping a logical block. A hole carries no physical block at
+/// all — there is no in-band "pblock 0" to misread as block 0.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Mapping {
-    pblock: Ext4Bid,
-    len: u32,
-    state: MapState,
+pub(super) enum Mapping {
+    /// A contiguous mapped physical run.
+    Mapped {
+        pblock: Ext4Bid,
+        /// Contiguous logical blocks from the queried one to the run's end.
+        len: u32,
+        /// `false` = preallocated-unwritten: allocated, but reads as zeros.
+        written: bool,
+    },
+    /// Not allocated; reads as zeros.
+    Hole {
+        /// Logical blocks known to be unmapped (currently always 1). Only the
+        /// test view reads it today; production hole consumers allocate or
+        /// zero-fill one block at a time.
+        #[cfg_attr(not(ktest), expect(dead_code))]
+        len: u32,
+    },
 }
 
 impl Mapping {
-    /// Returns the starting physical block of the run (meaningless for a `Hole`).
-    pub(super) const fn pblock(&self) -> Ext4Bid {
-        self.pblock
+    /// The three-way state view (see [`MapState`]).
+    #[cfg(ktest)]
+    pub(super) const fn state(&self) -> MapState {
+        match self {
+            Mapping::Mapped { written: true, .. } => MapState::Written,
+            Mapping::Mapped { written: false, .. } => MapState::Unwritten,
+            Mapping::Hole { .. } => MapState::Hole,
+        }
     }
 
     /// Returns the number of contiguous logical blocks this mapping describes.
+    #[cfg(ktest)]
     pub(super) const fn len(&self) -> u32 {
-        self.len
+        match self {
+            Mapping::Mapped { len, .. } | Mapping::Hole { len } => *len,
+        }
     }
 
-    pub(super) const fn state(&self) -> MapState {
-        self.state
+    /// The physical block backing the run, `None` for a hole.
+    pub(super) const fn mapped_pblock(&self) -> Option<Ext4Bid> {
+        match self {
+            Mapping::Mapped { pblock, .. } => Some(*pblock),
+            Mapping::Hole { .. } => None,
+        }
     }
 
     /// Returns whether reading these blocks must return zeros without device I/O.
+    #[cfg(ktest)]
     pub(super) const fn reads_as_zeros(&self) -> bool {
-        matches!(self.state, MapState::Hole | MapState::Unwritten)
+        !matches!(self, Mapping::Mapped { written: true, .. })
     }
 }
 
@@ -114,20 +143,13 @@ impl ExtentManager {
         match tree.lookup(&fs, iblock)? {
             Some(extent) => {
                 let offset_in_extent = iblock - extent.block();
-                let pblock = extent.start() + offset_in_extent as Ext4Bid;
-                let len = extent.len() as u32 - offset_in_extent;
-                let state = if extent.is_unwritten() {
-                    MapState::Unwritten
-                } else {
-                    MapState::Written
-                };
-                Ok(Mapping { pblock, len, state })
+                Ok(Mapping::Mapped {
+                    pblock: extent.start() + offset_in_extent as Ext4Bid,
+                    len: extent.len() as u32 - offset_in_extent,
+                    written: !extent.is_unwritten(),
+                })
             }
-            None => Ok(Mapping {
-                pblock: 0,
-                len: 1,
-                state: MapState::Hole,
-            }),
+            None => Ok(Mapping::Hole { len: 1 }),
         }
     }
 
@@ -331,18 +353,22 @@ impl BlockAsPageCacheBackend for ExtentManager {
         let iblock = Iblock::try_from(idx)
             .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
 
-        let mapping = self.map_blocks(iblock)?;
-        if mapping.reads_as_zeros() {
+        let Mapping::Mapped {
+            pblock,
+            written: true,
+            ..
+        } = self.map_blocks(iblock)?
+        else {
             // Holes and unwritten extents read as zeros without device I/O.
             complete_fn(BioStatus::Zeros);
             return Ok(());
-        }
+        };
 
         let fs = self
             .fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
-        fs.read_blocks_async(mapping.pblock(), bio_segment, Some(complete_fn), io_batch)
+        fs.read_blocks_async(pblock, bio_segment, Some(complete_fn), io_batch)
     }
 
     fn submit_write_bio(
@@ -363,10 +389,9 @@ impl BlockAsPageCacheBackend for ExtentManager {
         // usually already mapped (written or unwritten). The hole branch is the
         // defensive fallback for mmap-dirtied pages, which the upper layer does
         // not pre-allocate.
-        let mapping = self.map_blocks(iblock)?;
-        let pblock = match mapping.state() {
-            MapState::Written | MapState::Unwritten => mapping.pblock(),
-            MapState::Hole => self.allocate_one(iblock)?,
+        let pblock = match self.map_blocks(iblock)? {
+            Mapping::Mapped { pblock, .. } => pblock,
+            Mapping::Hole { .. } => self.allocate_one(iblock)?,
         };
         fs.write_blocks_async(pblock, bio_segment, Some(complete_fn), io_batch)
     }
@@ -413,12 +438,12 @@ mod tests {
 
         let m0 = em.map_blocks(0).unwrap();
         assert_eq!(m0.state(), MapState::Written);
-        assert_eq!(m0.pblock(), 100);
+        assert_eq!(m0.mapped_pblock(), Some(100));
         assert_eq!(m0.len(), 4);
 
         // Mapping from the middle returns the remaining run.
         let m2 = em.map_blocks(2).unwrap();
-        assert_eq!(m2.pblock(), 102);
+        assert_eq!(m2.mapped_pblock(), Some(102));
         assert_eq!(m2.len(), 2);
 
         // Past the extent: a hole.
@@ -440,7 +465,7 @@ mod tests {
         let m = em.map_blocks(0).unwrap();
         assert_eq!(m.state(), MapState::Unwritten);
         assert!(m.reads_as_zeros());
-        assert_eq!(m.pblock(), 500);
+        assert_eq!(m.mapped_pblock(), Some(500));
     }
 
     /// Regression: when `allocate_one` allocates a data block but the following

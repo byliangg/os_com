@@ -33,7 +33,12 @@
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
 
-use super::{fs::Ext4, journal, journal::Tid, prelude::*};
+use super::{
+    fs::{Ext4, OrphanLink},
+    journal,
+    journal::Tid,
+    prelude::*,
+};
 
 mod dir;
 mod extent_manager;
@@ -131,7 +136,7 @@ pub(super) struct InodeDesc {
     ctime: Duration,
     mtime: Duration,
     crtime: Duration,
-    dtime: Duration,
+    dtime: Dtime,
     link_count: u16,
     /// `i_blocks` in 512-byte sectors (48-bit: low 32 + high 16).
     sector_count: u64,
@@ -141,6 +146,37 @@ pub(super) struct InodeDesc {
     generation: u32,
     /// Raw `i_block` (60 bytes) — the inline extent-tree root.
     block: [u32; RAW_BLOCK_PTRS_LEN],
+}
+
+/// The in-memory state of `i_dtime`, whose 32 on-disk bits ext4 overloads:
+/// normally the deletion timestamp, but the orphan-chain "next" pointer while
+/// the inode is linked on the list. The two meanings are disjoint in time (an
+/// inode carries a pointer only while listed and a real deletion time only
+/// once freed) — this enum keeps them apart in memory instead of reproducing
+/// the pun in a `Duration`; they collapse to the shared u32 only at
+/// [`to_raw`](Self::to_raw).
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Dtime {
+    /// The deletion timestamp — ext4's normal meaning (zero = live).
+    Time(Duration),
+    /// On the orphan chain: `i_dtime` carries the successor (`None` = end of
+    /// chain). The authoritative successor of a *cached* on-list inode is the
+    /// fs-level in-memory chain; this records the value known at add time.
+    OrphanNext(Option<Ext4Ino>),
+}
+
+impl Dtime {
+    /// The on-disk `i_dtime` encoding (`0` = live / end-of-chain — the
+    /// on-disk convention; the sentinel exists only past this boundary).
+    pub(super) const fn to_raw(self) -> u32 {
+        match self {
+            Dtime::Time(time) => time.as_secs() as u32,
+            Dtime::OrphanNext(next) => match next {
+                Some(ino) => ino,
+                None => 0,
+            },
+        }
+    }
 }
 
 impl InodeDesc {
@@ -170,7 +206,7 @@ impl InodeDesc {
             ctime: now,
             mtime: now,
             crtime: now,
-            dtime: Duration::ZERO,
+            dtime: Dtime::Time(Duration::ZERO),
             link_count,
             sector_count: 0,
             flags: FileFlags::EXTENTS,
@@ -229,7 +265,7 @@ impl InodeDesc {
     /// Sets the deletion time (`i_dtime`). Mutates through `Dirty`; stamped when
     /// a fully unlinked inode is reclaimed.
     pub(super) fn set_dtime(&mut self, time: Duration) {
-        self.dtime = time;
+        self.dtime = Dtime::Time(time);
     }
 
     /// Clears the given inode flags. Mutates through `Dirty`; used to drop the
@@ -309,9 +345,10 @@ impl InodeDesc {
         self.crtime
     }
 
-    /// Returns the deletion time (`i_dtime`).
-    pub(super) const fn dtime(&self) -> Duration {
-        self.dtime
+    /// The on-disk `i_dtime` encoding of the current state — the one place
+    /// both meanings collapse to the shared u32 (encode boundary).
+    pub(super) const fn raw_dtime(&self) -> u32 {
+        self.dtime.to_raw()
     }
 
     /// Sets `i_dtime` to encode this inode's successor on the orphan list (ext4
@@ -326,8 +363,8 @@ impl InodeDesc {
     /// removal splices the on-disk pointer without reaching this descriptor —
     /// so the journaled writeback overrides `i_dtime` from that chain; this
     /// setter records the value known at add time.
-    pub(super) fn set_orphan_next(&mut self, next: u32) {
-        self.dtime = Duration::from_secs(next as u64);
+    pub(super) fn set_orphan_next(&mut self, next: Option<Ext4Ino>) {
+        self.dtime = Dtime::OrphanNext(next);
     }
 
     /// Returns the inode generation (`i_generation`).
@@ -375,7 +412,7 @@ impl InodeDesc {
             atime: atime_secs,
             ctime: ctime_secs,
             mtime: mtime_secs,
-            dtime: self.dtime().as_secs() as u32,
+            dtime: self.raw_dtime(),
             gid: self.gid() as u16,
             link_count: self.link_count(),
             sector_count: self.sector_count() as u32,
@@ -421,16 +458,20 @@ pub(in crate::fs::fs_impls::ext4) fn map_all_blocks(
     let mut map = Vec::with_capacity(nblocks as usize);
     let mut i: Iblock = 0;
     while i < nblocks {
-        let m = em.map_blocks(i)?;
-        if m.reads_as_zeros() {
+        let extent_manager::Mapping::Mapped {
+            pblock,
+            len,
+            written: true,
+        } = em.map_blocks(i)?
+        else {
             return_errno_with_message!(
                 Errno::EUCLEAN,
                 "journal inode has an unmapped (hole/unwritten) block"
             );
-        }
-        let run = m.len().min(nblocks - i);
+        };
+        let run = len.min(nblocks - i);
         for k in 0..run {
-            map.push(m.pblock() + k as Ext4Bid);
+            map.push(pblock + k as Ext4Bid);
         }
         i += run;
     }
@@ -504,7 +545,10 @@ impl TryFrom<&RawInode> for InodeDesc {
             ctime: decode_time(raw.ctime, raw.ctime_extra),
             mtime: decode_time(raw.mtime, raw.mtime_extra),
             crtime: decode_time(raw.crtime, raw.crtime_extra),
-            dtime: Duration::from_secs(raw.dtime as u64),
+            // Decode boundary: a normal read always carries a deletion time
+            // (an on-list inode has link count 0, which `try_from` rejects;
+            // the recovery scan reads the raw pointer directly).
+            dtime: Dtime::Time(Duration::from_secs(raw.dtime as u64)),
             link_count: raw.link_count,
             sector_count,
             flags,
@@ -606,8 +650,8 @@ impl Inode {
             inner: RwMutex::new(InodeInner {
                 desc,
                 payload,
-                sync_tid: 0,
-                datasync_tid: 0,
+                sync_tid: None,
+                datasync_tid: None,
             }),
             block_group_idx,
             fs,
@@ -654,7 +698,7 @@ impl Inode {
     /// write lock is uncontended and participates in no cycle.
     pub(super) fn record_sync_tid(&self, handle: Option<&journal::Handle>) {
         if let Some(handle) = handle {
-            self.inner.write().sync_tid = handle.tid();
+            self.inner.write().sync_tid = Some(handle.tid());
         }
     }
 
@@ -768,13 +812,7 @@ impl Inode {
             let was_dirty = inner.is_dirty();
             let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
-            if was_dirty {
-                op.tid()
-            } else if inner.sync_tid != 0 {
-                Some(inner.sync_tid)
-            } else {
-                None
-            }
+            if was_dirty { op.tid() } else { inner.sync_tid }
             // `op` closes here, then `inner` unlocks — the reverse of the
             // inner ① → handle ② acquisition order.
         };
@@ -834,15 +872,10 @@ impl Inode {
     /// (e.g. to prove the ordered flush reached the final location).
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn data_block_of(&self, iblock: Iblock) -> Option<Ext4Bid> {
-        use self::extent_manager::MapState;
-
         let inner = self.inner.read();
         let extent_manager = inner.extent_manager().ok()?;
         let mapping = extent_manager.map_blocks(iblock).ok()?;
-        match mapping.state() {
-            MapState::Written | MapState::Unwritten => Some(mapping.pblock()),
-            MapState::Hole => None,
-        }
+        mapping.mapped_pblock()
     }
 
     /// Reclaims a fully unlinked inode: frees its data blocks and inode bit.
@@ -1023,17 +1056,19 @@ struct InodeInner {
     desc: Dirty<InodeDesc>,
     payload: InodePayload,
     /// The transaction that captured this inode's most recent journaled
-    /// writeback (jbd2 `i_sync_tid`), `0` if none. `fsync` waits on it even
+    /// writeback (jbd2 `i_sync_tid`), `None` if none. `fsync` waits on it even
     /// when the inode looks clean: the dirty flag clears at *capture* time
     /// while the commit is asynchronous, so "clean" does not imply "committed"
     /// — an earlier op or fs-level sync may have captured this inode into a
     /// transaction that is still only in memory. Non-journaled volumes leave
-    /// it at 0 (`fsync` degrades to the direct writeback + barrier).
-    sync_tid: Tid,
+    /// it `None` (`fsync` degrades to the direct writeback + barrier). An
+    /// `Option`, not a `0` sentinel: tids wrap (see `tid_geq`), so `0` is a
+    /// legal transaction id a wrapped journal could hand out.
+    sync_tid: Option<Tid>,
     /// The `fdatasync` subset (jbd2 `i_datasync_tid`). Phase 4 routes
     /// `fdatasync` through the same full-sync path, so this stays unused.
     #[expect(dead_code)]
-    datasync_tid: Tid,
+    datasync_tid: Option<Tid>,
 }
 
 impl InodeInner {
@@ -1098,12 +1133,22 @@ impl InodeInner {
         self.desc.set_dtime(time);
     }
 
-    /// Encodes this inode's successor on the orphan list into `i_dtime` (ext4's
-    /// dual use of that field). Used by the orphan-list add path; the
-    /// authoritative successor lives in `Ext4::s_orphan_lock`'s in-memory chain
-    /// (see [`InodeDesc::set_orphan_next`]).
-    pub(super) fn set_orphan_next(&mut self, next: u32) {
-        self.desc.set_orphan_next(next);
+    /// Persists this inode as a freshly linked orphan, consuming the
+    /// [`OrphanLink`] its `Ext4::orphan_add` minted: records the previous
+    /// chain head into `i_dtime` (ext4's dual use of that field — the
+    /// authoritative successor lives in `Ext4::s_orphan_lock`'s in-memory
+    /// chain) and writes the inode back. Both steps MUST land in the same
+    /// transaction as the add, which is exactly why they only exist fused
+    /// here (see [`OrphanLink`]).
+    pub(super) fn persist_as_orphan(
+        &mut self,
+        fs: &Ext4,
+        ino: Ext4Ino,
+        link: OrphanLink,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        self.desc.set_orphan_next(link.into_old_head());
+        self.write_back_inode_desc(fs, ino, handle)
     }
 
     /// Clears the given inode flags. Used by rename to drop a moved directory's
@@ -1339,7 +1384,7 @@ impl InodeInner {
             // Record the transaction carrying this capture BEFORE clearing the
             // dirty flag: the flag clears now but the commit is asynchronous,
             // so `fsync` needs this tid to wait on (clean != committed).
-            self.sync_tid = handle.tid();
+            self.sync_tid = Some(handle.tid());
         }
         self.clear_dirty();
         Ok(())
@@ -1727,8 +1772,8 @@ mod write_tests {
             let inner = inode.inner.read();
             let bm = inner.extent_manager().unwrap();
             (
-                bm.map_blocks(1).unwrap().pblock(),
-                bm.map_blocks(2).unwrap().pblock(),
+                bm.map_blocks(1).unwrap().mapped_pblock().unwrap(),
+                bm.map_blocks(2).unwrap().mapped_pblock().unwrap(),
             )
         };
         assert!(block_is_allocated(&f, b1));
@@ -1860,7 +1905,7 @@ mod write_tests {
         let m2 = bm.map_blocks(2).unwrap();
         assert_eq!(m0.state(), MapState::Unwritten);
         assert_eq!(m1.state(), MapState::Written);
-        assert_eq!(m1.pblock(), 201);
+        assert_eq!(m1.mapped_pblock(), Some(201));
         assert_eq!(m2.state(), MapState::Unwritten);
 
         // No data block allocated or freed: the inline split fits the root, so

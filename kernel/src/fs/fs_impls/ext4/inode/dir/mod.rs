@@ -47,31 +47,6 @@ struct DirEntryInfo {
 }
 
 impl InodeInner {
-    /// Finds the inode number of the entry named `name`.
-    ///
-    /// Directory-index seam (Phase 6 htree): this and [`Self::find_dir_slot`]
-    /// are the only linear scans; when the `INDEX` flag is set the htree index
-    /// will be consulted here instead of walking blocks in physical order.
-    fn find_entry_ino(&self, name: &str) -> Result<Ext4Ino> {
-        if self.desc.type_() != InodeType::Dir {
-            return_errno!(Errno::ENOTDIR);
-        }
-        let file_size = self.file_size();
-        let name_bytes = name.as_bytes();
-        let page_cache = self.page_cache()?;
-
-        for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
-            let block = DirBlockView::from_index(page_cache, block_idx, file_size);
-            let mut iter = block.iter_entries();
-            while let Some((_offset, entry)) = iter.next_entry()? {
-                if entry.header.ino != 0 && entry.name == name_bytes {
-                    return Ok(entry.header.ino);
-                }
-            }
-        }
-        return_errno!(Errno::ENOENT)
-    }
-
     /// Iterates entries from byte `offset`, feeding each active entry to
     /// `visitor`. Returns the number of bytes advanced.
     fn readdir_at(&self, offset: usize, visitor: &mut dyn DirentVisitor) -> Result<usize> {
@@ -139,7 +114,7 @@ impl InodeInner {
     /// or the spare tail of a live entry that can be split.
     ///
     /// Directory-index seam (Phase 6 htree): together with
-    /// [`Self::find_entry_ino`] this is the only linear scan; when the `INDEX`
+    /// [`Self::find_entry_info`] this is the only linear scan; when the `INDEX`
     /// flag is set the htree index will pick the target leaf block here instead
     /// of walking blocks in physical order.
     fn find_dir_slot(&self, name_len: usize) -> Result<Option<DirSlotInfo>> {
@@ -258,18 +233,12 @@ impl InodeInner {
     /// cache's current content), so no device read is issued for a block we fully
     /// replace.
     fn journal_dir_block(&self, dir_offset: usize, handle: Option<&journal::Handle>) -> Result<()> {
-        use super::extent_manager::MapState;
-
         if handle.is_none() {
             return Ok(());
         }
         let logical = (dir_offset / BLOCK_SIZE) as Iblock;
-        let mapping = self.extent_manager()?.map_blocks(logical)?;
-        let phys = match mapping.state() {
-            MapState::Written | MapState::Unwritten => mapping.pblock(),
-            MapState::Hole => {
-                return_errno_with_message!(Errno::EIO, "directory block not mapped for journaling");
-            }
+        let Some(phys) = self.extent_manager()?.map_blocks(logical)?.mapped_pblock() else {
+            return_errno_with_message!(Errno::EIO, "directory block not mapped for journaling");
         };
         let block: [u8; BLOCK_SIZE] = self
             .page_cache()?
@@ -529,7 +498,7 @@ impl InodeInner {
 impl Inode {
     /// Looks up a child entry by name and reads its inode.
     pub(in crate::fs::fs_impls::ext4) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
-        let ino = self.inner.read().find_entry_ino(name)?;
+        let ino = self.inner.read().find_entry_info(name)?.ino;
         let fs = self
             .fs
             .upgrade()
@@ -676,28 +645,24 @@ impl Inode {
         child_inner.dec_link_count(1);
         let reached_zero = child_inner.link_count() == 0;
         if reached_zero {
-            // Link the fully unlinked inode onto the on-disk orphan list,
-            // recording the previous head in its `i_dtime`, so a crash between
-            // this transaction and the (separate) reclaim transaction leaves a
-            // chain recovery can finish. Ordered handle ② → `s_orphan_lock` →
-            // superblock ⑤; a no-op (returning 0) without a journal.
-            let old_head = fs.orphan_add(child.ino(), op.get())?;
+            // Link the fully unlinked inode onto the on-disk orphan list and
+            // persist the previous head in its `i_dtime` + the zeroed link
+            // count, all in this transaction, so a crash between it and the
+            // (separate) reclaim transaction leaves a chain recovery can
+            // finish. Ordered handle ② → `s_orphan_lock` → superblock ⑤; a
+            // no-op (empty link) without a journal.
+            let link = fs.orphan_add(child.ino(), op.get())?;
             let child_inner = guards.inner_mut(child.ino());
-            child_inner.set_orphan_next(old_head);
-        }
-        // Persist the child's inode in this transaction: for a surviving hard
-        // link its (crash-consistent) link count; for the last link its zeroed
-        // link count + orphan-next pointer. Non-journaled writes back only on
-        // the link==0 case (a surviving link defers to fsync, as before).
-        let child_inner = guards.inner_mut(child.ino());
-        if op.get().is_some() || reached_zero {
-            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
-        }
-        if reached_zero {
+            child_inner.persist_as_orphan(&fs, entry_info.ino, link, op.get())?;
             // Drop the cache's `Arc`; if an fd still holds one the inode stays
             // alive until that last `Arc` drops, then `Drop` reclaims it. We do
             // NOT force reclaim here — refcount + `Drop` handle unlink-of-open.
             let _ = fs.remove_inode(entry_info.ino);
+        } else if op.get().is_some() {
+            // Persist the surviving hard link's (crash-consistent) link count
+            // in this transaction; non-journaled defers to fsync, as before.
+            let child_inner = guards.inner_mut(child.ino());
+            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
         }
         Ok(())
     }
@@ -737,12 +702,11 @@ impl Inode {
         // The child loses its own `.` self-link and the parent's directory entry.
         child_inner.dec_link_count(2);
         if child_inner.link_count() == 0 {
-            // Link onto the orphan list before writing the child back, so its
-            // `i_dtime` carries the orphan-next pointer (see `unlink`).
-            let old_head = fs.orphan_add(child.ino(), op.get())?;
+            // Link onto the orphan list and persist the child (`i_dtime` =
+            // orphan-next pointer) in this transaction (see `unlink`).
+            let link = fs.orphan_add(child.ino(), op.get())?;
             let child_inner = guards.inner_mut(child.ino());
-            child_inner.set_orphan_next(old_head);
-            child_inner.write_back_inode_desc(&fs, entry_info.ino, op.get())?;
+            child_inner.persist_as_orphan(&fs, entry_info.ino, link, op.get())?;
             let _ = fs.remove_inode(entry_info.ino);
         }
 
@@ -832,9 +796,12 @@ impl Inode {
             return Ok(());
         }
 
-        // Step 1: read the inode numbers without write locks so we know which
-        // inodes to lock in step 2.
-        let old_ino = self.inner.read().find_entry_info(old_name)?.ino;
+        // Step 1: read the source entry without write locks — the ino tells us
+        // which inodes to lock in step 2, and the full `DirEntryInfo` feeds the
+        // cross-directory delete (the VFS `DirDentry.children` lock keeps the
+        // entry stable across the gap, the same argument unlink/rmdir rely on).
+        let old_info = self.inner.read().find_entry_info(old_name)?;
+        let old_ino = old_info.ino;
 
         // CRITICAL drop ordering (mirrors ext2; same hazard as unlink/rmdir):
         // `old_inode` and `replaced_inode` are declared *before* `guards`, so at
@@ -878,6 +845,7 @@ impl Inode {
             &mut guards,
             target,
             old_name,
+            &old_info,
             &old_inode,
             replaced_inode.as_deref(),
             new_name,
@@ -954,6 +922,7 @@ impl Inode {
         guards: &mut MultiInodeInnerGuards,
         target: &Inode,
         old_name: &str,
+        old_info: &DirEntryInfo,
         old_inode: &Inode,
         replaced_inode: Option<&Inode>,
         new_name: &str,
@@ -974,8 +943,11 @@ impl Inode {
             } else {
                 dir_inner.add_new_entry(&fs, new_name, old_ino, moved_file_type, handle)?;
             }
-            // Re-read the source entry: `add_new_entry` may have split it
-            // (shrinking its `rec_len`), making any earlier `DirEntryInfo` stale.
+            // Re-read the source entry — the ONE place the step-1
+            // `DirEntryInfo` cannot be trusted: `add_new_entry` mutated THIS
+            // directory and may have split the source entry (shrinking its
+            // `rec_len`). The cross-directory branch below keeps the step-1
+            // token instead, because there the source directory is untouched.
             let old_info = dir_inner.find_entry_info(old_name)?;
             dir_inner.delete_entry(&old_info, handle)?;
             // Replacing a directory with a directory in the same parent: the
@@ -1009,10 +981,12 @@ impl Inode {
             }
 
             let source_inner = guards.inner_mut(self.ino());
-            // Re-read the source entry (same staleness reason as above, though
-            // here only the target was mutated; kept symmetric with ext2).
-            let old_info = source_inner.find_entry_info(old_name)?;
-            source_inner.delete_entry(&old_info, handle)?;
+            // The step-1 `DirEntryInfo` is still valid here: only `target` was
+            // mutated above, the source directory is untouched, and the VFS
+            // `DirDentry.children` lock kept the entry stable across the
+            // read-lock → write-lock gap (the same token-trust unlink/rmdir
+            // already exercise). No re-walk needed.
+            source_inner.delete_entry(old_info, handle)?;
             // Moving a directory out of `self`: `self` loses the moved
             // directory's `..` back-reference.
             if old_is_dir {
@@ -1038,13 +1012,12 @@ impl Inode {
             replaced_inner.dec_link_count(1);
 
             if replaced_inner.link_count() == 0 {
-                // Link onto the orphan list before writing the replaced inode
-                // back, so its `i_dtime` carries the orphan-next pointer (see
+                // Link onto the orphan list and persist the replaced inode
+                // (`i_dtime` = orphan-next pointer) in this transaction (see
                 // `unlink`).
-                let old_head = fs.orphan_add(replaced.ino(), handle)?;
+                let link = fs.orphan_add(replaced.ino(), handle)?;
                 let replaced_inner = guards.inner_mut(replaced.ino());
-                replaced_inner.set_orphan_next(old_head);
-                replaced_inner.write_back_inode_desc(&fs, replaced.ino(), handle)?;
+                replaced_inner.persist_as_orphan(&fs, replaced.ino(), link, handle)?;
                 // Drop the cache's `Arc`. If an fd still holds one the inode stays
                 // alive until that last `Arc` (here in the caller's locals, dropped
                 // after `guards`) drops, then `Drop` reclaims it.
@@ -1297,13 +1270,18 @@ mod tests {
     }
 
     /// Collects the live entry names of a directory via `readdir_at`.
+    /// Test shorthand: the ino of `name` in `dir` (the lookup path's walk).
+    fn entry_ino(dir: &Inode, name: &str) -> Result<super::super::super::prelude::Ext4Ino> {
+        dir.inner.read().find_entry_info(name).map(|e| e.ino)
+    }
+
     fn readdir_names(dir: &Inode) -> Vec<String> {
         let mut names: Vec<String> = Vec::new();
         dir.readdir_at(0, &mut names).unwrap();
         names
     }
 
-    /// `add_new_entry` then `find_entry_ino`/`readdir_at` see the new name, and
+    /// `add_new_entry` then `find_entry_info`/`readdir_at` see the new name, and
     /// multiple adds in one block all become visible.
     #[ktest]
     fn add_new_entries_visible() {
@@ -1325,15 +1303,11 @@ mod tests {
         }
 
         // Each name resolves to the inode it was added with.
-        assert_eq!(dir.inner.read().find_entry_ino("alpha").unwrap(), 21);
-        assert_eq!(dir.inner.read().find_entry_ino("beta").unwrap(), 22);
-        assert_eq!(dir.inner.read().find_entry_ino("gamma").unwrap(), 23);
+        assert_eq!(dir.inner.read().find_entry_info("alpha").unwrap().ino, 21);
+        assert_eq!(dir.inner.read().find_entry_info("beta").unwrap().ino, 22);
+        assert_eq!(dir.inner.read().find_entry_info("gamma").unwrap().ino, 23);
         assert_eq!(
-            dir.inner
-                .read()
-                .find_entry_ino("missing")
-                .unwrap_err()
-                .error(),
+            entry_ino(&dir, "missing").unwrap_err().error(),
             Errno::ENOENT
         );
 
@@ -1360,8 +1334,8 @@ mod tests {
         }
 
         assert_eq!(dir.size(), BLOCK_SIZE);
-        assert_eq!(dir.inner.read().find_entry_ino("split-me").unwrap(), 31);
-        assert_eq!(dir.inner.read().find_entry_ino("..").unwrap(), 2);
+        assert_eq!(entry_ino(&dir, "split-me").unwrap(), 31);
+        assert_eq!(entry_ino(&dir, "..").unwrap(), 2);
         assert_eq!(readdir_names(&dir), [".", "..", "split-me"]);
     }
 
@@ -1402,10 +1376,7 @@ mod tests {
         // Every name (including ones that landed in the grown block) is found.
         for i in 0..count {
             let name = format!("entry_file_{i:05}");
-            assert_eq!(
-                dir.inner.read().find_entry_ino(&name).unwrap(),
-                1000 + i as u32
-            );
+            assert_eq!(entry_ino(&dir, &name).unwrap(), 1000 + i as u32);
         }
         // readdir sees `.`/`..` plus all names across both blocks.
         assert_eq!(readdir_names(&dir).len(), count + 2);
@@ -1440,11 +1411,7 @@ mod tests {
             inner.delete_entry(&info, None).unwrap();
         }
         assert_eq!(
-            dir.inner
-                .read()
-                .find_entry_ino("victim")
-                .unwrap_err()
-                .error(),
+            entry_ino(&dir, "victim").unwrap_err().error(),
             Errno::ENOENT
         );
         assert_eq!(readdir_names(&dir), [".", "..", "keep", "tail"]);
@@ -1459,7 +1426,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(dir.size(), size_after_delete, "re-add should not grow dir");
-        assert_eq!(dir.inner.read().find_entry_ino("reuse").unwrap(), 44);
+        assert_eq!(entry_ino(&dir, "reuse").unwrap(), 44);
         assert_eq!(readdir_names(&dir).len(), 5);
     }
 
@@ -1476,8 +1443,8 @@ mod tests {
         }
 
         // `.` points to self, `..` to the parent (ino 2).
-        assert_eq!(dir.inner.read().find_entry_ino(".").unwrap(), DIR_INO);
-        assert_eq!(dir.inner.read().find_entry_ino("..").unwrap(), 2);
+        assert_eq!(entry_ino(&dir, ".").unwrap(), DIR_INO);
+        assert_eq!(entry_ino(&dir, "..").unwrap(), 2);
         assert_eq!(dir.size(), BLOCK_SIZE);
         assert!(dir.inner.read().empty_dir(DIR_INO));
         // `..` pointing elsewhere does not count as an extra live name.
@@ -1567,8 +1534,8 @@ mod tests {
 
         // The new directory has only `.`/`..`, and `..` points back to DIR_INO.
         assert!(child.inner.read().empty_dir(child.ino()));
-        assert_eq!(child.inner.read().find_entry_ino(".").unwrap(), child.ino());
-        assert_eq!(child.inner.read().find_entry_ino("..").unwrap(), DIR_INO);
+        assert_eq!(entry_ino(&child, ".").unwrap(), child.ino());
+        assert_eq!(entry_ino(&child, "..").unwrap(), DIR_INO);
 
         // The parent gained one link for the child's `..` reference.
         assert_eq!(dir.link_count(), parent_links_before + 1);
@@ -1664,7 +1631,7 @@ mod tests {
         assert_eq!(
             dir.inner
                 .read()
-                .find_entry_ino("doomed")
+                .find_entry_info("doomed")
                 .unwrap_err()
                 .error(),
             Errno::ENOENT
@@ -1887,7 +1854,7 @@ mod tests {
 
         dir.unlink("seam").unwrap();
         assert!(!f.ext4.is_inode_allocated(child_ino));
-        assert_eq!(f.ext4.super_block().last_orphan(), 0);
+        assert_eq!(f.ext4.super_block().last_orphan(), None);
     }
 
     /// `fixture_for_create` plus a journal, for the orphan-list flow tests. The
@@ -1935,10 +1902,18 @@ mod tests {
         // Unlink both while "open" (our Arcs stand in for fds): reclaim defers,
         // the chain grows at the head: b → a.
         dir.unlink("a").unwrap();
-        assert_eq!(f.ext4.super_block().last_orphan(), a_ino, "a is the head");
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            Some(a_ino),
+            "a is the head"
+        );
         assert!(f.ext4.is_inode_allocated(a_ino), "reclaim deferred (open)");
         dir.unlink("b").unwrap();
-        assert_eq!(f.ext4.super_block().last_orphan(), b_ino, "b is the head");
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            Some(b_ino),
+            "b is the head"
+        );
 
         // The chain is durable: commit + checkpoint, then read it off the disk —
         // this is the state a crash would hand to the next mount's orphan scan.
@@ -1956,7 +1931,11 @@ mod tests {
         // spliced to a's successor (0), the head stays b.
         drop(a);
         assert!(!f.ext4.is_inode_allocated(a_ino), "a freed");
-        assert_eq!(f.ext4.super_block().last_orphan(), b_ino, "head unchanged");
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            Some(b_ino),
+            "head unchanged"
+        );
         journal.commit_now_for_test();
         journal.flush_on_unmount().unwrap();
         assert_eq!(
@@ -1968,7 +1947,7 @@ mod tests {
         // Reclaim the head (b): the list drains, on disk too.
         drop(b);
         assert!(!f.ext4.is_inode_allocated(b_ino), "b freed");
-        assert_eq!(f.ext4.super_block().last_orphan(), 0, "list drained");
+        assert_eq!(f.ext4.super_block().last_orphan(), None, "list drained");
         journal.commit_now_for_test();
         journal.flush_on_unmount().unwrap();
         let sb_disk: RawSuperBlock = f.disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();

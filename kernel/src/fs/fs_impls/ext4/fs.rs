@@ -573,13 +573,16 @@ impl Ext4 {
     /// head (the successor `ino` now points at; `0` if the list was empty).
     ///
     /// The caller — a namespace op that has just dropped an inode's link count
-    /// to 0 (Linux `ext4_orphan_add`) — records the returned successor in the
-    /// child's `i_dtime` (via `InodeInner::set_orphan_next`) and writes the
-    /// child back **in the same transaction**, so a crash after this
-    /// transaction commits leaves a well-formed chain the recovery scan can
-    /// walk. A no-op returning `0` without a handle: the orphan machinery is
-    /// journal-only (Linux parity — without a journal there is no recovery pass
-    /// to consume the list, and a stale `s_last_orphan` would just accrete).
+    /// to 0 (Linux `ext4_orphan_add`) — must consume the returned
+    /// [`OrphanLink`] through [`InodeInner::persist_as_orphan`], which records
+    /// the previous head in the child's `i_dtime` and writes the child back
+    /// **in the same transaction**: a crash after this transaction commits
+    /// then leaves a well-formed chain the recovery scan can walk. The
+    /// credential is `#[must_use]` and its field is private, so the add /
+    /// record / write-back triple cannot be half-done at a call site. A no-op
+    /// (empty link) without a handle: the orphan machinery is journal-only
+    /// (Linux parity — without a journal there is no recovery pass to consume
+    /// the list, and a stale `s_last_orphan` would just accrete).
     ///
     /// # Locking
     ///
@@ -587,16 +590,22 @@ impl Ext4 {
     /// the journal handle (②) and **before** the superblock (⑤); it never takes
     /// an inode `inner`, so it cannot invert against the caller's held child
     /// `inner` (①).
-    pub(super) fn orphan_add(&self, ino: Ext4Ino, handle: Option<&journal::Handle>) -> Result<u32> {
+    pub(super) fn orphan_add(
+        &self,
+        ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+    ) -> Result<OrphanLink> {
         if handle.is_none() {
-            return Ok(0);
+            return Ok(OrphanLink { old_head: None });
         }
         let mut chain = self.s_orphan_lock.lock();
         // Already listed (defensive — no current call site can re-add a listed
         // inode; Linux guards the same way): keep the existing successor.
-        if let Some(next) = chain.successor_of(ino) {
+        if chain.listed(ino) {
             warn!("ext4: inode {ino} is already on the orphan list");
-            return Ok(next);
+            return Ok(OrphanLink {
+                old_head: chain.successor_of(ino),
+            });
         }
         // One superblock WRITE guard across both the capture and the mutation:
         // the counters are guarded by the superblock lock (a concurrent
@@ -606,11 +615,11 @@ impl Ext4 {
         // mirror, and transaction mutually consistent.
         let mut sb = self.super_block.write();
         let old_head = sb.last_orphan();
-        sb.journal_capture(handle, ino)?;
-        sb.set_last_orphan(ino);
+        sb.journal_capture(handle, Some(ino))?;
+        sb.set_last_orphan(Some(ino));
         drop(sb);
         chain.push_head(ino);
-        Ok(old_head)
+        Ok(OrphanLink { old_head })
     }
 
     /// Unlinks `ino` from the orphan list, the mirror of
@@ -665,10 +674,12 @@ impl Ext4 {
     fn patch_orphan_next_on_disk(
         &self,
         ino: Ext4Ino,
-        next: u32,
+        next: Option<Ext4Ino>,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        self.inode_slot(ino)?.journal_patch_dtime(handle, next)
+        // `0 = end of chain` is the on-disk convention (encode boundary).
+        self.inode_slot(ino)?
+            .journal_patch_dtime(handle, next.unwrap_or(0))
     }
 
     /// Finishes deletions interrupted by a crash, by walking the on-disk orphan
@@ -695,7 +706,7 @@ impl Ext4 {
     /// Never fails the mount: every problem degrades to a warning and, at
     /// worst, a cleared head (Linux logs and continues the same way).
     fn recover_orphan_list(self: &Arc<Self>) {
-        if self.super_block.read().last_orphan() == 0 {
+        if self.super_block.read().last_orphan().is_none() {
             return;
         }
 
@@ -709,35 +720,36 @@ impl Ext4 {
         let mut to_free = Vec::new();
         let mut cursor = self.super_block.read().last_orphan();
         let mut suspect = false;
-        while cursor != 0 {
+        while let Some(cur) = cursor {
             // Reserved inodes (including the root) can never be orphans; a
             // revisit is a cycle; an unallocated inode's deletion completed and
             // its `i_dtime` is a deletion time, not a trustworthy pointer.
-            let in_range = cursor >= first_ino && cursor <= total_inodes;
-            if !in_range || chain.contains(&cursor) || !self.is_inode_allocated(cursor) {
+            let in_range = cur >= first_ino && cur <= total_inodes;
+            if !in_range || chain.contains(&cur) || !self.is_inode_allocated(cur) {
                 suspect = true;
                 break;
             }
-            let raw = match self.read_raw_inode(cursor) {
+            let raw = match self.read_raw_inode(cur) {
                 Ok(raw) => raw,
                 Err(e) => {
-                    warn!("ext4: orphan walk could not read inode {cursor}: {e:?}");
+                    warn!("ext4: orphan walk could not read inode {cur}: {e:?}");
                     suspect = true;
                     break;
                 }
             };
-            chain.push(cursor);
+            chain.push(cur);
             if raw.link_count == 0 {
-                to_free.push(cursor);
+                to_free.push(cur);
             } else {
                 warn!(
-                    "ext4: orphan inode {cursor} has link count {}; skipping (crash-mid-truncate \
+                    "ext4: orphan inode {cur} has link count {}; skipping (crash-mid-truncate \
                      recovery is not supported yet)",
                     raw.link_count
                 );
                 suspect = true;
             }
-            cursor = raw.dtime;
+            // On disk `0` terminates the chain (decode boundary).
+            cursor = (raw.dtime != 0).then_some(raw.dtime);
         }
 
         // Prime the in-memory mirror, then finish each interrupted deletion in
@@ -783,9 +795,11 @@ impl Ext4 {
         // superblock (⑤), as everywhere. Best-effort: on failure the head
         // stays and the next mount retries the scan.
         let head_after = self.super_block.read().last_orphan();
-        if suspect || head_after != 0 {
-            if head_after != 0 && !suspect {
-                warn!("ext4: orphan cleanup left an unexpected nonzero head {head_after}");
+        if suspect || head_after.is_some() {
+            if let Some(head) = head_after
+                && !suspect
+            {
+                warn!("ext4: orphan cleanup left an unexpected nonzero head {head}");
             }
             let op = match self.begin_op(Self::FSYNC_CREDITS) {
                 Ok(op) => op,
@@ -798,11 +812,11 @@ impl Ext4 {
             // One superblock write guard across capture + mutation (see
             // `orphan_add`).
             let mut sb = self.super_block.write();
-            if let Err(e) = sb.journal_capture(op.get(), 0) {
+            if let Err(e) = sb.journal_capture(op.get(), None) {
                 warn!("ext4: could not journal the cleared orphan head: {e:?}");
                 return;
             }
-            sb.set_last_orphan(0);
+            sb.set_last_orphan(None);
             drop(sb);
             chain.clear();
         }
@@ -968,8 +982,9 @@ impl Ext4 {
             // → `s_orphan_lock` → journal state (leaf), the same nesting as
             // `patch_orphan_next_on_disk`.
             let chain = self.s_orphan_lock.lock();
-            if let Some(next) = chain.successor_of(ino) {
-                raw.dtime = next;
+            if chain.listed(ino) {
+                // `0 = end of chain` is the on-disk convention (encode boundary).
+                raw.dtime = chain.successor_of(ino).unwrap_or(0);
             }
             return slot.journal_write(handle, &raw);
         }
@@ -1023,7 +1038,7 @@ impl Ext4 {
         // Deletion time (`i_dtime`, whole seconds). Zero for live inodes; the
         // reclaim path stamps it before the final writeback so a freed inode
         // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
-        raw.dtime = desc.dtime().as_secs() as u32;
+        raw.dtime = desc.raw_dtime();
 
         self.block_device
             .write_val(slot.device_offset(), &raw)
@@ -1137,16 +1152,39 @@ impl Drop for Ext4 {
 /// mirror — an error leaves mirror, head, and transaction mutually consistent.
 struct OrphanChain(Vec<Ext4Ino>);
 
+/// Proof that an inode was linked onto the orphan chain, carrying the
+/// previous head its `i_dtime` must record.
+///
+/// Minted only by [`Ext4::orphan_add`] and consumed only by
+/// [`InodeInner::persist_as_orphan`](super::inode::Inode) — which records the
+/// head into `i_dtime` and writes the inode back. Those two steps MUST land in
+/// the same transaction as the add (a committed superblock head pointing at an
+/// inode whose `i_dtime` is garbage breaks the recovery walk), so the
+/// credential is `#[must_use]` and its field is private: the triple cannot be
+/// half-done at a call site.
+#[must_use = "the link must be persisted into the inode via persist_as_orphan"]
+pub(super) struct OrphanLink {
+    old_head: Option<Ext4Ino>,
+}
+
+impl OrphanLink {
+    /// Consumes the credential, yielding the previous chain head the inode's
+    /// `i_dtime` must record (`None` = it becomes the last member).
+    pub(super) fn into_old_head(self) -> Option<Ext4Ino> {
+        self.old_head
+    }
+}
+
 /// What removing an inode from the [`OrphanChain`] must persist.
 enum OrphanSplice {
     /// The inode is the head: the superblock's `s_last_orphan` must advance to
-    /// `successor` (`0` = the list becomes empty).
-    Head { successor: u32 },
+    /// `successor` (`None` = the list becomes empty).
+    Head { successor: Option<Ext4Ino> },
     /// A middle/tail member: `predecessor`'s on-disk `i_dtime` must be
-    /// repointed to `successor`.
+    /// repointed to `successor` (`None` = it becomes the last member).
     Middle {
         predecessor: Ext4Ino,
-        successor: u32,
+        successor: Option<Ext4Ino>,
     },
 }
 
@@ -1155,11 +1193,17 @@ impl OrphanChain {
         Self(Vec::new())
     }
 
-    /// The on-disk successor of `ino` (`0` = `ino` is the last member), or
-    /// `None` when `ino` is not on the chain.
-    fn successor_of(&self, ino: Ext4Ino) -> Option<u32> {
+    /// Whether `ino` is on the chain.
+    fn listed(&self, ino: Ext4Ino) -> bool {
+        self.0.contains(&ino)
+    }
+
+    /// The chain successor of `ino`: `None` when `ino` is the last member —
+    /// or not listed at all (gate with [`listed`](Self::listed) where the
+    /// difference matters).
+    fn successor_of(&self, ino: Ext4Ino) -> Option<Ext4Ino> {
         let idx = self.0.iter().position(|&i| i == ino)?;
-        Some(self.0.get(idx + 1).copied().unwrap_or(0))
+        self.0.get(idx + 1).copied()
     }
 
     /// Prepends a new head. The caller has already persisted it as
@@ -1173,7 +1217,7 @@ impl OrphanChain {
     /// persist step succeeded.
     fn splice_for(&self, ino: Ext4Ino) -> Option<OrphanSplice> {
         let idx = self.0.iter().position(|&i| i == ino)?;
-        let successor = self.0.get(idx + 1).copied().unwrap_or(0);
+        let successor = self.0.get(idx + 1).copied();
         Some(if idx == 0 {
             OrphanSplice::Head { successor }
         } else {
@@ -2439,7 +2483,7 @@ mod tests {
             ext4.is_inode_allocated(live_ino),
             "a linked (live) chain member must not be freed"
         );
-        assert_eq!(ext4.super_block().last_orphan(), 0, "head cleared");
+        assert_eq!(ext4.super_block().last_orphan(), None, "head cleared");
         drop(ext4);
     }
 
@@ -2479,29 +2523,42 @@ mod tests {
         let c = f.ext4.alloc_ino(ROOT_INO, InodeType::File, None).unwrap();
 
         // Journal-only: without a handle the add is a no-op returning 0.
-        assert_eq!(f.ext4.orphan_add(a, None).unwrap(), 0);
-        assert_eq!(f.ext4.super_block().last_orphan(), 0);
+        assert_eq!(f.ext4.orphan_add(a, None).unwrap().into_old_head(), None);
+        assert_eq!(f.ext4.super_block().last_orphan(), None);
 
         {
             let op = f.ext4.begin_op(8).unwrap();
             // Build the chain c → b → a; each add returns the previous head.
-            assert_eq!(f.ext4.orphan_add(a, op.get()).unwrap(), 0);
-            assert_eq!(f.ext4.orphan_add(b, op.get()).unwrap(), a);
-            assert_eq!(f.ext4.orphan_add(c, op.get()).unwrap(), b);
-            assert_eq!(f.ext4.super_block().last_orphan(), c);
+            assert_eq!(
+                f.ext4.orphan_add(a, op.get()).unwrap().into_old_head(),
+                None
+            );
+            assert_eq!(
+                f.ext4.orphan_add(b, op.get()).unwrap().into_old_head(),
+                Some(a)
+            );
+            assert_eq!(
+                f.ext4.orphan_add(c, op.get()).unwrap().into_old_head(),
+                Some(b)
+            );
+            assert_eq!(f.ext4.super_block().last_orphan(), Some(c));
 
             // Remove the middle b: the head is untouched and predecessor c is
             // spliced (on disk, journaled) to point at a.
             f.ext4.orphan_del(b, op.get()).unwrap();
-            assert_eq!(f.ext4.super_block().last_orphan(), c, "head unchanged");
+            assert_eq!(
+                f.ext4.super_block().last_orphan(),
+                Some(c),
+                "head unchanged"
+            );
 
             // Remove the head c: the head advances past the spliced-out b to a.
             f.ext4.orphan_del(c, op.get()).unwrap();
-            assert_eq!(f.ext4.super_block().last_orphan(), a);
+            assert_eq!(f.ext4.super_block().last_orphan(), Some(a));
 
             // Drain.
             f.ext4.orphan_del(a, op.get()).unwrap();
-            assert_eq!(f.ext4.super_block().last_orphan(), 0);
+            assert_eq!(f.ext4.super_block().last_orphan(), None);
         }
         journal.commit_now_for_test();
         journal.flush_on_unmount().unwrap();
@@ -2540,14 +2597,14 @@ mod tests {
 
         {
             let op = f.ext4.begin_op(8).unwrap();
-            f.ext4.orphan_add(a, op.get()).unwrap();
-            f.ext4.orphan_add(b, op.get()).unwrap();
+            let _ = f.ext4.orphan_add(a, op.get()).unwrap().into_old_head();
+            let _ = f.ext4.orphan_add(b, op.get()).unwrap().into_old_head();
 
             // Write `b` back with a descriptor whose `i_dtime` is 0 (never told
             // about the chain): the writeback must serialize successor `a` from
             // the chain regardless.
             let desc_b = f.ext4.read_inode_desc(b).unwrap();
-            assert_eq!(desc_b.dtime(), Duration::ZERO);
+            assert_eq!(desc_b.raw_dtime(), 0);
             let root_b = *desc_b.raw_block();
             f.ext4
                 .write_back_inode_desc(b, &desc_b, &root_b, op.get())
@@ -2606,7 +2663,7 @@ mod tests {
             !ext4.is_inode_allocated(orphan_ino),
             "the orphan inode was freed by the mount scan"
         );
-        assert_eq!(ext4.super_block().last_orphan(), 0, "list drained");
+        assert_eq!(ext4.super_block().last_orphan(), None, "list drained");
         assert_eq!(
             ext4.super_block().free_inodes_count(),
             free_inodes_before + 1,
@@ -2641,7 +2698,11 @@ mod tests {
             .unwrap();
 
         let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
-        assert_eq!(ext4.super_block().last_orphan(), 0, "garbage head cleared");
+        assert_eq!(
+            ext4.super_block().last_orphan(),
+            None,
+            "garbage head cleared"
+        );
         drop(ext4);
         let sb_after: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
         assert_eq!(sb_after.last_orphan, 0, "cleared head persisted");

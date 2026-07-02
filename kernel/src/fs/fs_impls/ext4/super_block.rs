@@ -57,7 +57,7 @@ pub(super) struct SuperBlock {
     feature_incompat: FeatureIncompatSet,
     feature_ro_compat: FeatureRoCompatSet,
     uuid: [u8; 16],
-    last_orphan: u32,
+    last_orphan: Option<Ext4Ino>,
     reserved_blocks_count: u32,
     journal_ino: u32,
     journal_dev: u32,
@@ -194,7 +194,9 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             feature_incompat,
             feature_ro_compat,
             uuid: sb.uuid,
-            last_orphan: sb.last_orphan,
+            // `0 = empty` is the on-disk convention; in memory the head is an
+            // `Option` and the sentinel stops at this parse boundary.
+            last_orphan: (sb.last_orphan != 0).then_some(sb.last_orphan),
             reserved_blocks_count: sb.reserved_blocks_count,
             journal_ino: sb.journal_ino,
             journal_dev: sb.journal_dev,
@@ -306,7 +308,7 @@ impl SuperBlock {
     /// Crash recovery walks it from this head, following each inode's `i_dtime`
     /// (reused as the "next" pointer while an inode is on the list), to finish
     /// every interrupted deletion.
-    pub(super) const fn last_orphan(&self) -> u32 {
+    pub(super) const fn last_orphan(&self) -> Option<Ext4Ino> {
         self.last_orphan
     }
 
@@ -317,8 +319,8 @@ impl SuperBlock {
     /// mount-time recovery scan set it, and it reaches disk through the captured
     /// superblock after-image (`journal_superblock` in `fs.rs` patches it from
     /// memory on every capture) or [`Ext4::sync_metadata`](super::fs::Ext4).
-    pub(super) fn set_last_orphan(&mut self, ino: u32) {
-        self.last_orphan = ino;
+    pub(super) fn set_last_orphan(&mut self, head: Option<Ext4Ino>) {
+        self.last_orphan = head;
     }
 
     /// Returns the number of block groups, rounding up the last partial group.
@@ -392,7 +394,7 @@ impl SuperBlock {
     pub(super) fn journal_capture(
         &self,
         handle: Option<&journal::Handle>,
-        last_orphan: u32,
+        last_orphan: Option<Ext4Ino>,
     ) -> Result<()> {
         let free_blocks = self.free_blocks_count();
         let free_inodes = self.free_inodes_count();
@@ -407,7 +409,8 @@ impl SuperBlock {
                     RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
                 raw.free_blocks_count = free_blocks as u32;
                 raw.free_inodes_count = free_inodes;
-                raw.last_orphan = last_orphan;
+                // `0 = empty` is the on-disk convention (encode boundary).
+                raw.last_orphan = last_orphan.unwrap_or(0);
                 buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
             },
         )
@@ -454,7 +457,7 @@ impl SuperBlock {
     /// can be written (the `RECOVER` bit is set or an orphan list is pending).
     /// `Ext4::open` runs that recovery at mount, before any write.
     pub(super) fn needs_recovery(&self) -> bool {
-        self.feature_incompat.contains(FeatureIncompatSet::RECOVER) || self.last_orphan != 0
+        self.feature_incompat.contains(FeatureIncompatSet::RECOVER) || self.last_orphan.is_some()
     }
 }
 
