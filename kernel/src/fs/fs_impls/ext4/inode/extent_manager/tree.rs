@@ -586,7 +586,13 @@ fn search_entries(header: &ExtentHeader, bytes: &[u8], iblock: Iblock) -> Result
         }
         match chosen {
             Some(idx) => Ok(Step::Descend(idx.leaf())),
-            // `iblock` lies before the first index entry: a hole.
+            // `iblock` lies before the first index entry. Linux descends into
+            // the first child anyway and then finds no covering extent; we
+            // short-circuit to the same answer. On a well-formed tree the two
+            // are equivalent (no leaf under index 0 maps anything below its
+            // `first_block`); on a corrupt tree the short-circuit is the safer
+            // degradation — a hole read instead of chasing a bogus subtree
+            // (P1 review item, judged & documented at P5).
             None => Ok(Step::Hole),
         }
     }

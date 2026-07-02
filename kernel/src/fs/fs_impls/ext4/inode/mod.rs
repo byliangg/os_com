@@ -555,9 +555,15 @@ impl InodeDesc {
 /// The extra field packs a 2-bit epoch (extending seconds past 2038) in its low
 /// bits and nanoseconds in the upper bits (report §4.3).
 fn decode_time(secs: u32, extra: u32) -> Duration {
-    let epoch = (extra & 0x3) as u64;
+    let epoch = (extra & 0x3) as i64;
     let nsec = extra >> 2;
-    Duration::new((secs as u64) | (epoch << 32), nsec)
+    // Linux `ext4_decode_extra_time`: the base seconds are SIGNED and the
+    // 2-bit epoch extends them upward, so epoch 0 spans 1901..2038 and epoch 1
+    // continues seamlessly at 2^31. Decoding the base as unsigned misread
+    // foreign images' pre-1970 timestamps as far-future (P1 review item).
+    // `Duration` cannot express pre-1970 at all; clamp those to the epoch.
+    let secs = (secs as i32) as i64 + (epoch << 32);
+    Duration::new(u64::try_from(secs).unwrap_or(0), nsec)
 }
 
 /// Encodes a timestamp into its on-disk `(seconds, *_extra)` pair — the
@@ -2096,6 +2102,19 @@ mod write_tests {
         let dir = f.ext4.read_inode(2).unwrap();
         assert_eq!(dir.inode_type(), InodeType::Dir);
         assert_eq!(dir.resize(0).unwrap_err().error(), Errno::EISDIR);
+    }
+
+    /// `decode_time` follows Linux's signed-base + epoch-extension layout:
+    /// epoch 1 continues seamlessly at 2^31, and pre-1970 values (negative
+    /// base, epoch 0) clamp to the epoch since `Duration` cannot express them.
+    #[ktest]
+    fn decode_time_signed_epoch_semantics() {
+        // 0x8000_0000 as i32 = -2^31; epoch 1 adds 2^32 → exactly 2^31.
+        assert_eq!(decode_time(0x8000_0000, 0b01), Duration::new(1 << 31, 0));
+        // -1s (1969-12-31T23:59:59) is unrepresentable: clamps to 0.
+        assert_eq!(decode_time(u32::MAX, 0), Duration::new(0, 0));
+        // Plain positive seconds, nanoseconds in the upper extra bits.
+        assert_eq!(decode_time(1000, 7 << 2), Duration::new(1000, 7));
     }
 
     /// The special-file device encoding round-trips through `i_block` in both

@@ -131,6 +131,13 @@ impl<'a> DirBlockView<'a> {
 
     /// Reads and validates an entry header at absolute page-cache `offset`.
     fn read_header(&self, offset: usize) -> Result<DirEntryHeader> {
+        // The header itself must fit before it is read: on a malformed
+        // directory whose size is not block-aligned, a crafted rec_len chain
+        // can park `offset` close enough to the limit that the 8-byte header
+        // read crosses it (P1 review item, batch-fixed at P5).
+        if offset + size_of::<DirEntryHeader>() > self.offset + self.limit {
+            return_errno_with_message!(Errno::EIO, "dir entry header crosses the block limit");
+        }
         let header: DirEntryHeader = self
             .page_cache
             .read_val(offset)

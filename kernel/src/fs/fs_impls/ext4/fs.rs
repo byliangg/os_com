@@ -77,6 +77,10 @@ pub struct Ext4 {
     /// Inodes per group, cached once at mount to avoid locking `super_block` on
     /// the inode read path.
     nr_inodes_per_group: u32,
+    /// Total inode count, cached at mount like `nr_inodes_per_group` — the
+    /// corrupt-ino bound check sits on every inode load and must not touch
+    /// the `super_block` lock (callers may hold it).
+    total_inodes: u32,
     /// Monotonic source for the `i_generation` stamped onto each newly created
     /// inode. Seeded from the mount time, like ext2.
     next_generation: AtomicU32,
@@ -125,6 +129,7 @@ impl Ext4 {
         let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
         let super_block = SuperBlock::try_from(raw_super_block)?;
         let nr_inodes_per_group = super_block.nr_inodes_per_group();
+        let total_inodes = super_block.total_inodes();
 
         let block_groups = Self::load_block_groups(device.clone(), &super_block)?;
 
@@ -133,6 +138,7 @@ impl Ext4 {
             super_block: RwMutex::new(Dirty::new(super_block)),
             block_groups,
             nr_inodes_per_group,
+            total_inodes,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
             shutdown: AtomicBool::new(false),
             s_orphan_lock: Mutex::new(OrphanChain::new()),
@@ -1037,6 +1043,13 @@ impl Ext4 {
     fn find_group(&self, ino: Ext4Ino) -> Result<&BlockGroup> {
         if ino == 0 {
             return_errno_with_message!(Errno::ENOENT, "invalid inode number 0");
+        }
+        // A corrupt dirent can carry any 32-bit ino; bound it by the
+        // superblock's inode count, not just the group range (P1 review item,
+        // batch-fixed at P5). Uses the mount-time cache — callers may already
+        // hold the `super_block` lock.
+        if ino > self.total_inodes {
+            return_errno_with_message!(Errno::ENOENT, "inode number beyond s_inodes_count");
         }
         let group_idx = ((ino - 1) / self.nr_inodes_per_group) as usize;
         self.block_groups
@@ -2553,6 +2566,20 @@ mod tests {
     /// Mount contract (report §4.5): a superblock whose `s_journal_inum` names
     /// anything but the reserved ino 8 must fail the mount — silently parsing
     /// some other inode as the journal would "replay" unrelated file content.
+    #[ktest]
+    fn read_inode_rejects_out_of_range_ino() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+        // A corrupt dirent can carry any 32-bit ino; both the inode-count
+        // bound and the group-range check must answer ENOENT, never panic.
+        for ino in [u32::MAX, 1 << 20] {
+            let Err(err) = f.ext4.read_inode(ino) else {
+                panic!("out-of-range ino {ino} must not resolve");
+            };
+            assert_eq!(err.error(), Errno::ENOENT);
+        }
+    }
+
     #[ktest]
     fn shutdown_freezes_the_filesystem() {
         crate::time::clocks::init_for_ktest();
