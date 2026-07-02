@@ -480,6 +480,12 @@ pub(super) struct Journal {
 pub(super) struct JournalState {
     /// The single running transaction, if any (`journal_t.j_running_transaction`).
     pub(super) running: Option<Transaction>,
+    /// The tid the commit thread has taken out of `running` and is currently
+    /// writing to the log (`journal_t.j_committing_transaction`), if any.
+    /// Tracked so `commit_and_wait_running` can wait for a transaction that
+    /// left `running` a moment before the caller looked — otherwise sync(2)
+    /// returns while its captures are mid-commit, not yet durable.
+    pub(super) committing_tid: Option<Tid>,
     /// The tid to assign to the next transaction created
     /// (`journal_t.j_transaction_sequence`).
     pub(super) next_tid: Tid,
@@ -549,6 +555,7 @@ impl Journal {
             device,
             state: RwMutex::new(JournalState {
                 running: None,
+                committing_tid: None,
                 next_tid,
                 head,
                 tail_block,
@@ -753,6 +760,7 @@ impl Journal {
             let Some(txn) = st.running.take() else {
                 return;
             };
+            st.committing_tid = Some(txn.tid());
             txn.stash_uncheckpointed(&mut st.uncheckpointed);
             txn
         };
@@ -760,7 +768,9 @@ impl Journal {
         // Single-committer: this thread is the only production caller of
         // `commit_transaction`, so no commit lock is needed. `commit_transaction`
         // publishes `committed_tid` (Release) before returning.
-        if let Err(e) = commit_transaction(self, self.device.as_ref(), txn) {
+        let commit_result = commit_transaction(self, self.device.as_ref(), txn);
+        self.state_write().committing_tid = None;
+        if let Err(e) = commit_result {
             // The transaction was consumed: memory is ahead of the log and the
             // device, unrecoverably. Abort the journal (refuse further work and
             // wake sleepers with an error) rather than continue and publish
@@ -780,7 +790,7 @@ impl Journal {
         self.commit_trigger.wake_one();
     }
 
-    /// The current credit-release epoch (see
+    /// Returns the current credit-release epoch (see
     /// [`credit_release_epoch`](Journal::credit_release_epoch)). Snapshot it
     /// under the state lock that just observed "transaction full": any release
     /// after that observation bumps the epoch, so a waiter comparing against
@@ -809,8 +819,9 @@ impl Journal {
     /// wait only needs other handles to close or the commit thread to run, and
     /// neither takes `inner`: operations acquire all their inode locks *before*
     /// `journal_start` (lock order `inner` ① → handle ②), and the commit
-    /// thread's ordered flush snapshots the page cache instead of pinning
-    /// `inner` across IO (see `Inode::flush_ordered_data`).
+    /// thread's ordered flush works on page-cache handles cloned into the
+    /// transaction at registration time, touching no inode lock at all (see
+    /// `Transaction::register_ordered_data`).
     pub(super) fn wait_for_transaction_room(&self, tid: Tid, epoch: u64) -> Result<()> {
         self.request_commit();
         self.commit_wait_queue.wait_until(|| {
@@ -926,25 +937,32 @@ impl Journal {
     /// must hold no filesystem locks.
     pub(in crate::fs::fs_impls::ext4) fn commit_and_wait_running(&self) -> Result<()> {
         let target = {
-            let st = self.state_write();
+            let st = self.state_read();
             match st.running.as_ref() {
                 Some(txn) if txn.nr_metadata_blocks() > 0 => txn.tid(),
-                _ => return Ok(()),
+                // Nothing captured in `running` — but the transaction to make
+                // durable may have just been TAKEN by the commit thread and be
+                // mid-commit (its commit record not on disk yet). Waiting on
+                // nothing here would let sync(2) return early.
+                _ => match st.committing_tid {
+                    Some(tid) => tid,
+                    None => return Ok(()),
+                },
             }
         };
         self.log_wait_commit(target)
     }
 
-    /// The number of ordered-data inodes registered with the running
+    /// Returns the number of ordered-data entries registered with the running
     /// transaction. Test-only inspection for the write-path registration
     /// wiring; call with the commit thread stopped, or the transaction may be
     /// consumed between the operation and the assertion.
     #[cfg(ktest)]
-    pub(in crate::fs::fs_impls::ext4) fn running_nr_ordered_inodes_for_test(&self) -> usize {
-        self.state_write()
+    pub(in crate::fs::fs_impls::ext4) fn running_nr_ordered_data_for_test(&self) -> usize {
+        self.state_read()
             .running
             .as_ref()
-            .map_or(0, |txn| txn.nr_ordered_inodes())
+            .map_or(0, |txn| txn.nr_ordered_data())
     }
 
     /// Stops and joins the commit thread (jbd2 journal teardown).

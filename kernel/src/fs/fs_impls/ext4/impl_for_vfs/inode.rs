@@ -277,13 +277,29 @@ impl Inode for Ext4Inode {
     }
 
     fn mknod(&self, name: &str, mode: InodeMode, type_: MknodType) -> Result<Arc<dyn Inode>> {
+        // Validate the user-supplied device number at the boundary: the ext4
+        // on-disk encoding holds a 12-bit major / 20-bit minor, and an
+        // unfittable id would be silently truncated into a DIFFERENT device's
+        // rdev (review finding). `DeviceId::from_encoded_u64` is the same
+        // check the read side (`open`, `metadata`) already applies.
+        let checked = |device_id: u64| -> Result<u64> {
+            DeviceId::from_encoded_u64(device_id)
+                .ok_or_else(|| Error::with_message(Errno::EINVAL, "device number out of range"))?;
+            Ok(device_id)
+        };
         let new_inode = match type_ {
-            MknodType::CharDevice(device_id) => {
-                self.create_with_device(name, InodeType::CharDevice, mode.into(), device_id)?
-            }
-            MknodType::BlockDevice(device_id) => {
-                self.create_with_device(name, InodeType::BlockDevice, mode.into(), device_id)?
-            }
+            MknodType::CharDevice(device_id) => self.create_with_device(
+                name,
+                InodeType::CharDevice,
+                mode.into(),
+                checked(device_id)?,
+            )?,
+            MknodType::BlockDevice(device_id) => self.create_with_device(
+                name,
+                InodeType::BlockDevice,
+                mode.into(),
+                checked(device_id)?,
+            )?,
             MknodType::NamedPipe => self.create(name, InodeType::NamedPipe, mode.into())?,
         };
         Ok(new_inode)

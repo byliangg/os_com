@@ -312,11 +312,13 @@ pub(super) fn commit_transaction(
     // "data durable before metadata" unconditionally correct regardless of when
     // `flush_dirty_pages` completes. (Merging it with the step-2 metadata barrier
     // is a valid Phase-7 perf optimization once `flush_dirty_pages` completion
-    // semantics are pinned down.) The flush takes `inode.inner.read()` and holds
-    // no journal state lock — a leaf in the global order.
+    // semantics are pinned down.) The flush works on page-cache handles cloned
+    // into the transaction at registration time and takes NO inode or journal
+    // lock — an operation may be sleeping in `journal_start`'s capacity wait
+    // holding its `inner.write()`, waiting on this very commit.
     let mut flushed_any = false;
-    for inode in txn.ordered_inodes() {
-        inode.flush_ordered_data()?;
+    for (pages, len) in txn.ordered_data() {
+        pages.flush_range(0..len)?;
         flushed_any = true;
     }
     if flushed_any {
@@ -737,7 +739,13 @@ mod tests {
         meta[..4].copy_from_slice(b"META");
         txn.capture_create(500);
         txn.apply_patch(500, |b| b.copy_from_slice(&meta)).unwrap();
-        txn.add_ordered_inode(&inode);
+        let pages = inode.page_cache().unwrap();
+        txn.register_ordered_data(
+            inode.ino(),
+            inode.self_arc().map(|i| Arc::downgrade(&i)).unwrap(),
+            pages,
+            data.len(),
+        );
 
         let before = f.fixture.disk.flush_count();
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
@@ -759,7 +767,7 @@ mod tests {
     /// An empty ordered set issues no data barrier: only the metadata + commit
     /// barriers (2), plus the superblock barrier on a clean-journal commit (3).
     #[ktest]
-    fn commit_without_ordered_inodes_skips_data_barrier() {
+    fn commit_without_ordered_data_skips_data_barrier() {
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
 
@@ -768,7 +776,7 @@ mod tests {
         let mut content = [0u8; BLOCK_SIZE];
         content[..4].copy_from_slice(b"META");
         let txn = make_txn(1, &[(500u64, content)]);
-        assert_eq!(txn.nr_ordered_inodes(), 0);
+        assert_eq!(txn.nr_ordered_data(), 0);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // No ordered inodes => no data barrier: exactly the metadata + commit +

@@ -274,6 +274,22 @@ impl ExtentManager {
     /// and records it. Used by the `submit_write_bio` hole fallback.
     fn allocate_one(&self, iblock: Iblock) -> Result<Ext4Bid> {
         let fs = self.fs()?;
+        // On a journaled volume this fallback is unreachable from any legal
+        // path: every dirty page comes from write_at/resize/write_link, which
+        // allocate under a transaction BEFORE dirtying. A hole under a dirty
+        // page here would mean an unjournaled bitmap/GDT/superblock/extent
+        // mutation — exactly the write-around-the-journal class the crash
+        // review banned (and since the sync paths stopped direct-writing
+        // metadata, such a mutation would not even reach the disk). Fail loud
+        // instead of allocating outside WAL; the legitimate future consumer
+        // (mmap write-fault allocation) needs its own transaction plumbing
+        // (ledger: mmap-hole-writeback).
+        if fs.journal().is_some() {
+            return_errno_with_message!(
+                Errno::EIO,
+                "writeback hit an unallocated block with no transaction on a journaled volume"
+            );
+        }
         let mut tree = self.state.write();
         // The page-cache writeback fallback has no open handle to thread.
         let range = fs.alloc_blocks(1, 0, None)?;

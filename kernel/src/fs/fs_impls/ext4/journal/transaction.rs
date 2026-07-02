@@ -63,6 +63,16 @@ use super::{
     Journal, Tid,
 };
 
+/// One ordered-data registration: the pages an operation's new metadata will
+/// reference, flushed by commit with no inode lock (see
+/// [`Transaction::register_ordered_data`]).
+struct OrderedData {
+    /// Liveness gate only — never upgraded for access.
+    inode: Weak<Inode>,
+    pages: PageCache,
+    len: usize,
+}
+
 /// A captured whole-block after-image for one metadata block, held in a running
 /// transaction until commit writes it to the log. Model A (op-time capture):
 /// seeded by `get_write_access` (from the newest retained un-checkpointed
@@ -201,7 +211,7 @@ pub(in crate::fs::fs_impls::ext4) struct Transaction {
     /// data is no longer this transaction's concern). At commit each is upgraded
     /// and its dirty data flushed to its final location before any log block is
     /// written.
-    ordered_inodes: BTreeMap<Ext4Ino, Weak<Inode>>,
+    ordered_data: BTreeMap<Ext4Ino, OrderedData>,
 }
 
 impl Transaction {
@@ -213,7 +223,7 @@ impl Transaction {
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
-            ordered_inodes: BTreeMap::new(),
+            ordered_data: BTreeMap::new(),
         }
     }
 
@@ -352,35 +362,47 @@ impl Transaction {
             .map(|(&bid, buffer)| (bid, buffer.as_bytes()))
     }
 
-    /// Registers `inode` as an ordered-data inode of this transaction (jbd2
-    /// `jbd2_journal_inode_ranges_write` / `t_inode_list`): its dirty data will be
-    /// flushed to its final location before this transaction's metadata is
-    /// committed. Keyed by ino, so a repeat registration of the same inode is a
-    /// no-op beyond refreshing the `Weak`. Held weakly — the transaction never
-    /// keeps the inode alive.
-    pub(super) fn add_ordered_inode(&mut self, inode: &Arc<Inode>) {
-        self.add_ordered_inode_weak(inode.ino(), Arc::downgrade(inode));
+    /// Registers an inode's data pages as **ordered data** of this transaction
+    /// (jbd2 `jbd2_journal_inode_ranges_write` / `t_inode_list`): the pages are
+    /// flushed to their final locations before this transaction's metadata is
+    /// committed. Keyed by ino — a repeat registration replaces the entry with
+    /// the newer snapshot (larger `len` after an extending write).
+    ///
+    /// The page-cache handle is cloned INTO the transaction at registration
+    /// time, while the registering operation already holds the inode locks —
+    /// so the commit thread flushes with **no inode lock at all**. That is
+    /// load-bearing: an operation may sleep in `journal_start`'s capacity wait
+    /// holding its `inner.write()`, waiting for this very commit; a flush that
+    /// needed even a transient `inner.read()` would deadlock against it. The
+    /// `Weak<Inode>` is never upgraded for access, only checked for liveness:
+    /// a dropped (reclaimed) inode's pages are moot — and their extent-manager
+    /// backend is gone, so flushing them would error, not write.
+    pub(super) fn register_ordered_data(
+        &mut self,
+        ino: Ext4Ino,
+        inode: Weak<Inode>,
+        pages: PageCache,
+        len: usize,
+    ) {
+        self.ordered_data
+            .insert(ino, OrderedData { inode, pages, len });
     }
 
-    /// [`add_ordered_inode`](Self::add_ordered_inode) for callers that hold the
-    /// inode's own `Weak` instead of an `Arc` (the write paths, via
-    /// `Inode::self_weak`).
-    pub(super) fn add_ordered_inode_weak(&mut self, ino: Ext4Ino, inode: Weak<Inode>) {
-        self.ordered_inodes.insert(ino, inode);
+    /// Iterates the ordered-data registrations whose inode is still alive (see
+    /// [`register_ordered_data`](Self::register_ordered_data) for why dead ones
+    /// are skipped). The commit pipeline flushes each before writing any log
+    /// block.
+    pub(super) fn ordered_data(&self) -> impl Iterator<Item = (&PageCache, usize)> + '_ {
+        self.ordered_data
+            .values()
+            .filter(|od| od.inode.strong_count() > 0)
+            .map(|od| (&od.pages, od.len))
     }
 
-    /// Iterates the live ordered-data inodes, upgrading each [`Weak`] and skipping
-    /// any inode that has since been dropped (its data is no longer this
-    /// transaction's concern). The commit pipeline flushes each yielded inode's
-    /// data before writing any log block.
-    pub(super) fn ordered_inodes(&self) -> impl Iterator<Item = Arc<Inode>> + '_ {
-        self.ordered_inodes.values().filter_map(Weak::upgrade)
-    }
-
-    /// The number of registered ordered-data inodes (including any whose inode may
-    /// since have been dropped). Inspection/test accessor.
-    pub(super) fn nr_ordered_inodes(&self) -> usize {
-        self.ordered_inodes.len()
+    /// The number of registered ordered-data entries (including any whose inode
+    /// may since have been dropped). Inspection/test accessor.
+    pub(super) fn nr_ordered_data(&self) -> usize {
+        self.ordered_data.len()
     }
 
     /// Moves this transaction to `state` (jbd2 `t_state` transitions driven by
@@ -430,26 +452,31 @@ impl Handle {
         })
     }
 
-    /// Registers `inode` as **ordered data** of this handle's transaction
-    /// (jbd2 `data=ordered`): its dirty file pages are flushed to their final
+    /// Registers an inode's data pages as **ordered data** of this handle's
+    /// transaction (jbd2 `data=ordered`): they are flushed to their final
     /// locations before the transaction's commit block is written, so recovery
     /// never replays metadata that points at blocks whose data missed the
     /// platter. Every operation that makes committed metadata reference new
     /// data blocks (allocating writes, tail-zeroing truncates, slow-symlink
-    /// targets) must call this before its handle closes.
+    /// targets) must call this before its handle closes, passing a clone of
+    /// the page cache it just wrote — the caller already holds the inode
+    /// locks, and the commit thread must be able to flush without them (see
+    /// [`Transaction::register_ordered_data`]).
     ///
     /// Requiring the open handle pins the running transaction, so the
     /// registration cannot land in a different transaction than the
     /// operation's own metadata captures. Takes the journal state lock
     /// transiently, exactly like the capture funnels (lock order unchanged).
-    pub(in crate::fs::fs_impls::ext4) fn register_ordered_inode(
+    pub(in crate::fs::fs_impls::ext4) fn register_ordered_data(
         &self,
         ino: Ext4Ino,
         inode: Weak<Inode>,
+        pages: PageCache,
+        len: usize,
     ) -> Result<()> {
         let journal = self.journal()?;
         let mut st = journal.state_write();
-        super::verify_running(&mut st.running, self)?.add_ordered_inode_weak(ino, inode);
+        super::verify_running(&mut st.running, self)?.register_ordered_data(ino, inode, pages, len);
         Ok(())
     }
 }
@@ -525,7 +552,8 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
         // Sleeping here can hold the caller's inode locks; see
         // `wait_for_transaction_room`'s locking contract for why that cannot
         // deadlock (open handles drain without our locks, and the commit
-        // thread takes no `inner`).
+        // thread takes no inode lock — its ordered flush uses page-cache
+        // handles cloned in at registration time).
         journal.wait_for_transaction_room(tid, epoch)?;
     }
 }
@@ -872,7 +900,7 @@ mod tests {
     }
 
     #[ktest]
-    fn ordered_inodes_dedup_and_iterate() {
+    fn ordered_data_dedup_and_liveness() {
         use super::super::super::test_utils::make_empty_file_inode;
 
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -885,28 +913,47 @@ mod tests {
         f.write_raw_inode(12, &make_empty_file_inode());
         let a = f.ext4.read_inode(11).unwrap();
         let b = f.ext4.read_inode(12).unwrap();
+        let a_pages = a.page_cache().unwrap();
+        let b_pages = b.page_cache().unwrap();
 
         let mut txn = Transaction::new(1);
-        assert_eq!(txn.nr_ordered_inodes(), 0);
+        assert_eq!(txn.nr_ordered_data(), 0);
 
-        // Register `a` twice (dedups by ino) and `b` once.
-        txn.add_ordered_inode(&a);
-        txn.add_ordered_inode(&a);
-        txn.add_ordered_inode(&b);
-        assert_eq!(txn.nr_ordered_inodes(), 2);
+        // Register `a` twice (dedups by ino, keeping the newer snapshot) and
+        // `b` once.
+        txn.register_ordered_data(
+            11,
+            a.self_arc().map(|i| Arc::downgrade(&i)).unwrap(),
+            a_pages.clone(),
+            100,
+        );
+        txn.register_ordered_data(
+            11,
+            a.self_arc().map(|i| Arc::downgrade(&i)).unwrap(),
+            a_pages.clone(),
+            200,
+        );
+        txn.register_ordered_data(
+            12,
+            b.self_arc().map(|i| Arc::downgrade(&i)).unwrap(),
+            b_pages.clone(),
+            300,
+        );
+        assert_eq!(txn.nr_ordered_data(), 2);
 
-        // Both live inodes are yielded.
-        let mut inos: Vec<_> = txn.ordered_inodes().map(|i| i.ino()).collect();
-        inos.sort_unstable();
-        assert_eq!(inos, vec![11, 12]);
+        // Both live entries are yielded; the repeat registration replaced the
+        // first snapshot's length.
+        let mut lens: Vec<_> = txn.ordered_data().map(|(_, len)| len).collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![200, 300]);
 
         // Evict `b` from the cache and drop our only remaining strong ref: its
-        // `Weak` then no longer upgrades, so the iterator skips it (but the key
-        // remains counted).
+        // liveness gate then fails, so the iterator skips it (the key remains
+        // counted). The stored page-cache clone must NOT keep it "alive".
         f.ext4.remove_inode(12);
         drop(b);
-        let live: Vec<_> = txn.ordered_inodes().map(|i| i.ino()).collect();
-        assert_eq!(live, vec![11]);
-        assert_eq!(txn.nr_ordered_inodes(), 2);
+        let live: Vec<_> = txn.ordered_data().map(|(_, len)| len).collect();
+        assert_eq!(live, vec![200]);
+        assert_eq!(txn.nr_ordered_data(), 2);
     }
 }

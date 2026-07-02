@@ -278,8 +278,8 @@ impl InodeDesc {
         }
     }
 
-    /// The device id encoded in `i_block`, for character/block device inodes
-    /// (`None` for every other type — their `i_block` is not a device
+    /// Returns the device id encoded in `i_block`, for character/block device
+    /// inodes (`None` for every other type — their `i_block` is not a device
     /// encoding).
     pub(super) fn device_id(&self) -> Option<u64> {
         match self.type_ {
@@ -706,9 +706,9 @@ pub struct Inode {
     inner: RwMutex<InodeInner>,
     block_group_idx: usize,
     fs: Weak<Ext4>,
-    /// This inode's own `Weak` (minted by `Arc::new_cyclic`), so the write
-    /// paths can register the inode with the running transaction's
-    /// ordered-data table (jbd2 `data=ordered`) without the `Arc` in hand.
+    /// This inode's own `Weak` (minted by `Arc::new_cyclic`): the write paths
+    /// pass it as the ordered-data registrations' liveness gate (jbd2
+    /// `data=ordered`), and `self_arc` upgrades it for the per-open layer.
     /// Never used on the `Drop`/reclaim path, where upgrading would fail.
     self_weak: Weak<Inode>,
     /// The in-memory pipe object backing a named-pipe (FIFO) inode; `None`
@@ -848,8 +848,15 @@ impl Inode {
         // pages that are usually clean by commit time (Linux registers only
         // newly-mapped ranges; that precision needs `ensure_allocated` to
         // report whether it allocated, a P7/P9 refinement).
-        if let Some(handle) = op.get() {
-            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+        if let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
+        {
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
         }
         Ok(len)
     }
@@ -890,8 +897,14 @@ impl Inode {
         // the same case in __ext4_block_zero_page_range).
         if new_size < old_size
             && let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
         {
-            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
         }
         Ok(())
     }
@@ -939,8 +952,8 @@ impl Inode {
             // `op` closes here, then `inner` unlocks — the reverse of the
             // inner ① → handle ② acquisition order.
         };
-        // Wait with NO filesystem locks held (the commit thread takes
-        // `inode.inner` for the ordered-data flush).
+        // Wait with NO filesystem locks held (jbd2 discipline; the commit
+        // thread itself takes no inode lock).
         if let Some(target) = wait_tid
             && let Some(journal) = fs.journal()
         {
@@ -981,33 +994,6 @@ impl Inode {
     /// (that goes through the journal). Called by the commit pipeline for each
     /// ordered inode.
     ///
-    /// # Locking: must not pin `inner` across the flush IO
-    ///
-    /// This runs on the **commit thread**. An operation may be sleeping in
-    /// `journal_start`'s capacity wait while holding its `inner.write()` —
-    /// waiting for this very commit — so holding `inner` here for the flush
-    /// duration would deadlock the two. Instead the page cache handle and the
-    /// size are snapshotted under a transient `inner.read()` and the flush runs
-    /// with no inode lock held; the page cache and its extent-mapped backend
-    /// are internally synchronized, and `flush_range` only writes pages that
-    /// are still dirty when it reaches them (a racing writer's new dirty pages
-    /// belong to a later transaction — they could not have joined the
-    /// committing one).
-    pub(in crate::fs::fs_impls::ext4) fn flush_ordered_data(&self) -> Result<()> {
-        let (page_cache, file_size) = {
-            let inner = self.inner.read();
-            let Ok(page_cache) = inner.page_cache() else {
-                // Not data-backed (fast symlink): nothing ordered to flush.
-                return Ok(());
-            };
-            (page_cache.clone(), inner.file_size())
-        };
-        if file_size == 0 {
-            return Ok(());
-        }
-        page_cache.flush_range(0..file_size)
-    }
-
     /// Maps logical block `iblock` to its physical block, or `None` for a hole.
     /// Test-only inspection used to read a file's data straight off the device
     /// (e.g. to prove the ordered flush reached the final location).
@@ -1181,7 +1167,8 @@ impl Inode {
         self.self_weak.upgrade()
     }
 
-    /// The device id of a character/block device inode (`None` otherwise).
+    /// Returns the device id of a character/block device inode (`None`
+    /// otherwise).
     pub(super) fn device_id(&self) -> Option<u64> {
         self.inner.read().desc.device_id()
     }
@@ -2151,18 +2138,18 @@ mod write_tests {
         journal.stop_commit_thread();
 
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
-        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 0);
+        assert_eq!(journal.running_nr_ordered_data_for_test(), 0);
 
         // An allocating write registers the inode (keyed by ino — repeats stay
         // one entry).
         write_all(&inode, 0, &[0x5au8; 2 * BLOCK_SIZE]);
-        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
+        assert_eq!(journal.running_nr_ordered_data_for_test(), 1);
         write_all(&inode, 2 * BLOCK_SIZE, &[0xa5u8; BLOCK_SIZE]);
-        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
+        assert_eq!(journal.running_nr_ordered_data_for_test(), 1);
 
         // A shrink to a non-block-aligned size re-zeroes the kept tail in the
         // page cache and must (re-)register too.
         inode.resize(BLOCK_SIZE / 2).unwrap();
-        assert_eq!(journal.running_nr_ordered_inodes_for_test(), 1);
+        assert_eq!(journal.running_nr_ordered_data_for_test(), 1);
     }
 }

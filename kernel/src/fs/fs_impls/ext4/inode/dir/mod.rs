@@ -539,7 +539,7 @@ impl Inode {
         self.create_with_seed(name, type_, perm, seed)
     }
 
-    /// [`create`](Self::create) for character/block device nodes: the device
+    /// Creates a character/block device node ([`create`](Self::create) for devices): the device
     /// number is encoded into the fresh inode's `i_block` inside the creating
     /// transaction, so no crash window can leave a device node with rdev 0
     /// (ext2 sets the id in a second step; Linux ext4 initializes it under the
@@ -580,10 +580,17 @@ impl Inode {
             |child, fs, handle| {
                 let mut child_inner = child.inner.write();
                 let wrote_slow_target = child_inner.write_link(fs, target, handle)?;
-                drop(child_inner);
                 // data=ordered for a slow target (see `Inode::write_link`).
-                if wrote_slow_target && let Some(handle) = handle {
-                    handle.register_ordered_inode(child.ino(), Arc::downgrade(child))?;
+                if wrote_slow_target
+                    && let Some(handle) = handle
+                    && let Ok(pages) = child_inner.page_cache()
+                {
+                    handle.register_ordered_data(
+                        child.ino(),
+                        Arc::downgrade(child),
+                        pages.clone(),
+                        child_inner.file_size(),
+                    )?;
                 }
                 Ok(())
             },
@@ -657,8 +664,16 @@ impl Inode {
         if let Err(err) = result {
             // Clear the link count so other resources are reclaimed by `Drop`
             // (Task 4). The half-built inode is never inserted into the cache.
-            let mut child_inner = child.inner.write();
-            child_inner.set_link_count(0);
+            {
+                let mut child_inner = child.inner.write();
+                child_inner.set_link_count(0);
+            }
+            // Close this operation's handle BEFORE `child` drops at scope end:
+            // the Drop-reclaim opens its own `begin_op`, and with the blocking
+            // `journal_start` a nested open against a full transaction would
+            // wait for a commit that cannot happen while our handle pins the
+            // running transaction — a self-deadlock (review finding).
+            drop(op);
             return Err(err);
         }
 

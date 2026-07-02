@@ -90,8 +90,16 @@ impl Inode {
         }
         // data=ordered: a slow target lives in a data block; it must reach the
         // device before the extent metadata that points at it commits.
-        if wrote_slow_target && let Some(handle) = op.get() {
-            handle.register_ordered_inode(self.ino, self.self_weak.clone())?;
+        if wrote_slow_target
+            && let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
+        {
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
         }
         Ok(())
     }

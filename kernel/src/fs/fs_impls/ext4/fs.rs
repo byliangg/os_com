@@ -36,7 +36,6 @@ pub(super) const ROOT_INO: Ext4Ino = 2;
 /// Reserved inode holding the journal.
 pub(super) const JOURNAL_INO: Ext4Ino = 8;
 
-/// An ext4 filesystem instance.
 /// How `EXT4_IOC_SHUTDOWN` takes the filesystem down — the parse-once form of
 /// the ioctl's `EXT4_GOING_FLAGS_*` argument (Linux `ext4_ioctl_shutdown`).
 #[derive(Debug)]
@@ -68,6 +67,7 @@ impl TryFrom<u32> for GoingDown {
     }
 }
 
+/// An ext4 filesystem instance.
 pub struct Ext4 {
     block_device: Arc<dyn BlockDevice>,
     /// Superblock with dirty tracking.
@@ -311,7 +311,7 @@ impl Ext4 {
         }
     }
 
-    /// Whether `EXT4_IOC_SHUTDOWN` has killed this filesystem.
+    /// Returns whether `EXT4_IOC_SHUTDOWN` has killed this filesystem.
     pub(super) fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
@@ -948,7 +948,9 @@ impl Ext4 {
         self.inode_slot(ino)?.read_raw(self.block_device.as_ref())
     }
 
-    /// Writes back the superblock and every dirty group descriptor/bitmap.
+    /// Writes back the superblock and every dirty group descriptor/bitmap —
+    /// on a **non-journaled** volume, or at the unmount quiesce point. While a
+    /// journal is live this is a deliberate no-op (see the body).
     pub(super) fn sync_metadata(&self) -> Result<()> {
         // A shut-down filesystem writes nothing more (Linux: writeback paths
         // bail on `ext4_forced_shutdown`); fsync of a dirty inode reports the
