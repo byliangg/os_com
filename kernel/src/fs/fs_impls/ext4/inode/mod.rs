@@ -823,6 +823,17 @@ impl Inode {
         // allocations dirty. Dropped at return, closing the handle.
         let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
         let len = inner.write_at(&fs, offset, reader, op.get())?;
+        // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
+        // and — for an inline root — the extent mapping itself) must ride the
+        // SAME transaction as the bitmap/GDT captures above, or a crash
+        // between them persists allocated-but-unreferenced blocks (the crash
+        // matrix reconstructed exactly that: a bitmap with the write's 8
+        // blocks set and no extent pointing at them). Linux journals the
+        // inode under every handle (ext4_mark_inode_dirty); this is our
+        // equivalent.
+        if op.get().is_some() {
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        }
         // data=ordered: this write's dirty pages must reach their final blocks
         // before the transaction's commit block, or recovery could replay
         // extents that point at blocks whose data never hit the platter.
@@ -861,6 +872,11 @@ impl Inode {
         // brings the fs-level re-truncate orphan machinery with it.
         let old_size = inner.file_size();
         inner.resize(&fs, new_size, op.get())?;
+        // Same per-handle descriptor capture as `write_at`: the new size and
+        // truncated extent root must commit with the bitmap/GDT changes.
+        if op.get().is_some() {
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        }
         // data=ordered on shrink: the kept partial block is re-zeroed in the
         // page cache, and that zeroing must reach the device before this
         // transaction's commit — otherwise a later sparse extend over the tail

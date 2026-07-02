@@ -672,8 +672,21 @@ impl Inode {
         // and the child inode — otherwise a crash after commit but before the
         // deferred fsync would leave the parent's link count too low (e2fsck
         // "link count wrong"). Non-journaled keeps the buffered writeback.
+        //
+        // The CHILD descriptor is re-captured too: `create_inode` journaled
+        // its v0 (size 0, seed-only i_block), but `make_empty` / `init_child`
+        // may have grown it since — a directory's "."/".." block and extent
+        // root, a symlink's target. Committing only v0 persists a name that
+        // points at a half-built inode (the crash matrix reconstructed a
+        // zero-length directory whose journaled dir block leaked as an
+        // unreferenced bitmap bit). For plain files the re-capture is an
+        // idempotent no-op patch.
         if op.get().is_some() {
             parent_inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            child
+                .inner
+                .write()
+                .write_back_inode_desc(&fs, child_ino, op.get())?;
         }
         fs.insert_inode(child.clone());
         Ok(child)

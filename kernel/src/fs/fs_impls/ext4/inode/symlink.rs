@@ -82,6 +82,12 @@ impl Inode {
         let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
         let wrote_slow_target = inner.write_link(&fs, target, op.get())?;
         inner.set_mtime_ctime(utils::now());
+        // Same per-handle descriptor capture as `write_at`: the target (fast
+        // path) or the extent root (slow path) and the new size must commit
+        // with this transaction's allocation captures.
+        if op.get().is_some() {
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        }
         // data=ordered: a slow target lives in a data block; it must reach the
         // device before the extent metadata that points at it commits.
         if wrote_slow_target && let Some(handle) = op.get() {
