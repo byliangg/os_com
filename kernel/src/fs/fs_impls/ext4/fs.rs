@@ -535,13 +535,24 @@ impl Ext4 {
         }
 
         let block_group_idx = ((ino - 1) / self.nr_inodes_per_group) as usize;
-        let inode = Inode::new(
+        let inode = match Inode::new(
             ino,
             inode_desc.type_(),
             Dirty::new(inode_desc),
             block_group_idx,
             self.self_ref.clone(),
-        );
+        ) {
+            Ok(inode) => inode,
+            // Unreachable for a fresh descriptor (its root is
+            // `ExtentTree::empty()`, which always parses), but roll the
+            // allocation back symmetrically with the writeback failure above.
+            Err(err) => {
+                if let Err(free_err) = self.free_inode(ino, type_, handle) {
+                    error!("create_inode: rollback free_inode failed: {:?}", free_err);
+                }
+                return Err(err);
+            }
+        };
         // The fresh descriptor was captured under the creating op's handle
         // (before this `Inode` existed): record the transaction so an fsync of
         // the just-created inode waits for its commit (see

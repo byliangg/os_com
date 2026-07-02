@@ -39,7 +39,10 @@ mod dir;
 mod extent_manager;
 mod symlink;
 
-use self::{extent_manager::ExtentManager, symlink::FastSymlinkTarget};
+use self::{
+    extent_manager::{ExtentManager, ExtentTree},
+    symlink::FastSymlinkTarget,
+};
 use crate::fs::{file::InodeMode, vfs::inode::Extension};
 
 /// Number of 32-bit slots in `i_block` (60 bytes total).
@@ -140,28 +143,6 @@ pub(super) struct InodeDesc {
     block: [u32; RAW_BLOCK_PTRS_LEN],
 }
 
-/// `eh_magic` of an `ext4_extent_header` (Linux `EXT4_EXT_MAGIC`).
-const EXTENT_MAGIC: u16 = 0xF30A;
-
-/// Maximum extents the 60-byte inline root can hold past its 12-byte header
-/// (`(60 - 12) / 12`).
-const EXTENT_MAX_INLINE: u16 = 4;
-
-/// Builds the inline extent-tree root for a freshly created inode: a valid empty
-/// `ext4_extent_header` (magic `0xF30A`, 0 entries, max 4, depth 0) followed by
-/// zeros. New regular files and directories carry this so the extent reader sees
-/// a well-formed (empty) tree from the first byte — unlike ext2, whose new
-/// inodes start with zeroed indirect-block pointers.
-fn empty_extent_root() -> [u32; RAW_BLOCK_PTRS_LEN] {
-    let mut block = [0u32; RAW_BLOCK_PTRS_LEN];
-    // Each `i_block` word packs two 16-bit fields, little-endian: word 0 is
-    // `eh_magic | eh_entries(=0)`, word 1 is `eh_max(=4) | eh_depth(=0)`.
-    block[0] = EXTENT_MAGIC as u32;
-    block[1] = EXTENT_MAX_INLINE as u32;
-    block[2] = 0; // eh_generation
-    block
-}
-
 impl InodeDesc {
     /// Builds a fresh inode descriptor for a newly created file or directory.
     ///
@@ -195,7 +176,10 @@ impl InodeDesc {
             flags: FileFlags::EXTENTS,
             file_acl: 0,
             generation,
-            block: empty_extent_root(),
+            // A valid empty extent root, so the extent reader sees a
+            // well-formed tree from the first byte — unlike ext2, whose new
+            // inodes start with zeroed indirect-block pointers.
+            block: *ExtentTree::empty().root_bytes(),
         }
     }
 
@@ -376,7 +360,7 @@ pub(in crate::fs::fs_impls::ext4) fn map_all_blocks(
     sector_count: u64,
     nblocks: u32,
 ) -> Result<Vec<Ext4Bid>> {
-    let em = ExtentManager::new(root, sector_count, fs, nblocks as usize);
+    let em = ExtentManager::try_new(root, sector_count, fs, nblocks as usize)?;
     let mut map = Vec::with_capacity(nblocks as usize);
     let mut i: Iblock = 0;
     while i < nblocks {
@@ -532,15 +516,17 @@ pub struct Inode {
 }
 
 impl Inode {
+    /// Builds a live inode; fails if a data-backed extent root does not parse
+    /// (see [`InodePayload::new`]).
     pub(super) fn new(
         ino: Ext4Ino,
         type_: InodeType,
         desc: Dirty<InodeDesc>,
         block_group_idx: usize,
         fs: Weak<Ext4>,
-    ) -> Arc<Self> {
-        let payload = InodePayload::new(&desc, fs.clone());
-        Arc::new(Self {
+    ) -> Result<Arc<Self>> {
+        let payload = InodePayload::new(&desc, fs.clone())?;
+        Ok(Arc::new(Self {
             ino,
             type_,
             inner: RwMutex::new(InodeInner {
@@ -552,7 +538,7 @@ impl Inode {
             block_group_idx,
             fs,
             extension: Extension::new(),
-        })
+        }))
     }
 
     /// Builds a live inode for a crash-recovery orphan reclaim from its raw
@@ -576,7 +562,7 @@ impl Inode {
         // Restore the true (0) link count so the reclaim on drop fires.
         desc.set_link_count(0);
         let type_ = desc.type_();
-        Ok(Self::new(ino, type_, Dirty::new(desc), block_group_idx, fs))
+        Self::new(ino, type_, Dirty::new(desc), block_group_idx, fs)
     }
 
     pub(super) fn ino(&self) -> Ext4Ino {
@@ -777,8 +763,8 @@ impl Inode {
         use self::extent_manager::MapState;
 
         let inner = self.inner.read();
-        let block_manager = inner.block_manager().ok()?;
-        let mapping = block_manager.map_blocks(iblock).ok()?;
+        let extent_manager = inner.extent_manager().ok()?;
+        let mapping = extent_manager.map_blocks(iblock).ok()?;
         match mapping.state() {
             MapState::Written | MapState::Unwritten => Some(mapping.pblock()),
             MapState::Hole => None,
@@ -826,8 +812,8 @@ impl Inode {
         // cache and extent-mapped blocks. A fast symlink stores its target inline
         // in `i_block` with no data block, so it skips both the page-cache resize
         // and the block truncate below.
-        let block_manager = inner.block_manager().ok().cloned();
-        if block_manager.is_some() {
+        let extent_manager = inner.extent_manager().ok().cloned();
+        if extent_manager.is_some() {
             inner.resize_page_cache(0, old_size)?;
         }
         inner.set_dtime(super::utils::now());
@@ -836,10 +822,10 @@ impl Inode {
         // copy (which ext2 uses): the extent manager is the authority and the
         // descriptor may be stale until writeback. This divergence from the ext2
         // template is intentional — do not "fix" it back to `inner.desc`.
-        if let Some(block_manager) = block_manager
-            && block_manager.sector_count() > 0
+        if let Some(extent_manager) = extent_manager
+            && extent_manager.sector_count() > 0
         {
-            block_manager.truncate_to_byte_len(0, op.get())?;
+            extent_manager.truncate_to_byte_len(0, op.get())?;
         }
         inner.write_back_inode_desc(&fs, self.ino, op.get())?;
 
@@ -988,9 +974,9 @@ impl InodeInner {
         }
     }
 
-    fn block_manager(&self) -> Result<&Arc<ExtentManager>> {
+    fn extent_manager(&self) -> Result<&Arc<ExtentManager>> {
         match &self.payload {
-            InodePayload::DataBacked { block_manager, .. } => Ok(block_manager),
+            InodePayload::DataBacked { extent_manager, .. } => Ok(extent_manager),
             _ => return_errno_with_message!(Errno::EINVAL, "inode has no block manager"),
         }
     }
@@ -998,7 +984,7 @@ impl InodeInner {
     /// Returns `i_blocks` (512-byte sectors). For data-backed inodes the block
     /// manager owns the authoritative count; otherwise the descriptor's value.
     fn sector_count(&self) -> u64 {
-        match self.block_manager() {
+        match self.extent_manager() {
             Ok(bm) => bm.sector_count(),
             Err(_) => self.desc.sector_count(),
         }
@@ -1101,13 +1087,13 @@ impl InodeInner {
     fn resize_page_cache(&mut self, new_size: usize, old_size: usize) -> Result<()> {
         let InodePayload::DataBacked {
             page_cache,
-            block_manager,
+            extent_manager,
         } = &self.payload
         else {
             return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
         };
         page_cache.resize(new_size, old_size)?;
-        block_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
+        extent_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
         Ok(())
     }
 
@@ -1130,7 +1116,7 @@ impl InodeInner {
         }
         let start_block = (offset / BLOCK_SIZE) as Iblock;
         let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
-        self.block_manager()?
+        self.extent_manager()?
             .ensure_allocated(start_block, end_block, handle)
     }
 
@@ -1146,8 +1132,8 @@ impl InodeInner {
                 old_size, err
             );
         }
-        if let Ok(block_manager) = self.block_manager()
-            && let Err(err) = block_manager.truncate_to_byte_len(old_size, handle)
+        if let Ok(extent_manager) = self.extent_manager()
+            && let Err(err) = extent_manager.truncate_to_byte_len(old_size, handle)
         {
             error!("write_at: cleanup block truncate failed: {:?}", err);
         }
@@ -1188,7 +1174,7 @@ impl InodeInner {
         // kept partial block (BLOCK_SIZE == PAGE_SIZE), so stale tail bytes do
         // not reappear if the file is later extended.
         self.resize_page_cache(new_size, old_size)?;
-        self.block_manager()?
+        self.extent_manager()?
             .truncate_to_byte_len(new_size, handle)?;
         self.set_file_size(new_size);
         Ok(())
@@ -1245,14 +1231,14 @@ impl InodeInner {
     fn is_dirty(&self) -> bool {
         self.desc.is_dirty()
             || self
-                .block_manager()
-                .is_ok_and(|block_manager| block_manager.is_dirty())
+                .extent_manager()
+                .is_ok_and(|extent_manager| extent_manager.is_dirty())
     }
 
     fn clear_dirty(&mut self) {
         self.desc.clear_dirty();
-        if let Ok(block_manager) = self.block_manager() {
-            block_manager.clear_dirty();
+        if let Ok(extent_manager) = self.extent_manager() {
+            extent_manager.clear_dirty();
         }
     }
 
@@ -1268,7 +1254,7 @@ impl InodeInner {
         if !self.is_dirty() {
             return Ok(());
         }
-        let (root, sector_count) = match self.block_manager() {
+        let (root, sector_count) = match self.extent_manager() {
             Ok(bm) => (bm.root_snapshot(), bm.sector_count()),
             Err(_) => (*self.desc.raw_block(), self.desc.sector_count()),
         };
@@ -1306,7 +1292,7 @@ enum InodePayload {
         page_cache: PageCache,
         /// The authoritative extent tree + `i_blocks`, and the page-cache
         /// backend (the page cache holds only a `Weak` to it).
-        block_manager: Arc<ExtentManager>,
+        extent_manager: Arc<ExtentManager>,
     },
     /// Fast (inline) symlinks: the target bytes sit in the 60-byte `i_block`
     /// area without any data block, and the `EXTENTS` flag is cleared.
@@ -1319,14 +1305,16 @@ enum InodePayload {
 }
 
 impl InodePayload {
-    fn new(desc: &InodeDesc, fs: Weak<Ext4>) -> Self {
-        match desc.type_() {
+    /// Builds the payload for `desc`; fails if a data-backed inode's extent
+    /// root does not parse (`ExtentTree::try_new` — the parse-once boundary).
+    fn new(desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
+        Ok(match desc.type_() {
             InodeType::File | InodeType::Dir => Self::new_data_backed(
                 desc.size() as usize,
                 *desc.raw_block(),
                 desc.sector_count(),
                 fs,
-            ),
+            )?,
             // A symlink is fast (inline) when it is not extent-based and its
             // target fits in the `i_block` area; otherwise it is a slow,
             // extent-mapped data block. A freshly created symlink (before
@@ -1340,12 +1328,12 @@ impl InodePayload {
                         target: FastSymlinkTarget::new(*desc.raw_block()),
                     }
                 } else {
-                    Self::new_data_backed(size, *desc.raw_block(), desc.sector_count(), fs)
+                    Self::new_data_backed(size, *desc.raw_block(), desc.sector_count(), fs)?
                 }
             }
             // Devices and special files are handled by later tasks.
             _ => Self::NoPayload,
-        }
+        })
     }
 
     fn new_data_backed(
@@ -1353,17 +1341,17 @@ impl InodePayload {
         root: [u32; RAW_BLOCK_PTRS_LEN],
         sector_count: u64,
         fs: Weak<Ext4>,
-    ) -> Self {
+    ) -> Result<Self> {
         let page_cache_size = size.align_up(PAGE_SIZE);
         let page_count = page_cache_size / PAGE_SIZE;
-        let extent_manager = Arc::new(ExtentManager::new(root, sector_count, fs, page_count));
+        let extent_manager = Arc::new(ExtentManager::try_new(root, sector_count, fs, page_count)?);
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
         let page_cache = PageCache::new_with_backend(page_cache_size, backend)
             .expect("ext4 inode page cache allocation failed");
-        Self::DataBacked {
+        Ok(Self::DataBacked {
             page_cache,
-            block_manager: extent_manager,
-        }
+            extent_manager,
+        })
     }
 }
 
@@ -1494,7 +1482,7 @@ mod write_tests {
 
         // The extent tree maps logical block 0 to a real written extent.
         let bm = inode.inner.read();
-        let bm = bm.block_manager().unwrap();
+        let bm = bm.extent_manager().unwrap();
         let mapping = bm.map_blocks(0).unwrap();
         assert_eq!(mapping.state(), MapState::Written);
     }
@@ -1577,13 +1565,7 @@ mod write_tests {
         }
 
         // The root is now a depth-1 index tree.
-        let depth = inode
-            .inner
-            .read()
-            .block_manager()
-            .unwrap()
-            .root_depth()
-            .unwrap();
+        let depth = inode.inner.read().extent_manager().unwrap().root_depth();
         assert_eq!(depth, 1);
     }
 
@@ -1669,7 +1651,7 @@ mod write_tests {
         // partial block whose tail must be zeroed).
         let (b1, b2) = {
             let inner = inode.inner.read();
-            let bm = inner.block_manager().unwrap();
+            let bm = inner.extent_manager().unwrap();
             (
                 bm.map_blocks(1).unwrap().pblock(),
                 bm.map_blocks(2).unwrap().pblock(),
@@ -1726,8 +1708,8 @@ mod write_tests {
 
         // The tree is back to an empty inline depth-0 root.
         let inner = inode.inner.read();
-        let bm = inner.block_manager().unwrap();
-        assert_eq!(bm.root_depth().unwrap(), 0);
+        let bm = inner.extent_manager().unwrap();
+        assert_eq!(bm.root_depth(), 0);
         assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Hole);
     }
 
@@ -1798,7 +1780,7 @@ mod write_tests {
         // The extent split: block 1 is Written at the preserved physical block
         // (200 + 1 = 201); blocks 0 and 2 remain Unwritten.
         let inner = inode.inner.read();
-        let bm = inner.block_manager().unwrap();
+        let bm = inner.extent_manager().unwrap();
         let m0 = bm.map_blocks(0).unwrap();
         let m1 = bm.map_blocks(1).unwrap();
         let m2 = bm.map_blocks(2).unwrap();

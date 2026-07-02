@@ -264,7 +264,7 @@ impl InodeInner {
             return Ok(());
         }
         let logical = (dir_offset / BLOCK_SIZE) as Iblock;
-        let mapping = self.block_manager()?.map_blocks(logical)?;
+        let mapping = self.extent_manager()?.map_blocks(logical)?;
         let phys = match mapping.state() {
             MapState::Written | MapState::Unwritten => mapping.pblock(),
             MapState::Hole => {

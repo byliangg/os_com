@@ -86,6 +86,21 @@ impl ExtentHeader {
     }
 }
 
+impl ExtentHeader {
+    /// Decodes a header from bytes that are already trusted — the in-memory
+    /// root of a constructed [`ExtentTree`](super::tree::ExtentTree), which was
+    /// validated once at construction and is only rewritten by the tree's own
+    /// (validity-preserving) mutators. Freshly read device bytes are a parse
+    /// boundary and must go through `TryFrom` instead.
+    pub(super) const fn from_trusted(raw: &RawExtentHeader) -> Self {
+        Self {
+            entries: raw.entries,
+            max: raw.max,
+            depth: raw.depth,
+        }
+    }
+}
+
 impl TryFrom<&RawExtentHeader> for ExtentHeader {
     type Error = Error;
 

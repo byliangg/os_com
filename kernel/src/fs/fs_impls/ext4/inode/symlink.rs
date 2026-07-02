@@ -16,7 +16,7 @@
 use super::{
     super::{fs::Ext4, prelude::*, utils},
     FileFlags, Inode, InodeInner, InodePayload, MAX_FAST_SYMLINK_LEN, RAW_BLOCK_PTRS_LEN,
-    empty_extent_root,
+    extent_manager::ExtentTree,
 };
 
 /// Inline fast-symlink target stored in the raw `i_block` byte area.
@@ -93,8 +93,8 @@ impl InodeInner {
         if target_len < MAX_FAST_SYMLINK_LEN {
             // Fast path: store the target inline in the `i_block` area. Free any
             // data block held by a previous slow target first.
-            if let InodePayload::DataBacked { block_manager, .. } = &self.payload {
-                block_manager.truncate_to_byte_len(0, None)?;
+            if let InodePayload::DataBacked { extent_manager, .. } = &self.payload {
+                extent_manager.truncate_to_byte_len(0, None)?;
             }
             let mut fast_target = FastSymlinkTarget::new_zeros();
             fast_target.write(target.as_bytes());
@@ -112,8 +112,12 @@ impl InodeInner {
             // created by `create_inode` already arrives `DataBacked` (extent
             // flagged, size 0); only a fast→slow switch needs to rebuild it.
             if !matches!(self.payload, InodePayload::DataBacked { .. }) {
-                self.payload =
-                    InodePayload::new_data_backed(0, empty_extent_root(), 0, Arc::downgrade(fs));
+                self.payload = InodePayload::new_data_backed(
+                    0,
+                    *ExtentTree::empty().root_bytes(),
+                    0,
+                    Arc::downgrade(fs),
+                )?;
             }
             self.prepare_write(fs, 0, target_len, None)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();

@@ -344,7 +344,7 @@ impl BlockGroup {
 
         let desc = self.read_inode_desc(ino)?;
         let type_ = desc.type_();
-        let inode = Inode::new(ino, type_, Dirty::new(desc), self.group_idx, fs);
+        let inode = Inode::new(ino, type_, Dirty::new(desc), self.group_idx, fs)?;
         inode_cache.insert(inode_idx, inode.clone());
         Ok(inode)
     }

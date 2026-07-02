@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Ext4 extent block-mapping engine (the Phase 1 read path).
+//! Ext4 extent block-mapping engine — the inode's logical→physical block
+//! translation for reads, writes, allocation, and truncation.
 //!
-//! This replaces ext2's indirect-block tree: it maps a file's logical blocks to
-//! physical device blocks by walking an on-disk extent tree rooted inline in
-//! the inode's `i_block`. `map_blocks` is the single translation entry point;
-//! the `PageCache` backend that drives reads through it is wired up with the
-//! file read path in a later task.
+//! This replaces ext2's indirect-block tree. The authoritative state is one
+//! [`ExtentTree`] per inode (the validated tree root + `i_blocks` accounting,
+//! defined in [`tree`]); [`ExtentManager`] wraps it in the position-③ lock
+//! (report §5.1), delegates every operation, and doubles as the `PageCache`
+//! backend, mirroring ext2's `InodeBlockManager` over `BlockPtrTree`.
 //!
-//! Interior tree nodes are read directly from the device for now; a frame cache
-//! (an allocation-free fast path for repeated lookups) is a later optimization.
+//! Interior tree nodes are read per lookup (through the journal's read
+//! funnel); a frame cache (an allocation-free fast path for repeated lookups)
+//! is a P9 optimization.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -21,8 +23,7 @@ use super::{
 mod node;
 mod tree;
 
-/// 512-byte sectors per filesystem block; the unit `i_blocks` is counted in.
-const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
+pub(super) use self::tree::ExtentTree;
 
 /// State of a mapped logical block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,24 +65,16 @@ impl Mapping {
     }
 }
 
-/// The mutable, authoritative extent-tree state for one inode.
+/// Maps an inode's logical blocks to physical blocks via its [`ExtentTree`],
+/// which owns the authoritative tree + `i_blocks` accounting.
 ///
-/// `root` is the inode's 60-byte `i_block` holding the inline extent-tree root;
-/// `sector_count` mirrors the inode's `i_blocks` (data + extent-tree metadata,
-/// in 512-byte sectors); `dirty` records whether either has changed since the
-/// last writeback. This whole struct is the "ExtentTree" lock at position ③ in
-/// the global lock order (report §5.1).
-pub(super) struct ExtentTreeState {
-    root: [u32; RAW_BLOCK_PTRS_LEN],
-    sector_count: u64,
-    dirty: bool,
-}
-
-/// Maps an inode's logical blocks to physical blocks via its extent tree and
-/// owns the authoritative tree + `i_blocks` accounting.
+/// Thin delegation over the tree: this type contributes the lock (position ③
+/// in the global order, report §5.1), the filesystem back-reference, and the
+/// `PageCache` backend surface — mirroring ext2's `InodeBlockManager` over
+/// `BlockPtrTree`.
 pub(super) struct ExtentManager {
-    /// The mutable extent-tree state (the ③ "ExtentTree" lock).
-    state: RwMutex<ExtentTreeState>,
+    /// The authoritative extent tree (the ③ "ExtentTree" lock).
+    state: RwMutex<ExtentTree>,
     /// Cached page count for the `PageCache` backend.
     npages: AtomicUsize,
     /// Back-reference to the filesystem, for the block device and allocator.
@@ -89,21 +82,18 @@ pub(super) struct ExtentManager {
 }
 
 impl ExtentManager {
-    pub(super) fn new(
+    /// Validates `root` (see [`ExtentTree::try_new`]) and builds the manager.
+    pub(super) fn try_new(
         root: [u32; RAW_BLOCK_PTRS_LEN],
         sector_count: u64,
         fs: Weak<super::super::fs::Ext4>,
         npages: usize,
-    ) -> Self {
-        Self {
-            state: RwMutex::new(ExtentTreeState {
-                root,
-                sector_count,
-                dirty: false,
-            }),
+    ) -> Result<Self> {
+        Ok(Self {
+            state: RwMutex::new(ExtentTree::try_new(root, sector_count)?),
             npages: AtomicUsize::new(npages),
             fs,
-        }
+        })
     }
 
     /// Returns a strong reference to the owning filesystem.
@@ -119,9 +109,9 @@ impl ExtentManager {
     /// extent, so callers can batch contiguous reads.
     pub(super) fn map_blocks(&self, iblock: Iblock) -> Result<Mapping> {
         let fs = self.fs()?;
-        let state = self.state.read();
+        let tree = self.state.read();
 
-        match tree::find_extent(&state.root, &fs, iblock)? {
+        match tree.lookup(&fs, iblock)? {
             Some(extent) => {
                 let offset_in_extent = iblock - extent.block();
                 let pblock = extent.start() + offset_in_extent as Ext4Bid;
@@ -143,28 +133,29 @@ impl ExtentManager {
 
     /// Returns the inode's `i_blocks` (512-byte sectors) accounting.
     pub(super) fn sector_count(&self) -> u64 {
-        self.state.read().sector_count
+        self.state.read().sector_count()
     }
 
-    /// Returns a copy of the inode's 60-byte `i_block` (extent-tree root).
+    /// Returns a copy of the inode's 60-byte `i_block` (extent-tree root),
+    /// snapshotted under the lock — the inode-writeback serialization boundary.
     pub(super) fn root_snapshot(&self) -> [u32; RAW_BLOCK_PTRS_LEN] {
-        self.state.read().root
+        *self.state.read().root_bytes()
     }
 
     /// Returns the extent-tree depth (0 = inline leaf, 1 = one index level).
     #[cfg(ktest)]
-    pub(super) fn root_depth(&self) -> Result<u16> {
-        tree::root_depth(&self.state.read().root)
+    pub(super) fn root_depth(&self) -> u16 {
+        self.state.read().depth()
     }
 
     /// Returns whether the tree or `i_blocks` has changed since last writeback.
     pub(super) fn is_dirty(&self) -> bool {
-        self.state.read().dirty
+        self.state.read().is_dirty()
     }
 
     /// Clears the dirty flag after a successful inode writeback.
     pub(super) fn clear_dirty(&self) {
-        self.state.write().dirty = false;
+        self.state.write().clear_dirty();
     }
 
     /// Updates the cached page-cache capacity bound.
@@ -198,11 +189,11 @@ impl ExtentManager {
             return Ok(());
         }
         let fs = self.fs()?;
-        let mut s = self.state.write();
+        let mut tree = self.state.write();
 
         // Plan hole runs from a snapshot of the current tree by interval-
         // subtracting the existing (sorted, non-overlapping) extents.
-        let extents = tree::flatten_extents(&s.root, &fs)?;
+        let extents = tree.extents(&fs)?;
 
         // Flip any unwritten extent that overlaps the write range to written so
         // the blocks `submit_write_bio` fills read back the real data. The
@@ -213,22 +204,12 @@ impl ExtentManager {
                 && e.block() < end_iblock
                 && e.block() as u64 + e.len() as u64 > start_iblock as u64
         }) {
-            let delta = tree::convert_unwritten(
-                &mut s.root,
-                &fs,
-                start_iblock,
-                end_iblock - start_iblock,
-                handle,
-            )?;
-            let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
-            s.sector_count =
-                (s.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
-            s.dirty = true;
+            tree.convert_unwritten(&fs, start_iblock, end_iblock - start_iblock, handle)?;
         }
 
         // Re-snapshot after conversion (the tree layout may have changed), then
         // plan holes against the up-to-date extents.
-        let extents = tree::flatten_extents(&s.root, &fs)?;
+        let extents = tree.extents(&fs)?;
         let holes = compute_holes(&extents, start_iblock, end_iblock);
 
         for hole in holes {
@@ -250,8 +231,7 @@ impl ExtentManager {
                 // are not reachable through the inode, so free them here rather
                 // than leak them (`rollback_write` only reclaims blocks in the
                 // extent tree).
-                let delta = match tree::insert_extent(
-                    &mut s.root,
+                if let Err(err) = tree.insert(
                     &fs,
                     ib,
                     range.start,
@@ -259,19 +239,9 @@ impl ExtentManager {
                     node::ExtentKind::Written,
                     handle,
                 ) {
-                    Ok(delta) => delta,
-                    Err(err) => {
-                        let _ = fs.free_blocks(range.start, got, handle);
-                        return Err(err);
-                    }
-                };
-                let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
-                let added_blocks = got as i64 + net_meta;
-                // `.max(0)`: `i_blocks` must never wrap negative-to-huge on a
-                // miscounted delta (consistent with every other adjustment here).
-                s.sector_count =
-                    (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64).max(0) as u64;
-                s.dirty = true;
+                    let _ = fs.free_blocks(range.start, got, handle);
+                    return Err(err);
+                }
                 ib += got;
             }
         }
@@ -282,32 +252,15 @@ impl ExtentManager {
     /// and records it. Used by the `submit_write_bio` hole fallback.
     fn allocate_one(&self, iblock: Iblock) -> Result<Ext4Bid> {
         let fs = self.fs()?;
-        let mut s = self.state.write();
+        let mut tree = self.state.write();
         // The page-cache writeback fallback has no open handle to thread.
         let range = fs.alloc_blocks(1, 0, None)?;
         let pblock = range.start;
-        let delta = match tree::insert_extent(
-            &mut s.root,
-            &fs,
-            iblock,
-            pblock,
-            1,
-            node::ExtentKind::Written,
-            None,
-        ) {
-            Ok(delta) => delta,
-            Err(err) => {
-                // Free the just-allocated block rather than leak it.
-                let _ = fs.free_blocks(pblock, 1, None);
-                return Err(err);
-            }
-        };
-        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
-        let added_blocks = 1 + net_meta;
-        // `.max(0)`: see `ensure_allocated` — saturate rather than wrap.
-        s.sector_count =
-            (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64).max(0) as u64;
-        s.dirty = true;
+        if let Err(err) = tree.insert(&fs, iblock, pblock, 1, node::ExtentKind::Written, None) {
+            // Free the just-allocated block rather than leak it.
+            let _ = fs.free_blocks(pblock, 1, None);
+            return Err(err);
+        }
         Ok(pblock)
     }
 
@@ -321,45 +274,9 @@ impl ExtentManager {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let fs = self.fs()?;
-        let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
-        let mut s = self.state.write();
-
-        let extents = tree::flatten_extents(&s.root, &fs)?;
-        // Count old metadata blocks (external leaves) so the net delta is exact.
-        let old_meta = tree::external_leaf_count(&s.root, &fs)?;
-
-        let mut kept: Vec<(Iblock, u16, Ext4Bid, node::ExtentKind)> = Vec::new();
-        let mut freed_data: u64 = 0;
-        for e in &extents {
-            let e_start = e.block();
-            let e_end = e_start + e.len() as Iblock;
-            if e_end <= keep_blocks {
-                kept.push((e.block(), e.len(), e.start(), e.kind()));
-                continue;
-            }
-            if e_start >= keep_blocks {
-                // Entire extent is beyond the new size; free all its blocks.
-                fs.free_blocks(e.start(), e.len() as u32, handle)?;
-                freed_data += e.len() as u64;
-                continue;
-            }
-            // The extent straddles `keep_blocks`: keep the head, free the tail.
-            let head_len = (keep_blocks - e_start) as u16;
-            let tail_len = e.len() - head_len;
-            fs.free_blocks(e.start() + head_len as Ext4Bid, tail_len as u32, handle)?;
-            freed_data += tail_len as u64;
-            kept.push((e.block(), head_len, e.start(), e.kind()));
-        }
-
-        let new_meta = tree::rebuild_from_extents(&mut s.root, &fs, &kept, handle)?;
-        let net_meta = new_meta as i64 - old_meta as i64;
-        let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
-        // `i_blocks` must never drop below zero; `max(0)` saturates, the assert
-        // catches a miscounted `sector_count` in debug builds.
-        debug_assert!(s.sector_count as i64 >= removed_sectors);
-        s.sector_count = (s.sector_count as i64 - removed_sectors).max(0) as u64;
-        s.dirty = true;
-        Ok(())
+        self.state
+            .write()
+            .truncate_to_byte_len(&fs, new_size, handle)
     }
 }
 
@@ -492,7 +409,7 @@ mod tests {
             start_hi: 0,
             start_lo: 100,
         }]);
-        let em = ExtentManager::new(root, 4 * 8, f.ext4.this(), 4);
+        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 4).unwrap();
 
         let m0 = em.map_blocks(0).unwrap();
         assert_eq!(m0.state(), MapState::Written);
@@ -519,7 +436,7 @@ mod tests {
             start_hi: 0,
             start_lo: 500,
         }]);
-        let em = ExtentManager::new(root, 2 * 8, f.ext4.this(), 2);
+        let em = ExtentManager::try_new(root, 2 * 8, f.ext4.this(), 2).unwrap();
         let m = em.map_blocks(0).unwrap();
         assert_eq!(m.state(), MapState::Unwritten);
         assert!(m.reads_as_zeros());
@@ -563,7 +480,7 @@ mod tests {
                 start_lo: 400,
             },
         ]);
-        let em = ExtentManager::new(root, 4 * 8, f.ext4.this(), 8);
+        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 8).unwrap();
 
         let free_before = f.ext4.super_block().free_blocks_count();
         assert_eq!(free_before, 1);
@@ -583,7 +500,7 @@ mod tests {
             em.ensure_allocated(ib, ib + 1, op.get()).unwrap();
         }
         drop(op);
-        assert_eq!(em.root_depth().unwrap(), 1, "tree grew an external leaf");
+        assert_eq!(em.root_depth(), 1, "tree grew an external leaf");
     }
 
     /// A1-B0 regression (read side of the B-1 hazard): while a leaf's newest
@@ -603,7 +520,7 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::new(inline_root(&[]), 0, f.ext4.this(), 0);
+        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0).unwrap();
         grow_to_depth_1(&f, &em);
 
         // The leaf exists only as the running transaction's capture; the device
@@ -636,7 +553,7 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::new(inline_root(&[]), 0, f.ext4.this(), 0);
+        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0).unwrap();
         grow_to_depth_1(&f, &em);
 
         // Commit + checkpoint: the leaf's capture retires, the device becomes

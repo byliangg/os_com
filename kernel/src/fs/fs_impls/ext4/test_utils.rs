@@ -508,11 +508,10 @@ impl Ext4FixtureBuilder {
     }
 }
 
-/// A root-directory inode: one data block via an extent root (left empty here;
-/// the directory data block is populated when a later task needs to read it),
-/// link count 2, `EXT4_EXTENTS_FL` set.
+/// A root-directory inode: link count 2, `EXT4_EXTENTS_FL` set, and a valid
+/// **empty** extent root.
 fn make_root_dir_inode() -> RawInode {
-    RawInode {
+    let mut raw = RawInode {
         mode: 0o040755,
         size_lo: BLOCK_SIZE as u32,
         link_count: 2,
@@ -520,7 +519,13 @@ fn make_root_dir_inode() -> RawInode {
         flags: FileFlags::EXTENTS.bits(),
         extra_isize: 32,
         ..Default::default()
-    }
+    };
+    // A valid **empty** extent root — the root must parse, since
+    // `ExtentTree::try_new` validates it when the inode is loaded. Tests that
+    // read actual root-directory data overwrite ino 2 with a populated inode.
+    raw.block[0] = 0xF30A; // eh_magic | eh_entries(=0)
+    raw.block[1] = 4; // eh_max=4, eh_depth=0
+    raw
 }
 
 /// Builds a regular-file inode mapping logical block 0 to `data_block` via a
