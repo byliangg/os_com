@@ -81,9 +81,14 @@ fn search_node(bytes: &[u8], iblock: Iblock) -> Result<Step> {
 
 /// Walks the extent tree rooted in `root` (the inode's `i_block`) to find the
 /// extent covering `iblock`, returning `None` for a hole.
+///
+/// External nodes are read through [`journal::read_metadata_block`]: on a
+/// journaled volume a node's newest bytes may still sit in a journal capture
+/// (WAL suppresses the direct write until checkpoint), so a bare device read
+/// here would walk a stale tree.
 pub(super) fn find_extent(
     root: &[u32; super::super::RAW_BLOCK_PTRS_LEN],
-    device: &dyn BlockDevice,
+    fs: &Ext4,
     iblock: Iblock,
 ) -> Result<Option<Extent>> {
     let mut next_bid = match search_node(root.as_bytes(), iblock)? {
@@ -92,8 +97,10 @@ pub(super) fn find_extent(
         Step::Descend(bid) => bid,
     };
 
+    let journal = fs.journal();
+    let device = fs.block_device().as_ref();
     for _ in 0..MAX_DEPTH {
-        let block = device.read_val::<[u8; BLOCK_SIZE]>(next_bid as usize * BLOCK_SIZE)?;
+        let block = journal::read_metadata_block(journal.as_deref(), device, next_bid)?;
         match search_node(&block, iblock)? {
             Step::Found(extent) => return Ok(Some(extent)),
             Step::Hole => return Ok(None),
@@ -127,8 +134,10 @@ pub(super) struct TreeDelta {
 /// iblock+len)` is currently a hole (the write path only inserts for unmapped
 /// blocks).
 ///
-/// External leaf blocks are written synchronously and reused in place across
-/// mutations; Phase 4 routes them through the journal/buffer cache instead.
+/// External leaf blocks are reused in place across mutations. Under a journal
+/// handle their reads and writes go through the journal funnels
+/// ([`journal::read_metadata_block`], capture + patch), so WAL order holds;
+/// without one they are read and written directly (Phases 1–3 semantics).
 pub(super) fn insert_extent(
     root: &mut [u32; super::super::RAW_BLOCK_PTRS_LEN],
     fs: &Ext4,
@@ -138,8 +147,7 @@ pub(super) fn insert_extent(
     kind: ExtentKind,
     handle: Option<&journal::Handle>,
 ) -> Result<TreeDelta> {
-    let device = fs.block_device().as_ref();
-    let (mut extents, old_external) = flatten(root, device)?;
+    let (mut extents, old_external) = flatten(root, fs)?;
     extents.push(Extent::new(iblock, len, pblock, kind));
     merge_extents(&mut extents);
     reserialize(root, fs, &extents, &old_external, handle)
@@ -149,9 +157,9 @@ pub(super) fn insert_extent(
 /// block. Used by the write path to plan hole runs from a tree snapshot.
 pub(super) fn flatten_extents(
     root: &[u32; super::super::RAW_BLOCK_PTRS_LEN],
-    device: &dyn BlockDevice,
+    fs: &Ext4,
 ) -> Result<Vec<Extent>> {
-    let (mut extents, _external) = flatten(root, device)?;
+    let (mut extents, _external) = flatten(root, fs)?;
     extents.sort_by_key(|e| e.block());
     Ok(extents)
 }
@@ -170,9 +178,9 @@ pub(super) fn root_depth(root: &[u32; super::super::RAW_BLOCK_PTRS_LEN]) -> Resu
 /// the truncate path can compute the exact metadata-block delta for `i_blocks`.
 pub(super) fn external_leaf_count(
     root: &[u32; super::super::RAW_BLOCK_PTRS_LEN],
-    device: &dyn BlockDevice,
+    fs: &Ext4,
 ) -> Result<u32> {
-    let (_extents, external) = flatten(root, device)?;
+    let (_extents, external) = flatten(root, fs)?;
     Ok(external.len() as u32)
 }
 
@@ -186,15 +194,14 @@ pub(super) fn rebuild_from_extents(
     extents: &[(Iblock, u16, Ext4Bid, ExtentKind)],
     handle: Option<&journal::Handle>,
 ) -> Result<u32> {
-    let device = fs.block_device().as_ref();
-    let (_old, old_external) = flatten(root, device)?;
+    let (_old, old_external) = flatten(root, fs)?;
     let extents: Vec<Extent> = extents
         .iter()
         .map(|&(block, len, start, kind)| Extent::new(block, len, start, kind))
         .collect();
     reserialize(root, fs, &extents, &old_external, handle)?;
     // After reserialization, count the external leaves the new root references.
-    let (_new, new_external) = flatten(root, device)?;
+    let (_new, new_external) = flatten(root, fs)?;
     Ok(new_external.len() as u32)
 }
 
@@ -218,8 +225,7 @@ pub(super) fn convert_unwritten(
     len: u32,
     handle: Option<&journal::Handle>,
 ) -> Result<TreeDelta> {
-    let device = fs.block_device().as_ref();
-    let (extents, old_external) = flatten(root, device)?;
+    let (extents, old_external) = flatten(root, fs)?;
 
     let range_start = iblock;
     let range_end = iblock as u64 + len as u64;
@@ -274,10 +280,11 @@ pub(super) fn convert_unwritten(
 /// returning the physical blocks of any external (depth-1) leaf nodes.
 ///
 /// Phase 2 only ever builds depth-0 (inline) or depth-1 trees, so a depth of 2
-/// or more is rejected rather than walked.
+/// or more is rejected rather than walked. Leaf blocks are read through
+/// [`journal::read_metadata_block`] — see [`find_extent`].
 fn flatten(
     root: &[u32; super::super::RAW_BLOCK_PTRS_LEN],
-    device: &dyn BlockDevice,
+    fs: &Ext4,
 ) -> Result<(Vec<Extent>, Vec<Ext4Bid>)> {
     let root_bytes = root.as_bytes();
     let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&root_bytes[0..ENTRY_SIZE]))?;
@@ -307,9 +314,11 @@ fn flatten(
         leaf_bids.push(idx.leaf());
     }
 
+    let journal = fs.journal();
+    let device = fs.block_device().as_ref();
     let mut extents = Vec::new();
     for &bid in &leaf_bids {
-        let block = device.read_val::<[u8; BLOCK_SIZE]>(bid as usize * BLOCK_SIZE)?;
+        let block = journal::read_metadata_block(journal.as_deref(), device, bid)?;
         let leaf_hdr = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
         if !leaf_hdr.is_leaf() {
             return_errno_with_message!(Errno::EUCLEAN, "depth-1 child is not a leaf");
@@ -483,6 +492,13 @@ fn write_leaf_node(
         let off = ENTRY_SIZE * (1 + i);
         block[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(ext).as_bytes());
     }
+    // The leaf may be REUSED from the previous tree layout (`reserialize`
+    // re-fills surviving external leaves in place); only freshly allocated
+    // leaves were captured by `alloc_meta_block`. Capture idempotently so the
+    // reuse path is journaled too — a fresh leaf's zero-seeded capture is left
+    // untouched, a reused leaf gets one here (without it the patch below is
+    // dirty-without-access, `EIO`).
+    journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
     journal::dirty_metadata(handle, bid, journal::TriggerType::ExtentBlock, |buf| {
         buf.copy_from_slice(&block)
     })?;
@@ -562,7 +578,6 @@ mod tests {
     #[ktest]
     fn inline_single_extent_lookup() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
-        let device = f.ext4.block_device().as_ref();
         // One extent mapping logical 0..4 to physical 100..104.
         let root = inline_root(&[RawExtent {
             block: 0,
@@ -571,18 +586,17 @@ mod tests {
             start_lo: 100,
         }]);
 
-        let mapped = find_extent(&root, device, 2).unwrap().unwrap();
+        let mapped = find_extent(&root, &f.ext4, 2).unwrap().unwrap();
         assert_eq!(mapped.start(), 100);
         assert_eq!(mapped.block(), 0);
 
         // Block 4 is beyond the extent: a hole.
-        assert!(find_extent(&root, device, 4).unwrap().is_none());
+        assert!(find_extent(&root, &f.ext4, 4).unwrap().is_none());
     }
 
     #[ktest]
     fn inline_multiple_extents_lookup() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
-        let device = f.ext4.block_device().as_ref();
         let root = inline_root(&[
             RawExtent {
                 block: 0,
@@ -599,19 +613,18 @@ mod tests {
         ]);
 
         // Logical 6 → second extent, physical 300 + (6 - 5) = 301.
-        let mapped = find_extent(&root, device, 6).unwrap().unwrap();
+        let mapped = find_extent(&root, &f.ext4, 6).unwrap().unwrap();
         assert_eq!(mapped.start() + (6 - mapped.block()) as u64, 301);
 
         // Logical 3 falls in the gap between the two extents: a hole.
-        assert!(find_extent(&root, device, 3).unwrap().is_none());
+        assert!(find_extent(&root, &f.ext4, 3).unwrap().is_none());
     }
 
     #[ktest]
     fn empty_root_is_all_holes() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
-        let device = f.ext4.block_device().as_ref();
         let root = inline_root(&[]);
-        assert!(find_extent(&root, device, 0).unwrap().is_none());
+        assert!(find_extent(&root, &f.ext4, 0).unwrap().is_none());
     }
 
     /// Writes a depth-1 index root into a 60-byte `i_block`, pointing at a single
@@ -662,7 +675,6 @@ mod tests {
     #[ktest]
     fn descends_into_external_leaf() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
-        let device = f.ext4.block_device().as_ref();
 
         let leaf_block = 200u32;
         let leaf = leaf_node(&[
@@ -683,15 +695,15 @@ mod tests {
         let root = index_root(leaf_block);
 
         // Logical 1 → descend to the leaf → first extent (0..2) → physical 301.
-        let m0 = find_extent(&root, device, 1).unwrap().unwrap();
+        let m0 = find_extent(&root, &f.ext4, 1).unwrap().unwrap();
         assert_eq!(m0.start() + (1 - m0.block()) as u64, 301);
         // Logical 6 → second extent (5..8) → physical 401.
-        let m1 = find_extent(&root, device, 6).unwrap().unwrap();
+        let m1 = find_extent(&root, &f.ext4, 6).unwrap().unwrap();
         assert_eq!(m1.start() + (6 - m1.block()) as u64, 401);
         // Logical 3 → gap between the leaf's extents → hole.
-        assert!(find_extent(&root, device, 3).unwrap().is_none());
+        assert!(find_extent(&root, &f.ext4, 3).unwrap().is_none());
         // Logical 100 → beyond all extents → hole.
-        assert!(find_extent(&root, device, 100).unwrap().is_none());
+        assert!(find_extent(&root, &f.ext4, 100).unwrap().is_none());
     }
 
     /// Returns the depth and entry count of the inline root header.
@@ -718,8 +730,7 @@ mod tests {
 
         // Still inline depth-0 with a single merged extent.
         assert_eq!(root_header(&root), (0, 1));
-        let device = f.ext4.block_device().as_ref();
-        let m = find_extent(&root, device, 3).unwrap().unwrap();
+        let m = find_extent(&root, &f.ext4, 3).unwrap().unwrap();
         assert_eq!(m.start() + (3 - m.block()) as u64, 103);
     }
 
@@ -735,10 +746,15 @@ mod tests {
         insert_extent(&mut root, &f.ext4, 5, 200, 1, ExtentKind::Written, None).unwrap();
 
         assert_eq!(root_header(&root), (0, 2));
-        let device = f.ext4.block_device().as_ref();
-        assert_eq!(find_extent(&root, device, 0).unwrap().unwrap().start(), 100);
-        assert_eq!(find_extent(&root, device, 5).unwrap().unwrap().start(), 200);
-        assert!(find_extent(&root, device, 3).unwrap().is_none());
+        assert_eq!(
+            find_extent(&root, &f.ext4, 0).unwrap().unwrap().start(),
+            100
+        );
+        assert_eq!(
+            find_extent(&root, &f.ext4, 5).unwrap().unwrap().start(),
+            200
+        );
+        assert!(find_extent(&root, &f.ext4, 3).unwrap().is_none());
     }
 
     #[ktest]
@@ -770,9 +786,8 @@ mod tests {
         assert_eq!(total_allocated, 1); // exactly one leaf block allocated
 
         // All five mappings are still reachable through the external leaf.
-        let device = f.ext4.block_device().as_ref();
         for k in 0..5u32 {
-            let m = find_extent(&root, device, k * 2).unwrap().unwrap();
+            let m = find_extent(&root, &f.ext4, k * 2).unwrap().unwrap();
             assert_eq!(m.start(), 100 + k as u64 * 10);
         }
 
@@ -815,9 +830,8 @@ mod tests {
         let d = insert_extent(&mut root, &f.ext4, 20, 500, 1, ExtentKind::Written, None).unwrap();
         assert_eq!((d.meta_allocated, d.meta_freed), (0, 0));
 
-        let device = f.ext4.block_device().as_ref();
         assert_eq!(
-            find_extent(&root, device, 20).unwrap().unwrap().start(),
+            find_extent(&root, &f.ext4, 20).unwrap().unwrap().start(),
             500
         );
     }

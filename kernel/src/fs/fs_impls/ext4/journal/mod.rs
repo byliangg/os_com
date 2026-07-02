@@ -266,6 +266,21 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         return Ok(None);
     }
 
+    // Mount contract (report §4.5): only an *internal* journal at the fixed
+    // reserved inode is supported. A superblock naming a different journal
+    // inode, or an external journal device, must be rejected rather than
+    // silently parsed as an ino-8 internal journal (which would then be
+    // "replayed" from unrelated file content).
+    if fs.super_block().journal_ino() != JOURNAL_INO {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "unsupported journal inode number (only the reserved ino 8 is supported)"
+        );
+    }
+    if fs.super_block().journal_dev() != 0 {
+        return_errno_with_message!(Errno::EINVAL, "external journal devices are unsupported");
+    }
+
     let desc = fs.read_inode_desc(JOURNAL_INO)?;
     if !desc.is_extent_based() {
         return_errno_with_message!(
@@ -275,7 +290,11 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
     }
 
     // The journal file spans this many blocks; its log data starts at block 0.
-    let nblocks = desc.size().div_ceil(BLOCK_SIZE as u64) as u32;
+    // The on-disk size is untrusted: reject one whose block count overflows
+    // u32 instead of silently truncating the geometry.
+    let Ok(nblocks) = u32::try_from(desc.size().div_ceil(BLOCK_SIZE as u64)) else {
+        return_errno_with_message!(Errno::EUCLEAN, "journal inode is too large");
+    };
     if nblocks < 2 {
         return_errno_with_message!(Errno::EUCLEAN, "journal inode is too small");
     }
@@ -991,6 +1010,52 @@ pub(super) fn dirty_metadata(
     let journal = handle.journal()?;
     let mut state = journal.state_write();
     running_for(&mut state, handle)?.apply_patch(blocknr, patch)
+}
+
+/// Reads a metadata block through the journal's retained after-images: the
+/// running transaction's capture when one exists, else the newest
+/// committed-but-un-checkpointed image, else the device.
+///
+/// This is the **read side** of the WAL suppression. A captured block's newest
+/// bytes live in the journal's buffers and the device lags them until
+/// checkpoint, so every reader of a metadata block that the funnels capture
+/// (extent-tree nodes today; bitmaps/descriptors/superblock have in-memory
+/// owners and directory blocks live in the page cache) must read through here
+/// — a bare device read inside that window returns stale bytes, the read-side
+/// counterpart of the B-1 stale-seed hazard that [`get_write_access`] plugs on
+/// the capture side. jbd2 gets this for free from the kernel buffer cache (one
+/// canonical `buffer_head` per block); Model A retains the equivalents itself.
+///
+/// `journal` is `None` on a non-journaled volume — and during mount, before
+/// the journal is published, when replay has already made the device
+/// authoritative — leaving those reads plain device reads (Phases 1–3
+/// unchanged).
+pub(super) fn read_metadata_block(
+    journal: Option<&Journal>,
+    device: &dyn BlockDevice,
+    blocknr: Ext4Bid,
+) -> Result<[u8; BLOCK_SIZE]> {
+    if let Some(journal) = journal {
+        let state = journal.state_read();
+        // The running transaction's capture is newer than any retained image
+        // (a capture seeds *from* the retained image, then accumulates patches).
+        let newest = state
+            .running
+            .as_ref()
+            .and_then(|txn| txn.metadata_bytes(blocknr))
+            .or_else(|| {
+                state
+                    .uncheckpointed
+                    .get(&blocknr)
+                    .map(transaction::UncheckpointedImage::image_bytes)
+            });
+        if let Some(bytes) = newest {
+            let mut block = [0u8; BLOCK_SIZE];
+            block.copy_from_slice(bytes);
+            return Ok(block);
+        }
+    }
+    Ok(device.read_val(blocknr as usize * BLOCK_SIZE)?)
 }
 
 /// Records that a previously journaled metadata block is being freed. Phase 2:

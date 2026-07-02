@@ -16,6 +16,7 @@ use super::{
     super::{fs::Ext4, journal, prelude::*, utils},
     FileFlags, FilePerm, Inode, InodeInner, MAX_LINK_COUNT,
 };
+use crate::fs::utils::NAME_MAX;
 
 /// A candidate slot found by [`InodeInner::find_dir_slot`] or freshly created
 /// by [`InodeInner::grow_dir_block`], where a new entry can be written.
@@ -295,6 +296,14 @@ impl InodeInner {
         debug_assert_ne!(ino, 0);
 
         let name_bytes = name.as_bytes();
+        // The VFS resolver already rejects names over `NAME_MAX`; revalidate at
+        // the single write boundary (every entry insertion funnels through
+        // here) so the truncating `name_len: u8` encode below can never
+        // disagree with the written name bytes. Mirrors the read-side check in
+        // `dir_entry.rs`.
+        if name_bytes.len() > NAME_MAX {
+            return_errno_with_message!(Errno::ENAMETOOLONG, "directory entry name is too long");
+        }
         let new_rec_len = DirEntryHeader::min_rec_len(name_bytes.len()) as usize;
         debug_assert!(new_rec_len <= slot.slot_rec_len);
 
@@ -755,8 +764,8 @@ impl Inode {
     ///
     /// The VFS layer rejects hard links to directories (with `EPERM`) before
     /// reaching here, so — like ext2 — this does not re-check the type. It
-    /// rejects only an overflowing link count (`EOVERFLOW`), mirroring ext2
-    /// `Inode::link`. The two inodes (`self` and `old`) are locked through
+    /// rejects only an overflowing link count (`EMLINK`, as Linux ext4 does).
+    /// The two inodes (`self` and `old`) are locked through
     /// [`MultiInodeInnerGuards`] in ino order.
     pub(in crate::fs::fs_impls::ext4) fn link(&self, old: &Inode, name: &str) -> Result<()> {
         let fs = self.fs()?;
@@ -766,7 +775,7 @@ impl Inode {
         let op = fs.begin_op(Ext4::LINK_CREDITS)?;
 
         if guards.inner(old.ino()).link_count() >= MAX_LINK_COUNT {
-            return_errno!(Errno::EOVERFLOW);
+            return_errno!(Errno::EMLINK);
         }
 
         let dir_inner = guards.inner_mut(self.ino());

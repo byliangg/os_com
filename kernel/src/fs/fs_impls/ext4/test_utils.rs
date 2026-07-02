@@ -383,6 +383,9 @@ impl Ext4FixtureBuilder {
             feature_compat: if self.has_journal { 0x4 } else { 0 },
             feature_incompat: 0x2 | 0x40, // FILETYPE | EXTENTS
             feature_ro_compat: 0x1,       // SPARSE_SUPER
+            // The mount contract requires the internal journal at the reserved
+            // ino 8 (`s_journal_inum`); `mke2fs` writes the same.
+            journal_ino: if self.has_journal { JOURNAL_INO } else { 0 },
             ..Default::default()
         };
         let sb = SuperBlock::try_from(raw_sb)?;

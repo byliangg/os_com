@@ -52,6 +52,9 @@ pub(super) struct SuperBlock {
     feature_ro_compat: FeatureRoCompatSet,
     uuid: [u8; 16],
     last_orphan: u32,
+    reserved_blocks_count: u32,
+    journal_ino: u32,
+    journal_dev: u32,
 }
 
 impl TryFrom<RawSuperBlock> for SuperBlock {
@@ -172,6 +175,9 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             feature_ro_compat,
             uuid: sb.uuid,
             last_orphan: sb.last_orphan,
+            reserved_blocks_count: sb.reserved_blocks_count,
+            journal_ino: sb.journal_ino,
+            journal_dev: sb.journal_dev,
         })
     }
 }
@@ -317,9 +323,26 @@ impl SuperBlock {
         self.state
     }
 
-    #[expect(dead_code)]
     pub(super) const fn uuid(&self) -> &[u8; 16] {
         &self.uuid
+    }
+
+    /// Blocks reserved for privileged processes (`s_r_blocks_count`); `statfs`
+    /// subtracts them from `bfree` to report `bavail`.
+    pub(super) const fn reserved_blocks_count(&self) -> u32 {
+        self.reserved_blocks_count
+    }
+
+    /// The inode number of the internal journal (`s_journal_inum`); the mount
+    /// contract accepts only the reserved ino 8.
+    pub(super) const fn journal_ino(&self) -> u32 {
+        self.journal_ino
+    }
+
+    /// The external journal's device number (`s_journal_dev`); the mount
+    /// contract accepts only `0` (internal journal).
+    pub(super) const fn journal_dev(&self) -> u32 {
+        self.journal_dev
     }
 
     pub(super) const fn feature_compat(&self) -> FeatureCompatSet {

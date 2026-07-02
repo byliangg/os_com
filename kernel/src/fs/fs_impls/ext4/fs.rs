@@ -437,12 +437,21 @@ impl Ext4 {
                 continue;
             };
 
-            let ino = (group_idx as u32) * nr_inodes_per_group + local_idx + 1;
-            if ino < sb.first_ino() || ino > total_inodes {
-                // Roll back the group-level allocation before erroring out.
-                let _ = group.free_inode(local_idx, type_, handle);
-                return_errno_with_message!(Errno::EIO, "allocated inode number out of valid range");
-            }
+            // Compute in u64: near-2^32 `inodes_count` is valid, so a last-group
+            // `group * per_group + local` can exceed u32 — a wrapped number would
+            // alias an early-group inode while still passing the range check.
+            let ino64 = group_idx as u64 * nr_inodes_per_group as u64 + local_idx as u64 + 1;
+            let ino = match u32::try_from(ino64) {
+                Ok(ino) if ino >= sb.first_ino() && ino <= total_inodes => ino,
+                _ => {
+                    // Roll back the group-level allocation before erroring out.
+                    let _ = group.free_inode(local_idx, type_, handle);
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "allocated inode number out of valid range"
+                    );
+                }
+            };
             sb.dec_free_inodes()?;
             journal_superblock(
                 handle,
@@ -1124,7 +1133,11 @@ impl Drop for Ext4 {
 /// field packs a 2-bit epoch (the seconds bits past 2038) in its low bits and
 /// nanoseconds in the upper bits. Reverse of `decode_time` in `inode`.
 fn encode_time(time: Duration) -> (u32, u32) {
-    let secs = time.as_secs();
+    // The 2-bit epoch encodes seconds only up to 2^34 - 1 (~year 2514). Clamp
+    // rather than wrap: `secs` can come straight from `utimensat`, and a wrapped
+    // value would read back as an unrelated timestamp (Linux truncates to the
+    // filesystem's range at the VFS layer, `timestamp_truncate`).
+    let secs = time.as_secs().min((1 << 34) - 1);
     let nsec = time.subsec_nanos();
     let epoch = (secs >> 32) & 0x3;
     let secs_lo = secs as u32;
@@ -2470,6 +2483,52 @@ mod tests {
         );
         assert_eq!(ext4.read_inode_desc(ino).unwrap().link_count(), new_link);
         drop(ext4);
+    }
+
+    /// Mount contract (report §4.5): a superblock whose `s_journal_inum` names
+    /// anything but the reserved ino 8 must fail the mount — silently parsing
+    /// some other inode as the journal would "replay" unrelated file content.
+    #[ktest]
+    fn mount_rejects_nonstandard_journal_inum() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let disk = f.disk.clone();
+        drop(f); // clean unmount; the doctored field survives the RMW writeback
+
+        let mut raw: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        raw.journal_ino = 12;
+        disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw).unwrap();
+
+        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>) else {
+            panic!("mount must reject s_journal_inum != 8");
+        };
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    /// Mount contract (report §4.5): an external journal (`s_journal_dev != 0`)
+    /// is unsupported and must fail the mount, not be silently treated as an
+    /// internal ino-8 journal.
+    #[ktest]
+    fn mount_rejects_external_journal_device() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let disk = f.disk.clone();
+        drop(f);
+
+        let mut raw: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        raw.journal_dev = 0xff00;
+        disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw).unwrap();
+
+        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>) else {
+            panic!("mount must reject an external journal device");
+        };
+        assert_eq!(err.error(), Errno::EINVAL);
     }
 
     /// The mount-time orphan scan must never free a chain member with a

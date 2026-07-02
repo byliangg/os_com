@@ -119,10 +119,9 @@ impl ExtentManager {
     /// extent, so callers can batch contiguous reads.
     pub(super) fn map_blocks(&self, iblock: Iblock) -> Result<Mapping> {
         let fs = self.fs()?;
-        let device = fs.block_device().as_ref();
         let state = self.state.read();
 
-        match tree::find_extent(&state.root, device, iblock)? {
+        match tree::find_extent(&state.root, &fs, iblock)? {
             Some(extent) => {
                 let offset_in_extent = iblock - extent.block();
                 let pblock = extent.start() + offset_in_extent as Ext4Bid;
@@ -199,12 +198,11 @@ impl ExtentManager {
             return Ok(());
         }
         let fs = self.fs()?;
-        let device = fs.block_device().as_ref();
         let mut s = self.state.write();
 
         // Plan hole runs from a snapshot of the current tree by interval-
         // subtracting the existing (sorted, non-overlapping) extents.
-        let extents = tree::flatten_extents(&s.root, device)?;
+        let extents = tree::flatten_extents(&s.root, &fs)?;
 
         // Flip any unwritten extent that overlaps the write range to written so
         // the blocks `submit_write_bio` fills read back the real data. The
@@ -230,7 +228,7 @@ impl ExtentManager {
 
         // Re-snapshot after conversion (the tree layout may have changed), then
         // plan holes against the up-to-date extents.
-        let extents = tree::flatten_extents(&s.root, device)?;
+        let extents = tree::flatten_extents(&s.root, &fs)?;
         let holes = compute_holes(&extents, start_iblock, end_iblock);
 
         for hole in holes {
@@ -269,8 +267,10 @@ impl ExtentManager {
                 };
                 let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
                 let added_blocks = got as i64 + net_meta;
+                // `.max(0)`: `i_blocks` must never wrap negative-to-huge on a
+                // miscounted delta (consistent with every other adjustment here).
                 s.sector_count =
-                    (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64) as u64;
+                    (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64).max(0) as u64;
                 s.dirty = true;
                 ib += got;
             }
@@ -304,7 +304,9 @@ impl ExtentManager {
         };
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let added_blocks = 1 + net_meta;
-        s.sector_count = (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64) as u64;
+        // `.max(0)`: see `ensure_allocated` — saturate rather than wrap.
+        s.sector_count =
+            (s.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64).max(0) as u64;
         s.dirty = true;
         Ok(pblock)
     }
@@ -319,13 +321,12 @@ impl ExtentManager {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let fs = self.fs()?;
-        let device = fs.block_device().as_ref();
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
         let mut s = self.state.write();
 
-        let extents = tree::flatten_extents(&s.root, device)?;
+        let extents = tree::flatten_extents(&s.root, &fs)?;
         // Count old metadata blocks (external leaves) so the net delta is exact.
-        let old_meta = tree::external_leaf_count(&s.root, device)?;
+        let old_meta = tree::external_leaf_count(&s.root, &fs)?;
 
         let mut kept: Vec<(Iblock, u16, Ext4Bid, node::ExtentKind)> = Vec::new();
         let mut freed_data: u64 = 0;
@@ -572,5 +573,85 @@ mod tests {
 
         // The data block allocated before the failed insert was reclaimed.
         assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
+    }
+
+    /// Grows `em` from empty to a depth-1 tree (5 disjoint single-block extents
+    /// overflow the 4-entry inline root) inside one journaled op.
+    fn grow_to_depth_1(f: &super::super::super::test_utils::Ext4Fixture, em: &ExtentManager) {
+        let op = f.ext4.begin_op(8).unwrap();
+        for ib in [0u32, 2, 4, 6, 8] {
+            em.ensure_allocated(ib, ib + 1, op.get()).unwrap();
+        }
+        drop(op);
+        assert_eq!(em.root_depth().unwrap(), 1, "tree grew an external leaf");
+    }
+
+    /// A1-B0 regression (read side of the B-1 hazard): while a leaf's newest
+    /// bytes sit only in the journal — the running transaction's capture, or the
+    /// committed-but-un-checkpointed image — tree reads must be served from
+    /// them. A bare device read returns the pre-op bytes (all zeros for a leaf
+    /// grown this op, since WAL suppressed its direct write), so every lookup
+    /// on the file failed `EUCLEAN` until checkpoint caught the device up.
+    #[ktest]
+    fn journaled_tree_read_sees_uncheckpointed_leaf() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let em = ExtentManager::new(inline_root(&[]), 0, f.ext4.this(), 0);
+        grow_to_depth_1(&f, &em);
+
+        // The leaf exists only as the running transaction's capture; the device
+        // still holds zeros. The mapping must come from the capture.
+        let m = em.map_blocks(8).unwrap();
+        assert_eq!(m.state(), MapState::Written);
+
+        // Same across the commit boundary: the image is now retained
+        // un-checkpointed (the commit thread is stopped, so nothing applies it
+        // to its final location).
+        journal.commit_now_for_test();
+        let m = em.map_blocks(4).unwrap();
+        assert_eq!(m.state(), MapState::Written);
+    }
+
+    /// A1-B0 regression (`reused-leaf-missing-capture`): re-serializing into a
+    /// REUSED external leaf block must capture it first — only freshly
+    /// allocated leaves get `get_create_access` (in `alloc_meta_block`), so the
+    /// reuse path's `dirty_metadata` failed dirty-without-access (`EIO`) on
+    /// every journaled mutation of a depth-1 tree whose leaf survived from an
+    /// earlier transaction.
+    #[ktest]
+    fn journaled_reserialize_captures_reused_leaf() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let em = ExtentManager::new(inline_root(&[]), 0, f.ext4.this(), 0);
+        grow_to_depth_1(&f, &em);
+
+        // Commit + checkpoint: the leaf's capture retires, the device becomes
+        // authoritative — the next mutation reuses the on-disk leaf in place
+        // and must journal it itself.
+        journal.flush_on_unmount().unwrap();
+
+        {
+            let op = f.ext4.begin_op(8).unwrap();
+            em.ensure_allocated(10, 11, op.get()).unwrap();
+        }
+        let m = em.map_blocks(10).unwrap();
+        assert_eq!(m.state(), MapState::Written);
+        // The pre-flush extents survived the in-place rewrite.
+        let m = em.map_blocks(0).unwrap();
+        assert_eq!(m.state(), MapState::Written);
     }
 }

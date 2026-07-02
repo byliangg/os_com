@@ -39,15 +39,22 @@ impl FileSystem for Ext4 {
 
     fn sb(&self) -> SuperBlock {
         let sb = self.super_block();
+        // `bavail` excludes the root-reserved blocks (`s_r_blocks_count`), like
+        // Linux `ext4_statfs`, so unprivileged `df` sees the space it can use.
+        let bavail = sb
+            .free_blocks_count()
+            .saturating_sub(sb.reserved_blocks_count() as u64);
         SuperBlock {
             magic: MAGIC_NUM as u64,
             bsize: BLOCK_SIZE,
             blocks: sb.total_blocks() as usize,
             bfree: sb.free_blocks_count() as usize,
-            bavail: sb.free_blocks_count() as usize,
+            bavail: bavail as usize,
             files: sb.total_inodes() as usize,
             ffree: sb.free_inodes_count() as usize,
-            fsid: 0,
+            // The volume UUID's low 64 bits, so mounts are distinguishable
+            // (Linux folds the UUID into `f_fsid` too).
+            fsid: u64::from_le_bytes(sb.uuid()[..8].try_into().unwrap()),
             namelen: NAME_MAX,
             frsize: BLOCK_SIZE,
             flags: 0,
