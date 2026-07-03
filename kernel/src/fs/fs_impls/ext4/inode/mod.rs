@@ -703,6 +703,23 @@ impl InodeDesc {
         }
         Ok(())
     }
+
+    /// Stamps `raw`'s `i_checksum_lo` (and `i_checksum_hi` when the inode has the
+    /// extra region) for a `metadata_csum` volume, at an inode writeback funnel
+    /// (Linux `ext4_inode_csum_set`). `fs_seed` is the per-filesystem seed; the
+    /// caller stamps only when the feature is on.
+    pub(super) fn stamp_inode_checksum(
+        raw: &mut RawInode,
+        ino: Ext4Ino,
+        fs_seed: u32,
+        inode_size: usize,
+    ) {
+        let crc = Self::inode_checksum(raw, ino, fs_seed, inode_size);
+        raw.checksum_lo = (crc & 0xFFFF) as u16;
+        if inode_size > 128 {
+            raw.checksum_hi = ((crc >> 16) & 0xFFFF) as u16;
+        }
+    }
 }
 
 const_assert!(size_of::<RawInode>() == 256);
@@ -1865,6 +1882,25 @@ mod tests {
         // Storing the checksum back does not change the covered result.
         let recheck = InodeDesc::inode_checksum(&raw, ino, fs_seed, INODE_SIZE);
         assert_eq!(recheck, crc);
+    }
+
+    /// The write-side `stamp_inode_checksum` produces exactly what the read-side
+    /// `verify_inode_checksum` accepts — the compute/verify round-trip at the
+    /// inode writeback funnel.
+    #[ktest]
+    fn stamp_inode_checksum_round_trips_with_verify() {
+        const INODE_SIZE: usize = 256;
+        let fs_seed = 0x0102_0304;
+        let ino: Ext4Ino = 27;
+        let mut raw = raw_root_dir();
+        raw.generation = 0xC0FFEE;
+
+        InodeDesc::stamp_inode_checksum(&mut raw, ino, fs_seed, INODE_SIZE);
+        InodeDesc::verify_inode_checksum(&raw, ino, fs_seed, INODE_SIZE).unwrap();
+
+        // A post-stamp body change is then caught by verify.
+        raw.link_count += 1;
+        assert!(InodeDesc::verify_inode_checksum(&raw, ino, fs_seed, INODE_SIZE).is_err());
     }
 
     #[ktest]

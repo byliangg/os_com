@@ -996,6 +996,11 @@ impl Ext4 {
             sb.write_free_blocks_count(&mut raw);
             raw.free_inodes_count = sb.free_inodes_count();
             raw.feature_incompat = sb.feature_incompat().bits();
+            // Stamp the superblock checksum over the final image (a no-op field
+            // when the feature is off).
+            if sb.has_metadata_csum() {
+                raw.checksum = SuperBlock::superblock_checksum(&raw);
+            }
             // `last_orphan` is deliberately NOT patched from memory: the
             // in-memory head advances inside a still-running transaction
             // (`orphan_add`), so a direct write here would publish an
@@ -1107,6 +1112,15 @@ impl Ext4 {
     ) -> Result<()> {
         let slot = self.inode_slot(ino)?;
 
+        // On a metadata_csum volume, stamp i_checksum_lo/hi over the final raw
+        // inode at both writeback funnels (Linux `ext4_inode_csum_set`). `None`
+        // when the feature is off keeps the raw inode byte-for-byte unchanged.
+        let inode_csum = {
+            let sb = self.super_block.read();
+            sb.has_metadata_csum()
+                .then(|| (sb.metadata_csum_seed(), sb.inode_size()))
+        };
+
         // Journaled path: the on-disk inode may be **stale** — a prior write to it
         // was suppressed (WAL) and has not yet been checkpointed — so a
         // read-modify-write from the device would resurrect that block's zeroed
@@ -1134,6 +1148,9 @@ impl Ext4 {
             if let Some(next) = chain.successor_of(ino) {
                 // `0 = end of chain` is the on-disk convention (encode boundary).
                 raw.dtime = next.unwrap_or(0);
+            }
+            if let Some((seed, inode_size)) = inode_csum {
+                InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
             }
             return slot.journal_write(handle, &raw);
         }
@@ -1189,6 +1206,10 @@ impl Ext4 {
         // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
         raw.dtime = desc.raw_dtime();
 
+        if let Some((seed, inode_size)) = inode_csum {
+            InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
+        }
+
         self.block_device
             .write_val(slot.device_offset(), &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
@@ -1212,7 +1233,18 @@ impl Ext4 {
     ) -> Result<()> {
         let slot = self.inode_slot(ino)?;
 
-        let raw = desc.to_raw_inode(desc.raw_block());
+        let mut raw = desc.to_raw_inode(desc.raw_block());
+        {
+            let sb = self.super_block.read();
+            if sb.has_metadata_csum() {
+                InodeDesc::stamp_inode_checksum(
+                    &mut raw,
+                    ino,
+                    sb.metadata_csum_seed(),
+                    sb.inode_size(),
+                );
+            }
+        }
 
         slot.journal_write(handle, &raw)?;
         // See `write_back_inode_desc`: suppress the direct write under a handle so
