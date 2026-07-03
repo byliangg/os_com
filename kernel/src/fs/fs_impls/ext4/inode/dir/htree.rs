@@ -219,6 +219,37 @@ pub(super) fn dx_lookup_leaf(
     }
 }
 
+/// Returns the logical block numbers of this htree's **index** blocks — the
+/// dx_root (logical block 0) and, for a two-level tree, the dx_node blocks its
+/// root entries point at. The leaf blocks (which already hold the real entries
+/// in plain linear form) are *not* index blocks and are excluded, so degrading
+/// an htree to linear only has to rewrite these few blocks.
+pub(super) fn dx_index_blocks(
+    read_block: impl Fn(Ext4Bid) -> Result<[u8; BLOCK_SIZE]>,
+) -> Result<Vec<Ext4Bid>> {
+    let root_block = read_block(0)?;
+    let root = parse_dx_root(&root_block)?;
+    let mut blocks: Vec<Ext4Bid> = Vec::new();
+    blocks.push(0);
+    // indirect_levels == 0 is a depth-1 tree (root points straight at leaves), so
+    // block 0 is the only index block; == 1 adds the dx_node level the root
+    // entries reference.
+    if root.indirect_levels >= 1 {
+        let entries_off = DX_ROOT_INFO_OFF + root.info_length as usize;
+        let limit = read_le16(&root_block, entries_off) as usize;
+        let count = read_le16(&root_block, entries_off + 2) as usize;
+        if count < 1 || count > limit || entries_off + limit * DX_ENTRY_SIZE > BLOCK_SIZE {
+            return_errno_with_message!(Errno::EUCLEAN, "htree: dx entry count out of range");
+        }
+        for i in 0..count {
+            let block = Ext4Bid::from(read_le32(&root_block, entries_off + i * DX_ENTRY_SIZE + 4))
+                & Ext4Bid::from(DX_BLOCK_MASK);
+            blocks.push(block);
+        }
+    }
+    Ok(blocks)
+}
+
 #[cfg(ktest)]
 mod tests {
     use ostd::prelude::*;

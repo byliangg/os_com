@@ -18,7 +18,7 @@ use self::{
         DIR_TAIL_LEN, DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader,
         EXT4_FT_DIR_CSUM,
     },
-    htree::{DxCtx, dx_lookup_leaf},
+    htree::{DxCtx, dx_index_blocks, dx_lookup_leaf},
 };
 use super::{
     super::{checksum, fs::Ext4, journal, prelude::*, utils},
@@ -395,6 +395,105 @@ impl InodeInner {
 
     /// Inserts a new directory entry, growing the directory by one block when no
     /// existing block has a reusable slot.
+    /// Converts this htree directory to a plain linear one in place, so the
+    /// linear insert that follows cannot desync a (now removed) hash index —
+    /// the correctness core of P6d path C: we read htree indexes but never
+    /// maintain them, so before mutating an indexed directory we drop the index.
+    ///
+    /// Only the **index** blocks are rewritten: the dx_root (logical block 0)
+    /// becomes a bare `.`/`..` block — its `dx_root_info` and `dx_entries` were
+    /// index metadata, and every real entry already lives in a leaf block that is
+    /// left untouched — and any dx_node blocks become empty linear blocks. So
+    /// this touches O(index blocks) blocks (exactly one for the common depth-1
+    /// tree), always within one transaction, and never rewrites the O(n) leaves.
+    /// The `INDEX` flag is then cleared and persisted. (Rebuilding an htree —
+    /// `make_indexed_dir`/`do_split` — is deferred to a performance phase; a
+    /// degraded directory is a correct, if linearly-scanned, directory that
+    /// e2fsck accepts.)
+    fn degrade_htree_to_linear(
+        &mut self,
+        fs: &Ext4,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        let payload_len = self.dir_payload_len();
+        let has_csum = self.csum_seed.is_some();
+        let dot_len = DirEntryHeader::min_rec_len(DOT_BYTE.len()) as usize;
+
+        let index_blocks = {
+            let page_cache = self.page_cache()?;
+            let read_block = |logical: Ext4Bid| -> Result<[u8; BLOCK_SIZE]> {
+                page_cache
+                    .read_val(logical as usize * BLOCK_SIZE)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to read htree index block")
+                    })
+            };
+            dx_index_blocks(read_block)?
+        };
+
+        let page_cache = self.page_cache()?;
+        // Preserve `.`/`..` from the dx_root's fake entries (byte-identical to a
+        // linear dir's dot/dotdot headers).
+        let dot: DirEntryHeader = page_cache.read_val(0)?;
+        let dotdot: DirEntryHeader = page_cache.read_val(dot_len)?;
+        let self_ino = u32::from_le(dot.ino);
+        let parent_ino = u32::from_le(dotdot.ino);
+
+        // Rewrite block 0 as a linear `.`/`..` block, discarding the dead index.
+        page_cache.fill_zeros(0..BLOCK_SIZE)?;
+        let block0 = DirBlockView::create_view(page_cache, 0, BLOCK_SIZE);
+        block0.write_entry(
+            0,
+            DirEntryHeader {
+                ino: self_ino.to_le(),
+                rec_len: (dot_len as u16).to_le(),
+                name_len: DOT_BYTE.len() as u8,
+                file_type: DirEntryFileType::Dir as u8,
+            },
+            DOT_BYTE,
+        )?;
+        block0.write_entry(
+            dot_len,
+            DirEntryHeader {
+                ino: parent_ino.to_le(),
+                rec_len: ((payload_len - dot_len) as u16).to_le(),
+                name_len: DOT_DOT_BYTE.len() as u8,
+                file_type: DirEntryFileType::Dir as u8,
+            },
+            DOT_DOT_BYTE,
+        )?;
+        if has_csum {
+            block0.write_entry(payload_len, DirEntryHeader::dir_tail(), &[])?;
+        }
+
+        // Convert dx_node index blocks (depth-2 only) to empty linear blocks.
+        for &blk in &index_blocks[1..] {
+            let base = blk as usize * BLOCK_SIZE;
+            page_cache.fill_zeros(base..base + BLOCK_SIZE)?;
+            let view = DirBlockView::create_view(page_cache, base, BLOCK_SIZE);
+            view.write_entry(
+                0,
+                DirEntryHeader {
+                    ino: 0,
+                    rec_len: (payload_len as u16).to_le(),
+                    name_len: 0,
+                    file_type: DirEntryFileType::Unknown as u8,
+                },
+                &[],
+            )?;
+            if has_csum {
+                view.write_entry(payload_len, DirEntryHeader::dir_tail(), &[])?;
+            }
+        }
+
+        // Clear the INDEX flag and journal every converted block plus the inode.
+        self.remove_flags(FileFlags::INDEX);
+        for &blk in &index_blocks {
+            self.journal_dir_block(blk as usize * BLOCK_SIZE, handle)?;
+        }
+        self.write_back_inode_desc(fs, self_ino, handle)
+    }
+
     fn add_new_entry(
         &mut self,
         fs: &Ext4,
@@ -403,6 +502,12 @@ impl InodeInner {
         file_type: DirEntryFileType,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        // We never maintain an htree index on insert (path C); if this directory
+        // has one, degrade it to linear first so the linear insert below cannot
+        // leave the index inconsistent (which e2fsck would reject).
+        if self.desc.flags().contains(FileFlags::INDEX) && fs.super_block().has_dir_index() {
+            self.degrade_htree_to_linear(fs, handle)?;
+        }
         let slot = match self.find_dir_slot(name.len())? {
             Some(slot) => slot,
             None => self.grow_dir_block(fs, handle)?,
