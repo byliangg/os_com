@@ -16,7 +16,7 @@ use self::dir_entry::{
     EXT4_FT_DIR_CSUM,
 };
 use super::{
-    super::{checksum::crc32c, fs::Ext4, journal, prelude::*, utils},
+    super::{checksum, fs::Ext4, journal, prelude::*, utils},
     FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
 };
 use crate::fs::utils::NAME_MAX;
@@ -278,13 +278,13 @@ impl InodeInner {
         // `(char *)EXT4_DIRENT_TAIL - b_data == blocksize - sizeof(tail)`. The
         // result is stored in det_checksum, the block's last word.
         const CSUM_COVER: usize = BLOCK_SIZE - DIR_TAIL_LEN;
-        const DET_CHECKSUM_OFFSET: usize = BLOCK_SIZE - 4;
+        const DET_CHECKSUM_OFFSET: usize = BLOCK_SIZE - size_of::<u32>();
         let page_cache = self.page_cache()?;
         let block_offset = logical as usize * BLOCK_SIZE;
         let block: [u8; BLOCK_SIZE] = page_cache.read_val(block_offset).map_err(|_| {
             Error::with_message(Errno::EIO, "failed to read directory block for checksum")
         })?;
-        let csum = crc32c(seed, &block[..CSUM_COVER]);
+        let csum = checksum::crc32c(seed.get(), &block[..CSUM_COVER]);
         page_cache.write_val(block_offset + DET_CHECKSUM_OFFSET, &csum.to_le())?;
         Ok(())
     }
@@ -1336,7 +1336,7 @@ mod tests {
     /// the admission task.
     #[ktest]
     fn dir_tail_marker_and_checksum_formula() {
-        use super::{DIR_TAIL_LEN, DirEntryHeader, EXT4_FT_DIR_CSUM, crc32c};
+        use super::{DIR_TAIL_LEN, DirEntryHeader, EXT4_FT_DIR_CSUM, checksum};
 
         let tail = DirEntryHeader::dir_tail();
         assert_eq!(tail.ino, 0);
@@ -1351,14 +1351,14 @@ mod tests {
         block[..8].copy_from_slice(b"DIRDATA!");
         let seed = 0xD1E5;
         const COVER: usize = BLOCK_SIZE - DIR_TAIL_LEN;
-        let csum = crc32c(seed, &block[..COVER]);
+        let csum = checksum::crc32c(seed, &block[..COVER]);
         // Neither the tail's 8 header bytes nor its det_checksum word are covered.
         let mut probe = block;
         probe[COVER..].copy_from_slice(&[0xAB; DIR_TAIL_LEN]);
-        assert_eq!(crc32c(seed, &probe[..COVER]), csum);
+        assert_eq!(checksum::crc32c(seed, &probe[..COVER]), csum);
         // A covered byte is.
         probe[0] ^= 1;
-        assert_ne!(crc32c(seed, &probe[..COVER]), csum);
+        assert_ne!(checksum::crc32c(seed, &probe[..COVER]), csum);
     }
 
     #[ktest]

@@ -12,7 +12,12 @@
 
 use super::{
     super::{
-        super::{checksum::crc32c, fs::Ext4, journal, prelude::*},
+        super::{
+            checksum::{self, InodeCsumSeed},
+            fs::Ext4,
+            journal,
+            prelude::*,
+        },
         RAW_BLOCK_PTRS_LEN,
     },
     node::{
@@ -195,7 +200,7 @@ impl ExtentTree {
         len: u16,
         kind: ExtentKind,
         handle: Option<&journal::Handle>,
-        csum_seed: Option<u32>,
+        csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         let (mut extents, old_external) = self.flatten(fs)?;
         extents.push(Extent::new(iblock, len, pblock, kind));
@@ -233,7 +238,7 @@ impl ExtentTree {
         iblock: Iblock,
         len: u32,
         handle: Option<&journal::Handle>,
-        csum_seed: Option<u32>,
+        csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         let (extents, old_external) = self.flatten(fs)?;
 
@@ -321,7 +326,7 @@ impl ExtentTree {
         fs: &Ext4,
         new_size: usize,
         handle: Option<&journal::Handle>,
-        csum_seed: Option<u32>,
+        csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
@@ -451,7 +456,7 @@ impl ExtentTree {
         extents: &[Extent],
         old_external: &[Ext4Bid],
         handle: Option<&journal::Handle>,
-        csum_seed: Option<u32>,
+        csum_seed: Option<InodeCsumSeed>,
     ) -> Result<TreeDelta> {
         let device = fs.block_device().as_ref();
 
@@ -816,9 +821,10 @@ const EXTENT_TAIL_OFFSET: usize = ENTRY_SIZE * (1 + LEAF_MAX);
 /// crc32c of the node up to the tail, seeded with the owning inode's seed. Only
 /// external (full-block) leaf/interior nodes carry this tail; the inline root is
 /// covered by the inode checksum instead.
-fn stamp_extent_tail(block: &mut [u8], seed: u32) {
-    let csum = crc32c(seed, &block[..EXTENT_TAIL_OFFSET]);
-    block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4].copy_from_slice(&csum.to_le_bytes());
+fn stamp_extent_tail(block: &mut [u8], seed: InodeCsumSeed) {
+    let csum = checksum::crc32c(seed.get(), &block[..EXTENT_TAIL_OFFSET]);
+    block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + size_of::<u32>()]
+        .copy_from_slice(&csum.to_le_bytes());
 }
 
 /// Serializes `extents` into a full-block external leaf node at `bid`.
@@ -827,7 +833,7 @@ fn write_leaf_node(
     bid: Ext4Bid,
     extents: &[Extent],
     handle: Option<&journal::Handle>,
-    csum_seed: Option<u32>,
+    csum_seed: Option<InodeCsumSeed>,
 ) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
@@ -875,7 +881,7 @@ fn write_interior_node(
     bid: Ext4Bid,
     idx_entries: &[RawExtentIdx],
     handle: Option<&journal::Handle>,
-    csum_seed: Option<u32>,
+    csum_seed: Option<InodeCsumSeed>,
 ) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
@@ -1331,7 +1337,7 @@ mod tests {
     /// `ext4_extent_block_csum`).
     #[ktest]
     fn stamp_extent_tail_matches_crc32c() {
-        let seed = 0x1357_9bdfu32;
+        let seed = checksum::FsCsumSeed::new(0x1357_9bdf).derive_inode(1, 0);
         let mut block = [0u8; BLOCK_SIZE];
         for (i, b) in block.iter_mut().enumerate() {
             *b = (i % 251) as u8;
@@ -1345,7 +1351,10 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(stored, crc32c(seed, &block[..EXTENT_TAIL_OFFSET]));
+        assert_eq!(
+            stored,
+            checksum::crc32c(seed.get(), &block[..EXTENT_TAIL_OFFSET])
+        );
 
         // A single-byte change to the covered node re-stamps to a new value.
         block[0] ^= 0xFF;
@@ -1368,7 +1377,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let seed = 0x0bad_c0deu32;
+        let seed = checksum::FsCsumSeed::new(0x0bad_c0de).derive_inode(1, 0);
         let mut tree = ExtentTree::empty();
         // Five disjoint single-block extents overflow the inline root into one
         // external leaf (depth 1).
@@ -1403,6 +1412,9 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        assert_eq!(stored, crc32c(seed, &block[..EXTENT_TAIL_OFFSET]));
+        assert_eq!(
+            stored,
+            checksum::crc32c(seed.get(), &block[..EXTENT_TAIL_OFFSET])
+        );
     }
 }

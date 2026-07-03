@@ -13,7 +13,7 @@
 //! images with checksums disabled mount.
 
 use super::{
-    checksum::crc32c,
+    checksum::{self, FsCsumSeed},
     feature::{
         FeatureCompatSet, FeatureIncompatSet, FeatureRoCompatSet, INCOMPAT_SUPP, RO_COMPAT_SUPP,
     },
@@ -405,31 +405,31 @@ impl SuperBlock {
         &self.uuid
     }
 
-    /// Whether this volume carries crc32c metadata checksums (`metadata_csum`).
-    /// When false, every checksum compute/verify site is a no-op, so a
-    /// checksum-free image is handled byte-for-byte as in Phases 1–5.
+    /// Returns whether this volume carries crc32c metadata checksums
+    /// (`metadata_csum`). When false, every checksum compute/verify site is a
+    /// no-op, so a checksum-free image is handled byte-for-byte as in Phases 1–5.
     pub(super) fn has_metadata_csum(&self) -> bool {
         self.feature_ro_compat
             .contains(FeatureRoCompatSet::METADATA_CSUM)
     }
 
-    /// The per-filesystem checksum seed feeding the group-descriptor, inode,
-    /// bitmap, directory, and extent checksums: `crc32c(!0, uuid)`. (A
+    /// Returns the per-filesystem checksum seed feeding the group-descriptor,
+    /// inode, bitmap, directory, and extent checksums: `crc32c(!0, uuid)`. (A
     /// `csum_seed`-incompat volume, which would override this with an on-disk
     /// seed word, is refused at the incompat gate, so the UUID is authoritative.)
     /// The superblock's own checksum does not use this seed.
-    pub(super) fn metadata_csum_seed(&self) -> u32 {
-        crc32c(!0, &self.uuid)
+    pub(super) fn metadata_csum_seed(&self) -> FsCsumSeed {
+        FsCsumSeed::new(checksum::crc32c(!0, &self.uuid))
     }
 
-    /// crc32c of `raw`'s first [`S_CHECKSUM_OFFSET`] bytes: the superblock's own
-    /// checksum. Seeded with `!0` — the superblock, unlike group descriptors and
-    /// inodes, does not use the per-filesystem seed (Linux
+    /// Computes the crc32c of `raw`'s first [`S_CHECKSUM_OFFSET`] bytes: the
+    /// superblock's own checksum. Seeded with `!0` — the superblock, unlike group
+    /// descriptors and inodes, does not use the per-filesystem seed (Linux
     /// `ext4_superblock_csum`). The covered range stops short of `s_checksum`, so
     /// the result does not depend on the field's current value; a writer stores
     /// it straight back.
     pub(super) fn superblock_checksum(raw: &RawSuperBlock) -> u32 {
-        crc32c(!0, &raw.as_bytes()[..S_CHECKSUM_OFFSET])
+        checksum::crc32c(!0, &raw.as_bytes()[..S_CHECKSUM_OFFSET])
     }
 
     /// Verifies `raw`'s stored `s_checksum` (and that `s_checksum_type` names
@@ -766,7 +766,7 @@ pub(super) struct RawSuperBlock {
 
 /// Byte offset of `s_checksum` in the on-disk superblock (0x3FC): the crc32c
 /// covers exactly `[0, S_CHECKSUM_OFFSET)`, stopping short of the field itself.
-pub(super) const S_CHECKSUM_OFFSET: usize = 0x3FC;
+const S_CHECKSUM_OFFSET: usize = 0x3FC;
 
 /// Byte offset of `s_checksum_type` (0x175); `metadata_csum` requires it to name
 /// crc32c ([`CHECKSUM_TYPE_CRC32C`]).

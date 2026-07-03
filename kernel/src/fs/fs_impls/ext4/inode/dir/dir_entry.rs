@@ -28,8 +28,8 @@ pub(super) const EXT4_FT_DIR_CSUM: u8 = 0xDE;
 pub(super) const DIR_TAIL_LEN: usize = 12;
 
 impl DirEntryHeader {
-    /// The header of the fake tail entry that reserves the last [`DIR_TAIL_LEN`]
-    /// bytes of a directory block for its checksum.
+    /// Returns the header of the fake tail entry that reserves the last
+    /// [`DIR_TAIL_LEN`] bytes of a directory block for its checksum.
     pub(super) fn dir_tail() -> Self {
         Self {
             ino: 0,

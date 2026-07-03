@@ -16,7 +16,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    super::{journal, prelude::*},
+    super::{checksum::InodeCsumSeed, journal, prelude::*},
     RAW_BLOCK_PTRS_LEN,
 };
 
@@ -112,7 +112,7 @@ pub(super) struct ExtentManager {
     /// on. Threaded into every external-node write so leaf/interior blocks carry
     /// a correct extent-block tail checksum (`ext4_extent_block_csum`); `None`
     /// leaves those blocks byte-identical to the pre-feature layout.
-    csum_seed: Option<u32>,
+    csum_seed: Option<InodeCsumSeed>,
 }
 
 impl ExtentManager {
@@ -122,7 +122,7 @@ impl ExtentManager {
         sector_count: u64,
         fs: Weak<super::super::fs::Ext4>,
         npages: usize,
-        csum_seed: Option<u32>,
+        csum_seed: Option<InodeCsumSeed>,
     ) -> Result<Self> {
         Ok(Self {
             state: RwMutex::new(ExtentTree::try_new(root, sector_count)?),

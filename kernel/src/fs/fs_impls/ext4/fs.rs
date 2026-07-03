@@ -18,6 +18,7 @@ use device_id::DeviceId;
 
 use super::{
     block_group::BlockGroup,
+    checksum::FsCsumSeed,
     inode,
     inode::{FilePerm, Inode, InodeDesc, InodeSeed, RawInode},
     journal,
@@ -1157,8 +1158,9 @@ impl Ext4 {
                 // `0 = end of chain` is the on-disk convention (encode boundary).
                 raw.dtime = next.unwrap_or(0);
             }
-            if let Some((seed, inode_size)) = inode_csum {
-                InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
+            if let Some((fs_seed, inode_size)) = inode_csum {
+                let iseed = fs_seed.derive_inode(ino, raw.generation);
+                InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
             }
             return slot.journal_write(handle, &raw);
         }
@@ -1214,8 +1216,9 @@ impl Ext4 {
         // carries a non-zero `i_dtime`, matching ext4 on-disk semantics.
         raw.dtime = desc.raw_dtime();
 
-        if let Some((seed, inode_size)) = inode_csum {
-            InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
+        if let Some((fs_seed, inode_size)) = inode_csum {
+            let iseed = fs_seed.derive_inode(ino, raw.generation);
+            InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
         }
 
         self.block_device
@@ -1245,12 +1248,8 @@ impl Ext4 {
         {
             let sb = self.super_block.read();
             if sb.has_metadata_csum() {
-                InodeDesc::stamp_inode_checksum(
-                    &mut raw,
-                    ino,
-                    sb.metadata_csum_seed(),
-                    sb.inode_size(),
-                );
+                let iseed = sb.metadata_csum_seed().derive_inode(ino, raw.generation);
+                InodeDesc::stamp_inode_checksum(&mut raw, iseed, sb.inode_size());
             }
         }
 
@@ -1511,16 +1510,17 @@ impl InodeSlot {
         &self,
         handle: Option<&journal::Handle>,
         next: u32,
-        csum: Option<(Ext4Ino, u32, usize)>,
+        csum: Option<(Ext4Ino, FsCsumSeed, usize)>,
     ) -> Result<()> {
         let off = self.offset_in_block;
         let dtime_off = off + core::mem::offset_of!(RawInode, dtime);
         journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
             |buf| {
                 buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
-                if let Some((ino, seed, inode_size)) = csum {
+                if let Some((ino, fs_seed, inode_size)) = csum {
                     let mut raw = RawInode::from_bytes(&buf[off..off + size_of::<RawInode>()]);
-                    InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
+                    let iseed = fs_seed.derive_inode(ino, raw.generation);
+                    InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
                     buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
                 }
             },

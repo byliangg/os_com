@@ -16,6 +16,8 @@
 //! `~0`) therefore equals `!crc32c(!0, b"123456789")` here — the outer `!`
 //! being the caller-side xorout that ext4 does not use internally.
 
+use super::inode::Ext4Ino;
+
 /// The CRC-32C lookup table, one 32-bit residue per possible input byte,
 /// generated at compile time from the reflected polynomial `0x82F63B78`.
 const CRC32C_TABLE: [u32; 256] = {
@@ -51,6 +53,38 @@ pub(super) fn crc32c(seed: u32, data: &[u8]) -> u32 {
         crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ byte as u32) & 0xFF) as usize];
     }
     crc
+}
+
+/// The per-filesystem metadata_csum seed (`crc32c(!0, uuid)`): feeds the group
+/// descriptor and bitmap checksums directly, and folds into a per-inode seed for
+/// the inode, directory-block, and extent-node checksums.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FsCsumSeed(u32);
+
+impl FsCsumSeed {
+    pub(super) fn new(seed: u32) -> Self {
+        Self(seed)
+    }
+
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Folds `ino` and `generation` into the fs seed (Linux `ext4_inode_csum_seed`).
+    pub(super) fn derive_inode(self, ino: Ext4Ino, generation: u32) -> InodeCsumSeed {
+        let s = crc32c(self.0, &ino.to_le_bytes());
+        InodeCsumSeed(crc32c(s, &generation.to_le_bytes()))
+    }
+}
+
+/// The per-inode metadata_csum seed `crc32c(crc32c(fs_seed, ino), generation)`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InodeCsumSeed(u32);
+
+impl InodeCsumSeed {
+    pub(super) fn get(self) -> u32 {
+        self.0
+    }
 }
 
 #[cfg(ktest)]

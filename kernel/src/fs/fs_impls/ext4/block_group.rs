@@ -42,7 +42,7 @@
 use core::fmt;
 
 use super::{
-    checksum::crc32c,
+    checksum::{self, FsCsumSeed},
     fs::Ext4,
     inode::{Inode, InodeDesc, RawInode},
     journal,
@@ -151,8 +151,8 @@ impl BlockGroupDesc {
         }
     }
 
-    /// The crc32c group-descriptor checksum (`metadata_csum`), low 16 bits
-    /// (Linux `ext4_group_desc_csum`). Seeded with the per-filesystem `seed`,
+    /// Computes the crc32c group-descriptor checksum (`metadata_csum`), low 16
+    /// bits (Linux `ext4_group_desc_csum`). Seeded with the per-filesystem `seed`,
     /// then folded over the 0-based `group` number, the descriptor bytes up to
     /// `bg_checksum`, two zero bytes standing in for `bg_checksum` itself, and —
     /// for a 64-byte (`64BIT`) descriptor — the 32-byte high-half tail.
@@ -160,24 +160,24 @@ impl BlockGroupDesc {
         lo: &RawBlockGroup,
         hi: Option<&RawBlockGroupHi>,
         group: u32,
-        seed: u32,
+        seed: FsCsumSeed,
     ) -> u16 {
         // Byte offset of `bg_checksum` within the 32-byte low half.
         const BG_CHECKSUM_OFFSET: usize = 30;
-        let mut crc = crc32c(seed, &group.to_le_bytes());
-        crc = crc32c(crc, &lo.as_bytes()[..BG_CHECKSUM_OFFSET]);
-        crc = crc32c(crc, &[0u8, 0u8]); // bg_checksum, excluded from its own cover
+        let mut crc = checksum::crc32c(seed.get(), &group.to_le_bytes());
+        crc = checksum::crc32c(crc, &lo.as_bytes()[..BG_CHECKSUM_OFFSET]);
+        crc = checksum::crc32c(crc, &[0u8, 0u8]); // bg_checksum, excluded from its own cover
         if let Some(hi) = hi {
-            crc = crc32c(crc, hi.as_bytes());
+            crc = checksum::crc32c(crc, hi.as_bytes());
         }
         (crc & 0xFFFF) as u16
     }
 
-    /// The fixed crc32c checksum of a bitmap block (Linux
+    /// Computes the fixed crc32c checksum of a bitmap block (Linux
     /// `ext4_block/inode_bitmap_csum`): crc32c of its first `len` bytes
     /// (`blocks_per_group / 8` or `ceil(inodes_per_group / 8)`).
-    fn bitmap_checksum(seed: u32, bitmap: &[u8], len: usize) -> u32 {
-        crc32c(seed, &bitmap[..len])
+    fn bitmap_checksum(seed: FsCsumSeed, bitmap: &[u8], len: usize) -> u32 {
+        checksum::crc32c(seed.get(), &bitmap[..len])
     }
 
     /// Stamps the `metadata_csum` fields into decoded descriptor halves: the two
@@ -187,7 +187,7 @@ impl BlockGroupDesc {
         lo: &mut RawBlockGroup,
         mut hi: Option<&mut RawBlockGroupHi>,
         group: u32,
-        seed: u32,
+        seed: FsCsumSeed,
         block_bitmap_csum: u32,
         inode_bitmap_csum: u32,
     ) {
@@ -206,7 +206,7 @@ impl BlockGroupDesc {
         lo: &RawBlockGroup,
         hi: Option<&RawBlockGroupHi>,
         group: u32,
-        seed: u32,
+        seed: FsCsumSeed,
     ) -> Result<()> {
         if lo.checksum != Self::group_desc_checksum(lo, hi, group, seed) {
             return_errno_with_message!(Errno::EUCLEAN, "bad group descriptor checksum");
@@ -344,7 +344,7 @@ pub(super) struct BlockGroup {
     /// The per-filesystem crc32c seed when `metadata_csum` is on, else `None`
     /// (checksums are a no-op). Cached from the superblock at load so `reload`
     /// and the inode read path can verify without holding a `SuperBlock`.
-    csum_seed: Option<u32>,
+    csum_seed: Option<FsCsumSeed>,
     /// Per-group live inode cache keyed by group-local inode index.
     ///
     /// Ext4 keeps this cache locally because the VFS layer does not provide a
@@ -446,7 +446,7 @@ impl BlockGroup {
         desc_offset: usize,
         desc_size: u16,
         group: u32,
-        csum_seed: Option<u32>,
+        csum_seed: Option<FsCsumSeed>,
     ) -> Result<BlockGroupDesc> {
         if desc_size as usize >= size_of::<RawBlockGroup64>() {
             let raw = device
@@ -627,7 +627,11 @@ impl BlockGroup {
             self.inode_table_bid() as usize * self.block_size + idx_in_group * self.inode_size;
         let raw = self.block_device.read_val::<RawInode>(offset)?;
         if let Some(seed) = self.csum_seed {
-            InodeDesc::verify_inode_checksum(&raw, ino, seed, self.inode_size)?;
+            InodeDesc::verify_inode_checksum(
+                &raw,
+                seed.derive_inode(ino, raw.generation),
+                self.inode_size,
+            )?;
         }
         InodeDesc::try_from(&raw)
     }
@@ -1197,7 +1201,7 @@ mod tests {
     /// a different group index do not verify.
     #[ktest]
     fn group_desc_checksum_round_trip() {
-        let seed = 0x1234_5678;
+        let seed = FsCsumSeed::new(0x1234_5678);
         let mut lo = RawBlockGroup {
             block_bitmap_lo: 0x10,
             inode_bitmap_lo: 0x11,
@@ -1218,7 +1222,10 @@ mod tests {
             Errno::EUCLEAN
         );
         // Wrong seed.
-        assert!(BlockGroupDesc::verify_group_desc_checksum(&lo, None, 7, seed ^ 1).is_err());
+        assert!(
+            BlockGroupDesc::verify_group_desc_checksum(&lo, None, 7, FsCsumSeed::new(0x1234_5679))
+                .is_err()
+        );
         // Corrupted body.
         let mut bad = lo;
         bad.free_blocks_count_lo = 101;
@@ -1229,7 +1236,7 @@ mod tests {
     /// checksum high halves) into `bg_checksum`, so a change there is caught.
     #[ktest]
     fn group_desc_checksum_covers_high_tail() {
-        let seed = 0xABCD;
+        let seed = FsCsumSeed::new(0xABCD);
         let lo = RawBlockGroup {
             block_bitmap_lo: 0x20,
             ..Default::default()
@@ -1258,7 +1265,7 @@ mod tests {
     /// bitmap after stamping is then detectable. 32-byte descriptor.
     #[ktest]
     fn stamp_checksums_round_trip_32() {
-        let seed = 0x0BAD_F00D;
+        let seed = FsCsumSeed::new(0x0BAD_F00D);
         let group = 4;
         let mut block_bitmap = vec![0u8; BLOCK_SIZE];
         block_bitmap[..8].copy_from_slice(&[0xFF, 0x0F, 0, 0, 0, 0, 0, 0]);
@@ -1278,11 +1285,11 @@ mod tests {
         BlockGroupDesc::verify_group_desc_checksum(&lo, None, group, seed).unwrap();
         assert_eq!(
             lo.block_bitmap_csum_lo,
-            crc32c(seed, &block_bitmap[..bb_len]) as u16
+            checksum::crc32c(seed.get(), &block_bitmap[..bb_len]) as u16
         );
         assert_eq!(
             lo.inode_bitmap_csum_lo,
-            crc32c(seed, &inode_bitmap[..ib_len]) as u16
+            checksum::crc32c(seed.get(), &inode_bitmap[..ib_len]) as u16
         );
 
         // Flipping a bitmap bit changes what a fresh stamp would store.
@@ -1297,7 +1304,7 @@ mod tests {
     /// offset within the block.
     #[ktest]
     fn stamp_desc_in_block_at_offset() {
-        let seed = 0x1357_9BDF;
+        let seed = FsCsumSeed::new(0x1357_9BDF);
         let block_device: Arc<dyn BlockDevice> = Arc::new(Ext4MemoryDisk::new(4));
         let group_idx = 3usize;
         let desc_offset = BLOCK_SIZE + group_idx * size_of::<RawBlockGroup>();
@@ -1338,7 +1345,7 @@ mod tests {
         BlockGroupDesc::verify_group_desc_checksum(&lo, None, group_idx as u32, seed).unwrap();
         assert_eq!(
             lo.block_bitmap_csum_lo,
-            crc32c(seed, &vec![0xFFu8; BLOCK_SIZE]) as u16
+            checksum::crc32c(seed.get(), &vec![0xFFu8; BLOCK_SIZE]) as u16
         );
     }
 
