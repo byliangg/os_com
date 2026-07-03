@@ -13,10 +13,6 @@
 //!
 //! All arithmetic is 32-bit wrapping, exactly as the C wraps `__u32`.
 
-// The hashing entry point and its helpers are exercised only by the ktest
-// vectors until the htree read path (P6d Task 3) calls them.
-#![cfg_attr(not(ktest), allow(dead_code))]
-
 /// Hash versions (`DX_HASH_*`, `ext4.h`). The `*_UNSIGNED` variants hash the
 /// name bytes as unsigned rather than signed `char`.
 pub(super) const DX_HASH_LEGACY: u8 = 0;
@@ -36,6 +32,8 @@ const EXT4_HTREE_EOF_32BIT: u32 = (1 << 31) - 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DirHash {
     pub hash: u32,
+    /// Feeds the hash-ordered readdir cursor, which stays linear (path C); the
+    /// lookup path keys only on `hash`. Kept for the on-disk hash's full result.
     pub minor_hash: u32,
 }
 

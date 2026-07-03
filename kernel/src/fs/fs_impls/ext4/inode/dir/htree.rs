@@ -20,14 +20,7 @@
 //! overlaying a struct), because the count/limit of the first entry slot is
 //! overlaid onto the hash word of `entries[0]` — a struct view would misread it.
 
-// The traversal is exercised only by the ktest vectors until the htree lookup
-// path (P6d Task 3) wires it into `InodeInner::lookup`.
-#![cfg_attr(not(ktest), allow(dead_code))]
-
-use super::{
-    super::super::prelude::*,
-    hash::{DX_HASH_TEA, ext4fs_dirhash},
-};
+use super::{super::super::prelude::*, hash, hash::DX_HASH_TEA};
 
 /// The filesystem-wide inputs to the htree name hash, snapshotted from the
 /// superblock so a directory lookup can probe the index without re-reading it.
@@ -46,7 +39,10 @@ const DX_ENTRY_SIZE: usize = 8;
 
 /// Byte offset of `entries[]` within a `dx_root` block: two 12-byte fake dirents
 /// (`.` and `..`, each an 8-byte header plus a 4-byte name field) followed by the
-/// 8-byte `dx_root_info`.
+/// 8-byte `dx_root_info`. Production derives the offset from the parsed
+/// `info_length` (`DX_ROOT_INFO_OFF + info_length`); this named constant is the
+/// spec value the ktest fixtures build against.
+#[cfg_attr(not(ktest), expect(dead_code))]
 const DX_ROOT_ENTRIES_OFF: usize = 32;
 
 /// Byte offset of `entries[]` within a `dx_node` block: a single 8-byte fake
@@ -80,6 +76,48 @@ fn read_le32(buf: &[u8], off: usize) -> u32 {
 /// Reads a little-endian `u16` at byte offset `off` in `buf`.
 fn read_le16(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+}
+
+/// A validated view of one index block's `dx_entry` array (a `dx_root`'s or a
+/// `dx_node`'s), decoded once at `off` within a full-block buffer.
+///
+/// `entries[0]`'s hash word is overlaid by `{ limit, count }` (Linux
+/// `dx_countlimit`), so the real index entries are `1..count`; entry 0 carries
+/// only the hash-0 catch-all block. Construction validates the `{limit,count}`
+/// header and that the declared array fits the block, so every later
+/// [`hash`](Self::hash)/[`block`](Self::block) read is in bounds (a malformed
+/// index is rejected here rather than read off the end).
+struct DxEntries<'a> {
+    buf: &'a [u8],
+    off: usize,
+    count: usize,
+}
+
+impl<'a> DxEntries<'a> {
+    fn parse(buf: &'a [u8], off: usize) -> Result<Self> {
+        let limit = read_le16(buf, off) as usize;
+        let count = read_le16(buf, off + 2) as usize;
+        if count < 1 || count > limit || off + limit * DX_ENTRY_SIZE > BLOCK_SIZE {
+            return_errno_with_message!(Errno::EUCLEAN, "htree: dx entry count out of range");
+        }
+        Ok(Self { buf, off, count })
+    }
+
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    /// The hash key of entry `i` (`dx_get_hash`); entry 0's slot is the overlaid
+    /// `{limit,count}`, so callers treat it as the implicit-0 floor.
+    fn hash(&self, i: usize) -> u32 {
+        read_le32(self.buf, self.off + i * DX_ENTRY_SIZE)
+    }
+
+    /// The child block of entry `i` (`dx_get_block`), masked to 28 bits.
+    fn block(&self, i: usize) -> Ext4Bid {
+        Ext4Bid::from(read_le32(self.buf, self.off + i * DX_ENTRY_SIZE + 4))
+            & Ext4Bid::from(DX_BLOCK_MASK)
+    }
 }
 
 /// The validated `dx_root_info` header of an htree directory's root block.
@@ -155,7 +193,7 @@ pub(super) fn dx_lookup_leaf(
     } else {
         root.hash_version
     };
-    let Some(dirhash) = ext4fs_dirhash(name, version, hash_seed) else {
+    let Some(dirhash) = hash::ext4fs_dirhash(name, version, hash_seed) else {
         // Unsupported hash (e.g. siphash): let the caller scan linearly.
         return Ok(None);
     };
@@ -173,34 +211,22 @@ pub(super) fn dx_lookup_leaf(
     let mut block_buf = root_block;
 
     loop {
-        // `entries[0]`'s first four bytes are overlaid by `{ limit, count }`; the
-        // real per-entry hash of the catch-all slot is implicitly 0.
-        let limit = read_le16(&block_buf, entries_off) as usize;
-        let count = read_le16(&block_buf, entries_off + 2) as usize;
-        // The declared entry array must fit the block, or the entry reads below
-        // would run off the end of a malformed index block (Linux validates the
-        // exact `dx_{root,node}_limit`; the fit bound is what keeps reads safe).
-        if count < 1 || count > limit || entries_off + limit * DX_ENTRY_SIZE > BLOCK_SIZE {
-            return_errno_with_message!(Errno::EUCLEAN, "htree: dx entry count out of range");
-        }
+        let entries = DxEntries::parse(&block_buf, entries_off)?;
 
         // Binary search entries[1..count] for the last entry whose hash does not
         // exceed the target; entry 0 (hash 0, the catch-all) is the floor, so
         // `at` is 0 when every real entry sorts above the target.
         let mut p: usize = 1;
-        let mut q: usize = count - 1;
+        let mut q: usize = entries.count() - 1;
         while p <= q {
             let m = p + (q - p) / 2;
-            if read_le32(&block_buf, entries_off + m * DX_ENTRY_SIZE) > target {
+            if entries.hash(m) > target {
                 q = m - 1;
             } else {
                 p = m + 1;
             }
         }
-        let at = p - 1;
-
-        let block = Ext4Bid::from(read_le32(&block_buf, entries_off + at * DX_ENTRY_SIZE + 4))
-            & Ext4Bid::from(DX_BLOCK_MASK);
+        let block = entries.block(p - 1);
 
         // A block that reappears on the path back to the root is a cycle.
         if blocks[..=(level as usize)].contains(&block) {
@@ -235,16 +261,9 @@ pub(super) fn dx_index_blocks(
     // block 0 is the only index block; == 1 adds the dx_node level the root
     // entries reference.
     if root.indirect_levels >= 1 {
-        let entries_off = DX_ROOT_INFO_OFF + root.info_length as usize;
-        let limit = read_le16(&root_block, entries_off) as usize;
-        let count = read_le16(&root_block, entries_off + 2) as usize;
-        if count < 1 || count > limit || entries_off + limit * DX_ENTRY_SIZE > BLOCK_SIZE {
-            return_errno_with_message!(Errno::EUCLEAN, "htree: dx entry count out of range");
-        }
-        for i in 0..count {
-            let block = Ext4Bid::from(read_le32(&root_block, entries_off + i * DX_ENTRY_SIZE + 4))
-                & Ext4Bid::from(DX_BLOCK_MASK);
-            blocks.push(block);
+        let entries = DxEntries::parse(&root_block, DX_ROOT_INFO_OFF + root.info_length as usize)?;
+        for i in 0..entries.count() {
+            blocks.push(entries.block(i));
         }
     }
     Ok(blocks)
@@ -256,7 +275,10 @@ mod tests {
 
     // Explicit `Result` shadows the two glob imports (kernel + ostd preludes),
     // fixing the closure return type to the kernel `Result` `dx_lookup_leaf` uses.
-    use super::{super::hash::DX_HASH_HALF_MD4, Result, *};
+    use super::{
+        super::hash::{DX_HASH_HALF_MD4, ext4fs_dirhash},
+        Result, *,
+    };
 
     /// Seed and known hashes reused from the `hash.rs` reference vectors (signed
     /// half-MD4, the mkfs default): `ext4fs_dirhash(b"file0", HALF_MD4, seed)`.

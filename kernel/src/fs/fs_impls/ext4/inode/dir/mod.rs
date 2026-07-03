@@ -18,7 +18,7 @@ use self::{
         DIR_TAIL_LEN, DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader,
         EXT4_FT_DIR_CSUM,
     },
-    htree::{DxCtx, dx_index_blocks, dx_lookup_leaf},
+    htree::DxCtx,
 };
 use super::{
     super::{checksum, fs::Ext4, journal, prelude::*, utils},
@@ -393,8 +393,6 @@ impl InodeInner {
         Ok(())
     }
 
-    /// Inserts a new directory entry, growing the directory by one block when no
-    /// existing block has a reusable slot.
     /// Converts this htree directory to a plain linear one in place, so the
     /// linear insert that follows cannot desync a (now removed) hash index —
     /// the correctness core of P6d path C: we read htree indexes but never
@@ -428,7 +426,7 @@ impl InodeInner {
                         Error::with_message(Errno::EIO, "failed to read htree index block")
                     })
             };
-            dx_index_blocks(read_block)?
+            htree::dx_index_blocks(read_block)?
         };
 
         let page_cache = self.page_cache()?;
@@ -494,6 +492,8 @@ impl InodeInner {
         self.write_back_inode_desc(fs, self_ino, handle)
     }
 
+    /// Inserts a new directory entry, growing the directory by one block when no
+    /// existing block has a reusable slot.
     fn add_new_entry(
         &mut self,
         fs: &Ext4,
@@ -600,7 +600,8 @@ impl InodeInner {
                         Error::with_message(Errno::EIO, "failed to read htree index block")
                     })
             };
-            if let Ok(Some(leaf)) = dx_lookup_leaf(read_block, name_bytes, &dx.seed, dx.unsigned)
+            if let Ok(Some(leaf)) =
+                htree::dx_lookup_leaf(read_block, name_bytes, &dx.seed, dx.unsigned)
                 && let Some(info) = self.scan_block_for_name(leaf as usize, name_bytes)?
             {
                 return Ok(info);

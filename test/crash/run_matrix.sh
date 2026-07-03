@@ -60,7 +60,7 @@ rm -f "$BUILD/xfstests_test.img" "$BUILD/xfstests_scratch.img" \
 mkdir -p "$BUILD"
 truncate -s 2G "$BUILD/xfstests_test.img"
 mke2fs -F -q -t ext4 -b 4096 -I 256 \
-    -O has_journal,extent,filetype,^metadata_csum,^dir_index,^64bit,^flex_bg,^inline_data,^resize_inode,^uninit_bg \
+    -O has_journal,extent,filetype,metadata_csum,dir_index,64bit,flex_bg,^inline_data \
     -d "$STAGE/root" "$BUILD/xfstests_test.img"
 PRISTINE=$STAGE/pristine.img
 cp --sparse=always "$BUILD/xfstests_test.img" "$PRISTINE"
