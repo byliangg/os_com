@@ -29,6 +29,18 @@ use super::{
     hash::{DX_HASH_TEA, ext4fs_dirhash},
 };
 
+/// The filesystem-wide inputs to the htree name hash, snapshotted from the
+/// superblock so a directory lookup can probe the index without re-reading it.
+/// Built by the caller only for a `dir_index` volume; a directory that carries
+/// the `INDEX` flag is then probed, and any miss falls back to a linear scan.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DxCtx {
+    /// The `s_hash_seed` words.
+    pub seed: [u32; 4],
+    /// Whether name bytes hash as unsigned `char` (`s_flags` bit).
+    pub unsigned: bool,
+}
+
 /// Size of one on-disk `struct dx_entry` (`{ __le32 hash, __le32 block }`).
 const DX_ENTRY_SIZE: usize = 8;
 
@@ -163,12 +175,14 @@ pub(super) fn dx_lookup_leaf(
     loop {
         // `entries[0]`'s first four bytes are overlaid by `{ limit, count }`; the
         // real per-entry hash of the catch-all slot is implicitly 0.
-        let limit = read_le16(&block_buf, entries_off);
-        let count = read_le16(&block_buf, entries_off + 2);
-        if count < 1 || count > limit {
+        let limit = read_le16(&block_buf, entries_off) as usize;
+        let count = read_le16(&block_buf, entries_off + 2) as usize;
+        // The declared entry array must fit the block, or the entry reads below
+        // would run off the end of a malformed index block (Linux validates the
+        // exact `dx_{root,node}_limit`; the fit bound is what keeps reads safe).
+        if count < 1 || count > limit || entries_off + limit * DX_ENTRY_SIZE > BLOCK_SIZE {
             return_errno_with_message!(Errno::EUCLEAN, "htree: dx entry count out of range");
         }
-        let count = count as usize;
 
         // Binary search entries[1..count] for the last entry whose hash does not
         // exceed the target; entry 0 (hash 0, the catch-all) is the floor, so
@@ -368,6 +382,20 @@ mod tests {
         let mut root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 10), (0x2000_0000, 11)]);
         // Overwrite count (le16 at entries_off + 2) with 0.
         root[DX_ROOT_ENTRIES_OFF + 2..DX_ROOT_ENTRIES_OFF + 4].copy_from_slice(&0u16.to_le_bytes());
+        let err =
+            dx_lookup_leaf(|b| single_block(b, &root), b"file0", &MD4_SEED, false).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+    }
+
+    /// A `limit` whose entry array cannot fit the block is rejected rather than
+    /// read off the end — a crafted index must not panic the kernel.
+    #[ktest]
+    fn descent_rejects_oversize_limit() {
+        let mut root = build_dx_root(DX_HASH_HALF_MD4, 0, &[(0, 10), (0x2000_0000, 11)]);
+        // Overwrite limit (le16 at entries_off) with a value far larger than the
+        // block can hold; count stays 2 (valid), so only the fit bound catches it.
+        root[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 2]
+            .copy_from_slice(&60_000u16.to_le_bytes());
         let err =
             dx_lookup_leaf(|b| single_block(b, &root), b"file0", &MD4_SEED, false).unwrap_err();
         assert_eq!(err.error(), Errno::EUCLEAN);

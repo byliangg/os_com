@@ -590,7 +590,6 @@ impl SuperBlock {
     }
 
     /// Returns the four-word htree name-hash seed (`s_hash_seed`).
-    #[expect(dead_code)]
     pub(super) fn hash_seed(&self) -> &[u32; 4] {
         &self.hash_seed
     }
@@ -598,14 +597,12 @@ impl SuperBlock {
     /// Returns whether the on-disk htree hashes treat name bytes as unsigned
     /// `char` (`s_flags & EXT2_FLAGS_UNSIGNED_HASH`); `dx_probe` adds this to the
     /// root's hash version to pick the matching variant.
-    #[expect(dead_code)]
     pub(super) fn hash_unsigned(&self) -> bool {
         self.hash_unsigned
     }
 
     /// Returns whether the volume carries htree directory indexes
     /// (`COMPAT_DIR_INDEX`); a directory can only be probed as an htree when set.
-    #[expect(dead_code)]
     pub(super) fn has_dir_index(&self) -> bool {
         self.feature_compat.contains(FeatureCompatSet::DIR_INDEX)
     }

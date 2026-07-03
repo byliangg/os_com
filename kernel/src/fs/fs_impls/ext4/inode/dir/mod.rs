@@ -13,9 +13,12 @@ mod htree;
 
 use ostd::sync::RwMutexWriteGuard;
 
-use self::dir_entry::{
-    DIR_TAIL_LEN, DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader,
-    EXT4_FT_DIR_CSUM,
+use self::{
+    dir_entry::{
+        DIR_TAIL_LEN, DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader,
+        EXT4_FT_DIR_CSUM,
+    },
+    htree::{DxCtx, dx_lookup_leaf},
 };
 use super::{
     super::{checksum, fs::Ext4, journal, prelude::*, utils},
@@ -49,6 +52,17 @@ struct DirEntryInfo {
     dir_offset: usize,
     /// `rec_len` of the entry.
     entry_rec_len: usize,
+}
+
+/// Builds the htree hash context for a lookup on `fs`, or `None` when the volume
+/// has no `dir_index` feature (so every directory is scanned linearly). A
+/// directory that carries the `INDEX` flag is then probed via this context.
+fn dx_ctx(fs: &Ext4) -> Option<DxCtx> {
+    let sb = fs.super_block();
+    sb.has_dir_index().then(|| DxCtx {
+        seed: *sb.hash_seed(),
+        unsigned: sb.hash_unsigned(),
+    })
 }
 
 impl InodeInner {
@@ -406,7 +420,7 @@ impl InodeInner {
         new_file_type: DirEntryFileType,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        let entry_info = self.find_entry_info(name)?;
+        let entry_info = self.find_entry_info(name, None)?;
         self.set_entry_target(&entry_info, new_ino, new_file_type, handle)
     }
 
@@ -430,33 +444,70 @@ impl InodeInner {
         Ok(())
     }
 
+    /// Scans one directory logical block for `name`, returning the located entry
+    /// or `None` if it is not in this block.
+    fn scan_block_for_name(
+        &self,
+        block_idx: usize,
+        name_bytes: &[u8],
+    ) -> Result<Option<DirEntryInfo>> {
+        let file_size = self.file_size();
+        let block_offset = block_idx * BLOCK_SIZE;
+        let block = DirBlockView::from_index(self.page_cache()?, block_idx, file_size);
+        let mut iter = block.iter_entries();
+        while let Some((entry_offset, entry)) = iter.next_entry()? {
+            let ino = entry.header.ino;
+            if ino == 0 || entry.name != name_bytes {
+                continue;
+            }
+            return Ok(Some(DirEntryInfo {
+                ino,
+                dir_offset: block_offset + entry_offset,
+                entry_rec_len: entry.header.rec_len as usize,
+            }));
+        }
+        Ok(None)
+    }
+
     /// Locates a live entry by name, recording where it sits for deletion.
-    fn find_entry_info(&self, name: &str) -> Result<DirEntryInfo> {
+    ///
+    /// On a `dir_index` volume `dx` carries the hash inputs; when this directory
+    /// also has the `INDEX` flag, the htree index is probed to the single leaf
+    /// block that may hold the name and only that block is scanned (O(log n)). A
+    /// probe miss — an unsupported hash, a corrupt index, or a hash collision
+    /// that spilled the name into a neighbouring leaf — falls through to the
+    /// linear scan, which is always correct: the index is an accelerator, never
+    /// the source of truth (Linux falls back the same way on `ERR_BAD_DX_DIR`).
+    fn find_entry_info(&self, name: &str, dx: Option<&DxCtx>) -> Result<DirEntryInfo> {
         if self.desc.type_() != InodeType::Dir {
             return_errno!(Errno::ENOTDIR);
         }
-
-        let file_size = self.file_size();
         let name_bytes = name.as_bytes();
-        let page_cache = self.page_cache()?;
 
-        for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
-            let block_offset = block_idx * BLOCK_SIZE;
-            let block = DirBlockView::from_index(page_cache, block_idx, file_size);
-            let mut iter = block.iter_entries();
-            while let Some((entry_offset, entry)) = iter.next_entry()? {
-                let ino = entry.header.ino;
-                if ino == 0 || entry.name != name_bytes {
-                    continue;
-                }
-                return Ok(DirEntryInfo {
-                    ino,
-                    dir_offset: block_offset + entry_offset,
-                    entry_rec_len: entry.header.rec_len as usize,
-                });
+        if let Some(dx) = dx
+            && self.desc.flags().contains(FileFlags::INDEX)
+        {
+            let page_cache = self.page_cache()?;
+            let read_block = |logical: Ext4Bid| -> Result<[u8; BLOCK_SIZE]> {
+                page_cache
+                    .read_val(logical as usize * BLOCK_SIZE)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to read htree index block")
+                    })
+            };
+            if let Ok(Some(leaf)) = dx_lookup_leaf(read_block, name_bytes, &dx.seed, dx.unsigned)
+                && let Some(info) = self.scan_block_for_name(leaf as usize, name_bytes)?
+            {
+                return Ok(info);
             }
         }
 
+        let file_size = self.file_size();
+        for block_idx in 0..file_size.div_ceil(BLOCK_SIZE) {
+            if let Some(info) = self.scan_block_for_name(block_idx, name_bytes)? {
+                return Ok(info);
+            }
+        }
         return_errno!(Errno::ENOENT)
     }
 
@@ -574,11 +625,15 @@ impl InodeInner {
 impl Inode {
     /// Looks up a child entry by name and reads its inode.
     pub(in crate::fs::fs_impls::ext4) fn lookup(&self, name: &str) -> Result<Arc<Inode>> {
-        let ino = self.inner.read().find_entry_info(name)?.ino;
         let fs = self
             .fs
             .upgrade()
             .ok_or_else(|| Error::with_message(Errno::EIO, "filesystem dropped"))?;
+        let ino = self
+            .inner
+            .read()
+            .find_entry_info(name, dx_ctx(&fs).as_ref())?
+            .ino;
         fs.read_inode(ino)
     }
 
@@ -791,11 +846,11 @@ impl Inode {
     /// reclaimed by the last surviving `Arc` (see the drop-order note below).
     /// Mirrors ext2 `Inode::unlink`.
     pub(in crate::fs::fs_impls::ext4) fn unlink(&self, name: &str) -> Result<()> {
+        let fs = self.fs()?;
         let entry_info = {
             let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
+            parent_inner.find_entry_info(name, dx_ctx(&fs).as_ref())?
         };
-        let fs = self.fs()?;
 
         // CRITICAL drop ordering (mirrors ext2): `child` is declared *before*
         // `guards`, so at scope end Rust drops `guards` first (reverse
@@ -858,11 +913,11 @@ impl Inode {
     /// Mirrors ext2 `Inode::rmdir`. The same `child`-before-`guards` drop
     /// ordering as [`unlink`](Self::unlink) is required and observed here.
     pub(in crate::fs::fs_impls::ext4) fn rmdir(&self, name: &str) -> Result<()> {
+        let fs = self.fs()?;
         let entry_info = {
             let parent_inner = self.inner.read();
-            parent_inner.find_entry_info(name)?
+            parent_inner.find_entry_info(name, dx_ctx(&fs).as_ref())?
         };
-        let fs = self.fs()?;
 
         // CRITICAL drop ordering: `child` declared before `guards` so the multi-
         // inode lock is released before `child` drops and its `Drop` reclaim
@@ -986,7 +1041,10 @@ impl Inode {
         // which inodes to lock in step 2, and the full `DirEntryInfo` feeds the
         // cross-directory delete (the VFS `DirDentry.children` lock keeps the
         // entry stable across the gap, the same argument unlink/rmdir rely on).
-        let old_info = self.inner.read().find_entry_info(old_name)?;
+        let old_info = self
+            .inner
+            .read()
+            .find_entry_info(old_name, dx_ctx(&fs).as_ref())?;
         let old_ino = old_info.ino;
 
         // CRITICAL drop ordering (mirrors ext2; same hazard as unlink/rmdir):
@@ -1000,7 +1058,7 @@ impl Inode {
         let replaced_inode = {
             let target_inner = target.inner.read();
             target_inner
-                .find_entry_info(new_name)
+                .find_entry_info(new_name, dx_ctx(&fs).as_ref())
                 .ok()
                 .map(|entry_info| fs.read_inode(entry_info.ino))
                 .transpose()?
@@ -1062,7 +1120,7 @@ impl Inode {
         // before we silently write a wrong `..` update.
         if old_inode.inode_type() == InodeType::Dir {
             let old_inner = guards.inner(old_inode.ino());
-            let parent_ino = old_inner.find_entry_info("..")?.ino;
+            let parent_ino = old_inner.find_entry_info("..", None)?.ino;
             if parent_ino != self.ino() {
                 return_errno_with_message!(Errno::EIO, "dotdot entry inconsistent with source dir");
             }
@@ -1134,7 +1192,7 @@ impl Inode {
             // directory and may have split the source entry (shrinking its
             // `rec_len`). The cross-directory branch below keeps the step-1
             // token instead, because there the source directory is untouched.
-            let old_info = dir_inner.find_entry_info(old_name)?;
+            let old_info = dir_inner.find_entry_info(old_name, dx_ctx(&fs).as_ref())?;
             dir_inner.delete_entry(&old_info, handle)?;
             // Replacing a directory with a directory in the same parent: the
             // parent loses the replaced directory's `..` back-reference.
@@ -1214,7 +1272,7 @@ impl Inode {
         // Step 4.3: repoint a moved directory's `..` at its new parent.
         let old_inner = guards.inner_mut(old_ino);
         if old_is_dir && !is_same_dir {
-            let dotdot_entry_info = old_inner.find_entry_info("..")?;
+            let dotdot_entry_info = old_inner.find_entry_info("..", None)?;
             old_inner.set_entry_target(
                 &dotdot_entry_info,
                 target.ino(),
@@ -1491,7 +1549,7 @@ mod tests {
     /// Collects the live entry names of a directory via `readdir_at`.
     /// Test shorthand: the ino of `name` in `dir` (the lookup path's walk).
     fn entry_ino(dir: &Inode, name: &str) -> Result<super::super::super::prelude::Ext4Ino> {
-        dir.inner.read().find_entry_info(name).map(|e| e.ino)
+        dir.inner.read().find_entry_info(name, None).map(|e| e.ino)
     }
 
     fn readdir_names(dir: &Inode) -> Vec<String> {
@@ -1522,9 +1580,18 @@ mod tests {
         }
 
         // Each name resolves to the inode it was added with.
-        assert_eq!(dir.inner.read().find_entry_info("alpha").unwrap().ino, 21);
-        assert_eq!(dir.inner.read().find_entry_info("beta").unwrap().ino, 22);
-        assert_eq!(dir.inner.read().find_entry_info("gamma").unwrap().ino, 23);
+        assert_eq!(
+            dir.inner.read().find_entry_info("alpha", None).unwrap().ino,
+            21
+        );
+        assert_eq!(
+            dir.inner.read().find_entry_info("beta", None).unwrap().ino,
+            22
+        );
+        assert_eq!(
+            dir.inner.read().find_entry_info("gamma", None).unwrap().ino,
+            23
+        );
         assert_eq!(
             entry_ino(&dir, "missing").unwrap_err().error(),
             Errno::ENOENT
@@ -1642,7 +1709,7 @@ mod tests {
         // Delete the middle entry; its space merges into `keep`.
         {
             let mut inner = dir.inner.write();
-            let info = inner.find_entry_info("victim").unwrap();
+            let info = inner.find_entry_info("victim", None).unwrap();
             inner.delete_entry(&info, None).unwrap();
         }
         assert_eq!(
@@ -1910,7 +1977,7 @@ mod tests {
         assert_eq!(
             dir.inner
                 .read()
-                .find_entry_info("doomed")
+                .find_entry_info("doomed", None)
                 .unwrap_err()
                 .error(),
             Errno::ENOENT
@@ -2424,7 +2491,7 @@ mod tests {
         let dir2_links_before = dir2.link_count();
         // `sub`'s `..` points at dir1.
         assert_eq!(
-            moved.inner.read().find_entry_info("..").unwrap().ino,
+            moved.inner.read().find_entry_info("..", None).unwrap().ino,
             dir1.ino()
         );
 
@@ -2434,7 +2501,7 @@ mod tests {
         assert_eq!(dir2.lookup("sub").unwrap().ino(), moved_ino);
         // `..` now points at dir2.
         assert_eq!(
-            moved.inner.read().find_entry_info("..").unwrap().ino,
+            moved.inner.read().find_entry_info("..", None).unwrap().ino,
             dir2.ino()
         );
         // Old parent lost the back-link, new parent gained one.
