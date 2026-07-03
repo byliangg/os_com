@@ -173,6 +173,33 @@ impl BlockGroupDesc {
         (crc & 0xFFFF) as u16
     }
 
+    /// The fixed crc32c checksum of a bitmap block (Linux
+    /// `ext4_block/inode_bitmap_csum`): crc32c of its first `len` bytes
+    /// (`blocks_per_group / 8` or `ceil(inodes_per_group / 8)`).
+    fn bitmap_checksum(seed: u32, bitmap: &[u8], len: usize) -> u32 {
+        crc32c(seed, &bitmap[..len])
+    }
+
+    /// Stamps the `metadata_csum` fields into decoded descriptor halves: the two
+    /// precomputed bitmap checksums (low 16 in `*_csum_lo`, high 16 in
+    /// `*_csum_hi` for a 64-byte descriptor), then `bg_checksum` over the result.
+    fn stamp_checksums(
+        lo: &mut RawBlockGroup,
+        mut hi: Option<&mut RawBlockGroupHi>,
+        group: u32,
+        seed: u32,
+        block_bitmap_csum: u32,
+        inode_bitmap_csum: u32,
+    ) {
+        lo.block_bitmap_csum_lo = block_bitmap_csum as u16;
+        lo.inode_bitmap_csum_lo = inode_bitmap_csum as u16;
+        if let Some(hi) = hi.as_deref_mut() {
+            hi.block_bitmap_csum_hi = (block_bitmap_csum >> 16) as u16;
+            hi.inode_bitmap_csum_hi = (inode_bitmap_csum >> 16) as u16;
+        }
+        lo.checksum = Self::group_desc_checksum(lo, hi.as_deref(), group, seed);
+    }
+
     /// Verifies a raw descriptor's stored `bg_checksum` for a `metadata_csum`
     /// volume, at the descriptor read boundary.
     fn verify_group_desc_checksum(
@@ -300,6 +327,9 @@ pub(super) struct BlockGroup {
     nr_inode_table_blocks_per_group: u32,
     /// Cached geometry: inodes per group.
     nr_inodes_per_group: u32,
+    /// Cached geometry: blocks per group (the nominal `s_blocks_per_group`, used
+    /// as the fixed block-bitmap checksum length, `blocks_per_group / 8`).
+    nr_blocks_per_group: u32,
     /// Cached geometry: inode size in bytes.
     inode_size: usize,
     /// Cached geometry: filesystem block size in bytes.
@@ -370,6 +400,7 @@ impl BlockGroup {
         };
         let nr_inode_table_blocks_per_group = sb.nr_inode_table_blocks_per_group();
         let nr_inodes_per_group = sb.nr_inodes_per_group();
+        let nr_blocks_per_group = sb.nr_blocks_per_group();
         let inode_size = sb.inode_size();
         let block_size = sb.block_size();
 
@@ -390,6 +421,7 @@ impl BlockGroup {
             last_block,
             nr_inode_table_blocks_per_group,
             nr_inodes_per_group,
+            nr_blocks_per_group,
             inode_size,
             block_size,
             desc_size,
@@ -526,6 +558,64 @@ impl BlockGroup {
         Ok(())
     }
 
+    /// Recomputes this group's `metadata_csum` fields — the two bitmap
+    /// checksums (from the final in-memory bitmaps) and `bg_checksum` — into a
+    /// decoded descriptor. A no-op when the feature is off.
+    ///
+    /// This is the compute half of `metadata_csum` on the descriptor: it runs at
+    /// every descriptor patch/writeback funnel (the journaled `patch_into` path
+    /// and the direct `sync_metadata` path), so whichever operation last touches
+    /// this group's descriptor in a transaction leaves it self-consistent. The
+    /// bitmap checksums are folded from the in-memory bitmaps, which are the
+    /// exact bytes written to the bitmap blocks in the same transaction, so the
+    /// stored `*_bitmap_csum` always matches the on-disk bitmap; because both are
+    /// captured in that one transaction, the cross-block dependency is atomic
+    /// (P6b red line 2).
+    fn stamp_desc_csum(
+        &self,
+        lo: &mut RawBlockGroup,
+        hi: Option<&mut RawBlockGroupHi>,
+        metadata: &BlockGroupMetadata,
+    ) {
+        let Some(seed) = self.csum_seed else {
+            return;
+        };
+        // Linux uses a fixed checksum length: `blocks_per_group / 8` for the
+        // block bitmap and `ceil(inodes_per_group / 8)` for the inode bitmap.
+        let bb_len = (self.nr_blocks_per_group / 8) as usize;
+        let ib_len = (self.nr_inodes_per_group as usize).div_ceil(8);
+        let bb_csum =
+            BlockGroupDesc::bitmap_checksum(seed, metadata.block_bitmap.as_bytes(), bb_len);
+        let ib_csum =
+            BlockGroupDesc::bitmap_checksum(seed, metadata.inode_bitmap.as_bytes(), ib_len);
+        BlockGroupDesc::stamp_checksums(lo, hi, self.group_idx as u32, seed, bb_csum, ib_csum);
+    }
+
+    /// Stamps this group's `metadata_csum` fields into the descriptor block image
+    /// `block` (the journaled after-image), at this group's `desc_offset` within
+    /// it. Decodes the low half (and, for a 64-byte descriptor, the high tail),
+    /// stamps via [`Self::stamp_desc_csum`], and writes them back. A no-op when
+    /// the feature is off.
+    fn stamp_desc_csum_in_block(&self, block: &mut [u8], metadata: &BlockGroupMetadata) {
+        if self.csum_seed.is_none() {
+            return;
+        }
+        let off = self.desc_offset % BLOCK_SIZE;
+        let mut lo = RawBlockGroup::from_bytes(&block[off..off + size_of::<RawBlockGroup>()]);
+        if self.desc_size as usize >= size_of::<RawBlockGroup64>() {
+            let hi_start = off + size_of::<RawBlockGroup>();
+            let mut hi = RawBlockGroupHi::from_bytes(
+                &block[hi_start..hi_start + size_of::<RawBlockGroupHi>()],
+            );
+            self.stamp_desc_csum(&mut lo, Some(&mut hi), metadata);
+            block[off..off + size_of::<RawBlockGroup>()].copy_from_slice(lo.as_bytes());
+            block[hi_start..hi_start + size_of::<RawBlockGroupHi>()].copy_from_slice(hi.as_bytes());
+        } else {
+            self.stamp_desc_csum(&mut lo, None, metadata);
+            block[off..off + size_of::<RawBlockGroup>()].copy_from_slice(lo.as_bytes());
+        }
+    }
+
     /// Loads and decodes an inode's on-disk descriptor from the inode table.
     ///
     /// The inode-table read stays a direct device read (no page cache in
@@ -660,8 +750,12 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?
-            .patch(|buf| metadata.desc.patch_into(buf, self.desc_offset))?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
+            |buf| {
+                metadata.desc.patch_into(buf, self.desc_offset);
+                self.stamp_desc_csum_in_block(buf, &metadata);
+            },
+        )?;
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
@@ -719,8 +813,12 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?
-            .patch(|buf| metadata.desc.patch_into(buf, self.desc_offset))?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
+            |buf| {
+                metadata.desc.patch_into(buf, self.desc_offset);
+                self.stamp_desc_csum_in_block(buf, &metadata);
+            },
+        )?;
 
         Ok(actually_freed)
     }
@@ -764,8 +862,12 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?
-            .patch(|buf| metadata.desc.patch_into(buf, self.desc_offset))?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
+            |buf| {
+                metadata.desc.patch_into(buf, self.desc_offset);
+                self.stamp_desc_csum_in_block(buf, &metadata);
+            },
+        )?;
 
         Ok(Some(inode_idx))
     }
@@ -824,8 +926,12 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?
-            .patch(|buf| metadata.desc.patch_into(buf, self.desc_offset))?;
+        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
+            |buf| {
+                metadata.desc.patch_into(buf, self.desc_offset);
+                self.stamp_desc_csum_in_block(buf, &metadata);
+            },
+        )?;
 
         Ok(true)
     }
@@ -877,18 +983,45 @@ impl BlockGroup {
         }
 
         if metadata.desc.is_dirty() {
-            let mut raw = self
-                .block_device
-                .read_val::<RawBlockGroup>(self.desc_offset)
-                .map_err(|_| {
-                    Error::with_message(Errno::EIO, "failed to read group descriptor for sync")
-                })?;
-            raw.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
-            raw.free_inodes_count_lo = metadata.desc.free_inodes_count() as u16;
-            raw.used_dirs_count_lo = metadata.desc.used_dirs_count() as u16;
-            self.block_device
-                .write_val(self.desc_offset, &raw)
-                .map_err(|_| Error::with_message(Errno::EIO, "failed to write group descriptor"))?;
+            // A 64-byte descriptor with checksums needs its high-tail csum fields
+            // rewritten too, so read/write the whole 64 bytes; otherwise the
+            // classic 32-byte low-half RMW (the high tail's other fields — block
+            // number highs — are unchanged by a counter update).
+            let wide =
+                self.desc_size as usize >= size_of::<RawBlockGroup64>() && self.csum_seed.is_some();
+            if wide {
+                let mut raw = self
+                    .block_device
+                    .read_val::<RawBlockGroup64>(self.desc_offset)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to read group descriptor for sync")
+                    })?;
+                raw.lo.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
+                raw.lo.free_inodes_count_lo = metadata.desc.free_inodes_count() as u16;
+                raw.lo.used_dirs_count_lo = metadata.desc.used_dirs_count() as u16;
+                self.stamp_desc_csum(&mut raw.lo, Some(&mut raw.hi), &metadata);
+                self.block_device
+                    .write_val(self.desc_offset, &raw)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to write group descriptor")
+                    })?;
+            } else {
+                let mut raw = self
+                    .block_device
+                    .read_val::<RawBlockGroup>(self.desc_offset)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to read group descriptor for sync")
+                    })?;
+                raw.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
+                raw.free_inodes_count_lo = metadata.desc.free_inodes_count() as u16;
+                raw.used_dirs_count_lo = metadata.desc.used_dirs_count() as u16;
+                self.stamp_desc_csum(&mut raw, None, &metadata);
+                self.block_device
+                    .write_val(self.desc_offset, &raw)
+                    .map_err(|_| {
+                        Error::with_message(Errno::EIO, "failed to write group descriptor")
+                    })?;
+            }
             metadata.desc.clear_dirty();
         }
 
@@ -1116,6 +1249,96 @@ mod tests {
         assert_ne!(
             BlockGroupDesc::group_desc_checksum(&lo, Some(&hi), 2, seed),
             csum
+        );
+    }
+
+    /// The write-side stamp (bitmap checksums into the descriptor, then
+    /// bg_checksum) round-trips through the read-side verify, and the stored
+    /// bitmap checksum equals a fresh crc32c of the bitmap. A change to the
+    /// bitmap after stamping is then detectable. 32-byte descriptor.
+    #[ktest]
+    fn stamp_checksums_round_trip_32() {
+        let seed = 0x0BAD_F00D;
+        let group = 4;
+        let mut block_bitmap = vec![0u8; BLOCK_SIZE];
+        block_bitmap[..8].copy_from_slice(&[0xFF, 0x0F, 0, 0, 0, 0, 0, 0]);
+        let mut inode_bitmap = vec![0u8; BLOCK_SIZE];
+        inode_bitmap[0] = 0x07;
+        let (bb_len, ib_len) = (BLOCK_SIZE, 1024);
+
+        let mut lo = RawBlockGroup {
+            free_blocks_count_lo: 42,
+            ..Default::default()
+        };
+        let bb_csum = BlockGroupDesc::bitmap_checksum(seed, &block_bitmap, bb_len);
+        let ib_csum = BlockGroupDesc::bitmap_checksum(seed, &inode_bitmap, ib_len);
+        BlockGroupDesc::stamp_checksums(&mut lo, None, group, seed, bb_csum, ib_csum);
+
+        // The descriptor now verifies, and its bitmap checksum matches.
+        BlockGroupDesc::verify_group_desc_checksum(&lo, None, group, seed).unwrap();
+        assert_eq!(
+            lo.block_bitmap_csum_lo,
+            crc32c(seed, &block_bitmap[..bb_len]) as u16
+        );
+        assert_eq!(
+            lo.inode_bitmap_csum_lo,
+            crc32c(seed, &inode_bitmap[..ib_len]) as u16
+        );
+
+        // Flipping a bitmap bit changes what a fresh stamp would store.
+        block_bitmap[2] = 0x01;
+        let new_bb_csum = BlockGroupDesc::bitmap_checksum(seed, &block_bitmap, bb_len);
+        assert_ne!(new_bb_csum as u16, lo.block_bitmap_csum_lo);
+    }
+
+    /// `stamp_desc_csum_in_block` decodes this group's descriptor from a block
+    /// image, stamps it, and writes it back so a later read verifies. Exercises
+    /// the journaled `patch_into` funnel's csum step at a non-zero descriptor
+    /// offset within the block.
+    #[ktest]
+    fn stamp_desc_in_block_at_offset() {
+        let seed = 0x1357_9BDF;
+        let block_device: Arc<dyn BlockDevice> = Arc::new(Ext4MemoryDisk::new(4));
+        let group_idx = 3usize;
+        let desc_offset = BLOCK_SIZE + group_idx * size_of::<RawBlockGroup>();
+
+        let block_bitmap = IdBitmap::from_buf(vec![0xFFu8; BLOCK_SIZE].into_boxed_slice(), 32768);
+        let inode_bitmap = IdBitmap::from_buf(vec![0x00u8; BLOCK_SIZE].into_boxed_slice(), 8192);
+        let desc = BlockGroupDesc::from_raw(&RawBlockGroup::default(), None);
+        let metadata = BlockGroupMetadata {
+            desc: Dirty::new(desc),
+            block_bitmap: Dirty::new(block_bitmap),
+            inode_bitmap: Dirty::new(inode_bitmap),
+        };
+
+        let bg = BlockGroup {
+            group_idx,
+            metadata: RwMutex::new(metadata),
+            block_device,
+            first_block: 0,
+            last_block: 32767,
+            nr_inode_table_blocks_per_group: 512,
+            nr_inodes_per_group: 8192,
+            nr_blocks_per_group: 32768,
+            inode_size: 256,
+            block_size: BLOCK_SIZE,
+            desc_size: 32,
+            desc_offset,
+            csum_seed: Some(seed),
+            inode_cache: RwMutex::new(BTreeMap::new()),
+        };
+
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let md = bg.metadata.read();
+        bg.stamp_desc_csum_in_block(&mut block, &md);
+
+        // The stamped descriptor at its offset verifies against the group index.
+        let off = desc_offset % BLOCK_SIZE;
+        let lo = RawBlockGroup::from_bytes(&block[off..off + size_of::<RawBlockGroup>()]);
+        BlockGroupDesc::verify_group_desc_checksum(&lo, None, group_idx as u32, seed).unwrap();
+        assert_eq!(
+            lo.block_bitmap_csum_lo,
+            crc32c(seed, &vec![0xFFu8; BLOCK_SIZE]) as u16
         );
     }
 
