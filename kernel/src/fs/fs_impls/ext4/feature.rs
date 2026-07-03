@@ -111,17 +111,21 @@ bitflags! {
 /// `FLEX_BG`: flex_bg only relocates each group's bitmaps and inode table, and
 /// those block numbers already come from the descriptor getters
 /// (`block_bitmap_bid` etc.), never from geometry, so the read/write paths need
-/// no change beyond admitting the bit. Other incompatible features (64-bit,
-/// csum_seed, ...) are added in later phases and must stay out of this mask
-/// until then, so an image needing them is rejected rather than silently
-/// misread. In particular `IS_64BIT` must not join this mask before the 64-byte
-/// descriptor decoder lands, or every group descriptor would be misread.
-/// (`HAS_JOURNAL` is a *compat* feature, handled by the journal loader, so it
-/// does not belong in this incompat mask.)
+/// no change beyond admitting the bit. Phase 6 also adds `IS_64BIT`: 64-byte
+/// group descriptors and the `s_*_count_hi` superblock halves are decoded wide
+/// (`BlockGroup::read_desc` strides by `s_desc_size` and splices the block-number
+/// high halves; `SuperBlock::try_from` splices the count high halves). This bit
+/// joins the mask **atomically with that decoder** — admitting it before the wide
+/// decode existed would misread every group descriptor as a truncated address.
+/// Other incompatible features (csum_seed, ...) are added in later phases and
+/// must stay out of this mask until then, so an image needing them is rejected
+/// rather than silently misread. (`HAS_JOURNAL` is a *compat* feature, handled by
+/// the journal loader, so it does not belong in this incompat mask.)
 pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYPE
     .union(FeatureIncompatSet::EXTENTS)
     .union(FeatureIncompatSet::RECOVER)
-    .union(FeatureIncompatSet::FLEX_BG);
+    .union(FeatureIncompatSet::FLEX_BG)
+    .union(FeatureIncompatSet::IS_64BIT);
 
 /// Read-only compatible features this implementation handles.
 ///

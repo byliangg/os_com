@@ -991,7 +991,9 @@ impl Ext4 {
                 .map_err(|_| {
                     Error::with_message(Errno::EIO, "failed to read superblock for sync")
                 })?;
-            raw.free_blocks_count = sb.free_blocks_count() as u32;
+            // Emit the free-block count's low half (and, under `64BIT`, its high
+            // half) through the single write-side splice, mirroring the read.
+            sb.write_free_blocks_count(&mut raw);
             raw.free_inodes_count = sb.free_inodes_count();
             raw.feature_incompat = sb.feature_incompat().bits();
             // `last_orphan` is deliberately NOT patched from memory: the

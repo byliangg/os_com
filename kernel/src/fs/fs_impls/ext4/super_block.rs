@@ -6,10 +6,11 @@
 //! ext4-specific fields live in the trailing reserved area. The group
 //! descriptor size (`s_desc_size`) is parsed here so `flex_bg` images mount
 //! (their bitmaps/tables come from the descriptor getters, so relocating them
-//! needs no geometry change); the 64-bit counts and checksum fields are parsed
-//! when later P6 tasks bring the features that need them. Until then only
-//! images with 64-bit and checksums disabled mount, so the shared
-//! 32-byte-descriptor layout suffices.
+//! needs no geometry change), and the `64BIT` high halves of the block counts
+//! (`s_blocks_count_hi` / `s_free_blocks_count_hi`) are spliced at the parse
+//! boundary so `> 2^32`-block volumes count correctly. The metadata-checksum
+//! fields are parsed when a later P6 task brings that feature; until then only
+//! images with checksums disabled mount.
 
 use super::{
     feature::{
@@ -35,6 +36,11 @@ const SUPER_BLOCK_SIZE: usize = 1024;
 /// Classic group-descriptor size in bytes, and the size forced when the `64BIT`
 /// feature is absent (Linux `EXT4_MIN_DESC_SIZE`).
 const MIN_DESC_SIZE: u16 = 32;
+
+/// Smallest group descriptor a `64BIT` volume may declare (Linux
+/// `EXT4_MIN_DESC_SIZE_64BIT`). With `64BIT` set, `s_desc_size` must be at
+/// least this — a smaller value contradicts the wide on-disk GDT stride.
+const MIN_DESC_SIZE_64BIT: u16 = 64;
 
 /// Widest group descriptor the `64BIT` feature defines (Linux
 /// `EXT4_MAX_DESC_SIZE`); the 64-byte descriptor carries the high halves and
@@ -136,9 +142,9 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         let feature_compat = FeatureCompatSet::from_bits_truncate(sb.feature_compat);
 
         // Resolve `s_desc_size` at this boundary into the effective descriptor
-        // size the group-descriptor decoder strides by. `IS_64BIT` is not yet in
-        // `INCOMPAT_SUPP`, so it has already been rejected above; the gating is
-        // spelled out here in full so it stays correct once that feature lands.
+        // size the group-descriptor decoder strides by: `EXT4_DESC_SIZE =
+        // has_64bit ? s_desc_size : 32`. With `64BIT` now supported, a 64-byte
+        // descriptor is admitted and decoded wide by `BlockGroup::read_desc`.
         let desc_size = parse_desc_size(
             sb.desc_size,
             feature_incompat.contains(FeatureIncompatSet::IS_64BIT),
@@ -179,7 +185,14 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             return_errno_with_message!(Errno::EINVAL, "blocks per group is too small");
         }
 
-        let blocks_count = sb.blocks_count as u64;
+        // Splice the 64-bit block counts at this one parse boundary: the high
+        // halves are honored only with the `64BIT` feature, and a non-64bit image
+        // carrying a non-zero high half is malformed (rejected inside the helper).
+        let is_64bit = feature_incompat.contains(FeatureIncompatSet::IS_64BIT);
+        let blocks_count = splice_count_hi(sb.blocks_count, sb.blocks_count_hi, is_64bit)?;
+        let free_blocks_count =
+            splice_count_hi(sb.free_blocks_count, sb.free_blocks_count_hi, is_64bit)?;
+
         let first_data_block = sb.first_data_block as u64;
         if blocks_count <= first_data_block + 1 {
             return_errno_with_message!(Errno::EINVAL, "invalid blocks count");
@@ -193,7 +206,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         if inodes_count <= min_inodes || inodes_count > max_inodes {
             return_errno_with_message!(Errno::EINVAL, "invalid inodes count");
         }
-        if sb.free_blocks_count > sb.blocks_count {
+        if free_blocks_count > blocks_count {
             return_errno_with_message!(Errno::EINVAL, "free blocks count exceeds blocks count");
         }
         if sb.free_inodes_count > sb.inodes_count {
@@ -203,7 +216,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         Ok(Self {
             inodes_count: sb.inodes_count,
             blocks_count,
-            free_blocks_count: sb.free_blocks_count as u64,
+            free_blocks_count,
             free_inodes_count: sb.free_inodes_count,
             first_data_block,
             block_size,
@@ -240,9 +253,8 @@ impl SuperBlock {
 
     /// Returns the effective group-descriptor size in bytes (`EXT4_DESC_SIZE`):
     /// the raw `s_desc_size` when the `64BIT` feature is set, else the classic
-    /// 32. Always 32 until the 64-bit descriptor decoder lands (Task 2), which
-    /// is what the group-descriptor stride and RMW currently assume.
-    #[cfg_attr(not(ktest), expect(dead_code))]
+    /// 32. Drives the GDT stride and the 32-vs-64-byte descriptor decode in
+    /// [`BlockGroup::load`](super::block_group::BlockGroup).
     pub(super) const fn desc_size(&self) -> u16 {
         self.desc_size
     }
@@ -431,20 +443,36 @@ impl SuperBlock {
         handle: Option<&journal::Handle>,
         last_orphan: Option<Ext4Ino>,
     ) -> Result<()> {
-        let free_blocks = self.free_blocks_count();
         let free_inodes = self.free_inodes_count();
         journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?.patch(
             |buf| {
                 let off = SUPER_BLOCK_OFFSET;
                 let mut raw =
                     RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
-                raw.free_blocks_count = free_blocks as u32;
+                self.write_free_blocks_count(&mut raw);
                 raw.free_inodes_count = free_inodes;
                 // `0 = empty` is the on-disk convention (encode boundary).
                 raw.last_orphan = last_orphan.unwrap_or(0);
                 buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
             },
         )
+    }
+
+    /// Writes the free-block count's low half — and, under `64BIT`, its high half
+    /// — into a raw superblock being RMW'd back to disk.
+    ///
+    /// The single write-side splice boundary for `s_free_blocks_count{,_hi}`,
+    /// mirroring the read splice in [`Self::try_from`]. `count as u32` /
+    /// `(count >> 32) as u32` is the exact inverse of that read assembly and
+    /// lossless as a pair. The high half is emitted only with the `64BIT` feature,
+    /// so a non-64bit volume leaves its on-disk `s_free_blocks_count_hi` at the
+    /// zero the RMW read back (the 32-byte path stays byte-for-byte unchanged).
+    pub(super) fn write_free_blocks_count(&self, raw: &mut RawSuperBlock) {
+        let count = self.free_blocks_count;
+        raw.free_blocks_count = count as u32;
+        if self.feature_incompat.contains(FeatureIncompatSet::IS_64BIT) {
+            raw.free_blocks_count_hi = (count >> 32) as u32;
+        }
     }
 
     pub(super) const fn feature_compat(&self) -> FeatureCompatSet {
@@ -504,12 +532,11 @@ impl SuperBlock {
 /// descriptor is 32 bytes, so a raw value other than the unset sentinel or the
 /// classic size would be silently misread, and we reject it instead.
 fn parse_desc_size(raw: u16, has_64bit: bool) -> Result<u16> {
-    // `0` is the on-disk "unset" convention; it resolves to the classic size
-    // and never leaks past this boundary (the sentinel stops here).
-    let effective = if raw == 0 { MIN_DESC_SIZE } else { raw };
-
     if !has_64bit {
-        if effective != MIN_DESC_SIZE {
+        // Without the 64bit feature `s_desc_size` is not authoritative: `0`
+        // (unset) or the classic `32` both mean 32-byte descriptors, and any
+        // other value is a malformed superblock. The sentinel `0` stops here.
+        if raw != 0 && raw != MIN_DESC_SIZE {
             return_errno_with_message!(
                 Errno::EINVAL,
                 "group descriptor size set without the 64bit feature"
@@ -518,18 +545,38 @@ fn parse_desc_size(raw: u16, has_64bit: bool) -> Result<u16> {
         return Ok(MIN_DESC_SIZE);
     }
 
-    if !(MIN_DESC_SIZE..=MAX_DESC_SIZE).contains(&effective) || !effective.is_power_of_two() {
-        return_errno_with_message!(Errno::EINVAL, "invalid group descriptor size");
+    // With 64bit, `s_desc_size` is authoritative and MUST describe a 64-bit
+    // descriptor. Mirror Linux `super.c` (EXT4_MIN_DESC_SIZE_64BIT): it does NOT
+    // fold `0` to a default here and rejects anything below 64. Otherwise a
+    // 64bit image whose `s_desc_size` disagrees with its physical 64-byte GDT
+    // stride would mount and read every group's descriptor at the wrong offset —
+    // the refused-mount → silent-cross-linked-corruption the red-line forbids.
+    if raw < MIN_DESC_SIZE_64BIT || raw > MAX_DESC_SIZE || !raw.is_power_of_two() {
+        return_errno_with_message!(Errno::EINVAL, "invalid 64bit group descriptor size");
     }
-    if effective == MAX_DESC_SIZE {
-        // TODO(P6c Task 2, 64bit descriptors): the group-descriptor decoder
-        // reads only the 32-byte layout and strides by `size_of::<RawBlockGroup>()`.
-        // Admit the 64-byte descriptor once `RawBlockGroup64` and the
-        // desc_size-aware, high-half-splicing parse land; accepting it now would
-        // misread every group's block-bitmap/inode-table high halves.
-        return_errno_with_message!(Errno::EINVAL, "64-byte group descriptors not yet supported");
+    // `read_desc` strides by this size and decodes the 64-byte layout's high
+    // halves; it stays in lockstep with `IS_64BIT ∈ INCOMPAT_SUPP`.
+    Ok(raw)
+}
+
+/// Splices a superblock 64-bit block count's low and high halves into a `u64`.
+///
+/// The one read-side boundary for `s_{blocks,free_blocks}_count{,_hi}`
+/// (rust_rules #3). `(lo as u64) | ((hi as u64) << 32)` is lossless. The high
+/// half is honored only with the `64BIT` feature; a non-64bit image with a
+/// non-zero high half is malformed — that field is defined only under `64BIT` —
+/// and is rejected rather than silently folded in.
+fn splice_count_hi(lo: u32, hi: u32, has_64bit: bool) -> Result<u64> {
+    if !has_64bit {
+        if hi != 0 {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "64-bit count high half set without the 64bit feature"
+            );
+        }
+        return Ok(lo as u64);
     }
-    Ok(effective)
+    Ok((lo as u64) | ((hi as u64) << 32))
 }
 
 /// The ext4 revision level (`s_rev_level`).
@@ -639,19 +686,35 @@ pub(super) struct RawSuperBlock {
     pub(super) desc_size: u16,
     pub default_mount_opts: u32,
     pub first_meta_bg: u32,
+    /// `s_mkfs_time` (0x108): filesystem creation time.
+    pub mkfs_time: UnixTime,
+    /// `s_jnl_blocks` (0x10C): backup of the journal inode's block map.
+    pub jnl_blocks: [u32; 17],
+    /// `s_blocks_count_hi` (0x150): high 32 bits of the total block count.
+    /// Honored only with the `64BIT` feature; spliced with `blocks_count` at the
+    /// parse boundary ([`SuperBlock::try_from`]).
+    pub blocks_count_hi: u32,
+    /// `s_r_blocks_count_hi` (0x154): high 32 bits of the reserved block count.
+    /// Named for correct field placement; `reserved_blocks_count` stays 32-bit
+    /// (a >2^32-block reserve is beyond the supported geometry).
+    pub r_blocks_count_hi: u32,
+    /// `s_free_blocks_count_hi` (0x158): high 32 bits of the free block count.
+    /// Honored only with the `64BIT` feature; spliced with `free_blocks_count` at
+    /// the parse boundary and emitted back by [`SuperBlock::write_free_blocks_count`].
+    pub free_blocks_count_hi: u32,
     pub(super) reserved: Reserved,
 }
 
 /// Reserved padding that fills the on-disk superblock to 1024 bytes. In ext4
-/// this region also holds 64-bit counts, descriptor size, and checksum fields,
-/// parsed in later phases.
+/// this region also holds the checksum-seed, mount-option, and metadata-checksum
+/// fields, parsed in later phases.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct Reserved([u32; 190]);
+pub(super) struct Reserved([u32; 169]);
 
 impl Default for Reserved {
     fn default() -> Self {
-        Self([0u32; 190])
+        Self([0u32; 169])
     }
 }
 
@@ -723,8 +786,10 @@ mod tests {
 
     #[ktest]
     fn reject_unsupported_incompat() {
+        // `MMP` is a genuine incompatible feature this implementation does not
+        // support (it is not in `INCOMPAT_SUPP`), so it must refuse the mount.
         let mut raw = minimal_raw(2048, 2048, 256);
-        raw.feature_incompat |= FeatureIncompatSet::IS_64BIT.bits();
+        raw.feature_incompat |= FeatureIncompatSet::MMP.bits();
         assert!(SuperBlock::try_from(raw).is_err());
     }
 
@@ -806,11 +871,13 @@ mod tests {
         assert!(parse_desc_size(64, false).is_err());
         assert!(parse_desc_size(48, false).is_err());
 
-        // With 64BIT: 0 and 32 resolve to 32; 64 is well-formed but not yet
-        // decoded (TODO Task 2); non-power-of-two and out-of-range are rejected.
-        assert_eq!(parse_desc_size(0, true).unwrap(), MIN_DESC_SIZE);
-        assert_eq!(parse_desc_size(32, true).unwrap(), MIN_DESC_SIZE);
-        assert!(parse_desc_size(MAX_DESC_SIZE, true).is_err());
+        // With 64BIT: `s_desc_size` is authoritative and must be >= 64 (Linux
+        // EXT4_MIN_DESC_SIZE_64BIT); 0 and 32 are REJECTED — they would
+        // contradict the wide 64-byte GDT stride — as are non-power-of-two and
+        // out-of-range. Only 64 is admitted.
+        assert_eq!(parse_desc_size(MAX_DESC_SIZE, true).unwrap(), MAX_DESC_SIZE);
+        assert!(parse_desc_size(0, true).is_err());
+        assert!(parse_desc_size(32, true).is_err());
         assert!(parse_desc_size(48, true).is_err());
         assert!(parse_desc_size(16, true).is_err());
         assert!(parse_desc_size(128, true).is_err());
@@ -824,5 +891,62 @@ mod tests {
         raw.feature_incompat |= FeatureIncompatSet::FLEX_BG.bits();
         let sb = SuperBlock::try_from(raw).unwrap();
         assert!(sb.feature_incompat().contains(FeatureIncompatSet::FLEX_BG));
+    }
+
+    /// The `s_*_count_hi` splice boundary: the high half is honored only under
+    /// `64BIT`, and a non-64bit high half is rejected rather than folded in. A
+    /// genuine `> 2^32`-block image cannot be built here (the fixture's `u32`
+    /// `inodes_count` cannot express that geometry), so the wide decode itself is
+    /// verified at this boundary.
+    #[ktest]
+    fn splice_count_hi_gating() {
+        // Without 64BIT: the low half passes through; any high half is rejected.
+        assert_eq!(splice_count_hi(0x1234, 0, false).unwrap(), 0x1234);
+        assert!(splice_count_hi(0, 1, false).is_err());
+        assert!(splice_count_hi(5, 7, false).is_err());
+
+        // With 64BIT: `lo | (hi << 32)`, lossless.
+        assert_eq!(splice_count_hi(0xDEAD_BEEF, 0, true).unwrap(), 0xDEAD_BEEF);
+        assert_eq!(splice_count_hi(0, 1, true).unwrap(), 1u64 << 32);
+        assert_eq!(
+            splice_count_hi(0x8000_0001, 2, true).unwrap(),
+            (2u64 << 32) | 0x8000_0001
+        );
+    }
+
+    /// A non-64bit image carrying a non-zero `s_blocks_count_hi` or
+    /// `s_free_blocks_count_hi` is malformed and rejected at parse time.
+    #[ktest]
+    fn reject_high_count_without_64bit() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.blocks_count_hi = 1;
+        assert_eq!(
+            SuperBlock::try_from(raw).unwrap_err().error(),
+            Errno::EINVAL
+        );
+
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.free_blocks_count_hi = 1;
+        assert_eq!(
+            SuperBlock::try_from(raw).unwrap_err().error(),
+            Errno::EINVAL
+        );
+    }
+
+    /// A `64BIT` image (feature bit + `s_desc_size == 64`) mounts, records the
+    /// wide descriptor size, and round-trips the (here `< 2^32`) free-block count
+    /// through the u64 splice.
+    #[ktest]
+    fn accept_64bit_image() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.feature_incompat |= FeatureIncompatSet::IS_64BIT.bits();
+        raw.desc_size = MAX_DESC_SIZE;
+        raw.free_blocks_count = 500;
+        // High halves zero (this small image fits in 32 bits).
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert!(sb.feature_incompat().contains(FeatureIncompatSet::IS_64BIT));
+        assert_eq!(sb.desc_size(), MAX_DESC_SIZE);
+        assert_eq!(sb.free_blocks_count(), 500u64);
+        assert_eq!(sb.total_blocks(), 2048u64);
     }
 }

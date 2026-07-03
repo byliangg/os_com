@@ -70,6 +70,45 @@ pub(super) struct RawBlockGroup {
     pub checksum: u16,
 }
 
+const_assert!(size_of::<RawBlockGroupHi>() == 32);
+
+/// The 32-byte high-half tail of a `64BIT` group descriptor (`ext4_group_desc`
+/// bytes 32..64). Present only when `s_desc_size == 64`; carries the block-number
+/// high halves plus the per-group checksums the `metadata_csum` feature adds.
+///
+/// The per-group counter high halves (`*_count_hi`, `itable_unused_hi`) are
+/// structurally zero in our geometry: a group holds at most `block_size * 8 =
+/// 32768 < u16::MAX` blocks/inodes, so the counters never overflow their low
+/// half. Only the block-number high halves can be non-zero (on volumes past
+/// `2^32` blocks), and they are the only tail fields the decoder splices.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+pub(super) struct RawBlockGroupHi {
+    pub block_bitmap_hi: u32,
+    pub inode_bitmap_hi: u32,
+    pub inode_table_hi: u32,
+    pub free_blocks_count_hi: u16,
+    pub free_inodes_count_hi: u16,
+    pub used_dirs_count_hi: u16,
+    pub itable_unused_hi: u16,
+    pub exclude_bitmap_hi: u32,
+    pub block_bitmap_csum_hi: u16,
+    pub inode_bitmap_csum_hi: u16,
+    pub reserved: u32,
+}
+
+const_assert!(size_of::<RawBlockGroup64>() == 64);
+
+/// On-disk 64-byte `64BIT` group descriptor: the classic 32-byte low half
+/// ([`RawBlockGroup`]) followed by the 32-byte high-half tail
+/// ([`RawBlockGroupHi`]). Read whole when `s_desc_size == 64`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+pub(super) struct RawBlockGroup64 {
+    pub lo: RawBlockGroup,
+    pub hi: RawBlockGroupHi,
+}
+
 /// Validated, Rust-typed block-group descriptor.
 ///
 /// Block numbers are `Ext4Bid` (`u64`) so the `64BIT` high halves slot in later
@@ -85,6 +124,32 @@ pub(super) struct BlockGroupDesc {
 }
 
 impl BlockGroupDesc {
+    /// Decodes a group descriptor from its raw low half and, for `64BIT` volumes,
+    /// its high-half tail. This is the single parse-once boundary where the block
+    /// numbers combine `lo | (hi << 32)` (rust_rules #3); no caller splices high
+    /// halves itself, so a decode bug lives in exactly one place.
+    ///
+    /// The `(lo as u64) | ((hi as u64) << 32)` assembly is lossless: `lo` is
+    /// `u32`, `hi` is `u32`, and their union fits `u64` with no bits dropped. The
+    /// per-group counters are taken from the low half only — their high halves
+    /// are structurally zero (see [`RawBlockGroupHi`]).
+    fn from_raw(lo: &RawBlockGroup, hi: Option<&RawBlockGroupHi>) -> Self {
+        let (block_bitmap_hi, inode_bitmap_hi, inode_table_hi) = match hi {
+            Some(hi) => (hi.block_bitmap_hi, hi.inode_bitmap_hi, hi.inode_table_hi),
+            None => (0, 0, 0),
+        };
+        Self {
+            block_bitmap_bid: (lo.block_bitmap_lo as Ext4Bid)
+                | ((block_bitmap_hi as Ext4Bid) << 32),
+            inode_bitmap_bid: (lo.inode_bitmap_lo as Ext4Bid)
+                | ((inode_bitmap_hi as Ext4Bid) << 32),
+            inode_table_bid: (lo.inode_table_lo as Ext4Bid) | ((inode_table_hi as Ext4Bid) << 32),
+            free_blocks_count: lo.free_blocks_count_lo as u32,
+            free_inodes_count: lo.free_inodes_count_lo as u32,
+            used_dirs_count: lo.used_dirs_count_lo as u32,
+        }
+    }
+
     /// Patches this group's mutable descriptor counters into the after-image of the
     /// descriptor block, for op-time journaling.
     ///
@@ -93,7 +158,12 @@ impl BlockGroupDesc {
     /// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): only
     /// `free_blocks_count_lo` / `free_inodes_count_lo` / `used_dirs_count_lo` are
     /// overwritten, so every field the device held (flags, csum, itable_unused, …)
-    /// and every *other* group's descriptor in the same block are preserved. Because
+    /// and every *other* group's descriptor in the same block are preserved. For a
+    /// 64-byte (`64BIT`) descriptor this rewrites only the 32-byte low half at
+    /// `desc_offset % BLOCK_SIZE`; the high-half tail — the block-number high halves
+    /// (unchanged by counter updates) and the structurally-zero counter high halves
+    /// — is left intact, and the descriptor never straddles a block (`4096 % 64 ==
+    /// 0`). Because
     /// the after-image carries the absolute in-memory counters, repeated captures of
     /// the same block *within one transaction* converge on the final value.
     ///
@@ -148,19 +218,6 @@ impl BlockGroupDesc {
     }
 }
 
-impl From<&RawBlockGroup> for BlockGroupDesc {
-    fn from(raw: &RawBlockGroup) -> Self {
-        Self {
-            block_bitmap_bid: raw.block_bitmap_lo as Ext4Bid,
-            inode_bitmap_bid: raw.inode_bitmap_lo as Ext4Bid,
-            inode_table_bid: raw.inode_table_lo as Ext4Bid,
-            free_blocks_count: raw.free_blocks_count_lo as u32,
-            free_inodes_count: raw.free_inodes_count_lo as u32,
-            used_dirs_count: raw.used_dirs_count_lo as u32,
-        }
-    }
-}
-
 /// One block group's metadata: the descriptor, the block bitmap, and the inode
 /// bitmap.
 ///
@@ -210,7 +267,12 @@ pub(super) struct BlockGroup {
     inode_size: usize,
     /// Cached geometry: filesystem block size in bytes.
     block_size: usize,
-    /// Absolute byte offset of this group's `RawBlockGroup` in the GDT.
+    /// Cached geometry: on-disk group-descriptor size in bytes (32 or 64). Drives
+    /// the GDT stride and selects the 64-byte high-half decode on `reload`.
+    desc_size: u16,
+    /// Absolute byte offset of this group's descriptor in the GDT (strided by
+    /// [`Self::desc_size`], so it points at the 32-byte low half of a 64-byte
+    /// descriptor).
     desc_offset: usize,
     /// Per-group live inode cache keyed by group-local inode index.
     ///
@@ -232,8 +294,8 @@ impl Debug for BlockGroup {
 impl BlockGroup {
     /// Loads a block group from the descriptor table.
     ///
-    /// Reads and decodes the group's `RawBlockGroup` at
-    /// `gdt_base_offset + group_idx * size_of::<RawBlockGroup>()`, caches the
+    /// Reads and decodes the group's descriptor at `gdt_base_offset + group_idx *
+    /// sb.desc_size()` (32 or 64 bytes wide per the `64BIT` feature), caches the
     /// group's geometry from `sb`, and loads the block bitmap.
     ///
     /// Loading is lenient: strict validation that the system-metadata blocks are
@@ -245,11 +307,9 @@ impl BlockGroup {
         sb: &SuperBlock,
         gdt_base_offset: usize,
     ) -> Result<Self> {
-        let desc_offset = gdt_base_offset + group_idx * size_of::<RawBlockGroup>();
-        let raw_group = device
-            .read_val::<RawBlockGroup>(desc_offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
-        let desc = BlockGroupDesc::from(&raw_group);
+        let desc_size = sb.desc_size();
+        let desc_offset = gdt_base_offset + group_idx * desc_size as usize;
+        let desc = Self::read_desc(device.as_ref(), desc_offset, desc_size)?;
 
         // Cache geometry from `SuperBlock` at load time.
         let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
@@ -284,9 +344,33 @@ impl BlockGroup {
             nr_inodes_per_group,
             inode_size,
             block_size,
+            desc_size,
             desc_offset,
             inode_cache: RwMutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Reads and decodes this group's descriptor from `device` at `desc_offset`,
+    /// sized by `desc_size`: the 64-byte `64BIT` layout — splicing the block-number
+    /// high halves via [`BlockGroupDesc::from_raw`] — when `desc_size` is 64, else
+    /// the classic 32-byte layout. The single decode path shared by [`Self::load`]
+    /// and [`Self::reload_metadata`], so the high-half splice lives at one boundary.
+    fn read_desc(
+        device: &dyn BlockDevice,
+        desc_offset: usize,
+        desc_size: u16,
+    ) -> Result<BlockGroupDesc> {
+        if desc_size as usize >= size_of::<RawBlockGroup64>() {
+            let raw = device
+                .read_val::<RawBlockGroup64>(desc_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            Ok(BlockGroupDesc::from_raw(&raw.lo, Some(&raw.hi)))
+        } else {
+            let raw = device
+                .read_val::<RawBlockGroup>(desc_offset)
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            Ok(BlockGroupDesc::from_raw(&raw, None))
+        }
     }
 
     /// Re-reads this group's descriptor and both bitmaps from the device,
@@ -300,10 +384,7 @@ impl BlockGroup {
     /// back over the replayed values. The group's cached geometry is immutable
     /// and untouched; the inode cache is empty this early in the mount.
     pub(super) fn reload_metadata(&self, device: &dyn BlockDevice) -> Result<()> {
-        let raw_group = device
-            .read_val::<RawBlockGroup>(self.desc_offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to re-read group descriptor"))?;
-        let desc = BlockGroupDesc::from(&raw_group);
+        let desc = Self::read_desc(device, self.desc_offset, self.desc_size)?;
         let block_bitmap =
             Self::load_block_bitmap(device, self.first_block, self.last_block, &desc)?;
         let inode_bitmap = Self::load_inode_bitmap(device, self.nr_inodes_per_group, &desc)?;
@@ -684,7 +765,11 @@ impl BlockGroup {
     /// read-modify-write: the raw descriptor is read, only the mutated counters
     /// (`free_blocks_count_lo`, `free_inodes_count_lo`, `used_dirs_count_lo`) are
     /// patched, and the result is written back so every other on-disk field
-    /// (flags, csum, exclude, itable_unused) is preserved.
+    /// (flags, csum, exclude, itable_unused) is preserved. For a 64-byte (`64BIT`)
+    /// descriptor this reads and writes only the 32-byte low half at `desc_offset`,
+    /// leaving the high-half tail intact (mirroring [`BlockGroupDesc::patch_into`]);
+    /// the counters' high halves are structurally zero, so the low-half write is
+    /// complete.
     pub(super) fn sync_metadata(&self) -> Result<()> {
         let mut metadata = self.metadata.write();
 
@@ -805,5 +890,192 @@ impl BlockGroup {
 
     fn ranges_overlap(a: &Range<Ext4Bid>, b: &Range<Ext4Bid>) -> bool {
         !a.is_empty() && !b.is_empty() && a.start < b.end && b.start < a.end
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::{super::test_utils::Ext4MemoryDisk, *};
+
+    /// A 64-byte descriptor whose block-number high halves are non-zero decodes
+    /// to the correct `> 2^32` `Ext4Bid` — the red-line splice. The per-group
+    /// counters come from the low half untouched.
+    #[ktest]
+    fn decode_64byte_descriptor_high_halves() {
+        let raw = RawBlockGroup64 {
+            lo: RawBlockGroup {
+                block_bitmap_lo: 0x1111_2222,
+                inode_bitmap_lo: 0x3333_4444,
+                inode_table_lo: 0x5555_6666,
+                free_blocks_count_lo: 7,
+                free_inodes_count_lo: 9,
+                used_dirs_count_lo: 3,
+                ..Default::default()
+            },
+            hi: RawBlockGroupHi {
+                block_bitmap_hi: 0xA,
+                inode_bitmap_hi: 0xB,
+                inode_table_hi: 0xC,
+                ..Default::default()
+            },
+        };
+
+        let desc = BlockGroupDesc::from_raw(&raw.lo, Some(&raw.hi));
+        assert_eq!(desc.block_bitmap_bid(), 0x0000_000A_1111_2222);
+        assert_eq!(desc.inode_bitmap_bid(), 0x0000_000B_3333_4444);
+        assert_eq!(desc.inode_table_bid(), 0x0000_000C_5555_6666);
+        assert_eq!(desc.free_blocks_count(), 7);
+        assert_eq!(desc.free_inodes_count(), 9);
+        assert_eq!(desc.used_dirs_count(), 3);
+
+        // The 32-byte (no-hi) path leaves the block numbers at their low halves.
+        let desc32 = BlockGroupDesc::from_raw(&raw.lo, None);
+        assert_eq!(desc32.block_bitmap_bid(), 0x1111_2222);
+        assert_eq!(desc32.inode_bitmap_bid(), 0x3333_4444);
+        assert_eq!(desc32.inode_table_bid(), 0x5555_6666);
+    }
+
+    /// Two adjacent 64-byte descriptors in a GDT are read at their 64-byte-apart
+    /// offsets and each decodes to its own distinct (wide) block numbers — the
+    /// desc_size stride plus the wide read.
+    #[ktest]
+    fn read_desc_64byte_stride() {
+        let disk = Ext4MemoryDisk::new(4);
+        let gdt_base = BLOCK_SIZE; // GDT at block 1, as the fixture lays it out.
+        let desc_size: u16 = 64;
+
+        let g0 = RawBlockGroup64 {
+            lo: RawBlockGroup {
+                block_bitmap_lo: 0x10,
+                inode_bitmap_lo: 0x11,
+                inode_table_lo: 0x12,
+                ..Default::default()
+            },
+            hi: RawBlockGroupHi {
+                block_bitmap_hi: 1,
+                inode_table_hi: 2,
+                ..Default::default()
+            },
+        };
+        let g1 = RawBlockGroup64 {
+            lo: RawBlockGroup {
+                block_bitmap_lo: 0x20,
+                inode_bitmap_lo: 0x21,
+                inode_table_lo: 0x22,
+                ..Default::default()
+            },
+            hi: RawBlockGroupHi {
+                block_bitmap_hi: 3,
+                inode_table_hi: 4,
+                ..Default::default()
+            },
+        };
+
+        let off0 = gdt_base;
+        let off1 = gdt_base + desc_size as usize;
+        disk.segment().write_val(off0, &g0).unwrap();
+        disk.segment().write_val(off1, &g1).unwrap();
+
+        let d0 = BlockGroup::read_desc(&disk, off0, desc_size).unwrap();
+        let d1 = BlockGroup::read_desc(&disk, off1, desc_size).unwrap();
+        assert_eq!(d0.block_bitmap_bid(), (1u64 << 32) | 0x10);
+        assert_eq!(d0.inode_table_bid(), (2u64 << 32) | 0x12);
+        assert_eq!(d1.block_bitmap_bid(), (3u64 << 32) | 0x20);
+        assert_eq!(d1.inode_bitmap_bid(), 0x21);
+        assert_eq!(d1.inode_table_bid(), (4u64 << 32) | 0x22);
+    }
+
+    /// `patch_into` on a 64-byte descriptor rewrites only the 32-byte low half:
+    /// the counters take new values while the high tail (block-number high halves
+    /// and the zero counter high halves) is byte-for-byte preserved.
+    #[ktest]
+    fn patch_into_preserves_high_tail() {
+        let raw = RawBlockGroup64 {
+            lo: RawBlockGroup {
+                block_bitmap_lo: 0x100,
+                inode_bitmap_lo: 0x101,
+                inode_table_lo: 0x102,
+                free_blocks_count_lo: 50,
+                free_inodes_count_lo: 60,
+                used_dirs_count_lo: 2,
+                ..Default::default()
+            },
+            hi: RawBlockGroupHi {
+                block_bitmap_hi: 7,
+                inode_bitmap_hi: 8,
+                inode_table_hi: 9,
+                ..Default::default()
+            },
+        };
+
+        // Place the descriptor at group index 3's offset within the GDT block.
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let desc_offset = 3 * 64;
+        block[desc_offset..desc_offset + 64].copy_from_slice(raw.as_bytes());
+        let hi_before = block[desc_offset + 32..desc_offset + 64].to_vec();
+
+        let mut desc = BlockGroupDesc::from_raw(&raw.lo, Some(&raw.hi));
+        desc.free_blocks_count = 11;
+        desc.free_inodes_count = 22;
+        desc.used_dirs_count = 4;
+        desc.patch_into(&mut block, desc_offset);
+
+        // The 32-byte high tail is untouched.
+        assert_eq!(&block[desc_offset + 32..desc_offset + 64], &hi_before[..]);
+
+        // The low-half counters took the new values; the (wide) block numbers,
+        // whose high halves live in the tail, are unchanged.
+        let after = RawBlockGroup64::from_bytes(&block[desc_offset..desc_offset + 64]);
+        let desc_after = BlockGroupDesc::from_raw(&after.lo, Some(&after.hi));
+        assert_eq!(desc_after.free_blocks_count(), 11);
+        assert_eq!(desc_after.free_inodes_count(), 22);
+        assert_eq!(desc_after.used_dirs_count(), 4);
+        assert_eq!(desc_after.block_bitmap_bid(), (7u64 << 32) | 0x100);
+        assert_eq!(desc_after.inode_bitmap_bid(), (8u64 << 32) | 0x101);
+        assert_eq!(desc_after.inode_table_bid(), (9u64 << 32) | 0x102);
+    }
+
+    /// Round-trip: decode a 64-byte descriptor, patch its (unchanged) counters
+    /// back into the same block, re-decode, and assert every field survives — and
+    /// the full 64-byte on-disk image is byte-for-byte identical.
+    #[ktest]
+    fn descriptor_round_trip_64byte() {
+        let raw = RawBlockGroup64 {
+            lo: RawBlockGroup {
+                block_bitmap_lo: 0xABCD,
+                inode_bitmap_lo: 0xBCDE,
+                inode_table_lo: 0xCDEF,
+                free_blocks_count_lo: 100,
+                free_inodes_count_lo: 200,
+                used_dirs_count_lo: 5,
+                ..Default::default()
+            },
+            hi: RawBlockGroupHi {
+                block_bitmap_hi: 0x1,
+                inode_bitmap_hi: 0x2,
+                inode_table_hi: 0x3,
+                ..Default::default()
+            },
+        };
+
+        let mut block = vec![0u8; BLOCK_SIZE];
+        let off = 5 * 64;
+        block[off..off + 64].copy_from_slice(raw.as_bytes());
+
+        let desc = BlockGroupDesc::from_raw(&raw.lo, Some(&raw.hi));
+        desc.patch_into(&mut block, off);
+
+        let raw2 = RawBlockGroup64::from_bytes(&block[off..off + 64]);
+        let desc2 = BlockGroupDesc::from_raw(&raw2.lo, Some(&raw2.hi));
+        assert_eq!(desc2.block_bitmap_bid(), desc.block_bitmap_bid());
+        assert_eq!(desc2.inode_bitmap_bid(), desc.inode_bitmap_bid());
+        assert_eq!(desc2.inode_table_bid(), desc.inode_table_bid());
+        assert_eq!(desc2.free_blocks_count(), desc.free_blocks_count());
+        assert_eq!(desc2.free_inodes_count(), desc.free_inodes_count());
+        assert_eq!(desc2.used_dirs_count(), desc.used_dirs_count());
+        // Patch wrote back the same counters it decoded, so nothing moved.
+        assert_eq!(&block[off..off + 64], raw.as_bytes());
     }
 }
