@@ -272,15 +272,20 @@ impl InodeInner {
         let Some(seed) = self.csum_seed else {
             return Ok(());
         };
-        // The checksum covers the whole block except its last word (det_checksum).
-        const CSUM_OFFSET: usize = BLOCK_SIZE - 4;
+        // The checksum covers the block up to the tail entry — the whole payload,
+        // EXCLUDING all `DIR_TAIL_LEN` tail bytes (the fake entry's 8-byte header
+        // and its 4-byte det_checksum): Linux `ext4_dirblock_csum` runs over
+        // `(char *)EXT4_DIRENT_TAIL - b_data == blocksize - sizeof(tail)`. The
+        // result is stored in det_checksum, the block's last word.
+        const CSUM_COVER: usize = BLOCK_SIZE - DIR_TAIL_LEN;
+        const DET_CHECKSUM_OFFSET: usize = BLOCK_SIZE - 4;
         let page_cache = self.page_cache()?;
         let block_offset = logical as usize * BLOCK_SIZE;
         let block: [u8; BLOCK_SIZE] = page_cache.read_val(block_offset).map_err(|_| {
             Error::with_message(Errno::EIO, "failed to read directory block for checksum")
         })?;
-        let csum = crc32c(seed, &block[..CSUM_OFFSET]);
-        page_cache.write_val(block_offset + CSUM_OFFSET, &csum.to_le())?;
+        let csum = crc32c(seed, &block[..CSUM_COVER]);
+        page_cache.write_val(block_offset + DET_CHECKSUM_OFFSET, &csum.to_le())?;
         Ok(())
     }
 
@@ -1340,17 +1345,20 @@ mod tests {
         assert_eq!(tail.file_type, EXT4_FT_DIR_CSUM);
         assert_eq!(BLOCK_SIZE - DIR_TAIL_LEN, 4084);
 
+        // The checksum covers the block EXCLUDING the whole 12-byte tail (Linux
+        // `ext4_dirblock_csum` covers `blocksize - sizeof(ext4_dir_entry_tail)`).
         let mut block = [0u8; BLOCK_SIZE];
         block[..8].copy_from_slice(b"DIRDATA!");
         let seed = 0xD1E5;
-        let csum = crc32c(seed, &block[..BLOCK_SIZE - 4]);
-        // The det_checksum word itself is excluded from the cover.
+        const COVER: usize = BLOCK_SIZE - DIR_TAIL_LEN;
+        let csum = crc32c(seed, &block[..COVER]);
+        // Neither the tail's 8 header bytes nor its det_checksum word are covered.
         let mut probe = block;
-        probe[BLOCK_SIZE - 4..].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        assert_eq!(crc32c(seed, &probe[..BLOCK_SIZE - 4]), csum);
-        // A covered byte is not.
+        probe[COVER..].copy_from_slice(&[0xAB; DIR_TAIL_LEN]);
+        assert_eq!(crc32c(seed, &probe[..COVER]), csum);
+        // A covered byte is.
         probe[0] ^= 1;
-        assert_ne!(crc32c(seed, &probe[..BLOCK_SIZE - 4]), csum);
+        assert_ne!(crc32c(seed, &probe[..COVER]), csum);
     }
 
     #[ktest]

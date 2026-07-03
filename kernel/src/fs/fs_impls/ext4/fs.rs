@@ -775,9 +775,17 @@ impl Ext4 {
         next: Option<Ext4Ino>,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        // On a metadata_csum volume the 4-byte i_dtime splice invalidates the
+        // predecessor's inode checksum, so hand the slot what it needs to
+        // re-stamp the whole inode.
+        let csum = {
+            let sb = self.super_block.read();
+            sb.has_metadata_csum()
+                .then(|| (ino, sb.metadata_csum_seed(), sb.inode_size()))
+        };
         // `0 = end of chain` is the on-disk convention (encode boundary).
         self.inode_slot(ino)?
-            .journal_patch_dtime(handle, next.unwrap_or(0))
+            .journal_patch_dtime(handle, next.unwrap_or(0), csum)
     }
 
     /// Finishes deletions interrupted by a crash, by walking the on-disk orphan
@@ -1486,17 +1494,35 @@ impl InodeSlot {
     }
 
     /// Splices the slot's on-disk `i_dtime` (its orphan-next pointer) to
-    /// `next` with a journaled 4-byte patch. A no-op without a handle.
+    /// `next` with a journaled patch. A no-op without a handle.
     ///
-    /// The patch is sound without decoding or locking the inode: the capture's
-    /// seed is the block's newest committed image (see `journal_write`), and
-    /// only the 4 `i_dtime` bytes are overwritten, so every other field — and
-    /// every neighboring inode — keeps its committed content.
-    fn journal_patch_dtime(&self, handle: Option<&journal::Handle>, next: u32) -> Result<()> {
-        let dtime_off = self.offset_in_block + core::mem::offset_of!(RawInode, dtime);
+    /// The patch is sound without locking the inode: the capture's seed is the
+    /// block's newest committed image (see `journal_write`), and only the 4
+    /// `i_dtime` bytes (plus, on a `metadata_csum` volume, the inode's own
+    /// checksum) are overwritten, so every other field — and every neighboring
+    /// inode — keeps its committed content.
+    ///
+    /// `csum` carries `(ino, fs_seed, inode_size)` on a checksummed volume: the
+    /// `i_dtime` change invalidates this inode's checksum, so the whole slot is
+    /// decoded from the seeded image, re-stamped, and written back (Linux
+    /// `ext4_orphan_del` rewrites the predecessor via `ext4_inode_csum_set`).
+    /// Without it, the minimal 4-byte patch stands (Phases 1-5 verbatim).
+    fn journal_patch_dtime(
+        &self,
+        handle: Option<&journal::Handle>,
+        next: u32,
+        csum: Option<(Ext4Ino, u32, usize)>,
+    ) -> Result<()> {
+        let off = self.offset_in_block;
+        let dtime_off = off + core::mem::offset_of!(RawInode, dtime);
         journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
             |buf| {
                 buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
+                if let Some((ino, seed, inode_size)) = csum {
+                    let mut raw = RawInode::from_bytes(&buf[off..off + size_of::<RawInode>()]);
+                    InodeDesc::stamp_inode_checksum(&mut raw, ino, seed, inode_size);
+                    buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
+                }
             },
         )
     }
