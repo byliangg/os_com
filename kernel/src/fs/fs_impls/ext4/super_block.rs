@@ -48,6 +48,18 @@ const MIN_DESC_SIZE_64BIT: u16 = 64;
 /// per-group checksums.
 const MAX_DESC_SIZE: u16 = 64;
 
+/// `s_flags` bit recording that the on-disk htree hashes were computed treating
+/// name bytes as signed `char` (`EXT2_FLAGS_SIGNED_HASH`). Present here for
+/// documentation of the two-bit signedness encoding; the reader only needs the
+/// unsigned bit, defaulting to signed when neither is set.
+#[expect(dead_code)]
+const EXT2_FLAGS_SIGNED_HASH: u32 = 0x1;
+
+/// `s_flags` bit recording that the on-disk htree hashes were computed treating
+/// name bytes as unsigned `char` (`EXT2_FLAGS_UNSIGNED_HASH`); selects the
+/// `*_UNSIGNED` hash variants in `dx_probe`.
+const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x2;
+
 /// Validated, Rust-typed in-memory representation of the ext4 superblock.
 ///
 /// Counts that the `64BIT` feature would widen are stored as `u64` from the
@@ -83,6 +95,13 @@ pub(super) struct SuperBlock {
     reserved_blocks_count: u32,
     journal_ino: u32,
     journal_dev: u32,
+    /// `s_hash_seed`: the four seed words feeding the htree name hash. Consumed
+    /// by `dx_probe` (P6d) to reproduce the hashes the entries were indexed by.
+    hash_seed: [u32; 4],
+    /// Whether the on-disk htree hashes treat name bytes as unsigned `char`
+    /// (`s_flags & EXT2_FLAGS_UNSIGNED_HASH`); picks the `*_UNSIGNED` hash
+    /// variant. Defaults to signed (`false`) when neither signedness bit is set.
+    hash_unsigned: bool,
 }
 
 impl TryFrom<RawSuperBlock> for SuperBlock {
@@ -248,6 +267,10 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             reserved_blocks_count: sb.reserved_blocks_count,
             journal_ino: sb.journal_ino,
             journal_dev: sb.journal_dev,
+            hash_seed: sb.hash_seed,
+            // Neither signedness bit set means signed `char` (the historical
+            // default); only `UNSIGNED_HASH` flips it (Linux `ext4_fill_super`).
+            hash_unsigned: sb.flags & EXT2_FLAGS_UNSIGNED_HASH != 0,
         })
     }
 }
@@ -566,6 +589,27 @@ impl SuperBlock {
         self.feature_ro_compat
     }
 
+    /// Returns the four-word htree name-hash seed (`s_hash_seed`).
+    #[expect(dead_code)]
+    pub(super) fn hash_seed(&self) -> &[u32; 4] {
+        &self.hash_seed
+    }
+
+    /// Returns whether the on-disk htree hashes treat name bytes as unsigned
+    /// `char` (`s_flags & EXT2_FLAGS_UNSIGNED_HASH`); `dx_probe` adds this to the
+    /// root's hash version to pick the matching variant.
+    #[expect(dead_code)]
+    pub(super) fn hash_unsigned(&self) -> bool {
+        self.hash_unsigned
+    }
+
+    /// Returns whether the volume carries htree directory indexes
+    /// (`COMPAT_DIR_INDEX`); a directory can only be probed as an htree when set.
+    #[expect(dead_code)]
+    pub(super) fn has_dir_index(&self) -> bool {
+        self.feature_compat.contains(FeatureCompatSet::DIR_INDEX)
+    }
+
     /// Returns whether the volume has a journal that must be replayed before it
     /// can be written (the `RECOVER` bit is set or an orphan list is pending).
     /// `Ext4::open` runs that recovery at mount, before any write.
@@ -756,6 +800,14 @@ pub(super) struct RawSuperBlock {
     /// Honored only with the `64BIT` feature; spliced with `free_blocks_count` at
     /// the parse boundary and emitted back by [`SuperBlock::write_free_blocks_count`].
     pub free_blocks_count_hi: u32,
+    /// `s_min_extra_isize` (0x15C, u16) + `s_want_extra_isize` (0x15E, u16),
+    /// carved out only to place `flags` at the correct offset; not consumed.
+    pub(super) extra_isize_hints: u32,
+    /// `s_flags` (0x160): miscellaneous filesystem flags. The two low bits record
+    /// which `char` signedness the on-disk htree hashes were computed with
+    /// ([`EXT2_FLAGS_SIGNED_HASH`] / [`EXT2_FLAGS_UNSIGNED_HASH`]); `dx_probe`
+    /// reads them to pick the matching hash variant.
+    pub flags: u32,
     pub(super) reserved: Reserved,
     /// `s_checksum` (0x3FC): crc32c of the superblock over its first
     /// [`S_CHECKSUM_OFFSET`] bytes — the last word of the 1024-byte block.
@@ -781,11 +833,11 @@ const CHECKSUM_TYPE_CRC32C: u8 = 1;
 /// is refused at the feature gate, so the on-disk seed word is never consulted).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct Reserved([u32; 168]);
+pub(super) struct Reserved([u32; 166]);
 
 impl Default for Reserved {
     fn default() -> Self {
-        Self([0u32; 168])
+        Self([0u32; 166])
     }
 }
 

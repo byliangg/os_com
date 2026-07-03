@@ -9,6 +9,7 @@
 
 mod dir_entry;
 mod hash;
+mod htree;
 
 use ostd::sync::RwMutexWriteGuard;
 
