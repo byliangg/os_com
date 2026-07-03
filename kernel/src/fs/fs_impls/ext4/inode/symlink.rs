@@ -154,6 +154,10 @@ impl InodeInner {
                     *ExtentTree::empty().root_bytes(),
                     0,
                     Arc::downgrade(fs),
+                    // A slow symlink's target is a single block (< BLOCK_SIZE),
+                    // so its extent tree never grows an external node — the
+                    // node kind that would carry a tail checksum. No seed needed.
+                    None,
                 )?;
             }
             self.prepare_write(fs, 0, target_len, handle)?;

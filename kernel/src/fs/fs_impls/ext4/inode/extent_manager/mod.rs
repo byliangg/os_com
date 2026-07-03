@@ -108,6 +108,11 @@ pub(super) struct ExtentManager {
     npages: AtomicUsize,
     /// Back-reference to the filesystem, for the block device and allocator.
     fs: Weak<super::super::fs::Ext4>,
+    /// The owning inode's `metadata_csum` seed, `Some` only when the feature is
+    /// on. Threaded into every external-node write so leaf/interior blocks carry
+    /// a correct extent-block tail checksum (`ext4_extent_block_csum`); `None`
+    /// leaves those blocks byte-identical to the pre-feature layout.
+    csum_seed: Option<u32>,
 }
 
 impl ExtentManager {
@@ -117,11 +122,13 @@ impl ExtentManager {
         sector_count: u64,
         fs: Weak<super::super::fs::Ext4>,
         npages: usize,
+        csum_seed: Option<u32>,
     ) -> Result<Self> {
         Ok(Self {
             state: RwMutex::new(ExtentTree::try_new(root, sector_count)?),
             npages: AtomicUsize::new(npages),
             fs,
+            csum_seed,
         })
     }
 
@@ -253,6 +260,7 @@ impl ExtentManager {
                     got as u16,
                     node::ExtentKind::Unwritten,
                     handle,
+                    self.csum_seed,
                 ) {
                     let _ = fs.free_blocks(range.start, got, handle);
                     return Err(err);
@@ -284,9 +292,13 @@ impl ExtentManager {
             return Ok(());
         }
         let fs = self.fs()?;
-        self.state
-            .write()
-            .convert_unwritten(&fs, start_iblock, end_iblock - start_iblock, handle)
+        self.state.write().convert_unwritten(
+            &fs,
+            start_iblock,
+            end_iblock - start_iblock,
+            handle,
+            self.csum_seed,
+        )
     }
 
     /// Allocates a single data block for logical block `iblock` (assumed a hole)
@@ -313,7 +325,15 @@ impl ExtentManager {
         // The page-cache writeback fallback has no open handle to thread.
         let range = fs.alloc_blocks(1, 0, None)?;
         let pblock = range.start;
-        if let Err(err) = tree.insert(&fs, iblock, pblock, 1, node::ExtentKind::Written, None) {
+        if let Err(err) = tree.insert(
+            &fs,
+            iblock,
+            pblock,
+            1,
+            node::ExtentKind::Written,
+            None,
+            self.csum_seed,
+        ) {
             // Free the just-allocated block rather than leak it.
             let _ = fs.free_blocks(pblock, 1, None);
             return Err(err);
@@ -333,7 +353,7 @@ impl ExtentManager {
         let fs = self.fs()?;
         self.state
             .write()
-            .truncate_to_byte_len(&fs, new_size, handle)
+            .truncate_to_byte_len(&fs, new_size, handle, self.csum_seed)
     }
 }
 
@@ -469,7 +489,7 @@ mod tests {
             start_hi: 0,
             start_lo: 100,
         }]);
-        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 4).unwrap();
+        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 4, None).unwrap();
 
         let m0 = em.map_blocks(0).unwrap();
         assert_eq!(m0.state(), MapState::Written);
@@ -496,7 +516,7 @@ mod tests {
             start_hi: 0,
             start_lo: 500,
         }]);
-        let em = ExtentManager::try_new(root, 2 * 8, f.ext4.this(), 2).unwrap();
+        let em = ExtentManager::try_new(root, 2 * 8, f.ext4.this(), 2, None).unwrap();
         let m = em.map_blocks(0).unwrap();
         assert_eq!(m.state(), MapState::Unwritten);
         assert!(m.reads_as_zeros());
@@ -540,7 +560,7 @@ mod tests {
                 start_lo: 400,
             },
         ]);
-        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 8).unwrap();
+        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 8, None).unwrap();
 
         let free_before = f.ext4.super_block().free_blocks_count();
         assert_eq!(free_before, 1);
@@ -580,7 +600,7 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0).unwrap();
+        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0, None).unwrap();
         grow_to_depth_1(&f, &em);
 
         // The leaf exists only as the running transaction's capture; the device
@@ -616,7 +636,7 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0).unwrap();
+        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0, None).unwrap();
         grow_to_depth_1(&f, &em);
 
         // Commit + checkpoint: the leaf's capture retires, the device becomes

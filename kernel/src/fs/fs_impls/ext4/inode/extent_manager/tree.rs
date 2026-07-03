@@ -12,7 +12,7 @@
 
 use super::{
     super::{
-        super::{fs::Ext4, journal, prelude::*},
+        super::{checksum::crc32c, fs::Ext4, journal, prelude::*},
         RAW_BLOCK_PTRS_LEN,
     },
     node::{
@@ -186,6 +186,7 @@ impl ExtentTree {
     /// ([`journal::read_metadata_block`], capture + patch), so WAL order
     /// holds; without one they are read and written directly (Phases 1–3
     /// semantics).
+    #[expect(clippy::too_many_arguments)]
     pub(super) fn insert(
         &mut self,
         fs: &Ext4,
@@ -194,11 +195,12 @@ impl ExtentTree {
         len: u16,
         kind: ExtentKind,
         handle: Option<&journal::Handle>,
+        csum_seed: Option<u32>,
     ) -> Result<()> {
         let (mut extents, old_external) = self.flatten(fs)?;
         extents.push(Extent::new(iblock, len, pblock, kind));
         merge_extents(&mut extents);
-        let delta = self.reserialize(fs, &extents, &old_external, handle)?;
+        let delta = self.reserialize(fs, &extents, &old_external, handle, csum_seed)?;
 
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let added_blocks = len as i64 + net_meta;
@@ -231,6 +233,7 @@ impl ExtentTree {
         iblock: Iblock,
         len: u32,
         handle: Option<&journal::Handle>,
+        csum_seed: Option<u32>,
     ) -> Result<()> {
         let (extents, old_external) = self.flatten(fs)?;
 
@@ -301,7 +304,7 @@ impl ExtentTree {
         }
 
         merge_extents(&mut converted);
-        let delta = self.reserialize(fs, &converted, &old_external, handle)?;
+        let delta = self.reserialize(fs, &converted, &old_external, handle, csum_seed)?;
 
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         self.sector_count =
@@ -318,6 +321,7 @@ impl ExtentTree {
         fs: &Ext4,
         new_size: usize,
         handle: Option<&journal::Handle>,
+        csum_seed: Option<u32>,
     ) -> Result<()> {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
@@ -350,7 +354,7 @@ impl ExtentTree {
             kept.push(Extent::new(e.block(), head_len, e.start(), e.kind()));
         }
 
-        let delta = self.reserialize(fs, &kept, &old_external, handle)?;
+        let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
         // The external-leaf count changes by exactly the mutation's delta.
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
@@ -447,6 +451,7 @@ impl ExtentTree {
         extents: &[Extent],
         old_external: &[Ext4Bid],
         handle: Option<&journal::Handle>,
+        csum_seed: Option<u32>,
     ) -> Result<TreeDelta> {
         let device = fs.block_device().as_ref();
 
@@ -477,7 +482,7 @@ impl ExtentTree {
             // blocks (the in-memory root is not yet updated, so the old tree
             // stays referenced).
             for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
-                if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle) {
+                if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
                     rollback_meta_blocks(fs, &newly_allocated, handle);
                     return Err(err);
                 }
@@ -523,7 +528,7 @@ impl ExtentTree {
         // Write leaves, then interiors. On any failure, roll back the freshly
         // allocated blocks (the in-memory root is not yet updated).
         for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
-            if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle) {
+            if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
                 rollback_meta_blocks(fs, &newly_allocated, handle);
                 return Err(err);
             }
@@ -538,7 +543,7 @@ impl ExtentTree {
             .collect();
 
         for (chunk, &interior_bid) in leaf_index.chunks(INTERIOR_MAX).zip(interior_bids.iter()) {
-            if let Err(err) = write_interior_node(device, interior_bid, chunk, handle) {
+            if let Err(err) = write_interior_node(device, interior_bid, chunk, handle, csum_seed) {
                 rollback_meta_blocks(fs, &newly_allocated, handle);
                 return Err(err);
             }
@@ -801,12 +806,28 @@ fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) ->
     fs.free_blocks(bid, 1, handle)
 }
 
+/// Byte offset of `et_checksum` in a full-block external extent node: a 4-byte
+/// tail after the header and `LEAF_MAX`/`INTERIOR_MAX` (== 340) entries. Both
+/// node kinds write `eh_max = 340`, so Linux's `EXT4_EXTENT_TAIL_OFFSET`
+/// (`12 * (1 + eh_max)`) is fixed at this offset.
+const EXTENT_TAIL_OFFSET: usize = ENTRY_SIZE * (1 + LEAF_MAX);
+
+/// Stamps the `metadata_csum` extent-block tail (Linux `ext4_extent_block_csum`):
+/// crc32c of the node up to the tail, seeded with the owning inode's seed. Only
+/// external (full-block) leaf/interior nodes carry this tail; the inline root is
+/// covered by the inode checksum instead.
+fn stamp_extent_tail(block: &mut [u8], seed: u32) {
+    let csum = crc32c(seed, &block[..EXTENT_TAIL_OFFSET]);
+    block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4].copy_from_slice(&csum.to_le_bytes());
+}
+
 /// Serializes `extents` into a full-block external leaf node at `bid`.
 fn write_leaf_node(
     device: &dyn BlockDevice,
     bid: Ext4Bid,
     extents: &[Extent],
     handle: Option<&journal::Handle>,
+    csum_seed: Option<u32>,
 ) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
@@ -820,6 +841,12 @@ fn write_leaf_node(
     for (i, ext) in extents.iter().enumerate() {
         let off = ENTRY_SIZE * (1 + i);
         block[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(ext).as_bytes());
+    }
+    // With `metadata_csum`, stamp the extent-block tail over the finished node
+    // (header + entries) before it is captured/written; a `None` seed (feature
+    // off) leaves the block byte-for-byte identical.
+    if let Some(seed) = csum_seed {
+        stamp_extent_tail(&mut block, seed);
     }
     // The leaf may be REUSED from the previous tree layout (`reserialize`
     // re-fills surviving external leaves in place); only freshly allocated
@@ -848,6 +875,7 @@ fn write_interior_node(
     bid: Ext4Bid,
     idx_entries: &[RawExtentIdx],
     handle: Option<&journal::Handle>,
+    csum_seed: Option<u32>,
 ) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
@@ -861,6 +889,11 @@ fn write_interior_node(
     for (i, idx) in idx_entries.iter().enumerate() {
         let off = ENTRY_SIZE * (1 + i);
         block[off..off + ENTRY_SIZE].copy_from_slice(idx.as_bytes());
+    }
+    // Stamp the extent-block tail with `metadata_csum` on (see `write_leaf_node`);
+    // a `None` seed leaves the block unchanged.
+    if let Some(seed) = csum_seed {
+        stamp_extent_tail(&mut block, seed);
     }
     // Capture idempotently: a reused block gets its capture here, a freshly
     // allocated one keeps the zero-seeded capture from `alloc_meta_block`.
@@ -1091,11 +1124,11 @@ mod tests {
         let mut tree = ExtentTree::empty();
 
         // [0,2) -> 100, then contiguous [2,2) -> 102 must coalesce into [0,4).
-        tree.insert(&f.ext4, 0, 100, 2, ExtentKind::Written, None)
+        tree.insert(&f.ext4, 0, 100, 2, ExtentKind::Written, None, None)
             .unwrap();
         // Pure data growth: no metadata block was needed.
         assert_eq!(tree.sector_count(), 2 * SECTORS_PER_BLOCK);
-        tree.insert(&f.ext4, 2, 102, 2, ExtentKind::Written, None)
+        tree.insert(&f.ext4, 2, 102, 2, ExtentKind::Written, None, None)
             .unwrap();
 
         // Still inline depth-0 with a single merged extent.
@@ -1114,9 +1147,9 @@ mod tests {
             .unwrap();
         let mut tree = ExtentTree::empty();
 
-        tree.insert(&f.ext4, 0, 100, 1, ExtentKind::Written, None)
+        tree.insert(&f.ext4, 0, 100, 1, ExtentKind::Written, None, None)
             .unwrap();
-        tree.insert(&f.ext4, 5, 200, 1, ExtentKind::Written, None)
+        tree.insert(&f.ext4, 5, 200, 1, ExtentKind::Written, None, None)
             .unwrap();
 
         assert_eq!((tree.depth(), root_entries(&tree)), (0, 2));
@@ -1141,6 +1174,7 @@ mod tests {
                 100 + k as u64 * 10,
                 1,
                 ExtentKind::Written,
+                None,
                 None,
             )
             .unwrap();
@@ -1186,6 +1220,7 @@ mod tests {
                 1,
                 ExtentKind::Written,
                 None,
+                None,
             )
             .unwrap();
         }
@@ -1194,7 +1229,7 @@ mod tests {
 
         // A sixth extent fits the existing leaf: no new metadata block, so
         // `i_blocks` grows by the data block only.
-        tree.insert(&f.ext4, 20, 500, 1, ExtentKind::Written, None)
+        tree.insert(&f.ext4, 20, 500, 1, ExtentKind::Written, None, None)
             .unwrap();
         assert_eq!(tree.sector_count(), sectors_before + SECTORS_PER_BLOCK);
 
@@ -1224,6 +1259,7 @@ mod tests {
                 DATA_BASE + k as Ext4Bid,
                 1,
                 ExtentKind::Written,
+                None,
                 None,
             )
             .unwrap();
@@ -1287,5 +1323,86 @@ mod tests {
         merge_extents(&mut written);
         assert_eq!(written.len(), 1);
         assert_eq!(written[0].len(), MAX_WRITTEN_LEN);
+    }
+
+    /// `stamp_extent_tail` writes crc32c of the node's first `EXTENT_TAIL_OFFSET`
+    /// bytes into the 4-byte tail, and any change to the covered region changes
+    /// the stamp — the `metadata_csum` extent-block invariant (Linux
+    /// `ext4_extent_block_csum`).
+    #[ktest]
+    fn stamp_extent_tail_matches_crc32c() {
+        let seed = 0x1357_9bdfu32;
+        let mut block = [0u8; BLOCK_SIZE];
+        for (i, b) in block.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        // The tail is excluded from its own cover; zero it before stamping.
+        block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4].fill(0);
+
+        stamp_extent_tail(&mut block, seed);
+        let stored = u32::from_le_bytes(
+            block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, crc32c(seed, &block[..EXTENT_TAIL_OFFSET]));
+
+        // A single-byte change to the covered node re-stamps to a new value.
+        block[0] ^= 0xFF;
+        stamp_extent_tail(&mut block, seed);
+        let restamped = u32::from_le_bytes(
+            block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_ne!(stored, restamped);
+    }
+
+    /// End-to-end: a seeded depth-1 rebuild writes its external leaf to the
+    /// device with a correct extent-block tail checksum; a `None` seed leaves the
+    /// tail zeroed. Exercises the `write_leaf_node` compute-on-write hook.
+    #[ktest]
+    fn seeded_reserialize_stamps_leaf_tail() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+
+        let seed = 0x0bad_c0deu32;
+        let mut tree = ExtentTree::empty();
+        // Five disjoint single-block extents overflow the inline root into one
+        // external leaf (depth 1).
+        for k in 0..5u32 {
+            tree.insert(
+                &f.ext4,
+                k * 2,
+                100 + k as Ext4Bid,
+                1,
+                ExtentKind::Written,
+                None,
+                Some(seed),
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+
+        // The leaf block id lives in the root's single index entry.
+        let leaf_bid = ExtentIdx::from(&RawExtentIdx::from_bytes(
+            &tree.root_bytes().as_bytes()[ENTRY_SIZE..2 * ENTRY_SIZE],
+        ))
+        .leaf();
+
+        // No journal handle was used, so the leaf was written straight to disk.
+        let mut block = [0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(leaf_bid as usize * BLOCK_SIZE, &mut block)
+            .unwrap();
+        let stored = u32::from_le_bytes(
+            block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, crc32c(seed, &block[..EXTENT_TAIL_OFFSET]));
     }
 }

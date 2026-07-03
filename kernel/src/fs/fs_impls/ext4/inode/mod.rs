@@ -468,8 +468,15 @@ impl InodeDesc {
         fs: Weak<Ext4>,
         nblocks: u32,
     ) -> Result<Vec<Ext4Bid>> {
-        let em =
-            ExtentManager::try_new(*self.raw_block(), self.sector_count(), fs, nblocks as usize)?;
+        // The journal inode is read-only here (no external node is ever
+        // written), so no checksum seed is needed.
+        let em = ExtentManager::try_new(
+            *self.raw_block(),
+            self.sector_count(),
+            fs,
+            nblocks as usize,
+            None,
+        )?;
         let mut map = Vec::with_capacity(nblocks as usize);
         let mut i: Iblock = 0;
         while i < nblocks {
@@ -652,7 +659,7 @@ impl InodeDesc {
     /// (Linux `ext4_inode_csum` / `ei->i_csum_seed`). Folds the inode number and
     /// generation into the filesystem seed so an inode's checksum does not match
     /// after it is reused elsewhere.
-    fn inode_csum_seed(fs_seed: u32, ino: Ext4Ino, generation: u32) -> u32 {
+    pub(super) fn inode_csum_seed(fs_seed: u32, ino: Ext4Ino, generation: u32) -> u32 {
         let seed = crc32c(fs_seed, &ino.to_le_bytes());
         crc32c(seed, &generation.to_le_bytes())
     }
@@ -790,7 +797,17 @@ impl Inode {
         block_group_idx: usize,
         fs: Weak<Ext4>,
     ) -> Result<Arc<Self>> {
-        let payload = InodePayload::new(&desc, fs.clone())?;
+        // With `metadata_csum`, external extent-tree nodes carry a tail checksum
+        // seeded per inode (ino + generation folded into the fs seed). Compute
+        // it once here and thread it into the payload's extent manager; `None`
+        // when the feature is off keeps external nodes byte-identical.
+        let csum_seed = fs.upgrade().and_then(|f| {
+            let sb = f.super_block();
+            sb.has_metadata_csum().then(|| {
+                InodeDesc::inode_csum_seed(sb.metadata_csum_seed(), ino, desc.generation())
+            })
+        });
+        let payload = InodePayload::new(&desc, fs.clone(), csum_seed)?;
         let pipe = match type_ {
             InodeType::NamedPipe => Some(crate::fs::pipe::Pipe::new()),
             _ => None,
@@ -1724,13 +1741,14 @@ enum InodePayload {
 impl InodePayload {
     /// Builds the payload for `desc`; fails if a data-backed inode's extent
     /// root does not parse (`ExtentTree::try_new` — the parse-once boundary).
-    fn new(desc: &InodeDesc, fs: Weak<Ext4>) -> Result<Self> {
+    fn new(desc: &InodeDesc, fs: Weak<Ext4>, csum_seed: Option<u32>) -> Result<Self> {
         Ok(match desc.type_() {
             InodeType::File | InodeType::Dir => Self::new_data_backed(
                 desc.size() as usize,
                 *desc.raw_block(),
                 desc.sector_count(),
                 fs,
+                csum_seed,
             )?,
             // A symlink is fast (inline) when it is not extent-based and its
             // target fits in the `i_block` area; otherwise it is a slow,
@@ -1745,7 +1763,13 @@ impl InodePayload {
                         target: FastSymlinkTarget::new(*desc.raw_block()),
                     }
                 } else {
-                    Self::new_data_backed(size, *desc.raw_block(), desc.sector_count(), fs)?
+                    Self::new_data_backed(
+                        size,
+                        *desc.raw_block(),
+                        desc.sector_count(),
+                        fs,
+                        csum_seed,
+                    )?
                 }
             }
             // Devices and special files are handled by later tasks.
@@ -1758,10 +1782,17 @@ impl InodePayload {
         root: [u32; RAW_BLOCK_PTRS_LEN],
         sector_count: u64,
         fs: Weak<Ext4>,
+        csum_seed: Option<u32>,
     ) -> Result<Self> {
         let page_cache_size = size.align_up(PAGE_SIZE);
         let page_count = page_cache_size / PAGE_SIZE;
-        let extent_manager = Arc::new(ExtentManager::try_new(root, sector_count, fs, page_count)?);
+        let extent_manager = Arc::new(ExtentManager::try_new(
+            root,
+            sector_count,
+            fs,
+            page_count,
+            csum_seed,
+        )?);
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
         let page_cache = PageCache::new_with_backend(page_cache_size, backend)
             .expect("ext4 inode page cache allocation failed");
