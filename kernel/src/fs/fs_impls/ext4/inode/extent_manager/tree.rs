@@ -36,8 +36,8 @@ const LEAF_MAX: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
 
 /// Maximum index entries in one full-block external interior node — the same
 /// geometry as a leaf, since an index entry is also 12 bytes. A depth-2 tree
-/// therefore holds up to `INLINE_MAX × IDX_MAX × LEAF_MAX` extents.
-const IDX_MAX: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
+/// therefore holds up to `INLINE_MAX × INTERIOR_MAX × LEAF_MAX` extents.
+const INTERIOR_MAX: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
 
 /// 512-byte sectors per filesystem block; the unit `i_blocks` is counted in.
 const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
@@ -173,9 +173,10 @@ impl ExtentTree {
     /// pblock+len)`, rebuilding the on-disk layout and growing `i_blocks` by
     /// the `len` data blocks plus the net metadata-block delta.
     ///
-    /// Phase 2 takes the simple, correct route: the tree is flattened to a
+    /// The rebuild takes the simple, correct route: the tree is flattened to a
     /// sorted extent list, the new run is merged in, and the list is
-    /// re-serialized as an inline (≤ [`INLINE_MAX`] extents) or depth-1 tree.
+    /// re-serialized as an inline (≤ [`INLINE_MAX`] extents), depth-1, or
+    /// depth-2 tree (see [`reserialize`](Self::reserialize)).
     /// In-place B-tree surgery is a later (Phase 9) optimization. The caller
     /// must guarantee `[iblock, iblock+len)` is currently a hole (the write
     /// path only inserts for unmapped blocks).
@@ -437,7 +438,7 @@ impl ExtentTree {
     /// The shape follows the extent count: an inline (depth-0) root for up to
     /// [`INLINE_MAX`] extents, a depth-1 index for up to `INLINE_MAX × LEAF_MAX`,
     /// and a depth-2 index (root → interior nodes → leaf nodes) for up to
-    /// `INLINE_MAX × IDX_MAX × LEAF_MAX`. Beyond that a depth-3 tree would be
+    /// `INLINE_MAX × INTERIOR_MAX × LEAF_MAX`. Beyond that a depth-3 tree would be
     /// needed, which the flatten-and-rebuild strategy does not build — the
     /// honest [`Errno::ENOSPC`]. In-place B-tree surgery is a later optimization.
     fn reserialize(
@@ -486,7 +487,7 @@ impl ExtentTree {
             let index_entries: Vec<RawExtentIdx> = extents
                 .chunks(LEAF_MAX)
                 .zip(leaf_bids.iter())
-                .map(|(chunk, &leaf_bid)| leaf_index_entry(chunk[0].block(), leaf_bid))
+                .map(|(chunk, &leaf_bid)| make_index_entry(chunk[0].block(), leaf_bid))
                 .collect();
             self.write_index_root(&index_entries, 1);
 
@@ -503,14 +504,14 @@ impl ExtentTree {
             });
         }
 
-        let nr_interior = nr_leaves.div_ceil(IDX_MAX);
+        let nr_interior = nr_leaves.div_ceil(INTERIOR_MAX);
         if nr_interior > INLINE_MAX {
             // Would need a depth-3 tree; the rebuild strategy caps at depth 2.
             return_errno_with_message!(Errno::ENOSPC, "extent tree would exceed depth 2");
         }
 
         // Depth-2: the inline root indexes `nr_interior` interior nodes, each of
-        // which indexes up to `IDX_MAX` leaf blocks. Interior and leaf blocks are
+        // which indexes up to `INTERIOR_MAX` leaf blocks. Interior and leaf blocks are
         // interchangeable metadata blocks (each is fully overwritten), so one
         // reuse pool serves both; the first `nr_leaves` become leaves, the rest
         // interiors.
@@ -533,10 +534,10 @@ impl ExtentTree {
         let leaf_index: Vec<RawExtentIdx> = extents
             .chunks(LEAF_MAX)
             .zip(leaf_bids.iter())
-            .map(|(chunk, &leaf_bid)| leaf_index_entry(chunk[0].block(), leaf_bid))
+            .map(|(chunk, &leaf_bid)| make_index_entry(chunk[0].block(), leaf_bid))
             .collect();
 
-        for (chunk, &interior_bid) in leaf_index.chunks(IDX_MAX).zip(interior_bids.iter()) {
+        for (chunk, &interior_bid) in leaf_index.chunks(INTERIOR_MAX).zip(interior_bids.iter()) {
             if let Err(err) = write_interior_node(device, interior_bid, chunk, handle) {
                 rollback_meta_blocks(fs, &newly_allocated, handle);
                 return Err(err);
@@ -546,9 +547,9 @@ impl ExtentTree {
         // Commit: rewrite the depth-2 index root, one entry per interior node
         // keyed by that interior's first logical block (in memory, infallible).
         let root_index: Vec<RawExtentIdx> = leaf_index
-            .chunks(IDX_MAX)
+            .chunks(INTERIOR_MAX)
             .zip(interior_bids.iter())
-            .map(|(chunk, &interior_bid)| leaf_index_entry(chunk[0].block, interior_bid))
+            .map(|(chunk, &interior_bid)| make_index_entry(chunk[0].block, interior_bid))
             .collect();
         self.write_index_root(&root_index, 2);
 
@@ -771,7 +772,7 @@ fn rollback_meta_blocks(fs: &Ext4, blocks: &[Ext4Bid], handle: Option<&journal::
 
 /// Builds an index entry keyed by first logical block `block`, pointing at the
 /// child node at physical block `child_bid`.
-fn leaf_index_entry(block: Iblock, child_bid: Ext4Bid) -> RawExtentIdx {
+fn make_index_entry(block: Iblock, child_bid: Ext4Bid) -> RawExtentIdx {
     // 48-bit on-disk cap (see `RawExtent::from`); lossless while the no-64bit
     // mount invariant bounds bids below 2^32.
     debug_assert!(child_bid < 1 << 48);
@@ -852,7 +853,7 @@ fn write_interior_node(
     let header = RawExtentHeader {
         magic: EXTENT_MAGIC,
         entries: idx_entries.len() as u16,
-        max: IDX_MAX as u16,
+        max: INTERIOR_MAX as u16,
         depth: 1,
         generation: 0,
     };
