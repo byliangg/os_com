@@ -129,12 +129,17 @@ pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYP
 
 /// Read-only compatible features this implementation handles.
 ///
-/// These need no extra code to read correctly. A volume carrying any other
-/// `ro_compat` bit (e.g. `METADATA_CSUM`, added in Phase 6) must not be
-/// written; with no read-only mount mode yet, `SuperBlock::try_from` refuses
-/// the mount with `EROFS` (Linux `ext4_setup_super` parity).
+/// Most need no extra code to read correctly. `METADATA_CSUM` is the
+/// exception: Phase 6b implements its crc32c compute-on-write and
+/// verify-on-read across the superblock, group descriptors, inodes, bitmaps,
+/// directory blocks, and extent nodes, so a checksummed volume can now be
+/// mounted writably. A volume carrying any `ro_compat` bit still outside this
+/// mask must not be written; with no read-only mount mode yet,
+/// `SuperBlock::try_from` refuses the mount with `EROFS` (Linux
+/// `ext4_setup_super` parity).
 pub(super) const RO_COMPAT_SUPP: FeatureRoCompatSet = FeatureRoCompatSet::SPARSE_SUPER
     .union(FeatureRoCompatSet::LARGE_FILE)
     .union(FeatureRoCompatSet::HUGE_FILE)
     .union(FeatureRoCompatSet::DIR_NLINK)
-    .union(FeatureRoCompatSet::EXTRA_ISIZE);
+    .union(FeatureRoCompatSet::EXTRA_ISIZE)
+    .union(FeatureRoCompatSet::METADATA_CSUM);

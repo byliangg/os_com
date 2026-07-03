@@ -870,7 +870,10 @@ mod tests {
     #[ktest]
     fn reject_unsupported_ro_compat_for_writable_mount() {
         let mut raw = minimal_raw(2048, 2048, 256);
-        raw.feature_ro_compat |= FeatureRoCompatSet::METADATA_CSUM.bits();
+        // `GDT_CSUM` (legacy crc16 group-descriptor checksums) is a known but
+        // unimplemented ro_compat feature — mutually exclusive with the
+        // `METADATA_CSUM` we do support — so it still refuses a writable mount.
+        raw.feature_ro_compat |= FeatureRoCompatSet::GDT_CSUM.bits();
         let Err(err) = SuperBlock::try_from(raw) else {
             panic!("unsupported ro_compat must not mount writable");
         };
