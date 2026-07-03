@@ -34,6 +34,11 @@ const INLINE_MAX: usize = 4;
 /// Maximum extents in one full-block external leaf node.
 const LEAF_MAX: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
 
+/// Maximum index entries in one full-block external interior node — the same
+/// geometry as a leaf, since an index entry is also 12 bytes. A depth-2 tree
+/// therefore holds up to `INLINE_MAX × IDX_MAX × LEAF_MAX` extents.
+const IDX_MAX: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
+
 /// 512-byte sectors per filesystem block; the unit `i_blocks` is counted in.
 const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
 
@@ -112,9 +117,9 @@ impl ExtentTree {
         self.dirty = false;
     }
 
-    /// Returns the tree depth (0 = inline leaf, 1 = one level of index
-    /// blocks). Infallible: the root was validated at construction. Used by
-    /// tests to assert tree shape.
+    /// Returns the tree depth (0 = inline leaf, 1 = one level of index blocks,
+    /// 2 = two levels). Infallible: the root was validated at construction. Used
+    /// by tests to assert tree shape.
     #[cfg(ktest)]
     pub(super) fn depth(&self) -> u16 {
         self.header().depth()
@@ -338,12 +343,15 @@ impl ExtentTree {
         Ok(())
     }
 
-    /// Parses the whole tree into a sorted list of leaf extents, also
-    /// returning the physical blocks of any external (depth-1) leaf nodes.
+    /// Parses the whole tree into a list of leaf extents, also returning the
+    /// physical blocks of **every** external node — leaf blocks at depth 1, and
+    /// both interior and leaf blocks at depth 2. The returned block list is the
+    /// reuse/free pool [`reserialize`](Self::reserialize) draws from, so it must
+    /// name all metadata blocks the current tree references.
     ///
-    /// Phase 2 only ever builds depth-0 (inline) or depth-1 trees, so a depth
-    /// of 2 or more is rejected rather than walked. Leaf blocks are read
-    /// through [`journal::read_metadata_block`] — see [`lookup`](Self::lookup).
+    /// Phase 6 builds depth-0 (inline), depth-1, or depth-2 trees, so a depth of
+    /// 3 or more is rejected rather than walked. External nodes are read through
+    /// [`journal::read_metadata_block`] — see [`lookup`](Self::lookup).
     fn flatten(&self, fs: &Ext4) -> Result<(Vec<Extent>, Vec<Ext4Bid>)> {
         let root_bytes = self.root.as_bytes();
         let header = self.header();
@@ -360,46 +368,60 @@ impl ExtentTree {
             return Ok((extents, Vec::new()));
         }
 
-        if header.depth() != 1 {
-            return_errno_with_message!(Errno::EUCLEAN, "extent tree deeper than phase 2 supports");
+        let depth = header.depth();
+        if depth != 1 && depth != 2 {
+            return_errno_with_message!(Errno::EUCLEAN, "extent tree deeper than phase 6 supports");
         }
 
-        let mut leaf_bids = Vec::with_capacity(nr);
+        // The root's index entries name the immediate children: leaf blocks at
+        // depth 1, interior blocks at depth 2.
+        let mut child_bids = Vec::with_capacity(nr);
         for i in 0..nr {
             let off = ENTRY_SIZE * (1 + i);
             let idx = ExtentIdx::from(&RawExtentIdx::from_bytes(
                 &root_bytes[off..off + ENTRY_SIZE],
             ));
-            leaf_bids.push(idx.leaf());
+            child_bids.push(idx.leaf());
         }
 
         let journal = fs.journal();
         let device = fs.block_device().as_ref();
+
+        if depth == 1 {
+            let mut extents = Vec::new();
+            for &leaf_bid in &child_bids {
+                let block = journal::read_metadata_block(journal.as_deref(), device, leaf_bid)?;
+                extents.extend(parse_leaf_node(&block)?);
+            }
+            return Ok((extents, child_bids));
+        }
+
+        // depth == 2: root → interior nodes → leaf nodes. Collect every external
+        // block (interior and leaf) into the reuse pool.
         let mut extents = Vec::new();
-        for &bid in &leaf_bids {
-            let block = journal::read_metadata_block(journal.as_deref(), device, bid)?;
-            let leaf_hdr =
-                ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
-            if !leaf_hdr.is_leaf() {
-                return_errno_with_message!(Errno::EUCLEAN, "depth-1 child is not a leaf");
-            }
-            let lnr = leaf_hdr.entries() as usize;
-            if ENTRY_SIZE * (1 + lnr) > block.len() {
-                return_errno_with_message!(Errno::EUCLEAN, "extent leaf entries overrun node");
-            }
-            for j in 0..lnr {
-                let off = ENTRY_SIZE * (1 + j);
-                extents.push(Extent::from(&RawExtent::from_bytes(
-                    &block[off..off + ENTRY_SIZE],
-                )));
+        let mut external = Vec::new();
+        for &interior_bid in &child_bids {
+            external.push(interior_bid);
+            let interior = journal::read_metadata_block(journal.as_deref(), device, interior_bid)?;
+            for leaf_bid in parse_interior_node(&interior)? {
+                let leaf = journal::read_metadata_block(journal.as_deref(), device, leaf_bid)?;
+                extents.extend(parse_leaf_node(&leaf)?);
+                external.push(leaf_bid);
             }
         }
-        Ok((extents, leaf_bids))
+        Ok((extents, external))
     }
 
     /// Re-serializes `extents` into the on-disk tree, reusing the existing
-    /// external leaf blocks where possible and allocating/freeing the
+    /// external metadata blocks where possible and allocating/freeing the
     /// difference.
+    ///
+    /// The shape follows the extent count: an inline (depth-0) root for up to
+    /// [`INLINE_MAX`] extents, a depth-1 index for up to `INLINE_MAX × LEAF_MAX`,
+    /// and a depth-2 index (root → interior nodes → leaf nodes) for up to
+    /// `INLINE_MAX × IDX_MAX × LEAF_MAX`. Beyond that a depth-3 tree would be
+    /// needed, which the flatten-and-rebuild strategy does not build — the
+    /// honest [`Errno::ENOSPC`]. In-place B-tree surgery is a later optimization.
     fn reserialize(
         &mut self,
         fs: &Ext4,
@@ -424,59 +446,95 @@ impl ExtentTree {
         }
 
         let nr_leaves = extents.len().div_ceil(LEAF_MAX);
-        if nr_leaves > INLINE_MAX {
-            // Would need a depth-2 tree; Phase 2 caps the rebuild at depth 1.
-            return_errno_with_message!(Errno::ENOSPC, "extent tree would exceed phase 2 depth");
-        }
-
-        // Reuse old external blocks; allocate any shortfall (rolling back on error).
-        let reuse = nr_leaves.min(old_external.len());
-        let mut leaf_bids: Vec<Ext4Bid> = old_external[..reuse].to_vec();
-        let mut newly_allocated: Vec<Ext4Bid> = Vec::new();
         let goal = extents.first().map(|e| e.start()).unwrap_or(0);
-        for _ in reuse..nr_leaves {
-            match alloc_meta_block(fs, goal, handle) {
-                Ok(bid) => newly_allocated.push(bid),
-                Err(err) => {
-                    for &bid in &newly_allocated {
-                        let _ = free_meta_block(fs, bid, handle);
-                    }
+
+        if nr_leaves <= INLINE_MAX {
+            // Depth-1: the inline root indexes `nr_leaves` external leaf blocks.
+            let reuse = nr_leaves.min(old_external.len());
+            let (leaf_bids, newly_allocated) =
+                acquire_meta_blocks(fs, old_external, nr_leaves, goal, handle)?;
+
+            // Write each leaf node. On failure, roll back the freshly allocated
+            // blocks (the in-memory root is not yet updated, so the old tree
+            // stays referenced).
+            for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
+                if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle) {
+                    rollback_meta_blocks(fs, &newly_allocated, handle);
                     return Err(err);
                 }
             }
-        }
-        leaf_bids.extend_from_slice(&newly_allocated);
 
-        // Write each leaf node. On failure, roll back the freshly allocated blocks
-        // (the in-memory root is not yet updated, so the old tree stays referenced).
+            // Commit: rewrite the depth-1 index root (in memory, infallible).
+            let index_entries: Vec<RawExtentIdx> = extents
+                .chunks(LEAF_MAX)
+                .zip(leaf_bids.iter())
+                .map(|(chunk, &leaf_bid)| leaf_index_entry(chunk[0].block(), leaf_bid))
+                .collect();
+            self.write_index_root(&index_entries, 1);
+
+            // Free surplus old external blocks the root no longer references.
+            let mut meta_freed = 0;
+            for &bid in &old_external[reuse..] {
+                free_meta_block(fs, bid, handle)?;
+                meta_freed += 1;
+            }
+
+            return Ok(TreeDelta {
+                meta_allocated: newly_allocated.len() as u32,
+                meta_freed,
+            });
+        }
+
+        let nr_interior = nr_leaves.div_ceil(IDX_MAX);
+        if nr_interior > INLINE_MAX {
+            // Would need a depth-3 tree; the rebuild strategy caps at depth 2.
+            return_errno_with_message!(Errno::ENOSPC, "extent tree would exceed depth 2");
+        }
+
+        // Depth-2: the inline root indexes `nr_interior` interior nodes, each of
+        // which indexes up to `IDX_MAX` leaf blocks. Interior and leaf blocks are
+        // interchangeable metadata blocks (each is fully overwritten), so one
+        // reuse pool serves both; the first `nr_leaves` become leaves, the rest
+        // interiors.
+        let total = nr_leaves + nr_interior;
+        let reuse = total.min(old_external.len());
+        let (blocks, newly_allocated) = acquire_meta_blocks(fs, old_external, total, goal, handle)?;
+        let (leaf_bids, interior_bids) = blocks.split_at(nr_leaves);
+
+        // Write leaves, then interiors. On any failure, roll back the freshly
+        // allocated blocks (the in-memory root is not yet updated).
         for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
             if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle) {
-                for &bid in &newly_allocated {
-                    let _ = free_meta_block(fs, bid, handle);
-                }
+                rollback_meta_blocks(fs, &newly_allocated, handle);
                 return Err(err);
             }
         }
 
-        // Commit: rewrite the depth-1 index root (in memory, infallible).
-        let index_entries: Vec<RawExtentIdx> = extents
+        // One leaf-index entry per leaf, keyed by that leaf's first logical block
+        // (the extents are sorted, so the chunk's first entry is its minimum).
+        let leaf_index: Vec<RawExtentIdx> = extents
             .chunks(LEAF_MAX)
             .zip(leaf_bids.iter())
-            .map(|(chunk, &leaf_bid)| {
-                // 48-bit on-disk cap (see `RawExtent::from`); lossless while the
-                // no-64bit mount invariant bounds bids below 2^32.
-                debug_assert!(leaf_bid < 1 << 48);
-                RawExtentIdx {
-                    block: chunk[0].block(),
-                    leaf_lo: leaf_bid as u32,
-                    leaf_hi: (leaf_bid >> 32) as u16,
-                    unused: 0,
-                }
-            })
+            .map(|(chunk, &leaf_bid)| leaf_index_entry(chunk[0].block(), leaf_bid))
             .collect();
-        self.write_index_root(&index_entries);
 
-        // Free surplus old external blocks the root no longer references.
+        for (chunk, &interior_bid) in leaf_index.chunks(IDX_MAX).zip(interior_bids.iter()) {
+            if let Err(err) = write_interior_node(device, interior_bid, chunk, handle) {
+                rollback_meta_blocks(fs, &newly_allocated, handle);
+                return Err(err);
+            }
+        }
+
+        // Commit: rewrite the depth-2 index root, one entry per interior node
+        // keyed by that interior's first logical block (in memory, infallible).
+        let root_index: Vec<RawExtentIdx> = leaf_index
+            .chunks(IDX_MAX)
+            .zip(interior_bids.iter())
+            .map(|(chunk, &interior_bid)| leaf_index_entry(chunk[0].block, interior_bid))
+            .collect();
+        self.write_index_root(&root_index, 2);
+
+        // Free surplus old external blocks the tree no longer references.
         let mut meta_freed = 0;
         for &bid in &old_external[reuse..] {
             free_meta_block(fs, bid, handle)?;
@@ -508,16 +566,17 @@ impl ExtentTree {
         }
     }
 
-    /// Rewrites the root as a depth-1 index (header + one index entry per
-    /// external leaf).
-    fn write_index_root(&mut self, entries: &[RawExtentIdx]) {
+    /// Rewrites the root as an index node at `depth` (1 or 2): a header plus one
+    /// index entry per child (an external leaf at depth 1, an interior node at
+    /// depth 2). The inline root's capacity is [`INLINE_MAX`] at either depth.
+    fn write_index_root(&mut self, entries: &[RawExtentIdx], depth: u16) {
         let bytes = self.root.as_mut_bytes();
         bytes.fill(0);
         let header = RawExtentHeader {
             magic: EXTENT_MAGIC,
             entries: entries.len() as u16,
             max: INLINE_MAX as u16,
-            depth: 1,
+            depth,
             generation: 0,
         };
         bytes[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
@@ -598,11 +657,112 @@ fn search_entries(header: &ExtentHeader, bytes: &[u8], iblock: Iblock) -> Result
     }
 }
 
+/// Parses one freshly read (untrusted) external leaf node into its extents —
+/// the parse boundary for a depth-0 node's device bytes. Rejects a non-leaf
+/// header or an entry count that overruns the block.
+fn parse_leaf_node(block: &[u8]) -> Result<Vec<Extent>> {
+    let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
+    if !header.is_leaf() {
+        return_errno_with_message!(Errno::EUCLEAN, "external extent leaf is not a leaf node");
+    }
+    let nr = header.entries() as usize;
+    if ENTRY_SIZE * (1 + nr) > block.len() {
+        return_errno_with_message!(Errno::EUCLEAN, "extent leaf entries overrun node");
+    }
+    let mut extents = Vec::with_capacity(nr);
+    for i in 0..nr {
+        let off = ENTRY_SIZE * (1 + i);
+        extents.push(Extent::from(&RawExtent::from_bytes(
+            &block[off..off + ENTRY_SIZE],
+        )));
+    }
+    Ok(extents)
+}
+
+/// Parses one freshly read (untrusted) external interior node (a depth-2 tree's
+/// middle level) into its child leaf-block ids — the parse boundary for a
+/// depth-1 node's device bytes. Rejects a node that is not a depth-1 interior or
+/// an entry count that overruns the block.
+fn parse_interior_node(block: &[u8]) -> Result<Vec<Ext4Bid>> {
+    let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
+    if header.is_leaf() || header.depth() != 1 {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "depth-2 child is not a depth-1 interior node"
+        );
+    }
+    let nr = header.entries() as usize;
+    if ENTRY_SIZE * (1 + nr) > block.len() {
+        return_errno_with_message!(Errno::EUCLEAN, "extent index entries overrun node");
+    }
+    let mut leaf_bids = Vec::with_capacity(nr);
+    for i in 0..nr {
+        let off = ENTRY_SIZE * (1 + i);
+        leaf_bids
+            .push(ExtentIdx::from(&RawExtentIdx::from_bytes(&block[off..off + ENTRY_SIZE])).leaf());
+    }
+    Ok(leaf_bids)
+}
+
 /// The metadata (index/leaf) blocks a tree mutation allocated and freed;
 /// consumed internally by the mutators' `i_blocks` accounting.
 struct TreeDelta {
     meta_allocated: u32,
     meta_freed: u32,
+}
+
+/// Acquires `count` metadata blocks for an external-node rebuild: reuses the
+/// front of `pool` (surviving blocks the mutation will overwrite in place) and
+/// allocates the shortfall. On an allocation error the freshly allocated blocks
+/// are freed before returning, so no metadata leaks.
+///
+/// Returns the full block list (`reuse` reused blocks followed by the fresh
+/// ones) and, separately, just the freshly allocated blocks — the caller frees
+/// those if a later node write fails, since the in-memory root has not yet been
+/// pointed at the new layout.
+fn acquire_meta_blocks(
+    fs: &Ext4,
+    pool: &[Ext4Bid],
+    count: usize,
+    goal: Ext4Bid,
+    handle: Option<&journal::Handle>,
+) -> Result<(Vec<Ext4Bid>, Vec<Ext4Bid>)> {
+    let reuse = count.min(pool.len());
+    let mut blocks: Vec<Ext4Bid> = pool[..reuse].to_vec();
+    let mut newly_allocated: Vec<Ext4Bid> = Vec::new();
+    for _ in reuse..count {
+        match alloc_meta_block(fs, goal, handle) {
+            Ok(bid) => newly_allocated.push(bid),
+            Err(err) => {
+                rollback_meta_blocks(fs, &newly_allocated, handle);
+                return Err(err);
+            }
+        }
+    }
+    blocks.extend_from_slice(&newly_allocated);
+    Ok((blocks, newly_allocated))
+}
+
+/// Frees blocks allocated during a rebuild that then failed, on a best-effort
+/// basis (the mutation is already returning an error).
+fn rollback_meta_blocks(fs: &Ext4, blocks: &[Ext4Bid], handle: Option<&journal::Handle>) {
+    for &bid in blocks {
+        let _ = free_meta_block(fs, bid, handle);
+    }
+}
+
+/// Builds an index entry keyed by first logical block `block`, pointing at the
+/// child node at physical block `child_bid`.
+fn leaf_index_entry(block: Iblock, child_bid: Ext4Bid) -> RawExtentIdx {
+    // 48-bit on-disk cap (see `RawExtent::from`); lossless while the no-64bit
+    // mount invariant bounds bids below 2^32.
+    debug_assert!(child_bid < 1 << 48);
+    RawExtentIdx {
+        block,
+        leaf_lo: child_bid as u32,
+        leaf_hi: (child_bid >> 32) as u16,
+        unused: 0,
+    }
 }
 
 /// Allocates one metadata block for an external extent-tree node.
@@ -653,6 +813,43 @@ fn write_leaf_node(
     // checkpoint after the transaction commits; suppress the direct write so
     // metadata never precedes its commit (WAL). See
     // `fs::Ext4::write_back_inode_desc`.
+    if !access.is_live() {
+        device.write_val(Bid::new(bid).to_offset(), &block)?;
+    }
+    Ok(())
+}
+
+/// Serializes `idx_entries` into a full-block external interior (depth-1) node
+/// at `bid` — the middle level of a depth-2 tree, whose entries point at leaf
+/// blocks. Mirrors [`write_leaf_node`], including its journal-capture idempotency
+/// (a block reused as an interior may have been a leaf, and vice versa; the whole
+/// block is overwritten either way).
+fn write_interior_node(
+    device: &dyn BlockDevice,
+    bid: Ext4Bid,
+    idx_entries: &[RawExtentIdx],
+    handle: Option<&journal::Handle>,
+) -> Result<()> {
+    let mut block = [0u8; BLOCK_SIZE];
+    let header = RawExtentHeader {
+        magic: EXTENT_MAGIC,
+        entries: idx_entries.len() as u16,
+        max: IDX_MAX as u16,
+        depth: 1,
+        generation: 0,
+    };
+    block[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+    for (i, idx) in idx_entries.iter().enumerate() {
+        let off = ENTRY_SIZE * (1 + i);
+        block[off..off + ENTRY_SIZE].copy_from_slice(idx.as_bytes());
+    }
+    // Capture idempotently: a reused block gets its capture here, a freshly
+    // allocated one keeps the zero-seeded capture from `alloc_meta_block`.
+    let access = journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    access.patch(|buf| buf.copy_from_slice(&block))?;
+    // Under a live capture the block reaches its final location via checkpoint
+    // after commit; suppress the direct write so metadata never precedes its
+    // commit (WAL). See `write_leaf_node`.
     if !access.is_live() {
         device.write_val(Bid::new(bid).to_offset(), &block)?;
     }
@@ -983,6 +1180,57 @@ mod tests {
         assert_eq!(tree.sector_count(), sectors_before + SECTORS_PER_BLOCK);
 
         assert_eq!(tree.lookup(&f.ext4, 20).unwrap().unwrap().start(), 500);
+    }
+
+    /// A file fragmented past the depth-1 capacity (`INLINE_MAX × LEAF_MAX` =
+    /// 4 × 340 = 1360 extents) must grow a *depth-2* tree (root → interior node →
+    /// leaf nodes), and every mapping must stay reachable through both index
+    /// levels. Stride-2 single-block extents never coalesce, so N inserts yield N
+    /// distinct extents. 1400 extents need 5 leaves (> `INLINE_MAX`), overflowing
+    /// the inline root into one interior node holding 5 leaf-index entries.
+    #[ktest]
+    fn overflow_past_depth1_grows_to_depth2() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+
+        const N: u32 = 1400;
+        const DATA_BASE: Ext4Bid = 100_000;
+        for k in 0..N {
+            tree.insert(
+                &f.ext4,
+                k * 2,
+                DATA_BASE + k as Ext4Bid,
+                1,
+                ExtentKind::Written,
+                None,
+            )
+            .unwrap();
+        }
+
+        // The inline root is now a depth-2 index.
+        assert_eq!(tree.depth(), 2);
+
+        // Every mapping is reachable, spot-checked across all five leaf blocks
+        // (each leaf holds 340 extents: 0..340, 340..680, 680..1020, 1020..1360,
+        // 1360..1400). The stride-1 gap after each extent stays a hole.
+        for k in [0u32, 339, 340, 680, 1020, 1360, 1399] {
+            let m = tree.lookup(&f.ext4, k * 2).unwrap().unwrap();
+            assert_eq!(m.block(), k * 2);
+            assert_eq!(m.start(), DATA_BASE + k as Ext4Bid);
+            assert!(tree.lookup(&f.ext4, k * 2 + 1).unwrap().is_none());
+        }
+
+        // `i_blocks` counts the N data blocks plus the tree metadata: 5 leaves +
+        // 1 interior = 6 blocks. The pure-growth sequence never frees, so the
+        // total is exact — and trivially non-negative and above the data count.
+        const NR_META: u64 = 6;
+        assert_eq!(
+            tree.sector_count(),
+            (N as u64 + NR_META) * SECTORS_PER_BLOCK
+        );
     }
 
     /// Regression: two contiguous *unwritten* extents whose lengths sum to
