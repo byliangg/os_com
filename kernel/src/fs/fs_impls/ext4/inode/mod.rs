@@ -823,6 +823,7 @@ impl Inode {
                 payload,
                 sync_tid: None,
                 datasync_tid: None,
+                csum_seed,
             }),
             block_group_idx,
             fs,
@@ -1291,6 +1292,11 @@ struct InodeInner {
     /// `fdatasync` through the same full-sync path, so this stays unused.
     #[expect(dead_code)]
     datasync_tid: Option<Tid>,
+    /// This inode's `metadata_csum` seed `crc32c(crc32c(fs_seed, ino),
+    /// generation)`, or `None` when the feature is off. Seeds the directory-block
+    /// and inode checksums this inner computes on writeback; the same value
+    /// threads into the extent manager for the extent-node tail checksums.
+    csum_seed: Option<u32>,
 }
 
 impl InodeInner {

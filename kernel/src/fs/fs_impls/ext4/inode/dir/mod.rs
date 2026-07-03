@@ -11,9 +11,12 @@ mod dir_entry;
 
 use ostd::sync::RwMutexWriteGuard;
 
-use self::dir_entry::{DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader};
+use self::dir_entry::{
+    DIR_TAIL_LEN, DOT_BYTE, DOT_DOT_BYTE, DirBlockView, DirEntryFileType, DirEntryHeader,
+    EXT4_FT_DIR_CSUM,
+};
 use super::{
-    super::{fs::Ext4, journal, prelude::*, utils},
+    super::{checksum::crc32c, fs::Ext4, journal, prelude::*, utils},
     FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
 };
 use crate::fs::utils::NAME_MAX;
@@ -135,6 +138,10 @@ impl InodeInner {
             let mut iter = block.iter_entries();
 
             while let Some((entry_offset, header)) = iter.next_entry_header()? {
+                // The checksum tail is not free space: never split or reuse it.
+                if header.file_type == EXT4_FT_DIR_CSUM {
+                    continue;
+                }
                 let ino = header.ino;
                 let rec_len = header.rec_len as usize;
 
@@ -192,17 +199,28 @@ impl InodeInner {
         // Initialize the new block as one empty entry spanning the whole block
         // before publishing the new size, so any reader that observes the grown
         // size sees a well-formed (empty) entry chain rather than zeros.
+        let payload_len = self.dir_payload_len();
+        let has_csum = self.csum_seed.is_some();
         let init_result = (|| -> Result<()> {
             let page_cache = self.page_cache()?;
             page_cache.fill_zeros(old_size..new_size)?;
             let block = DirBlockView::create_view(page_cache, old_size, BLOCK_SIZE);
+            // The empty entry spans the usable payload; on a metadata_csum volume
+            // the last `DIR_TAIL_LEN` bytes are the checksum tail, so the entry
+            // chain stops short of them.
             let empty_header = DirEntryHeader {
                 ino: 0,
-                rec_len: (BLOCK_SIZE as u16).to_le(),
+                rec_len: (payload_len as u16).to_le(),
                 name_len: 0,
                 file_type: DirEntryFileType::Unknown as u8,
             };
-            block.write_entry(0, empty_header, &[])
+            block.write_entry(0, empty_header, &[])?;
+            if has_csum {
+                // Reserve the checksum tail as a fake `EXT4_FT_DIR_CSUM` entry;
+                // `det_checksum` is filled by `seal_dir_block` at journal time.
+                block.write_entry(payload_len, DirEntryHeader::dir_tail(), &[])?;
+            }
+            Ok(())
         })();
 
         if let Err(err) = init_result {
@@ -229,9 +247,41 @@ impl InodeInner {
 
         Ok(DirSlotInfo {
             dir_offset: old_size,
-            slot_rec_len: BLOCK_SIZE,
+            slot_rec_len: payload_len,
             used_rec_len: 0,
         })
+    }
+
+    /// Usable payload length of a directory block: the whole block, minus the
+    /// [`DIR_TAIL_LEN`]-byte checksum tail on a `metadata_csum` volume. Real
+    /// entries pack into `[0, dir_payload_len())`; the fake tail entry occupies
+    /// the rest.
+    fn dir_payload_len(&self) -> usize {
+        BLOCK_SIZE
+            - if self.csum_seed.is_some() {
+                DIR_TAIL_LEN
+            } else {
+                0
+            }
+    }
+
+    /// Recomputes and writes a directory block's `metadata_csum` tail into the
+    /// page cache (Linux `ext4_dirent_csum_set`): crc32c of the block up to the
+    /// last word, stored in `det_checksum`. A no-op when the feature is off.
+    fn seal_dir_block(&self, logical: Iblock) -> Result<()> {
+        let Some(seed) = self.csum_seed else {
+            return Ok(());
+        };
+        // The checksum covers the whole block except its last word (det_checksum).
+        const CSUM_OFFSET: usize = BLOCK_SIZE - 4;
+        let page_cache = self.page_cache()?;
+        let block_offset = logical as usize * BLOCK_SIZE;
+        let block: [u8; BLOCK_SIZE] = page_cache.read_val(block_offset).map_err(|_| {
+            Error::with_message(Errno::EIO, "failed to read directory block for checksum")
+        })?;
+        let csum = crc32c(seed, &block[..CSUM_OFFSET]);
+        page_cache.write_val(block_offset + CSUM_OFFSET, &csum.to_le())?;
+        Ok(())
     }
 
     /// Captures a directory block's after-image into the operation's transaction
@@ -241,17 +291,21 @@ impl InodeInner {
     /// journal the block it edits atomically with the inode / bitmap changes it
     /// makes — otherwise a crash could leave a committed inode allocation with a
     /// torn or missing directory entry (a dangling or lost name). `dir_offset` is
-    /// any byte offset within the modified block. A no-op without a handle.
+    /// any byte offset within the modified block.
     ///
     /// A whole-block capture: `get_create_access` seeds zeros (irrelevant, since
     /// the `dirty_metadata` closure overwrites the whole block with the page
     /// cache's current content), so no device read is issued for a block we fully
     /// replace.
     fn journal_dir_block(&self, dir_offset: usize, handle: Option<&journal::Handle>) -> Result<()> {
+        let logical = (dir_offset / BLOCK_SIZE) as Iblock;
+        // Seal the checksum tail (into the page cache) whether or not the volume
+        // is journaled, so the block that later reaches disk — via checkpoint of
+        // this capture, or a direct page-cache flush — carries a valid checksum.
+        self.seal_dir_block(logical)?;
         if handle.is_none() {
             return Ok(());
         }
-        let logical = (dir_offset / BLOCK_SIZE) as Iblock;
         let Some(phys) = self.extent_manager()?.map_blocks(logical)?.mapped_pblock() else {
             return_errno_with_message!(Errno::EIO, "directory block not mapped for journaling");
         };
@@ -450,9 +504,11 @@ impl InodeInner {
         };
         block.write_entry(0, dot_header, DOT_BYTE)?;
 
+        // `..` spans the rest of the usable payload (the slot from
+        // `grow_dir_block` already excludes the checksum tail).
         let dot_dot_header = DirEntryHeader {
             ino: parent_ino.to_le(),
-            rec_len: ((BLOCK_SIZE - dot_len) as u16).to_le(),
+            rec_len: ((slot.slot_rec_len - dot_len) as u16).to_le(),
             name_len: DOT_DOT_BYTE.len() as u8,
             file_type: DirEntryFileType::Dir as u8,
         };
@@ -1266,6 +1322,36 @@ mod tests {
         fs::{file::InodeType, utils::DirentVisitor},
         prelude::{Errno, Error, Result},
     };
+
+    /// The `metadata_csum` directory tail is a fake `EXT4_FT_DIR_CSUM` entry an
+    /// old kernel skips as deleted, and the block checksum covers the block up to
+    /// its last word (`det_checksum`). Integration (tail reservation on grow,
+    /// skip in slot search, seal correctness) is validated by the guest e2fsck on
+    /// a real metadata_csum image, since a checksummed volume mounts only after
+    /// the admission task.
+    #[ktest]
+    fn dir_tail_marker_and_checksum_formula() {
+        use super::{DIR_TAIL_LEN, DirEntryHeader, EXT4_FT_DIR_CSUM, crc32c};
+
+        let tail = DirEntryHeader::dir_tail();
+        assert_eq!(tail.ino, 0);
+        assert_eq!(u16::from_le(tail.rec_len) as usize, DIR_TAIL_LEN);
+        assert_eq!(tail.name_len, 0);
+        assert_eq!(tail.file_type, EXT4_FT_DIR_CSUM);
+        assert_eq!(BLOCK_SIZE - DIR_TAIL_LEN, 4084);
+
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..8].copy_from_slice(b"DIRDATA!");
+        let seed = 0xD1E5;
+        let csum = crc32c(seed, &block[..BLOCK_SIZE - 4]);
+        // The det_checksum word itself is excluded from the cover.
+        let mut probe = block;
+        probe[BLOCK_SIZE - 4..].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        assert_eq!(crc32c(seed, &probe[..BLOCK_SIZE - 4]), csum);
+        // A covered byte is not.
+        probe[0] ^= 1;
+        assert_ne!(crc32c(seed, &probe[..BLOCK_SIZE - 4]), csum);
+    }
 
     #[ktest]
     fn lookup_and_readdir() {

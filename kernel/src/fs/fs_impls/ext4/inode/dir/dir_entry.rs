@@ -16,6 +16,30 @@ pub(super) const DOT_BYTE: &[u8] = b".";
 /// Name bytes of the `..` (parent) directory entry.
 pub(super) const DOT_DOT_BYTE: &[u8] = b"..";
 
+/// `file_type` marking the fake `ext4_dir_entry_tail` that carries a directory
+/// block's `metadata_csum` (Linux `EXT4_FT_DIR_CSUM`). A checksum-unaware reader
+/// sees it as a deleted entry (`ino == 0`) and skips it.
+pub(super) const EXT4_FT_DIR_CSUM: u8 = 0xDE;
+
+/// Byte length of the fake tail entry (`struct ext4_dir_entry_tail`): an 8-byte
+/// header (`ino 0, rec_len 12, name_len 0, file_type 0xDE`) then the 4-byte
+/// `det_checksum`. Present at the end of every directory block on a
+/// `metadata_csum` volume, shrinking the usable payload by this many bytes.
+pub(super) const DIR_TAIL_LEN: usize = 12;
+
+impl DirEntryHeader {
+    /// The header of the fake tail entry that reserves the last [`DIR_TAIL_LEN`]
+    /// bytes of a directory block for its checksum.
+    pub(super) fn dir_tail() -> Self {
+        Self {
+            ino: 0,
+            rec_len: (DIR_TAIL_LEN as u16).to_le(),
+            name_len: 0,
+            file_type: EXT4_FT_DIR_CSUM,
+        }
+    }
+}
+
 const_assert!(size_of::<DirEntryHeader>() == 8);
 
 /// On-disk fixed part of a directory entry (`ext4_dir_entry_2`).
