@@ -26,6 +26,7 @@ use self::fs_type::Ext4Type;
 use crate::fs::vfs::registry;
 
 mod block_group;
+mod checksum;
 mod feature;
 mod fs;
 mod fs_type;
