@@ -69,6 +69,33 @@ pub(super) const MAX_LINK_COUNT: u16 = 32000;
 /// Logical (file-relative) block index (Linux `ext4_lblk_t`, 32-bit).
 pub(super) type Iblock = u32;
 
+/// Policy for the page cache's boundary zero-fill during a resize.
+///
+/// The two caller families need opposite treatments of a boundary block that
+/// is a hole:
+///
+/// - Pure truncates ([`InodeInner::shrink`]/[`InodeInner::expand`]) leave the
+///   hole a hole, so the fill would create a dirty page with no backing block;
+///   journaled writeback later refuses to allocate for it (an ordered flush
+///   aborts the journal, an unmount/sync flush fails with EIO). A hole already
+///   reads as zeros, so the fill is skipped — Linux
+///   `ext4_block_truncate_page` skips unmapped blocks the same way.
+/// - Write paths ([`InodeInner::prepare_write`]/[`InodeInner::rollback_write`])
+///   allocate the boundary block right after the resize, as `Written` and
+///   without zeroing the device block. The fill is what materializes the
+///   boundary page as zeros *while the block is still a hole*; skipping it
+///   would let the write's own sub-page commit read the freshly allocated
+///   block's stale device contents into the cache (silent corruption and a
+///   cross-file data leak). The root fix — inserting fresh allocations as
+///   unwritten extents and converting after the data lands, as Linux does —
+///   is recorded debt (`hole-alloc-stale-exposure`).
+enum BoundaryFill {
+    /// Zero-fill the boundary partial page only when its block is mapped.
+    IfMapped,
+    /// Always let the cache zero-fill (pre-allocation write-path behavior).
+    Always,
+}
+
 /// Physical block number on the device. 64-bit from day one so enabling the
 /// `64BIT` feature later needs no widening (report §3.3); the on-disk extent
 /// encodes a 48-bit physical block.
@@ -1048,7 +1075,7 @@ impl Inode {
         // and the block truncate below.
         let extent_manager = inner.extent_manager().ok().cloned();
         if extent_manager.is_some() {
-            inner.resize_page_cache(0, old_size)?;
+            inner.resize_page_cache(0, old_size, BoundaryFill::IfMapped)?;
         }
         inner.set_dtime(super::utils::now());
         inner.set_file_size(0);
@@ -1347,7 +1374,21 @@ impl InodeInner {
     /// the VMO grows; on shrink the VMO shrinks before the size drops. The page
     /// cache's `resize` takes `(new, old)`; mirroring ext2, the caller passes
     /// the captured sizes so this stays correct in both directions.
-    fn resize_page_cache(&mut self, new_size: usize, old_size: usize) -> Result<()> {
+    ///
+    /// `PageCache::resize` zero-fills the partial page at the resize boundary
+    /// (the kept tail on shrink, the old EOF tail on grow), and that fill marks
+    /// the page dirty. `fill` picks the policy for a boundary block that is a
+    /// hole — see [`BoundaryFill`] for why the truncate and write families need
+    /// opposite treatments. Under [`BoundaryFill::IfMapped`] with a hole
+    /// boundary we resize with page-aligned sizes instead, which never triggers
+    /// the fill and changes nothing else about the cache (the capacity end
+    /// state and the decommit range are identical).
+    fn resize_page_cache(
+        &mut self,
+        new_size: usize,
+        old_size: usize,
+        fill: BoundaryFill,
+    ) -> Result<()> {
         let InodePayload::DataBacked {
             page_cache,
             extent_manager,
@@ -1355,13 +1396,51 @@ impl InodeInner {
         else {
             return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
         };
-        page_cache.resize(new_size, old_size)?;
+        let boundary = new_size.min(old_size);
+        let let_cache_fill = if boundary.is_multiple_of(PAGE_SIZE) {
+            // No partial page at the boundary: the cache has nothing to fill
+            // either way, so skip the mapping lookup.
+            false
+        } else {
+            match fill {
+                BoundaryFill::Always => true,
+                BoundaryFill::IfMapped => {
+                    let Ok(iblock) = Iblock::try_from(boundary / BLOCK_SIZE) else {
+                        return_errno_with_message!(
+                            Errno::EFBIG,
+                            "resize boundary beyond the 32-bit logical block space"
+                        );
+                    };
+                    matches!(
+                        extent_manager.map_blocks(iblock)?,
+                        extent_manager::Mapping::Mapped { .. }
+                    )
+                }
+            }
+        };
+        if let_cache_fill {
+            page_cache.resize(new_size, old_size)?;
+        } else {
+            page_cache.resize(new_size.align_up(PAGE_SIZE), old_size.align_up(PAGE_SIZE))?;
+        }
         extent_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
         Ok(())
     }
 
     /// Prepares the inode for a write spanning `[offset, end)`: grows the page
     /// cache if extending, then allocates data blocks for any holes covered.
+    ///
+    /// The grow-resize's boundary fill is load-bearing exactly when this write
+    /// is about to allocate the old-EOF boundary block: the fill materializes
+    /// that page as zeros *while the block is still a hole*, so the write's
+    /// own sub-page commit never reads the freshly allocated block's stale
+    /// device contents (see [`BoundaryFill`]). When the write leaves a gap
+    /// past the old EOF, the boundary block stays a hole and the fill must be
+    /// skipped instead — a dirty page over a hole is a journaled-writeback
+    /// bomb. Residual window (recorded in the `hole-alloc-stale-exposure`
+    /// debt): if allocation fails before reaching a hole boundary the fill
+    /// already dirtied, the loud writeback EIO returns until the extents are
+    /// truncated away.
     ///
     /// On failure the caller must invoke `rollback_write` to restore page-cache
     /// capacity and free the partially allocated blocks.
@@ -1373,23 +1452,36 @@ impl InodeInner {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let old_size = self.file_size();
-        if end > old_size {
-            self.ensure_size_within_limit(fs, end)?;
-            self.resize_page_cache(end, old_size)?;
-        }
         let start_block = (offset / BLOCK_SIZE) as Iblock;
         let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        if end > old_size {
+            self.ensure_size_within_limit(fs, end)?;
+            let boundary_block = (old_size / BLOCK_SIZE) as Iblock;
+            let fill = if (start_block..end_block).contains(&boundary_block) {
+                BoundaryFill::Always
+            } else {
+                BoundaryFill::IfMapped
+            };
+            self.resize_page_cache(end, old_size, fill)?;
+        }
         self.extent_manager()?
             .ensure_allocated(start_block, end_block, handle)
     }
 
     /// Restores page-cache capacity and frees blocks allocated past `old_size`
     /// after a failed write.
+    ///
+    /// The shrink-resize uses [`BoundaryFill::IfMapped`]: a boundary block
+    /// that is still a hole here was never reached by the failed write (its
+    /// page holds no write splatter to clean, and filling it would plant a
+    /// dirty page over a hole), while a mapped one either predates the write
+    /// (a legitimate device read) or was committed as zeros by
+    /// `prepare_write`'s covered-boundary fill before allocation.
     fn rollback_write(&mut self, old_size: usize, end: usize, handle: Option<&journal::Handle>) {
         if end <= old_size {
             return;
         }
-        if let Err(err) = self.resize_page_cache(old_size, end) {
+        if let Err(err) = self.resize_page_cache(old_size, end, BoundaryFill::IfMapped) {
             error!(
                 "write_at: cleanup page cache resize failed: old_size={}, err={:?}",
                 old_size, err
@@ -1446,9 +1538,10 @@ impl InodeInner {
         }
         // Order (report §5.2 rule 4, shrink): zero + shrink the VMO before the
         // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
-        // kept partial block (BLOCK_SIZE == PAGE_SIZE), so stale tail bytes do
-        // not reappear if the file is later extended.
-        self.resize_page_cache(new_size, old_size)?;
+        // kept partial block (BLOCK_SIZE == PAGE_SIZE) when that block is
+        // mapped, so stale tail bytes do not reappear if the file is later
+        // extended; a hole tail is left untouched (`BoundaryFill::IfMapped`).
+        self.resize_page_cache(new_size, old_size, BoundaryFill::IfMapped)?;
         self.extent_manager()?
             .truncate_to_byte_len(new_size, handle)?;
         self.set_file_size(new_size);
@@ -1466,7 +1559,7 @@ impl InodeInner {
         // Order (report §5.2 rule 4, grow): publish the size before the VMO
         // grows; `resize_page_cache` keeps the backend's `npages` bound in sync.
         self.set_file_size(new_size);
-        self.resize_page_cache(new_size, old_size)?;
+        self.resize_page_cache(new_size, old_size, BoundaryFill::IfMapped)?;
         Ok(())
     }
 
@@ -2125,17 +2218,10 @@ mod write_tests {
     /// so the commit pipeline flushes its pages before the commit block.
     #[ktest]
     fn journaled_write_and_shrink_register_ordered_data() {
-        clocks::init_for_ktest();
-        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
-            .with_block_bitmap_metadata_marked()
-            .with_journal_inode(64)
-            .build()
-            .unwrap();
-        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
-        let journal = f.ext4.journal().unwrap();
-        // Keep the running transaction inspectable: without the commit thread
+        // The stopped commit thread keeps the running transaction inspectable:
         // nothing consumes it between the operation and the assertion.
-        journal.stop_commit_thread();
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
 
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
         assert_eq!(journal.running_nr_ordered_data_for_test(), 0);
@@ -2151,5 +2237,148 @@ mod write_tests {
         // page cache and must (re-)register too.
         inode.resize(BLOCK_SIZE / 2).unwrap();
         assert_eq!(journal.running_nr_ordered_data_for_test(), 1);
+    }
+
+    /// Builds a journaled fixture with an empty regular file and a stopped
+    /// commit thread (keeps every state transition inspectable).
+    fn journaled_fixture_with_empty_file() -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        f.ext4.journal().unwrap().stop_commit_thread();
+        f
+    }
+
+    /// Shrinking a sparse file so the kept partial tail lands inside a hole
+    /// must not leave a dirty page there: the tail zero-fill would dirty a
+    /// page with no backing block, and journaled writeback later fails on it
+    /// (the loud "writeback hit an unallocated block" EIO — as an ordered
+    /// flush it aborts the journal). Reproduces xfstests generic/014
+    /// (truncfile) and the generic/127 fsx poisoning.
+    #[ktest]
+    fn shrink_into_hole_leaves_no_dirty_tail_page() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 mapped; every later block stays a hole.
+        write_all(&inode, 0, &[0xEE; BLOCK_SIZE]);
+        inode.resize(3 * BLOCK_SIZE).unwrap();
+        // Materialize the hole page in the cache the way a reader would
+        // (clean, all zeros) — the fsx shape.
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE]
+        );
+
+        // Shrink so the kept partial tail is inside hole block 1.
+        inode.resize(BLOCK_SIZE + 100).unwrap();
+
+        let inner = inode.inner.read();
+        // Writeback of the whole cache must succeed: nothing dirty may point
+        // at an unallocated block.
+        inner
+            .page_cache()
+            .unwrap()
+            .flush_range(0..3 * BLOCK_SIZE)
+            .unwrap();
+        // The tail stayed a hole (neither the resize nor the flush allocated),
+        // and the retained bytes are intact.
+        let bm = inner.extent_manager().unwrap();
+        assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+        drop(inner);
+        assert_eq!(read_back(&inode, 0, 100), vec![0xEE; 100]);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 100), vec![0u8; 100]);
+    }
+
+    /// A write leaving a gap past an unaligned hole EOF must not dirty the
+    /// old-EOF boundary page: the write never allocates that block, so the
+    /// grow-fill would plant a dirty page over a hole (the generic/014
+    /// truncfile journal abort came through this flow).
+    #[ktest]
+    fn gap_write_past_unaligned_hole_eof_leaves_no_dirty_boundary_page() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 mapped; an unaligned sparse EOF inside hole block 1.
+        write_all(&inode, 0, &[0xEE; BLOCK_SIZE]);
+        inode.resize(BLOCK_SIZE + 100).unwrap();
+
+        // Write far past EOF: blocks 1..4 stay holes, block 4 is allocated.
+        write_all(&inode, 4 * BLOCK_SIZE, &[0xBB; 100]);
+
+        let inner = inode.inner.read();
+        inner
+            .page_cache()
+            .unwrap()
+            .flush_range(0..5 * BLOCK_SIZE)
+            .unwrap();
+        let bm = inner.extent_manager().unwrap();
+        assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+        drop(inner);
+        // The gap reads as zeros; head and tail data are intact.
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 100), vec![0u8; 100]);
+        assert_eq!(read_back(&inode, 4 * BLOCK_SIZE, 100), vec![0xBB; 100]);
+        assert_eq!(read_back(&inode, 0, 100), vec![0xEE; 100]);
+    }
+
+    /// A write that extends across an unaligned hole EOF *and allocates the
+    /// boundary block* must keep the pre-allocation zero materialization: the
+    /// bytes between the old EOF and the write start must read as zeros, and
+    /// writeback of the now-backed page must succeed.
+    #[ktest]
+    fn covered_extend_write_across_unaligned_hole_eof_reads_zeros() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &[0xEE; BLOCK_SIZE]);
+        inode.resize(BLOCK_SIZE + 100).unwrap();
+
+        // Extend within the boundary block: block 1 gets allocated.
+        write_all(&inode, BLOCK_SIZE + 200, &[0xBB; 100]);
+
+        let inner = inode.inner.read();
+        inner
+            .page_cache()
+            .unwrap()
+            .flush_range(0..2 * BLOCK_SIZE)
+            .unwrap();
+        drop(inner);
+        // POSIX: the old tail and the gap below the write read as zeros.
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 200), vec![0u8; 200]);
+        assert_eq!(read_back(&inode, BLOCK_SIZE + 200, 100), vec![0xBB; 100]);
+    }
+
+    /// Growing a file whose EOF sits unaligned inside a hole must not dirty
+    /// the old tail page either — the grow-direction twin of the shrink fill
+    /// (both directions of `PageCache::resize` zero-fill the boundary page).
+    #[ktest]
+    fn expand_from_unaligned_hole_eof_leaves_no_dirty_page() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 mapped; an unaligned sparse EOF inside hole block 1.
+        write_all(&inode, 0, &[0xEE; BLOCK_SIZE]);
+        inode.resize(BLOCK_SIZE + 100).unwrap();
+
+        // Grow across the unaligned hole EOF.
+        inode.resize(3 * BLOCK_SIZE).unwrap();
+
+        let inner = inode.inner.read();
+        inner
+            .page_cache()
+            .unwrap()
+            .flush_range(0..3 * BLOCK_SIZE)
+            .unwrap();
+        let bm = inner.extent_manager().unwrap();
+        assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+        drop(inner);
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE]
+        );
     }
 }
