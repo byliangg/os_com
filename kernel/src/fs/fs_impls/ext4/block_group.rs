@@ -42,6 +42,7 @@
 use core::fmt;
 
 use super::{
+    checksum::crc32c,
     fs::Ext4,
     inode::{Inode, InodeDesc, RawInode},
     journal,
@@ -148,6 +149,42 @@ impl BlockGroupDesc {
             free_inodes_count: lo.free_inodes_count_lo as u32,
             used_dirs_count: lo.used_dirs_count_lo as u32,
         }
+    }
+
+    /// The crc32c group-descriptor checksum (`metadata_csum`), low 16 bits
+    /// (Linux `ext4_group_desc_csum`). Seeded with the per-filesystem `seed`,
+    /// then folded over the 0-based `group` number, the descriptor bytes up to
+    /// `bg_checksum`, two zero bytes standing in for `bg_checksum` itself, and —
+    /// for a 64-byte (`64BIT`) descriptor — the 32-byte high-half tail.
+    fn group_desc_checksum(
+        lo: &RawBlockGroup,
+        hi: Option<&RawBlockGroupHi>,
+        group: u32,
+        seed: u32,
+    ) -> u16 {
+        // Byte offset of `bg_checksum` within the 32-byte low half.
+        const BG_CHECKSUM_OFFSET: usize = 30;
+        let mut crc = crc32c(seed, &group.to_le_bytes());
+        crc = crc32c(crc, &lo.as_bytes()[..BG_CHECKSUM_OFFSET]);
+        crc = crc32c(crc, &[0u8, 0u8]); // bg_checksum, excluded from its own cover
+        if let Some(hi) = hi {
+            crc = crc32c(crc, hi.as_bytes());
+        }
+        (crc & 0xFFFF) as u16
+    }
+
+    /// Verifies a raw descriptor's stored `bg_checksum` for a `metadata_csum`
+    /// volume, at the descriptor read boundary.
+    fn verify_group_desc_checksum(
+        lo: &RawBlockGroup,
+        hi: Option<&RawBlockGroupHi>,
+        group: u32,
+        seed: u32,
+    ) -> Result<()> {
+        if lo.checksum != Self::group_desc_checksum(lo, hi, group, seed) {
+            return_errno_with_message!(Errno::EUCLEAN, "bad group descriptor checksum");
+        }
+        Ok(())
     }
 
     /// Patches this group's mutable descriptor counters into the after-image of the
@@ -274,6 +311,10 @@ pub(super) struct BlockGroup {
     /// [`Self::desc_size`], so it points at the 32-byte low half of a 64-byte
     /// descriptor).
     desc_offset: usize,
+    /// The per-filesystem crc32c seed when `metadata_csum` is on, else `None`
+    /// (checksums are a no-op). Cached from the superblock at load so `reload`
+    /// and the inode read path can verify without holding a `SuperBlock`.
+    csum_seed: Option<u32>,
     /// Per-group live inode cache keyed by group-local inode index.
     ///
     /// Ext4 keeps this cache locally because the VFS layer does not provide a
@@ -309,7 +350,14 @@ impl BlockGroup {
     ) -> Result<Self> {
         let desc_size = sb.desc_size();
         let desc_offset = gdt_base_offset + group_idx * desc_size as usize;
-        let desc = Self::read_desc(device.as_ref(), desc_offset, desc_size)?;
+        let csum_seed = sb.has_metadata_csum().then(|| sb.metadata_csum_seed());
+        let desc = Self::read_desc(
+            device.as_ref(),
+            desc_offset,
+            desc_size,
+            group_idx as u32,
+            csum_seed,
+        )?;
 
         // Cache geometry from `SuperBlock` at load time.
         let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
@@ -346,6 +394,7 @@ impl BlockGroup {
             block_size,
             desc_size,
             desc_offset,
+            csum_seed,
             inode_cache: RwMutex::new(BTreeMap::new()),
         })
     }
@@ -355,20 +404,33 @@ impl BlockGroup {
     /// high halves via [`BlockGroupDesc::from_raw`] — when `desc_size` is 64, else
     /// the classic 32-byte layout. The single decode path shared by [`Self::load`]
     /// and [`Self::reload_metadata`], so the high-half splice lives at one boundary.
+    /// `group` (0-based index) and `csum_seed` drive the `metadata_csum`
+    /// verify-on-read: when `csum_seed` is `Some`, the stored `bg_checksum` is
+    /// checked against a recomputation over this group's descriptor before the
+    /// decode is trusted (`EUCLEAN` on mismatch); when `None` the descriptor is
+    /// decoded as in Phases 1–5.
     fn read_desc(
         device: &dyn BlockDevice,
         desc_offset: usize,
         desc_size: u16,
+        group: u32,
+        csum_seed: Option<u32>,
     ) -> Result<BlockGroupDesc> {
         if desc_size as usize >= size_of::<RawBlockGroup64>() {
             let raw = device
                 .read_val::<RawBlockGroup64>(desc_offset)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            if let Some(seed) = csum_seed {
+                BlockGroupDesc::verify_group_desc_checksum(&raw.lo, Some(&raw.hi), group, seed)?;
+            }
             Ok(BlockGroupDesc::from_raw(&raw.lo, Some(&raw.hi)))
         } else {
             let raw = device
                 .read_val::<RawBlockGroup>(desc_offset)
                 .map_err(|_| Error::with_message(Errno::EIO, "failed to read group descriptor"))?;
+            if let Some(seed) = csum_seed {
+                BlockGroupDesc::verify_group_desc_checksum(&raw, None, group, seed)?;
+            }
             Ok(BlockGroupDesc::from_raw(&raw, None))
         }
     }
@@ -384,7 +446,13 @@ impl BlockGroup {
     /// back over the replayed values. The group's cached geometry is immutable
     /// and untouched; the inode cache is empty this early in the mount.
     pub(super) fn reload_metadata(&self, device: &dyn BlockDevice) -> Result<()> {
-        let desc = Self::read_desc(device, self.desc_offset, self.desc_size)?;
+        let desc = Self::read_desc(
+            device,
+            self.desc_offset,
+            self.desc_size,
+            self.group_idx as u32,
+            self.csum_seed,
+        )?;
         let block_bitmap =
             Self::load_block_bitmap(device, self.first_block, self.last_block, &desc)?;
         let inode_bitmap = Self::load_inode_bitmap(device, self.nr_inodes_per_group, &desc)?;
@@ -468,6 +536,9 @@ impl BlockGroup {
         let offset =
             self.inode_table_bid() as usize * self.block_size + idx_in_group * self.inode_size;
         let raw = self.block_device.read_val::<RawInode>(offset)?;
+        if let Some(seed) = self.csum_seed {
+            InodeDesc::verify_inode_checksum(&raw, ino, seed, self.inode_size)?;
+        }
         InodeDesc::try_from(&raw)
     }
 
@@ -978,13 +1049,74 @@ mod tests {
         disk.segment().write_val(off0, &g0).unwrap();
         disk.segment().write_val(off1, &g1).unwrap();
 
-        let d0 = BlockGroup::read_desc(&disk, off0, desc_size).unwrap();
-        let d1 = BlockGroup::read_desc(&disk, off1, desc_size).unwrap();
+        let d0 = BlockGroup::read_desc(&disk, off0, desc_size, 0, None).unwrap();
+        let d1 = BlockGroup::read_desc(&disk, off1, desc_size, 1, None).unwrap();
         assert_eq!(d0.block_bitmap_bid(), (1u64 << 32) | 0x10);
         assert_eq!(d0.inode_table_bid(), (2u64 << 32) | 0x12);
         assert_eq!(d1.block_bitmap_bid(), (3u64 << 32) | 0x20);
         assert_eq!(d1.inode_bitmap_bid(), 0x21);
         assert_eq!(d1.inode_table_bid(), (4u64 << 32) | 0x22);
+    }
+
+    /// A 32-byte descriptor stamped with its crc32c `bg_checksum` verifies; a
+    /// corrupted field, a wrong group number, or a wrong seed each fail with
+    /// `EUCLEAN`. The checksum depends on the group number, so the same bytes at
+    /// a different group index do not verify.
+    #[ktest]
+    fn group_desc_checksum_round_trip() {
+        let seed = 0x1234_5678;
+        let mut lo = RawBlockGroup {
+            block_bitmap_lo: 0x10,
+            inode_bitmap_lo: 0x11,
+            inode_table_lo: 0x12,
+            free_blocks_count_lo: 100,
+            free_inodes_count_lo: 50,
+            used_dirs_count_lo: 3,
+            ..Default::default()
+        };
+        lo.checksum = BlockGroupDesc::group_desc_checksum(&lo, None, 7, seed);
+        BlockGroupDesc::verify_group_desc_checksum(&lo, None, 7, seed).unwrap();
+
+        // Wrong group number: the checksum folds it in.
+        assert_eq!(
+            BlockGroupDesc::verify_group_desc_checksum(&lo, None, 8, seed)
+                .unwrap_err()
+                .error(),
+            Errno::EUCLEAN
+        );
+        // Wrong seed.
+        assert!(BlockGroupDesc::verify_group_desc_checksum(&lo, None, 7, seed ^ 1).is_err());
+        // Corrupted body.
+        let mut bad = lo;
+        bad.free_blocks_count_lo = 101;
+        assert!(BlockGroupDesc::verify_group_desc_checksum(&bad, None, 7, seed).is_err());
+    }
+
+    /// The 64-byte descriptor folds its high-half tail (including the bitmap
+    /// checksum high halves) into `bg_checksum`, so a change there is caught.
+    #[ktest]
+    fn group_desc_checksum_covers_high_tail() {
+        let seed = 0xABCD;
+        let lo = RawBlockGroup {
+            block_bitmap_lo: 0x20,
+            ..Default::default()
+        };
+        let mut hi = RawBlockGroupHi {
+            block_bitmap_hi: 1,
+            block_bitmap_csum_hi: 0x9999,
+            ..Default::default()
+        };
+        let csum = BlockGroupDesc::group_desc_checksum(&lo, Some(&hi), 2, seed);
+        let mut lo_stamped = lo;
+        lo_stamped.checksum = csum;
+        BlockGroupDesc::verify_group_desc_checksum(&lo_stamped, Some(&hi), 2, seed).unwrap();
+
+        // A change in the high tail changes the checksum.
+        hi.block_bitmap_csum_hi = 0x8888;
+        assert_ne!(
+            BlockGroupDesc::group_desc_checksum(&lo, Some(&hi), 2, seed),
+            csum
+        );
     }
 
     /// `patch_into` on a 64-byte descriptor rewrites only the 32-byte low half:

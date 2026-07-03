@@ -34,6 +34,7 @@
 //! lock first).
 
 use super::{
+    checksum::crc32c,
     fs::{Ext4, OrphanLink},
     journal,
     journal::Tid,
@@ -634,6 +635,66 @@ impl TryFrom<&RawInode> for InodeDesc {
             generation: raw.generation,
             block: raw.block,
         })
+    }
+}
+
+/// Byte offset of `i_checksum_lo` in [`RawInode`] (0x7C, inside osd2); the low
+/// half of the inode checksum, present in every inode.
+const I_CHECKSUM_LO_OFFSET: usize = 0x7C;
+
+/// Byte offset of `i_checksum_hi` in [`RawInode`] (0x82, just past
+/// `i_extra_isize`); the high half, present only when the inode carries the
+/// extra-size region (`s_inode_size > 128`).
+const I_CHECKSUM_HI_OFFSET: usize = 0x82;
+
+impl InodeDesc {
+    /// The per-inode checksum seed: `crc32c(crc32c(fs_seed, ino), generation)`
+    /// (Linux `ext4_inode_csum` / `ei->i_csum_seed`). Folds the inode number and
+    /// generation into the filesystem seed so an inode's checksum does not match
+    /// after it is reused elsewhere.
+    fn inode_csum_seed(fs_seed: u32, ino: Ext4Ino, generation: u32) -> u32 {
+        let seed = crc32c(fs_seed, &ino.to_le_bytes());
+        crc32c(seed, &generation.to_le_bytes())
+    }
+
+    /// The full 32-bit crc32c of `raw` over the whole `inode_size`, with both
+    /// checksum fields treated as zero (Linux `ext4_inode_csum`). The caller
+    /// splits it into `i_checksum_lo` (low 16 bits) and, when the inode has the
+    /// extra region, `i_checksum_hi` (high 16 bits).
+    fn inode_checksum(raw: &RawInode, ino: Ext4Ino, fs_seed: u32, inode_size: usize) -> u32 {
+        let seed = Self::inode_csum_seed(fs_seed, ino, raw.generation);
+        let bytes = raw.as_bytes();
+        let mut crc = crc32c(seed, &bytes[..I_CHECKSUM_LO_OFFSET]);
+        crc = crc32c(crc, &[0u8, 0u8]); // i_checksum_lo
+        if inode_size > 128 {
+            // The extra region carries i_checksum_hi: checksum the gap between
+            // the two fields, then the zeroed hi, then the remainder.
+            crc = crc32c(crc, &bytes[I_CHECKSUM_LO_OFFSET + 2..I_CHECKSUM_HI_OFFSET]);
+            crc = crc32c(crc, &[0u8, 0u8]); // i_checksum_hi
+            crc = crc32c(crc, &bytes[I_CHECKSUM_HI_OFFSET + 2..inode_size]);
+        } else {
+            crc = crc32c(crc, &bytes[I_CHECKSUM_LO_OFFSET + 2..inode_size]);
+        }
+        crc
+    }
+
+    /// Verifies `raw`'s stored `i_checksum_lo` (and `i_checksum_hi` when the
+    /// inode has the extra region) for a `metadata_csum` volume, at the inode
+    /// read boundary. `fs_seed` is the per-filesystem seed.
+    pub(super) fn verify_inode_checksum(
+        raw: &RawInode,
+        ino: Ext4Ino,
+        fs_seed: u32,
+        inode_size: usize,
+    ) -> Result<()> {
+        let crc = Self::inode_checksum(raw, ino, fs_seed, inode_size);
+        if raw.checksum_lo != (crc & 0xFFFF) as u16 {
+            return_errno_with_message!(Errno::EUCLEAN, "bad inode checksum (lo)");
+        }
+        if inode_size > 128 && raw.checksum_hi != ((crc >> 16) & 0xFFFF) as u16 {
+            return_errno_with_message!(Errno::EUCLEAN, "bad inode checksum (hi)");
+        }
+        Ok(())
     }
 }
 
@@ -1729,6 +1790,44 @@ mod tests {
             extra_isize: 32,
             ..Default::default()
         }
+    }
+
+    /// An inode stamped with its crc32c `i_checksum_lo`/`i_checksum_hi` verifies;
+    /// a body change, a wrong inode number, or a wrong generation each fail with
+    /// `EUCLEAN`. The seed folds in the inode number and generation, so identical
+    /// bytes at a different inode number do not verify.
+    #[ktest]
+    fn inode_checksum_round_trip() {
+        const INODE_SIZE: usize = 256;
+        let fs_seed = 0xFEED_BEEF;
+        let ino: Ext4Ino = 12;
+        let mut raw = raw_root_dir();
+        raw.generation = 0x55AA;
+
+        let crc = InodeDesc::inode_checksum(&raw, ino, fs_seed, INODE_SIZE);
+        raw.checksum_lo = (crc & 0xFFFF) as u16;
+        raw.checksum_hi = ((crc >> 16) & 0xFFFF) as u16;
+        InodeDesc::verify_inode_checksum(&raw, ino, fs_seed, INODE_SIZE).unwrap();
+
+        // Wrong inode number / generation are folded into the seed.
+        assert_eq!(
+            InodeDesc::verify_inode_checksum(&raw, ino + 1, fs_seed, INODE_SIZE)
+                .unwrap_err()
+                .error(),
+            Errno::EUCLEAN
+        );
+        let mut regen = raw;
+        regen.generation = 0x55AB;
+        assert!(InodeDesc::verify_inode_checksum(&regen, ino, fs_seed, INODE_SIZE).is_err());
+
+        // Corrupted body (the covered range excludes the checksum fields).
+        let mut bad = raw;
+        bad.size_lo += 1;
+        assert!(InodeDesc::verify_inode_checksum(&bad, ino, fs_seed, INODE_SIZE).is_err());
+
+        // Storing the checksum back does not change the covered result.
+        let recheck = InodeDesc::inode_checksum(&raw, ino, fs_seed, INODE_SIZE);
+        assert_eq!(recheck, crc);
     }
 
     #[ktest]

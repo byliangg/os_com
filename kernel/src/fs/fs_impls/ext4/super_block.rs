@@ -408,11 +408,18 @@ impl SuperBlock {
     /// Whether this volume carries crc32c metadata checksums (`metadata_csum`).
     /// When false, every checksum compute/verify site is a no-op, so a
     /// checksum-free image is handled byte-for-byte as in Phases 1–5.
-    // Task 2 (group-descriptor / inode verify) is its first consumer.
-    #[expect(dead_code)]
     pub(super) fn has_metadata_csum(&self) -> bool {
         self.feature_ro_compat
             .contains(FeatureRoCompatSet::METADATA_CSUM)
+    }
+
+    /// The per-filesystem checksum seed feeding the group-descriptor, inode,
+    /// bitmap, directory, and extent checksums: `crc32c(!0, uuid)`. (A
+    /// `csum_seed`-incompat volume, which would override this with an on-disk
+    /// seed word, is refused at the incompat gate, so the UUID is authoritative.)
+    /// The superblock's own checksum does not use this seed.
+    pub(super) fn metadata_csum_seed(&self) -> u32 {
+        crc32c(!0, &self.uuid)
     }
 
     /// crc32c of `raw`'s first [`S_CHECKSUM_OFFSET`] bytes: the superblock's own
