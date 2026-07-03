@@ -13,6 +13,7 @@
 //! images with checksums disabled mount.
 
 use super::{
+    checksum::crc32c,
     feature::{
         FeatureCompatSet, FeatureIncompatSet, FeatureRoCompatSet, INCOMPAT_SUPP, RO_COMPAT_SUPP,
     },
@@ -164,6 +165,15 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             );
         }
         let feature_ro_compat = FeatureRoCompatSet::from_bits_truncate(sb.feature_ro_compat);
+
+        // Verify the superblock's own checksum at the parse boundary (Linux
+        // `ext4_superblock_csum_verify`). Unreachable until `METADATA_CSUM` joins
+        // `RO_COMPAT_SUPP` (the admission task) — a checksummed volume is refused
+        // by the `EROFS` gate above until then — but wired in now so the write
+        // side has a verified read to round-trip against.
+        if feature_ro_compat.contains(FeatureRoCompatSet::METADATA_CSUM) {
+            Self::verify_superblock_checksum(&sb)?;
+        }
 
         let nr_inodes_per_group = sb.inodes_per_group;
         let nr_blocks_per_group = sb.blocks_per_group;
@@ -393,6 +403,38 @@ impl SuperBlock {
 
     pub(super) const fn uuid(&self) -> &[u8; 16] {
         &self.uuid
+    }
+
+    /// Whether this volume carries crc32c metadata checksums (`metadata_csum`).
+    /// When false, every checksum compute/verify site is a no-op, so a
+    /// checksum-free image is handled byte-for-byte as in Phases 1–5.
+    // Task 2 (group-descriptor / inode verify) is its first consumer.
+    #[expect(dead_code)]
+    pub(super) fn has_metadata_csum(&self) -> bool {
+        self.feature_ro_compat
+            .contains(FeatureRoCompatSet::METADATA_CSUM)
+    }
+
+    /// crc32c of `raw`'s first [`S_CHECKSUM_OFFSET`] bytes: the superblock's own
+    /// checksum. Seeded with `!0` — the superblock, unlike group descriptors and
+    /// inodes, does not use the per-filesystem seed (Linux
+    /// `ext4_superblock_csum`). The covered range stops short of `s_checksum`, so
+    /// the result does not depend on the field's current value; a writer stores
+    /// it straight back.
+    pub(super) fn superblock_checksum(raw: &RawSuperBlock) -> u32 {
+        crc32c(!0, &raw.as_bytes()[..S_CHECKSUM_OFFSET])
+    }
+
+    /// Verifies `raw`'s stored `s_checksum` (and that `s_checksum_type` names
+    /// crc32c), for a `metadata_csum` volume at the parse boundary.
+    pub(super) fn verify_superblock_checksum(raw: &RawSuperBlock) -> Result<()> {
+        if raw.as_bytes()[S_CHECKSUM_TYPE_OFFSET] != CHECKSUM_TYPE_CRC32C {
+            return_errno_with_message!(Errno::EUCLEAN, "superblock checksum type is not crc32c");
+        }
+        if raw.checksum != Self::superblock_checksum(raw) {
+            return_errno_with_message!(Errno::EUCLEAN, "bad superblock checksum");
+        }
+        Ok(())
     }
 
     /// Returns the blocks reserved for privileged processes
@@ -703,18 +745,35 @@ pub(super) struct RawSuperBlock {
     /// the parse boundary and emitted back by [`SuperBlock::write_free_blocks_count`].
     pub free_blocks_count_hi: u32,
     pub(super) reserved: Reserved,
+    /// `s_checksum` (0x3FC): crc32c of the superblock over its first
+    /// [`S_CHECKSUM_OFFSET`] bytes — the last word of the 1024-byte block.
+    /// Meaningful only with `metadata_csum`; computed by
+    /// [`SuperBlock::superblock_checksum`] and verified at the parse boundary.
+    pub checksum: u32,
 }
 
-/// Reserved padding that fills the on-disk superblock to 1024 bytes. In ext4
-/// this region also holds the checksum-seed, mount-option, and metadata-checksum
-/// fields, parsed in later phases.
+/// Byte offset of `s_checksum` in the on-disk superblock (0x3FC): the crc32c
+/// covers exactly `[0, S_CHECKSUM_OFFSET)`, stopping short of the field itself.
+pub(super) const S_CHECKSUM_OFFSET: usize = 0x3FC;
+
+/// Byte offset of `s_checksum_type` (0x175); `metadata_csum` requires it to name
+/// crc32c ([`CHECKSUM_TYPE_CRC32C`]).
+const S_CHECKSUM_TYPE_OFFSET: usize = 0x175;
+
+/// The only `s_checksum_type` ext4 defines: crc32c.
+const CHECKSUM_TYPE_CRC32C: u8 = 1;
+
+/// Reserved padding filling the on-disk superblock up to `s_checksum` at 0x3FC.
+/// In ext4 this region also holds the checksum-seed and mount-option fields; the
+/// checksum seed is derived from the UUID instead (a `csum_seed`-incompat volume
+/// is refused at the feature gate, so the on-disk seed word is never consulted).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct Reserved([u32; 169]);
+pub(super) struct Reserved([u32; 168]);
 
 impl Default for Reserved {
     fn default() -> Self {
-        Self([0u32; 169])
+        Self([0u32; 168])
     }
 }
 
@@ -809,6 +868,57 @@ mod tests {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.feature_ro_compat |= 1 << 12; // RO_COMPAT_READONLY
         assert!(SuperBlock::try_from(raw).is_err());
+    }
+
+    /// `superblock_checksum` covers exactly the first `S_CHECKSUM_OFFSET` bytes,
+    /// so recomputing after only the `s_checksum` field changes is stable, and a
+    /// change anywhere in the covered range flips it.
+    #[ktest]
+    fn superblock_checksum_covers_body_not_field() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        let csum = SuperBlock::superblock_checksum(&raw);
+
+        // Storing the checksum (the excluded last word) does not change it.
+        raw.checksum = csum;
+        assert_eq!(SuperBlock::superblock_checksum(&raw), csum);
+        raw.checksum = 0xDEAD_BEEF;
+        assert_eq!(SuperBlock::superblock_checksum(&raw), csum);
+
+        // A change inside the covered body does change it.
+        raw.blocks_count += 1;
+        assert_ne!(SuperBlock::superblock_checksum(&raw), csum);
+    }
+
+    /// `verify_superblock_checksum` accepts a correctly stamped superblock and
+    /// rejects a corrupted one or a non-crc32c checksum type with `EUCLEAN`.
+    #[ktest]
+    fn verify_superblock_checksum_round_trip() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        // `s_checksum_type` (0x175) must name crc32c (== 1).
+        raw.as_mut_bytes()[S_CHECKSUM_TYPE_OFFSET] = CHECKSUM_TYPE_CRC32C;
+        raw.checksum = SuperBlock::superblock_checksum(&raw);
+        SuperBlock::verify_superblock_checksum(&raw).unwrap();
+
+        // Corrupt the stored checksum.
+        let mut bad = raw;
+        bad.checksum ^= 1;
+        assert_eq!(
+            SuperBlock::verify_superblock_checksum(&bad)
+                .unwrap_err()
+                .error(),
+            Errno::EUCLEAN
+        );
+
+        // Wrong checksum type is rejected even with a matching value.
+        let mut wrong_type = raw;
+        wrong_type.as_mut_bytes()[S_CHECKSUM_TYPE_OFFSET] = 0;
+        wrong_type.checksum = SuperBlock::superblock_checksum(&wrong_type);
+        assert_eq!(
+            SuperBlock::verify_superblock_checksum(&wrong_type)
+                .unwrap_err()
+                .error(),
+            Errno::EUCLEAN
+        );
     }
 
     #[ktest]

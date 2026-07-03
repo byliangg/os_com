@@ -45,9 +45,6 @@ const CRC32C_TABLE: [u32; 256] = {
 /// Segments chain: `crc32c(crc32c(seed, a), b) == crc32c(seed, a ++ b)`, which
 /// is how ext4 checksums a structure across the gap left by its own (zeroed)
 /// checksum field.
-// Only the ktest vectors call this today; Phase 6b Task 1 onward wires it into
-// the superblock/descriptor/inode/bitmap/directory/extent checksum paths.
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) fn crc32c(seed: u32, data: &[u8]) -> u32 {
     let mut crc = seed;
     for &byte in data {
