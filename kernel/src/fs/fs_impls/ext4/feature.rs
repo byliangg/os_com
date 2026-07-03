@@ -107,14 +107,21 @@ bitflags! {
 /// dirty log, then *stamps* the bit for its own writable session (cleared only
 /// at clean unmount, so a crash of our session forces the next mount to
 /// replay), not rejected as it
-/// was in Phases 1–3 when there was no journal machinery. Other incompatible
-/// features (64-bit, flex_bg, csum_seed, ...) are added in later phases and must
-/// stay out of this mask until then, so an image needing them is rejected rather
-/// than silently misread. (`HAS_JOURNAL` is a *compat* feature, handled by the
-/// journal loader, so it does not belong in this incompat mask.)
+/// was in Phases 1–3 when there was no journal machinery. Phase 6 adds
+/// `FLEX_BG`: flex_bg only relocates each group's bitmaps and inode table, and
+/// those block numbers already come from the descriptor getters
+/// (`block_bitmap_bid` etc.), never from geometry, so the read/write paths need
+/// no change beyond admitting the bit. Other incompatible features (64-bit,
+/// csum_seed, ...) are added in later phases and must stay out of this mask
+/// until then, so an image needing them is rejected rather than silently
+/// misread. In particular `IS_64BIT` must not join this mask before the 64-byte
+/// descriptor decoder lands, or every group descriptor would be misread.
+/// (`HAS_JOURNAL` is a *compat* feature, handled by the journal loader, so it
+/// does not belong in this incompat mask.)
 pub(super) const INCOMPAT_SUPP: FeatureIncompatSet = FeatureIncompatSet::FILETYPE
     .union(FeatureIncompatSet::EXTENTS)
-    .union(FeatureIncompatSet::RECOVER);
+    .union(FeatureIncompatSet::RECOVER)
+    .union(FeatureIncompatSet::FLEX_BG);
 
 /// Read-only compatible features this implementation handles.
 ///

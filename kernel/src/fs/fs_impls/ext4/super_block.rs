@@ -3,10 +3,13 @@
 //! On-disk ext4 superblock parsing and the validated in-memory representation.
 //!
 //! The ext4 superblock shares its first 264 bytes of layout with ext2; the
-//! ext4-specific fields (64-bit counts, descriptor size, checksum) live in the
-//! trailing reserved area and are parsed when P6 brings the features that need
-//! them. Until then only minimal-feature images (64-bit, flex_bg, and
-//! checksums disabled) mount, so the shared layout suffices.
+//! ext4-specific fields live in the trailing reserved area. The group
+//! descriptor size (`s_desc_size`) is parsed here so `flex_bg` images mount
+//! (their bitmaps/tables come from the descriptor getters, so relocating them
+//! needs no geometry change); the 64-bit counts and checksum fields are parsed
+//! when later P6 tasks bring the features that need them. Until then only
+//! images with 64-bit and checksums disabled mount, so the shared
+//! 32-byte-descriptor layout suffices.
 
 use super::{
     feature::{
@@ -29,6 +32,15 @@ const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
 
 const SUPER_BLOCK_SIZE: usize = 1024;
 
+/// Classic group-descriptor size in bytes, and the size forced when the `64BIT`
+/// feature is absent (Linux `EXT4_MIN_DESC_SIZE`).
+const MIN_DESC_SIZE: u16 = 32;
+
+/// Widest group descriptor the `64BIT` feature defines (Linux
+/// `EXT4_MAX_DESC_SIZE`); the 64-byte descriptor carries the high halves and
+/// per-group checksums.
+const MAX_DESC_SIZE: u16 = 64;
+
 /// Validated, Rust-typed in-memory representation of the ext4 superblock.
 ///
 /// Counts that the `64BIT` feature would widen are stored as `u64` from the
@@ -50,6 +62,9 @@ pub(super) struct SuperBlock {
     // each of which carries the `#[expect(dead_code)]` marker until wired in.
     nr_inode_table_blocks_per_group: u32,
     inode_size: usize,
+    /// Effective group-descriptor size in bytes (32 or 64), already resolved
+    /// from the raw `s_desc_size` sentinel by [`parse_desc_size`].
+    desc_size: u16,
     first_ino: u32,
     rev_level: RevLevel,
     state: FsState,
@@ -120,6 +135,15 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         }
         let feature_compat = FeatureCompatSet::from_bits_truncate(sb.feature_compat);
 
+        // Resolve `s_desc_size` at this boundary into the effective descriptor
+        // size the group-descriptor decoder strides by. `IS_64BIT` is not yet in
+        // `INCOMPAT_SUPP`, so it has already been rejected above; the gating is
+        // spelled out here in full so it stays correct once that feature lands.
+        let desc_size = parse_desc_size(
+            sb.desc_size,
+            feature_incompat.contains(FeatureIncompatSet::IS_64BIT),
+        )?;
+
         // A ro_compat feature we cannot safely *write* (e.g. `METADATA_CSUM`
         // before P6) must not mount writable — our writes would corrupt that
         // feature's invariants for every other implementation. Linux falls
@@ -187,6 +211,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             nr_inodes_per_group,
             nr_inode_table_blocks_per_group,
             inode_size,
+            desc_size,
             first_ino,
             rev_level,
             state,
@@ -211,6 +236,15 @@ impl SuperBlock {
 
     pub(super) const fn inode_size(&self) -> usize {
         self.inode_size
+    }
+
+    /// Returns the effective group-descriptor size in bytes (`EXT4_DESC_SIZE`):
+    /// the raw `s_desc_size` when the `64BIT` feature is set, else the classic
+    /// 32. Always 32 until the 64-bit descriptor decoder lands (Task 2), which
+    /// is what the group-descriptor stride and RMW currently assume.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) const fn desc_size(&self) -> u16 {
+        self.desc_size
     }
 
     pub(super) const fn first_ino(&self) -> u32 {
@@ -458,6 +492,46 @@ impl SuperBlock {
     }
 }
 
+/// Resolves and validates the raw `s_desc_size` into the effective
+/// group-descriptor size in bytes.
+///
+/// Mirrors Linux ext4 `super.c`: the on-disk field is honored only with the
+/// `64BIT` feature (`EXT4_DESC_SIZE = has_64bit ? s_desc_size : 32`); a `0` on
+/// disk means the classic 32-byte descriptor either way. When honored the size
+/// must be a power of two within `[MIN_DESC_SIZE, MAX_DESC_SIZE]`.
+///
+/// The classic-layout branch is deliberately strict: without `64BIT` the
+/// descriptor is 32 bytes, so a raw value other than the unset sentinel or the
+/// classic size would be silently misread, and we reject it instead.
+fn parse_desc_size(raw: u16, has_64bit: bool) -> Result<u16> {
+    // `0` is the on-disk "unset" convention; it resolves to the classic size
+    // and never leaks past this boundary (the sentinel stops here).
+    let effective = if raw == 0 { MIN_DESC_SIZE } else { raw };
+
+    if !has_64bit {
+        if effective != MIN_DESC_SIZE {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "group descriptor size set without the 64bit feature"
+            );
+        }
+        return Ok(MIN_DESC_SIZE);
+    }
+
+    if !(MIN_DESC_SIZE..=MAX_DESC_SIZE).contains(&effective) || !effective.is_power_of_two() {
+        return_errno_with_message!(Errno::EINVAL, "invalid group descriptor size");
+    }
+    if effective == MAX_DESC_SIZE {
+        // TODO(P6c Task 2, 64bit descriptors): the group-descriptor decoder
+        // reads only the 32-byte layout and strides by `size_of::<RawBlockGroup>()`.
+        // Admit the 64-byte descriptor once `RawBlockGroup64` and the
+        // desc_size-aware, high-half-splicing parse land; accepting it now would
+        // misread every group's block-bitmap/inode-table high halves.
+        return_errno_with_message!(Errno::EINVAL, "64-byte group descriptors not yet supported");
+    }
+    Ok(effective)
+}
+
 /// The ext4 revision level (`s_rev_level`).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, TryFromInt)]
@@ -559,7 +633,10 @@ pub(super) struct RawSuperBlock {
     pub hash_seed: [u32; 4],
     pub def_hash_version: u8,
     pub(super) reserved_char_pad: u8,
-    pub(super) reserved_word_pad: u16,
+    /// `s_desc_size`: on-disk group-descriptor size in bytes (offset 0xFE).
+    /// Honored only with the `64BIT` feature; `0` means the classic 32-byte
+    /// descriptor. Validated at the parse boundary by [`parse_desc_size`].
+    pub(super) desc_size: u16,
     pub default_mount_opts: u32,
     pub first_meta_bg: u32,
     pub(super) reserved: Reserved,
@@ -683,5 +760,69 @@ mod tests {
         let sb = SuperBlock::try_from(raw).unwrap();
         assert_eq!(sb.nr_block_groups(), 3);
         assert_eq!(sb.total_blocks(), 3 * 2048);
+    }
+
+    /// A `0` on-disk `s_desc_size` (the mkfs default for non-64bit images)
+    /// resolves to the classic 32-byte descriptor.
+    #[ktest]
+    fn desc_size_defaults_to_classic() {
+        let raw = minimal_raw(2048, 2048, 256);
+        assert_eq!(raw.desc_size, 0);
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.desc_size(), MIN_DESC_SIZE);
+    }
+
+    /// An explicit `s_desc_size == 32` resolves to 32.
+    #[ktest]
+    fn desc_size_explicit_classic() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.desc_size = MIN_DESC_SIZE;
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.desc_size(), MIN_DESC_SIZE);
+    }
+
+    /// Without `64BIT`, any `s_desc_size` other than 0 or 32 is rejected rather
+    /// than silently misread by the 32-byte decoder.
+    #[ktest]
+    fn reject_out_of_range_desc_size() {
+        for bad in [16u16, 33, 48, 64, 128] {
+            let mut raw = minimal_raw(2048, 2048, 256);
+            raw.desc_size = bad;
+            let Err(err) = SuperBlock::try_from(raw) else {
+                panic!("desc_size {bad} must be rejected without 64bit");
+            };
+            assert_eq!(err.error(), Errno::EINVAL);
+        }
+    }
+
+    /// The `EXT4_DESC_SIZE = has_64bit ? s_desc_size : 32` gating, exercised at
+    /// the parse boundary directly (the mount-level `IS_64BIT` gate rejects the
+    /// feature earlier today, so the 64bit branch is only reachable here).
+    #[ktest]
+    fn parse_desc_size_gating() {
+        // Without 64BIT: 0 and 32 resolve to 32; anything else is rejected.
+        assert_eq!(parse_desc_size(0, false).unwrap(), MIN_DESC_SIZE);
+        assert_eq!(parse_desc_size(32, false).unwrap(), MIN_DESC_SIZE);
+        assert!(parse_desc_size(64, false).is_err());
+        assert!(parse_desc_size(48, false).is_err());
+
+        // With 64BIT: 0 and 32 resolve to 32; 64 is well-formed but not yet
+        // decoded (TODO Task 2); non-power-of-two and out-of-range are rejected.
+        assert_eq!(parse_desc_size(0, true).unwrap(), MIN_DESC_SIZE);
+        assert_eq!(parse_desc_size(32, true).unwrap(), MIN_DESC_SIZE);
+        assert!(parse_desc_size(MAX_DESC_SIZE, true).is_err());
+        assert!(parse_desc_size(48, true).is_err());
+        assert!(parse_desc_size(16, true).is_err());
+        assert!(parse_desc_size(128, true).is_err());
+    }
+
+    /// A `flex_bg` image mounts now that `FLEX_BG` is in `INCOMPAT_SUPP` (the
+    /// read side already locates bitmaps/tables through the descriptor getters).
+    #[ktest]
+    fn accept_flex_bg() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.feature_incompat |= FeatureIncompatSet::FLEX_BG.bits();
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert!(sb.feature_incompat().contains(FeatureIncompatSet::FLEX_BG));
     }
 }
