@@ -159,6 +159,15 @@ impl InodeInner {
             self.prepare_write(fs, 0, target_len, handle)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();
             self.page_cache()?.write(0, &mut reader)?;
+            // `prepare_write` allocated the target block UNWRITTEN
+            // (Unwritten-first); convert it to written in this transaction, or a
+            // slow symlink's target reads back as zeros — a broken link. A slow
+            // target is < BLOCK_SIZE (a longer one is rejected), so this is the
+            // single block [0, 1).
+            let end_block = Iblock::try_from(target_len.div_ceil(BLOCK_SIZE))
+                .map_err(|_| Error::with_message(Errno::EFBIG, "symlink target too large"))?;
+            self.extent_manager()?
+                .mark_range_written(0, end_block, handle)?;
             self.set_file_size(target_len);
             Ok(true)
         }

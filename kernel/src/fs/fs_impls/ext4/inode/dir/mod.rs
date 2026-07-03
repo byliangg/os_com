@@ -210,6 +210,21 @@ impl InodeInner {
             return Err(err);
         }
 
+        // `prepare_write` allocated the new block UNWRITTEN (Unwritten-first);
+        // its full contents (the empty-entry chain) are now in the page cache,
+        // so convert it to written in this transaction. A directory block that
+        // stayed unwritten would read back as zeros — a lost, fsck-inconsistent
+        // directory. The whole block was `fill_zeros`ed, so no stale sub-range
+        // is exposed.
+        let start_block = (old_size / BLOCK_SIZE) as Iblock;
+        if let Err(err) = self
+            .extent_manager()
+            .and_then(|em| em.mark_range_written(start_block, start_block + 1, handle))
+        {
+            self.rollback_write(old_size, new_size, handle);
+            return Err(err);
+        }
+
         self.set_file_size(new_size);
 
         Ok(DirSlotInfo {
@@ -1488,6 +1503,22 @@ mod tests {
         }
         // readdir sees `.`/`..` plus all names across both blocks.
         assert_eq!(readdir_names(&dir).len(), count + 2);
+
+        // Unwritten-first regression: every directory block, including the grown
+        // one, must be WRITTEN on the extent tree. A block left unwritten (as
+        // `grow_dir_block` did before it converted the range) reads back as
+        // zeros on disk — every entry in it lost, fsck-inconsistent. The
+        // page-cache-served reads above would not reveal that (they hit the
+        // still-cached bytes); the on-tree extent state does.
+        let inner = dir.inner.read();
+        let em = inner.extent_manager().unwrap();
+        for blk in 0..(dir.size() / BLOCK_SIZE) as u32 {
+            assert_eq!(
+                em.map_blocks(blk).unwrap().state(),
+                super::super::extent_manager::MapState::Written,
+                "directory block {blk} left unwritten"
+            );
+        }
     }
 
     /// `delete_entry` removes a name, merges its space into the predecessor, and

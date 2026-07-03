@@ -185,22 +185,21 @@ impl ExtentManager {
         self.npages.store(npages, Ordering::Release);
     }
 
-    /// Allocates data blocks for every hole in `[start_iblock, end_iblock)`,
-    /// converts any unwritten (preallocated) extent overlapping the range to
-    /// written, and records both in the extent tree.
+    /// Allocates data blocks (as UNWRITTEN) for every hole in `[start_iblock,
+    /// end_iblock)`, and records them in the extent tree.
     ///
     /// Planning is done from a single snapshot of the current tree: existing
-    /// written extents are left untouched (overwrites reuse the mapped block),
-    /// unwritten extents in range are flipped to written (so the data the caller
-    /// is about to write becomes readable), and blocks are allocated only where
-    /// the snapshot showed a true hole. `i_blocks` is grown by every data block
-    /// allocated plus the net extent-tree metadata blocks; the conversion adds
-    /// no data sectors (the blocks were already counted at allocation time).
+    /// written and unwritten extents are left untouched, and blocks are
+    /// allocated only where the snapshot showed a true hole. The Unwritten-first
+    /// protocol (see [`mark_range_written`](Self::mark_range_written)) means the
+    /// fresh blocks stay read-as-zeros until the caller's data lands and
+    /// `write_at` converts the range to written — so a partial-block write never
+    /// exposes the freshly recycled block's stale contents. `i_blocks` grows by
+    /// every data block allocated plus the net extent-tree metadata blocks.
     ///
     /// On an allocation error mid-way the partial allocation stays in `state`;
-    /// the caller's `rollback_write` truncates it away. A successful conversion
-    /// that precedes a failed page-cache write also stays (the blocks were
-    /// already allocated, so nothing leaks): leaving them written is benign.
+    /// the caller's `rollback_write` truncates it away (the just-allocated
+    /// unwritten blocks read as zeros meanwhile, so nothing leaks).
     pub(super) fn ensure_allocated(
         &self,
         start_iblock: Iblock,
@@ -215,22 +214,16 @@ impl ExtentManager {
 
         // Plan hole runs from a snapshot of the current tree by interval-
         // subtracting the existing (sorted, non-overlapping) extents.
-        let extents = tree.extents(&fs)?;
-
-        // Flip any unwritten extent that overlaps the write range to written so
-        // the blocks `submit_write_bio` fills read back the real data. The
-        // physical mapping is preserved; only metadata blocks (a split may grow
-        // the tree) move, so `i_blocks` changes by the net metadata delta only.
-        if extents.iter().any(|e| {
-            e.is_unwritten()
-                && e.block() < end_iblock
-                && e.block() as u64 + e.len() as u64 > start_iblock as u64
-        }) {
-            tree.convert_unwritten(&fs, start_iblock, end_iblock - start_iblock, handle)?;
-        }
-
-        // Re-snapshot after conversion (the tree layout may have changed), then
-        // plan holes against the up-to-date extents.
+        //
+        // Fresh holes are allocated as UNWRITTEN, not written: the block stays
+        // read-as-zeros until the caller's data lands and `write_at` converts
+        // it (in the same transaction). This is the Unwritten-first protocol —
+        // a partial-block write's page-cache read-fill of an unwritten block
+        // returns zeros instead of the freshly recycled block's stale contents,
+        // so no stale data (another file's freed blocks) can leak into the
+        // file, on disk or across a crash (ledger: hole-alloc-stale-exposure).
+        // Any pre-existing unwritten extent in range (e.g. from a future
+        // fallocate) is likewise left unwritten here and converted post-write.
         let extents = tree.extents(&fs)?;
         let holes = compute_holes(&extents, start_iblock, end_iblock);
 
@@ -258,7 +251,7 @@ impl ExtentManager {
                     ib,
                     range.start,
                     got as u16,
-                    node::ExtentKind::Written,
+                    node::ExtentKind::Unwritten,
                     handle,
                 ) {
                     let _ = fs.free_blocks(range.start, got, handle);
@@ -268,6 +261,32 @@ impl ExtentManager {
             }
         }
         Ok(())
+    }
+
+    /// Converts every unwritten extent in the logical block range `[start,
+    /// end)` to written, in the caller's transaction.
+    ///
+    /// The Unwritten-first counterpart to [`ensure_allocated`](Self::ensure_allocated):
+    /// `write_at` calls this AFTER the data pages are in the page cache, so the
+    /// extent-tree metadata that makes the blocks readable-as-data commits no
+    /// earlier than the ordered-data flush of those pages (crash red-line: a
+    /// crash before this transaction commits leaves the blocks unwritten —
+    /// read-as-zeros, never stale). Written extents (a plain overwrite) and
+    /// unmapped tails are untouched. No data blocks move; `i_blocks` shifts
+    /// only by the metadata delta a split may cause.
+    pub(super) fn mark_range_written(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        if start_iblock >= end_iblock {
+            return Ok(());
+        }
+        let fs = self.fs()?;
+        self.state
+            .write()
+            .convert_unwritten(&fs, start_iblock, end_iblock - start_iblock, handle)
     }
 
     /// Allocates a single data block for logical block `iblock` (assumed a hole)
@@ -565,16 +584,19 @@ mod tests {
         grow_to_depth_1(&f, &em);
 
         // The leaf exists only as the running transaction's capture; the device
-        // still holds zeros. The mapping must come from the capture.
+        // still holds zeros. The mapping must come from the capture — decoding
+        // it at all (not `EUCLEAN`) is the point; `ensure_allocated` yields
+        // unwritten extents (Unwritten-first), converted to written only when a
+        // write's data lands.
         let m = em.map_blocks(8).unwrap();
-        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(m.state(), MapState::Unwritten);
 
         // Same across the commit boundary: the image is now retained
         // un-checkpointed (the commit thread is stopped, so nothing applies it
         // to its final location).
         journal.commit_now_for_test();
         let m = em.map_blocks(4).unwrap();
-        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(m.state(), MapState::Unwritten);
     }
 
     /// A1-B0 regression (`reused-leaf-missing-capture`): re-serializing into a
@@ -606,10 +628,13 @@ mod tests {
             let op = f.ext4.begin_op(8).unwrap();
             em.ensure_allocated(10, 11, op.get()).unwrap();
         }
+        // `ensure_allocated` yields unwritten extents (Unwritten-first); the
+        // point here is that the reused leaf was captured and the mapping is
+        // served (not `EIO`/`EUCLEAN`), for both the new and pre-flush extents.
         let m = em.map_blocks(10).unwrap();
-        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(m.state(), MapState::Unwritten);
         // The pre-flush extents survived the in-place rewrite.
         let m = em.map_blocks(0).unwrap();
-        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(m.state(), MapState::Unwritten);
     }
 }

@@ -69,33 +69,6 @@ pub(super) const MAX_LINK_COUNT: u16 = 32000;
 /// Logical (file-relative) block index (Linux `ext4_lblk_t`, 32-bit).
 pub(super) type Iblock = u32;
 
-/// Policy for the page cache's boundary zero-fill during a resize.
-///
-/// The two caller families need opposite treatments of a boundary block that
-/// is a hole:
-///
-/// - Pure truncates ([`InodeInner::shrink`]/[`InodeInner::expand`]) leave the
-///   hole a hole, so the fill would create a dirty page with no backing block;
-///   journaled writeback later refuses to allocate for it (an ordered flush
-///   aborts the journal, an unmount/sync flush fails with EIO). A hole already
-///   reads as zeros, so the fill is skipped — Linux
-///   `ext4_block_truncate_page` skips unmapped blocks the same way.
-/// - Write paths ([`InodeInner::prepare_write`]/[`InodeInner::rollback_write`])
-///   allocate the boundary block right after the resize, as `Written` and
-///   without zeroing the device block. The fill is what materializes the
-///   boundary page as zeros *while the block is still a hole*; skipping it
-///   would let the write's own sub-page commit read the freshly allocated
-///   block's stale device contents into the cache (silent corruption and a
-///   cross-file data leak). The root fix — inserting fresh allocations as
-///   unwritten extents and converting after the data lands, as Linux does —
-///   is recorded debt (`hole-alloc-stale-exposure`).
-enum BoundaryFill {
-    /// Zero-fill the boundary partial page only when its block is mapped.
-    IfMapped,
-    /// Always let the cache zero-fill (pre-allocation write-path behavior).
-    Always,
-}
-
 /// Physical block number on the device. 64-bit from day one so enabling the
 /// `64BIT` feature later needs no widening (report §3.3); the on-disk extent
 /// encodes a 48-bit physical block.
@@ -1075,7 +1048,7 @@ impl Inode {
         // and the block truncate below.
         let extent_manager = inner.extent_manager().ok().cloned();
         if extent_manager.is_some() {
-            inner.resize_page_cache(0, old_size, BoundaryFill::IfMapped)?;
+            inner.resize_page_cache(0, old_size)?;
         }
         inner.set_dtime(super::utils::now());
         inner.set_file_size(0);
@@ -1377,18 +1350,17 @@ impl InodeInner {
     ///
     /// `PageCache::resize` zero-fills the partial page at the resize boundary
     /// (the kept tail on shrink, the old EOF tail on grow), and that fill marks
-    /// the page dirty. `fill` picks the policy for a boundary block that is a
-    /// hole — see [`BoundaryFill`] for why the truncate and write families need
-    /// opposite treatments. Under [`BoundaryFill::IfMapped`] with a hole
-    /// boundary we resize with page-aligned sizes instead, which never triggers
-    /// the fill and changes nothing else about the cache (the capacity end
-    /// state and the decommit range are identical).
-    fn resize_page_cache(
-        &mut self,
-        new_size: usize,
-        old_size: usize,
-        fill: BoundaryFill,
-    ) -> Result<()> {
+    /// the page dirty. Over a HOLE that dirty page has no backing block, and
+    /// journaled writeback later refuses to allocate one — an ordered flush
+    /// aborts the journal, an unmount flush fails with EIO. A hole already reads
+    /// as zeros, so the fill only has real work when the boundary block is
+    /// mapped (Linux `ext4_block_truncate_page` skips unmapped blocks the same
+    /// way); over a hole we resize with page-aligned sizes, which never triggers
+    /// the fill and changes nothing else (identical capacity end state and
+    /// decommit range). The write path relies on Unwritten-first — not a
+    /// boundary fill — to keep a freshly allocated block's stale contents out of
+    /// the file (see [`write_at`](Self::write_at)).
+    fn resize_page_cache(&mut self, new_size: usize, old_size: usize) -> Result<()> {
         let InodePayload::DataBacked {
             page_cache,
             extent_manager,
@@ -1397,28 +1369,23 @@ impl InodeInner {
             return_errno_with_message!(Errno::EINVAL, "inode has no data page cache");
         };
         let boundary = new_size.min(old_size);
-        let let_cache_fill = if boundary.is_multiple_of(PAGE_SIZE) {
+        let boundary_block_is_mapped = if boundary.is_multiple_of(PAGE_SIZE) {
             // No partial page at the boundary: the cache has nothing to fill
             // either way, so skip the mapping lookup.
             false
         } else {
-            match fill {
-                BoundaryFill::Always => true,
-                BoundaryFill::IfMapped => {
-                    let Ok(iblock) = Iblock::try_from(boundary / BLOCK_SIZE) else {
-                        return_errno_with_message!(
-                            Errno::EFBIG,
-                            "resize boundary beyond the 32-bit logical block space"
-                        );
-                    };
-                    matches!(
-                        extent_manager.map_blocks(iblock)?,
-                        extent_manager::Mapping::Mapped { .. }
-                    )
-                }
-            }
+            let Ok(iblock) = Iblock::try_from(boundary / BLOCK_SIZE) else {
+                return_errno_with_message!(
+                    Errno::EFBIG,
+                    "resize boundary beyond the 32-bit logical block space"
+                );
+            };
+            matches!(
+                extent_manager.map_blocks(iblock)?,
+                extent_manager::Mapping::Mapped { .. }
+            )
         };
-        if let_cache_fill {
+        if boundary_block_is_mapped {
             page_cache.resize(new_size, old_size)?;
         } else {
             page_cache.resize(new_size.align_up(PAGE_SIZE), old_size.align_up(PAGE_SIZE))?;
@@ -1428,19 +1395,17 @@ impl InodeInner {
     }
 
     /// Prepares the inode for a write spanning `[offset, end)`: grows the page
-    /// cache if extending, then allocates data blocks for any holes covered.
+    /// cache if extending, then allocates data blocks (as unwritten) for any
+    /// holes covered.
     ///
-    /// The grow-resize's boundary fill is load-bearing exactly when this write
-    /// is about to allocate the old-EOF boundary block: the fill materializes
-    /// that page as zeros *while the block is still a hole*, so the write's
-    /// own sub-page commit never reads the freshly allocated block's stale
-    /// device contents (see [`BoundaryFill`]). When the write leaves a gap
-    /// past the old EOF, the boundary block stays a hole and the fill must be
-    /// skipped instead — a dirty page over a hole is a journaled-writeback
-    /// bomb. Residual window (recorded in the `hole-alloc-stale-exposure`
-    /// debt): if allocation fails before reaching a hole boundary the fill
-    /// already dirtied, the loud writeback EIO returns until the extents are
-    /// truncated away.
+    /// The grow-resize skips the boundary zero-fill over a hole (it would plant
+    /// a dirty page with no backing block — a journaled-writeback bomb).
+    /// Unwritten-first makes that safe: `ensure_allocated` allocates the write's
+    /// hole blocks as UNWRITTEN, so the write's own sub-page page-cache commit
+    /// reads them back as zeros (not the freshly recycled block's stale
+    /// contents), and `write_at` converts the range to written after the data
+    /// lands. A mapped partial boundary block still has its tail zeroed; a hole
+    /// boundary is left untouched (`resize_page_cache`).
     ///
     /// On failure the caller must invoke `rollback_write` to restore page-cache
     /// capacity and free the partially allocated blocks.
@@ -1456,13 +1421,7 @@ impl InodeInner {
         let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
         if end > old_size {
             self.ensure_size_within_limit(fs, end)?;
-            let boundary_block = (old_size / BLOCK_SIZE) as Iblock;
-            let fill = if (start_block..end_block).contains(&boundary_block) {
-                BoundaryFill::Always
-            } else {
-                BoundaryFill::IfMapped
-            };
-            self.resize_page_cache(end, old_size, fill)?;
+            self.resize_page_cache(end, old_size)?;
         }
         self.extent_manager()?
             .ensure_allocated(start_block, end_block, handle)
@@ -1471,7 +1430,7 @@ impl InodeInner {
     /// Restores page-cache capacity and frees blocks allocated past `old_size`
     /// after a failed write.
     ///
-    /// The shrink-resize uses [`BoundaryFill::IfMapped`]: a boundary block
+    /// The shrink-resize skips the boundary fill over a hole: a boundary block
     /// that is still a hole here was never reached by the failed write (its
     /// page holds no write splatter to clean, and filling it would plant a
     /// dirty page over a hole), while a mapped one either predates the write
@@ -1481,7 +1440,7 @@ impl InodeInner {
         if end <= old_size {
             return;
         }
-        if let Err(err) = self.resize_page_cache(old_size, end, BoundaryFill::IfMapped) {
+        if let Err(err) = self.resize_page_cache(old_size, end) {
             error!(
                 "write_at: cleanup page cache resize failed: old_size={}, err={:?}",
                 old_size, err
@@ -1540,8 +1499,8 @@ impl InodeInner {
         // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
         // kept partial block (BLOCK_SIZE == PAGE_SIZE) when that block is
         // mapped, so stale tail bytes do not reappear if the file is later
-        // extended; a hole tail is left untouched (`BoundaryFill::IfMapped`).
-        self.resize_page_cache(new_size, old_size, BoundaryFill::IfMapped)?;
+        // extended; a hole tail is left untouched by `resize_page_cache`.
+        self.resize_page_cache(new_size, old_size)?;
         self.extent_manager()?
             .truncate_to_byte_len(new_size, handle)?;
         self.set_file_size(new_size);
@@ -1559,7 +1518,7 @@ impl InodeInner {
         // Order (report §5.2 rule 4, grow): publish the size before the VMO
         // grows; `resize_page_cache` keeps the backend's `npages` bound in sync.
         self.set_file_size(new_size);
-        self.resize_page_cache(new_size, old_size, BoundaryFill::IfMapped)?;
+        self.resize_page_cache(new_size, old_size)?;
         Ok(())
     }
 
@@ -1587,6 +1546,23 @@ impl InodeInner {
         if let Err(err) = self.page_cache()?.write(offset, reader) {
             self.rollback_write(old_size, end, handle);
             return Err(err.into());
+        }
+        // Unwritten-first: the blocks this write covers were allocated as
+        // unwritten (so the sub-page commit above read them back as zeros, not
+        // stale recycled contents). Now that the data is in the page cache,
+        // convert the range to written IN THIS TRANSACTION — the extent
+        // metadata that makes the blocks readable-as-data thus commits together
+        // with (never before) the ordered-data flush the caller registers. A
+        // crash before this transaction commits leaves the blocks unwritten:
+        // read-as-zeros, never another file's freed data.
+        let start_block = (offset / BLOCK_SIZE) as Iblock;
+        let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        if let Err(err) = self
+            .extent_manager()
+            .and_then(|em| em.mark_range_written(start_block, end_block, handle))
+        {
+            self.rollback_write(old_size, end, handle);
+            return Err(err);
         }
 
         self.set_mtime_ctime(super::utils::now());
@@ -2251,6 +2227,101 @@ mod write_tests {
         f.write_raw_inode(FILE_INO, &make_empty_file_inode());
         f.ext4.journal().unwrap().stop_commit_thread();
         f
+    }
+
+    /// Unwritten-first (`hole-alloc-stale-exposure`): a partial-block write into
+    /// a hole must not expose the freshly allocated block's stale contents —
+    /// another file's freed data still on the device. The block is allocated
+    /// UNWRITTEN, so the write's own sub-page page-cache read-fill returns zeros
+    /// (not the recycled block), and only the written bytes land; the convert to
+    /// written follows in the same transaction. Before the fix (fresh holes
+    /// inserted as written) the sub-page commit read the recycled block's bytes
+    /// into the uncovered range — a silent cross-file leak. Reproduces the fsx
+    /// (generic/127) and posix_fallocate (generic/345) failures.
+    #[ktest]
+    fn partial_write_into_recycled_hole_reads_zeros_not_stale() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Fill block 0 with a recognizable pattern, record its physical block,
+        // then free it. `free` does not zero the device, so the pattern stays.
+        write_all(&inode, 0, &[0xAB; BLOCK_SIZE]);
+        let recycled = inode
+            .inner
+            .read()
+            .extent_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .mapped_pblock()
+            .unwrap();
+        inode.resize(0).unwrap();
+
+        // Partial write inside block 0 at a non-zero offset: [200, 300). The
+        // allocator hands block 0 back the freed physical block (first-fit),
+        // now allocated unwritten.
+        write_all(&inode, 200, &[0xCD; 100]);
+        let reused = inode
+            .inner
+            .read()
+            .extent_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .mapped_pblock()
+            .unwrap();
+        // Non-vacuous: the hazard only exists when the stale block is recycled.
+        assert_eq!(
+            reused, recycled,
+            "the freed block must be reallocated to exercise the stale-exposure hazard"
+        );
+
+        // The written bytes are the new data; the UNCOVERED head [0, 200) must
+        // read zeros, NOT the 0xAB stale contents of the recycled block.
+        assert_eq!(read_back(&inode, 0, 200), vec![0u8; 200]);
+        assert_eq!(read_back(&inode, 200, 100), vec![0xCD; 100]);
+        // The block is now written (the convert ran), so re-reads are stable.
+        assert_eq!(
+            inode
+                .inner
+                .read()
+                .extent_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .state(),
+            MapState::Written
+        );
+    }
+
+    /// A pure overwrite of already-written blocks must convert nothing: on a
+    /// large/fragmented file the extent-tree rewrite that a needless
+    /// `convert_unwritten` would trigger re-journals every external node and can
+    /// abort a legal write. Here we pin the invariant on a small file — the
+    /// mapping stays written and `i_blocks` is unchanged.
+    #[ktest]
+    fn overwrite_of_written_block_converts_nothing() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&inode, 0, &[0x11; BLOCK_SIZE]);
+        let sc_before = inode.sector_count();
+
+        // Overwrite the same, already-written block.
+        write_all(&inode, 0, &[0x22; BLOCK_SIZE]);
+
+        assert_eq!(inode.sector_count(), sc_before);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0x22; BLOCK_SIZE]);
+        assert_eq!(
+            inode
+                .inner
+                .read()
+                .extent_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .state(),
+            MapState::Written
+        );
     }
 
     /// Shrinking a sparse file so the kept partial tail lands inside a hole

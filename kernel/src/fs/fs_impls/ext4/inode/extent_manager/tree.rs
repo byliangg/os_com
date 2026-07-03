@@ -235,6 +235,24 @@ impl ExtentTree {
 
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
+
+        // No unwritten extent overlaps the range → nothing to convert. Return
+        // before `reserialize`, which would re-journal every external node of
+        // the tree. `write_at` calls this on EVERY write, so without this gate
+        // a plain overwrite of already-written blocks (no allocation, no size
+        // change) would flatten-and-rebuild a large file's whole extent tree:
+        // pure write amplification, and on a depth-2 file the rewrite can
+        // capture more metadata blocks than one transaction's descriptor holds
+        // and abort a legal write. (The old pre-write gate in `ensure_allocated`
+        // did this check; it moved here with the conversion.)
+        if !extents.iter().any(|e| {
+            e.is_unwritten()
+                && (e.block() as u64) < range_end
+                && e.block() as u64 + e.len() as u64 > range_start as u64
+        }) {
+            return Ok(());
+        }
+
         // The `as u16` narrowings on the three split lengths below are
         // lossless: each split lies inside one extent, whose length is a u16
         // (`ee_len` on disk, biased below `MAX_WRITTEN_LEN`).
