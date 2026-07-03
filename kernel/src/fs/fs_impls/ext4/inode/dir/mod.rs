@@ -8,6 +8,7 @@
 //! always walks blocks in physical order.
 
 mod dir_entry;
+mod hash;
 
 use ostd::sync::RwMutexWriteGuard;
 
