@@ -124,8 +124,8 @@ bitflags! {
 
 /// Validated, Rust-typed in-memory inode metadata.
 ///
-/// The raw `i_block` bytes are retained in `block` for the extent reader; their
-/// interpretation as an extent tree happens in Task 3.
+/// The raw `i_block` bytes are retained in `block`; they are parsed into an
+/// `ExtentTree` when the inode's payload is built (`InodePayload::new`).
 #[derive(Clone, Debug)]
 pub(super) struct InodeDesc {
     type_: InodeType,
@@ -1748,10 +1748,12 @@ enum InodePayload {
     /// Fast (inline) symlinks: the target bytes sit in the 60-byte `i_block`
     /// area without any data block, and the `EXTENTS` flag is cleared.
     FastSymlink { target: FastSymlinkTarget },
-    /// Inline data (small files stored in the inode); unsupported in Phase 1.
+    /// Inline data (small files stored in the inode); not supported (volumes are
+    /// mounted `^inline_data`).
     #[expect(dead_code)]
     Inline,
-    /// Devices and special files (filled in by later tasks).
+    /// Devices, FIFOs, and sockets: no in-memory payload — a device node's id is
+    /// decoded from the descriptor's `i_block` on demand (`InodeDesc::device_id`).
     NoPayload,
 }
 
@@ -1789,7 +1791,8 @@ impl InodePayload {
                     )?
                 }
             }
-            // Devices and special files are handled by later tasks.
+            // Devices, FIFOs, and sockets carry no payload (a device id lives in
+            // the descriptor's `i_block`, decoded on demand).
             _ => Self::NoPayload,
         })
     }

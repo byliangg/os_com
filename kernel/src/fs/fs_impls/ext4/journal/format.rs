@@ -17,11 +17,12 @@
 //!
 //! # Supported features (the Phase 4 subset)
 //!
-//! Phase 4 parses only the journal layout it can honor. Of the jbd2 INCOMPAT
-//! features, it tolerates **only** [`INCOMPAT_REVOKE`] — and even then it merely
-//! *ignores* revoke blocks during recovery (the documented "revoke gap"; full
-//! revoke support is Phase 7). Every other INCOMPAT feature changes the on-disk
-//! layout we cannot yet parse and is rejected:
+//! We parse only the journal layout we can honor. Of the jbd2 INCOMPAT
+//! features, only [`INCOMPAT_REVOKE`] is tolerated at mount — but a log that
+//! *actually* contains revoke blocks is refused during recovery with `EUCLEAN`
+//! rather than under-replayed (the "revoke gap"; full revoke support is Phase
+//! 7). Every other INCOMPAT feature changes the on-disk layout we cannot yet
+//! parse and is rejected:
 //!
 //! - [`INCOMPAT_64BIT`] widens block tags with a `t_blocknr_high` word (so
 //!   [`RawBlockTag`] would no longer be 8 bytes),
@@ -131,10 +132,9 @@ pub(super) const BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
 pub(super) const BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
 /// Revoke block: lists blocks that must not be replayed (`JBD2_REVOKE_BLOCK`).
 ///
-/// Referenced by [`recovery`](super::recovery)'s SCAN pass, which treats a
-/// revoke block found where a descriptor is expected as the log boundary (Phase
-/// 4 writes none and ignores them on recovery; full PASS_REVOKE is Phase 7), so
-/// it is live even in non-ktest builds.
+/// Referenced by [`recovery`](super::recovery)'s SCAN pass, which rejects a
+/// revoke block met during recovery with `EUCLEAN` (we write none; applying
+/// them — full PASS_REVOKE — is Phase 7), so it is live even in non-ktest builds.
 pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 
 /// The journaled block was escaped because it began with [`JBD2_MAGIC`]
@@ -151,8 +151,9 @@ pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
 pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
 
-/// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Tolerated by
-/// Phase 4, which ignores revoke blocks during recovery (see the module docs).
+/// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Tolerated at
+/// mount; a revoke block actually met during recovery hard-errors (see the
+/// module docs).
 pub(super) const INCOMPAT_REVOKE: u32 = 0x1;
 /// 64-bit block numbers in block tags (`JBD2_FEATURE_INCOMPAT_64BIT`).
 #[cfg_attr(not(ktest), expect(dead_code))]
@@ -173,13 +174,13 @@ pub(super) const INCOMPAT_CSUM_V3: u32 = 0x10;
 #[expect(dead_code)]
 pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 
-/// The jbd2 INCOMPAT features Phase 4 supports.
+/// The jbd2 INCOMPAT features we admit at mount.
 ///
-/// Only [`INCOMPAT_REVOKE`] is tolerated (and its blocks are ignored during
-/// recovery, the "revoke gap" — full support is Phase 7). Every other INCOMPAT
-/// feature (64-bit tags, async commit, csum v2/v3, fast commit) changes the
-/// on-disk layout this phase cannot parse, so a journal carrying one is
-/// rejected rather than silently misread.
+/// Only [`INCOMPAT_REVOKE`] is tolerated — the feature bit passes, but a revoke
+/// block actually met during recovery hard-errors (`EUCLEAN`), the "revoke gap"
+/// (full support is Phase 7). Every other INCOMPAT feature (64-bit tags, async
+/// commit, csum v2/v3, fast commit) changes the on-disk layout we cannot parse,
+/// so a journal carrying one is rejected rather than silently misread.
 pub(super) const INCOMPAT_SUPP: u32 = INCOMPAT_REVOKE;
 
 /// The 12-byte header shared by every jbd2 log block (`journal_header_t`).
@@ -313,8 +314,8 @@ const_assert!(size_of::<RawBlockTag>() == BLOCK_TAG_SIZE);
 /// The on-disk commit block (`commit_header`, exactly 60 bytes) that seals a
 /// transaction.
 ///
-/// Phase 4 writes the checksum fields as zero; journal checksums arrive in
-/// Phase 6/7.
+/// The checksum fields are written as zero; journal checksums (csum v2/v3)
+/// arrive in Phase 7.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawCommitBlock {

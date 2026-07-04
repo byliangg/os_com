@@ -5,8 +5,10 @@
 //! - `Dirty` — a wrapper that tracks whether its inner value has been mutated,
 //!   for writeback scheduling.
 //! - `IsPowerOf` — a trait for testing whether a number is a power of another;
-//!   dormant until P6's sparse-superblock backup-group selection (backup
-//!   superblocks live in groups that are powers of 3/5/7).
+//!   currently unused (kept for sparse-superblock backup-group detection —
+//!   backups live in groups that are powers of 3/5/7 — if the allocator ever
+//!   needs it; the block-side lazy-group reconstruction derives its overhead
+//!   from the descriptor's free count instead).
 //! - `now` — reads the real-time coarse clock.
 
 use core::ops::MulAssign;
@@ -14,7 +16,7 @@ use core::ops::MulAssign;
 use super::prelude::*;
 use crate::prelude::warn;
 
-#[expect(dead_code)] // Dormant until P6's sparse-superblock backup-group selection.
+#[expect(dead_code)] // Currently unused; kept for sparse-superblock backup-group detection.
 pub(super) trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
     /// Returns whether `self` equals `x^k` for some `k > 0`.
     ///

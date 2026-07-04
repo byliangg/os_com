@@ -2,15 +2,17 @@
 
 //! Ext4 filesystem implementation (work in progress).
 //!
-//! Phase 1 scope: read-only mount, extent-based file reads, and linear
-//! directory reads. The module is built as a sibling to `ext2`, mirroring its
-//! layering and visibility discipline; the only core component replaced is the
-//! block-mapping engine, where ext2's indirect-block tree gives way to an
-//! extent reader (`inode::extent_manager`).
+//! A writable, journaled ext4 built as a sibling to `ext2`, mirroring its
+//! layering and visibility discipline. Implemented so far: read-write mount;
+//! extent-mapped file I/O (extent trees up to depth 2, Unwritten-first
+//! allocation); the full directory namespace (create/unlink/rename/link/mknod/
+//! symlink, htree reads with degrade-on-insert); JBD2 journaling (ordered-data,
+//! SCAN/REPLAY recovery, orphan list, checkpoint); and the `metadata_csum`,
+//! `64bit`, and `flex_bg` features. Full JBD2 (revoke apply, journal checksums,
+//! group commit) is Phase 7 and performance work is Phase 9.
 //!
-//! The design and staged plan live in the project workspace under
-//! `stages/P1_plan.md`; the authoritative technical scheme is
-//! `ext4_rebuild_report.md`.
+//! The design and staged plan live in the project workspace under `stages/`;
+//! the authoritative technical scheme is `ext4_rebuild_report.md`.
 
 // Set this module's log prefix for `ostd::log`.
 macro_rules! __log_prefix {

@@ -60,10 +60,11 @@
 //!
 //! # Phase 4 gaps
 //!
-//! - **No PASS_REVOKE**: Phase 4 writes no revoke blocks and ignores them on
-//!   recovery. A [`BLOCKTYPE_REVOKE`] block found where a descriptor is expected
-//!   is treated as the log boundary (SCAN stops). Full revoke replay-suppression
-//!   is Phase 7.
+//! - **No PASS_REVOKE**: we write no revoke blocks, so a [`BLOCKTYPE_REVOKE`]
+//!   block met during recovery means an interop (Linux-written) log whose
+//!   committed transactions carry revoke records we cannot apply. Rather than
+//!   silently under-replay it (treating the revoke block as a boundary), SCAN
+//!   refuses the mount with `EUCLEAN`. Full revoke replay-suppression is Phase 7.
 //! - **No checksums**: the same-sequence-after-a-full-`2^32`-wrap edge (see above)
 //!   is a Phase-7 hardening once per-block/commit checksums are written.
 //!

@@ -82,7 +82,7 @@
 //! - **Single descriptor** per transaction: all N tags must fit one descriptor
 //!   block ([`JournalGeometry::tags_per_descriptor`]); a larger transaction is
 //!   rejected. [`Journal::max_credits`] enforces the same bound up front.
-//! - **No checksums** (the commit block's csum fields are zero) — Phase 6/7.
+//! - **No checksums** (the commit block's csum fields are zero) — Phase 7.
 //! - **No revoke records** — Phase 7.
 //! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
 //!   called by the background commit thread ([`Journal::start_commit_thread`],

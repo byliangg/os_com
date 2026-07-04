@@ -137,8 +137,11 @@ pub(super) struct BlockGroupDesc {
     /// the bit (persisting it through `patch_into`/`sync_metadata`) on first use.
     flags: u16,
     /// `bg_itable_unused` — inodes at the tail of this group's inode table that
-    /// have never been used. Decoded so it round-trips losslessly through
-    /// writeback; this port does not yet lazily initialize inode tables.
+    /// have never been used. Recomputed from the inode bitmap on every alloc/free
+    /// (see [`Self::itable_unused_from_bitmap`]) so it stays consistent with the
+    /// e2fsck check on a `metadata_csum` volume; this port does not yet lazily
+    /// initialize (zero) inode tables, so `INODE_UNINIT` groups are skipped by
+    /// the allocator instead.
     itable_unused: u32,
 }
 
@@ -243,10 +246,11 @@ impl BlockGroupDesc {
     ///
     /// The descriptor block holds many group descriptors; this group's lives at
     /// `desc_offset % BLOCK_SIZE` within the block. It is a read-modify-write on the
-    /// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): only
-    /// `free_blocks_count_lo` / `free_inodes_count_lo` / `used_dirs_count_lo` are
-    /// overwritten, so every field the device held (flags, csum, itable_unused, …)
-    /// and every *other* group's descriptor in the same block are preserved. For a
+    /// seeded buffer (mirroring [`BlockGroup::sync_metadata`]): the mutated
+    /// low-half fields — the three counters plus `flags` and `itable_unused_lo` —
+    /// are overwritten from the in-memory descriptor (and the caller restamps
+    /// `bg_checksum`), while `exclude`/reserved fields and every *other* group's
+    /// descriptor in the same block are preserved. For a
     /// 64-byte (`64BIT`) descriptor this rewrites only the 32-byte low half at
     /// `desc_offset % BLOCK_SIZE`; the high-half tail — the block-number high halves
     /// (unchanged by counter updates) and the structurally-zero counter high halves
@@ -279,8 +283,8 @@ impl BlockGroupDesc {
         raw.used_dirs_count_lo = self.used_dirs_count() as u16;
         // Persist `bg_flags` too: clearing `BLOCK_UNINIT` on first allocation into
         // a lazy group must reach disk, or a later mount would re-reconstruct the
-        // bitmap over blocks we have since handed out. `itable_unused` is unchanged
-        // by this port but written back for losslessness.
+        // bitmap over blocks we have since handed out. `itable_unused` is likewise
+        // recomputed on alloc/free and written back here.
         raw.flags = self.flags;
         raw.itable_unused_lo = self.itable_unused as u16;
         raw_bytes.copy_from_slice(raw.as_bytes());
@@ -1008,10 +1012,10 @@ impl BlockGroup {
     /// Writes dirty metadata back to disk under a single lock.
     ///
     /// Both bitmaps are written in full. The group descriptor is updated via
-    /// read-modify-write: the raw descriptor is read, only the mutated counters
-    /// (`free_blocks_count_lo`, `free_inodes_count_lo`, `used_dirs_count_lo`) are
-    /// patched, and the result is written back so every other on-disk field
-    /// (flags, csum, exclude, itable_unused) is preserved. For a 64-byte (`64BIT`)
+    /// read-modify-write: the raw descriptor is read, the mutated fields (the
+    /// three counters plus `flags` and `itable_unused_lo`) are patched and
+    /// `bg_checksum` restamped, and the result is written back so the `exclude`/
+    /// reserved fields are preserved. For a 64-byte (`64BIT`)
     /// descriptor this reads and writes only the 32-byte low half at `desc_offset`,
     /// leaving the high-half tail intact (mirroring [`BlockGroupDesc::patch_into`]);
     /// the counters' high halves are structurally zero, so the low-half write is
