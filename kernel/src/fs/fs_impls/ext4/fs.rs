@@ -171,15 +171,18 @@ impl Ext4 {
                 ext4.reload_metadata_after_replay()?;
             }
 
-            // D-4 journal feature upgrade (Linux `ext4_load_and_init_journal`
-            // → `jbd2_journal_set_features`): a metadata_csum filesystem over
-            // a fresh featureless journal flips it to csum_v3 (+64bit iff the
-            // fs is 64bit). Placed exactly here — after recovery left the log
-            // clean and empty (the flip is only crash-safe then; see
-            // `journal::upgrade_journal_on_mount`) and before the journal is
-            // published for new transactions. A rewrite invalidates the
-            // parsed geometry (tag layout / csum seed were derived from the
-            // pre-upgrade bytes), so the journal is rebuilt from a reload.
+            // D-4 journal feature upgrade: a metadata_csum filesystem over a
+            // fresh featureless journal flips it to csum_v3 (+64bit iff the
+            // fs is 64bit). Deliberately narrower than Linux's every-mount
+            // clear-and-reset (`set_journal_csum_feature_set`) — a journal
+            // already carrying features is honored verbatim; see
+            // `journal::upgrade_journal_on_mount`. Placed exactly here —
+            // after recovery left the log clean and empty (the flip is only
+            // crash-safe then; see `journal::upgrade_journal_on_mount`) and
+            // before the journal is published for new transactions. A
+            // rewrite invalidates the parsed geometry (tag layout / csum
+            // seed were derived from the pre-upgrade bytes), so the journal
+            // is rebuilt from a reload.
             let journal = {
                 let needs = {
                     let sb = ext4.super_block();

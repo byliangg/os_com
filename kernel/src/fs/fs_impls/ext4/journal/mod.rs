@@ -406,13 +406,22 @@ pub(in crate::fs::fs_impls::ext4) struct JournalUpgradeNeeds {
 }
 
 /// Upgrades a fresh (featureless) journal to match the filesystem's checksum
-/// and width features at mount time — project decision D-4, mirroring what a
-/// Linux RW mount does via `ext4_load_and_init_journal` →
-/// `jbd2_journal_set_features` (this port mounts read-write only, so every
-/// mount is the "RW mount" of that policy). Returns whether the on-disk
-/// journal superblock was rewritten; the caller must then reload the journal
-/// geometry, because the in-memory tag layout / csum seed were parsed from
-/// the pre-upgrade bytes.
+/// and width features at mount time — project decision D-4, a deliberately
+/// NARROWER policy than Linux's. Linux clear-and-resets the journal's csum
+/// features on every RW mount (`set_journal_csum_feature_set` clears
+/// COMPAT_CHECKSUM + CSUM_V2 + CSUM_V3 and then sets what the fs wants,
+/// fs/ext4/super.c:4094-4104 — so a v2 journal is upgraded to v3 — and
+/// `ext4_load_and_init_journal` adds 64BIT to already-featured journals,
+/// super.c:4909-4912). D-4 instead honors any pre-featured journal verbatim:
+/// never downgrade, never reshape. Consequences: a v2 journal stays v2
+/// (fully supported end to end), and a featured journal never gains 64BIT —
+/// a block number past 2^32 then fails loudly at tag time (`EFBIG`) rather
+/// than being reshaped under a live log. Only the "fresh featureless journal
+/// on a metadata_csum fs" row acts, and there the outcome matches Linux's.
+///
+/// Returns whether the on-disk journal superblock was rewritten; the caller
+/// must then reload the journal geometry, because the in-memory tag layout /
+/// csum seed were parsed from the pre-upgrade bytes.
 ///
 /// # Policy (fs `metadata_csum` × journal features → action)
 ///
@@ -553,18 +562,38 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         .read_val(Bid::new(block_map[0]).to_offset())
         .map_err(|_| Error::with_message(Errno::EIO, "failed to read the journal superblock"))?;
 
-    // Admission gate (mount policy, [`format::INCOMPAT_SUPP`]): refuse every
-    // INCOMPAT feature we do not honor end-to-end BEFORE parsing further.
-    // As of P7a-4 the set is REVOKE | 64BIT | CSUM_V2 | CSUM_V3 — the csum
-    // and width layouts parse (P7a-2), recovery verifies them (P7a-3), and
-    // the commit pipeline stamps them (P7a-4), so an admitted journal
-    // round-trips through our own recovery. Async/fast commit stay refused,
-    // and csum_v2 + csum_v3 together is refused by the parse below.
-    if raw.s_feature_incompat.get() & !INCOMPAT_SUPP != 0 {
-        return_errno_with_message!(
-            Errno::EINVAL,
-            "journal has an unsupported incompatible feature"
-        );
+    // Feature words carry meaning only on a V2 superblock (Linux
+    // `journal_check_superblock` succeeds on a V1 BEFORE any feature gate,
+    // via `jbd2_format_support_feature`, fs/jbd2/journal.c:1379-1380): a V1
+    // journal is admitted whatever its feature bytes hold, and the parse
+    // below reads it as featureless v0. Both feature-word gates live here,
+    // together, on the raw bits.
+    if raw.header.h_blocktype.get() == BLOCKTYPE_SUPERBLOCK_V2 {
+        // Admission gate (mount policy, [`format::INCOMPAT_SUPP`]): refuse
+        // every INCOMPAT feature we do not honor end-to-end BEFORE parsing
+        // further. As of P7a-4 the set is REVOKE | 64BIT | CSUM_V2 | CSUM_V3
+        // — the csum and width layouts parse (P7a-2), recovery verifies them
+        // (P7a-3), and the commit pipeline stamps them (P7a-4), so an
+        // admitted journal round-trips through our own recovery. Async/fast
+        // commit stay refused, and csum_v2 + csum_v3 together is refused by
+        // the parse below.
+        if raw.s_feature_incompat.get() & !INCOMPAT_SUPP != 0 {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "journal has an unsupported incompatible feature"
+            );
+        }
+        // Linux refuses ANY unknown journal ro_compat bit at load
+        // (fs/jbd2/journal.c:1382-1388), and `JBD2_KNOWN_ROCOMPAT_FEATURES`
+        // is empty in 6.6 — so any set bit refuses. RO_COMPAT semantics
+        // ("safe to read, unsafe to write") offer no fallback here either:
+        // this port always mounts read-write.
+        if raw.s_feature_ro_compat.get() != 0 {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "journal has an unsupported read-only compatible feature"
+            );
+        }
     }
 
     let superblock = JournalSuperblock::try_from(raw)?;
@@ -1729,6 +1758,65 @@ mod tests {
         write_sb(INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3);
         let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    /// Any set journal ro_compat bit refuses the mount: Linux refuses every
+    /// unknown ro_compat bit at load (fs/jbd2/journal.c:1382-1388) and
+    /// `JBD2_KNOWN_ROCOMPAT_FEATURES` is empty in 6.6 — there is no "mount
+    /// read-only instead" fallback, and this port always mounts read-write.
+    #[ktest]
+    fn load_geometry_refuses_journal_ro_compat_bits() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_has_journal()
+            .build()
+            .unwrap();
+        f.write_raw_inode(
+            JOURNAL_INO,
+            &make_multi_block_file_inode(JOURNAL_START_BLOCK, 2),
+        );
+
+        // An otherwise pristine featureless journal with one ro_compat bit.
+        let mut raw = journal_super(2, 1, 1, 0);
+        raw.s_feature_ro_compat = Be32::new(0x1);
+        f.disk
+            .segment()
+            .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
+            .unwrap();
+
+        let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    /// A V1-blocktype journal superblock's feature words are meaningless
+    /// (Linux `jbd2_format_support_feature`; see the format-module parse
+    /// test), so admission ignores them entirely: bits that refuse a V2
+    /// journal two ways over — an unadmitted INCOMPAT (fast commit) and a
+    /// set ro_compat word — load fine on a V1 and parse as featureless v0.
+    #[ktest]
+    fn load_geometry_admits_v1_journal_regardless_of_feature_bits() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_has_journal()
+            .build()
+            .unwrap();
+        f.write_raw_inode(
+            JOURNAL_INO,
+            &make_multi_block_file_inode(JOURNAL_START_BLOCK, 2),
+        );
+
+        let mut raw = journal_super(2, 1, 1, 0);
+        raw.header.h_blocktype = Be32::new(format::BLOCKTYPE_SUPERBLOCK_V1);
+        raw.s_feature_incompat = Be32::new(0x20); // fast commit: refused on V2
+        raw.s_feature_ro_compat = Be32::new(0xFF); // any bit: refused on V2
+        f.disk
+            .segment()
+            .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
+            .unwrap();
+
+        let geo = load_geometry(&f.ext4).unwrap().unwrap();
+        assert_eq!(geo.tag_layout(), TagLayout::from_features(0).unwrap());
+        assert!(geo.csum_seed().is_none());
     }
 
     #[ktest]

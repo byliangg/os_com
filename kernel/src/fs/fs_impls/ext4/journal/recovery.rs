@@ -1119,6 +1119,52 @@ mod tests {
         assert!(JournalSuperblock::try_from(sb).is_ok());
     }
 
+    /// Partial-replay-then-refuse, the intended politics: with TWO committed
+    /// transactions and the corruption in the SECOND, recovery applies txn
+    /// #1 to its final location, fails `EUCLEAN` on txn #2, and leaves the
+    /// journal dirty (`s_start` untouched) — the refused mount keeps the log
+    /// for a repair tool, never a clean-marked under-replay. Re-running
+    /// recovery is idempotent: the same prefix replays to the same bytes and
+    /// the same refusal follows.
+    #[ktest]
+    fn recover_applies_prefix_then_refuses_corrupt_second_transaction() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(24, 1, 7);
+        let device = f.fixture.ext4.block_device();
+
+        let dest1 = 500u64;
+        let dest2 = 800u64;
+        let content1 = tagged_block(b"T1PREFIX");
+
+        // T1 (tid 7) at log [1..=3], T2 (tid 8) at log [4..=6]; corrupt T2's
+        // logged data block (log 5). SCAN seals both (it reads no data
+        // blocks); REPLAY applies T1 and refuses on T2's tag checksum.
+        let t1 = make_txn(Tid::new(7), &[(dest1, content1)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        let t2 = make_txn(Tid::new(8), &[(dest2, tagged_block(b"T2CORRPT"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        let mut logged = read_log_block_at(&f, 5);
+        logged[321] ^= 0x40;
+        write_log_block_at(&f, 5, &logged);
+
+        for round in 0..2 {
+            let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
+            assert_eq!(err.error(), Errno::EUCLEAN, "round {round}");
+            // Txn #1 IS applied; txn #2's corrupt block is not.
+            assert_eq!(read_final_block(&f, dest1), content1, "round {round}");
+            assert_eq!(
+                read_final_block(&f, dest2),
+                [0u8; BLOCK_SIZE],
+                "round {round}"
+            );
+            // The journal stays dirty: `s_start` (and `s_sequence`) untouched,
+            // so the next mount retries the identical recovery.
+            let sb = read_journal_super(&f);
+            assert_eq!(sb.s_start.get(), 1, "round {round}");
+            assert_eq!(sb.s_sequence.get(), 7, "round {round}");
+        }
+    }
+
     /// End to end: a corrupt journaled data block refuses recovery (and thus
     /// the mount) — SCAN still seals the transaction (it does not read data
     /// blocks, matching Linux), REPLAY's tag verification catches it, and
@@ -1148,15 +1194,19 @@ mod tests {
     // superblock restamping at every serialization site. ---
 
     /// Every admitted tag layout round-trips through the production writer
-    /// and recovery: v0 (unchanged bytes), csum_v3, csum_v3+64bit, and
-    /// csum_v2's frozen quirk strides (±64bit). Each transaction includes an
-    /// ESCAPED block, so the stamped-over-logged-form contract is exercised
-    /// end to end, and the clean superblock's checksum matches its features.
+    /// and recovery: v0 (unchanged bytes), 64bit alone (the 12-byte-tag walk
+    /// with no csum machinery — the fixture geometry cannot reach a > 2^32
+    /// block number, so the tag WALK is what this exercises end to end),
+    /// csum_v3, csum_v3+64bit, and csum_v2's frozen quirk strides (±64bit).
+    /// Each transaction includes an ESCAPED block, so the
+    /// stamped-over-logged-form contract is exercised end to end, and the
+    /// clean superblock's checksum matches its features.
     #[ktest]
     fn production_round_trip_replays_across_feature_sets() {
         crate::time::clocks::init_for_ktest();
         for features in [
             0,
+            INCOMPAT_64BIT,
             INCOMPAT_CSUM_V3,
             INCOMPAT_CSUM_V3 | INCOMPAT_64BIT,
             INCOMPAT_CSUM_V2,

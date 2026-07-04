@@ -185,7 +185,9 @@ impl Transaction {
         };
         block[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
 
-        let mut writer = layout.writer(&mut block, self.tid(), seed)?;
+        // The writer owns the buffer from here on; only `finish` (the seal)
+        // hands it back, so an unsealed descriptor cannot reach the log.
+        let mut writer = layout.writer(block, self.tid(), seed)?;
         let mut escape = Vec::with_capacity(n);
 
         for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
@@ -229,10 +231,9 @@ impl Transaction {
         }
 
         // Seal: stamps the descriptor-tail checksum over the tags above on a
-        // csum layout (a no-op on v0 — the frozen byte path).
-        writer.finish();
-
-        Ok((block, escape))
+        // csum layout (byte-identical on v0 — the frozen byte path) and
+        // returns the sealed bytes.
+        Ok((writer.finish(), escape))
     }
 }
 
