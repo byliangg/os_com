@@ -10,11 +10,19 @@
 # Exit 0 = the state is crash-consistent; exit 1 = it is not (structural
 # damage that journal replay cannot repair, or the data oracle failed).
 #
-# The judgement pipeline is all-official (see test.md §5.3-5.4): first let
-# e2fsck replay the journal — exactly what the kernel would do on the next
-# mount — then demand a fully clean fsck. The replay MUST happen on a scratch
-# copy: the caller keeps appending log entries to <crash.img> for the next
-# crash point, and a repaired-in-place image would corrupt the simulation.
+# The judgement pipeline is all-official (see test.md §5.3-5.4): let e2fsck
+# replay the journal — exactly what the kernel would do on the next mount —
+# then demand a fully clean fsck. The replay MUST happen on a scratch copy: the
+# caller keeps appending log entries to <crash.img> for the next crash point,
+# and a repaired-in-place image would corrupt the simulation.
+#
+# Strictness note: the replay pass must NOT be a preen (`e2fsck -p`) run. Preen
+# mode silently REPAIRS post-replay corruption (wrong bitmaps, stale
+# itable_unused, bad group checksums) before the verification fsck ever sees it,
+# masking exactly the crash-inconsistency this judge exists to catch — the
+# crash matrix was blind to a real `bg_itable_unused` bug for this reason. So we
+# run a single `-fy` pass and FAIL if it repaired ANYTHING beyond replaying the
+# journal (every repair prints `Fix? yes` / `FIXED`; journal recovery does not).
 
 set -u
 
@@ -30,20 +38,23 @@ WORK=$(mktemp "${TMPDIR:-/tmp}/crash-judge-XXXXXX.img")
 trap 'rm -f "$WORK"' EXIT
 cp --sparse=always "$IMG" "$WORK"
 
-# Replay the journal (the kernel's mount-time recovery, done by e2fsck so the
-# oracle is official). rc 0 = nothing to do, rc 1 = replayed/fixed; anything
-# >= 4 means the journal itself is broken — a real crash-consistency failure.
-e2fsck -E journal_only -p "$WORK" >/dev/null 2>&1
+# Replay the journal and check, in one strict non-interactive pass. `-fy`
+# auto-answers, so its exit code alone cannot distinguish journal replay from a
+# corruption repair (both set the "fixed" bit); we judge on the output instead.
+OUT=$(e2fsck -fy "$WORK" 2>&1)
 rc=$?
-if [ "$rc" -ge 4 ]; then
-    echo "CRASH-JUDGE: journal replay failed (e2fsck rc=$rc) on $IMG" >&2
+if [ "$rc" -ge 8 ]; then
+    echo "CRASH-JUDGE: e2fsck operational error (rc=$rc) on $IMG" >&2
+    echo "$OUT" | head -20 >&2
     exit 1
 fi
 
-# After replay the filesystem must be spotless; -n never modifies.
-if ! e2fsck -fn "$WORK" >/dev/null 2>&1; then
-    echo "CRASH-JUDGE: post-replay fsck not clean on $IMG" >&2
-    e2fsck -fn "$WORK" 2>&1 | head -20 >&2
+# The only repair allowed is journal recovery ("recovering journal", no
+# `Fix?`). Any `Fix? yes` / `FIXED` means the post-replay filesystem was NOT
+# crash-consistent — the state a real kernel would have mounted was corrupt.
+if echo "$OUT" | grep -qE "Fix\? yes|FIXED|CLEARED|RECONNECT"; then
+    echo "CRASH-JUDGE: post-replay fsck repaired corruption on $IMG" >&2
+    echo "$OUT" | grep -iE "Fix\? yes|FIXED|CLEARED|RECONNECT|differences|wrong|invalid|overlaps|orphan|unused inodes" | head -20 >&2
     exit 1
 fi
 
