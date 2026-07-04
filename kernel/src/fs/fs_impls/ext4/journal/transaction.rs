@@ -96,9 +96,9 @@ impl MetaBuffer {
         self.data.as_slice()
     }
 
-    /// The captured after-image as a whole block — the commit pipeline logs
-    /// (and, under csum v2/v3, checksums) full blocks, so it takes the
-    /// width-carrying type rather than re-checking a slice length.
+    /// Returns the captured after-image as a whole block — the commit
+    /// pipeline logs (and, under csum v2/v3, checksums) full blocks, so it
+    /// takes the width-carrying type rather than re-checking a slice length.
     fn as_block(&self) -> &[u8; BLOCK_SIZE] {
         &self.data
     }
@@ -165,7 +165,7 @@ impl UncheckpointedImage {
 /// (a single committer thread needs no intermediate states). The five
 /// in-between states are reserved for P7's staged/group commit; they are
 /// defined up front to keep the jbd2 lifecycle visible and avoid enum churn.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TransactionState {
     /// Accepting new handles and metadata (`T_RUNNING`).
     Running,

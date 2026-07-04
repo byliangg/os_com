@@ -21,7 +21,7 @@
 //! INCOMPAT features, only [`INCOMPAT_REVOKE`] is tolerated at mount — but a
 //! log that *actually* contains revoke blocks is refused during recovery with
 //! `EUCLEAN` rather than under-replayed (the "revoke gap"; full revoke support
-//! is Phase 7). See [`INCOMPAT_SUPP`] for the mask.
+//! is P7b). See [`INCOMPAT_SUPP`] for the mask.
 //!
 //! The descriptor-tag *geometry* of the layout-shaping features is nonetheless
 //! modeled: every descriptor builder/walker is parameterized over one
@@ -60,7 +60,7 @@ use super::{
 /// Backed by raw bytes (alignment 1) so it never forces padding into the packed
 /// on-disk structs it appears in.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Pod, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Pod)]
 pub(super) struct Be16([u8; 2]);
 
 impl Be16 {
@@ -87,7 +87,7 @@ impl Debug for Be16 {
 /// Backed by raw bytes (alignment 1) so it never forces padding into the packed
 /// on-disk structs it appears in.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Pod, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Pod)]
 pub(super) struct Be32([u8; 4]);
 
 impl Be32 {
@@ -115,7 +115,7 @@ impl Debug for Be32 {
 /// on-disk structs it appears in (e.g. the 60-byte commit block's unaligned
 /// `h_commit_sec`).
 #[repr(C)]
-#[derive(Clone, Copy, Default, Pod, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq, Pod)]
 pub(super) struct Be64([u8; 8]);
 
 impl Be64 {
@@ -153,7 +153,7 @@ pub(super) const BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
 ///
 /// Referenced by [`recovery`](super::recovery)'s SCAN pass, which rejects a
 /// revoke block met during recovery with `EUCLEAN` (we write none; applying
-/// them — full PASS_REVOKE — is Phase 7), so it is live even in non-ktest builds.
+/// them — full PASS_REVOKE — is P7b), so it is live even in non-ktest builds.
 pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 
 /// The journaled block was escaped because it began with [`JBD2_MAGIC`]
@@ -161,10 +161,10 @@ pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 pub(super) const TAG_FLAG_ESCAPE: u16 = 1;
 /// This tag reuses the UUID of the previous tag (`JBD2_FLAG_SAME_UUID`).
 pub(super) const TAG_FLAG_SAME_UUID: u16 = 2;
-/// The tagged block was deleted (`JBD2_FLAG_DELETED`).
-// Defined for jbd2 completeness; unused in Phase 4 (no revoke). Unconditional
-// `expect` (not `cfg_attr(not(ktest), ...)`) because it is dead in the ktest
-// build too, where the tests do not reference it.
+/// The tagged block was deleted (`JBD2_FLAG_DELETED`) — the revoke tag flag,
+/// owned by P7b's revoke machinery. Unconditional `expect` (not
+/// `cfg_attr(not(ktest), ...)`) because it is dead in the ktest build too,
+/// where the tests do not reference it.
 #[expect(dead_code)]
 pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
@@ -187,16 +187,18 @@ pub(super) const INCOMPAT_REVOKE: u32 = 0x1;
 pub(super) const INCOMPAT_64BIT: u32 = 0x2;
 /// Commit blocks may be written before their data is durable
 /// (`JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT`).
-// Defined for jbd2 completeness; dead in both builds (Phase 4 rejects it via
-// the INCOMPAT_SUPP mask rather than naming it), so an unconditional `expect`.
-#[expect(dead_code)]
+// Production code rejects it via the INCOMPAT_SUPP mask rather than naming
+// it; the admission tests spell the bit by name.
+#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const INCOMPAT_ASYNC_COMMIT: u32 = 0x4;
 /// Version-2 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V2`).
 pub(super) const INCOMPAT_CSUM_V2: u32 = 0x8;
 /// Version-3 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V3`).
 pub(super) const INCOMPAT_CSUM_V3: u32 = 0x10;
 /// Fast-commit area is present (`JBD2_FEATURE_INCOMPAT_FAST_COMMIT`).
-#[expect(dead_code)]
+// Production code rejects it via the INCOMPAT_SUPP mask rather than naming
+// it; the admission tests spell the bit by name.
+#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 
 /// The jbd2 INCOMPAT features we admit at mount, enforced by
@@ -332,7 +334,7 @@ const JOURNAL_SUPERBLOCK_SIZE: usize = 1024;
 const_assert!(size_of::<RawJournalSuperblock>() == JOURNAL_SUPERBLOCK_SIZE);
 
 impl RawJournalSuperblock {
-    /// The superblock's own crc32c (Linux `jbd2_superblock_csum`,
+    /// Returns the superblock's own crc32c (Linux `jbd2_superblock_csum`,
     /// fs/jbd2/journal.c:118-129): `crc32c(!0, ..)` over the **1024-byte
     /// superblock struct** — `sizeof(journal_superblock_t)`, not the whole
     /// 4 KiB block it occupies — with the `s_checksum` field treated as zero.
@@ -353,6 +355,16 @@ impl RawJournalSuperblock {
         let head = checksum::crc32c(!0, &bytes[..CHECKSUM_OFFSET]);
         let hole = checksum::crc32c(head, &[0u8; size_of::<Be32>()]);
         checksum::crc32c(hole, &bytes[CHECKSUM_OFFSET + size_of::<Be32>()..])
+    }
+
+    /// Returns the log block where recovery starts (`s_start`), or `None`
+    /// when the journal is clean — THE decode of the on-disk 0-means-clean
+    /// sentinel: the [`JournalSuperblock`] parse and the raw-superblock
+    /// readers (recovery, the D-4 mount upgrade) all convert through here, so
+    /// the sentinel never travels in-band past the disk-format boundary.
+    pub(super) fn recovery_start(&self) -> Option<u32> {
+        let start = self.s_start.get();
+        (start != 0).then_some(start)
     }
 
     /// Stamps `s_checksum` when this superblock's **own** INCOMPAT bits carry
@@ -473,8 +485,9 @@ impl JournalCsumSeed {
         Self::derive(uuid)
     }
 
-    /// The crc32c of a descriptor-class block with its trailing 4-byte
-    /// `jbd2_journal_block_tail` treated as zero — the value the tail stores.
+    /// Returns the crc32c of a descriptor-class block with its trailing
+    /// 4-byte `jbd2_journal_block_tail` treated as zero — the value the tail
+    /// stores.
     pub(super) fn block_tail_csum(&self, block: &[u8; BLOCK_SIZE]) -> u32 {
         // Zeroing the tail and hashing the whole block equals hashing the
         // body and then four zero bytes (crc32c segments chain).
@@ -495,8 +508,8 @@ impl JournalCsumSeed {
         stored == self.block_tail_csum(block)
     }
 
-    /// The crc32c of a commit block with its `h_chksum[0]` word treated as
-    /// zero — the value that word stores. (`h_chksum_type`/`h_chksum_size`
+    /// Returns the crc32c of a commit block with its `h_chksum[0]` word
+    /// treated as zero — the value that word stores. (`h_chksum_type`/`h_chksum_size`
     /// stay zero under csum v2/v3; they belong to the v1 COMPAT checksum.)
     pub(super) fn commit_block_csum(&self, block: &[u8; BLOCK_SIZE]) -> u32 {
         // Hash around the h_chksum[0] hole, as in `block_tail_csum`.
@@ -531,7 +544,7 @@ impl JournalCsumSeed {
         stored == self.commit_block_csum(block)
     }
 
-    /// The crc32c a descriptor tag stores for its data block (Linux
+    /// Returns the crc32c a descriptor tag stores for its data block (Linux
     /// `jbd2_block_tag_csum_verify`, fs/jbd2/recovery.c:443-461, and the
     /// write side `jbd2_block_tag_csum_set`, fs/jbd2/commit.c:319-340):
     /// `crc32c(seed, be32(tid))` folded over the 4 KiB block **as it sits in
@@ -571,7 +584,7 @@ const COMMIT_CHKSUM_OFFSET: usize = core::mem::offset_of!(RawCommitBlock, h_chks
 /// Linux-written csum_v2 log parses (and our own writes stride) exactly as
 /// jbd2's would — csum_v2 is admitted since P7a-4, though nothing modern
 /// creates it (Linux upgrades v2 requests to v3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct TagLayout {
     /// Bytes one tag occupies in the descriptor's tag array (the walk stride,
     /// excluding the 16-byte UUID after a non-`SAME_UUID` tag).
@@ -628,12 +641,13 @@ impl TagLayout {
         })
     }
 
-    /// The byte offset of the first tag: right past the 12-byte block header.
+    /// Returns the byte offset of the first tag: right past the 12-byte
+    /// block header.
     const fn first_tag_offset(&self) -> usize {
         size_of::<RawJournalHeader>()
     }
 
-    /// The end of the usable tag area: the block, minus the reserved
+    /// Returns the end of the usable tag area: the block, minus the reserved
     /// descriptor-tail checksum when the layout carries one. Builder and
     /// walkers bound the tag array by this one value, so neither side can
     /// place or parse a tag inside the tail.
@@ -641,8 +655,8 @@ impl TagLayout {
         BLOCK_SIZE - self.descriptor_tail_bytes
     }
 
-    /// The exact number of block tags one descriptor block holds under this
-    /// layout: `n` tags occupy the 12-byte block header, one 16-byte UUID
+    /// Returns the exact number of block tags one descriptor block holds
+    /// under this layout: `n` tags occupy the 12-byte block header, one 16-byte UUID
     /// after the first tag (every later tag sets [`TAG_FLAG_SAME_UUID`] and
     /// reuses it), and `n` tag strides, so `n` fits iff
     /// `header + UUID + n * tag_bytes` fits the tag area. This is the
@@ -655,7 +669,7 @@ impl TagLayout {
         (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
     }
 
-    /// Whether this layout carries csum v2 or v3 (Linux
+    /// Returns whether this layout carries csum v2 or v3 (Linux
     /// `jbd2_journal_has_csum_v2or3` on the feature bits the layout was
     /// derived from): tags store a data checksum and descriptor-class blocks
     /// reserve the trailing tail checksum.
@@ -973,7 +987,7 @@ impl TagWriter {
 /// layout prescribes — decoded by [`TagLayout::decode_tag`] alongside the
 /// block number so no verifier re-derives tag offsets (the walker yields the
 /// stored value; rust_rules "expose intermediate results").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TagChecksum {
     /// csum_v2: the 8-byte tag's 16-bit `t_checksum` holds only the **low 16
     /// bits** of the crc32c — jbd2 truncates via `cpu_to_be16(csum32)`
@@ -988,7 +1002,7 @@ pub(super) enum TagChecksum {
 /// halves already joined on a 64-bit layout), its flags, and — under csum
 /// v2/v3 — the stored data-block checksum, so no caller recomputes offsets or
 /// re-splits block numbers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DescriptorTag {
     blocknr: Ext4Bid,
     flags: u16,
@@ -998,31 +1012,32 @@ pub(super) struct DescriptorTag {
 }
 
 impl DescriptorTag {
-    /// The tag's destination filesystem block.
+    /// Returns the tag's destination filesystem block.
     pub(super) const fn blocknr(&self) -> Ext4Bid {
         self.blocknr
     }
 
-    /// The raw `TAG_FLAG_*` bits. Production readers use the semantic
-    /// accessors below; the round-trip tests assert the exact bits.
+    /// Returns the raw `TAG_FLAG_*` bits. Production readers use the
+    /// semantic accessors below; the round-trip tests assert the exact bits.
     #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn flags(&self) -> u16 {
         self.flags
     }
 
-    /// Whether the logged block was escaped ([`TAG_FLAG_ESCAPE`]): its first
+    /// Returns whether the logged block was escaped ([`TAG_FLAG_ESCAPE`]): its first
     /// four bytes were zeroed in the log and must be restored to
     /// [`JBD2_MAGIC`] on apply.
     pub(super) const fn is_escaped(&self) -> bool {
         self.flags & TAG_FLAG_ESCAPE != 0
     }
 
-    /// Whether this is the last tag of the descriptor ([`TAG_FLAG_LAST_TAG`]).
+    /// Returns whether this is the last tag of the descriptor
+    /// ([`TAG_FLAG_LAST_TAG`]).
     pub(super) const fn is_last(&self) -> bool {
         self.flags & TAG_FLAG_LAST_TAG != 0
     }
 
-    /// Whether this tag reuses the previous tag's UUID
+    /// Returns whether this tag reuses the previous tag's UUID
     /// ([`TAG_FLAG_SAME_UUID`]), i.e. no UUID follows it on disk.
     const fn reuses_uuid(&self) -> bool {
         self.flags & TAG_FLAG_SAME_UUID != 0
@@ -1164,8 +1179,9 @@ pub(super) struct JournalSuperblock {
     first: u32,
     /// First transaction id expected on recovery (`s_sequence`).
     sequence: Tid,
-    /// Log block where recovery starts; 0 means clean (`s_start`).
-    start: u32,
+    /// Log block where recovery starts (`s_start`); `None` when the journal
+    /// is clean (the on-disk `0` sentinel, decoded once at parse).
+    start: Option<u32>,
     /// Journal block size in bytes (`s_blocksize`).
     blocksize: u32,
     /// The descriptor-tag geometry the INCOMPAT feature bits select, derived
@@ -1267,9 +1283,9 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             first,
             // `s_sequence` is the first transaction id; recovery starts here.
             sequence: Tid::new(raw.s_sequence.get()),
-            // `s_start` may be nonzero: a dirty journal awaiting recovery. Just
-            // record it.
-            start: raw.s_start.get(),
+            // A dirty journal awaiting recovery records its start; the on-disk
+            // 0-means-clean sentinel decodes to `None` (once, here).
+            start: raw.recovery_start(),
             blocksize,
             tag_layout,
             csum_seed,
@@ -1293,8 +1309,9 @@ impl JournalSuperblock {
         self.sequence
     }
 
-    /// Returns the log block where recovery starts; 0 means clean (`s_start`).
-    pub(super) const fn start(&self) -> u32 {
+    /// Returns the log block where recovery starts (`s_start`), or `None`
+    /// when the journal is clean (the on-disk `0` sentinel, decoded at parse).
+    pub(super) const fn start(&self) -> Option<u32> {
         self.start
     }
 
@@ -1381,7 +1398,7 @@ mod tests {
         assert_eq!(sb.first(), 1);
         assert_eq!(sb.sequence(), Tid::new(7));
         // A nonzero `s_start` (a dirty journal awaiting recovery) is accepted.
-        assert_eq!(sb.start(), 3);
+        assert_eq!(sb.start(), Some(3));
         assert_eq!(sb.blocksize(), BLOCK_SIZE as u32);
     }
 

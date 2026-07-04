@@ -47,7 +47,7 @@
 //!   its `patch` closure writes the modification into the captured after-image,
 //!   so sub-objects sharing a block accumulate onto one buffer.
 //! - [`forget`] — a previously journaled metadata block is being freed (the
-//!   sole insertion point for Phase 7 revoke records); still a no-op.
+//!   sole insertion point for P7b revoke records); still a no-op.
 //!
 //! **Without a handle (`None`) every wrapper is inert** and persistence stays
 //! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
@@ -168,7 +168,7 @@ impl Drop for OpHandle {
 /// counts) and the wrapping successor/comparison rules live on the type.
 /// Deliberately **no `Ord`**: a plain `>=` is only meaningful within a
 /// non-wrapping window, so "is at or after" must go through [`Tid::geq`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Tid(u32);
 
 impl Tid {
@@ -180,19 +180,19 @@ impl Tid {
         Self(raw)
     }
 
-    /// The raw sequence number, for the boundaries that store a bare `u32`:
-    /// the on-disk big-endian fields and the `committed_tid` atomic.
+    /// Returns the raw sequence number, for the boundaries that store a bare
+    /// `u32`: the on-disk big-endian fields and the `committed_tid` atomic.
     pub(super) const fn get(self) -> u32 {
         self.0
     }
 
-    /// The next tid in sequence (tids wrap at `u32::MAX`).
+    /// Returns the next tid in sequence (tids wrap at `u32::MAX`).
     pub(super) const fn next(self) -> Self {
         Self(self.0.wrapping_add(1))
     }
 
-    /// The previous tid in sequence (tids wrap at `u32::MAX`) — used to seed
-    /// `committed_tid` one behind the first tid a commit will bear.
+    /// Returns the previous tid in sequence (tids wrap at `u32::MAX`) — used
+    /// to seed `committed_tid` one behind the first tid a commit will bear.
     pub(super) const fn prev(self) -> Self {
         Self(self.0.wrapping_sub(1))
     }
@@ -249,10 +249,10 @@ impl JournalGeometry {
         self.superblock.sequence()
     }
 
-    /// The descriptor-tag geometry this journal's feature bits select — the
-    /// single source of truth for the tag byte layout, derived once at parse
-    /// ([`format::TagLayout`]) and consumed by the commit writer, the recovery
-    /// scanner, and the checkpoint/replay applier.
+    /// Returns the descriptor-tag geometry this journal's feature bits select
+    /// — the single source of truth for the tag byte layout, derived once at
+    /// parse ([`format::TagLayout`]) and consumed by the commit writer, the
+    /// recovery scanner, and the checkpoint/replay applier.
     ///
     /// Private to the journal module (unlike the `pub(super)` geometry
     /// accessors): the tag layout is a journal-internal concern, and
@@ -261,10 +261,10 @@ impl JournalGeometry {
         self.superblock.tag_layout()
     }
 
-    /// The csum v2/v3 seed, present iff the journal carries either checksum
-    /// feature — derived once at parse ([`format::JournalCsumSeed`]). The
-    /// recovery scanner and the checkpoint/replay applier gate every log-block
-    /// checksum verification on this one value.
+    /// Returns the csum v2/v3 seed, present iff the journal carries either
+    /// checksum feature — derived once at parse ([`format::JournalCsumSeed`]).
+    /// The recovery scanner and the checkpoint/replay applier gate every
+    /// log-block checksum verification on this one value.
     ///
     /// Private to the journal module for the same reason as
     /// [`tag_layout`](Self::tag_layout): the seed is a journal-internal
@@ -273,10 +273,12 @@ impl JournalGeometry {
         self.superblock.csum_seed()
     }
 
-    /// Returns the log block where recovery starts; 0 means clean (`s_start`).
+    /// Returns the log block where recovery starts (`s_start`), or `None`
+    /// when the journal is clean (the on-disk `0` sentinel, decoded at the
+    /// parse boundary).
     ///
     /// Used by [`Journal::new`] to seed the tail, so it is live in non-ktest.
-    pub(super) fn start(&self) -> u32 {
+    pub(super) fn start(&self) -> Option<u32> {
         self.superblock.start()
     }
 
@@ -319,8 +321,8 @@ impl JournalGeometry {
         pos
     }
 
-    /// The number of log blocks a commit may write without touching the
-    /// un-checkpointed tail: the ring distance from `head` forward to
+    /// Returns the number of log blocks a commit may write without touching
+    /// the un-checkpointed tail: the ring distance from `head` forward to
     /// `dirty_tail` — the committed-but-un-checkpointed log occupies
     /// `[tail, head)` in ring order, so `[head, tail)` is free — or the whole
     /// usable ring `[first, maxlen)` when nothing awaits checkpoint
@@ -371,9 +373,9 @@ impl JournalGeometry {
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal log block"))
     }
 
-    /// The physical byte offset of the journal superblock (log block 0), the
-    /// one location [`read_raw_superblock`](Self::read_raw_superblock) and
-    /// [`write_superblock`](Self::write_superblock) address.
+    /// Returns the physical byte offset of the journal superblock (log block
+    /// 0), the one location [`read_raw_superblock`](Self::read_raw_superblock)
+    /// and [`write_superblock`](Self::write_superblock) address.
     fn superblock_offset(&self) -> Result<usize> {
         let sb_pblock = self.log_block_to_physical(0).ok_or_else(|| {
             Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped")
@@ -438,6 +440,17 @@ pub(in crate::fs::fs_impls::ext4) struct JournalUpgradeNeeds {
     pub(in crate::fs::fs_impls::ext4) fs_is_64bit: bool,
 }
 
+/// The outcome of [`upgrade_journal_on_mount`], `#[must_use]` because it
+/// carries an obligation: a rewritten superblock invalidates the parsed
+/// [`JournalGeometry`] (its tag layout / csum seed were derived from the
+/// pre-upgrade bytes), so the caller must examine the outcome and reload the
+/// geometry when `upgraded` — dropping the value unexamined warns.
+#[must_use = "a rewritten journal superblock obligates a geometry reload"]
+pub(in crate::fs::fs_impls::ext4) struct JournalUpgradeOutcome {
+    /// Whether the on-disk journal superblock was rewritten.
+    pub(in crate::fs::fs_impls::ext4) upgraded: bool,
+}
+
 /// Upgrades a fresh (featureless) journal to match the filesystem's checksum
 /// and width features at mount time — project decision D-4, a deliberately
 /// NARROWER policy than Linux's. Linux clear-and-resets the journal's csum
@@ -452,9 +465,11 @@ pub(in crate::fs::fs_impls::ext4) struct JournalUpgradeNeeds {
 /// than being reshaped under a live log. Only the "fresh featureless journal
 /// on a metadata_csum fs" row acts, and there the outcome matches Linux's.
 ///
-/// Returns whether the on-disk journal superblock was rewritten; the caller
-/// must then reload the journal geometry, because the in-memory tag layout /
-/// csum seed were parsed from the pre-upgrade bytes.
+/// Returns a [`JournalUpgradeOutcome`] saying whether the on-disk journal
+/// superblock was rewritten; when it was, the caller must reload the journal
+/// geometry, because the in-memory tag layout / csum seed were parsed from
+/// the pre-upgrade bytes (the outcome type is `#[must_use]` so the obligation
+/// cannot be dropped silently).
 ///
 /// # Policy (fs `metadata_csum` × journal features → action)
 ///
@@ -490,10 +505,12 @@ pub(in crate::fs::fs_impls::ext4) fn upgrade_journal_on_mount(
     geometry: &JournalGeometry,
     device: &dyn BlockDevice,
     needs: JournalUpgradeNeeds,
-) -> Result<bool> {
+) -> Result<JournalUpgradeOutcome> {
+    const UNTOUCHED: JournalUpgradeOutcome = JournalUpgradeOutcome { upgraded: false };
+
     // Only a metadata_csum fs upgrades its journal (D-4, first table row).
     if !needs.fs_has_metadata_csum {
-        return Ok(false);
+        return Ok(UNTOUCHED);
     }
 
     let mut raw = geometry.read_raw_superblock(device)?;
@@ -501,19 +518,19 @@ pub(in crate::fs::fs_impls::ext4) fn upgrade_journal_on_mount(
     // A V1 superblock cannot carry feature bits at all; Linux refuses to set
     // features on one (`jbd2_format_support_feature`). Leave it alone.
     if raw.header.h_blocktype.get() != BLOCKTYPE_SUPERBLOCK_V2 {
-        return Ok(false);
+        return Ok(UNTOUCHED);
     }
     // Any pre-existing INCOMPAT feature means a Linux-touched journal: honor
     // its choices verbatim (second table row).
     if raw.s_feature_incompat.get() != 0 {
-        return Ok(false);
+        return Ok(UNTOUCHED);
     }
     // The flip is only crash-safe on a clean, empty log (see the docs).
-    // Recovery already ran by the time the mount calls this, so a nonzero
+    // Recovery already ran by the time the mount calls this, so a dirty
     // `s_start` is an anomaly (a dirty log the fs superblock did not flag for
     // recovery) we leave untouched rather than re-shape under.
-    if raw.s_start.get() != 0 {
-        return Ok(false);
+    if raw.recovery_start().is_some() {
+        return Ok(UNTOUCHED);
     }
 
     let mut incompat = INCOMPAT_CSUM_V3;
@@ -529,7 +546,7 @@ pub(in crate::fs::fs_impls::ext4) fn upgrade_journal_on_mount(
     // The funnel stamps `s_checksum` (the bits above make this a csum
     // superblock) and barriers the write.
     geometry.write_superblock(device, raw)?;
-    Ok(true)
+    Ok(JournalUpgradeOutcome { upgraded: true })
 }
 
 /// Loads the journal geometry: reads the journal inode (ino 8), maps its blocks,
@@ -775,9 +792,10 @@ pub(super) struct JournalState {
     /// `journal_t.j_head`). Wraps within `[first, maxlen)`.
     pub(super) head: u32,
     /// The oldest un-checkpointed transaction's start log block — the on-disk
-    /// `s_start` (jbd2 `journal_t.j_tail`). `0` means the journal is clean (no
-    /// transaction awaits checkpoint).
-    pub(super) tail_block: u32,
+    /// `s_start` (jbd2 `journal_t.j_tail`). `None` means the journal is clean
+    /// (no transaction awaits checkpoint); the on-disk `0` sentinel is decoded
+    /// at the disk-format boundary and never travels in-band here.
+    pub(super) tail_block: Option<u32>,
     /// The oldest un-checkpointed transaction's id — the on-disk `s_sequence`
     /// (jbd2 `journal_t.j_tail_sequence`).
     pub(super) tail_tid: Tid,
@@ -810,7 +828,7 @@ impl Journal {
     /// head/tail/tids in memory from the replayed log before `Ext4::open`
     /// publishes the journal):
     /// - `head = s_first`: the first writable log block.
-    /// - `tail_block = s_start`: `0` when clean, so nothing awaits checkpoint.
+    /// - `tail_block = s_start`: `None` when clean, so nothing awaits checkpoint.
     /// - `tail_tid = s_sequence`.
     /// - `committed_tid = s_sequence - 1`: nothing is committed yet, and the
     ///   first commit will bear `s_sequence`.
@@ -1624,14 +1642,14 @@ pub(super) fn read_metadata_block(
 pub(super) enum ForgetKind {
     /// A journaled metadata block (extent-tree node, directory block, …).
     Metadata,
-    /// File data (ordered-mode bookkeeping) — constructed once P7's revoke
+    /// File data (ordered-mode bookkeeping) — constructed once P7b's revoke
     /// machinery covers data blocks.
     #[expect(dead_code)]
     Data,
 }
 
 /// Records that a previously journaled metadata block is being freed. Still a
-/// no-op; `kind`/`blocknr` are the Phase-7 revoke insertion point.
+/// no-op; `kind`/`blocknr` are the P7b revoke insertion point.
 pub(super) fn forget(_handle: Option<&Handle>, _kind: ForgetKind, _blocknr: Ext4Bid) -> Result<()> {
     Ok(())
 }
@@ -1761,7 +1779,7 @@ mod tests {
         assert_eq!(geo.maxlen(), 2);
         assert_eq!(geo.first(), 1);
         assert_eq!(geo.sequence(), Tid::new(1));
-        assert_eq!(geo.start(), 0);
+        assert_eq!(geo.start(), None);
         assert_eq!(geo.blocksize(), BLOCK_SIZE as u32);
         assert_eq!(
             geo.log_block_to_physical(0),
@@ -1781,7 +1799,9 @@ mod tests {
     /// contradictory csum_v2+csum_v3 pair stay refused with `EINVAL`.
     #[ktest]
     fn load_geometry_admission_matches_supp_set() {
-        use super::format::{INCOMPAT_CSUM_V2, INCOMPAT_REVOKE};
+        use super::format::{
+            INCOMPAT_ASYNC_COMMIT, INCOMPAT_CSUM_V2, INCOMPAT_FAST_COMMIT, INCOMPAT_REVOKE,
+        };
 
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -1825,8 +1845,8 @@ mod tests {
             );
         }
 
-        // Async commit (0x4) and fast commit (0x20) stay outside the set.
-        for features in [0x4u32, 0x20u32] {
+        // Async commit and fast commit stay outside the set.
+        for features in [INCOMPAT_ASYNC_COMMIT, INCOMPAT_FAST_COMMIT] {
             write_sb(features);
             let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
             assert_eq!(err.error(), Errno::EINVAL, "features {features:#x}");
@@ -2247,7 +2267,7 @@ mod tests {
             .read_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE)
             .unwrap();
         assert_eq!(sb.s_start.get(), 0);
-        assert_eq!(f.journal.state_read().tail_block, 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
         assert!(f.journal.state_read().running.is_none());
     }
 
@@ -2258,7 +2278,7 @@ mod tests {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
         f.journal.flush_on_unmount().unwrap();
-        assert_eq!(f.journal.state_read().tail_block, 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
     }
 
     // --- a5 review MAJOR 2: the free-segment fit bound and its abort
@@ -2368,7 +2388,7 @@ mod tests {
         {
             let st = f.journal.state_read();
             assert_eq!(st.head, 4);
-            assert_eq!(st.tail_block, 1);
+            assert_eq!(st.tail_block, Some(1));
         }
         assert_eq!(f.journal.committed_tid(), Tid::new(1));
 
@@ -2550,7 +2570,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(rewritten);
+        assert!(rewritten.upgraded);
 
         let sb = read_fixture_journal_super(&f);
         assert_eq!(sb.s_feature_incompat.get(), INCOMPAT_CSUM_V3);
@@ -2581,7 +2601,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(rewritten);
+        assert!(rewritten.upgraded);
 
         let sb = read_fixture_journal_super(&f);
         assert_eq!(
@@ -2611,7 +2631,7 @@ mod tests {
         let assert_untouched = |needs: JournalUpgradeNeeds, why: &str| {
             let before = read_fixture_journal_super(&f);
             let rewritten = upgrade_journal_on_mount(geo, device.as_ref(), needs).unwrap();
-            assert!(!rewritten, "{why}");
+            assert!(!rewritten.upgraded, "{why}");
             let after = read_fixture_journal_super(&f);
             assert_eq!(after.as_bytes(), before.as_bytes(), "{why}");
         };

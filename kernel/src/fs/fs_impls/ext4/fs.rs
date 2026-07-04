@@ -195,7 +195,9 @@ impl Ext4 {
                     journal.geometry(),
                     ext4.block_device().as_ref(),
                     needs,
-                )? {
+                )?
+                .upgraded
+                {
                     let geometry = journal::load_geometry(&ext4)?.ok_or_else(|| {
                         Error::with_message(
                             Errno::EIO,

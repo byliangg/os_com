@@ -116,7 +116,7 @@
 //!
 //! # Phase 4 simplifications
 //!
-//! - **No revoke records** — Phase 7.
+//! - **No revoke records** — P7b.
 //! - **Synchronous**: [`try_commit_transaction`] does its device I/O inline.
 //!   Production reaches it only through
 //!   [`Journal::commit_or_drain_tail`](super::Journal) (the background commit
@@ -172,20 +172,32 @@ pub(super) fn barrier(device: &dyn BlockDevice) -> Result<()> {
     }
 }
 
-/// One descriptor block of a transaction's chain, sealed, plus the escape
-/// decision for each captured block it tags (in tag order): `escape[i]` says
-/// whether the i-th tagged block must have its 4-byte head zeroed when
-/// written into the log.
-struct DescriptorRun {
+/// One descriptor block of a transaction's chain, sealed, plus the logged
+/// sequence it tags (in tag order): each captured after-image paired with its
+/// escape decision. The log writer consumes exactly the sequence the builder
+/// tagged — the pairing travels inside the run, so writer and builder cannot
+/// desync.
+struct DescriptorRun<'t> {
     descriptor: Box<[u8; BLOCK_SIZE]>,
-    escape: Vec<bool>,
+    blocks: Vec<LoggedBlock<'t>>,
 }
 
-impl DescriptorRun {
-    /// The number of metadata blocks this descriptor tags (== the log blocks
-    /// that follow it before the next chain block).
+/// One tagged metadata block of a [`DescriptorRun`], to be written into the
+/// log right after its descriptor.
+struct LoggedBlock<'t> {
+    /// The captured after-image, borrowed from the transaction the chain was
+    /// built from.
+    bytes: &'t [u8; BLOCK_SIZE],
+    /// Whether the block's tag carries [`TAG_FLAG_ESCAPE`]: its 4-byte head
+    /// must be zeroed as it is written into the log (recovery restores it).
+    escape: bool,
+}
+
+impl DescriptorRun<'_> {
+    /// Returns the number of metadata blocks this descriptor tags (== the log
+    /// blocks that follow it before the next chain block).
     fn nr_blocks(&self) -> usize {
-        self.escape.len()
+        self.blocks.len()
     }
 }
 
@@ -207,7 +219,7 @@ impl Transaction {
         &self,
         layout: TagLayout,
         seed: Option<JournalCsumSeed>,
-    ) -> Result<Vec<DescriptorRun>> {
+    ) -> Result<Vec<DescriptorRun<'_>>> {
         let captures: Vec<(Ext4Bid, &[u8; BLOCK_SIZE])> = self.metadata_blocks().collect();
         if captures.is_empty() {
             return_errno_with_message!(Errno::EINVAL, "cannot commit an empty transaction");
@@ -227,12 +239,12 @@ impl Transaction {
     /// commit.c:700-710): **this** descriptor's first tag carries the UUID
     /// area and no `SAME_UUID`; its later tags set `SAME_UUID`; its last tag
     /// sets `LAST_TAG` — whether or not more descriptors follow in the chain.
-    fn build_descriptor_run(
+    fn build_descriptor_run<'t>(
         &self,
-        run: &[(Ext4Bid, &[u8; BLOCK_SIZE])],
+        run: &[(Ext4Bid, &'t [u8; BLOCK_SIZE])],
         layout: TagLayout,
         seed: Option<JournalCsumSeed>,
-    ) -> Result<DescriptorRun> {
+    ) -> Result<DescriptorRun<'t>> {
         let mut block = Box::new([0u8; BLOCK_SIZE]);
 
         // Header: magic + descriptor block type + this transaction's tid
@@ -249,7 +261,7 @@ impl Transaction {
         // The writer owns the buffer from here on; only `finish` (the seal)
         // hands it back, so an unsealed descriptor cannot reach the log.
         let mut writer = layout.writer(block, self.tid(), seed)?;
-        let mut escape = Vec::with_capacity(run.len());
+        let mut blocks = Vec::with_capacity(run.len());
 
         for (i, (bid, bytes)) in run.iter().enumerate() {
             let is_first = i == 0;
@@ -269,7 +281,10 @@ impl Transaction {
             if needs_escape {
                 flags |= TAG_FLAG_ESCAPE;
             }
-            escape.push(needs_escape);
+            blocks.push(LoggedBlock {
+                bytes,
+                escape: needs_escape,
+            });
 
             // `put` refuses a block number that does not fit the layout's
             // tag (`EFBIG`, only possible without 64-bit tags) and a tag that
@@ -296,7 +311,7 @@ impl Transaction {
         // path) and returns the sealed bytes.
         Ok(DescriptorRun {
             descriptor: writer.finish(),
-            escape,
+            blocks,
         })
     }
 }
@@ -341,10 +356,11 @@ impl Journal {
     ///
     /// Does NOT touch `s_head`: Linux only reads `s_head` on the clean-unmount fast
     /// path (`recovery.c`, when `s_start == 0`), which Phase 4 never produces — our
-    /// commits always leave `s_start != 0` until a checkpoint clears it. **Task 6
-    /// (checkpoint / clean unmount) owns `s_head`: when it zeroes `s_start` on a
-    /// clean unmount it MUST also write a correct `s_head`, or Linux would resume
-    /// the log at a stale offset.** (Adversarial-review finding, Phase 4 Task 3.)
+    /// commits always leave `s_start != 0` until a checkpoint clears it. **The
+    /// checkpoint pass (the checkpoint / clean-unmount rewrite) owns `s_head`:
+    /// when it zeroes `s_start` it MUST also write a correct `s_head`, or Linux
+    /// would resume the log at a stale offset.** (Adversarial-review finding,
+    /// Phase 4 Task 3.)
     fn update_superblock_tail(
         &self,
         device: &dyn BlockDevice,
@@ -436,11 +452,10 @@ pub(super) fn try_commit_transaction(
     // The head to write at and the un-checkpointed tail are read under the
     // state lock; the writes themselves happen without holding it (a single
     // committer, so no other committer races us) and the state is updated
-    // again at the end. The on-disk 0-means-clean sentinel is parsed into an
-    // `Option` here, once.
+    // again at the end.
     let (start_head, dirty_tail) = {
         let st = journal.state_write();
-        (st.head, (st.tail_block != 0).then_some(st.tail_block))
+        (st.head, st.tail_block)
     };
     let was_clean = dirty_tail.is_none();
 
@@ -458,6 +473,9 @@ pub(super) fn try_commit_transaction(
     // drain the tail and retry, or abort loudly — is the minimal safe
     // behavior.
     if footprint > journal.geometry.free_log_blocks(start_head, dirty_tail) {
+        // The chain borrows `txn`'s captures; release it before handing the
+        // transaction back.
+        drop(chain);
         return Ok(CommitAttempt::NeedsLogSpace(txn));
     }
 
@@ -494,36 +512,32 @@ pub(super) fn try_commit_transaction(
     // the jbd2 chain layout; a single-run chain is the frozen Phase-4
     // [descriptor][data...] bytes). ---
     let mut log = start_head;
-    {
-        // Scoped: the capture iterator borrows `txn`, which step 6 consumes.
-        let mut captures = txn.metadata_blocks();
-        for (i, run) in chain.iter().enumerate() {
-            if i > 0 {
-                log = journal.geometry.next_log_block(log);
-            }
-            write_log_block(journal, device, log, &run.descriptor)?;
+    for (i, run) in chain.iter().enumerate() {
+        if i > 0 {
+            log = journal.geometry.next_log_block(log);
+        }
+        write_log_block(journal, device, log, &run.descriptor)?;
 
-            for needs_escape in &run.escape {
-                // The chain was built from this same iteration order
-                // (`metadata_blocks` is deterministic), so the k-th escape
-                // decision belongs to the k-th capture; the builder tagged
-                // exactly `nr_data` captures, so the iterator cannot run dry.
-                let Some((_, bytes)) = captures.next() else {
-                    return_errno_with_message!(Errno::EINVAL, "descriptor chain out of sync");
-                };
-                log = journal.geometry.next_log_block(log);
-                let mut buf = Box::new([0u8; BLOCK_SIZE]);
-                buf.copy_from_slice(bytes);
-                if *needs_escape {
-                    // Zero the head so recovery does not mistake it for a log
-                    // header; recovery restores the magic when applying the
-                    // block.
-                    buf[..4].copy_from_slice(&[0u8; 4]);
-                }
+        // Each run carries the after-image sequence its descriptor tagged
+        // ([`LoggedBlock`]), so the writer emits exactly what the builder
+        // saw — there is no second capture walk to fall out of step with.
+        for block in &run.blocks {
+            log = journal.geometry.next_log_block(log);
+            if block.escape {
+                // Zero the head so recovery does not mistake it for a log
+                // header; recovery restores the magic when applying the
+                // block.
+                let mut buf = Box::new(*block.bytes);
+                buf[..4].fill(0);
                 write_log_block(journal, device, log, &buf)?;
+            } else {
+                write_log_block(journal, device, log, block.bytes)?;
             }
         }
     }
+    // The chain (which borrows `txn`'s captures) is fully written; release it
+    // so step 6 can consume the transaction.
+    drop(chain);
 
     // --- Step 2: barrier. Descriptor + data durable BEFORE the commit block,
     // so a commit record never certifies data that never reached the platter.
@@ -556,7 +570,7 @@ pub(super) fn try_commit_transaction(
         let mut st = journal.state_write();
         st.head = new_head;
         if was_clean {
-            st.tail_block = start_head;
+            st.tail_block = Some(start_head);
             st.tail_tid = tid;
         }
     }
@@ -716,11 +730,10 @@ mod tests {
             .build_descriptor_chain(TagLayout::from_features(0).unwrap(), None)
             .unwrap();
         assert_eq!(chain.len(), 1);
-        let DescriptorRun {
-            descriptor: block,
-            escape,
-        } = &chain[0];
-        assert_eq!(*escape, vec![false, false]);
+        let run = &chain[0];
+        let block = &run.descriptor;
+        let escapes: Vec<bool> = run.blocks.iter().map(|b| b.escape).collect();
+        assert_eq!(escapes, vec![false, false]);
 
         let mut expected = [0u8; BLOCK_SIZE];
         // Header: magic, DESCRIPTOR (1), tid 7 — all big-endian.
@@ -750,7 +763,8 @@ mod tests {
         let chain = txn.build_descriptor_chain(layout, None).unwrap();
         assert_eq!(chain.len(), 1);
         let block = &chain[0].descriptor;
-        assert_eq!(chain[0].escape, vec![false, false]);
+        let escapes: Vec<bool> = chain[0].blocks.iter().map(|b| b.escape).collect();
+        assert_eq!(escapes, vec![false, false]);
 
         let tags: Vec<_> = layout.walk(block).map(|tag| tag.unwrap()).collect();
         assert_eq!(tags.len(), 2);
@@ -779,7 +793,11 @@ mod tests {
         let chain = txn.build_descriptor_chain(layout, Some(seed)).unwrap();
         assert_eq!(chain.len(), 1);
         let block = &chain[0].descriptor;
-        assert_eq!(chain[0].escape, vec![true, false]);
+        // The run pairs each escape decision with the after-image it tagged.
+        let escapes: Vec<bool> = chain[0].blocks.iter().map(|b| b.escape).collect();
+        assert_eq!(escapes, vec![true, false]);
+        assert_eq!(chain[0].blocks[0].bytes, &escaped);
+        assert_eq!(chain[0].blocks[1].bytes, &plain);
 
         let tags: Vec<_> = layout.walk(block).map(|tag| tag.unwrap()).collect();
         assert_eq!(tags.len(), 2);
@@ -835,8 +853,8 @@ mod tests {
 
         let chain = txn.build_descriptor_chain(layout, None).unwrap();
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].escape.len(), per_descriptor);
-        assert_eq!(chain[1].escape.len(), 2);
+        assert_eq!(chain[0].nr_blocks(), per_descriptor);
+        assert_eq!(chain[1].nr_blocks(), 2);
 
         // Both descriptors bear the transaction's tid.
         for run in &chain {
@@ -975,7 +993,7 @@ mod tests {
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 5);
-            assert_eq!(st.tail_block, 1);
+            assert_eq!(st.tail_block, Some(1));
             assert_eq!(st.tail_tid, Tid::new(1));
         }
 
@@ -1009,7 +1027,7 @@ mod tests {
             let st = f.journal.state_write();
             assert_eq!(st.head, 8);
             // s_start still points at T1 (the oldest un-checkpointed txn).
-            assert_eq!(st.tail_block, 1);
+            assert_eq!(st.tail_block, Some(1));
             assert_eq!(st.tail_tid, Tid::new(1));
         }
 
@@ -1178,7 +1196,7 @@ mod tests {
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 4);
-            assert_eq!(st.tail_block, 1);
+            assert_eq!(st.tail_block, Some(1));
         }
 
         // T2: 11 captures -> footprint 13 (11 data + 1 desc + 1 commit):
@@ -1197,7 +1215,7 @@ mod tests {
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 4);
-            assert_eq!(st.tail_block, 1);
+            assert_eq!(st.tail_block, Some(1));
         }
         assert_eq!(f.journal.committed_tid(), Tid::new(1));
 
@@ -1248,7 +1266,7 @@ mod tests {
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 4);
-            assert_eq!(st.tail_block, 11);
+            assert_eq!(st.tail_block, Some(11));
         }
 
         // T3 (5 captures -> 7 blocks) fills the free segment EXACTLY: the

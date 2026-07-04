@@ -49,16 +49,16 @@
 //! # `s_head`
 //!
 //! [`commit.rs::update_superblock_tail`](super::commit) deliberately never writes
-//! `s_head`, documenting that Task 6 (this module) owns it: when we clear
+//! `s_head`, documenting that the checkpoint pass (this module) owns it: when we clear
 //! `s_start` on a clean journal, Linux's clean-unmount fast path
 //! (`recovery.c`, `s_start == 0`) reads `s_head` to resume the log; a stale
 //! `s_head` would make it resume at the wrong offset. So the clean-superblock
 //! write here sets `s_head` to the live log head.
 //!
-//! # Shared with recovery (Task 7)
+//! # Shared with recovery
 //!
-//! [`apply_log_transaction`] is the log-transaction reader that Task 7 (SCAN /
-//! REPLAY recovery) reuses to replay a transaction found in the log. It mirrors
+//! [`apply_log_transaction`] is the log-transaction reader that mount-time
+//! recovery (SCAN / REPLAY) reuses to replay a transaction found in the log. It mirrors
 //! [`commit.rs`](super::commit)'s writer through the one shared definition of
 //! the descriptor-tag byte layout, [`TagLayout`](super::format::TagLayout) —
 //! reader and writer cannot drift because neither owns any offset itself.
@@ -74,8 +74,10 @@
 //!   rewrite restamps `s_checksum` through the
 //!   [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)
 //!   funnel.
-//! - Synchronous, driven inline by the caller (here, tests); no background
-//!   checkpoint thread yet.
+//! - Synchronous, driven inline by its production callers — the commit
+//!   thread's post-commit pass, `commit_or_drain_tail`'s inline tail drain,
+//!   and the unmount flush ([`Journal::flush_on_unmount`](super::Journal)) —
+//!   no background checkpoint thread yet.
 
 use super::{
     super::prelude::*,
@@ -109,8 +111,8 @@ use super::{
 ///
 /// Every write here targets a filesystem block (`t_blocknr`), **not** a log
 /// block. Re-applying the same committed transaction rewrites the same bytes, so
-/// this is idempotent — the property [`checkpoint`]'s crash-safety and Task 7's
-/// recovery both rely on.
+/// this is idempotent — the property [`checkpoint`]'s crash-safety and
+/// mount-time recovery both rely on.
 ///
 /// # Descriptor byte layout
 ///
@@ -206,9 +208,9 @@ pub(super) fn apply_log_transaction(
             // The next transaction starts right after this commit block.
             return Ok(journal.geometry().next_log_block(log));
         }
-        // A chain block must be a descriptor or the commit. Phase 4 writes no
+        // A chain block must be a descriptor or the commit. We write no
         // revoke blocks, so any other type (including BLOCKTYPE_REVOKE) is
-        // corruption here; full revoke handling is Phase 7.
+        // corruption here; full revoke handling is P7b.
         if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
             return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");
         }
@@ -300,15 +302,15 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // I/O below runs WITHOUT the lock (the state lock is never held across I/O).
     // Phase 4 is single-transaction with no concurrent committer racing a
     // checkpoint, so a consistent snapshot is enough.
-    let (tail_block, tail_tid, committed_tid, head) = {
+    let (dirty_tail, tail_tid, committed_tid, head) = {
         let st = journal.state_read();
         (st.tail_block, st.tail_tid, journal.committed_tid(), st.head)
     };
 
-    // A clean journal (tail_block == 0) has nothing un-checkpointed.
-    if tail_block == 0 {
+    // A clean journal (no dirty tail) has nothing un-checkpointed.
+    let Some(tail_block) = dirty_tail else {
         return Ok(());
-    }
+    };
 
     // Apply each committed transaction in tid order, oldest first. Each is
     // known-committed, so `apply_log_transaction` must find a valid commit block;
@@ -348,8 +350,8 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
 
     // Publish the clean state in memory: the tail is cleared and its tid advances
     // to the next expected. `head` is left as-is — the ring continues from where
-    // commit left it; the next commit sees `tail_block == 0` (clean) and
-    // re-establishes `s_start` at its own start block.
+    // commit left it; the next commit sees a clean tail (`tail_block` is
+    // `None`) and re-establishes `s_start` at its own start block.
     //
     // The same critical section evicts the retained after-images this pass made
     // durable (their final-location writes are behind the barrier above, so the
@@ -358,7 +360,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // later capture the device's still-lagging bytes.
     {
         let mut st = journal.state_write();
-        st.tail_block = 0;
+        st.tail_block = None;
         st.tail_tid = committed_tid.next();
         st.uncheckpointed
             .retain(|_, image| !image.is_checkpointed_by(committed_tid));
@@ -506,7 +508,7 @@ mod tests {
         assert_eq!(sb.s_head.get(), head_before);
 
         // In-memory tail is cleared.
-        assert_eq!(f.journal.state_read().tail_block, 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
     }
 
     /// Test 2: an escaped block round-trips through checkpoint — the final
@@ -579,7 +581,7 @@ mod tests {
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
         checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
-        assert_eq!(f.journal.state_read().tail_block, 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
 
         // A fresh commit: the was-clean path must re-establish s_start at its
         // start block and advance committed_tid.
@@ -593,7 +595,7 @@ mod tests {
         // The journal is dirty again (s_start re-established) and the tail records
         // the new transaction.
         assert_ne!(read_journal_super(&f).s_start.get(), 0);
-        assert_ne!(f.journal.state_read().tail_block, 0);
+        assert_ne!(f.journal.state_read().tail_block, None);
 
         // Its final location is still pre-transaction until we checkpoint again.
         assert_eq!(read_final_block(&f, dest2), [0u8; BLOCK_SIZE]);

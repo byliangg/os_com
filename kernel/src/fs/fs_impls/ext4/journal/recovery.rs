@@ -14,7 +14,7 @@
 //! jbd2 runs recovery in passes over the log, walking transactions from the tail
 //! (`s_start`) forward, each transaction bearing the next `tid` in sequence
 //! (`s_sequence`, `s_sequence + 1`, …). This module implements the two Phase-4
-//! passes; PASS_REVOKE is Phase 7 (see the gaps below):
+//! passes; PASS_REVOKE is P7b (see the gaps below):
 //!
 //! - **PASS_SCAN** ([`scan_transaction`] in a loop): walks the log from the tail,
 //!   counting how many complete committed transactions are present, and finds the
@@ -96,7 +96,7 @@
 //! the one shared [`TagLayout`](super::format::TagLayout) definition but is
 //! read-only and treats a missing/incomplete transaction as the boundary
 //! rather than corruption. The wrap walk uses
-//! [`next_log_block`](super::commit::next_log_block) and the final durability
+//! [`next_log_block`](super::JournalGeometry::next_log_block) and the final durability
 //! flush uses [`barrier`](super::commit::barrier) — one definition each, shared
 //! with commit/checkpoint.
 
@@ -149,7 +149,8 @@ use super::{
 /// commit writer's [`TagWriter`](super::format::TagWriter) and
 /// [`apply_log_transaction`](super::checkpoint::apply_log_transaction) use, so
 /// the three cannot drift. Each tag's metadata block is the next log block
-/// after the previous ([`next_log_block`]); the next chain block (another
+/// after the previous ([`next_log_block`](super::JournalGeometry::next_log_block));
+/// the next chain block (another
 /// descriptor, or the commit) is the next log block after a descriptor's last
 /// metadata block. The walk stops at each descriptor's `LAST_TAG`, so a
 /// descriptor jbd2 sealed early (its `j_wbufsize` batch limit, not the tag
@@ -247,7 +248,7 @@ fn scan_transaction(
             return Ok(None);
         }
 
-        // Revoke gap (full PASS_REVOKE is Phase 7): our own log never emits
+        // Revoke gap (full PASS_REVOKE is P7b): our own log never emits
         // revoke blocks, so a valid-magic revoke block during recovery means
         // an interop (Linux-written) journal whose committed transactions
         // carry revoke records we cannot apply. Treating it as a clean
@@ -262,7 +263,7 @@ fn scan_transaction(
         if blocktype == BLOCKTYPE_REVOKE {
             return_errno_with_message!(
                 Errno::EUCLEAN,
-                "journal contains revoke records; recovery unsupported until Phase 7"
+                "journal contains revoke records; recovery unsupported until P7b"
             );
         }
 
@@ -382,7 +383,8 @@ fn scan_transaction(
 /// # SCAN/REPLAY count agreement
 ///
 /// REPLAY re-walks from the identical `(s_start, s_sequence)` start with the same
-/// per-tag / wrap arithmetic as SCAN (both use [`next_log_block`] and the same
+/// per-tag / wrap arithmetic as SCAN (both use
+/// [`next_log_block`](super::JournalGeometry::next_log_block) and the same
 /// offset stride, and [`apply_log_transaction`] is the exact reader
 /// [`scan_transaction`] mirrors), so the k-th REPLAY step lands on the same log
 /// block SCAN's k-th step did and consumes the same tid. Replaying exactly
@@ -395,13 +397,13 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     // --- Read the on-disk journal superblock (log block 0). ---
     let mut raw = journal.geometry().read_raw_superblock(device)?;
 
-    let s_start = raw.s_start.get();
-    let s_sequence = Tid::new(raw.s_sequence.get());
-
-    // A clean journal (`s_start == 0`) has nothing to recover.
-    if s_start == 0 {
+    // The on-disk 0-means-clean sentinel is decoded at the raw disk-format
+    // boundary ([`RawJournalSuperblock::recovery_start`]): a clean journal
+    // has nothing to recover.
+    let Some(s_start) = raw.recovery_start() else {
         return Ok(());
-    }
+    };
+    let s_sequence = Tid::new(raw.s_sequence.get());
 
     let first = journal.geometry().first();
 
@@ -461,7 +463,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     {
         let mut st = journal.state_write();
         st.head = first;
-        st.tail_block = 0;
+        st.tail_block = None;
         st.tail_tid = end_tid;
         st.next_tid = end_tid;
     }
@@ -663,7 +665,7 @@ mod tests {
 
         // In-memory clean state.
         let st = f.journal.state_read();
-        assert_eq!(st.tail_block, 0);
+        assert_eq!(st.tail_block, None);
         assert_eq!(st.tail_tid, Tid::new(2));
         assert_eq!(st.next_tid, Tid::new(2));
         assert_eq!(st.head, f.journal.geometry().first());
@@ -1553,7 +1555,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, maxlen as u16);
+        let raw_journal_inode =
+            make_multi_block_file_inode(JOURNAL_START_BLOCK, u16::try_from(maxlen).unwrap());
         f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
         let mut raw = journal_super(maxlen, first, sequence, start);
         raw.s_feature_incompat = Be32::new(feature_incompat);
