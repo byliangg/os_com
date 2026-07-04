@@ -87,12 +87,23 @@ use super::{
 /// Applies one committed transaction from the log to its final locations, the
 /// mirror of [`commit.rs`](super::commit)'s writer.
 ///
-/// Reads the descriptor at `start_log`, validates it (magic, `DESCRIPTOR` type,
-/// `h_sequence == expected_tid`), then for each tag writes the following log
-/// block to the tag's destination block (`t_blocknr`), restoring the jbd2 magic
-/// in an escaped block. Finally validates the trailing commit block (magic,
-/// `COMMIT`, `h_sequence == expected_tid`). Returns the log block immediately
-/// after the commit block — the next transaction's start.
+/// A transaction is a **descriptor chain** (jbd2 `do_one_pass`, matching the
+/// scanner): zero or more descriptor blocks — each followed by the metadata
+/// blocks its tags count — terminated by a commit block, every chain block
+/// bearing `expected_tid`. For each descriptor this validates it (magic,
+/// `DESCRIPTOR` type, `h_sequence == expected_tid`), then for each of its
+/// tags writes the following log block to the tag's destination block
+/// (`t_blocknr`), restoring the jbd2 magic in an escaped block — all
+/// descriptors' blocks, in chain order. The chain ends at the validated
+/// commit block (magic, `COMMIT`, `h_sequence == expected_tid`); the
+/// zero-descriptor chain (a Linux `data=ordered` transaction that carried
+/// only file data) applies nothing. Returns the log block immediately after
+/// the commit block — the next transaction's start.
+///
+/// Apply granularity is the whole chain: the caller only reaches this for a
+/// transaction SCAN found sealed, so there is no partial-descriptor apply —
+/// a chain that turns out malformed mid-walk errors (`EUCLEAN`) and the
+/// mount/checkpoint refuses.
 ///
 /// # Writes go to FINAL locations
 ///
@@ -154,101 +165,118 @@ pub(super) fn apply_log_transaction(
     start_log: u32,
     expected_tid: Tid,
 ) -> Result<u32> {
-    // --- Descriptor block. ---
-    let mut descriptor = [0u8; BLOCK_SIZE];
-    journal
-        .geometry()
-        .read_log_block(device, start_log, &mut descriptor)?;
-    let header = RawJournalHeader::parse(&descriptor);
-    if header.h_magic.get() != JBD2_MAGIC {
-        return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has bad magic");
-    }
-    // A block where a descriptor is expected must BE a descriptor. Phase 4 writes
-    // no revoke blocks, so any other type (including BLOCKTYPE_REVOKE) is
-    // corruption here; full revoke handling is Phase 7.
-    if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
-        return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");
-    }
-    if Tid::new(header.h_sequence.get()) != expected_tid {
-        return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has an unexpected tid");
-    }
-
-    // Descriptor-tail checksum (csum journals): hard error before any tag is
-    // trusted — replay/checkpoint follows a pass that already vouched for the
-    // transaction, so unlike SCAN there is no stale-block excuse here (jbd2
-    // recovery.c:570-580, `-EFSBADCRC` in any pass but SCAN).
     let seed = journal.geometry().csum_seed();
-    if seed.is_some_and(|s| !s.verify_block_tail(&descriptor)) {
-        return_errno_with_message!(Errno::EUCLEAN, "journal descriptor checksum mismatch");
-    }
 
-    // Walk the tag array (the byte geometry lives in ONE place, the journal's
-    // `TagLayout`, shared with the writer and the recovery scanner), applying
-    // each tag's logged block to its final location. `log` tracks the log block
-    // holding the *current* tag's metadata: it starts at the descriptor and steps
-    // one block per tag (the writer wrote descriptor, then metadata 0, 1, …). A
-    // malformed tag array (a tag overrunning the tag area) yields `EUCLEAN` from
-    // the walker — corruption here, never a panic.
-    let mut log = start_log;
+    // Set when any tag's logged data block fails its checksum: the block is
+    // skipped, the walk continues, and the apply as a whole refuses at the
+    // commit block (jbd2's skip-and-record shape; see the function docs).
     let mut bad_tag_csum = false;
-    for tag in journal.geometry().tag_layout().walk(&descriptor) {
-        let tag = tag?;
+    // Chain blocks consumed, for the anti-cycle bound (a valid chain can
+    // never occupy more blocks than the log holds; more means the walk has
+    // cycled the ring through stale same-tid blocks — refuse rather than
+    // loop forever, the scanner's same defensive bound).
+    let mut consumed: u32 = 0;
 
-        // This tag's metadata is the next log block after the previous one.
+    let mut log = start_log;
+    loop {
+        // --- The next chain block: a descriptor, or the sealing commit. ---
+        let mut chain_block = [0u8; BLOCK_SIZE];
+        journal
+            .geometry()
+            .read_log_block(device, log, &mut chain_block)?;
+        let header = RawJournalHeader::parse(&chain_block);
+        if header.h_magic.get() != JBD2_MAGIC {
+            return_errno_with_message!(Errno::EUCLEAN, "journal chain block has bad magic");
+        }
+        if Tid::new(header.h_sequence.get()) != expected_tid {
+            return_errno_with_message!(Errno::EUCLEAN, "journal chain block has an unexpected tid");
+        }
+
+        if header.h_blocktype.get() == BLOCKTYPE_COMMIT {
+            // A tag failed its data checksum above: every intact block was
+            // applied, but the transaction as a whole is corrupt — refuse
+            // (the caller refuses the mount / fails the checkpoint) rather
+            // than pretend it replayed.
+            if bad_tag_csum {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal data block checksum mismatch during replay"
+                );
+            }
+            // The next transaction starts right after this commit block.
+            return Ok(journal.geometry().next_log_block(log));
+        }
+        // A chain block must be a descriptor or the commit. Phase 4 writes no
+        // revoke blocks, so any other type (including BLOCKTYPE_REVOKE) is
+        // corruption here; full revoke handling is Phase 7.
+        if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
+            return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");
+        }
+
+        // Descriptor-tail checksum (csum journals): hard error before any of
+        // this descriptor's tags is trusted — replay/checkpoint follows a
+        // pass that already vouched for the transaction, so unlike SCAN there
+        // is no stale-block excuse here (jbd2 recovery.c:570-580,
+        // `-EFSBADCRC` in any pass but SCAN).
+        if seed.is_some_and(|s| !s.verify_block_tail(&chain_block)) {
+            return_errno_with_message!(Errno::EUCLEAN, "journal descriptor checksum mismatch");
+        }
+
+        // Walk this descriptor's tag array (the byte geometry lives in ONE
+        // place, the journal's `TagLayout`, shared with the writer and the
+        // recovery scanner), applying each tag's logged block to its final
+        // location. `log` tracks the log block holding the *current* tag's
+        // metadata: it steps one block per tag from the descriptor (the
+        // writer wrote descriptor, then metadata 0, 1, …). A malformed tag
+        // array (a tag overrunning the tag area) yields `EUCLEAN` from the
+        // walker — corruption here, never a panic.
+        for tag in journal.geometry().tag_layout().walk(&chain_block) {
+            let tag = tag?;
+
+            // This tag's metadata is the next log block after the previous one.
+            log = journal.geometry().next_log_block(log);
+            consumed += 1;
+            let mut block = [0u8; BLOCK_SIZE];
+            journal.geometry().read_log_block(device, log, &mut block)?;
+
+            // Per-tag data checksum (csum journals), over the logged bytes
+            // BEFORE the escape restoration below — the checksum covers the
+            // block as it sits in the log. A mismatched block is skipped
+            // (never applied with corrupt content), the walk continues so
+            // intact blocks still land, and the apply fails at the commit —
+            // jbd2's skip-and-record shape (see the function docs;
+            // recovery.c:655-666).
+            if seed.is_some_and(|s| !tag.verify_data_csum(s, expected_tid, &block)) {
+                bad_tag_csum = true;
+                continue;
+            }
+
+            // Restore the escaped head: the writer zeroed the first 4 bytes
+            // of a block that began with JBD2_MAGIC so a recovery scan would
+            // not mistake the metadata for a log header. Put the magic back
+            // before applying.
+            if tag.is_escaped() {
+                block[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+            }
+
+            // Apply to the FINAL location (a filesystem block), not a log block.
+            device
+                .write_bytes(Bid::new(tag.blocknr()).to_offset(), block.as_slice())
+                .map_err(|_| Error::with_message(Errno::EIO, "failed to apply journaled block"))?;
+        }
+
+        // The next chain block — another descriptor, or the commit — follows
+        // this descriptor's last metadata block.
         log = journal.geometry().next_log_block(log);
-        let mut block = [0u8; BLOCK_SIZE];
-        journal.geometry().read_log_block(device, log, &mut block)?;
+        consumed += 1;
 
-        // Per-tag data checksum (csum journals), over the logged bytes BEFORE
-        // the escape restoration below — the checksum covers the block as it
-        // sits in the log. A mismatched block is skipped (never applied with
-        // corrupt content), the walk continues so intact blocks still land,
-        // and the apply fails at the end — jbd2's skip-and-record shape (see
-        // the function docs; recovery.c:655-666).
-        if seed.is_some_and(|s| !tag.verify_data_csum(s, expected_tid, &block)) {
-            bad_tag_csum = true;
-            continue;
+        if consumed > journal.geometry().maxlen() {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal transaction chain exceeds the log size"
+            );
         }
-
-        // Restore the escaped head: the writer zeroed the first 4 bytes of a
-        // block that began with JBD2_MAGIC so a recovery scan would not mistake
-        // the metadata for a log header. Put the magic back before applying.
-        if tag.is_escaped() {
-            block[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
-        }
-
-        // Apply to the FINAL location (a filesystem block), not a log block.
-        device
-            .write_bytes(Bid::new(tag.blocknr()).to_offset(), block.as_slice())
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to apply journaled block"))?;
     }
-
-    // --- Commit block: the next log block after the last metadata block. ---
-    let commit_log = journal.geometry().next_log_block(log);
-    let mut commit = [0u8; BLOCK_SIZE];
-    journal
-        .geometry()
-        .read_log_block(device, commit_log, &mut commit)?;
-    let commit_header = RawJournalHeader::parse(&commit);
-    if commit_header.h_magic.get() != JBD2_MAGIC
-        || commit_header.h_blocktype.get() != BLOCKTYPE_COMMIT
-        || Tid::new(commit_header.h_sequence.get()) != expected_tid
-    {
-        return_errno_with_message!(Errno::EUCLEAN, "journal commit block is malformed");
-    }
-
-    // A tag failed its data checksum above: every intact block was applied,
-    // but the transaction as a whole is corrupt — refuse (the caller refuses
-    // the mount / fails the checkpoint) rather than pretend it replayed.
-    if bad_tag_csum {
-        return_errno_with_message!(
-            Errno::EUCLEAN,
-            "journal data block checksum mismatch during replay"
-        );
-    }
-
-    // The next transaction starts right after this commit block.
-    Ok(journal.geometry().next_log_block(commit_log))
 }
 
 /// Checkpoints ALL committed-but-un-checkpointed transactions

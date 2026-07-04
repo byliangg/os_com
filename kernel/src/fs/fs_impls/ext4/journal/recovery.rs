@@ -118,40 +118,55 @@ use super::{
 /// Scans one transaction at `start_log` expecting tid `expected_tid`, WITHOUT
 /// writing anything (jbd2 `do_one_pass` in `PASS_SCAN`).
 ///
-/// Returns `Some(next_start_log)` when a complete committed transaction is present
-/// — a valid descriptor for `expected_tid` followed, after its metadata blocks, by
-/// a valid commit block for `expected_tid`. Returns `Ok(None)` at the **log
-/// boundary**: a block that is not a matching descriptor, or a descriptor with no
-/// valid commit block (an interrupted commit). `None` is the normal end of the
-/// log, **not** an error — this is the one place recovery differs from
+/// A transaction is a **descriptor chain**: zero or more descriptor blocks —
+/// each followed by the metadata blocks its tags count — terminated by a
+/// commit block, every one of them bearing `expected_tid`. jbd2 walks the
+/// chain flat (`do_one_pass` reads block after block; descriptors accumulate,
+/// and the same-tid commit block seals ALL of them, fs/jbd2/recovery.c:
+/// 531-560 dispatch); this mirrors that walk. The zero-descriptor case is
+/// real interop: a Linux `data=ordered` transaction that carried only file
+/// data commits as a bare commit block, and treating it as a boundary would
+/// silently under-replay everything after it.
+///
+/// Returns `Some(next_start_log)` when the chain completes with a valid
+/// commit block for `expected_tid`. Returns `Ok(None)` at the **log
+/// boundary**: a block that is neither a matching descriptor nor a matching
+/// commit (an interrupted commit, a stale leftover, or a blank slot). `None`
+/// is the normal end of the log, **not** an error — this is the one place
+/// recovery differs from
 /// [`apply_log_transaction`](super::checkpoint::apply_log_transaction), which
 /// treats the same conditions as corruption (`EUCLEAN`).
 ///
 /// # Byte layout (one shared definition)
 ///
-/// The descriptor's tag geometry is owned by the journal's
+/// Each descriptor's tag geometry is owned by the journal's
 /// [`TagLayout`](super::format::TagLayout): this walk iterates
 /// [`TagLayout::walk`](super::format::TagLayout::walk), the same definition the
 /// commit writer's [`TagWriter`](super::format::TagWriter) and
 /// [`apply_log_transaction`](super::checkpoint::apply_log_transaction) use, so
 /// the three cannot drift. Each tag's metadata block is the next log block
-/// after the previous ([`next_log_block`]); the commit block is the next log
-/// block after the last metadata block.
+/// after the previous ([`next_log_block`]); the next chain block (another
+/// descriptor, or the commit) is the next log block after a descriptor's last
+/// metadata block. The walk stops at each descriptor's `LAST_TAG`, so a
+/// descriptor jbd2 sealed early (its `j_wbufsize` batch limit, not the tag
+/// area) still walks correctly — the tag count is whatever the bytes say.
 ///
 /// # Boundary conditions (each yields `Ok(None)`)
 ///
-/// - The descriptor's magic/type is wrong, or its `h_sequence != expected_tid`
-///   (a stale block left by a previous log wrap, or a blank/never-written block —
-///   the monotonic sequence is what tells a fresh descriptor from a stale one).
-///   A [`BLOCKTYPE_REVOKE`] block encountered during recovery is instead a hard
-///   error (`EUCLEAN`) — see the revoke gap below.
-/// - A tag offset would run past the descriptor block (a malformed descriptor is
-///   not a valid transaction; do not panic).
-/// - The trailing commit block's magic/type/`h_sequence` does not match (an
-///   interrupted commit — the descriptor and metadata were written but the commit
-///   record never reached the platter, so the transaction did not commit).
+/// - A chain block's magic is wrong, or its `h_sequence != expected_tid` (a
+///   stale block left by a previous log wrap, or a blank/never-written block —
+///   the monotonic sequence is what tells a fresh chain block from a stale
+///   one), or its type is neither descriptor nor commit (jbd2's
+///   "unrecognised magic" scan end). A [`BLOCKTYPE_REVOKE`] block is instead
+///   a hard error whatever its tid — conservatively even a stale one, the
+///   Phase-4 politics kept verbatim (see the revoke gap in the module docs).
+/// - A tag offset would run past its descriptor block (a malformed descriptor
+///   is not a valid transaction; do not panic).
+/// - No commit block for `expected_tid` ever seals the chain (an interrupted
+///   commit — descriptors and metadata were written but the commit record
+///   never reached the platter, so the transaction did not commit).
 /// - A **bad descriptor-tail checksum with no valid commit block** downstream
-///   (csum journals only): the torn tail tore inside the descriptor itself.
+///   (csum journals only): the torn tail tore inside a descriptor itself.
 ///
 /// # Checksum politics (csum v2/v3 journals; `EUCLEAN`, not a boundary)
 ///
@@ -161,14 +176,16 @@ use super::{
 /// - A bad **descriptor-tail** checksum does not fail the scan by itself —
 ///   PASS_SCAN can meet stale lazy-init blocks, so jbd2 defers judgment
 ///   (`need_check_commit_time`, fs/jbd2/recovery.c:571-586) until the commit
-///   slot. If a valid commit block for the same tid seals the transaction,
-///   the descriptor corruption is real and the scan refuses (`EUCLEAN`);
-///   jbd2 reaches the same refusal through the commit-time comparison
-///   (recovery.c:749-760, `-EFSBADCRC`). *Divergence*: jbd2 treats a
-///   **decreasing** `h_commit_sec` as stale pre-existing data and ends
-///   recovery successfully at this boundary (recovery.c:761-767); we always
-///   refuse — strictly safer (a refused mount, never an under-replayed one),
-///   and we never lazily init a journal ourselves.
+///   slot; with a chain, the verdict accumulates across ALL its descriptors.
+///   If a valid commit block for the same tid seals the transaction, the
+///   descriptor corruption is real and the scan refuses (`EUCLEAN`) — the
+///   whole transaction, no partial-descriptor apply; jbd2 reaches the same
+///   refusal through the commit-time comparison (recovery.c:749-760,
+///   `-EFSBADCRC`). *Divergence*: jbd2 treats a **decreasing**
+///   `h_commit_sec` as stale pre-existing data and ends recovery
+///   successfully at this boundary (recovery.c:761-767); we always refuse —
+///   strictly safer (a refused mount, never an under-replayed one), and we
+///   never lazily init a journal ourselves.
 /// - A bad **commit-block** checksum on an otherwise matching commit block
 ///   refuses the scan (`EUCLEAN`): the transaction cannot prove it committed
 ///   intact. This is jbd2's sync-commit path (recovery.c:806-817 records
@@ -177,6 +194,13 @@ use super::{
 ///   `INCOMPAT_ASYNC_COMMIT`, so its keep-scanning leniency and the
 ///   decreasing-commit-time escape (recovery.c:810-811) are both dropped.
 ///
+/// # Chain-length bound (defensive divergence)
+///
+/// A valid chain can never occupy more blocks than the log holds; a walk
+/// consuming more has cycled the ring through stale same-tid blocks (jbd2
+/// would spin on such a crafted log). We refuse with `EUCLEAN` rather than
+/// loop forever — refusing garbage is strictly safer than scanning it.
+///
 /// Device errors propagate as `Err(EIO)`.
 fn scan_transaction(
     journal: &Journal,
@@ -184,85 +208,59 @@ fn scan_transaction(
     start_log: u32,
     expected_tid: Tid,
 ) -> Result<Option<u32>> {
-    // --- Descriptor block. ---
-    let mut descriptor = [0u8; BLOCK_SIZE];
-    journal
-        .geometry()
-        .read_log_block(device, start_log, &mut descriptor)?;
-    let header = RawJournalHeader::parse(&descriptor);
-    let blocktype = header.h_blocktype.get();
-    // Revoke gap (full PASS_REVOKE is Phase 7): our own log never emits revoke
-    // blocks, so one appearing during recovery means an interop (Linux-written)
-    // journal whose committed transactions carry revoke records we cannot apply.
-    // Treating it as a clean boundary would silently under-replay a committed
-    // transaction (and everything after it), then stamp a too-small `s_sequence`
-    // on the clean superblock — corruption. Refuse the mount loudly instead.
-    if blocktype == BLOCKTYPE_REVOKE {
-        return_errno_with_message!(
-            Errno::EUCLEAN,
-            "journal contains revoke records; recovery unsupported until Phase 7"
-        );
-    }
-    // Boundary, not corruption: a stale/blank block (bad magic or a non-descriptor
-    // type), or a descriptor from a different generation (wrong tid), marks the end
-    // of the committed log. The monotonic `h_sequence` check is the crux: it
-    // distinguishes a freshly written descriptor for `expected_tid` from a stale
-    // one a previous wrap left behind.
-    if header.h_magic.get() != JBD2_MAGIC
-        || blocktype != BLOCKTYPE_DESCRIPTOR
-        || Tid::new(header.h_sequence.get()) != expected_tid
-    {
-        return Ok(None);
-    }
-
-    // Descriptor-tail checksum (csum journals): verified here, judged at the
-    // commit slot below — jbd2's PASS_SCAN defers a descriptor-checksum
-    // failure (recovery.c:571-586) because the block may be stale garbage
-    // whose transaction never committed (then it is the normal boundary, not
-    // corruption). Only a valid commit block sealing this tid turns the
-    // mismatch into a refusal. See the checksum-politics doc above.
     let seed = journal.geometry().csum_seed();
-    let descriptor_csum_ok = seed.is_none_or(|s| s.verify_block_tail(&descriptor));
 
-    // Walk the tag array (the byte geometry lives in ONE place, the journal's
-    // `TagLayout`, shared with the writer and the checkpoint/replay reader),
-    // advancing a `log` cursor one block per tag — the same walk the
-    // reader/writer use to place the logged metadata. We only need the cursor's
-    // final position (where the commit block sits); the count is implicit in
-    // the walk.
+    // The deferred descriptor-tail verdict, accumulated over every descriptor
+    // of the chain (see the checksum-politics doc above): judged only if a
+    // valid commit seals the transaction.
+    let mut descriptors_csum_ok = true;
+    // Chain blocks consumed, for the anti-cycle bound (see the doc above).
+    let mut consumed: u32 = 0;
+
     let mut log = start_log;
-    for tag in journal.geometry().tag_layout().walk(&descriptor) {
-        // A malformed tag array (a tag overrunning the tag area, or garbage
-        // flags) is not a valid committed transaction: treat it as the
-        // boundary (never panic on a bad log).
-        if tag.is_err() {
+    loop {
+        let mut block = [0u8; BLOCK_SIZE];
+        journal.geometry().read_log_block(device, log, &mut block)?;
+        let header = RawJournalHeader::parse(&block);
+        let blocktype = header.h_blocktype.get();
+
+        // Revoke gap (full PASS_REVOKE is Phase 7): our own log never emits
+        // revoke blocks, so one appearing during recovery means an interop
+        // (Linux-written) journal whose committed transactions carry revoke
+        // records we cannot apply. Treating it as a clean boundary would
+        // silently under-replay a committed transaction (and everything after
+        // it), then stamp a too-small `s_sequence` on the clean superblock —
+        // corruption. Refuse the mount loudly instead.
+        if blocktype == BLOCKTYPE_REVOKE {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal contains revoke records; recovery unsupported until Phase 7"
+            );
+        }
+        // Boundary, not corruption: a stale/blank block (bad magic, or a type
+        // that is neither descriptor nor commit), or a block from a different
+        // generation (wrong tid), marks the end of the committed log. The
+        // monotonic `h_sequence` check is the crux: it distinguishes a
+        // freshly written chain block for `expected_tid` from a stale one a
+        // previous wrap left behind. Reached mid-chain, this is the
+        // interrupted commit: descriptors were written but the commit record
+        // never made it, so the transaction did not commit.
+        if header.h_magic.get() != JBD2_MAGIC
+            || Tid::new(header.h_sequence.get()) != expected_tid
+            || (blocktype != BLOCKTYPE_DESCRIPTOR && blocktype != BLOCKTYPE_COMMIT)
+        {
             return Ok(None);
         }
 
-        // This tag's metadata is the next log block after the previous one.
-        log = journal.geometry().next_log_block(log);
-    }
-
-    // --- Commit block: the next log block after the last metadata block. ---
-    let commit_log = journal.geometry().next_log_block(log);
-    let mut commit = [0u8; BLOCK_SIZE];
-    journal
-        .geometry()
-        .read_log_block(device, commit_log, &mut commit)?;
-    let commit_header = RawJournalHeader::parse(&commit);
-    if commit_header.h_magic.get() == JBD2_MAGIC {
-        let commit_blocktype = commit_header.h_blocktype.get();
-        if commit_blocktype == BLOCKTYPE_COMMIT
-            && Tid::new(commit_header.h_sequence.get()) == expected_tid
-        {
+        if blocktype == BLOCKTYPE_COMMIT {
             // A matching commit block seals the transaction ONLY if the
             // checksums agree (csum journals; see the politics doc above):
             //
             // - The deferred descriptor verdict lands here: a valid commit
-            //   sealing a checksum-bad descriptor is real corruption, never a
-            //   boundary (jbd2 recovery.c:749-760, minus the commit-time
-            //   staleness escape we deliberately drop).
-            if !descriptor_csum_ok {
+            //   sealing a checksum-bad descriptor (any of the chain) is real
+            //   corruption, never a boundary (jbd2 recovery.c:749-760, minus
+            //   the commit-time staleness escape we deliberately drop).
+            if !descriptors_csum_ok {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
                     "journal descriptor checksum invalid on a committed transaction"
@@ -272,48 +270,61 @@ fn scan_transaction(
             //   cannot prove it committed intact (jbd2's sync-commit refusal,
             //   recovery.c:806-817 + journal.c:2078-2083; we support no
             //   ASYNC_COMMIT leniency).
-            if seed.is_some_and(|s| !s.verify_commit_block(&commit)) {
+            if seed.is_some_and(|s| !s.verify_commit_block(&block)) {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
                     "journal commit block checksum mismatch"
                 );
             }
-            // A complete committed transaction: the next one starts right after
-            // this commit block.
-            return Ok(Some(journal.geometry().next_log_block(commit_log)));
+            // A complete committed transaction: the next one starts right
+            // after this commit block.
+            return Ok(Some(journal.geometry().next_log_block(log)));
         }
-        if commit_blocktype == BLOCKTYPE_REVOKE {
-            // A revoke block sits where this transaction's commit was computed to
-            // be. Linux writes revoke records between the metadata and the commit
-            // block, so the real commit is further along and this transaction *did*
-            // commit — but we cannot walk past revoke blocks (PASS_REVOKE is Phase
-            // 7). Treating this as a torn tail would silently under-replay a
-            // committed transaction, so fail loudly like the multi-descriptor case.
+
+        // --- A descriptor of the chain. ---
+
+        // Its tail checksum (csum journals) is verified here, judged at the
+        // commit slot — jbd2's PASS_SCAN defers a descriptor-checksum failure
+        // (recovery.c:571-586) because the block may be stale garbage whose
+        // transaction never committed (then it is the normal boundary, not
+        // corruption).
+        descriptors_csum_ok &= seed.is_none_or(|s| s.verify_block_tail(&block));
+
+        // Walk its tag array (the byte geometry lives in ONE place, the
+        // journal's `TagLayout`, shared with the writer and the
+        // checkpoint/replay reader), advancing the cursor one block per tag —
+        // the same walk the reader/writer use to place the logged metadata.
+        // Only the cursor's final position matters here (where the next chain
+        // block sits); the count is implicit in the walk.
+        for tag in journal.geometry().tag_layout().walk(&block) {
+            // A malformed tag array (a tag overrunning the tag area, or
+            // garbage flags) is not a valid committed transaction: treat it
+            // as the boundary (never panic on a bad log).
+            if tag.is_err() {
+                return Ok(None);
+            }
+
+            // This tag's metadata is the next log block after the previous
+            // one.
+            log = journal.geometry().next_log_block(log);
+            consumed += 1;
+        }
+
+        // The next chain block — another descriptor, or the commit — follows
+        // this descriptor's last metadata block.
+        log = journal.geometry().next_log_block(log);
+        consumed += 1;
+
+        // Anti-cycle bound (see the doc above): a chain longer than the log
+        // itself has wrapped onto stale same-tid blocks and can never
+        // terminate validly.
+        if consumed > journal.geometry().maxlen() {
             return_errno_with_message!(
                 Errno::EUCLEAN,
-                "journal revoke records unsupported in recovery until Phase 7"
-            );
-        }
-        if commit_blocktype == BLOCKTYPE_DESCRIPTOR {
-            // A *second* descriptor where the commit block should be: this
-            // transaction spans multiple descriptor blocks. Our writer never
-            // produces these (one descriptor per transaction, capped at
-            // `max_credits`), but a Linux-written log can for a large transaction
-            // (`commit.c` starts a new descriptor when a tag no longer fits). We
-            // have no code path to walk a second descriptor, so we would otherwise
-            // mistake this for a torn tail and *silently under-replay a committed
-            // transaction* — a latent inconsistency. Fail LOUDLY instead so the
-            // mount refuses rather than corrupts (adversarial-review Finding 5).
-            // Full multi-descriptor support is a later phase.
-            return_errno_with_message!(
-                Errno::EUCLEAN,
-                "multi-descriptor journal transaction unsupported in Phase 4"
+                "journal transaction chain exceeds the log size"
             );
         }
     }
-    // Interrupted commit (or a stale/blank commit slot): the transaction did not
-    // commit, so this is the boundary — the normal end of the log.
-    Ok(None)
 }
 
 /// Recovers the journal after a crash (jbd2 `jbd2_journal_recover`): PASS_SCAN
@@ -445,7 +456,8 @@ mod tests {
             commit::commit_transaction,
             format::{
                 BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_64BIT, INCOMPAT_CSUM_V2, INCOMPAT_CSUM_V3,
-                JBD2_CRC32C_CHKSUM, JournalSuperblock, RawCommitBlock, RawJournalSuperblock,
+                JBD2_CRC32C_CHKSUM, JournalCsumSeed, JournalSuperblock, RawCommitBlock,
+                RawJournalSuperblock, TAG_FLAG_SAME_UUID,
             },
             load_geometry,
         },
@@ -871,37 +883,474 @@ mod tests {
         );
     }
 
-    /// A second descriptor where the commit block should be (a multi-descriptor
-    /// transaction, which a Linux-written log can produce but Phase 4 cannot
-    /// parse) must fail LOUDLY, not be silently under-replayed as a torn tail
-    /// (adversarial-review Finding 5).
+    /// A commit block with the expected tid but NO preceding descriptor seals
+    /// a zero-descriptor transaction — real Linux interop: a `data=ordered`
+    /// transaction that carried only file data commits as a bare commit
+    /// block (jbd2 `do_one_pass` seals on any same-tid commit block), and
+    /// treating it as a boundary would silently under-replay everything
+    /// after it. Recovery walks past it to the following transaction.
     #[ktest]
-    fn scan_transaction_rejects_multi_descriptor() {
+    fn recover_walks_past_commit_only_transaction() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(24, 1, 1);
         let device = f.fixture.ext4.block_device();
 
-        // A real single-block transaction: desc @1, data @2, commit @3.
-        let t1 = make_txn(Tid::new(1), &[(500u64, tagged_block(b"MULTIDSC"))]);
-        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-
-        // Overwrite the commit block (log 3) with a *descriptor* header for the
-        // same tid: this is what the block after the first descriptor's LAST_TAG
-        // would look like in a multi-descriptor Linux transaction. Scan must
-        // return an error, not `None`.
-        let mut block = read_log_block_at(&f, 3);
-        let desc_header = RawJournalHeader {
-            h_magic: Be32::new(JBD2_MAGIC),
-            h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
-            h_sequence: Be32::new(1),
+        // Hand-write T1 (tid 1) as a bare commit block at log 1.
+        let commit_only = RawCommitBlock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_COMMIT),
+                h_sequence: Be32::new(1),
+            },
+            ..Default::default()
         };
-        block[..size_of::<RawJournalHeader>()].copy_from_slice(desc_header.as_bytes());
-        write_log_block_at(&f, 3, &block);
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..size_of::<RawCommitBlock>()].copy_from_slice(commit_only.as_bytes());
+        write_log_block_at(&f, 1, &block);
 
-        let first = f.journal.geometry().first();
-        assert!(scan_transaction(f.journal.as_ref(), device.as_ref(), first, Tid::new(1)).is_err());
-        // And `recover` propagates the error rather than under-replaying.
-        assert!(recover(f.journal.as_ref(), device.as_ref()).is_err());
+        // Scan seals it and moves the cursor one block.
+        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(1))
+            .unwrap()
+            .expect("a bare same-tid commit block seals a data-only transaction");
+        assert_eq!(next, 2);
+
+        // Commit a real T2 (tid 2) right after it, then point the on-disk
+        // tail at T1 so recovery walks the pair.
+        let dest = 500u64;
+        let content = tagged_block(b"AFTERCMO");
+        f.journal.state_write().head = 2;
+        let t2 = make_txn(Tid::new(2), &[(dest, content)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        set_journal_tail(&f, 1, 1);
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        // T1 applied nothing (it tagged nothing); T2 replayed past it; the
+        // clean superblock accounts for BOTH tids.
+        assert_eq!(read_final_block(&f, dest), content);
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 3);
+    }
+
+    // --- P7a-5: multi-descriptor transactions (descriptor chains). The
+    // production writer splits a transaction across descriptors whenever one
+    // tag area fills; SCAN/REPLAY walk the chain to the same-tid commit
+    // block that seals ALL of it. ---
+
+    /// A distinct, index-derived after-image for the bulk chain tests (the
+    /// escaped variant's head is the jbd2 magic, so the block is logged
+    /// escaped).
+    fn bulk_block(i: usize, escaped: bool) -> [u8; BLOCK_SIZE] {
+        let mut b = [0u8; BLOCK_SIZE];
+        b[8..16].copy_from_slice(&u64::try_from(i).unwrap().to_le_bytes());
+        b[16..24].copy_from_slice(b"BULKBLK!");
+        b[BLOCK_SIZE - 4..].copy_from_slice(b"TAIL");
+        if escaped {
+            b[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        }
+        b
+    }
+
+    /// Builds a transaction of `n` captures at consecutive destinations
+    /// `first_dest..first_dest + n`, with the capture at index `escape_at`
+    /// (if any) starting with the jbd2 magic.
+    fn make_bulk_txn(
+        tid: Tid,
+        first_dest: Ext4Bid,
+        n: usize,
+        escape_at: Option<usize>,
+    ) -> Transaction {
+        let mut txn = Transaction::new(tid);
+        for i in 0..n {
+            let dest = first_dest + u64::try_from(i).unwrap();
+            let content = bulk_block(i, escape_at == Some(i));
+            txn.capture_create(dest);
+            txn.apply_patch(dest, |b| b.copy_from_slice(&content))
+                .unwrap();
+        }
+        txn
+    }
+
+    /// Asserts every one of `n` bulk destinations carries its after-image.
+    fn assert_bulk_applied(
+        f: &JournaledFixture,
+        first_dest: Ext4Bid,
+        n: usize,
+        escape_at: Option<usize>,
+    ) {
+        for i in 0..n {
+            let dest = first_dest + u64::try_from(i).unwrap();
+            assert_eq!(
+                read_final_block(f, dest),
+                bulk_block(i, escape_at == Some(i)),
+                "bulk block {i} must be applied verbatim (escape restored)"
+            );
+        }
+    }
+
+    /// Production write → recovery round trip of a MULTI-DESCRIPTOR
+    /// transaction, per admitted feature set (v0's 8-byte tags need > 508
+    /// captures; csum_v3's 16-byte tags > 254), with an ESCAPED block landing
+    /// in a NON-FIRST descriptor. Verifies on the raw bytes that the chain
+    /// really has two descriptors — each with its own UUID area, LAST_TAG,
+    /// and (on csum layouts) its own verifying tail checksum — then recovers
+    /// and checks every after-image (escape restored) plus the clean
+    /// superblock.
+    #[ktest]
+    fn production_round_trip_replays_multi_descriptor_chain() {
+        crate::time::clocks::init_for_ktest();
+        for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
+            let f = feature_journaled_fixture(features, 560, 1, 1, 0);
+            let device = f.fixture.ext4.block_device();
+            let layout = f.journal.geometry().tag_layout();
+            let per_descriptor = layout.tags_per_descriptor();
+
+            // Two tags past one descriptor's capacity: a two-descriptor
+            // chain whose LAST capture (the escaped one) tags in descriptor
+            // #2. Chain footprint: n data + 2 descriptors + 1 commit.
+            let n = per_descriptor + 2;
+            let first_dest = 1000u64;
+            let escape_at = n - 1;
+            let txn = make_bulk_txn(Tid::new(1), first_dest, n, Some(escape_at));
+            commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+            // The bytes really are a chain: descriptor #1 at log 1, its
+            // `per_descriptor` data blocks, descriptor #2 right after, its 2
+            // data blocks, then the commit sealing the tid.
+            let desc2_log = u32::try_from(2 + per_descriptor).unwrap();
+            let commit_log = desc2_log + 3;
+            let desc1 = read_log_block_at(&f, 1);
+            let desc2 = read_log_block_at(&f, desc2_log);
+            for (which, desc) in [(1u32, &desc1), (2u32, &desc2)] {
+                let header = RawJournalHeader::parse(desc);
+                assert_eq!(
+                    header.h_blocktype.get(),
+                    BLOCKTYPE_DESCRIPTOR,
+                    "features {features:#x}: descriptor #{which}"
+                );
+                assert_eq!(header.h_sequence.get(), 1, "features {features:#x}");
+                // Per-descriptor UUID discipline: ITS first tag lacks
+                // SAME_UUID (a UUID area follows it), ITS last tag is
+                // LAST_TAG.
+                let tags: Vec<_> = layout.walk(desc).map(|tag| tag.unwrap()).collect();
+                assert!(
+                    tags[0].flags() & TAG_FLAG_SAME_UUID == 0,
+                    "features {features:#x}: descriptor #{which} first tag carries the UUID"
+                );
+                assert!(
+                    tags[tags.len() - 1].is_last(),
+                    "features {features:#x}: descriptor #{which} ends in LAST_TAG"
+                );
+                if features & INCOMPAT_CSUM_V3 != 0 {
+                    // Each descriptor of the chain carries its OWN tail
+                    // checksum (jbd2 seals per descriptor, commit.c:712-714).
+                    let seed = JournalCsumSeed::for_test(&CSUM_UUID);
+                    assert!(
+                        seed.verify_block_tail(desc),
+                        "features {features:#x}: descriptor #{which} tail checksum"
+                    );
+                }
+            }
+            assert_eq!(
+                layout.walk(&desc1).count(),
+                per_descriptor,
+                "features {features:#x}"
+            );
+            assert_eq!(layout.walk(&desc2).count(), 2, "features {features:#x}");
+            // The escaped capture tags in descriptor #2 and its logged form
+            // is zero-headed.
+            let tags2: Vec<_> = layout.walk(&desc2).map(|tag| tag.unwrap()).collect();
+            assert!(tags2[1].is_escaped(), "features {features:#x}");
+            let logged_escaped = read_log_block_at(&f, desc2_log + 2);
+            assert_eq!(&logged_escaped[..4], &[0u8; 4], "features {features:#x}");
+            assert_eq!(
+                RawJournalHeader::parse(&read_log_block_at(&f, commit_log))
+                    .h_blocktype
+                    .get(),
+                BLOCKTYPE_COMMIT,
+                "features {features:#x}"
+            );
+
+            // Nothing at the final locations before recovery.
+            assert_eq!(
+                read_final_block(&f, first_dest),
+                [0u8; BLOCK_SIZE],
+                "features {features:#x}"
+            );
+
+            recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+            assert_bulk_applied(&f, first_dest, n, Some(escape_at));
+            let sb = read_journal_super(&f);
+            assert_eq!(sb.s_start.get(), 0, "features {features:#x}");
+            assert_eq!(sb.s_sequence.get(), 2, "features {features:#x}");
+        }
+    }
+
+    /// A multi-descriptor transaction whose chain WRAPS the log ring round
+    /// trips: committed with the head near the end of the ring, recovered
+    /// across the wrap.
+    #[ktest]
+    fn recover_replays_wrap_spanning_multi_descriptor_chain() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(300, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let per_descriptor = f.journal.geometry().tag_layout().tags_per_descriptor();
+        assert_eq!(per_descriptor, 254); // csum_v3 16-byte tags
+
+        // T1 advances the head deep into the ring; checkpoint reclaims it so
+        // the ring is clean (and reusable) before the wrapping T2.
+        let t1 = make_bulk_txn(Tid::new(1), 1000, 100, None);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let head = f.journal.state_read().head;
+        assert_eq!(head, 103); // desc + 100 data + commit from log 1
+
+        // T2: a two-descriptor chain of 256 captures = 259 log blocks, which
+        // cannot fit the 197 blocks left before the ring end — it wraps.
+        let n = per_descriptor + 2;
+        let escape_at = n - 1;
+        let t2 = make_bulk_txn(Tid::new(2), 1300, n, Some(escape_at));
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+
+        // The scanner walks the wrapped chain to the same next-start the
+        // writer's arithmetic produced.
+        let expected_next = f
+            .journal
+            .geometry()
+            .advance(head, u32::try_from(n + 3).unwrap());
+        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), head, Tid::new(2))
+            .unwrap()
+            .expect("the wrapped chain is sealed");
+        assert_eq!(next, expected_next);
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        assert_bulk_applied(&f, 1300, n, Some(escape_at));
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 3);
+    }
+
+    /// A bad tail checksum in descriptor #2 of a SEALED chain refuses the
+    /// whole transaction (`EUCLEAN`) with NOTHING applied — transaction
+    /// atomicity holds at the chain level, never per descriptor. With the
+    /// commit torn away instead, the same corruption is the ordinary
+    /// boundary (the a3 deferral, accumulated across the chain).
+    #[ktest]
+    fn scan_refuses_bad_tail_csum_in_second_descriptor() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(300, 1, 7);
+        let device = f.fixture.ext4.block_device();
+        let per_descriptor = f.journal.geometry().tag_layout().tags_per_descriptor();
+
+        let n = per_descriptor + 2;
+        let txn = make_bulk_txn(Tid::new(7), 1000, n, None);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // Corrupt descriptor #2's stored tail checksum.
+        let desc2_log = u32::try_from(2 + per_descriptor).unwrap();
+        let commit_log = desc2_log + 3;
+        let mut desc2 = read_log_block_at(&f, desc2_log);
+        desc2[BLOCK_SIZE - 1] ^= 0xFF;
+        write_log_block_at(&f, desc2_log, &desc2);
+
+        let err =
+            scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7)).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+
+        // `recover` refuses before REPLAY: no block of the transaction — not
+        // even descriptor #1's intact ones — reaches its final location.
+        let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        assert_eq!(read_final_block(&f, 1000), [0u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 1);
+
+        // Tear the commit away: the same corrupt chain is now just the
+        // torn-tail boundary.
+        write_log_block_at(&f, commit_log, &[0u8; BLOCK_SIZE]);
+        assert!(
+            scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A bad data-block checksum under descriptor #2 follows the a3
+    /// skip-and-refuse politics: SCAN seals (it reads no data blocks), REPLAY
+    /// skips the corrupt block, still applies every intact one — across BOTH
+    /// descriptors — and the recovery fails (`EUCLEAN`), leaving the journal
+    /// dirty.
+    #[ktest]
+    fn apply_skips_csum_bad_block_under_second_descriptor() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(300, 1, 7);
+        let device = f.fixture.ext4.block_device();
+        let per_descriptor = f.journal.geometry().tag_layout().tags_per_descriptor();
+
+        let n = per_descriptor + 2;
+        let first_dest = 1000u64;
+        let txn = make_bulk_txn(Tid::new(7), first_dest, n, None);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // Corrupt the SECOND data block under descriptor #2 (the chain's
+        // last logged block, destination `first_dest + n - 1`).
+        let desc2_log = u32::try_from(2 + per_descriptor).unwrap();
+        let corrupt_log = desc2_log + 2;
+        let mut logged = read_log_block_at(&f, corrupt_log);
+        logged[321] ^= 0x40;
+        write_log_block_at(&f, corrupt_log, &logged);
+
+        let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+
+        // Intact blocks landed — descriptor #1's first and descriptor #2's
+        // first — the corrupt one did not, and the journal stays dirty.
+        assert_eq!(read_final_block(&f, first_dest), bulk_block(0, false));
+        let desc2_first_dest = first_dest + u64::try_from(per_descriptor).unwrap();
+        assert_eq!(
+            read_final_block(&f, desc2_first_dest),
+            bulk_block(per_descriptor, false)
+        );
+        let corrupt_dest = first_dest + u64::try_from(n - 1).unwrap();
+        assert_eq!(read_final_block(&f, corrupt_dest), [0u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 1);
+    }
+
+    /// Space math: a transaction of exactly `max_credits` blocks commits (its
+    /// exact footprint fits the ring), and one whose footprint exceeds the
+    /// ring is refused up front (`ENOSPC`) with nothing written — the
+    /// commit-side fit guard behind `journal_start`'s conservative bound.
+    #[ktest]
+    fn commit_honors_log_capacity_bounds() {
+        crate::time::clocks::init_for_ktest();
+
+        // maxlen 64, first 1: usable 63, v0 max_credits = 60 (see
+        // `max_credits`' formula). Footprint: 60 + 1 + 1 = 62 <= 63.
+        let f = journaled_fixture(64, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let cap = f.journal.max_credits();
+        assert_eq!(cap, 60);
+        let txn = make_bulk_txn(Tid::new(1), 1000, cap, None);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_bulk_applied(&f, 1000, cap, None);
+
+        // A directly built transaction of 62 blocks (footprint 64 > 63) must
+        // be refused BEFORE any log write — an optimistic commit would wrap
+        // onto its own blocks.
+        let f = journaled_fixture(64, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let before = read_log_block_at(&f, 1);
+        let txn = make_bulk_txn(Tid::new(1), 1000, 62, None);
+        let err = commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        assert_eq!(read_log_block_at(&f, 1), before);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
+    }
+
+    // --- P7a-5 gate 3: a REAL Linux-written multi-descriptor chain
+    // (`interop_vectors`, provenance in its module docs) walked by OUR
+    // production scanner. ---
+
+    /// Zero-extends a pinned nonzero-prefix vector to a full log block.
+    fn planted(pinned: &[u8]) -> [u8; BLOCK_SIZE] {
+        let mut block = [0u8; BLOCK_SIZE];
+        block[..pinned.len()].copy_from_slice(pinned);
+        block
+    }
+
+    /// SCAN walks a REAL Linux 6.8 two-descriptor chain — verbatim
+    /// descriptor/commit bytes whose tail, tag, and commit checksums were
+    /// stamped by jbd2 under the real journal UUID — and seals it at exactly
+    /// the cursor the real layout prescribes. Also pins that the walk is
+    /// LAST_TAG-driven, never capacity-driven: Linux sealed descriptor #1
+    /// EARLY (its conservative `space_left` check), at 253 tags where the
+    /// tag area holds 254. The logged data blocks are not pinned (SCAN reads
+    /// none); the REPLAY side of the chain walk is pinned by the synthetic
+    /// production round trips above, and the full real-image replay proof is
+    /// the P7a-6 guest interop gate.
+    #[ktest]
+    fn scan_walks_real_linux_multi_descriptor_chain() {
+        use super::super::interop_vectors::{
+            GATE3_COMMIT, GATE3_COMMIT_LOG, GATE3_DESC_LOGS, GATE3_DESC_NTAGS, GATE3_DESC1,
+            GATE3_DESC2, GATE3_INCOMPAT, GATE3_START_LOG, GATE3_TID, GATE3_UUID,
+        };
+        crate::time::clocks::init_for_ktest();
+
+        // A fixture journal carrying the REAL journal's feature word
+        // (csum_v3 | 64bit) and UUID — the seed the real checksums were
+        // stamped under — with its dirty tail at the pinned chain.
+        let f = feature_journaled_fixture_with_uuid(
+            GATE3_INCOMPAT,
+            400,
+            1,
+            GATE3_TID,
+            GATE3_START_LOG,
+            GATE3_UUID,
+        );
+        let device = f.fixture.ext4.block_device();
+        let layout = f.journal.geometry().tag_layout();
+        let seed = f
+            .journal
+            .geometry()
+            .csum_seed()
+            .expect("a csum_v3 journal parses a seed");
+
+        let desc1 = planted(&GATE3_DESC1);
+        let desc2 = planted(&GATE3_DESC2);
+        let commit = planted(&GATE3_COMMIT);
+        write_log_block_at(&f, GATE3_DESC_LOGS[0], &desc1);
+        write_log_block_at(&f, GATE3_DESC_LOGS[1], &desc2);
+        write_log_block_at(&f, GATE3_COMMIT_LOG, &commit);
+
+        // The real bytes under OUR walker: per-descriptor tag counts, the
+        // UUID area on each descriptor's FIRST tag only, LAST_TAG on each
+        // descriptor's last tag, and tail checksums that reproduce under our
+        // formula seeded from the real UUID.
+        for (desc, ntags) in [(&desc1, GATE3_DESC_NTAGS[0]), (&desc2, GATE3_DESC_NTAGS[1])] {
+            let tags: Vec<_> = layout.walk(desc).map(|tag| tag.unwrap()).collect();
+            assert_eq!(tags.len(), ntags);
+            assert_eq!(tags[0].flags() & TAG_FLAG_SAME_UUID, 0);
+            assert!(
+                tags[1..]
+                    .iter()
+                    .all(|t| t.flags() & TAG_FLAG_SAME_UUID != 0)
+            );
+            assert!(tags.last().unwrap().is_last());
+            assert!(tags[..ntags - 1].iter().all(|t| !t.is_last()));
+            assert!(seed.verify_block_tail(desc));
+        }
+        assert_eq!(layout.tags_per_descriptor(), 254);
+        assert_eq!(GATE3_DESC_NTAGS[0], 253); // Linux sealed #1 early
+        assert!(seed.verify_commit_block(&commit));
+
+        // The production scanner walks the whole real chain and seals it
+        // exactly one block past the real commit.
+        let next = scan_transaction(
+            f.journal.as_ref(),
+            device.as_ref(),
+            GATE3_START_LOG,
+            Tid::new(GATE3_TID),
+        )
+        .unwrap()
+        .expect("the real Linux chain is sealed");
+        assert_eq!(next, GATE3_COMMIT_LOG + 1);
+
+        // The real checksums are load-bearing, not vacuous: one flipped byte
+        // in descriptor #2's stored tail refuses the sealed transaction.
+        let mut bad = desc2;
+        bad[BLOCK_SIZE - 1] ^= 0x01;
+        write_log_block_at(&f, GATE3_DESC_LOGS[1], &bad);
+        let err = scan_transaction(
+            f.journal.as_ref(),
+            device.as_ref(),
+            GATE3_START_LOG,
+            Tid::new(GATE3_TID),
+        )
+        .unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
     }
 
     // --- P7a-3/P7a-4: checksum verification during SCAN and REPLAY, on logs
@@ -928,6 +1377,28 @@ mod tests {
         sequence: u32,
         start: u32,
     ) -> JournaledFixture {
+        feature_journaled_fixture_with_uuid(
+            feature_incompat,
+            maxlen,
+            first,
+            sequence,
+            start,
+            CSUM_UUID,
+        )
+    }
+
+    /// [`feature_journaled_fixture`] with an explicit journal UUID — the
+    /// checksum seed derives from it, so the real-Linux interop vectors
+    /// (whose checksums were stamped under the REAL journal's UUID) need
+    /// theirs.
+    fn feature_journaled_fixture_with_uuid(
+        feature_incompat: u32,
+        maxlen: u32,
+        first: u32,
+        sequence: u32,
+        start: u32,
+        uuid: [u8; 16],
+    ) -> JournaledFixture {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
             .with_has_journal()
@@ -940,7 +1411,7 @@ mod tests {
         raw.s_feature_incompat = Be32::new(feature_incompat);
         if feature_incompat & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0 {
             raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
-            raw.s_uuid = CSUM_UUID;
+            raw.s_uuid = uuid;
             raw.s_checksum = Be32::new(raw.checksum());
         }
         f.disk

@@ -87,6 +87,8 @@ use super::{
 mod checkpoint;
 mod commit;
 mod format;
+#[cfg(ktest)]
+mod interop_vectors;
 mod recovery;
 mod transaction;
 
@@ -819,19 +821,37 @@ impl Journal {
 
     /// The maximum metadata blocks a single transaction may reserve.
     ///
-    /// The bound is the smaller of two limits:
-    /// - The usable log blocks (`s_maxlen - s_first`) minus a descriptor + commit
-    ///   block of per-transaction overhead.
-    /// - The tags that fit in a **single** descriptor block under this
-    ///   journal's tag layout ([`TagLayout::tags_per_descriptor`]). The commit
-    ///   pipeline writes one descriptor block per transaction, so admitting
-    ///   more blocks than fit its tag array would make the transaction
-    ///   uncommittable. Multi-descriptor transactions are P7a-5.
+    /// A transaction of `n` captured blocks occupies, in the log,
     ///
-    /// Precise per-transaction credit accounting is P7's.
+    /// ```text
+    /// n data blocks + ceil(n / t) descriptor blocks + 1 commit block
+    /// ```
+    ///
+    /// where `t` is [`TagLayout::tags_per_descriptor`] (the commit pipeline
+    /// starts a fresh descriptor whenever the previous one's tag area fills,
+    /// P7a-5). The whole footprint must fit the usable ring
+    /// (`s_maxlen - s_first`): the exact bound is the largest `n` with
+    /// `n + ceil(n/t) + 1 <= usable`, and this solves it **conservatively**
+    /// via `ceil(n/t) <= n/t + 1`:
+    ///
+    /// ```text
+    /// n <= t * (usable - 2) / (t + 1)
+    /// ```
+    ///
+    /// Under-admitting by a block or two is harmless (`journal_start` just
+    /// waits or refuses a little early); over-admitting would be corruption —
+    /// the commit's log writes would wrap onto the transaction's own blocks
+    /// (or an un-checkpointed predecessor). The commit pipeline re-checks the
+    /// exact footprint against the ring as a last line of defense
+    /// (`commit_transaction`'s fit guard).
+    ///
+    /// This is the whole-transaction capacity bound (`check_capacity`
+    /// compares captured + reserved credits against it); precise
+    /// *per-operation* credit accounting is P7's.
     pub(super) fn max_credits(&self) -> usize {
-        let log_bound = (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
-        log_bound.min(self.geometry.tag_layout().tags_per_descriptor())
+        let usable = (self.geometry.maxlen() - self.geometry.first()) as usize;
+        let tags = self.geometry.tag_layout().tags_per_descriptor();
+        tags * usable.saturating_sub(2) / (tags + 1)
     }
 
     /// Acquires the running-transaction state for writing.

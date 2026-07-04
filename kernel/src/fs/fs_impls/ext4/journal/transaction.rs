@@ -901,9 +901,12 @@ mod tests {
 
     #[ktest]
     fn max_credits_matches_geometry() {
-        // maxlen 64, first 1: usable = 64 - 1, minus 2 overhead = 61.
+        // maxlen 64, first 1: usable = 63. v0 tags: t = 508 per descriptor.
+        // Conservative bound t * (usable - 2) / (t + 1) = 508 * 61 / 509 = 60;
+        // exact footprint check: 60 data + ceil(60/508) = 1 descriptor + 1
+        // commit = 62 <= 63 usable ring blocks.
         let j = journaled_fixture(64, 1, 1);
-        assert_eq!(j.max_credits(), 61);
+        assert_eq!(j.max_credits(), 60);
     }
 
     #[ktest]

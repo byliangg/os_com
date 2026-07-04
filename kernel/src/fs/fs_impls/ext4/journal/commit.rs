@@ -10,24 +10,41 @@
 //! # Log layout produced
 //!
 //! A committed transaction occupies consecutive log blocks starting at the
-//! current log head, wrapping within `[first, maxlen)`:
+//! current log head, wrapping within `[first, maxlen)`. When all N captured
+//! blocks fit one descriptor's tag array, the layout is:
 //!
 //! ```text
 //! [descriptor] [metadata 0] [metadata 1] ... [metadata N-1] [commit]
 //! ```
 //!
+//! A larger transaction splits across a **descriptor chain** (P7a-5,
+//! mirroring jbd2 `journal_commit_transaction`, which starts a fresh
+//! descriptor whenever the previous one fills, fs/jbd2/commit.c:606-635 /
+//! 700-737):
+//!
+//! ```text
+//! [descriptor 1] [its metadata ...] [descriptor 2] [its metadata ...] ... [commit]
+//! ```
+//!
 //! - **Descriptor** (`JBD2_DESCRIPTOR_BLOCK`): a 12-byte [`RawJournalHeader`]
 //!   then one block tag per captured block, in block-number order, with every
 //!   byte offset owned by the journal's [`TagLayout`] (tag size, the 64-bit
-//!   high word, the reserved checksum tail). The first tag is followed by a
-//!   16-byte journal UUID (written as zeros — we carry no journal UUID;
-//!   recovery just skips it) and does *not* set `TAG_FLAG_SAME_UUID`; every
-//!   later tag sets it (no UUID follows). The last tag also sets
-//!   `TAG_FLAG_LAST_TAG`.
-//! - **Metadata blocks**: the N captured after-images, in the same order as
-//!   their tags, one full [`BLOCK_SIZE`] block each.
-//! - **Commit** (`JBD2_COMMIT_BLOCK`): a [`RawCommitBlock`] sealing the
-//!   transaction, carrying the wall-clock commit time.
+//!   high word, the reserved checksum tail). Each descriptor of the chain is
+//!   independent, exactly as in jbd2's `first_tag`-per-descriptor loop: **its**
+//!   first tag is followed by a 16-byte journal UUID (written as zeros — we
+//!   carry no journal UUID; recovery just skips it) and does *not* set
+//!   `TAG_FLAG_SAME_UUID`; every later tag of that descriptor sets it (no
+//!   UUID follows). **Its** last tag sets `TAG_FLAG_LAST_TAG`
+//!   (`JBD2_FLAG_LAST_TAG` marks the end of *each* descriptor's tag array,
+//!   commit.c:700-710 — recovery uses it to find the next chain block), and
+//!   on a csum layout each descriptor carries its **own** tail checksum
+//!   (`jbd2_descriptor_block_csum_set` runs per descriptor, commit.c:712-714).
+//! - **Metadata blocks**: each descriptor's captured after-images follow it,
+//!   in the same order as its tags, one full [`BLOCK_SIZE`] block each.
+//! - **Commit** (`JBD2_COMMIT_BLOCK`): ONE [`RawCommitBlock`] sealing the
+//!   whole chain, carrying the wall-clock commit time. The transaction is
+//!   atomic at the chain level: recovery applies all of its descriptors or —
+//!   absent a valid same-tid commit block — none.
 //!
 //! ## Escaping
 //!
@@ -54,8 +71,9 @@
 //!    before the journal write. Skipped (no barrier) when the transaction has no
 //!    ordered inodes. (Merging this barrier with step 2 is a valid Phase-7 perf
 //!    optimization once `flush_dirty_pages` completion semantics are pinned down.)
-//! 1. Write the descriptor + all N metadata blocks to the log.
-//! 2. **Barrier.** The descriptor and data must be durable *before* the commit
+//! 1. Write the descriptor chain — every descriptor and all N metadata
+//!    blocks — to the log.
+//! 2. **Barrier.** The descriptors and data must be durable *before* the commit
 //!    block; otherwise a crash could leave a commit record pointing at data that
 //!    never reached the platter, and recovery would replay garbage.
 //! 3. Write the commit block.
@@ -76,8 +94,9 @@
 //!    `s_start` already points at an older un-checkpointed transaction and must
 //!    not be overwritten.
 //! 6. Update the in-memory journal state under the state lock: advance `head`
-//!    past the N+2 written blocks, set the tail to this transaction if the
-//!    journal was clean, and publish `committed_tid`.
+//!    past the written blocks (N data + one per descriptor + the commit), set
+//!    the tail to this transaction if the journal was clean, and publish
+//!    `committed_tid`.
 //!
 //! # Checksums (csum v2/v3 journals, P7a-4)
 //!
@@ -94,10 +113,6 @@
 //!
 //! # Phase 4 simplifications
 //!
-//! - **Single descriptor** per transaction: all N tags must fit one descriptor
-//!   block ([`TagLayout::tags_per_descriptor`]); a larger transaction is
-//!   rejected. [`Journal::max_credits`] enforces the same bound up front.
-//!   Multi-descriptor transactions are P7a-5.
 //! - **No revoke records** — Phase 7.
 //! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
 //!   called by the background commit thread ([`Journal::start_commit_thread`],
@@ -152,32 +167,73 @@ pub(super) fn barrier(device: &dyn BlockDevice) -> Result<()> {
     }
 }
 
+/// One descriptor block of a transaction's chain, sealed, plus the escape
+/// decision for each captured block it tags (in tag order): `escape[i]` says
+/// whether the i-th tagged block must have its 4-byte head zeroed when
+/// written into the log.
+struct DescriptorRun {
+    descriptor: Box<[u8; BLOCK_SIZE]>,
+    escape: Vec<bool>,
+}
+
+impl DescriptorRun {
+    /// The number of metadata blocks this descriptor tags (== the log blocks
+    /// that follow it before the next chain block).
+    fn nr_blocks(&self) -> usize {
+        self.escape.len()
+    }
+}
+
 impl Transaction {
-    /// Builds this transaction's descriptor block into a fresh [`BLOCK_SIZE`]
-    /// buffer.
+    /// Builds this transaction's descriptor chain: one sealed descriptor
+    /// block per [`TagLayout::tags_per_descriptor`]-sized run of captured
+    /// blocks, in block-number order (jbd2 `journal_commit_transaction`
+    /// starts a fresh descriptor whenever the previous one's tag area fills,
+    /// fs/jbd2/commit.c:606-635; a transaction that fits one descriptor
+    /// produces a single-element chain with the frozen Phase-4 bytes).
     ///
-    /// Lays down the 12-byte header then one tag per captured block (in block
-    /// order), with every byte offset — tag stride, the first tag's 16-byte
-    /// UUID, the reserved checksum tail — owned by `layout`'s tag writer
+    /// Every byte offset — tag stride, each descriptor's first-tag 16-byte
+    /// UUID, the reserved checksum tail — is owned by `layout`'s tag writer
     /// ([`TagLayout::writer`]), the same source of truth the recovery scanner
     /// and the checkpoint/replay applier walk with. On a csum journal (`seed`
-    /// present) the writer stamps every tag's data checksum and the
-    /// descriptor-tail checksum. Returns the buffer plus, for each captured
-    /// block in the same order, whether that block must be escaped when
-    /// written into the log (`escape[i] == true`).
-    fn build_descriptor_block(
+    /// present) the writer stamps every tag's data checksum and each
+    /// descriptor's own tail checksum.
+    fn build_descriptor_chain(
         &self,
         layout: TagLayout,
         seed: Option<JournalCsumSeed>,
-    ) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
-        let n = self.metadata_blocks().count();
-        if n == 0 {
+    ) -> Result<Vec<DescriptorRun>> {
+        let captures: Vec<(Ext4Bid, &[u8; BLOCK_SIZE])> = self.metadata_blocks().collect();
+        if captures.is_empty() {
             return_errno_with_message!(Errno::EINVAL, "cannot commit an empty transaction");
         }
 
+        captures
+            .chunks(layout.tags_per_descriptor())
+            .map(|run| self.build_descriptor_run(run, layout, seed))
+            .collect()
+    }
+
+    /// Builds one descriptor block of the chain, tagging `run`'s captures.
+    ///
+    /// The per-descriptor flag discipline mirrors jbd2's (`first_tag` resets
+    /// with every fresh descriptor, fs/jbd2/commit.c:635 / 679-693, and
+    /// `JBD2_FLAG_LAST_TAG` marks the end of each descriptor's tag array,
+    /// commit.c:700-710): **this** descriptor's first tag carries the UUID
+    /// area and no `SAME_UUID`; its later tags set `SAME_UUID`; its last tag
+    /// sets `LAST_TAG` — whether or not more descriptors follow in the chain.
+    fn build_descriptor_run(
+        &self,
+        run: &[(Ext4Bid, &[u8; BLOCK_SIZE])],
+        layout: TagLayout,
+        seed: Option<JournalCsumSeed>,
+    ) -> Result<DescriptorRun> {
         let mut block = Box::new([0u8; BLOCK_SIZE]);
 
-        // Header: magic + descriptor block type + this transaction's tid.
+        // Header: magic + descriptor block type + this transaction's tid
+        // (every descriptor of the chain bears the same tid; the shared tid
+        // plus ONE trailing commit block is what makes the chain one atomic
+        // transaction to recovery).
         let header = RawJournalHeader {
             h_magic: Be32::new(JBD2_MAGIC),
             h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
@@ -188,15 +244,16 @@ impl Transaction {
         // The writer owns the buffer from here on; only `finish` (the seal)
         // hands it back, so an unsealed descriptor cannot reach the log.
         let mut writer = layout.writer(block, self.tid(), seed)?;
-        let mut escape = Vec::with_capacity(n);
+        let mut escape = Vec::with_capacity(run.len());
 
-        for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
+        for (i, (bid, bytes)) in run.iter().enumerate() {
             let is_first = i == 0;
-            let is_last = i == n - 1;
+            let is_last = i == run.len() - 1;
 
             let mut flags = 0u16;
             if !is_first {
-                // Only the first tag carries a UUID; every later tag reuses it.
+                // Only this descriptor's first tag carries a UUID; every
+                // later tag of the same descriptor reuses it.
                 flags |= TAG_FLAG_SAME_UUID;
             }
             if is_last {
@@ -211,10 +268,9 @@ impl Transaction {
 
             // `put` refuses a block number that does not fit the layout's
             // tag (`EFBIG`, only possible without 64-bit tags) and a tag that
-            // would overrun the descriptor's tag area (`ENOSPC` — the
-            // single-descriptor bound; `max_credits` refuses over-large
-            // transactions up front, but the re-check keeps a directly built
-            // transaction from overflowing).
+            // would overrun the descriptor's tag area (`ENOSPC` — unreachable
+            // here by construction: the chain builder cuts each run at
+            // `tags_per_descriptor`, but the writer keeps its own bound).
             //
             // The tag checksum covers the block AS LOGGED (jbd2 checksums the
             // escaped `wbuf` copy, commit.c:684): hand `put` the zero-headed
@@ -222,18 +278,21 @@ impl Transaction {
             // original — step 1 below applies the same transform when writing.
             if needs_escape {
                 let mut logged = Box::new([0u8; BLOCK_SIZE]);
-                logged.copy_from_slice(bytes);
+                logged.copy_from_slice(*bytes);
                 logged[..4].fill(0);
-                writer.put(bid, flags, &logged)?;
+                writer.put(*bid, flags, &logged)?;
             } else {
-                writer.put(bid, flags, bytes)?;
+                writer.put(*bid, flags, bytes)?;
             }
         }
 
-        // Seal: stamps the descriptor-tail checksum over the tags above on a
-        // csum layout (byte-identical on v0 — the frozen byte path) and
-        // returns the sealed bytes.
-        Ok((writer.finish(), escape))
+        // Seal: stamps this descriptor's own tail checksum over the tags
+        // above on a csum layout (byte-identical on v0 — the frozen byte
+        // path) and returns the sealed bytes.
+        Ok(DescriptorRun {
+            descriptor: writer.finish(),
+            escape,
+        })
     }
 }
 
@@ -350,23 +409,57 @@ pub(super) fn commit_transaction(
     // The csum seed exists iff the journal carries csum v2/v3; threading it
     // into the descriptor/commit builders is what turns their stamping on.
     let seed = journal.geometry.csum_seed();
-    let (descriptor, escape) = txn.build_descriptor_block(journal.geometry.tag_layout(), seed)?;
-    let n = escape.len() as u32;
+    let chain = txn.build_descriptor_chain(journal.geometry.tag_layout(), seed)?;
+    let nr_data: usize = chain.iter().map(DescriptorRun::nr_blocks).sum();
+    // Total log blocks this transaction occupies: its data blocks, one
+    // descriptor per run, and the commit block.
+    let nr_log_blocks = nr_data + chain.len() + 1;
 
-    // --- Step 1: write the descriptor and every metadata after-image. ---
+    // Fit guard: the whole chain must fit the usable ring, or the writes
+    // below would wrap onto this very transaction's own log blocks — silent
+    // log corruption. `max_credits` enforces a (conservative) version of this
+    // bound at `journal_start`; the exact re-check here keeps a directly
+    // built transaction from overwriting the log.
+    let usable = journal.geometry.maxlen() - journal.geometry.first();
+    let fits = u32::try_from(nr_log_blocks).is_ok_and(|blocks| blocks <= usable);
+    if !fits {
+        return_errno_with_message!(Errno::ENOSPC, "transaction does not fit the journal");
+    }
+
+    // --- Step 1: write the descriptor chain — each descriptor followed by
+    // the after-images it tags ([desc 1][its data...][desc 2][its data...]…,
+    // the jbd2 chain layout; a single-run chain is the frozen Phase-4
+    // [descriptor][data...] bytes). ---
     let mut log = start_head;
-    write_log_block(journal, device, log, &descriptor)?;
+    {
+        // Scoped: the capture iterator borrows `txn`, which step 6 consumes.
+        let mut captures = txn.metadata_blocks();
+        for (i, run) in chain.iter().enumerate() {
+            if i > 0 {
+                log = journal.geometry.next_log_block(log);
+            }
+            write_log_block(journal, device, log, &run.descriptor)?;
 
-    for ((_, bytes), needs_escape) in txn.metadata_blocks().zip(escape.iter()) {
-        log = journal.geometry.next_log_block(log);
-        let mut buf = Box::new([0u8; BLOCK_SIZE]);
-        buf.copy_from_slice(bytes);
-        if *needs_escape {
-            // Zero the head so recovery does not mistake it for a log header;
-            // recovery restores the magic when applying the block.
-            buf[..4].copy_from_slice(&[0u8; 4]);
+            for needs_escape in &run.escape {
+                // The chain was built from this same iteration order
+                // (`metadata_blocks` is deterministic), so the k-th escape
+                // decision belongs to the k-th capture; the builder tagged
+                // exactly `nr_data` captures, so the iterator cannot run dry.
+                let Some((_, bytes)) = captures.next() else {
+                    return_errno_with_message!(Errno::EINVAL, "descriptor chain out of sync");
+                };
+                log = journal.geometry.next_log_block(log);
+                let mut buf = Box::new([0u8; BLOCK_SIZE]);
+                buf.copy_from_slice(bytes);
+                if *needs_escape {
+                    // Zero the head so recovery does not mistake it for a log
+                    // header; recovery restores the magic when applying the
+                    // block.
+                    buf[..4].copy_from_slice(&[0u8; 4]);
+                }
+                write_log_block(journal, device, log, &buf)?;
+            }
         }
-        write_log_block(journal, device, log, &buf)?;
     }
 
     // --- Step 2: barrier. Descriptor + data durable BEFORE the commit block,
@@ -393,8 +486,13 @@ pub(super) fn commit_transaction(
     }
 
     // --- Step 6: publish the new log position and commit id in memory. ---
-    // Blocks written: 1 descriptor + N metadata + 1 commit = N + 2.
-    let new_head = journal.geometry.advance(start_head, n + 2);
+    // Blocks written: the data blocks + one descriptor per chain run + the
+    // commit block (`nr_log_blocks`, already proven to fit the ring above).
+    let Ok(written) = u32::try_from(nr_log_blocks) else {
+        // Unreachable: the fit guard bounded `nr_log_blocks <= usable: u32`.
+        return_errno_with_message!(Errno::ENOSPC, "transaction does not fit the journal");
+    };
+    let new_head = journal.geometry.advance(start_head, written);
     {
         let mut st = journal.state_write();
         st.head = new_head;
@@ -546,17 +644,24 @@ mod tests {
 
     /// The v0 (feature-less) descriptor block is BIT-IDENTICAL to the
     /// pre-TagLayout writer's output — the byte freeze the whole 160×825
-    /// crash-matrix baseline rides on. Expected bytes hardcoded from the
-    /// pre-change code's layout: 12-byte header, 8-byte tag 0, 16 zero UUID
-    /// bytes, 8-byte tag 1 (SAME_UUID | LAST_TAG), zeros to the end.
+    /// crash-matrix baseline rides on. A transaction that fits one descriptor
+    /// must produce a single-run chain (P7a-5 changed nothing on this path).
+    /// Expected bytes hardcoded from the pre-change code's layout: 12-byte
+    /// header, 8-byte tag 0, 16 zero UUID bytes, 8-byte tag 1
+    /// (SAME_UUID | LAST_TAG), zeros to the end.
     #[ktest]
     fn descriptor_block_v0_bytes_are_frozen() {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(7), &[(0x123u64, c), (0x456u64, c)]);
-        let (block, escape) = txn
-            .build_descriptor_block(TagLayout::from_features(0).unwrap(), None)
+        let chain = txn
+            .build_descriptor_chain(TagLayout::from_features(0).unwrap(), None)
             .unwrap();
-        assert_eq!(escape, vec![false, false]);
+        assert_eq!(chain.len(), 1);
+        let DescriptorRun {
+            descriptor: block,
+            escape,
+        } = &chain[0];
+        assert_eq!(*escape, vec![false, false]);
 
         let mut expected = [0u8; BLOCK_SIZE];
         // Header: magic, DESCRIPTOR (1), tid 7 — all big-endian.
@@ -583,10 +688,12 @@ mod tests {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(3), &[(small, c), (wide, c)]);
 
-        let (block, escape) = txn.build_descriptor_block(layout, None).unwrap();
-        assert_eq!(escape, vec![false, false]);
+        let chain = txn.build_descriptor_chain(layout, None).unwrap();
+        assert_eq!(chain.len(), 1);
+        let block = &chain[0].descriptor;
+        assert_eq!(chain[0].escape, vec![false, false]);
 
-        let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        let tags: Vec<_> = layout.walk(block).map(|tag| tag.unwrap()).collect();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].blocknr(), small);
         assert!(!tags[0].is_last());
@@ -610,10 +717,12 @@ mod tests {
         let wide: Ext4Bid = (9 << 32) | 0x800;
         let txn = make_txn(tid, &[(0x200u64, escaped), (wide, plain)]);
 
-        let (block, escape) = txn.build_descriptor_block(layout, Some(seed)).unwrap();
-        assert_eq!(escape, vec![true, false]);
+        let chain = txn.build_descriptor_chain(layout, Some(seed)).unwrap();
+        assert_eq!(chain.len(), 1);
+        let block = &chain[0].descriptor;
+        assert_eq!(chain[0].escape, vec![true, false]);
 
-        let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        let tags: Vec<_> = layout.walk(block).map(|tag| tag.unwrap()).collect();
         assert_eq!(tags.len(), 2);
         assert_eq!(tags[0].blocknr(), 0x200);
         assert!(tags[0].is_escaped());
@@ -629,7 +738,7 @@ mod tests {
         assert!(!tags[0].verify_data_csum(seed, tid, &escaped));
         assert!(tags[1].verify_data_csum(seed, tid, &plain));
         // `finish` sealed the descriptor tail over the stamped tags.
-        assert!(seed.verify_block_tail(&block));
+        assert!(seed.verify_block_tail(block));
     }
 
     /// Without 64-bit tags a > 32-bit destination block still refuses with
@@ -639,9 +748,76 @@ mod tests {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(1), &[((1u64 << 32) | 5, c)]);
         let err = txn
-            .build_descriptor_block(TagLayout::from_features(0).unwrap(), None)
+            .build_descriptor_chain(TagLayout::from_features(0).unwrap(), None)
+            .map(|chain| chain.len())
             .unwrap_err();
         assert_eq!(err.error(), Errno::EFBIG);
+    }
+
+    /// A transaction with more captures than one descriptor's tag area holds
+    /// splits into a chain, and the per-descriptor flag discipline mirrors
+    /// jbd2's: EACH descriptor's first tag carries the UUID area (no
+    /// `SAME_UUID`) and EACH descriptor's last tag sets `LAST_TAG`
+    /// (fs/jbd2/commit.c:679-710 — `first_tag` resets per descriptor and the
+    /// end-of-descriptor marker is written whenever one fills).
+    #[ktest]
+    fn descriptor_chain_splits_with_per_descriptor_flags() {
+        let layout = TagLayout::from_features(0).unwrap();
+        let per_descriptor = layout.tags_per_descriptor();
+        let n = per_descriptor + 2;
+
+        let c = [0u8; BLOCK_SIZE];
+        let mut txn = Transaction::new(Tid::new(9));
+        for i in 0..n {
+            let bid = Ext4Bid::try_from(1000 + i).unwrap();
+            txn.capture_create(bid);
+            txn.apply_patch(bid, |b| b.copy_from_slice(&c)).unwrap();
+        }
+
+        let chain = txn.build_descriptor_chain(layout, None).unwrap();
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].escape.len(), per_descriptor);
+        assert_eq!(chain[1].escape.len(), 2);
+
+        // Both descriptors bear the transaction's tid.
+        for run in &chain {
+            let header = RawJournalHeader::parse(&run.descriptor);
+            assert_eq!(header.h_magic.get(), JBD2_MAGIC);
+            assert_eq!(header.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+            assert_eq!(header.h_sequence.get(), 9);
+        }
+
+        // Descriptor 1: a full tag array; only ITS first tag lacks SAME_UUID,
+        // only ITS last tag is LAST_TAG.
+        let tags1: Vec<_> = layout
+            .walk(&chain[0].descriptor)
+            .map(|tag| tag.unwrap())
+            .collect();
+        assert_eq!(tags1.len(), per_descriptor);
+        assert_eq!(tags1[0].flags() & TAG_FLAG_SAME_UUID, 0);
+        assert!(
+            tags1[1..]
+                .iter()
+                .all(|t| t.flags() & TAG_FLAG_SAME_UUID != 0)
+        );
+        assert!(tags1[..per_descriptor - 1].iter().all(|t| !t.is_last()));
+        assert!(tags1[per_descriptor - 1].is_last());
+
+        // Descriptor 2: the 2-tag remainder, with the SAME per-descriptor
+        // discipline — its first tag again carries the UUID area.
+        let tags2: Vec<_> = layout
+            .walk(&chain[1].descriptor)
+            .map(|tag| tag.unwrap())
+            .collect();
+        assert_eq!(tags2.len(), 2);
+        assert_eq!(tags2[0].flags() & TAG_FLAG_SAME_UUID, 0);
+        assert!(!tags2[0].is_last());
+        assert_ne!(tags2[1].flags() & TAG_FLAG_SAME_UUID, 0);
+        assert!(tags2[1].is_last());
+
+        // The chain tags every capture in block order across the split.
+        assert_eq!(tags1[0].blocknr(), 1000);
+        assert_eq!(tags2[1].blocknr(), Ext4Bid::try_from(1000 + n - 1).unwrap());
     }
 
     #[ktest]
