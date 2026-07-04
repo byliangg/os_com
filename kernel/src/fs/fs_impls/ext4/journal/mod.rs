@@ -80,8 +80,9 @@
 //!    flush strictly after it stops), so a commit's step-6 effects — revoke
 //!    publication, pinned-free release ([`JournalState::release_pinned_frees`])
 //!    — can never land in the middle of a checkpoint pass, and at most one
-//!    [`CommittingTxn`] can ever exist (guarded anyway:
-//!    [`Journal::take_running_for_commit`] refuses an occupied slot).
+//!    [`CommittingTxn`] can ever exist (guarded anyway: every stager —
+//!    [`Journal::take_running_for_commit`], the unmount flush, and the ktest
+//!    stager — refuses an occupied slot).
 //! 2. **Committing images are visible to seeders from the staging instant**
 //!    (law 4 / the B-1 restated invariant): staging stashes the transaction's
 //!    after-images into [`JournalState::uncheckpointed`] in the same
@@ -900,10 +901,18 @@ impl CommittingTxn {
 
     /// Copies the committing transaction's not-yet-published revoke set into
     /// `out` — the checkpoint snapshot's committing half (see
-    /// [`Transaction::collect_unpublished_revokes`]). The set is frozen (see
-    /// the type docs), so reading it under any one state-lock window is
-    /// exact, not a racy sample.
+    /// [`Transaction::collect_unpublished_revokes`]). Exact, not a racy
+    /// sample: the set is frozen (see the type docs) and read under one
+    /// state-lock window, and a [`Finished`](CommitPhase::Finished) slot
+    /// contributes nothing — commit step 6 publishes the revokes in the
+    /// same lock window that advances the phase, so from `Finished` until
+    /// retirement the set already lives in [`JournalState::revoked`] and
+    /// returning it here would call published revokes unpublished (an
+    /// over-defer; harmless, but the exactness claim would be false).
     pub(super) fn collect_unpublished_revokes(&self, out: &mut BTreeSet<Ext4Bid>) {
+        if self.phase == CommitPhase::Finished {
+            return;
+        }
         self.txn.collect_unpublished_revokes(out);
     }
 
@@ -1040,7 +1049,10 @@ impl JournalState {
     /// lock window (the B-1 stash: from the very first instant a new running
     /// transaction can exist, captures of these blocks seed from these bytes,
     /// never from the lagging device). The caller must have verified the
-    /// slot is empty; both production stagers do, before `running.take()`.
+    /// slot is empty; all three stagers — the commit thread's take
+    /// ([`Journal::take_running_for_commit`]), the unmount flush
+    /// ([`Journal::flush_on_unmount`]), and the ktest stager — refuse an
+    /// occupied slot before `running.take()`.
     fn stage_committing(&mut self, txn: Transaction) -> Arc<Transaction> {
         debug_assert!(self.committing.is_none());
         txn.stash_uncheckpointed(&mut self.uncheckpointed);
@@ -1320,7 +1332,14 @@ impl Journal {
                 CommitAction::Exit => break,
                 CommitAction::Commit => {
                     let Some(j) = weak.upgrade() else { break };
-                    j.commit_one();
+                    if !j.commit_one() {
+                        // Nothing was staged: the poll's answer went stale (a
+                        // new handle joined) or — defensively — the slot
+                        // filled between poll and take. Go back to waiting;
+                        // running the checkpoint pass below on a refusal
+                        // would spin full passes against a stuck commit.
+                        continue;
+                    }
                     if j.is_aborted() {
                         // A failed commit aborted the journal: the device state
                         // no longer matches the log; checkpointing would make it
@@ -1367,9 +1386,21 @@ impl Journal {
         if j.is_aborted() {
             return None;
         }
+        let st = j.state.read();
+        // A mid-flight commit occupies the slot: commits are serial, so
+        // there is nothing to do until it retires — keep waiting rather
+        // than report `Commit` into a take that refuses, which would turn
+        // a stuck/slow commit into a busy loop of poll + checkpoint
+        // passes. No lost wakeup: `clear_committing` wakes
+        // `commit_trigger` after emptying the slot, and `wait_until`
+        // re-checks this predicate before sleeping. Occupied-at-poll is
+        // unreachable while the committer is the only production stager
+        // (it retires its own stage before re-polling); defense in depth.
+        if st.committing.is_some() {
+            return None;
+        }
         // A running transaction with no open handles and some captured metadata
         // is committable.
-        let st = j.state.read();
         match &st.running {
             Some(txn) if txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0 => {
                 Some(CommitAction::Commit)
@@ -1379,14 +1410,17 @@ impl Journal {
     }
 
     /// Commits the running transaction, if it is (still) committable, and wakes
-    /// `log_wait_commit` sleepers. Runs on the commit thread.
-    fn commit_one(&self) {
+    /// `log_wait_commit` sleepers. Runs on the commit thread. Returns whether a
+    /// transaction was taken (and a commit attempted) — `false` sends the loop
+    /// back to its wait instead of into a pointless checkpoint pass.
+    fn commit_one(&self) -> bool {
         let Some(txn) = self.take_running_for_commit() else {
-            return;
+            return false;
         };
         if let Err(e) = self.commit_staged(&txn) {
             error!("ext4 journal commit failed, aborting the journal: {:?}", e);
         }
+        true
     }
 
     /// Takes the committable running transaction and stages it as the
@@ -1422,7 +1456,9 @@ impl Journal {
             // thread; the unmount flush runs only after it stopped), so an
             // occupied slot here is a broken contract. Refuse to pipeline a
             // second commit — that would fork the seeding/publication story —
-            // and leave the running transaction for a later pass.
+            // and leave the running transaction in place; the commit loop
+            // then waits for the slot to clear (`poll_commit_action`'s slot
+            // gate, woken by `clear_committing`) instead of re-polling hot.
             error!("ext4 journal: a transaction is already committing; not taking another");
             return None;
         }
@@ -1491,6 +1527,12 @@ impl Journal {
             }
         }
         self.commit_wait_queue.wake_all();
+        // Pairs with `poll_commit_action`'s occupied-slot gate: a committer
+        // waiting out the slot re-polls now that it is clear. Production-
+        // unreachable today (the committer retires its own stage), but the
+        // gate must not be able to sleep through the only event that clears
+        // it.
+        self.commit_trigger.wake_all();
     }
 
     /// Advances the committing transaction's pipeline phase under a transient
@@ -1719,30 +1761,38 @@ impl Journal {
     /// Same contract as [`log_wait_commit`](Self::log_wait_commit): the caller
     /// must hold no filesystem locks.
     pub(in crate::fs::fs_impls::ext4) fn commit_and_wait_running(&self) -> Result<()> {
-        let target = {
-            let st = self.state_read();
-            match st.running.as_ref() {
-                Some(txn) if txn.nr_metadata_blocks() > 0 => txn.tid(),
-                // Nothing captured in `running` — but the transaction to make
-                // durable may have just been TAKEN by the commit thread and be
-                // mid-commit (its commit record not on disk yet). Waiting on
-                // nothing here would let sync(2) return early.
-                _ => match st.committing.as_ref().map(CommittingTxn::tid) {
-                    Some(tid) => tid,
-                    // Nothing running and nothing committing: everything captured
-                    // is durable — unless a failed commit aborted the journal and
-                    // dropped a transaction, in which case durability must not be
-                    // claimed (else sync(2) returns Ok for data the abort lost).
-                    None => {
-                        if self.is_aborted() {
-                            return_errno_with_message!(Errno::EIO, "journal aborted");
-                        }
-                        return Ok(());
+        match self.sync_durability_target()? {
+            Some(target) => self.log_wait_commit(target),
+            None => Ok(()),
+        }
+    }
+
+    /// The tid [`commit_and_wait_running`](Self::commit_and_wait_running) must
+    /// wait on to claim durability, decided in one state-lock window — split
+    /// out so the probe's target selection is testable deterministically,
+    /// separate from the wait itself.
+    fn sync_durability_target(&self) -> Result<Option<Tid>> {
+        let st = self.state_read();
+        match st.running.as_ref() {
+            Some(txn) if txn.nr_metadata_blocks() > 0 => Ok(Some(txn.tid())),
+            // Nothing captured in `running` — but the transaction to make
+            // durable may have just been TAKEN by the commit thread and be
+            // mid-commit (its commit record not on disk yet). Waiting on
+            // nothing here would let sync(2) return early.
+            _ => match st.committing.as_ref().map(CommittingTxn::tid) {
+                Some(tid) => Ok(Some(tid)),
+                // Nothing running and nothing committing: everything captured
+                // is durable — unless a failed commit aborted the journal and
+                // dropped a transaction, in which case durability must not be
+                // claimed (else sync(2) returns Ok for data the abort lost).
+                None => {
+                    if self.is_aborted() {
+                        return_errno_with_message!(Errno::EIO, "journal aborted");
                     }
-                },
-            }
-        };
-        self.log_wait_commit(target)
+                    Ok(None)
+                }
+            },
+        }
     }
 
     /// Returns the number of ordered-data entries registered with the running
@@ -1800,16 +1850,44 @@ impl Journal {
     ///
     /// A no-op on a journal that never ran a transaction (nothing captured,
     /// already-clean tail): the take yields `None` and [`checkpoint`] returns early.
+    ///
+    /// # Aborted journal
+    ///
+    /// On an aborted journal this refuses at **entry** with `EIO`, dropping
+    /// the running transaction unstaged and writing nothing: the abort lost
+    /// a transaction (see [`aborted`](Journal::aborted)), so committing the
+    /// running successor here would publish a recoverable transaction built
+    /// on the lost one's absent effects — exactly the
+    /// fragments-of-lost-transaction leak the abort discipline forbids. The
+    /// on-disk log is left as the abort left it, and that is safe: `Ext4::drop`
+    /// keeps `RECOVER` stamped on error, so the next mount replays the log —
+    /// which holds only transactions *committed before* the abort (the lost
+    /// and running ones never got a commit block, so recovery cannot see
+    /// them). This is the same terminal state as a commit failing *inside*
+    /// this flush (`commit_staged` aborts and its error propagates before
+    /// the checkpoint below); entry gating just refuses one step earlier.
     pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
+        if self.is_aborted() {
+            self.state_write().running = None;
+            return_errno_with_message!(Errno::EIO, "journal aborted; leaving the log for recovery");
+        }
         let staged = {
             let mut st = self.state_write();
+            // `stop_commit_thread` joined the sole other committer, so a
+            // still-occupied slot is a broken contract; staging over it
+            // would silently overwrite a mid-flight `CommittingTxn`. Refuse
+            // like the other stagers do — the log stays dirty and
+            // replay-safe for the next mount.
+            if st.committing.is_some() {
+                error!("ext4 journal: the committing slot is occupied at unmount; not flushing");
+                return_errno_with_message!(Errno::EIO, "committing slot occupied at unmount");
+            }
             match st.running.take() {
                 // Mirror the commit thread: stage (which retains the images
                 // atomically with the take — nothing races at unmount, but
                 // the invariant is cheap and uniform: every transaction
                 // entering the pipeline is slot-resident with its images
-                // stashed). The slot is empty here — the commit thread
-                // stopped after retiring its last stage.
+                // stashed).
                 Some(txn) if txn.nr_metadata_blocks() > 0 => Some(st.stage_committing(txn)),
                 // A captureless leftover is not committable; drop it.
                 Some(_) | None => None,
@@ -1820,9 +1898,6 @@ impl Journal {
             // failure; the transaction is lost, so do not checkpoint device
             // state that no longer matches the log.
             self.commit_staged(&txn)?;
-        }
-        if self.is_aborted() {
-            return_errno_with_message!(Errno::EIO, "journal aborted; not checkpointing");
         }
         // Nothing is running (taken above) or mid-commit (the slot was
         // retired by `commit_staged`), so the pass's snapshot finds no
@@ -2203,8 +2278,9 @@ impl Journal {
     /// ([`commit_transaction`](commit::commit_transaction)), so direct
     /// pipeline tests run slot-resident exactly like production. Errors
     /// `EIO` if a transaction is already staged. Production transactions
-    /// reach the slot only through
-    /// [`take_running_for_commit`](Journal::take_running_for_commit).
+    /// reach the slot through
+    /// [`take_running_for_commit`](Journal::take_running_for_commit) or the
+    /// unmount flush's staging ([`flush_on_unmount`](Journal::flush_on_unmount)).
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4::journal) fn stage_transaction_for_test(
         &self,
@@ -2813,6 +2889,49 @@ mod tests {
         assert_eq!(f.journal.state_read().tail_block, None);
     }
 
+    /// The abort discipline at unmount (P7c-1 review MAJOR): on an aborted
+    /// journal `flush_on_unmount` refuses at entry — nothing staged, no log
+    /// byte written, the running transaction dropped. Committing it would
+    /// publish a recoverable successor of the transaction the abort lost;
+    /// the untouched dirty log is what the next mount safely replays
+    /// (committed-before-abort transactions only).
+    #[ktest]
+    fn flush_on_unmount_on_aborted_journal_writes_nothing() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        // A dirty (committable) running transaction at unmount time.
+        let h = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h), 500)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(b"LOST"))
+            .unwrap();
+        journal_stop(h).unwrap();
+
+        f.journal.abort_for_fs_error();
+        let mut before = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &mut before)
+            .unwrap();
+
+        let err = f.journal.flush_on_unmount().unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        // Nothing staged, the running transaction gone, every log byte
+        // exactly as the abort left it.
+        assert_eq!(f.journal.committing_for_test(), None);
+        assert!(f.journal.state_read().running.is_none());
+        let mut after = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &mut after)
+            .unwrap();
+        assert_eq!(before, after, "the flush must not touch an aborted log");
+    }
+
     // --- a5 review MAJOR 2: the free-segment fit bound and its abort
     // fallback. ---
 
@@ -3384,13 +3503,18 @@ mod tests {
         journal_stop(h2).unwrap();
     }
 
-    /// `sync(2)`'s durability probe covers the committing slot: with
-    /// `running` empty but T1 staged mid-flight, `commit_and_wait_running`
-    /// waits for T1's commit (returning early would claim durability for a
-    /// commit record not yet on disk). A second thread finishes the staged
-    /// commit; the waiter returns only with T1 committed.
+    /// `sync(2)`'s durability probe covers the committing slot,
+    /// deterministically (the earlier threaded form let the finisher outrun
+    /// the probe on SMP and degrade to the empty-journal path while still
+    /// passing): with `running` empty and T1 staged mid-flight, the probe's
+    /// target IS T1's tid — the wait `commit_and_wait_running` enters;
+    /// returning early would claim durability for a commit record not yet
+    /// on disk. Once T1 commits and retires, the target clears and the
+    /// production probe returns without waiting. (The wait primitive itself
+    /// — blocking until `committed_tid` reaches the target — is covered by
+    /// `commit_thread_end_to_end`.)
     #[ktest]
-    fn sync_probe_waits_on_the_committing_slot() {
+    fn sync_probe_targets_the_committing_slot() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
 
@@ -3400,21 +3524,85 @@ mod tests {
             .unwrap()
             .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
+        // Captures present in `running`: the probe targets the running tid.
+        assert_eq!(f.journal.sync_durability_target().unwrap(), Some(t1_tid));
         journal_stop(h1).unwrap();
+
+        // Slot known-occupied, `running` empty: the probe targets the
+        // committing tid.
         let t1 = f.journal.take_running_for_commit().unwrap();
         assert!(f.journal.state_read().running.is_none());
+        assert_eq!(f.journal.sync_durability_target().unwrap(), Some(t1_tid));
 
-        let finisher = {
-            let journal = f.journal.clone();
-            crate::thread::kernel_thread::ThreadOptions::new(move || {
-                crate::thread::Thread::yield_now();
-                journal.commit_staged(&t1).unwrap();
-            })
-            .spawn()
-        };
+        // Finish T1: no target remains and the production probe returns
+        // with T1 durable.
+        f.journal.commit_staged(&t1).unwrap();
+        assert_eq!(f.journal.sync_durability_target().unwrap(), None);
         f.journal.commit_and_wait_running().unwrap();
         assert!(f.journal.committed_tid().geq(t1_tid));
-        finisher.join();
+    }
+
+    /// The probe's empty path, split from the occupied-slot case: nothing
+    /// running and nothing committing (and no abort) is trivially durable —
+    /// `sync(2)` returns at once, with no tid to wait on.
+    #[ktest]
+    fn sync_probe_on_empty_journal_is_trivially_durable() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        assert_eq!(f.journal.sync_durability_target().unwrap(), None);
+        f.journal.commit_and_wait_running().unwrap();
+    }
+
+    /// The committer's occupied-slot wait shape (P7c-1 review MINOR): with a
+    /// commit mid-flight in the slot AND a committable running transaction
+    /// behind it, the poll keeps WAITING (`None`) instead of reporting
+    /// `Commit` into a take that refuses — otherwise the loop busy-spins
+    /// full checkpoint passes against a stuck commit. Retiring the slot
+    /// (which wakes the trigger, `clear_committing`) re-arms the poll.
+    /// Occupied-at-poll is unreachable in production today — the committer
+    /// is the only production stager while running and retires its own
+    /// stage before re-polling — so this pins the defensive shape, not a
+    /// reachable livelock.
+    #[ktest]
+    fn committer_waits_out_an_occupied_slot_instead_of_spinning() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let weak = Arc::downgrade(&f.journal);
+
+        // T1 staged mid-flight (slot occupied)…
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let t1_tid = h1.tid();
+        get_write_access(Some(&h1), 516)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+        let t1 = f.journal.take_running_for_commit().unwrap();
+        // …and T2 committable behind it.
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h2), 517)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
+            .unwrap();
+        journal_stop(h2).unwrap();
+
+        // The poll waits rather than handing the loop a refusing take…
+        assert!(Journal::poll_commit_action(&weak).is_none());
+        // …and the take-time guard itself refuses, both transactions intact.
+        assert!(f.journal.take_running_for_commit().is_none());
+        assert_eq!(
+            f.journal.committing_for_test(),
+            Some((t1_tid, CommitPhase::Locked))
+        );
+        assert!(f.journal.state_read().running.is_some());
+
+        // Retiring the slot (which wakes the trigger) re-arms the poll: T2
+        // is now the committable pick.
+        f.journal.commit_staged(&t1).unwrap();
+        assert!(matches!(
+            Journal::poll_commit_action(&weak),
+            Some(CommitAction::Commit)
+        ));
     }
 
     // --- P7a-4: the D-4 mount-time journal feature upgrade. ---
