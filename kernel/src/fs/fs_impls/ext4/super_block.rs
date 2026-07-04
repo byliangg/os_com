@@ -62,9 +62,9 @@ const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x2;
 
 /// Validated, Rust-typed in-memory representation of the ext4 superblock.
 ///
-/// Counts that the `64BIT` feature would widen are stored as `u64` from the
-/// start so enabling that feature later (Phase 6) reads the high halves without
-/// changing this type; until then the high halves are zero.
+/// Counts that the `64BIT` feature widens are stored as `u64`, and the parse
+/// boundary splices in their high halves for a `64BIT` volume (the high halves
+/// are zero on a 32-bit volume).
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SuperBlock {
     inodes_count: u32,
@@ -74,11 +74,14 @@ pub(super) struct SuperBlock {
     first_data_block: Ext4Bid,
     block_size: usize,
     nr_blocks_per_group: u32,
+    /// Number of block groups, computed once at parse from the geometry above
+    /// (rounding up the last partial group).
+    nr_block_groups: u32,
     nr_inodes_per_group: u32,
-    // The fields below are decoded for completeness but not yet read by the
-    // read-only path; later phases (allocation, journal recovery, checksums)
-    // consume them. They are kept live by the accessors and predicates below,
-    // each of which carries the `#[expect(dead_code)]` marker until wired in.
+    // The fields below are decoded from the raw superblock and consumed by the
+    // allocation, journal, and checksum paths. A few not yet read by any path
+    // (e.g. `rev_level`, `state`) still carry an `#[expect(dead_code)]` marker on
+    // their accessor.
     nr_inode_table_blocks_per_group: u32,
     inode_size: usize,
     /// Effective group-descriptor size in bytes (32 or 64), already resolved
@@ -170,9 +173,10 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             feature_incompat.contains(FeatureIncompatSet::IS_64BIT),
         )?;
 
-        // A ro_compat feature we cannot safely *write* (e.g. `METADATA_CSUM`
-        // before P6) must not mount writable — our writes would corrupt that
-        // feature's invariants for every other implementation. Linux falls
+        // A ro_compat feature we cannot safely *write* (e.g. `GDT_CSUM` or
+        // `BIGALLOC`, which are not in `RO_COMPAT_SUPP`) must not mount writable —
+        // our writes would corrupt that feature's invariants for every other
+        // implementation. Linux falls
         // back to a read-only mount and refuses `MS_RDWR` with `EROFS`
         // (`ext4_setup_super`); with no read-only mode here yet, refuse the
         // mount the same way. Checked on the raw bits so bits unknown to
@@ -227,9 +231,11 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         }
         let nr_block_groups =
             (blocks_count - first_data_block - 1) / nr_blocks_per_group as u64 + 1;
+        let nr_block_groups = u32::try_from(nr_block_groups)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "block group count exceeds 32 bits"))?;
 
-        let max_inodes = nr_block_groups * nr_inodes_per_group as u64;
-        let min_inodes = (nr_block_groups - 1) * nr_inodes_per_group as u64;
+        let max_inodes = nr_block_groups as u64 * nr_inodes_per_group as u64;
+        let min_inodes = (nr_block_groups as u64 - 1) * nr_inodes_per_group as u64;
         let inodes_count = sb.inodes_count as u64;
         if inodes_count <= min_inodes || inodes_count > max_inodes {
             return_errno_with_message!(Errno::EINVAL, "invalid inodes count");
@@ -249,6 +255,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             first_data_block,
             block_size,
             nr_blocks_per_group,
+            nr_block_groups,
             nr_inodes_per_group,
             nr_inode_table_blocks_per_group,
             inode_size,
@@ -401,10 +408,10 @@ impl SuperBlock {
         self.last_orphan = head;
     }
 
-    /// Returns the number of block groups, rounding up the last partial group.
-    pub(super) fn nr_block_groups(&self) -> u32 {
-        ((self.blocks_count - self.first_data_block - 1) / self.nr_blocks_per_group as u64 + 1)
-            as u32
+    /// Returns the number of block groups (computed once at parse, rounding up
+    /// the last partial group).
+    pub(super) const fn nr_block_groups(&self) -> u32 {
+        self.nr_block_groups
     }
 
     /// Returns the number of inodes stored per block.

@@ -4,7 +4,7 @@
 //! `fs/ext4/namei.c` (`dx_probe`).
 //!
 //! An htree directory keeps a hash index in its first data blocks: a `dx_root`
-//! in logical block 0 and, for larger directories, one or two levels of
+//! in logical block 0 and, for larger directories, one level of
 //! `dx_node` index blocks, each an array of `{ hash, block }` entries sorted by
 //! hash. To locate the leaf block that may hold a name, hash the name and, at
 //! each level, binary-search the entries for the last one whose hash does not
@@ -57,9 +57,12 @@ const DX_ROOT_INFO_OFF: usize = 24;
 const DX_ROOT_INFO_LEN: u8 = 8;
 
 /// Largest `indirect_levels` an htree root may declare without the (unsupported)
-/// `largedir` feature: root plus up to two index levels (Linux
-/// `EXT4_HTREE_LEVEL_COMPAT` region). A deeper tree is refused with `EUCLEAN`.
-const MAX_INDIRECT_LEVELS: u8 = 2;
+/// `largedir` feature: 0 (root points straight at leaf blocks) or 1 (root →
+/// one `dx_node` level → leaves). Linux `dx_probe` refuses more than
+/// `ext4_dir_htree_level() - 1` == 1 for a non-`largedir` volume; a deeper tree
+/// (which also implies index levels `dx_index_blocks` does not walk, so a
+/// degrade could leave stale blocks) is refused here with `EUCLEAN`.
+const MAX_INDIRECT_LEVELS: u8 = 1;
 
 /// The low 28 bits of a `dx_entry.block` hold the logical block number; the top
 /// four are reserved (Linux `dx_get_block`).
@@ -127,7 +130,9 @@ pub(super) struct DxRootInfo {
     hash_version: u8,
     /// `info_length`; validated to equal [`DX_ROOT_INFO_LEN`].
     info_length: u8,
-    /// Number of index levels below the root (0, 1, or 2).
+    /// Number of index levels below the root (0 or 1; a deeper tree needs the
+    /// unsupported `largedir` feature and is rejected — see
+    /// [`MAX_INDIRECT_LEVELS`]).
     indirect_levels: u8,
 }
 
@@ -202,7 +207,8 @@ pub(super) fn dx_lookup_leaf(
     let indirect = root.indirect_levels;
     // Blocks visited on the path from the root, indexed by level, for the cycle
     // guard. `blocks[0]` is the root's own block (0); at most one entry per level
-    // and `indirect <= MAX_INDIRECT_LEVELS` (2), so three slots suffice.
+    // and `indirect <= MAX_INDIRECT_LEVELS` (1), so the root + one `dx_node`
+    // level fit in three slots with room to spare.
     let mut blocks: [Ext4Bid; 3] = [0; 3];
     let mut level: u8 = 0;
     // Root `entries[]` follow `dx_root_info` (Linux `&root->info + info_length`);

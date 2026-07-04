@@ -769,16 +769,19 @@ impl Journal {
         // `commit_transaction`, so no commit lock is needed. `commit_transaction`
         // publishes `committed_tid` (Release) before returning.
         let commit_result = commit_transaction(self, self.device.as_ref(), txn);
-        self.state_write().committing_tid = None;
         if let Err(e) = commit_result {
             // The transaction was consumed: memory is ahead of the log and the
             // device, unrecoverably. Abort the journal (refuse further work and
             // wake sleepers with an error) rather than continue and publish
-            // fragments of the lost transaction through later commits. The full
-            // jbd2 abort/errno machinery is Phase 7.
+            // fragments of the lost transaction through later commits. Set the
+            // aborted flag BEFORE clearing `committing_tid`, or a `sync(2)`
+            // sampling the gap would see neither a running nor a committing
+            // transaction and wrongly report the lost data durable. The full jbd2
+            // abort/errno machinery is Phase 7.
             error!("ext4 journal commit failed, aborting the journal: {:?}", e);
             self.abort();
         }
+        self.state_write().committing_tid = None;
         // Wake `log_wait_commit` sleepers to re-check `committed_tid`.
         self.commit_wait_queue.wake_all();
     }
@@ -946,7 +949,16 @@ impl Journal {
                 // nothing here would let sync(2) return early.
                 _ => match st.committing_tid {
                     Some(tid) => tid,
-                    None => return Ok(()),
+                    // Nothing running and nothing committing: everything captured
+                    // is durable — unless a failed commit aborted the journal and
+                    // dropped a transaction, in which case durability must not be
+                    // claimed (else sync(2) returns Ok for data the abort lost).
+                    None => {
+                        if self.is_aborted() {
+                            return_errno_with_message!(Errno::EIO, "journal aborted");
+                        }
+                        return Ok(());
+                    }
                 },
             }
         };
@@ -1064,9 +1076,11 @@ impl Drop for Journal {
 
 /// Identifies the kind of metadata block being accessed.
 ///
-/// Every variant is now constructed at a metadata-access call site. The funnels
-/// still ignore the value; it is the hook where Phase 6 attaches the right
-/// checksum computation when a metadata block is dirtied.
+/// Every variant is constructed at a metadata-access call site, but the funnels
+/// ignore the value: `metadata_csum` (Phase 6b) ended up stamping each checksum
+/// at its own dedicated setter (`stamp_*_checksum`) rather than through this
+/// capture-time tag, so it remains an unused block-kind label kept for the
+/// credential's wrong-trigger guard below.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TriggerType {
     Superblock,
@@ -1184,8 +1198,7 @@ pub(super) fn get_create_access<'h>(
 /// patch-without-capture is unrepresentable, and the block number and
 /// [`TriggerType`] travel inside the credential — a wrong-bid patch landing on
 /// a neighbor's capture in the shared running transaction, or a get/dirty
-/// trigger divergence (live corruption once P6 checksums key off it), can no
-/// longer be written.
+/// trigger divergence, can no longer be written.
 ///
 /// On a non-journaled volume — or from a caller with no open transaction —
 /// the credential is **inert**: `patch` succeeds without invoking the closure
@@ -1209,8 +1222,8 @@ pub(super) struct WriteAccess<'h> {
 struct LiveAccess<'h> {
     handle: &'h Handle,
     bid: Ext4Bid,
-    /// Carried so the P6 checksum hook sees the same kind at capture and
-    /// patch time by construction.
+    /// Carried so a capture and its patch are guaranteed the same block kind by
+    /// construction (the wrong-trigger guard); the kind itself is otherwise unused.
     #[expect(dead_code)]
     trigger: TriggerType,
 }

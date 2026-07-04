@@ -68,7 +68,7 @@
 //! - No revoke handling: our own logs carry no revoke blocks (Phase 7), so a
 //!   block where a descriptor is expected must be a descriptor; any other block
 //!   type is treated as corruption (`EUCLEAN`), never panicked on.
-//! - No checksums (Phase 6/7): the commit block's csum fields are ignored.
+//! - No checksums (Phase 7): the commit block's csum fields are ignored.
 //! - Synchronous, driven inline by the caller (here, tests); no background
 //!   checkpoint thread yet.
 
@@ -169,7 +169,7 @@ pub(super) fn apply_log_transaction(
             );
         }
         let tag = RawBlockTag::from_bytes(&descriptor[offset..offset + TAG_LEN]);
-        let dest = tag.t_blocknr.get() as Ext4Bid;
+        let dest = Ext4Bid::from(tag.t_blocknr.get());
         let flags = tag.t_flags.get();
 
         // This tag's metadata is the next log block after the previous one.
