@@ -74,10 +74,13 @@
 //!   images. An **unpublished** revoke (a forget whose transaction has not
 //!   committed) suppresses nothing — the pass instead **defers** in front of
 //!   the first transaction touching such a block (see [`checkpoint`]'s
-//!   defer-prefix rule). On-disk revoke *blocks* are still absent from our
-//!   own logs (P7b-3), so a block where a descriptor is expected must be a
-//!   descriptor; any other block type is treated as corruption (`EUCLEAN`),
-//!   never panicked on.
+//!   defer-prefix rule). A revoking transaction's chain additionally carries
+//!   on-disk revoke *blocks* (P7b-3, at the chain head): the walkers here
+//!   step over a same-tid revoke block positionally — its records serve
+//!   mount-time recovery's PASS_REVOKE; the live checkpoint's suppression
+//!   authority is the in-memory table, published at commit step 6 with
+//!   identical `(block, tid)` content. Any other block type where a chain
+//!   block is expected is corruption (`EUCLEAN`), never panicked on.
 //! - On a csum v2/v3 journal (admitted since P7a-4), [`apply_log_transaction`]
 //!   verifies the descriptor tail and each tag's data checksum (see its docs)
 //!   against what the commit pipeline stamped, and the clean-superblock
@@ -93,7 +96,10 @@ use super::{
     super::prelude::*,
     Journal, Tid,
     commit::barrier,
-    format::{BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawJournalHeader},
+    format::{
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC,
+        RawJournalHeader,
+    },
     revoke::RevokeTable,
     transaction::Transaction,
 };
@@ -102,17 +108,18 @@ use super::{
 /// mirror of [`commit.rs`](super::commit)'s writer.
 ///
 /// A transaction is a **descriptor chain** (jbd2 `do_one_pass`, matching the
-/// scanner): zero or more descriptor blocks — each followed by the metadata
-/// blocks its tags count — terminated by a commit block, every chain block
-/// bearing `expected_tid`. For each descriptor this validates it (magic,
-/// `DESCRIPTOR` type, `h_sequence == expected_tid`), then for each of its
-/// tags writes the following log block to the tag's destination block
-/// (`t_blocknr`), restoring the jbd2 magic in an escaped block — all
-/// descriptors' blocks, in chain order. The chain ends at the validated
-/// commit block (magic, `COMMIT`, `h_sequence == expected_tid`); the
-/// zero-descriptor chain (a Linux `data=ordered` transaction that carried
-/// only file data) applies nothing. Returns the log block immediately after
-/// the commit block — the next transaction's start.
+/// scanner): zero or more revoke blocks (stepped over positionally — see the
+/// revoke-suppression section) and descriptor blocks — each descriptor
+/// followed by the metadata blocks its tags count — terminated by a commit
+/// block, every chain block bearing `expected_tid`. For each descriptor this
+/// validates it (magic, `DESCRIPTOR` type, `h_sequence == expected_tid`),
+/// then for each of its tags writes the following log block to the tag's
+/// destination block (`t_blocknr`), restoring the jbd2 magic in an escaped
+/// block — all descriptors' blocks, in chain order. The chain ends at the
+/// validated commit block (magic, `COMMIT`, `h_sequence == expected_tid`);
+/// the zero-descriptor chain (a Linux `data=ordered` transaction that
+/// carried only file data) applies nothing. Returns the log block
+/// immediately after the commit block — the next transaction's start.
 ///
 /// Apply granularity is the whole chain: the caller only reaches this for a
 /// transaction SCAN found sealed, so there is no partial-descriptor apply —
@@ -178,9 +185,8 @@ use super::{
 /// consumed by the walk but neither read nor written. An image in a
 /// transaction *newer* than `tid_r` still applies. The checkpoint caller
 /// passes the journal's committed-revoke memory; the mount-time replay
-/// caller passes an empty table until PASS_REVOKE builds the real one from
-/// the on-disk revoke blocks (P7b-4) — this same predicate then serves both
-/// consumers.
+/// caller passes the recovery-local table PASS_REVOKE built from the log's
+/// own revoke blocks — one predicate serves both consumers.
 ///
 /// # Errors
 ///
@@ -236,9 +242,25 @@ pub(super) fn apply_log_transaction(
             // The next transaction starts right after this commit block.
             return Ok(journal.geometry().next_log_block(log));
         }
-        // A chain block must be a descriptor or the commit. We write no
-        // revoke blocks, so any other type (including BLOCKTYPE_REVOKE) is
-        // corruption here; full revoke handling is P7b.
+        // A same-tid revoke block (P7b-3 writes them at the chain head) is a
+        // legitimate one-block chain member: step over it. Its records are
+        // not read here — this apply's suppression authority is the
+        // `revoked` table the caller passed (the live committed-revoke
+        // memory for checkpoint; the PASS_REVOKE-built table, parsed from
+        // exactly these blocks, for mount-time replay).
+        if header.h_blocktype.get() == BLOCKTYPE_REVOKE {
+            log = journal.geometry().next_log_block(log);
+            consumed += 1;
+            if consumed > journal.geometry().maxlen() {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal transaction chain exceeds the log size"
+                );
+            }
+            continue;
+        }
+        // A chain block must be a descriptor, a revoke block, or the commit;
+        // any other type is corruption here.
         if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
             return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");
         }
@@ -357,6 +379,19 @@ fn chain_covers_unpublished(
         }
         if header.h_blocktype.get() == BLOCKTYPE_COMMIT {
             return Ok(false);
+        }
+        // A same-tid revoke block: a one-block chain member with no
+        // destination tags, so nothing of it can cover `unpublished`.
+        if header.h_blocktype.get() == BLOCKTYPE_REVOKE {
+            log = journal.geometry().next_log_block(log);
+            consumed += 1;
+            if consumed > journal.geometry().maxlen() {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal transaction chain exceeds the log size"
+                );
+            }
+            continue;
         }
         if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
             return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");

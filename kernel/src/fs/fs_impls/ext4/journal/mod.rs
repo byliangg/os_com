@@ -961,26 +961,45 @@ impl Journal {
 
     /// The maximum metadata blocks a single transaction may reserve.
     ///
-    /// A transaction of `n` captured blocks occupies, in the log,
+    /// A transaction of `n` captured blocks and `v` revoke blocks
+    /// (`ceil(revokes / entries_per_block)`,
+    /// [`Transaction::nr_revoke_blocks`]) occupies, in the log,
     ///
     /// ```text
-    /// n data blocks + ceil(n / t) descriptor blocks + 1 commit block
+    /// v revoke blocks + n data blocks + ceil(n / t) descriptors + 1 commit
     /// ```
     ///
     /// where `t` is [`TagLayout::tags_per_descriptor`] (the commit pipeline
     /// starts a fresh descriptor whenever the previous one's tag area fills,
-    /// P7a-5). The whole footprint must fit the usable ring
-    /// (`s_maxlen - s_first`): the exact bound is the largest `n` with
-    /// `n + ceil(n/t) + 1 <= usable`, and this solves it **conservatively**
-    /// via `ceil(n/t) <= n/t + 1`:
+    /// P7a-5; revoke blocks join the chain in P7b-3). The whole footprint
+    /// must fit the usable ring (`s_maxlen - s_first`): the exact bound is
+    /// the largest `n + v` with `v + n + ceil(n/t) + 1 <= usable`, and this
+    /// solves it **conservatively** via `ceil(n/t) <= n/t + 1`:
     ///
     /// ```text
-    /// n <= t * (usable - 2) / (t + 1)
+    /// n + v <= t * (usable - 2) / (t + 1)
     /// ```
+    ///
+    /// The bound is checked against `n + v` (each whole revoke block charged
+    /// as one capture-equivalent, `check_capacity`), which keeps the proof:
+    /// a revoke block costs one log block and no descriptor tag, so
+    /// `v + n + ceil(n/t) + 1 <= (n+v) + ceil((n+v)/t) + 1 <= usable`
+    /// whenever `n + v` passes the formula — the revoke charge only
+    /// over-counts.
     ///
     /// Under-admitting by a block or two is harmless (`journal_start` just
     /// waits or refuses a little early); over-admitting would be corruption —
     /// the commit's log writes would wrap onto the transaction's own blocks.
+    ///
+    /// One residue: the revoke charge is only sampled at the capacity gates
+    /// (`journal_start`/`extend`/`restart`) — the set itself grows at frees
+    /// ([`RevokeDuty::discharge`](revoke::RevokeDuty)), which cannot refuse
+    /// (the free already happened in memory). A single restart-less
+    /// operation freeing hundreds of thousands of blocks could therefore
+    /// outgrow the admitted slack; the commit-time exact fit guard is the
+    /// hard line there (refuse → drain → loud `ENOSPC` abort, never an
+    /// overwrite), and P7c's `journal_restart` commit boundaries bound the
+    /// per-transaction revoke set the way Linux's do.
     ///
     /// This bounds ONE transaction against the whole usable ring; it says
     /// nothing about the log space an un-checkpointed PREDECESSOR still
@@ -1017,7 +1036,19 @@ impl Journal {
     /// [`checkpoint`](checkpoint::checkpoint) uses this to snapshot the tail /
     /// committed-tid / head under the lock before doing its (lock-free) device
     /// I/O, mirroring the commit pipeline's "read state, release lock, do I/O"
-    /// discipline (the state lock is never held across device I/O).
+    /// discipline.
+    ///
+    /// The state lock's REAL invariant is the leaf discipline: **no
+    /// filesystem lock is acquired while holding it** (the capture funnels
+    /// take it under the inode/superblock/group locks, never the reverse).
+    /// It is *not* "never held across device I/O": the capture-seed read is
+    /// the one deliberate exception — [`get_write_access`] holds
+    /// `state_write` across [`Transaction::capture_write`]'s device read, so
+    /// the seed provenance decision (retained image vs device) and the
+    /// capture it feeds are atomic against a concurrent commit's
+    /// `running.take()` (the P4 B-1 seeding fix). Every other holder —
+    /// commit, checkpoint, recovery — snapshots under the lock and does its
+    /// I/O outside it.
     pub(super) fn state_read(&self) -> RwMutexReadGuard<'_, JournalState> {
         self.state.read()
     }
@@ -1355,6 +1386,15 @@ impl Journal {
     /// replays exactly what had committed before the shutdown, which is the
     /// "crash here" semantics the ioctl exists to simulate.
     pub(in crate::fs::fs_impls::ext4) fn abort_for_shutdown(&self) {
+        self.abort();
+    }
+
+    /// Aborts the journal on a filesystem-detected inconsistency (the
+    /// minimal Linux `ext4_error` → `jbd2_journal_abort` shape), reached
+    /// through [`Handle::abort_journal_on_fs_error`] by a site whose
+    /// irreversible journal effects (a discharged revoke duty) cannot be
+    /// unwound after the operation they served has failed.
+    pub(super) fn abort_for_fs_error(&self) {
         self.abort();
     }
 

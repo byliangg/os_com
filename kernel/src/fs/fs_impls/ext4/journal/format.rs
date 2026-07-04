@@ -18,10 +18,11 @@
 //! # Supported features
 //!
 //! We admit only the journal feature set we can honor end-to-end. Of the jbd2
-//! INCOMPAT features, only [`INCOMPAT_REVOKE`] is tolerated at mount — but a
-//! log that *actually* contains revoke blocks is refused during recovery with
-//! `EUCLEAN` rather than under-replayed (the "revoke gap"; full revoke support
-//! is P7b). See [`INCOMPAT_SUPP`] for the mask.
+//! INCOMPAT features, [`INCOMPAT_REVOKE`] is honored on both sides as of
+//! P7b-3/4: the commit pipeline serializes each transaction's revoke set into
+//! [`BLOCKTYPE_REVOKE`] blocks ([`RevokeBlockWriter`]) and recovery's
+//! PASS_REVOKE applies them ([`TagLayout::walk_revoke`]). See
+//! [`INCOMPAT_SUPP`] for the mask.
 //!
 //! The descriptor-tag *geometry* of the layout-shaping features is nonetheless
 //! modeled: every descriptor builder/walker is parameterized over one
@@ -44,6 +45,14 @@
 //! [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)).
 //! 64-bit tags and csum v2/v3 are therefore admitted at mount
 //! ([`INCOMPAT_SUPP`]).
+//!
+//! Revoke blocks (P7b-3/4) follow the same discipline: the entry geometry is
+//! derived from the feature bits on the same [`TagLayout`]
+//! ([`TagLayout::revoke_entries_per_block`]), the write side seals each block
+//! through [`RevokeBlockWriter`] (tail checksum stamped through the one
+//! [`JournalCsumSeed::stamp_block_tail`] funnel [`TagWriter::finish`] uses),
+//! and the read side parses through [`TagLayout::walk_revoke`].
+//!
 //! [`INCOMPAT_ASYNC_COMMIT`] (removes the trailing commit-block barrier) and
 //! [`INCOMPAT_FAST_COMMIT`] (adds a wholly different fast-commit area) change
 //! behavior we do not model and remain rejected.
@@ -151,9 +160,9 @@ pub(super) const BLOCKTYPE_SUPERBLOCK_V1: u32 = 3;
 pub(super) const BLOCKTYPE_SUPERBLOCK_V2: u32 = 4;
 /// Revoke block: lists blocks that must not be replayed (`JBD2_REVOKE_BLOCK`).
 ///
-/// Referenced by [`recovery`](super::recovery)'s SCAN pass, which rejects a
-/// revoke block met during recovery with `EUCLEAN` (we write none; applying
-/// them — full PASS_REVOKE — is P7b), so it is live even in non-ktest builds.
+/// Written by the commit pipeline for a transaction with a nonempty revoke
+/// set ([`RevokeBlockWriter`]); walked by recovery's SCAN (a same-tid chain
+/// member) and parsed by its PASS_REVOKE ([`TagLayout::walk_revoke`]).
 pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 
 /// The journaled block was escaped because it began with [`JBD2_MAGIC`]
@@ -161,10 +170,11 @@ pub(super) const BLOCKTYPE_REVOKE: u32 = 5;
 pub(super) const TAG_FLAG_ESCAPE: u16 = 1;
 /// This tag reuses the UUID of the previous tag (`JBD2_FLAG_SAME_UUID`).
 pub(super) const TAG_FLAG_SAME_UUID: u16 = 2;
-/// The tagged block was deleted (`JBD2_FLAG_DELETED`) — the revoke tag flag,
-/// owned by P7b's revoke machinery. Unconditional `expect` (not
-/// `cfg_attr(not(ktest), ...)`) because it is dead in the ktest build too,
-/// where the tests do not reference it.
+/// The tagged block was deleted (`JBD2_FLAG_DELETED`). Defined by the jbd2
+/// format but never written: revocation travels in [`BLOCKTYPE_REVOKE`]
+/// blocks, not tag flags — Linux 6.6 defines the flag and sets it nowhere
+/// either. Unconditional `expect` (not `cfg_attr(not(ktest), ...)`) because
+/// it is dead in the ktest build too, where the tests do not reference it.
 #[expect(dead_code)]
 pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
@@ -179,9 +189,14 @@ pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
 /// 2349-2353 — v3 supersedes the v1 checksum).
 pub(super) const COMPAT_CHECKSUM: u32 = 0x1;
 
-/// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Tolerated at
-/// mount; a revoke block actually met during recovery hard-errors (see the
-/// module docs).
+/// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Honored end
+/// to end since P7b-3/4 (see the module docs). We do not SET the bit when we
+/// write revoke blocks — Linux flips it lazily at the first revoke
+/// (`jbd2_journal_revoke` → `jbd2_journal_set_features`, revoke.c:339), but
+/// every recovery implementation in circulation (jbd2's and e2fsprogs')
+/// dispatches on the block type without consulting the bit
+/// (recovery.c:830-856), so the bit only guards pre-revoke-era tools; a
+/// documented divergence to keep the frozen v0 superblock bytes untouched.
 pub(super) const INCOMPAT_REVOKE: u32 = 0x1;
 /// 64-bit block numbers in block tags (`JBD2_FEATURE_INCOMPAT_64BIT`).
 pub(super) const INCOMPAT_64BIT: u32 = 0x2;
@@ -209,13 +224,13 @@ pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 /// 64-bit tags and csum v2/v3 are admitted end-to-end as of P7a-4: the
 /// layouts parse (P7a-2), recovery verifies their checksums (P7a-3), and the
 /// commit pipeline stamps them (P7a-4), so our own commits round-trip through
-/// our own recovery on every admitted layout. [`INCOMPAT_REVOKE`] stays
-/// tolerated-not-honored — the feature bit passes, but a revoke block actually
-/// met during recovery hard-errors (`EUCLEAN`), the "revoke gap" (full support
-/// is P7b). csum_v2 + csum_v3 together prescribe contradictory tag layouts
-/// and are still refused at parse ([`TagLayout::from_features`]). Async
-/// commit and fast commit change behavior we do not model and are rejected
-/// outright.
+/// our own recovery on every admitted layout. [`INCOMPAT_REVOKE`] is honored
+/// end to end as of P7b-3/4: the commit pipeline writes revoke blocks and
+/// recovery's PASS_REVOKE applies them (the a5-era refusal of a valid-magic
+/// revoke block is retired). csum_v2 + csum_v3 together prescribe
+/// contradictory tag layouts and are still refused at parse
+/// ([`TagLayout::from_features`]). Async commit and fast commit change
+/// behavior we do not model and are rejected outright.
 pub(super) const INCOMPAT_SUPP: u32 =
     INCOMPAT_REVOKE | INCOMPAT_64BIT | INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3;
 
@@ -448,6 +463,36 @@ const TAG_UUID_BYTES: usize = 16;
 /// [`TagWriter::finish`].
 const DESCRIPTOR_TAIL_BYTES: usize = 4;
 
+/// The 16-byte head of a revoke block (`jbd2_journal_revoke_header_t`): the
+/// shared 12-byte [`RawJournalHeader`] plus `r_count`. The block-number
+/// entries follow it back to back ([`TagLayout::revoke_entries_per_block`]).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+pub(super) struct RawRevokeHeader {
+    /// Shared header; `h_blocktype` is [`BLOCKTYPE_REVOKE`].
+    pub(super) header: RawJournalHeader,
+    /// Bytes of this block in use, **including this 16-byte header**
+    /// (`r_count`): the writer stores its running byte offset, which started
+    /// at `sizeof(jbd2_journal_revoke_header_t)` and advanced one entry
+    /// width per record (Linux `write_one_revoke_record` initializes
+    /// `offset = sizeof(...)`, revoke.c:616, and `flush_descriptor` stores
+    /// the final offset, revoke.c:655). The read side iterates entries from
+    /// byte 16 while `offset + entry_size <= r_count`
+    /// (`scan_revoke_records`, recovery.c:911-937).
+    pub(super) r_count: Be32,
+}
+
+impl RawRevokeHeader {
+    /// Parses the 16-byte revoke header from the head of a log-block buffer
+    /// (like [`RawJournalHeader::parse`]; no device read).
+    pub(super) fn parse(block: &[u8; BLOCK_SIZE]) -> Self {
+        Self::from_bytes(&block[..size_of::<Self>()])
+    }
+}
+
+const REVOKE_HEADER_SIZE: usize = 16;
+const_assert!(size_of::<RawRevokeHeader>() == REVOKE_HEADER_SIZE);
+
 /// The per-journal csum v2/v3 seed: `crc32c(!0, s_uuid)` of the **journal**
 /// superblock's UUID (Linux `j_csum_seed`, derived in
 /// `journal_load_superblock`, fs/jbd2/journal.c:1493-1495).
@@ -502,10 +547,23 @@ impl JournalCsumSeed {
     ///
     /// Deliberately generic over the block class: revoke blocks end in the
     /// same tail checksum and Linux verifies them through this same function
-    /// (recovery.c:836), so P7b's revoke support reuses this helper as is.
+    /// (recovery.c:836), so the recovery scanner runs it on descriptor and
+    /// revoke blocks alike.
     pub(super) fn verify_block_tail(&self, block: &[u8; BLOCK_SIZE]) -> bool {
         let stored = Be32::from_bytes(&block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..]).get();
         stored == self.block_tail_csum(block)
+    }
+
+    /// Stamps a descriptor-class block's trailing `jbd2_journal_block_tail`
+    /// checksum — the write-side mirror of [`Self::verify_block_tail`], and
+    /// as generic over the block class as Linux's
+    /// `jbd2_descriptor_block_csum_set` (which seals metadata descriptors,
+    /// commit.c:712-714, and revoke blocks, revoke.c:656, through the one
+    /// function): [`TagWriter::finish`] and [`RevokeBlockWriter::finish`]
+    /// both seal through here, so one formula serves every tail.
+    pub(super) fn stamp_block_tail(&self, block: &mut [u8; BLOCK_SIZE]) {
+        let tail = self.block_tail_csum(block);
+        block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..].copy_from_slice(Be32::new(tail).as_bytes());
     }
 
     /// Returns the crc32c of a commit block with its `h_chksum[0]` word
@@ -669,6 +727,36 @@ impl TagLayout {
         (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
     }
 
+    /// Returns the on-disk width of one revoke-block entry: 8-byte `be64`
+    /// block numbers on a 64-bit journal, 4-byte `be32` otherwise. Both
+    /// sides of Linux key this on the 64BIT feature alone — the writer
+    /// (`write_one_revoke_record`, revoke.c:597-601: `sz = 8` iff
+    /// `jbd2_has_feature_64bit`) and the reader (`scan_revoke_records`,
+    /// recovery.c:926-927: `record_len = 8` iff 64bit) — so, unlike tags,
+    /// the csum features do NOT widen revoke entries.
+    const fn revoke_entry_width(&self) -> RevokeEntryWidth {
+        if self.has_blocknr_high {
+            RevokeEntryWidth::Wide
+        } else {
+            RevokeEntryWidth::Narrow
+        }
+    }
+
+    /// Returns the exact number of block-number entries one revoke block
+    /// holds under this layout: the usable area past the 16-byte
+    /// [`RawRevokeHeader`], up to the reserved checksum tail, divided by the
+    /// entry width — `(blocksize − header − tail) / entry_size`, the same
+    /// bound Linux's writer enforces per record (`offset + sz >
+    /// j_blocksize - csum_size` starts a fresh block, revoke.c:602-607).
+    /// This is the per-block chunk size of the commit pipeline's revoke
+    /// serialization and the divisor of a transaction's revoke-block
+    /// footprint (`Transaction::nr_revoke_blocks`), kept here beside
+    /// [`tags_per_descriptor`](Self::tags_per_descriptor) so every capacity
+    /// formula reads one source.
+    pub(super) const fn revoke_entries_per_block(&self) -> usize {
+        (self.tag_area_end() - REVOKE_HEADER_SIZE) / self.revoke_entry_width().bytes()
+    }
+
     /// Returns whether this layout carries csum v2 or v3 (Linux
     /// `jbd2_journal_has_csum_v2or3` on the feature bits the layout was
     /// derived from): tags store a data checksum and descriptor-class blocks
@@ -807,6 +895,88 @@ impl TagLayout {
             offset: self.first_tag_offset(),
             done: false,
         }
+    }
+
+    /// Returns a [`RevokeBlockWriter`] over a fresh revoke-block buffer with
+    /// its 12-byte header (magic / [`BLOCKTYPE_REVOKE`] / `tid`) in place,
+    /// positioned at the first entry — the write half of
+    /// [`walk_revoke`](Self::walk_revoke), owning buffer and cursor exactly
+    /// like [`writer`](Self::writer)'s [`TagWriter`]: entries can neither
+    /// skip nor reuse an offset, and the sealed bytes (with `r_count` and,
+    /// on a csum layout, the tail checksum stamped) exist only past
+    /// [`finish`](RevokeBlockWriter::finish).
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when `seed` presence contradicts the layout, exactly as in
+    /// [`writer`](Self::writer): both derive from the same superblock
+    /// feature bits, so a mismatch is a wiring bug refused before any entry
+    /// is placed.
+    pub(super) fn revoke_writer(
+        &self,
+        tid: Tid,
+        seed: Option<JournalCsumSeed>,
+    ) -> Result<RevokeBlockWriter> {
+        if seed.is_some() != self.has_csum() {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "journal csum seed does not match the tag layout"
+            );
+        }
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let header = RawJournalHeader {
+            h_magic: Be32::new(JBD2_MAGIC),
+            h_blocktype: Be32::new(BLOCKTYPE_REVOKE),
+            h_sequence: Be32::new(tid.get()),
+        };
+        block[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
+        Ok(RevokeBlockWriter {
+            layout: *self,
+            width: self.revoke_entry_width(),
+            block,
+            offset: REVOKE_HEADER_SIZE,
+            seed,
+        })
+    }
+
+    /// Parses a revoke block's entry list under this layout (Linux
+    /// `scan_revoke_records`, fs/jbd2/recovery.c:905-943): validates
+    /// `r_count` once at this boundary, then returns the iterator over the
+    /// decoded block numbers. The caller (SCAN / PASS_REVOKE) has already
+    /// vouched for the 12-byte header (magic / type / tid) through the
+    /// ordinary chain dispatch.
+    ///
+    /// Mirroring Linux exactly, `r_count` is trusted only as an upper byte
+    /// bound: a value above the usable area (into the reserved checksum
+    /// tail, or past the block) is refused (recovery.c:923-924, `-EINVAL`
+    /// there, our corruption errno here); a value below the 16-byte header
+    /// — or one stopping mid-entry — simply yields the entries that fit
+    /// (`while (offset + record_len <= max)`, recovery.c:929).
+    ///
+    /// # Errors
+    ///
+    /// `EUCLEAN` when `r_count` exceeds `blocksize − tail` — the one
+    /// malformation the byte bound cannot absorb.
+    pub(super) fn walk_revoke<'a>(
+        &self,
+        block: &'a [u8; BLOCK_SIZE],
+    ) -> Result<RevokeEntryWalk<'a>> {
+        let header = RawRevokeHeader::parse(block);
+        let Ok(end) = usize::try_from(header.r_count.get()) else {
+            return_errno_with_message!(Errno::EUCLEAN, "journal revoke block r_count overflows");
+        };
+        if end > self.tag_area_end() {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal revoke block r_count exceeds the usable block area"
+            );
+        }
+        Ok(RevokeEntryWalk {
+            width: self.revoke_entry_width(),
+            block,
+            offset: REVOKE_HEADER_SIZE,
+            end,
+        })
     }
 }
 
@@ -966,9 +1136,7 @@ impl TagWriter {
             TagCsumMode::Plain => return self.block,
             TagCsumMode::V2(seed) | TagCsumMode::V3(seed) => seed,
         };
-        let tail = seed.block_tail_csum(&self.block);
-        self.block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..]
-            .copy_from_slice(Be32::new(tail).as_bytes());
+        seed.stamp_block_tail(&mut self.block);
         self.block
     }
 
@@ -1121,6 +1289,141 @@ impl Iterator for TagWalk<'_> {
             self.done = true;
         }
         Some(Ok(tag))
+    }
+}
+
+/// The on-disk width of one revoke-block entry, selected by the journal's
+/// 64BIT feature (see [`TagLayout::revoke_entries_per_block`]) — carried as a
+/// variant, not a raw byte count, so the encode/decode sites match on the
+/// two real formats instead of comparing sizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevokeEntryWidth {
+    /// A 4-byte `be32` block number (no 64BIT feature).
+    Narrow,
+    /// An 8-byte `be64` block number ([`INCOMPAT_64BIT`]).
+    Wide,
+}
+
+impl RevokeEntryWidth {
+    /// The entry stride in bytes.
+    const fn bytes(self) -> usize {
+        match self {
+            Self::Narrow => size_of::<Be32>(),
+            Self::Wide => size_of::<Be64>(),
+        }
+    }
+}
+
+/// Serializer for one revoke block (see [`TagLayout::revoke_writer`]) — the
+/// write-side mirror of [`RevokeEntryWalk`], with [`TagWriter`]'s ownership
+/// discipline: it owns the cursor (each [`put`](Self::put) lays one entry
+/// down and advances) and the buffer (the sealed bytes come back only from
+/// [`finish`](Self::finish), which stamps `r_count` and — on a csum layout —
+/// the tail checksum, so an unsealed revoke block cannot be emitted).
+pub(super) struct RevokeBlockWriter {
+    layout: TagLayout,
+    /// The entry width the layout's 64BIT feature selects (derived once at
+    /// construction; the cursor strides by it).
+    width: RevokeEntryWidth,
+    block: Box<[u8; BLOCK_SIZE]>,
+    /// The next entry's byte offset — also, at any instant, the exact
+    /// `r_count` value describing the entries placed so far (bytes used
+    /// including the header; see [`RawRevokeHeader::r_count`]).
+    offset: usize,
+    /// The csum v2/v3 seed, present iff the layout has a checksum tail (the
+    /// constructor's refusal makes the pairing total).
+    seed: Option<JournalCsumSeed>,
+}
+
+impl RevokeBlockWriter {
+    /// Serializes one revoked block number at the cursor and advances it
+    /// (Linux `write_one_revoke_record`'s store, revoke.c:625-631).
+    ///
+    /// # Errors
+    ///
+    /// - `EFBIG` when `blocknr` does not fit the 4-byte entry of a non-64bit
+    ///   journal — truncating would revoke the wrong block, the same refusal
+    ///   as [`TagWriter::put`]'s.
+    /// - `ENOSPC` when the entry would run past the usable area (into the
+    ///   reserved checksum tail, or past the block) — the caller sizes its
+    ///   chunks by [`TagLayout::revoke_entries_per_block`], but the writer
+    ///   keeps its own bound, mirroring Linux's per-record space check
+    ///   (revoke.c:602-607).
+    pub(super) fn put(&mut self, blocknr: Ext4Bid) -> Result<()> {
+        let end = self.offset + self.width.bytes();
+        if end > self.layout.tag_area_end() {
+            return_errno_with_message!(Errno::ENOSPC, "journal revoke block is full");
+        }
+        match self.width {
+            RevokeEntryWidth::Wide => {
+                self.block[self.offset..end].copy_from_slice(Be64::new(blocknr).as_bytes());
+            }
+            RevokeEntryWidth::Narrow => {
+                let Ok(low) = u32::try_from(blocknr) else {
+                    return_errno_with_message!(
+                        Errno::EFBIG,
+                        "revoked block number exceeds 32-bit revoke entry"
+                    );
+                };
+                self.block[self.offset..end].copy_from_slice(Be32::new(low).as_bytes());
+            }
+        }
+        self.offset = end;
+        Ok(())
+    }
+
+    /// Seals the revoke block and hands its bytes back: stamps `r_count`
+    /// with the final byte offset (bytes used including the header — Linux
+    /// `flush_descriptor`, revoke.c:655), then the trailing tail checksum on
+    /// a csum layout, in that order (the tail covers `r_count`;
+    /// `jbd2_descriptor_block_csum_set` runs after the `r_count` store,
+    /// revoke.c:655-656) — through the same
+    /// [`JournalCsumSeed::stamp_block_tail`] funnel that seals descriptors.
+    ///
+    /// Consumes the writer, and is the ONLY way to get the block out of it.
+    pub(super) fn finish(mut self) -> Box<[u8; BLOCK_SIZE]> {
+        const R_COUNT_OFFSET: usize = core::mem::offset_of!(RawRevokeHeader, r_count);
+        // The cursor is bounded by `tag_area_end() <= BLOCK_SIZE`, so it
+        // always fits the on-disk u32.
+        let r_count =
+            u32::try_from(self.offset).expect("revoke cursor is bounded by the block size");
+        self.block[R_COUNT_OFFSET..R_COUNT_OFFSET + size_of::<Be32>()]
+            .copy_from_slice(Be32::new(r_count).as_bytes());
+        if let Some(seed) = self.seed {
+            seed.stamp_block_tail(&mut self.block);
+        }
+        self.block
+    }
+}
+
+/// Iterator over the block-number entries of one revoke block (see
+/// [`TagLayout::walk_revoke`]): yields each decoded number in on-disk order,
+/// stopping at the validated `r_count` bound. Infallible past the parse
+/// boundary — every entry inside the bound is a plain big-endian integer.
+pub(super) struct RevokeEntryWalk<'a> {
+    width: RevokeEntryWidth,
+    block: &'a [u8; BLOCK_SIZE],
+    offset: usize,
+    /// The validated `r_count`: one past the last byte entries may occupy.
+    end: usize,
+}
+
+impl Iterator for RevokeEntryWalk<'_> {
+    type Item = Ext4Bid;
+
+    fn next(&mut self) -> Option<Ext4Bid> {
+        // Linux's loop bound verbatim: `while (offset + record_len <= max)`
+        // (recovery.c:929) — a trailing partial entry is never read.
+        let end = self.offset + self.width.bytes();
+        if end > self.end {
+            return None;
+        }
+        let bytes = &self.block[self.offset..end];
+        self.offset = end;
+        Some(match self.width {
+            RevokeEntryWidth::Narrow => Ext4Bid::from(Be32::from_bytes(bytes).get()),
+            RevokeEntryWidth::Wide => Be64::from_bytes(bytes).get(),
+        })
     }
 }
 
@@ -2200,5 +2503,165 @@ mod tests {
         let before = raw;
         raw.stamp_checksum();
         assert_eq!(raw.as_bytes(), before.as_bytes());
+    }
+
+    // --- P7b-3/4: the revoke block format. ---
+
+    /// Per-block revoke entry capacity per layout: `(blocksize − 16-byte
+    /// header − tail) / entry_size`, with the entry width keyed on 64BIT
+    /// alone (the csum features reserve the 4-byte tail but do NOT widen
+    /// entries — Linux revoke.c:597-601 / recovery.c:926-927).
+    #[ktest]
+    fn revoke_entry_capacity_math() {
+        let capacity = |features: u32| {
+            TagLayout::from_features(features)
+                .unwrap()
+                .revoke_entries_per_block()
+        };
+        assert_eq!(capacity(0), (BLOCK_SIZE - 16) / 4);
+        assert_eq!(capacity(INCOMPAT_64BIT), (BLOCK_SIZE - 16) / 8);
+        assert_eq!(capacity(INCOMPAT_CSUM_V3), (BLOCK_SIZE - 4 - 16) / 4);
+        assert_eq!(
+            capacity(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT),
+            (BLOCK_SIZE - 4 - 16) / 8
+        );
+        assert_eq!(capacity(INCOMPAT_CSUM_V2), (BLOCK_SIZE - 4 - 16) / 4);
+        assert_eq!(
+            capacity(INCOMPAT_CSUM_V2 | INCOMPAT_64BIT),
+            (BLOCK_SIZE - 4 - 16) / 8
+        );
+    }
+
+    /// The revoke writer demands a seed exactly when the layout carries csum
+    /// v2/v3, like [`TagLayout::writer`].
+    #[ktest]
+    fn revoke_writer_requires_seed_iff_csum_layout() {
+        let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        let err = v3.revoke_writer(Tid::new(1), None).map(|_| ()).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        let v0 = TagLayout::from_features(0).unwrap();
+        let err = v0
+            .revoke_writer(Tid::new(1), Some(linux_seed()))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
+    /// v0 (4-byte entries, no tail) round trip with the exact on-disk bytes
+    /// pinned: header (magic / REVOKE / tid), `r_count` = 16 + n·4 (bytes
+    /// used INCLUDING the header — revoke.c:616/655), and each be32 entry at
+    /// its offset. A > 32-bit block number refuses with `EFBIG`.
+    #[ktest]
+    fn revoke_block_round_trip_v0() {
+        let layout = TagLayout::from_features(0).unwrap();
+        let mut writer = layout.revoke_writer(Tid::new(7), None).unwrap();
+        writer.put(0x123).unwrap();
+        writer.put(0xAB_CDEF).unwrap();
+        let err = writer.put((1 << 32) | 5).unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+        let block = writer.finish();
+
+        // Header: magic, REVOKE (5), tid 7; r_count = 16 + 2*4 = 24.
+        assert_eq!(&block[..4], &[0xC0, 0x3B, 0x39, 0x98]);
+        assert_eq!(&block[4..8], &[0x00, 0x00, 0x00, 0x05]);
+        assert_eq!(&block[8..12], &[0x00, 0x00, 0x00, 0x07]);
+        assert_eq!(&block[12..16], &[0x00, 0x00, 0x00, 24]);
+        // The two be32 entries; everything after stays zero.
+        assert_eq!(&block[16..20], &[0x00, 0x00, 0x01, 0x23]);
+        assert_eq!(&block[20..24], &[0x00, 0xAB, 0xCD, 0xEF]);
+        assert_eq!(&block[24..28], &[0u8; 4]);
+
+        let entries: Vec<_> = layout.walk_revoke(&block).unwrap().collect();
+        assert_eq!(entries, vec![0x123, 0xAB_CDEF]);
+    }
+
+    /// 64bit + csum_v3: 8-byte entries round-trip a > 32-bit block number,
+    /// `r_count` counts the wide strides, and `finish` seals the tail
+    /// checksum over the stamped `r_count` (the descriptor-tail formula —
+    /// one funnel, `stamp_block_tail`).
+    #[ktest]
+    fn revoke_block_round_trip_wide_with_tail_csum() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let seed = linux_seed();
+        let wide: Ext4Bid = (9 << 32) | 0x800;
+        let mut writer = layout.revoke_writer(Tid::new(3), Some(seed)).unwrap();
+        writer.put(0x42).unwrap();
+        writer.put(wide).unwrap();
+        let block = writer.finish();
+
+        // r_count = 16 + 2*8 = 32; entry 1 is the full be64.
+        assert_eq!(&block[12..16], &[0x00, 0x00, 0x00, 32]);
+        assert_eq!(&block[16..24], &[0, 0, 0, 0, 0, 0, 0, 0x42]);
+        assert_eq!(&block[24..32], &[0, 0, 0, 9, 0, 0, 0x08, 0x00]);
+        // The sealed tail verifies, and covers r_count: patching it breaks
+        // verification.
+        assert!(seed.verify_block_tail(&block));
+        let mut patched = *block;
+        patched[12] ^= 0x01;
+        assert!(!seed.verify_block_tail(&patched));
+
+        let entries: Vec<_> = layout.walk_revoke(&block).unwrap().collect();
+        assert_eq!(entries, vec![0x42, wide]);
+    }
+
+    /// The writer refuses an entry past the usable area (`ENOSPC`) at
+    /// exactly the capacity the math promises, on a csum layout (whose tail
+    /// the last entry must not touch).
+    #[ktest]
+    fn revoke_writer_bounds_at_capacity() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let capacity = layout.revoke_entries_per_block();
+        let mut writer = layout
+            .revoke_writer(Tid::new(1), Some(linux_seed()))
+            .unwrap();
+        for i in 0..capacity {
+            writer.put(Ext4Bid::try_from(i).unwrap()).unwrap();
+        }
+        let err = writer.put(0xFFFF).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        let block = writer.finish();
+        assert_eq!(layout.walk_revoke(&block).unwrap().count(), capacity);
+    }
+
+    /// The read boundary mirrors `scan_revoke_records` exactly: an `r_count`
+    /// past the usable area refuses (`EUCLEAN` — Linux `-EINVAL`,
+    /// recovery.c:923-924); one below the header yields zero entries; one
+    /// stopping mid-entry drops the partial trailing entry (the
+    /// `offset + record_len <= max` loop bound, recovery.c:929).
+    #[ktest]
+    fn revoke_walk_r_count_boundaries() {
+        let v0 = TagLayout::from_features(0).unwrap();
+        let mut writer = v0.revoke_writer(Tid::new(1), None).unwrap();
+        writer.put(0x11).unwrap();
+        writer.put(0x22).unwrap();
+        let mut block = *writer.finish();
+
+        let with_r_count = |block: &mut [u8; BLOCK_SIZE], count: u32| {
+            block[12..16].copy_from_slice(Be32::new(count).as_bytes());
+        };
+
+        // Past the block: refused (v0 has no tail, so the bound is 4096).
+        with_r_count(&mut block, BLOCK_SIZE as u32 + 1);
+        assert_eq!(
+            v0.walk_revoke(&block).map(|_| ()).unwrap_err().error(),
+            Errno::EUCLEAN
+        );
+        // On a csum layout the tail is off limits too.
+        let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        with_r_count(&mut block, BLOCK_SIZE as u32);
+        assert_eq!(
+            v3.walk_revoke(&block).map(|_| ()).unwrap_err().error(),
+            Errno::EUCLEAN
+        );
+
+        // Below the header: zero entries, not an error.
+        with_r_count(&mut block, 10);
+        assert_eq!(v0.walk_revoke(&block).unwrap().count(), 0);
+
+        // Mid-entry (16 + 4 + 2): only the first, complete entry is read.
+        with_r_count(&mut block, 22);
+        let entries: Vec<_> = v0.walk_revoke(&block).unwrap().collect();
+        assert_eq!(entries, vec![0x11]);
     }
 }

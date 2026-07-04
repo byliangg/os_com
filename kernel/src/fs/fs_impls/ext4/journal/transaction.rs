@@ -61,6 +61,7 @@
 use super::{
     super::{inode::Inode, prelude::*},
     Journal, Tid,
+    format::TagLayout,
     revoke::RevokeTable,
 };
 
@@ -446,11 +447,23 @@ impl Transaction {
         }
     }
 
-    /// The blocks currently in this transaction's revoke set, in block order.
-    /// Inspection accessor for the revoke/coverage tests.
-    #[cfg(ktest)]
+    /// The blocks currently in this transaction's revoke set, in block order
+    /// — what the commit pipeline serializes into the transaction's revoke
+    /// blocks (P7b-3), and the inspection accessor of the revoke/coverage
+    /// tests.
     pub(super) fn revoked_blocks(&self) -> impl Iterator<Item = Ext4Bid> + '_ {
         self.revoked.iter().copied()
+    }
+
+    /// The log blocks this transaction's revoke set serializes into:
+    /// `ceil(revokes / entries_per_block)` under `layout`'s entry geometry
+    /// ([`TagLayout::revoke_entries_per_block`]) — zero for an empty set.
+    /// One addend of the transaction's whole log footprint (the commit-time
+    /// fit guard) and of the capacity charge ([`check_capacity`]).
+    pub(super) fn nr_revoke_blocks(&self, layout: TagLayout) -> usize {
+        self.revoked
+            .len()
+            .div_ceil(layout.revoke_entries_per_block())
     }
 
     /// Patches a captured block's after-image in place (jbd2 `dirty_metadata`):
@@ -629,13 +642,35 @@ impl Handle {
         super::verify_running(&mut st.running, self)?.register_ordered_data(ino, inode, pages, len);
         Ok(())
     }
+
+    /// Aborts this handle's journal on a filesystem-detected inconsistency —
+    /// the minimal Linux `ext4_error` → `jbd2_journal_abort` shape, for a
+    /// site that has already run irreversible journal effects it cannot
+    /// unwind (see `BlockGroup::free_blocks`' system-zone refusal): further
+    /// `journal_start`s refuse `EIO` and sleepers wake with an error, so the
+    /// poisoned state can never act. Quietly a no-op when the journal is
+    /// already gone (unmount teardown) — there is nothing left to poison.
+    pub(in crate::fs::fs_impls::ext4) fn abort_journal_on_fs_error(&self) {
+        if let Ok(journal) = self.journal() {
+            journal.abort_for_fs_error();
+        }
+    }
 }
 
 /// Ensures adding `extra` credits keeps the running transaction within the
 /// journal's capacity, erroring `ENOSPC` otherwise. `running` must be the
 /// journal's running transaction.
+///
+/// Each whole revoke block the transaction's revoke set serializes into
+/// ([`Transaction::nr_revoke_blocks`]) is charged as one capture-equivalent,
+/// which keeps [`Journal::max_credits`]' footprint proof intact (see its
+/// docs: a revoke block costs one log block and no descriptor tag, so
+/// charging it like a capture over-counts). The charge is a snapshot — the
+/// revoke set grows at frees, which pass no capacity gate — so the
+/// commit-time exact fit guard stays the hard line; see `max_credits`.
 fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Result<()> {
-    let needed = running.nr_metadata_blocks() + running.outstanding_credits + extra;
+    let revoke_blocks = running.nr_revoke_blocks(journal.geometry().tag_layout());
+    let needed = running.nr_metadata_blocks() + revoke_blocks + running.outstanding_credits + extra;
     if needed > journal.max_credits() {
         return_errno_with_message!(Errno::ENOSPC, "journal transaction is full");
     }
@@ -1057,6 +1092,36 @@ mod tests {
         // commit = 62 <= 63 usable ring blocks.
         let j = journaled_fixture(64, 1, 1);
         assert_eq!(j.max_credits(), 60);
+    }
+
+    /// The capacity check charges the running transaction's revoke-block
+    /// footprint as capture-equivalents (P7b-3 space math): with a revoke
+    /// set spanning two v0 revoke blocks (1021 records at 1020 per block),
+    /// two credits of headroom vanish — an extension that would fit without
+    /// the charge is refused.
+    #[ktest]
+    fn capacity_charges_revoke_block_footprint() {
+        let j = journaled_fixture(64, 1, 1); // max_credits = 60
+        let mut h = journal_start(&j, 30).unwrap();
+        {
+            let mut st = j.state_write();
+            let running = st.running.as_mut().unwrap();
+            for i in 0..1021u64 {
+                running.forget_block(30_000 + i);
+            }
+            assert_eq!(
+                running.nr_revoke_blocks(j.geometry().tag_layout()),
+                2,
+                "1021 records at 1020 per v0 block"
+            );
+        }
+        // needed = 0 captures + 2 revoke blocks + 30 held + 28 extra = 60: fits.
+        journal_extend(&mut h, 28).unwrap();
+        // One more credit tips it to 61 > 60 — refused ONLY because of the
+        // revoke charge (0 + 58 + 1 = 59 would fit without it).
+        let err = journal_extend(&mut h, 1).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        journal_stop(h).unwrap();
     }
 
     #[ktest]

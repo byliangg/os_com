@@ -84,9 +84,11 @@
 //! ([`RevokeTable::retire_through`]): once the pass has applied (or
 //! suppressed) everything up to its `committed_tid` snapshot and advanced the
 //! tail past it, no runtime consumer can ever apply those transactions again.
-//! Mount-time recovery never reads this table — it rebuilds its own from the
-//! on-disk revoke blocks (PASS_REVOKE, P7b-4; until then a revoke block in
-//! the log still refuses the mount, unchanged).
+//! Mount-time recovery never reads this table — it rebuilds its own,
+//! recovery-local instance from the on-disk revoke blocks (PASS_REVOKE,
+//! P7b-4) and drops it with the recovered — hence emptied — log (see
+//! [`recovery`](super::recovery)'s module docs for why the live table
+//! correctly starts empty).
 //!
 //! # The forget-before-free protocol (effects at consumption)
 //!
@@ -121,9 +123,9 @@ use super::{super::prelude::*, Handle, JournalState, Tid};
 /// a single block, only the last one counts"* (revoke.c) — and consulted by
 /// the checkpoint/replay applier through [`suppresses`](Self::suppresses).
 /// Held in [`JournalState`](super::JournalState) under the journal state
-/// lock; checkpoint snapshots it by clone (the state lock is never held
-/// across device I/O). P7b-4's PASS_REVOKE builds a second, recovery-local
-/// instance of this same type from the on-disk revoke blocks.
+/// lock; checkpoint snapshots it by clone so its device I/O runs without the
+/// lock. PASS_REVOKE (P7b-4) builds a second, recovery-local instance of
+/// this same type from the on-disk revoke blocks.
 //
 // Visible at the `ext4` level only because it is a field of the
 // equally-visible `JournalState`; every method stays `pub(super)`, so the
@@ -134,8 +136,8 @@ pub(in crate::fs::fs_impls::ext4) struct RevokeTable {
 }
 
 impl RevokeTable {
-    /// An empty table — the journal's initial state, and what the mount-time
-    /// replay passes until PASS_REVOKE (P7b-4) builds the real one.
+    /// An empty table — the journal's initial state, and PASS_REVOKE's
+    /// starting point before it collects the log's revoke records.
     pub(super) const fn new() -> Self {
         Self {
             records: BTreeMap::new(),
@@ -144,8 +146,9 @@ impl RevokeTable {
 
     /// Records that `tid` revoked `bid`, keeping the newest tid if a record
     /// already exists (max-wins; commits publish in tid order, so this is
-    /// defensive — but it is also exactly PASS_REVOKE's rule, and b4 reuses
-    /// this funnel).
+    /// defensive there — but it is also exactly PASS_REVOKE's rule, jbd2
+    /// `jbd2_journal_set_revoke`, and that pass records in log order where
+    /// re-revokes do occur).
     pub(super) fn record(&mut self, bid: Ext4Bid, tid: Tid) {
         if self
             .records

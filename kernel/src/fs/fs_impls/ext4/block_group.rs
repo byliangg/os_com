@@ -885,7 +885,8 @@ impl BlockGroup {
     ///
     /// Returns the number of blocks actually freed (allocated-to-free
     /// transitions). Returns `Err(EIO)` when the range overlaps the group's
-    /// system zone.
+    /// system zone — **after aborting the journal** (under a live handle):
+    /// see the comment at the refusal.
     pub(super) fn free_blocks(
         &self,
         bit_range: Range<u32>,
@@ -900,6 +901,22 @@ impl BlockGroup {
         let mut metadata = self.metadata.write();
 
         if self.overlaps_system_zone_with(&metadata.desc, abs_range) {
+            // A free targeting the system zone is filesystem corruption
+            // (Linux refuses it through `ext4_error`, whose errors=journal
+            // shape aborts the journal). A plain error return is NOT enough
+            // under a handle (P7b-2 re-verification finding): the caller
+            // (`Ext4::free_blocks`) discharged this run's revoke duty BEFORE
+            // calling here, so the journal already holds a revoke record —
+            // and a cancelled capture — for blocks that were never freed and
+            // are still referenced; left standing, that revoke would
+            // suppress the blocks' legitimate log images at every later
+            // checkpoint/replay (silent rollback). The effects cannot be
+            // unwound (the revoke may have evicted a retained image), so
+            // abort loudly: an aborted journal accepts no further work, and
+            // the poisoned records can never act.
+            if let Some(handle) = handle {
+                handle.abort_journal_on_fs_error();
+            }
             return_errno_with_message!(Errno::EIO, "freeing blocks in system zone");
         }
 

@@ -1801,6 +1801,40 @@ mod tests {
         drop(op2);
     }
 
+    /// b2 re-verification rider: a system-zone free fails AFTER the run's
+    /// revoke duty was discharged (record-then-free), leaving a standing
+    /// revoke — and a cancelled capture — for never-freed, still-referenced
+    /// blocks; left to act, it would suppress their legitimate log images at
+    /// every later checkpoint/replay. The effects cannot be unwound, so the
+    /// path must abort the journal (the Linux `ext4_error` shape), not
+    /// error-return into continued operation with the poison standing.
+    #[ktest]
+    fn system_zone_free_aborts_journal() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Group 0's block bitmap: squarely in the system zone.
+        let bitmap_bid = f.ext4.block_group(0).metadata().desc.block_bitmap_bid();
+        let op = f.ext4.begin_op(8).unwrap();
+        let err = f
+            .ext4
+            .free_blocks(journal::forget(bitmap_bid, 1), op.get())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        // The poisoned revoke can never act: the journal is aborted and
+        // refuses all further work.
+        assert!(journal.is_aborted());
+        assert!(f.ext4.begin_op(8).is_err());
+        drop(op);
+    }
+
     /// RED-LINE ③ structural closure: a block freed under a live handle does
     /// not return to the allocator until the freeing transaction commits
     /// (Linux mballoc — *"we don't reuse the freed block until after the

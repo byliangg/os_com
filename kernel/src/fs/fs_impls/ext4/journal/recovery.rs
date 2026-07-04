@@ -9,26 +9,56 @@
 //! again. This is the mechanism the Phase-4 guest matrix (mount a dirty journal
 //! → recover → host `e2fsck -fn` CLEAN) depends on.
 //!
-//! # Two-pass model
+//! # Three-pass model
 //!
-//! jbd2 runs recovery in passes over the log, walking transactions from the tail
+//! jbd2 runs recovery in three passes over the log (`jbd2_journal_recover`,
+//! fs/jbd2/recovery.c:309-313), walking transactions from the tail
 //! (`s_start`) forward, each transaction bearing the next `tid` in sequence
-//! (`s_sequence`, `s_sequence + 1`, …). This module implements the two Phase-4
-//! passes; PASS_REVOKE is P7b (see the gaps below):
+//! (`s_sequence`, `s_sequence + 1`, …):
 //!
 //! - **PASS_SCAN** ([`scan_transaction`] in a loop): walks the log from the tail,
 //!   counting how many complete committed transactions are present, and finds the
 //!   first *uncommitted* tid — the boundary at which the log ends. It writes
 //!   nothing.
+//! - **PASS_REVOKE** ([`collect_transaction_revokes`] in a loop, P7b-4):
+//!   re-walks exactly the committed region, collecting every revoke block's
+//!   records into a recovery-local
+//!   [`RevokeTable`](super::revoke::RevokeTable) — `(block, tid of the
+//!   revoking transaction)`, max-wins across transactions (jbd2
+//!   `scan_revoke_records` + `jbd2_journal_set_revoke`).
 //! - **PASS_REPLAY** ([`apply_log_transaction`](super::checkpoint::apply_log_transaction)
-//!   in a loop): re-walks exactly the transactions SCAN found committed, applying
-//!   each after-image to its **final** location. This is the same primitive
-//!   checkpoint uses, so replay and checkpoint apply an identical transaction
-//!   identically.
+//!   in a loop): re-walks the same transactions, applying each after-image to
+//!   its **final** location — except images the revoke table suppresses: a
+//!   record `(B, tid_r)` suppresses B's image in every transaction with
+//!   `tid ≤ tid_r`, while a LATER transaction's image still applies
+//!   (RED-LINE ③; jbd2 `jbd2_journal_test_revoke`, recovery.c:647-653 —
+//!   *"a revoke record … revokes all blocks in that transaction and earlier
+//!   ones, but later transactions still need replayed"*, revoke.c:701-705).
+//!   The whole table is built BEFORE any replay, so a revoke in a late
+//!   transaction suppresses an early transaction's image even though the
+//!   early one replays first. This is the same primitive checkpoint uses, so
+//!   replay and checkpoint apply an identical transaction identically.
 //!
 //! After REPLAY the journal is marked clean on disk (`s_start = 0`) and the
 //! in-memory state is reset so continued operation assigns fresh tids past the
 //! recovered ones.
+//!
+//! The recovery-local revoke table **dies with recovery** — nothing of it is
+//! published into the live
+//! [`JournalState::revoked`](super::JournalState::revoked), which starts
+//! empty on every mount. That is correct because a revoke record's whole job
+//! is to guard *un-retired log images* of its block, and successful recovery
+//! retires the entire log: every committed image was applied (or
+//! suppressed) and the clean superblock (`s_start = 0`) moved the tail past
+//! all of it, so no consumer — runtime checkpoint or a future recovery —
+//! can ever apply those transactions again (the same argument as
+//! [`RevokeTable::retire_through`](super::revoke::RevokeTable), at the
+//! all-of-it boundary). jbd2 does the same: `jbd2_journal_clear_revoke`
+//! empties the table once recovery is over (revoke.c: *"once recovery is
+//! over, we need to clear the revoke table so that it can be reused by the
+//! running filesystem"*). A recovery that FAILS mid-replay leaves the
+//! journal dirty and the mount refused, so no live journal state exists to
+//! inherit anything.
 //!
 //! # The monotonic-sequence staleness argument (why SCAN's boundary is correct)
 //!
@@ -71,20 +101,12 @@
 //!
 //! # Gaps
 //!
-//! - **No PASS_REVOKE**: we write no revoke blocks, so a **valid-magic**
-//!   [`BLOCKTYPE_REVOKE`] block met during recovery means an interop
-//!   (Linux-written) log whose committed transactions carry revoke records we
-//!   cannot apply. Rather than silently under-replay it (treating the revoke
-//!   block as a boundary), SCAN refuses the mount with `EUCLEAN` — but only
-//!   behind the magic check: a garbage-magic block whose type bytes merely
-//!   read revoke is the ordinary log boundary (jbd2 breaks on bad magic
-//!   before dispatching on the type, fs/jbd2/recovery.c:545-548). Full revoke
-//!   replay-suppression is P7b.
 //! - **Checksums** (csum v2/v3 journals, admitted since P7a-4): SCAN verifies
-//!   the descriptor-tail and commit-block checksums (in the seal decision)
-//!   and REPLAY verifies the descriptor-tail and per-tag data checksums —
-//!   against what the commit pipeline stamps, so an own-write → own-recover
-//!   round trip verifies end to end. The jbd2 v1 COMPAT checksum
+//!   the chain-block tail checksums (descriptors AND revoke blocks, in the
+//!   seal decision) and the commit-block checksum; REPLAY verifies the
+//!   descriptor-tail and per-tag data checksums — against what the commit
+//!   pipeline stamps, so an own-write → own-recover round trip verifies end
+//!   to end. The jbd2 v1 COMPAT checksum
 //!   (`JBD2_FEATURE_COMPAT_CHECKSUM`'s accumulated `crc32_be`) is not modeled
 //!   — an unknown COMPAT bit is safe to ignore by definition. The
 //!   `2^32`-wrap ambiguity is NOT closed by any of this (see above).
@@ -117,20 +139,24 @@ use super::{
         BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC,
         RawJournalHeader,
     },
+    revoke::RevokeTable,
 };
 
 /// Scans one transaction at `start_log` expecting tid `expected_tid`, WITHOUT
 /// writing anything (jbd2 `do_one_pass` in `PASS_SCAN`).
 ///
-/// A transaction is a **descriptor chain**: zero or more descriptor blocks —
-/// each followed by the metadata blocks its tags count — terminated by a
-/// commit block, every one of them bearing `expected_tid`. jbd2 walks the
-/// chain flat (`do_one_pass` reads block after block; descriptors accumulate,
-/// and the same-tid commit block seals ALL of them, fs/jbd2/recovery.c:
-/// 531-560 dispatch); this mirrors that walk. The zero-descriptor case is
-/// real interop: a Linux `data=ordered` transaction that carried only file
-/// data commits as a bare commit block, and treating it as a boundary would
-/// silently under-replay everything after it.
+/// A transaction is a **descriptor chain**: zero or more revoke blocks
+/// (one-block chain members — P7b-3 writes them at the chain head; SCAN
+/// only steps over them, PASS_REVOKE reads them) and descriptor blocks —
+/// each descriptor followed by the metadata blocks its tags count —
+/// terminated by a commit block, every one of them bearing `expected_tid`.
+/// jbd2 walks the chain flat (`do_one_pass` reads block after block;
+/// descriptors accumulate, revoke blocks are skipped outside PASS_REVOKE
+/// (recovery.c:844-847), and the same-tid commit block seals ALL of them,
+/// fs/jbd2/recovery.c:531-560 dispatch); this mirrors that walk. The
+/// zero-descriptor case is real interop: a Linux `data=ordered` transaction
+/// that carried only file data commits as a bare commit block, and treating
+/// it as a boundary would silently under-replay everything after it.
 ///
 /// Returns `Some(next_start_log)` when the chain completes with a valid
 /// commit block for `expected_tid`. Returns `Ok(None)` at the **log
@@ -161,43 +187,50 @@ use super::{
 /// - A chain block's magic is wrong, or its `h_sequence != expected_tid` (a
 ///   stale block left by a previous log wrap, or a blank/never-written block —
 ///   the monotonic sequence is what tells a fresh chain block from a stale
-///   one), or its type is neither descriptor nor commit (jbd2's
-///   "unrecognised magic" scan end). The magic test runs FIRST, before any
-///   dispatch on the blocktype (jbd2 breaks on bad magic before dispatching,
-///   fs/jbd2/recovery.c:545-548): a boundary slot holds arbitrary old logged
-///   data — escaping sanitizes only a block's first four bytes — so its type
-///   bytes mean nothing until the magic vouches the block is a jbd2 header.
-///   A **valid-magic** [`BLOCKTYPE_REVOKE`] block is instead a hard error
-///   whatever its tid — conservatively even a stale-tid one, where jbd2
-///   would end the scan on the sequence check (recovery.c:555-558) before
-///   ever seeing the type; the deliberate Phase-4 politics (see the revoke
-///   gap in the module docs), now gated behind the magic.
+///   one), or its type is not a chain member — descriptor, revoke, or commit
+///   (jbd2's "unrecognised magic" scan end). The checks run in jbd2's exact
+///   order: magic FIRST (jbd2 breaks on bad magic before dispatching,
+///   fs/jbd2/recovery.c:545-548 — a boundary slot holds arbitrary old logged
+///   data, and escaping sanitizes only a block's first four bytes, so its
+///   type bytes mean nothing until the magic vouches for the header), then
+///   the sequence (recovery.c:555-558), then the type dispatch. A
+///   **stale-tid** revoke block therefore ends the scan at the sequence
+///   check like any other stale block — this retires the a5-era politics
+///   that refused a valid-magic revoke block at ANY tid (`EUCLEAN`), which
+///   was the honest bottom line while revoke records could not be applied
+///   and which would now brick mounts on a foreign wrap leftover.
 /// - A tag offset would run past its descriptor block (a malformed descriptor
 ///   is not a valid transaction; do not panic).
 /// - No commit block for `expected_tid` ever seals the chain (an interrupted
 ///   commit — descriptors and metadata were written but the commit record
 ///   never reached the platter, so the transaction did not commit).
-/// - A **bad descriptor-tail checksum with no valid commit block** downstream
-///   (csum journals only): the torn tail tore inside a descriptor itself.
+/// - A **bad chain-block tail checksum with no valid commit block**
+///   downstream (csum journals only): the torn tail tore inside a
+///   descriptor or revoke block itself.
 ///
 /// # Checksum politics (csum v2/v3 journals; `EUCLEAN`, not a boundary)
 ///
 /// Mirrors Linux `do_one_pass` PASS_SCAN, minus the two escapes we
 /// deliberately drop (documented divergences):
 ///
-/// - A bad **descriptor-tail** checksum does not fail the scan by itself —
-///   PASS_SCAN can meet stale lazy-init blocks, so jbd2 defers judgment
-///   (`need_check_commit_time`, fs/jbd2/recovery.c:571-586) until the commit
-///   slot; with a chain, the verdict accumulates across ALL its descriptors.
-///   If a valid commit block for the same tid seals the transaction, the
-///   descriptor corruption is real and the scan refuses (`EUCLEAN`) — the
-///   whole transaction, no partial-descriptor apply; jbd2 reaches the same
-///   refusal through the commit-time comparison (recovery.c:749-760,
-///   `-EFSBADCRC`). *Divergence*: jbd2 treats a **decreasing**
-///   `h_commit_sec` as stale pre-existing data and ends recovery
-///   successfully at this boundary (recovery.c:761-767); we always refuse —
-///   strictly safer (a refused mount, never an under-replayed one), and we
-///   never lazily init a journal ourselves.
+/// - A bad **chain-block tail** checksum (a descriptor's, recovery.c:571-586,
+///   or a revoke block's, recovery.c:835-841 — Linux runs the same deferral
+///   for both) does not fail the scan by itself — PASS_SCAN can meet stale
+///   lazy-init blocks, so jbd2 defers judgment (`need_check_commit_time`)
+///   until the commit slot; with a chain, the verdict accumulates across ALL
+///   its descriptor-class blocks. If a valid commit block for the same tid
+///   seals the transaction, the corruption is real and the scan refuses
+///   (`EUCLEAN`) — the whole transaction, no partial apply; jbd2 reaches the
+///   same refusal through the commit-time comparison (recovery.c:749-760,
+///   `-EFSBADCRC`). A torn revoke block in a SEALED transaction must refuse
+///   like a torn descriptor: silently boundary-ing it would under-suppress
+///   (replay freed blocks' stale images); silently skipping it would
+///   under-replay nothing but lose its revokes — both corruption.
+///   *Divergence*: jbd2 treats a **decreasing** `h_commit_sec` as stale
+///   pre-existing data and ends recovery successfully at this boundary
+///   (recovery.c:761-767); we always refuse — strictly safer (a refused
+///   mount, never an under-replayed one), and we never lazily init a
+///   journal ourselves.
 /// - A bad **commit-block** checksum on an otherwise matching commit block
 ///   refuses the scan (`EUCLEAN`): the transaction cannot prove it committed
 ///   intact. This is jbd2's sync-commit path (recovery.c:806-817 records
@@ -222,10 +255,10 @@ fn scan_transaction(
 ) -> Result<Option<u32>> {
     let seed = journal.geometry().csum_seed();
 
-    // The deferred descriptor-tail verdict, accumulated over every descriptor
-    // of the chain (see the checksum-politics doc above): judged only if a
-    // valid commit seals the transaction.
-    let mut descriptors_csum_ok = true;
+    // The deferred chain-block-tail verdict, accumulated over every
+    // descriptor AND revoke block of the chain (see the checksum-politics
+    // doc above): judged only if a valid commit seals the transaction.
+    let mut chain_tails_csum_ok = true;
     // Chain blocks consumed, for the anti-cycle bound (see the doc above).
     let mut consumed: u32 = 0;
 
@@ -248,35 +281,43 @@ fn scan_transaction(
             return Ok(None);
         }
 
-        // Revoke gap (full PASS_REVOKE is P7b): our own log never emits
-        // revoke blocks, so a valid-magic revoke block during recovery means
-        // an interop (Linux-written) journal whose committed transactions
-        // carry revoke records we cannot apply. Treating it as a clean
-        // boundary would silently under-replay a committed transaction (and
-        // everything after it), then stamp a too-small `s_sequence` on the
-        // clean superblock — corruption. Refuse the mount loudly instead,
-        // whatever the block's tid: conservatively even a stale-tid one
-        // (where jbd2 would end the scan on the sequence check,
-        // recovery.c:555-558, before ever seeing the type) — a real revoke
-        // block anywhere in the log window is evidence of revoke data we
-        // cannot honor yet.
-        if blocktype == BLOCKTYPE_REVOKE {
-            return_errno_with_message!(
-                Errno::EUCLEAN,
-                "journal contains revoke records; recovery unsupported until P7b"
-            );
+        // Boundary: a block from a different generation (wrong tid) marks
+        // the end of the committed log, BEFORE any dispatch on the type —
+        // jbd2's order (the sequence check, recovery.c:555-558, precedes the
+        // blocktype switch), which is what makes a stale-tid revoke block
+        // left by a foreign log or a previous wrap the ordinary boundary
+        // rather than anything to interpret. The monotonic `h_sequence`
+        // check is the crux: it distinguishes a freshly written chain block
+        // for `expected_tid` from a stale one. Reached mid-chain, this is
+        // the interrupted commit: chain blocks were written but the commit
+        // record never made it, so the transaction did not commit.
+        if Tid::new(header.h_sequence.get()) != expected_tid {
+            return Ok(None);
         }
 
-        // Boundary: a block from a different generation (wrong tid), or a
-        // type that is neither descriptor nor commit, marks the end of the
-        // committed log. The monotonic `h_sequence` check is the crux: it
-        // distinguishes a freshly written chain block for `expected_tid`
-        // from a stale one a previous wrap left behind. Reached mid-chain,
-        // this is the interrupted commit: descriptors were written but the
-        // commit record never made it, so the transaction did not commit.
-        if Tid::new(header.h_sequence.get()) != expected_tid
-            || (blocktype != BLOCKTYPE_DESCRIPTOR && blocktype != BLOCKTYPE_COMMIT)
-        {
+        // A same-tid revoke block is an ordinary one-block chain member
+        // (P7b-3 writes them at the chain head): its tail checksum joins the
+        // deferred verdict exactly like a descriptor's (jbd2 sets
+        // `need_check_commit_time` for a csum-bad revoke block in PASS_SCAN,
+        // recovery.c:835-841), its records are PASS_REVOKE's business
+        // (SCAN reads no entries, like jbd2's `if (pass != PASS_REVOKE)`
+        // skip, recovery.c:844-847), and the cursor steps over it.
+        if blocktype == BLOCKTYPE_REVOKE {
+            chain_tails_csum_ok &= seed.is_none_or(|s| s.verify_block_tail(&block));
+            log = journal.geometry().next_log_block(log);
+            consumed += 1;
+            if consumed > journal.geometry().maxlen() {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal transaction chain exceeds the log size"
+                );
+            }
+            continue;
+        }
+
+        // Boundary: a same-tid block of a type that is not a chain member
+        // (jbd2's "unrecognised magic" default arm, recovery.c:858-861).
+        if blocktype != BLOCKTYPE_DESCRIPTOR && blocktype != BLOCKTYPE_COMMIT {
             return Ok(None);
         }
 
@@ -284,14 +325,15 @@ fn scan_transaction(
             // A matching commit block seals the transaction ONLY if the
             // checksums agree (csum journals; see the politics doc above):
             //
-            // - The deferred descriptor verdict lands here: a valid commit
-            //   sealing a checksum-bad descriptor (any of the chain) is real
-            //   corruption, never a boundary (jbd2 recovery.c:749-760, minus
-            //   the commit-time staleness escape we deliberately drop).
-            if !descriptors_csum_ok {
+            // - The deferred chain-tail verdict lands here: a valid commit
+            //   sealing a checksum-bad descriptor or revoke block (any of
+            //   the chain) is real corruption, never a boundary (jbd2
+            //   recovery.c:749-760, minus the commit-time staleness escape
+            //   we deliberately drop).
+            if !chain_tails_csum_ok {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
-                    "journal descriptor checksum invalid on a committed transaction"
+                    "journal chain block checksum invalid on a committed transaction"
                 );
             }
             // - The commit block must itself re-checksum, or the transaction
@@ -316,7 +358,7 @@ fn scan_transaction(
         // (recovery.c:571-586) because the block may be stale garbage whose
         // transaction never committed (then it is the normal boundary, not
         // corruption).
-        descriptors_csum_ok &= seed.is_none_or(|s| s.verify_block_tail(&block));
+        chain_tails_csum_ok &= seed.is_none_or(|s| s.verify_block_tail(&block));
 
         // Walk its tag array (the byte geometry lives in ONE place, the
         // journal's `TagLayout`, shared with the writer and the
@@ -338,8 +380,8 @@ fn scan_transaction(
             consumed += 1;
         }
 
-        // The next chain block — another descriptor, or the commit — follows
-        // this descriptor's last metadata block.
+        // The next chain block — another descriptor, a revoke block, or the
+        // commit — follows this descriptor's last metadata block.
         log = journal.geometry().next_log_block(log);
         consumed += 1;
 
@@ -355,13 +397,91 @@ fn scan_transaction(
     }
 }
 
+/// Walks one SCAN-sealed transaction's chain, collecting every revoke
+/// block's records into `table` (jbd2 `do_one_pass` in `PASS_REVOKE` +
+/// `scan_revoke_records`, fs/jbd2/recovery.c:844-856 / 905-943): each entry
+/// of every same-tid revoke block records `(blocknr, expected_tid)`, with
+/// max-wins across transactions ([`RevokeTable::record`], jbd2
+/// `jbd2_journal_set_revoke` — *"only record the latest sequence number"*,
+/// revoke.c:692-696). Descriptors' tagged data blocks are stepped over
+/// positionally — nothing but the chain blocks is read. Returns the log
+/// block after the sealing commit — the next transaction's start; the same
+/// cursor arithmetic as SCAN and REPLAY, so the k-th step of every pass
+/// lands on the same block.
+///
+/// No checksum is re-verified here, mirroring Linux (revoke-block tails are
+/// verified only in PASS_SCAN, recovery.c:835-841): SCAN's deferred verdict
+/// already refused any SEALED transaction with a torn chain-block tail
+/// (`EUCLEAN`), and this pass only walks transactions SCAN sealed. A
+/// structural violation (bad magic / tid / type, a malformed tag array or
+/// `r_count`, an over-long chain) is therefore real corruption (`EUCLEAN`),
+/// exactly as in the replay walk — never a boundary.
+fn collect_transaction_revokes(
+    journal: &Journal,
+    device: &dyn BlockDevice,
+    start_log: u32,
+    expected_tid: Tid,
+    table: &mut RevokeTable,
+) -> Result<u32> {
+    // Chain blocks consumed, for the anti-cycle bound (the scanner's same
+    // defensive divergence).
+    let mut consumed: u32 = 0;
+    let mut log = start_log;
+    loop {
+        let mut block = [0u8; BLOCK_SIZE];
+        journal.geometry().read_log_block(device, log, &mut block)?;
+        let header = RawJournalHeader::parse(&block);
+        if header.h_magic.get() != JBD2_MAGIC {
+            return_errno_with_message!(Errno::EUCLEAN, "journal chain block has bad magic");
+        }
+        if Tid::new(header.h_sequence.get()) != expected_tid {
+            return_errno_with_message!(Errno::EUCLEAN, "journal chain block has an unexpected tid");
+        }
+
+        match header.h_blocktype.get() {
+            // The commit seals the chain; the next transaction follows it.
+            BLOCKTYPE_COMMIT => return Ok(journal.geometry().next_log_block(log)),
+            // The pass's whole point: record every entry under this
+            // transaction's tid.
+            BLOCKTYPE_REVOKE => {
+                for blocknr in journal.geometry().tag_layout().walk_revoke(&block)? {
+                    table.record(blocknr, expected_tid);
+                }
+            }
+            // A descriptor: step over its tagged data blocks positionally.
+            BLOCKTYPE_DESCRIPTOR => {
+                for tag in journal.geometry().tag_layout().walk(&block) {
+                    tag?;
+                    log = journal.geometry().next_log_block(log);
+                    consumed += 1;
+                }
+            }
+            _ => {
+                return_errno_with_message!(Errno::EUCLEAN, "unexpected journal chain block type")
+            }
+        }
+
+        log = journal.geometry().next_log_block(log);
+        consumed += 1;
+        if consumed > journal.geometry().maxlen() {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal transaction chain exceeds the log size"
+            );
+        }
+    }
+}
+
 /// Recovers the journal after a crash (jbd2 `jbd2_journal_recover`): PASS_SCAN
-/// finds the last committed transaction, PASS_REPLAY applies every committed
-/// transaction to its final locations, then the journal is marked clean.
+/// finds the last committed transaction, PASS_REVOKE collects the committed
+/// region's revoke records, PASS_REPLAY applies every committed transaction
+/// to its final locations under revoke suppression, then the journal is
+/// marked clean.
 ///
 /// Idempotent — running it twice (or after a crash mid-recovery, before the
-/// clean-superblock write was durable) replays the same committed transactions
-/// and reaches the same clean state (see the module docs).
+/// clean-superblock write was durable) rebuilds the same revoke table,
+/// replays the same committed transactions (suppressing the same images) and
+/// reaches the same clean state (see the module docs).
 ///
 /// # Passes
 ///
@@ -370,26 +490,38 @@ fn scan_transaction(
 /// 2. **PASS_SCAN**: from `(s_start, s_sequence)`, [`scan_transaction`] each
 ///    transaction, counting the committed ones until it returns `None` (the
 ///    boundary). `end_tid` is then the first uncommitted / next-expected tid.
-/// 3. **PASS_REPLAY**: re-walk exactly those `count` transactions with
+/// 3. **PASS_REVOKE**: re-walk those `count` transactions with
+///    [`collect_transaction_revokes`], building the recovery-local
+///    [`RevokeTable`] — completed BEFORE any replay, so a late transaction's
+///    revoke suppresses an early transaction's image (jbd2 runs the passes
+///    in this order for exactly this reason, recovery.c:309-313).
+/// 4. **PASS_REPLAY**: re-walk the same `count` transactions with
 ///    [`apply_log_transaction`](super::checkpoint::apply_log_transaction),
-///    applying each to its final locations. Each was found committed by SCAN, so
-///    a failure here is real corruption and propagates.
-/// 4. **Barrier**, so every replayed final-location write is durable before the
+///    applying each to its final locations — minus the images the table
+///    suppresses (`(B, tid_r)` suppresses B in transactions with
+///    `tid ≤ tid_r`; later ones replay). Each was found committed by SCAN,
+///    so a failure here is real corruption and propagates.
+/// 5. **Barrier**, so every replayed final-location write is durable before the
 ///    journal is marked clean.
-/// 5. Rewrite the on-disk journal superblock to the clean state
+/// 6. Rewrite the on-disk journal superblock to the clean state
 ///    (`s_start = 0`, `s_sequence = end_tid`, `s_head = first`), then barrier.
-/// 6. Reset the in-memory journal state to the clean post-recovery state.
+/// 7. Reset the in-memory journal state to the clean post-recovery state.
+///    The revoke table is dropped here, NOT published into the live
+///    `JournalState.revoked` — correct because the log the records guarded
+///    is now empty (see the module docs; jbd2's
+///    `jbd2_journal_clear_revoke`).
 ///
-/// # SCAN/REPLAY count agreement
+/// # Pass count agreement
 ///
-/// REPLAY re-walks from the identical `(s_start, s_sequence)` start with the same
-/// per-tag / wrap arithmetic as SCAN (both use
+/// REVOKE and REPLAY re-walk from the identical `(s_start, s_sequence)` start
+/// with the same per-tag / wrap arithmetic as SCAN (all three use
 /// [`next_log_block`](super::JournalGeometry::next_log_block) and the same
 /// offset stride, and [`apply_log_transaction`] is the exact reader
-/// [`scan_transaction`] mirrors), so the k-th REPLAY step lands on the same log
-/// block SCAN's k-th step did and consumes the same tid. Replaying exactly
-/// `count` transactions therefore stops precisely at the boundary SCAN found — no
-/// interrupted-tail transaction is ever replayed.
+/// [`scan_transaction`] and [`collect_transaction_revokes`] mirror), so the
+/// k-th step of every pass lands on the same log block and consumes the same
+/// tid. Walking exactly `count` transactions therefore stops precisely at
+/// the boundary SCAN found — no interrupted-tail transaction is ever read
+/// for revokes or replayed.
 pub(in crate::fs::fs_impls::ext4) fn recover(
     journal: &Journal,
     device: &dyn BlockDevice,
@@ -422,6 +554,20 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     }
     let end_tid = tid;
 
+    // --- PASS_REVOKE: build the recovery-local revoke table over the WHOLE
+    // committed region, before any replay (jbd2 recovery.c:311 runs it to
+    // completion between SCAN and REPLAY): a revoke in transaction k must
+    // suppress a block's images in transactions ≤ k, which replay FIRST.
+    let mut revoked = RevokeTable::new();
+    {
+        let mut log = s_start;
+        let mut tid = s_sequence;
+        for _ in 0..count {
+            log = collect_transaction_revokes(journal, device, log, tid, &mut revoked)?;
+            tid = tid.next();
+        }
+    }
+
     // --- PASS_REPLAY: apply exactly the `count` committed transactions. ---
     // Re-walk from the same tail with the same tids; each was found committed by
     // SCAN, so `apply_log_transaction` must succeed (an error is real corruption
@@ -429,16 +575,13 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     // `count` transactions stops exactly at the boundary — an interrupted tail is
     // never replayed. (When `count == 0` nothing is replayed: the log records a
     // start but the first block is not a valid committed transaction; recovery
-    // just marks the journal clean with `end_tid == s_sequence`.)
+    // just marks the journal clean with `end_tid == s_sequence`.) The revoke
+    // table suppresses the freed blocks' stale images (RED-LINE ③): applying
+    // one would clobber the block's post-free reuse with pre-free bytes.
     let mut log = s_start;
     let mut tid = s_sequence;
-    // No PASS_REVOKE yet (P7b-4): replay runs with an EMPTY revoke table — a
-    // valid revoke block in the log already refused the mount at SCAN, so no
-    // suppression can be owed here. b4 replaces this with the table built
-    // from the log's revoke blocks, through this same parameter.
-    let no_revokes = super::revoke::RevokeTable::new();
     for _ in 0..count {
-        log = apply_log_transaction(journal, device, log, tid, &no_revokes)?;
+        log = apply_log_transaction(journal, device, log, tid, &revoked)?;
         tid = tid.next();
     }
 
@@ -1051,41 +1194,437 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), 2);
     }
 
-    /// A VALID-magic revoke block still refuses recovery (`EUCLEAN`)
-    /// whatever its tid: same-tid (real revoke data we cannot honor until
-    /// P7b) and stale-tid (deliberately more conservative than jbd2, which
-    /// would end the scan on the sequence check, recovery.c:555-558) alike.
-    /// The refusal politics are pinned — behind the magic gate only.
+    /// The P7b-4 revoke-block scan politics, replacing the a5-era
+    /// `scan_refuses_valid_magic_revoke_block_any_tid` (which pinned the
+    /// honest-bottom-line refusal of ANY valid-magic revoke block while
+    /// revoke records could not be applied — both halves of that refusal are
+    /// retired):
+    ///
+    /// - A **same-tid** revoke block is an ordinary chain member: the scan
+    ///   steps over it and the same-tid commit still seals the transaction
+    ///   (jbd2 skips revoke blocks outside PASS_REVOKE, recovery.c:844-847).
+    /// - A **stale-tid** revoke block is the ordinary log boundary — jbd2's
+    ///   sequence check precedes the type dispatch (recovery.c:555-558) — so
+    ///   a foreign (Linux-written, previous-wrap) revoke leftover no longer
+    ///   bricks the mount; recovery ends there and cleans up normally.
     #[ktest]
-    fn scan_refuses_valid_magic_revoke_block_any_tid() {
+    fn scan_walks_same_tid_revoke_and_bounds_at_stale_tid() {
         crate::time::clocks::init_for_ktest();
         let f = journaled_fixture(16, 1, 1);
         let device = f.fixture.ext4.block_device();
 
-        let t1 = make_txn(Tid::new(1), &[(500u64, tagged_block(b"REVOKED0"))]);
+        let dest = 500u64;
+        let content = tagged_block(b"REVOKED0");
+        let t1 = make_txn(Tid::new(1), &[(dest, content)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
 
-        // tid 2 = the expected (same-tid) case; tid 99 = a stale-tid one.
-        for tid_in_block in [2u32, 99u32] {
+        let hand_built_revoke = |tid_in_block: u32| {
             let mut revoke = [0u8; BLOCK_SIZE];
             revoke[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
             revoke[4..8].copy_from_slice(&BLOCKTYPE_REVOKE.to_be_bytes());
             revoke[8..12].copy_from_slice(&tid_in_block.to_be_bytes());
-            write_log_block_at(&f, 4, &revoke);
+            // r_count = 16: a header-only (zero-entry) revoke block.
+            revoke[12..16].copy_from_slice(&16u32.to_be_bytes());
+            revoke
+        };
 
-            let err =
-                scan_transaction(f.journal.as_ref(), device.as_ref(), 4, Tid::new(2)).unwrap_err();
-            assert_eq!(err.error(), Errno::EUCLEAN, "tid {tid_in_block}");
-            // Recovery refuses too, leaving the journal dirty for a repair
-            // tool — never a clean-marked under-replay.
-            let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
-            assert_eq!(err.error(), Errno::EUCLEAN, "tid {tid_in_block}");
+        // Same-tid: plant [revoke tid2 @4][commit tid2 @5] — the scan steps
+        // over the revoke block and seals at the commit.
+        write_log_block_at(&f, 4, &hand_built_revoke(2));
+        let commit_only = RawCommitBlock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_COMMIT),
+                h_sequence: Be32::new(2),
+            },
+            ..Default::default()
+        };
+        let mut commit_block = [0u8; BLOCK_SIZE];
+        commit_block[..size_of::<RawCommitBlock>()].copy_from_slice(commit_only.as_bytes());
+        write_log_block_at(&f, 5, &commit_block);
+        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), 4, Tid::new(2))
+            .unwrap()
+            .expect("a same-tid revoke block is a chain member, sealed by the commit");
+        assert_eq!(next, 6);
+
+        // Stale-tid: a valid-magic revoke block bearing tid 99 where tid 2
+        // is expected is the boundary — not a refusal, not a chain member.
+        write_log_block_at(&f, 4, &hand_built_revoke(99));
+        assert!(
+            scan_transaction(f.journal.as_ref(), device.as_ref(), 4, Tid::new(2))
+                .unwrap()
+                .is_none()
+        );
+
+        // Full recovery survives the stale-tid leftover: T1 replays and the
+        // journal is left clean (`s_sequence` = 2 — T2 never committed).
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(read_final_block(&f, dest), content);
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 2);
+    }
+
+    // --- P7b-3/4: revoke blocks in the log and PASS_REVOKE. ---
+
+    /// The revoke serialization across admitted feature sets, pinned on the
+    /// raw log bytes: the revoke block heads the chain, its entry width
+    /// follows the 64BIT feature (be32 vs be64 — revoke.c:597-601),
+    /// `r_count` counts bytes including the 16-byte header (revoke.c:655),
+    /// the block bears the transaction's tid, and on a csum layout the tail
+    /// checksum verifies under the journal's seed.
+    #[ktest]
+    fn commit_writes_revoke_records_across_feature_sets() {
+        crate::time::clocks::init_for_ktest();
+        for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
+            let f = feature_journaled_fixture(features, 16, 1, 1, 0);
+            let device = f.fixture.ext4.block_device();
+            let wide_ok = features & INCOMPAT_64BIT != 0;
+
+            let mut txn = make_txn(Tid::new(1), &[(700u64, tagged_block(b"RVKBYTES"))]);
+            txn.forget_block(0x123);
+            txn.forget_block(0x456);
+            let wide: Ext4Bid = (7 << 32) | 0x42;
+            if wide_ok {
+                txn.forget_block(wide);
+            }
+            commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+            let revoke = read_log_block_at(&f, 1);
+            let header = RawJournalHeader::parse(&revoke);
+            assert_eq!(header.h_magic.get(), JBD2_MAGIC, "features {features:#x}");
             assert_eq!(
-                read_journal_super(&f).s_start.get(),
-                1,
-                "tid {tid_in_block}"
+                header.h_blocktype.get(),
+                BLOCKTYPE_REVOKE,
+                "features {features:#x}"
+            );
+            assert_eq!(header.h_sequence.get(), 1, "features {features:#x}");
+            if wide_ok {
+                // Three 8-byte entries: r_count = 16 + 24 = 40.
+                assert_eq!(&revoke[12..16], &[0, 0, 0, 40], "features {features:#x}");
+                assert_eq!(&revoke[16..24], &0x123u64.to_be_bytes());
+                assert_eq!(&revoke[24..32], &0x456u64.to_be_bytes());
+                assert_eq!(&revoke[32..40], &wide.to_be_bytes());
+            } else {
+                // Two 4-byte entries: r_count = 16 + 8 = 24.
+                assert_eq!(&revoke[12..16], &[0, 0, 0, 24], "features {features:#x}");
+                assert_eq!(&revoke[16..20], &0x123u32.to_be_bytes());
+                assert_eq!(&revoke[20..24], &0x456u32.to_be_bytes());
+            }
+            if features & INCOMPAT_CSUM_V3 != 0 {
+                let seed = JournalCsumSeed::for_test(&CSUM_UUID);
+                assert!(seed.verify_block_tail(&revoke), "features {features:#x}");
+            }
+            // The metadata descriptor follows the revoke block; the commit
+            // (at revoke + desc + 1 data) seals.
+            assert_eq!(
+                RawJournalHeader::parse(&read_log_block_at(&f, 2))
+                    .h_blocktype
+                    .get(),
+                BLOCKTYPE_DESCRIPTOR,
+                "features {features:#x}"
+            );
+            assert_eq!(
+                RawJournalHeader::parse(&read_log_block_at(&f, 4))
+                    .h_blocktype
+                    .get(),
+                BLOCKTYPE_COMMIT,
+                "features {features:#x}"
             );
         }
+    }
+
+    /// The money test (RED-LINE ③, the 0x52-style oracle in ktest form):
+    /// a block journaled by T1, freed (revoked) by T2, and reused as DATA —
+    /// its new owner's bytes reach the final location directly — keeps the
+    /// NEW content across crash-recovery: PASS_REVOKE's record `(B, 2)`
+    /// suppresses T1's stale image, while T1's un-revoked sibling and T2's
+    /// own capture still replay. Run per admitted feature set.
+    #[ktest]
+    fn recovery_suppresses_revoked_block_replay() {
+        crate::time::clocks::init_for_ktest();
+        for features in [0, INCOMPAT_CSUM_V3, INCOMPAT_CSUM_V3 | INCOMPAT_64BIT] {
+            let f = feature_journaled_fixture(features, 24, 1, 1, 0);
+            let device = f.fixture.ext4.block_device();
+
+            let freed = 500u64;
+            let sibling = 800u64;
+            let t2_dest = 900u64;
+            let old_image = tagged_block(b"OLDMETA!");
+            let sibling_img = tagged_block(b"SIBLING!");
+            let t2_img = tagged_block(b"T2BLOCK!");
+
+            // T1 journals the doomed block and a sibling; T2 revokes the
+            // doomed block (its free) and captures its own metadata.
+            let t1 = make_txn(Tid::new(1), &[(freed, old_image), (sibling, sibling_img)]);
+            commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+            let mut t2 = make_txn(Tid::new(2), &[(t2_dest, t2_img)]);
+            t2.forget_block(freed);
+            commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+
+            // The freed block's reuse as data: the new owner's bytes sit at
+            // the final location (data writes bypass the journal). This is
+            // exactly what an unsuppressed replay of T1 would destroy.
+            let sentinel = tagged_block(b"REUSED-DATA-0x52");
+            write_final_block(&f, freed, &sentinel);
+
+            recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+            assert_eq!(
+                read_final_block(&f, freed),
+                sentinel,
+                "features {features:#x}: the revoked image must NOT be applied"
+            );
+            assert_eq!(
+                read_final_block(&f, sibling),
+                sibling_img,
+                "features {features:#x}: the un-revoked sibling still replays"
+            );
+            assert_eq!(
+                read_final_block(&f, t2_dest),
+                t2_img,
+                "features {features:#x}"
+            );
+            let sb = read_journal_super(&f);
+            assert_eq!(sb.s_start.get(), 0, "features {features:#x}");
+            assert_eq!(sb.s_sequence.get(), 3, "features {features:#x}");
+        }
+    }
+
+    /// The other half of the suppression window: an image in a transaction
+    /// NEWER than the revoke still replays — *"if there is a log entry for a
+    /// block beyond the last revoke, then that log entry still gets
+    /// replayed"* (revoke.c; `jbd2_journal_test_revoke`, recovery.c:632-636).
+    /// T1 journals B, T2 revokes it, T3 re-journals it: recovery lands T3's
+    /// image (tid 3 > tid_r 2), never T1's.
+    #[ktest]
+    fn recovery_replays_image_newer_than_revoke() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let reused = 500u64;
+        let old_image = tagged_block(b"OLD-LIFE");
+        let new_image = tagged_block(b"NEW-LIFE");
+
+        let t1 = make_txn(Tid::new(1), &[(reused, old_image)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        let mut t2 = make_txn(Tid::new(2), &[(800u64, tagged_block(b"T2OTHER!"))]);
+        t2.forget_block(reused);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        // T3: the block reallocated as metadata again, with a new image.
+        let t3 = make_txn(Tid::new(3), &[(reused, new_image)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t3).unwrap();
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        assert_eq!(read_final_block(&f, reused), new_image);
+        assert_eq!(read_final_block(&f, 800), tagged_block(b"T2OTHER!"));
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 4);
+    }
+
+    /// A revoke set larger than one block's entry capacity splits across
+    /// revoke blocks (Linux flushes and starts a fresh descriptor at the
+    /// space bound, revoke.c:602-607), pinned on the raw bytes — the first
+    /// block completely full (v0: r_count = 16 + 1020·4 = 4096, the exact
+    /// `j_blocksize` bound) — and PASS_REVOKE honors records from BOTH
+    /// blocks: doomed blocks landing in either are suppressed.
+    #[ktest]
+    fn recovery_honors_multi_block_revoke_set() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let per_block = f.journal.geometry().tag_layout().revoke_entries_per_block();
+        assert_eq!(per_block, 1020); // v0: (4096 - 16) / 4
+
+        // Two doomed blocks journaled by T1 (both within the fixture's
+        // 2048-block disk — they get sentinel content below): `doomed_lo`
+        // sorts into revoke block #1, `doomed_hi` into #2 (the revoke set
+        // serializes in block order and splits at `per_block`).
+        let doomed_lo = 500u64;
+        let doomed_hi = 2040u64;
+        let t1 = make_txn(
+            Tid::new(1),
+            &[
+                (doomed_lo, tagged_block(b"DOOMEDLO")),
+                (doomed_hi, tagged_block(b"DOOMEDHI")),
+            ],
+        );
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+
+        // T2 revokes both plus `per_block - 1` fillers sorting between them
+        // (record numbers only — nothing is ever written at a filler): 1021
+        // records total, so the sorted set splits
+        // [doomed_lo, fillers…] | [doomed_hi].
+        let mut t2 = make_txn(Tid::new(2), &[(600u64, tagged_block(b"T2CAPTUR"))]);
+        t2.forget_block(doomed_lo);
+        t2.forget_block(doomed_hi);
+        for i in 0..u64::try_from(per_block - 1).unwrap() {
+            t2.forget_block(1000 + i);
+        }
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+
+        // Raw bytes: T1 occupies log [1..=4]; T2's chain is [revoke #1 @5]
+        // [revoke #2 @6][descriptor @7][data @8][commit @9]. Block #1 is
+        // FULL: r_count = 4096; block #2 holds the one leftover entry.
+        let revoke1 = read_log_block_at(&f, 5);
+        let revoke2 = read_log_block_at(&f, 6);
+        assert_eq!(
+            RawJournalHeader::parse(&revoke1).h_blocktype.get(),
+            BLOCKTYPE_REVOKE
+        );
+        assert_eq!(
+            RawJournalHeader::parse(&revoke2).h_blocktype.get(),
+            BLOCKTYPE_REVOKE
+        );
+        assert_eq!(&revoke1[12..16], &4096u32.to_be_bytes());
+        assert_eq!(
+            &revoke1[16..20],
+            &u32::try_from(doomed_lo).unwrap().to_be_bytes()
+        );
+        assert_eq!(&revoke2[12..16], &20u32.to_be_bytes());
+        assert_eq!(
+            &revoke2[16..20],
+            &u32::try_from(doomed_hi).unwrap().to_be_bytes()
+        );
+        assert_eq!(
+            RawJournalHeader::parse(&read_log_block_at(&f, 7))
+                .h_blocktype
+                .get(),
+            BLOCKTYPE_DESCRIPTOR
+        );
+
+        // Both doomed blocks reused as data; recovery must preserve both —
+        // the suppression reads records from BOTH revoke blocks.
+        let sentinel_lo = tagged_block(b"SENTINEL-LO");
+        let sentinel_hi = tagged_block(b"SENTINEL-HI");
+        write_final_block(&f, doomed_lo, &sentinel_lo);
+        write_final_block(&f, doomed_hi, &sentinel_hi);
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        assert_eq!(read_final_block(&f, doomed_lo), sentinel_lo);
+        assert_eq!(read_final_block(&f, doomed_hi), sentinel_hi);
+        assert_eq!(read_final_block(&f, 600), tagged_block(b"T2CAPTUR"));
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
+    }
+
+    /// A torn revoke block follows the a3 deferred-verdict politics exactly
+    /// like a torn descriptor: bad tail checksum in a SEALED transaction →
+    /// `EUCLEAN` (nothing applied, journal left dirty); with the commit torn
+    /// away → the ordinary boundary.
+    #[ktest]
+    fn scan_defers_torn_revoke_tail_to_the_seal() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(24, 1, 7);
+        let device = f.fixture.ext4.block_device();
+
+        let dest = 500u64;
+        let mut txn = make_txn(Tid::new(7), &[(dest, tagged_block(b"RVK-TORN"))]);
+        txn.forget_block(777);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+        // Chain: [revoke @1][descriptor @2][data @3][commit @4].
+
+        // Corrupt the revoke block's stored tail checksum.
+        let mut revoke = read_log_block_at(&f, 1);
+        revoke[BLOCK_SIZE - 1] ^= 0xFF;
+        write_log_block_at(&f, 1, &revoke);
+
+        let err =
+            scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7)).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        // Recovery refuses before REPLAY: nothing applied, journal dirty.
+        let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+        assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 1);
+
+        // Tear the commit away: the same torn revoke block is now just the
+        // torn-tail boundary.
+        write_log_block_at(&f, 4, &[0u8; BLOCK_SIZE]);
+        assert!(
+            scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Revoke blocks in a WRAP-SPANNING chain: a transaction whose chain —
+    /// two revoke blocks (a split set), two descriptors, 256 after-images —
+    /// wraps the ring end walks identically through SCAN, PASS_REVOKE, and
+    /// REPLAY (same cursor arithmetic), and its revokes still suppress.
+    #[ktest]
+    fn recover_replays_wrap_spanning_chain_with_revoke_blocks() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(300, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let layout = f.journal.geometry().tag_layout();
+        let per_descriptor = layout.tags_per_descriptor();
+        let per_revoke_block = layout.revoke_entries_per_block();
+        assert_eq!(per_descriptor, 254); // csum_v3 16-byte tags
+        assert_eq!(per_revoke_block, 1019); // csum_v3: (4096 - 4 - 16) / 4
+
+        // T1 journals a doomed block and advances the head deep into the
+        // ring; checkpoint reclaims the ring (T1's image lands at its final
+        // location — the pre-reuse content the sentinel then overwrites).
+        let doomed = 900u64;
+        let mut t1 = make_bulk_txn(Tid::new(1), 1000, 99, None);
+        let generation = t1.capture_create(doomed);
+        t1.apply_patch(doomed, generation, |b| {
+            b.copy_from_slice(&tagged_block(b"DOOMED-W"))
+        })
+        .unwrap();
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        let head = f.journal.state_read().head;
+        assert_eq!(head, 103); // desc + 100 data + commit from log 1
+
+        // T2: 256 captures (a two-descriptor chain) + a revoke set of
+        // per_revoke_block + 1 records (two revoke blocks) = 2 + 2 + 256 + 1
+        // = 261 log blocks from head 103 — wrapping the 300-block ring.
+        // Its revoke of `doomed` must suppress T1's image... which was
+        // checkpointed already, so instead T2's own chain is preceded by a
+        // re-journaling: commit T2 with the revoke, then verify the wrapped
+        // walk and that the doomed block's post-free reuse survives replay
+        // (the revoke suppresses any tid ≤ 2 image; none is left in the log,
+        // so this leg checks the WALK, while the suppression legs above
+        // check the semantics).
+        let n = per_descriptor + 2;
+        let mut t2 = make_bulk_txn(Tid::new(2), 1300, n, None);
+        t2.forget_block(doomed);
+        for i in 0..u64::try_from(per_revoke_block).unwrap() {
+            t2.forget_block(5000 + i);
+        }
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+
+        // The chain leads with two revoke blocks at the pre-wrap positions.
+        for log in [head, head + 1] {
+            assert_eq!(
+                RawJournalHeader::parse(&read_log_block_at(&f, log))
+                    .h_blocktype
+                    .get(),
+                BLOCKTYPE_REVOKE
+            );
+        }
+        // The scanner walks the wrapped chain to the same next-start the
+        // writer's arithmetic produced.
+        let expected_next = f
+            .journal
+            .geometry()
+            .advance(head, u32::try_from(n + 5).unwrap());
+        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), head, Tid::new(2))
+            .unwrap()
+            .expect("the wrapped revoke-led chain is sealed");
+        assert_eq!(next, expected_next);
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        assert_bulk_applied(&f, 1300, n, None);
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 3);
     }
 
     // --- P7a-5: multi-descriptor transactions (descriptor chains). The
@@ -1403,6 +1942,32 @@ mod tests {
         assert_eq!(err.error(), Errno::ENOSPC);
         assert_eq!(read_log_block_at(&f, 1), before);
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
+
+        // The footprint now includes revoke blocks (P7b-3). 60 captures + a
+        // 1-entry revoke set: 60 + 1 revoke + 1 desc + 1 commit = 63, still
+        // exactly the 63-block ring — commits and round-trips.
+        let f = journaled_fixture(64, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let mut txn = make_bulk_txn(Tid::new(1), 1000, 60, None);
+        txn.forget_block(9999);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_bulk_applied(&f, 1000, 60, None);
+
+        // With a revoke set spilling into a SECOND revoke block (v0 holds
+        // 1020 entries per block), the same 60 captures no longer fit:
+        // 60 + 2 + 1 + 1 = 64 > 63 — refused with nothing written.
+        let f = journaled_fixture(64, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let before = read_log_block_at(&f, 1);
+        let mut txn = make_bulk_txn(Tid::new(1), 1000, 60, None);
+        for i in 0..1021u64 {
+            txn.forget_block(20000 + i);
+        }
+        let err = commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        assert_eq!(read_log_block_at(&f, 1), before);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
     }
 
     // --- P7a-5 gate 3: a REAL Linux-written multi-descriptor chain
@@ -1679,7 +2244,7 @@ mod tests {
             device.as_ref(),
             1,
             Tid::new(7),
-            &super::super::revoke::RevokeTable::new(),
+            &RevokeTable::new(),
         )
         .unwrap_err();
         assert_eq!(err.error(), Errno::EUCLEAN);
@@ -1715,7 +2280,7 @@ mod tests {
             device.as_ref(),
             1,
             Tid::new(7),
-            &super::super::revoke::RevokeTable::new(),
+            &RevokeTable::new(),
         )
         .unwrap_err();
         assert_eq!(err.error(), Errno::EUCLEAN);

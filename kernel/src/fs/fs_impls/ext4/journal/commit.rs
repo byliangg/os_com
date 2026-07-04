@@ -14,7 +14,8 @@
 //!
 //! A committed transaction occupies consecutive log blocks starting at the
 //! current log head, wrapping within `[first, maxlen)`. When all N captured
-//! blocks fit one descriptor's tag array, the layout is:
+//! blocks fit one descriptor's tag array and nothing was revoked, the layout
+//! is:
 //!
 //! ```text
 //! [descriptor] [metadata 0] [metadata 1] ... [metadata N-1] [commit]
@@ -28,6 +29,26 @@
 //! ```text
 //! [descriptor 1] [its metadata ...] [descriptor 2] [its metadata ...] ... [commit]
 //! ```
+//!
+//! A transaction with a nonempty revoke set (P7b-3) additionally writes its
+//! **revoke blocks** at the head of the chain, before the first descriptor —
+//! mirroring jbd2's log-block allocation order: revoke records are written in
+//! commit phase 2a (`jbd2_journal_write_revoke_records`,
+//! fs/jbd2/commit.c:551), before the metadata loop of phase 2b, each revoke
+//! descriptor taking its log block from the same `j_head` cursor:
+//!
+//! ```text
+//! [revoke 1] ... [revoke R] [descriptor 1] [its metadata ...] ... [commit]
+//! ```
+//!
+//! Each revoke block is a [`RawRevokeHeader`](super::format::RawRevokeHeader)
+//! followed by back-to-back big-endian block numbers, split at
+//! [`TagLayout::revoke_entries_per_block`] exactly as the captures split at
+//! `tags_per_descriptor`; an empty revoke set writes no revoke block, so the
+//! no-revoke chain stays byte-identical to Phase 4. Recovery treats a
+//! same-tid revoke block as an ordinary chain member: SCAN steps over it,
+//! PASS_REVOKE consumes it, and the one commit block still seals the whole
+//! chain.
 //!
 //! - **Descriptor** (`JBD2_DESCRIPTOR_BLOCK`): a 12-byte [`RawJournalHeader`]
 //!   then one block tag per captured block, in block-number order, with every
@@ -74,11 +95,13 @@
 //!    before the journal write. Skipped (no barrier) when the transaction has no
 //!    ordered inodes. (Merging this barrier with step 2 is a valid Phase-7 perf
 //!    optimization once `flush_dirty_pages` completion semantics are pinned down.)
-//! 1. Write the descriptor chain — every descriptor and all N metadata
-//!    blocks — to the log.
-//! 2. **Barrier.** The descriptors and data must be durable *before* the commit
-//!    block; otherwise a crash could leave a commit record pointing at data that
-//!    never reached the platter, and recovery would replay garbage.
+//! 1. Write the transaction's log blocks: its revoke blocks (if any), then
+//!    the descriptor chain — every descriptor and all N metadata blocks.
+//! 2. **Barrier.** The revoke blocks, descriptors and data must be durable
+//!    *before* the commit block; otherwise a crash could leave a commit record
+//!    pointing at data that never reached the platter, and recovery would
+//!    replay garbage — or, for a torn revoke block, under-suppress a freed
+//!    block's stale image.
 //! 3. Write the commit block.
 //! 4. **Barrier.** Once the commit block is durable the transaction is
 //!    committed: recovery will now see a complete (and, on a csum journal,
@@ -114,16 +137,20 @@
 //! every rewrite (the [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)
 //! funnel). A featureless (v0) journal writes byte-identical logs to Phase 4.
 //!
+//! # Revoke records (P7b-3)
+//!
+//! A committed transaction's revoke set travels twice, once per consumer:
+//! serialized into the chain's revoke blocks for mount-time recovery's
+//! PASS_REVOKE (the *crash* half — without it, recovery would replay a freed
+//! block's old image over its post-free reuse), and published to the
+//! journal's in-memory committed-revoke table at step 6 — the
+//! [`revoke`](super::revoke) publication rule — for the *runtime* checkpoint
+//! replay. Both memories carry the same `(block, tid)` records and feed the
+//! same suppression predicate
+//! ([`RevokeTable::suppresses`](super::revoke::RevokeTable)).
+//!
 //! # Phase 4 simplifications
 //!
-//! - **Revoke records are not yet written to the log** (P7b-3): a committed
-//!   transaction's revoke set is published to the journal's in-memory
-//!   committed-revoke table at step 6 — the [`revoke`](super::revoke)
-//!   publication rule — which suppresses the *runtime* checkpoint replay of
-//!   freed blocks; the on-disk log carries no revoke blocks yet, so the
-//!   *crash* half (mount-time recovery replaying a freed block's old image)
-//!   remains open until b3 serializes the set and b4's PASS_REVOKE consumes
-//!   it.
 //! - **Synchronous**: [`try_commit_transaction`] does its device I/O inline.
 //!   Production reaches it only through
 //!   [`Journal::commit_or_drain_tail`](super::Journal) (the background commit
@@ -321,6 +348,38 @@ impl Transaction {
             blocks,
         })
     }
+
+    /// Serializes this transaction's revoke set into zero or more sealed
+    /// revoke blocks (jbd2 `jbd2_journal_write_revoke_records`,
+    /// fs/jbd2/revoke.c:530-565): one
+    /// [`RevokeBlockWriter`](super::format::RevokeBlockWriter) per
+    /// [`TagLayout::revoke_entries_per_block`]-sized run of revoked block
+    /// numbers, in block order — the same chunking shape as
+    /// [`build_descriptor_chain`](Self::build_descriptor_chain), with the
+    /// per-block bound owned by the writer (Linux starts a fresh descriptor
+    /// when a record would cross `j_blocksize - csum_size`,
+    /// revoke.c:602-607). Each block bears this transaction's tid and, on a
+    /// csum journal, its own tail checksum ([`RevokeBlockWriter::finish`]).
+    ///
+    /// An empty revoke set yields no blocks: the no-revoke chain stays
+    /// byte-identical to the pre-P7b layout.
+    fn build_revoke_blocks(
+        &self,
+        layout: TagLayout,
+        seed: Option<JournalCsumSeed>,
+    ) -> Result<Vec<Box<[u8; BLOCK_SIZE]>>> {
+        let revokes: Vec<Ext4Bid> = self.revoked_blocks().collect();
+        revokes
+            .chunks(layout.revoke_entries_per_block())
+            .map(|run| {
+                let mut writer = layout.revoke_writer(self.tid(), seed)?;
+                for &blocknr in run {
+                    writer.put(blocknr)?;
+                }
+                Ok(writer.finish())
+            })
+            .collect()
+    }
 }
 
 /// Builds the commit block into a fresh [`BLOCK_SIZE`] buffer: header +
@@ -444,15 +503,16 @@ pub(super) fn try_commit_transaction(
     let tid = txn.tid();
 
     // The csum seed exists iff the journal carries csum v2/v3; threading it
-    // into the descriptor/commit builders is what turns their stamping on.
-    // The chain is built first (pure in-memory work): its exact footprint
-    // drives the fit guard below.
+    // into the revoke/descriptor/commit builders is what turns their
+    // stamping on. The revoke blocks and the chain are built first (pure
+    // in-memory work): their exact footprint drives the fit guard below.
     let seed = journal.geometry.csum_seed();
+    let revoke_blocks = txn.build_revoke_blocks(journal.geometry.tag_layout(), seed)?;
     let chain = txn.build_descriptor_chain(journal.geometry.tag_layout(), seed)?;
     let nr_data: usize = chain.iter().map(DescriptorRun::nr_blocks).sum();
-    // Total log blocks this transaction occupies: its data blocks, one
-    // descriptor per run, and the commit block.
-    let nr_log_blocks = nr_data + chain.len() + 1;
+    // Total log blocks this transaction occupies: its revoke blocks, its
+    // data blocks, one descriptor per run, and the commit block.
+    let nr_log_blocks = revoke_blocks.len() + nr_data + chain.len() + 1;
     let Ok(footprint) = u32::try_from(nr_log_blocks) else {
         // No ring is this large (`s_maxlen` is a u32 of blocks), so no drain
         // can ever make it fit: a hard refusal, not a retryable one.
@@ -517,22 +577,29 @@ pub(super) fn try_commit_transaction(
         barrier(device)?;
     }
 
-    // --- Step 1: write the descriptor chain — each descriptor followed by
-    // the after-images it tags ([desc 1][its data...][desc 2][its data...]…,
-    // the jbd2 chain layout; a single-run chain is the frozen Phase-4
-    // [descriptor][data...] bytes). ---
+    // --- Step 1: write the transaction's log blocks. Its revoke blocks go
+    // first, before the metadata descriptors — jbd2's log-block allocation
+    // order: `jbd2_journal_write_revoke_records` runs in commit phase 2a
+    // (fs/jbd2/commit.c:551), before the phase-2b metadata loop, each revoke
+    // descriptor drawing its block from the same `j_head` cursor. Then the
+    // descriptor chain — each descriptor followed by the after-images it
+    // tags ([desc 1][its data...][desc 2][its data...]…, the jbd2 chain
+    // layout; a revoke-less single-run chain is the frozen Phase-4
+    // [descriptor][data...] bytes). `log` is the NEXT slot to write
+    // throughout, so after the loops it is the commit block's. ---
     let mut log = start_head;
-    for (i, run) in chain.iter().enumerate() {
-        if i > 0 {
-            log = journal.geometry.next_log_block(log);
-        }
+    for revoke_block in &revoke_blocks {
+        write_log_block(journal, device, log, revoke_block)?;
+        log = journal.geometry.next_log_block(log);
+    }
+    for run in &chain {
         write_log_block(journal, device, log, &run.descriptor)?;
+        log = journal.geometry.next_log_block(log);
 
         // Each run carries the after-image sequence its descriptor tagged
         // ([`LoggedBlock`]), so the writer emits exactly what the builder
         // saw — there is no second capture walk to fall out of step with.
         for block in &run.blocks {
-            log = journal.geometry.next_log_block(log);
             if block.escape {
                 // Zero the head so recovery does not mistake it for a log
                 // header; recovery restores the magic when applying the
@@ -543,18 +610,20 @@ pub(super) fn try_commit_transaction(
             } else {
                 write_log_block(journal, device, log, block.bytes)?;
             }
+            log = journal.geometry.next_log_block(log);
         }
     }
     // The chain (which borrows `txn`'s captures) is fully written; release it
     // so step 6 can consume the transaction.
     drop(chain);
 
-    // --- Step 2: barrier. Descriptor + data durable BEFORE the commit block,
-    // so a commit record never certifies data that never reached the platter.
+    // --- Step 2: barrier. Revoke blocks + descriptors + data durable BEFORE
+    // the commit block, so a commit record never certifies log content that
+    // never reached the platter.
     barrier(device)?;
 
     // --- Step 3: write the commit block, sealing the transaction. ---
-    let commit_log = journal.geometry.next_log_block(log);
+    let commit_log = log;
     let commit = build_commit_block(tid, seed);
     write_log_block(journal, device, commit_log, &commit)?;
 
@@ -625,8 +694,8 @@ mod tests {
             super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
             JOURNAL_INO,
             format::{
-                BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_64BIT, INCOMPAT_CSUM_V3, RawBlockTag,
-                RawJournalSuperblock,
+                BLOCKTYPE_REVOKE, BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_64BIT, INCOMPAT_CSUM_V3,
+                RawBlockTag, RawJournalSuperblock,
             },
             load_geometry,
         },
@@ -1164,10 +1233,12 @@ mod tests {
         assert!(issued >= 3, "expected >= 3 barriers, got {issued}");
     }
 
-    /// A forgotten block leaves no trace in the committed log (jbd2 "block is
-    /// journaled and then revoked", the cancel-the-journal-entry option): the
-    /// descriptor chain tags only the surviving captures, the freed block's
-    /// after-image is not logged, and the revoke is published to the
+    /// A forgotten block leaves no trace in the committed log's DESCRIPTORS
+    /// (jbd2 "block is journaled and then revoked", the
+    /// cancel-the-journal-entry option) and instead names the block in the
+    /// chain's leading REVOKE block (P7b-3): the revoke block heads the
+    /// chain with the freed block as its one be32 entry, the descriptor tags
+    /// only the surviving capture, and the revoke is also published to the
     /// journal's committed-revoke memory at commit.
     #[ktest]
     fn commit_omits_forgotten_block_and_publishes_revoke() {
@@ -1184,23 +1255,65 @@ mod tests {
         txn.forget_block(freed);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
-        // Walk the committed descriptor's tag bytes: exactly one tag, naming
-        // the kept block (with LAST_TAG), followed by its after-image.
-        let desc = read_log_header(&f, 1);
+        // The chain leads with the revoke block: header (magic / REVOKE /
+        // tid 1), r_count = 16 + one 4-byte entry, the freed block number.
+        let revoke = read_log_block(&f, 1);
+        let revoke_header = read_log_header(&f, 1);
+        assert_eq!(revoke_header.h_magic.get(), JBD2_MAGIC);
+        assert_eq!(revoke_header.h_blocktype.get(), BLOCKTYPE_REVOKE);
+        assert_eq!(revoke_header.h_sequence.get(), 1);
+        assert_eq!(&revoke[12..16], &[0, 0, 0, 20]);
+        assert_eq!(
+            &revoke[16..20],
+            &u32::try_from(freed).unwrap().to_be_bytes()
+        );
+
+        // Then the descriptor: exactly one tag, naming the kept block (with
+        // LAST_TAG), followed by its after-image.
+        let desc = read_log_header(&f, 2);
         assert_eq!(desc.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
-        let tag0 = read_tag(&f, 1, 0);
+        let tag0 = read_tag(&f, 2, 0);
         assert_eq!(tag0.t_blocknr.get(), kept as u32);
         assert_ne!(tag0.t_flags.get() & TAG_FLAG_LAST_TAG, 0);
-        assert_eq!(read_log_block(&f, 2), kept_img);
+        assert_eq!(read_log_block(&f, 3), kept_img);
         // The chain block right after the single logged image is the commit
         // block — no second data block (the freed image) was written.
-        assert_eq!(read_log_header(&f, 3).h_blocktype.get(), BLOCKTYPE_COMMIT);
+        assert_eq!(read_log_header(&f, 4).h_blocktype.get(), BLOCKTYPE_COMMIT);
+        // The in-memory head accounts for all four chain blocks.
+        assert_eq!(f.journal.state_write().head, 5);
 
         // The revoke crossed into the committed-revoke memory with the
-        // commit, and only then retires (by checkpoint).
+        // commit, and only then retires (by checkpoint — whose chain walk
+        // now steps over the on-disk revoke block).
         assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
         super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+        // The checkpoint really applied through the revoke-led chain: the
+        // kept image reached its final location and the journal is clean.
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(kept as usize * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(final_block, kept_img);
+    }
+
+    /// Without 64-bit entries a > 32-bit revoked block number refuses
+    /// loudly before any write (the revoke builder's `EFBIG`, mirroring the
+    /// tag writer's) rather than truncating to revoke the wrong block. (The
+    /// per-feature-set raw-bytes pin of the revoke serialization lives with
+    /// the recovery round trips, `commit_writes_revoke_records_across_feature_sets`.)
+    #[ktest]
+    fn commit_refuses_wide_revoke_on_v0_layout() {
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let before = read_log_block(&f, 1);
+        let mut txn = make_txn(Tid::new(1), &[(700u64, [0u8; BLOCK_SIZE])]);
+        txn.forget_block((1 << 32) | 5);
+        let err = commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+        assert_eq!(read_log_block(&f, 1), before);
     }
 
     /// An empty ordered set issues no data barrier: only the metadata + commit
