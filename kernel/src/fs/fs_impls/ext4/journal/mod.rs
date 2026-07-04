@@ -70,7 +70,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
 use self::{
-    commit::commit_transaction,
+    commit::{CommitAttempt, try_commit_transaction},
     format::{
         BLOCKTYPE_SUPERBLOCK_V2, Be32, COMPAT_CHECKSUM, INCOMPAT_64BIT, INCOMPAT_CSUM_V3,
         INCOMPAT_SUPP, JBD2_CRC32C_CHKSUM, JournalCsumSeed, JournalSuperblock,
@@ -317,6 +317,37 @@ impl JournalGeometry {
             pos = self.next_log_block(pos);
         }
         pos
+    }
+
+    /// The number of log blocks a commit may write without touching the
+    /// un-checkpointed tail: the ring distance from `head` forward to
+    /// `dirty_tail` — the committed-but-un-checkpointed log occupies
+    /// `[tail, head)` in ring order, so `[head, tail)` is free — or the whole
+    /// usable ring `[first, maxlen)` when nothing awaits checkpoint
+    /// (`dirty_tail` is `None`). On a dirty ring `head == tail` means the
+    /// ring is FULL (the head has wrapped all the way around to the tail), so
+    /// the distance is 0, never the ring size — a dirty ring is nonempty by
+    /// definition.
+    ///
+    /// Both positions must be ring positions in `[first, maxlen)`, the
+    /// invariant [`next_log_block`](Self::next_log_block) /
+    /// [`advance`](Self::advance) maintain.
+    pub(super) fn free_log_blocks(&self, head: u32, dirty_tail: Option<u32>) -> u32 {
+        let ring = self.maxlen() - self.first();
+        let Some(tail) = dirty_tail else {
+            return ring;
+        };
+        debug_assert!(self.first() <= head && head < self.maxlen());
+        debug_assert!(self.first() <= tail && tail < self.maxlen());
+        // Work in ring offsets (position - first) so the wrap subtraction
+        // cannot underflow.
+        let head_off = head - self.first();
+        let tail_off = tail - self.first();
+        if tail_off >= head_off {
+            tail_off - head_off
+        } else {
+            ring - (head_off - tail_off)
+        }
     }
 
     /// Reads a full [`BLOCK_SIZE`] log block by its log index into `buf`.
@@ -627,9 +658,11 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
 /// # Commit-thread model (jbd2 `kjournald`)
 ///
 /// A single background thread ([`Journal::start_commit_thread`]) is the **sole**
-/// committer: it is the only path that calls
-/// [`commit_transaction`](commit::commit_transaction) in production. Any number
-/// of [`log_wait_commit`](Journal::log_wait_commit) callers only *wait* for a
+/// committer: it is the only path that drives
+/// [`try_commit_transaction`](commit::try_commit_transaction) (through
+/// [`Journal::commit_or_drain_tail`]) in production, besides the unmount
+/// flush, which runs strictly after the thread stops. Any number of
+/// [`log_wait_commit`](Journal::log_wait_commit) callers only *wait* for a
 /// tid to become durable — they never commit — so commit is serialized to one
 /// transaction at a time without an explicit commit lock. The thread's closure
 /// holds a [`Weak<Journal>`] so it never keeps the journal alive; this is what
@@ -661,8 +694,8 @@ pub(super) struct Journal {
     /// The parsed on-disk geometry (the log block map + journal superblock).
     geometry: JournalGeometry,
     /// The block device the log lives on, so the commit thread can drive
-    /// [`commit_transaction`](commit::commit_transaction) without threading the
-    /// device through every wakeup.
+    /// [`try_commit_transaction`](commit::try_commit_transaction) without
+    /// threading the device through every wakeup.
     ///
     /// Held as a strong [`Arc`]: the device outlives the filesystem and does not
     /// hold the journal, so there is no reference cycle. (The cycle to avoid is
@@ -700,7 +733,9 @@ pub(super) struct Journal {
     stop: AtomicBool,
     /// Set when a commit fails (jbd2 journal abort, minimal form).
     ///
-    /// A failed `commit_transaction` consumed its transaction: the in-memory
+    /// A failed [`commit_or_drain_tail`](Journal::commit_or_drain_tail) lost
+    /// its transaction — consumed mid-write, or dropped because the ring
+    /// could not make room even after draining the tail: the in-memory
     /// metadata is ahead of both the log and the device, and the retained
     /// after-images seeded from it can never be checkpointed — continuing to
     /// journal would publish fragments of the lost transaction through later
@@ -840,10 +875,19 @@ impl Journal {
     ///
     /// Under-admitting by a block or two is harmless (`journal_start` just
     /// waits or refuses a little early); over-admitting would be corruption —
-    /// the commit's log writes would wrap onto the transaction's own blocks
-    /// (or an un-checkpointed predecessor). The commit pipeline re-checks the
-    /// exact footprint against the ring as a last line of defense
-    /// (`commit_transaction`'s fit guard).
+    /// the commit's log writes would wrap onto the transaction's own blocks.
+    ///
+    /// This bounds ONE transaction against the whole usable ring; it says
+    /// nothing about the log space an un-checkpointed PREDECESSOR still
+    /// occupies (the ring can be dirty at commit time — the post-commit
+    /// checkpoint is non-fatal on failure). That half is enforced where the
+    /// footprint is exact, at commit time:
+    /// [`try_commit_transaction`](commit::try_commit_transaction) checks the
+    /// chain against the ring's FREE segment
+    /// ([`JournalGeometry::free_log_blocks`]) and refuses to write rather
+    /// than overwrite the tail, with
+    /// [`commit_or_drain_tail`](Self::commit_or_drain_tail) draining the tail
+    /// and retrying once before aborting.
     ///
     /// This is the whole-transaction capacity bound (`check_capacity`
     /// compares captured + reserved credits against it); precise
@@ -956,7 +1000,10 @@ impl Journal {
                     // small transactions would fill the log. Checkpoint copies the
                     // committed after-images to their final locations and clears
                     // `s_start`. Failure is non-fatal — the log stays dirty and the
-                    // next commit (or the unmount flush) retries. Batching commits
+                    // next commit (or the unmount flush) retries; the dirty tail
+                    // left behind is protected from being overwritten by the
+                    // commit fit guard, which bounds every chain to the ring's
+                    // free segment (`commit_or_drain_tail`). Batching commits
                     // with lazy, space-pressure-driven checkpoint is a P7
                     // optimization.
                     if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
@@ -1030,25 +1077,60 @@ impl Journal {
             txn
         };
 
-        // Single-committer: this thread is the only production caller of
-        // `commit_transaction`, so no commit lock is needed. `commit_transaction`
-        // publishes `committed_tid` (Release) before returning.
-        let commit_result = commit_transaction(self, self.device.as_ref(), txn);
+        // Single-committer: this thread is the only production committer, so
+        // no commit lock is needed. A successful commit publishes
+        // `committed_tid` (Release) before returning.
+        let commit_result = self.commit_or_drain_tail(txn);
         if let Err(e) = commit_result {
-            // The transaction was consumed: memory is ahead of the log and the
-            // device, unrecoverably. Abort the journal (refuse further work and
-            // wake sleepers with an error) rather than continue and publish
-            // fragments of the lost transaction through later commits. Set the
-            // aborted flag BEFORE clearing `committing_tid`, or a `sync(2)`
-            // sampling the gap would see neither a running nor a committing
-            // transaction and wrongly report the lost data durable. The full jbd2
-            // abort/errno machinery is Phase 7.
+            // The transaction is gone: either it was consumed mid-write, or it
+            // was dropped because the ring could not make room even after
+            // draining the tail — either way memory is ahead of the log and
+            // the device, unrecoverably. Abort the journal (refuse further
+            // work and wake sleepers with an error) rather than continue and
+            // publish fragments of the lost transaction through later commits.
+            // Set the aborted flag BEFORE clearing `committing_tid`, or a
+            // `sync(2)` sampling the gap would see neither a running nor a
+            // committing transaction and wrongly report the lost data durable.
+            // The full jbd2 abort/errno machinery is Phase 7.
             error!("ext4 journal commit failed, aborting the journal: {:?}", e);
             self.abort();
         }
         self.state_write().committing_tid = None;
         // Wake `log_wait_commit` sleepers to re-check `committed_tid`.
         self.commit_wait_queue.wake_all();
+    }
+
+    /// Commits `txn`, draining the un-checkpointed tail inline (once) when the
+    /// chain does not fit the ring's free segment — the sole production commit
+    /// funnel (the commit thread's [`commit_one`](Self::commit_one) and the
+    /// unmount flush).
+    ///
+    /// A dirty tail can be in the way because the post-commit checkpoint is
+    /// non-fatal on failure: the tail transactions' after-images exist nowhere
+    /// but their log blocks until checkpoint (Model A), so overwriting them
+    /// would turn the next crash into a silent under-replay of
+    /// fsync-acknowledged metadata. jbd2 never reaches this state — writers
+    /// block up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291) —
+    /// and P7c builds that space backpressure; until then the commit refuses
+    /// to write ([`CommitAttempt::NeedsLogSpace`]), this drains the tail (an
+    /// inline [`checkpoint`](checkpoint::checkpoint) — the same thread context
+    /// as the post-commit checkpoint, so no new lock interaction) and retries
+    /// ONCE. If the checkpoint fails, or the chain still does not fit a clean
+    /// ring, the error propagates and the caller aborts the journal: a loud
+    /// abort is the only safe fallback left.
+    fn commit_or_drain_tail(&self, txn: Transaction) -> Result<Tid> {
+        let txn = match try_commit_transaction(self, self.device.as_ref(), txn)? {
+            CommitAttempt::Committed(tid) => return Ok(tid),
+            CommitAttempt::NeedsLogSpace(txn) => txn,
+        };
+        checkpoint::checkpoint(self, self.device.as_ref())?;
+        match try_commit_transaction(self, self.device.as_ref(), txn)? {
+            CommitAttempt::Committed(tid) => Ok(tid),
+            CommitAttempt::NeedsLogSpace(_) => Err(Error::with_message(
+                Errno::ENOSPC,
+                "transaction does not fit the journal even after draining the tail",
+            )),
+        }
     }
 
     /// Wakes the commit thread to commit the running transaction (jbd2 requesting
@@ -1299,7 +1381,7 @@ impl Journal {
         };
         if let Some(txn) = txn
             && txn.nr_metadata_blocks() > 0
-            && let Err(e) = commit_transaction(self, self.device.as_ref(), txn)
+            && let Err(e) = self.commit_or_drain_tail(txn)
         {
             // Same as `commit_one`: the transaction is lost, abort rather than
             // checkpoint device state that no longer matches the log.
@@ -1629,7 +1711,8 @@ impl Journal {
 /// leaving the on-disk log dirty (`s_start != 0`) so a subsequent mount recovers it.
 ///
 /// Encapsulates the journal-internal commit machinery ([`Transaction`],
-/// [`commit_transaction`]) so the `fs.rs` mount-lifecycle tests can lay down a
+/// [`commit_transaction`](commit::commit_transaction)) so the `fs.rs`
+/// mount-lifecycle tests can lay down a
 /// crashed (committed-but-un-checkpointed) journal on the fixture disk without
 /// reaching into those internals themselves. Only compiled for ktest.
 #[cfg(ktest)]
@@ -1642,7 +1725,7 @@ pub(in crate::fs::fs_impls::ext4) fn commit_single_block_for_test(
     let mut txn = Transaction::new(journal.state_read().next_tid);
     txn.capture_create(dest);
     txn.apply_patch(dest, |b| b.copy_from_slice(&after))?;
-    commit_transaction(journal, device, txn)?;
+    commit::commit_transaction(journal, device, txn)?;
     Ok(())
 }
 
@@ -2202,6 +2285,123 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
         f.journal.flush_on_unmount().unwrap();
         assert_eq!(f.journal.state_read().tail_block, 0);
+    }
+
+    // --- a5 review MAJOR 2: the free-segment fit bound and its abort
+    // fallback. ---
+
+    /// The free-segment ring distance ([`JournalGeometry::free_log_blocks`]):
+    /// a clean ring frees the whole usable ring; a dirty ring frees the
+    /// distance from the head forward to the tail, across the wrap; and
+    /// `head == tail` on a dirty ring is FULL (0), never the ring size.
+    #[ktest]
+    fn free_log_blocks_ring_distance() {
+        // maxlen 16, first 1: ring = 15, positions in [1, 16).
+        let f = journaled_fixture(16, 1, 1);
+        let geo = f.journal.geometry();
+
+        // Clean: the whole ring, wherever the head sits.
+        assert_eq!(geo.free_log_blocks(1, None), 15);
+        assert_eq!(geo.free_log_blocks(9, None), 15);
+
+        // Dirty, free segment wrapping the ring end: [4..16) + nothing
+        // before tail 1 = 12.
+        assert_eq!(geo.free_log_blocks(4, Some(1)), 12);
+        // Dirty, forward free segment: [4..11) = 7.
+        assert_eq!(geo.free_log_blocks(4, Some(11)), 7);
+        // Head at the last ring position: {15} = 1.
+        assert_eq!(geo.free_log_blocks(15, Some(1)), 1);
+        // Tail at the last ring position: [1..15) = 14.
+        assert_eq!(geo.free_log_blocks(1, Some(15)), 14);
+        // Full ring: head wrapped onto the tail.
+        assert_eq!(geo.free_log_blocks(7, Some(7)), 0);
+    }
+
+    /// The abort half of the fit bound: when a commit does not fit the free
+    /// segment AND the inline tail drain fails, the commit thread ABORTS the
+    /// journal rather than overwrite the un-checkpointed tail — those log
+    /// blocks are the only copy of committed metadata, and overwriting them
+    /// would turn the next crash into a silent under-replay. (No fault
+    /// injection exists for checkpoint writes; the drain failure is driven by
+    /// corrupting the tail transaction's on-disk descriptor magic, which
+    /// `apply_log_transaction` refuses with `EUCLEAN`.)
+    #[ktest]
+    fn commit_aborts_when_tail_cannot_drain() {
+        crate::time::clocks::init_for_ktest();
+        // maxlen 16, first 1: ring = 15.
+        let f = journaled_fixture(16, 1, 1);
+
+        // T1: one capture -> log [1..4); head 4, tail 1, free 12.
+        let mut t1 = Transaction::new(Tid::new(1));
+        t1.capture_create(500);
+        t1.apply_patch(500, |b| b[..4].copy_from_slice(b"TAIL"))
+            .unwrap();
+        commit::commit_transaction(
+            f.journal.as_ref(),
+            f.fixture.ext4.block_device().as_ref(),
+            t1,
+        )
+        .unwrap();
+
+        // Break the tail's descriptor magic so the drain (checkpoint ->
+        // `apply_log_transaction`) fails.
+        let desc_off = usize::try_from(JOURNAL_START_BLOCK + 1).unwrap() * BLOCK_SIZE;
+        let mut desc = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(desc_off, &mut desc)
+            .unwrap();
+        desc[..4].fill(0xFF);
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(desc_off, &desc)
+            .unwrap();
+
+        // Snapshot the whole log: the refused T2 must write NOTHING.
+        let log_off = usize::try_from(JOURNAL_START_BLOCK).unwrap() * BLOCK_SIZE;
+        let mut before = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(log_off, &mut before)
+            .unwrap();
+
+        // T2: 11 captures -> footprint 13 (11 data + 1 desc + 1 commit),
+        // over the 12 free blocks. Plant it as the running transaction and
+        // drive the commit thread's own path synchronously.
+        let mut t2 = Transaction::new(Tid::new(2));
+        for dest in 1000u64..1011 {
+            t2.capture_create(dest);
+            t2.apply_patch(dest, |b| b[..4].copy_from_slice(b"OVER"))
+                .unwrap();
+        }
+        f.journal.state_write().running = Some(t2);
+        f.journal.commit_now_for_test();
+
+        // Aborted, not overwritten: the journal refuses further work, every
+        // log byte (the tail transaction included) is untouched, and no
+        // state advanced.
+        assert!(f.journal.is_aborted());
+        let mut after = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(log_off, &mut after)
+            .unwrap();
+        assert_eq!(before, after, "the refused commit must write nothing");
+        {
+            let st = f.journal.state_read();
+            assert_eq!(st.head, 4);
+            assert_eq!(st.tail_block, 1);
+        }
+        assert_eq!(f.journal.committed_tid(), Tid::new(1));
+
+        // Waiters fail loudly instead of hanging on a tid that will never
+        // commit.
+        let err = f.journal.log_wait_commit(Tid::new(2)).unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
     }
 
     /// T1 regression (the B-1 shared-block stale-seed class — the Task-8 guest

@@ -41,8 +41,9 @@ pub(super) const GATE3_START_LOG: u32 = 1;
 
 /// Descriptor #1 of the chain (log block 1, 253 tags, real tail checksum).
 ///
-/// The 4096 non-zero leading bytes of the real 4096-byte block
-/// (the rest is zeros; tests zero-extend to a full block).
+/// The FULL real 4096-byte block, pinned verbatim — no truncation applies
+/// (unlike [`GATE3_COMMIT`]): its last four bytes are the descriptor's tail
+/// checksum, which is load-bearing (the scanner verifies it).
 pub(super) const GATE3_DESC1: [u8; 4096] = [
     0xC0, 0x3B, 0x39, 0x98, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x49,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x5D, 0x7F, 0x19, 0x00, 0x00, 0x00, 0x00,
@@ -304,8 +305,9 @@ pub(super) const GATE3_DESC1: [u8; 4096] = [
 
 /// Descriptor #2 of the chain (log block 255, 128 tags, real tail checksum).
 ///
-/// The 4096 non-zero leading bytes of the real 4096-byte block
-/// (the rest is zeros; tests zero-extend to a full block).
+/// The FULL real 4096-byte block, pinned verbatim — no truncation applies
+/// (unlike [`GATE3_COMMIT`]): its last four bytes are the descriptor's tail
+/// checksum, which is load-bearing (the scanner verifies it).
 pub(super) const GATE3_DESC2: [u8; 4096] = [
     0xC0, 0x3B, 0x39, 0x98, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, 0x46,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x62, 0xD7, 0x7E, 0x01, 0x00, 0x00, 0x00, 0x00,

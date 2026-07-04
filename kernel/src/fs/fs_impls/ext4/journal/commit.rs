@@ -2,10 +2,13 @@
 
 //! The metadata commit pipeline (jbd2 `jbd2_journal_commit_transaction`).
 //!
-//! [`commit_transaction`] writes one running [`Transaction`]'s captured
+//! [`try_commit_transaction`] writes one running [`Transaction`]'s captured
 //! metadata after-images to the on-disk log as a single jbd2 transaction, with
 //! the crash-safe write ordering that makes the transaction atomic, and updates
-//! the on-disk journal superblock so recovery can find it.
+//! the on-disk journal superblock so recovery can find it. When the chain does
+//! not fit the ring's free segment it instead refuses before any write and
+//! hands the transaction back ([`CommitAttempt::NeedsLogSpace`]) so the caller
+//! can drain the un-checkpointed tail and retry.
 //!
 //! # Log layout produced
 //!
@@ -114,10 +117,12 @@
 //! # Phase 4 simplifications
 //!
 //! - **No revoke records** — Phase 7.
-//! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
-//!   called by the background commit thread ([`Journal::start_commit_thread`],
-//!   the sole production caller); ordered-data flushing is synchronous in that
-//!   thread's task context, with no interrupt handoff (a Phase-7 optimization).
+//! - **Synchronous**: [`try_commit_transaction`] does its device I/O inline.
+//!   Production reaches it only through
+//!   [`Journal::commit_or_drain_tail`](super::Journal) (the background commit
+//!   thread and the unmount flush); ordered-data flushing is synchronous in
+//!   that thread's task context, with no interrupt handoff (a Phase-7
+//!   optimization).
 
 use super::{
     super::prelude::*,
@@ -355,19 +360,106 @@ impl Journal {
     }
 }
 
-/// Commits `txn` to the on-disk log as a jbd2 transaction and makes it
-/// recoverable. Consumes the transaction. Returns its tid.
+/// The outcome of one commit attempt ([`try_commit_transaction`]).
 ///
-/// Implements the log layout and crash-safe write ordering documented at the
-/// module level: ordered data → barrier → log (descriptor + metadata) → barrier
-/// → commit → barrier → (superblock → barrier if the journal was clean) →
-/// in-memory state.
+/// An `Err` from the attempt means the transaction was consumed and is lost
+/// (the caller must abort the journal); these variants are the two NON-fatal
+/// outcomes, kept apart from `Err` so "refused before any write, retryable"
+/// can never be confused with "failed mid-write".
+pub(super) enum CommitAttempt {
+    /// The transaction committed: its commit record is durable in the log.
+    Committed(Tid),
+    /// The chain footprint exceeds the ring's free segment
+    /// ([`JournalGeometry::free_log_blocks`](super::JournalGeometry::free_log_blocks)):
+    /// an un-checkpointed predecessor still occupies `[tail, head)`, whose log
+    /// blocks are the ONLY copy of its committed after-images (Model A) —
+    /// writing would overwrite them and turn the next crash into a silent
+    /// under-replay. NOTHING was written or flushed; the transaction is handed
+    /// back intact so the caller can drain the tail (checkpoint) and retry.
+    NeedsLogSpace(Transaction),
+}
+
+/// [`try_commit_transaction`] for callers that treat "does not fit the free
+/// segment" as a plain `ENOSPC` error, dropping the transaction: the ktest
+/// suites, which drive commits directly against known-sized rings. Production
+/// commits go through [`Journal::commit_or_drain_tail`](super::Journal), which
+/// drains the tail and retries instead of dropping.
+#[cfg(ktest)]
 pub(super) fn commit_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
-    mut txn: Transaction,
+    txn: Transaction,
 ) -> Result<Tid> {
+    match try_commit_transaction(journal, device, txn)? {
+        CommitAttempt::Committed(tid) => Ok(tid),
+        CommitAttempt::NeedsLogSpace(_) => Err(Error::with_message(
+            Errno::ENOSPC,
+            "transaction does not fit the journal's free segment",
+        )),
+    }
+}
+
+/// Commits `txn` to the on-disk log as a jbd2 transaction and makes it
+/// recoverable ([`CommitAttempt::Committed`]) — unless the chain does not fit
+/// the ring's free segment, in which case NOTHING is written and the
+/// transaction is handed back ([`CommitAttempt::NeedsLogSpace`]) for the
+/// caller to checkpoint and retry. Consumes the transaction on every other
+/// path, including `Err`.
+///
+/// Implements the log layout and crash-safe write ordering documented at the
+/// module level: fit guard → ordered data → barrier → log (descriptors +
+/// metadata) → barrier → commit → barrier → (superblock → barrier if the
+/// journal was clean) → in-memory state.
+pub(super) fn try_commit_transaction(
+    journal: &Journal,
+    device: &dyn BlockDevice,
+    mut txn: Transaction,
+) -> Result<CommitAttempt> {
     let tid = txn.tid();
+
+    // The csum seed exists iff the journal carries csum v2/v3; threading it
+    // into the descriptor/commit builders is what turns their stamping on.
+    // The chain is built first (pure in-memory work): its exact footprint
+    // drives the fit guard below.
+    let seed = journal.geometry.csum_seed();
+    let chain = txn.build_descriptor_chain(journal.geometry.tag_layout(), seed)?;
+    let nr_data: usize = chain.iter().map(DescriptorRun::nr_blocks).sum();
+    // Total log blocks this transaction occupies: its data blocks, one
+    // descriptor per run, and the commit block.
+    let nr_log_blocks = nr_data + chain.len() + 1;
+    let Ok(footprint) = u32::try_from(nr_log_blocks) else {
+        // No ring is this large (`s_maxlen` is a u32 of blocks), so no drain
+        // can ever make it fit: a hard refusal, not a retryable one.
+        return_errno_with_message!(Errno::ENOSPC, "transaction does not fit the journal");
+    };
+
+    // The head to write at and the un-checkpointed tail are read under the
+    // state lock; the writes themselves happen without holding it (a single
+    // committer, so no other committer races us) and the state is updated
+    // again at the end. The on-disk 0-means-clean sentinel is parsed into an
+    // `Option` here, once.
+    let (start_head, dirty_tail) = {
+        let st = journal.state_write();
+        (st.head, (st.tail_block != 0).then_some(st.tail_block))
+    };
+    let was_clean = dirty_tail.is_none();
+
+    // Fit guard (BEFORE any write, including the ordered-data flush): the
+    // exact chain footprint must fit the ring's FREE segment `[head, tail)`,
+    // not merely the whole ring. The dirty segment `[tail, head)` holds
+    // committed transactions whose after-images exist nowhere but the log
+    // until checkpoint (Model A); overwriting them would make a crash
+    // silently under-replay fsync-acknowledged metadata. A dirty tail CAN be
+    // in the way here — the commit thread's post-commit checkpoint is
+    // non-fatal on failure, and `max_credits` bounds one transaction against
+    // the whole ring only. jbd2 never reaches this point: it blocks writers
+    // up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291); until
+    // P7c builds that backpressure, refusing to write — letting the caller
+    // drain the tail and retry, or abort loudly — is the minimal safe
+    // behavior.
+    if footprint > journal.geometry.free_log_blocks(start_head, dirty_tail) {
+        return Ok(CommitAttempt::NeedsLogSpace(txn));
+    }
 
     // --- Step 0: ordered-data mode. Every ordered inode's dirty data must reach
     // its final location and be durable BEFORE any log block (and thus the commit
@@ -395,35 +487,6 @@ pub(super) fn commit_transaction(
     }
     if flushed_any {
         barrier(device)?;
-    }
-
-    // The head to write at, and whether the journal is clean, are read under the
-    // state lock; the writes themselves happen without holding it (Phase 4 is
-    // single-transaction, so no other committer races us) and the state is
-    // updated again at the end.
-    let (start_head, was_clean) = {
-        let st = journal.state_write();
-        (st.head, st.tail_block == 0)
-    };
-
-    // The csum seed exists iff the journal carries csum v2/v3; threading it
-    // into the descriptor/commit builders is what turns their stamping on.
-    let seed = journal.geometry.csum_seed();
-    let chain = txn.build_descriptor_chain(journal.geometry.tag_layout(), seed)?;
-    let nr_data: usize = chain.iter().map(DescriptorRun::nr_blocks).sum();
-    // Total log blocks this transaction occupies: its data blocks, one
-    // descriptor per run, and the commit block.
-    let nr_log_blocks = nr_data + chain.len() + 1;
-
-    // Fit guard: the whole chain must fit the usable ring, or the writes
-    // below would wrap onto this very transaction's own log blocks — silent
-    // log corruption. `max_credits` enforces a (conservative) version of this
-    // bound at `journal_start`; the exact re-check here keeps a directly
-    // built transaction from overwriting the log.
-    let usable = journal.geometry.maxlen() - journal.geometry.first();
-    let fits = u32::try_from(nr_log_blocks).is_ok_and(|blocks| blocks <= usable);
-    if !fits {
-        return_errno_with_message!(Errno::ENOSPC, "transaction does not fit the journal");
     }
 
     // --- Step 1: write the descriptor chain — each descriptor followed by
@@ -487,12 +550,8 @@ pub(super) fn commit_transaction(
 
     // --- Step 6: publish the new log position and commit id in memory. ---
     // Blocks written: the data blocks + one descriptor per chain run + the
-    // commit block (`nr_log_blocks`, already proven to fit the ring above).
-    let Ok(written) = u32::try_from(nr_log_blocks) else {
-        // Unreachable: the fit guard bounded `nr_log_blocks <= usable: u32`.
-        return_errno_with_message!(Errno::ENOSPC, "transaction does not fit the journal");
-    };
-    let new_head = journal.geometry.advance(start_head, written);
+    // commit block (`footprint`, already proven to fit the free segment).
+    let new_head = journal.geometry.advance(start_head, footprint);
     {
         let mut st = journal.state_write();
         st.head = new_head;
@@ -510,7 +569,7 @@ pub(super) fn commit_transaction(
     txn.set_state(TransactionState::Finished);
     drop(txn);
 
-    Ok(tid)
+    Ok(CommitAttempt::Committed(tid))
 }
 
 #[cfg(ktest)]
@@ -1078,5 +1137,151 @@ mod tests {
         // (clean-journal) superblock barriers, i.e. 3.
         let issued = f.fixture.disk.flush_count() - before;
         assert_eq!(issued, 3, "expected exactly 3 barriers (no data barrier)");
+    }
+
+    // --- a5 review MAJOR 2: the fit guard bounds the chain against the
+    // ring's FREE segment `[head, tail)`, never the whole ring. ---
+
+    /// A distinct per-index after-image for the free-segment tests.
+    fn indexed_block(i: u64) -> [u8; BLOCK_SIZE] {
+        let mut b = [0u8; BLOCK_SIZE];
+        b[..8].copy_from_slice(&i.to_le_bytes());
+        b[8..16].copy_from_slice(b"FREESEG!");
+        b
+    }
+
+    /// Builds a transaction of `n` captures at destinations
+    /// `first_dest..first_dest + n`, each carrying [`indexed_block`]`(i)`.
+    fn indexed_txn(tid: Tid, first_dest: u64, n: u64) -> Transaction {
+        let blocks: Vec<(Ext4Bid, [u8; BLOCK_SIZE])> =
+            (0..n).map(|i| (first_dest + i, indexed_block(i))).collect();
+        make_txn(tid, &blocks)
+    }
+
+    /// With an un-checkpointed T1 at the tail, a T2 that fits the whole ring
+    /// but NOT the free segment is refused with NOTHING written — its writes
+    /// would have wrapped onto T1's log blocks, the only copy of T1's
+    /// committed after-images — and handed back intact
+    /// ([`CommitAttempt::NeedsLogSpace`]); after a checkpoint drains the
+    /// tail, the SAME transaction commits (the commit thread's
+    /// drain-and-retry flow, driven by hand).
+    #[ktest]
+    fn commit_refuses_chain_crossing_uncheckpointed_tail() {
+        crate::time::clocks::init_for_ktest();
+        // maxlen 16, first 1: ring = 15.
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        // T1: 1 capture -> log [1..4); head 4, tail 1 -> free 12.
+        let t1 = indexed_txn(Tid::new(1), 500, 1);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        {
+            let st = f.journal.state_write();
+            assert_eq!(st.head, 4);
+            assert_eq!(st.tail_block, 1);
+        }
+
+        // T2: 11 captures -> footprint 13 (11 data + 1 desc + 1 commit):
+        // fits the 15-block ring, NOT the 12-block free segment. From head 4
+        // its blocks would cover [4..16) and wrap onto [1..3) — T1's chain.
+        let t2 = indexed_txn(Tid::new(2), 1000, 11);
+        let before: Vec<[u8; BLOCK_SIZE]> = (1u32..4).map(|log| read_log_block(&f, log)).collect();
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        let CommitAttempt::NeedsLogSpace(t2) = attempt else {
+            panic!("a chain crossing the tail must be refused");
+        };
+
+        // NOTHING written: T1's log blocks are intact and no state moved.
+        let after: Vec<[u8; BLOCK_SIZE]> = (1u32..4).map(|log| read_log_block(&f, log)).collect();
+        assert_eq!(before, after, "the refused commit must not touch the tail");
+        {
+            let st = f.journal.state_write();
+            assert_eq!(st.head, 4);
+            assert_eq!(st.tail_block, 1);
+        }
+        assert_eq!(f.journal.committed_tid(), Tid::new(1));
+
+        // Drain the tail, then retry the SAME handed-back transaction: it now
+        // fits the clean ring and commits.
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        let CommitAttempt::Committed(tid) = attempt else {
+            panic!("after the drain the chain fits");
+        };
+        assert_eq!(tid, Tid::new(2));
+        assert_eq!(f.journal.committed_tid(), Tid::new(2));
+
+        // The retried commit is a real one: checkpointing lands T2's
+        // after-images at their final locations.
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(1000 * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(final_block, indexed_block(0));
+    }
+
+    /// The free-segment arithmetic across the ring wrap: a chain that
+    /// exactly fills the wrapped free segment `[head..ring end) + [first..tail)`
+    /// commits — the head lands exactly ON the tail, a legally FULL ring —
+    /// and the next commit is refused with zero free blocks, the tail intact.
+    #[ktest]
+    fn commit_fills_wrapped_free_segment_exactly() {
+        crate::time::clocks::init_for_ktest();
+        // maxlen 16, first 1: ring = 15.
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        // T1 (8 captures -> 10 blocks [1..11)) pushes the head deep into the
+        // ring; checkpoint reclaims it (head stays at 11, ring clean).
+        let t1 = indexed_txn(Tid::new(1), 500, 8);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(f.journal.state_write().head, 11);
+
+        // T2 (6 captures -> 8 blocks) wraps the ring end: [11..16) + [1..4);
+        // the was-clean tail is re-established at 11. Free = [4..11) = 7.
+        let t2 = indexed_txn(Tid::new(2), 600, 6);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        {
+            let st = f.journal.state_write();
+            assert_eq!(st.head, 4);
+            assert_eq!(st.tail_block, 11);
+        }
+
+        // T3 (5 captures -> 7 blocks) fills the free segment EXACTLY: the
+        // head wraps forward onto the tail without touching a tail block.
+        let t3 = indexed_txn(Tid::new(3), 700, 5);
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t3).unwrap();
+        assert!(matches!(attempt, CommitAttempt::Committed(_)));
+        assert_eq!(f.journal.state_write().head, 11);
+
+        // Full ring: even the smallest chain (1 capture -> 3 blocks) has
+        // zero free blocks. Refused; T2's tail descriptor is untouched.
+        let tail_desc = read_log_block(&f, 11);
+        let t4 = indexed_txn(Tid::new(4), 800, 1);
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t4).unwrap();
+        assert!(matches!(attempt, CommitAttempt::NeedsLogSpace(_)));
+        assert_eq!(read_log_block(&f, 11), tail_desc);
+
+        // Everything committed into the wrapped ring is real: draining the
+        // full ring applies T2 and T3 to their final locations.
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        for (first_dest, n) in [(600u64, 6u64), (700, 5)] {
+            for i in 0..n {
+                let mut b = [0u8; BLOCK_SIZE];
+                f.fixture
+                    .disk
+                    .segment()
+                    .read_bytes(
+                        usize::try_from(first_dest + i).unwrap() * BLOCK_SIZE,
+                        &mut b,
+                    )
+                    .unwrap();
+                assert_eq!(b, indexed_block(i), "dest {}", first_dest + i);
+            }
+        }
     }
 }

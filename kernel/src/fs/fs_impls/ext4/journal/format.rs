@@ -645,10 +645,12 @@ impl TagLayout {
     /// layout: `n` tags occupy the 12-byte block header, one 16-byte UUID
     /// after the first tag (every later tag sets [`TAG_FLAG_SAME_UUID`] and
     /// reuses it), and `n` tag strides, so `n` fits iff
-    /// `header + UUID + n * tag_bytes` fits the tag area. Bounds a single
-    /// transaction's metadata blocks while the commit pipeline writes one
-    /// descriptor per transaction
-    /// ([`Journal::max_credits`](super::Journal::max_credits)).
+    /// `header + UUID + n * tag_bytes` fits the tag area. This is the
+    /// per-RUN chunk size of the commit pipeline's descriptor chain (P7a-5:
+    /// a transaction's captures split into `tags_per_descriptor`-sized runs,
+    /// one descriptor each), and the `t` in
+    /// [`Journal::max_credits`](super::Journal::max_credits)'s
+    /// whole-transaction footprint bound `n + ceil(n/t) + 1 <= usable ring`.
     pub(super) const fn tags_per_descriptor(&self) -> usize {
         (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
     }
