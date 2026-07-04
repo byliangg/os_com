@@ -32,15 +32,24 @@
 //! - [`INCOMPAT_CSUM_V2`]/[`INCOMPAT_CSUM_V3`] change the tag size and reserve
 //!   a checksum tail at the end of each descriptor block.
 //!
-//! Admitting them stays gated on the checksum machinery they imply (verify is
-//! P7a-3, write is P7a-4): until then a journal carrying one is rejected at
-//! mount, exactly as before. [`INCOMPAT_ASYNC_COMMIT`] (removes the trailing
-//! commit-block barrier) and [`INCOMPAT_FAST_COMMIT`] (adds a wholly different
-//! fast-commit area) change behavior we do not model and remain rejected.
+//! The csum v2/v3 **verification** side (P7a-3) is implemented here: the
+//! journal superblock checksum is verified at the [`JournalSuperblock`] parse
+//! boundary, and the [`JournalCsumSeed`] + [`DescriptorTag`] helpers verify
+//! descriptor-tail, commit-block, and per-tag data checksums during recovery.
+//! Admission stays gated on the **write** side (stamping is P7a-4): until
+//! that lands, a journal carrying a csum feature is rejected at mount by
+//! [`load_geometry`](super::load_geometry)'s [`INCOMPAT_SUPP`] gate, exactly
+//! as before, and the verification paths run only under ktest fixtures.
+//! [`INCOMPAT_ASYNC_COMMIT`] (removes the trailing commit-block barrier) and
+//! [`INCOMPAT_FAST_COMMIT`] (adds a wholly different fast-commit area) change
+//! behavior we do not model and remain rejected.
 
 use core::fmt;
 
-use super::{super::prelude::*, Tid};
+use super::{
+    super::{checksum, prelude::*},
+    Tid,
+};
 
 /// A big-endian `u16` as stored on disk (jbd2 is big-endian, unlike ext4 proper).
 ///
@@ -177,14 +186,26 @@ pub(super) const INCOMPAT_CSUM_V3: u32 = 0x10;
 #[expect(dead_code)]
 pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 
-/// The jbd2 INCOMPAT features we admit at mount.
+/// The jbd2 INCOMPAT features we admit at mount, enforced by
+/// [`load_geometry`](super::load_geometry) (the mount-side admission gate;
+/// [`JournalSuperblock`]'s `TryFrom` parses any layout it can model so the
+/// verification paths are testable below the gate).
 ///
 /// Only [`INCOMPAT_REVOKE`] is tolerated — the feature bit passes, but a revoke
 /// block actually met during recovery hard-errors (`EUCLEAN`), the "revoke gap"
-/// (full support is Phase 7). Every other INCOMPAT feature (64-bit tags, async
-/// commit, csum v2/v3, fast commit) changes the on-disk layout we cannot parse,
-/// so a journal carrying one is rejected rather than silently misread.
+/// (full support is Phase 7). 64-bit tags and csum v2/v3 now *parse* (layout +
+/// read-side verification, P7a-2/-3) but stay unadmitted until the write side
+/// stamps what recovery verifies (P7a-4; admission flip is a later task) —
+/// otherwise our own commits would produce logs whose zero checksums fail our
+/// own recovery. Async commit and fast commit change behavior we do not model
+/// and are rejected outright.
 pub(super) const INCOMPAT_SUPP: u32 = INCOMPAT_REVOKE;
+
+/// The only checksum algorithm jbd2 defines for csum v2/v3
+/// (`JBD2_CRC32C_CHKSUM`), named by the journal superblock's
+/// `s_checksum_type`. Any other value there is rejected at parse, mirroring
+/// Linux `journal_check_superblock` (fs/jbd2/journal.c:1417-1420).
+pub(super) const JBD2_CRC32C_CHKSUM: u8 = 4;
 
 /// The 12-byte header shared by every jbd2 log block (`journal_header_t`).
 #[repr(C)]
@@ -294,6 +315,30 @@ pub(super) struct RawJournalSuperblock {
 const JOURNAL_SUPERBLOCK_SIZE: usize = 1024;
 const_assert!(size_of::<RawJournalSuperblock>() == JOURNAL_SUPERBLOCK_SIZE);
 
+impl RawJournalSuperblock {
+    /// The superblock's own crc32c (Linux `jbd2_superblock_csum`,
+    /// fs/jbd2/journal.c:118-129): `crc32c(!0, ..)` over the **1024-byte
+    /// superblock struct** — `sizeof(journal_superblock_t)`, not the whole
+    /// 4 KiB block it occupies — with the `s_checksum` field treated as zero.
+    ///
+    /// Seeded with `!0` directly, not with the UUID-derived
+    /// [`JournalCsumSeed`]: the seed protects log blocks, while this checksum
+    /// protects the superblock that *carries* the UUID the seed hashes.
+    ///
+    /// Verified at the [`JournalSuperblock`] parse boundary when the journal
+    /// has csum v2/v3; P7a-4's write side will stamp it on every superblock
+    /// rewrite (Linux `jbd2_write_superblock`, journal.c:1812-1813).
+    pub(super) fn checksum(&self) -> u32 {
+        const CHECKSUM_OFFSET: usize = core::mem::offset_of!(RawJournalSuperblock, s_checksum);
+        // Hash around the s_checksum hole: bytes before it, four zero bytes in
+        // its place, bytes after it (crc32c segments chain).
+        let bytes = self.as_bytes();
+        let head = checksum::crc32c(!0, &bytes[..CHECKSUM_OFFSET]);
+        let hole = checksum::crc32c(head, &[0u8; size_of::<Be32>()]);
+        checksum::crc32c(hole, &bytes[CHECKSUM_OFFSET + size_of::<Be32>()..])
+    }
+}
+
 /// The 8-byte head of a non-csum-v3 block tag in a descriptor block
 /// (`journal_block_tag_t` truncated after `t_flags`).
 ///
@@ -321,8 +366,9 @@ const_assert!(size_of::<RawBlockTag>() == BLOCK_TAG_SIZE);
 /// Unlike [`RawBlockTag`], the flags widen to 32 bits and the (full crc32c)
 /// checksum moves to a trailing 32-bit word. `t_blocknr`/`t_blocknr_high` sit
 /// at the same offsets (0 and 8) as in the 12-byte 64-bit tag, which is what
-/// lets Linux read both through one struct. The checksum is written as zero
-/// until P7a-4 (verify is P7a-3).
+/// lets Linux read both through one struct. Recovery verifies the checksum
+/// ([`DescriptorTag::verify_data_csum`]); our writer still emits zero there
+/// until P7a-4 stamps it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawJournalBlockTag3 {
@@ -349,10 +395,97 @@ const TAG_UUID_BYTES: usize = 16;
 
 /// Size of `struct jbd2_journal_block_tail`: one big-endian u32 crc32c of the
 /// whole descriptor block, reserved at the *end* of the tag area when
-/// [`INCOMPAT_CSUM_V2`] or [`INCOMPAT_CSUM_V3`] is on. The space is reserved
-/// (and written as zeros) now so the descriptor geometry never moves again;
-/// verifying it is P7a-3 and computing it is P7a-4.
+/// [`INCOMPAT_CSUM_V2`] or [`INCOMPAT_CSUM_V3`] is on. Recovery verifies it
+/// via [`JournalCsumSeed::verify_block_tail`]; our writer still emits zeros
+/// there until P7a-4 stamps it.
 const DESCRIPTOR_TAIL_BYTES: usize = 4;
+
+/// The per-journal csum v2/v3 seed: `crc32c(!0, s_uuid)` of the **journal**
+/// superblock's UUID (Linux `j_csum_seed`, derived in
+/// `journal_load_superblock`, fs/jbd2/journal.c:1493-1495).
+///
+/// Deliberately a distinct newtype from the filesystem's
+/// [`FsCsumSeed`](checksum::FsCsumSeed): the two hash different superblocks'
+/// UUIDs (equal for an internal journal, but distinct semantic layers — an
+/// external journal carries its own UUID) and feed entirely different
+/// checksum formulas. Collapsing two seed layers into one type was the exact
+/// mistake the P6b review split `FsCsumSeed`/`InodeCsumSeed` to fix.
+///
+/// Derived once at the [`JournalSuperblock`] parse boundary — only when the
+/// journal carries csum v2/v3, so *holding* one is the license to verify —
+/// and owned by it. The log-block checksum formulas hang off this type: the
+/// seed is what turns "bytes + polynomial" into "*this* journal's checksum".
+/// The `*_csum` computations are shared with P7a-4's write-side stamping.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct JournalCsumSeed(u32);
+
+impl JournalCsumSeed {
+    /// Derives the seed from the journal superblock's UUID
+    /// (`crc32c(!0, uuid)`, fs/jbd2/journal.c:1493-1495).
+    fn derive(uuid: &[u8; 16]) -> Self {
+        Self(checksum::crc32c(!0, uuid))
+    }
+
+    /// The crc32c of a descriptor-class block with its trailing 4-byte
+    /// `jbd2_journal_block_tail` treated as zero — the value the tail stores.
+    pub(super) fn block_tail_csum(&self, block: &[u8; BLOCK_SIZE]) -> u32 {
+        // Zeroing the tail and hashing the whole block equals hashing the
+        // body and then four zero bytes (crc32c segments chain).
+        let body = checksum::crc32c(self.0, &block[..BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES]);
+        checksum::crc32c(body, &[0u8; DESCRIPTOR_TAIL_BYTES])
+    }
+
+    /// Verifies the trailing `jbd2_journal_block_tail` checksum of a
+    /// descriptor block (Linux `jbd2_descriptor_block_csum_verify`,
+    /// fs/jbd2/recovery.c:179-196): the big-endian crc32c stored at
+    /// `BLOCK_SIZE - 4` must equal [`Self::block_tail_csum`].
+    ///
+    /// Deliberately generic over the block class: revoke blocks end in the
+    /// same tail checksum and Linux verifies them through this same function
+    /// (recovery.c:836), so P7b's revoke support reuses this helper as is.
+    pub(super) fn verify_block_tail(&self, block: &[u8; BLOCK_SIZE]) -> bool {
+        let stored = Be32::from_bytes(&block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..]).get();
+        stored == self.block_tail_csum(block)
+    }
+
+    /// The crc32c of a commit block with its `h_chksum[0]` word treated as
+    /// zero — the value that word stores. (`h_chksum_type`/`h_chksum_size`
+    /// stay zero under csum v2/v3; they belong to the v1 COMPAT checksum.)
+    pub(super) fn commit_block_csum(&self, block: &[u8; BLOCK_SIZE]) -> u32 {
+        // Hash around the h_chksum[0] hole, as in `block_tail_csum`.
+        let head = checksum::crc32c(self.0, &block[..COMMIT_CHKSUM_OFFSET]);
+        let hole = checksum::crc32c(head, &[0u8; size_of::<Be32>()]);
+        checksum::crc32c(hole, &block[COMMIT_CHKSUM_OFFSET + size_of::<Be32>()..])
+    }
+
+    /// Verifies a commit block's checksum (Linux
+    /// `jbd2_commit_block_csum_verify`, fs/jbd2/recovery.c:425-441): the
+    /// big-endian crc32c stored in `h_chksum[0]` must equal
+    /// [`Self::commit_block_csum`].
+    pub(super) fn verify_commit_block(&self, block: &[u8; BLOCK_SIZE]) -> bool {
+        let stored = Be32::from_bytes(
+            &block[COMMIT_CHKSUM_OFFSET..COMMIT_CHKSUM_OFFSET + size_of::<Be32>()],
+        )
+        .get();
+        stored == self.commit_block_csum(block)
+    }
+
+    /// The crc32c a descriptor tag stores for its data block (Linux
+    /// `jbd2_block_tag_csum_verify`, fs/jbd2/recovery.c:443-461, and the
+    /// write side `jbd2_block_tag_csum_set`, fs/jbd2/commit.c:319-340):
+    /// `crc32c(seed, be32(tid))` folded over the 4 KiB block **as it sits in
+    /// the log**. See [`DescriptorTag::verify_data_csum`] for the
+    /// escaped-form contract.
+    pub(super) fn data_block_csum(&self, tid: Tid, logged_block: &[u8; BLOCK_SIZE]) -> u32 {
+        let seq = checksum::crc32c(self.0, &tid.get().to_be_bytes());
+        checksum::crc32c(seq, logged_block)
+    }
+}
+
+/// Byte offset of a commit block's `h_chksum[0]` — the one checksum word csum
+/// v2/v3 uses (Linux stores the whole-block crc32c there and leaves the other
+/// seven words zero).
+const COMMIT_CHKSUM_OFFSET: usize = core::mem::offset_of!(RawCommitBlock, h_chksum);
 
 /// The descriptor-block tag geometry a journal's INCOMPAT feature bits select
 /// — the single source of truth for the byte layout of the tag array, derived
@@ -458,6 +591,14 @@ impl TagLayout {
         (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
     }
 
+    /// Whether this layout carries csum v2 or v3 (Linux
+    /// `jbd2_journal_has_csum_v2or3` on the feature bits the layout was
+    /// derived from): tags store a data checksum and descriptor-class blocks
+    /// reserve the trailing tail checksum.
+    pub(super) const fn has_csum(&self) -> bool {
+        self.descriptor_tail_bytes != 0
+    }
+
     /// Splits a filesystem block number into the on-disk
     /// `(t_blocknr, t_blocknr_high)` halves (Linux `write_tag_block`).
     fn split_blocknr(blocknr: Ext4Bid) -> (u32, u32) {
@@ -510,6 +651,7 @@ impl TagLayout {
             Ok(DescriptorTag {
                 blocknr: Self::join_blocknr(raw.t_blocknr.get(), high),
                 flags,
+                checksum: Some(TagChecksum::V3(raw.t_checksum.get())),
             })
         } else {
             let raw = RawBlockTag::from_bytes(&descriptor[offset..offset + BLOCK_TAG_SIZE]);
@@ -519,9 +661,16 @@ impl TagLayout {
             } else {
                 0
             };
+            // The 8-byte tag's `t_checksum` bytes exist on every layout, but
+            // they carry a checksum only under csum_v2 — without the feature
+            // the field is meaningless zero-fill, not a stored value.
+            let checksum = self
+                .has_csum()
+                .then(|| TagChecksum::V2(raw.t_checksum.get()));
             Ok(DescriptorTag {
                 blocknr: Self::join_blocknr(raw.t_blocknr.get(), high),
                 flags: raw.t_flags.get(),
+                checksum,
             })
         }
     }
@@ -621,13 +770,32 @@ impl TagWriter<'_> {
     }
 }
 
+/// The checksum a descriptor tag stores for its data block, in the width its
+/// layout prescribes — decoded by [`TagLayout::decode_tag`] alongside the
+/// block number so no verifier re-derives tag offsets (the walker yields the
+/// stored value; rust_rules "expose intermediate results").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TagChecksum {
+    /// csum_v2: the 8-byte tag's 16-bit `t_checksum` holds only the **low 16
+    /// bits** of the crc32c — jbd2 truncates via `cpu_to_be16(csum32)`
+    /// (fs/jbd2/recovery.c:460 / commit.c:339), a frozen on-disk quirk like
+    /// the v2 tag strides.
+    V2(u16),
+    /// csum_v3: the 16-byte tag3's 32-bit `t_checksum` holds the full crc32c.
+    V3(u32),
+}
+
 /// One decoded descriptor-block tag: the destination block number (both
-/// halves already joined on a 64-bit layout) and its flags, so no caller
-/// recomputes offsets or re-splits block numbers.
+/// halves already joined on a 64-bit layout), its flags, and — under csum
+/// v2/v3 — the stored data-block checksum, so no caller recomputes offsets or
+/// re-splits block numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DescriptorTag {
     blocknr: Ext4Bid,
     flags: u16,
+    /// The stored data-block checksum; `None` on a layout without csum v2/v3
+    /// (the raw field bytes are zero-fill there, not a stored value).
+    checksum: Option<TagChecksum>,
 }
 
 impl DescriptorTag {
@@ -659,6 +827,39 @@ impl DescriptorTag {
     /// ([`TAG_FLAG_SAME_UUID`]), i.e. no UUID follows it on disk.
     const fn reuses_uuid(&self) -> bool {
         self.flags & TAG_FLAG_SAME_UUID != 0
+    }
+
+    /// Verifies this tag's stored data-block checksum against the logged
+    /// bytes (Linux `jbd2_block_tag_csum_verify`, fs/jbd2/recovery.c:443-461):
+    /// `crc32c(seed, be32(tid))` folded over the block **as it sits in the
+    /// log** — the possibly ESCAPE-mangled form. Both sides hash the logged
+    /// bytes, never the restored ones: the writer checksums the escaped copy
+    /// it queues (`jbd2_block_tag_csum_set` on `wbuf`, fs/jbd2/commit.c:684),
+    /// and recovery verifies the log block before restoring the magic head
+    /// (recovery.c:656 verifies, :686 restores). Callers must therefore pass
+    /// the block bytes *before* any escape restoration.
+    ///
+    /// A tag from a layout without csum v2/v3 verifies vacuously (Linux
+    /// returns 1 when `!jbd2_journal_has_csum_v2or3`); callers gate on the
+    /// journal's [`JournalCsumSeed`] being present, which derives from the
+    /// same feature bits as the tag layout, so the `None` arm never carries a
+    /// verification decision on a csum journal.
+    pub(super) fn verify_data_csum(
+        &self,
+        seed: JournalCsumSeed,
+        tid: Tid,
+        logged_block: &[u8; BLOCK_SIZE],
+    ) -> bool {
+        let Some(stored) = self.checksum else {
+            return true;
+        };
+        let csum32 = seed.data_block_csum(tid, logged_block);
+        match stored {
+            // v2 stores only the low half (see [`TagChecksum::V2`]); compare
+            // in the wide domain rather than narrowing the computed value.
+            TagChecksum::V2(low16) => u32::from(low16) == csum32 & 0xFFFF,
+            TagChecksum::V3(full) => full == csum32,
+        }
     }
 }
 
@@ -712,8 +913,10 @@ impl Iterator for TagWalk<'_> {
 /// The on-disk commit block (`commit_header`, exactly 60 bytes) that seals a
 /// transaction.
 ///
-/// The checksum fields are written as zero; journal checksums (csum v2/v3)
-/// arrive in Phase 7.
+/// Under csum v2/v3 the block's crc32c lives in `h_chksum[0]` and recovery
+/// verifies it ([`JournalCsumSeed::verify_commit_block`]); `h_chksum_type` /
+/// `h_chksum_size` stay zero (they belong to the v1 COMPAT checksum we do not
+/// model). Our writer still emits zeros until P7a-4 stamps the checksum.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawCommitBlock {
@@ -738,9 +941,13 @@ const_assert!(size_of::<RawCommitBlock>() == COMMIT_BLOCK_SIZE);
 
 /// A validated, Rust-typed view of the journal superblock.
 ///
-/// Built from [`RawJournalSuperblock`] via `TryFrom`, which rejects a superblock
-/// whose magic, block type, block size, geometry, or feature set Phase 4 cannot
-/// honor.
+/// Built from [`RawJournalSuperblock`] via `TryFrom`, which rejects a
+/// superblock whose magic, block type, block size, geometry, or checksum is
+/// bad, or whose feature bits prescribe a layout we cannot model (csum_v2 +
+/// csum_v3 together). Whether the feature set is *admitted* for a real mount
+/// is [`load_geometry`](super::load_geometry)'s separate policy gate
+/// ([`INCOMPAT_SUPP`]); parse handles every modelable layout so recovery's
+/// verification paths are testable below that gate.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct JournalSuperblock {
     /// Total number of log blocks (`s_maxlen`).
@@ -756,6 +963,10 @@ pub(super) struct JournalSuperblock {
     /// The descriptor-tag geometry the INCOMPAT feature bits select, derived
     /// once here so every walker/builder trusts it (parse-once).
     tag_layout: TagLayout,
+    /// The csum v2/v3 seed, present iff the journal carries either checksum
+    /// feature — derived once here from `s_uuid` (parse-once), after the
+    /// superblock's own checksum proved the UUID trustworthy.
+    csum_seed: Option<JournalCsumSeed>,
 }
 
 impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
@@ -789,19 +1000,31 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             return_errno_with_message!(Errno::EUCLEAN, "journal s_first out of range");
         }
 
+        // Derive the tag geometry before the checksum gate below, mirroring
+        // Linux `journal_check_superblock`'s order (fs/jbd2/journal.c:
+        // 1399-1405 rejects the contradictory csum_v2 + csum_v3 combination
+        // before either bit selects a checksum formula). Note the *admission*
+        // gate (INCOMPAT_SUPP) is not here: it is mount policy, enforced by
+        // `load_geometry` on the raw feature bits.
         let feature_incompat = raw.s_feature_incompat.get();
-        if feature_incompat & !INCOMPAT_SUPP != 0 {
-            return_errno_with_message!(
-                Errno::EINVAL,
-                "journal has an unsupported incompatible feature"
-            );
-        }
-
-        // Derived after the admission gate above: while INCOMPAT_SUPP is
-        // revoke-only this always yields the 8-byte v0 layout, but the moment
-        // P7a-6 admits 64bit/csum_v3 the layout follows the bits with no
-        // further plumbing.
         let tag_layout = TagLayout::from_features(feature_incompat)?;
+
+        // Integrity gate (Linux journal_check_superblock, journal.c:
+        // 1416-1433): with csum v2/v3 on, the superblock names its algorithm
+        // and carries its own checksum; verify both before trusting any field
+        // further, and derive the per-journal seed the log-block verifiers
+        // use (journal.c:1493-1495 derives j_csum_seed at the same boundary).
+        let csum_seed = if tag_layout.has_csum() {
+            if raw.s_checksum_type != JBD2_CRC32C_CHKSUM {
+                return_errno_with_message!(Errno::EINVAL, "unsupported journal checksum type");
+            }
+            if raw.s_checksum.get() != raw.checksum() {
+                return_errno_with_message!(Errno::EUCLEAN, "journal superblock checksum mismatch");
+            }
+            Some(JournalCsumSeed::derive(&raw.s_uuid))
+        } else {
+            None
+        };
 
         Ok(Self {
             maxlen,
@@ -813,6 +1036,7 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             start: raw.s_start.get(),
             blocksize,
             tag_layout,
+            csum_seed,
         })
     }
 }
@@ -847,6 +1071,12 @@ impl JournalSuperblock {
     /// superblock's INCOMPAT feature bits.
     pub(super) const fn tag_layout(&self) -> TagLayout {
         self.tag_layout
+    }
+
+    /// Returns the csum v2/v3 seed, present iff the journal carries either
+    /// checksum feature (derived once, at parse, from the superblock UUID).
+    pub(super) const fn csum_seed(&self) -> Option<JournalCsumSeed> {
+        self.csum_seed
     }
 }
 
@@ -962,15 +1192,52 @@ mod tests {
         assert!(JournalSuperblock::try_from(raw).is_err());
     }
 
+    /// Parse (`TryFrom`) accepts every modelable layout — admission is
+    /// `load_geometry`'s separate mount gate (which still refuses these; see
+    /// the mod.rs test) — but a csum layout must pass the integrity gate:
+    /// a named crc32c algorithm and a matching superblock checksum.
     #[ktest]
-    fn reject_unsupported_incompat() {
+    fn parse_gates_csum_layouts_on_superblock_integrity() {
+        // 64bit alone: no csum feature, parses with no seed.
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.s_feature_incompat = Be32::new(INCOMPAT_64BIT);
-        assert!(JournalSuperblock::try_from(raw).is_err());
+        let sb = JournalSuperblock::try_from(raw).unwrap();
+        assert!(sb.csum_seed().is_none());
 
+        // csum_v3 without a checksum type: EINVAL (journal.c:1417-1420).
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.s_feature_incompat = Be32::new(INCOMPAT_CSUM_V3);
-        assert!(JournalSuperblock::try_from(raw).is_err());
+        let err = JournalSuperblock::try_from(raw).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        // csum_v3 with crc32c named but a wrong stored checksum: EUCLEAN
+        // (journal.c:1429-1433).
+        raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+        raw.s_checksum = Be32::new(raw.checksum() ^ 1);
+        let err = JournalSuperblock::try_from(raw).unwrap_err();
+        assert_eq!(err.error(), Errno::EUCLEAN);
+
+        // A correct checksum parses, and the seed appears.
+        raw.s_checksum = Be32::new(raw.checksum());
+        let sb = JournalSuperblock::try_from(raw).unwrap();
+        assert!(sb.csum_seed().is_some());
+    }
+
+    /// The superblock checksum covers everything BUT its own field: patching
+    /// `s_checksum` leaves `checksum()` unchanged, patching any covered byte
+    /// changes it.
+    #[ktest]
+    fn superblock_checksum_excludes_own_field() {
+        let raw = valid_raw(1024, 1, 1, 0);
+        let base = raw.checksum();
+
+        let mut stamped = raw;
+        stamped.s_checksum = Be32::new(base);
+        assert_eq!(stamped.checksum(), base);
+
+        let mut touched = raw;
+        touched.s_sequence = Be32::new(2);
+        assert_ne!(touched.checksum(), base);
     }
 
     #[ktest]
@@ -1216,5 +1483,318 @@ mod tests {
         assert_eq!(count_ok(&v0), 170);
         // v3: offsets 12 + 32k, valid while 12 + 32k + 16 <= 4092 -> k <= 127.
         assert_eq!(count_ok(&v3), 128);
+    }
+
+    // --- P7a-3 gate 3: checksum vectors pinned from a REAL Linux-written
+    // journal. Ground truth: a 256 MiB `mke2fs -b 4096 -O metadata_csum,64bit
+    // -E lazy_journal_init=0` image, loop-mounted under Linux 6.8 (which
+    // upgrades the journal to csum_v3 + 64bit, `s_feature_incompat = 0x12`),
+    // dirtied with count-neutral ops (chmod/rename of lost+found), synced,
+    // and snapshotted BEFORE unmount. The constants below reproduce, byte for
+    // byte, that snapshot's journal superblock, its one transaction's
+    // descriptor and commit blocks, and one journaled data block (the root
+    // directory block); the reconstructions were diffed against the raw
+    // image, and every stored checksum was independently recomputed in
+    // Python from the reflected 0x82F63B78 polynomial, before being pinned
+    // here. ---
+
+    /// The snapshot filesystem's UUID (`s_uuid` of the journal superblock).
+    const LINUX_UUID: [u8; 16] = [
+        0x60, 0xDA, 0xC8, 0xE1, 0x3E, 0x5E, 0x42, 0x3F, 0xA7, 0x28, 0xBF, 0x37, 0xE9, 0x1C, 0x87,
+        0xBB,
+    ];
+    /// Linux's `j_csum_seed` for that journal: `crc32c(!0, LINUX_UUID)`.
+    const LINUX_SEED: u32 = 0x4A61_B9AA;
+    /// The journal superblock's stored `s_checksum`.
+    const LINUX_SB_CSUM: u32 = 0x9FD2_29EE;
+    /// The transaction's tid (`h_sequence` of its descriptor/commit blocks;
+    /// also the journal superblock's `s_sequence` — the log was dirty).
+    const LINUX_TID: u32 = 2;
+    /// tag0's stored `t_checksum` (data block: an inode-table block, fs block
+    /// 37 — not pinned here; tag1's sparser data block is).
+    const LINUX_TAG0_CSUM: u32 = 0x1A0C_8FB6;
+    /// tag1's stored `t_checksum` (data block: the root directory block, fs
+    /// block 4133, pinned in [`linux_data_block`]).
+    const LINUX_TAG1_CSUM: u32 = 0x5C00_D228;
+    /// The descriptor block's stored tail checksum (at byte 4092).
+    const LINUX_DESC_TAIL_CSUM: u32 = 0xE10F_C75F;
+    /// The commit block's stored `h_chksum[0]`.
+    const LINUX_COMMIT_CSUM: u32 = 0x0850_86F5;
+
+    /// The seed our formula derives — pinned equal to [`LINUX_SEED`] by
+    /// [`csum_seed_matches_linux`].
+    fn linux_seed() -> JournalCsumSeed {
+        JournalCsumSeed::derive(&LINUX_UUID)
+    }
+
+    /// The snapshot's journal superblock, field for field (all others zero —
+    /// verified byte-identical to the raw image).
+    fn linux_journal_superblock() -> RawJournalSuperblock {
+        RawJournalSuperblock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_SUPERBLOCK_V2),
+                h_sequence: Be32::new(0),
+            },
+            s_blocksize: Be32::new(4096),
+            s_maxlen: Be32::new(4096),
+            s_first: Be32::new(1),
+            s_sequence: Be32::new(LINUX_TID),
+            s_start: Be32::new(1),
+            s_feature_incompat: Be32::new(INCOMPAT_64BIT | INCOMPAT_CSUM_V3),
+            s_uuid: LINUX_UUID,
+            s_nr_users: Be32::new(1),
+            s_checksum_type: JBD2_CRC32C_CHKSUM,
+            s_checksum: Be32::new(LINUX_SB_CSUM),
+            ..Default::default()
+        }
+    }
+
+    /// The snapshot's descriptor block (log block 1): header, two tag3 tags —
+    /// fs blocks 37 and 4133, a zero journal UUID after the first — and the
+    /// stored tail checksum. Everything else zero (verified byte-identical).
+    fn linux_descriptor_block() -> Box<[u8; BLOCK_SIZE]> {
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let header = RawJournalHeader {
+            h_magic: Be32::new(JBD2_MAGIC),
+            h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
+            h_sequence: Be32::new(LINUX_TID),
+        };
+        block[..JOURNAL_HEADER_SIZE].copy_from_slice(header.as_bytes());
+        let tag0 = RawJournalBlockTag3 {
+            t_blocknr: Be32::new(37),
+            t_flags: Be32::new(0),
+            t_blocknr_high: Be32::new(0),
+            t_checksum: Be32::new(LINUX_TAG0_CSUM),
+        };
+        block[12..28].copy_from_slice(tag0.as_bytes());
+        // [28..44): the 16-byte journal UUID after tag0 — Linux wrote zeros.
+        let tag1 = RawJournalBlockTag3 {
+            t_blocknr: Be32::new(4133),
+            t_flags: Be32::new(u32::from(TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)),
+            t_blocknr_high: Be32::new(0),
+            t_checksum: Be32::new(LINUX_TAG1_CSUM),
+        };
+        block[44..60].copy_from_slice(tag1.as_bytes());
+        block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..]
+            .copy_from_slice(Be32::new(LINUX_DESC_TAIL_CSUM).as_bytes());
+        block
+    }
+
+    /// The snapshot's commit block (log block 4): header, `h_chksum[0]`, and
+    /// the commit timestamp; `h_chksum_type`/`h_chksum_size` are ZERO under
+    /// csum v2/v3 (they belong to the v1 COMPAT checksum). Everything else
+    /// zero (verified byte-identical).
+    fn linux_commit_block() -> Box<[u8; BLOCK_SIZE]> {
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let mut commit = RawCommitBlock {
+            header: RawJournalHeader {
+                h_magic: Be32::new(JBD2_MAGIC),
+                h_blocktype: Be32::new(BLOCKTYPE_COMMIT),
+                h_sequence: Be32::new(LINUX_TID),
+            },
+            h_commit_sec: Be64::new(1_783_157_811),
+            h_commit_nsec: Be32::new(790_793_834),
+            ..Default::default()
+        };
+        commit.h_chksum[0] = Be32::new(LINUX_COMMIT_CSUM);
+        block[..size_of::<RawCommitBlock>()].copy_from_slice(commit.as_bytes());
+        block
+    }
+
+    /// tag1's journaled data block (log block 3 = fs block 4133, the root
+    /// directory: `.`, `..`, `lost+found`, and the metadata_csum dir tail),
+    /// rebuilt from its sparse nonzero segments (verified byte-identical).
+    fn linux_data_block() -> Box<[u8; BLOCK_SIZE]> {
+        let segments: &[(usize, &[u8])] = &[
+            (0, &[0x02]),
+            (4, &[0x0C, 0x00, 0x01, 0x02, 0x2E]),
+            (12, &[0x02]),
+            (16, &[0x0C, 0x00, 0x02, 0x02, 0x2E, 0x2E]),
+            (24, &[0x0B]),
+            (28, b"\xDC\x0F\x0A\x02lost+found"),
+            (4088, &[0x0C]),
+            (4091, &[0xDE, 0x4D, 0x83, 0xA0, 0x4D]),
+        ];
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        for (offset, bytes) in segments {
+            block[*offset..*offset + bytes.len()].copy_from_slice(bytes);
+        }
+        block
+    }
+
+    /// Our seed derivation reproduces Linux's `j_csum_seed` for the real UUID.
+    #[ktest]
+    fn csum_seed_matches_linux() {
+        assert_eq!(linux_seed().0, LINUX_SEED);
+    }
+
+    /// The journal-superblock checksum formula reproduces the stored value on
+    /// the real bytes; a bit flip breaks it; and the parse boundary both
+    /// accepts the intact superblock (deriving the seed) and refuses the
+    /// corrupt one with `EUCLEAN`.
+    #[ktest]
+    fn superblock_csum_matches_real_linux_bytes() {
+        let raw = linux_journal_superblock();
+        assert_eq!(raw.checksum(), LINUX_SB_CSUM);
+
+        let sb = JournalSuperblock::try_from(raw).unwrap();
+        assert_eq!(sb.csum_seed().unwrap().0, LINUX_SEED);
+        assert_eq!(sb.sequence(), Tid::new(LINUX_TID));
+
+        let mut corrupt = raw;
+        corrupt.s_uuid[3] ^= 0x10;
+        assert_ne!(corrupt.checksum(), LINUX_SB_CSUM);
+        assert_eq!(
+            JournalSuperblock::try_from(corrupt).unwrap_err().error(),
+            Errno::EUCLEAN
+        );
+    }
+
+    /// The descriptor-tail formula reproduces the stored value on the real
+    /// bytes; a bit flip anywhere in the covered area breaks verification.
+    #[ktest]
+    fn descriptor_tail_csum_matches_real_linux_bytes() {
+        let block = linux_descriptor_block();
+        let seed = linux_seed();
+        assert_eq!(seed.block_tail_csum(&block), LINUX_DESC_TAIL_CSUM);
+        assert!(seed.verify_block_tail(&block));
+
+        let mut corrupt = block;
+        corrupt[100] ^= 0x40;
+        assert!(!seed.verify_block_tail(&corrupt));
+    }
+
+    /// The commit-block formula reproduces the stored value on the real
+    /// bytes; a bit flip breaks verification.
+    #[ktest]
+    fn commit_block_csum_matches_real_linux_bytes() {
+        let block = linux_commit_block();
+        let seed = linux_seed();
+        assert_eq!(seed.commit_block_csum(&block), LINUX_COMMIT_CSUM);
+        assert!(seed.verify_commit_block(&block));
+
+        let mut corrupt = block;
+        corrupt[50] ^= 0x01;
+        assert!(!seed.verify_commit_block(&corrupt));
+    }
+
+    /// The per-tag data checksum reproduces the stored tag3 value on the real
+    /// bytes, end to end through the walker (the tag carries its stored
+    /// checksum out of `decode_tag`; nothing re-slices the descriptor): the
+    /// right block under the right tid verifies; a flipped bit, the wrong
+    /// tid, or the wrong tag all fail.
+    #[ktest]
+    fn tag3_data_csum_matches_real_linux_bytes() {
+        let layout = TagLayout::from_features(INCOMPAT_64BIT | INCOMPAT_CSUM_V3).unwrap();
+        let descriptor = linux_descriptor_block();
+        let tags: Vec<_> = layout.walk(&descriptor).map(|tag| tag.unwrap()).collect();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].blocknr(), 37);
+        assert_eq!(tags[1].blocknr(), 4133);
+        assert_eq!(tags[1].checksum, Some(TagChecksum::V3(LINUX_TAG1_CSUM)));
+
+        let seed = linux_seed();
+        let data = linux_data_block();
+        assert_eq!(
+            seed.data_block_csum(Tid::new(LINUX_TID), &data),
+            LINUX_TAG1_CSUM
+        );
+        assert!(tags[1].verify_data_csum(seed, Tid::new(LINUX_TID), &data));
+
+        // A flipped bit in the data fails.
+        let mut corrupt = data.clone();
+        corrupt[77] ^= 0x01;
+        assert!(!tags[1].verify_data_csum(seed, Tid::new(LINUX_TID), &corrupt));
+        // The tid folds into the checksum: the wrong sequence fails.
+        assert!(!tags[1].verify_data_csum(seed, Tid::new(LINUX_TID + 1), &data));
+        // And this block does not verify against the OTHER tag's checksum.
+        assert!(!tags[0].verify_data_csum(seed, Tid::new(LINUX_TID), &data));
+    }
+
+    /// csum_v2 semantics (no real artifact — Linux 6.8 writes csum_v3; the
+    /// formula is the same crc32c, truncated): the 16-bit tag field must
+    /// equal the LOW half of the computed crc32c, per jbd2's
+    /// `cpu_to_be16(csum32)` truncation (recovery.c:460).
+    #[ktest]
+    fn tag_csum_v2_stores_low_16_bits() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V2).unwrap();
+        let seed = linux_seed();
+        let tid = Tid::new(9);
+        let data = linux_data_block();
+        let csum32 = seed.data_block_csum(tid, &data);
+
+        let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
+        layout
+            .writer(&mut descriptor)
+            .put(0x321, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+            .unwrap();
+        // Stamp the stored 16-bit checksum by hand (the write side is P7a-4):
+        // the 8-byte tag sits at offset 12, its `t_checksum` at 12 + 4. The
+        // low half must verify...
+        let low = (csum32 & 0xFFFF).to_be_bytes();
+        descriptor[16..18].copy_from_slice(&low[2..]);
+        let tag = layout.walk(&descriptor).next().unwrap().unwrap();
+        assert!(tag.verify_data_csum(seed, tid, &data));
+
+        // ...and the HIGH half must not (a truncation-direction pin).
+        let high = (csum32 >> 16).to_be_bytes();
+        descriptor[16..18].copy_from_slice(&high[2..]);
+        let tag = layout.walk(&descriptor).next().unwrap().unwrap();
+        assert!(!tag.verify_data_csum(seed, tid, &data));
+    }
+
+    /// The data checksum covers the block AS LOGGED — the escaped form: a
+    /// checksum computed over the zero-headed log copy verifies against that
+    /// copy and NOT against the restored original, so verification must run
+    /// before the magic head is put back (recovery.c:656 vs :686).
+    #[ktest]
+    fn tag_data_csum_covers_escaped_form() {
+        let seed = linux_seed();
+        let tid = Tid::new(5);
+
+        // A metadata block that begins with the jbd2 magic...
+        let mut original = Box::new([0u8; BLOCK_SIZE]);
+        original[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        original[4..8].copy_from_slice(b"REST");
+        // ...is escaped in the log: first four bytes zeroed.
+        let mut logged = original.clone();
+        logged[..4].fill(0);
+
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
+        layout
+            .writer(&mut descriptor)
+            .put(
+                0x700,
+                TAG_FLAG_ESCAPE | TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+            )
+            .unwrap();
+        // Stamp tag3's stored checksum over the LOGGED (escaped) bytes; the
+        // tag3 t_checksum sits at offset 12 + 12.
+        let csum = seed.data_block_csum(tid, &logged);
+        descriptor[24..28].copy_from_slice(Be32::new(csum).as_bytes());
+
+        let tag = layout.walk(&descriptor).next().unwrap().unwrap();
+        assert!(tag.is_escaped());
+        assert!(tag.verify_data_csum(seed, tid, &logged));
+        assert!(!tag.verify_data_csum(seed, tid, &original));
+    }
+
+    /// On a layout without csum v2/v3 the tag carries no stored checksum and
+    /// verification is vacuous (Linux returns 1 when
+    /// `!jbd2_journal_has_csum_v2or3`) — production callers never reach it
+    /// there because no seed exists to gate on.
+    #[ktest]
+    fn tag_without_csum_layout_verifies_vacuously() {
+        let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
+        let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
+        layout
+            .writer(&mut descriptor)
+            .put(0x42, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+            .unwrap();
+        let tag = layout.walk(&descriptor).next().unwrap().unwrap();
+        assert_eq!(tag.checksum, None);
+        assert!(tag.verify_data_csum(linux_seed(), Tid::new(1), &linux_data_block()));
     }
 }

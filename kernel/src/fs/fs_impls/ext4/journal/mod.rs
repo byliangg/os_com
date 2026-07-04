@@ -71,7 +71,7 @@ use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
 use self::{
     commit::commit_transaction,
-    format::{JournalSuperblock, RawJournalSuperblock, TagLayout},
+    format::{INCOMPAT_SUPP, JournalCsumSeed, JournalSuperblock, RawJournalSuperblock, TagLayout},
     transaction::Transaction,
 };
 use super::{
@@ -255,6 +255,18 @@ impl JournalGeometry {
         self.superblock.tag_layout()
     }
 
+    /// The csum v2/v3 seed, present iff the journal carries either checksum
+    /// feature — derived once at parse ([`format::JournalCsumSeed`]). The
+    /// recovery scanner and the checkpoint/replay applier gate every log-block
+    /// checksum verification on this one value.
+    ///
+    /// Private to the journal module for the same reason as
+    /// [`tag_layout`](Self::tag_layout): the seed is a journal-internal
+    /// concern.
+    fn csum_seed(&self) -> Option<JournalCsumSeed> {
+        self.superblock.csum_seed()
+    }
+
     /// Returns the log block where recovery starts; 0 means clean (`s_start`).
     ///
     /// Used by [`Journal::new`] to seed the tail, so it is live in non-ktest.
@@ -385,6 +397,21 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         .block_device()
         .read_val(Bid::new(block_map[0]).to_offset())
         .map_err(|_| Error::with_message(Errno::EIO, "failed to read the journal superblock"))?;
+
+    // Admission gate (mount policy, [`format::INCOMPAT_SUPP`]): refuse every
+    // INCOMPAT feature we do not honor end-to-end BEFORE parsing further —
+    // the same behavior the parse boundary itself enforced until P7a-3, kept
+    // here so production mounts are byte-for-byte unaffected while `TryFrom`
+    // learns to parse (and checksum-verify) the still-unadmitted csum
+    // layouts for the recovery tests. The flip that admits 64bit/csum_v3 is
+    // a later task, gated on P7a-4's write-side stamping.
+    if raw.s_feature_incompat.get() & !INCOMPAT_SUPP != 0 {
+        return_errno_with_message!(
+            Errno::EINVAL,
+            "journal has an unsupported incompatible feature"
+        );
+    }
+
     let superblock = JournalSuperblock::try_from(raw)?;
 
     // The superblock's declared length must fit within the blocks the inode
@@ -1421,7 +1448,10 @@ mod tests {
 
     use super::{
         super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
-        format::{BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader},
+        format::{
+            BLOCKTYPE_SUPERBLOCK_V2, Be32, INCOMPAT_CSUM_V3, JBD2_CRC32C_CHKSUM, JBD2_MAGIC,
+            RawJournalHeader,
+        },
         *,
     };
 
@@ -1484,6 +1514,37 @@ mod tests {
         );
         // Past the end of the log.
         assert_eq!(geo.log_block_to_physical(2), None);
+    }
+
+    /// The csum layouts PARSE now (P7a-3's verify side), but mount admission
+    /// must keep refusing them until the write side stamps what recovery
+    /// verifies (P7a-4): a structurally valid, correctly self-checksummed
+    /// csum_v3 journal is still rejected by `load_geometry` with `EINVAL` —
+    /// no admission flip in this task.
+    #[ktest]
+    fn load_geometry_rejects_unadmitted_csum_journal() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_has_journal()
+            .build()
+            .unwrap();
+        let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, 2);
+        f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
+
+        let mut raw = journal_super(2, 1, 1, 0);
+        raw.s_feature_incompat = Be32::new(INCOMPAT_CSUM_V3);
+        raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+        raw.s_checksum = Be32::new(raw.checksum());
+        // Sanity: the parse boundary itself accepts this superblock...
+        assert!(JournalSuperblock::try_from(raw).is_ok());
+        f.disk
+            .segment()
+            .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
+            .unwrap();
+
+        // ...but mount admission refuses the unadmitted feature.
+        let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
     }
 
     #[ktest]

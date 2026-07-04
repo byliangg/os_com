@@ -63,12 +63,16 @@
 //! the descriptor-tag byte layout, [`TagLayout`](super::format::TagLayout) —
 //! reader and writer cannot drift because neither owns any offset itself.
 //!
-//! # Phase 4 scope
+//! # Scope
 //!
-//! - No revoke handling: our own logs carry no revoke blocks (Phase 7), so a
+//! - No revoke handling: our own logs carry no revoke blocks (P7b), so a
 //!   block where a descriptor is expected must be a descriptor; any other block
 //!   type is treated as corruption (`EUCLEAN`), never panicked on.
-//! - No checksums (Phase 7): the commit block's csum fields are ignored.
+//! - Checksums are verify-only (P7a-3): on a csum v2/v3 journal,
+//!   [`apply_log_transaction`] verifies the descriptor tail and each tag's
+//!   data checksum (see its docs); the write side stamps nothing until P7a-4,
+//!   so csum journals stay unadmitted at mount and these paths run under
+//!   ktest fixtures.
 //! - Synchronous, driven inline by the caller (here, tests); no background
 //!   checkpoint thread yet.
 
@@ -113,11 +117,39 @@ use super::{
 /// walk the writer used to place them, so reader and writer wrap the ring
 /// identically.
 ///
+/// # Checksum verification (csum v2/v3 journals)
+///
+/// Mirrors Linux `do_one_pass` PASS_REPLAY:
+///
+/// - The descriptor's tail checksum is verified before its tags are trusted;
+///   a mismatch is an immediate hard error (jbd2 errors with `-EFSBADCRC` in
+///   any pass but SCAN, fs/jbd2/recovery.c:570-580) — SCAN already vouched
+///   for this transaction, so corruption here is real, mapped to `EUCLEAN`.
+/// - Each tag's logged data block is verified against the tag's stored
+///   checksum **before** any escape restoration (the checksum covers the
+///   block as it sits in the log; see
+///   [`DescriptorTag::verify_data_csum`](super::format::DescriptorTag::verify_data_csum)).
+///   On a mismatch the block is skipped — never applied — and the walk
+///   continues so every intact block still reaches its final location, then
+///   the whole apply fails (`EUCLEAN`), exactly jbd2's skip-and-record shape
+///   (recovery.c:655-666 skips the write and records `-EFSBADCRC`;
+///   recovery.c:895-896 turns it into the pass verdict, which
+///   `jbd2_journal_load` then refuses the mount over, journal.c:2072-2076 —
+///   Linux does NOT mount off a log with a bad tag checksum either).
+///   *Divergence*: Linux's REPLAY keeps salvaging **subsequent
+///   transactions** before failing; our caller stops at this transaction.
+///   The mount is refused either way — the extra salvage only feeds a
+///   subsequent `e2fsck`, which replays the journal itself anyway.
+/// - The commit block is not checksum-verified here, matching Linux (only
+///   PASS_SCAN checks it, recovery.c:806-807 — by REPLAY it already sealed
+///   the transaction).
+///
 /// # Errors
 ///
 /// `EUCLEAN` if the descriptor or commit block is malformed (bad magic, wrong
-/// type, wrong sequence, or a tag offset that would run past the block); `EIO`
-/// on a device failure. Never panics on a malformed log.
+/// type, wrong sequence, a tag offset that would run past the block, or a
+/// checksum mismatch); `EIO` on a device failure. Never panics on a malformed
+/// log.
 pub(super) fn apply_log_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
@@ -143,6 +175,15 @@ pub(super) fn apply_log_transaction(
         return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has an unexpected tid");
     }
 
+    // Descriptor-tail checksum (csum journals): hard error before any tag is
+    // trusted — replay/checkpoint follows a pass that already vouched for the
+    // transaction, so unlike SCAN there is no stale-block excuse here (jbd2
+    // recovery.c:570-580, `-EFSBADCRC` in any pass but SCAN).
+    let seed = journal.geometry().csum_seed();
+    if seed.is_some_and(|s| !s.verify_block_tail(&descriptor)) {
+        return_errno_with_message!(Errno::EUCLEAN, "journal descriptor checksum mismatch");
+    }
+
     // Walk the tag array (the byte geometry lives in ONE place, the journal's
     // `TagLayout`, shared with the writer and the recovery scanner), applying
     // each tag's logged block to its final location. `log` tracks the log block
@@ -151,6 +192,7 @@ pub(super) fn apply_log_transaction(
     // malformed tag array (a tag overrunning the tag area) yields `EUCLEAN` from
     // the walker — corruption here, never a panic.
     let mut log = start_log;
+    let mut bad_tag_csum = false;
     for tag in journal.geometry().tag_layout().walk(&descriptor) {
         let tag = tag?;
 
@@ -158,6 +200,17 @@ pub(super) fn apply_log_transaction(
         log = journal.geometry().next_log_block(log);
         let mut block = [0u8; BLOCK_SIZE];
         journal.geometry().read_log_block(device, log, &mut block)?;
+
+        // Per-tag data checksum (csum journals), over the logged bytes BEFORE
+        // the escape restoration below — the checksum covers the block as it
+        // sits in the log. A mismatched block is skipped (never applied with
+        // corrupt content), the walk continues so intact blocks still land,
+        // and the apply fails at the end — jbd2's skip-and-record shape (see
+        // the function docs; recovery.c:655-666).
+        if seed.is_some_and(|s| !tag.verify_data_csum(s, expected_tid, &block)) {
+            bad_tag_csum = true;
+            continue;
+        }
 
         // Restore the escaped head: the writer zeroed the first 4 bytes of a
         // block that began with JBD2_MAGIC so a recovery scan would not mistake
@@ -184,6 +237,16 @@ pub(super) fn apply_log_transaction(
         || Tid::new(commit_header.h_sequence.get()) != expected_tid
     {
         return_errno_with_message!(Errno::EUCLEAN, "journal commit block is malformed");
+    }
+
+    // A tag failed its data checksum above: every intact block was applied,
+    // but the transaction as a whole is corrupt — refuse (the caller refuses
+    // the mount / fails the checkpoint) rather than pretend it replayed.
+    if bad_tag_csum {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "journal data block checksum mismatch during replay"
+        );
     }
 
     // The next transaction starts right after this commit block.
@@ -260,6 +323,9 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // fast path (recovery.c, s_start == 0) resumes the log from s_head, so a
     // stale value would corrupt a subsequent mount. `commit.rs` deliberately
     // leaves this to us. (Phase 4 Task 3 adversarial-review requirement.)
+    // On a csum journal this rewrite would also have to restamp `s_checksum`
+    // (jbd2_write_superblock, journal.c:1812-1813) — P7a-4's write side;
+    // until then admission keeps csum journals off real mounts.
     raw.s_head = Be32::new(head);
     device
         .write_val(sb_offset, &raw)
