@@ -58,10 +58,10 @@
 //! # Shared with recovery (Task 7)
 //!
 //! [`apply_log_transaction`] is the log-transaction reader that Task 7 (SCAN /
-//! REPLAY recovery) will reuse to replay a transaction found in the log. It is
-//! the exact mirror of [`commit.rs`](super::commit)'s writer — every byte offset
-//! it reads is cross-referenced against `build_descriptor_block` — so keeping the
-//! two in lockstep is a correctness invariant for both checkpoint and recovery.
+//! REPLAY recovery) reuses to replay a transaction found in the log. It mirrors
+//! [`commit.rs`](super::commit)'s writer through the one shared definition of
+//! the descriptor-tag byte layout, [`TagLayout`](super::format::TagLayout) —
+//! reader and writer cannot drift because neither owns any offset itself.
 //!
 //! # Phase 4 scope
 //!
@@ -77,20 +77,10 @@ use super::{
     Journal, Tid,
     commit::barrier,
     format::{
-        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawBlockTag, RawJournalHeader,
-        RawJournalSuperblock, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawJournalHeader,
+        RawJournalSuperblock,
     },
 };
-
-/// The 12-byte jbd2 block header size, the offset at which a descriptor block's
-/// tag array begins (`size_of::<RawJournalHeader>()`).
-const HEADER_LEN: usize = size_of::<RawJournalHeader>();
-/// The 8-byte block-tag size (`size_of::<RawBlockTag>()`).
-const TAG_LEN: usize = size_of::<RawBlockTag>();
-/// The 16-byte journal UUID that follows the *first* tag of a descriptor block
-/// (the writer emits it once; every later tag reuses it via `TAG_FLAG_SAME_UUID`
-/// and carries no UUID of its own).
-const UUID_LEN: usize = 16;
 
 /// Applies one committed transaction from the log to its final locations, the
 /// mirror of [`commit.rs`](super::commit)'s writer.
@@ -109,14 +99,14 @@ const UUID_LEN: usize = 16;
 /// this is idempotent — the property [`checkpoint`]'s crash-safety and Task 7's
 /// recovery both rely on.
 ///
-/// # Descriptor byte layout (must mirror the writer exactly)
+/// # Descriptor byte layout
 ///
-/// A descriptor block is `[12-byte header][tag 0][16-byte UUID][tag 1][tag 2]…`.
-/// Cross-reference `commit.rs::build_descriptor_block` (which lays these down)
-/// and the `read_tag` test helper in `commit.rs`'s tests: tag `i > 0` sits at
-/// `12 + 8 + 16 + (i-1)*8`. We reproduce that by advancing a running byte offset
-/// past each 8-byte tag, plus a further 16 bytes after any tag lacking
-/// `TAG_FLAG_SAME_UUID` (which, per the writer, is exactly the first tag).
+/// A descriptor block is `[12-byte header][tag 0][16-byte UUID][tag 1][tag 2]…`,
+/// with every byte offset owned by the journal's
+/// [`TagLayout`](super::format::TagLayout): this walk iterates
+/// [`TagLayout::walk`](super::format::TagLayout::walk), the same definition the
+/// writer's `put_tag` and the recovery scanner use, so reader and writer cannot
+/// drift.
 ///
 /// Each tag's logged metadata block is the **next** log block after the previous
 /// one, starting from `start_log` (the descriptor) — the same `next_log_block`
@@ -153,23 +143,16 @@ pub(super) fn apply_log_transaction(
         return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has an unexpected tid");
     }
 
-    // Walk the tag array from byte offset 12 (right after the header), applying
+    // Walk the tag array (the byte geometry lives in ONE place, the journal's
+    // `TagLayout`, shared with the writer and the recovery scanner), applying
     // each tag's logged block to its final location. `log` tracks the log block
     // holding the *current* tag's metadata: it starts at the descriptor and steps
-    // one block per tag (the writer wrote descriptor, then metadata 0, 1, …).
-    let mut offset = HEADER_LEN;
+    // one block per tag (the writer wrote descriptor, then metadata 0, 1, …). A
+    // malformed tag array (a tag overrunning the tag area) yields `EUCLEAN` from
+    // the walker — corruption here, never a panic.
     let mut log = start_log;
-    loop {
-        // The tag must fit wholly within the descriptor block.
-        if offset + TAG_LEN > BLOCK_SIZE {
-            return_errno_with_message!(
-                Errno::EUCLEAN,
-                "journal descriptor tag runs past the block"
-            );
-        }
-        let tag = RawBlockTag::from_bytes(&descriptor[offset..offset + TAG_LEN]);
-        let dest = Ext4Bid::from(tag.t_blocknr.get());
-        let flags = tag.t_flags.get();
+    for tag in journal.geometry().tag_layout().walk(&descriptor) {
+        let tag = tag?;
 
         // This tag's metadata is the next log block after the previous one.
         log = journal.geometry().next_log_block(log);
@@ -179,25 +162,14 @@ pub(super) fn apply_log_transaction(
         // Restore the escaped head: the writer zeroed the first 4 bytes of a
         // block that began with JBD2_MAGIC so a recovery scan would not mistake
         // the metadata for a log header. Put the magic back before applying.
-        if flags & TAG_FLAG_ESCAPE != 0 {
+        if tag.is_escaped() {
             block[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
         }
 
         // Apply to the FINAL location (a filesystem block), not a log block.
         device
-            .write_bytes(Bid::new(dest).to_offset(), block.as_slice())
+            .write_bytes(Bid::new(tag.blocknr()).to_offset(), block.as_slice())
             .map_err(|_| Error::with_message(Errno::EIO, "failed to apply journaled block"))?;
-
-        // Advance past this 8-byte tag; the first tag (the one lacking
-        // SAME_UUID) is additionally followed by its 16-byte UUID.
-        offset += TAG_LEN;
-        if flags & TAG_FLAG_SAME_UUID == 0 {
-            offset += UUID_LEN;
-        }
-
-        if flags & TAG_FLAG_LAST_TAG != 0 {
-            break;
-        }
     }
 
     // --- Commit block: the next log block after the last metadata block. ---

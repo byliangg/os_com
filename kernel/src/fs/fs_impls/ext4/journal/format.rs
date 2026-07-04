@@ -15,22 +15,28 @@
 //! bytes in big-endian order on disk and converts on access; the raw structs are
 //! never read as native-endian integers.
 //!
-//! # Supported features (the Phase 4 subset)
+//! # Supported features
 //!
-//! We parse only the journal layout we can honor. Of the jbd2 INCOMPAT
-//! features, only [`INCOMPAT_REVOKE`] is tolerated at mount — but a log that
-//! *actually* contains revoke blocks is refused during recovery with `EUCLEAN`
-//! rather than under-replayed (the "revoke gap"; full revoke support is Phase
-//! 7). Every other INCOMPAT feature changes the on-disk layout we cannot yet
-//! parse and is rejected:
+//! We admit only the journal feature set we can honor end-to-end. Of the jbd2
+//! INCOMPAT features, only [`INCOMPAT_REVOKE`] is tolerated at mount — but a
+//! log that *actually* contains revoke blocks is refused during recovery with
+//! `EUCLEAN` rather than under-replayed (the "revoke gap"; full revoke support
+//! is Phase 7). See [`INCOMPAT_SUPP`] for the mask.
 //!
-//! - [`INCOMPAT_64BIT`] widens block tags with a `t_blocknr_high` word (so
-//!   [`RawBlockTag`] would no longer be 8 bytes),
-//! - [`INCOMPAT_CSUM_V2`]/[`INCOMPAT_CSUM_V3`] add per-block/per-tag checksums,
-//! - [`INCOMPAT_ASYNC_COMMIT`] removes the trailing commit-block barrier,
-//! - [`INCOMPAT_FAST_COMMIT`] adds a wholly different fast-commit area.
+//! The descriptor-tag *geometry* of the layout-shaping features is nonetheless
+//! modeled: every descriptor builder/walker is parameterized over one
+//! [`TagLayout`] derived from the feature bits (parse-once, held by
+//! [`JournalSuperblock`]):
 //!
-//! See [`INCOMPAT_SUPP`] for the resulting support mask.
+//! - [`INCOMPAT_64BIT`] widens block tags with a `t_blocknr_high` word,
+//! - [`INCOMPAT_CSUM_V2`]/[`INCOMPAT_CSUM_V3`] change the tag size and reserve
+//!   a checksum tail at the end of each descriptor block.
+//!
+//! Admitting them stays gated on the checksum machinery they imply (verify is
+//! P7a-3, write is P7a-4): until then a journal carrying one is rejected at
+//! mount, exactly as before. [`INCOMPAT_ASYNC_COMMIT`] (removes the trailing
+//! commit-block barrier) and [`INCOMPAT_FAST_COMMIT`] (adds a wholly different
+//! fast-commit area) change behavior we do not model and remain rejected.
 
 use core::fmt;
 
@@ -156,7 +162,6 @@ pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
 /// module docs).
 pub(super) const INCOMPAT_REVOKE: u32 = 0x1;
 /// 64-bit block numbers in block tags (`JBD2_FEATURE_INCOMPAT_64BIT`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const INCOMPAT_64BIT: u32 = 0x2;
 /// Commit blocks may be written before their data is durable
 /// (`JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT`).
@@ -165,10 +170,8 @@ pub(super) const INCOMPAT_64BIT: u32 = 0x2;
 #[expect(dead_code)]
 pub(super) const INCOMPAT_ASYNC_COMMIT: u32 = 0x4;
 /// Version-2 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V2`).
-#[expect(dead_code)]
 pub(super) const INCOMPAT_CSUM_V2: u32 = 0x8;
 /// Version-3 checksums (`JBD2_FEATURE_INCOMPAT_CSUM_V3`).
-#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) const INCOMPAT_CSUM_V3: u32 = 0x10;
 /// Fast-commit area is present (`JBD2_FEATURE_INCOMPAT_FAST_COMMIT`).
 #[expect(dead_code)]
@@ -291,12 +294,14 @@ pub(super) struct RawJournalSuperblock {
 const JOURNAL_SUPERBLOCK_SIZE: usize = 1024;
 const_assert!(size_of::<RawJournalSuperblock>() == JOURNAL_SUPERBLOCK_SIZE);
 
-/// An 8-byte block tag in a descriptor block (`journal_block_tag_t` without the
-/// 64-bit / checksum extensions).
+/// The 8-byte head of a non-csum-v3 block tag in a descriptor block
+/// (`journal_block_tag_t` truncated after `t_flags`).
 ///
-/// jbd2's `t_blocknr_high` word (present only with [`INCOMPAT_64BIT`], which we
-/// reject) is deliberately omitted so this struct stays 8 bytes, matching the
-/// only tag layout Phase 4 parses.
+/// jbd2's `t_blocknr_high` word (present only with [`INCOMPAT_64BIT`]) is
+/// deliberately not a field, so this struct stays the 8-byte common prefix: on
+/// a 64-bit journal the [`TagLayout`] builder/walker append/read the high word
+/// as a separate [`Be32`] right after it (the 12-byte case). A csum-v3 journal
+/// uses [`RawJournalBlockTag3`] instead.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawBlockTag {
@@ -310,6 +315,362 @@ pub(super) struct RawBlockTag {
 
 const BLOCK_TAG_SIZE: usize = 8;
 const_assert!(size_of::<RawBlockTag>() == BLOCK_TAG_SIZE);
+
+/// A 16-byte csum-v3 block tag in a descriptor block (`journal_block_tag3_t`).
+///
+/// Unlike [`RawBlockTag`], the flags widen to 32 bits and the (full crc32c)
+/// checksum moves to a trailing 32-bit word. `t_blocknr`/`t_blocknr_high` sit
+/// at the same offsets (0 and 8) as in the 12-byte 64-bit tag, which is what
+/// lets Linux read both through one struct. The checksum is written as zero
+/// until P7a-4 (verify is P7a-3).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod)]
+pub(super) struct RawJournalBlockTag3 {
+    /// Low 32 bits of the target filesystem block (`t_blocknr`).
+    pub(super) t_blocknr: Be32,
+    /// `TAG_FLAG_*` bits (`t_flags`); the value fits 16 bits — Linux writes it
+    /// through the 8-byte tag's `__be16` at offset 6, which encodes the same
+    /// bytes.
+    pub(super) t_flags: Be32,
+    /// High 32 bits of the target filesystem block (`t_blocknr_high`), zero
+    /// unless [`INCOMPAT_64BIT`] is on.
+    pub(super) t_blocknr_high: Be32,
+    /// Tag checksum (`t_checksum`), zero until P7a-4.
+    pub(super) t_checksum: Be32,
+}
+
+const BLOCK_TAG3_SIZE: usize = 16;
+const_assert!(size_of::<RawJournalBlockTag3>() == BLOCK_TAG3_SIZE);
+
+/// The 16-byte journal UUID that follows a descriptor tag lacking
+/// [`TAG_FLAG_SAME_UUID`] — per the writer, exactly the first tag. We carry no
+/// journal UUID, so the region is written as zeros and skipped on read.
+const TAG_UUID_BYTES: usize = 16;
+
+/// Size of `struct jbd2_journal_block_tail`: one big-endian u32 crc32c of the
+/// whole descriptor block, reserved at the *end* of the tag area when
+/// [`INCOMPAT_CSUM_V2`] or [`INCOMPAT_CSUM_V3`] is on. The space is reserved
+/// (and written as zeros) now so the descriptor geometry never moves again;
+/// verifying it is P7a-3 and computing it is P7a-4.
+const DESCRIPTOR_TAIL_BYTES: usize = 4;
+
+/// The descriptor-block tag geometry a journal's INCOMPAT feature bits select
+/// — the single source of truth for the byte layout of the tag array, derived
+/// once (parse-once, held by [`JournalSuperblock`]) and consumed by the commit
+/// writer, the recovery scanner, and the checkpoint/replay applier. Before
+/// this type each of those kept a hand-mirrored copy of the same offsets.
+///
+/// Tag sizes follow Linux 6.6 `journal_tag_bytes()` (fs/jbd2/journal.c)
+/// exactly:
+///
+/// | features           | tag bytes | descriptor tail |
+/// |--------------------|-----------|-----------------|
+/// | (none) / revoke    | 8         | 0               |
+/// | 64bit              | 12        | 0               |
+/// | csum_v2            | 10        | 4               |
+/// | csum_v2 + 64bit    | 14        | 4               |
+/// | csum_v3 (± 64bit)  | 16        | 4               |
+///
+/// The odd csum_v2 sizes are jbd2's frozen on-disk quirk: the tag-size
+/// function that shipped with csum_v2 over-counted by two bytes, and csum_v3
+/// exists to supersede it (Linux commit `db9ee220361d`, "jbd2: fix descriptor
+/// block size handling errors with journal_csum"). We reproduce the quirk so a
+/// Linux-written csum_v2 log would parse at the right stride if csum_v2 were
+/// ever admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct TagLayout {
+    /// Bytes one tag occupies in the descriptor's tag array (the walk stride,
+    /// excluding the 16-byte UUID after a non-`SAME_UUID` tag).
+    tag_bytes: usize,
+    /// 64-bit journal: tags carry a `t_blocknr_high` word.
+    has_blocknr_high: bool,
+    /// csum-v3 journal: tags are the 16-byte [`RawJournalBlockTag3`].
+    csum_v3: bool,
+    /// Bytes reserved at the end of the descriptor block for the
+    /// `jbd2_journal_block_tail` checksum (0 or [`DESCRIPTOR_TAIL_BYTES`]).
+    descriptor_tail_bytes: usize,
+}
+
+impl TagLayout {
+    /// Derives the tag geometry from the journal superblock's raw INCOMPAT
+    /// feature bits (the parse-once boundary; see the type-level table).
+    ///
+    /// Total over every feature combination except csum_v2 + csum_v3 together,
+    /// which jbd2 itself refuses (`journal_get_superblock`) because the two
+    /// prescribe contradictory tag layouts.
+    pub(super) fn from_features(feature_incompat: u32) -> Result<Self> {
+        let csum_v2 = feature_incompat & INCOMPAT_CSUM_V2 != 0;
+        let csum_v3 = feature_incompat & INCOMPAT_CSUM_V3 != 0;
+        if csum_v2 && csum_v3 {
+            return_errno_with_message!(Errno::EINVAL, "journal enables both csum_v2 and csum_v3");
+        }
+        let has_blocknr_high = feature_incompat & INCOMPAT_64BIT != 0;
+
+        let tag_bytes = if csum_v3 {
+            size_of::<RawJournalBlockTag3>()
+        } else {
+            // The 8-byte common prefix, plus the high word on a 64-bit
+            // journal, plus csum_v2's frozen 2-byte stride quirk (see the
+            // type-level docs).
+            size_of::<RawBlockTag>()
+                + if has_blocknr_high {
+                    size_of::<Be32>()
+                } else {
+                    0
+                }
+                + if csum_v2 { size_of::<Be16>() } else { 0 }
+        };
+        let descriptor_tail_bytes = if csum_v2 || csum_v3 {
+            DESCRIPTOR_TAIL_BYTES
+        } else {
+            0
+        };
+
+        Ok(Self {
+            tag_bytes,
+            has_blocknr_high,
+            csum_v3,
+            descriptor_tail_bytes,
+        })
+    }
+
+    /// The byte offset of the first tag: right past the 12-byte block header.
+    pub(super) const fn first_tag_offset(&self) -> usize {
+        size_of::<RawJournalHeader>()
+    }
+
+    /// The end of the usable tag area: the block, minus the reserved
+    /// descriptor-tail checksum when the layout carries one. Builder and
+    /// walkers bound the tag array by this one value, so neither side can
+    /// place or parse a tag inside the tail.
+    const fn tag_area_end(&self) -> usize {
+        BLOCK_SIZE - self.descriptor_tail_bytes
+    }
+
+    /// The number of block tags guaranteed to fit one descriptor block under
+    /// this layout, conservatively charging every tag the 16-byte UUID cost
+    /// (only the first tag actually pays it). Bounds a single transaction's
+    /// metadata blocks while the commit pipeline writes one descriptor per
+    /// transaction ([`Journal::max_credits`](super::Journal::max_credits)).
+    pub(super) const fn tags_per_descriptor(&self) -> usize {
+        (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
+    }
+
+    /// Splits a filesystem block number into the on-disk
+    /// `(t_blocknr, t_blocknr_high)` halves (Linux `write_tag_block`).
+    fn split_blocknr(blocknr: Ext4Bid) -> (u32, u32) {
+        let bytes = blocknr.to_be_bytes();
+        let high = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let low = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        (low, high)
+    }
+
+    /// Serializes one block tag at `offset` into a (zeroed) descriptor-block
+    /// buffer and returns the offset where the next tag begins — past the tag
+    /// and, when this tag lacks [`TAG_FLAG_SAME_UUID`], its 16-byte UUID
+    /// (left as zeros; we carry no journal UUID). Tag checksum fields are
+    /// written as zero (P7a-4 fills them in).
+    ///
+    /// # Errors
+    ///
+    /// - `EFBIG` when `blocknr` does not fit 32 bits and the layout carries no
+    ///   `t_blocknr_high` word: truncating would journal the after-image to
+    ///   the wrong block on a > 16 TiB volume, so it is a real error, not a
+    ///   debug assert.
+    /// - `ENOSPC` when the tag (plus its UUID) would run past the tag area —
+    ///   into the reserved descriptor tail, or past the block.
+    pub(super) fn put_tag(
+        &self,
+        block: &mut [u8; BLOCK_SIZE],
+        offset: usize,
+        blocknr: Ext4Bid,
+        flags: u16,
+    ) -> Result<usize> {
+        let (low, high) = Self::split_blocknr(blocknr);
+        if high != 0 && !self.has_blocknr_high {
+            return_errno_with_message!(Errno::EFBIG, "journal block number exceeds 32-bit tag");
+        }
+
+        let mut end = offset + self.tag_bytes;
+        if flags & TAG_FLAG_SAME_UUID == 0 {
+            end += TAG_UUID_BYTES;
+        }
+        if end > self.tag_area_end() {
+            return_errno_with_message!(Errno::ENOSPC, "journal descriptor tag area is full");
+        }
+
+        if self.csum_v3 {
+            let tag3 = RawJournalBlockTag3 {
+                t_blocknr: Be32::new(low),
+                t_flags: Be32::new(u32::from(flags)),
+                t_blocknr_high: Be32::new(high),
+                t_checksum: Be32::new(0),
+            };
+            block[offset..offset + BLOCK_TAG3_SIZE].copy_from_slice(tag3.as_bytes());
+        } else {
+            let tag = RawBlockTag {
+                t_blocknr: Be32::new(low),
+                t_checksum: Be16::new(0),
+                t_flags: Be16::new(flags),
+            };
+            block[offset..offset + BLOCK_TAG_SIZE].copy_from_slice(tag.as_bytes());
+            if self.has_blocknr_high {
+                let high_offset = offset + BLOCK_TAG_SIZE;
+                block[high_offset..high_offset + size_of::<Be32>()]
+                    .copy_from_slice(Be32::new(high).as_bytes());
+            }
+            // csum_v2's 2 stride-padding bytes (the frozen quirk) stay zero:
+            // the buffer arrives zeroed, exactly like jbd2's memset-clean
+            // descriptor buffer.
+        }
+
+        Ok(end)
+    }
+
+    /// Decodes the tag at `offset`. The caller ([`TagWalk`]) has already
+    /// bounds-checked `offset + tag_bytes` against the tag area.
+    fn decode_tag(&self, descriptor: &[u8; BLOCK_SIZE], offset: usize) -> Result<DescriptorTag> {
+        if self.csum_v3 {
+            let raw =
+                RawJournalBlockTag3::from_bytes(&descriptor[offset..offset + BLOCK_TAG3_SIZE]);
+            // Linux reads tag3 flags as the low 16 bits of the 32-bit word
+            // (its writer only ever stores a 16-bit value there); nonzero high
+            // bits are corruption no writer produces, so reject rather than
+            // silently mask.
+            let Ok(flags) = u16::try_from(raw.t_flags.get()) else {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "journal descriptor tag has malformed flags"
+                );
+            };
+            Ok(DescriptorTag {
+                blocknr: Self::join_blocknr(raw.t_blocknr.get(), raw.t_blocknr_high.get()),
+                flags,
+            })
+        } else {
+            let raw = RawBlockTag::from_bytes(&descriptor[offset..offset + BLOCK_TAG_SIZE]);
+            let high = if self.has_blocknr_high {
+                let high_offset = offset + BLOCK_TAG_SIZE;
+                Be32::from_bytes(&descriptor[high_offset..high_offset + size_of::<Be32>()]).get()
+            } else {
+                0
+            };
+            Ok(DescriptorTag {
+                blocknr: Self::join_blocknr(raw.t_blocknr.get(), high),
+                flags: raw.t_flags.get(),
+            })
+        }
+    }
+
+    /// Joins the on-disk `(t_blocknr, t_blocknr_high)` halves back into the
+    /// filesystem block number (Linux `read_tag_block`); lossless by
+    /// construction.
+    fn join_blocknr(low: u32, high: u32) -> Ext4Bid {
+        Ext4Bid::from(low) | (Ext4Bid::from(high) << 32)
+    }
+
+    /// Walks the tag array of a descriptor block under this layout, starting
+    /// right after the block header. The one shared reader of the tag
+    /// geometry: the recovery scanner (PASS_SCAN), the checkpoint/replay
+    /// applier, and the round-trip tests all iterate through it, so a reader
+    /// can never drift from [`put_tag`](Self::put_tag).
+    pub(super) fn walk<'a>(&self, descriptor: &'a [u8; BLOCK_SIZE]) -> TagWalk<'a> {
+        TagWalk {
+            layout: *self,
+            descriptor,
+            offset: self.first_tag_offset(),
+            done: false,
+        }
+    }
+}
+
+/// One decoded descriptor-block tag: the destination block number (both
+/// halves already joined on a 64-bit layout) and its flags, so no caller
+/// recomputes offsets or re-splits block numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct DescriptorTag {
+    blocknr: Ext4Bid,
+    flags: u16,
+}
+
+impl DescriptorTag {
+    /// The tag's destination filesystem block.
+    pub(super) const fn blocknr(&self) -> Ext4Bid {
+        self.blocknr
+    }
+
+    /// The raw `TAG_FLAG_*` bits. Production readers use the semantic
+    /// accessors below; the round-trip tests assert the exact bits.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) const fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    /// Whether the logged block was escaped ([`TAG_FLAG_ESCAPE`]): its first
+    /// four bytes were zeroed in the log and must be restored to
+    /// [`JBD2_MAGIC`] on apply.
+    pub(super) const fn is_escaped(&self) -> bool {
+        self.flags & TAG_FLAG_ESCAPE != 0
+    }
+
+    /// Whether this is the last tag of the descriptor ([`TAG_FLAG_LAST_TAG`]).
+    pub(super) const fn is_last(&self) -> bool {
+        self.flags & TAG_FLAG_LAST_TAG != 0
+    }
+
+    /// Whether this tag reuses the previous tag's UUID
+    /// ([`TAG_FLAG_SAME_UUID`]), i.e. no UUID follows it on disk.
+    const fn reuses_uuid(&self) -> bool {
+        self.flags & TAG_FLAG_SAME_UUID != 0
+    }
+}
+
+/// Iterator over the tags of one descriptor block (see [`TagLayout::walk`]).
+///
+/// Yields each decoded [`DescriptorTag`] in on-disk order and stops after the
+/// [`TAG_FLAG_LAST_TAG`] tag. A tag that would run past the tag area (which
+/// excludes the reserved checksum tail), or that fails to decode, yields one
+/// `Err` and ends the walk — a malformed descriptor is reported, never
+/// panicked on; the recovery scanner maps the error to its log boundary while
+/// the checkpoint/replay applier propagates it as corruption.
+pub(super) struct TagWalk<'a> {
+    layout: TagLayout,
+    descriptor: &'a [u8; BLOCK_SIZE],
+    offset: usize,
+    done: bool,
+}
+
+impl Iterator for TagWalk<'_> {
+    type Item = Result<DescriptorTag>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        if self.offset + self.layout.tag_bytes > self.layout.tag_area_end() {
+            self.done = true;
+            return Some(Err(Error::with_message(
+                Errno::EUCLEAN,
+                "journal descriptor tag runs past the block",
+            )));
+        }
+        let tag = match self.layout.decode_tag(self.descriptor, self.offset) {
+            Ok(tag) => tag,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        self.offset += self.layout.tag_bytes;
+        if !tag.reuses_uuid() {
+            self.offset += TAG_UUID_BYTES;
+        }
+        if tag.is_last() {
+            self.done = true;
+        }
+        Some(Ok(tag))
+    }
+}
 
 /// The on-disk commit block (`commit_header`, exactly 60 bytes) that seals a
 /// transaction.
@@ -355,6 +716,9 @@ pub(super) struct JournalSuperblock {
     start: u32,
     /// Journal block size in bytes (`s_blocksize`).
     blocksize: u32,
+    /// The descriptor-tag geometry the INCOMPAT feature bits select, derived
+    /// once here so every walker/builder trusts it (parse-once).
+    tag_layout: TagLayout,
 }
 
 impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
@@ -396,6 +760,12 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             );
         }
 
+        // Derived after the admission gate above: while INCOMPAT_SUPP is
+        // revoke-only this always yields the 8-byte v0 layout, but the moment
+        // P7a-6 admits 64bit/csum_v3 the layout follows the bits with no
+        // further plumbing.
+        let tag_layout = TagLayout::from_features(feature_incompat)?;
+
         Ok(Self {
             maxlen,
             first,
@@ -405,6 +775,7 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             // record it.
             start: raw.s_start.get(),
             blocksize,
+            tag_layout,
         })
     }
 }
@@ -433,6 +804,12 @@ impl JournalSuperblock {
     /// Returns the journal block size in bytes (`s_blocksize`).
     pub(super) const fn blocksize(&self) -> u32 {
         self.blocksize
+    }
+
+    /// Returns the descriptor-tag geometry derived (once, at parse) from the
+    /// superblock's INCOMPAT feature bits.
+    pub(super) const fn tag_layout(&self) -> TagLayout {
+        self.tag_layout
     }
 }
 
@@ -564,5 +941,220 @@ mod tests {
         let mut raw = valid_raw(1024, 1, 1, 0);
         raw.s_feature_incompat = Be32::new(INCOMPAT_REVOKE);
         assert!(JournalSuperblock::try_from(raw).is_ok());
+    }
+
+    /// Feature bits → tag geometry, the Linux 6.6 `journal_tag_bytes()` +
+    /// `jbd2_journal_has_csum_v2or3` vectors (including csum_v2's frozen
+    /// 10/14-byte stride quirk).
+    #[ktest]
+    fn tag_layout_derivation_vectors() {
+        let cases: [(u32, usize, usize); 7] = [
+            (0, 8, 0),
+            (INCOMPAT_REVOKE, 8, 0), // revoke does not shape tags
+            (INCOMPAT_64BIT, 12, 0),
+            (INCOMPAT_CSUM_V3, 16, 4),
+            (INCOMPAT_CSUM_V3 | INCOMPAT_64BIT, 16, 4),
+            (INCOMPAT_CSUM_V2, 10, 4),
+            (INCOMPAT_CSUM_V2 | INCOMPAT_64BIT, 14, 4),
+        ];
+        for (features, tag_bytes, tail) in cases {
+            let layout = TagLayout::from_features(features).unwrap();
+            assert_eq!(layout.tag_bytes, tag_bytes, "features {features:#x}");
+            assert_eq!(layout.descriptor_tail_bytes, tail, "features {features:#x}");
+        }
+
+        // csum_v2 + csum_v3 together prescribe contradictory tag layouts and
+        // are refused, as in jbd2's `journal_get_superblock`.
+        assert!(TagLayout::from_features(INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3).is_err());
+    }
+
+    /// Single-descriptor capacity per layout: `(tag area − header − UUID) /
+    /// tag bytes`, the conservative bound `max_credits` builds on. The v0
+    /// value is pinned to the pre-TagLayout constant.
+    #[ktest]
+    fn tag_layout_capacity_math() {
+        let capacity = |features: u32| {
+            TagLayout::from_features(features)
+                .unwrap()
+                .tags_per_descriptor()
+        };
+        // (4096 - 12 - 16) / 8, exactly the old `tags_per_descriptor`.
+        assert_eq!(capacity(0), (BLOCK_SIZE - 12 - 16) / 8);
+        assert_eq!(capacity(INCOMPAT_64BIT), (BLOCK_SIZE - 12 - 16) / 12);
+        // The csum layouts additionally reserve the 4-byte descriptor tail.
+        assert_eq!(capacity(INCOMPAT_CSUM_V3), (BLOCK_SIZE - 4 - 12 - 16) / 16);
+        assert_eq!(
+            capacity(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT),
+            (BLOCK_SIZE - 4 - 12 - 16) / 16
+        );
+        assert_eq!(capacity(INCOMPAT_CSUM_V2), (BLOCK_SIZE - 4 - 12 - 16) / 10);
+        assert_eq!(
+            capacity(INCOMPAT_CSUM_V2 | INCOMPAT_64BIT),
+            (BLOCK_SIZE - 4 - 12 - 16) / 14
+        );
+    }
+
+    /// A block number above 32 bits is `EFBIG` on a layout without
+    /// `t_blocknr_high`, and round-trips on one with it.
+    #[ktest]
+    fn put_tag_blocknr_width_is_layout_gated() {
+        let wide: Ext4Bid = (1 << 32) | 5;
+
+        let v0 = TagLayout::from_features(0).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let err = v0
+            .put_tag(&mut block, v0.first_tag_offset(), wide, TAG_FLAG_LAST_TAG)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
+
+        let b64 = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
+        b64.put_tag(&mut block, b64.first_tag_offset(), wide, TAG_FLAG_LAST_TAG)
+            .unwrap();
+        let tag = b64.walk(&block).next().unwrap().unwrap();
+        assert_eq!(tag.blocknr(), wide);
+        assert!(tag.is_last());
+    }
+
+    /// 12-byte (64-bit) tags round-trip through `put_tag` + the walker,
+    /// including a > 32-bit block number, and land at the exact on-disk
+    /// offsets (low word, high word, first-tag UUID gap).
+    #[ktest]
+    fn tag_round_trip_64bit_layout() {
+        let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+
+        let tags: [(Ext4Bid, u16); 3] = [
+            (0x123, 0), // first tag: a 16-byte UUID follows
+            ((7 << 32) | 42, TAG_FLAG_SAME_UUID),
+            (0xFFFF_FFFF, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
+        ];
+        let mut offset = layout.first_tag_offset();
+        for (blocknr, flags) in tags {
+            offset = layout.put_tag(&mut block, offset, blocknr, flags).unwrap();
+        }
+
+        let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        assert_eq!(decoded.len(), 3);
+        for ((blocknr, flags), tag) in tags.iter().zip(&decoded) {
+            assert_eq!(tag.blocknr(), *blocknr);
+            assert_eq!(tag.flags(), *flags);
+        }
+
+        // On-disk pin: tag 0 spans [12, 24) + UUID [24, 40); tag 1 starts at
+        // 40 with t_blocknr = 42 and t_blocknr_high = 7 at offset 48.
+        assert_eq!(&block[40..44], &[0, 0, 0, 42]);
+        assert_eq!(&block[48..52], &[0, 0, 0, 7]);
+    }
+
+    /// 16-byte (csum-v3) tags round-trip, with the checksum word written as
+    /// zero and the widened flags at their tag3 offsets.
+    #[ktest]
+    fn tag_round_trip_csum_v3_layout() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+
+        let tags: [(Ext4Bid, u16); 2] = [
+            (0x0102_0304, 0),
+            ((3 << 32) | 9, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
+        ];
+        let mut offset = layout.first_tag_offset();
+        for (blocknr, flags) in tags {
+            offset = layout.put_tag(&mut block, offset, blocknr, flags).unwrap();
+        }
+
+        let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].blocknr(), 0x0102_0304);
+        assert_eq!(decoded[1].blocknr(), (3 << 32) | 9);
+        assert!(decoded[1].is_last());
+
+        // On-disk pin for tag 0 at offset 12: t_blocknr [12,16), t_flags
+        // [16,20) (a 32-bit zero here), t_blocknr_high [20,24) (zero),
+        // t_checksum [24,28) — written as ZERO until P7a-4.
+        assert_eq!(&block[12..16], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&block[16..28], &[0; 12]);
+        // Tag 1 at 28 + UUID(16) = 44: flags be32 = 0x0000000A, high word 3.
+        assert_eq!(&block[44..48], &[0, 0, 0, 9]);
+        assert_eq!(&block[48..52], &[0, 0, 0, 0x0A]);
+        assert_eq!(&block[52..56], &[0, 0, 0, 3]);
+    }
+
+    /// csum_v2's frozen 10/14-byte strides round-trip (the two quirk padding
+    /// bytes stay zero and the walker steps over them).
+    #[ktest]
+    fn tag_round_trip_csum_v2_quirk_strides() {
+        for features in [INCOMPAT_CSUM_V2, INCOMPAT_CSUM_V2 | INCOMPAT_64BIT] {
+            let layout = TagLayout::from_features(features).unwrap();
+            let mut block = Box::new([0u8; BLOCK_SIZE]);
+            let wide_ok = features & INCOMPAT_64BIT != 0;
+            let second: Ext4Bid = if wide_ok { (5 << 32) | 6 } else { 0x600 };
+
+            let mut offset = layout.first_tag_offset();
+            offset = layout.put_tag(&mut block, offset, 0x500, 0).unwrap();
+            layout
+                .put_tag(
+                    &mut block,
+                    offset,
+                    second,
+                    TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+                )
+                .unwrap();
+
+            let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+            assert_eq!(decoded.len(), 2, "features {features:#x}");
+            assert_eq!(decoded[0].blocknr(), 0x500);
+            assert_eq!(decoded[1].blocknr(), second);
+            assert!(decoded[1].is_last());
+        }
+    }
+
+    /// Both sides respect the reserved descriptor tail: the writer refuses a
+    /// tag that would intrude into it, and a walker on a LAST_TAG-less (all
+    /// zeros) descriptor stops with an error before reading the tail as a tag.
+    #[ktest]
+    fn tag_area_excludes_descriptor_tail() {
+        let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        // A 16-byte tag at BLOCK_SIZE - 16 fits the block but overlaps the
+        // 4-byte tail: refused.
+        let err = v3
+            .put_tag(
+                &mut block,
+                BLOCK_SIZE - 16,
+                0x1,
+                TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+            )
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        // One slot earlier (clear of the tail) is accepted.
+        v3.put_tag(
+            &mut block,
+            BLOCK_SIZE - 4 - 16,
+            0x1,
+            TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+        )
+        .unwrap();
+
+        // Walker bound: an all-zero tag array never sets LAST_TAG, so the walk
+        // ends at the tag-area boundary with exactly one error. Every zero tag
+        // lacks SAME_UUID, so the stride is tag_bytes + 16.
+        let zeroed = Box::new([0u8; BLOCK_SIZE]);
+        let count_ok = |layout: &TagLayout| {
+            let mut oks = 0usize;
+            let mut errs = 0usize;
+            for tag in layout.walk(&zeroed) {
+                match tag {
+                    Ok(_) => oks += 1,
+                    Err(_) => errs += 1,
+                }
+            }
+            assert_eq!(errs, 1);
+            oks
+        };
+        // v0: offsets 12 + 24k, valid while 12 + 24k + 8 <= 4096 -> k <= 169.
+        let v0 = TagLayout::from_features(0).unwrap();
+        assert_eq!(count_ok(&v0), 170);
+        // v3: offsets 12 + 32k, valid while 12 + 32k + 16 <= 4092 -> k <= 127.
+        assert_eq!(count_ok(&v3), 128);
     }
 }

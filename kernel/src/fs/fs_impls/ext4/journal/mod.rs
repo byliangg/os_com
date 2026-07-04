@@ -71,7 +71,7 @@ use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
 use self::{
     commit::commit_transaction,
-    format::{JournalSuperblock, RawJournalSuperblock},
+    format::{JournalSuperblock, RawJournalSuperblock, TagLayout},
     transaction::Transaction,
 };
 use super::{
@@ -243,20 +243,16 @@ impl JournalGeometry {
         self.superblock.sequence()
     }
 
-    /// The number of block tags that fit in a single descriptor block.
+    /// The descriptor-tag geometry this journal's feature bits select — the
+    /// single source of truth for the tag byte layout, derived once at parse
+    /// ([`format::TagLayout`]) and consumed by the commit writer, the recovery
+    /// scanner, and the checkpoint/replay applier.
     ///
-    /// A descriptor block holds a 12-byte [`RawJournalHeader`](format::RawJournalHeader)
-    /// then a tag array of 8-byte [`RawBlockTag`](format::RawBlockTag)s. The first
-    /// tag is followed by a 16-byte journal UUID, so the conservative capacity
-    /// (charging every tag the 16-byte UUID cost) is `(blocksize - 12 - 16) / 8`.
-    /// Phase 4 writes one descriptor per transaction, so this bounds a single
-    /// transaction's metadata blocks; used by [`Journal::max_credits`], hence live
-    /// in non-ktest builds.
-    pub(super) fn tags_per_descriptor(&self) -> usize {
-        const HEADER_LEN: usize = 12;
-        const UUID_LEN: usize = 16;
-        const TAG_LEN: usize = 8;
-        (BLOCK_SIZE - HEADER_LEN - UUID_LEN) / TAG_LEN
+    /// Private to the journal module (unlike the `pub(super)` geometry
+    /// accessors): the tag layout is a journal-internal concern, and
+    /// [`TagLayout`] itself is not visible above the journal.
+    fn tag_layout(&self) -> TagLayout {
+        self.superblock.tag_layout()
     }
 
     /// Returns the log block where recovery starts; 0 means clean (`s_start`).
@@ -615,16 +611,16 @@ impl Journal {
     /// The bound is the smaller of two limits:
     /// - The usable log blocks (`s_maxlen - s_first`) minus a descriptor + commit
     ///   block of per-transaction overhead.
-    /// - The tags that fit in a **single** descriptor block
-    ///   ([`JournalGeometry::tags_per_descriptor`]). Phase 4's commit pipeline
-    ///   writes one descriptor block per transaction, so admitting more blocks
-    ///   than fit its tag array would make the transaction uncommittable.
-    ///   Multi-descriptor transactions are a later/perf extension.
+    /// - The tags that fit in a **single** descriptor block under this
+    ///   journal's tag layout ([`TagLayout::tags_per_descriptor`]). The commit
+    ///   pipeline writes one descriptor block per transaction, so admitting
+    ///   more blocks than fit its tag array would make the transaction
+    ///   uncommittable. Multi-descriptor transactions are P7a-5.
     ///
     /// Precise per-transaction credit accounting is P7's.
     pub(super) fn max_credits(&self) -> usize {
         let log_bound = (self.geometry.maxlen() - self.geometry.first()).saturating_sub(2) as usize;
-        log_bound.min(self.geometry.tags_per_descriptor())
+        log_bound.min(self.geometry.tag_layout().tags_per_descriptor())
     }
 
     /// Acquires the running-transaction state for writing.

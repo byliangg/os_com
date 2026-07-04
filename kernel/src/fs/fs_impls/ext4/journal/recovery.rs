@@ -71,8 +71,9 @@
 //! # Reuse
 //!
 //! REPLAY reuses [`apply_log_transaction`](super::checkpoint::apply_log_transaction)
-//! verbatim; [`scan_transaction`] mirrors that reader's byte offsets exactly but
-//! is read-only and treats a missing/incomplete transaction as the boundary
+//! verbatim; [`scan_transaction`] walks the same descriptor-tag geometry through
+//! the one shared [`TagLayout`](super::format::TagLayout) definition but is
+//! read-only and treats a missing/incomplete transaction as the boundary
 //! rather than corruption. The wrap walk uses
 //! [`next_log_block`](super::commit::next_log_block) and the final durability
 //! flush uses [`barrier`](super::commit::barrier) — one definition each, shared
@@ -92,22 +93,10 @@ use super::{
     checkpoint::apply_log_transaction,
     commit::barrier,
     format::{
-        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC, RawBlockTag,
-        RawJournalHeader, RawJournalSuperblock, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC,
+        RawJournalHeader, RawJournalSuperblock,
     },
 };
-
-/// The 12-byte jbd2 block header size (`size_of::<RawJournalHeader>()`), the
-/// offset at which a descriptor block's tag array begins. Mirrors
-/// [`checkpoint`](super::checkpoint)'s `HEADER_LEN`.
-const HEADER_LEN: usize = size_of::<RawJournalHeader>();
-/// The 8-byte block-tag size (`size_of::<RawBlockTag>()`). Mirrors
-/// [`checkpoint`](super::checkpoint)'s `TAG_LEN`.
-const TAG_LEN: usize = size_of::<RawBlockTag>();
-/// The 16-byte journal UUID that follows the *first* tag of a descriptor block
-/// (the writer emits it once; later tags reuse it via `TAG_FLAG_SAME_UUID`).
-/// Mirrors [`checkpoint`](super::checkpoint)'s `UUID_LEN`.
-const UUID_LEN: usize = 16;
 
 /// Scans one transaction at `start_log` expecting tid `expected_tid`, WITHOUT
 /// writing anything (jbd2 `do_one_pass` in `PASS_SCAN`).
@@ -121,17 +110,16 @@ const UUID_LEN: usize = 16;
 /// [`apply_log_transaction`](super::checkpoint::apply_log_transaction), which
 /// treats the same conditions as corruption (`EUCLEAN`).
 ///
-/// # Byte layout (mirrors `apply_log_transaction` / the writer exactly)
+/// # Byte layout (one shared definition)
 ///
-/// This walk reproduces the reader offsets in
-/// [`apply_log_transaction`](super::checkpoint::apply_log_transaction) byte-for-
-/// byte (which in turn mirror `commit.rs::build_descriptor_block`): descriptor at
-/// `start_log`; a 12-byte header, then one 8-byte tag per metadata block, with a
-/// 16-byte UUID after the first tag only (the one lacking `TAG_FLAG_SAME_UUID`);
-/// each tag's metadata block is the next log block after the previous
-/// ([`next_log_block`]); the commit block is the next log block after the last
-/// metadata block. Keeping this in lockstep with the writer/reader is a
-/// correctness invariant.
+/// The descriptor's tag geometry is owned by the journal's
+/// [`TagLayout`](super::format::TagLayout): this walk iterates
+/// [`TagLayout::walk`](super::format::TagLayout::walk), the same definition the
+/// writer's `put_tag` and
+/// [`apply_log_transaction`](super::checkpoint::apply_log_transaction) use, so
+/// the three cannot drift. Each tag's metadata block is the next log block
+/// after the previous ([`next_log_block`]); the commit block is the next log
+/// block after the last metadata block.
 ///
 /// # Boundary conditions (each yields `Ok(None)`)
 ///
@@ -184,35 +172,23 @@ fn scan_transaction(
         return Ok(None);
     }
 
-    // Walk the tag array (offset 12), counting tags and advancing a `log` cursor
-    // one block per tag — the same walk the reader/writer use to place the logged
-    // metadata. We only need the cursor's final position (where the commit block
-    // sits); the count is implicit in the walk.
-    let mut offset = HEADER_LEN;
+    // Walk the tag array (the byte geometry lives in ONE place, the journal's
+    // `TagLayout`, shared with the writer and the checkpoint/replay reader),
+    // advancing a `log` cursor one block per tag — the same walk the
+    // reader/writer use to place the logged metadata. We only need the cursor's
+    // final position (where the commit block sits); the count is implicit in
+    // the walk.
     let mut log = start_log;
-    loop {
-        // A tag that would not fit wholly in the descriptor block means a malformed
-        // descriptor: not a valid committed transaction, so treat it as the
+    for tag in journal.geometry().tag_layout().walk(&descriptor) {
+        // A malformed tag array (a tag overrunning the tag area, or garbage
+        // flags) is not a valid committed transaction: treat it as the
         // boundary (never panic on a bad log).
-        if offset + TAG_LEN > BLOCK_SIZE {
+        if tag.is_err() {
             return Ok(None);
         }
-        let tag = RawBlockTag::from_bytes(&descriptor[offset..offset + TAG_LEN]);
-        let flags = tag.t_flags.get();
 
         // This tag's metadata is the next log block after the previous one.
         log = journal.geometry().next_log_block(log);
-
-        // Advance past this 8-byte tag; the first tag (the one lacking SAME_UUID)
-        // is additionally followed by its 16-byte UUID — identical to the reader.
-        offset += TAG_LEN;
-        if flags & TAG_FLAG_SAME_UUID == 0 {
-            offset += UUID_LEN;
-        }
-
-        if flags & TAG_FLAG_LAST_TAG != 0 {
-            break;
-        }
     }
 
     // --- Commit block: the next log block after the last metadata block. ---

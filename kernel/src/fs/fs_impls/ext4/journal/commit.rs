@@ -17,11 +17,13 @@
 //! ```
 //!
 //! - **Descriptor** (`JBD2_DESCRIPTOR_BLOCK`): a 12-byte [`RawJournalHeader`]
-//!   then one 8-byte [`RawBlockTag`] per captured block, in block-number order.
-//!   The first tag is followed by a 16-byte journal UUID (written as zeros — we
-//!   carry no journal UUID or checksum in Phase 4; recovery just skips it) and
-//!   does *not* set `TAG_FLAG_SAME_UUID`; every later tag sets it (no UUID
-//!   follows). The last tag also sets `TAG_FLAG_LAST_TAG`.
+//!   then one block tag per captured block, in block-number order, with every
+//!   byte offset owned by the journal's [`TagLayout`] (tag size, the 64-bit
+//!   high word, the reserved checksum tail). The first tag is followed by a
+//!   16-byte journal UUID (written as zeros — we carry no journal UUID;
+//!   recovery just skips it) and does *not* set `TAG_FLAG_SAME_UUID`; every
+//!   later tag sets it (no UUID follows). The last tag also sets
+//!   `TAG_FLAG_LAST_TAG`.
 //! - **Metadata blocks**: the N captured after-images, in the same order as
 //!   their tags, one full [`BLOCK_SIZE`] block each.
 //! - **Commit** (`JBD2_COMMIT_BLOCK`): a [`RawCommitBlock`] sealing the
@@ -80,8 +82,9 @@
 //! # Phase 4 simplifications
 //!
 //! - **Single descriptor** per transaction: all N tags must fit one descriptor
-//!   block ([`JournalGeometry::tags_per_descriptor`]); a larger transaction is
+//!   block ([`TagLayout::tags_per_descriptor`]); a larger transaction is
 //!   rejected. [`Journal::max_credits`] enforces the same bound up front.
+//!   Multi-descriptor transactions are P7a-5.
 //! - **No checksums** (the commit block's csum fields are zero) — Phase 7.
 //! - **No revoke records** — Phase 7.
 //! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
@@ -93,8 +96,8 @@ use super::{
     super::prelude::*,
     Journal, Tid, Transaction,
     format::{
-        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be16, Be32, Be64, JBD2_MAGIC, RawBlockTag,
-        RawCommitBlock, RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, Be64, JBD2_MAGIC, RawCommitBlock,
+        RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID, TagLayout,
     },
     transaction::TransactionState,
 };
@@ -140,11 +143,17 @@ impl Transaction {
     /// Builds this transaction's descriptor block into a fresh [`BLOCK_SIZE`]
     /// buffer.
     ///
-    /// Lays down the 12-byte header then one 8-byte tag per captured block (in
-    /// block order), with the first tag's 16-byte UUID region zeroed. Returns the
-    /// buffer plus, for each captured block in the same order, whether that block
-    /// must be escaped when written into the log (`escape[i] == true`).
-    fn build_descriptor_block(&self) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
+    /// Lays down the 12-byte header then one tag per captured block (in block
+    /// order), with every byte offset — tag stride, the first tag's 16-byte
+    /// UUID, the reserved checksum tail — owned by `layout`
+    /// ([`TagLayout::put_tag`]), the same source of truth the recovery scanner
+    /// and the checkpoint/replay applier walk with. Returns the buffer plus,
+    /// for each captured block in the same order, whether that block must be
+    /// escaped when written into the log (`escape[i] == true`).
+    fn build_descriptor_block(
+        &self,
+        layout: TagLayout,
+    ) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
         let n = self.metadata_blocks().count();
         if n == 0 {
             return_errno_with_message!(Errno::EINVAL, "cannot commit an empty transaction");
@@ -158,14 +167,9 @@ impl Transaction {
             h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
             h_sequence: Be32::new(self.tid().get()),
         };
-        let header_len = size_of::<RawJournalHeader>();
-        block[..header_len].copy_from_slice(header.as_bytes());
+        block[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
 
-        // The tag array starts right after the header. Each tag is 8 bytes; the
-        // first tag is additionally followed by a 16-byte UUID (left zeroed).
-        let tag_len = size_of::<RawBlockTag>();
-        let uuid_len = 16;
-        let mut offset = header_len;
+        let mut offset = layout.first_tag_offset();
         let mut escape = Vec::with_capacity(n);
 
         for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
@@ -187,33 +191,13 @@ impl Transaction {
             }
             escape.push(needs_escape);
 
-            // A block tag holds only a 32-bit block number until INCOMPAT_64BIT
-            // (Phase 7 adds v3 tags with `t_blocknr_high`). Guard the narrowing
-            // with a real error, not a debug-only assert: on a `> 16 TiB` volume
-            // an `as` truncation would journal an after-image to the wrong block.
-            let t_blocknr = u32::try_from(bid).map_err(|_| {
-                Error::with_message(Errno::EFBIG, "journal block number exceeds 32-bit tag")
-            })?;
-            let tag = RawBlockTag {
-                t_blocknr: Be32::new(t_blocknr),
-                t_checksum: Be16::new(0),
-                t_flags: Be16::new(flags),
-            };
-
-            // The tag region (tags + the first tag's UUID) must fit the block. This
-            // is the single-descriptor bound; `max_credits` refuses over-large
-            // transactions up front, but re-check here so a directly built
-            // transaction cannot overflow the descriptor.
-            let tag_end = offset + tag_len + if is_first { uuid_len } else { 0 };
-            if tag_end > BLOCK_SIZE {
-                return_errno_with_message!(
-                    Errno::ENOSPC,
-                    "transaction needs more than one descriptor block (unsupported in Phase 4)"
-                );
-            }
-
-            block[offset..offset + tag_len].copy_from_slice(tag.as_bytes());
-            offset = tag_end;
+            // `put_tag` refuses a block number that does not fit the layout's
+            // tag (`EFBIG`, only possible without 64-bit tags) and a tag that
+            // would overrun the descriptor's tag area (`ENOSPC` — the
+            // single-descriptor bound; `max_credits` refuses over-large
+            // transactions up front, but the re-check keeps a directly built
+            // transaction from overflowing).
+            offset = layout.put_tag(&mut block, offset, bid, flags)?;
         }
 
         Ok((block, escape))
@@ -336,7 +320,7 @@ pub(super) fn commit_transaction(
         (st.head, st.tail_block == 0)
     };
 
-    let (descriptor, escape) = txn.build_descriptor_block()?;
+    let (descriptor, escape) = txn.build_descriptor_block(journal.geometry.tag_layout())?;
     let n = escape.len() as u32;
 
     // --- Step 1: write the descriptor and every metadata after-image. ---
@@ -407,13 +391,16 @@ mod tests {
 
     use super::{
         // `*` re-exports the parent module's imports (`Journal`, `Transaction`,
-        // `Be32`, `RawBlockTag`, `RawCommitBlock`, `RawJournalHeader`,
-        // `BLOCKTYPE_COMMIT`, `BLOCKTYPE_DESCRIPTOR`, `JBD2_MAGIC`, the tag
-        // flags). Only items the parent does not import are named explicitly.
+        // `Be32`, `RawCommitBlock`, `RawJournalHeader`, `BLOCKTYPE_COMMIT`,
+        // `BLOCKTYPE_DESCRIPTOR`, `JBD2_MAGIC`, `TagLayout`, the tag flags).
+        // Only items the parent does not import are named explicitly.
         super::{
             super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
             JOURNAL_INO,
-            format::{BLOCKTYPE_SUPERBLOCK_V2, RawJournalSuperblock},
+            format::{
+                BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_64BIT, INCOMPAT_CSUM_V3, RawBlockTag,
+                RawJournalSuperblock,
+            },
             load_geometry,
         },
         *,
@@ -525,6 +512,91 @@ mod tests {
                 .unwrap();
         }
         txn
+    }
+
+    /// The v0 (feature-less) descriptor block is BIT-IDENTICAL to the
+    /// pre-TagLayout writer's output — the byte freeze the whole 160×825
+    /// crash-matrix baseline rides on. Expected bytes hardcoded from the
+    /// pre-change code's layout: 12-byte header, 8-byte tag 0, 16 zero UUID
+    /// bytes, 8-byte tag 1 (SAME_UUID | LAST_TAG), zeros to the end.
+    #[ktest]
+    fn descriptor_block_v0_bytes_are_frozen() {
+        let c = [0u8; BLOCK_SIZE];
+        let txn = make_txn(Tid::new(7), &[(0x123u64, c), (0x456u64, c)]);
+        let (block, escape) = txn
+            .build_descriptor_block(TagLayout::from_features(0).unwrap())
+            .unwrap();
+        assert_eq!(escape, vec![false, false]);
+
+        let mut expected = [0u8; BLOCK_SIZE];
+        // Header: magic, DESCRIPTOR (1), tid 7 — all big-endian.
+        expected[..12].copy_from_slice(&[
+            0xC0, 0x3B, 0x39, 0x98, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07,
+        ]);
+        // Tag 0 at 12: t_blocknr 0x123, t_checksum 0, t_flags 0; UUID zeros
+        // [20, 36).
+        expected[12..20].copy_from_slice(&[0x00, 0x00, 0x01, 0x23, 0, 0, 0, 0]);
+        // Tag 1 at 36: t_blocknr 0x456, t_checksum 0, t_flags SAME_UUID |
+        // LAST_TAG = 0x000A.
+        expected[36..44].copy_from_slice(&[0x00, 0x00, 0x04, 0x56, 0, 0, 0x00, 0x0A]);
+
+        assert_eq!(block.as_slice(), expected.as_slice());
+    }
+
+    /// The builder emits 12-byte 64-bit tags (including a > 32-bit block
+    /// number) that the shared recovery-side walker reads back verbatim.
+    #[ktest]
+    fn descriptor_builder_64bit_round_trip() {
+        let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
+        let small: Ext4Bid = 0x321;
+        let wide: Ext4Bid = (1 << 32) | 0x700;
+        let c = [0u8; BLOCK_SIZE];
+        let txn = make_txn(Tid::new(3), &[(small, c), (wide, c)]);
+
+        let (block, escape) = txn.build_descriptor_block(layout).unwrap();
+        assert_eq!(escape, vec![false, false]);
+
+        let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].blocknr(), small);
+        assert!(!tags[0].is_last());
+        assert_eq!(tags[1].blocknr(), wide);
+        assert!(tags[1].is_last());
+    }
+
+    /// The builder emits 16-byte csum-v3 tags the shared walker reads back,
+    /// with the escape flag surviving the round trip.
+    #[ktest]
+    fn descriptor_builder_csum_v3_round_trip() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let mut escaped = [0u8; BLOCK_SIZE];
+        escaped[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        let plain = [0u8; BLOCK_SIZE];
+        let wide: Ext4Bid = (9 << 32) | 0x800;
+        let txn = make_txn(Tid::new(4), &[(0x200u64, escaped), (wide, plain)]);
+
+        let (block, escape) = txn.build_descriptor_block(layout).unwrap();
+        assert_eq!(escape, vec![true, false]);
+
+        let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].blocknr(), 0x200);
+        assert!(tags[0].is_escaped());
+        assert_eq!(tags[1].blocknr(), wide);
+        assert!(!tags[1].is_escaped());
+        assert!(tags[1].is_last());
+    }
+
+    /// Without 64-bit tags a > 32-bit destination block still refuses with
+    /// `EFBIG` (the pre-TagLayout guard, now layout-conditional).
+    #[ktest]
+    fn descriptor_builder_rejects_wide_block_on_v0_layout() {
+        let c = [0u8; BLOCK_SIZE];
+        let txn = make_txn(Tid::new(1), &[((1u64 << 32) | 5, c)]);
+        let err = txn
+            .build_descriptor_block(TagLayout::from_features(0).unwrap())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EFBIG);
     }
 
     #[ktest]
