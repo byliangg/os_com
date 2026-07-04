@@ -1421,24 +1421,6 @@ impl Drop for Journal {
     }
 }
 
-/// Identifies the kind of metadata block being accessed.
-///
-/// Every variant is constructed at a metadata-access call site, but the funnels
-/// ignore the value: `metadata_csum` (Phase 6b) ended up stamping each checksum
-/// at its own dedicated setter (`stamp_*_checksum`) rather than through this
-/// capture-time tag, so it remains an unused block-kind label kept for the
-/// credential's wrong-trigger guard below.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TriggerType {
-    Superblock,
-    GroupDesc,
-    BlockBitmap,
-    InodeBitmap,
-    InodeTable,
-    ExtentBlock,
-    DirBlock,
-}
-
 /// Returns `running`'s transaction, verifying it still matches the handle's
 /// transaction id.
 ///
@@ -1485,7 +1467,6 @@ fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a m
 pub(super) fn get_write_access<'h>(
     handle: Option<&'h Handle>,
     blocknr: Ext4Bid,
-    trigger: TriggerType,
 ) -> Result<WriteAccess<'h>> {
     let Some(handle) = handle else {
         return Ok(WriteAccess { live: None });
@@ -1509,7 +1490,6 @@ pub(super) fn get_write_access<'h>(
         live: Some(LiveAccess {
             handle,
             bid: blocknr,
-            trigger,
         }),
     })
 }
@@ -1521,7 +1501,6 @@ pub(super) fn get_write_access<'h>(
 pub(super) fn get_create_access<'h>(
     handle: Option<&'h Handle>,
     blocknr: Ext4Bid,
-    trigger: TriggerType,
 ) -> Result<WriteAccess<'h>> {
     let Some(handle) = handle else {
         return Ok(WriteAccess { live: None });
@@ -1533,7 +1512,6 @@ pub(super) fn get_create_access<'h>(
         live: Some(LiveAccess {
             handle,
             bid: blocknr,
-            trigger,
         }),
     })
 }
@@ -1542,10 +1520,11 @@ pub(super) fn get_create_access<'h>(
 /// value: proof that [`get_write_access`] / [`get_create_access`] captured
 /// this block's after-image into the running transaction. [`patch`](Self::patch)
 /// (jbd2 `dirty_metadata`) is the only way to modify a captured image, so
-/// patch-without-capture is unrepresentable, and the block number and
-/// [`TriggerType`] travel inside the credential — a wrong-bid patch landing on
-/// a neighbor's capture in the shared running transaction, or a get/dirty
-/// trigger divergence, can no longer be written.
+/// patch-without-capture is unrepresentable, and the block number travels
+/// inside the credential — a wrong-bid patch landing on a neighbor's capture
+/// in the shared running transaction can no longer be written. The credential
+/// carries no block-kind tag: journal checksums are keyed by the
+/// journal-UUID seed plus commit tid, and revoke records by [`ForgetKind`].
 ///
 /// On a non-journaled volume — or from a caller with no open transaction —
 /// the credential is **inert**: `patch` succeeds without invoking the closure
@@ -1569,10 +1548,6 @@ pub(super) struct WriteAccess<'h> {
 struct LiveAccess<'h> {
     handle: &'h Handle,
     bid: Ext4Bid,
-    /// Carried so a capture and its patch are guaranteed the same block kind by
-    /// construction (the wrong-trigger guard); the kind itself is otherwise unused.
-    #[expect(dead_code)]
-    trigger: TriggerType,
 }
 
 impl WriteAccess<'_> {
@@ -2129,7 +2104,7 @@ mod tests {
             .unwrap();
 
         let handle = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::BlockBitmap)
+        get_write_access(Some(&handle), CAPTURE_BLOCK)
             .unwrap()
             .patch(|buf| {
                 buf[4] = 0xAB;
@@ -2170,11 +2145,10 @@ mod tests {
             .unwrap();
 
         let handle = journal_start(&f.journal, 4).unwrap();
-        let access =
-            get_create_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock).unwrap();
+        let access = get_create_access(Some(&handle), CAPTURE_BLOCK).unwrap();
         access.patch(|buf| buf[0] = 1).unwrap();
         // A re-minted credential patches the SAME capture (idempotent access).
-        get_write_access(Some(&handle), CAPTURE_BLOCK, TriggerType::ExtentBlock)
+        get_write_access(Some(&handle), CAPTURE_BLOCK)
             .unwrap()
             .patch(|buf| buf[1] = 2)
             .unwrap();
@@ -2200,7 +2174,7 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
 
         let mut patched = false;
-        let access = get_write_access(None, CAPTURE_BLOCK, TriggerType::BlockBitmap).unwrap();
+        let access = get_write_access(None, CAPTURE_BLOCK).unwrap();
         assert!(!access.is_live());
         access.patch(|_| patched = true).unwrap();
 
@@ -2244,7 +2218,7 @@ mod tests {
 
         let bid: Ext4Bid = 500;
         let handle = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&handle), bid, TriggerType::BlockBitmap)
+        get_write_access(Some(&handle), bid)
             .unwrap()
             .patch(|buf| buf[..8].copy_from_slice(b"UNMOUNT!"))
             .unwrap();
@@ -2433,7 +2407,7 @@ mod tests {
 
         // Txn 1: "slot A" writes bytes [0..4].
         let h1 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h1), bid, TriggerType::InodeTable)
+        get_write_access(Some(&h1), bid)
             .unwrap()
             .patch(|buf| buf[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
@@ -2444,7 +2418,7 @@ mod tests {
         // Txn 2 (a fresh transaction): "slot B" writes bytes [8..12]. Its capture
         // of the shared block must see txn 1's [0..4] == 0x11.
         let h2 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h2), bid, TriggerType::InodeTable)
+        get_write_access(Some(&h2), bid)
             .unwrap()
             .patch(|buf| buf[8..12].copy_from_slice(&[0x22; 4]))
             .unwrap();
@@ -2485,7 +2459,7 @@ mod tests {
         let bid: Ext4Bid = 501;
         // Txn 1 writes [0..4]; commit + checkpoint make the device authoritative.
         let h1 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h1), bid, TriggerType::InodeTable)
+        get_write_access(Some(&h1), bid)
             .unwrap()
             .patch(|buf| buf[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
@@ -2511,7 +2485,7 @@ mod tests {
         // Txn 2 captures the block again: post-checkpoint there is no retained
         // image, so the seed is the (current) device content.
         let h2 = journal_start(&f.journal, 4).unwrap();
-        get_write_access(Some(&h2), bid, TriggerType::InodeTable)
+        get_write_access(Some(&h2), bid)
             .unwrap()
             .patch(|buf| {
                 assert_eq!(buf[100], 0x77, "post-checkpoint capture seeds from device");

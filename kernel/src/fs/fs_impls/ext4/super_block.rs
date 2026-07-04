@@ -522,23 +522,20 @@ impl SuperBlock {
         last_orphan: Option<Ext4Ino>,
     ) -> Result<()> {
         let free_inodes = self.free_inodes_count();
-        journal::get_write_access(handle, SUPERBLOCK_BID, journal::TriggerType::Superblock)?.patch(
-            |buf| {
-                let off = SUPER_BLOCK_OFFSET;
-                let mut raw =
-                    RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
-                self.write_free_blocks_count(&mut raw);
-                raw.free_inodes_count = free_inodes;
-                // `0 = empty` is the on-disk convention (encode boundary).
-                raw.last_orphan = last_orphan.unwrap_or(0);
-                // Stamp the superblock checksum over the final image (Linux
-                // `ext4_superblock_csum_set`); a no-op field when the feature is off.
-                if self.has_metadata_csum() {
-                    raw.checksum = Self::superblock_checksum(&raw);
-                }
-                buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
-            },
-        )
+        journal::get_write_access(handle, SUPERBLOCK_BID)?.patch(|buf| {
+            let off = SUPER_BLOCK_OFFSET;
+            let mut raw = RawSuperBlock::from_bytes(&buf[off..off + size_of::<RawSuperBlock>()]);
+            self.write_free_blocks_count(&mut raw);
+            raw.free_inodes_count = free_inodes;
+            // `0 = empty` is the on-disk convention (encode boundary).
+            raw.last_orphan = last_orphan.unwrap_or(0);
+            // Stamp the superblock checksum over the final image (Linux
+            // `ext4_superblock_csum_set`); a no-op field when the feature is off.
+            if self.has_metadata_csum() {
+                raw.checksum = Self::superblock_checksum(&raw);
+            }
+            buf[off..off + size_of::<RawSuperBlock>()].copy_from_slice(raw.as_bytes());
+        })
     }
 
     /// Writes the free-block count's low half — and, under `64BIT`, its high half

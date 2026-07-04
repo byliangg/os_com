@@ -1519,11 +1519,9 @@ impl InodeSlot {
     /// guest data loss).
     fn journal_write(&self, handle: Option<&journal::Handle>, raw: &RawInode) -> Result<()> {
         let off = self.offset_in_block;
-        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
-            |buf| {
-                buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
-            },
-        )
+        journal::get_write_access(handle, self.bid)?.patch(|buf| {
+            buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
+        })
     }
 
     /// Splices the slot's on-disk `i_dtime` (its orphan-next pointer) to
@@ -1548,17 +1546,15 @@ impl InodeSlot {
     ) -> Result<()> {
         let off = self.offset_in_block;
         let dtime_off = off + core::mem::offset_of!(RawInode, dtime);
-        journal::get_write_access(handle, self.bid, journal::TriggerType::InodeTable)?.patch(
-            |buf| {
-                buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
-                if let Some((ino, fs_seed, inode_size)) = csum {
-                    let mut raw = RawInode::from_bytes(&buf[off..off + size_of::<RawInode>()]);
-                    let iseed = fs_seed.derive_inode(ino, raw.generation);
-                    InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
-                    buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
-                }
-            },
-        )
+        journal::get_write_access(handle, self.bid)?.patch(|buf| {
+            buf[dtime_off..dtime_off + size_of::<u32>()].copy_from_slice(&next.to_le_bytes());
+            if let Some((ino, fs_seed, inode_size)) = csum {
+                let mut raw = RawInode::from_bytes(&buf[off..off + size_of::<RawInode>()]);
+                let iseed = fs_seed.derive_inode(ino, raw.generation);
+                InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
+                buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
+            }
+        })
     }
 }
 

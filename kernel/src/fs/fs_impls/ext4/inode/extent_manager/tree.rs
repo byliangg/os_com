@@ -801,7 +801,7 @@ fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) 
     // Zero-seed the fresh block's capture now; the capture lives in the
     // running transaction (the credential is proof, not owner), and
     // `write_leaf_node` re-mints its own when it fills the block.
-    let _create = journal::get_create_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    let _create = journal::get_create_access(handle, bid)?;
     Ok(bid)
 }
 
@@ -859,7 +859,7 @@ fn write_leaf_node(
     // leaves were captured by `alloc_meta_block`. Capture idempotently so the
     // reuse path is journaled too — a fresh leaf's zero-seeded capture is left
     // untouched, a reused leaf gets one here.
-    let access = journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    let access = journal::get_write_access(handle, bid)?;
     access.patch(|buf| buf.copy_from_slice(&block))?;
     // Under a live capture the extent block reaches its final location via
     // checkpoint after the transaction commits; suppress the direct write so
@@ -903,7 +903,7 @@ fn write_interior_node(
     }
     // Capture idempotently: a reused block gets its capture here, a freshly
     // allocated one keeps the zero-seeded capture from `alloc_meta_block`.
-    let access = journal::get_write_access(handle, bid, journal::TriggerType::ExtentBlock)?;
+    let access = journal::get_write_access(handle, bid)?;
     access.patch(|buf| buf.copy_from_slice(&block))?;
     // Under a live capture the block reaches its final location via checkpoint
     // after commit; suppress the direct write so metadata never precedes its

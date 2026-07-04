@@ -759,8 +759,7 @@ impl BlockGroup {
             as u16;
 
         let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-        let bitmap_access =
-            journal::get_write_access(handle, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        let bitmap_access = journal::get_write_access(handle, block_bitmap_bid)?;
 
         // TODO(P9, allocator work): improve bitmap allocation to reduce
         // fragmentation (e.g. find the first free run directly instead of
@@ -807,12 +806,10 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
-            |buf| {
-                metadata.desc.patch_into(buf, self.desc_offset);
-                self.stamp_desc_csum_in_block(buf, &metadata);
-            },
-        )?;
+        journal::get_write_access(handle, desc_block_bid)?.patch(|buf| {
+            metadata.desc.patch_into(buf, self.desc_offset);
+            self.stamp_desc_csum_in_block(buf, &metadata);
+        })?;
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
@@ -842,8 +839,7 @@ impl BlockGroup {
         }
 
         let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-        let bitmap_access =
-            journal::get_write_access(handle, block_bitmap_bid, journal::TriggerType::BlockBitmap)?;
+        let bitmap_access = journal::get_write_access(handle, block_bitmap_bid)?;
 
         // Clear bits one by one and count only allocated-to-free transitions.
         let range_start = start_bit as u16;
@@ -870,12 +866,10 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
-            |buf| {
-                metadata.desc.patch_into(buf, self.desc_offset);
-                self.stamp_desc_csum_in_block(buf, &metadata);
-            },
-        )?;
+        journal::get_write_access(handle, desc_block_bid)?.patch(|buf| {
+            metadata.desc.patch_into(buf, self.desc_offset);
+            self.stamp_desc_csum_in_block(buf, &metadata);
+        })?;
 
         Ok(actually_freed)
     }
@@ -912,8 +906,7 @@ impl BlockGroup {
         }
 
         let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
-        let bitmap_access =
-            journal::get_write_access(handle, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
+        let bitmap_access = journal::get_write_access(handle, inode_bitmap_bid)?;
 
         // Allocate exactly one free inode bit.
         let Some(range) = metadata.inode_bitmap.alloc_consecutive(1) else {
@@ -933,12 +926,10 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
-            |buf| {
-                metadata.desc.patch_into(buf, self.desc_offset);
-                self.stamp_desc_csum_in_block(buf, &metadata);
-            },
-        )?;
+        journal::get_write_access(handle, desc_block_bid)?.patch(|buf| {
+            metadata.desc.patch_into(buf, self.desc_offset);
+            self.stamp_desc_csum_in_block(buf, &metadata);
+        })?;
 
         Ok(Some(inode_idx))
     }
@@ -967,8 +958,7 @@ impl BlockGroup {
         }
 
         let inode_bitmap_bid = metadata.desc.inode_bitmap_bid();
-        let bitmap_access =
-            journal::get_write_access(handle, inode_bitmap_bid, journal::TriggerType::InodeBitmap)?;
+        let bitmap_access = journal::get_write_access(handle, inode_bitmap_bid)?;
 
         let new_free = metadata
             .desc
@@ -999,12 +989,10 @@ impl BlockGroup {
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
-        journal::get_write_access(handle, desc_block_bid, journal::TriggerType::GroupDesc)?.patch(
-            |buf| {
-                metadata.desc.patch_into(buf, self.desc_offset);
-                self.stamp_desc_csum_in_block(buf, &metadata);
-            },
-        )?;
+        journal::get_write_access(handle, desc_block_bid)?.patch(|buf| {
+            metadata.desc.patch_into(buf, self.desc_offset);
+            self.stamp_desc_csum_in_block(buf, &metadata);
+        })?;
 
         Ok(true)
     }
