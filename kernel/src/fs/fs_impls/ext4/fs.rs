@@ -487,22 +487,34 @@ impl Ext4 {
         return_errno_with_message!(Errno::ENOSPC, "no free blocks available in any group");
     }
 
-    /// Frees the physical block run `auth` covers, splitting across groups.
+    /// Frees the physical block run `auth` covers, splitting across groups —
+    /// the sole consumption funnel of the forget-before-free protocol.
     ///
     /// Consuming a [`journal::BlockFreeAuth`] instead of a bare
-    /// `(start, count)` pair is the forget-before-free protocol (rust_rules
-    /// ⑤; Linux `ext4_free_blocks` runs `ext4_forget` before the bitmap
-    /// clear, fs/ext4/mballoc.c:6676/6719): the credential is minted either
-    /// by [`journal::forget`] — journaled metadata and revoke-covered data
-    /// (extent-tree nodes, directory blocks, slow-symlink targets) — or by
-    /// [`journal::BlockFreeAuth::for_never_journaled_data`] for ordered-mode
-    /// file data, so a free that skips the revoke decision does not compile.
+    /// `(start, count)` pair means a free that skips the revoke decision does
+    /// not compile (rust_rules ⑤): the credential is minted either by
+    /// [`journal::forget`] — journaled metadata and revoke-covered data
+    /// (extent-tree nodes, directory blocks, slow-symlink targets), carrying
+    /// the revoke duty — or duty-free by
+    /// [`journal::BlockFreeAuth::without_revoke_duty`].
+    ///
+    /// The mint is pure; the forget **effects** (capture cancel, revoke
+    /// record, retained-image eviction) run HERE, per contiguous per-group
+    /// run, immediately before that run's bitmap clear, under the caller's
+    /// handle and this funnel's lock scope — record-then-free, Linux's order
+    /// within `ext4_free_blocks` (`ext4_forget` before the bitmap clear,
+    /// fs/ext4/mballoc.c:6676/6719). An operation that errors *before* a
+    /// run's effects (an earlier extent's free failing, a mint whose free is
+    /// never reached) therefore leaves the journal state of the unfreed
+    /// blocks untouched: no revoke stands for a still-referenced block, no
+    /// capture is lost (`RevokeDuty::discharge` in the journal's revoke
+    /// module documents the three effects).
     pub(super) fn free_blocks(
         &self,
         auth: journal::BlockFreeAuth,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
-        let (start, count) = auth.into_parts();
+        let (start, count, duty) = auth.into_parts();
         if count == 0 {
             return Ok(());
         }
@@ -523,6 +535,14 @@ impl Ext4 {
             let group_size = (group_last_block - group_first_block + 1) as u32;
             let group_start_bit = (current_block - group_first_block) as u32;
             let blocks_in_group = remaining_blocks.min(group_size - group_start_bit);
+            // Discharge this run's revoke duty right before its bitmap clear
+            // (record-then-free; see the function docs). Without a handle
+            // there is no log whose replay could resurrect the blocks, so
+            // the duty is inert — the pre-consumption semantics of a
+            // non-journaled volume.
+            if let (Some(handle), Some(duty)) = (handle, duty.as_ref()) {
+                duty.discharge(handle, current_block, blocks_in_group)?;
+            }
             let freed_count =
                 group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
             if freed_count > 0 {
@@ -1649,12 +1669,86 @@ mod tests {
 
         f.ext4
             .free_blocks(
-                journal::BlockFreeAuth::for_never_journaled_data(range.start, alloc_len),
+                journal::BlockFreeAuth::without_revoke_duty(range.start, alloc_len),
                 None,
             )
             .unwrap();
         assert_eq!(f.ext4.block_group(0).free_blocks_count(), before_group_free);
         assert_eq!(f.ext4.super_block().free_blocks_count(), before_sb_free);
+    }
+
+    /// MAJOR-B red→green: the forget effects (capture cancel, revoke record,
+    /// retained-image eviction) run at the authorization's CONSUMPTION —
+    /// inside `free_blocks`, with the bitmap clear — never at mint. An
+    /// operation that errors between minting and freeing (a multi-extent
+    /// truncate failing mid-loop, a failed tree reserialize) must leave the
+    /// not-yet-freed blocks' journal state untouched: a standing revoke for a
+    /// still-referenced block would suppress its legitimate journaled updates
+    /// at checkpoint (silent content rollback), and the cancelled capture's
+    /// update would be lost. Reverting to effects-at-mint fails every `b2`
+    /// assertion below.
+    #[ktest]
+    fn forget_effects_run_at_free_not_at_mint() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Two journaled "metadata" blocks (as two extents' tree/dir blocks),
+        // committed but NOT checkpointed so both have retained images.
+        let op1 = f.ext4.begin_op(8).unwrap();
+        let b1 = f.ext4.alloc_blocks(1, 0, op1.get()).unwrap().start;
+        let b2 = f.ext4.alloc_blocks(1, 0, op1.get()).unwrap().start;
+        journal::get_create_access(op1.get(), b1)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal::get_create_access(op1.get(), b2)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
+            .unwrap();
+        drop(op1);
+        journal.commit_now_for_test();
+        assert!(journal.uncheckpointed_blocks_for_test().contains(&b1));
+        assert!(journal.uncheckpointed_blocks_for_test().contains(&b2));
+
+        // A fresh transaction journals both blocks again (their next update).
+        let op2 = f.ext4.begin_op(8).unwrap();
+        journal::get_write_access(op2.get(), b1)
+            .unwrap()
+            .patch(|b| b[4..8].copy_from_slice(&[0x33; 4]))
+            .unwrap();
+        journal::get_write_access(op2.get(), b2)
+            .unwrap()
+            .patch(|b| b[4..8].copy_from_slice(&[0x44; 4]))
+            .unwrap();
+        let sb_free_before = f.ext4.super_block().free_blocks_count();
+
+        // Extent #1: minted AND consumed — all three effects land, with the
+        // bitmap clear.
+        f.ext4
+            .free_blocks(journal::forget(b1, 1), op2.get())
+            .unwrap();
+        assert!(journal.running_revoked_blocks_for_test().contains(&b1));
+        assert!(!journal.running_captured_blocks_for_test().contains(&b1));
+        assert!(!journal.uncheckpointed_blocks_for_test().contains(&b1));
+        assert_eq!(f.ext4.super_block().free_blocks_count(), sb_free_before + 1);
+
+        // Extent #2: minted, then DROPPED — the operation errored before this
+        // extent's free. A true no-op: capture intact, NO revoke recorded,
+        // retained image intact, bitmap untouched.
+        let auth = journal::forget(b2, 1);
+        drop(auth);
+        assert!(!journal.running_revoked_blocks_for_test().contains(&b2));
+        assert!(journal.running_captured_blocks_for_test().contains(&b2));
+        assert!(journal.uncheckpointed_blocks_for_test().contains(&b2));
+        assert_eq!(f.ext4.super_block().free_blocks_count(), sb_free_before + 1);
+
+        drop(op2);
     }
 
     #[ktest]

@@ -54,6 +54,25 @@
 //! a freed buffer stays on the older transaction's checkpoint list until the
 //! freeing transaction commits.
 //!
+//! An **unpublished** revoke (the running transaction's, or the mid-commit
+//! transaction's on the drain path) is unsound to act on in *either*
+//! direction, which is why the checkpoint pass carries the unpublished sets
+//! separately and **defers** in front of them
+//! ([`checkpoint`](super::checkpoint::checkpoint)'s defer-prefix rule):
+//!
+//! - It must not suppress-and-retire an older image: a crash may still erase
+//!   the revoking transaction, and the suppressed (fsync-acknowledged) image
+//!   would then be missing from both the device and the retired log.
+//! - The older image must not be *applied* either: the forget's free already
+//!   took effect in memory — the bitmap freed the block, and a new owner's
+//!   bytes may already sit at the final location — so applying the old image
+//!   is the S1 runtime clobber, no crash required.
+//!
+//! Deferral is the only remaining move: the pass stops (applies nothing,
+//! retires nothing) at the first transaction touching such a block, keeping
+//! its prefix progress. The revoke publishes with its commit, and the next
+//! pass proceeds under ordinary suppression-with-retention.
+//!
 //! A record `(B, tid_r)` matters only while some transaction with tid ≤
 //! `tid_r` can still be applied from the log. Checkpoint therefore retires
 //! records at the same tid boundary that retires the un-checkpointed images
@@ -64,16 +83,28 @@
 //! on-disk revoke blocks (PASS_REVOKE, P7b-4; until then a revoke block in
 //! the log still refuses the mount, unchanged).
 //!
-//! # The forget-before-free protocol
+//! # The forget-before-free protocol (effects at consumption)
 //!
 //! [`forget`] is the sole minting point of [`BlockFreeAuth`] for
 //! revoke-covered blocks, and [`Ext4::free_blocks`](super::super::fs::Ext4)
 //! consumes the credential — freeing journaled metadata without the revoke
-//! decision does not compile (rust_rules ⑤). Never-journaled file data takes
-//! the other constructor, whose name states the claim it makes
-//! ([`BlockFreeAuth::for_never_journaled_data`]). The forget-then-free order
-//! within one handle mirrors Linux (`ext4_free_blocks`:
-//! `ext4_forget` before the bitmap clear, fs/ext4/mballoc.c:6676/6719).
+//! decision does not compile (rust_rules ⑤). Freeing with **no** revoke duty
+//! takes the other constructor, whose name states the claim it makes
+//! ([`BlockFreeAuth::without_revoke_duty`]).
+//!
+//! Minting is **pure**: every journal effect of a forget — capture cancel,
+//! revoke record, retained-image eviction ([`RevokeDuty::discharge`]) — runs
+//! when `Ext4::free_blocks` consumes the credential, immediately before (and
+//! in the same lock scope as) the bitmap clear it authorizes,
+//! record-then-free, mirroring Linux's order within `ext4_free_blocks`
+//! (`ext4_forget` before the bitmap clear, fs/ext4/mballoc.c:6676/6719).
+//! Effects at mint would let an operation that errors *between* mint and
+//! free (a multi-extent truncate failing mid-loop, a failed tree
+//! reserialize) silently roll back live metadata: a revoke standing for a
+//! still-referenced block suppresses that block's legitimate journaled
+//! updates at checkpoint/replay, and the cancelled capture's update is lost.
+//! With consumption-time effects, an authorization dropped un-consumed is a
+//! true no-op.
 
 use super::{super::prelude::*, Handle, JournalState, Tid};
 
@@ -150,20 +181,27 @@ impl RevokeTable {
     }
 }
 
-/// Authorization to free one physical block run — proof that the
-/// forget-before-free protocol ran (or was knowingly, nameably skipped).
+/// Authorization to free one physical block run — the free site's recorded
+/// decision on revoke duty.
 ///
 /// [`Ext4::free_blocks`](super::super::fs::Ext4) consumes this instead of a
 /// bare `(start, count)` pair, so every free site must state which of the two
 /// legs it stands on (rust_rules ⑤ — free-without-forget is uncompilable):
 ///
-/// - [`forget`] mints it for blocks whose free needs a revoke record:
-///   journaled metadata (extent-tree nodes, directory blocks) and
-///   slow-symlink targets (Linux revokes those unconditionally,
+/// - [`forget`] mints it *with* a [`RevokeDuty`], for blocks whose free
+///   needs a revoke record: journaled metadata (extent-tree nodes, directory
+///   blocks) and slow-symlink targets (Linux revokes those unconditionally,
 ///   fs/ext4/extents.c:2415-2417).
-/// - [`for_never_journaled_data`](Self::for_never_journaled_data) mints it
-///   for ordered-mode file data, which never enters the log and so has
-///   nothing to revoke.
+/// - [`without_revoke_duty`](Self::without_revoke_duty) mints it duty-free,
+///   on the caller's claim that nothing about the blocks' history remains
+///   for this free to revoke.
+///
+/// Minting is **pure** — the credential only carries the run and the intent;
+/// the forget effects run at consumption (see the module docs and
+/// [`RevokeDuty::discharge`]), so a credential dropped un-consumed (an
+/// operation erroring between mint and free) changes no journal state: no
+/// revoke stands for a still-referenced block, no capture was cancelled, no
+/// retained image was evicted.
 ///
 /// The run travels *inside* the credential so a forget on one range cannot
 /// authorize a free of another.
@@ -171,27 +209,102 @@ impl RevokeTable {
 pub(in crate::fs::fs_impls::ext4) struct BlockFreeAuth {
     start: Ext4Bid,
     count: u32,
+    duty: Option<RevokeDuty>,
 }
 
 impl BlockFreeAuth {
-    /// Authorizes freeing `count` blocks at `start` **without** a revoke
-    /// record, on the caller's claim that the blocks never carried journaled
-    /// content: ordered-mode file data (Linux frees it with `flags == 0`,
+    /// Authorizes freeing `count` blocks at `start` with **no revoke duty**,
+    /// on the caller's claim that *any prior journaled life of these blocks
+    /// was ended by that life's own forget* — nothing about their history
+    /// remains for THIS free to revoke. That covers ordered-mode file data
+    /// (never journaled at all; Linux frees it with `flags == 0`,
     /// fs/ext4/extents.c:2413-2420) and rollback of freshly allocated,
-    /// never-yet-referenced data blocks. Using this for a journaled metadata
-    /// block would re-open the replay-clobber hazard [`forget`] closes — the
-    /// constructor's name is the reviewable statement of the claim.
-    pub(in crate::fs::fs_impls::ext4) fn for_never_journaled_data(
-        start: Ext4Bid,
-        count: u32,
-    ) -> Self {
-        Self { start, count }
+    /// never-yet-referenced data blocks. Using this for a block whose
+    /// journaled life is ending *with* this free re-opens the replay-clobber
+    /// hazard [`forget`] closes — the constructor's name is the reviewable
+    /// statement of the claim.
+    pub(in crate::fs::fs_impls::ext4) fn without_revoke_duty(start: Ext4Bid, count: u32) -> Self {
+        Self {
+            start,
+            count,
+            duty: None,
+        }
     }
 
-    /// Surrenders the authorized run to the free itself (consuming the
-    /// credential: one mint, one free).
-    pub(in crate::fs::fs_impls::ext4) fn into_parts(self) -> (Ext4Bid, u32) {
-        (self.start, self.count)
+    /// Surrenders the authorized run and its duty to the free itself
+    /// (consuming the credential: one mint, one free).
+    pub(in crate::fs::fs_impls::ext4) fn into_parts(self) -> (Ext4Bid, u32, Option<RevokeDuty>) {
+        (self.start, self.count, self.duty)
+    }
+}
+
+/// The revoke half of a [`BlockFreeAuth`] minted by [`forget`]: the
+/// obligation to run the forget effects with the free. Its constructor is
+/// private, so the effects cannot run without a free site's forget decision;
+/// [`Ext4::free_blocks`](super::super::fs::Ext4) is the consumption funnel
+/// that discharges it.
+pub(in crate::fs::fs_impls::ext4) struct RevokeDuty {
+    /// Private unit: mintable only by [`forget`].
+    _forget_decision: (),
+}
+
+impl RevokeDuty {
+    /// Runs the forget effects for `count` blocks at `start` — the
+    /// running-transaction half of jbd2's `jbd2_journal_forget` +
+    /// `jbd2_journal_revoke`. For each block this:
+    ///
+    /// 1. Cancels any capture of the block in the running transaction — the
+    ///    free supersedes the pending write ("journaled and then revoked",
+    ///    see the module docs), so the stale image must not commit;
+    /// 2. Records the block in the running transaction's revoke set,
+    ///    published to the journal's committed-revoke memory when the
+    ///    transaction commits;
+    /// 3. Evicts the block's committed-but-un-checkpointed image, so the
+    ///    stale bytes stop seeding later captures
+    ///    ([`get_write_access`](super::get_write_access)) and reads
+    ///    ([`read_metadata_block`](super::read_metadata_block)). The image's
+    ///    LOG copy is beyond eviction's reach — that side is what the revoke
+    ///    record suppresses at checkpoint/replay.
+    ///
+    /// Called by `Ext4::free_blocks` for each contiguous per-group run of
+    /// the authorization it consumes, immediately before that run's bitmap
+    /// clear, in the same lock scope and under the same handle
+    /// (record-then-free — Linux's `ext4_forget`-before-clear order,
+    /// fs/ext4/mballoc.c:6676/6719). `start`/`count` must lie within the run
+    /// of the credential this duty traveled in. A failure of the bitmap
+    /// clear *itself* after the effects leaves that run's revoke standing —
+    /// Linux's exposure too, and reachable only through a capture `EIO`
+    /// that already fails the operation.
+    ///
+    /// # Stale credentials
+    ///
+    /// The caller should hold no live [`WriteAccess`](super::WriteAccess)
+    /// for the blocks: the capture cancel makes an outstanding credential
+    /// stale, and a later `patch` through it errors `EIO` — "no prior
+    /// capture", or a capture-generation mismatch if the block was
+    /// re-captured after reallocation — rather than resurrecting the block.
+    pub(in crate::fs::fs_impls::ext4) fn discharge(
+        &self,
+        handle: &Handle,
+        start: Ext4Bid,
+        count: u32,
+    ) -> Result<()> {
+        let journal = handle.journal()?;
+        let mut state = journal.state_write();
+        // Disjoint field borrows: the running transaction (capture cancel +
+        // revoke record) and the retained-image map (stale-seed eviction).
+        let JournalState {
+            running,
+            uncheckpointed,
+            ..
+        } = &mut *state;
+        let txn = super::verify_running(running, handle)?;
+        for i in 0..count {
+            let bid = start + Ext4Bid::from(i);
+            txn.forget_block(bid);
+            uncheckpointed.remove(&bid);
+        }
+        Ok(())
     }
 }
 
@@ -213,75 +326,43 @@ pub(in crate::fs::fs_impls::ext4) enum DataForgetPolicy {
 
 impl DataForgetPolicy {
     /// Authorizes freeing `count` data blocks at `start` under this policy:
-    /// the [`Forget`](Self::Forget) leg records revokes via [`forget`], the
-    /// [`PlainData`](Self::PlainData) leg states the no-journal claim.
+    /// the [`Forget`](Self::Forget) leg mints the revoke duty via [`forget`],
+    /// the [`PlainData`](Self::PlainData) leg states the no-duty claim. Pure
+    /// either way — the effects belong to the free that consumes the
+    /// authorization.
     pub(in crate::fs::fs_impls::ext4) fn authorize(
         self,
-        handle: Option<&Handle>,
         start: Ext4Bid,
         count: u32,
-    ) -> Result<BlockFreeAuth> {
+    ) -> BlockFreeAuth {
         match self {
-            Self::Forget => forget(handle, start, count),
-            Self::PlainData => Ok(BlockFreeAuth::for_never_journaled_data(start, count)),
+            Self::Forget => forget(start, count),
+            Self::PlainData => BlockFreeAuth::without_revoke_duty(start, count),
         }
     }
 }
 
-/// Records that `count` previously journaled (or revoke-covered) blocks at
-/// `start` are being freed, and mints the [`BlockFreeAuth`] their free
-/// consumes (jbd2 `jbd2_journal_forget` + `jbd2_journal_revoke`; Linux
-/// callers reach it through `ext4_forget`, fs/ext4/ext4_jbd2.c:266-296).
+/// Declares that `count` previously journaled (or revoke-covered) blocks at
+/// `start` are being freed, minting the [`BlockFreeAuth`] whose consumption
+/// runs the forget effects (jbd2 `jbd2_journal_forget` +
+/// `jbd2_journal_revoke`; Linux callers reach the pair through `ext4_forget`,
+/// fs/ext4/ext4_jbd2.c:266-296).
 ///
-/// Under a live handle, for each block this:
-///
-/// 1. Cancels any capture of the block in the running transaction — the free
-///    supersedes the pending write ("journaled and then revoked", see the
-///    module docs), so the stale image must not commit;
-/// 2. Records the block in the running transaction's revoke set, published to
-///    the journal's committed-revoke memory when the transaction commits;
-/// 3. Evicts the block's committed-but-un-checkpointed image, so the stale
-///    bytes stop seeding later captures ([`get_write_access`](super::get_write_access))
-///    and reads ([`read_metadata_block`](super::read_metadata_block)). The
-///    image's LOG copy is beyond eviction's reach — that side is what the
-///    revoke record suppresses at checkpoint/replay.
-///
-/// Without a handle (a non-journaled volume) nothing is recorded — there is
-/// no log whose replay could resurrect the blocks — and the authorization is
-/// minted as-is.
-///
-/// # No live accesses
-///
-/// The caller must hold no live [`WriteAccess`](super::WriteAccess) for the
-/// blocks: forgetting cancels the capture, so a later `patch` through an
-/// outstanding credential errors `EIO` ("dirty_metadata without prior
-/// get_*_access") rather than resurrecting the block. Every current caller
-/// frees a block only after its writer credentials are dropped.
-pub(in crate::fs::fs_impls::ext4) fn forget(
-    handle: Option<&Handle>,
-    start: Ext4Bid,
-    count: u32,
-) -> Result<BlockFreeAuth> {
-    let auth = BlockFreeAuth { start, count };
-    let Some(handle) = handle else {
-        return Ok(auth);
-    };
-    let journal = handle.journal()?;
-    let mut state = journal.state_write();
-    // Disjoint field borrows: the running transaction (capture cancel + revoke
-    // record) and the retained-image map (stale-seed eviction).
-    let JournalState {
-        running,
-        uncheckpointed,
-        ..
-    } = &mut *state;
-    let txn = super::verify_running(running, handle)?;
-    for i in 0..count {
-        let bid = start + Ext4Bid::from(i);
-        txn.forget_block(bid);
-        uncheckpointed.remove(&bid);
+/// The mint is pure — see [`BlockFreeAuth`]: the effects (capture cancel,
+/// revoke record, retained-image eviction) run inside
+/// [`Ext4::free_blocks`](super::super::fs::Ext4), via
+/// [`RevokeDuty::discharge`], immediately before the bitmap clear and under
+/// the caller's own handle. On a non-journaled volume (no handle at the
+/// free) the duty is inert — there is no log whose replay could resurrect
+/// the blocks.
+pub(in crate::fs::fs_impls::ext4) fn forget(start: Ext4Bid, count: u32) -> BlockFreeAuth {
+    BlockFreeAuth {
+        start,
+        count,
+        duty: Some(RevokeDuty {
+            _forget_decision: (),
+        }),
     }
-    Ok(auth)
 }
 
 #[cfg(ktest)]

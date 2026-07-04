@@ -622,8 +622,8 @@ mod tests {
     fn make_txn(tid: Tid, blocks: &[(Ext4Bid, [u8; BLOCK_SIZE])]) -> Transaction {
         let mut txn = Transaction::new(tid);
         for (bid, content) in blocks {
-            txn.capture_create(*bid);
-            txn.apply_patch(*bid, |b| b.copy_from_slice(content))
+            let generation = txn.capture_create(*bid);
+            txn.apply_patch(*bid, generation, |b| b.copy_from_slice(content))
                 .unwrap();
         }
         txn
@@ -1120,8 +1120,8 @@ mod tests {
         for i in 0..n {
             let dest = first_dest + u64::try_from(i).unwrap();
             let content = bulk_block(i, escape_at == Some(i));
-            txn.capture_create(dest);
-            txn.apply_patch(dest, |b| b.copy_from_slice(&content))
+            let generation = txn.capture_create(dest);
+            txn.apply_patch(dest, generation, |b| b.copy_from_slice(&content))
                 .unwrap();
         }
         txn
@@ -1258,7 +1258,7 @@ mod tests {
         // the ring is clean (and reusable) before the wrapping T2.
         let t1 = make_bulk_txn(Tid::new(1), 1000, 100, None);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         let head = f.journal.state_read().head;
         assert_eq!(head, 103); // desc + 100 data + commit from log 1
 
@@ -1966,7 +1966,7 @@ mod tests {
         assert_eq!(sb.s_checksum.get(), sb.checksum(), "commit tail publish");
 
         // Site 2: the checkpoint clean rewrite.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
         assert_eq!(sb.s_checksum.get(), sb.checksum(), "checkpoint rewrite");

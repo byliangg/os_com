@@ -278,9 +278,10 @@ impl ExtentManager {
                     self.csum_seed,
                 ) {
                     // Fresh unwritten blocks never referenced by the tree:
-                    // nothing journaled, nothing to revoke.
+                    // no journaled life is ending with this free, so it
+                    // carries no revoke duty.
                     let _ = fs.free_blocks(
-                        journal::BlockFreeAuth::for_never_journaled_data(range.start, got),
+                        journal::BlockFreeAuth::without_revoke_duty(range.start, got),
                         handle,
                     );
                     return Err(err);
@@ -355,11 +356,9 @@ impl ExtentManager {
             self.csum_seed,
         ) {
             // Free the just-allocated block rather than leak it (a data
-            // block that never entered the tree: nothing to revoke).
-            let _ = fs.free_blocks(
-                journal::BlockFreeAuth::for_never_journaled_data(pblock, 1),
-                None,
-            );
+            // block that never entered the tree: no journaled life ends
+            // with this free, so it carries no revoke duty).
+            let _ = fs.free_blocks(journal::BlockFreeAuth::without_revoke_duty(pblock, 1), None);
             return Err(err);
         }
         Ok(pblock)

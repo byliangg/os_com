@@ -358,17 +358,20 @@ impl Journal {
     /// un-checkpointed transaction (jbd2 updates `s_start`/`s_sequence` when the
     /// journal transitions from clean to dirty), then barriers.
     ///
-    /// Called only when the journal was clean before this commit; a dirty journal
-    /// already records an older transaction that must be preserved.
+    /// Two callers, both moving the tail onto a live transaction: this commit
+    /// pipeline when the journal was clean before the commit (a dirty journal
+    /// already records an older transaction that must be preserved), and the
+    /// checkpoint pass's partial advance, when the defer-prefix rule stops it
+    /// on a transaction it must not apply (see
+    /// [`checkpoint`](super::checkpoint::checkpoint)).
     ///
     /// Does NOT touch `s_head`: Linux only reads `s_head` on the clean-unmount fast
-    /// path (`recovery.c`, when `s_start == 0`), which Phase 4 never produces — our
-    /// commits always leave `s_start != 0` until a checkpoint clears it. **The
-    /// checkpoint pass (the checkpoint / clean-unmount rewrite) owns `s_head`:
-    /// when it zeroes `s_start` it MUST also write a correct `s_head`, or Linux
-    /// would resume the log at a stale offset.** (Adversarial-review finding,
-    /// Phase 4 Task 3.)
-    fn update_superblock_tail(
+    /// path (`recovery.c`, when `s_start == 0`), which neither caller produces —
+    /// `s_start` stays nonzero until a full checkpoint clears it. **The
+    /// checkpoint pass's clean rewrite owns `s_head`: when it zeroes `s_start`
+    /// it MUST also write a correct `s_head`, or Linux would resume the log at
+    /// a stale offset.** (Adversarial-review finding, Phase 4 Task 3.)
+    pub(super) fn update_superblock_tail(
         &self,
         device: &dyn BlockDevice,
         txn_start: u32,
@@ -726,8 +729,8 @@ mod tests {
     fn make_txn(tid: Tid, blocks: &[(Ext4Bid, [u8; BLOCK_SIZE])]) -> Transaction {
         let mut txn = Transaction::new(tid);
         for (bid, content) in blocks {
-            txn.capture_create(*bid);
-            txn.apply_patch(*bid, |b| b.copy_from_slice(content))
+            let generation = txn.capture_create(*bid);
+            txn.apply_patch(*bid, generation, |b| b.copy_from_slice(content))
                 .unwrap();
         }
         txn
@@ -865,8 +868,9 @@ mod tests {
         let mut txn = Transaction::new(Tid::new(9));
         for i in 0..n {
             let bid = Ext4Bid::try_from(1000 + i).unwrap();
-            txn.capture_create(bid);
-            txn.apply_patch(bid, |b| b.copy_from_slice(&c)).unwrap();
+            let generation = txn.capture_create(bid);
+            txn.apply_patch(bid, generation, |b| b.copy_from_slice(&c))
+                .unwrap();
         }
 
         let chain = txn.build_descriptor_chain(layout, None).unwrap();
@@ -1127,8 +1131,9 @@ mod tests {
         let mut txn = Transaction::new(Tid::new(1));
         let mut meta = [0u8; BLOCK_SIZE];
         meta[..4].copy_from_slice(b"META");
-        txn.capture_create(500);
-        txn.apply_patch(500, |b| b.copy_from_slice(&meta)).unwrap();
+        let generation = txn.capture_create(500);
+        txn.apply_patch(500, generation, |b| b.copy_from_slice(&meta))
+            .unwrap();
         let pages = inode.page_cache().unwrap();
         txn.register_ordered_data(
             inode.ino(),
@@ -1189,7 +1194,7 @@ mod tests {
         // The revoke crossed into the committed-revoke memory with the
         // commit, and only then retires (by checkpoint).
         assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
     }
 
@@ -1278,7 +1283,7 @@ mod tests {
 
         // Drain the tail, then retry the SAME handed-back transaction: it now
         // fits the clean ring and commits.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
         let CommitAttempt::Committed(tid) = attempt else {
             panic!("after the drain the chain fits");
@@ -1288,7 +1293,7 @@ mod tests {
 
         // The retried commit is a real one: checkpointing lands T2's
         // after-images at their final locations.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         let mut final_block = [0u8; BLOCK_SIZE];
         f.fixture
             .disk
@@ -1313,7 +1318,7 @@ mod tests {
         // ring; checkpoint reclaims it (head stays at 11, ring clean).
         let t1 = indexed_txn(Tid::new(1), 500, 8);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         assert_eq!(f.journal.state_write().head, 11);
 
         // T2 (6 captures -> 8 blocks) wraps the ring end: [11..16) + [1..4);
@@ -1343,7 +1348,7 @@ mod tests {
 
         // Everything committed into the wrapped ring is real: draining the
         // full ring applies T2 and T3 to their final locations.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
         for (first_dest, n) in [(600u64, 6u64), (700, 5)] {
             for i in 0..n {
                 let mut b = [0u8; BLOCK_SIZE];

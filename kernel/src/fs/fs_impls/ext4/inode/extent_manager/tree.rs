@@ -353,9 +353,12 @@ impl ExtentTree {
             }
             if e_start >= keep_blocks {
                 // Entire extent is beyond the new size; free all its blocks
-                // (forgetting them first when the inode's policy says its
-                // data is revoke-covered — dir blocks, slow-symlink targets).
-                let auth = data_policy.authorize(handle, e.start(), e.len() as u32)?;
+                // (the free discharges the forget when the inode's policy
+                // says its data is revoke-covered — dir blocks, slow-symlink
+                // targets). Per-extent authorization means an error on a
+                // later extent leaves this one fully freed-and-revoked and
+                // the later ones' journal state untouched.
+                let auth = data_policy.authorize(e.start(), e.len() as u32);
                 fs.free_blocks(auth, handle)?;
                 freed_data += e.len() as u64;
                 continue;
@@ -364,8 +367,7 @@ impl ExtentTree {
             // Lossless: the head lies inside this extent, whose length is u16.
             let head_len = (keep_blocks - e_start) as u16;
             let tail_len = e.len() - head_len;
-            let auth =
-                data_policy.authorize(handle, e.start() + head_len as Ext4Bid, tail_len as u32)?;
+            let auth = data_policy.authorize(e.start() + head_len as Ext4Bid, tail_len as u32);
             fs.free_blocks(auth, handle)?;
             freed_data += tail_len as u64;
             kept.push(Extent::new(e.block(), head_len, e.start(), e.kind()));
@@ -819,11 +821,13 @@ fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) 
 
 /// Frees one external extent-tree metadata block — the textbook revoke case
 /// (Linux `ext4_ext_rm_idx` frees tree nodes with `METADATA | FORGET`,
-/// fs/ext4/extents.c:2332): forget before free, under the same handle, so the
-/// revoke record and the bitmap clear commit together.
+/// fs/ext4/extents.c:2332). The mint is pure; `free_blocks` discharges the
+/// forget effects immediately before the bitmap clear, under the same
+/// handle, so the revoke record and the clear commit together — and a
+/// rebuild that errors before reaching this block's free leaves its journal
+/// state untouched (no revoke for a still-referenced node).
 fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) -> Result<()> {
-    let auth = journal::forget(handle, bid, 1)?;
-    fs.free_blocks(auth, handle)
+    fs.free_blocks(journal::forget(bid, 1), handle)
 }
 
 /// Byte offset of `et_checksum` in a full-block external extent node: a 4-byte

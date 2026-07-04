@@ -46,11 +46,13 @@
 //! - [`WriteAccess::patch`] — the metadata block has been modified; live,
 //!   its `patch` closure writes the modification into the captured after-image,
 //!   so sub-objects sharing a block accumulate onto one buffer.
-//! - [`forget`] — a previously journaled metadata block is being freed: the
-//!   running transaction's capture of it is cancelled, the block enters the
-//!   transaction's revoke set (suppressing older log images at checkpoint /
-//!   replay once committed), and its retained un-checkpointed image is
-//!   evicted. Mints the [`BlockFreeAuth`] the free consumes — see [`revoke`].
+//! - [`forget`] — a previously journaled metadata block is being freed: mints
+//!   the [`BlockFreeAuth`] carrying the revoke duty that
+//!   [`Ext4::free_blocks`](super::fs::Ext4) discharges with the bitmap clear
+//!   (cancelling the running transaction's capture, recording the revoke,
+//!   evicting the retained un-checkpointed image). The mint itself is pure —
+//!   an operation erroring between mint and free changes nothing — see
+//!   [`revoke`].
 //!
 //! **Without a handle (`None`) every wrapper is inert** and persistence stays
 //! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
@@ -103,9 +105,10 @@ mod transaction;
 /// on-disk journal superblock is already clean (`s_start == 0`).
 pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
 /// Re-exported at the `ext4` level: the forget-before-free protocol —
-/// [`forget`] mints the [`BlockFreeAuth`] that
-/// [`Ext4::free_blocks`](super::fs::Ext4) consumes, and [`DataForgetPolicy`]
-/// is the per-inode-type rule the truncate paths thread down to their data
+/// [`forget`] purely mints the [`BlockFreeAuth`] that
+/// [`Ext4::free_blocks`](super::fs::Ext4) consumes (the forget *effects* run
+/// at that consumption, with the bitmap clear), and [`DataForgetPolicy`] is
+/// the per-inode-type rule the truncate paths thread down to their data
 /// frees. See the [`revoke`] module.
 pub(in crate::fs::fs_impls::ext4) use self::revoke::{BlockFreeAuth, DataForgetPolicy, forget};
 /// Re-exported at the `ext4` level so allocation/extent paths can thread an
@@ -1048,7 +1051,11 @@ impl Journal {
                     // free segment (`commit_or_drain_tail`). Batching commits
                     // with lazy, space-pressure-driven checkpoint is a P7
                     // optimization.
-                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
+                    // No in-flight committing transaction here: `commit_one`
+                    // returned, so its revokes are published (or the journal
+                    // aborted above). A RUNNING transaction's unpublished
+                    // forgets are snapshotted inside `checkpoint` itself.
+                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref(), None) {
                         error!("ext4 journal checkpoint failed: {:?}", e);
                     }
                 }
@@ -1165,7 +1172,14 @@ impl Journal {
             CommitAttempt::Committed(tid) => return Ok(tid),
             CommitAttempt::NeedsLogSpace(txn) => txn,
         };
-        checkpoint::checkpoint(self, self.device.as_ref())?;
+        // The drain runs MID-COMMIT: `txn`'s revokes are unpublished (its
+        // commit block is not durable — a crash can still erase it), so the
+        // checkpoint must not apply-or-retire an older transaction touching a
+        // block `txn` forgot. Thread the caller-owned committing transaction
+        // in so the pass defers in front of such a transaction; a defer here
+        // drains less space, and the retry below then fails loudly
+        // (`NeedsLogSpace` → `ENOSPC` → journal abort) rather than corrupt.
+        checkpoint::checkpoint(self, self.device.as_ref(), Some(&txn))?;
         match try_commit_transaction(self, self.device.as_ref(), txn)? {
             CommitAttempt::Committed(tid) => Ok(tid),
             CommitAttempt::NeedsLogSpace(_) => Err(Error::with_message(
@@ -1433,7 +1447,10 @@ impl Journal {
         if self.is_aborted() {
             return_errno_with_message!(Errno::EIO, "journal aborted; not checkpointing");
         }
-        checkpoint::checkpoint(self, self.device.as_ref())
+        // Nothing is running (taken above) or mid-commit (the commit thread is
+        // stopped and the commit above returned), so no unpublished revokes
+        // exist to thread in.
+        checkpoint::checkpoint(self, self.device.as_ref(), None)
     }
 }
 
@@ -1527,11 +1544,12 @@ pub(super) fn get_write_access<'h>(
     let seed = uncheckpointed
         .get(&blocknr)
         .map(transaction::UncheckpointedImage::image_bytes);
-    txn.capture_write(blocknr, seed, device.as_ref())?;
+    let generation = txn.capture_write(blocknr, seed, device.as_ref())?;
     Ok(WriteAccess {
         live: Some(LiveAccess {
             handle,
             bid: blocknr,
+            generation,
         }),
     })
 }
@@ -1549,11 +1567,12 @@ pub(super) fn get_create_access<'h>(
     };
     let journal = handle.journal()?;
     let mut state = journal.state_write();
-    running_for(&mut state, handle)?.capture_create(blocknr);
+    let generation = running_for(&mut state, handle)?.capture_create(blocknr);
     Ok(WriteAccess {
         live: Some(LiveAccess {
             handle,
             bid: blocknr,
+            generation,
         }),
     })
 }
@@ -1587,10 +1606,17 @@ pub(super) struct WriteAccess<'h> {
     live: Option<LiveAccess<'h>>,
 }
 
-/// The live half of a [`WriteAccess`]: which block of which transaction.
+/// The live half of a [`WriteAccess`]: which block of which transaction, and
+/// which *capture* of that block — the mint generation distinguishes a
+/// credential of a capture that was since cancelled (forget) and re-created
+/// (the block reallocated within the same transaction) from the live one, so
+/// a stale credential's patch fails `EIO` instead of writing the old owner's
+/// bytes into the new owner's image (see
+/// [`CaptureGeneration`](transaction::CaptureGeneration)).
 struct LiveAccess<'h> {
     handle: &'h Handle,
     bid: Ext4Bid,
+    generation: transaction::CaptureGeneration,
 }
 
 impl WriteAccess<'_> {
@@ -1611,7 +1637,7 @@ impl WriteAccess<'_> {
         };
         let journal = live.handle.journal()?;
         let mut state = journal.state_write();
-        running_for(&mut state, live.handle)?.apply_patch(live.bid, patch)
+        running_for(&mut state, live.handle)?.apply_patch(live.bid, live.generation, patch)
     }
 }
 
@@ -1725,6 +1751,26 @@ impl Journal {
     pub(in crate::fs::fs_impls::ext4) fn committed_revoke_records_for_test(&self) -> usize {
         self.state_read().revoked.len()
     }
+
+    /// Test helper: the blocks the running transaction has captured, in block
+    /// order (empty when no transaction runs). White-box inspection for the
+    /// forget-effects tests; call with the commit thread stopped.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn running_captured_blocks_for_test(&self) -> Vec<Ext4Bid> {
+        self.state_read()
+            .running
+            .as_ref()
+            .map_or_else(Vec::new, |txn| {
+                txn.metadata_blocks().map(|(bid, _)| bid).collect()
+            })
+    }
+
+    /// Test helper: the blocks with a retained committed-but-un-checkpointed
+    /// after-image. White-box inspection for the forget-effects tests.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn uncheckpointed_blocks_for_test(&self) -> Vec<Ext4Bid> {
+        self.state_read().uncheckpointed.keys().copied().collect()
+    }
 }
 
 /// Test helper: commits a single-block transaction (`dest` ← `after`) to `journal`,
@@ -1743,8 +1789,8 @@ pub(in crate::fs::fs_impls::ext4) fn commit_single_block_for_test(
     after: [u8; BLOCK_SIZE],
 ) -> Result<()> {
     let mut txn = Transaction::new(journal.state_read().next_tid);
-    txn.capture_create(dest);
-    txn.apply_patch(dest, |b| b.copy_from_slice(&after))?;
+    let generation = txn.capture_create(dest);
+    txn.apply_patch(dest, generation, |b| b.copy_from_slice(&after))?;
     commit::commit_transaction(journal, device, txn)?;
     Ok(())
 }
@@ -2056,8 +2102,8 @@ mod tests {
         {
             let mut st = f.journal.state_write();
             let txn = st.running.as_mut().unwrap();
-            txn.capture_create(500);
-            txn.apply_patch(500, |b| b[..4].copy_from_slice(b"META"))
+            let generation = txn.capture_create(500);
+            txn.apply_patch(500, generation, |b| b[..4].copy_from_slice(b"META"))
                 .unwrap();
         }
         journal_stop(handle).unwrap();
@@ -2101,8 +2147,8 @@ mod tests {
         {
             let mut st = f.journal.state_write();
             let txn = st.running.as_mut().unwrap();
-            txn.capture_create(500);
-            txn.apply_patch(500, |b| b[..4].copy_from_slice(b"META"))
+            let generation = txn.capture_create(500);
+            txn.apply_patch(500, generation, |b| b[..4].copy_from_slice(b"META"))
                 .unwrap();
         }
         journal_stop(handle).unwrap();
@@ -2240,11 +2286,14 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
         let handle = journal_start(&f.journal, 4).unwrap();
         let mut st = f.journal.state_write();
+        // A generation minted for a DIFFERENT block: `CAPTURE_BLOCK` itself
+        // was never captured, so the patch must fail regardless.
+        let generation = st.running.as_mut().unwrap().capture_create(999);
         assert!(
             st.running
                 .as_mut()
                 .unwrap()
-                .apply_patch(CAPTURE_BLOCK, |_| {})
+                .apply_patch(CAPTURE_BLOCK, generation, |_| {})
                 .is_err(),
             "apply_patch without a capture must fail"
         );
@@ -2354,8 +2403,8 @@ mod tests {
 
         // T1: one capture -> log [1..4); head 4, tail 1, free 12.
         let mut t1 = Transaction::new(Tid::new(1));
-        t1.capture_create(500);
-        t1.apply_patch(500, |b| b[..4].copy_from_slice(b"TAIL"))
+        let generation = t1.capture_create(500);
+        t1.apply_patch(500, generation, |b| b[..4].copy_from_slice(b"TAIL"))
             .unwrap();
         commit::commit_transaction(
             f.journal.as_ref(),
@@ -2394,8 +2443,8 @@ mod tests {
         // drive the commit thread's own path synchronously.
         let mut t2 = Transaction::new(Tid::new(2));
         for dest in 1000u64..1011 {
-            t2.capture_create(dest);
-            t2.apply_patch(dest, |b| b[..4].copy_from_slice(b"OVER"))
+            let generation = t2.capture_create(dest);
+            t2.apply_patch(dest, generation, |b| b[..4].copy_from_slice(b"OVER"))
                 .unwrap();
         }
         f.journal.state_write().running = Some(t2);
@@ -2471,7 +2520,7 @@ mod tests {
             .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
 
         // Both writers' bytes reach the final location; untouched bytes keep the
         // device content.
@@ -2512,7 +2561,7 @@ mod tests {
             .unwrap();
         journal_stop(h1).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
 
         // Doctor a byte on the device — a capture that seeds from the device (and
         // only such a capture) will see it.
@@ -2546,7 +2595,7 @@ mod tests {
             .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
 
         let mut final_block = [0u8; BLOCK_SIZE];
         f.fixture
@@ -2593,9 +2642,13 @@ mod tests {
         assert_eq!(&served[..4], &[0x11; 4]);
 
         // Txn 2 frees the block: the retained image is evicted, so metadata
-        // reads fall through to the device again…
+        // reads fall through to the device again. The effects run at the
+        // authorization's CONSUMPTION (inside `Ext4::free_blocks`); this
+        // white-box test discharges the minted duty directly, standing in
+        // for that consumption funnel.
         let h2 = journal_start(&f.journal, 4).unwrap();
-        let _auth = forget(Some(&h2), bid, 1).unwrap();
+        let (start, count, duty) = forget(bid, 1).into_parts();
+        duty.unwrap().discharge(&h2, start, count).unwrap();
         assert_eq!(f.journal.running_revoked_blocks_for_test(), vec![bid]);
         let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), bid).unwrap();
         assert_eq!(
@@ -2620,6 +2673,54 @@ mod tests {
             .unwrap();
         assert!(f.journal.running_revoked_blocks_for_test().is_empty());
         journal_stop(h2).unwrap();
+    }
+
+    /// A `WriteAccess` credential minted against a capture that was then
+    /// cancelled (forget) and re-created (the block reallocated within the
+    /// SAME transaction) is stale: the capture map's `(transaction, block#)`
+    /// key matches, but the image belongs to the block's new owner, so the
+    /// old credential's patch must fail `EIO` (capture-generation mismatch)
+    /// instead of writing the old owner's bytes into the new owner's image.
+    /// The fresh credential works.
+    #[ktest]
+    fn stale_write_access_across_recapture_fails() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let h = journal_start(&f.journal, 8).unwrap();
+
+        let bid: Ext4Bid = 503;
+        let old = get_write_access(Some(&h), bid).unwrap();
+        old.patch(|b| b[..4].copy_from_slice(&[0x11; 4])).unwrap();
+
+        // The block is freed (the forget effects cancel the capture) and
+        // reallocated as fresh metadata in the same transaction — a new
+        // capture, a new image. The duty is discharged directly, standing in
+        // for `Ext4::free_blocks`'s consumption funnel.
+        let (start, count, duty) = forget(bid, 1).into_parts();
+        duty.unwrap().discharge(&h, start, count).unwrap();
+        let new = get_create_access(Some(&h), bid).unwrap();
+
+        // The stale credential must not write into the new image.
+        let err = old
+            .patch(|b| b[..4].copy_from_slice(&[0x66; 4]))
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        // The fresh credential patches normally, unpolluted by the stale one.
+        new.patch(|b| {
+            assert_eq!(&b[..4], &[0u8; 4], "the new capture is a fresh zero image");
+            b[..4].copy_from_slice(&[0x22; 4]);
+        })
+        .unwrap();
+        assert_eq!(
+            f.journal
+                .state_read()
+                .running
+                .as_ref()
+                .and_then(|txn| txn.buffer_bytes(bid).map(|b| b[..4].to_vec())),
+            Some(vec![0x22; 4])
+        );
+        journal_stop(h).unwrap();
     }
 
     // --- P7a-4: the D-4 mount-time journal feature upgrade. ---

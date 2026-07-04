@@ -74,6 +74,28 @@ struct OrderedData {
     len: usize,
 }
 
+/// The mint identity of one capture within its transaction (jbd2 gets this
+/// from `journal_head` pointer identity; Model A's capture map is keyed by
+/// `(transaction, block#)` alone, which a re-capture REUSES).
+///
+/// A block can be captured, forgotten (the capture cancelled by a free), and
+/// captured again inside one transaction — the block reallocated to a new
+/// owner. The map key is then identical, but the image is a different
+/// object: a [`WriteAccess`](super::WriteAccess) credential minted against
+/// the old capture must not patch the new one (it would write the old
+/// owner's bytes into the new owner's image). Each capture therefore carries
+/// the generation it was minted under, the credential stores it, and
+/// [`Transaction::apply_patch`] refuses a mismatch with `EIO`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CaptureGeneration(u64);
+
+/// One captured metadata block of a running transaction: its after-image
+/// buffer plus the [`CaptureGeneration`] it was minted under.
+struct Capture {
+    generation: CaptureGeneration,
+    buffer: MetaBuffer,
+}
+
 /// A captured whole-block after-image for one metadata block, held in a running
 /// transaction until commit writes it to the log. Model A (op-time capture):
 /// seeded by `get_write_access` (from the newest retained un-checkpointed
@@ -211,7 +233,12 @@ pub(in crate::fs::fs_impls::ext4) struct Transaction {
     outstanding_credits: usize,
     /// The captured after-images, keyed by physical block number. An ordered map
     /// so commit writes tags in a deterministic block order.
-    metadata: BTreeMap<Ext4Bid, MetaBuffer>,
+    metadata: BTreeMap<Ext4Bid, Capture>,
+    /// The next [`CaptureGeneration`] to mint — bumped whenever a block gains
+    /// a FRESH capture (an idempotent re-capture keeps the existing one), so
+    /// a forget-then-recapture of the same block is distinguishable to the
+    /// outstanding credentials of the old capture.
+    next_capture_generation: u64,
     /// The blocks this transaction revoked (jbd2's *running* revoke table,
     /// revoke.c): each was freed under this transaction via
     /// [`forget`](super::revoke::forget) after having been (or being eligible
@@ -241,9 +268,17 @@ impl Transaction {
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
+            next_capture_generation: 0,
             revoked: BTreeSet::new(),
             ordered_data: BTreeMap::new(),
         }
+    }
+
+    /// Mints the generation for a FRESH capture (see [`CaptureGeneration`]).
+    fn mint_capture_generation(&mut self) -> CaptureGeneration {
+        let generation = CaptureGeneration(self.next_capture_generation);
+        self.next_capture_generation += 1;
+        generation
     }
 
     /// This transaction's id.
@@ -269,7 +304,9 @@ impl Transaction {
     /// Captures a freshly allocated metadata block as a zeroed after-image
     /// (jbd2 `get_create_access`): its prior device content is meaningless, so
     /// no read is needed. Idempotent — a block already captured (possibly with
-    /// patches applied) is left untouched.
+    /// patches applied) is left untouched, and its existing generation is
+    /// returned; a fresh capture is minted under a new [`CaptureGeneration`],
+    /// which the returned value hands to the block's credential.
     ///
     /// Re-journaling a block this transaction revoked cancels the revoke
     /// (jbd2 `jbd2_journal_cancel_revoke`; revoke.c "block is revoked and
@@ -277,9 +314,20 @@ impl Transaction {
     /// both commit and stay applicable. Load-bearing for block reuse within
     /// one transaction — a freed-then-reallocated metadata block whose revoke
     /// survived would have its own new image suppressed at checkpoint.
-    pub(super) fn capture_create(&mut self, bid: Ext4Bid) {
+    pub(super) fn capture_create(&mut self, bid: Ext4Bid) -> CaptureGeneration {
         self.revoked.remove(&bid);
-        self.metadata.entry(bid).or_insert_with(MetaBuffer::zeroed);
+        if let Some(capture) = self.metadata.get(&bid) {
+            return capture.generation;
+        }
+        let generation = self.mint_capture_generation();
+        self.metadata.insert(
+            bid,
+            Capture {
+                generation,
+                buffer: MetaBuffer::zeroed(),
+            },
+        );
+        generation
     }
 
     /// Captures an existing metadata block's current content as its after-image
@@ -294,7 +342,9 @@ impl Transaction {
     /// authoritative and is read directly.
     ///
     /// Idempotent — if the block is already captured, does nothing (it is *not*
-    /// re-seeded, so any patches already applied survive).
+    /// re-seeded, so any patches already applied survive) and returns the
+    /// existing generation; a fresh capture is minted under a new
+    /// [`CaptureGeneration`], handed to the block's credential.
     ///
     /// Cancels any revoke this transaction holds for the block, exactly as
     /// [`capture_create`](Self::capture_create) does (jbd2
@@ -307,10 +357,10 @@ impl Transaction {
         bid: Ext4Bid,
         seed: Option<&[u8]>,
         device: &dyn BlockDevice,
-    ) -> Result<()> {
+    ) -> Result<CaptureGeneration> {
         self.revoked.remove(&bid);
-        if self.metadata.contains_key(&bid) {
-            return Ok(());
+        if let Some(capture) = self.metadata.get(&bid) {
+            return Ok(capture.generation);
         }
         let mut buffer = MetaBuffer::zeroed();
         if let Some(seed) = seed {
@@ -321,8 +371,9 @@ impl Transaction {
         {
             return_errno_with_message!(Errno::EIO, "failed to read metadata block for journaling");
         }
-        self.metadata.insert(bid, buffer);
-        Ok(())
+        let generation = self.mint_capture_generation();
+        self.metadata.insert(bid, Capture { generation, buffer });
+        Ok(generation)
     }
 
     /// Retains a copy of every captured after-image in `retained`, keyed by
@@ -339,12 +390,12 @@ impl Transaction {
         &self,
         retained: &mut BTreeMap<Ext4Bid, UncheckpointedImage>,
     ) {
-        for (bid, buffer) in &self.metadata {
+        for (bid, capture) in &self.metadata {
             retained.insert(
                 *bid,
                 UncheckpointedImage {
                     tid: self.tid,
-                    image: buffer.duplicate(),
+                    image: capture.buffer.duplicate(),
                 },
             );
         }
@@ -358,11 +409,27 @@ impl Transaction {
     /// cancel-the-journal-entry option), while the revoke record must — it
     /// is what stops *older* committed log images of the block from being
     /// applied over its post-free reuse. Reached through
-    /// [`forget`](super::revoke::forget), which also evicts the block's
-    /// retained un-checkpointed image.
+    /// [`RevokeDuty::discharge`](super::revoke::RevokeDuty::discharge) —
+    /// inside `Ext4::free_blocks`, with the bitmap clear, never at
+    /// [`forget`](super::revoke::forget)-mint time — which also evicts the
+    /// block's retained un-checkpointed image.
     pub(super) fn forget_block(&mut self, bid: Ext4Bid) {
         self.metadata.remove(&bid);
         self.revoked.insert(bid);
+    }
+
+    /// Copies this transaction's not-yet-published revoke set into `out` —
+    /// the checkpoint pass's defer-prefix input (see
+    /// [`checkpoint`](super::checkpoint::checkpoint)). While these revokes
+    /// are unpublished, an older transaction's log image of any of these
+    /// blocks may neither be applied (the block is already freed — and
+    /// possibly reused — in memory) nor suppressed-and-retired (a crash may
+    /// still erase this transaction), so the checkpoint pass must stop in
+    /// front of it. Called under the journal state lock for the running
+    /// transaction, and by the inline tail-drain path for the caller-owned
+    /// committing one.
+    pub(super) fn collect_unpublished_revokes(&self, out: &mut BTreeSet<Ext4Bid>) {
+        out.extend(self.revoked.iter().copied());
     }
 
     /// Publishes this transaction's revoke set into the journal's
@@ -387,7 +454,8 @@ impl Transaction {
     }
 
     /// Patches a captured block's after-image in place (jbd2 `dirty_metadata`):
-    /// looks up `bid`'s buffer and hands its bytes to `patch`.
+    /// looks up `bid`'s buffer, verifies the caller's capture `generation`
+    /// still names the live capture, and hands the bytes to `patch`.
     ///
     /// This is how a whole-block object (a bitmap:
     /// `|b| b.copy_from_slice(bitmap.as_bytes())`) or a sub-block object (a group
@@ -396,16 +464,27 @@ impl Transaction {
     /// patch the *same* buffer, so their images accumulate correctly.
     ///
     /// Errors with `EIO` if the block was not captured first (a
-    /// `dirty_metadata` without a prior `get_*_access`).
+    /// `dirty_metadata` without a prior `get_*_access`), or if the capture the
+    /// caller's generation was minted under has since been cancelled and
+    /// re-created — a forget-then-reallocate of the block within this
+    /// transaction; the stale credential must not write the old owner's bytes
+    /// into the new owner's image (see [`CaptureGeneration`]).
     pub(super) fn apply_patch(
         &mut self,
         bid: Ext4Bid,
+        generation: CaptureGeneration,
         patch: impl FnOnce(&mut [u8]),
     ) -> Result<()> {
-        let Some(buffer) = self.metadata.get_mut(&bid) else {
+        let Some(capture) = self.metadata.get_mut(&bid) else {
             return_errno_with_message!(Errno::EIO, "dirty_metadata without prior get_*_access");
         };
-        patch(buffer.as_mut());
+        if capture.generation != generation {
+            return_errno_with_message!(
+                Errno::EIO,
+                "stale write access: the block was re-captured since the credential was minted"
+            );
+        }
+        patch(capture.buffer.as_mut());
         Ok(())
     }
 
@@ -417,7 +496,7 @@ impl Transaction {
     /// readers must be served from it, never from the (lagging) device. Also
     /// the inspection accessor tests use.
     pub(super) fn buffer_bytes(&self, bid: Ext4Bid) -> Option<&[u8]> {
-        self.metadata.get(&bid).map(MetaBuffer::as_bytes)
+        self.metadata.get(&bid).map(|c| c.buffer.as_bytes())
     }
 
     /// Iterates the captured metadata blocks as `(destination block#,
@@ -430,7 +509,7 @@ impl Transaction {
     pub(super) fn metadata_blocks(&self) -> impl Iterator<Item = (Ext4Bid, &[u8; BLOCK_SIZE])> {
         self.metadata
             .iter()
-            .map(|(&bid, buffer)| (bid, buffer.as_block()))
+            .map(|(&bid, capture)| (bid, capture.buffer.as_block()))
     }
 
     /// Registers an inode's data pages as **ordered data** of this transaction
@@ -795,15 +874,16 @@ mod tests {
     #[ktest]
     fn transaction_capture_create_is_idempotent() {
         let mut txn = Transaction::new(Tid::new(1));
-        txn.capture_create(42);
+        let generation = txn.capture_create(42);
         assert_eq!(txn.nr_metadata_blocks(), 1);
         // A freshly created block is all zeros.
         assert_eq!(txn.buffer_bytes(42), Some([0u8; BLOCK_SIZE].as_slice()));
 
-        // Patch it, then a second `capture_create` must NOT wipe the patch.
-        txn.apply_patch(42, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
+        // Patch it, then a second `capture_create` must NOT wipe the patch —
+        // and, being the same capture, must return the same generation.
+        txn.apply_patch(42, generation, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
             .unwrap();
-        txn.capture_create(42);
+        assert_eq!(txn.capture_create(42), generation);
         assert_eq!(txn.nr_metadata_blocks(), 1);
         assert_eq!(&txn.buffer_bytes(42).unwrap()[0..4], &[1, 2, 3, 4]);
     }
@@ -820,30 +900,33 @@ mod tests {
         f.write_data_block(300, &first);
 
         let mut txn = Transaction::new(Tid::new(1));
-        txn.capture_write(300, None, f.ext4.block_device().as_ref())
+        let generation = txn
+            .capture_write(300, None, f.ext4.block_device().as_ref())
             .unwrap();
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
 
-        // Change the device, then capture again: a no-op, so the buffer keeps the
-        // FIRST content.
+        // Change the device, then capture again: a no-op (same capture, same
+        // generation), so the buffer keeps the FIRST content.
         let second = [0xCDu8; BLOCK_SIZE];
         f.write_data_block(300, &second);
-        txn.capture_write(300, None, f.ext4.block_device().as_ref())
+        let again = txn
+            .capture_write(300, None, f.ext4.block_device().as_ref())
             .unwrap();
+        assert_eq!(again, generation);
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
     }
 
     #[ktest]
     fn transaction_apply_patch_accumulates_sub_objects() {
         let mut txn = Transaction::new(Tid::new(1));
-        txn.capture_create(7);
+        let generation = txn.capture_create(7);
 
         // Two sub-object patches at different offsets in the SAME block: both
         // persist (the Model-A correctness property for group descriptors /
         // inodes packed into one metadata block).
-        txn.apply_patch(7, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
+        txn.apply_patch(7, generation, |b| b[0..4].copy_from_slice(&[1, 2, 3, 4]))
             .unwrap();
-        txn.apply_patch(7, |b| b[64..68].copy_from_slice(&[5, 6, 7, 8]))
+        txn.apply_patch(7, generation, |b| b[64..68].copy_from_slice(&[5, 6, 7, 8]))
             .unwrap();
 
         let bytes = txn.buffer_bytes(7).unwrap();
@@ -856,7 +939,10 @@ mod tests {
     #[ktest]
     fn transaction_apply_patch_uncaptured_errors() {
         let mut txn = Transaction::new(Tid::new(1));
-        assert!(txn.apply_patch(99, |_| {}).is_err());
+        // A generation from ANOTHER block's capture: block 99 itself was
+        // never captured, so the patch must fail regardless.
+        let generation = txn.capture_create(1);
+        assert!(txn.apply_patch(99, generation, |_| {}).is_err());
     }
 
     #[ktest]
@@ -1038,8 +1124,8 @@ mod tests {
     #[ktest]
     fn forget_block_cancels_capture_and_records_revoke() {
         let mut txn = Transaction::new(Tid::new(1));
-        txn.capture_create(42);
-        txn.apply_patch(42, |b| b[..4].copy_from_slice(&[1, 2, 3, 4]))
+        let generation = txn.capture_create(42);
+        txn.apply_patch(42, generation, |b| b[..4].copy_from_slice(&[1, 2, 3, 4]))
             .unwrap();
         assert_eq!(txn.nr_metadata_blocks(), 1);
 
@@ -1049,7 +1135,18 @@ mod tests {
         assert_eq!(txn.revoked_blocks().collect::<Vec<_>>(), vec![42]);
         // A patch after the forget (an outstanding `WriteAccess` misused past
         // the free) fails loudly rather than re-journaling the freed block.
-        assert!(txn.apply_patch(42, |_| {}).is_err());
+        assert!(txn.apply_patch(42, generation, |_| {}).is_err());
+
+        // The block reallocated within the same transaction: a NEW capture
+        // under a NEW generation. The stale credential's patch still fails —
+        // it must not write the old owner's bytes into the new owner's image
+        // — while the fresh generation patches normally.
+        let recaptured = txn.capture_create(42);
+        assert_ne!(recaptured, generation);
+        assert!(txn.apply_patch(42, generation, |_| {}).is_err());
+        txn.apply_patch(42, recaptured, |b| b[..4].copy_from_slice(&[9, 9, 9, 9]))
+            .unwrap();
+        assert_eq!(&txn.buffer_bytes(42).unwrap()[..4], &[9, 9, 9, 9]);
     }
 
     /// jbd2 `jbd2_journal_cancel_revoke` ("block is revoked and then
