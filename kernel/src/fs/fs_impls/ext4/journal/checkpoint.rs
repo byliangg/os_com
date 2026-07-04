@@ -101,7 +101,6 @@ use super::{
         RawJournalHeader,
     },
     revoke::RevokeTable,
-    transaction::Transaction,
 };
 
 /// Applies one committed transaction from the log to its final locations, the
@@ -431,8 +430,10 @@ fn chain_covers_unpublished(
 ///
 /// The pass stops **in front of** the first transaction any of whose blocks
 /// carries an *unpublished* revoke — a forget in the running transaction, or
-/// in `committing` (the caller-owned mid-commit transaction of the inline
-/// tail drain). Such a block is already freed (and possibly reused) in
+/// in the committing slot's mid-flight transaction
+/// ([`JournalState::committing`](super::JournalState), occupied during the
+/// inline tail drain; empty for the post-commit and unmount passes, which
+/// run after retirement). Such a block is already freed (and possibly reused) in
 /// memory, so applying the older image is the S1 runtime clobber; yet the
 /// revoking transaction may still vanish in a crash, so the older image may
 /// not be suppressed-and-retired either (see the snapshot comment below).
@@ -452,16 +453,14 @@ fn chain_covers_unpublished(
 /// state (recovery re-applies, same bytes) or the post-checkpoint state —
 /// never a torn in-between. A partial (deferred) advance keeps `s_start` on
 /// the first unapplied transaction, which is exactly what recovery replays.
-pub(super) fn checkpoint(
-    journal: &Journal,
-    device: &dyn BlockDevice,
-    committing: Option<&Transaction>,
-) -> Result<()> {
+pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<()> {
     // Snapshot the tail / committed-tid / head, the committed-revoke memory
     // (cloned so the applies below run without the lock — the state lock is
     // never held across I/O), and the UNPUBLISHED revoke sets: the running
-    // transaction's, plus — on the inline tail-drain path — the caller-owned
-    // committing transaction's, all under one state-lock hold.
+    // transaction's, plus — when the inline tail drain runs this pass
+    // mid-commit — the committing slot's, all under one state-lock hold
+    // (uniform: both sets live in the journal state, so the snapshot cannot
+    // tear between them).
     //
     // The committed-revoke clone holds only *committed* revokes by
     // construction (commit publishes at its step 6, commit block already
@@ -500,7 +499,7 @@ pub(super) fn checkpoint(
         if let Some(running) = st.running.as_ref() {
             running.collect_unpublished_revokes(&mut unpublished);
         }
-        if let Some(committing) = committing {
+        if let Some(committing) = st.committing.as_ref() {
             committing.collect_unpublished_revokes(&mut unpublished);
         }
         (
@@ -625,6 +624,7 @@ mod tests {
             commit::commit_transaction,
             format::{BLOCKTYPE_SUPERBLOCK_V2, RawJournalSuperblock},
             load_geometry,
+            transaction::Transaction,
         },
         *,
     };
@@ -741,7 +741,7 @@ mod tests {
         assert_ne!(read_journal_super(&f).s_start.get(), 0);
 
         let head_before = f.journal.state_read().head;
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // After checkpoint: the final location carries the after-image.
         assert_eq!(read_final_block(&f, dest), after);
@@ -773,7 +773,7 @@ mod tests {
         let txn = make_txn(Tid::new(1), &[(dest, original)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // The final location has the ORIGINAL bytes: the magic head restored, not
         // the zeroed log copy.
@@ -801,7 +801,7 @@ mod tests {
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
         assert_eq!(f.journal.committed_tid(), Tid::new(2));
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // Applied in tid order (T1 then T2), so B (the newest) is the final state.
         assert_eq!(read_final_block(&f, dest), content_b);
@@ -824,7 +824,7 @@ mod tests {
         c1[..4].copy_from_slice(b"ONE0");
         let t1 = make_txn(Tid::new(1), &[(dest1, c1)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
         assert_eq!(f.journal.state_read().tail_block, None);
 
@@ -846,7 +846,7 @@ mod tests {
         assert_eq!(read_final_block(&f, dest2), [0u8; BLOCK_SIZE]);
 
         // A second checkpoint applies the new transaction and cleans the journal.
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(read_final_block(&f, dest2), c2);
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
         // s_sequence now expects tid 3.
@@ -943,7 +943,7 @@ mod tests {
             .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
             .unwrap();
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // The reused content survives T1's replay (suppressed)…
         assert_eq!(
@@ -981,7 +981,7 @@ mod tests {
         let t2 = make_txn(Tid::new(2), &[(reborn, t2_img)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // tid 2 > revoke tid 1: the newer image applies.
         assert_eq!(read_final_block(&f, reborn), t2_img);
@@ -1031,7 +1031,7 @@ mod tests {
             .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
             .unwrap();
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // Deferred: the reuse survives, NOTHING of T1 was applied, and the
         // tail did not move (T1 not retired) — on disk or in memory.
@@ -1052,8 +1052,72 @@ mod tests {
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
         assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
+        assert_eq!(read_final_block(&f, freed), reused_data);
+        assert_eq!(read_final_block(&f, control), t1_control);
+        assert_eq!(read_final_block(&f, bitmapish), [0x22u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+    }
+
+    /// The committing-slot half of the defer-prefix collect (P7c-1, the
+    /// inline tail-drain window): a block journaled by the committed (NOT
+    /// checkpointed) T1 is forgotten by T2, which sits MID-COMMIT in the
+    /// committing slot — `running` is empty and there is no caller-side
+    /// channel, so the pass must find the unpublished revoke in the slot
+    /// itself and defer in front of T1. Once T2's commit finishes
+    /// (publishing the revoke), the next pass applies T1 under ordinary
+    /// suppression and reclaims the whole log.
+    #[ktest]
+    fn checkpoint_defers_on_the_committing_slots_unpublished_revoke() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let (freed, control, bitmapish) = (500u64, 501u64, 600u64);
+        let mut t1_freed = [0u8; BLOCK_SIZE];
+        t1_freed[..8].copy_from_slice(b"T1FREED!");
+        let mut t1_control = [0u8; BLOCK_SIZE];
+        t1_control[..8].copy_from_slice(b"T1KEEP00");
+
+        // T1 journals both blocks; committed but NOT checkpointed.
+        let t1 = make_txn(Tid::new(1), &[(freed, t1_freed), (control, t1_control)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+
+        // T2 forgets `freed` and is STAGED mid-flight: its revoke is
+        // unpublished and lives only in the committing slot.
+        let mut t2 = make_txn(Tid::new(2), &[(bitmapish, [0x22u8; BLOCK_SIZE])]);
+        t2.forget_block(freed);
+        let t2 = f.journal.stage_transaction_for_test(t2).unwrap();
+        assert!(f.journal.state_read().running.is_none());
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+
+        // The freed block is reused as file DATA: content X lands directly.
+        let reused_data = [0xEEu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
+            .unwrap();
+
+        // Deferred on the slot's revoke: nothing applied, tail unmoved.
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(
+            read_final_block(&f, freed),
+            reused_data,
+            "the pass must defer on the committing slot's unpublished revoke"
+        );
+        assert_eq!(read_final_block(&f, control), [0u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 1);
+        assert_eq!(f.journal.state_read().tail_block, Some(1));
+
+        // T2's commit finishes (publishing the revoke); the next pass
+        // applies T1 under ordinary suppression and reclaims fully.
+        f.journal.commit_staged(&t2).unwrap();
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(read_final_block(&f, freed), reused_data);
         assert_eq!(read_final_block(&f, control), t1_control);
         assert_eq!(read_final_block(&f, bitmapish), [0x22u8; BLOCK_SIZE]);
@@ -1098,7 +1162,7 @@ mod tests {
             .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
             .unwrap();
 
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // T1 applied; T2 deferred (the reuse survives); the tail sits ON T2.
         assert_eq!(read_final_block(&f, clean_dest), t1_img);
@@ -1117,7 +1181,7 @@ mod tests {
         // image of `freed` (2 ≤ 3), applies T3, and the journal is clean.
         let t3 = f.journal.state_write().running.take().unwrap();
         commit_transaction(f.journal.as_ref(), device.as_ref(), t3).unwrap();
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         assert_eq!(read_final_block(&f, freed), reused_data);
         assert_eq!(read_final_block(&f, bitmapish), [0x33u8; BLOCK_SIZE]);
@@ -1170,7 +1234,7 @@ mod tests {
 
         // The pass steps over T1's revoke block, finds `freed` covered in
         // the LATER descriptor, and defers: nothing applied, tail unmoved.
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(
             read_final_block(&f, freed),
             reused_data,
@@ -1187,7 +1251,7 @@ mod tests {
         // whole log. The cursor math held on both walks.
         let t2 = f.journal.state_write().running.take().unwrap();
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         assert_eq!(read_final_block(&f, freed), reused_data);
         assert_eq!(read_final_block(&f, control), t1_control);
@@ -1248,7 +1312,7 @@ mod tests {
 
         // A pass right now defers in front of T1 (B's revoke is unpublished)
         // and applies nothing; B's final location keeps its pre-T1 bytes.
-        checkpoint(journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(journal.as_ref(), device.as_ref()).unwrap();
         assert!(journal.state_read().tail_block.is_some());
         let mut on_disk = [0u8; BLOCK_SIZE];
         f.disk
@@ -1264,7 +1328,7 @@ mod tests {
 
         // The next pass retires everything; the published revoke keeps T1's
         // stale image of B off the device.
-        checkpoint(journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint(journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(journal.state_read().tail_block, None);
         f.disk
             .segment()

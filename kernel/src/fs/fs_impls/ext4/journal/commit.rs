@@ -166,7 +166,7 @@ use super::{
         RawCommitBlock, RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
         TagLayout,
     },
-    transaction::TransactionState,
+    transaction::CommitPhase,
 };
 
 /// The four bytes a metadata block must start with to require escaping: the
@@ -447,10 +447,10 @@ impl Journal {
 
 /// The outcome of one commit attempt ([`try_commit_transaction`]).
 ///
-/// An `Err` from the attempt means the transaction was consumed and is lost
-/// (the caller must abort the journal); these variants are the two NON-fatal
-/// outcomes, kept apart from `Err` so "refused before any write, retryable"
-/// can never be confused with "failed mid-write".
+/// An `Err` from the attempt means the transaction is lost (the caller must
+/// abort the journal); these variants are the two NON-fatal outcomes, kept
+/// apart from `Err` so "refused before any write, retryable" can never be
+/// confused with "failed mid-write".
 pub(super) enum CommitAttempt {
     /// The transaction committed: its commit record is durable in the log.
     Committed(Tid),
@@ -459,37 +459,48 @@ pub(super) enum CommitAttempt {
     /// an un-checkpointed predecessor still occupies `[tail, head)`, whose log
     /// blocks are the ONLY copy of its committed after-images (Model A) —
     /// writing would overwrite them and turn the next crash into a silent
-    /// under-replay. NOTHING was written or flushed; the transaction is handed
-    /// back intact so the caller can drain the tail (checkpoint) and retry.
-    NeedsLogSpace(Transaction),
+    /// under-replay. NOTHING was written or flushed and no phase advanced
+    /// (the transaction stays [`Locked`](CommitPhase::Locked) in the
+    /// committing slot), so the caller can drain the tail (checkpoint) and
+    /// retry with the same staged transaction.
+    NeedsLogSpace,
 }
 
-/// [`try_commit_transaction`] for callers that treat "does not fit the free
-/// segment" as a plain `ENOSPC` error, dropping the transaction: the ktest
-/// suites, which drive commits directly against known-sized rings. Production
-/// commits go through [`Journal::commit_or_drain_tail`](super::Journal), which
-/// drains the tail and retries instead of dropping.
+/// The staged commit funnel for the ktest suites, which drive commits
+/// directly against known-sized rings: stages `txn` into the committing slot
+/// (so the pipeline's phase walk runs slot-resident exactly like
+/// production), runs one attempt, and retires the slot — treating "does not
+/// fit the free segment" as a plain `ENOSPC` error instead of draining.
+/// Production commits go through
+/// [`Journal::commit_or_drain_tail`](super::Journal) under the commit
+/// thread's / unmount flush's own staging.
 #[cfg(ktest)]
 pub(super) fn commit_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
     txn: Transaction,
 ) -> Result<Tid> {
-    match try_commit_transaction(journal, device, txn)? {
-        CommitAttempt::Committed(tid) => Ok(tid),
-        CommitAttempt::NeedsLogSpace(_) => Err(Error::with_message(
+    let txn = journal.stage_transaction_for_test(txn)?;
+    let outcome = match try_commit_transaction(journal, device, &txn) {
+        Ok(CommitAttempt::Committed(tid)) => Ok(tid),
+        Ok(CommitAttempt::NeedsLogSpace) => Err(Error::with_message(
             Errno::ENOSPC,
             "transaction does not fit the journal's free segment",
         )),
-    }
+        Err(e) => Err(e),
+    };
+    journal.clear_committing(txn.tid());
+    outcome
 }
 
-/// Commits `txn` to the on-disk log as a jbd2 transaction and makes it
-/// recoverable ([`CommitAttempt::Committed`]) — unless the chain does not fit
-/// the ring's free segment, in which case NOTHING is written and the
-/// transaction is handed back ([`CommitAttempt::NeedsLogSpace`]) for the
-/// caller to checkpoint and retry. Consumes the transaction on every other
-/// path, including `Err`.
+/// Commits `txn` — the transaction staged in the journal's committing slot —
+/// to the on-disk log as a jbd2 transaction and makes it recoverable
+/// ([`CommitAttempt::Committed`]), walking the slot's [`CommitPhase`] through
+/// `Locked → Flush → Commit → CommitRecord → Finished` at the step
+/// boundaries below. Unless the chain does not fit the ring's free segment,
+/// in which case NOTHING is written, no phase advances, and
+/// [`CommitAttempt::NeedsLogSpace`] asks the caller to checkpoint and retry.
+/// On `Err` the transaction is lost mid-write and the caller must abort.
 ///
 /// Implements the log layout and crash-safe write ordering documented at the
 /// module level: fit guard → ordered data → barrier → log (descriptors +
@@ -498,7 +509,7 @@ pub(super) fn commit_transaction(
 pub(super) fn try_commit_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
-    mut txn: Transaction,
+    txn: &Transaction,
 ) -> Result<CommitAttempt> {
     let tid = txn.tid();
 
@@ -543,11 +554,16 @@ pub(super) fn try_commit_transaction(
     // drain the tail and retry, or abort loudly — is the minimal safe
     // behavior.
     if footprint > journal.geometry.free_log_blocks(start_head, dirty_tail) {
-        // The chain borrows `txn`'s captures; release it before handing the
-        // transaction back.
-        drop(chain);
-        return Ok(CommitAttempt::NeedsLogSpace(txn));
+        // The transaction stays `Locked` in the committing slot: nothing was
+        // written, so the caller may drain the tail and retry it.
+        return Ok(CommitAttempt::NeedsLogSpace);
     }
+
+    // The transaction is going to be written: enter the I/O phases. Each
+    // advance below asserts the pipeline order under the state lock; an
+    // illegal transition errors `EIO` and the caller aborts (see
+    // `Journal::advance_committing_phase`).
+    journal.advance_committing_phase(tid, CommitPhase::Flush)?;
 
     // --- Step 0: ordered-data mode. Every ordered inode's dirty data must reach
     // its final location and be durable BEFORE any log block (and thus the commit
@@ -576,6 +592,9 @@ pub(super) fn try_commit_transaction(
     if flushed_any {
         barrier(device)?;
     }
+
+    // Ordered data is durable; the log writes begin (`T_FLUSH` → `T_COMMIT`).
+    journal.advance_committing_phase(tid, CommitPhase::Commit)?;
 
     // --- Step 1: write the transaction's log blocks. Its revoke blocks go
     // first, before the metadata descriptors — jbd2's log-block allocation
@@ -613,14 +632,18 @@ pub(super) fn try_commit_transaction(
             log = journal.geometry.next_log_block(log);
         }
     }
-    // The chain (which borrows `txn`'s captures) is fully written; release it
-    // so step 6 can consume the transaction.
+    // The chain (which borrows `txn`'s captures) is fully written.
     drop(chain);
 
     // --- Step 2: barrier. Revoke blocks + descriptors + data durable BEFORE
     // the commit block, so a commit record never certifies log content that
     // never reached the platter.
     barrier(device)?;
+
+    // The chain is durable; the commit record is next (`T_COMMIT` →
+    // `CommitRecord`, jbd2's DFLUSH+JFLUSH collapsed — one device,
+    // synchronous barriers).
+    journal.advance_committing_phase(tid, CommitPhase::CommitRecord)?;
 
     // --- Step 3: write the commit block, sealing the transaction. ---
     let commit_log = log;
@@ -648,6 +671,11 @@ pub(super) fn try_commit_transaction(
     let new_head = journal.geometry.advance(start_head, footprint);
     {
         let mut st = journal.state_write();
+        // The commit record is durable: `CommitRecord` → `Finished`, inside
+        // the same lock window that publishes the transaction's effects, so
+        // no observer can see a `Finished` slot whose revokes/pins are still
+        // unpublished (or vice versa).
+        st.advance_committing_phase(tid, CommitPhase::Finished)?;
         st.head = new_head;
         if was_clean {
             st.tail_block = Some(start_head);
@@ -674,10 +702,6 @@ pub(super) fn try_commit_transaction(
     journal
         .committed_tid
         .store(tid.get(), core::sync::atomic::Ordering::Release);
-
-    // The transaction is fully committed; consume it.
-    txn.set_state(TransactionState::Finished);
-    drop(txn);
 
     Ok(CommitAttempt::Committed(tid))
 }
@@ -1287,7 +1311,7 @@ mod tests {
         // commit, and only then retires (by checkpoint — whose chain walk
         // now steps over the on-disk revoke block).
         assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
         // The checkpoint really applied through the revoke-led chain: the
         // kept image reached its final location and the journal is clean.
@@ -1360,9 +1384,9 @@ mod tests {
     /// With an un-checkpointed T1 at the tail, a T2 that fits the whole ring
     /// but NOT the free segment is refused with NOTHING written — its writes
     /// would have wrapped onto T1's log blocks, the only copy of T1's
-    /// committed after-images — and handed back intact
+    /// committed after-images — staying `Locked` in the committing slot
     /// ([`CommitAttempt::NeedsLogSpace`]); after a checkpoint drains the
-    /// tail, the SAME transaction commits (the commit thread's
+    /// tail, the SAME staged transaction commits (the commit thread's
     /// drain-and-retry flow, driven by hand).
     #[ktest]
     fn commit_refuses_chain_crossing_uncheckpointed_tail() {
@@ -1383,14 +1407,20 @@ mod tests {
         // T2: 11 captures -> footprint 13 (11 data + 1 desc + 1 commit):
         // fits the 15-block ring, NOT the 12-block free segment. From head 4
         // its blocks would cover [4..16) and wrap onto [1..3) — T1's chain.
-        let t2 = indexed_txn(Tid::new(2), 1000, 11);
+        // Staged like production, so the refusal is observable in the slot.
+        let t2 = f
+            .journal
+            .stage_transaction_for_test(indexed_txn(Tid::new(2), 1000, 11))
+            .unwrap();
         let before: Vec<[u8; BLOCK_SIZE]> = (1u32..4).map(|log| read_log_block(&f, log)).collect();
-        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        let CommitAttempt::NeedsLogSpace(t2) = attempt else {
-            panic!("a chain crossing the tail must be refused");
-        };
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), &t2).unwrap();
+        assert!(
+            matches!(attempt, CommitAttempt::NeedsLogSpace),
+            "a chain crossing the tail must be refused"
+        );
 
-        // NOTHING written: T1's log blocks are intact and no state moved.
+        // NOTHING written: T1's log blocks are intact, no state moved, and
+        // no phase advanced — the refused transaction is still `Locked`.
         let after: Vec<[u8; BLOCK_SIZE]> = (1u32..4).map(|log| read_log_block(&f, log)).collect();
         assert_eq!(before, after, "the refused commit must not touch the tail");
         {
@@ -1399,20 +1429,31 @@ mod tests {
             assert_eq!(st.tail_block, Some(1));
         }
         assert_eq!(f.journal.committed_tid(), Tid::new(1));
+        assert_eq!(
+            f.journal.committing_for_test(),
+            Some((Tid::new(2), CommitPhase::Locked))
+        );
 
-        // Drain the tail, then retry the SAME handed-back transaction: it now
-        // fits the clean ring and commits.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
-        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        // Drain the tail — the pass snapshots the committing slot's (empty)
+        // unpublished-revoke set from the journal state, exactly the
+        // production drain shape — then retry the SAME staged transaction:
+        // it now fits the clean ring and commits, ending `Finished`.
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), &t2).unwrap();
         let CommitAttempt::Committed(tid) = attempt else {
             panic!("after the drain the chain fits");
         };
         assert_eq!(tid, Tid::new(2));
         assert_eq!(f.journal.committed_tid(), Tid::new(2));
+        assert_eq!(
+            f.journal.committing_for_test(),
+            Some((Tid::new(2), CommitPhase::Finished))
+        );
+        f.journal.clear_committing(Tid::new(2));
 
         // The retried commit is a real one: checkpointing lands T2's
         // after-images at their final locations.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         let mut final_block = [0u8; BLOCK_SIZE];
         f.fixture
             .disk
@@ -1437,7 +1478,7 @@ mod tests {
         // ring; checkpoint reclaims it (head stays at 11, ring clean).
         let t1 = indexed_txn(Tid::new(1), 500, 8);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(f.journal.state_write().head, 11);
 
         // T2 (6 captures -> 8 blocks) wraps the ring end: [11..16) + [1..4);
@@ -1452,22 +1493,30 @@ mod tests {
 
         // T3 (5 captures -> 7 blocks) fills the free segment EXACTLY: the
         // head wraps forward onto the tail without touching a tail block.
-        let t3 = indexed_txn(Tid::new(3), 700, 5);
-        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t3).unwrap();
+        let t3 = f
+            .journal
+            .stage_transaction_for_test(indexed_txn(Tid::new(3), 700, 5))
+            .unwrap();
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), &t3).unwrap();
         assert!(matches!(attempt, CommitAttempt::Committed(_)));
+        f.journal.clear_committing(Tid::new(3));
         assert_eq!(f.journal.state_write().head, 11);
 
         // Full ring: even the smallest chain (1 capture -> 3 blocks) has
         // zero free blocks. Refused; T2's tail descriptor is untouched.
         let tail_desc = read_log_block(&f, 11);
-        let t4 = indexed_txn(Tid::new(4), 800, 1);
-        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), t4).unwrap();
-        assert!(matches!(attempt, CommitAttempt::NeedsLogSpace(_)));
+        let t4 = f
+            .journal
+            .stage_transaction_for_test(indexed_txn(Tid::new(4), 800, 1))
+            .unwrap();
+        let attempt = try_commit_transaction(f.journal.as_ref(), device.as_ref(), &t4).unwrap();
+        assert!(matches!(attempt, CommitAttempt::NeedsLogSpace));
+        f.journal.clear_committing(Tid::new(4));
         assert_eq!(read_log_block(&f, 11), tail_desc);
 
         // Everything committed into the wrapped ring is real: draining the
         // full ring applies T2 and T3 to their final locations.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         for (first_dest, n) in [(600u64, 6u64), (700, 5)] {
             for i in 0..n {
                 let mut b = [0u8; BLOCK_SIZE];

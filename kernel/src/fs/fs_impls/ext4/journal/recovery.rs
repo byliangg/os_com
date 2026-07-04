@@ -1582,7 +1582,7 @@ mod tests {
         })
         .unwrap();
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         let head = f.journal.state_read().head;
         assert_eq!(head, 103); // desc + 100 data + commit from log 1
 
@@ -1802,7 +1802,7 @@ mod tests {
         // the ring is clean (and reusable) before the wrapping T2.
         let t1 = make_bulk_txn(Tid::new(1), 1000, 100, None);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         let head = f.journal.state_read().head;
         assert_eq!(head, 103); // desc + 100 data + commit from log 1
 
@@ -2536,7 +2536,7 @@ mod tests {
         assert_eq!(sb.s_checksum.get(), sb.checksum(), "commit tail publish");
 
         // Site 2: the checkpoint clean rewrite.
-        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
         assert_eq!(sb.s_checksum.get(), sb.checksum(), "checkpoint rewrite");

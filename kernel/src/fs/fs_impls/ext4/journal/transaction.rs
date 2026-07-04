@@ -31,9 +31,13 @@
 //! # jbd2 correspondence
 //!
 //! - [`Transaction`] ≈ `transaction_t`: an in-memory transaction accumulating
-//!   the metadata blocks it will commit, with the 7-state [`TransactionState`]
-//!   lifecycle (`t_state`) and the open-handle / credit bookkeeping
-//!   (`t_updates` / `t_outstanding_credits`).
+//!   the metadata blocks it will commit, with the open-handle / credit
+//!   bookkeeping (`t_updates` / `t_outstanding_credits`). Its lifecycle state
+//!   (`t_state`) is residency, not a field: running in
+//!   [`JournalState::running`](super::JournalState), mid-commit in
+//!   [`JournalState::committing`](super::JournalState) (whose [`CommitPhase`]
+//!   walks the pipeline), retired to its retained after-images in
+//!   [`JournalState::uncheckpointed`](super::JournalState).
 //! - [`Handle`] ≈ `handle_t`: one open unit of work against a transaction,
 //!   holding a credit reservation, obtained from [`journal_start`] and released
 //!   by [`journal_stop`].
@@ -50,12 +54,12 @@
 // Most of this module is live in non-ktest since Int-B: every journaled
 // metadata operation opens a handle (`Ext4::begin_op` → `journal_start`,
 // closed by `OpHandle::drop` → `journal_stop`), the capture half feeds the
-// metadata funnels, and `Handle::tid` backs fsync's `sync_tid`. Still dead in
-// non-ktest builds: `journal_extend`/`journal_restart` (mid-op credit growth —
-// ops use fixed conservative credits until P7's precise accounting) and the
-// non-`Running`/`Finished` `TransactionState` variants (the staged commit
-// pipeline states). This one module-level expectation absorbs those (avoiding
-// a marker on each); it is absent in ktest, where all of it is exercised.
+// metadata funnels, `Handle::tid` backs fsync's `sync_tid`, and the
+// [`CommitPhase`] walk is driven by the production commit pipeline (P7c-1).
+// Still dead in non-ktest builds: `journal_extend`/`journal_restart` (mid-op
+// credit growth — ops use fixed conservative credits until P7d's precise
+// accounting). This one module-level expectation absorbs those (avoiding a
+// marker on each); it is absent in ktest, where all of it is exercised.
 #![cfg_attr(not(ktest), expect(dead_code))]
 
 use super::{
@@ -182,50 +186,89 @@ impl UncheckpointedImage {
     }
 }
 
-/// The jbd2 transaction lifecycle (`transaction_t.t_state`).
+/// The committing transaction's pipeline phase — the observable half of the
+/// jbd2 transaction lifecycle (`transaction_t.t_state`).
 ///
-/// Phase 4's commit pipeline drives only
-/// [`Running`](TransactionState::Running) → [`Finished`](TransactionState::Finished)
-/// (a single committer thread needs no intermediate states). The five
-/// in-between states are reserved for P7's staged/group commit; they are
-/// defined up front to keep the jbd2 lifecycle visible and avoid enum churn.
+/// A transaction's *state* is encoded by where it resides, so no in-band
+/// state field can drift out of step with residency:
+///
+/// - `T_RUNNING` ≡ residency in [`JournalState::running`](super::JournalState)
+///   (accepting handles and captures);
+/// - the five phases below ≡ residency in
+///   [`JournalState::committing`](super::JournalState) (the slot's `phase`
+///   field, advanced by the commit pipeline under the state lock);
+/// - past retirement, only the transaction's after-images remain, in
+///   [`JournalState::uncheckpointed`](super::JournalState), until checkpoint.
+///
+/// jbd2 mapping: `Locked` ≈ `T_LOCKED` (+ the zero-width `T_SWITCH` — our
+/// take happens only once every handle has closed, so there is no draining
+/// window to observe), `Flush` ≈ `T_FLUSH`, `Commit` ≈ `T_COMMIT`,
+/// `CommitRecord` ≈ `T_COMMIT_DFLUSH` + `T_COMMIT_JFLUSH` **collapsed** (one
+/// block device and synchronous barriers: the data-device and
+/// journal-device flushes of the commit record are one indivisible step
+/// here), `Finished` ≈ `T_FINISHED` (`T_COMMIT_CALLBACK` has no equivalent —
+/// there are no commit callbacks). Phases advance strictly one step
+/// ([`next_in_pipeline`](Self::next_in_pipeline)); an out-of-order advance
+/// is refused with `EIO` ([`Journal::advance_committing_phase`](super::Journal)),
+/// failing that commit loudly instead of running the pipeline out of order.
+//
+// Visible at the `ext4` level for the same reason as [`Transaction`]: it is
+// carried by the equally-visible `JournalState`'s committing slot (and its
+// ktest inspection accessor); every constructor/consumer stays inside the
+// journal module.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TransactionState {
-    /// Accepting new handles and metadata (`T_RUNNING`).
-    Running,
-    /// Closed to new handles, draining outstanding ones (`T_LOCKED`).
-    #[expect(dead_code)]
+pub(in crate::fs::fs_impls::ext4) enum CommitPhase {
+    /// Taken out of `running`, pre-I/O (`T_LOCKED`): the fit guard and chain
+    /// building run here, including the inline tail-drain window of
+    /// [`Journal::commit_or_drain_tail`](super::Journal) — nothing of the
+    /// transaction has been written.
     Locked,
-    /// Flushing data buffers before the commit record (`T_FLUSH`).
-    #[expect(dead_code)]
+    /// Flushing the transaction's ordered data to its final locations
+    /// (`T_FLUSH`, commit step 0).
     Flush,
-    /// Writing the log (`T_COMMIT`).
-    #[expect(dead_code)]
+    /// Writing the log: revoke blocks + the descriptor chain, and the
+    /// pre-commit barrier (`T_COMMIT`, steps 1–2).
     Commit,
-    /// Flushing the commit record to the data device (`T_COMMIT_DFLUSH`).
-    #[expect(dead_code)]
-    CommitDFlush,
-    /// Flushing the commit record to the journal device (`T_COMMIT_JFLUSH`).
-    #[expect(dead_code)]
-    CommitJFlush,
-    /// Fully committed; awaiting checkpoint (`T_FINISHED`).
+    /// Writing the commit block and making it durable (steps 3–5).
+    CommitRecord,
+    /// The commit block is durable and step 6 published the in-memory state;
+    /// awaiting retirement from the slot (`T_FINISHED`).
     Finished,
+}
+
+impl CommitPhase {
+    /// The phase that legally follows `self` in the commit pipeline, or
+    /// `None` for the terminal [`Finished`](Self::Finished). The single
+    /// definition of the legal order that
+    /// [`Journal::advance_committing_phase`](super::Journal) enforces.
+    pub(super) fn next_in_pipeline(self) -> Option<Self> {
+        match self {
+            Self::Locked => Some(Self::Flush),
+            Self::Flush => Some(Self::Commit),
+            Self::Commit => Some(Self::CommitRecord),
+            Self::CommitRecord => Some(Self::Finished),
+            Self::Finished => None,
+        }
+    }
 }
 
 /// An in-memory transaction accumulating metadata after-images (jbd2
 /// `transaction_t`).
 ///
-/// Phase 4 is single-transaction: the [`Journal`] holds at most one of these as
-/// its running transaction. It records the captured after-images plus the
-/// open-handle and credit bookkeeping used to bound its size.
+/// The [`Journal`] holds at most one of these as its running transaction and
+/// at most one as its committing transaction (the two-transaction pipeline:
+/// while the taken one commits, a new running one accepts captures). It
+/// records the captured after-images plus the open-handle and credit
+/// bookkeeping used to bound its size. From the moment it is staged for
+/// commit it is **frozen**: it travels behind a shared `Arc` with no `&mut`
+/// path left (the Linux `frozen_data` discipline), so the committer's I/O
+/// and every state-lock-holding reader see one immutable object.
 //
 // Visible at the `ext4` level (`pub(in crate::fs::fs_impls::ext4)`) so it can be
 // a field of the equally-visible `JournalState`.
 pub(in crate::fs::fs_impls::ext4) struct Transaction {
     /// This transaction's id (`t_tid`).
     tid: Tid,
-    /// The lifecycle state (`t_state`); Task 2a leaves it [`Running`](TransactionState::Running).
-    state: TransactionState,
     /// Number of open handles (`journal_start` not yet `journal_stop`'d;
     /// `t_updates`).
     t_updates: usize,
@@ -265,7 +308,6 @@ impl Transaction {
     pub(super) fn new(tid: Tid) -> Self {
         Self {
             tid,
-            state: TransactionState::Running,
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
@@ -285,11 +327,6 @@ impl Transaction {
     /// This transaction's id.
     pub(super) fn tid(&self) -> Tid {
         self.tid
-    }
-
-    /// This transaction's lifecycle state.
-    pub(super) fn state(&self) -> TransactionState {
-        self.state
     }
 
     /// The number of open handles against this transaction.
@@ -379,11 +416,14 @@ impl Transaction {
 
     /// Retains a copy of every captured after-image in `retained`, keyed by
     /// block and tagged with this transaction's tid — called (under the journal
-    /// state lock) at the moment this transaction leaves `running` to commit,
-    /// so that from the very first instant a *new* transaction can exist, a
-    /// capture of one of these blocks seeds from these bytes and never from the
-    /// (lagging) device. Checkpoint evicts the entries once the device has
-    /// caught up (see [`UncheckpointedImage`]).
+    /// state lock) at the moment this transaction is staged into the
+    /// committing slot, so that from the very first instant a *new*
+    /// transaction can exist, a capture of one of these blocks seeds from
+    /// these bytes and never from the (lagging) device. This stash **is** the
+    /// committing transaction's image visibility: seeders read the map, not
+    /// the slot (see [`JournalState::uncheckpointed`](super::JournalState)).
+    /// Checkpoint evicts the entries once the device has caught up (see
+    /// [`UncheckpointedImage`]).
     ///
     /// An entry for a block this transaction re-captured simply overwrites the
     /// older image: this transaction's is the newest.
@@ -426,9 +466,9 @@ impl Transaction {
     /// blocks may neither be applied (the block is already freed — and
     /// possibly reused — in memory) nor suppressed-and-retired (a crash may
     /// still erase this transaction), so the checkpoint pass must stop in
-    /// front of it. Called under the journal state lock for the running
-    /// transaction, and by the inline tail-drain path for the caller-owned
-    /// committing one.
+    /// front of it. Called under the journal state lock, uniformly for the
+    /// running transaction and for the committing slot's (see
+    /// [`checkpoint`](super::checkpoint::checkpoint)'s snapshot).
     pub(super) fn collect_unpublished_revokes(&self, out: &mut BTreeSet<Ext4Bid>) {
         out.extend(self.revoked.iter().copied());
     }
@@ -567,12 +607,6 @@ impl Transaction {
     pub(super) fn nr_ordered_data(&self) -> usize {
         self.ordered_data.len()
     }
-
-    /// Moves this transaction to `state` (jbd2 `t_state` transitions driven by
-    /// the commit pipeline).
-    pub(super) fn set_state(&mut self, state: TransactionState) {
-        self.state = state;
-    }
 }
 
 /// An open handle against the running transaction (jbd2 `handle_t`).
@@ -680,11 +714,15 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 /// Opens a handle on the journal's running transaction, reserving `credits`
 /// metadata blocks (jbd2 `jbd2_journal_start`).
 ///
-/// If no transaction is running, a fresh one is created with the next tid. When
-/// the running transaction cannot fit the reservation, this blocks until it
-/// commits or another handle releases credits, then retries — the minimal form
-/// of jbd2 `add_transaction_credits`' wait loop. (Precise credit accounting and
-/// commit *batching* under pressure remain P7; this only stops a full
+/// If no transaction is running, a fresh one is created with the next tid —
+/// even while a committing transaction is mid-flight (the two-transaction
+/// pipeline): starting neither consults nor waits on the committing slot
+/// (iron law 1: the only wait here is for *space* in the running
+/// transaction, legal under inode locks). When the running transaction
+/// cannot fit the reservation, this blocks until it commits or another
+/// handle releases credits, then retries — the minimal form of jbd2
+/// `add_transaction_credits`' wait loop. (Precise credit accounting and
+/// commit *batching* under pressure remain P7c-2/P7d; this only stops a full
 /// transaction from surfacing as `ENOSPC` to unlink/write under load.)
 pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
     // A reservation that exceeds an *empty* transaction's capacity can never
@@ -901,9 +939,21 @@ mod tests {
     fn transaction_new_starts_running_and_empty() {
         let txn = Transaction::new(Tid::new(7));
         assert_eq!(txn.tid(), Tid::new(7));
-        assert_eq!(txn.state(), TransactionState::Running);
         assert_eq!(txn.nr_updates(), 0);
         assert_eq!(txn.nr_metadata_blocks(), 0);
+    }
+
+    /// The commit pipeline's legal phase order is exactly Locked → Flush →
+    /// Commit → CommitRecord → Finished, with Finished terminal — the single
+    /// table [`Journal::advance_committing_phase`] enforces.
+    #[ktest]
+    fn commit_phase_pipeline_order() {
+        use super::CommitPhase::*;
+        assert_eq!(Locked.next_in_pipeline(), Some(Flush));
+        assert_eq!(Flush.next_in_pipeline(), Some(Commit));
+        assert_eq!(Commit.next_in_pipeline(), Some(CommitRecord));
+        assert_eq!(CommitRecord.next_in_pipeline(), Some(Finished));
+        assert_eq!(Finished.next_in_pipeline(), None);
     }
 
     #[ktest]

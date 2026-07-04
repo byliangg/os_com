@@ -67,6 +67,50 @@
 //! "write through immediately" would bake in a flush-timing assumption the
 //! ordered-mode journal breaks.
 //!
+//! # Duality invariants (the running/committing pipeline, P7c-1)
+//!
+//! [`JournalState`] holds at most one *running* and at most one *committing*
+//! transaction: a new running transaction starts (lazily, at the next
+//! `journal_start`) while the staged one is still being written — the
+//! two-transaction pipeline. What keeps the overlap sound, each re-verified
+//! under explicit duality:
+//!
+//! 1. **One committer serializes commit and checkpoint.** All production
+//!    checkpoint passes and commits run on the commit thread (the unmount
+//!    flush strictly after it stops), so a commit's step-6 effects — revoke
+//!    publication, pinned-free release ([`JournalState::release_pinned_frees`])
+//!    — can never land in the middle of a checkpoint pass, and at most one
+//!    [`CommittingTxn`] can ever exist (guarded anyway:
+//!    [`Journal::take_running_for_commit`] refuses an occupied slot).
+//! 2. **Committing images are visible to seeders from the staging instant**
+//!    (law 4 / the B-1 restated invariant): staging stashes the transaction's
+//!    after-images into [`JournalState::uncheckpointed`] in the same
+//!    state-lock window that empties `running`, and the whole seed decision
+//!    (running capture → retained image → device) happens in one state-lock
+//!    window ([`get_write_access`]). See the `uncheckpointed` field docs for
+//!    why the map is the committing-visibility mechanism and why tid-keyed
+//!    eviction can never evict a mid-flight commit's images.
+//! 3. **The committing transaction is frozen** ([`CommittingTxn`]): handles
+//!    are drained before the take, and every mutating funnel (captures,
+//!    forgets, ordered-data registration) reaches only `running` — so the
+//!    committer's lock-free I/O and the state-lock-holding readers share a
+//!    read-only object. The one adjacent mutation, a forget's eviction of the
+//!    block's retained image, acts on the *map*, not the transaction.
+//! 4. **Unpublished-revoke collection is uniform**: the checkpoint snapshot
+//!    reads the running transaction's AND the committing slot's unpublished
+//!    revokes from the state in one lock window
+//!    ([`checkpoint`](checkpoint::checkpoint)), so a new running
+//!    transaction's forget of a block the committing (or any logged)
+//!    transaction journaled defers the pass exactly like before the split.
+//! 5. **Iron law 1 holds across the overlap**: `journal_start` under inode
+//!    locks never waits on the committing transaction — joining/creating
+//!    `running` ignores the slot entirely, and its capacity wait
+//!    ([`Journal::wait_for_transaction_room`]) is released by handle closes
+//!    and by the committer thread, which takes no fs lock (see that method's
+//!    locking contract). `log_wait_commit` is called with no fs locks held,
+//!    as always; commits stay strictly serial (one slot), so waiting on a
+//!    tid still covers every earlier tid.
+//!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
 //! `MetaBuffer` handle owning the raw block bytes. We instead reuse ext2's
 //! typed-and-dirty-tracked metadata (`Dirty<IdBitmap>`, `Dirty<BlockGroupDesc>`,
@@ -84,7 +128,7 @@ use self::{
         INCOMPAT_SUPP, JBD2_CRC32C_CHKSUM, JournalCsumSeed, JournalSuperblock,
         RawJournalSuperblock, TagLayout,
     },
-    transaction::Transaction,
+    transaction::{CommitPhase, Transaction},
 };
 use super::{
     feature::FeatureCompatSet,
@@ -717,12 +761,14 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
 ///
 /// # Lock order
 ///
-/// The commit thread takes the [`state`](Journal::state) lock **only** to swap
-/// the running transaction out (`running.take()`); it then commits *without*
-/// holding that lock, because commit does device I/O and takes `inode.inner`
-/// (the ordered-data flush). The state lock is never held across device I/O or
-/// `inode.inner` — matching the leaf position the commit pipeline already
-/// documents.
+/// The commit thread takes the [`state`](Journal::state) lock only for short
+/// windows: staging the running transaction out (`running.take()` + the slot
+/// install), the pipeline's phase advances, the step-6 publication, and the
+/// slot retirement. It commits *without* holding that lock — commit does
+/// device I/O, which must never happen under the journal state lock (and it
+/// takes no inode lock at all: the ordered-data flush works on page-cache
+/// handles cloned in at registration time, the P5 deadlock invariant) —
+/// matching the leaf position the commit pipeline already documents.
 pub(super) struct Journal {
     /// The parsed on-disk geometry (the log block map + journal superblock).
     geometry: JournalGeometry,
@@ -799,22 +845,110 @@ pub(in crate::fs::fs_impls::ext4) struct PinnedRun {
     tid: Tid,
 }
 
-/// The mutable running-transaction state of a [`Journal`].
+/// The transaction currently occupying the commit pipeline
+/// (`journal_t.j_committing_transaction`), resident in [`JournalState`] so
+/// every consumer of "the in-flight transaction" reads it from the one
+/// lock-guarded place: the checkpoint pass's defer-prefix snapshot (its
+/// unpublished revokes), `sync(2)`'s durability probe
+/// ([`Journal::commit_and_wait_running`], its tid), and the pipeline's own
+/// phase walk. Capture seeding does NOT read the slot: the transaction's
+/// after-images were stashed into [`JournalState::uncheckpointed`] in the
+/// same lock window that staged it (see that field's docs) — the stash is
+/// the image-visibility half, the slot is the control half.
 ///
-/// Phase 4 is single-transaction: there is at most one running transaction and
-/// no pipelined committing transaction yet.
+/// The `Arc` is shared with the committer, which runs the pipeline's device
+/// I/O through its own clone WITHOUT the state lock. That share is sound
+/// because the transaction is **frozen** at staging: every handle has
+/// closed, `&mut` access is gone with `running.take()`, and both the forget
+/// path ([`RevokeDuty::discharge`](revoke::RevokeDuty)) and the capture
+/// funnels reach only [`JournalState::running`] — a committing transaction's
+/// captures and revoke set cannot change (the Linux `frozen_data`
+/// discipline). Only `phase` here advances, under the state lock, at the
+/// pipeline's step boundaries ([`Journal::advance_committing_phase`]).
+//
+// Visible at the `ext4` level only because it is a value of the
+// equally-visible `JournalState`'s slot; it is constructed and read only
+// inside the journal module.
+pub(in crate::fs::fs_impls::ext4) struct CommittingTxn {
+    /// The frozen transaction, shared with the committer's pipeline run.
+    txn: Arc<Transaction>,
+    /// Where the pipeline stands (jbd2 `t_state`); see [`CommitPhase`].
+    phase: CommitPhase,
+}
+
+impl CommittingTxn {
+    /// Stages `txn` as the committing transaction: the `Running` →
+    /// [`Locked`](CommitPhase::Locked) transition (jbd2 `T_LOCKED`; ours is
+    /// zero-width on the handle side — a transaction is only ever taken with
+    /// zero open handles, so there is nothing to drain).
+    fn new(txn: Arc<Transaction>) -> Self {
+        Self {
+            txn,
+            phase: CommitPhase::Locked,
+        }
+    }
+
+    /// The committing transaction's id.
+    pub(super) fn tid(&self) -> Tid {
+        self.txn.tid()
+    }
+
+    /// The pipeline phase the committing transaction is in.
+    pub(super) fn phase(&self) -> CommitPhase {
+        self.phase
+    }
+
+    /// Copies the committing transaction's not-yet-published revoke set into
+    /// `out` — the checkpoint snapshot's committing half (see
+    /// [`Transaction::collect_unpublished_revokes`]). The set is frozen (see
+    /// the type docs), so reading it under any one state-lock window is
+    /// exact, not a racy sample.
+    pub(super) fn collect_unpublished_revokes(&self, out: &mut BTreeSet<Ext4Bid>) {
+        self.txn.collect_unpublished_revokes(out);
+    }
+
+    /// Advances the phase to `to`, refusing anything but the single legal
+    /// successor ([`CommitPhase::next_in_pipeline`]) or a tid mismatch with
+    /// `EIO` — the commit then fails loudly and the caller aborts the
+    /// journal, rather than a panic in production or a pipeline running out
+    /// of order.
+    fn advance_to(&mut self, tid: Tid, to: CommitPhase) -> Result<()> {
+        if self.tid() != tid {
+            return_errno_with_message!(
+                Errno::EIO,
+                "phase advance names a different transaction than the committing one"
+            );
+        }
+        if self.phase.next_in_pipeline() != Some(to) {
+            error!(
+                "ext4 journal: illegal commit-phase transition {:?} -> {:?}",
+                self.phase, to
+            );
+            return_errno_with_message!(Errno::EIO, "illegal commit-phase transition");
+        }
+        self.phase = to;
+        Ok(())
+    }
+}
+
+/// The mutable transaction state of a [`Journal`]: the two-transaction
+/// pipeline (P7c-1) holds at most one *running* transaction (accepting
+/// handles and captures) and at most one *committing* transaction (staged
+/// out of `running`, being written to the log) — a new running transaction
+/// starts while its predecessor commits, which is what batches concurrent
+/// operations into one commit.
 //
 // Referenced by the transaction lifecycle functions (via `Journal::state_write`),
 // so it counts as used in non-ktest builds.
 pub(super) struct JournalState {
     /// The single running transaction, if any (`journal_t.j_running_transaction`).
     pub(super) running: Option<Transaction>,
-    /// The tid the commit thread has taken out of `running` and is currently
-    /// writing to the log (`journal_t.j_committing_transaction`), if any.
-    /// Tracked so `commit_and_wait_running` can wait for a transaction that
-    /// left `running` a moment before the caller looked — otherwise sync(2)
+    /// The transaction staged for (or mid-way through) commit, if any
+    /// (`journal_t.j_committing_transaction`) — see [`CommittingTxn`]. Also
+    /// what `commit_and_wait_running` waits on for a transaction that left
+    /// `running` a moment before the caller looked: otherwise sync(2)
     /// returns while its captures are mid-commit, not yet durable.
-    pub(super) committing_tid: Option<Tid>,
+    pub(super) committing: Option<CommittingTxn>,
     /// The tid to assign to the next transaction created
     /// (`journal_t.j_transaction_sequence`).
     pub(super) next_tid: Tid,
@@ -842,20 +976,31 @@ pub(super) struct JournalState {
     /// commit's revokes), and retired by [`checkpoint`](checkpoint::checkpoint)
     /// at the same tid boundary that evicts `uncheckpointed`. See [`revoke`].
     pub(super) revoked: revoke::RevokeTable,
-    /// The newest committed-but-un-checkpointed after-image of each metadata
-    /// block, retained from the moment a transaction leaves `running` to commit
-    /// until checkpoint writes the block to its final location.
+    /// The newest post-`running` after-image of each metadata block: the
+    /// committing transaction's from the instant it is staged, and every
+    /// committed-but-un-checkpointed transaction's until checkpoint writes
+    /// the block to its final location.
     ///
-    /// This is what makes [`get_write_access`] seeding stale-free: inside the
-    /// commit→checkpoint window the device lags these images, so a new
-    /// transaction's capture must seed from here (see
-    /// [`UncheckpointedImage`](transaction::UncheckpointedImage) for the failure
-    /// this prevents — the B-1 shared-block clobber). Entries are inserted by
-    /// the commit path under this state lock, atomically with `running.take()`
-    /// (no instant exists where a new transaction can start but the images are
-    /// missing), and evicted by [`checkpoint`](checkpoint::checkpoint) once the
-    /// device is authoritative again. Bounded by the blocks of the transactions
-    /// in flight — one transaction deep under Phase 4's eager checkpoint.
+    /// This is what makes [`get_write_access`] seeding stale-free (the B-1
+    /// invariant, restated for the two-transaction pipeline): the abstract
+    /// seed order is *running capture → committing image → un-checkpointed
+    /// image → device*, and the middle two stations share this one map —
+    /// [`Transaction::stash_uncheckpointed`] runs in the SAME state-lock
+    /// window as `running.take()` ([`JournalState::stage_committing`]), so
+    /// no instant exists where a new transaction can start but the
+    /// committing images are missing, and a committing transaction's entries
+    /// are the newest of their blocks by tid order. The whole seed decision
+    /// is made in one state-lock window ([`get_write_access`]); the
+    /// committing transaction itself is frozen (see [`CommittingTxn`]), so
+    /// its images are read-only to seeders; and eviction stays tid-keyed —
+    /// [`checkpoint`](checkpoint::checkpoint) evicts only up through its
+    /// last *applied* tid, which can never reach a still-mid-flight commit
+    /// (its tid is beyond `committed_tid` until its own step 6). The one
+    /// mutation that may touch a committing transaction's entry is a forget
+    /// ([`RevokeDuty::discharge`](revoke::RevokeDuty)): eviction-on-free is
+    /// the forget semantics — the stale bytes must stop seeding — not a
+    /// violation of the frozen commit (the LOG copy still commits; revoke
+    /// suppression handles it at apply time).
     pub(super) uncheckpointed: BTreeMap<Ext4Bid, transaction::UncheckpointedImage>,
     /// The freed-but-uncommitted block runs, keyed by first block: every run
     /// a live-handle `Ext4::free_blocks` discharged ([`pin_freed_run`]),
@@ -889,6 +1034,36 @@ pub(super) struct JournalState {
 }
 
 impl JournalState {
+    /// Stages `txn` as THE committing transaction — the `Running` →
+    /// [`Locked`](CommitPhase::Locked) transition — retaining its
+    /// after-images in [`uncheckpointed`](Self::uncheckpointed) in the same
+    /// lock window (the B-1 stash: from the very first instant a new running
+    /// transaction can exist, captures of these blocks seed from these bytes,
+    /// never from the lagging device). The caller must have verified the
+    /// slot is empty; both production stagers do, before `running.take()`.
+    fn stage_committing(&mut self, txn: Transaction) -> Arc<Transaction> {
+        debug_assert!(self.committing.is_none());
+        txn.stash_uncheckpointed(&mut self.uncheckpointed);
+        let txn = Arc::new(txn);
+        self.committing = Some(CommittingTxn::new(txn.clone()));
+        txn
+    }
+
+    /// Advances the committing transaction's pipeline phase (see
+    /// [`CommittingTxn::advance_to`]); `EIO` if nothing is committing. This
+    /// state-level form exists so commit step 6 can advance to
+    /// [`Finished`](CommitPhase::Finished) inside its existing lock window;
+    /// [`Journal::advance_committing_phase`] wraps it for the other steps.
+    pub(super) fn advance_committing_phase(&mut self, tid: Tid, to: CommitPhase) -> Result<()> {
+        let Some(committing) = self.committing.as_mut() else {
+            return_errno_with_message!(
+                Errno::EIO,
+                "phase advance without a committing transaction"
+            );
+        };
+        committing.advance_to(tid, to)
+    }
+
     /// Releases every pinned freed run whose freeing transaction is covered
     /// by `committed` — commit step 6, the moment those frees become durable
     /// (the commit block is behind the step-4 barrier), so their blocks may
@@ -940,7 +1115,7 @@ impl Journal {
             device,
             state: RwMutex::new(JournalState {
                 running: None,
-                committing_tid: None,
+                committing: None,
                 next_tid,
                 head,
                 tail_block,
@@ -1163,11 +1338,10 @@ impl Journal {
                     // free segment (`commit_or_drain_tail`). Batching commits
                     // with lazy, space-pressure-driven checkpoint is a P7
                     // optimization.
-                    // No in-flight committing transaction here: `commit_one`
-                    // returned, so its revokes are published (or the journal
-                    // aborted above). A RUNNING transaction's unpublished
-                    // forgets are snapshotted inside `checkpoint` itself.
-                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref(), None) {
+                    // The committing slot is empty here (`commit_one` retired
+                    // it), so the pass's snapshot collects unpublished
+                    // forgets only from the RUNNING transaction.
+                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
                         error!("ext4 journal checkpoint failed: {:?}", e);
                     }
                 }
@@ -1206,65 +1380,134 @@ impl Journal {
 
     /// Commits the running transaction, if it is (still) committable, and wakes
     /// `log_wait_commit` sleepers. Runs on the commit thread.
+    fn commit_one(&self) {
+        let Some(txn) = self.take_running_for_commit() else {
+            return;
+        };
+        if let Err(e) = self.commit_staged(&txn) {
+            error!("ext4 journal commit failed, aborting the journal: {:?}", e);
+        }
+    }
+
+    /// Takes the committable running transaction and stages it as the
+    /// committing one, or returns `None` when nothing is committable.
     ///
-    /// The running transaction is taken **out** under the state write lock, then
-    /// committed **without** holding that lock — commit does device I/O and takes
-    /// `inode.inner` (the ordered-data flush), which must never happen under the
-    /// journal state lock. A fresh running transaction is created lazily by the
-    /// next [`journal_start`](transaction::journal_start).
+    /// The running transaction is taken **out** under the state write lock,
+    /// then committed **without** holding that lock — commit does device I/O,
+    /// which must never happen under the journal state lock. A fresh running
+    /// transaction is created lazily by the next
+    /// [`journal_start`](transaction::journal_start), possibly while this one
+    /// is still mid-commit: that overlap IS the two-transaction pipeline.
     ///
     /// Committability is checked and the transaction taken under ONE lock hold
-    /// (between `poll_commit_action` and here a new handle could have joined, so
-    /// the poll's answer is stale); the same critical section stashes the
-    /// transaction's after-images into [`JournalState::uncheckpointed`] — the
-    /// take is the instant from which the next `journal_start` opens a NEW
-    /// transaction, so the images must already be in place for its captures to
-    /// seed from (the device lags this commit until its checkpoint).
-    fn commit_one(&self) {
-        let txn = {
-            let mut st = self.state_write();
-            let committable = st
-                .running
-                .as_ref()
-                .is_some_and(|txn| txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0);
-            if !committable {
-                return;
-            }
-            let Some(txn) = st.running.take() else {
-                return;
-            };
-            st.committing_tid = Some(txn.tid());
-            txn.stash_uncheckpointed(&mut st.uncheckpointed);
-            txn
-        };
-
-        // Single-committer: this thread is the only production committer, so
-        // no commit lock is needed. A successful commit publishes
-        // `committed_tid` (Release) before returning.
-        let commit_result = self.commit_or_drain_tail(txn);
-        if let Err(e) = commit_result {
-            // The transaction is gone: either it was consumed mid-write, or it
-            // was dropped because the ring could not make room even after
-            // draining the tail — either way memory is ahead of the log and
-            // the device, unrecoverably. Abort the journal (refuse further
-            // work and wake sleepers with an error) rather than continue and
-            // publish fragments of the lost transaction through later commits.
-            // Set the aborted flag BEFORE clearing `committing_tid`, or a
-            // `sync(2)` sampling the gap would see neither a running nor a
-            // committing transaction and wrongly report the lost data durable.
-            // The full jbd2 abort/errno machinery is Phase 7.
-            error!("ext4 journal commit failed, aborting the journal: {:?}", e);
-            self.abort();
+    /// (between `poll_commit_action` and here a new handle could have joined,
+    /// so the poll's answer is stale); the same critical section stashes the
+    /// transaction's after-images into [`JournalState::uncheckpointed`] and
+    /// installs the [`CommittingTxn`] slot ([`JournalState::stage_committing`])
+    /// — the take is the instant from which the next `journal_start` opens a
+    /// NEW transaction, so the images must already be in place for its
+    /// captures to seed from (the device lags this commit until its
+    /// checkpoint).
+    fn take_running_for_commit(&self) -> Option<Arc<Transaction>> {
+        let mut st = self.state_write();
+        let committable = st
+            .running
+            .as_ref()
+            .is_some_and(|txn| txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0);
+        if !committable {
+            return None;
         }
-        self.state_write().committing_tid = None;
-        // Wake `log_wait_commit` sleepers to re-check `committed_tid`.
+        if st.committing.is_some() {
+            // Commits are serialized on the single committer (the commit
+            // thread; the unmount flush runs only after it stopped), so an
+            // occupied slot here is a broken contract. Refuse to pipeline a
+            // second commit — that would fork the seeding/publication story —
+            // and leave the running transaction for a later pass.
+            error!("ext4 journal: a transaction is already committing; not taking another");
+            return None;
+        }
+        let txn = st.running.take()?;
+        Some(st.stage_committing(txn))
+    }
+
+    /// Commits the staged committing transaction and retires the slot — the
+    /// shared tail of both production committers ([`commit_one`](Self::commit_one)
+    /// and the unmount flush), after [`take_running_for_commit`](Self::take_running_for_commit)
+    /// (or the flush's own staging) installed `txn` in the slot.
+    ///
+    /// Single-committer: the caller's thread is the only production
+    /// committer, so no commit lock is needed. A successful commit publishes
+    /// `committed_tid` (Release) before this returns. On failure the journal
+    /// is aborted **before** the slot is cleared — a `sync(2)` sampling the
+    /// gap must see the committing transaction or the aborted flag, never a
+    /// quiet journal that lost one — and the error is returned.
+    fn commit_staged(&self, txn: &Arc<Transaction>) -> Result<Tid> {
+        let result = self.commit_or_drain_tail(txn);
+        if result.is_err() {
+            // The transaction is lost: consumed mid-write, or dropped because
+            // the ring could not make room even after draining the tail —
+            // either way memory is ahead of the log and the device,
+            // unrecoverably. Abort the journal (refuse further work and wake
+            // sleepers with an error) rather than continue and publish
+            // fragments of the lost transaction through later commits. The
+            // full jbd2 abort/errno machinery is P7e.
+            self.abort();
+        } else {
+            // A successful pipeline run ends in `Finished` by construction
+            // (step 6's phase advance would have errored otherwise).
+            debug_assert!(matches!(
+                self.committing_phase(),
+                Some(CommitPhase::Finished)
+            ));
+        }
+        self.clear_committing(txn.tid());
+        result
+    }
+
+    /// The committing slot's current phase, `None` when nothing is staged.
+    fn committing_phase(&self) -> Option<CommitPhase> {
+        self.state_read()
+            .committing
+            .as_ref()
+            .map(CommittingTxn::phase)
+    }
+
+    /// Retires the committing slot and wakes `log_wait_commit` sleepers to
+    /// re-check `committed_tid` — the [`Finished`](CommitPhase::Finished) →
+    /// gone transition on a successful commit; on the failure paths (the
+    /// journal already aborted, or a ktest attempt that refused) it discards
+    /// whatever phase the pipeline stopped in.
+    fn clear_committing(&self, tid: Tid) {
+        {
+            let mut st = self.state_write();
+            if st
+                .committing
+                .as_ref()
+                .is_some_and(|committing| committing.tid() == tid)
+            {
+                st.committing = None;
+            } else {
+                error!("ext4 journal: the committing slot does not hold the retiring txn");
+            }
+        }
         self.commit_wait_queue.wake_all();
     }
 
-    /// Commits `txn`, draining the un-checkpointed tail inline (once) when the
-    /// chain does not fit the ring's free segment — the sole production commit
-    /// funnel (the commit thread's [`commit_one`](Self::commit_one) and the
-    /// unmount flush).
+    /// Advances the committing transaction's pipeline phase under a transient
+    /// state-lock hold — the commit pipeline calls this at its step
+    /// boundaries; an illegal transition (no committing transaction, a tid
+    /// mismatch, or a skipped step) errors `EIO`, failing that commit so the
+    /// caller aborts the journal, instead of panicking in production. (The
+    /// step-6 advance to [`Finished`](CommitPhase::Finished) goes through
+    /// [`JournalState::advance_committing_phase`] directly, inside the
+    /// publication lock window.)
+    pub(super) fn advance_committing_phase(&self, tid: Tid, to: CommitPhase) -> Result<()> {
+        self.state_write().advance_committing_phase(tid, to)
+    }
+
+    /// Commits `txn` (already staged in the committing slot), draining the
+    /// un-checkpointed tail inline (once) when the chain does not fit the
+    /// ring's free segment.
     ///
     /// A dirty tail can be in the way because the post-commit checkpoint is
     /// non-fatal on failure: the tail transactions' after-images exist nowhere
@@ -1272,29 +1515,31 @@ impl Journal {
     /// would turn the next crash into a silent under-replay of
     /// fsync-acknowledged metadata. jbd2 never reaches this state — writers
     /// block up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291) —
-    /// and P7c builds that space backpressure; until then the commit refuses
+    /// and P7c-3 builds that space backpressure; until then the commit refuses
     /// to write ([`CommitAttempt::NeedsLogSpace`]), this drains the tail (an
     /// inline [`checkpoint`](checkpoint::checkpoint) — the same thread context
     /// as the post-commit checkpoint, so no new lock interaction) and retries
     /// ONCE. If the checkpoint fails, or the chain still does not fit a clean
     /// ring, the error propagates and the caller aborts the journal: a loud
     /// abort is the only safe fallback left.
-    fn commit_or_drain_tail(&self, txn: Transaction) -> Result<Tid> {
-        let txn = match try_commit_transaction(self, self.device.as_ref(), txn)? {
+    ///
+    /// The drain runs MID-COMMIT: `txn`'s revokes are unpublished (its commit
+    /// block is not durable — a crash can still erase it), so the checkpoint
+    /// must not apply-or-retire an older transaction touching a block `txn`
+    /// forgot. The pass reads the committing slot's unpublished revokes out
+    /// of the journal state itself (there is no side channel to thread), and
+    /// defers in front of such a transaction; a defer here drains less space,
+    /// and the retry below then fails loudly (`NeedsLogSpace` → `ENOSPC` →
+    /// journal abort) rather than corrupt.
+    fn commit_or_drain_tail(&self, txn: &Transaction) -> Result<Tid> {
+        match try_commit_transaction(self, self.device.as_ref(), txn)? {
             CommitAttempt::Committed(tid) => return Ok(tid),
-            CommitAttempt::NeedsLogSpace(txn) => txn,
-        };
-        // The drain runs MID-COMMIT: `txn`'s revokes are unpublished (its
-        // commit block is not durable — a crash can still erase it), so the
-        // checkpoint must not apply-or-retire an older transaction touching a
-        // block `txn` forgot. Thread the caller-owned committing transaction
-        // in so the pass defers in front of such a transaction; a defer here
-        // drains less space, and the retry below then fails loudly
-        // (`NeedsLogSpace` → `ENOSPC` → journal abort) rather than corrupt.
-        checkpoint::checkpoint(self, self.device.as_ref(), Some(&txn))?;
+            CommitAttempt::NeedsLogSpace => {}
+        }
+        checkpoint::checkpoint(self, self.device.as_ref())?;
         match try_commit_transaction(self, self.device.as_ref(), txn)? {
             CommitAttempt::Committed(tid) => Ok(tid),
-            CommitAttempt::NeedsLogSpace(_) => Err(Error::with_message(
+            CommitAttempt::NeedsLogSpace => Err(Error::with_message(
                 Errno::ENOSPC,
                 "transaction does not fit the journal even after draining the tail",
             )),
@@ -1340,6 +1585,17 @@ impl Journal {
     /// thread's ordered flush works on page-cache handles cloned into the
     /// transaction at registration time, touching no inode lock at all (see
     /// `Transaction::register_ordered_data`).
+    ///
+    /// Under the running/committing pipeline this remains iron law 1's legal
+    /// exception (waiting for *space*, like Linux): the wait can only be on
+    /// the RUNNING transaction's fullness — never on the committing one,
+    /// which took none of the waiter's reservations with it — and everything
+    /// that frees the space progresses without the waiter's locks: handle
+    /// closes bump the epoch from their own threads, and the running
+    /// transaction's commit (which may first have to finish the committing
+    /// one — commits are serial) plus the log-reclaiming checkpoint both run
+    /// on the committer thread, which takes brief state-lock windows and
+    /// device I/O only.
     pub(super) fn wait_for_transaction_room(&self, tid: Tid, epoch: u64) -> Result<()> {
         self.request_commit();
         self.commit_wait_queue.wait_until(|| {
@@ -1471,7 +1727,7 @@ impl Journal {
                 // durable may have just been TAKEN by the commit thread and be
                 // mid-commit (its commit record not on disk yet). Waiting on
                 // nothing here would let sync(2) return early.
-                _ => match st.committing_tid {
+                _ => match st.committing.as_ref().map(CommittingTxn::tid) {
                     Some(tid) => tid,
                     // Nothing running and nothing committing: everything captured
                     // is durable — unless a failed commit aborted the journal and
@@ -1545,33 +1801,33 @@ impl Journal {
     /// A no-op on a journal that never ran a transaction (nothing captured,
     /// already-clean tail): the take yields `None` and [`checkpoint`] returns early.
     pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
-        let txn = {
+        let staged = {
             let mut st = self.state_write();
-            let txn = st.running.take();
-            // Mirror `commit_one`: the images must be retained atomically with
-            // the take (nothing races at unmount, but the invariant is cheap and
-            // uniform — every commit path stashes what it is about to commit).
-            if let Some(txn) = &txn {
-                txn.stash_uncheckpointed(&mut st.uncheckpointed);
+            match st.running.take() {
+                // Mirror the commit thread: stage (which retains the images
+                // atomically with the take — nothing races at unmount, but
+                // the invariant is cheap and uniform: every transaction
+                // entering the pipeline is slot-resident with its images
+                // stashed). The slot is empty here — the commit thread
+                // stopped after retiring its last stage.
+                Some(txn) if txn.nr_metadata_blocks() > 0 => Some(st.stage_committing(txn)),
+                // A captureless leftover is not committable; drop it.
+                Some(_) | None => None,
             }
-            txn
         };
-        if let Some(txn) = txn
-            && txn.nr_metadata_blocks() > 0
-            && let Err(e) = self.commit_or_drain_tail(txn)
-        {
-            // Same as `commit_one`: the transaction is lost, abort rather than
-            // checkpoint device state that no longer matches the log.
-            self.abort();
-            return Err(e);
+        if let Some(txn) = staged {
+            // `commit_staged` aborts the journal and retires the slot on
+            // failure; the transaction is lost, so do not checkpoint device
+            // state that no longer matches the log.
+            self.commit_staged(&txn)?;
         }
         if self.is_aborted() {
             return_errno_with_message!(Errno::EIO, "journal aborted; not checkpointing");
         }
-        // Nothing is running (taken above) or mid-commit (the commit thread is
-        // stopped and the commit above returned), so no unpublished revokes
-        // exist to thread in.
-        checkpoint::checkpoint(self, self.device.as_ref(), None)
+        // Nothing is running (taken above) or mid-commit (the slot was
+        // retired by `commit_staged`), so the pass's snapshot finds no
+        // unpublished revokes.
+        checkpoint::checkpoint(self, self.device.as_ref())
     }
 }
 
@@ -1633,12 +1889,18 @@ fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a m
 /// [`WriteAccess`] credential whose [`patch`](WriteAccess::patch) calls
 /// accumulate onto its newest committed content (jbd2 `get_write_access`).
 ///
-/// The seed is the block's retained committed-but-un-checkpointed image when one
-/// exists ([`JournalState::uncheckpointed`]) and the device content otherwise:
-/// between a transaction's commit and its checkpoint the device lags, and a
-/// device seed taken in that window would hand this transaction stale bytes for
-/// every neighbor object it does not patch itself (the B-1 clobber — see
-/// [`UncheckpointedImage`](transaction::UncheckpointedImage)).
+/// The seed is the block's retained post-`running` image when one exists
+/// ([`JournalState::uncheckpointed`] — which holds the mid-flight COMMITTING
+/// transaction's images from the instant it was staged, alongside the
+/// committed-but-un-checkpointed ones; see that field's docs for the B-1
+/// invariant restated under the two-transaction pipeline) and the device
+/// content otherwise: between a transaction's staging and its checkpoint the
+/// device lags, and a device seed taken in that window would hand this
+/// transaction stale bytes for every neighbor object it does not patch itself
+/// (the B-1 clobber — see
+/// [`UncheckpointedImage`](transaction::UncheckpointedImage)). The whole
+/// decision — running-capture reuse vs retained image vs device read — is
+/// made under ONE `state_write` window, atomic against a concurrent staging.
 ///
 /// Without a handle (a non-journaled volume, or a caller that opened no
 /// transaction) the returned credential is inert: nothing is captured and
@@ -1804,7 +2066,8 @@ impl WriteAccess<'_> {
 
 /// Reads a metadata block through the journal's retained after-images: the
 /// running transaction's capture when one exists, else the newest
-/// committed-but-un-checkpointed image, else the device.
+/// post-`running` image (a mid-flight committing transaction's — stashed at
+/// staging — or a committed-but-un-checkpointed one), else the device.
 ///
 /// This is the **read side** of the WAL suppression. A captured block's newest
 /// bytes live in the journal's buffers and the device lags them until
@@ -1931,6 +2194,38 @@ impl Journal {
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn uncheckpointed_blocks_for_test(&self) -> Vec<Ext4Bid> {
         self.state_read().uncheckpointed.keys().copied().collect()
+    }
+
+    /// Test helper: stages an externally built transaction into the
+    /// committing slot WITHOUT committing it — the deterministic "pin the
+    /// pipeline mid-flight" primitive of the duality tests, and the staging
+    /// half of the ktest commit funnel
+    /// ([`commit_transaction`](commit::commit_transaction)), so direct
+    /// pipeline tests run slot-resident exactly like production. Errors
+    /// `EIO` if a transaction is already staged. Production transactions
+    /// reach the slot only through
+    /// [`take_running_for_commit`](Journal::take_running_for_commit).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4::journal) fn stage_transaction_for_test(
+        &self,
+        txn: Transaction,
+    ) -> Result<Arc<Transaction>> {
+        let mut st = self.state_write();
+        if st.committing.is_some() {
+            return_errno_with_message!(Errno::EIO, "a transaction is already committing");
+        }
+        Ok(st.stage_committing(txn))
+    }
+
+    /// Test helper: the committing slot's `(tid, phase)`, or `None` when no
+    /// transaction is committing. White-box inspection for the pipeline
+    /// tests.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn committing_for_test(&self) -> Option<(Tid, CommitPhase)> {
+        self.state_read()
+            .committing
+            .as_ref()
+            .map(|committing| (committing.tid(), committing.phase()))
     }
 }
 
@@ -2681,7 +2976,7 @@ mod tests {
             .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // Both writers' bytes reach the final location; untouched bytes keep the
         // device content.
@@ -2722,7 +3017,7 @@ mod tests {
             .unwrap();
         journal_stop(h1).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         // Doctor a byte on the device — a capture that seeds from the device (and
         // only such a capture) will see it.
@@ -2756,7 +3051,7 @@ mod tests {
             .unwrap();
         journal_stop(h2).unwrap();
         f.journal.commit_now_for_test();
-        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
         let mut final_block = [0u8; BLOCK_SIZE];
         f.fixture
@@ -2882,6 +3177,244 @@ mod tests {
             Some(vec![0x22; 4])
         );
         journal_stop(h).unwrap();
+    }
+
+    // --- P7c-1: the running/committing two-transaction pipeline. ---
+    // Deterministic recipe (experience §10.6): no commit thread runs; the
+    // pipeline is pinned mid-flight by staging via the production taker
+    // (`take_running_for_commit`) and finished by hand (`commit_staged`).
+
+    /// The pipeline overlap itself: while T1 sits staged in the committing
+    /// slot (mid-flight, `Locked`), `journal_start` opens a NEW running
+    /// transaction with the next tid — without consulting or waiting on the
+    /// slot — and it accepts captures; finishing T1 leaves T2 untouched.
+    #[ktest]
+    fn new_running_transaction_starts_while_committing_is_in_flight() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        // T1 captures a block and becomes committable.
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let t1_tid = h1.tid();
+        get_write_access(Some(&h1), 510)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+
+        // Pin the pipeline mid-flight: T1 staged, no I/O run yet.
+        let t1 = f.journal.take_running_for_commit().unwrap();
+        assert_eq!(
+            f.journal.committing_for_test(),
+            Some((t1_tid, CommitPhase::Locked))
+        );
+        assert!(f.journal.state_read().running.is_none());
+
+        // A new running transaction starts while T1 commits: the next tid,
+        // accepting captures — the two-transaction pipeline.
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        assert_eq!(h2.tid(), t1_tid.next());
+        get_write_access(Some(&h2), 600)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
+            .unwrap();
+        {
+            let st = f.journal.state_read();
+            assert_eq!(st.running.as_ref().unwrap().tid(), t1_tid.next());
+            assert_eq!(st.committing.as_ref().unwrap().tid(), t1_tid);
+        }
+        journal_stop(h2).unwrap();
+
+        // Finishing T1 commits and retires exactly T1; T2 stays running.
+        assert_eq!(f.journal.commit_staged(&t1).unwrap(), t1_tid);
+        assert_eq!(f.journal.committing_for_test(), None);
+        assert_eq!(f.journal.committed_tid(), t1_tid);
+        assert_eq!(
+            f.journal.state_read().running.as_ref().unwrap().tid(),
+            t1_tid.next()
+        );
+    }
+
+    /// The B-1 invariant under explicit duality: with T1 staged mid-flight
+    /// (its after-images not on the device — not even in the log), a capture
+    /// in the new running T2 seeds from T1's stashed image, and the metadata
+    /// read funnel serves it; the end-to-end result carries both writers'
+    /// bytes.
+    #[ktest]
+    fn capture_while_committing_seeds_from_its_stashed_image() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device().clone();
+
+        let bid: Ext4Bid = 511;
+        let base = [0xAAu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(bid as usize * BLOCK_SIZE, &base)
+            .unwrap();
+
+        // T1 patches bytes [0..4] and is STAGED — mid-flight, zero I/O: the
+        // device (and the log) still hold the pre-T1 bytes.
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h1), bid)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+        let t1 = f.journal.take_running_for_commit().unwrap();
+
+        // The read funnel serves the committing transaction's image.
+        let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), bid).unwrap();
+        assert_eq!(&served[..4], &[0x11; 4]);
+        assert_eq!(served[100], 0xAA);
+
+        // A capture in the NEW running T2 seeds from T1's image, not the
+        // lagging device.
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h2), bid)
+            .unwrap()
+            .patch(|b| {
+                assert_eq!(&b[..4], &[0x11; 4], "seed must be the committing image");
+                assert_eq!(b[100], 0xAA, "layered over the base content");
+                b[8..12].copy_from_slice(&[0x22; 4]);
+            })
+            .unwrap();
+        journal_stop(h2).unwrap();
+
+        // Finish T1, then T2, then checkpoint: both writers' bytes land.
+        f.journal.commit_staged(&t1).unwrap();
+        f.journal.commit_now_for_test();
+        checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let mut final_block = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(bid as usize * BLOCK_SIZE, &mut final_block)
+            .unwrap();
+        assert_eq!(&final_block[..4], &[0x11; 4], "T1's bytes survive");
+        assert_eq!(&final_block[8..12], &[0x22; 4], "T2's bytes applied");
+        assert_eq!(final_block[100], 0xAA, "unpatched bytes keep the base");
+    }
+
+    /// The phase machine's guards: a skipped station and a wrong tid are
+    /// refused with `EIO` (phase intact), the legal single-step walk goes
+    /// through, and `Finished` is terminal.
+    #[ktest]
+    fn commit_phase_advance_guards_pipeline_order() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h = journal_start(&f.journal, 4).unwrap();
+        let tid = h.tid();
+        {
+            let mut st = f.journal.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(512);
+            txn.apply_patch(512, generation, |b| b[..4].copy_from_slice(b"PHSE"))
+                .unwrap();
+        }
+        journal_stop(h).unwrap();
+        let _t1 = f.journal.take_running_for_commit().unwrap();
+
+        // Skipping a station is refused, with the phase intact.
+        let err = f
+            .journal
+            .advance_committing_phase(tid, CommitPhase::Commit)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+        assert_eq!(
+            f.journal.committing_for_test(),
+            Some((tid, CommitPhase::Locked))
+        );
+        // A wrong tid is refused even for the legal successor.
+        let err = f
+            .journal
+            .advance_committing_phase(tid.next(), CommitPhase::Flush)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        // The legal single-step walk goes through…
+        for to in [
+            CommitPhase::Flush,
+            CommitPhase::Commit,
+            CommitPhase::CommitRecord,
+            CommitPhase::Finished,
+        ] {
+            f.journal.advance_committing_phase(tid, to).unwrap();
+            assert_eq!(f.journal.committing_for_test(), Some((tid, to)));
+        }
+        // …and Finished is terminal.
+        let err = f
+            .journal
+            .advance_committing_phase(tid, CommitPhase::Finished)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        f.journal.clear_committing(tid);
+        assert_eq!(f.journal.committing_for_test(), None);
+    }
+
+    /// Commits stay strictly serial under the pipeline (one slot), so
+    /// waiting on an already-committed tid returns immediately even while a
+    /// successor transaction is running with live captures.
+    #[ktest]
+    fn log_wait_commit_returns_for_earlier_tid_while_successor_runs() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let t1_tid = h1.tid();
+        get_write_access(Some(&h1), 513)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+        let t1 = f.journal.take_running_for_commit().unwrap();
+        f.journal.commit_staged(&t1).unwrap();
+
+        // T2 running with a live capture (not committable — handle open).
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h2), 514)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
+            .unwrap();
+        // The already-committed T1 must not be gated on T2's fate.
+        f.journal.log_wait_commit(t1_tid).unwrap();
+        journal_stop(h2).unwrap();
+    }
+
+    /// `sync(2)`'s durability probe covers the committing slot: with
+    /// `running` empty but T1 staged mid-flight, `commit_and_wait_running`
+    /// waits for T1's commit (returning early would claim durability for a
+    /// commit record not yet on disk). A second thread finishes the staged
+    /// commit; the waiter returns only with T1 committed.
+    #[ktest]
+    fn sync_probe_waits_on_the_committing_slot() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let t1_tid = h1.tid();
+        get_write_access(Some(&h1), 515)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+        let t1 = f.journal.take_running_for_commit().unwrap();
+        assert!(f.journal.state_read().running.is_none());
+
+        let finisher = {
+            let journal = f.journal.clone();
+            crate::thread::kernel_thread::ThreadOptions::new(move || {
+                crate::thread::Thread::yield_now();
+                journal.commit_staged(&t1).unwrap();
+            })
+            .spawn()
+        };
+        f.journal.commit_and_wait_running().unwrap();
+        assert!(f.journal.committed_tid().geq(t1_tid));
+        finisher.join();
     }
 
     // --- P7a-4: the D-4 mount-time journal feature upgrade. ---
