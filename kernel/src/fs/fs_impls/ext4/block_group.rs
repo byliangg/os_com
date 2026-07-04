@@ -50,6 +50,16 @@ use super::{
     super_block::SuperBlock,
 };
 
+/// `bg_flags` bit: the group's inode bitmap and inode table are uninitialized
+/// (`EXT4_BG_INODE_UNINIT`). No inode has ever been allocated here; the on-disk
+/// inode bitmap is not maintained and the inode table is not zeroed.
+const BG_INODE_UNINIT: u16 = 0x0001;
+/// `bg_flags` bit: the group's block bitmap is uninitialized
+/// (`EXT4_BG_BLOCK_UNINIT`). No data block has ever been allocated here; the
+/// on-disk block bitmap is not maintained and must be reconstructed from the
+/// group layout (only the group's fixed metadata/backup overhead is in use).
+const BG_BLOCK_UNINIT: u16 = 0x0002;
+
 const_assert!(size_of::<RawBlockGroup>() == 32);
 
 /// On-disk block-group descriptor, 32 bytes (without the `64BIT` high halves).
@@ -122,6 +132,14 @@ pub(super) struct BlockGroupDesc {
     free_blocks_count: u32,
     free_inodes_count: u32,
     used_dirs_count: u32,
+    /// `bg_flags` — carries the `BLOCK_UNINIT`/`INODE_UNINIT` lazy-init bits. Kept
+    /// so the block side can reconstruct an uninitialized bitmap on load and clear
+    /// the bit (persisting it through `patch_into`/`sync_metadata`) on first use.
+    flags: u16,
+    /// `bg_itable_unused` — inodes at the tail of this group's inode table that
+    /// have never been used. Decoded so it round-trips losslessly through
+    /// writeback; this port does not yet lazily initialize inode tables.
+    itable_unused: u32,
 }
 
 impl BlockGroupDesc {
@@ -139,6 +157,10 @@ impl BlockGroupDesc {
             Some(hi) => (hi.block_bitmap_hi, hi.inode_bitmap_hi, hi.inode_table_hi),
             None => (0, 0, 0),
         };
+        // `itable_unused` has a high half in the 64BIT tail; splice it like the
+        // block numbers (in our geometry it fits the low half, but decode both so
+        // the value round-trips losslessly).
+        let itable_unused_hi = hi.map_or(0, |hi| hi.itable_unused_hi);
         Self {
             block_bitmap_bid: (lo.block_bitmap_lo as Ext4Bid)
                 | ((block_bitmap_hi as Ext4Bid) << 32),
@@ -148,6 +170,8 @@ impl BlockGroupDesc {
             free_blocks_count: lo.free_blocks_count_lo as u32,
             free_inodes_count: lo.free_inodes_count_lo as u32,
             used_dirs_count: lo.used_dirs_count_lo as u32,
+            flags: lo.flags,
+            itable_unused: (lo.itable_unused_lo as u32) | ((itable_unused_hi as u32) << 16),
         }
     }
 
@@ -253,6 +277,12 @@ impl BlockGroupDesc {
         raw.free_blocks_count_lo = self.free_blocks_count() as u16;
         raw.free_inodes_count_lo = self.free_inodes_count() as u16;
         raw.used_dirs_count_lo = self.used_dirs_count() as u16;
+        // Persist `bg_flags` too: clearing `BLOCK_UNINIT` on first allocation into
+        // a lazy group must reach disk, or a later mount would re-reconstruct the
+        // bitmap over blocks we have since handed out. `itable_unused` is unchanged
+        // by this port but written back for losslessness.
+        raw.flags = self.flags;
+        raw.itable_unused_lo = self.itable_unused as u16;
         raw_bytes.copy_from_slice(raw.as_bytes());
     }
 
@@ -279,6 +309,18 @@ impl BlockGroupDesc {
 
     pub(super) const fn used_dirs_count(&self) -> u32 {
         self.used_dirs_count
+    }
+
+    /// Whether this group's on-disk block bitmap is uninitialized and must be
+    /// reconstructed from the group layout (`EXT4_BG_BLOCK_UNINIT`).
+    pub(super) const fn is_block_uninit(&self) -> bool {
+        self.flags & BG_BLOCK_UNINIT != 0
+    }
+
+    /// Whether this group's inode bitmap and table are uninitialized
+    /// (`EXT4_BG_INODE_UNINIT`).
+    pub(super) const fn is_inode_uninit(&self) -> bool {
+        self.flags & BG_INODE_UNINIT != 0
     }
 }
 
@@ -751,6 +793,13 @@ impl BlockGroup {
 
         let new_free = metadata.desc.free_blocks_count() - alloc_count;
         metadata.desc.free_blocks_count = new_free;
+        // First data allocation into a lazily-initialized group: the reconstructed
+        // in-memory bitmap is now authoritative, so drop BLOCK_UNINIT (persisted by
+        // `patch_into` below). A later mount must then read the real bitmap rather
+        // than re-reconstruct a prefix over blocks we have already handed out.
+        if metadata.desc.is_block_uninit() {
+            metadata.desc.flags &= !BG_BLOCK_UNINIT;
+        }
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.block_bitmap.as_bytes()))?;
@@ -844,6 +893,16 @@ impl BlockGroup {
         if metadata.desc.free_inodes_count() == 0 {
             return Ok(None);
         }
+        // Skip a group whose inode table is uninitialized. Lazy inode-table init
+        // (zeroing the table + maintaining `itable_unused`) is not yet
+        // implemented; clearing INODE_UNINIT without it would expose an
+        // unzeroed table of garbage inodes to e2fsck. Treating the group as
+        // "no free inode here" confines allocation to initialized groups (on a
+        // fresh image, effectively group 0's flex until it fills) — a capacity
+        // limit, never corruption. Full support is a later phase.
+        if metadata.desc.is_inode_uninit() {
+            return Ok(None);
+        }
         if type_.is_directory() && metadata.desc.used_dirs_count() == u32::from(u16::MAX) {
             return_errno_with_message!(Errno::EIO, "group used directory counter overflow");
         }
@@ -863,6 +922,10 @@ impl BlockGroup {
         if type_.is_directory() {
             metadata.desc.used_dirs_count = metadata.desc.used_dirs_count() + 1;
         }
+        // Keep `bg_itable_unused` in step with the bitmap so e2fsck does not flag
+        // a stale count on a metadata_csum volume.
+        metadata.desc.itable_unused =
+            Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
@@ -927,6 +990,8 @@ impl BlockGroup {
         if let Some(new_used_dirs) = new_used_dirs {
             metadata.desc.used_dirs_count = new_used_dirs;
         }
+        metadata.desc.itable_unused =
+            Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
@@ -1003,6 +1068,8 @@ impl BlockGroup {
                 raw.lo.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
                 raw.lo.free_inodes_count_lo = metadata.desc.free_inodes_count() as u16;
                 raw.lo.used_dirs_count_lo = metadata.desc.used_dirs_count() as u16;
+                raw.lo.flags = metadata.desc.flags;
+                raw.lo.itable_unused_lo = metadata.desc.itable_unused as u16;
                 self.stamp_desc_csum(&mut raw.lo, Some(&mut raw.hi), &metadata);
                 self.block_device
                     .write_val(self.desc_offset, &raw)
@@ -1019,6 +1086,8 @@ impl BlockGroup {
                 raw.free_blocks_count_lo = metadata.desc.free_blocks_count() as u16;
                 raw.free_inodes_count_lo = metadata.desc.free_inodes_count() as u16;
                 raw.used_dirs_count_lo = metadata.desc.used_dirs_count() as u16;
+                raw.flags = metadata.desc.flags;
+                raw.itable_unused_lo = metadata.desc.itable_unused as u16;
                 self.stamp_desc_csum(&mut raw, None, &metadata);
                 self.block_device
                     .write_val(self.desc_offset, &raw)
@@ -1039,8 +1108,53 @@ impl BlockGroup {
         last_block: Ext4Bid,
         desc: &BlockGroupDesc,
     ) -> Result<IdBitmap> {
-        let bitmap_bid = desc.block_bitmap_bid();
+        let group_size = (last_block - first_block + 1) as u32;
+        let capacity = group_size as u16;
+        debug_assert!(capacity as u32 == group_size && capacity <= IdBitmap::capacity());
 
+        // A `BLOCK_UNINIT` group's on-disk block bitmap is not maintained, so the
+        // raw block is meaningless (often all-zero) — trusting it would hand out
+        // the group's backup superblock/GDT blocks as "free". Reconstruct the
+        // bitmap from the group layout instead: such a group holds no data, so its
+        // only used blocks are the fixed metadata/backup overhead at the group
+        // start — a contiguous prefix whose length the descriptor's authoritative
+        // free-block count gives us directly (Linux `ext4_init_block_bitmap`).
+        if desc.is_block_uninit() {
+            let overhead = group_size
+                .checked_sub(desc.free_blocks_count())
+                .ok_or_else(|| {
+                    Error::with_message(
+                        Errno::EUCLEAN,
+                        "uninit group free count exceeds group size",
+                    )
+                })?;
+            let mut bitmap = IdBitmap::from_buf(vec![0u8; BLOCK_SIZE].into_boxed_slice(), capacity);
+            if overhead > 0 {
+                // `capacity == group_size >= overhead`, so this cannot fail.
+                bitmap.alloc_consecutive(overhead as u16);
+            }
+            // Safety net for the prefix assumption: any of this group's own
+            // metadata blocks that fall within the group must lie inside the
+            // reconstructed prefix. If one sits beyond it the layout is not the
+            // prefix we assumed — refuse rather than risk handing that block out.
+            for bid in [
+                desc.block_bitmap_bid(),
+                desc.inode_bitmap_bid(),
+                desc.inode_table_bid(),
+            ] {
+                if (first_block..=last_block).contains(&bid)
+                    && bid - first_block >= overhead as Ext4Bid
+                {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "uninit group metadata block outside reconstructed prefix"
+                    );
+                }
+            }
+            return Ok(bitmap);
+        }
+
+        let bitmap_bid = desc.block_bitmap_bid();
         let mut buf = vec![0u8; BLOCK_SIZE];
         if block_device
             .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
@@ -1049,8 +1163,6 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "failed to read block bitmap");
         }
 
-        let capacity = (last_block - first_block + 1) as u16;
-        debug_assert!(capacity <= IdBitmap::capacity());
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity))
     }
 
@@ -1064,8 +1176,23 @@ impl BlockGroup {
         nr_inodes_per_group: u32,
         desc: &BlockGroupDesc,
     ) -> Result<IdBitmap> {
-        let bitmap_bid = desc.inode_bitmap_bid();
+        let capacity = nr_inodes_per_group.min(u32::from(IdBitmap::capacity())) as u16;
 
+        // An `INODE_UNINIT` group has never had an inode allocated: its on-disk
+        // inode bitmap is not maintained (raw content is meaningless). Present an
+        // all-free bitmap rather than trusting the garbage. The inode allocator
+        // additionally skips such groups (see `alloc_ino`), so no inode is ever
+        // placed here until lazy inode-table init lands, but generating the
+        // correct bitmap keeps any incidental read (e.g. a bogus inode number)
+        // from observing spurious allocations.
+        if desc.is_inode_uninit() {
+            return Ok(IdBitmap::from_buf(
+                vec![0u8; BLOCK_SIZE].into_boxed_slice(),
+                capacity,
+            ));
+        }
+
+        let bitmap_bid = desc.inode_bitmap_bid();
         let mut buf = vec![0u8; BLOCK_SIZE];
         if block_device
             .read_bytes(Bid::new(bitmap_bid).to_offset(), &mut buf)
@@ -1074,8 +1201,27 @@ impl BlockGroup {
             return_errno_with_message!(Errno::EIO, "failed to read inode bitmap");
         }
 
-        let capacity = nr_inodes_per_group.min(u32::from(IdBitmap::capacity())) as u16;
         Ok(IdBitmap::from_buf(buf.into_boxed_slice(), capacity))
+    }
+
+    /// Recomputes `bg_itable_unused` — the number of never-used inodes at the
+    /// tail of the group's inode table — from the in-memory inode bitmap. On a
+    /// `metadata_csum`/`gdt_csum` volume e2fsck verifies this equals
+    /// `nr_inodes_per_group` minus one past the highest allocated inode, so it
+    /// must track every allocation and free rather than stay at the stale mke2fs
+    /// value (Linux `ext4_bg_itable_unused` / `ext4_free_inodes_count`).
+    fn itable_unused_from_bitmap(bitmap: &IdBitmap, nr_inodes_per_group: u32) -> u32 {
+        let nbytes = (nr_inodes_per_group as usize).div_ceil(8);
+        let high_water = bitmap.as_bytes()[..nbytes]
+            .iter()
+            .rposition(|&b| b != 0)
+            .map_or(0, |byte_idx| {
+                // Highest set bit within the last non-zero byte, one-based: bit
+                // index `7 - leading_zeros`, plus one.
+                byte_idx * 8 + (8 - bitmap.as_bytes()[byte_idx].leading_zeros() as usize)
+            })
+            .min(nr_inodes_per_group as usize);
+        nr_inodes_per_group - high_water as u32
     }
 
     /// Checks whether `range` (filesystem-wide block numbers) overlaps any
@@ -1106,6 +1252,67 @@ mod tests {
     use ostd::prelude::*;
 
     use super::{super::test_utils::Ext4MemoryDisk, *};
+
+    /// A `BLOCK_UNINIT` group reconstructs its block bitmap from the layout — the
+    /// leading `group_size - free_blocks_count` overhead blocks marked used, the
+    /// rest free — and does NOT trust the (garbage) on-disk bitmap block. This is
+    /// the fix for handing out a lazily-initialized group's backup metadata as
+    /// "free" space.
+    #[ktest]
+    fn block_uninit_reconstructs_prefix_bitmap() {
+        const GROUP_SIZE: u32 = 100;
+        const OVERHEAD: u32 = 10;
+
+        // Poison the on-disk block-bitmap block (bid 0) with all-ones: if the code
+        // trusted it, every block would read as used and the asserts below fail.
+        let disk = Ext4MemoryDisk::new(2);
+        disk.segment()
+            .write_bytes(0, &[0xFFu8; BLOCK_SIZE])
+            .unwrap();
+
+        let desc = BlockGroupDesc {
+            block_bitmap_bid: 0,
+            inode_bitmap_bid: 0,
+            inode_table_bid: 0,
+            free_blocks_count: GROUP_SIZE - OVERHEAD,
+            free_inodes_count: 0,
+            used_dirs_count: 0,
+            flags: BG_BLOCK_UNINIT,
+            itable_unused: 0,
+        };
+
+        let bitmap =
+            BlockGroup::load_block_bitmap(&disk, 0, (GROUP_SIZE - 1) as Ext4Bid, &desc).unwrap();
+
+        for bit in 0..OVERHEAD as u16 {
+            assert!(
+                bitmap.is_allocated(bit),
+                "overhead block {bit} must be used"
+            );
+        }
+        for bit in OVERHEAD as u16..GROUP_SIZE as u16 {
+            assert!(!bitmap.is_allocated(bit), "data block {bit} must be free");
+        }
+    }
+
+    /// A metadata block sitting beyond the reconstructed prefix breaks the
+    /// prefix assumption, so reconstruction refuses (fail-closed) rather than
+    /// risk handing that block out.
+    #[ktest]
+    fn block_uninit_rejects_metadata_past_prefix() {
+        let disk = Ext4MemoryDisk::new(2);
+        let desc = BlockGroupDesc {
+            block_bitmap_bid: 50, // in-range but past the 10-block prefix
+            inode_bitmap_bid: 0,
+            inode_table_bid: 0,
+            free_blocks_count: 90,
+            free_inodes_count: 0,
+            used_dirs_count: 0,
+            flags: BG_BLOCK_UNINIT,
+            itable_unused: 0,
+        };
+        assert!(BlockGroup::load_block_bitmap(&disk, 0, 99, &desc).is_err());
+    }
 
     /// A 64-byte descriptor whose block-number high halves are non-zero decodes
     /// to the correct `> 2^32` `Ext4Bid` — the red-line splice. The per-group
