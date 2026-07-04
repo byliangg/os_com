@@ -2451,6 +2451,12 @@ mod write_tests {
             .mapped_pblock()
             .unwrap();
         inode.resize(0).unwrap();
+        // The freeing transaction must commit before the block can recycle:
+        // freed blocks are pinned out of the allocator until then (P7b
+        // freed-block pinning). Production reaches the recycle the same way —
+        // after the free's commit — and the stale bytes are still on the
+        // device (nothing zeroes them).
+        f.ext4.journal().unwrap().commit_now_for_test();
 
         // Partial write inside block 0 at a non-zero offset: [200, 300). The
         // allocator hands block 0 back the freed physical block (first-fit),

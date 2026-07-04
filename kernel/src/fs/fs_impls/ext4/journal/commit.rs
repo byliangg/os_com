@@ -594,6 +594,11 @@ pub(super) fn try_commit_transaction(
         // buffer on the older checkpoint list until the freeing transaction
         // commits.)
         txn.stash_revokes(&mut st.revoked);
+        // Release this transaction's freed-block pins in the same critical
+        // section: its frees are durable exactly now, so the blocks may
+        // re-enter the allocator — the pins and the revokes retire together
+        // (Linux `ext4_process_freed_data`, the jbd2 post-commit callback).
+        st.release_pinned_frees(tid);
     }
     // Release `Acquire` in `committed_tid()`: publishes after the state update.
     journal

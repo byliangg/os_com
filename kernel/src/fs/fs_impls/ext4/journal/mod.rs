@@ -53,6 +53,9 @@
 //!   evicting the retained un-checkpointed image). The mint itself is pure —
 //!   an operation erroring between mint and free changes nothing — see
 //!   [`revoke`].
+//! - [`pin_freed_run`] — every journaled free (either [`BlockFreeAuth`]
+//!   flavor) additionally pins its run out of the allocator until the freeing
+//!   transaction commits ([`JournalState::pinned_frees`]).
 //!
 //! **Without a handle (`None`) every wrapper is inert** and persistence stays
 //! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
@@ -782,6 +785,20 @@ pub(super) struct Journal {
     commit_thread: Mutex<Option<Arc<crate::thread::Thread>>>,
 }
 
+/// One pinned freed block run: `count` blocks whose free was discharged under
+/// the transaction `tid`, held out of the allocator until that transaction
+/// commits (see [`JournalState::pinned_frees`]).
+//
+// Visible at the `ext4` level only because it is a value of the
+// equally-visible `JournalState`'s map; it is constructed and read only
+// inside the journal module.
+pub(in crate::fs::fs_impls::ext4) struct PinnedRun {
+    /// Blocks in the run.
+    count: u32,
+    /// The freeing transaction — the pin releases when it commits.
+    tid: Tid,
+}
+
 /// The mutable running-transaction state of a [`Journal`].
 ///
 /// Phase 4 is single-transaction: there is at most one running transaction and
@@ -840,6 +857,48 @@ pub(super) struct JournalState {
     /// device is authoritative again. Bounded by the blocks of the transactions
     /// in flight — one transaction deep under Phase 4's eager checkpoint.
     pub(super) uncheckpointed: BTreeMap<Ext4Bid, transaction::UncheckpointedImage>,
+    /// The freed-but-uncommitted block runs, keyed by first block: every run
+    /// a live-handle `Ext4::free_blocks` discharged ([`pin_freed_run`]),
+    /// tagged with the freeing transaction's tid. While a run is here the
+    /// allocator must not hand its blocks out
+    /// ([`Journal::pinned_frees_snapshot`] feeds `Ext4::alloc_blocks`'s skip)
+    /// — Linux's mballoc discipline: *"We need to make sure we don't reuse
+    /// the freed block until after the transaction is committed"*
+    /// (`ext4_mb_free_metadata` / `ext4_free_data`, fs/ext4/mballoc.c:6536,
+    /// returned to the buddy only by the post-commit callback
+    /// `ext4_free_data_in_buddy`). Reuse before the commit is unsound in both
+    /// directions: a crash erases the freeing transaction, so the on-disk
+    /// bitmap still assigns the block to its OLD life while the NEW owner's
+    /// (flushed) bytes sit on it — cross-file exposure with a clean e2fsck —
+    /// and at runtime an older log image could be checkpoint-applied over the
+    /// reuse (the S1 clobber's last window; see [`checkpoint`]'s snapshot
+    /// note).
+    ///
+    /// Entries are inserted by [`pin_freed_run`] under this state lock (the
+    /// free site holds the superblock write lock, serializing it against the
+    /// allocator's snapshot) and released by
+    /// [`release_pinned_frees`](JournalState::release_pinned_frees) at commit
+    /// step 6, in the same critical section that publishes the transaction's
+    /// revokes — the pins and the revokes retire together. On journal abort
+    /// nothing releases them: the filesystem is dead (`journal_start` refuses
+    /// `EIO`), and keeping the pins is the safe default. A crash releases
+    /// them trivially (in-memory only), which is exactly correct: the frees
+    /// either committed (recovery sees them) or vanished with their
+    /// transaction.
+    pub(super) pinned_frees: BTreeMap<Ext4Bid, PinnedRun>,
+}
+
+impl JournalState {
+    /// Releases every pinned freed run whose freeing transaction is covered
+    /// by `committed` — commit step 6, the moment those frees become durable
+    /// (the commit block is behind the step-4 barrier), so their blocks may
+    /// re-enter the allocator (Linux `ext4_process_freed_data`, driven by the
+    /// jbd2 post-commit callback). Runs of a NEWER (still running)
+    /// transaction survive, exactly like the revoke records above this
+    /// boundary.
+    pub(super) fn release_pinned_frees(&mut self, committed: Tid) {
+        self.pinned_frees.retain(|_, run| !committed.geq(run.tid));
+    }
 }
 
 impl Journal {
@@ -888,6 +947,7 @@ impl Journal {
                 tail_tid,
                 revoked: revoke::RevokeTable::new(),
                 uncheckpointed: BTreeMap::new(),
+                pinned_frees: BTreeMap::new(),
             }),
             committed_tid: AtomicU32::new(committed_tid.get()),
             commit_trigger: WaitQueue::new(),
@@ -989,6 +1049,27 @@ impl Journal {
     /// writes to this counter without the state lock.
     pub(super) fn committed_tid(&self) -> Tid {
         Tid::new(self.committed_tid.load(Ordering::Acquire))
+    }
+
+    /// Snapshots the pinned freed runs as `(first block, count)` pairs — the
+    /// allocator's skip set (see [`JournalState::pinned_frees`]).
+    ///
+    /// Taken once per allocation, under a transient state-lock hold. The
+    /// journal state lock is a leaf of the filesystem's lock order (the
+    /// capture funnels already take it under the superblock and group locks,
+    /// and nothing acquires a filesystem lock while holding it), so reading
+    /// here from `Ext4::alloc_blocks` — which holds the superblock write lock
+    /// — adds no edge. The snapshot cannot miss a pin: insertion
+    /// ([`pin_freed_run`]) runs inside `Ext4::free_blocks`, which needs the
+    /// same superblock write lock the allocator is holding. It can only be
+    /// conservatively stale the other way — a release (commit step 6) landing
+    /// mid-scan merely leaves a just-unpinned block skipped for this attempt.
+    pub(in crate::fs::fs_impls::ext4) fn pinned_frees_snapshot(&self) -> Vec<(Ext4Bid, u32)> {
+        self.state_read()
+            .pinned_frees
+            .iter()
+            .map(|(&start, run)| (start, run.count))
+            .collect()
     }
 
     /// Spawns the background commit thread (jbd2 `kjournald`).
@@ -1575,6 +1656,46 @@ pub(super) fn get_create_access<'h>(
             generation,
         }),
     })
+}
+
+/// Pins a just-freed block run out of the allocator until the freeing
+/// transaction commits ([`JournalState::pinned_frees`] holds the run;
+/// [`JournalState::release_pinned_frees`] releases it at commit step 6).
+///
+/// Called by `Ext4::free_blocks` for each contiguous per-group run it clears,
+/// right after that run's bitmap clear, under the same superblock write lock
+/// — which is what makes "clear the bits, then pin" atomic against the
+/// allocator (it needs that lock too). Applies to **both** [`BlockFreeAuth`]
+/// flavors: a revoke-duty free's old *journaled* image survives in the
+/// un-retired log, and even a plain-data free is not durable until the
+/// commit — reusing either early hands the block to a new owner whose bytes
+/// a crash (or the checkpoint replay) then crosses with the old life. Linux
+/// pins exactly this set in ordered mode (`ext4_mb_clear_bb`,
+/// fs/ext4/mballoc.c:6536-6560: metadata always, data whenever the inode is
+/// not writeback). Inert without a handle: a non-journaled volume has no
+/// commit boundary for the pin to wait on, so its frees stay immediately
+/// reusable.
+///
+/// A run pinned twice (a double free — already a warned bug path at the
+/// bitmap) keeps the larger extent and the newer tid: over-pinning is merely
+/// conservative, under-pinning would re-open the reuse window.
+pub(super) fn pin_freed_run(handle: Option<&Handle>, start: Ext4Bid, count: u32) -> Result<()> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    if count == 0 {
+        return Ok(());
+    }
+    let journal = handle.journal()?;
+    let mut state = journal.state_write();
+    let tid = running_for(&mut state, handle)?.tid();
+    if let Some(run) = state.pinned_frees.get_mut(&start) {
+        run.count = run.count.max(count);
+        run.tid = tid;
+    } else {
+        state.pinned_frees.insert(start, PinnedRun { count, tid });
+    }
+    Ok(())
 }
 
 /// A capture credential for one metadata block — jbd2's "write access" made a

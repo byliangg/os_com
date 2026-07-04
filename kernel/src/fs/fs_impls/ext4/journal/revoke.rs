@@ -71,7 +71,12 @@
 //! Deferral is the only remaining move: the pass stops (applies nothing,
 //! retires nothing) at the first transaction touching such a block, keeping
 //! its prefix progress. The revoke publishes with its commit, and the next
-//! pass proceeds under ordinary suppression-with-retention.
+//! pass proceeds under ordinary suppression-with-retention. The *reuse* half
+//! of the hazard is closed independently by freed-block pinning
+//! ([`pin_freed_run`](super::pin_freed_run)): a forgotten block cannot
+//! return to the allocator before its freeing transaction commits, so while
+//! a revoke is unpublished no new owner's bytes can be standing at the final
+//! location.
 //!
 //! A record `(B, tid_r)` matters only while some transaction with tid ≤
 //! `tid_r` can still be applied from the log. Checkpoint therefore retires

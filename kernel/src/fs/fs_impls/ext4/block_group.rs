@@ -352,6 +352,21 @@ impl Debug for BlockGroupMetadata {
     }
 }
 
+/// The outcome of one group's block-allocation attempt
+/// ([`BlockGroup::alloc_blocks`]).
+pub(super) enum GroupBlockAlloc {
+    /// The allocated run, in filesystem-wide block numbers.
+    Allocated(Range<Ext4Bid>),
+    /// Nothing fit. `pinned_in_group` reports whether freed-but-uncommitted
+    /// pins covered free bits here — the caller's evidence for the transient
+    /// "everything free awaits a commit" `ENOSPC` leg, kept apart from truly
+    /// out of space.
+    NoFit {
+        /// Whether pinned freed runs overlapped this group.
+        pinned_in_group: bool,
+    },
+}
+
 /// A block group's allocation domain.
 ///
 /// Owns the cached block bitmap, inode bitmap, and group descriptor behind a
@@ -736,19 +751,41 @@ impl BlockGroup {
         self.metadata.read()
     }
 
-    /// Attempts to allocate up to `count` contiguous blocks within this group.
+    /// Attempts to allocate up to `count` contiguous blocks within this group,
+    /// skipping the pinned freed runs (`pinned_frees`, filesystem-wide
+    /// `(start, count)` pairs from
+    /// [`Journal::pinned_frees_snapshot`](super::journal): blocks freed under
+    /// a transaction that has not committed yet, clear in the bitmap but not
+    /// yet allocatable).
     ///
-    /// Returns `Ok(range)` with filesystem-wide block numbers on success, or an
-    /// empty range (`Ok(0..0)`) if the group has no allocatable blocks. Returns
-    /// `Err(EIO)` on bitmap/counter corruption.
+    /// Returns [`GroupBlockAlloc::Allocated`] with filesystem-wide block
+    /// numbers on success, [`GroupBlockAlloc::NoFit`] if the group has no
+    /// allocatable blocks (reporting whether pins covered free bits here).
+    /// Returns `Err(EIO)` on bitmap/counter corruption.
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
         sb_free_blocks: u64,
+        pinned_frees: &[(Ext4Bid, u32)],
         handle: Option<&journal::Handle>,
-    ) -> Result<Range<Ext4Bid>> {
+    ) -> Result<GroupBlockAlloc> {
         let group_size = (self.last_block - self.first_block + 1) as u32;
         debug_assert!(group_size <= IdBitmap::capacity() as u32);
+
+        // This group's slice of the pinned freed runs, as group-local bit
+        // ranges. Pinned blocks are free in the bitmap (their free already
+        // cleared the bits); only the allocator must pretend otherwise, and
+        // only until the freeing transaction commits. The `as u16` casts are
+        // bounded by the clamp: both offsets are at most `group_size`, which
+        // the assert above bounds by the bitmap capacity (32768).
+        let mut pinned_bits: Vec<Range<u16>> = Vec::new();
+        for &(run_start, run_len) in pinned_frees {
+            let lo = run_start.max(self.first_block);
+            let hi = (run_start + run_len as Ext4Bid).min(self.last_block + 1);
+            if lo < hi {
+                pinned_bits.push((lo - self.first_block) as u16..(hi - self.first_block) as u16);
+            }
+        }
 
         let mut metadata = self.metadata.write();
 
@@ -764,21 +801,47 @@ impl BlockGroup {
         // TODO(P9, allocator work): improve bitmap allocation to reduce
         // fragmentation (e.g. find the first free run directly instead of
         // retrying with halved counts).
+        //
+        // A candidate overlapping a pinned run is HELD (left allocated) so the
+        // first-fit scan moves past it instead of finding it again; every hold
+        // is released below, before the bitmap is read or serialized. This is
+        // the scan-local mirror of Linux's "mark the pending frees used when
+        // generating the buddy" (mballoc.c `ext4_mb_generate_from_freelist`).
+        // Holding the WHOLE candidate (not just the overlap) is what makes the
+        // scan terminate; the free capacity it hides is transient — the pins
+        // release when the freeing transaction commits.
+        let mut pinned_held: Vec<Range<u16>> = Vec::new();
         let mut allocated_range = None;
-        while requested_count > 0 {
-            let candidate_range = metadata.block_bitmap.alloc_consecutive(requested_count);
-            if candidate_range.is_some() {
-                allocated_range = candidate_range;
-                break;
+        'search: while requested_count > 0 {
+            while let Some(candidate) = metadata.block_bitmap.alloc_consecutive(requested_count) {
+                if pinned_bits
+                    .iter()
+                    .any(|pin| pin.start < candidate.end && candidate.start < pin.end)
+                {
+                    pinned_held.push(candidate);
+                    continue;
+                }
+                allocated_range = Some(candidate);
+                break 'search;
             }
             requested_count /= 2;
         }
+        // The pinned bits must stay clear everywhere but inside this scan: the
+        // capture patch below serializes the whole bitmap, so a hold leaking
+        // past this point would journal freed blocks as allocated.
+        for held in pinned_held {
+            metadata.block_bitmap.free_consecutive(held);
+        }
 
         let Some(range) = allocated_range else {
-            if metadata.desc.free_blocks_count() > 0 {
+            let pinned_in_group = !pinned_bits.is_empty();
+            // With pins in the group, "free count > 0 but nothing fits" is the
+            // expected transient, not corruption — the heuristic is suspended
+            // for the pins' lifetime.
+            if metadata.desc.free_blocks_count() > 0 && !pinned_in_group {
                 return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
             }
-            return Ok(0..0);
+            return Ok(GroupBlockAlloc::NoFit { pinned_in_group });
         };
 
         let range_start = range.start as Ext4Bid;
@@ -813,7 +876,9 @@ impl BlockGroup {
 
         let range_start_block = self.first_block + range.start as Ext4Bid;
         let range_end_block = self.first_block + range.end as Ext4Bid;
-        Ok(range_start_block..range_end_block)
+        Ok(GroupBlockAlloc::Allocated(
+            range_start_block..range_end_block,
+        ))
     }
 
     /// Frees a contiguous range of group-relative block bits.

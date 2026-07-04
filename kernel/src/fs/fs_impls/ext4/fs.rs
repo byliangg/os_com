@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use device_id::DeviceId;
 
 use super::{
-    block_group::BlockGroup,
+    block_group::{BlockGroup, GroupBlockAlloc},
     checksum::FsCsumSeed,
     feature::FeatureIncompatSet,
     inode,
@@ -442,9 +442,20 @@ impl Ext4 {
     /// Allocates up to `count` contiguous blocks, preferring the group that owns
     /// `goal`.
     ///
-    /// Searches groups in a ring starting from the goal group. Returns
-    /// `Err(ENOSPC)` if no group can satisfy the request, `Err(EINVAL)` if
-    /// `count` is zero.
+    /// Searches groups in a ring starting from the goal group, skipping the
+    /// journal's pinned freed runs — blocks freed under a transaction that has
+    /// not committed yet must not be handed to a new owner
+    /// ([`journal::pin_freed_run`]; Linux mballoc's freed-extent pinning).
+    /// Returns `Err(ENOSPC)` if no group can satisfy the request — the pinned
+    /// flavor (free blocks exist but all await a commit) is transient: it
+    /// nudges the committer asynchronously and clears once the freeing
+    /// transaction commits. Never waits: the caller holds inode/group locks
+    /// and — the deeper deadlock — the pinning transaction is typically the
+    /// caller's own, uncommittable until the caller's handle closes (Linux
+    /// retries around `jbd2_journal_force_commit_nested` from
+    /// `ext4_should_retry_alloc` at the op level, outside the handle; that
+    /// retry seam is P7c's group-commit batching work). Returns `Err(EINVAL)`
+    /// if `count` is zero.
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
@@ -464,6 +475,16 @@ impl Ext4 {
             return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
         }
 
+        // The pinned freed runs, snapshotted once per allocation. A transient
+        // journal-state read under the superblock write lock — a leaf edge
+        // the capture funnels already establish; the same superblock lock
+        // serializes this snapshot against `free_blocks`' pin insertions, so
+        // it cannot miss a pin (see `Journal::pinned_frees_snapshot`).
+        let pinned_frees = match self.journal() {
+            Some(journal) => journal.pinned_frees_snapshot(),
+            None => Vec::new(),
+        };
+
         let goal_group = if goal > first_data_block {
             ((goal - first_data_block) / nr_blocks_per_group) as usize
         } else {
@@ -471,19 +492,36 @@ impl Ext4 {
         }
         .min(nr_block_groups - 1);
 
+        let mut pinned_blocked = false;
         for group_search_offset in 0..nr_block_groups {
             let group_idx = (goal_group + group_search_offset) % nr_block_groups;
             let group = &self.block_groups[group_idx];
 
-            let range = group.alloc_blocks(count, sb_free_blocks, handle)?;
-            if !range.is_empty() {
-                let allocated_count = range.end - range.start;
-                sb.dec_free_blocks(allocated_count)?;
-                sb.journal_capture(handle, sb.last_orphan())?;
-                return Ok(range);
+            match group.alloc_blocks(count, sb_free_blocks, &pinned_frees, handle)? {
+                GroupBlockAlloc::Allocated(range) => {
+                    let allocated_count = range.end - range.start;
+                    sb.dec_free_blocks(allocated_count)?;
+                    sb.journal_capture(handle, sb.last_orphan())?;
+                    return Ok(range);
+                }
+                GroupBlockAlloc::NoFit { pinned_in_group } => pinned_blocked |= pinned_in_group,
             }
         }
 
+        if pinned_blocked {
+            // Everything left is pinned. Wake the committer (asynchronous —
+            // waiting here, under the superblock lock and the caller's inode
+            // locks and open handle, is banned; see the function docs) and
+            // fail the attempt: the state ends with the pinning transaction's
+            // commit, so a retry then succeeds.
+            if let Some(journal) = self.journal() {
+                journal.request_commit();
+            }
+            return_errno_with_message!(
+                Errno::ENOSPC,
+                "free blocks are pinned until the freeing transaction commits"
+            );
+        }
         return_errno_with_message!(Errno::ENOSPC, "no free blocks available in any group");
     }
 
@@ -509,6 +547,13 @@ impl Ext4 {
     /// blocks untouched: no revoke stands for a still-referenced block, no
     /// capture is lost (`RevokeDuty::discharge` in the journal's revoke
     /// module documents the three effects).
+    ///
+    /// Under a handle each run is also **pinned** right after its bitmap
+    /// clear ([`journal::pin_freed_run`]): the freed blocks stay out of the
+    /// allocator until this transaction commits — both credential flavors,
+    /// data and metadata alike (Linux pins exactly this set in ordered mode,
+    /// fs/ext4/mballoc.c:6536-6560). The superblock write lock held across
+    /// the whole function makes clear-then-pin atomic against the allocator.
     pub(super) fn free_blocks(
         &self,
         auth: journal::BlockFreeAuth,
@@ -545,6 +590,11 @@ impl Ext4 {
             }
             let freed_count =
                 group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
+            // Pin the freed run until this transaction commits (released at
+            // commit step 6). The bits are already clear, but no allocator can
+            // observe the gap: it needs the superblock write lock this
+            // function holds.
+            journal::pin_freed_run(handle, current_block, blocks_in_group)?;
             if freed_count > 0 {
                 sb.inc_free_blocks(freed_count as u64)?;
                 sb.journal_capture(handle, sb.last_orphan())?;
@@ -1749,6 +1799,132 @@ mod tests {
         assert_eq!(f.ext4.super_block().free_blocks_count(), sb_free_before + 1);
 
         drop(op2);
+    }
+
+    /// RED-LINE ③ structural closure: a block freed under a live handle does
+    /// not return to the allocator until the freeing transaction commits
+    /// (Linux mballoc — *"we don't reuse the freed block until after the
+    /// transaction is committed"*, `ext4_mb_free_metadata` /
+    /// `ext4_process_freed_data`). First-fit would hand the just-freed lowest
+    /// block right back, so reverting the allocator's pin skip fails the
+    /// mid-transaction assert; the commit (step 6) releases the pin and the
+    /// block is allocatable again.
+    #[ktest]
+    fn freed_blocks_pinned_until_commit() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // The lowest free block: after a free, first-fit would return it
+        // again immediately.
+        let op = f.ext4.begin_op(8).unwrap();
+        let pinned = f.ext4.alloc_blocks(1, 0, op.get()).unwrap().start;
+        f.ext4
+            .free_blocks(
+                journal::BlockFreeAuth::without_revoke_duty(pinned, 1),
+                op.get(),
+            )
+            .unwrap();
+        assert!(journal.pinned_frees_snapshot().contains(&(pinned, 1)));
+
+        // While the freeing transaction runs — even for the SAME transaction
+        // (Linux pins against same-transaction reuse too) — the allocator
+        // must skip the pinned block.
+        let other = f.ext4.alloc_blocks(1, pinned, op.get()).unwrap();
+        assert!(!other.contains(&pinned));
+        drop(op);
+
+        // The commit releases the pin with the revoke publication (step 6)…
+        journal.commit_now_for_test();
+        assert!(journal.pinned_frees_snapshot().is_empty());
+
+        // …and first-fit reclaims the block.
+        let op2 = f.ext4.begin_op(8).unwrap();
+        let reused = f.ext4.alloc_blocks(1, pinned, op2.get()).unwrap();
+        assert_eq!(reused.start, pinned);
+        drop(op2);
+    }
+
+    /// The ENOSPC interplay: when every free block is pinned, allocation
+    /// fails with a transient `ENOSPC` — never a hang (waiting for a commit
+    /// under the caller's locks is banned, and the pinning transaction is
+    /// the caller's own) and never a pinned block — and succeeds again once
+    /// the freeing transaction commits.
+    #[ktest]
+    fn pinned_exhaustion_is_transient_enospc() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Fill the volume (non-journaled allocs keep the fixture small).
+        let mut filled: Vec<Range<Ext4Bid>> = Vec::new();
+        loop {
+            match f.ext4.alloc_blocks(64, 0, None) {
+                Ok(range) => filled.push(range),
+                Err(e) => {
+                    // Truly full: the plain ENOSPC leg, unchanged.
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+        assert!(!filled.is_empty());
+
+        // Free everything under ONE running transaction: every free block on
+        // the volume is now pinned.
+        let op = f.ext4.begin_op(8).unwrap();
+        for range in &filled {
+            f.ext4
+                .free_blocks(
+                    journal::BlockFreeAuth::without_revoke_duty(
+                        range.start,
+                        (range.end - range.start) as u32,
+                    ),
+                    op.get(),
+                )
+                .unwrap();
+        }
+        assert!(!journal.pinned_frees_snapshot().is_empty());
+
+        // Free space exists (the superblock counter says so), but all of it
+        // awaits the commit: ENOSPC — not a wrong block, not a wait.
+        assert!(f.ext4.super_block().free_blocks_count() > 0);
+        let err = f.ext4.alloc_blocks(1, 0, op.get()).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        drop(op);
+
+        journal.commit_now_for_test();
+        assert!(journal.pinned_frees_snapshot().is_empty());
+        let op2 = f.ext4.begin_op(8).unwrap();
+        assert!(f.ext4.alloc_blocks(1, 0, op2.get()).is_ok());
+        drop(op2);
+    }
+
+    /// A non-journaled volume keeps the pre-pinning behavior: no log means no
+    /// commit boundary for a free to wait on, so a freed block is immediately
+    /// allocatable (first-fit returns it right back).
+    #[ktest]
+    fn non_journaled_free_is_immediately_reusable() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let freed = f.ext4.alloc_blocks(1, 0, None).unwrap().start;
+        f.ext4
+            .free_blocks(journal::BlockFreeAuth::without_revoke_duty(freed, 1), None)
+            .unwrap();
+        let reused = f.ext4.alloc_blocks(1, 0, None).unwrap();
+        assert_eq!(reused.start, freed);
     }
 
     #[ktest]

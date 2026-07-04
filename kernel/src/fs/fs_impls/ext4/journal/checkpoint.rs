@@ -447,13 +447,18 @@ pub(super) fn checkpoint(
     // first transaction touching an unpublished revoke's block.
     //
     // The snapshot is taken once per pass: a forget landing AFTER it (a free
-    // racing this pass on another thread) is outside this pass's defer set,
-    // so its block is protected only if this pass already applied every
-    // older image of it. The remaining exposure needs the freed block
-    // reallocated and caller-thread-flushed before this same pass reaches an
-    // older image of it; the structural closure is Linux's discipline of not
-    // returning freed blocks to the allocator until the freeing transaction
-    // commits (mballoc `ext4_mb_free_metadata`), tracked as P7 debt.
+    // racing this pass on another thread) is outside this pass's defer set.
+    // That arrival is harmless since freed-block pinning closed the reuse
+    // half of the hazard structurally (`JournalState::pinned_frees`, Linux's
+    // mballoc `ext4_mb_free_metadata` discipline): the mid-pass free pins
+    // its blocks, so no new owner can exist — applying an older image over a
+    // freed-but-unreused block is sound in both crash directions (the block
+    // still belongs to its old life if the freeing transaction vanishes, and
+    // its content is dont-care garbage once that transaction commits and
+    // publishes the revoke). Nor can the pins release mid-pass: release runs
+    // at commit step 6, and commits are serialized with checkpoint passes
+    // (the single committer thread runs both; the unmount flush runs after
+    // that thread stopped).
     let (dirty_tail, tail_tid, committed_tid, head, revoked, unpublished) = {
         let st = journal.state_read();
         let mut unpublished = BTreeSet::new();
@@ -1084,5 +1089,87 @@ mod tests {
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
         assert_eq!(f.journal.state_read().tail_block, None);
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+    }
+
+    /// The b2 residual (a forget landing after a pass's snapshot, the block
+    /// reused and caller-thread-flushed mid-pass), now structurally
+    /// unreachable: the forget's free PINS the block, so while the freeing
+    /// transaction is uncommitted the allocator cannot hand it to a new
+    /// owner — there is no reuse for the pass's older image to clobber,
+    /// whichever side of the snapshot the forget lands on. End-to-end
+    /// through the real free/alloc funnels: T1 journals B and commits
+    /// (un-checkpointed); a running T2 forgets-and-frees B; the allocator
+    /// refuses B; a pass defers in front of T1 (belt) and, deferred or not,
+    /// finds B unreused; after T2 commits, the pin releases with the revoke
+    /// publication, the next pass suppresses T1's image of B (suspenders),
+    /// and B is allocatable again.
+    #[ktest]
+    fn pinning_closes_the_mid_pass_reuse_window() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+        let device = f.ext4.block_device().clone();
+
+        // T1: B journaled as fresh metadata (content 0x51), committed, NOT
+        // checkpointed — T1's image of B waits in the log for a pass.
+        let op1 = f.ext4.begin_op(8).unwrap();
+        let b = f.ext4.alloc_blocks(1, 0, op1.get()).unwrap().start;
+        super::super::get_create_access(op1.get(), b)
+            .unwrap()
+            .patch(|buf| buf.fill(0x51))
+            .unwrap();
+        drop(op1);
+        journal.commit_now_for_test();
+        assert!(journal.state_read().tail_block.is_some());
+
+        // Running T2 forgets-and-frees B through the real funnel: the revoke
+        // is unpublished and B is pinned.
+        let op2 = f.ext4.begin_op(8).unwrap();
+        f.ext4
+            .free_blocks(super::super::forget(b, 1), op2.get())
+            .unwrap();
+        assert!(journal.pinned_frees_snapshot().contains(&(b, 1)));
+
+        // The reuse the residual race needed cannot happen: the allocator
+        // refuses B (first-fit would return the just-freed lowest block).
+        let other = f.ext4.alloc_blocks(1, b, op2.get()).unwrap();
+        assert!(!other.contains(&b));
+
+        // A pass right now defers in front of T1 (B's revoke is unpublished)
+        // and applies nothing; B's final location keeps its pre-T1 bytes.
+        checkpoint(journal.as_ref(), device.as_ref(), None).unwrap();
+        assert!(journal.state_read().tail_block.is_some());
+        let mut on_disk = [0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(b as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, [0u8; BLOCK_SIZE]);
+
+        // T2 commits: the pin releases with the revoke publication (step 6).
+        drop(op2);
+        journal.commit_now_for_test();
+        assert!(journal.pinned_frees_snapshot().is_empty());
+
+        // The next pass retires everything; the published revoke keeps T1's
+        // stale image of B off the device.
+        checkpoint(journal.as_ref(), device.as_ref(), None).unwrap();
+        assert_eq!(journal.state_read().tail_block, None);
+        f.disk
+            .segment()
+            .read_bytes(b as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, [0u8; BLOCK_SIZE]);
+
+        // B is allocatable again (first-fit reclaims it).
+        let op3 = f.ext4.begin_op(8).unwrap();
+        let reused = f.ext4.alloc_blocks(1, b, op3.get()).unwrap();
+        assert!(reused.contains(&b));
+        drop(op3);
     }
 }
