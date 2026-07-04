@@ -115,7 +115,7 @@ use super::{
 /// The descriptor's tag geometry is owned by the journal's
 /// [`TagLayout`](super::format::TagLayout): this walk iterates
 /// [`TagLayout::walk`](super::format::TagLayout::walk), the same definition the
-/// writer's `put_tag` and
+/// commit writer's [`TagWriter`](super::format::TagWriter) and
 /// [`apply_log_transaction`](super::checkpoint::apply_log_transaction) use, so
 /// the three cannot drift. Each tag's metadata block is the next log block
 /// after the previous ([`next_log_block`]); the commit block is the next log

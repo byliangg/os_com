@@ -357,8 +357,7 @@ const DESCRIPTOR_TAIL_BYTES: usize = 4;
 /// The descriptor-block tag geometry a journal's INCOMPAT feature bits select
 /// — the single source of truth for the byte layout of the tag array, derived
 /// once (parse-once, held by [`JournalSuperblock`]) and consumed by the commit
-/// writer, the recovery scanner, and the checkpoint/replay applier. Before
-/// this type each of those kept a hand-mirrored copy of the same offsets.
+/// writer, the recovery scanner, and the checkpoint/replay applier.
 ///
 /// Tag sizes follow Linux 6.6 `journal_tag_bytes()` (fs/jbd2/journal.c)
 /// exactly:
@@ -435,7 +434,7 @@ impl TagLayout {
     }
 
     /// The byte offset of the first tag: right past the 12-byte block header.
-    pub(super) const fn first_tag_offset(&self) -> usize {
+    const fn first_tag_offset(&self) -> usize {
         size_of::<RawJournalHeader>()
     }
 
@@ -447,11 +446,14 @@ impl TagLayout {
         BLOCK_SIZE - self.descriptor_tail_bytes
     }
 
-    /// The number of block tags guaranteed to fit one descriptor block under
-    /// this layout, conservatively charging every tag the 16-byte UUID cost
-    /// (only the first tag actually pays it). Bounds a single transaction's
-    /// metadata blocks while the commit pipeline writes one descriptor per
-    /// transaction ([`Journal::max_credits`](super::Journal::max_credits)).
+    /// The exact number of block tags one descriptor block holds under this
+    /// layout: `n` tags occupy the 12-byte block header, one 16-byte UUID
+    /// after the first tag (every later tag sets [`TAG_FLAG_SAME_UUID`] and
+    /// reuses it), and `n` tag strides, so `n` fits iff
+    /// `header + UUID + n * tag_bytes` fits the tag area. Bounds a single
+    /// transaction's metadata blocks while the commit pipeline writes one
+    /// descriptor per transaction
+    /// ([`Journal::max_credits`](super::Journal::max_credits)).
     pub(super) const fn tags_per_descriptor(&self) -> usize {
         (self.tag_area_end() - self.first_tag_offset() - TAG_UUID_BYTES) / self.tag_bytes
     }
@@ -465,66 +467,16 @@ impl TagLayout {
         (low, high)
     }
 
-    /// Serializes one block tag at `offset` into a (zeroed) descriptor-block
-    /// buffer and returns the offset where the next tag begins — past the tag
-    /// and, when this tag lacks [`TAG_FLAG_SAME_UUID`], its 16-byte UUID
-    /// (left as zeros; we carry no journal UUID). Tag checksum fields are
-    /// written as zero (P7a-4 fills them in).
-    ///
-    /// # Errors
-    ///
-    /// - `EFBIG` when `blocknr` does not fit 32 bits and the layout carries no
-    ///   `t_blocknr_high` word: truncating would journal the after-image to
-    ///   the wrong block on a > 16 TiB volume, so it is a real error, not a
-    ///   debug assert.
-    /// - `ENOSPC` when the tag (plus its UUID) would run past the tag area —
-    ///   into the reserved descriptor tail, or past the block.
-    pub(super) fn put_tag(
-        &self,
-        block: &mut [u8; BLOCK_SIZE],
-        offset: usize,
-        blocknr: Ext4Bid,
-        flags: u16,
-    ) -> Result<usize> {
-        let (low, high) = Self::split_blocknr(blocknr);
-        if high != 0 && !self.has_blocknr_high {
-            return_errno_with_message!(Errno::EFBIG, "journal block number exceeds 32-bit tag");
+    /// Returns a [`TagWriter`] over a descriptor-block buffer (zeroed past the
+    /// 12-byte header), positioned at the first tag — the write-side
+    /// counterpart of [`walk`](Self::walk). The writer owns the cursor, so tag
+    /// placement can neither skip nor reuse an offset.
+    pub(super) fn writer<'a>(&self, block: &'a mut [u8; BLOCK_SIZE]) -> TagWriter<'a> {
+        TagWriter {
+            layout: *self,
+            block,
+            offset: self.first_tag_offset(),
         }
-
-        let mut end = offset + self.tag_bytes;
-        if flags & TAG_FLAG_SAME_UUID == 0 {
-            end += TAG_UUID_BYTES;
-        }
-        if end > self.tag_area_end() {
-            return_errno_with_message!(Errno::ENOSPC, "journal descriptor tag area is full");
-        }
-
-        if self.csum_v3 {
-            let tag3 = RawJournalBlockTag3 {
-                t_blocknr: Be32::new(low),
-                t_flags: Be32::new(u32::from(flags)),
-                t_blocknr_high: Be32::new(high),
-                t_checksum: Be32::new(0),
-            };
-            block[offset..offset + BLOCK_TAG3_SIZE].copy_from_slice(tag3.as_bytes());
-        } else {
-            let tag = RawBlockTag {
-                t_blocknr: Be32::new(low),
-                t_checksum: Be16::new(0),
-                t_flags: Be16::new(flags),
-            };
-            block[offset..offset + BLOCK_TAG_SIZE].copy_from_slice(tag.as_bytes());
-            if self.has_blocknr_high {
-                let high_offset = offset + BLOCK_TAG_SIZE;
-                block[high_offset..high_offset + size_of::<Be32>()]
-                    .copy_from_slice(Be32::new(high).as_bytes());
-            }
-            // csum_v2's 2 stride-padding bytes (the frozen quirk) stay zero:
-            // the buffer arrives zeroed, exactly like jbd2's memset-clean
-            // descriptor buffer.
-        }
-
-        Ok(end)
     }
 
     /// Decodes the tag at `offset`. The caller ([`TagWalk`]) has already
@@ -543,8 +495,20 @@ impl TagLayout {
                     "journal descriptor tag has malformed flags"
                 );
             };
+            // A tag3 always carries the `t_blocknr_high` word on disk, but it
+            // joins the block number only when the journal has
+            // [`INCOMPAT_64BIT`]: Linux `read_tag_block` (fs/jbd2/recovery.c)
+            // gates the high word on the 64bit FEATURE for both tag formats.
+            // csum_v3 without 64bit is a real combination (a metadata_csum
+            // filesystem on a < 16 TiB volume), and stray bytes in the unused
+            // word must not redirect the replay.
+            let high = if self.has_blocknr_high {
+                raw.t_blocknr_high.get()
+            } else {
+                0
+            };
             Ok(DescriptorTag {
-                blocknr: Self::join_blocknr(raw.t_blocknr.get(), raw.t_blocknr_high.get()),
+                blocknr: Self::join_blocknr(raw.t_blocknr.get(), high),
                 flags,
             })
         } else {
@@ -573,7 +537,7 @@ impl TagLayout {
     /// right after the block header. The one shared reader of the tag
     /// geometry: the recovery scanner (PASS_SCAN), the checkpoint/replay
     /// applier, and the round-trip tests all iterate through it, so a reader
-    /// can never drift from [`put_tag`](Self::put_tag).
+    /// can never drift from the writer ([`TagWriter`]).
     pub(super) fn walk<'a>(&self, descriptor: &'a [u8; BLOCK_SIZE]) -> TagWalk<'a> {
         TagWalk {
             layout: *self,
@@ -581,6 +545,79 @@ impl TagLayout {
             offset: self.first_tag_offset(),
             done: false,
         }
+    }
+}
+
+/// Serializer for the tag array of one descriptor block (see
+/// [`TagLayout::writer`]) — the write-side mirror of [`TagWalk`].
+///
+/// Owns the write cursor: each [`put`](Self::put) lays one tag down at the
+/// current offset and advances past it (and, when the tag lacks
+/// [`TAG_FLAG_SAME_UUID`], its 16-byte UUID area), so a caller cannot place a
+/// tag at a stale or skipped offset — that misuse does not compile.
+pub(super) struct TagWriter<'a> {
+    layout: TagLayout,
+    block: &'a mut [u8; BLOCK_SIZE],
+    offset: usize,
+}
+
+impl TagWriter<'_> {
+    /// Serializes one block tag at the cursor into the (zeroed) descriptor
+    /// buffer and advances the cursor — past the tag and, when this tag lacks
+    /// [`TAG_FLAG_SAME_UUID`], its 16-byte UUID (left as zeros; we carry no
+    /// journal UUID). Tag checksum fields are written as zero (P7a-4 fills
+    /// them in).
+    ///
+    /// # Errors
+    ///
+    /// - `EFBIG` when `blocknr` does not fit 32 bits and the layout carries no
+    ///   `t_blocknr_high` word: truncating would journal the after-image to
+    ///   the wrong block on a > 16 TiB volume, so it is a real error, not a
+    ///   debug assert.
+    /// - `ENOSPC` when the tag (plus its UUID) would run past the tag area —
+    ///   into the reserved descriptor tail, or past the block.
+    pub(super) fn put(&mut self, blocknr: Ext4Bid, flags: u16) -> Result<()> {
+        let (low, high) = TagLayout::split_blocknr(blocknr);
+        if high != 0 && !self.layout.has_blocknr_high {
+            return_errno_with_message!(Errno::EFBIG, "journal block number exceeds 32-bit tag");
+        }
+
+        let offset = self.offset;
+        let mut end = offset + self.layout.tag_bytes;
+        if flags & TAG_FLAG_SAME_UUID == 0 {
+            end += TAG_UUID_BYTES;
+        }
+        if end > self.layout.tag_area_end() {
+            return_errno_with_message!(Errno::ENOSPC, "journal descriptor tag area is full");
+        }
+
+        if self.layout.csum_v3 {
+            let tag3 = RawJournalBlockTag3 {
+                t_blocknr: Be32::new(low),
+                t_flags: Be32::new(u32::from(flags)),
+                t_blocknr_high: Be32::new(high),
+                t_checksum: Be32::new(0),
+            };
+            self.block[offset..offset + BLOCK_TAG3_SIZE].copy_from_slice(tag3.as_bytes());
+        } else {
+            let tag = RawBlockTag {
+                t_blocknr: Be32::new(low),
+                t_checksum: Be16::new(0),
+                t_flags: Be16::new(flags),
+            };
+            self.block[offset..offset + BLOCK_TAG_SIZE].copy_from_slice(tag.as_bytes());
+            if self.layout.has_blocknr_high {
+                let high_offset = offset + BLOCK_TAG_SIZE;
+                self.block[high_offset..high_offset + size_of::<Be32>()]
+                    .copy_from_slice(Be32::new(high).as_bytes());
+            }
+            // csum_v2's 2 stride-padding bytes (the frozen quirk) stay zero:
+            // the buffer arrives zeroed, exactly like jbd2's memset-clean
+            // descriptor buffer.
+        }
+
+        self.offset = end;
+        Ok(())
     }
 }
 
@@ -651,7 +688,7 @@ impl Iterator for TagWalk<'_> {
             self.done = true;
             return Some(Err(Error::with_message(
                 Errno::EUCLEAN,
-                "journal descriptor tag runs past the block",
+                "journal descriptor tag runs past the tag area",
             )));
         }
         let tag = match self.layout.decode_tag(self.descriptor, self.offset) {
@@ -969,8 +1006,8 @@ mod tests {
     }
 
     /// Single-descriptor capacity per layout: `(tag area − header − UUID) /
-    /// tag bytes`, the conservative bound `max_credits` builds on. The v0
-    /// value is pinned to the pre-TagLayout constant.
+    /// tag bytes`, the exact bound `max_credits` builds on. The v0 value is
+    /// pinned to the pre-TagLayout constant.
     #[ktest]
     fn tag_layout_capacity_math() {
         let capacity = |features: u32| {
@@ -997,25 +1034,25 @@ mod tests {
     /// A block number above 32 bits is `EFBIG` on a layout without
     /// `t_blocknr_high`, and round-trips on one with it.
     #[ktest]
-    fn put_tag_blocknr_width_is_layout_gated() {
+    fn put_blocknr_width_is_layout_gated() {
         let wide: Ext4Bid = (1 << 32) | 5;
 
         let v0 = TagLayout::from_features(0).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
         let err = v0
-            .put_tag(&mut block, v0.first_tag_offset(), wide, TAG_FLAG_LAST_TAG)
+            .writer(&mut block)
+            .put(wide, TAG_FLAG_LAST_TAG)
             .unwrap_err();
         assert_eq!(err.error(), Errno::EFBIG);
 
         let b64 = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
-        b64.put_tag(&mut block, b64.first_tag_offset(), wide, TAG_FLAG_LAST_TAG)
-            .unwrap();
+        b64.writer(&mut block).put(wide, TAG_FLAG_LAST_TAG).unwrap();
         let tag = b64.walk(&block).next().unwrap().unwrap();
         assert_eq!(tag.blocknr(), wide);
         assert!(tag.is_last());
     }
 
-    /// 12-byte (64-bit) tags round-trip through `put_tag` + the walker,
+    /// 12-byte (64-bit) tags round-trip through the tag writer + the walker,
     /// including a > 32-bit block number, and land at the exact on-disk
     /// offsets (low word, high word, first-tag UUID gap).
     #[ktest]
@@ -1028,9 +1065,9 @@ mod tests {
             ((7 << 32) | 42, TAG_FLAG_SAME_UUID),
             (0xFFFF_FFFF, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
         ];
-        let mut offset = layout.first_tag_offset();
+        let mut writer = layout.writer(&mut block);
         for (blocknr, flags) in tags {
-            offset = layout.put_tag(&mut block, offset, blocknr, flags).unwrap();
+            writer.put(blocknr, flags).unwrap();
         }
 
         let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -1057,9 +1094,9 @@ mod tests {
             (0x0102_0304, 0),
             ((3 << 32) | 9, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
         ];
-        let mut offset = layout.first_tag_offset();
+        let mut writer = layout.writer(&mut block);
         for (blocknr, flags) in tags {
-            offset = layout.put_tag(&mut block, offset, blocknr, flags).unwrap();
+            writer.put(blocknr, flags).unwrap();
         }
 
         let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -1079,6 +1116,32 @@ mod tests {
         assert_eq!(&block[52..56], &[0, 0, 0, 3]);
     }
 
+    /// csum_v3 WITHOUT 64bit (a metadata_csum filesystem on a < 16 TiB
+    /// volume): the 16-byte tag3 still carries a `t_blocknr_high` word on
+    /// disk, but Linux `read_tag_block` (fs/jbd2/recovery.c) joins it only
+    /// when the journal has the 64bit FEATURE — the gate is the feature, not
+    /// the tag format. A stray nonzero high word must decode to the low word
+    /// alone.
+    #[ktest]
+    fn csum_v3_without_64bit_ignores_stray_blocknr_high() {
+        let layout = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+
+        let raw = RawJournalBlockTag3 {
+            t_blocknr: Be32::new(0x1234),
+            t_flags: Be32::new(u32::from(TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)),
+            // Garbage where a 64bit journal would keep the high half.
+            t_blocknr_high: Be32::new(0xDEAD_BEEF),
+            t_checksum: Be32::new(0),
+        };
+        let offset = layout.first_tag_offset();
+        block[offset..offset + BLOCK_TAG3_SIZE].copy_from_slice(raw.as_bytes());
+
+        let tag = layout.walk(&block).next().unwrap().unwrap();
+        assert_eq!(tag.blocknr(), 0x1234);
+        assert!(tag.is_last());
+    }
+
     /// csum_v2's frozen 10/14-byte strides round-trip (the two quirk padding
     /// bytes stay zero and the walker steps over them).
     #[ktest]
@@ -1089,15 +1152,10 @@ mod tests {
             let wide_ok = features & INCOMPAT_64BIT != 0;
             let second: Ext4Bid = if wide_ok { (5 << 32) | 6 } else { 0x600 };
 
-            let mut offset = layout.first_tag_offset();
-            offset = layout.put_tag(&mut block, offset, 0x500, 0).unwrap();
-            layout
-                .put_tag(
-                    &mut block,
-                    offset,
-                    second,
-                    TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
-                )
+            let mut writer = layout.writer(&mut block);
+            writer.put(0x500, 0).unwrap();
+            writer
+                .put(second, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
                 .unwrap();
 
             let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -1116,23 +1174,25 @@ mod tests {
         let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
         // A 16-byte tag at BLOCK_SIZE - 16 fits the block but overlaps the
-        // 4-byte tail: refused.
-        let err = v3
-            .put_tag(
-                &mut block,
-                BLOCK_SIZE - 16,
-                0x1,
-                TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
-            )
-            .unwrap_err();
+        // 4-byte tail: refused. The cursor is planted there directly (a
+        // white-box `TagWriter` literal): the offsets a sequential writer can
+        // reach on this geometry are all congruent mod 16, and this
+        // tail-only-overlap one is not among them.
+        let err = TagWriter {
+            layout: v3,
+            block: &mut block,
+            offset: BLOCK_SIZE - 16,
+        }
+        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+        .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
         // One slot earlier (clear of the tail) is accepted.
-        v3.put_tag(
-            &mut block,
-            BLOCK_SIZE - 4 - 16,
-            0x1,
-            TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
-        )
+        TagWriter {
+            layout: v3,
+            block: &mut block,
+            offset: BLOCK_SIZE - 4 - 16,
+        }
+        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
         .unwrap();
 
         // Walker bound: an all-zero tag array never sets LAST_TAG, so the walk

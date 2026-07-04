@@ -105,8 +105,8 @@ use super::{
 /// with every byte offset owned by the journal's
 /// [`TagLayout`](super::format::TagLayout): this walk iterates
 /// [`TagLayout::walk`](super::format::TagLayout::walk), the same definition the
-/// writer's `put_tag` and the recovery scanner use, so reader and writer cannot
-/// drift.
+/// commit writer's [`TagWriter`](super::format::TagWriter) and the recovery
+/// scanner use, so reader and writer cannot drift.
 ///
 /// Each tag's logged metadata block is the **next** log block after the previous
 /// one, starting from `start_log` (the descriptor) — the same `next_log_block`

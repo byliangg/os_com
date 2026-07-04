@@ -145,8 +145,8 @@ impl Transaction {
     ///
     /// Lays down the 12-byte header then one tag per captured block (in block
     /// order), with every byte offset — tag stride, the first tag's 16-byte
-    /// UUID, the reserved checksum tail — owned by `layout`
-    /// ([`TagLayout::put_tag`]), the same source of truth the recovery scanner
+    /// UUID, the reserved checksum tail — owned by `layout`'s tag writer
+    /// ([`TagLayout::writer`]), the same source of truth the recovery scanner
     /// and the checkpoint/replay applier walk with. Returns the buffer plus,
     /// for each captured block in the same order, whether that block must be
     /// escaped when written into the log (`escape[i] == true`).
@@ -169,7 +169,7 @@ impl Transaction {
         };
         block[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
 
-        let mut offset = layout.first_tag_offset();
+        let mut writer = layout.writer(&mut block);
         let mut escape = Vec::with_capacity(n);
 
         for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
@@ -191,13 +191,13 @@ impl Transaction {
             }
             escape.push(needs_escape);
 
-            // `put_tag` refuses a block number that does not fit the layout's
+            // `put` refuses a block number that does not fit the layout's
             // tag (`EFBIG`, only possible without 64-bit tags) and a tag that
             // would overrun the descriptor's tag area (`ENOSPC` — the
             // single-descriptor bound; `max_credits` refuses over-large
             // transactions up front, but the re-check keeps a directly built
             // transaction from overflowing).
-            offset = layout.put_tag(&mut block, offset, bid, flags)?;
+            writer.put(bid, flags)?;
         }
 
         Ok((block, escape))
