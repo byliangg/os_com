@@ -61,6 +61,7 @@
 use super::{
     super::{inode::Inode, prelude::*},
     Journal, Tid,
+    revoke::RevokeTable,
 };
 
 /// One ordered-data registration: the pages an operation's new metadata will
@@ -211,6 +212,16 @@ pub(in crate::fs::fs_impls::ext4) struct Transaction {
     /// The captured after-images, keyed by physical block number. An ordered map
     /// so commit writes tags in a deterministic block order.
     metadata: BTreeMap<Ext4Bid, MetaBuffer>,
+    /// The blocks this transaction revoked (jbd2's *running* revoke table,
+    /// revoke.c): each was freed under this transaction via
+    /// [`forget`](super::revoke::forget) after having been (or being eligible
+    /// to be) journaled. `running.take()` at commit is jbd2's
+    /// `journal_switch_revoke_table()` — the set rides into the commit
+    /// pipeline, which publishes it to the journal's committed-revoke memory
+    /// ([`stash_revokes`](Self::stash_revokes)) once the commit block is
+    /// durable. Capturing a revoked block again cancels its record
+    /// (`jbd2_journal_cancel_revoke`; see [`capture_write`](Self::capture_write)).
+    revoked: BTreeSet<Ext4Bid>,
     /// The inodes whose **data** was dirtied under this transaction, for
     /// ordered-data mode (jbd2 `t_inode_list`). Keyed by ino so an inode dirtied
     /// several times in one transaction is flushed once; the value is a [`Weak`]
@@ -230,6 +241,7 @@ impl Transaction {
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
+            revoked: BTreeSet::new(),
             ordered_data: BTreeMap::new(),
         }
     }
@@ -258,7 +270,15 @@ impl Transaction {
     /// (jbd2 `get_create_access`): its prior device content is meaningless, so
     /// no read is needed. Idempotent — a block already captured (possibly with
     /// patches applied) is left untouched.
+    ///
+    /// Re-journaling a block this transaction revoked cancels the revoke
+    /// (jbd2 `jbd2_journal_cancel_revoke`; revoke.c "block is revoked and
+    /// then journaled"): the desired end state is the new image, which must
+    /// both commit and stay applicable. Load-bearing for block reuse within
+    /// one transaction — a freed-then-reallocated metadata block whose revoke
+    /// survived would have its own new image suppressed at checkpoint.
     pub(super) fn capture_create(&mut self, bid: Ext4Bid) {
+        self.revoked.remove(&bid);
         self.metadata.entry(bid).or_insert_with(MetaBuffer::zeroed);
     }
 
@@ -275,12 +295,20 @@ impl Transaction {
     ///
     /// Idempotent — if the block is already captured, does nothing (it is *not*
     /// re-seeded, so any patches already applied survive).
+    ///
+    /// Cancels any revoke this transaction holds for the block, exactly as
+    /// [`capture_create`](Self::capture_create) does (jbd2
+    /// `jbd2_journal_cancel_revoke`). Data writes never pass this funnel, so
+    /// a revoked block reused as *data* keeps its revoke — revoke.c's third
+    /// case ("revoked and then written as data: … the revoke is _not_
+    /// cancelled").
     pub(super) fn capture_write(
         &mut self,
         bid: Ext4Bid,
         seed: Option<&[u8]>,
         device: &dyn BlockDevice,
     ) -> Result<()> {
+        self.revoked.remove(&bid);
         if self.metadata.contains_key(&bid) {
             return Ok(());
         }
@@ -320,6 +348,42 @@ impl Transaction {
                 },
             );
         }
+    }
+
+    /// Cancels any captured after-image of `bid` and records the block in
+    /// this transaction's revoke set — the running-transaction half of jbd2's
+    /// `jbd2_journal_forget` + `jbd2_journal_revoke` (revoke.c "block is
+    /// journaled and then revoked"): the free supersedes the pending write,
+    /// so the stale capture must not commit (we take the header's
+    /// cancel-the-journal-entry option), while the revoke record must — it
+    /// is what stops *older* committed log images of the block from being
+    /// applied over its post-free reuse. Reached through
+    /// [`forget`](super::revoke::forget), which also evicts the block's
+    /// retained un-checkpointed image.
+    pub(super) fn forget_block(&mut self, bid: Ext4Bid) {
+        self.metadata.remove(&bid);
+        self.revoked.insert(bid);
+    }
+
+    /// Publishes this transaction's revoke set into the journal's
+    /// committed-revoke memory, tagged with this transaction's tid (max-wins
+    /// — "only the last one counts", revoke.c). Called by the commit pipeline
+    /// under the journal state lock only after the commit block is durable;
+    /// publishing at `running.take()` time instead would let the inline
+    /// tail-drain checkpoint suppress older transactions' images on the
+    /// authority of a commit a crash could still erase (see the
+    /// [`revoke`](super::revoke) module docs on publication).
+    pub(super) fn stash_revokes(&self, table: &mut RevokeTable) {
+        for &bid in &self.revoked {
+            table.record(bid, self.tid);
+        }
+    }
+
+    /// The blocks currently in this transaction's revoke set, in block order.
+    /// Inspection accessor for the revoke/coverage tests.
+    #[cfg(ktest)]
+    pub(super) fn revoked_blocks(&self) -> impl Iterator<Item = Ext4Bid> + '_ {
+        self.revoked.iter().copied()
     }
 
     /// Patches a captured block's after-image in place (jbd2 `dirty_metadata`):
@@ -965,5 +1029,54 @@ mod tests {
         let live: Vec<_> = txn.ordered_data().map(|(_, len)| len).collect();
         assert_eq!(live, vec![200]);
         assert_eq!(txn.nr_ordered_data(), 2);
+    }
+
+    /// `forget_block` is jbd2's "journaled and then revoked": the pending
+    /// capture is cancelled (it must not commit), the revoke is recorded, and
+    /// a patch through a stale credential path errors instead of resurrecting
+    /// the block.
+    #[ktest]
+    fn forget_block_cancels_capture_and_records_revoke() {
+        let mut txn = Transaction::new(Tid::new(1));
+        txn.capture_create(42);
+        txn.apply_patch(42, |b| b[..4].copy_from_slice(&[1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(txn.nr_metadata_blocks(), 1);
+
+        txn.forget_block(42);
+        assert_eq!(txn.nr_metadata_blocks(), 0);
+        assert_eq!(txn.buffer_bytes(42), None);
+        assert_eq!(txn.revoked_blocks().collect::<Vec<_>>(), vec![42]);
+        // A patch after the forget (an outstanding `WriteAccess` misused past
+        // the free) fails loudly rather than re-journaling the freed block.
+        assert!(txn.apply_patch(42, |_| {}).is_err());
+    }
+
+    /// jbd2 `jbd2_journal_cancel_revoke` ("block is revoked and then
+    /// journaled"): a NEW capture of a revoked block in the same running
+    /// transaction cancels the revoke, through both capture funnels —
+    /// load-bearing for freed-then-reallocated metadata within one
+    /// transaction, whose new image a surviving revoke would suppress.
+    #[ktest]
+    fn recapture_cancels_revoke() {
+        // The create funnel (a freed block reallocated as fresh metadata).
+        let mut txn = Transaction::new(Tid::new(1));
+        txn.forget_block(42);
+        assert_eq!(txn.revoked_blocks().count(), 1);
+        txn.capture_create(42);
+        assert_eq!(txn.revoked_blocks().count(), 0);
+        assert_eq!(txn.nr_metadata_blocks(), 1);
+
+        // The write funnel (a reused block re-captured in place).
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut txn = Transaction::new(Tid::new(2));
+        txn.forget_block(300);
+        txn.capture_write(300, None, f.ext4.block_device().as_ref())
+            .unwrap();
+        assert_eq!(txn.revoked_blocks().count(), 0);
+        assert_eq!(txn.nr_metadata_blocks(), 1);
     }
 }

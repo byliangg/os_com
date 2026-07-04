@@ -475,13 +475,15 @@ impl InodeDesc {
         nblocks: u32,
     ) -> Result<Vec<Ext4Bid>> {
         // The journal inode is read-only here (no external node is ever
-        // written), so no checksum seed is needed.
+        // written, no block is ever freed), so no checksum seed and no
+        // forget policy apply.
         let em = ExtentManager::try_new(
             *self.raw_block(),
             self.sector_count(),
             fs,
             nblocks as usize,
             None,
+            journal::DataForgetPolicy::PlainData,
         )?;
         let mut map = Vec::with_capacity(nblocks as usize);
         let mut i: Iblock = 0;
@@ -1762,12 +1764,27 @@ impl InodePayload {
     /// root does not parse (`ExtentTree::try_new` — the parse-once boundary).
     fn new(desc: &InodeDesc, fs: Weak<Ext4>, csum_seed: Option<InodeCsumSeed>) -> Result<Self> {
         Ok(match desc.type_() {
-            InodeType::File | InodeType::Dir => Self::new_data_backed(
+            // The freed-data revoke policy keys off the inode type, exactly
+            // Linux `get_default_free_blocks_flags` (fs/ext4/extents.c:
+            // 2405-2420): directory blocks are journaled metadata and
+            // symlink targets are revoked conservatively, so both forget
+            // their freed data blocks; regular-file data (ordered mode,
+            // never journaled) does not.
+            InodeType::File => Self::new_data_backed(
                 desc.size() as usize,
                 *desc.raw_block(),
                 desc.sector_count(),
                 fs,
                 csum_seed,
+                journal::DataForgetPolicy::PlainData,
+            )?,
+            InodeType::Dir => Self::new_data_backed(
+                desc.size() as usize,
+                *desc.raw_block(),
+                desc.sector_count(),
+                fs,
+                csum_seed,
+                journal::DataForgetPolicy::Forget,
             )?,
             // A symlink is fast (inline) when it is not extent-based and its
             // target fits in the `i_block` area; otherwise it is a slow,
@@ -1788,6 +1805,7 @@ impl InodePayload {
                         desc.sector_count(),
                         fs,
                         csum_seed,
+                        journal::DataForgetPolicy::Forget,
                     )?
                 }
             }
@@ -1803,6 +1821,7 @@ impl InodePayload {
         sector_count: u64,
         fs: Weak<Ext4>,
         csum_seed: Option<InodeCsumSeed>,
+        data_forget_policy: journal::DataForgetPolicy,
     ) -> Result<Self> {
         let page_cache_size = size.align_up(PAGE_SIZE);
         let page_count = page_cache_size / PAGE_SIZE;
@@ -1812,6 +1831,7 @@ impl InodePayload {
             fs,
             page_count,
             csum_seed,
+            data_forget_policy,
         )?);
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
         let page_cache = PageCache::new_with_backend(page_cache_size, backend)

@@ -158,6 +158,10 @@ impl InodeInner {
                     // so its extent tree never grows an external node — the
                     // node kind that would carry a tail checksum. No seed needed.
                     None,
+                    // Symlink data blocks are revoked on free, mirroring
+                    // Linux's unconditional S_ISLNK → METADATA | FORGET
+                    // (fs/ext4/extents.c:2415-2417).
+                    journal::DataForgetPolicy::Forget,
                 )?;
                 // The `i_block` now holds an extent root, not inline bytes: restore
                 // the `EXTENTS` flag a prior fast target cleared, or writeback would

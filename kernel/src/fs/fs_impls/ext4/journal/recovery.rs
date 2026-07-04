@@ -432,8 +432,13 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     // just marks the journal clean with `end_tid == s_sequence`.)
     let mut log = s_start;
     let mut tid = s_sequence;
+    // No PASS_REVOKE yet (P7b-4): replay runs with an EMPTY revoke table — a
+    // valid revoke block in the log already refused the mount at SCAN, so no
+    // suppression can be owed here. b4 replaces this with the table built
+    // from the log's revoke blocks, through this same parameter.
+    let no_revokes = super::revoke::RevokeTable::new();
     for _ in 0..count {
-        log = apply_log_transaction(journal, device, log, tid)?;
+        log = apply_log_transaction(journal, device, log, tid, &no_revokes)?;
         tid = tid.next();
     }
 
@@ -1669,8 +1674,14 @@ mod tests {
         descriptor[BLOCK_SIZE - 2] ^= 0x20;
         write_log_block_at(&f, 1, &descriptor);
 
-        let err =
-            apply_log_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7)).unwrap_err();
+        let err = apply_log_transaction(
+            f.journal.as_ref(),
+            device.as_ref(),
+            1,
+            Tid::new(7),
+            &super::super::revoke::RevokeTable::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.error(), Errno::EUCLEAN);
         // Nothing was applied: the tail check precedes every tag write.
         assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
@@ -1699,8 +1710,14 @@ mod tests {
         logged[123] ^= 0x08;
         write_log_block_at(&f, 3, &logged);
 
-        let err =
-            apply_log_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7)).unwrap_err();
+        let err = apply_log_transaction(
+            f.journal.as_ref(),
+            device.as_ref(),
+            1,
+            Tid::new(7),
+            &super::super::revoke::RevokeTable::new(),
+        )
+        .unwrap_err();
         assert_eq!(err.error(), Errno::EUCLEAN);
         assert_eq!(read_final_block(&f, good_dest), good);
         assert_eq!(read_final_block(&f, bad_dest), [0u8; BLOCK_SIZE]);

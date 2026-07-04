@@ -487,13 +487,22 @@ impl Ext4 {
         return_errno_with_message!(Errno::ENOSPC, "no free blocks available in any group");
     }
 
-    /// Frees `count` blocks starting at `start`, splitting across groups.
+    /// Frees the physical block run `auth` covers, splitting across groups.
+    ///
+    /// Consuming a [`journal::BlockFreeAuth`] instead of a bare
+    /// `(start, count)` pair is the forget-before-free protocol (rust_rules
+    /// ⑤; Linux `ext4_free_blocks` runs `ext4_forget` before the bitmap
+    /// clear, fs/ext4/mballoc.c:6676/6719): the credential is minted either
+    /// by [`journal::forget`] — journaled metadata and revoke-covered data
+    /// (extent-tree nodes, directory blocks, slow-symlink targets) — or by
+    /// [`journal::BlockFreeAuth::for_never_journaled_data`] for ordered-mode
+    /// file data, so a free that skips the revoke decision does not compile.
     pub(super) fn free_blocks(
         &self,
-        start: Ext4Bid,
-        count: u32,
+        auth: journal::BlockFreeAuth,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        let (start, count) = auth.into_parts();
         if count == 0 {
             return Ok(());
         }
@@ -1638,7 +1647,12 @@ mod tests {
             before_sb_free - alloc_len as u64
         );
 
-        f.ext4.free_blocks(range.start, alloc_len, None).unwrap();
+        f.ext4
+            .free_blocks(
+                journal::BlockFreeAuth::for_never_journaled_data(range.start, alloc_len),
+                None,
+            )
+            .unwrap();
         assert_eq!(f.ext4.block_group(0).free_blocks_count(), before_group_free);
         assert_eq!(f.ext4.super_block().free_blocks_count(), before_sb_free);
     }

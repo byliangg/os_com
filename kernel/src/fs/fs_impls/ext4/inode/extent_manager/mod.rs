@@ -113,6 +113,13 @@ pub(super) struct ExtentManager {
     /// a correct extent-block tail checksum (`ext4_extent_block_csum`); `None`
     /// leaves those blocks byte-identical to the pre-feature layout.
     csum_seed: Option<InodeCsumSeed>,
+    /// The owning inode's revoke rule for its freed DATA blocks (Linux
+    /// `get_default_free_blocks_flags`): [`Forget`](journal::DataForgetPolicy::Forget)
+    /// for directories (journaled dir blocks) and symlinks (Linux-conservative
+    /// slow-target revoke), [`PlainData`](journal::DataForgetPolicy::PlainData)
+    /// for regular files. Fixed at inode type, threaded to the truncate free
+    /// sites the same route as `csum_seed`.
+    data_forget_policy: journal::DataForgetPolicy,
 }
 
 impl ExtentManager {
@@ -123,12 +130,14 @@ impl ExtentManager {
         fs: Weak<super::super::fs::Ext4>,
         npages: usize,
         csum_seed: Option<InodeCsumSeed>,
+        data_forget_policy: journal::DataForgetPolicy,
     ) -> Result<Self> {
         Ok(Self {
             state: RwMutex::new(ExtentTree::try_new(root, sector_count)?),
             npages: AtomicUsize::new(npages),
             fs,
             csum_seed,
+            data_forget_policy,
         })
     }
 
@@ -268,7 +277,12 @@ impl ExtentManager {
                     handle,
                     self.csum_seed,
                 ) {
-                    let _ = fs.free_blocks(range.start, got, handle);
+                    // Fresh unwritten blocks never referenced by the tree:
+                    // nothing journaled, nothing to revoke.
+                    let _ = fs.free_blocks(
+                        journal::BlockFreeAuth::for_never_journaled_data(range.start, got),
+                        handle,
+                    );
                     return Err(err);
                 }
                 ib += got;
@@ -340,8 +354,12 @@ impl ExtentManager {
             None,
             self.csum_seed,
         ) {
-            // Free the just-allocated block rather than leak it.
-            let _ = fs.free_blocks(pblock, 1, None);
+            // Free the just-allocated block rather than leak it (a data
+            // block that never entered the tree: nothing to revoke).
+            let _ = fs.free_blocks(
+                journal::BlockFreeAuth::for_never_journaled_data(pblock, 1),
+                None,
+            );
             return Err(err);
         }
         Ok(pblock)
@@ -357,9 +375,13 @@ impl ExtentManager {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let fs = self.fs()?;
-        self.state
-            .write()
-            .truncate_to_byte_len(&fs, new_size, handle, self.csum_seed)
+        self.state.write().truncate_to_byte_len(
+            &fs,
+            new_size,
+            handle,
+            self.csum_seed,
+            self.data_forget_policy,
+        )
     }
 }
 
@@ -495,7 +517,15 @@ mod tests {
             start_hi: 0,
             start_lo: 100,
         }]);
-        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 4, None).unwrap();
+        let em = ExtentManager::try_new(
+            root,
+            4 * 8,
+            f.ext4.this(),
+            4,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
 
         let m0 = em.map_blocks(0).unwrap();
         assert_eq!(m0.state(), MapState::Written);
@@ -522,7 +552,15 @@ mod tests {
             start_hi: 0,
             start_lo: 500,
         }]);
-        let em = ExtentManager::try_new(root, 2 * 8, f.ext4.this(), 2, None).unwrap();
+        let em = ExtentManager::try_new(
+            root,
+            2 * 8,
+            f.ext4.this(),
+            2,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
         let m = em.map_blocks(0).unwrap();
         assert_eq!(m.state(), MapState::Unwritten);
         assert!(m.reads_as_zeros());
@@ -566,7 +604,15 @@ mod tests {
                 start_lo: 400,
             },
         ]);
-        let em = ExtentManager::try_new(root, 4 * 8, f.ext4.this(), 8, None).unwrap();
+        let em = ExtentManager::try_new(
+            root,
+            4 * 8,
+            f.ext4.this(),
+            8,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
 
         let free_before = f.ext4.super_block().free_blocks_count();
         assert_eq!(free_before, 1);
@@ -606,7 +652,15 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0, None).unwrap();
+        let em = ExtentManager::try_new(
+            inline_root(&[]),
+            0,
+            f.ext4.this(),
+            0,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
         grow_to_depth_1(&f, &em);
 
         // The leaf exists only as the running transaction's capture; the device
@@ -642,7 +696,15 @@ mod tests {
         let journal = f.ext4.journal().unwrap();
         journal.stop_commit_thread();
 
-        let em = ExtentManager::try_new(inline_root(&[]), 0, f.ext4.this(), 0, None).unwrap();
+        let em = ExtentManager::try_new(
+            inline_root(&[]),
+            0,
+            f.ext4.this(),
+            0,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
         grow_to_depth_1(&f, &em);
 
         // Commit + checkpoint: the leaf's capture retires, the device becomes

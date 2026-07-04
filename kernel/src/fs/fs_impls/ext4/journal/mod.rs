@@ -46,8 +46,11 @@
 //! - [`WriteAccess::patch`] — the metadata block has been modified; live,
 //!   its `patch` closure writes the modification into the captured after-image,
 //!   so sub-objects sharing a block accumulate onto one buffer.
-//! - [`forget`] — a previously journaled metadata block is being freed (the
-//!   sole insertion point for P7b revoke records); still a no-op.
+//! - [`forget`] — a previously journaled metadata block is being freed: the
+//!   running transaction's capture of it is cancelled, the block enters the
+//!   transaction's revoke set (suppressing older log images at checkpoint /
+//!   replay once committed), and its retained un-checkpointed image is
+//!   evicted. Mints the [`BlockFreeAuth`] the free consumes — see [`revoke`].
 //!
 //! **Without a handle (`None`) every wrapper is inert** and persistence stays
 //! ext2-style: metadata objects carry a [`Dirty`](super::utils::Dirty) flag
@@ -90,6 +93,7 @@ mod format;
 #[cfg(ktest)]
 mod interop_vectors;
 mod recovery;
+mod revoke;
 mod transaction;
 
 /// Replays a dirty journal at mount time (jbd2 `jbd2_journal_recover`).
@@ -98,6 +102,12 @@ mod transaction;
 /// mount-time recovery; the pass machinery lives in [`recovery`]. A no-op when the
 /// on-disk journal superblock is already clean (`s_start == 0`).
 pub(in crate::fs::fs_impls::ext4) use self::recovery::recover;
+/// Re-exported at the `ext4` level: the forget-before-free protocol —
+/// [`forget`] mints the [`BlockFreeAuth`] that
+/// [`Ext4::free_blocks`](super::fs::Ext4) consumes, and [`DataForgetPolicy`]
+/// is the per-inode-type rule the truncate paths thread down to their data
+/// frees. See the [`revoke`] module.
+pub(in crate::fs::fs_impls::ext4) use self::revoke::{BlockFreeAuth, DataForgetPolicy, forget};
 /// Re-exported at the `ext4` level so allocation/extent paths can thread an
 /// `Option<&Handle>` through to the [`get_write_access`]/[`WriteAccess::patch`]
 /// funnels. The handle lifecycle (`journal_start`/`journal_stop`) stays inside
@@ -799,6 +809,19 @@ pub(super) struct JournalState {
     /// The oldest un-checkpointed transaction's id — the on-disk `s_sequence`
     /// (jbd2 `journal_t.j_tail_sequence`).
     pub(super) tail_tid: Tid,
+    /// The committed-revoke memory: for each revoked block, the tid of the
+    /// newest committed transaction that revoked (freed) it.
+    ///
+    /// This is what suppresses the S1 runtime clobber: our checkpoint re-reads
+    /// the LOG ([`checkpoint::apply_log_transaction`]) — so a block freed and
+    /// reused after an older transaction journaled it would be overwritten by
+    /// that transaction's log image on the next checkpoint pass, no crash
+    /// required. Entries are published by the commit pipeline once a
+    /// transaction's commit block is durable (never earlier — the inline
+    /// tail-drain checkpoint runs mid-commit and must not trust an erasable
+    /// commit's revokes), and retired by [`checkpoint`](checkpoint::checkpoint)
+    /// at the same tid boundary that evicts `uncheckpointed`. See [`revoke`].
+    pub(super) revoked: revoke::RevokeTable,
     /// The newest committed-but-un-checkpointed after-image of each metadata
     /// block, retained from the moment a transaction leaves `running` to commit
     /// until checkpoint writes the block to its final location.
@@ -860,6 +883,7 @@ impl Journal {
                 head,
                 tail_block,
                 tail_tid,
+                revoked: revoke::RevokeTable::new(),
                 uncheckpointed: BTreeMap::new(),
             }),
             committed_tid: AtomicU32::new(committed_tid.get()),
@@ -1542,7 +1566,8 @@ pub(super) fn get_create_access<'h>(
 /// inside the credential — a wrong-bid patch landing on a neighbor's capture
 /// in the shared running transaction can no longer be written. The credential
 /// carries no block-kind tag: journal checksums are keyed by the
-/// journal-UUID seed plus commit tid, and revoke records by [`ForgetKind`].
+/// journal-UUID seed plus commit tid, and revoke records by the free-side
+/// [`DataForgetPolicy`] / [`forget`] protocol.
 ///
 /// On a non-journaled volume — or from a caller with no open transaction —
 /// the credential is **inert**: `patch` succeeds without invoking the closure
@@ -1636,24 +1661,6 @@ pub(super) fn read_metadata_block(
     Ok(device.read_val(Bid::new(blocknr).to_offset())?)
 }
 
-/// What kind of block a [`forget`] covers — the revoke record P7 writes
-/// differs per kind, and a bare `bool` at the call sites said nothing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ForgetKind {
-    /// A journaled metadata block (extent-tree node, directory block, …).
-    Metadata,
-    /// File data (ordered-mode bookkeeping) — constructed once P7b's revoke
-    /// machinery covers data blocks.
-    #[expect(dead_code)]
-    Data,
-}
-
-/// Records that a previously journaled metadata block is being freed. Still a
-/// no-op; `kind`/`blocknr` are the P7b revoke insertion point.
-pub(super) fn forget(_handle: Option<&Handle>, _kind: ForgetKind, _blocknr: Ext4Bid) -> Result<()> {
-    Ok(())
-}
-
 /// Test helper: writes a clean [`RawJournalSuperblock`] (`s_start == 0`) at the
 /// given physical block, mirroring what `mke2fs` lays down for a fresh journal.
 ///
@@ -1697,6 +1704,26 @@ impl Journal {
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn commit_now_for_test(&self) {
         self.commit_one();
+    }
+
+    /// Test helper: the blocks in the running transaction's revoke set, in
+    /// block order (empty when no transaction runs). White-box inspection for
+    /// the forget-coverage tests; call with the commit thread stopped, or the
+    /// transaction may be consumed between the operation and the assertion.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn running_revoked_blocks_for_test(&self) -> Vec<Ext4Bid> {
+        self.state_read()
+            .running
+            .as_ref()
+            .map_or_else(Vec::new, |txn| txn.revoked_blocks().collect())
+    }
+
+    /// Test helper: the number of records in the committed-revoke memory —
+    /// nonzero between a revoking transaction's commit and the checkpoint
+    /// that retires it.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn committed_revoke_records_for_test(&self) -> usize {
+        self.state_read().revoked.len()
     }
 }
 
@@ -2529,6 +2556,70 @@ mod tests {
             .unwrap();
         assert_eq!(&final_block[8..12], &[0x22; 4]);
         assert_eq!(final_block[100], 0x77);
+    }
+
+    /// `forget` evicts the freed block's committed-but-un-checkpointed image:
+    /// the stale bytes stop being served by the read funnel
+    /// (`read_metadata_block`) and stop seeding later captures — the device
+    /// is the fallback again. Also drives cancel-on-recapture end to end
+    /// through the production funnels: re-capturing the forgotten block in
+    /// the same running transaction cancels its revoke record
+    /// (`jbd2_journal_cancel_revoke`).
+    #[ktest]
+    fn forget_evicts_uncheckpointed_image_and_recapture_cancels() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device().clone();
+
+        let bid: Ext4Bid = 502;
+        let base = [0xAAu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(bid as usize * BLOCK_SIZE, &base)
+            .unwrap();
+
+        // Txn 1 journals the block; committed but NOT checkpointed — the
+        // retained image (not the lagging device) is the block's newest
+        // content, and the read funnel serves it.
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        get_write_access(Some(&h1), bid)
+            .unwrap()
+            .patch(|buf| buf[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        journal_stop(h1).unwrap();
+        f.journal.commit_now_for_test();
+        let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), bid).unwrap();
+        assert_eq!(&served[..4], &[0x11; 4]);
+
+        // Txn 2 frees the block: the retained image is evicted, so metadata
+        // reads fall through to the device again…
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        let _auth = forget(Some(&h2), bid, 1).unwrap();
+        assert_eq!(f.journal.running_revoked_blocks_for_test(), vec![bid]);
+        let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), bid).unwrap();
+        assert_eq!(
+            served, base,
+            "a forgotten block's stale image must stop being served"
+        );
+
+        // …and a re-capture (the block reallocated as metadata within the
+        // same transaction) seeds from the device, not the evicted image —
+        // and cancels the revoke, so the block's new image will not be
+        // suppressed at checkpoint.
+        get_write_access(Some(&h2), bid)
+            .unwrap()
+            .patch(|buf| {
+                assert_eq!(
+                    &buf[..4],
+                    &[0xAA; 4],
+                    "the capture must seed from the device"
+                );
+                buf[..4].copy_from_slice(&[0x22; 4]);
+            })
+            .unwrap();
+        assert!(f.journal.running_revoked_blocks_for_test().is_empty());
+        journal_stop(h2).unwrap();
     }
 
     // --- P7a-4: the D-4 mount-time journal feature upgrade. ---

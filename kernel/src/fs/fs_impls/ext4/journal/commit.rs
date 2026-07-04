@@ -116,7 +116,14 @@
 //!
 //! # Phase 4 simplifications
 //!
-//! - **No revoke records** — P7b.
+//! - **Revoke records are not yet written to the log** (P7b-3): a committed
+//!   transaction's revoke set is published to the journal's in-memory
+//!   committed-revoke table at step 6 — the [`revoke`](super::revoke)
+//!   publication rule — which suppresses the *runtime* checkpoint replay of
+//!   freed blocks; the on-disk log carries no revoke blocks yet, so the
+//!   *crash* half (mount-time recovery replaying a freed block's old image)
+//!   remains open until b3 serializes the set and b4's PASS_REVOKE consumes
+//!   it.
 //! - **Synchronous**: [`try_commit_transaction`] does its device I/O inline.
 //!   Production reaches it only through
 //!   [`Journal::commit_or_drain_tail`](super::Journal) (the background commit
@@ -573,6 +580,17 @@ pub(super) fn try_commit_transaction(
             st.tail_block = Some(start_head);
             st.tail_tid = tid;
         }
+        // Publish the transaction's revoke records: they become effective
+        // exactly now, with the commit block durable (step 4) — never
+        // earlier. `commit_or_drain_tail`'s inline drain checkpoint runs
+        // mid-commit; had these been published at `running.take()` time, the
+        // drain would suppress OLDER transactions' after-images on the
+        // authority of a commit a crash could still erase, leaving the
+        // device short of committed (fsync-acknowledged) metadata whose log
+        // blocks the drain just retired. (jbd2 equivalently keeps a freed
+        // buffer on the older checkpoint list until the freeing transaction
+        // commits.)
+        txn.stash_revokes(&mut st.revoked);
     }
     // Release `Acquire` in `committed_tid()`: publishes after the state update.
     journal
@@ -1134,6 +1152,45 @@ mod tests {
         // (this is a clean-journal commit) = 4.
         let issued = f.fixture.disk.flush_count() - before;
         assert!(issued >= 3, "expected >= 3 barriers, got {issued}");
+    }
+
+    /// A forgotten block leaves no trace in the committed log (jbd2 "block is
+    /// journaled and then revoked", the cancel-the-journal-entry option): the
+    /// descriptor chain tags only the surviving captures, the freed block's
+    /// after-image is not logged, and the revoke is published to the
+    /// journal's committed-revoke memory at commit.
+    #[ktest]
+    fn commit_omits_forgotten_block_and_publishes_revoke() {
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let (freed, kept) = (500u64, 700u64);
+        let mut freed_img = [0u8; BLOCK_SIZE];
+        freed_img[..8].copy_from_slice(b"FREEDIMG");
+        let mut kept_img = [0u8; BLOCK_SIZE];
+        kept_img[..8].copy_from_slice(b"KEPT-IMG");
+
+        let mut txn = make_txn(Tid::new(1), &[(freed, freed_img), (kept, kept_img)]);
+        txn.forget_block(freed);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // Walk the committed descriptor's tag bytes: exactly one tag, naming
+        // the kept block (with LAST_TAG), followed by its after-image.
+        let desc = read_log_header(&f, 1);
+        assert_eq!(desc.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+        let tag0 = read_tag(&f, 1, 0);
+        assert_eq!(tag0.t_blocknr.get(), kept as u32);
+        assert_ne!(tag0.t_flags.get() & TAG_FLAG_LAST_TAG, 0);
+        assert_eq!(read_log_block(&f, 2), kept_img);
+        // The chain block right after the single logged image is the commit
+        // block — no second data block (the freed image) was written.
+        assert_eq!(read_log_header(&f, 3).h_blocktype.get(), BLOCKTYPE_COMMIT);
+
+        // The revoke crossed into the committed-revoke memory with the
+        // commit, and only then retires (by checkpoint).
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
     }
 
     /// An empty ordered set issues no data barrier: only the metadata + commit

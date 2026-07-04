@@ -2350,6 +2350,108 @@ mod tests {
         f
     }
 
+    /// Revoke coverage, directory reclaim (audit row 3b — the historical
+    /// `forget-coverage-gap`): rmdir of a subdirectory reclaims it through
+    /// `try_reclaim_deleted_inode` → `truncate_to_byte_len(0)`, whose
+    /// dir-typed forget policy must land every freed dir block in the
+    /// transaction's revoke set (Linux `S_ISDIR → METADATA | FORGET`,
+    /// fs/ext4/extents.c:2415-2417).
+    #[ktest]
+    fn rmdir_reclaim_forgets_dir_blocks() {
+        let f = journaled_fixture_for_create();
+        let journal = f.ext4.journal().unwrap();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let sub = dir.create("gone", InodeType::Dir, perm()).unwrap();
+        // The subdirectory's `.`/`..` block — the journaled dir block the
+        // reclaim must revoke.
+        let dir_block = sub
+            .inner
+            .read()
+            .extent_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .mapped_pblock()
+            .unwrap();
+        drop(sub);
+        // Commit the creation, so the reclaim below runs in a fresh
+        // transaction whose revoke set is exactly the reclaim's own.
+        journal.commit_now_for_test();
+        assert!(journal.running_revoked_blocks_for_test().is_empty());
+
+        // rmdir drops the last reference: the reclaim runs synchronously.
+        dir.rmdir("gone").unwrap();
+
+        assert!(
+            journal
+                .running_revoked_blocks_for_test()
+                .contains(&dir_block),
+            "the freed dir block must be in the reclaim transaction's revoke set"
+        );
+    }
+
+    /// Revoke coverage, slow-symlink reclaim (audit row 3c): unlinking a
+    /// symlink with an extent-mapped (slow) target forgets the freed target
+    /// block, mirroring Linux's unconditional `S_ISLNK → METADATA | FORGET`.
+    #[ktest]
+    fn symlink_reclaim_forgets_target_block() {
+        let f = journaled_fixture_for_create();
+        let journal = f.ext4.journal().unwrap();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let link = dir.create("ln", InodeType::SymLink, perm()).unwrap();
+        // A target too long for the inline fast path: it takes a data block.
+        link.write_link(&"x".repeat(300)).unwrap();
+        let target_block = link
+            .inner
+            .read()
+            .extent_manager()
+            .unwrap()
+            .map_blocks(0)
+            .unwrap()
+            .mapped_pblock()
+            .unwrap();
+        drop(link);
+        journal.commit_now_for_test();
+        assert!(journal.running_revoked_blocks_for_test().is_empty());
+
+        dir.unlink("ln").unwrap();
+
+        assert!(
+            journal
+                .running_revoked_blocks_for_test()
+                .contains(&target_block),
+            "the freed slow-symlink target must be in the revoke set"
+        );
+    }
+
+    /// Revoke NON-coverage, regular-file data (audit row 3a): a file
+    /// truncate frees its data blocks with NO revoke records — ordered-mode
+    /// file data never enters the log (Linux frees it with `flags == 0`,
+    /// fs/ext4/extents.c:2413-2420), so revoking it would only bloat the
+    /// revoke table and, later, the on-disk revoke blocks.
+    #[ktest]
+    fn file_truncate_records_no_revoke() {
+        let f = journaled_fixture_for_create();
+        let journal = f.ext4.journal().unwrap();
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+
+        let file = dir.create("data.bin", InodeType::File, perm()).unwrap();
+        let payload = [0x5Au8; BLOCK_SIZE];
+        let mut reader = VmReader::from(payload.as_slice()).to_fallible();
+        assert_eq!(file.write_at(0, &mut reader).unwrap(), BLOCK_SIZE);
+        assert!(file.sector_count() > 0);
+        journal.commit_now_for_test();
+
+        file.resize(0).unwrap();
+
+        assert!(
+            journal.running_revoked_blocks_for_test().is_empty(),
+            "regular-file data frees must not produce revoke records"
+        );
+    }
+
     /// The Task 8 story end to end: unlink-of-open chains both inodes onto the
     /// orphan list (head = the newest, `i_dtime` = the successor, all
     /// journaled); reclaiming the *tail* first exercises the non-head splice

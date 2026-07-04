@@ -321,12 +321,19 @@ impl ExtentTree {
     /// Frees every data block and extent-tree metadata block mapping a logical
     /// region at or beyond `new_size` bytes, rewriting the tree and updating
     /// `i_blocks`.
+    ///
+    /// `data_policy` is the owning inode's revoke rule for its DATA blocks
+    /// (Linux `get_default_free_blocks_flags`): directory blocks and
+    /// slow-symlink targets are forgotten (revoked) before their free,
+    /// regular-file data is not. The tree's own external nodes are always
+    /// forgotten ([`free_meta_block`]), independent of the policy.
     pub(super) fn truncate_to_byte_len(
         &mut self,
         fs: &Ext4,
         new_size: usize,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
@@ -345,8 +352,11 @@ impl ExtentTree {
                 continue;
             }
             if e_start >= keep_blocks {
-                // Entire extent is beyond the new size; free all its blocks.
-                fs.free_blocks(e.start(), e.len() as u32, handle)?;
+                // Entire extent is beyond the new size; free all its blocks
+                // (forgetting them first when the inode's policy says its
+                // data is revoke-covered — dir blocks, slow-symlink targets).
+                let auth = data_policy.authorize(handle, e.start(), e.len() as u32)?;
+                fs.free_blocks(auth, handle)?;
                 freed_data += e.len() as u64;
                 continue;
             }
@@ -354,7 +364,9 @@ impl ExtentTree {
             // Lossless: the head lies inside this extent, whose length is u16.
             let head_len = (keep_blocks - e_start) as u16;
             let tail_len = e.len() - head_len;
-            fs.free_blocks(e.start() + head_len as Ext4Bid, tail_len as u32, handle)?;
+            let auth =
+                data_policy.authorize(handle, e.start() + head_len as Ext4Bid, tail_len as u32)?;
+            fs.free_blocks(auth, handle)?;
             freed_data += tail_len as u64;
             kept.push(Extent::new(e.block(), head_len, e.start(), e.kind()));
         }
@@ -805,10 +817,13 @@ fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) 
     Ok(bid)
 }
 
-/// Frees one external extent-tree metadata block.
+/// Frees one external extent-tree metadata block — the textbook revoke case
+/// (Linux `ext4_ext_rm_idx` frees tree nodes with `METADATA | FORGET`,
+/// fs/ext4/extents.c:2332): forget before free, under the same handle, so the
+/// revoke record and the bitmap clear commit together.
 fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) -> Result<()> {
-    journal::forget(handle, journal::ForgetKind::Metadata, bid)?;
-    fs.free_blocks(bid, 1, handle)
+    let auth = journal::forget(handle, bid, 1)?;
+    fs.free_blocks(auth, handle)
 }
 
 /// Byte offset of `et_checksum` in a full-block external extent node: a 4-byte
