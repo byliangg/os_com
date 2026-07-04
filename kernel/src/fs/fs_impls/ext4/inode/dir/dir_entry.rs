@@ -131,7 +131,9 @@ impl<'a> DirBlockView<'a> {
         file_size: usize,
     ) -> Self {
         let offset = block_idx * BLOCK_SIZE;
-        let limit = (file_size - offset).min(BLOCK_SIZE);
+        // `saturating_sub` so a block index past EOF yields an empty view instead
+        // of underflowing (defence in depth against a corrupt htree leaf pointer).
+        let limit = file_size.saturating_sub(offset).min(BLOCK_SIZE);
         Self {
             page_cache,
             offset,

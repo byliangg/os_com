@@ -602,6 +602,12 @@ impl InodeInner {
             };
             if let Ok(Some(leaf)) =
                 htree::dx_lookup_leaf(read_block, name_bytes, &dx.seed, dx.unsigned)
+                // A corrupt index can point a leaf past EOF; validate the block
+                // against the directory size before scanning so a bad pointer
+                // falls through to the linear scan below rather than driving an
+                // out-of-range read (Linux rejects `block >= i_size` up front in
+                // `__ext4_read_dirblock`).
+                && leaf < self.file_size().div_ceil(BLOCK_SIZE) as Ext4Bid
                 && let Some(info) = self.scan_block_for_name(leaf as usize, name_bytes)?
             {
                 return Ok(info);
@@ -1378,6 +1384,20 @@ impl Inode {
         // Step 4.3: repoint a moved directory's `..` at its new parent.
         let old_inner = guards.inner_mut(old_ino);
         if old_is_dir && !is_same_dir {
+            // If the directory carries an htree index, flatten it to linear
+            // *before* repointing `..`. A bare `INDEX`-flag clear would leave
+            // block 0 in `dx_root` shape — its `..` `rec_len` spanning the now
+            // dead index array, with no checksum tail reserved — which e2fsck
+            // rejects (and on a metadata_csum volume the `..` repoint below would
+            // then stamp a dirent checksum onto a block that has none). Clearing
+            // the flag would also gate out the degrade `add_new_entry` performs,
+            // so the stale index would never be reclaimed.
+            // `degrade_htree_to_linear` rewrites block 0 into a valid linear
+            // block, writes the correct tail, and clears `INDEX` itself.
+            if old_inner.desc.flags().contains(FileFlags::INDEX) && fs.super_block().has_dir_index()
+            {
+                old_inner.degrade_htree_to_linear(&fs, handle)?;
+            }
             let dotdot_entry_info = old_inner.find_entry_info("..", None)?;
             old_inner.set_entry_target(
                 &dotdot_entry_info,
@@ -1385,9 +1405,6 @@ impl Inode {
                 DirEntryFileType::Dir,
                 handle,
             )?;
-            // The htree index would describe the now-stale block layout; the
-            // moved directory must be re-indexed on its next insert (P6).
-            old_inner.remove_flags(FileFlags::INDEX);
             old_inner.set_mtime_ctime(utils::now());
         } else {
             old_inner.set_ctime(utils::now());

@@ -245,7 +245,13 @@ impl ExtentManager {
                 .map(|e| e.start() + e.len() as Ext4Bid)
                 .unwrap_or(0);
             while ib < hole.end {
-                let want = hole.end - ib;
+                // Cap each allocation request at the widest length an *unwritten*
+                // extent can bias-encode. Without this, a full-group run of
+                // `MAX_WRITTEN_LEN` (32768) blocks would encode as `len +
+                // MAX_WRITTEN_LEN` = 65536, wrap the 16-bit `ee_len` to 0, and
+                // silently drop the whole run on decode (Linux clamps identically
+                // in `ext4_ext_map_blocks`).
+                let want = (hole.end - ib).min(node::MAX_UNWRITTEN_LEN as u32);
                 let range = fs.alloc_blocks(want, goal, handle)?;
                 let got = (range.end - range.start) as u32;
                 debug_assert!(got > 0 && got <= want);

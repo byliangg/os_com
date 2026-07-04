@@ -137,7 +137,8 @@ const UUID_LEN: usize = 16;
 /// - The descriptor's magic/type is wrong, or its `h_sequence != expected_tid`
 ///   (a stale block left by a previous log wrap, or a blank/never-written block —
 ///   the monotonic sequence is what tells a fresh descriptor from a stale one).
-///   A [`BLOCKTYPE_REVOKE`] block here is likewise a boundary for Phase 4.
+///   A [`BLOCKTYPE_REVOKE`] block encountered during recovery is instead a hard
+///   error (`EUCLEAN`) — see the revoke gap below.
 /// - A tag offset would run past the descriptor block (a malformed descriptor is
 ///   not a valid transaction; do not panic).
 /// - The trailing commit block's magic/type/`h_sequence` does not match (an
@@ -158,12 +159,17 @@ fn scan_transaction(
         .read_log_block(device, start_log, &mut descriptor)?;
     let header = RawJournalHeader::parse(&descriptor);
     let blocktype = header.h_blocktype.get();
-    // Phase-4 revoke gap: a revoke block where a descriptor is expected is the log
-    // boundary, not a transaction to process (full PASS_REVOKE is Phase 7). It is
-    // one of the non-descriptor block types the general test below already rejects;
-    // calling it out keeps the gap explicit at the one place recovery meets it.
+    // Revoke gap (full PASS_REVOKE is Phase 7): our own log never emits revoke
+    // blocks, so one appearing during recovery means an interop (Linux-written)
+    // journal whose committed transactions carry revoke records we cannot apply.
+    // Treating it as a clean boundary would silently under-replay a committed
+    // transaction (and everything after it), then stamp a too-small `s_sequence`
+    // on the clean superblock — corruption. Refuse the mount loudly instead.
     if blocktype == BLOCKTYPE_REVOKE {
-        return Ok(None);
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "journal contains revoke records; recovery unsupported until Phase 7"
+        );
     }
     // Boundary, not corruption: a stale/blank block (bad magic or a non-descriptor
     // type), or a descriptor from a different generation (wrong tid), marks the end
@@ -221,6 +227,18 @@ fn scan_transaction(
             // A complete committed transaction: the next one starts right after
             // this commit block.
             return Ok(Some(journal.geometry().next_log_block(commit_log)));
+        }
+        if commit_blocktype == BLOCKTYPE_REVOKE {
+            // A revoke block sits where this transaction's commit was computed to
+            // be. Linux writes revoke records between the metadata and the commit
+            // block, so the real commit is further along and this transaction *did*
+            // commit — but we cannot walk past revoke blocks (PASS_REVOKE is Phase
+            // 7). Treating this as a torn tail would silently under-replay a
+            // committed transaction, so fail loudly like the multi-descriptor case.
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "journal revoke records unsupported in recovery until Phase 7"
+            );
         }
         if commit_blocktype == BLOCKTYPE_DESCRIPTOR {
             // A *second* descriptor where the commit block should be: this

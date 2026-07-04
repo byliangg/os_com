@@ -15,6 +15,13 @@ pub(super) const EXTENT_MAGIC: u16 = 0xF30A;
 /// marks the extent as unwritten (preallocated but not yet written).
 pub(super) const MAX_WRITTEN_LEN: u16 = 32768;
 
+/// Maximum logical length of a single *unwritten* extent. An unwritten extent
+/// bias-encodes its length as `len + MAX_WRITTEN_LEN` in the 16-bit `ee_len`
+/// field, so the pre-bias length must stay strictly below `MAX_WRITTEN_LEN` or
+/// the sum wraps to a bogus (often zero-length) written extent on decode. This
+/// mirrors Linux `EXT_UNWRITTEN_MAX_LEN = EXT_INIT_MAX_LEN - 1`.
+pub(super) const MAX_UNWRITTEN_LEN: u16 = MAX_WRITTEN_LEN - 1;
+
 const_assert!(size_of::<RawExtentHeader>() == 12);
 const_assert!(size_of::<RawExtentIdx>() == 12);
 const_assert!(size_of::<RawExtent>() == 12);
@@ -328,6 +335,23 @@ mod tests {
         assert!(ext.is_unwritten());
         assert_eq!(ext.len(), 3);
         assert_eq!(ext.start(), 100);
+    }
+
+    #[ktest]
+    fn max_unwritten_extent_round_trips() {
+        // Regression: a full-group unwritten run must encode within `ee_len`.
+        // `MAX_UNWRITTEN_LEN` (32767) bias-encodes to 65535 (still non-zero) and
+        // decodes back to an unwritten extent of the same length. One more block
+        // (32768) would encode to 65536, wrap the u16 to 0, and decode as a bogus
+        // zero-length *written* extent — silent data loss `ensure_allocated` now
+        // prevents by clamping the request to `MAX_UNWRITTEN_LEN`.
+        let ext = Extent::new(0, MAX_UNWRITTEN_LEN, 1000, ExtentKind::Unwritten);
+        let raw = RawExtent::from(&ext);
+        assert_eq!(raw.len, u16::MAX); // 32767 + 32768, no wrap
+        let decoded = Extent::from(&raw);
+        assert!(decoded.is_unwritten());
+        assert_eq!(decoded.len(), MAX_UNWRITTEN_LEN);
+        assert_eq!(decoded.start(), 1000);
     }
 
     #[ktest]
