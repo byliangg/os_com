@@ -346,6 +346,12 @@ impl InodeDesc {
         self.flags.remove(flags);
     }
 
+    /// Sets the given inode flags. Mutates through `Dirty`; used to restore the
+    /// `EXTENTS` flag when an inode switches back to extent-mapped storage.
+    pub(super) fn insert_flags(&mut self, flags: FileFlags) {
+        self.flags.insert(flags);
+    }
+
     /// Overwrites the raw `i_block` words. Mutates through `Dirty`; used to store
     /// a fast-symlink target inline so writeback persists it (a fast symlink has
     /// no block manager to snapshot the `i_block` from).
@@ -1502,8 +1508,10 @@ impl InodeInner {
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let old_size = self.file_size();
-        let start_block = (offset / BLOCK_SIZE) as Iblock;
-        let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         if end > old_size {
             self.ensure_size_within_limit(fs, end)?;
             self.resize_page_cache(end, old_size)?;
@@ -1640,8 +1648,10 @@ impl InodeInner {
         // with (never before) the ordered-data flush the caller registers. A
         // crash before this transaction commits leaves the blocks unwritten:
         // read-as-zeros, never another file's freed data.
-        let start_block = (offset / BLOCK_SIZE) as Iblock;
-        let end_block = end.div_ceil(BLOCK_SIZE) as Iblock;
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         if let Err(err) = self
             .extent_manager()
             .and_then(|em| em.mark_range_written(start_block, end_block, handle))

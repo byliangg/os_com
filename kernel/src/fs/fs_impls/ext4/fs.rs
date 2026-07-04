@@ -3,14 +3,11 @@
 //! The `Ext4` filesystem object: mount, geometry, block allocation, and inode
 //! lookup.
 //!
-//! Phase 1 mounted a volume read-only. Phase 2 makes the block side writable:
-//! the superblock and block-group descriptors become mutable behind dirty
-//! tracking, each group caches its block bitmap, and `Ext4` routes block
-//! allocation/free across groups and writes the mutated metadata back.
-//!
-//! The inode side is unchanged: inodes are still read directly from the device
-//! by [`Ext4::read_inode_desc`]. The inode bitmap, inode-table page cache, and
-//! inode allocation arrive in Phase 3.
+//! The superblock and block-group descriptors are mutable behind dirty
+//! tracking, each group caches its block and inode bitmaps, and `Ext4` routes
+//! block and inode allocation/free across groups, threads the journal, and
+//! writes the mutated metadata back. `Ext4` also owns the per-group inode cache,
+//! the orphan chain, and inode-descriptor writeback (`write_back_inode_desc`).
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -366,8 +363,7 @@ impl Ext4 {
     ///
     /// An extent maps a 32-bit logical block index, so a file spans at most
     /// `2^32 - 1` blocks; the result is also clamped to `i64::MAX` (the VFS
-    /// size limit). Phase 2's flatten-and-rebuild tree caps depth at 1, so real
-    /// files are far smaller, but this bound is what `write_at` rejects against.
+    /// size limit). This is the bound `write_at` rejects against.
     pub(super) fn max_file_size(&self) -> usize {
         let by_blocks = (u32::MAX as u64) * BLOCK_SIZE as u64;
         by_blocks.min(i64::MAX as u64) as usize

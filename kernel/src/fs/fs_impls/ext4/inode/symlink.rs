@@ -159,6 +159,11 @@ impl InodeInner {
                     // node kind that would carry a tail checksum. No seed needed.
                     None,
                 )?;
+                // The `i_block` now holds an extent root, not inline bytes: restore
+                // the `EXTENTS` flag a prior fast target cleared, or writeback would
+                // persist an extent-backed symlink with the flag off and Linux/
+                // e2fsck would read the root as ext2 indirect block pointers.
+                self.desc.insert_flags(FileFlags::EXTENTS);
             }
             self.prepare_write(fs, 0, target_len, handle)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();

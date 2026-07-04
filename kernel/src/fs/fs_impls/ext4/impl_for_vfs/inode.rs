@@ -430,7 +430,9 @@ fn ensure_sys_admin() -> Result<()> {
     let Some(posix_thread) = task.as_posix_thread() else {
         return_errno_with_message!(Errno::EPERM, "not a POSIX thread");
     };
-    let thread_local = task.as_thread_local().unwrap();
+    let Some(thread_local) = task.as_thread_local() else {
+        return_errno_with_message!(Errno::EPERM, "no thread-local state");
+    };
     let user_ns = thread_local.borrow_user_ns();
     lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
         user_ns.as_ref(),

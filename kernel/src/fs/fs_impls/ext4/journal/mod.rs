@@ -349,7 +349,7 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
     // Log block 0 holds the journal superblock.
     let raw: RawJournalSuperblock = fs
         .block_device()
-        .read_val(block_map[0] as usize * BLOCK_SIZE)
+        .read_val(Bid::new(block_map[0]).to_offset())
         .map_err(|_| Error::with_message(Errno::EIO, "failed to read the journal superblock"))?;
     let superblock = JournalSuperblock::try_from(raw)?;
 

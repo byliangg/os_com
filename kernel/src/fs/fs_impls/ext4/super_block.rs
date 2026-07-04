@@ -9,8 +9,8 @@
 //! needs no geometry change), and the `64BIT` high halves of the block counts
 //! (`s_blocks_count_hi` / `s_free_blocks_count_hi`) are spliced at the parse
 //! boundary so `> 2^32`-block volumes count correctly. The metadata-checksum
-//! fields are parsed when a later P6 task brings that feature; until then only
-//! images with checksums disabled mount.
+//! fields are parsed and, for a `metadata_csum` volume, the superblock checksum
+//! is verified at this boundary and restamped on write.
 
 use super::{
     checksum::{self, FsCsumSeed},
@@ -186,10 +186,9 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
         let feature_ro_compat = FeatureRoCompatSet::from_bits_truncate(sb.feature_ro_compat);
 
         // Verify the superblock's own checksum at the parse boundary (Linux
-        // `ext4_superblock_csum_verify`). Unreachable until `METADATA_CSUM` joins
-        // `RO_COMPAT_SUPP` (the admission task) — a checksummed volume is refused
-        // by the `EROFS` gate above until then — but wired in now so the write
-        // side has a verified read to round-trip against.
+        // `ext4_superblock_csum_verify`). `METADATA_CSUM` is in `RO_COMPAT_SUPP`,
+        // so a checksummed volume passes the `EROFS` gate above and reaches here on
+        // every mount; the write side restamps this checksum to round-trip.
         if feature_ro_compat.contains(FeatureRoCompatSet::METADATA_CSUM) {
             Self::verify_superblock_checksum(&sb)?;
         }

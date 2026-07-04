@@ -4,9 +4,11 @@
 //!
 //! Features are split into three classes per the ext4 on-disk format: compatible
 //! (`s_feature_compat`), incompatible (`s_feature_incompat`), and read-only
-//! compatible (`s_feature_ro_compat`). Mount handling (Phase 1 Task 6) uses the
-//! `*_SUPP` masks to decide whether to reject a volume or downgrade it to
-//! read-only.
+//! compatible (`s_feature_ro_compat`). Mount handling uses the `*_SUPP` masks to
+//! decide whether to reject a volume: an unsupported `incompat` feature is
+//! refused outright, and an unsupported `ro_compat` feature is refused with
+//! `EROFS` (this port mounts read-write only; it does not fall back to a
+//! read-only mount).
 //!
 //! Naming follows ext2's de-prefixed style; each flag's doc comment cites the
 //! Linux `EXT4_FEATURE_*` constant for cross-reference.

@@ -187,13 +187,15 @@ impl Transaction {
             }
             escape.push(needs_escape);
 
-            // Bids stay below 2^32 until INCOMPAT_64BIT (P6): the mount rejects the
-            // feature and reads only the 32-bit blocks_count. P6 needs v3 journal
-            // tags (t_blocknr_high) here.
-            debug_assert!(bid <= u32::MAX as u64);
+            // A block tag holds only a 32-bit block number until INCOMPAT_64BIT
+            // (Phase 7 adds v3 tags with `t_blocknr_high`). Guard the narrowing
+            // with a real error, not a debug-only assert: on a `> 16 TiB` volume
+            // an `as` truncation would journal an after-image to the wrong block.
+            let t_blocknr = u32::try_from(bid).map_err(|_| {
+                Error::with_message(Errno::EFBIG, "journal block number exceeds 32-bit tag")
+            })?;
             let tag = RawBlockTag {
-                // Only the low 32 bits: 64-bit tags (INCOMPAT_64BIT) are rejected.
-                t_blocknr: Be32::new(bid as u32),
+                t_blocknr: Be32::new(t_blocknr),
                 t_checksum: Be16::new(0),
                 t_flags: Be16::new(flags),
             };
