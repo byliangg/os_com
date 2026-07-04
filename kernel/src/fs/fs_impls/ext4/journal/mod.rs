@@ -67,13 +67,73 @@
 //! "write through immediately" would bake in a flush-timing assumption the
 //! ordered-mode journal breaks.
 //!
-//! # Duality invariants (the running/committing pipeline, P7c-1)
+//! # Group commit (P7c-2)
 //!
-//! [`JournalState`] holds at most one *running* and at most one *committing*
+//! The running transaction **batches** operations: `journal_stop` no longer
+//! requests a commit — the transaction accumulates until one of three
+//! triggers fires (jbd2's exact trigger set):
+//!
+//! - **Durability**: `fsync`/`O_SYNC`/`sync(2)` reach
+//!   [`Journal::log_wait_commit`], which force-requests the target tid's
+//!   commit ([`Journal::request_commit_for`], jbd2 `jbd2_log_start_commit`);
+//!   a capacity-blocked `journal_start` and the pinned-block `ENOSPC` retry
+//!   path escalate the same way.
+//! - **Size**: the transaction's captured log footprint reaches
+//!   [`Journal::batch_trigger_credits`] — a quarter of [`Journal::max_credits`],
+//!   mirroring jbd2's `j_max_transaction_buffers = j_total_len / 4`
+//!   (`jbd2_journal_get_max_txn_bufs`): committing at the quarter point
+//!   keeps the running + committing + un-checkpointed tail comfortably
+//!   inside the ring, so the commit-time fit guard's drain path stays rare.
+//! - **Age**: the transaction outlives `COMMIT_INTERVAL_JIFFIES` (5 s, jbd2
+//!   `JBD2_DEFAULT_MAX_COMMIT_AGE`); the commit thread arms its sleep with
+//!   the running transaction's fixed deadline (jbd2 arms `j_commit_timer`
+//!   per transaction). **Crash-loss window**: un-synced work may lose up to
+//!   this interval — Linux data=ordered semantics, unchanged for anything
+//!   fsync-acknowledged.
+//!
+//! When a trigger fires while handles are open, the committer parks the
+//! transaction in [`JournalState::locking`] (jbd2 `T_LOCKED`) to **drain**:
+//! its own handles keep patching it (the funnels are handle-tid-keyed,
+//! [`active_txn_mut`]) until they close; NEW handles are barred — and, more
+//! than barred, `journal_start` *blocks* until the drained transaction is
+//! staged (jbd2 `add_transaction_credits` → `wait_transaction_locked`,
+//! fs/jbd2/transaction.c:236-243). The block is load-bearing, not an
+//! implementation convenience: Model A patches serialize the
+//! globally-current typed metadata state, so a successor's captures running
+//! concurrently with the locked transaction's still-open handles would leak
+//! uncommitted successor state into the OLDER commit's after-images (crash
+//! ⇒ e.g. a committed directory entry naming an inode whose transaction
+//! never committed) — the isolation break jbd2 closes with this same
+//! barrier. The barrier ends at STAGING, not at commit-I/O completion: the
+//! successor then runs while the commit writes, which is the pipeline
+//! overlap.
+//!
+//! Deadlock audit of the two waits this adds (law 1):
+//!
+//! - `journal_start`'s locked barrier extends the existing capacity wait
+//!   (same waiter profile: only ①-inode locks held, no handle, no ③-level
+//!   lock — the documented space-wait exception). The drain progresses
+//!   without any lock a waiter holds: the locked handles' operations
+//!   acquired all their inode locks *before* `journal_start` (lock order ①
+//!   → ②) and never take another ①; the ③-level locks they may still need
+//!   are held only by other handle-holders (order ② → ③), never by a
+//!   thread parked in `journal_start`. Wakers: every `journal_stop` (epoch
+//!   bump) and the committer's staging (epoch bump), neither of which
+//!   takes a filesystem lock.
+//! - The drain wait itself lives ONLY on the committer thread (its `Parked`
+//!   poll outcome sends it back to an untimed sleep), which holds no
+//!   filesystem lock — a user thread never waits for a drain it could be
+//!   blocking.
+//!
+//! # Duality invariants (the running/locking/committing pipeline, P7c-1/2)
+//!
+//! [`JournalState`] holds at most one *running*, at most one *locking*
+//! (force-locked, draining its open handles — never coexisting with a
+//! running transaction, see the barrier above), and at most one *committing*
 //! transaction: a new running transaction starts (lazily, at the next
 //! `journal_start`) while the staged one is still being written — the
 //! two-transaction pipeline. What keeps the overlap sound, each re-verified
-//! under explicit duality:
+//! under explicit duality (and re-audited for the locking seat):
 //!
 //! 1. **One committer serializes commit and checkpoint.** All production
 //!    checkpoint passes and commits run on the commit thread (the unmount
@@ -81,36 +141,50 @@
 //!    publication, pinned-free release ([`JournalState::release_pinned_frees`])
 //!    — can never land in the middle of a checkpoint pass, and at most one
 //!    [`CommittingTxn`] can ever exist (guarded anyway: every stager —
-//!    [`Journal::take_running_for_commit`], the unmount flush, and the ktest
-//!    stager — refuses an occupied slot).
+//!    [`Journal::advance_pipeline`], the unmount flush, and the ktest
+//!    stager — refuses an occupied slot). Locking a due running transaction
+//!    is equally the committer's move alone, so the seats advance in one
+//!    place.
 //! 2. **Committing images are visible to seeders from the staging instant**
 //!    (law 4 / the B-1 restated invariant): staging stashes the transaction's
 //!    after-images into [`JournalState::uncheckpointed`] in the same
-//!    state-lock window that empties `running`, and the whole seed decision
-//!    (running capture → retained image → device) happens in one state-lock
-//!    window ([`get_write_access`]). See the `uncheckpointed` field docs for
-//!    why the map is the committing-visibility mechanism and why tid-keyed
-//!    eviction can never evict a mid-flight commit's images.
-//! 3. **The committing transaction is frozen** ([`CommittingTxn`]): handles
-//!    are drained before the take, and every mutating funnel (captures,
-//!    forgets, ordered-data registration) reaches only `running` — so the
-//!    committer's lock-free I/O and the state-lock-holding readers share a
-//!    read-only object. The one adjacent mutation, a forget's eviction of the
-//!    block's retained image, acts on the *map*, not the transaction.
-//! 4. **Unpublished-revoke collection is uniform**: the checkpoint snapshot
-//!    reads the running transaction's AND the committing slot's unpublished
-//!    revokes from the state in one lock window
-//!    ([`checkpoint`](checkpoint::checkpoint)), so a new running
-//!    transaction's forget of a block the committing (or any logged)
-//!    transaction journaled defers the pass exactly like before the split.
+//!    state-lock window that empties its seat, and the whole seed decision
+//!    (running capture → locked capture → retained image → device) happens
+//!    in one state-lock window ([`get_write_access`]). A LOCKING-seat
+//!    transaction's captures are not yet in the map — they are still
+//!    receiving its own handles' patches — but no successor exists to seed
+//!    from them (the locked barrier), and the funnels consult the seat
+//!    directly anyway (newest-wins order above), so the one-window property
+//!    is preserved by construction, not by timing. See the `uncheckpointed`
+//!    field docs for why the map is the committing-visibility mechanism and
+//!    why tid-keyed eviction can never evict a mid-flight commit's images.
+//! 3. **The committing transaction is frozen** ([`CommittingTxn`]): staging
+//!    still happens only at `nr_updates() == 0` — the locking seat is where
+//!    a transaction waits until that is true — and every mutating funnel
+//!    (captures, forgets, ordered-data registration) reaches only the
+//!    running/locking seats via handle-tid-keyed lookup ([`active_txn_mut`])
+//!    — so the committer's lock-free I/O and the state-lock-holding readers
+//!    share a read-only object. The one adjacent mutation, a forget's
+//!    eviction of the block's retained image, acts on the *map*, not the
+//!    transaction.
+//! 4. **Unpublished-revoke collection is uniform across all three seats**:
+//!    the checkpoint snapshot reads the running transaction's, the locking
+//!    seat's, AND the committing slot's unpublished revokes from the state
+//!    in one lock window ([`checkpoint`](checkpoint::checkpoint)), so a
+//!    forget landed in any not-yet-durable transaction defers the pass
+//!    exactly like before the split. Pinned-free release and revoke
+//!    publication stay at commit step 6, keyed by the committed tid — a
+//!    parked transaction's pins and revokes ride with it through the seats
+//!    untouched.
 //! 5. **Iron law 1 holds across the overlap**: `journal_start` under inode
 //!    locks never waits on the committing transaction — joining/creating
-//!    `running` ignores the slot entirely, and its capacity wait
-//!    ([`Journal::wait_for_transaction_room`]) is released by handle closes
-//!    and by the committer thread, which takes no fs lock (see that method's
-//!    locking contract). `log_wait_commit` is called with no fs locks held,
-//!    as always; commits stay strictly serial (one slot), so waiting on a
-//!    tid still covers every earlier tid.
+//!    `running` ignores the slot entirely; its two waits (capacity, the
+//!    locked barrier) are both space-shaped and released by handle closes
+//!    and by the committer thread, which takes no fs lock (see the group-
+//!    commit deadlock audit above and `wait_for_transaction_room`'s locking
+//!    contract). `log_wait_commit` is called with no fs locks held, as
+//!    always; commits stay strictly serial (one slot), so waiting on a tid
+//!    still covers every earlier tid.
 //!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
 //! `MetaBuffer` handle owning the raw block bytes. We instead reuse ext2's
@@ -120,7 +194,10 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use ostd::sync::{RwMutexWriteGuard, WaitQueue};
+use ostd::{
+    sync::{RwMutexWriteGuard, WaitQueue},
+    timer::Jiffies,
+};
 
 use self::{
     commit::{CommitAttempt, try_commit_transaction},
@@ -136,6 +213,7 @@ use super::{
     fs::{Ext4, JOURNAL_INO},
     prelude::*,
 };
+use crate::time::clocks::JIFFIES_TIMER_MANAGER;
 
 mod checkpoint;
 mod commit;
@@ -952,6 +1030,28 @@ impl CommittingTxn {
 pub(super) struct JournalState {
     /// The single running transaction, if any (`journal_t.j_running_transaction`).
     pub(super) running: Option<Transaction>,
+    /// The force-locked transaction draining its open handles (jbd2
+    /// `T_LOCKED`), if any — the P7c-2 seat between `running` and
+    /// `committing`. The committer parks a due running transaction here when
+    /// handles are still open; the transaction's OWN handles keep reaching
+    /// it through the tid-keyed funnels ([`active_txn_mut`]) until they
+    /// close, while `journal_start` bars new handles AND blocks successor
+    /// creation (the locked barrier — see the module docs' group-commit
+    /// section for why that block is an isolation requirement, not a
+    /// convenience). Invariant: `locking.is_some() ⟹ running.is_none()` —
+    /// the successor is born only after this seat stages, so at most one
+    /// capture-accepting transaction exists at any instant.
+    pub(super) locking: Option<Transaction>,
+    /// The newest commit-forcing request (jbd2 `j_commit_request`): a tid
+    /// whose transaction must commit without waiting for the size/age
+    /// triggers — set by `log_wait_commit` (fsync/O_SYNC/sync(2)), the
+    /// capacity escalation ([`Journal::wait_for_transaction_room`]), and
+    /// the pinned-block `ENOSPC` retry path
+    /// ([`Journal::request_commit_of_running`]). Cleared when a staged
+    /// transaction's tid covers it; a stale request (tid at or before
+    /// `committed_tid`) never fires — the due check compares it against the
+    /// running transaction's tid with `geq`.
+    pub(super) commit_request: Option<Tid>,
     /// The transaction staged for (or mid-way through) commit, if any
     /// (`journal_t.j_committing_transaction`) — see [`CommittingTxn`]. Also
     /// what `commit_and_wait_running` waits on for a transaction that left
@@ -1043,19 +1143,30 @@ pub(super) struct JournalState {
 }
 
 impl JournalState {
-    /// Stages `txn` as THE committing transaction — the `Running` →
-    /// [`Locked`](CommitPhase::Locked) transition — retaining its
-    /// after-images in [`uncheckpointed`](Self::uncheckpointed) in the same
-    /// lock window (the B-1 stash: from the very first instant a new running
-    /// transaction can exist, captures of these blocks seed from these bytes,
-    /// never from the lagging device). The caller must have verified the
-    /// slot is empty; all three stagers — the commit thread's take
-    /// ([`Journal::take_running_for_commit`]), the unmount flush
+    /// Stages `txn` as THE committing transaction — the (drained)
+    /// `Running`/locking-seat → [`Locked`](CommitPhase::Locked) transition —
+    /// retaining its after-images in [`uncheckpointed`](Self::uncheckpointed)
+    /// in the same lock window (the B-1 stash: from the very first instant a
+    /// new running transaction can exist, captures of these blocks seed from
+    /// these bytes, never from the lagging device; a drain-parked
+    /// transaction's final own-handle patches are all in by now, since
+    /// staging requires `nr_updates() == 0`). The caller must have verified
+    /// the slot is empty; all three stagers — the commit thread's pipeline
+    /// advance ([`Journal::advance_pipeline`]), the unmount flush
     /// ([`Journal::flush_on_unmount`]), and the ktest stager — refuse an
-    /// occupied slot before `running.take()`.
+    /// occupied slot before taking the transaction out of its seat.
     fn stage_committing(&mut self, txn: Transaction) -> Arc<Transaction> {
         debug_assert!(self.committing.is_none());
+        debug_assert_eq!(txn.nr_updates(), 0);
         txn.stash_uncheckpointed(&mut self.uncheckpointed);
+        // The staged transaction covers any commit request at or before its
+        // tid (requests name transactions, and commits are serial).
+        if self
+            .commit_request
+            .is_some_and(|requested| txn.tid().geq(requested))
+        {
+            self.commit_request = None;
+        }
         let txn = Arc::new(txn);
         self.committing = Some(CommittingTxn::new(txn.clone()));
         txn
@@ -1127,6 +1238,8 @@ impl Journal {
             device,
             state: RwMutex::new(JournalState {
                 running: None,
+                locking: None,
+                commit_request: None,
                 committing: None,
                 next_tid,
                 head,
@@ -1315,68 +1428,90 @@ impl Journal {
     /// journal only through `weak`, so it holds no strong reference between wakes.
     fn commit_thread_loop(weak: &Weak<Journal>) {
         loop {
-            // Sleep until teardown is requested, the journal is gone, or a
-            // committable running transaction exists. `wait_until` re-evaluates
-            // this closure on every wake, so a spurious wake simply re-checks.
-            //
-            // Upgrading the `Weak` inside the closure keeps the journal alive only
-            // for the duration of the check; between checks the thread holds no
-            // strong reference, so `stop_commit_thread`'s strong count can drain.
+            // Arm the age trigger: the running transaction's fixed commit
+            // deadline (jbd2 arms `j_commit_timer` at transaction creation;
+            // our timer is this sleep's timeout). The armed key names the
+            // transaction the deadline belongs to, so the poll can detect
+            // that the answer changed (a transaction was created or gained
+            // its first capture — `journal_start`/`journal_stop` wake this
+            // thread for exactly that) and re-arm.
+            let (armed_age_key, timeout) = {
+                let Some(j) = weak.upgrade() else { break };
+                j.age_deadline()
+            };
+
+            // Sleep until teardown, work, a re-arm, or the age deadline.
+            // The closure re-evaluates on every wake, so a spurious wake
+            // simply re-checks. Upgrading the `Weak` inside the closure
+            // keeps the journal alive only for the duration of the check.
             let action = {
                 let Some(j) = weak.upgrade() else { break };
-                j.commit_trigger
-                    .wait_until(|| Self::poll_commit_action(weak))
+                match j.commit_trigger.wait_until_or_timeout(
+                    || Self::poll_commit_action(weak, armed_age_key),
+                    timeout.as_ref(),
+                ) {
+                    Ok(action) => action,
+                    // The age deadline fired (`ETIME`): advance — the aged
+                    // transaction is now due, or the state moved on and the
+                    // next iteration re-arms.
+                    Err(_expired) => CommitAction::Advance,
+                }
             };
 
             match action {
                 CommitAction::Exit => break,
-                CommitAction::Commit => {
-                    let Some(j) = weak.upgrade() else { break };
-                    if !j.commit_one() {
-                        // Nothing was staged: the poll's answer went stale (a
-                        // new handle joined) or — defensively — the slot
-                        // filled between poll and take. Go back to waiting;
-                        // running the checkpoint pass below on a refusal
-                        // would spin full passes against a stuck commit.
-                        continue;
-                    }
-                    if j.is_aborted() {
-                        // A failed commit aborted the journal: the device state
-                        // no longer matches the log; checkpointing would make it
-                        // worse. Idle until teardown.
-                        continue;
-                    }
-                    // Reclaim the log right after committing: Phase 4 is
-                    // commit-per-op, so without eager checkpointing a stream of
-                    // small transactions would fill the log. Checkpoint copies the
-                    // committed after-images to their final locations and clears
-                    // `s_start`. Failure is non-fatal — the log stays dirty and the
-                    // next commit (or the unmount flush) retries; the dirty tail
-                    // left behind is protected from being overwritten by the
-                    // commit fit guard, which bounds every chain to the ring's
-                    // free segment (`commit_or_drain_tail`). Batching commits
-                    // with lazy, space-pressure-driven checkpoint is a P7
-                    // optimization.
-                    // The committing slot is empty here (`commit_one` retired
-                    // it), so the pass's snapshot collects unpublished
-                    // forgets only from the RUNNING transaction.
-                    if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
-                        error!("ext4 journal checkpoint failed: {:?}", e);
-                    }
+                CommitAction::Rearm => continue,
+                CommitAction::Advance => {}
+            }
+
+            let Some(j) = weak.upgrade() else { break };
+            // Drive the pipeline until nothing more is immediately
+            // committable: lock/stage/commit each due transaction, then
+            // checkpoint. The loop matters under batching — the size
+            // trigger can cross again while a commit's I/O runs, and no
+            // further wake is guaranteed to be pending.
+            loop {
+                if !j.commit_one(false) {
+                    // Nothing staged: idle, or a parked transaction is
+                    // still draining (its last `journal_stop` wakes us).
+                    break;
+                }
+                if j.is_aborted() {
+                    // A failed commit aborted the journal: the device state
+                    // no longer matches the log; checkpointing would make it
+                    // worse. Idle until teardown.
+                    break;
+                }
+                // Reclaim the log right after committing. Checkpoint copies
+                // the committed after-images to their final locations and
+                // clears `s_start`. Failure is non-fatal — the log stays
+                // dirty and the next commit (or the unmount flush) retries;
+                // the dirty tail left behind is protected from being
+                // overwritten by the commit fit guard, which bounds every
+                // chain to the ring's free segment (`commit_or_drain_tail`).
+                // Lazy, space-pressure-driven checkpoint is P7c-3.
+                // The committing slot is empty here (`commit_one` retired
+                // it), so the pass's snapshot collects unpublished forgets
+                // only from the running/locking transactions.
+                if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
+                    error!("ext4 journal checkpoint failed: {:?}", e);
                 }
             }
         }
     }
 
-    /// The `wait_until` condition for the commit thread: decides whether to exit,
-    /// commit, or keep waiting, based on the current journal state.
+    /// The commit thread's wait condition: decides whether to exit, advance
+    /// the pipeline, re-arm the age timer, or keep waiting.
     ///
     /// Returns `None` (keep waiting) when there is nothing to do. The short
     /// `state.read()` taken here is safe inside a `wait_until` closure: the guard
     /// is created and dropped entirely within this call, never held across a
-    /// suspend, and the commit itself (which needs the *write* lock and does I/O)
-    /// happens back in [`commit_one`](Journal::commit_one), outside any wait.
-    fn poll_commit_action(weak: &Weak<Journal>) -> Option<CommitAction> {
+    /// suspend, and the pipeline advance itself (which needs the *write* lock
+    /// and does I/O) happens back in the loop, outside any wait.
+    fn poll_commit_action(
+        weak: &Weak<Journal>,
+        armed_age_key: Option<Tid>,
+    ) -> Option<CommitAction> {
         let j = weak.upgrade()?;
         if j.stop.load(Ordering::Acquire) {
             return Some(CommitAction::Exit);
@@ -1389,7 +1524,7 @@ impl Journal {
         let st = j.state.read();
         // A mid-flight commit occupies the slot: commits are serial, so
         // there is nothing to do until it retires — keep waiting rather
-        // than report `Commit` into a take that refuses, which would turn
+        // than report work into an advance that refuses, which would turn
         // a stuck/slow commit into a busy loop of poll + checkpoint
         // passes. No lost wakeup: `clear_committing` wakes
         // `commit_trigger` after emptying the slot, and `wait_until`
@@ -1399,76 +1534,176 @@ impl Journal {
         if st.committing.is_some() {
             return None;
         }
-        // A running transaction with no open handles and some captured metadata
-        // is committable.
-        match &st.running {
-            Some(txn) if txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0 => {
-                Some(CommitAction::Commit)
-            }
-            _ => None,
+        if let Some(locked) = st.locking.as_ref() {
+            // A parked transaction stages the moment its drain completes;
+            // until then there is nothing to do — the last `journal_stop`
+            // of one of its handles wakes this queue.
+            return (locked.nr_updates() == 0).then_some(CommitAction::Advance);
         }
-    }
-
-    /// Commits the running transaction, if it is (still) committable, and wakes
-    /// `log_wait_commit` sleepers. Runs on the commit thread. Returns whether a
-    /// transaction was taken (and a commit attempted) — `false` sends the loop
-    /// back to its wait instead of into a pointless checkpoint pass.
-    fn commit_one(&self) -> bool {
-        let Some(txn) = self.take_running_for_commit() else {
-            return false;
-        };
-        if let Err(e) = self.commit_staged(&txn) {
-            error!("ext4 journal commit failed, aborting the journal: {:?}", e);
-        }
-        true
-    }
-
-    /// Takes the committable running transaction and stages it as the
-    /// committing one, or returns `None` when nothing is committable.
-    ///
-    /// The running transaction is taken **out** under the state write lock,
-    /// then committed **without** holding that lock — commit does device I/O,
-    /// which must never happen under the journal state lock. A fresh running
-    /// transaction is created lazily by the next
-    /// [`journal_start`](transaction::journal_start), possibly while this one
-    /// is still mid-commit: that overlap IS the two-transaction pipeline.
-    ///
-    /// Committability is checked and the transaction taken under ONE lock hold
-    /// (between `poll_commit_action` and here a new handle could have joined,
-    /// so the poll's answer is stale); the same critical section stashes the
-    /// transaction's after-images into [`JournalState::uncheckpointed`] and
-    /// installs the [`CommittingTxn`] slot ([`JournalState::stage_committing`])
-    /// — the take is the instant from which the next `journal_start` opens a
-    /// NEW transaction, so the images must already be in place for its
-    /// captures to seed from (the device lags this commit until its
-    /// checkpoint).
-    fn take_running_for_commit(&self) -> Option<Arc<Transaction>> {
-        let mut st = self.state_write();
-        let committable = st
+        if st
             .running
             .as_ref()
-            .is_some_and(|txn| txn.nr_updates() == 0 && txn.nr_metadata_blocks() > 0);
-        if !committable {
-            return None;
+            .is_some_and(|txn| j.transaction_is_due(txn, Jiffies::elapsed(), st.commit_request))
+        {
+            return Some(CommitAction::Advance);
         }
+        // Nothing due — but if the transaction the age deadline was armed
+        // for is no longer the one that needs one, re-arm the sleep.
+        if Self::age_key(&st) != armed_age_key {
+            return Some(CommitAction::Rearm);
+        }
+        None
+    }
+
+    /// The identity the age trigger is armed against: the running
+    /// transaction's tid, if it has captured work to age (a captureless
+    /// transaction never becomes due, so arming a deadline for it would
+    /// spin the timeout against nothing).
+    fn age_key(st: &JournalState) -> Option<Tid> {
+        st.running
+            .as_ref()
+            .filter(|txn| txn.nr_metadata_blocks() > 0)
+            .map(Transaction::tid)
+    }
+
+    /// Computes the commit thread's sleep arming: the age key (see
+    /// [`age_key`](Self::age_key)) and the time remaining until that
+    /// transaction's commit deadline. The timeout is `None` — an untimed
+    /// sleep — when nothing needs aging, or when the jiffies timer manager
+    /// is not up (the ktest test-kernel boots no kernel-crate timer
+    /// machinery; production initializes it at boot, and the deterministic
+    /// ktest age path goes through `force_expire_for_test` + an explicit
+    /// wake instead of real timeouts).
+    fn age_deadline(&self) -> (Option<Tid>, Option<Duration>) {
+        let st = self.state_read();
+        let key = Self::age_key(&st);
+        let timeout = if JIFFIES_TIMER_MANAGER.get().is_some() {
+            key.map(|_| {
+                st.running
+                    .as_ref()
+                    .expect("age_key names the running transaction")
+                    .until_expiry(Jiffies::elapsed())
+            })
+        } else {
+            None
+        };
+        (key, timeout)
+    }
+
+    /// The group-commit due test for the running transaction — the three
+    /// triggers (see the module docs): an explicit commit request covering
+    /// its tid (durability/escalation), its age deadline, or its captured
+    /// batch footprint reaching [`batch_trigger_credits`](Self::batch_trigger_credits).
+    /// A transaction with no captured metadata is never due: it writes no
+    /// log blocks, so committing it would be a no-op (and waiting on its
+    /// tid would hang — see [`log_wait_commit`](Self::log_wait_commit)'s
+    /// contract).
+    fn transaction_is_due(&self, txn: &Transaction, now: Jiffies, requested: Option<Tid>) -> bool {
+        if txn.nr_metadata_blocks() == 0 {
+            return false;
+        }
+        requested.is_some_and(|r| r.geq(txn.tid()))
+            || txn.is_expired_at(now)
+            || txn.batch_footprint(self.geometry.tag_layout()) >= self.batch_trigger_credits()
+    }
+
+    /// The captured-footprint threshold at which the running transaction is
+    /// committed for size: a quarter of [`max_credits`](Self::max_credits),
+    /// mirroring jbd2's per-transaction cap `j_max_transaction_buffers =
+    /// j_total_len / 4` (`jbd2_journal_get_max_txn_bufs`). Our `max_credits`
+    /// bounds one transaction against the WHOLE usable ring — a correctness
+    /// bound, not a batching policy — so the quarter point is where jbd2
+    /// would have stopped growing the transaction: committing there yields
+    /// jbd2-equivalent batch sizes and keeps running + committing +
+    /// un-checkpointed tail comfortably inside the ring (the commit-time
+    /// fit guard's drain path stays the exception). Measured on captured
+    /// work ([`Transaction::batch_footprint`]), not reservations — see that
+    /// method for why.
+    fn batch_trigger_credits(&self) -> usize {
+        (self.max_credits() / 4).max(1)
+    }
+
+    /// Advances the transaction pipeline by one step under a single
+    /// state-lock window: stages the drained locking-seat transaction, or
+    /// locks a due running transaction (staging it directly when it has no
+    /// open handles — the zero-width `T_LOCKED` fast path; parking it in the
+    /// locking seat to drain otherwise). `force_due` treats the running
+    /// transaction as due regardless of policy (the ktest force-commit and
+    /// nothing else).
+    ///
+    /// Staging happens in the SAME critical section as the seat take — it
+    /// stashes the transaction's after-images into
+    /// [`JournalState::uncheckpointed`] and installs the [`CommittingTxn`]
+    /// slot ([`JournalState::stage_committing`]) — because the take is the
+    /// instant from which the next `journal_start` opens a NEW transaction,
+    /// so the images must already be in place for its captures to seed from
+    /// (the device lags this commit until its checkpoint). The commit I/O
+    /// itself runs without the lock.
+    fn advance_pipeline(&self, force_due: bool) -> PipelineStep {
+        let mut st = self.state_write();
         if st.committing.is_some() {
             // Commits are serialized on the single committer (the commit
             // thread; the unmount flush runs only after it stopped), so an
-            // occupied slot here is a broken contract. Refuse to pipeline a
-            // second commit — that would fork the seeding/publication story —
-            // and leave the running transaction in place; the commit loop
-            // then waits for the slot to clear (`poll_commit_action`'s slot
-            // gate, woken by `clear_committing`) instead of re-polling hot.
-            error!("ext4 journal: a transaction is already committing; not taking another");
-            return None;
+            // occupied slot here means "wait for it to retire" — never
+            // pipeline a second commit, which would fork the
+            // seeding/publication story.
+            return PipelineStep::Idle;
         }
-        let txn = st.running.take()?;
-        Some(st.stage_committing(txn))
+        if let Some(locked) = st.locking.take_if(|txn| txn.nr_updates() == 0) {
+            return PipelineStep::Staged(st.stage_committing(locked));
+        }
+        if st.locking.is_some() {
+            return PipelineStep::Parked;
+        }
+        let due = st.running.as_ref().is_some_and(|txn| {
+            txn.nr_metadata_blocks() > 0
+                && (force_due
+                    || self.transaction_is_due(txn, Jiffies::elapsed(), st.commit_request))
+        });
+        if !due {
+            return PipelineStep::Idle;
+        }
+        let txn = st
+            .running
+            .take()
+            .expect("due implies a running transaction");
+        if txn.nr_updates() == 0 {
+            return PipelineStep::Staged(st.stage_committing(txn));
+        }
+        // T_LOCKED with open handles: park to drain. From this instant
+        // `journal_start` blocks (the locked barrier) while the
+        // transaction's own handles finish and close; the last close wakes
+        // the commit thread, whose next advance stages it above.
+        st.locking = Some(txn);
+        PipelineStep::Parked
+    }
+
+    /// Advances the pipeline once and, when that staged a transaction,
+    /// commits it. Returns whether a commit was attempted — `false` sends
+    /// the commit loop back to its wait instead of into a pointless
+    /// checkpoint pass. Runs on the commit thread (and, force-variant, the
+    /// ktest committer).
+    fn commit_one(&self, force_due: bool) -> bool {
+        match self.advance_pipeline(force_due) {
+            PipelineStep::Staged(txn) => {
+                // The seats moved: wake the locked-barrier / capacity
+                // waiters in `journal_start` so a successor can be created
+                // NOW, while this commit's I/O runs — the pipeline overlap
+                // (jbd2 wakes `j_wait_transaction_locked` at the same
+                // point, commit phase 1).
+                self.note_credits_released();
+                if let Err(e) = self.commit_staged(&txn) {
+                    error!("ext4 journal commit failed, aborting the journal: {:?}", e);
+                }
+                true
+            }
+            PipelineStep::Parked | PipelineStep::Idle => false,
+        }
     }
 
     /// Commits the staged committing transaction and retires the slot — the
     /// shared tail of both production committers ([`commit_one`](Self::commit_one)
-    /// and the unmount flush), after [`take_running_for_commit`](Self::take_running_for_commit)
+    /// and the unmount flush), after [`advance_pipeline`](Self::advance_pipeline)
     /// (or the flush's own staging) installed `txn` in the slot.
     ///
     /// Single-committer: the caller's thread is the only production
@@ -1588,11 +1823,57 @@ impl Journal {
         }
     }
 
-    /// Wakes the commit thread to commit the running transaction (jbd2 requesting
-    /// a commit). A single wake suffices: the thread re-evaluates the running
-    /// transaction's committability in its `wait_until` closure.
+    /// Wakes the commit thread to re-evaluate its policy (drain completion,
+    /// size, age, re-arm) WITHOUT forcing anything — the bare nudge. A
+    /// single wake suffices: the thread re-evaluates in its wait closure.
+    /// To force a commit regardless of the size/age triggers, use
+    /// [`request_commit_for`](Self::request_commit_for).
     pub(super) fn request_commit(&self) {
         self.commit_trigger.wake_one();
+    }
+
+    /// Requests that the transaction bearing `target` (and everything before
+    /// it — commits are serial) commit without waiting for the size/age
+    /// triggers (jbd2 `jbd2_log_start_commit` setting `j_commit_request`),
+    /// then wakes the commit thread. The waiters that need a tid durable —
+    /// `log_wait_commit` (fsync/O_SYNC/sync(2)) and the capacity escalation
+    /// — funnel through here: a running transaction holding `target` is
+    /// force-locked and drained by the committer rather than aged out.
+    pub(super) fn request_commit_for(&self, target: Tid) {
+        {
+            let mut st = self.state_write();
+            if !st
+                .commit_request
+                .is_some_and(|existing| existing.geq(target))
+            {
+                st.commit_request = Some(target);
+            }
+        }
+        self.request_commit();
+    }
+
+    /// Requests a commit of whatever the running transaction currently is
+    /// (if it has captured work) — the escalation for waiters that need "the
+    /// pins/space held by uncommitted transactions" released but hold no
+    /// tid to name: the allocator's pinned-block `ENOSPC` retry path (Linux
+    /// equivalently forces a commit via `ext4_should_retry_alloc` →
+    /// `jbd2_journal_force_commit_nested`). If the blocking transaction is
+    /// already in the locking/committing seats, the wake alone suffices —
+    /// it is already on its way to durability.
+    pub(in crate::fs::fs_impls::ext4) fn request_commit_of_running(&self) {
+        {
+            let mut st = self.state_write();
+            if let Some(tid) = st
+                .running
+                .as_ref()
+                .filter(|txn| txn.nr_metadata_blocks() > 0)
+                .map(Transaction::tid)
+                && !st.commit_request.is_some_and(|existing| existing.geq(tid))
+            {
+                st.commit_request = Some(tid);
+            }
+        }
+        self.request_commit();
     }
 
     /// Returns the current credit-release epoch (see
@@ -1604,18 +1885,30 @@ impl Journal {
         self.credit_release_epoch.load(Ordering::Acquire)
     }
 
-    /// Records that a handle released its credit reservation and wakes
-    /// capacity-blocked `journal_start` sleepers to re-check for room.
+    /// Records that admission conditions may have improved — a handle
+    /// released its credit reservation, or the pipeline's seats moved
+    /// (staging emptied the locking seat, lifting `journal_start`'s locked
+    /// barrier) — and wakes blocked `journal_start` sleepers to re-check.
+    /// One epoch serves both waits: they share the retry loop and the
+    /// "cannot miss a wake" snapshot discipline.
     pub(super) fn note_credits_released(&self) {
         self.credit_release_epoch.fetch_add(1, Ordering::Release);
         self.commit_wait_queue.wake_all();
     }
 
-    /// Blocks until the reservation pressure that kept a `journal_start` out of
-    /// transaction `tid` may have eased: `tid` committed, some handle released
-    /// credits (the epoch moved past `epoch`), or the journal aborted (error).
-    /// The caller re-checks capacity and retries — this is the sleeping half of
-    /// jbd2 `add_transaction_credits`' wait loop.
+    /// Blocks until the admission pressure that kept a `journal_start` out of
+    /// transaction `tid` may have eased: `tid` committed, the epoch moved
+    /// past `epoch` (a handle released credits, or the pipeline's seats
+    /// moved — the locked barrier's lift), or the journal aborted (error).
+    /// The caller re-checks admission and retries — the sleeping half of
+    /// jbd2 `add_transaction_credits`' wait loop, covering both its stalls
+    /// (full transaction, and `t_state != T_RUNNING` →
+    /// `wait_transaction_locked`). Entering the wait escalates: the
+    /// blocking transaction is force-requested for commit
+    /// ([`request_commit_for`](Self::request_commit_for)) so a full or
+    /// locked transaction drains and commits rather than aging out under a
+    /// waiter (jbd2's `wait_transaction_locked` similarly calls
+    /// `jbd2_log_start_commit` on the way in).
     ///
     /// # Locking
     ///
@@ -1628,18 +1921,18 @@ impl Journal {
     /// transaction at registration time, touching no inode lock at all (see
     /// `Transaction::register_ordered_data`).
     ///
-    /// Under the running/committing pipeline this remains iron law 1's legal
-    /// exception (waiting for *space*, like Linux): the wait can only be on
-    /// the RUNNING transaction's fullness — never on the committing one,
-    /// which took none of the waiter's reservations with it — and everything
-    /// that frees the space progresses without the waiter's locks: handle
-    /// closes bump the epoch from their own threads, and the running
-    /// transaction's commit (which may first have to finish the committing
-    /// one — commits are serial) plus the log-reclaiming checkpoint both run
-    /// on the committer thread, which takes brief state-lock windows and
-    /// device I/O only.
+    /// Under the running/locking/committing pipeline this remains iron law
+    /// 1's legal exception (waiting for *space*, like Linux): the wait can
+    /// only be on the RUNNING transaction's fullness or the LOCKING seat's
+    /// drain — never on the committing slot, which took none of the
+    /// waiter's reservations with it — and everything that frees the space
+    /// progresses without the waiter's locks: handle closes bump the epoch
+    /// from their own threads (the module docs' group-commit section audits
+    /// why a draining handle can never need a parked waiter's locks), and
+    /// staging/commit/checkpoint run on the committer thread, which takes
+    /// brief state-lock windows and device I/O only.
     pub(super) fn wait_for_transaction_room(&self, tid: Tid, epoch: u64) -> Result<()> {
-        self.request_commit();
+        self.request_commit_for(tid);
         self.commit_wait_queue.wait_until(|| {
             if self.is_aborted() {
                 // The journal died while we waited; surface it rather than
@@ -1700,12 +1993,23 @@ impl Journal {
     /// committed to the log — the primitive `fsync`/`fdatasync` use (jbd2
     /// `jbd2_log_wait_commit`).
     ///
-    /// Returns immediately if `target` is already committed. Otherwise it requests
-    /// a commit and sleeps on [`commit_wait_queue`](Journal::commit_wait_queue)
-    /// until the commit thread advances `committed_tid` past `target`. The
-    /// `request_commit` + condition re-check pairing is what stops it hanging: the
-    /// wake sets `committed_tid` *before* `wake_all`, and the `wait_until` closure
-    /// re-reads it on every wake (`Acquire`, pairing with the commit's `Release`).
+    /// Returns immediately if `target` is already committed. Otherwise it
+    /// force-requests the commit ([`request_commit_for`](Self::request_commit_for)
+    /// — the durability trigger, jbd2 `jbd2_log_start_commit` +
+    /// `jbd2_log_wait_commit`) and sleeps on
+    /// [`commit_wait_queue`](Journal::commit_wait_queue) until the commit
+    /// thread advances `committed_tid` past `target`. The request + condition
+    /// re-check pairing is what stops it hanging: the wake sets
+    /// `committed_tid` *before* `wake_all`, and the `wait_until` closure
+    /// re-reads it on every wake (`Acquire`, pairing with the commit's
+    /// `Release`).
+    ///
+    /// Under group commit the target's transaction may still have OTHER
+    /// operations' handles open: the request force-locks it (the committer
+    /// parks it in [`JournalState::locking`] and stages it when the last
+    /// handle closes), so the wait spans that drain — bounded by in-flight
+    /// operations, never by the age interval. The P4 "caller's own handle
+    /// closed ⟹ transaction committable" assumption is thereby retired.
     ///
     /// # Locking
     ///
@@ -1713,16 +2017,6 @@ impl Journal {
     /// thread, which needs those same locks. The caller records `target` (the tid
     /// its own now-closed handle joined), releases every inode/journal lock, then
     /// waits.
-    ///
-    /// # Phase 4 assumption
-    ///
-    /// The caller's own handle must already be [`journal_stop`](transaction::journal_stop)'d
-    /// (so the running transaction has `nr_updates() == 0`) before calling; the
-    /// single `request_commit` then suffices to make it committable. The
-    /// concurrent-open-handle case — where a commit request must wait for *other*
-    /// handles to drain first — is a Phase-7 refinement; a production integration
-    /// should also wake [`commit_trigger`](Journal::commit_trigger) from
-    /// `journal_stop` when the last handle of a transaction closes.
     ///
     /// The caller must additionally have contributed (or observed) captured
     /// metadata for `target`'s transaction: a transaction that never captures a
@@ -1733,7 +2027,7 @@ impl Journal {
         if self.committed_tid().geq(target) {
             return Ok(());
         }
-        self.request_commit();
+        self.request_commit_for(target);
         self.commit_wait_queue.wait_until(|| {
             if self.committed_tid().geq(target) {
                 return Some(Ok(()));
@@ -1773,25 +2067,36 @@ impl Journal {
     /// separate from the wait itself.
     fn sync_durability_target(&self) -> Result<Option<Tid>> {
         let st = self.state_read();
-        match st.running.as_ref() {
-            Some(txn) if txn.nr_metadata_blocks() > 0 => Ok(Some(txn.tid())),
-            // Nothing captured in `running` — but the transaction to make
-            // durable may have just been TAKEN by the commit thread and be
-            // mid-commit (its commit record not on disk yet). Waiting on
-            // nothing here would let sync(2) return early.
-            _ => match st.committing.as_ref().map(CommittingTxn::tid) {
-                Some(tid) => Ok(Some(tid)),
-                // Nothing running and nothing committing: everything captured
-                // is durable — unless a failed commit aborted the journal and
-                // dropped a transaction, in which case durability must not be
-                // claimed (else sync(2) returns Ok for data the abort lost).
-                None => {
-                    if self.is_aborted() {
-                        return_errno_with_message!(Errno::EIO, "journal aborted");
-                    }
-                    Ok(None)
+        // Newest-first across the three seats: the running transaction's
+        // captures, else a force-locked (draining) transaction's, else the
+        // mid-commit slot's — a transaction is not durable in ANY seat, so
+        // waiting on the newest one with work covers them all (commits are
+        // serial, and a running transaction can only exist once the locking
+        // seat staged).
+        if let Some(txn) = st
+            .running
+            .as_ref()
+            .or(st.locking.as_ref())
+            .filter(|txn| txn.nr_metadata_blocks() > 0)
+        {
+            return Ok(Some(txn.tid()));
+        }
+        // Nothing captured in the seats — but the transaction to make
+        // durable may have just been TAKEN by the commit thread and be
+        // mid-commit (its commit record not on disk yet). Waiting on
+        // nothing here would let sync(2) return early.
+        match st.committing.as_ref().map(CommittingTxn::tid) {
+            Some(tid) => Ok(Some(tid)),
+            // Nothing running, draining, or committing: everything captured
+            // is durable — unless a failed commit aborted the journal and
+            // dropped a transaction, in which case durability must not be
+            // claimed (else sync(2) returns Ok for data the abort lost).
+            None => {
+                if self.is_aborted() {
+                    return_errno_with_message!(Errno::EIO, "journal aborted");
                 }
-            },
+                Ok(None)
+            }
         }
     }
 
@@ -1868,40 +2173,70 @@ impl Journal {
     /// the checkpoint below); entry gating just refuses one step earlier.
     pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
         if self.is_aborted() {
-            self.state_write().running = None;
+            let mut st = self.state_write();
+            st.running = None;
+            st.locking = None;
             return_errno_with_message!(Errno::EIO, "journal aborted; leaving the log for recovery");
         }
-        let staged = {
-            let mut st = self.state_write();
-            // `stop_commit_thread` joined the sole other committer, so a
-            // still-occupied slot is a broken contract; staging over it
-            // would silently overwrite a mid-flight `CommittingTxn`. Refuse
-            // like the other stagers do — the log stays dirty and
-            // replay-safe for the next mount.
-            if st.committing.is_some() {
-                error!("ext4 journal: the committing slot is occupied at unmount; not flushing");
-                return_errno_with_message!(Errno::EIO, "committing slot occupied at unmount");
+        // Up to TWO transactions can be left over under group commit: a
+        // force-locked one the stopped committer never staged (its drain
+        // completed after — or its trigger fired right before — the join),
+        // and the running successor... except the locked barrier means a
+        // successor only exists once the locking seat staged, so in
+        // practice one seat is occupied; the loop handles both uniformly,
+        // oldest first (the locking seat's transaction predates any
+        // running one, and log order must be tid order).
+        loop {
+            let staged = {
+                let mut st = self.state_write();
+                // `stop_commit_thread` joined the sole other committer, so a
+                // still-occupied slot is a broken contract; staging over it
+                // would silently overwrite a mid-flight `CommittingTxn`.
+                // Refuse like the other stagers do — the log stays dirty and
+                // replay-safe for the next mount.
+                if st.committing.is_some() {
+                    error!(
+                        "ext4 journal: the committing slot is occupied at unmount; not flushing"
+                    );
+                    return_errno_with_message!(Errno::EIO, "committing slot occupied at unmount");
+                }
+                // At unmount no operation is in flight, so every handle has
+                // closed; an undrained seat is a broken contract (a leaked
+                // OpHandle), and staging it would violate the freeze
+                // invariant — leave the log dirty and replay-safe instead.
+                if st
+                    .locking
+                    .as_ref()
+                    .or(st.running.as_ref())
+                    .is_some_and(|txn| txn.nr_updates() != 0)
+                {
+                    error!("ext4 journal: open journal handles at unmount; not flushing");
+                    return_errno_with_message!(Errno::EIO, "open journal handles at unmount");
+                }
+                match st.locking.take().or_else(|| st.running.take()) {
+                    // Mirror the commit thread: stage (which retains the
+                    // images atomically with the take — nothing races at
+                    // unmount, but the invariant is cheap and uniform: every
+                    // transaction entering the pipeline is slot-resident
+                    // with its images stashed).
+                    Some(txn) if txn.nr_metadata_blocks() > 0 => Some(st.stage_committing(txn)),
+                    // A captureless leftover is not committable; drop it and
+                    // look at the next seat.
+                    Some(_) => None,
+                    // Both seats empty: flushing is done.
+                    None => break,
+                }
+            };
+            if let Some(txn) = staged {
+                // `commit_staged` aborts the journal and retires the slot on
+                // failure; the transaction is lost, so do not checkpoint
+                // device state that no longer matches the log.
+                self.commit_staged(&txn)?;
             }
-            match st.running.take() {
-                // Mirror the commit thread: stage (which retains the images
-                // atomically with the take — nothing races at unmount, but
-                // the invariant is cheap and uniform: every transaction
-                // entering the pipeline is slot-resident with its images
-                // stashed).
-                Some(txn) if txn.nr_metadata_blocks() > 0 => Some(st.stage_committing(txn)),
-                // A captureless leftover is not committable; drop it.
-                Some(_) | None => None,
-            }
-        };
-        if let Some(txn) = staged {
-            // `commit_staged` aborts the journal and retires the slot on
-            // failure; the transaction is lost, so do not checkpoint device
-            // state that no longer matches the log.
-            self.commit_staged(&txn)?;
         }
-        // Nothing is running (taken above) or mid-commit (the slot was
-        // retired by `commit_staged`), so the pass's snapshot finds no
-        // unpublished revokes.
+        // Nothing is running, draining (both seats emptied above), or
+        // mid-commit (the slot was retired by `commit_staged`), so the
+        // pass's snapshot finds no unpublished revokes.
         checkpoint::checkpoint(self, self.device.as_ref())
     }
 }
@@ -1915,8 +2250,23 @@ impl Journal {
 enum CommitAction {
     /// Teardown requested (or the journal is gone): leave the loop.
     Exit,
-    /// The running transaction is committable: commit it.
-    Commit,
+    /// The pipeline has work: a drained locked transaction to stage, or a
+    /// due running transaction to lock/commit.
+    Advance,
+    /// The transaction the age deadline was armed for changed: recompute
+    /// the sleep's timeout and wait again.
+    Rearm,
+}
+
+/// One [`Journal::advance_pipeline`] outcome.
+enum PipelineStep {
+    /// A transaction was staged into the committing slot; commit it.
+    Staged(Arc<Transaction>),
+    /// A locked transaction is draining its open handles; nothing to do
+    /// until its last `journal_stop` wakes the committer.
+    Parked,
+    /// Nothing due (or a mid-flight commit occupies the slot).
+    Idle,
 }
 
 /// The owner is responsible for [`stop_commit_thread`](Journal::stop_commit_thread);
@@ -1932,50 +2282,81 @@ impl Drop for Journal {
     }
 }
 
-/// Returns `running`'s transaction, verifying it still matches the handle's
-/// transaction id.
+/// Looks up the capture-accepting transaction bearing `tid` — in the running
+/// seat, or in the locking seat while it drains (a force-locked
+/// transaction's OWN handles keep patching it there; only NEW handles are
+/// barred, see [`JournalState::locking`]).
 ///
-/// A mismatch means the handle outlived its transaction — impossible while the
-/// handle holds an open update (the transaction cannot commit until its last
-/// handle closes), but checked so a stale patch can never land on the wrong
-/// transaction's after-image.
-///
-/// Takes the `running` slot rather than the whole [`JournalState`] so a caller
+/// Takes the two seats rather than the whole [`JournalState`] so a caller
 /// can keep disjoint borrows of the state's other fields (the seed lookup in
 /// [`get_write_access`] reads `uncheckpointed` alongside the returned
-/// transaction).
-fn verify_running<'a>(
+/// transaction; `journal_stop` mutates only the found seat).
+fn active_txn_mut<'a>(
     running: &'a mut Option<Transaction>,
-    handle: &Handle,
-) -> Result<&'a mut Transaction> {
+    locking: &'a mut Option<Transaction>,
+    tid: Tid,
+) -> Option<&'a mut Transaction> {
     match running.as_mut() {
-        Some(running) if running.tid() == handle.tid() => Ok(running),
-        _ => return_errno_with_message!(Errno::EIO, "journal handle outlived its transaction"),
+        Some(txn) if txn.tid() == tid => Some(txn),
+        _ => match locking.as_mut() {
+            Some(txn) if txn.tid() == tid => Some(txn),
+            _ => None,
+        },
     }
 }
 
-/// [`verify_running`] over the whole state, for the funnels that need no other
+/// [`active_txn_mut`] for a handle, erroring on a miss: a miss means the
+/// handle outlived its transaction — impossible while the handle holds an
+/// open update (the transaction cannot stage until its last handle closes),
+/// but checked so a stale patch can never land on the wrong transaction's
+/// after-image.
+fn verify_active<'a>(
+    running: &'a mut Option<Transaction>,
+    locking: &'a mut Option<Transaction>,
+    handle: &Handle,
+) -> Result<&'a mut Transaction> {
+    active_txn_mut(running, locking, handle.tid())
+        .ok_or_else(|| Error::with_message(Errno::EIO, "journal handle outlived its transaction"))
+}
+
+/// [`verify_active`] over the whole state, for the funnels that need no other
 /// state field.
-fn running_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a mut Transaction> {
-    verify_running(&mut state.running, handle)
+fn active_for<'a>(state: &'a mut JournalState, handle: &Handle) -> Result<&'a mut Transaction> {
+    let JournalState {
+        running, locking, ..
+    } = state;
+    verify_active(running, locking, handle)
 }
 
 /// Seeds an existing metadata block's after-image and mints the
 /// [`WriteAccess`] credential whose [`patch`](WriteAccess::patch) calls
 /// accumulate onto its newest committed content (jbd2 `get_write_access`).
 ///
-/// The seed is the block's retained post-`running` image when one exists
-/// ([`JournalState::uncheckpointed`] — which holds the mid-flight COMMITTING
-/// transaction's images from the instant it was staged, alongside the
-/// committed-but-un-checkpointed ones; see that field's docs for the B-1
-/// invariant restated under the two-transaction pipeline) and the device
-/// content otherwise: between a transaction's staging and its checkpoint the
-/// device lags, and a device seed taken in that window would hand this
-/// transaction stale bytes for every neighbor object it does not patch itself
-/// (the B-1 clobber — see
+/// The seed order is newest-wins across the pipeline's stations: the
+/// force-locked (draining) predecessor's capture when one exists — its
+/// after-images are not in the retained map yet (they are still receiving
+/// its own handles' patches until staging); unreachable while
+/// `journal_start`'s locked barrier holds, since no successor can run
+/// alongside the seat, but the funnel consults the seat so the order is
+/// correct by construction, not by that gate — then the block's retained
+/// post-`running` image ([`JournalState::uncheckpointed`] — which holds the
+/// mid-flight COMMITTING transaction's images from the instant it was
+/// staged, alongside the committed-but-un-checkpointed ones; see that
+/// field's docs for the B-1 invariant restated under the pipeline), and the
+/// device content otherwise: between a transaction's staging and its
+/// checkpoint the device lags, and a device seed taken in that window would
+/// hand this transaction stale bytes for every neighbor object it does not
+/// patch itself (the B-1 clobber — see
 /// [`UncheckpointedImage`](transaction::UncheckpointedImage)). The whole
-/// decision — running-capture reuse vs retained image vs device read — is
-/// made under ONE `state_write` window, atomic against a concurrent staging.
+/// decision — running-capture reuse vs locked capture vs retained image vs
+/// device read — is made under ONE `state_write` window, atomic against a
+/// concurrent staging.
+///
+/// A handle of the LOCKED transaction itself seeds from the map/device only
+/// (its own captures are reused idempotently inside `capture_write`): the
+/// running successor — if one could exist — is NEWER, and seeding an older
+/// transaction from a newer one's uncommitted capture would be the
+/// isolation break the locked barrier exists to prevent.
 ///
 /// Without a handle (a non-journaled volume, or a caller that opened no
 /// transaction) the returned credential is inert: nothing is captured and
@@ -1991,17 +2372,34 @@ pub(super) fn get_write_access<'h>(
     let journal = handle.journal()?;
     let device = journal.device.clone();
     let mut state = journal.state_write();
-    // Disjoint field borrows: the running transaction (mutated by the capture)
-    // and the retained-image map (read for the seed).
+    // Disjoint field borrows: the handle's transaction (mutated by the
+    // capture), the other seat (read as a seed station), and the
+    // retained-image map (read for the seed).
     let JournalState {
         running,
+        locking,
         uncheckpointed,
         ..
     } = &mut *state;
-    let txn = verify_running(running, handle)?;
-    let seed = uncheckpointed
-        .get(&blocknr)
-        .map(transaction::UncheckpointedImage::image_bytes);
+    let (txn, locked_predecessor) = match running.as_mut() {
+        // A running-transaction handle: the locking seat, if occupied,
+        // holds the newest not-yet-retained images (see the docs above).
+        Some(txn) if txn.tid() == handle.tid() => (txn, locking.as_ref()),
+        // A locked transaction's own handle: no newer station to seed from.
+        _ => match locking.as_mut() {
+            Some(txn) if txn.tid() == handle.tid() => (txn, None),
+            _ => {
+                return_errno_with_message!(Errno::EIO, "journal handle outlived its transaction")
+            }
+        },
+    };
+    let seed = locked_predecessor
+        .and_then(|locked| locked.buffer_bytes(blocknr))
+        .or_else(|| {
+            uncheckpointed
+                .get(&blocknr)
+                .map(transaction::UncheckpointedImage::image_bytes)
+        });
     let generation = txn.capture_write(blocknr, seed, device.as_ref())?;
     Ok(WriteAccess {
         live: Some(LiveAccess {
@@ -2025,7 +2423,7 @@ pub(super) fn get_create_access<'h>(
     };
     let journal = handle.journal()?;
     let mut state = journal.state_write();
-    let generation = running_for(&mut state, handle)?.capture_create(blocknr);
+    let generation = active_for(&mut state, handle)?.capture_create(blocknr);
     Ok(WriteAccess {
         live: Some(LiveAccess {
             handle,
@@ -2065,7 +2463,7 @@ pub(super) fn pin_freed_run(handle: Option<&Handle>, start: Ext4Bid, count: u32)
     }
     let journal = handle.journal()?;
     let mut state = journal.state_write();
-    let tid = running_for(&mut state, handle)?.tid();
+    let tid = active_for(&mut state, handle)?.tid();
     if let Some(run) = state.pinned_frees.get_mut(&start) {
         run.count = run.count.max(count);
         run.tid = tid;
@@ -2135,7 +2533,7 @@ impl WriteAccess<'_> {
         };
         let journal = live.handle.journal()?;
         let mut state = journal.state_write();
-        running_for(&mut state, live.handle)?.apply_patch(live.bid, live.generation, patch)
+        active_for(&mut state, live.handle)?.apply_patch(live.bid, live.generation, patch)
     }
 }
 
@@ -2165,12 +2563,23 @@ pub(super) fn read_metadata_block(
 ) -> Result<[u8; BLOCK_SIZE]> {
     if let Some(journal) = journal {
         let state = journal.state_read();
-        // The running transaction's capture is newer than any retained image
-        // (a capture seeds *from* the retained image, then accumulates patches).
+        // Newest-wins across the stations: a running capture is newer than a
+        // locked (draining) predecessor's, which is newer than any retained
+        // image (a capture seeds *from* the older stations, then accumulates
+        // patches). The locking-seat station is load-bearing on the READ
+        // side even under the locked barrier: readers take no handle, so
+        // they run concurrently with a drain, and a drained-transaction
+        // capture's bytes exist nowhere else until staging stashes them.
         let newest = state
             .running
             .as_ref()
             .and_then(|txn| txn.buffer_bytes(blocknr))
+            .or_else(|| {
+                state
+                    .locking
+                    .as_ref()
+                    .and_then(|txn| txn.buffer_bytes(blocknr))
+            })
             .or_else(|| {
                 state
                     .uncheckpointed
@@ -2221,14 +2630,66 @@ pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
 }
 
 impl Journal {
-    /// Test helper: runs one commit pass (the commit thread's
-    /// [`commit_one`](Journal::commit_one)) **without** the eager checkpoint that
-    /// normally follows it, so a test can hold the journal in the
-    /// committed-but-un-checkpointed window deterministically — the window in
-    /// which the device lags the log and a capture's seed provenance matters.
+    /// Test helper: runs one FORCED commit pass (the commit thread's
+    /// [`commit_one`](Journal::commit_one) with the due policy overridden)
+    /// **without** the eager checkpoint that normally follows it, so a test
+    /// can hold the journal in the committed-but-un-checkpointed window
+    /// deterministically — the window in which the device lags the log and
+    /// a capture's seed provenance matters. Under group commit "forced"
+    /// means the batching triggers are bypassed, NOT the freeze invariant:
+    /// a transaction with open handles is parked to drain, not committed.
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn commit_now_for_test(&self) {
-        self.commit_one();
+        self.commit_one(true);
+    }
+
+    /// Test helper: one UNFORCED pipeline advance — exactly what the commit
+    /// thread does on a wake, minus the checkpoint — so the batching policy
+    /// (size/age/request triggers) is testable deterministically. Returns
+    /// whether a commit was attempted.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn commit_if_due_for_test(&self) -> bool {
+        self.commit_one(false)
+    }
+
+    /// Test helper: FORCED staging without the commit I/O — the pipeline
+    /// tests' deterministic "pin the pipeline mid-flight" primitive: the
+    /// drained running transaction is staged into the committing slot (via
+    /// [`advance_pipeline`](Self::advance_pipeline), policy overridden)
+    /// and returned for a hand-driven [`commit_staged`](Self::commit_staged);
+    /// `None` when nothing stages (no captures, open handles → parked, or
+    /// an occupied slot).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4::journal) fn stage_running_for_test(
+        &self,
+    ) -> Option<Arc<Transaction>> {
+        match self.advance_pipeline(true) {
+            PipelineStep::Staged(txn) => Some(txn),
+            PipelineStep::Parked | PipelineStep::Idle => None,
+        }
+    }
+
+    /// Test helper: the locking seat's `(tid, open handles, captured
+    /// blocks)`, or `None` when no transaction is draining. White-box
+    /// inspection for the T_LOCKED drain tests.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn locking_state_for_test(
+        &self,
+    ) -> Option<(Tid, usize, usize)> {
+        self.state_read()
+            .locking
+            .as_ref()
+            .map(|txn| (txn.tid(), txn.nr_updates(), txn.nr_metadata_blocks()))
+    }
+
+    /// Test helper: back-dates the running transaction's age deadline so the
+    /// age trigger fires on the next (deterministic, test-driven) poll —
+    /// real timer waits are not deterministic in ktest.
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn age_running_for_test(&self) {
+        if let Some(txn) = self.state_write().running.as_mut() {
+            txn.force_expire_for_test();
+        }
     }
 
     /// Test helper: the blocks in the running transaction's revoke set, in
@@ -2279,7 +2740,7 @@ impl Journal {
     /// pipeline tests run slot-resident exactly like production. Errors
     /// `EIO` if a transaction is already staged. Production transactions
     /// reach the slot through
-    /// [`take_running_for_commit`](Journal::take_running_for_commit) or the
+    /// [`advance_pipeline`](Journal::advance_pipeline) or the
     /// unmount flush's staging ([`flush_on_unmount`](Journal::flush_on_unmount)).
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4::journal) fn stage_transaction_for_test(
@@ -3300,8 +3761,9 @@ mod tests {
 
     // --- P7c-1: the running/committing two-transaction pipeline. ---
     // Deterministic recipe (experience §10.6): no commit thread runs; the
-    // pipeline is pinned mid-flight by staging via the production taker
-    // (`take_running_for_commit`) and finished by hand (`commit_staged`).
+    // pipeline is pinned mid-flight by staging via the production advance
+    // (`stage_running_for_test` → `advance_pipeline`, policy forced) and
+    // finished by hand (`commit_staged`).
 
     /// The pipeline overlap itself: while T1 sits staged in the committing
     /// slot (mid-flight, `Locked`), `journal_start` opens a NEW running
@@ -3322,7 +3784,7 @@ mod tests {
         journal_stop(h1).unwrap();
 
         // Pin the pipeline mid-flight: T1 staged, no I/O run yet.
-        let t1 = f.journal.take_running_for_commit().unwrap();
+        let t1 = f.journal.stage_running_for_test().unwrap();
         assert_eq!(
             f.journal.committing_for_test(),
             Some((t1_tid, CommitPhase::Locked))
@@ -3381,7 +3843,7 @@ mod tests {
             .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
         journal_stop(h1).unwrap();
-        let t1 = f.journal.take_running_for_commit().unwrap();
+        let t1 = f.journal.stage_running_for_test().unwrap();
 
         // The read funnel serves the committing transaction's image.
         let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), bid).unwrap();
@@ -3434,7 +3896,7 @@ mod tests {
                 .unwrap();
         }
         journal_stop(h).unwrap();
-        let _t1 = f.journal.take_running_for_commit().unwrap();
+        let _t1 = f.journal.stage_running_for_test().unwrap();
 
         // Skipping a station is refused, with the phase intact.
         let err = f
@@ -3489,7 +3951,7 @@ mod tests {
             .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
         journal_stop(h1).unwrap();
-        let t1 = f.journal.take_running_for_commit().unwrap();
+        let t1 = f.journal.stage_running_for_test().unwrap();
         f.journal.commit_staged(&t1).unwrap();
 
         // T2 running with a live capture (not committable — handle open).
@@ -3530,7 +3992,7 @@ mod tests {
 
         // Slot known-occupied, `running` empty: the probe targets the
         // committing tid.
-        let t1 = f.journal.take_running_for_commit().unwrap();
+        let t1 = f.journal.stage_running_for_test().unwrap();
         assert!(f.journal.state_read().running.is_none());
         assert_eq!(f.journal.sync_durability_target().unwrap(), Some(t1_tid));
 
@@ -3577,19 +4039,22 @@ mod tests {
             .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
             .unwrap();
         journal_stop(h1).unwrap();
-        let t1 = f.journal.take_running_for_commit().unwrap();
-        // …and T2 committable behind it.
+        let t1 = f.journal.stage_running_for_test().unwrap();
+        // …and T2 committable behind it (commit-forced: under group commit
+        // an untriggered transaction keeps batching instead).
         let h2 = journal_start(&f.journal, 4).unwrap();
+        let t2_tid = h2.tid();
         get_write_access(Some(&h2), 517)
             .unwrap()
             .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
             .unwrap();
         journal_stop(h2).unwrap();
+        f.journal.request_commit_for(t2_tid);
 
-        // The poll waits rather than handing the loop a refusing take…
-        assert!(Journal::poll_commit_action(&weak).is_none());
-        // …and the take-time guard itself refuses, both transactions intact.
-        assert!(f.journal.take_running_for_commit().is_none());
+        // The poll waits rather than handing the loop a refusing advance…
+        assert!(Journal::poll_commit_action(&weak, Some(t2_tid)).is_none());
+        // …and the advance-time guard itself refuses, both transactions intact.
+        assert!(f.journal.stage_running_for_test().is_none());
         assert_eq!(
             f.journal.committing_for_test(),
             Some((t1_tid, CommitPhase::Locked))
@@ -3597,11 +4062,11 @@ mod tests {
         assert!(f.journal.state_read().running.is_some());
 
         // Retiring the slot (which wakes the trigger) re-arms the poll: T2
-        // is now the committable pick.
+        // is now the pick.
         f.journal.commit_staged(&t1).unwrap();
         assert!(matches!(
-            Journal::poll_commit_action(&weak),
-            Some(CommitAction::Commit)
+            Journal::poll_commit_action(&weak, Some(t2_tid)),
+            Some(CommitAction::Advance)
         ));
     }
 
@@ -3769,5 +4234,182 @@ mod tests {
             },
             "a V1 superblock has no feature fields to set",
         );
+    }
+
+    // --- P7c-2: T_LOCKED — the locking seat, the drain, and the barrier. ---
+
+    /// The drain machinery end to end: a due transaction with an open
+    /// handle is PARKED (not committed), its own handle keeps capturing and
+    /// patching into the seat (tid-keyed funnels) and the read funnel
+    /// serves the seat's captures; the last close completes the drain, the
+    /// next advance stages + commits; and — the §10.6 pin-window recipe
+    /// extended — a successor capture then seeds the drained transaction's
+    /// stashed image, never the lagging device.
+    #[ktest]
+    fn due_transaction_with_open_handles_parks_drains_and_stages() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device().clone();
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let tid = h1.tid();
+        get_write_access(Some(&h1), 520)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        journal_stop(h1).unwrap();
+
+        // Force the trigger with h2 still open: the advance PARKS the
+        // transaction in the locking seat (T_LOCKED) instead of committing.
+        f.journal.request_commit_for(tid);
+        assert!(!f.journal.commit_if_due_for_test());
+        assert_eq!(f.journal.locking_state_for_test(), Some((tid, 1, 1)));
+        assert!(f.journal.state_read().running.is_none());
+
+        // The locked transaction's OWN handle keeps working: a fresh
+        // capture + patch land in the seat through the tid-keyed funnels…
+        get_write_access(Some(&h2), 521)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x22; 4]))
+            .unwrap();
+        assert_eq!(f.journal.locking_state_for_test(), Some((tid, 1, 2)));
+        // …and the metadata read funnel serves the seat's captures (readers
+        // take no handle, so they run concurrently with a drain).
+        let served = read_metadata_block(Some(f.journal.as_ref()), device.as_ref(), 520).unwrap();
+        assert_eq!(&served[..4], &[0x11; 4]);
+
+        // The last close completes the drain; the next advance stages and
+        // commits the seat.
+        journal_stop(h2).unwrap();
+        assert!(f.journal.commit_if_due_for_test());
+        assert!(f.journal.locking_state_for_test().is_none());
+        assert_eq!(f.journal.committed_tid(), tid);
+
+        // Pin window (§10.6): no checkpoint ran, so the device still lags.
+        // The successor's capture must seed the drained transaction's
+        // stashed image (both its blocks), not the device zeros.
+        let h3 = journal_start(&f.journal, 4).unwrap();
+        assert_eq!(h3.tid(), tid.next());
+        get_write_access(Some(&h3), 520)
+            .unwrap()
+            .patch(|b| {
+                assert_eq!(&b[..4], &[0x11; 4], "seed = the drained txn's image");
+                b[8..12].copy_from_slice(&[0x33; 4]);
+            })
+            .unwrap();
+        journal_stop(h3).unwrap();
+    }
+
+    /// The locked barrier: while a predecessor drains in the locking seat,
+    /// `journal_start` neither joins it nor creates a successor — it blocks
+    /// (jbd2 `wait_transaction_locked`) and joins the successor only once
+    /// the seat staged.
+    #[ktest]
+    fn journal_start_blocks_at_the_locked_barrier() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let tid = h1.tid();
+        get_write_access(Some(&h1), 522)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        journal_stop(h1).unwrap();
+        f.journal.request_commit_for(tid);
+        assert!(!f.journal.commit_if_due_for_test());
+        assert!(f.journal.locking_state_for_test().is_some());
+
+        // A new operation's `journal_start` must wait out the drain.
+        let joined = Arc::new(AtomicU32::new(u32::MAX));
+        let joined_clone = joined.clone();
+        let journal = f.journal.clone();
+        let joiner = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            let h = journal_start(&journal, 4).unwrap();
+            joined_clone.store(h.tid().get(), Ordering::Release);
+            journal_stop(h).unwrap();
+        })
+        .spawn();
+
+        // Give the joiner plenty of chances to (wrongly) run ahead: it must
+        // not have created a successor while the seat drains.
+        for _ in 0..16 {
+            crate::thread::Thread::yield_now();
+        }
+        assert_eq!(joined.load(Ordering::Acquire), u32::MAX, "barrier held");
+        assert!(f.journal.state_read().running.is_none());
+
+        // Drain + stage: the barrier lifts at STAGING (the successor may
+        // run while the commit's I/O would still be in flight).
+        journal_stop(h2).unwrap();
+        assert!(f.journal.commit_if_due_for_test());
+        joiner.join();
+        assert_eq!(joined.load(Ordering::Acquire), tid.next().get());
+    }
+
+    /// `sync(2)`'s durability probe covers the locking seat: with `running`
+    /// empty and the transaction parked mid-drain, the probe's target IS
+    /// its tid — returning early would claim durability for captures that
+    /// are not even staged yet.
+    #[ktest]
+    fn sync_probe_targets_the_locking_seat() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let tid = h1.tid();
+        get_write_access(Some(&h1), 523)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        journal_stop(h1).unwrap();
+        f.journal.request_commit_for(tid);
+        assert!(!f.journal.commit_if_due_for_test());
+        assert!(f.journal.locking_state_for_test().is_some());
+
+        assert_eq!(f.journal.sync_durability_target().unwrap(), Some(tid));
+
+        journal_stop(h2).unwrap();
+        assert!(f.journal.commit_if_due_for_test());
+        assert_eq!(f.journal.sync_durability_target().unwrap(), None);
+    }
+
+    /// The unmount flush commits a transaction left parked in the locking
+    /// seat (the committer joined mid-drain): staged oldest-first, committed,
+    /// checkpointed — the on-disk log ends clean and the bytes land.
+    #[ktest]
+    fn flush_on_unmount_commits_the_parked_transaction() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let h1 = journal_start(&f.journal, 4).unwrap();
+        let tid = h1.tid();
+        get_write_access(Some(&h1), 524)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x44; 4]))
+            .unwrap();
+        let h2 = journal_start(&f.journal, 4).unwrap();
+        journal_stop(h1).unwrap();
+        f.journal.request_commit_for(tid);
+        assert!(!f.journal.commit_if_due_for_test());
+        // The drain completes, but no committer runs again before unmount.
+        journal_stop(h2).unwrap();
+        assert!(f.journal.locking_state_for_test().is_some());
+
+        f.journal.flush_on_unmount().unwrap();
+
+        assert_eq!(f.journal.committed_tid(), tid);
+        assert!(f.journal.locking_state_for_test().is_none());
+        assert_eq!(f.journal.state_read().tail_block, None, "log left clean");
+        let mut buf = [0u8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(524 * BLOCK_SIZE, &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..4], &[0x44; 4], "checkpointed to the final location");
     }
 }

@@ -509,13 +509,17 @@ impl Ext4 {
         }
 
         if pinned_blocked {
-            // Everything left is pinned. Wake the committer (asynchronous —
-            // waiting here, under the superblock lock and the caller's inode
-            // locks and open handle, is banned; see the function docs) and
-            // fail the attempt: the state ends with the pinning transaction's
-            // commit, so a retry then succeeds.
+            // Everything left is pinned. Force-request a commit of the
+            // running transaction (asynchronous — waiting here, under the
+            // superblock lock and the caller's inode locks and open handle,
+            // is banned; see the function docs) and fail the attempt: the
+            // state ends with the pinning transaction's commit, so a retry
+            // then succeeds. Under group commit a bare wake would no longer
+            // help — an untriggered running transaction just keeps batching
+            // — so this escalates like Linux's failed-allocation retry
+            // (`ext4_should_retry_alloc` → `jbd2_journal_force_commit_nested`).
             if let Some(journal) = self.journal() {
-                journal.request_commit();
+                journal.request_commit_of_running();
             }
             return_errno_with_message!(
                 Errno::ENOSPC,

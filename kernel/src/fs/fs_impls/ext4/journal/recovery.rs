@@ -2555,4 +2555,76 @@ mod tests {
         assert_eq!(sb.s_checksum.get(), sb.checksum(), "unmount flush");
         assert_eq!(read_final_block(&f, 800u64), tagged_block(b"SBSTAMP2"));
     }
+
+    /// P7c-2 end to end: a group-commit-sized batch (600 captures > the 508
+    /// v0 tags one descriptor carries) commits as ONE transaction whose log
+    /// chain splits across two descriptors (a5's writer), and recovery
+    /// walks the whole chain as one tid and replays every block. This is
+    /// the writer+recovery same-batch pairing the `multi-descriptor-replay`
+    /// ledger row asks for.
+    #[ktest]
+    fn recover_replays_multi_descriptor_transaction() {
+        crate::time::clocks::init_for_ktest();
+        // 1024 log blocks: the 603-block chain (desc + 508 data + desc +
+        // 92 data + commit) fits the usable ring.
+        let f = journaled_fixture(1024, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        const NR_BLOCKS: u64 = 600;
+        const FIRST_DEST: u64 = 1300; // above the 1024-block journal at 200..1224
+        let stamp = |i: u64| (0xB10C_0000_0000_0000u64 | i).to_be_bytes();
+
+        let mut txn = Transaction::new(Tid::new(1));
+        for i in 0..NR_BLOCKS {
+            let bid = FIRST_DEST + i;
+            let generation = txn.capture_create(bid);
+            txn.apply_patch(bid, generation, |b| b[..8].copy_from_slice(&stamp(i)))
+                .unwrap();
+        }
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // The on-disk chain: descriptors at log 1 and 510 (both bearing THE
+        // one tid — a chain split, not a second transaction), commit at 603.
+        let desc1: RawJournalHeader = f
+            .fixture
+            .disk
+            .segment()
+            .read_val((JOURNAL_START_BLOCK + 1) as usize * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(desc1.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(desc1.h_sequence.get(), 1);
+        let desc2: RawJournalHeader = f
+            .fixture
+            .disk
+            .segment()
+            .read_val((JOURNAL_START_BLOCK + 510) as usize * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(desc2.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR, "chain split");
+        assert_eq!(desc2.h_sequence.get(), 1, "same transaction");
+        let commit: RawJournalHeader = f
+            .fixture
+            .disk
+            .segment()
+            .read_val((JOURNAL_START_BLOCK + 603) as usize * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(commit.h_blocktype.get(), BLOCKTYPE_COMMIT);
+        assert_eq!(commit.h_sequence.get(), 1);
+
+        // Final locations untouched before recovery (no checkpoint ran).
+        assert_eq!(read_final_block(&f, FIRST_DEST), [0u8; BLOCK_SIZE]);
+
+        recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+        // Every one of the 600 blocks replayed to its final location.
+        for i in 0..NR_BLOCKS {
+            let block = read_final_block(&f, FIRST_DEST + i);
+            assert_eq!(&block[..8], &stamp(i), "block {i} replayed");
+            assert_eq!(&block[8..64], &[0u8; 56], "rest of block {i} intact");
+        }
+        // One transaction consumed: the journal is clean at sequence 2.
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_sequence.get(), 2);
+        assert_eq!(f.journal.committed_tid(), Tid::new(1));
+    }
 }

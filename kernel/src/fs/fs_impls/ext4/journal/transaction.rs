@@ -62,12 +62,24 @@
 // marker on each); it is absent in ktest, where all of it is exercised.
 #![cfg_attr(not(ktest), expect(dead_code))]
 
+use ostd::timer::{Jiffies, TIMER_FREQ};
+
 use super::{
     super::{inode::Inode, prelude::*},
-    Journal, Tid,
+    Journal, JournalState, Tid,
     format::TagLayout,
     revoke::RevokeTable,
 };
+
+/// How long a running transaction may age before the commit thread commits it
+/// (jbd2 `j_commit_interval`), in jiffies: 5 seconds, Linux's
+/// `JBD2_DEFAULT_MAX_COMMIT_AGE` (include/linux/jbd2.h; ext4 mounts set
+/// `j_commit_interval = HZ * JBD2_DEFAULT_MAX_COMMIT_AGE`, fs/ext4/super.c:5242).
+/// This bounds the crash-loss window of un-synced work under group commit —
+/// matching Linux's data=ordered semantics exactly, so anything an
+/// application did not fsync may lose up to this much recent work in a crash
+/// (plus the drain of then-open handles), never anything it did fsync.
+const COMMIT_INTERVAL_JIFFIES: u64 = 5 * TIMER_FREQ;
 
 /// One ordered-data registration: the pages an operation's new metadata will
 /// reference, flushed by commit with no inode lock (see
@@ -194,15 +206,20 @@ impl UncheckpointedImage {
 ///
 /// - `T_RUNNING` ≡ residency in [`JournalState::running`](super::JournalState)
 ///   (accepting handles and captures);
+/// - `T_LOCKED`-with-open-handles ≡ residency in
+///   [`JournalState::locking`](super::JournalState) (accepting no NEW
+///   handles; its own still-open handles keep patching until they close —
+///   the drain, P7c-2);
 /// - the five phases below ≡ residency in
 ///   [`JournalState::committing`](super::JournalState) (the slot's `phase`
 ///   field, advanced by the commit pipeline under the state lock);
 /// - past retirement, only the transaction's after-images remain, in
 ///   [`JournalState::uncheckpointed`](super::JournalState), until checkpoint.
 ///
-/// jbd2 mapping: `Locked` ≈ `T_LOCKED` (+ the zero-width `T_SWITCH` — our
-/// take happens only once every handle has closed, so there is no draining
-/// window to observe), `Flush` ≈ `T_FLUSH`, `Commit` ≈ `T_COMMIT`,
+/// jbd2 mapping: the locking seat above is `T_LOCKED`'s draining window;
+/// the slot's `Locked` phase is its drained tail end (+ the zero-width
+/// `T_SWITCH` — staging happens only once every handle has closed, so
+/// there is nothing left to switch), `Flush` ≈ `T_FLUSH`, `Commit` ≈ `T_COMMIT`,
 /// `CommitRecord` ≈ `T_COMMIT_DFLUSH` + `T_COMMIT_JFLUSH` **collapsed** (one
 /// block device and synchronous barriers: the data-device and
 /// journal-device flushes of the commit record are one indivisible step
@@ -269,6 +286,12 @@ impl CommitPhase {
 pub(in crate::fs::fs_impls::ext4) struct Transaction {
     /// This transaction's id (`t_tid`).
     tid: Tid,
+    /// When this transaction's age makes it due for commit (jbd2
+    /// `t_expires = jiffies + j_commit_interval`), fixed at creation. The
+    /// commit thread's age trigger compares it against the current jiffies
+    /// ([`is_expired_at`](Self::is_expired_at)); it never changes, so the
+    /// armed sleep deadline stays valid for the transaction's whole life.
+    expires_at: Jiffies,
     /// Number of open handles (`journal_start` not yet `journal_stop`'d;
     /// `t_updates`).
     t_updates: usize,
@@ -304,10 +327,15 @@ pub(in crate::fs::fs_impls::ext4) struct Transaction {
 }
 
 impl Transaction {
-    /// Creates a fresh running transaction with id `tid` and no captured blocks.
+    /// Creates a fresh running transaction with id `tid` and no captured
+    /// blocks, due for an age-triggered commit [`COMMIT_INTERVAL_JIFFIES`]
+    /// from now (jbd2 `jbd2_get_transaction` stamping `t_expires`).
     pub(super) fn new(tid: Tid) -> Self {
+        let mut expires_at = Jiffies::elapsed();
+        expires_at.add(COMMIT_INTERVAL_JIFFIES);
         Self {
             tid,
+            expires_at,
             t_updates: 0,
             outstanding_credits: 0,
             metadata: BTreeMap::new(),
@@ -315,6 +343,40 @@ impl Transaction {
             revoked: BTreeSet::new(),
             ordered_data: BTreeMap::new(),
         }
+    }
+
+    /// Returns whether this transaction's age makes it due for commit at
+    /// `now` (jbd2 `time_after_eq(jiffies, transaction->t_expires)`).
+    /// Jiffies since boot never wrap a `u64` in practice, so the comparison
+    /// is plain.
+    pub(super) fn is_expired_at(&self, now: Jiffies) -> bool {
+        now.as_u64() >= self.expires_at.as_u64()
+    }
+
+    /// The time remaining until this transaction's age deadline (zero once
+    /// expired) — what the commit thread arms its sleep timeout with.
+    pub(super) fn until_expiry(&self, now: Jiffies) -> Duration {
+        Jiffies::new(self.expires_at.as_u64().saturating_sub(now.as_u64())).as_duration()
+    }
+
+    /// The log blocks this transaction's captured work serializes into so
+    /// far — its captured metadata blocks plus its whole revoke blocks under
+    /// `layout` — the measure the batch-size commit trigger compares against
+    /// [`Journal::batch_trigger_credits`](super::Journal). Deliberately NOT
+    /// `outstanding_credits`: reservations are fixed conservative worst
+    /// cases until P7d's precise accounting, so counting them would trigger
+    /// commits an order of magnitude early; captured work is the
+    /// transaction's real, already-incurred footprint.
+    pub(super) fn batch_footprint(&self, layout: TagLayout) -> usize {
+        self.nr_metadata_blocks() + self.nr_revoke_blocks(layout)
+    }
+
+    /// Test helper: back-dates the age deadline so the transaction is
+    /// expired at every future `now` — the deterministic form of the age
+    /// trigger for ktest (real timer waits are non-deterministic there).
+    #[cfg(ktest)]
+    pub(super) fn force_expire_for_test(&mut self) {
+        self.expires_at = Jiffies::new(0);
     }
 
     /// Mints the generation for a FRESH capture (see [`CaptureGeneration`]).
@@ -673,7 +735,7 @@ impl Handle {
     ) -> Result<()> {
         let journal = self.journal()?;
         let mut st = journal.state_write();
-        super::verify_running(&mut st.running, self)?.register_ordered_data(ino, inode, pages, len);
+        super::active_for(&mut st, self)?.register_ordered_data(ino, inode, pages, len);
         Ok(())
     }
 
@@ -717,13 +779,24 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 /// If no transaction is running, a fresh one is created with the next tid —
 /// even while a committing transaction is mid-flight (the two-transaction
 /// pipeline): starting neither consults nor waits on the committing slot
-/// (iron law 1: the only wait here is for *space* in the running
-/// transaction, legal under inode locks). When the running transaction
-/// cannot fit the reservation, this blocks until it commits or another
-/// handle releases credits, then retries — the minimal form of jbd2
-/// `add_transaction_credits`' wait loop. (Precise credit accounting and
-/// commit *batching* under pressure remain P7c-2/P7d; this only stops a full
-/// transaction from surfacing as `ENOSPC` to unlink/write under load.)
+/// (iron law 1: the only waits here are for *space*, legal under inode
+/// locks). Two conditions block, both resolved by the same waker set:
+///
+/// - **The locked barrier** (jbd2 `add_transaction_credits`:
+///   `t_state != T_RUNNING` → `wait_transaction_locked`,
+///   fs/jbd2/transaction.c:236-243): while a predecessor drains in the
+///   locking seat, no handle may join it AND no successor may run — Model A
+///   patches serialize the globally-current typed metadata state, so a
+///   successor capture racing the locked transaction's still-open handles
+///   would leak uncommitted successor state into the older commit's images
+///   (an isolation break jbd2 closes the same way, by parking new handles
+///   until the drain completes). The wait ends at STAGING, not at the end of
+///   commit I/O — the successor then runs concurrently with the commit,
+///   which is the pipeline overlap.
+/// - **A full running transaction** (jbd2's wait loop): this escalates via
+///   [`Journal::request_commit_for`], so under group commit the full
+///   transaction is force-locked and drained rather than waited out
+///   passively, then retries.
 pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
     // A reservation that exceeds an *empty* transaction's capacity can never
     // succeed no matter how many commits retire; refuse it outright so the
@@ -743,33 +816,52 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
         let (tid, epoch) = {
             let mut st = journal.state_write();
 
-            if st.running.is_none() {
-                let tid = st.next_tid;
-                st.next_tid = tid.next();
-                st.running = Some(Transaction::new(tid));
+            if let Some(locking) = st.locking.as_ref() {
+                // The locked barrier (see the function docs). Snapshot the
+                // epoch under this lock: staging bumps it, so the wake
+                // cannot be missed.
+                (locking.tid(), journal.credit_release_epoch())
+            } else {
+                let created = st.running.is_none();
+                if created {
+                    let tid = st.next_tid;
+                    st.next_tid = tid.next();
+                    st.running = Some(Transaction::new(tid));
+                }
+
+                // Split the borrow: read the capacity bound off `journal`,
+                // then mutate the running transaction. `running` is `Some`
+                // by construction above.
+                let running = st.running.as_mut().unwrap();
+                let tid = running.tid;
+
+                if check_capacity(journal, running, credits).is_ok() {
+                    running.t_updates += 1;
+                    running.outstanding_credits += credits;
+                    drop(st);
+                    if created {
+                        // Wake the commit thread so it re-arms its age-
+                        // trigger sleep on the new transaction's deadline
+                        // (jbd2 arms `j_commit_timer` in
+                        // `jbd2_get_transaction`; our timer is the commit
+                        // thread's own timed sleep, so creation must nudge
+                        // it to re-evaluate).
+                        journal.request_commit();
+                    }
+
+                    return Ok(Handle {
+                        tid,
+                        credits,
+                        journal: Arc::downgrade(journal),
+                    });
+                }
+
+                // Full. Snapshot the release epoch under the same lock that
+                // observed fullness so a release between dropping the lock
+                // and sleeping still wakes us (it must bump the epoch after
+                // this).
+                (tid, journal.credit_release_epoch())
             }
-
-            // Split the borrow: read the capacity bound off `journal`, then
-            // mutate the running transaction. `running` is `Some` by
-            // construction above.
-            let running = st.running.as_mut().unwrap();
-            let tid = running.tid;
-
-            if check_capacity(journal, running, credits).is_ok() {
-                running.t_updates += 1;
-                running.outstanding_credits += credits;
-
-                return Ok(Handle {
-                    tid,
-                    credits,
-                    journal: Arc::downgrade(journal),
-                });
-            }
-
-            // Full. Snapshot the release epoch under the same lock that
-            // observed fullness so a release between dropping the lock and
-            // sleeping still wakes us (it must bump the epoch after this).
-            (tid, journal.credit_release_epoch())
         };
 
         // Sleeping here can hold the caller's inode locks; see
@@ -783,9 +875,24 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
 
 /// Closes a handle, releasing its credit reservation (jbd2 `jbd2_journal_stop`).
 ///
-/// When the last handle of a transaction closes (`t_updates` reaches 0) and the
-/// transaction captured metadata, this signals the commit thread — Phase 4's
-/// commit-per-op. The signal is asynchronous; durability is `fsync`'s job.
+/// Under group commit (P7c-2) this does NOT request a commit of the
+/// transaction — the batching change from Phase 4's commit-per-op. The
+/// running transaction keeps accumulating operations until a trigger fires:
+/// an explicit durability demand (`fsync`/`O_SYNC`/`sync(2)` →
+/// [`Journal::log_wait_commit`] escalates), the batch-size threshold
+/// ([`Journal::batch_trigger_credits`]), or the transaction's age
+/// ([`COMMIT_INTERVAL_JIFFIES`]) — jbd2's `h_sync` / size / `t_expires`
+/// triggers respectively. **Crash-loss window**: un-synced work can now sit
+/// un-committed for up to the age interval (5 s) plus the drain of
+/// then-open handles — exactly Linux's data=ordered semantics; anything
+/// fsync-acknowledged is still durable at the fsync's return.
+///
+/// The close always wakes the commit thread to re-evaluate its policy
+/// (cheap when it is not waiting): that single uniform wake is what
+/// completes a locked transaction's drain (the close of ITS last handle is
+/// the event the committer's `Parked` wait sleeps on), arms the age trigger
+/// once a transaction gains captures, and lets the size trigger fire at the
+/// close that crossed the threshold.
 pub(super) fn journal_stop(handle: Handle) -> Result<()> {
     let journal = handle
         .journal
@@ -794,38 +901,39 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
 
     let released = {
         let mut st = journal.state_write();
-        if let Some(running) = st.running.as_mut()
-            && running.tid == handle.tid
-        {
-            running.t_updates = running.t_updates.saturating_sub(1);
-            running.outstanding_credits =
-                running.outstanding_credits.saturating_sub(handle.credits);
-            // Once the last handle closes and the transaction has captured
-            // metadata, it is committable. Phase 4 is commit-per-op: signal the
-            // commit thread now. This is asynchronous — the operation does not wait
-            // for the commit (durability is `fsync`'s job, via `log_wait_commit`).
-            Some(running.t_updates == 0 && running.nr_metadata_blocks() > 0)
+        // The handle's transaction is in `running`, or in `locking` if the
+        // committer force-locked it while this handle was open (its own
+        // handles keep reaching it there; only NEW handles are barred).
+        let JournalState {
+            running, locking, ..
+        } = &mut *st;
+        if let Some(txn) = super::active_txn_mut(running, locking, handle.tid) {
+            txn.t_updates = txn.t_updates.saturating_sub(1);
+            txn.outstanding_credits = txn.outstanding_credits.saturating_sub(handle.credits);
+            true
         } else {
-            None
+            false
         }
     };
 
-    if let Some(should_commit) = released {
-        // Wake capacity-blocked `journal_start`s: this handle's reservation is
-        // back in the pool even if the transaction is not committable.
+    if released {
+        // Wake capacity-blocked `journal_start`s: this handle's reservation
+        // is back in the pool.
         journal.note_credits_released();
-        if should_commit {
-            journal.request_commit();
-        }
+        // Let the committer re-evaluate (drain completion / size / age); see
+        // the function docs.
+        journal.request_commit();
     }
     Ok(())
 }
 
 /// Grows a handle's reservation by `extra` blocks (jbd2 `jbd2_journal_extend`).
 ///
-/// Fails `ENOSPC` if the transaction cannot fit the extra credits. (jbd2 returns
-/// a distinct "cannot extend" signal so the caller can restart; `ENOSPC` is
-/// adequate for Phase 4.)
+/// Fails `ENOSPC` if the transaction cannot fit the extra credits, or if the
+/// handle's transaction has been force-locked for commit (jbd2 refuses to
+/// extend any transaction not in `T_RUNNING`, fs/jbd2/transaction.c
+/// `jbd2_journal_extend`: the locked transaction must drain, not grow; the
+/// caller's move is a restart). `ENOSPC` covers both for Phase 4.
 pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
     let journal = handle
         .journal
@@ -833,6 +941,16 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
         .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
     let mut st = journal.state_write();
 
+    if st
+        .locking
+        .as_ref()
+        .is_some_and(|locked| locked.tid == handle.tid)
+    {
+        return_errno_with_message!(
+            Errno::ENOSPC,
+            "cannot extend a transaction locked for commit"
+        );
+    }
     let Some(running) = st.running.as_mut() else {
         return_errno_with_message!(Errno::EIO, "journal_extend without a running transaction");
     };
@@ -850,8 +968,11 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
 /// current transaction and starts a fresh one so an unbounded operation (write /
 /// truncate) never overflows a single transaction. That needs multi-transaction
 /// operations (re-capture after the boundary, re-truncate orphan recovery),
-/// which are P7's journal_restart work; this skeleton only releases the old
-/// reservation and re-reserves on the *still-running* transaction.
+/// which are P7d's journal_restart work; this skeleton only releases the old
+/// reservation and re-reserves on the *still-running* transaction — so a
+/// handle whose transaction was force-locked mid-operation is refused
+/// `ENOSPC` (a true restart would close out of the locked transaction and
+/// rejoin through `journal_start`'s locked barrier, jbd2's shape).
 pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()> {
     let journal = handle
         .journal
@@ -859,6 +980,16 @@ pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()>
         .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
     let mut st = journal.state_write();
 
+    if st
+        .locking
+        .as_ref()
+        .is_some_and(|locked| locked.tid == handle.tid)
+    {
+        return_errno_with_message!(
+            Errno::ENOSPC,
+            "cannot restart within a transaction locked for commit"
+        );
+    }
     let Some(running) = st.running.as_mut() else {
         return_errno_with_message!(Errno::EIO, "journal_restart without a running transaction");
     };
@@ -1290,5 +1421,148 @@ mod tests {
             .unwrap();
         assert_eq!(txn.revoked_blocks().count(), 0);
         assert_eq!(txn.nr_metadata_blocks(), 1);
+    }
+
+    // --- P7c-2: the group-commit batching policy (size / age / request). ---
+    // Deterministic: no commit thread runs; `commit_if_due_for_test` is one
+    // unforced pipeline advance — exactly the commit thread's wake.
+
+    /// `journal_stop` no longer commits: below every trigger the batch
+    /// persists across operations — a second op joins the SAME transaction.
+    #[ktest]
+    fn journal_stop_batches_instead_of_committing() {
+        let j = journaled_fixture(64, 1, 1);
+        let h = journal_start(&j, 4).unwrap();
+        {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(1500);
+            txn.apply_patch(1500, generation, |b| b[..4].copy_from_slice(b"BTCH"))
+                .unwrap();
+        }
+        journal_stop(h).unwrap();
+
+        assert!(!j.commit_if_due_for_test(), "no trigger: nothing commits");
+        assert_eq!(j.running_nr_metadata_blocks(), 1, "the batch persists");
+
+        // The next operation joins the same running transaction: the batch.
+        let h2 = journal_start(&j, 4).unwrap();
+        assert_eq!(h2.tid(), Tid::new(1));
+        journal_stop(h2).unwrap();
+        assert!(!j.commit_if_due_for_test());
+    }
+
+    /// The size trigger: the captured footprint reaching a quarter of
+    /// `max_credits` (jbd2's `j_max_transaction_buffers = total/4`) makes
+    /// the transaction due — one capture short of it does not.
+    #[ktest]
+    fn size_threshold_makes_transaction_due() {
+        // maxlen 64 → max_credits 60 → the quarter trigger is 15.
+        let j = journaled_fixture(64, 1, 1);
+        let h = journal_start(&j, 4).unwrap();
+        {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            for i in 0..14u64 {
+                txn.capture_create(1500 + i);
+            }
+        }
+        journal_stop(h).unwrap();
+        assert!(
+            !j.commit_if_due_for_test(),
+            "one below the quarter: batching"
+        );
+
+        let h = journal_start(&j, 4).unwrap();
+        {
+            let mut st = j.state_write();
+            st.running.as_mut().unwrap().capture_create(1600);
+        }
+        journal_stop(h).unwrap();
+        assert!(j.commit_if_due_for_test(), "at the quarter: committed");
+        assert_eq!(j.committed_tid(), Tid::new(1));
+    }
+
+    /// The age trigger: a batch too small for the size trigger commits once
+    /// its transaction outlives the commit interval (deterministically
+    /// back-dated; the real deadline is the commit thread's timed sleep).
+    #[ktest]
+    fn age_makes_transaction_due() {
+        let j = journaled_fixture(64, 1, 1);
+        let h = journal_start(&j, 4).unwrap();
+        {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(1500);
+            txn.apply_patch(1500, generation, |b| b[..4].copy_from_slice(b"AGED"))
+                .unwrap();
+        }
+        journal_stop(h).unwrap();
+        assert!(!j.commit_if_due_for_test(), "young and small: batching");
+
+        j.age_running_for_test();
+        assert!(j.commit_if_due_for_test(), "expired: committed");
+        assert_eq!(j.committed_tid(), Tid::new(1));
+    }
+
+    /// The durability trigger: `request_commit_for` (what `log_wait_commit`
+    /// and the capacity escalation call) makes the named transaction due
+    /// immediately, and is cleared by its staging.
+    #[ktest]
+    fn commit_request_makes_transaction_due() {
+        let j = journaled_fixture(64, 1, 1);
+        let h = journal_start(&j, 4).unwrap();
+        let tid = h.tid();
+        {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(1500);
+            txn.apply_patch(1500, generation, |b| b[..4].copy_from_slice(b"SYNC"))
+                .unwrap();
+        }
+        journal_stop(h).unwrap();
+        assert!(!j.commit_if_due_for_test());
+
+        j.request_commit_for(tid);
+        assert!(j.commit_if_due_for_test(), "requested: committed");
+        assert_eq!(j.committed_tid(), tid);
+        assert!(
+            j.state_write().commit_request.is_none(),
+            "staging clears the covered request"
+        );
+    }
+
+    /// A batch-sized revoke set counts toward the size trigger through the
+    /// same P7b-3 charge as capacity: whole revoke blocks are
+    /// capture-equivalents, so a transaction that mostly FREES still
+    /// commits at the quarter footprint (and its 14 revoke blocks + 1 data
+    /// + 1 descriptor + 1 commit chain passes the commit fit guard).
+    #[ktest]
+    fn revoke_footprint_counts_toward_size_trigger() {
+        // maxlen 64 → trigger 15: 1 capture + 14 revoke blocks (13*1020+1
+        // records at 1020 per v0 block) = 15.
+        let j = journaled_fixture(64, 1, 1);
+        let h = journal_start(&j, 4).unwrap();
+        {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(1500);
+            txn.apply_patch(1500, generation, |b| b[..4].copy_from_slice(b"FREE"))
+                .unwrap();
+            for i in 0..(13u64 * 1020 + 1) {
+                txn.forget_block(30_000 + i);
+            }
+            assert_eq!(
+                txn.batch_footprint(j.geometry().tag_layout()),
+                15,
+                "1 capture + 14 revoke blocks"
+            );
+        }
+        journal_stop(h).unwrap();
+        assert!(
+            j.commit_if_due_for_test(),
+            "revoke footprint tips the trigger"
+        );
+        assert_eq!(j.committed_tid(), Tid::new(1));
     }
 }

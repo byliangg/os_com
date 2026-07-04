@@ -306,14 +306,17 @@ impl RevokeDuty {
     ) -> Result<()> {
         let journal = handle.journal()?;
         let mut state = journal.state_write();
-        // Disjoint field borrows: the running transaction (capture cancel +
-        // revoke record) and the retained-image map (stale-seed eviction).
+        // Disjoint field borrows: the handle's transaction (capture cancel +
+        // revoke record; found tid-keyed in the running or locking seat — a
+        // force-locked transaction's own operations may still free blocks
+        // while it drains) and the retained-image map (stale-seed eviction).
         let JournalState {
             running,
+            locking,
             uncheckpointed,
             ..
         } = &mut *state;
-        let txn = super::verify_running(running, handle)?;
+        let txn = super::verify_active(running, locking, handle)?;
         for i in 0..count {
             let bid = start + Ext4Bid::from(i);
             txn.forget_block(bid);
