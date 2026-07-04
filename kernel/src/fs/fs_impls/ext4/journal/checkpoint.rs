@@ -80,7 +80,6 @@ use super::{
         BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawBlockTag, RawJournalHeader,
         RawJournalSuperblock, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
     },
-    tid_geq,
 };
 
 /// The 12-byte jbd2 block header size, the offset at which a descriptor block's
@@ -150,7 +149,7 @@ pub(super) fn apply_log_transaction(
     if header.h_blocktype.get() != BLOCKTYPE_DESCRIPTOR {
         return_errno_with_message!(Errno::EUCLEAN, "expected a journal descriptor block");
     }
-    if header.h_sequence.get() != expected_tid {
+    if Tid::new(header.h_sequence.get()) != expected_tid {
         return_errno_with_message!(Errno::EUCLEAN, "journal descriptor has an unexpected tid");
     }
 
@@ -210,7 +209,7 @@ pub(super) fn apply_log_transaction(
     let commit_header = RawJournalHeader::parse(&commit);
     if commit_header.h_magic.get() != JBD2_MAGIC
         || commit_header.h_blocktype.get() != BLOCKTYPE_COMMIT
-        || commit_header.h_sequence.get() != expected_tid
+        || Tid::new(commit_header.h_sequence.get()) != expected_tid
     {
         return_errno_with_message!(Errno::EUCLEAN, "journal commit block is malformed");
     }
@@ -254,7 +253,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // known-committed, so `apply_log_transaction` must find a valid commit block;
     // a failure means log corruption (EUCLEAN/EIO), which we propagate.
     //
-    // Loop termination: `tid_geq(committed_tid, tid)` is jbd2's wrapping-aware
+    // Loop termination: `committed_tid.geq(tid)` is jbd2's wrapping-aware
     // "is committed_tid at or after tid?". `tid` starts at `tail_tid` and steps
     // by one per committed transaction; because at most half the id space
     // separates `tail_tid` from `committed_tid` (they bound the live log), the
@@ -262,9 +261,9 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // terminating after applying tid `committed_tid`.
     let mut log = tail_block;
     let mut tid = tail_tid;
-    while tid_geq(committed_tid, tid) {
+    while committed_tid.geq(tid) {
         log = apply_log_transaction(journal, device, log, tid)?;
-        tid = tid.wrapping_add(1);
+        tid = tid.next();
     }
 
     // --- Barrier: every final-location write durable BEFORE we drop the log's
@@ -284,7 +283,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // Journal now clean: nothing awaits recovery.
     raw.s_start = Be32::new(0);
     // The tid recovery would expect for the first transaction after this point.
-    raw.s_sequence = Be32::new(committed_tid.wrapping_add(1));
+    raw.s_sequence = Be32::new(committed_tid.next().get());
     // A clean-unmount superblock MUST carry a correct s_head: Linux's clean
     // fast path (recovery.c, s_start == 0) resumes the log from s_head, so a
     // stale value would corrupt a subsequent mount. `commit.rs` deliberately
@@ -310,7 +309,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     {
         let mut st = journal.state_write();
         st.tail_block = 0;
-        st.tail_tid = committed_tid.wrapping_add(1);
+        st.tail_tid = committed_tid.next();
         st.uncheckpointed
             .retain(|_, image| !image.is_checkpointed_by(committed_tid));
     }
@@ -433,10 +432,10 @@ mod tests {
         after[..8].copy_from_slice(b"AFTERIMG");
         after[BLOCK_SIZE - 4..].copy_from_slice(b"TAIL");
 
-        let txn = make_txn(1, &[(dest, after)]);
+        let txn = make_txn(Tid::new(1), &[(dest, after)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
         let committed = f.journal.committed_tid();
-        assert_eq!(committed, 1);
+        assert_eq!(committed, Tid::new(1));
 
         // Before checkpoint: the final location still holds the fixture's zeroed
         // disk — the after-image lives only in the log.
@@ -453,7 +452,7 @@ mod tests {
         // The on-disk superblock is now clean, with the right next tid and head.
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
-        assert_eq!(sb.s_sequence.get(), committed + 1);
+        assert_eq!(sb.s_sequence.get(), committed.next().get());
         assert_eq!(sb.s_head.get(), head_before);
 
         // In-memory tail is cleared.
@@ -474,7 +473,7 @@ mod tests {
         original[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
         original[4..8].copy_from_slice(b"REST");
 
-        let txn = make_txn(1, &[(dest, original)]);
+        let txn = make_txn(Tid::new(1), &[(dest, original)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
@@ -499,11 +498,11 @@ mod tests {
         content_b[..8].copy_from_slice(b"CONTENTB");
 
         // T1 (tid 1) writes A, T2 (tid 2) writes B, to the SAME final block.
-        let t1 = make_txn(1, &[(dest, content_a)]);
+        let t1 = make_txn(Tid::new(1), &[(dest, content_a)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        let t2 = make_txn(2, &[(dest, content_b)]);
+        let t2 = make_txn(Tid::new(2), &[(dest, content_b)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        assert_eq!(f.journal.committed_tid(), 2);
+        assert_eq!(f.journal.committed_tid(), Tid::new(2));
 
         checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
 
@@ -526,7 +525,7 @@ mod tests {
         let dest1 = 500u64;
         let mut c1 = [0u8; BLOCK_SIZE];
         c1[..4].copy_from_slice(b"ONE0");
-        let t1 = make_txn(1, &[(dest1, c1)]);
+        let t1 = make_txn(Tid::new(1), &[(dest1, c1)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
         checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
         assert_eq!(read_journal_super(&f).s_start.get(), 0);
@@ -537,9 +536,9 @@ mod tests {
         let dest2 = 800u64;
         let mut c2 = [0u8; BLOCK_SIZE];
         c2[..4].copy_from_slice(b"TWO0");
-        let t2 = make_txn(2, &[(dest2, c2)]);
+        let t2 = make_txn(Tid::new(2), &[(dest2, c2)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        assert_eq!(f.journal.committed_tid(), 2);
+        assert_eq!(f.journal.committed_tid(), Tid::new(2));
 
         // The journal is dirty again (s_start re-established) and the tail records
         // the new transaction.
@@ -569,7 +568,7 @@ mod tests {
         let mut after = [0u8; BLOCK_SIZE];
         after[..8].copy_from_slice(b"IDEMPOT!");
 
-        let txn = make_txn(1, &[(dest, after)]);
+        let txn = make_txn(Tid::new(1), &[(dest, after)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // The transaction starts at log block `first` (== 1).
@@ -577,7 +576,8 @@ mod tests {
 
         // First apply.
         let next1 =
-            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1).unwrap();
+            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, Tid::new(1))
+                .unwrap();
         assert_eq!(read_final_block(&f, dest), after);
 
         // Clobber the final location, then re-apply the SAME committed transaction:
@@ -589,7 +589,8 @@ mod tests {
             .unwrap();
         assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
         let next2 =
-            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, 1).unwrap();
+            apply_log_transaction(f.journal.as_ref(), device.as_ref(), start_log, Tid::new(1))
+                .unwrap();
         assert_eq!(read_final_block(&f, dest), after);
         assert_eq!(next1, next2);
     }

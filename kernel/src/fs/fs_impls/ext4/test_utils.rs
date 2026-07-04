@@ -498,8 +498,8 @@ impl Ext4FixtureBuilder {
                 disk.as_ref(),
                 JOURNAL_START_BLOCK as Ext4Bid,
                 maxlen,
-                1, // s_first: first log-data block
-                1, // s_sequence: fresh journal starts at tid 1
+                1,                           // s_first: first log-data block
+                super::journal::Tid::new(1), // s_sequence: fresh journal starts at tid 1
             )?;
         }
 

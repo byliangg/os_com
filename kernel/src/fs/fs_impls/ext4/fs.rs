@@ -2458,8 +2458,8 @@ mod tests {
         // `fsync` returned only after its transaction committed.
         let committed_after = journal.committed_tid();
         assert!(
-            journal::tid_geq(committed_after, committed_before.wrapping_add(1)),
-            "fsync must wait for its commit (before={committed_before}, after={committed_after})"
+            committed_after.geq(committed_before.next()),
+            "fsync must wait for its commit (before={committed_before:?}, after={committed_after:?})"
         );
 
         // A second fsync with nothing dirty must not hang (nothing to commit).

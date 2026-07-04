@@ -400,7 +400,7 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             maxlen,
             first,
             // `s_sequence` is the first transaction id; recovery starts here.
-            sequence: raw.s_sequence.get(),
+            sequence: Tid::new(raw.s_sequence.get()),
             // `s_start` may be nonzero: a dirty journal awaiting recovery. Just
             // record it.
             start: raw.s_start.get(),
@@ -499,7 +499,7 @@ mod tests {
         let sb = JournalSuperblock::try_from(raw).unwrap();
         assert_eq!(sb.maxlen(), 1024);
         assert_eq!(sb.first(), 1);
-        assert_eq!(sb.sequence(), 7);
+        assert_eq!(sb.sequence(), Tid::new(7));
         // A nonzero `s_start` (a dirty journal awaiting recovery) is accepted.
         assert_eq!(sb.start(), 3);
         assert_eq!(sb.blocksize(), BLOCK_SIZE as u32);

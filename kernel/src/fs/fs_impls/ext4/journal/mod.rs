@@ -24,8 +24,8 @@
 //! - [`recovery`] — mount-time SCAN/REPLAY of a dirty log.
 //!
 //! This module root additionally hosts the commit thread + `log_wait_commit`
-//! (the fsync primitive), [`Tid`]/[`tid_geq`], and the metadata-access seam
-//! below.
+//! (the fsync primitive), [`Tid`] (with its wrapping [`geq`](Tid::geq)
+//! comparison), and the metadata-access seam below.
 //!
 //! # Metadata-access seam
 //!
@@ -156,19 +156,57 @@ impl Drop for OpHandle {
 }
 
 /// Journal transaction id (jbd2 `tid_t`).
-pub(super) type Tid = u32;
-
-/// Wrapping-aware "is `a` at or after `b`?" for transaction ids (jbd2 `tid_geq`).
 ///
-/// Tids are a monotonically increasing `u32` that wrap at `u32::MAX`. A plain
-/// `a >= b` would answer wrongly across a wrap (e.g. `0` is *after* `u32::MAX`,
-/// but `0 >= u32::MAX` is `false`). jbd2 solves this by working in the signed
-/// difference: `(a - b)` computed with wrapping arithmetic, reinterpreted as an
-/// `i32`, is `>= 0` exactly when `a` is within half the id space *ahead of* `b`.
-/// This is the comparison [`Journal::log_wait_commit`] uses to decide whether the
-/// target transaction has already committed.
-pub(super) fn tid_geq(a: Tid, b: Tid) -> bool {
-    (a.wrapping_sub(b) as i32) >= 0
+/// A newtype over the wrapping `u32` sequence number, so a tid cannot be mixed
+/// up with the journal's other `u32` quantities (log block indices, geometry
+/// counts) and the wrapping successor/comparison rules live on the type.
+/// Deliberately **no `Ord`**: a plain `>=` is only meaningful within a
+/// non-wrapping window, so "is at or after" must go through [`Tid::geq`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Tid(u32);
+
+impl Tid {
+    /// Wraps a raw sequence number. The callers are the boundaries where a tid
+    /// enters typed code: the on-disk big-endian `h_sequence`/`s_sequence`
+    /// fields (every value is a valid tid, so no validation applies) and test
+    /// fixtures.
+    pub(super) const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// The raw sequence number, for the boundaries that store a bare `u32`:
+    /// the on-disk big-endian fields and the `committed_tid` atomic.
+    pub(super) const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The next tid in sequence (tids wrap at `u32::MAX`).
+    pub(super) const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    /// The previous tid in sequence (tids wrap at `u32::MAX`) — used to seed
+    /// `committed_tid` one behind the first tid a commit will bear.
+    pub(super) const fn prev(self) -> Self {
+        Self(self.0.wrapping_sub(1))
+    }
+
+    /// Wrapping-aware "is `self` at or after `other`?" (jbd2 `tid_geq`).
+    ///
+    /// Tids are a monotonically increasing `u32` that wrap at `u32::MAX`. A
+    /// plain `a >= b` would answer wrongly across a wrap (e.g. `0` is *after*
+    /// `u32::MAX`, but `0 >= u32::MAX` is `false`). jbd2 solves this by working
+    /// in the signed difference: `(a - b)` computed with wrapping arithmetic,
+    /// reinterpreted as an `i32`, is `>= 0` exactly when `a` is within half the
+    /// id space *ahead of* `b`. This is the comparison
+    /// [`Journal::log_wait_commit`] uses to decide whether the target
+    /// transaction has already committed.
+    pub(super) fn geq(self, other: Tid) -> bool {
+        // The `as` below is a same-width sign reinterpret, not a narrowing: it
+        // IS the jbd2 wraparound algorithm (`tid_geq`, include/linux/jbd2.h),
+        // kept verbatim (ledger: `tid-geq-sign-reinterpret`).
+        (self.0.wrapping_sub(other.0) as i32) >= 0
+    }
 }
 
 /// The parsed geometry of the on-disk journal.
@@ -546,7 +584,7 @@ impl Journal {
         let tail_block = geometry.start();
         let tail_tid = geometry.sequence();
         // Nothing is committed yet; the first commit will bear `s_sequence`.
-        let committed_tid = geometry.sequence().wrapping_sub(1);
+        let committed_tid = geometry.sequence().prev();
         // Fields are listed in struct-declaration order (clippy
         // `inconsistent_struct_constructor`); the geometry-derived values above
         // are pulled into locals so `geometry` can be moved in first.
@@ -562,7 +600,7 @@ impl Journal {
                 tail_tid,
                 uncheckpointed: BTreeMap::new(),
             }),
-            committed_tid: AtomicU32::new(committed_tid),
+            committed_tid: AtomicU32::new(committed_tid.get()),
             commit_trigger: WaitQueue::new(),
             commit_wait_queue: WaitQueue::new(),
             credit_release_epoch: AtomicU64::new(0),
@@ -634,7 +672,7 @@ impl Journal {
     /// Read with `Acquire` so `log_wait_commit` sees the commit pipeline's
     /// writes to this counter without the state lock.
     pub(super) fn committed_tid(&self) -> Tid {
-        self.committed_tid.load(Ordering::Acquire)
+        Tid::new(self.committed_tid.load(Ordering::Acquire))
     }
 
     /// Spawns the background commit thread (jbd2 `kjournald`).
@@ -836,7 +874,7 @@ impl Journal {
                     "journal aborted while waiting for transaction room",
                 )));
             }
-            if tid_geq(self.committed_tid(), tid) || self.credit_release_epoch() != epoch {
+            if self.committed_tid().geq(tid) || self.credit_release_epoch() != epoch {
                 return Some(Ok(()));
             }
             None
@@ -908,12 +946,12 @@ impl Journal {
     /// `fsync` guards this by only waiting when the inode writeback actually
     /// wrote (see `Inode::sync_data_and_meta`).
     pub(in crate::fs::fs_impls::ext4) fn log_wait_commit(&self, target: Tid) -> Result<()> {
-        if tid_geq(self.committed_tid(), target) {
+        if self.committed_tid().geq(target) {
             return Ok(());
         }
         self.request_commit();
         self.commit_wait_queue.wait_until(|| {
-            if tid_geq(self.committed_tid(), target) {
+            if self.committed_tid().geq(target) {
                 return Some(Ok(()));
             }
             if self.is_aborted() {
@@ -1338,7 +1376,7 @@ pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
         s_blocksize: Be32::new(BLOCK_SIZE as u32),
         s_maxlen: Be32::new(maxlen),
         s_first: Be32::new(first),
-        s_sequence: Be32::new(sequence),
+        s_sequence: Be32::new(sequence.get()),
         s_start: Be32::new(0),
         s_nr_users: Be32::new(1),
         ..Default::default()
@@ -1437,7 +1475,7 @@ mod tests {
         let geo = load_geometry(&f.ext4).unwrap().unwrap();
         assert_eq!(geo.maxlen(), 2);
         assert_eq!(geo.first(), 1);
-        assert_eq!(geo.sequence(), 1);
+        assert_eq!(geo.sequence(), Tid::new(1));
         assert_eq!(geo.start(), 0);
         assert_eq!(geo.blocksize(), BLOCK_SIZE as u32);
         assert_eq!(
@@ -1462,7 +1500,7 @@ mod tests {
         assert!(load_geometry(&f.ext4).unwrap().is_none());
     }
 
-    // --- Task 5: commit thread, log_wait_commit, teardown, tid_geq. ---
+    // --- Task 5: commit thread, log_wait_commit, teardown, Tid::geq. ---
 
     use super::{
         super::test_utils::Ext4Fixture,
@@ -1527,12 +1565,25 @@ mod tests {
     #[ktest]
     fn tid_geq_wrapping() {
         // Simple ordering.
-        assert!(tid_geq(1, 0));
-        assert!(tid_geq(5, 5)); // equal is "at or after"
-        assert!(!tid_geq(0, 1));
+        assert!(Tid::new(1).geq(Tid::new(0)));
+        assert!(Tid::new(5).geq(Tid::new(5))); // equal is "at or after"
+        assert!(!Tid::new(0).geq(Tid::new(1)));
         // Wrap: 0 is "after" u32::MAX (0 == MAX + 1 in wrapping arithmetic).
-        assert!(tid_geq(0, u32::MAX));
-        assert!(!tid_geq(u32::MAX, 0));
+        assert!(Tid::new(0).geq(Tid::new(u32::MAX)));
+        assert!(!Tid::new(u32::MAX).geq(Tid::new(0)));
+    }
+
+    /// The successor/predecessor helpers wrap at the `u32` boundary, matching
+    /// the wrapping arithmetic the raw tids used.
+    #[ktest]
+    fn tid_next_prev_wrap() {
+        assert_eq!(Tid::new(1).next(), Tid::new(2));
+        assert_eq!(Tid::new(2).prev(), Tid::new(1));
+        // Across the wrap in both directions.
+        assert_eq!(Tid::new(u32::MAX).next(), Tid::new(0));
+        assert_eq!(Tid::new(0).prev(), Tid::new(u32::MAX));
+        // A wrapped successor is still "at or after" its predecessor.
+        assert!(Tid::new(u32::MAX).next().geq(Tid::new(u32::MAX)));
     }
 
     /// The money test: a full commit driven by the background thread, waited on
@@ -1569,11 +1620,11 @@ mod tests {
         let desc = read_log_header(&f, 1);
         assert_eq!(desc.h_magic.get(), JBD2_MAGIC);
         assert_eq!(desc.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
-        assert_eq!(desc.h_sequence.get(), running_tid);
+        assert_eq!(desc.h_sequence.get(), running_tid.get());
         assert_eq!(read_first_tag(&f, 1).t_blocknr.get(), 500);
         let commit = read_log_header(&f, 3);
         assert_eq!(commit.h_blocktype.get(), BLOCKTYPE_COMMIT);
-        assert_eq!(commit.h_sequence.get(), running_tid);
+        assert_eq!(commit.h_sequence.get(), running_tid.get());
 
         // The running transaction was consumed by the commit.
         assert!(f.journal.state_write().running.is_none());

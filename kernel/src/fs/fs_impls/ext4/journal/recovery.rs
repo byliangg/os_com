@@ -179,7 +179,7 @@ fn scan_transaction(
     // one a previous wrap left behind.
     if header.h_magic.get() != JBD2_MAGIC
         || blocktype != BLOCKTYPE_DESCRIPTOR
-        || header.h_sequence.get() != expected_tid
+        || Tid::new(header.h_sequence.get()) != expected_tid
     {
         return Ok(None);
     }
@@ -224,7 +224,9 @@ fn scan_transaction(
     let commit_header = RawJournalHeader::parse(&commit);
     if commit_header.h_magic.get() == JBD2_MAGIC {
         let commit_blocktype = commit_header.h_blocktype.get();
-        if commit_blocktype == BLOCKTYPE_COMMIT && commit_header.h_sequence.get() == expected_tid {
+        if commit_blocktype == BLOCKTYPE_COMMIT
+            && Tid::new(commit_header.h_sequence.get()) == expected_tid
+        {
             // A complete committed transaction: the next one starts right after
             // this commit block.
             return Ok(Some(journal.geometry().next_log_block(commit_log)));
@@ -312,7 +314,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
         .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
 
     let s_start = raw.s_start.get();
-    let s_sequence = raw.s_sequence.get();
+    let s_sequence = Tid::new(raw.s_sequence.get());
 
     // A clean journal (`s_start == 0`) has nothing to recover.
     if s_start == 0 {
@@ -331,7 +333,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     let mut count = 0u64;
     while let Some(next) = scan_transaction(journal, device, log, tid)? {
         log = next;
-        tid = tid.wrapping_add(1);
+        tid = tid.next();
         count += 1;
     }
     let end_tid = tid;
@@ -348,7 +350,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     let mut tid = s_sequence;
     for _ in 0..count {
         log = apply_log_transaction(journal, device, log, tid)?;
-        tid = tid.wrapping_add(1);
+        tid = tid.next();
     }
 
     // --- Barrier: every replayed final-location write must be durable BEFORE we
@@ -363,7 +365,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     // clean fast path reads `s_head` when `s_start == 0`; a stale value would
     // resume the log at the wrong offset — mirroring checkpoint's `s_head` care.)
     raw.s_start = Be32::new(0);
-    raw.s_sequence = Be32::new(end_tid);
+    raw.s_sequence = Be32::new(end_tid.get());
     raw.s_head = Be32::new(first);
     device
         .write_val(sb_offset, &raw)
@@ -385,7 +387,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     }
     journal
         .committed_tid
-        .store(end_tid.wrapping_sub(1), Ordering::Release);
+        .store(end_tid.prev().get(), Ordering::Release);
 
     Ok(())
 }
@@ -557,9 +559,9 @@ mod tests {
 
         // Commit (writes the after-image to the log + sets s_start), but do NOT
         // checkpoint: the final location still holds the fixture's zeroed disk.
-        let txn = make_txn(1, &[(dest, after)]);
+        let txn = make_txn(Tid::new(1), &[(dest, after)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
-        assert_eq!(f.journal.committed_tid(), 1);
+        assert_eq!(f.journal.committed_tid(), Tid::new(1));
         assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
         assert_ne!(read_journal_super(&f).s_start.get(), 0);
 
@@ -578,11 +580,11 @@ mod tests {
         // In-memory clean state.
         let st = f.journal.state_read();
         assert_eq!(st.tail_block, 0);
-        assert_eq!(st.tail_tid, 2);
-        assert_eq!(st.next_tid, 2);
+        assert_eq!(st.tail_tid, Tid::new(2));
+        assert_eq!(st.next_tid, Tid::new(2));
         assert_eq!(st.head, f.journal.geometry().first());
         drop(st);
-        assert_eq!(f.journal.committed_tid(), 1); // end_tid - 1
+        assert_eq!(f.journal.committed_tid(), Tid::new(1)); // end_tid - 1
     }
 
     /// Test 2: recovery is idempotent — a straight double-recover is a no-op, and
@@ -596,7 +598,7 @@ mod tests {
         let dest = 500u64;
         let after = tagged_block(b"IDEMPOT!");
 
-        let txn = make_txn(1, &[(dest, after)]);
+        let txn = make_txn(Tid::new(1), &[(dest, after)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         recover(f.journal.as_ref(), device.as_ref()).unwrap();
@@ -642,11 +644,11 @@ mod tests {
 
         // T1 writes A to `shared` and a distinct block to `t1_only`; T2 writes B to
         // `shared`. Commit both, checkpoint neither.
-        let t1 = make_txn(1, &[(shared, content_a), (t1_only, t1_side)]);
+        let t1 = make_txn(Tid::new(1), &[(shared, content_a), (t1_only, t1_side)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        let t2 = make_txn(2, &[(shared, content_b)]);
+        let t2 = make_txn(Tid::new(2), &[(shared, content_b)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        assert_eq!(f.journal.committed_tid(), 2);
+        assert_eq!(f.journal.committed_tid(), Tid::new(2));
 
         recover(f.journal.as_ref(), device.as_ref()).unwrap();
 
@@ -658,7 +660,7 @@ mod tests {
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
         assert_eq!(sb.s_sequence.get(), 3); // end_tid = 3
-        assert_eq!(f.journal.state_read().next_tid, 3);
+        assert_eq!(f.journal.state_read().next_tid, Tid::new(3));
     }
 
     /// Test 4 (the crash-consistency crux): an interrupted tail transaction —
@@ -678,7 +680,7 @@ mod tests {
         let content2 = tagged_block(b"T2INTERR");
 
         // T1 (tid 1) commits fully: log [1..=3] = desc, 1 data, commit.
-        let t1 = make_txn(1, &[(dest1, content1)]);
+        let t1 = make_txn(Tid::new(1), &[(dest1, content1)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
 
         // T2 (tid 2) commits for real right after T1: log [4..=6] = desc, 1 data,
@@ -686,7 +688,7 @@ mod tests {
         // then damage, so the descriptor/tag layout is exactly what the reader
         // expects (mirroring the writer) — the cleanest way to build an interrupted
         // tail is to write a real one and zero only its commit block.
-        let t2 = make_txn(2, &[(dest2, content2)]);
+        let t2 = make_txn(Tid::new(2), &[(dest2, content2)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
 
         // Sanity: T2's descriptor is at log 4, its metadata at 5, its commit at 6.
@@ -732,7 +734,7 @@ mod tests {
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
         assert_eq!(sb.s_sequence.get(), 2);
-        assert_eq!(f.journal.state_read().next_tid, 2);
+        assert_eq!(f.journal.state_read().next_tid, Tid::new(2));
     }
 
     /// A direct `scan_transaction` boundary check: a fully committed T1 scans to
@@ -744,13 +746,13 @@ mod tests {
         let f = journaled_fixture(24, 1, 1);
         let device = f.fixture.ext4.block_device();
 
-        let t1 = make_txn(1, &[(500u64, tagged_block(b"SCANONE0"))]);
+        let t1 = make_txn(Tid::new(1), &[(500u64, tagged_block(b"SCANONE0"))]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
 
         let first = f.journal.geometry().first();
         // T1 at the tail scans to the next start (log 4, right after its commit at
         // 3).
-        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), first, 1)
+        let next = scan_transaction(f.journal.as_ref(), device.as_ref(), first, Tid::new(1))
             .unwrap()
             .expect("T1 is a complete committed transaction");
         assert_eq!(next, 4);
@@ -758,7 +760,7 @@ mod tests {
         // The block after T1 was never written for tid 2, so scanning it as tid 2
         // hits the boundary.
         assert!(
-            scan_transaction(f.journal.as_ref(), device.as_ref(), next, 2)
+            scan_transaction(f.journal.as_ref(), device.as_ref(), next, Tid::new(2))
                 .unwrap()
                 .is_none()
         );
@@ -798,7 +800,7 @@ mod tests {
         let device = f.fixture.ext4.block_device();
 
         // A real single-block transaction: desc @1, data @2, commit @3.
-        let t1 = make_txn(1, &[(500u64, tagged_block(b"WRONGSEQ"))]);
+        let t1 = make_txn(Tid::new(1), &[(500u64, tagged_block(b"WRONGSEQ"))]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
 
         // Rewrite the commit block with a mismatched h_sequence (2 instead of 1):
@@ -818,7 +820,7 @@ mod tests {
 
         let first = f.journal.geometry().first();
         assert!(
-            scan_transaction(f.journal.as_ref(), device.as_ref(), first, 1)
+            scan_transaction(f.journal.as_ref(), device.as_ref(), first, Tid::new(1))
                 .unwrap()
                 .is_none()
         );
@@ -835,7 +837,7 @@ mod tests {
         let device = f.fixture.ext4.block_device();
 
         // A real single-block transaction: desc @1, data @2, commit @3.
-        let t1 = make_txn(1, &[(500u64, tagged_block(b"MULTIDSC"))]);
+        let t1 = make_txn(Tid::new(1), &[(500u64, tagged_block(b"MULTIDSC"))]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
 
         // Overwrite the commit block (log 3) with a *descriptor* header for the
@@ -852,7 +854,7 @@ mod tests {
         write_log_block_at(&f, 3, &block);
 
         let first = f.journal.geometry().first();
-        assert!(scan_transaction(f.journal.as_ref(), device.as_ref(), first, 1).is_err());
+        assert!(scan_transaction(f.journal.as_ref(), device.as_ref(), first, Tid::new(1)).is_err());
         // And `recover` propagates the error rather than under-replaying.
         assert!(recover(f.journal.as_ref(), device.as_ref()).is_err());
     }

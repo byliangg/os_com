@@ -147,7 +147,7 @@ impl UncheckpointedImage {
     /// `committed_tid` has been applied to its final location — i.e. whether
     /// eviction is due.
     pub(super) fn is_checkpointed_by(&self, committed_tid: Tid) -> bool {
-        super::tid_geq(committed_tid, self.tid)
+        committed_tid.geq(self.tid)
     }
 }
 
@@ -522,7 +522,7 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
 
             if st.running.is_none() {
                 let tid = st.next_tid;
-                st.next_tid = st.next_tid.wrapping_add(1);
+                st.next_tid = tid.next();
                 st.running = Some(Transaction::new(tid));
             }
 
@@ -714,8 +714,8 @@ mod tests {
 
     #[ktest]
     fn transaction_new_starts_running_and_empty() {
-        let txn = Transaction::new(7);
-        assert_eq!(txn.tid(), 7);
+        let txn = Transaction::new(Tid::new(7));
+        assert_eq!(txn.tid(), Tid::new(7));
         assert_eq!(txn.state(), TransactionState::Running);
         assert_eq!(txn.nr_updates(), 0);
         assert_eq!(txn.nr_metadata_blocks(), 0);
@@ -723,7 +723,7 @@ mod tests {
 
     #[ktest]
     fn transaction_capture_create_is_idempotent() {
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         txn.capture_create(42);
         assert_eq!(txn.nr_metadata_blocks(), 1);
         // A freshly created block is all zeros.
@@ -748,7 +748,7 @@ mod tests {
         let first = [0xABu8; BLOCK_SIZE];
         f.write_data_block(300, &first);
 
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         txn.capture_write(300, None, f.ext4.block_device().as_ref())
             .unwrap();
         assert_eq!(txn.buffer_bytes(300), Some(first.as_slice()));
@@ -764,7 +764,7 @@ mod tests {
 
     #[ktest]
     fn transaction_apply_patch_accumulates_sub_objects() {
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         txn.capture_create(7);
 
         // Two sub-object patches at different offsets in the SAME block: both
@@ -784,7 +784,7 @@ mod tests {
 
     #[ktest]
     fn transaction_apply_patch_uncaptured_errors() {
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         assert!(txn.apply_patch(99, |_| {}).is_err());
     }
 
@@ -796,11 +796,11 @@ mod tests {
         {
             let st = j.state_write();
             let running = st.running.as_ref().unwrap();
-            assert_eq!(running.tid(), 1); // == geometry.sequence()
+            assert_eq!(running.tid(), Tid::new(1)); // == geometry.sequence()
             assert_eq!(running.nr_updates(), 1);
             assert_eq!(running.outstanding_credits, 4);
         }
-        assert_eq!(h1.tid(), 1);
+        assert_eq!(h1.tid(), Tid::new(1));
         assert_eq!(h1.credits(), 4);
 
         // A second start shares the same running transaction.
@@ -808,11 +808,11 @@ mod tests {
         {
             let st = j.state_write();
             let running = st.running.as_ref().unwrap();
-            assert_eq!(running.tid(), 1);
+            assert_eq!(running.tid(), Tid::new(1));
             assert_eq!(running.nr_updates(), 2);
             assert_eq!(running.outstanding_credits, 6);
         }
-        assert_eq!(h2.tid(), 1);
+        assert_eq!(h2.tid(), Tid::new(1));
 
         // Stopping one handle releases its reservation.
         journal_stop(h1).unwrap();
@@ -886,7 +886,7 @@ mod tests {
             // The old 10-credit reservation was released, only 3 remain.
             assert_eq!(running.outstanding_credits, 3);
             // Still the same running transaction (no commit boundary yet).
-            assert_eq!(running.tid(), 1);
+            assert_eq!(running.tid(), Tid::new(1));
         }
 
         journal_stop(h).unwrap();
@@ -916,7 +916,7 @@ mod tests {
         let a_pages = a.page_cache().unwrap();
         let b_pages = b.page_cache().unwrap();
 
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         assert_eq!(txn.nr_ordered_data(), 0);
 
         // Register `a` twice (dedups by ino, keeping the newer snapshot) and

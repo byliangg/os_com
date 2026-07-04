@@ -156,7 +156,7 @@ impl Transaction {
         let header = RawJournalHeader {
             h_magic: Be32::new(JBD2_MAGIC),
             h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
-            h_sequence: Be32::new(self.tid()),
+            h_sequence: Be32::new(self.tid().get()),
         };
         let header_len = size_of::<RawJournalHeader>();
         block[..header_len].copy_from_slice(header.as_bytes());
@@ -228,7 +228,7 @@ fn build_commit_block(tid: Tid) -> Box<[u8; BLOCK_SIZE]> {
         header: RawJournalHeader {
             h_magic: Be32::new(JBD2_MAGIC),
             h_blocktype: Be32::new(BLOCKTYPE_COMMIT),
-            h_sequence: Be32::new(tid),
+            h_sequence: Be32::new(tid.get()),
         },
         h_chksum_type: 0,
         h_chksum_size: 0,
@@ -275,7 +275,7 @@ impl Journal {
             .read_val(sb_offset)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
         raw.s_start = Be32::new(txn_start);
-        raw.s_sequence = Be32::new(tid);
+        raw.s_sequence = Be32::new(tid.get());
         device
             .write_val(sb_offset, &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
@@ -392,7 +392,7 @@ pub(super) fn commit_transaction(
     // Release `Acquire` in `committed_tid()`: publishes after the state update.
     journal
         .committed_tid
-        .store(tid, core::sync::atomic::Ordering::Release);
+        .store(tid.get(), core::sync::atomic::Ordering::Release);
 
     // The transaction is fully committed; consume it.
     txn.set_state(TransactionState::Finished);
@@ -538,15 +538,15 @@ mod tests {
         let mut c1 = [0u8; BLOCK_SIZE];
         c1[..8].copy_from_slice(b"BLOCKZR1");
 
-        let txn = make_txn(1, &[(dest0, c0), (dest1, c1)]);
+        let txn = make_txn(Tid::new(1), &[(dest0, c0), (dest1, c1)]);
         let tid = commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
-        assert_eq!(tid, 1);
+        assert_eq!(tid, Tid::new(1));
 
         // Descriptor at log block `first` (== 1).
         let desc = read_log_header(&f, 1);
         assert_eq!(desc.h_magic.get(), JBD2_MAGIC);
         assert_eq!(desc.h_blocktype.get(), BLOCKTYPE_DESCRIPTOR);
-        assert_eq!(desc.h_sequence.get(), tid);
+        assert_eq!(desc.h_sequence.get(), tid.get());
 
         // Tag 0 -> dest0, no SAME_UUID; tag 1 -> dest1, SAME_UUID | LAST_TAG.
         let tag0 = read_tag(&f, 1, 0);
@@ -567,7 +567,7 @@ mod tests {
         let commit = read_log_header(&f, 4);
         assert_eq!(commit.h_magic.get(), JBD2_MAGIC);
         assert_eq!(commit.h_blocktype.get(), BLOCKTYPE_COMMIT);
-        assert_eq!(commit.h_sequence.get(), tid);
+        assert_eq!(commit.h_sequence.get(), tid.get());
 
         assert_eq!(f.journal.committed_tid(), tid);
 
@@ -579,7 +579,7 @@ mod tests {
             .read_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE)
             .unwrap();
         assert_eq!(sb.s_start.get(), 1); // == first
-        assert_eq!(sb.s_sequence.get(), tid);
+        assert_eq!(sb.s_sequence.get(), tid.get());
     }
 
     #[ktest]
@@ -592,7 +592,7 @@ mod tests {
         content[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
         content[4..8].copy_from_slice(b"REST");
 
-        let txn = make_txn(1, &[(600u64, content)]);
+        let txn = make_txn(Tid::new(1), &[(600u64, content)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // Its (sole) tag has ESCAPE set.
@@ -615,24 +615,24 @@ mod tests {
         a[..4].copy_from_slice(b"T1A0");
         let mut b = [0u8; BLOCK_SIZE];
         b[..4].copy_from_slice(b"T1B0");
-        let t1 = make_txn(1, &[(500u64, a), (700u64, b)]);
+        let t1 = make_txn(Tid::new(1), &[(500u64, a), (700u64, b)]);
         let tid1 = commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
-        assert_eq!(tid1, 1);
+        assert_eq!(tid1, Tid::new(1));
 
         // Head advanced past T1's 4 blocks: now at log block 5.
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 5);
             assert_eq!(st.tail_block, 1);
-            assert_eq!(st.tail_tid, 1);
+            assert_eq!(st.tail_tid, Tid::new(1));
         }
 
         // T2: tid 2, one block -> occupies log [5..=7] (desc, 1 data, commit).
         let mut c = [0u8; BLOCK_SIZE];
         c[..4].copy_from_slice(b"T2C0");
-        let t2 = make_txn(2, &[(900u64, c)]);
+        let t2 = make_txn(Tid::new(2), &[(900u64, c)]);
         let tid2 = commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
-        assert_eq!(tid2, 2);
+        assert_eq!(tid2, Tid::new(2));
 
         // T1's descriptor and commit still carry tid 1.
         assert_eq!(read_log_header(&f, 1).h_sequence.get(), 1);
@@ -652,13 +652,13 @@ mod tests {
         assert_eq!(read_log_header(&f, 7).h_sequence.get(), 2);
         assert_eq!(read_log_header(&f, 7).h_blocktype.get(), BLOCKTYPE_COMMIT);
 
-        assert_eq!(f.journal.committed_tid(), 2);
+        assert_eq!(f.journal.committed_tid(), Tid::new(2));
         {
             let st = f.journal.state_write();
             assert_eq!(st.head, 8);
             // s_start still points at T1 (the oldest un-checkpointed txn).
             assert_eq!(st.tail_block, 1);
-            assert_eq!(st.tail_tid, 1);
+            assert_eq!(st.tail_tid, Tid::new(1));
         }
 
         // On-disk superblock unchanged since T1: still first/tid1.
@@ -681,7 +681,7 @@ mod tests {
 
         let mut content = [0u8; BLOCK_SIZE];
         content[..4].copy_from_slice(b"DATA");
-        let txn = make_txn(1, &[(500u64, content)]);
+        let txn = make_txn(Tid::new(1), &[(500u64, content)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // At least the two data/commit barriers fired (a clean-journal commit
@@ -736,7 +736,7 @@ mod tests {
 
         // Build a transaction that captures a metadata block (so the commit has
         // something to log) AND registers the inode as ordered data.
-        let mut txn = Transaction::new(1);
+        let mut txn = Transaction::new(Tid::new(1));
         let mut meta = [0u8; BLOCK_SIZE];
         meta[..4].copy_from_slice(b"META");
         txn.capture_create(500);
@@ -777,7 +777,7 @@ mod tests {
 
         let mut content = [0u8; BLOCK_SIZE];
         content[..4].copy_from_slice(b"META");
-        let txn = make_txn(1, &[(500u64, content)]);
+        let txn = make_txn(Tid::new(1), &[(500u64, content)]);
         assert_eq!(txn.nr_ordered_data(), 0);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 

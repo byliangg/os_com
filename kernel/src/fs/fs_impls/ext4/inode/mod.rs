@@ -1292,7 +1292,7 @@ struct InodeInner {
     /// — an earlier op or fs-level sync may have captured this inode into a
     /// transaction that is still only in memory. Non-journaled volumes leave
     /// it `None` (`fsync` degrades to the direct writeback + barrier). An
-    /// `Option`, not a `0` sentinel: tids wrap (see `tid_geq`), so `0` is a
+    /// `Option`, not a `0` sentinel: tids wrap (see `Tid::geq`), so `0` is a
     /// legal transaction id a wrapped journal could hand out.
     sync_tid: Option<Tid>,
     /// The `fdatasync` subset (jbd2 `i_datasync_tid`). Phase 4 routes
