@@ -32,14 +32,18 @@
 //! - [`INCOMPAT_CSUM_V2`]/[`INCOMPAT_CSUM_V3`] change the tag size and reserve
 //!   a checksum tail at the end of each descriptor block.
 //!
-//! The csum v2/v3 **verification** side (P7a-3) is implemented here: the
-//! journal superblock checksum is verified at the [`JournalSuperblock`] parse
-//! boundary, and the [`JournalCsumSeed`] + [`DescriptorTag`] helpers verify
-//! descriptor-tail, commit-block, and per-tag data checksums during recovery.
-//! Admission stays gated on the **write** side (stamping is P7a-4): until
-//! that lands, a journal carrying a csum feature is rejected at mount by
-//! [`load_geometry`](super::load_geometry)'s [`INCOMPAT_SUPP`] gate, exactly
-//! as before, and the verification paths run only under ktest fixtures.
+//! The csum v2/v3 machinery is complete on both sides: the journal superblock
+//! checksum is verified at the [`JournalSuperblock`] parse boundary (P7a-3),
+//! the [`JournalCsumSeed`] + [`DescriptorTag`] helpers verify descriptor-tail,
+//! commit-block, and per-tag data checksums during recovery (P7a-3), and the
+//! write side stamps every one of them (P7a-4): [`TagWriter::put`] stamps the
+//! per-tag data checksum, [`TagWriter::finish`] the descriptor tail,
+//! [`JournalCsumSeed::stamp_commit_block`] the commit block, and
+//! [`RawJournalSuperblock::stamp_checksum`] the superblock (through the
+//! serialization funnel
+//! [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)).
+//! 64-bit tags and csum v2/v3 are therefore admitted at mount
+//! ([`INCOMPAT_SUPP`]).
 //! [`INCOMPAT_ASYNC_COMMIT`] (removes the trailing commit-block barrier) and
 //! [`INCOMPAT_FAST_COMMIT`] (adds a wholly different fast-commit area) change
 //! behavior we do not model and remain rejected.
@@ -166,6 +170,13 @@ pub(super) const TAG_FLAG_DELETED: u16 = 4;
 /// This is the last tag in the descriptor block (`JBD2_FLAG_LAST_TAG`).
 pub(super) const TAG_FLAG_LAST_TAG: u16 = 8;
 
+/// The jbd2 v1 accumulated commit-block checksum
+/// (`JBD2_FEATURE_COMPAT_CHECKSUM`). Not modeled (a COMPAT bit is safe to
+/// ignore by definition); cleared when the D-4 mount upgrade enables csum_v3,
+/// mirroring `jbd2_journal_set_features` (fs/jbd2/journal.c:2349-2353 — v3
+/// supersedes the v1 checksum).
+pub(super) const COMPAT_CHECKSUM: u32 = 0x1;
+
 /// Revoke records are present (`JBD2_FEATURE_INCOMPAT_REVOKE`). Tolerated at
 /// mount; a revoke block actually met during recovery hard-errors (see the
 /// module docs).
@@ -191,15 +202,18 @@ pub(super) const INCOMPAT_FAST_COMMIT: u32 = 0x20;
 /// [`JournalSuperblock`]'s `TryFrom` parses any layout it can model so the
 /// verification paths are testable below the gate).
 ///
-/// Only [`INCOMPAT_REVOKE`] is tolerated — the feature bit passes, but a revoke
-/// block actually met during recovery hard-errors (`EUCLEAN`), the "revoke gap"
-/// (full support is Phase 7). 64-bit tags and csum v2/v3 now *parse* (layout +
-/// read-side verification, P7a-2/-3) but stay unadmitted until the write side
-/// stamps what recovery verifies (P7a-4; admission flip is a later task) —
-/// otherwise our own commits would produce logs whose zero checksums fail our
-/// own recovery. Async commit and fast commit change behavior we do not model
-/// and are rejected outright.
-pub(super) const INCOMPAT_SUPP: u32 = INCOMPAT_REVOKE;
+/// 64-bit tags and csum v2/v3 are admitted end-to-end as of P7a-4: the
+/// layouts parse (P7a-2), recovery verifies their checksums (P7a-3), and the
+/// commit pipeline stamps them (P7a-4), so our own commits round-trip through
+/// our own recovery on every admitted layout. [`INCOMPAT_REVOKE`] stays
+/// tolerated-not-honored — the feature bit passes, but a revoke block actually
+/// met during recovery hard-errors (`EUCLEAN`), the "revoke gap" (full support
+/// is P7b). csum_v2 + csum_v3 together prescribe contradictory tag layouts
+/// and are still refused at parse ([`TagLayout::from_features`]). Async
+/// commit and fast commit change behavior we do not model and are rejected
+/// outright.
+pub(super) const INCOMPAT_SUPP: u32 =
+    INCOMPAT_REVOKE | INCOMPAT_64BIT | INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3;
 
 /// The only checksum algorithm jbd2 defines for csum v2/v3
 /// (`JBD2_CRC32C_CHKSUM`), named by the journal superblock's
@@ -326,8 +340,9 @@ impl RawJournalSuperblock {
     /// protects the superblock that *carries* the UUID the seed hashes.
     ///
     /// Verified at the [`JournalSuperblock`] parse boundary when the journal
-    /// has csum v2/v3; P7a-4's write side will stamp it on every superblock
-    /// rewrite (Linux `jbd2_write_superblock`, journal.c:1812-1813).
+    /// has csum v2/v3; the write side stamps it on every superblock rewrite
+    /// via [`Self::stamp_checksum`] (Linux `jbd2_write_superblock`,
+    /// journal.c:1812-1813).
     pub(super) fn checksum(&self) -> u32 {
         const CHECKSUM_OFFSET: usize = core::mem::offset_of!(RawJournalSuperblock, s_checksum);
         // Hash around the s_checksum hole: bytes before it, four zero bytes in
@@ -336,6 +351,25 @@ impl RawJournalSuperblock {
         let head = checksum::crc32c(!0, &bytes[..CHECKSUM_OFFSET]);
         let hole = checksum::crc32c(head, &[0u8; size_of::<Be32>()]);
         checksum::crc32c(hole, &bytes[CHECKSUM_OFFSET + size_of::<Be32>()..])
+    }
+
+    /// Stamps `s_checksum` when this superblock's **own** INCOMPAT bits carry
+    /// csum v2/v3 — the write-side mirror of the parse-boundary verification.
+    ///
+    /// Keyed off the bytes being written, not off any parsed state, so the
+    /// D-4 mount upgrade — whose raw is one feature set ahead of the parsed
+    /// geometry — stamps correctly through the same funnel. A featureless
+    /// superblock is left untouched: the v0 byte path stays frozen.
+    ///
+    /// Every serialization goes through
+    /// [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock),
+    /// which calls this — mirroring Linux, where every journal-superblock
+    /// write funnels through `jbd2_write_superblock`, which stamps under csum
+    /// v2/v3 (fs/jbd2/journal.c:1812-1813).
+    pub(super) fn stamp_checksum(&mut self) {
+        if self.s_feature_incompat.get() & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0 {
+            self.s_checksum = Be32::new(self.checksum());
+        }
     }
 }
 
@@ -367,8 +401,8 @@ const_assert!(size_of::<RawBlockTag>() == BLOCK_TAG_SIZE);
 /// checksum moves to a trailing 32-bit word. `t_blocknr`/`t_blocknr_high` sit
 /// at the same offsets (0 and 8) as in the 12-byte 64-bit tag, which is what
 /// lets Linux read both through one struct. Recovery verifies the checksum
-/// ([`DescriptorTag::verify_data_csum`]); our writer still emits zero there
-/// until P7a-4 stamps it.
+/// ([`DescriptorTag::verify_data_csum`]); the writer stamps it
+/// ([`TagWriter::put`]).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawJournalBlockTag3 {
@@ -381,7 +415,7 @@ pub(super) struct RawJournalBlockTag3 {
     /// High 32 bits of the target filesystem block (`t_blocknr_high`), zero
     /// unless [`INCOMPAT_64BIT`] is on.
     pub(super) t_blocknr_high: Be32,
-    /// Tag checksum (`t_checksum`), zero until P7a-4.
+    /// Tag checksum (`t_checksum`), stamped by [`TagWriter::put`].
     pub(super) t_checksum: Be32,
 }
 
@@ -396,8 +430,8 @@ const TAG_UUID_BYTES: usize = 16;
 /// Size of `struct jbd2_journal_block_tail`: one big-endian u32 crc32c of the
 /// whole descriptor block, reserved at the *end* of the tag area when
 /// [`INCOMPAT_CSUM_V2`] or [`INCOMPAT_CSUM_V3`] is on. Recovery verifies it
-/// via [`JournalCsumSeed::verify_block_tail`]; our writer still emits zeros
-/// there until P7a-4 stamps it.
+/// via [`JournalCsumSeed::verify_block_tail`]; the writer stamps it via
+/// [`TagWriter::finish`].
 const DESCRIPTOR_TAIL_BYTES: usize = 4;
 
 /// The per-journal csum v2/v3 seed: `crc32c(!0, s_uuid)` of the **journal**
@@ -415,7 +449,9 @@ const DESCRIPTOR_TAIL_BYTES: usize = 4;
 /// journal carries csum v2/v3, so *holding* one is the license to verify —
 /// and owned by it. The log-block checksum formulas hang off this type: the
 /// seed is what turns "bytes + polynomial" into "*this* journal's checksum".
-/// The `*_csum` computations are shared with P7a-4's write-side stamping.
+/// The `*_csum` computations are shared by recovery's verification and the
+/// commit pipeline's stamping ([`TagWriter::put`]/[`TagWriter::finish`]/
+/// [`Self::stamp_commit_block`]), so both sides compute one formula.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct JournalCsumSeed(u32);
 
@@ -424,6 +460,15 @@ impl JournalCsumSeed {
     /// (`crc32c(!0, uuid)`, fs/jbd2/journal.c:1493-1495).
     fn derive(uuid: &[u8; 16]) -> Self {
         Self(checksum::crc32c(!0, uuid))
+    }
+
+    /// Test-only constructor: derives a seed from an arbitrary UUID so
+    /// sibling modules' fixtures can exercise the stamping paths without a
+    /// parsed superblock. Production code receives a seed only from the
+    /// [`JournalSuperblock`] parse boundary.
+    #[cfg(ktest)]
+    pub(super) fn for_test(uuid: &[u8; 16]) -> Self {
+        Self::derive(uuid)
     }
 
     /// The crc32c of a descriptor-class block with its trailing 4-byte
@@ -456,6 +501,20 @@ impl JournalCsumSeed {
         let head = checksum::crc32c(self.0, &block[..COMMIT_CHKSUM_OFFSET]);
         let hole = checksum::crc32c(head, &[0u8; size_of::<Be32>()]);
         checksum::crc32c(hole, &block[COMMIT_CHKSUM_OFFSET + size_of::<Be32>()..])
+    }
+
+    /// Stamps a commit block's `h_chksum[0]` with [`Self::commit_block_csum`]
+    /// — the write-side mirror of [`Self::verify_commit_block`] (Linux
+    /// `jbd2_commit_block_csum_set`, fs/jbd2/commit.c:89-103).
+    /// `h_chksum_type`/`h_chksum_size` stay zero under csum v2/v3 (they
+    /// belong to the v1 COMPAT checksum; pinned by the real-Linux-bytes
+    /// vectors below).
+    pub(super) fn stamp_commit_block(&self, block: &mut [u8; BLOCK_SIZE]) {
+        // `commit_block_csum` hashes around the `h_chksum[0]` hole, so the
+        // word's current content never folds into its own checksum.
+        let csum = self.commit_block_csum(block);
+        block[COMMIT_CHKSUM_OFFSET..COMMIT_CHKSUM_OFFSET + size_of::<Be32>()]
+            .copy_from_slice(Be32::new(csum).as_bytes());
     }
 
     /// Verifies a commit block's checksum (Linux
@@ -507,8 +566,9 @@ const COMMIT_CHKSUM_OFFSET: usize = core::mem::offset_of!(RawCommitBlock, h_chks
 /// function that shipped with csum_v2 over-counted by two bytes, and csum_v3
 /// exists to supersede it (Linux commit `db9ee220361d`, "jbd2: fix descriptor
 /// block size handling errors with journal_csum"). We reproduce the quirk so a
-/// Linux-written csum_v2 log would parse at the right stride if csum_v2 were
-/// ever admitted.
+/// Linux-written csum_v2 log parses (and our own writes stride) exactly as
+/// jbd2's would — csum_v2 is admitted since P7a-4, though nothing modern
+/// creates it (Linux upgrades v2 requests to v3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TagLayout {
     /// Bytes one tag occupies in the descriptor's tag array (the walk stride,
@@ -612,12 +672,39 @@ impl TagLayout {
     /// 12-byte header), positioned at the first tag — the write-side
     /// counterpart of [`walk`](Self::walk). The writer owns the cursor, so tag
     /// placement can neither skip nor reuse an offset.
-    pub(super) fn writer<'a>(&self, block: &'a mut [u8; BLOCK_SIZE]) -> TagWriter<'a> {
-        TagWriter {
+    ///
+    /// `tid` is the transaction the tags belong to and `seed` the journal's
+    /// csum seed; on a csum layout every [`put`](TagWriter::put) stamps the
+    /// tag's data checksum from them and [`finish`](TagWriter::finish) stamps
+    /// the descriptor tail.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` when `seed` presence contradicts the layout: a csum layout
+    /// must stamp (its zero checksums would fail our own recovery) and a
+    /// plain layout has nothing to stamp with. Both derive from the same
+    /// superblock feature bits, so a mismatch is a wiring bug, refused before
+    /// any tag is placed — a stamped-layout descriptor without checksums
+    /// cannot be emitted.
+    pub(super) fn writer<'a>(
+        &self,
+        block: &'a mut [u8; BLOCK_SIZE],
+        tid: Tid,
+        seed: Option<JournalCsumSeed>,
+    ) -> Result<TagWriter<'a>> {
+        if self.has_csum() != seed.is_some() {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "journal csum seed does not match the tag layout"
+            );
+        }
+        Ok(TagWriter {
             layout: *self,
             block,
             offset: self.first_tag_offset(),
-        }
+            tid,
+            seed,
+        })
     }
 
     /// Decodes the tag at `offset`. The caller ([`TagWalk`]) has already
@@ -708,14 +795,29 @@ pub(super) struct TagWriter<'a> {
     layout: TagLayout,
     block: &'a mut [u8; BLOCK_SIZE],
     offset: usize,
+    /// The transaction the tags belong to; folded into every tag's data
+    /// checksum on a csum layout.
+    tid: Tid,
+    /// The journal's csum seed, present iff the layout carries csum v2/v3
+    /// (validated by [`TagLayout::writer`], so a csum-layout tag can never be
+    /// laid down unstamped).
+    seed: Option<JournalCsumSeed>,
 }
 
 impl TagWriter<'_> {
     /// Serializes one block tag at the cursor into the (zeroed) descriptor
     /// buffer and advances the cursor — past the tag and, when this tag lacks
     /// [`TAG_FLAG_SAME_UUID`], its 16-byte UUID (left as zeros; we carry no
-    /// journal UUID). Tag checksum fields are written as zero (P7a-4 fills
-    /// them in).
+    /// journal UUID).
+    ///
+    /// `logged_block` is the block **as it will sit in the log** — the
+    /// post-escape form when the tag carries [`TAG_FLAG_ESCAPE`]. On a csum
+    /// layout the tag's data checksum is stamped from it (Linux
+    /// `jbd2_block_tag_csum_set`, fs/jbd2/commit.c:319-340, called on the
+    /// escaped `wbuf` copy at commit.c:684-685), exactly the bytes recovery
+    /// verifies before restoring the magic head
+    /// ([`DescriptorTag::verify_data_csum`]). On a plain layout the bytes are
+    /// not read.
     ///
     /// # Errors
     ///
@@ -725,7 +827,12 @@ impl TagWriter<'_> {
     ///   debug assert.
     /// - `ENOSPC` when the tag (plus its UUID) would run past the tag area —
     ///   into the reserved descriptor tail, or past the block.
-    pub(super) fn put(&mut self, blocknr: Ext4Bid, flags: u16) -> Result<()> {
+    pub(super) fn put(
+        &mut self,
+        blocknr: Ext4Bid,
+        flags: u16,
+        logged_block: &[u8; BLOCK_SIZE],
+    ) -> Result<()> {
         let (low, high) = TagLayout::split_blocknr(blocknr);
         if high != 0 && !self.layout.has_blocknr_high {
             return_errno_with_message!(Errno::EFBIG, "journal block number exceeds 32-bit tag");
@@ -740,18 +847,38 @@ impl TagWriter<'_> {
             return_errno_with_message!(Errno::ENOSPC, "journal descriptor tag area is full");
         }
 
+        // The per-tag data checksum (see the method docs); `None` exactly on
+        // a plain layout, per the `writer` constructor's invariant.
+        let csum32 = self
+            .seed
+            .map(|seed| seed.data_block_csum(self.tid, logged_block));
+
         if self.layout.csum_v3 {
             let tag3 = RawJournalBlockTag3 {
                 t_blocknr: Be32::new(low),
                 t_flags: Be32::new(u32::from(flags)),
                 t_blocknr_high: Be32::new(high),
-                t_checksum: Be32::new(0),
+                // csum_v3 implies a csum layout, so the constructor invariant
+                // makes `csum32` `Some` here; the zero arm keeps the match
+                // total without a panic path.
+                t_checksum: Be32::new(csum32.unwrap_or(0)),
             };
             self.block[offset..offset + BLOCK_TAG3_SIZE].copy_from_slice(tag3.as_bytes());
         } else {
+            // csum_v2 stores only the LOW 16 bits of the crc32c — jbd2's
+            // frozen `cpu_to_be16(csum32)` truncation (commit.c:339), taken
+            // bytewise from the big-endian encoding (no narrowing cast); the
+            // read side compares in the widened domain ([`TagChecksum::V2`]).
+            let t_checksum = match csum32 {
+                Some(csum32) => {
+                    let be = csum32.to_be_bytes();
+                    Be16([be[2], be[3]])
+                }
+                None => Be16::new(0),
+            };
             let tag = RawBlockTag {
                 t_blocknr: Be32::new(low),
-                t_checksum: Be16::new(0),
+                t_checksum,
                 t_flags: Be16::new(flags),
             };
             self.block[offset..offset + BLOCK_TAG_SIZE].copy_from_slice(tag.as_bytes());
@@ -767,6 +894,23 @@ impl TagWriter<'_> {
 
         self.offset = end;
         Ok(())
+    }
+
+    /// Seals the descriptor: stamps the trailing `jbd2_journal_block_tail`
+    /// checksum on a csum layout (Linux `jbd2_descriptor_block_csum_set`,
+    /// fs/jbd2/journal.c:1026-1041, run once after the LAST tag is placed,
+    /// commit.c:710-714). A plain layout reserves no tail and nothing is
+    /// written.
+    ///
+    /// Consumes the writer: the tail checksum covers every tag byte, so no
+    /// tag can be placed after the seal — that misuse does not compile.
+    pub(super) fn finish(self) {
+        let Some(seed) = self.seed else {
+            return;
+        };
+        let tail = seed.block_tail_csum(self.block);
+        self.block[BLOCK_SIZE - DESCRIPTOR_TAIL_BYTES..]
+            .copy_from_slice(Be32::new(tail).as_bytes());
     }
 }
 
@@ -913,10 +1057,11 @@ impl Iterator for TagWalk<'_> {
 /// The on-disk commit block (`commit_header`, exactly 60 bytes) that seals a
 /// transaction.
 ///
-/// Under csum v2/v3 the block's crc32c lives in `h_chksum[0]` and recovery
+/// Under csum v2/v3 the block's crc32c lives in `h_chksum[0]`: the commit
+/// pipeline stamps it ([`JournalCsumSeed::stamp_commit_block`]) and recovery
 /// verifies it ([`JournalCsumSeed::verify_commit_block`]); `h_chksum_type` /
 /// `h_chksum_size` stay zero (they belong to the v1 COMPAT checksum we do not
-/// model). Our writer still emits zeros until P7a-4 stamps the checksum.
+/// model).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod)]
 pub(super) struct RawCommitBlock {
@@ -1298,22 +1443,55 @@ mod tests {
         );
     }
 
+    /// A zeroed data block for the writer calls of tests that do not care
+    /// about the logged bytes.
+    fn zero_block() -> Box<[u8; BLOCK_SIZE]> {
+        Box::new([0u8; BLOCK_SIZE])
+    }
+
+    /// The writer demands a seed exactly when the layout carries csum v2/v3:
+    /// a csum layout without one could emit unstamped tags (which our own
+    /// recovery would refuse), and a plain layout has nothing to stamp with.
+    #[ktest]
+    fn writer_requires_seed_iff_csum_layout() {
+        let mut block = zero_block();
+
+        let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
+        let err = v3
+            .writer(&mut block, Tid::new(1), None)
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        let v0 = TagLayout::from_features(0).unwrap();
+        let err = v0
+            .writer(&mut block, Tid::new(1), Some(linux_seed()))
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+    }
+
     /// A block number above 32 bits is `EFBIG` on a layout without
     /// `t_blocknr_high`, and round-trips on one with it.
     #[ktest]
     fn put_blocknr_width_is_layout_gated() {
         let wide: Ext4Bid = (1 << 32) | 5;
+        let data = zero_block();
 
         let v0 = TagLayout::from_features(0).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
         let err = v0
-            .writer(&mut block)
-            .put(wide, TAG_FLAG_LAST_TAG)
+            .writer(&mut block, Tid::new(1), None)
+            .unwrap()
+            .put(wide, TAG_FLAG_LAST_TAG, &data)
             .unwrap_err();
         assert_eq!(err.error(), Errno::EFBIG);
 
         let b64 = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
-        b64.writer(&mut block).put(wide, TAG_FLAG_LAST_TAG).unwrap();
+        b64.writer(&mut block, Tid::new(1), None)
+            .unwrap()
+            .put(wide, TAG_FLAG_LAST_TAG, &data)
+            .unwrap();
         let tag = b64.walk(&block).next().unwrap().unwrap();
         assert_eq!(tag.blocknr(), wide);
         assert!(tag.is_last());
@@ -1326,15 +1504,16 @@ mod tests {
     fn tag_round_trip_64bit_layout() {
         let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let data = zero_block();
 
         let tags: [(Ext4Bid, u16); 3] = [
             (0x123, 0), // first tag: a 16-byte UUID follows
             ((7 << 32) | 42, TAG_FLAG_SAME_UUID),
             (0xFFFF_FFFF, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
         ];
-        let mut writer = layout.writer(&mut block);
+        let mut writer = layout.writer(&mut block, Tid::new(1), None).unwrap();
         for (blocknr, flags) in tags {
-            writer.put(blocknr, flags).unwrap();
+            writer.put(blocknr, flags, &data).unwrap();
         }
 
         let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -1350,33 +1529,49 @@ mod tests {
         assert_eq!(&block[48..52], &[0, 0, 0, 7]);
     }
 
-    /// 16-byte (csum-v3) tags round-trip, with the checksum word written as
-    /// zero and the widened flags at their tag3 offsets.
+    /// 16-byte (csum-v3) tags round-trip with their stamped data checksums at
+    /// the tag3 offsets, the widened flags in place, and the sealed
+    /// descriptor tail verifying.
     #[ktest]
     fn tag_round_trip_csum_v3_layout() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let seed = linux_seed();
+        let tid = Tid::new(5);
         let mut block = Box::new([0u8; BLOCK_SIZE]);
 
-        let tags: [(Ext4Bid, u16); 2] = [
-            (0x0102_0304, 0),
-            ((3 << 32) | 9, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG),
-        ];
-        let mut writer = layout.writer(&mut block);
-        for (blocknr, flags) in tags {
-            writer.put(blocknr, flags).unwrap();
-        }
+        let mut d0 = zero_block();
+        d0[..4].copy_from_slice(b"DAT0");
+        let mut d1 = zero_block();
+        d1[..4].copy_from_slice(b"DAT1");
+
+        let mut writer = layout.writer(&mut block, tid, Some(seed)).unwrap();
+        writer.put(0x0102_0304, 0, &d0).unwrap();
+        writer
+            .put((3 << 32) | 9, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &d1)
+            .unwrap();
+        writer.finish();
 
         let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[0].blocknr(), 0x0102_0304);
         assert_eq!(decoded[1].blocknr(), (3 << 32) | 9);
         assert!(decoded[1].is_last());
+        // Each tag verifies against ITS logged block and not the other's.
+        assert!(decoded[0].verify_data_csum(seed, tid, &d0));
+        assert!(!decoded[0].verify_data_csum(seed, tid, &d1));
+        assert!(decoded[1].verify_data_csum(seed, tid, &d1));
+        // The sealed descriptor tail verifies over the stamped tags.
+        assert!(seed.verify_block_tail(&block));
 
         // On-disk pin for tag 0 at offset 12: t_blocknr [12,16), t_flags
         // [16,20) (a 32-bit zero here), t_blocknr_high [20,24) (zero),
-        // t_checksum [24,28) — written as ZERO until P7a-4.
+        // t_checksum [24,28) — the stamped big-endian crc32c.
         assert_eq!(&block[12..16], &[0x01, 0x02, 0x03, 0x04]);
-        assert_eq!(&block[16..28], &[0; 12]);
+        assert_eq!(&block[16..24], &[0; 8]);
+        assert_eq!(
+            &block[24..28],
+            Be32::new(seed.data_block_csum(tid, &d0)).as_bytes()
+        );
         // Tag 1 at 28 + UUID(16) = 44: flags be32 = 0x0000000A, high word 3.
         assert_eq!(&block[44..48], &[0, 0, 0, 9]);
         assert_eq!(&block[48..52], &[0, 0, 0, 0x0A]);
@@ -1410,26 +1605,35 @@ mod tests {
     }
 
     /// csum_v2's frozen 10/14-byte strides round-trip (the two quirk padding
-    /// bytes stay zero and the walker steps over them).
+    /// bytes stay zero and the walker steps over them), with the stamped
+    /// low-16-bit data checksums verifying end to end.
     #[ktest]
     fn tag_round_trip_csum_v2_quirk_strides() {
+        let seed = linux_seed();
+        let tid = Tid::new(3);
+        let data = linux_data_block();
         for features in [INCOMPAT_CSUM_V2, INCOMPAT_CSUM_V2 | INCOMPAT_64BIT] {
             let layout = TagLayout::from_features(features).unwrap();
             let mut block = Box::new([0u8; BLOCK_SIZE]);
             let wide_ok = features & INCOMPAT_64BIT != 0;
             let second: Ext4Bid = if wide_ok { (5 << 32) | 6 } else { 0x600 };
 
-            let mut writer = layout.writer(&mut block);
-            writer.put(0x500, 0).unwrap();
+            let mut writer = layout.writer(&mut block, tid, Some(seed)).unwrap();
+            writer.put(0x500, 0, &data).unwrap();
             writer
-                .put(second, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+                .put(second, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &data)
                 .unwrap();
+            writer.finish();
 
             let decoded: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
             assert_eq!(decoded.len(), 2, "features {features:#x}");
             assert_eq!(decoded[0].blocknr(), 0x500);
             assert_eq!(decoded[1].blocknr(), second);
             assert!(decoded[1].is_last());
+            // The stamped low-16 checksum verifies; a different block fails.
+            assert!(decoded[0].verify_data_csum(seed, tid, &data));
+            assert!(!decoded[0].verify_data_csum(seed, tid, &zero_block()));
+            assert!(seed.verify_block_tail(&block), "features {features:#x}");
         }
     }
 
@@ -1440,17 +1644,21 @@ mod tests {
     fn tag_area_excludes_descriptor_tail() {
         let v3 = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let data = zero_block();
         // A 16-byte tag at BLOCK_SIZE - 16 fits the block but overlaps the
         // 4-byte tail: refused. The cursor is planted there directly (a
-        // white-box `TagWriter` literal): the offsets a sequential writer can
-        // reach on this geometry are all congruent mod 16, and this
-        // tail-only-overlap one is not among them.
+        // white-box `TagWriter` literal, seed-less since only the bounds
+        // check is under test): the offsets a sequential writer can reach on
+        // this geometry are all congruent mod 16, and this tail-only-overlap
+        // one is not among them.
         let err = TagWriter {
             layout: v3,
             block: &mut block,
             offset: BLOCK_SIZE - 16,
+            tid: Tid::new(1),
+            seed: None,
         }
-        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &data)
         .unwrap_err();
         assert_eq!(err.error(), Errno::ENOSPC);
         // One slot earlier (clear of the tail) is accepted.
@@ -1458,8 +1666,10 @@ mod tests {
             layout: v3,
             block: &mut block,
             offset: BLOCK_SIZE - 4 - 16,
+            tid: Tid::new(1),
+            seed: None,
         }
-        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+        .put(0x1, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &data)
         .unwrap();
 
         // Walker bound: an all-zero tag array never sets LAST_TAG, so the walk
@@ -1713,9 +1923,10 @@ mod tests {
     }
 
     /// csum_v2 semantics (no real artifact — Linux 6.8 writes csum_v3; the
-    /// formula is the same crc32c, truncated): the 16-bit tag field must
-    /// equal the LOW half of the computed crc32c, per jbd2's
-    /// `cpu_to_be16(csum32)` truncation (recovery.c:460).
+    /// formula is the same crc32c, truncated): the 16-bit tag field the
+    /// WRITER stamps must equal the LOW half of the computed crc32c, per
+    /// jbd2's `cpu_to_be16(csum32)` truncation (commit.c:339 /
+    /// recovery.c:460).
     #[ktest]
     fn tag_csum_v2_stores_low_16_bits() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V2).unwrap();
@@ -1726,28 +1937,28 @@ mod tests {
 
         let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
         layout
-            .writer(&mut descriptor)
-            .put(0x321, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+            .writer(&mut descriptor, tid, Some(seed))
+            .unwrap()
+            .put(0x321, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &data)
             .unwrap();
-        // Stamp the stored 16-bit checksum by hand (the write side is P7a-4):
-        // the 8-byte tag sits at offset 12, its `t_checksum` at 12 + 4. The
-        // low half must verify...
-        let low = (csum32 & 0xFFFF).to_be_bytes();
-        descriptor[16..18].copy_from_slice(&low[2..]);
+        // The 8-byte tag sits at offset 12, its `t_checksum` at 12 + 4: the
+        // stamped bytes are the LOW half of the big-endian crc32c...
+        assert_eq!(&descriptor[16..18], &csum32.to_be_bytes()[2..]);
         let tag = layout.walk(&descriptor).next().unwrap().unwrap();
         assert!(tag.verify_data_csum(seed, tid, &data));
 
-        // ...and the HIGH half must not (a truncation-direction pin).
+        // ...and the HIGH half must not verify (a truncation-direction pin).
         let high = (csum32 >> 16).to_be_bytes();
         descriptor[16..18].copy_from_slice(&high[2..]);
         let tag = layout.walk(&descriptor).next().unwrap().unwrap();
         assert!(!tag.verify_data_csum(seed, tid, &data));
     }
 
-    /// The data checksum covers the block AS LOGGED — the escaped form: a
-    /// checksum computed over the zero-headed log copy verifies against that
-    /// copy and NOT against the restored original, so verification must run
-    /// before the magic head is put back (recovery.c:656 vs :686).
+    /// The data checksum covers the block AS LOGGED — the escaped form: the
+    /// writer stamps over the zero-headed log copy it is handed, which
+    /// verifies against that copy and NOT against the restored original, so
+    /// verification must run before the magic head is put back
+    /// (recovery.c:656 vs :686).
     #[ktest]
     fn tag_data_csum_covers_escaped_form() {
         let seed = linux_seed();
@@ -1764,16 +1975,15 @@ mod tests {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap();
         let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
         layout
-            .writer(&mut descriptor)
+            .writer(&mut descriptor, tid, Some(seed))
+            .unwrap()
             .put(
                 0x700,
                 TAG_FLAG_ESCAPE | TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+                // The writer's contract: the block as it will sit in the log.
+                &logged,
             )
             .unwrap();
-        // Stamp tag3's stored checksum over the LOGGED (escaped) bytes; the
-        // tag3 t_checksum sits at offset 12 + 12.
-        let csum = seed.data_block_csum(tid, &logged);
-        descriptor[24..28].copy_from_slice(Be32::new(csum).as_bytes());
 
         let tag = layout.walk(&descriptor).next().unwrap().unwrap();
         assert!(tag.is_escaped());
@@ -1790,11 +2000,68 @@ mod tests {
         let layout = TagLayout::from_features(INCOMPAT_64BIT).unwrap();
         let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
         layout
-            .writer(&mut descriptor)
-            .put(0x42, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG)
+            .writer(&mut descriptor, Tid::new(1), None)
+            .unwrap()
+            .put(0x42, TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG, &zero_block())
             .unwrap();
         let tag = layout.walk(&descriptor).next().unwrap().unwrap();
         assert_eq!(tag.checksum, None);
         assert!(tag.verify_data_csum(linux_seed(), Tid::new(1), &linux_data_block()));
+    }
+
+    /// The WRITE side reproduces the real Linux artifacts, pinning the
+    /// stampers to the same ground truth as the verifiers, independently of
+    /// them: [`TagWriter::put`] stamps tag1's exact stored checksum for the
+    /// real logged root-directory block, [`RawJournalSuperblock::stamp_checksum`]
+    /// reproduces the stored `s_checksum`, and
+    /// [`JournalCsumSeed::stamp_commit_block`] reproduces the stored
+    /// `h_chksum[0]` byte for byte.
+    #[ktest]
+    fn write_side_reproduces_real_linux_csums() {
+        let seed = linux_seed();
+        let tid = Tid::new(LINUX_TID);
+
+        // Tag: stamped over the real logged block. (The tag's position and
+        // flags differ from the snapshot's tag1 — only tid + block bytes fold
+        // into the data checksum, recovery.c:443-461.)
+        let layout = TagLayout::from_features(INCOMPAT_64BIT | INCOMPAT_CSUM_V3).unwrap();
+        let mut block = Box::new([0u8; BLOCK_SIZE]);
+        let mut writer = layout.writer(&mut block, tid, Some(seed)).unwrap();
+        writer
+            .put(
+                4133,
+                TAG_FLAG_SAME_UUID | TAG_FLAG_LAST_TAG,
+                &linux_data_block(),
+            )
+            .unwrap();
+        writer.finish();
+        let tag = layout.walk(&block).next().unwrap().unwrap();
+        assert_eq!(tag.checksum, Some(TagChecksum::V3(LINUX_TAG1_CSUM)));
+        // The sealed tail re-verifies over this (differently laid out)
+        // descriptor.
+        assert!(seed.verify_block_tail(&block));
+
+        // Superblock: strip the stored checksum, restamp, exact value back.
+        let mut raw = linux_journal_superblock();
+        raw.s_checksum = Be32::new(0);
+        raw.stamp_checksum();
+        assert_eq!(raw.s_checksum.get(), LINUX_SB_CSUM);
+
+        // Commit block: strip the stored checksum, restamp, byte-identical.
+        let mut commit = linux_commit_block();
+        commit[COMMIT_CHKSUM_OFFSET..COMMIT_CHKSUM_OFFSET + 4].fill(0);
+        seed.stamp_commit_block(&mut commit);
+        assert_eq!(commit.as_slice(), linux_commit_block().as_slice());
+    }
+
+    /// [`RawJournalSuperblock::stamp_checksum`] keys off the superblock's own
+    /// feature bits: a featureless (v0) superblock is left byte-untouched —
+    /// the frozen v0 byte path every pre-P7 image rides on.
+    #[ktest]
+    fn superblock_stamp_only_under_csum_features() {
+        let mut raw = valid_raw(1024, 1, 1, 0);
+        let before = raw;
+        raw.stamp_checksum();
+        assert_eq!(raw.as_bytes(), before.as_bytes());
     }
 }

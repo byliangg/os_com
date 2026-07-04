@@ -16,6 +16,7 @@ use device_id::DeviceId;
 use super::{
     block_group::BlockGroup,
     checksum::FsCsumSeed,
+    feature::FeatureIncompatSet,
     inode,
     inode::{FilePerm, Inode, InodeDesc, InodeSeed, RawInode},
     journal,
@@ -169,6 +170,40 @@ impl Ext4 {
                 // sync would write stale counters back over the replayed values.
                 ext4.reload_metadata_after_replay()?;
             }
+
+            // D-4 journal feature upgrade (Linux `ext4_load_and_init_journal`
+            // → `jbd2_journal_set_features`): a metadata_csum filesystem over
+            // a fresh featureless journal flips it to csum_v3 (+64bit iff the
+            // fs is 64bit). Placed exactly here — after recovery left the log
+            // clean and empty (the flip is only crash-safe then; see
+            // `journal::upgrade_journal_on_mount`) and before the journal is
+            // published for new transactions. A rewrite invalidates the
+            // parsed geometry (tag layout / csum seed were derived from the
+            // pre-upgrade bytes), so the journal is rebuilt from a reload.
+            let journal = {
+                let needs = {
+                    let sb = ext4.super_block();
+                    journal::JournalUpgradeNeeds {
+                        fs_has_metadata_csum: sb.has_metadata_csum(),
+                        fs_is_64bit: sb.feature_incompat().contains(FeatureIncompatSet::IS_64BIT),
+                    }
+                };
+                if journal::upgrade_journal_on_mount(
+                    journal.geometry(),
+                    ext4.block_device().as_ref(),
+                    needs,
+                )? {
+                    let geometry = journal::load_geometry(&ext4)?.ok_or_else(|| {
+                        Error::with_message(
+                            Errno::EIO,
+                            "the journal disappeared across the feature upgrade",
+                        )
+                    })?;
+                    journal::Journal::new(geometry, ext4.block_device().clone())
+                } else {
+                    journal
+                }
+            };
 
             // Stamp `INCOMPAT_RECOVER` for the lifetime of this writable mount
             // (Linux sets it in `ext4_load_journal`, clears it at clean unmount
@@ -2141,7 +2176,7 @@ mod tests {
 
     // --- Int-A: journal mount lifecycle (load / recover / start / stop). ---
 
-    use super::super::{feature::FeatureIncompatSet, test_utils::JOURNAL_START_BLOCK};
+    use super::super::test_utils::JOURNAL_START_BLOCK;
 
     /// The on-disk `RECOVER` incompatible feature bit.
     const RECOVER_BIT: u32 = FeatureIncompatSet::RECOVER.bits();

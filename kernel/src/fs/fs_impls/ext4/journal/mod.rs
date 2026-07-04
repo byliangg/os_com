@@ -71,7 +71,11 @@ use ostd::sync::{RwMutexWriteGuard, WaitQueue};
 
 use self::{
     commit::commit_transaction,
-    format::{INCOMPAT_SUPP, JournalCsumSeed, JournalSuperblock, RawJournalSuperblock, TagLayout},
+    format::{
+        BLOCKTYPE_SUPERBLOCK_V2, Be32, COMPAT_CHECKSUM, INCOMPAT_64BIT, INCOMPAT_CSUM_V3,
+        INCOMPAT_SUPP, JBD2_CRC32C_CHKSUM, JournalCsumSeed, JournalSuperblock,
+        RawJournalSuperblock, TagLayout,
+    },
     transaction::Transaction,
 };
 use super::{
@@ -333,6 +337,157 @@ impl JournalGeometry {
             .read_bytes(Bid::new(pblock).to_offset(), buf.as_mut_slice())
             .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal log block"))
     }
+
+    /// The physical byte offset of the journal superblock (log block 0), the
+    /// one location [`read_raw_superblock`](Self::read_raw_superblock) and
+    /// [`write_superblock`](Self::write_superblock) address.
+    fn superblock_offset(&self) -> Result<usize> {
+        let sb_pblock = self.log_block_to_physical(0).ok_or_else(|| {
+            Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped")
+        })?;
+        Ok(Bid::new(sb_pblock).to_offset())
+    }
+
+    /// Reads the raw on-disk journal superblock (log block 0), the
+    /// read-modify-write source for [`write_superblock`](Self::write_superblock):
+    /// callers patch the fields they own and hand the struct back to the
+    /// funnel. Private to the journal module, like
+    /// [`tag_layout`](Self::tag_layout): the raw superblock is a
+    /// journal-internal concern.
+    fn read_raw_superblock(&self, device: &dyn BlockDevice) -> Result<RawJournalSuperblock> {
+        device
+            .read_val(self.superblock_offset()?)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))
+    }
+
+    /// Writes the on-disk journal superblock (log block 0) and barriers — THE
+    /// journal-superblock serialization funnel: the commit step-5 tail
+    /// publish, the checkpoint clean rewrite, recovery's clean rewrite, and
+    /// the D-4 mount upgrade all serialize through here, so a csum journal's
+    /// superblock can never reach the device unstamped. This mirrors Linux,
+    /// where every journal-superblock write funnels through
+    /// `jbd2_write_superblock`, which stamps `s_checksum` under csum v2/v3
+    /// (fs/jbd2/journal.c:1812-1813). The stamp keys off the raw's **own**
+    /// feature bits ([`RawJournalSuperblock::stamp_checksum`]), so the funnel
+    /// is total across v0 superblocks (bytes untouched — the frozen path) and
+    /// the upgrade's just-flipped one alike.
+    ///
+    /// The trailing barrier is part of the funnel: every superblock rewrite
+    /// moves the recoverability pointer (`s_start`/`s_sequence`) or the
+    /// feature set, and none may be claimed done before it is durable — the
+    /// same barrier each pre-P7a-4 site issued by hand.
+    ///
+    /// Private to the journal module (the sites above are all inside it),
+    /// like [`read_raw_superblock`](Self::read_raw_superblock).
+    fn write_superblock(
+        &self,
+        device: &dyn BlockDevice,
+        mut raw: RawJournalSuperblock,
+    ) -> Result<()> {
+        raw.stamp_checksum();
+        device
+            .write_val(self.superblock_offset()?, &raw)
+            .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
+        commit::barrier(device)
+    }
+}
+
+/// The filesystem-side feature bits that drive the mount-time journal feature
+/// upgrade ([`upgrade_journal_on_mount`], project decision D-4) — a plain-data
+/// view, so the journal module reads nothing of the fs superblock itself.
+pub(in crate::fs::fs_impls::ext4) struct JournalUpgradeNeeds {
+    /// The fs carries `metadata_csum` — the upgrade trigger: Linux picks
+    /// journal CSUM_V3 exactly for it (`set_journal_csum_feature_set`,
+    /// fs/ext4/super.c:4078-4092).
+    pub(in crate::fs::fs_impls::ext4) fs_has_metadata_csum: bool,
+    /// The fs carries `64bit` — adds `INCOMPAT_64BIT` to the upgrade set
+    /// (`ext4_load_and_init_journal`, fs/ext4/super.c:4909-4912).
+    pub(in crate::fs::fs_impls::ext4) fs_is_64bit: bool,
+}
+
+/// Upgrades a fresh (featureless) journal to match the filesystem's checksum
+/// and width features at mount time — project decision D-4, mirroring what a
+/// Linux RW mount does via `ext4_load_and_init_journal` →
+/// `jbd2_journal_set_features` (this port mounts read-write only, so every
+/// mount is the "RW mount" of that policy). Returns whether the on-disk
+/// journal superblock was rewritten; the caller must then reload the journal
+/// geometry, because the in-memory tag layout / csum seed were parsed from
+/// the pre-upgrade bytes.
+///
+/// # Policy (fs `metadata_csum` × journal features → action)
+///
+/// | fs metadata_csum | journal INCOMPAT bits | action                        |
+/// |------------------|-----------------------|-------------------------------|
+/// | no               | any (even csum)       | untouched — v0 path frozen; a |
+/// |                  |                       | csum journal (tune2fs oddity) |
+/// |                  |                       | is honored as-is              |
+/// | yes              | any nonzero           | untouched — a Linux-touched   |
+/// |                  |                       | journal keeps its features;   |
+/// |                  |                       | never downgraded or reshaped  |
+/// | yes              | none                  | set CSUM_V3 (+ 64BIT iff the  |
+/// |                  |                       | fs is 64bit), name crc32c,    |
+/// |                  |                       | stamp `s_checksum`, write     |
+/// |                  |                       | with a barrier                |
+///
+/// D-4 deliberately diverges from Linux for a 64bit fs *without*
+/// `metadata_csum` (Linux would still add journal 64BIT): such volumes stay
+/// on the frozen v0 byte path — the whole pre-P7 crash-matrix baseline rides
+/// on it — and a block number past 2^32 fails loudly at tag time (`EFBIG`)
+/// rather than corrupting.
+///
+/// # Timing / crash safety
+///
+/// Must run after mount-time recovery and before the journal is published
+/// for new transactions, and acts only on a clean, **empty** journal
+/// (`s_start == 0`): the log then contains no transaction, so no logged byte
+/// exists whose parse the new tag geometry could change — a crash before the
+/// superblock write leaves the old featureless journal, a crash after it the
+/// upgraded one, and either way the next mount scans an empty log. That is
+/// what makes the flip a single plain superblock write and still crash-safe.
+pub(in crate::fs::fs_impls::ext4) fn upgrade_journal_on_mount(
+    geometry: &JournalGeometry,
+    device: &dyn BlockDevice,
+    needs: JournalUpgradeNeeds,
+) -> Result<bool> {
+    // Only a metadata_csum fs upgrades its journal (D-4, first table row).
+    if !needs.fs_has_metadata_csum {
+        return Ok(false);
+    }
+
+    let mut raw = geometry.read_raw_superblock(device)?;
+
+    // A V1 superblock cannot carry feature bits at all; Linux refuses to set
+    // features on one (`jbd2_format_support_feature`). Leave it alone.
+    if raw.header.h_blocktype.get() != BLOCKTYPE_SUPERBLOCK_V2 {
+        return Ok(false);
+    }
+    // Any pre-existing INCOMPAT feature means a Linux-touched journal: honor
+    // its choices verbatim (second table row).
+    if raw.s_feature_incompat.get() != 0 {
+        return Ok(false);
+    }
+    // The flip is only crash-safe on a clean, empty log (see the docs).
+    // Recovery already ran by the time the mount calls this, so a nonzero
+    // `s_start` is an anomaly (a dirty log the fs superblock did not flag for
+    // recovery) we leave untouched rather than re-shape under.
+    if raw.s_start.get() != 0 {
+        return Ok(false);
+    }
+
+    let mut incompat = INCOMPAT_CSUM_V3;
+    if needs.fs_is_64bit {
+        incompat |= INCOMPAT_64BIT;
+    }
+    raw.s_feature_incompat = Be32::new(incompat);
+    // v3 names its algorithm and supersedes the v1 COMPAT checksum
+    // (`jbd2_journal_set_features`, fs/jbd2/journal.c:2349-2353).
+    raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+    raw.s_feature_compat = Be32::new(raw.s_feature_compat.get() & !COMPAT_CHECKSUM);
+
+    // The funnel stamps `s_checksum` (the bits above make this a csum
+    // superblock) and barriers the write.
+    geometry.write_superblock(device, raw)?;
+    Ok(true)
 }
 
 /// Loads the journal geometry: reads the journal inode (ino 8), maps its blocks,
@@ -399,12 +554,12 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
         .map_err(|_| Error::with_message(Errno::EIO, "failed to read the journal superblock"))?;
 
     // Admission gate (mount policy, [`format::INCOMPAT_SUPP`]): refuse every
-    // INCOMPAT feature we do not honor end-to-end BEFORE parsing further —
-    // the same behavior the parse boundary itself enforced until P7a-3, kept
-    // here so production mounts are byte-for-byte unaffected while `TryFrom`
-    // learns to parse (and checksum-verify) the still-unadmitted csum
-    // layouts for the recovery tests. The flip that admits 64bit/csum_v3 is
-    // a later task, gated on P7a-4's write-side stamping.
+    // INCOMPAT feature we do not honor end-to-end BEFORE parsing further.
+    // As of P7a-4 the set is REVOKE | 64BIT | CSUM_V2 | CSUM_V3 — the csum
+    // and width layouts parse (P7a-2), recovery verifies them (P7a-3), and
+    // the commit pipeline stamps them (P7a-4), so an admitted journal
+    // round-trips through our own recovery. Async/fast commit stay refused,
+    // and csum_v2 + csum_v3 together is refused by the parse below.
     if raw.s_feature_incompat.get() & !INCOMPAT_SUPP != 0 {
         return_errno_with_message!(
             Errno::EINVAL,
@@ -1389,7 +1544,7 @@ pub(in crate::fs::fs_impls::ext4) fn write_clean_journal_superblock_for_test(
     first: u32,
     sequence: Tid,
 ) -> Result<()> {
-    use self::format::{BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader};
+    use self::format::{JBD2_MAGIC, RawJournalHeader};
     let raw = RawJournalSuperblock {
         header: RawJournalHeader {
             h_magic: Be32::new(JBD2_MAGIC),
@@ -1448,10 +1603,7 @@ mod tests {
 
     use super::{
         super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
-        format::{
-            BLOCKTYPE_SUPERBLOCK_V2, Be32, INCOMPAT_CSUM_V3, JBD2_CRC32C_CHKSUM, JBD2_MAGIC,
-            RawJournalHeader,
-        },
+        format::{JBD2_MAGIC, RawJournalHeader},
         *,
     };
 
@@ -1516,13 +1668,14 @@ mod tests {
         assert_eq!(geo.log_block_to_physical(2), None);
     }
 
-    /// The csum layouts PARSE now (P7a-3's verify side), but mount admission
-    /// must keep refusing them until the write side stamps what recovery
-    /// verifies (P7a-4): a structurally valid, correctly self-checksummed
-    /// csum_v3 journal is still rejected by `load_geometry` with `EINVAL` —
-    /// no admission flip in this task.
+    /// The P7a-4 admission set, end to end through `load_geometry`: every
+    /// stamped-and-verified feature combination (64bit, csum v2/v3, ±64bit,
+    /// revoke) is admitted, while async commit, fast commit, and the
+    /// contradictory csum_v2+csum_v3 pair stay refused with `EINVAL`.
     #[ktest]
-    fn load_geometry_rejects_unadmitted_csum_journal() {
+    fn load_geometry_admission_matches_supp_set() {
+        use super::format::{INCOMPAT_CSUM_V2, INCOMPAT_REVOKE};
+
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
             .with_has_journal()
@@ -1531,18 +1684,49 @@ mod tests {
         let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, 2);
         f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
 
-        let mut raw = journal_super(2, 1, 1, 0);
-        raw.s_feature_incompat = Be32::new(INCOMPAT_CSUM_V3);
-        raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
-        raw.s_checksum = Be32::new(raw.checksum());
-        // Sanity: the parse boundary itself accepts this superblock...
-        assert!(JournalSuperblock::try_from(raw).is_ok());
-        f.disk
-            .segment()
-            .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
-            .unwrap();
+        let write_sb = |features: u32| {
+            let mut raw = journal_super(2, 1, 1, 0);
+            raw.s_feature_incompat = Be32::new(features);
+            if features & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0 {
+                raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+                raw.s_checksum = Be32::new(raw.checksum());
+            }
+            f.disk
+                .segment()
+                .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
+                .unwrap();
+        };
 
-        // ...but mount admission refuses the unadmitted feature.
+        for features in [
+            0,
+            INCOMPAT_REVOKE,
+            INCOMPAT_64BIT,
+            INCOMPAT_CSUM_V3,
+            INCOMPAT_CSUM_V3 | INCOMPAT_64BIT,
+            INCOMPAT_CSUM_V2,
+            INCOMPAT_CSUM_V2 | INCOMPAT_64BIT,
+        ] {
+            write_sb(features);
+            let geo = load_geometry(&f.ext4)
+                .unwrap_or_else(|e| panic!("features {features:#x} refused: {e:?}"))
+                .unwrap();
+            // The parse derived the seed exactly for the csum sets.
+            assert_eq!(
+                geo.csum_seed().is_some(),
+                features & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0,
+                "features {features:#x}"
+            );
+        }
+
+        // Async commit (0x4) and fast commit (0x20) stay outside the set.
+        for features in [0x4u32, 0x20u32] {
+            write_sb(features);
+            let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL, "features {features:#x}");
+        }
+        // csum_v2 + csum_v3 passes the SUPP mask (both bits are admitted) but
+        // the parse refuses the contradictory tag layouts.
+        write_sb(INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3);
         let err = load_geometry(&f.ext4).map(|_| ()).unwrap_err();
         assert_eq!(err.error(), Errno::EINVAL);
     }
@@ -2043,5 +2227,171 @@ mod tests {
             .unwrap();
         assert_eq!(&final_block[8..12], &[0x22; 4]);
         assert_eq!(final_block[100], 0x77);
+    }
+
+    // --- P7a-4: the D-4 mount-time journal feature upgrade. ---
+
+    /// Reads the raw on-disk journal superblock of a [`journaled_fixture`].
+    fn read_fixture_journal_super(f: &JournaledFixture) -> RawJournalSuperblock {
+        f.fixture
+            .disk
+            .segment()
+            .read_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE)
+            .unwrap()
+    }
+
+    /// Overwrites the on-disk journal superblock of a [`journaled_fixture`].
+    fn write_fixture_journal_super(f: &JournaledFixture, raw: &RawJournalSuperblock) {
+        f.fixture
+            .disk
+            .segment()
+            .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, raw)
+            .unwrap();
+    }
+
+    /// D-4 upgrade, the acting row: a metadata_csum fs over a featureless
+    /// clean journal flips it to csum_v3 (+64bit iff the fs is 64bit), names
+    /// crc32c, and stamps a valid `s_checksum` — and the rewritten superblock
+    /// re-parses through the production `load_geometry` with the new tag
+    /// layout and a seed, exactly the reload the mount performs.
+    #[ktest]
+    fn upgrade_stamps_csum_v3_on_featureless_journal() {
+        let f = journaled_fixture(16, 1, 1);
+        assert_eq!(read_fixture_journal_super(&f).s_feature_incompat.get(), 0);
+
+        let rewritten = upgrade_journal_on_mount(
+            f.journal.geometry(),
+            f.fixture.ext4.block_device().as_ref(),
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: true,
+                fs_is_64bit: false,
+            },
+        )
+        .unwrap();
+        assert!(rewritten);
+
+        let sb = read_fixture_journal_super(&f);
+        assert_eq!(sb.s_feature_incompat.get(), INCOMPAT_CSUM_V3);
+        assert_eq!(sb.s_checksum_type, JBD2_CRC32C_CHKSUM);
+        assert_eq!(sb.s_checksum.get(), sb.checksum());
+
+        // The mount reloads the geometry from the upgraded bytes: admission
+        // passes, the tag layout is csum_v3's, and the seed exists.
+        let geo = load_geometry(&f.fixture.ext4).unwrap().unwrap();
+        assert_eq!(
+            geo.tag_layout(),
+            TagLayout::from_features(INCOMPAT_CSUM_V3).unwrap()
+        );
+        assert!(geo.csum_seed().is_some());
+    }
+
+    /// D-4 upgrade on a 64bit fs adds `INCOMPAT_64BIT` alongside csum_v3
+    /// (fs/ext4/super.c:4909-4912).
+    #[ktest]
+    fn upgrade_adds_64bit_iff_fs_is_64bit() {
+        let f = journaled_fixture(16, 1, 1);
+        let rewritten = upgrade_journal_on_mount(
+            f.journal.geometry(),
+            f.fixture.ext4.block_device().as_ref(),
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: true,
+                fs_is_64bit: true,
+            },
+        )
+        .unwrap();
+        assert!(rewritten);
+
+        let sb = read_fixture_journal_super(&f);
+        assert_eq!(
+            sb.s_feature_incompat.get(),
+            INCOMPAT_CSUM_V3 | INCOMPAT_64BIT
+        );
+        assert_eq!(sb.s_checksum.get(), sb.checksum());
+        let geo = load_geometry(&f.fixture.ext4).unwrap().unwrap();
+        assert_eq!(
+            geo.tag_layout(),
+            TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap()
+        );
+    }
+
+    /// Every "honor, don't touch" row of the D-4 policy leaves the on-disk
+    /// journal superblock byte-identical: a non-metadata_csum fs (even a
+    /// 64bit one — the deliberate divergence from Linux), a journal already
+    /// carrying features (64bit-only or csum_v3, with or without fs
+    /// metadata_csum), a dirty (`s_start != 0`) journal, and a V1-blocktype
+    /// superblock that cannot carry features at all.
+    #[ktest]
+    fn upgrade_honors_journal_per_policy_table() {
+        let f = journaled_fixture(16, 1, 1);
+        let device = f.fixture.ext4.block_device();
+        let geo = f.journal.geometry();
+
+        let assert_untouched = |needs: JournalUpgradeNeeds, why: &str| {
+            let before = read_fixture_journal_super(&f);
+            let rewritten = upgrade_journal_on_mount(geo, device.as_ref(), needs).unwrap();
+            assert!(!rewritten, "{why}");
+            let after = read_fixture_journal_super(&f);
+            assert_eq!(after.as_bytes(), before.as_bytes(), "{why}");
+        };
+
+        // Non-metadata_csum fs: untouched, even when the fs is 64bit.
+        assert_untouched(
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: false,
+                fs_is_64bit: true,
+            },
+            "non-csum fs must leave the v0 journal frozen",
+        );
+
+        // A journal already carrying an INCOMPAT feature (64bit-only): honored.
+        let mut raw = journal_super(16, 1, 1, 0);
+        raw.s_feature_incompat = Be32::new(INCOMPAT_64BIT);
+        write_fixture_journal_super(&f, &raw);
+        assert_untouched(
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: true,
+                fs_is_64bit: false,
+            },
+            "a Linux-touched journal keeps its features",
+        );
+
+        // A csum_v3 journal on a fs WITHOUT metadata_csum (tune2fs oddity):
+        // honored as-is.
+        let mut raw = journal_super(16, 1, 1, 0);
+        raw.s_feature_incompat = Be32::new(INCOMPAT_CSUM_V3);
+        raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+        raw.s_checksum = Be32::new(raw.checksum());
+        write_fixture_journal_super(&f, &raw);
+        assert_untouched(
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: false,
+                fs_is_64bit: false,
+            },
+            "journal csum features without fs metadata_csum are honored",
+        );
+
+        // A dirty featureless journal (s_start != 0 without the fs recovery
+        // flag — an anomaly): never re-shaped underfoot.
+        write_fixture_journal_super(&f, &journal_super(16, 1, 1, 3));
+        assert_untouched(
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: true,
+                fs_is_64bit: false,
+            },
+            "a non-empty log must never change tag geometry",
+        );
+
+        // A V1-blocktype superblock cannot carry feature bits
+        // (jbd2_format_support_feature).
+        let mut raw = journal_super(16, 1, 1, 0);
+        raw.header.h_blocktype = Be32::new(format::BLOCKTYPE_SUPERBLOCK_V1);
+        write_fixture_journal_super(&f, &raw);
+        assert_untouched(
+            JournalUpgradeNeeds {
+                fs_has_metadata_csum: true,
+                fs_is_64bit: false,
+            },
+            "a V1 superblock has no feature fields to set",
+        );
     }
 }

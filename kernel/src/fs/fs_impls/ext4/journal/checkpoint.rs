@@ -68,11 +68,12 @@
 //! - No revoke handling: our own logs carry no revoke blocks (P7b), so a
 //!   block where a descriptor is expected must be a descriptor; any other block
 //!   type is treated as corruption (`EUCLEAN`), never panicked on.
-//! - Checksums are verify-only (P7a-3): on a csum v2/v3 journal,
-//!   [`apply_log_transaction`] verifies the descriptor tail and each tag's
-//!   data checksum (see its docs); the write side stamps nothing until P7a-4,
-//!   so csum journals stay unadmitted at mount and these paths run under
-//!   ktest fixtures.
+//! - On a csum v2/v3 journal (admitted since P7a-4), [`apply_log_transaction`]
+//!   verifies the descriptor tail and each tag's data checksum (see its docs)
+//!   against what the commit pipeline stamped, and the clean-superblock
+//!   rewrite restamps `s_checksum` through the
+//!   [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)
+//!   funnel.
 //! - Synchronous, driven inline by the caller (here, tests); no background
 //!   checkpoint thread yet.
 
@@ -80,10 +81,7 @@ use super::{
     super::prelude::*,
     Journal, Tid,
     commit::barrier,
-    format::{
-        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawJournalHeader,
-        RawJournalSuperblock,
-    },
+    format::{BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, JBD2_MAGIC, RawJournalHeader},
 };
 
 /// Applies one committed transaction from the log to its final locations, the
@@ -306,15 +304,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     barrier(device)?;
 
     // --- Rewrite the on-disk journal superblock to the clean state. ---
-    let sb_pblock = journal
-        .geometry()
-        .log_block_to_physical(0)
-        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped"))?;
-    let sb_offset = Bid::new(sb_pblock).to_offset();
-
-    let mut raw: RawJournalSuperblock = device
-        .read_val(sb_offset)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
+    let mut raw = journal.geometry().read_raw_superblock(device)?;
     // Journal now clean: nothing awaits recovery.
     raw.s_start = Be32::new(0);
     // The tid recovery would expect for the first transaction after this point.
@@ -323,16 +313,10 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // fast path (recovery.c, s_start == 0) resumes the log from s_head, so a
     // stale value would corrupt a subsequent mount. `commit.rs` deliberately
     // leaves this to us. (Phase 4 Task 3 adversarial-review requirement.)
-    // On a csum journal this rewrite would also have to restamp `s_checksum`
-    // (jbd2_write_superblock, journal.c:1812-1813) — P7a-4's write side;
-    // until then admission keeps csum journals off real mounts.
     raw.s_head = Be32::new(head);
-    device
-        .write_val(sb_offset, &raw)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
-
-    // --- Barrier: the clean superblock must itself be durable. ---
-    barrier(device)?;
+    // The funnel restamps `s_checksum` on a csum journal and barriers: the
+    // clean superblock must itself be durable.
+    journal.geometry().write_superblock(device, raw)?;
 
     // Publish the clean state in memory: the tail is cleared and its tid advances
     // to the next expected. `head` is left as-is — the ring continues from where
@@ -364,7 +348,7 @@ mod tests {
             super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
             JOURNAL_INO, Transaction,
             commit::commit_transaction,
-            format::BLOCKTYPE_SUPERBLOCK_V2,
+            format::{BLOCKTYPE_SUPERBLOCK_V2, RawJournalSuperblock},
             load_geometry,
         },
         *,

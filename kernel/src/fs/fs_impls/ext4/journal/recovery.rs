@@ -76,15 +76,14 @@
 //!   committed transactions carry revoke records we cannot apply. Rather than
 //!   silently under-replay it (treating the revoke block as a boundary), SCAN
 //!   refuses the mount with `EUCLEAN`. Full revoke replay-suppression is P7b.
-//! - **Checksums are verify-only (P7a-3)**: on a csum v2/v3 journal, SCAN
-//!   verifies the descriptor-tail and commit-block checksums (in the seal
-//!   decision) and REPLAY verifies the descriptor-tail and per-tag data
-//!   checksums; the jbd2 v1 COMPAT checksum (`JBD2_FEATURE_COMPAT_CHECKSUM`'s
-//!   accumulated `crc32_be`) is not modeled — an unknown COMPAT bit is safe
-//!   to ignore by definition. The write side does not stamp checksums yet
-//!   (P7a-4), so csum journals stay unadmitted at mount and these paths run
-//!   under ktest fixtures. The `2^32`-wrap ambiguity is NOT closed by any of
-//!   this (see above).
+//! - **Checksums** (csum v2/v3 journals, admitted since P7a-4): SCAN verifies
+//!   the descriptor-tail and commit-block checksums (in the seal decision)
+//!   and REPLAY verifies the descriptor-tail and per-tag data checksums —
+//!   against what the commit pipeline stamps, so an own-write → own-recover
+//!   round trip verifies end to end. The jbd2 v1 COMPAT checksum
+//!   (`JBD2_FEATURE_COMPAT_CHECKSUM`'s accumulated `crc32_be`) is not modeled
+//!   — an unknown COMPAT bit is safe to ignore by definition. The
+//!   `2^32`-wrap ambiguity is NOT closed by any of this (see above).
 //!
 //! # Reuse
 //!
@@ -112,7 +111,7 @@ use super::{
     commit::barrier,
     format::{
         BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, BLOCKTYPE_REVOKE, Be32, JBD2_MAGIC,
-        RawJournalHeader, RawJournalSuperblock,
+        RawJournalHeader,
     },
 };
 
@@ -356,14 +355,7 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     device: &dyn BlockDevice,
 ) -> Result<()> {
     // --- Read the on-disk journal superblock (log block 0). ---
-    let sb_pblock = journal
-        .geometry()
-        .log_block_to_physical(0)
-        .ok_or_else(|| Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped"))?;
-    let sb_offset = Bid::new(sb_pblock).to_offset();
-    let mut raw: RawJournalSuperblock = device
-        .read_val(sb_offset)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
+    let mut raw = journal.geometry().read_raw_superblock(device)?;
 
     let s_start = raw.s_start.get();
     let s_sequence = Tid::new(raw.s_sequence.get());
@@ -416,19 +408,13 @@ pub(in crate::fs::fs_impls::ext4) fn recover(
     // subsequent commit restarts the ring at the first log-data block. (Linux's
     // clean fast path reads `s_head` when `s_start == 0`; a stale value would
     // resume the log at the wrong offset — mirroring checkpoint's `s_head` care.)
-    // On a csum journal this rewrite would also have to restamp `s_checksum`
-    // (Linux `jbd2_write_superblock`, journal.c:1812-1813) — that is P7a-4's
-    // write side; until it lands, admission keeps csum journals off real
-    // mounts, so no production superblock is ever rewritten unstamped.
     raw.s_start = Be32::new(0);
     raw.s_sequence = Be32::new(end_tid.get());
     raw.s_head = Be32::new(first);
-    device
-        .write_val(sb_offset, &raw)
-        .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
-
-    // --- Barrier: the clean superblock must itself be durable. ---
-    barrier(device)?;
+    // The funnel restamps `s_checksum` on a csum journal (Linux
+    // `jbd2_write_superblock`, journal.c:1812-1813) and barriers: the clean
+    // superblock must itself be durable.
+    journal.geometry().write_superblock(device, raw)?;
 
     // --- Publish the clean post-recovery state in memory. ---
     // The log is empty and the ring restarts at `first`; the next transaction
@@ -455,11 +441,11 @@ mod tests {
     use super::{
         super::{
             super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
-            JOURNAL_INO, JournalGeometry, Transaction,
+            JOURNAL_INO, Transaction,
             commit::commit_transaction,
             format::{
-                BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_CSUM_V3, JBD2_CRC32C_CHKSUM, JournalSuperblock,
-                RawCommitBlock, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+                BLOCKTYPE_SUPERBLOCK_V2, INCOMPAT_64BIT, INCOMPAT_CSUM_V2, INCOMPAT_CSUM_V3,
+                JBD2_CRC32C_CHKSUM, JournalSuperblock, RawCommitBlock, RawJournalSuperblock,
             },
             load_geometry,
         },
@@ -918,37 +904,25 @@ mod tests {
         assert!(recover(f.journal.as_ref(), device.as_ref()).is_err());
     }
 
-    // --- P7a-3: checksum verification during SCAN and REPLAY, on hand-built
-    // csum_v3 fixtures. The checksum FORMULAS are pinned against real
+    // --- P7a-3/P7a-4: checksum verification during SCAN and REPLAY, on logs
+    // written by the PRODUCTION commit pipeline (the write side stamps since
+    // P7a-4, so the a3-era hand-stamper is gone and the loop is closed:
+    // own-write → own-recover). The checksum FORMULAS are pinned against real
     // Linux-written journal bytes in format.rs's gate tests; these tests pin
-    // the recovery POLITICS built on them. ---
+    // the recovery POLITICS on our own stamped logs. ---
 
-    /// The journal UUID baked into the csum_v3 fixtures (any bytes work; the
+    /// The journal UUID baked into the csum fixtures (any bytes work; the
     /// seed just hashes them).
     const CSUM_UUID: [u8; 16] = *b"p7a3-test-uuid!!";
 
-    /// An on-disk csum_v3 journal superblock: feature bit, named crc32c
-    /// algorithm, UUID, and a correct self-checksum.
-    fn csum_journal_super(
-        maxlen: u32,
-        first: u32,
-        sequence: u32,
-        start: u32,
-    ) -> RawJournalSuperblock {
-        let mut raw = journal_super(maxlen, first, sequence, start);
-        raw.s_feature_incompat = Be32::new(INCOMPAT_CSUM_V3);
-        raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
-        raw.s_uuid = CSUM_UUID;
-        raw.s_checksum = Be32::new(raw.checksum());
-        raw
-    }
-
-    /// Builds a csum_v3 journaled fixture — deliberately NOT through
-    /// `load_geometry`, whose `INCOMPAT_SUPP` admission gate still refuses
-    /// csum journals at mount (the flip waits for P7a-4's write-side
-    /// stamping); the geometry is assembled directly, exactly as
-    /// `load_geometry` would have.
-    fn csum_journaled_fixture(
+    /// Builds a journaled fixture whose on-disk journal superblock carries
+    /// `feature_incompat`, loaded through the PRODUCTION `load_geometry` —
+    /// P7a-4 admits 64bit and csum v2/v3, so no hand-assembled geometry
+    /// remains. A csum feature set gets the named crc32c algorithm, the
+    /// fixture UUID, and a valid self-checksum, exactly as `mke2fs`/Linux
+    /// leave a real journal superblock.
+    fn feature_journaled_fixture(
+        feature_incompat: u32,
         maxlen: u32,
         first: u32,
         sequence: u32,
@@ -962,20 +936,19 @@ mod tests {
 
         let raw_journal_inode = make_multi_block_file_inode(JOURNAL_START_BLOCK, maxlen as u16);
         f.write_raw_inode(JOURNAL_INO, &raw_journal_inode);
-        let raw = csum_journal_super(maxlen, first, sequence, start);
+        let mut raw = journal_super(maxlen, first, sequence, start);
+        raw.s_feature_incompat = Be32::new(feature_incompat);
+        if feature_incompat & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0 {
+            raw.s_checksum_type = JBD2_CRC32C_CHKSUM;
+            raw.s_uuid = CSUM_UUID;
+            raw.s_checksum = Be32::new(raw.checksum());
+        }
         f.disk
             .segment()
             .write_val(JOURNAL_START_BLOCK as usize * BLOCK_SIZE, &raw)
             .unwrap();
 
-        let superblock = JournalSuperblock::try_from(raw).unwrap();
-        let block_map = (0..maxlen)
-            .map(|log| Ext4Bid::from(JOURNAL_START_BLOCK + log))
-            .collect();
-        let geometry = JournalGeometry {
-            block_map,
-            superblock,
-        };
+        let geometry = load_geometry(&f.ext4).unwrap().unwrap();
         let journal = Journal::new(geometry, f.ext4.block_device().clone());
         JournaledFixture {
             journal,
@@ -983,84 +956,30 @@ mod tests {
         }
     }
 
-    /// Hand-writes a fully checksum-stamped csum_v3 transaction (descriptor +
-    /// one log block per tag + commit) at `start_log` with `tid` — a
-    /// test-side stand-in for P7a-4's write-side stamping, so the read side
-    /// has a valid log to verify. Tag placement goes through the shared
-    /// `TagWriter`; only the checksum stamps (which the production writer
-    /// does not produce yet) are poked in at the tag3 offsets its flags
-    /// imply (first tag at 12 followed by the 16-byte UUID, then 16-byte
-    /// strides).
-    fn write_stamped_csum_v3_txn(
-        f: &JournaledFixture,
-        start_log: u32,
-        tid: Tid,
-        blocks: &[(Ext4Bid, [u8; BLOCK_SIZE])],
-    ) {
-        let seed = f.journal.geometry().csum_seed().unwrap();
-        let layout = f.journal.geometry().tag_layout();
-
-        let mut descriptor = Box::new([0u8; BLOCK_SIZE]);
-        let header = RawJournalHeader {
-            h_magic: Be32::new(JBD2_MAGIC),
-            h_blocktype: Be32::new(BLOCKTYPE_DESCRIPTOR),
-            h_sequence: Be32::new(tid.get()),
-        };
-        descriptor[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
-        let mut writer = layout.writer(&mut descriptor);
-        for (i, (bid, _)) in blocks.iter().enumerate() {
-            let mut flags = if i == 0 { 0 } else { TAG_FLAG_SAME_UUID };
-            if i == blocks.len() - 1 {
-                flags |= TAG_FLAG_LAST_TAG;
-            }
-            writer.put(*bid, flags).unwrap();
-        }
-        let mut offset = 12;
-        for (i, (_, content)) in blocks.iter().enumerate() {
-            let csum = seed.data_block_csum(tid, content);
-            // tag3's `t_checksum` is its trailing word, at tag offset + 12.
-            descriptor[offset + 12..offset + 16].copy_from_slice(Be32::new(csum).as_bytes());
-            offset += 16 + if i == 0 { 16 } else { 0 };
-        }
-        // The tail checksum covers the stamped tags, so it goes last.
-        let tail = seed.block_tail_csum(&descriptor);
-        descriptor[BLOCK_SIZE - 4..].copy_from_slice(Be32::new(tail).as_bytes());
-        write_log_block_at(f, start_log, &descriptor);
-
-        for (i, (_, content)) in blocks.iter().enumerate() {
-            write_log_block_at(f, start_log + 1 + i as u32, content);
-        }
-
-        let mut commit = [0u8; BLOCK_SIZE];
-        let commit_header = RawJournalHeader {
-            h_magic: Be32::new(JBD2_MAGIC),
-            h_blocktype: Be32::new(BLOCKTYPE_COMMIT),
-            h_sequence: Be32::new(tid.get()),
-        };
-        commit[..size_of::<RawJournalHeader>()].copy_from_slice(commit_header.as_bytes());
-        // `h_chksum[0]` (bytes [16, 20)) is stamped over the block with that
-        // word still zero — exactly the region the verifier re-zeroes.
-        let csum = seed.commit_block_csum(&commit);
-        commit[16..20].copy_from_slice(Be32::new(csum).as_bytes());
-        write_log_block_at(f, start_log + 1 + blocks.len() as u32, &commit);
+    /// A csum_v3 fixture with a clean journal; the production commit dirties
+    /// it (stamping every checksum) and recovery/replay verify what it wrote.
+    fn csum_journaled_fixture(maxlen: u32, first: u32, sequence: u32) -> JournaledFixture {
+        feature_journaled_fixture(INCOMPAT_CSUM_V3, maxlen, first, sequence, 0)
     }
 
-    /// SCAN on a csum_v3 journal: an intact stamped transaction seals; a
-    /// commit block whose header matches but whose checksum does not REFUSES
-    /// (`EUCLEAN` — jbd2's sync-commit `j_failed_commit` path, never a silent
-    /// boundary); a zeroed commit slot stays the ordinary torn-tail boundary.
+    /// SCAN on a csum_v3 journal: an intact transaction written by the
+    /// production commit path seals; a commit block whose header matches but
+    /// whose checksum does not REFUSES (`EUCLEAN` — jbd2's sync-commit
+    /// `j_failed_commit` path, never a silent boundary); a zeroed commit slot
+    /// stays the ordinary torn-tail boundary.
     #[ktest]
     fn scan_seals_only_with_valid_commit_csum() {
         crate::time::clocks::init_for_ktest();
-        let f = csum_journaled_fixture(24, 1, 7, 0);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(500u64, tagged_block(b"CSUMSCAN"))]);
+        let txn = make_txn(Tid::new(7), &[(500u64, tagged_block(b"CSUMSCAN"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // Intact: desc @1, data @2, commit @3; the next start is 4.
         let next = scan_transaction(f.journal.as_ref(), device.as_ref(), 1, Tid::new(7))
             .unwrap()
-            .expect("stamped transaction is sealed");
+            .expect("own stamped transaction is sealed");
         assert_eq!(next, 4);
 
         // Flip a byte in the commit block BODY (header untouched).
@@ -1087,10 +1006,11 @@ mod tests {
     #[ktest]
     fn scan_defers_descriptor_csum_verdict_to_the_seal() {
         crate::time::clocks::init_for_ktest();
-        let f = csum_journaled_fixture(24, 1, 7, 0);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(500u64, tagged_block(b"DESCDEFR"))]);
+        let txn = make_txn(Tid::new(7), &[(500u64, tagged_block(b"DESCDEFR"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         // Corrupt the descriptor's stored tail checksum.
         let mut descriptor = read_log_block_at(&f, 1);
@@ -1116,11 +1036,12 @@ mod tests {
     #[ktest]
     fn apply_rejects_descriptor_csum_mismatch() {
         crate::time::clocks::init_for_ktest();
-        let f = csum_journaled_fixture(24, 1, 7, 0);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
         let dest = 500u64;
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(dest, tagged_block(b"RPLYDESC"))]);
+        let txn = make_txn(Tid::new(7), &[(dest, tagged_block(b"RPLYDESC"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
         let mut descriptor = read_log_block_at(&f, 1);
         descriptor[BLOCK_SIZE - 2] ^= 0x20;
@@ -1140,16 +1061,18 @@ mod tests {
     #[ktest]
     fn apply_skips_csum_bad_block_and_fails() {
         crate::time::clocks::init_for_ktest();
-        let f = csum_journaled_fixture(24, 1, 7, 0);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
         let good_dest = 500u64;
         let bad_dest = 800u64;
         let good = tagged_block(b"TAGGOOD0");
         let bad = tagged_block(b"TAGBAD00");
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(good_dest, good), (bad_dest, bad)]);
+        let txn = make_txn(Tid::new(7), &[(good_dest, good), (bad_dest, bad)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
-        // Corrupt the SECOND tag's logged data block (log 3).
+        // Corrupt the SECOND tag's logged data block (log 3; the commit
+        // pipeline logs blocks in ascending destination order).
         let mut logged = read_log_block_at(&f, 3);
         logged[123] ^= 0x08;
         write_log_block_at(&f, 3, &logged);
@@ -1161,20 +1084,28 @@ mod tests {
         assert_eq!(read_final_block(&f, bad_dest), [0u8; BLOCK_SIZE]);
     }
 
-    /// End to end: `recover` replays a fully stamped csum_v3 log and marks
-    /// the journal clean. (The clean-superblock rewrite does not restamp
-    /// `s_checksum` yet — that is P7a-4's write side; admission keeps csum
-    /// journals off real mounts until it lands.)
+    /// The loop closed end to end (the a3 stand-in stamper is gone): the
+    /// PRODUCTION commit path writes a csum_v3 transaction — stamping the
+    /// tags, the descriptor tail, the commit block, and the dirty superblock
+    /// — and `recover` verifies and replays it, leaving a clean superblock
+    /// whose restamped checksum verifies.
     #[ktest]
-    fn recover_replays_stamped_csum_v3_log() {
+    fn recover_replays_own_stamped_csum_v3_log() {
         crate::time::clocks::init_for_ktest();
-        // Dirty on-disk superblock: s_start = 1, s_sequence = 7.
-        let f = csum_journaled_fixture(24, 1, 7, 1);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
         let dest = 600u64;
         let content = tagged_block(b"CSUMRCVR");
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(dest, content)]);
+        let txn = make_txn(Tid::new(7), &[(dest, content)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+        // The commit dirtied the superblock (step 5) and restamped it.
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 1);
+        assert_eq!(sb.s_checksum.get(), sb.checksum());
+        // The after-image lives only in the log until recovery replays it.
+        assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
 
         recover(f.journal.as_ref(), device.as_ref()).unwrap();
 
@@ -1182,6 +1113,10 @@ mod tests {
         let sb = read_journal_super(&f);
         assert_eq!(sb.s_start.get(), 0);
         assert_eq!(sb.s_sequence.get(), 8);
+        // The clean rewrite restamped `s_checksum` (the funnel), so the
+        // superblock still passes its own parse boundary.
+        assert_eq!(sb.s_checksum.get(), sb.checksum());
+        assert!(JournalSuperblock::try_from(sb).is_ok());
     }
 
     /// End to end: a corrupt journaled data block refuses recovery (and thus
@@ -1191,11 +1126,12 @@ mod tests {
     #[ktest]
     fn recover_refuses_corrupt_csum_log() {
         crate::time::clocks::init_for_ktest();
-        let f = csum_journaled_fixture(24, 1, 7, 1);
+        let f = csum_journaled_fixture(24, 1, 7);
         let device = f.fixture.ext4.block_device();
 
         let dest = 600u64;
-        write_stamped_csum_v3_txn(&f, 1, Tid::new(7), &[(dest, tagged_block(b"CSUMBAD0"))]);
+        let txn = make_txn(Tid::new(7), &[(dest, tagged_block(b"CSUMBAD0"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
         let mut logged = read_log_block_at(&f, 2);
         logged[321] ^= 0x40;
         write_log_block_at(&f, 2, &logged);
@@ -1205,5 +1141,159 @@ mod tests {
         assert_eq!(read_final_block(&f, dest), [0u8; BLOCK_SIZE]);
         // The journal stays dirty: recovery never reached the clean write.
         assert_eq!(read_journal_super(&f).s_start.get(), 1);
+    }
+
+    // --- P7a-4 gate: production write → recovery round trips per admitted
+    // feature set, single-byte-corruption refusal per csum feature set, and
+    // superblock restamping at every serialization site. ---
+
+    /// Every admitted tag layout round-trips through the production writer
+    /// and recovery: v0 (unchanged bytes), csum_v3, csum_v3+64bit, and
+    /// csum_v2's frozen quirk strides (±64bit). Each transaction includes an
+    /// ESCAPED block, so the stamped-over-logged-form contract is exercised
+    /// end to end, and the clean superblock's checksum matches its features.
+    #[ktest]
+    fn production_round_trip_replays_across_feature_sets() {
+        crate::time::clocks::init_for_ktest();
+        for features in [
+            0,
+            INCOMPAT_CSUM_V3,
+            INCOMPAT_CSUM_V3 | INCOMPAT_64BIT,
+            INCOMPAT_CSUM_V2,
+            INCOMPAT_CSUM_V2 | INCOMPAT_64BIT,
+        ] {
+            let f = feature_journaled_fixture(features, 24, 1, 1, 0);
+            let device = f.fixture.ext4.block_device();
+
+            let plain_dest = 500u64;
+            let escaped_dest = 800u64;
+            let plain = tagged_block(b"RT-PLAIN");
+            // A block whose head IS the jbd2 magic: logged escaped, so its
+            // tag checksum covers the zero-headed form.
+            let mut escaped = tagged_block(b"RT-ESCAP");
+            escaped[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+
+            let txn = make_txn(Tid::new(1), &[(plain_dest, plain), (escaped_dest, escaped)]);
+            commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+            assert_eq!(
+                read_final_block(&f, plain_dest),
+                [0u8; BLOCK_SIZE],
+                "features {features:#x}: nothing on disk before recovery"
+            );
+
+            recover(f.journal.as_ref(), device.as_ref()).unwrap();
+
+            assert_eq!(
+                read_final_block(&f, plain_dest),
+                plain,
+                "features {features:#x}"
+            );
+            assert_eq!(
+                read_final_block(&f, escaped_dest),
+                escaped,
+                "features {features:#x}: escape restored"
+            );
+            let sb = read_journal_super(&f);
+            assert_eq!(sb.s_start.get(), 0, "features {features:#x}");
+            assert_eq!(sb.s_sequence.get(), 2, "features {features:#x}");
+            if features & (INCOMPAT_CSUM_V2 | INCOMPAT_CSUM_V3) != 0 {
+                assert_eq!(
+                    sb.s_checksum.get(),
+                    sb.checksum(),
+                    "features {features:#x}: clean rewrite restamped"
+                );
+            } else {
+                // The v0 byte path never touches `s_checksum` (frozen bytes).
+                assert_eq!(sb.s_checksum.get(), 0, "features {features:#x}");
+            }
+        }
+    }
+
+    /// One flipped byte anywhere the checksums cover — a logged data block,
+    /// the descriptor tail, the commit block — makes recovery refuse
+    /// (`EUCLEAN`, per the a3 politics), for every csum feature set the
+    /// production writer stamps. The final location stays untouched and the
+    /// journal stays dirty.
+    #[ktest]
+    fn recovery_refuses_one_byte_corruption_per_csum_feature_set() {
+        crate::time::clocks::init_for_ktest();
+        // (log block to corrupt, byte offset within it): the logged data
+        // block @2 (body), the descriptor @1 (stored tail checksum), and the
+        // commit block @3 (body).
+        let corruptions: [(u32, usize); 3] = [(2, 200), (1, BLOCK_SIZE - 1), (3, 100)];
+        for features in [
+            INCOMPAT_CSUM_V3,
+            INCOMPAT_CSUM_V3 | INCOMPAT_64BIT,
+            INCOMPAT_CSUM_V2,
+        ] {
+            for (log, byte) in corruptions {
+                let f = feature_journaled_fixture(features, 24, 1, 1, 0);
+                let device = f.fixture.ext4.block_device();
+
+                let dest = 500u64;
+                let txn = make_txn(Tid::new(1), &[(dest, tagged_block(b"CORRUPT1"))]);
+                commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+
+                let mut block = read_log_block_at(&f, log);
+                block[byte] ^= 0x01;
+                write_log_block_at(&f, log, &block);
+
+                let err = recover(f.journal.as_ref(), device.as_ref()).unwrap_err();
+                assert_eq!(
+                    err.error(),
+                    Errno::EUCLEAN,
+                    "features {features:#x}, log {log}, byte {byte}"
+                );
+                assert_eq!(
+                    read_final_block(&f, dest),
+                    [0u8; BLOCK_SIZE],
+                    "features {features:#x}: corrupt log must not be applied"
+                );
+                assert_eq!(
+                    read_journal_super(&f).s_start.get(),
+                    1,
+                    "features {features:#x}: journal stays dirty"
+                );
+            }
+        }
+    }
+
+    /// Every journal-superblock serialization site produces a valid
+    /// `s_checksum` on a csum journal: the commit step-5 tail publish, the
+    /// checkpoint clean rewrite, and the unmount flush (commit + checkpoint
+    /// driven through `flush_on_unmount`). Recovery's clean rewrite is
+    /// covered by `recover_replays_own_stamped_csum_v3_log`.
+    #[ktest]
+    fn superblock_restamped_at_every_serialization_site() {
+        crate::time::clocks::init_for_ktest();
+        let f = csum_journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        // Site 1: commit step 5 (the was-clean tail publish).
+        let txn = make_txn(Tid::new(1), &[(500u64, tagged_block(b"SBSTAMP1"))]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+        let sb = read_journal_super(&f);
+        assert_ne!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_checksum.get(), sb.checksum(), "commit tail publish");
+
+        // Site 2: the checkpoint clean rewrite.
+        super::super::checkpoint::checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_checksum.get(), sb.checksum(), "checkpoint rewrite");
+        // The restamped superblock passes its own parse boundary.
+        assert!(JournalSuperblock::try_from(sb).is_ok());
+
+        // Site 3: the unmount flush (commits the running transaction, then
+        // checkpoints — both rewrites go through the same funnel).
+        f.journal.state_write().running = Some(make_txn(
+            Tid::new(2),
+            &[(800u64, tagged_block(b"SBSTAMP2"))],
+        ));
+        f.journal.flush_on_unmount().unwrap();
+        let sb = read_journal_super(&f);
+        assert_eq!(sb.s_start.get(), 0);
+        assert_eq!(sb.s_checksum.get(), sb.checksum(), "unmount flush");
+        assert_eq!(read_final_block(&f, 800u64), tagged_block(b"SBSTAMP2"));
     }
 }

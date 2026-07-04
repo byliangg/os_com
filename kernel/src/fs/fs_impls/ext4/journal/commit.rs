@@ -60,8 +60,8 @@
 //!    never reached the platter, and recovery would replay garbage.
 //! 3. Write the commit block.
 //! 4. **Barrier.** Once the commit block is durable the transaction is
-//!    committed: recovery will now see a complete, checksum-free (Phase 4) log
-//!    record and replay it.
+//!    committed: recovery will now see a complete (and, on a csum journal,
+//!    checksum-verifying) log record and replay it.
 //! 5. If the journal was **clean** before this commit (`s_start == 0`), update
 //!    the on-disk journal superblock's `s_start`/`s_sequence` to point at this
 //!    transaction, then barrier again. This is ordered *after* step 4
@@ -79,13 +79,25 @@
 //!    past the N+2 written blocks, set the tail to this transaction if the
 //!    journal was clean, and publish `committed_tid`.
 //!
+//! # Checksums (csum v2/v3 journals, P7a-4)
+//!
+//! On a journal carrying [`INCOMPAT_CSUM_V2`](super::format::INCOMPAT_CSUM_V2)
+//! or [`INCOMPAT_CSUM_V3`](super::format::INCOMPAT_CSUM_V3), every log
+//! structure is stamped exactly where jbd2 stamps it: each tag's data checksum
+//! at tag placement (over the block **as logged**, i.e. post-escape —
+//! [`TagWriter::put`](super::format::TagWriter::put)), the descriptor tail at
+//! the seal ([`TagWriter::finish`](super::format::TagWriter::finish)), the
+//! commit block's `h_chksum[0]`
+//! ([`JournalCsumSeed::stamp_commit_block`]), and the journal superblock on
+//! every rewrite (the [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)
+//! funnel). A featureless (v0) journal writes byte-identical logs to Phase 4.
+//!
 //! # Phase 4 simplifications
 //!
 //! - **Single descriptor** per transaction: all N tags must fit one descriptor
 //!   block ([`TagLayout::tags_per_descriptor`]); a larger transaction is
 //!   rejected. [`Journal::max_credits`] enforces the same bound up front.
 //!   Multi-descriptor transactions are P7a-5.
-//! - **No checksums** (the commit block's csum fields are zero) — Phase 7.
 //! - **No revoke records** — Phase 7.
 //! - **Synchronous**: [`commit_transaction`] does its device I/O inline. It is
 //!   called by the background commit thread ([`Journal::start_commit_thread`],
@@ -96,8 +108,9 @@ use super::{
     super::prelude::*,
     Journal, Tid, Transaction,
     format::{
-        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, Be64, JBD2_MAGIC, RawCommitBlock,
-        RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID, TagLayout,
+        BLOCKTYPE_COMMIT, BLOCKTYPE_DESCRIPTOR, Be32, Be64, JBD2_MAGIC, JournalCsumSeed,
+        RawCommitBlock, RawJournalHeader, TAG_FLAG_ESCAPE, TAG_FLAG_LAST_TAG, TAG_FLAG_SAME_UUID,
+        TagLayout,
     },
     transaction::TransactionState,
 };
@@ -147,12 +160,15 @@ impl Transaction {
     /// order), with every byte offset — tag stride, the first tag's 16-byte
     /// UUID, the reserved checksum tail — owned by `layout`'s tag writer
     /// ([`TagLayout::writer`]), the same source of truth the recovery scanner
-    /// and the checkpoint/replay applier walk with. Returns the buffer plus,
-    /// for each captured block in the same order, whether that block must be
-    /// escaped when written into the log (`escape[i] == true`).
+    /// and the checkpoint/replay applier walk with. On a csum journal (`seed`
+    /// present) the writer stamps every tag's data checksum and the
+    /// descriptor-tail checksum. Returns the buffer plus, for each captured
+    /// block in the same order, whether that block must be escaped when
+    /// written into the log (`escape[i] == true`).
     fn build_descriptor_block(
         &self,
         layout: TagLayout,
+        seed: Option<JournalCsumSeed>,
     ) -> Result<(Box<[u8; BLOCK_SIZE]>, Vec<bool>)> {
         let n = self.metadata_blocks().count();
         if n == 0 {
@@ -169,7 +185,7 @@ impl Transaction {
         };
         block[..size_of::<RawJournalHeader>()].copy_from_slice(header.as_bytes());
 
-        let mut writer = layout.writer(&mut block);
+        let mut writer = layout.writer(&mut block, self.tid(), seed)?;
         let mut escape = Vec::with_capacity(n);
 
         for (i, (bid, bytes)) in self.metadata_blocks().enumerate() {
@@ -197,16 +213,35 @@ impl Transaction {
             // single-descriptor bound; `max_credits` refuses over-large
             // transactions up front, but the re-check keeps a directly built
             // transaction from overflowing).
-            writer.put(bid, flags)?;
+            //
+            // The tag checksum covers the block AS LOGGED (jbd2 checksums the
+            // escaped `wbuf` copy, commit.c:684): hand `put` the zero-headed
+            // form an escaped block will have in the log, not the in-memory
+            // original — step 1 below applies the same transform when writing.
+            if needs_escape {
+                let mut logged = Box::new([0u8; BLOCK_SIZE]);
+                logged.copy_from_slice(bytes);
+                logged[..4].fill(0);
+                writer.put(bid, flags, &logged)?;
+            } else {
+                writer.put(bid, flags, bytes)?;
+            }
         }
+
+        // Seal: stamps the descriptor-tail checksum over the tags above on a
+        // csum layout (a no-op on v0 — the frozen byte path).
+        writer.finish();
 
         Ok((block, escape))
     }
 }
 
 /// Builds the commit block into a fresh [`BLOCK_SIZE`] buffer: header +
-/// wall-clock commit time, all checksum fields zero (Phase 4).
-fn build_commit_block(tid: Tid) -> Box<[u8; BLOCK_SIZE]> {
+/// wall-clock commit time. On a csum journal (`seed` present) the block's
+/// crc32c is stamped into `h_chksum[0]`
+/// ([`JournalCsumSeed::stamp_commit_block`]); `h_chksum_type`/`h_chksum_size`
+/// stay zero under csum v2/v3 — they belong to the v1 COMPAT checksum.
+fn build_commit_block(tid: Tid, seed: Option<JournalCsumSeed>) -> Box<[u8; BLOCK_SIZE]> {
     let now = super::super::utils::now();
     let commit = RawCommitBlock {
         header: RawJournalHeader {
@@ -225,6 +260,9 @@ fn build_commit_block(tid: Tid) -> Box<[u8; BLOCK_SIZE]> {
     let mut block = Box::new([0u8; BLOCK_SIZE]);
     let commit_len = size_of::<RawCommitBlock>();
     block[..commit_len].copy_from_slice(commit.as_bytes());
+    if let Some(seed) = seed {
+        seed.stamp_commit_block(&mut block);
+    }
     block
 }
 
@@ -248,24 +286,12 @@ impl Journal {
         txn_start: u32,
         tid: Tid,
     ) -> Result<()> {
-        use super::format::RawJournalSuperblock;
-
-        let sb_pblock = self.geometry.log_block_to_physical(0).ok_or_else(|| {
-            Error::with_message(Errno::EUCLEAN, "journal superblock block unmapped")
-        })?;
-        let sb_offset = Bid::new(sb_pblock).to_offset();
-
-        let mut raw: RawJournalSuperblock = device
-            .read_val(sb_offset)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to read journal superblock"))?;
+        let mut raw = self.geometry.read_raw_superblock(device)?;
         raw.s_start = Be32::new(txn_start);
         raw.s_sequence = Be32::new(tid.get());
-        device
-            .write_val(sb_offset, &raw)
-            .map_err(|_| Error::with_message(Errno::EIO, "failed to write journal superblock"))?;
-
-        // The recoverability pointer must itself be durable.
-        barrier(device)
+        // The funnel restamps `s_checksum` on a csum journal and barriers:
+        // the recoverability pointer must itself be durable.
+        self.geometry.write_superblock(device, raw)
     }
 }
 
@@ -320,7 +346,10 @@ pub(super) fn commit_transaction(
         (st.head, st.tail_block == 0)
     };
 
-    let (descriptor, escape) = txn.build_descriptor_block(journal.geometry.tag_layout())?;
+    // The csum seed exists iff the journal carries csum v2/v3; threading it
+    // into the descriptor/commit builders is what turns their stamping on.
+    let seed = journal.geometry.csum_seed();
+    let (descriptor, escape) = txn.build_descriptor_block(journal.geometry.tag_layout(), seed)?;
     let n = escape.len() as u32;
 
     // --- Step 1: write the descriptor and every metadata after-image. ---
@@ -345,7 +374,7 @@ pub(super) fn commit_transaction(
 
     // --- Step 3: write the commit block, sealing the transaction. ---
     let commit_log = journal.geometry.next_log_block(log);
-    let commit = build_commit_block(tid);
+    let commit = build_commit_block(tid, seed);
     write_log_block(journal, device, commit_log, &commit)?;
 
     // --- Step 4: barrier. The commit block is now durable: the transaction is
@@ -524,7 +553,7 @@ mod tests {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(7), &[(0x123u64, c), (0x456u64, c)]);
         let (block, escape) = txn
-            .build_descriptor_block(TagLayout::from_features(0).unwrap())
+            .build_descriptor_block(TagLayout::from_features(0).unwrap(), None)
             .unwrap();
         assert_eq!(escape, vec![false, false]);
 
@@ -553,7 +582,7 @@ mod tests {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(3), &[(small, c), (wide, c)]);
 
-        let (block, escape) = txn.build_descriptor_block(layout).unwrap();
+        let (block, escape) = txn.build_descriptor_block(layout, None).unwrap();
         assert_eq!(escape, vec![false, false]);
 
         let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -565,17 +594,22 @@ mod tests {
     }
 
     /// The builder emits 16-byte csum-v3 tags the shared walker reads back,
-    /// with the escape flag surviving the round trip.
+    /// with the escape flag surviving the round trip, every tag checksum
+    /// stamped over the LOGGED (post-escape) form, and the descriptor tail
+    /// sealed.
     #[ktest]
     fn descriptor_builder_csum_v3_round_trip() {
         let layout = TagLayout::from_features(INCOMPAT_CSUM_V3 | INCOMPAT_64BIT).unwrap();
+        let seed = JournalCsumSeed::for_test(b"p7a4-commit-uuid");
+        let tid = Tid::new(4);
         let mut escaped = [0u8; BLOCK_SIZE];
         escaped[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        escaped[4..8].copy_from_slice(b"REST");
         let plain = [0u8; BLOCK_SIZE];
         let wide: Ext4Bid = (9 << 32) | 0x800;
-        let txn = make_txn(Tid::new(4), &[(0x200u64, escaped), (wide, plain)]);
+        let txn = make_txn(tid, &[(0x200u64, escaped), (wide, plain)]);
 
-        let (block, escape) = txn.build_descriptor_block(layout).unwrap();
+        let (block, escape) = txn.build_descriptor_block(layout, Some(seed)).unwrap();
         assert_eq!(escape, vec![true, false]);
 
         let tags: Vec<_> = layout.walk(&block).map(|tag| tag.unwrap()).collect();
@@ -585,6 +619,16 @@ mod tests {
         assert_eq!(tags[1].blocknr(), wide);
         assert!(!tags[1].is_escaped());
         assert!(tags[1].is_last());
+
+        // The escaped tag's checksum covers the zero-headed LOG form, not the
+        // in-memory original (jbd2 checksums the escaped wbuf, commit.c:684).
+        let mut logged = escaped;
+        logged[..4].fill(0);
+        assert!(tags[0].verify_data_csum(seed, tid, &logged));
+        assert!(!tags[0].verify_data_csum(seed, tid, &escaped));
+        assert!(tags[1].verify_data_csum(seed, tid, &plain));
+        // `finish` sealed the descriptor tail over the stamped tags.
+        assert!(seed.verify_block_tail(&block));
     }
 
     /// Without 64-bit tags a > 32-bit destination block still refuses with
@@ -594,7 +638,7 @@ mod tests {
         let c = [0u8; BLOCK_SIZE];
         let txn = make_txn(Tid::new(1), &[((1u64 << 32) | 5, c)]);
         let err = txn
-            .build_descriptor_block(TagLayout::from_features(0).unwrap())
+            .build_descriptor_block(TagLayout::from_features(0).unwrap(), None)
             .unwrap_err();
         assert_eq!(err.error(), Errno::EFBIG);
     }

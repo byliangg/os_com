@@ -96,6 +96,13 @@ impl MetaBuffer {
         self.data.as_slice()
     }
 
+    /// The captured after-image as a whole block — the commit pipeline logs
+    /// (and, under csum v2/v3, checksums) full blocks, so it takes the
+    /// width-carrying type rather than re-checking a slice length.
+    fn as_block(&self) -> &[u8; BLOCK_SIZE] {
+        &self.data
+    }
+
     /// The after-image bytes, for seeding from the device or patching in place.
     fn as_mut(&mut self) -> &mut [u8] {
         self.data.as_mut_slice()
@@ -356,10 +363,10 @@ impl Transaction {
     /// descriptor tags and their logged blocks in a single deterministic order
     /// (jbd2 walks `t_buffers` in insertion order; block order is equally valid
     /// and lets recovery apply each after-image to its final location).
-    pub(super) fn metadata_blocks(&self) -> impl Iterator<Item = (Ext4Bid, &[u8])> {
+    pub(super) fn metadata_blocks(&self) -> impl Iterator<Item = (Ext4Bid, &[u8; BLOCK_SIZE])> {
         self.metadata
             .iter()
-            .map(|(&bid, buffer)| (bid, buffer.as_bytes()))
+            .map(|(&bid, buffer)| (bid, buffer.as_block()))
     }
 
     /// Registers an inode's data pages as **ordered data** of this transaction
