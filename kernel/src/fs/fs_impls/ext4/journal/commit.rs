@@ -642,8 +642,9 @@ pub(super) fn try_commit_transaction(
     }
 
     // --- Step 6: publish the new log position and commit id in memory. ---
-    // Blocks written: the data blocks + one descriptor per chain run + the
-    // commit block (`footprint`, already proven to fit the free segment).
+    // Blocks written: the revoke blocks + the data blocks + one descriptor
+    // per chain run + the commit block (`footprint`, already proven to fit
+    // the free segment).
     let new_head = journal.geometry.advance(start_head, footprint);
     {
         let mut st = journal.state_write();

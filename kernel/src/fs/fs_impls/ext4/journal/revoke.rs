@@ -280,9 +280,15 @@ impl RevokeDuty {
     /// (record-then-free — Linux's `ext4_forget`-before-clear order,
     /// fs/ext4/mballoc.c:6676/6719). `start`/`count` must lie within the run
     /// of the credential this duty traveled in. A failure of the bitmap
-    /// clear *itself* after the effects leaves that run's revoke standing —
-    /// Linux's exposure too, and reachable only through a capture `EIO`
-    /// that already fails the operation.
+    /// clear *itself* after the effects would leave that run's revoke
+    /// standing for still-referenced blocks, so `Ext4::free_blocks` aborts
+    /// the journal on ANY post-discharge failure (discharge and the bitmap
+    /// free are atomic-or-dead): the standing revoke can never act.
+    ///
+    /// Can only fail *before* any effect runs (the journal lookup and the
+    /// running-transaction check precede the per-block loop, which is
+    /// infallible) — the caller relies on this to propagate a discharge
+    /// `Err` without aborting.
     ///
     /// # Stale credentials
     ///

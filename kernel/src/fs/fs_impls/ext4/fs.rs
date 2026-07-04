@@ -548,6 +548,12 @@ impl Ext4 {
     /// capture is lost (`RevokeDuty::discharge` in the journal's revoke
     /// module documents the three effects).
     ///
+    /// Once a run's discharge HAS run, that run is **atomic-or-dead**: any
+    /// error after it — every failure arm of the group funnel, the pin, the
+    /// counter updates — aborts the journal before propagating (see the wrap
+    /// in the loop body), because the discharge cannot be unwound and a
+    /// partially applied run must never commit.
+    ///
     /// Under a handle each run is also **pinned** right after its bitmap
     /// clear ([`journal::pin_freed_run`]): the freed blocks stay out of the
     /// allocator until this transaction commits — both credential flavors,
@@ -584,20 +590,46 @@ impl Ext4 {
             // (record-then-free; see the function docs). Without a handle
             // there is no log whose replay could resurrect the blocks, so
             // the duty is inert — the pre-consumption semantics of a
-            // non-journaled volume.
+            // non-journaled volume. A discharge `Err` still propagates
+            // plainly: `discharge` can only fail before any of its effects
+            // run, so nothing needs unwinding.
             if let (Some(handle), Some(duty)) = (handle, duty.as_ref()) {
                 duty.discharge(handle, current_block, blocks_in_group)?;
             }
-            let freed_count =
-                group.free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
-            // Pin the freed run until this transaction commits (released at
-            // commit step 6). The bits are already clear, but no allocator can
-            // observe the gap: it needs the superblock write lock this
-            // function holds.
-            journal::pin_freed_run(handle, current_block, blocks_in_group)?;
-            if freed_count > 0 {
-                sb.inc_free_blocks(freed_count as u64)?;
-                sb.journal_capture(handle, sb.last_orphan())?;
+            // Post-discharge, the run is atomic-or-dead: the discharge and
+            // the bitmap free must both happen, or the filesystem must stop.
+            // The discharge cannot be unwound — a standing revoke, a
+            // cancelled capture, and an evicted retained image for
+            // never-freed, still-referenced blocks would roll back their
+            // legitimate log images at every later checkpoint/replay — and a
+            // run that fails after its bitmap after-image is patched clear
+            // is additionally visible-free-but-unpinned. So ANY error out of
+            // the run below — the group funnel's failure arms (present and
+            // future), a failed pin, a counter overflow, the superblock
+            // capture — aborts the journal (the Linux errors=journal
+            // `ext4_error` shape) before propagating: an aborted journal
+            // accepts no further work, so the poison can never act. Without
+            // a handle nothing was discharged or pinned and there is no
+            // journal to poison; the error propagates plainly.
+            let run_result = (|| -> Result<()> {
+                let freed_count = group
+                    .free_blocks(group_start_bit..(group_start_bit + blocks_in_group), handle)?;
+                // Pin the freed run until this transaction commits (released
+                // at commit step 6). The bits are already clear, but no
+                // allocator can observe the gap: it needs the superblock
+                // write lock this function holds.
+                journal::pin_freed_run(handle, current_block, blocks_in_group)?;
+                if freed_count > 0 {
+                    sb.inc_free_blocks(freed_count as u64)?;
+                    sb.journal_capture(handle, sb.last_orphan())?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = run_result {
+                if let Some(handle) = handle {
+                    handle.abort_journal_on_fs_error();
+                }
+                return Err(e);
             }
             current_block += blocks_in_group as Ext4Bid;
             remaining_blocks -= blocks_in_group;
@@ -1830,6 +1862,50 @@ mod tests {
 
         // The poisoned revoke can never act: the journal is aborted and
         // refuses all further work.
+        assert!(journal.is_aborted());
+        assert!(f.ext4.begin_op(8).is_err());
+        drop(op);
+    }
+
+    /// The rider generalized (P7b close-out MAJOR): ANY failure after a
+    /// run's revoke duty is discharged — not just the system-zone refusal —
+    /// must abort the journal, because the discharge cannot be unwound and a
+    /// half-freed run must never commit. Driven through the deterministic
+    /// post-discharge arm: a corrupted-in-memory free counter makes the
+    /// count update overflow AFTER the discharge and the bitmap clear. The
+    /// error must propagate AND the journal must be dead — which is also
+    /// what makes the run's missing pin moot: no new operation can reach the
+    /// visible-free blocks (`begin_op` refuses), and the in-flight
+    /// transaction that could is never committed.
+    #[ktest]
+    fn post_discharge_free_failure_aborts_journal() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let op = f.ext4.begin_op(8).unwrap();
+        let freed = f.ext4.alloc_blocks(1, 0, op.get()).unwrap().start;
+        // Corrupt the group's in-memory free counter so the free's counter
+        // update overflows — an error arm firing after the run's discharge
+        // and after its bitmap bits are cleared.
+        f.ext4
+            .block_group(0)
+            .corrupt_free_blocks_count_for_test(u32::MAX);
+
+        let err = f
+            .ext4
+            .free_blocks(journal::forget(freed, 1), op.get())
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EIO);
+
+        // Atomic-or-dead: the standing revoke and the unpinned visible-free
+        // run can never act, because the journal is aborted and accepts no
+        // further work.
         assert!(journal.is_aborted());
         assert!(f.ext4.begin_op(8).is_err());
         drop(op);

@@ -1126,6 +1126,77 @@ mod tests {
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
     }
 
+    /// The defer decision over a revoke-led chain —
+    /// `chain_covers_unpublished`'s revoke-block skip arm: T1's own forget
+    /// puts a revoke block at its chain head ([revoke][desc][data…][commit]),
+    /// and the block a running T2 forgot sits in a descriptor BEHIND it. The
+    /// skip must advance the cursor by exactly one block: stepping wrong
+    /// reads a data block as a chain header (`EUCLEAN` — the pass dies) or
+    /// walks the tags out of position and misjudges the defer — the
+    /// off-by-one catastrophe class (applying T1's stale image over the
+    /// reuse). The pass must defer in front of T1, and the next pass (T2
+    /// committed, revoke published) must finish the same walk on the apply
+    /// side.
+    #[ktest]
+    fn defer_decision_walks_revoke_led_chain() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let (freed, control, bitmapish, unrelated) = (500u64, 501u64, 600u64, 900u64);
+        let mut t1_freed = [0u8; BLOCK_SIZE];
+        t1_freed[..8].copy_from_slice(b"T1FREED!");
+        let mut t1_control = [0u8; BLOCK_SIZE];
+        t1_control[..8].copy_from_slice(b"T1KEEP00");
+
+        // T1 revokes `unrelated` (a block it never captured), so its
+        // committed chain LEADS with a revoke block; the descriptor tagging
+        // `freed` and `control` follows it.
+        let mut t1 = make_txn(Tid::new(1), &[(freed, t1_freed), (control, t1_control)]);
+        t1.forget_block(unrelated);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+
+        // Running T2 forgets `freed` (unpublished), and the block is reused
+        // as data.
+        let mut t2 = make_txn(Tid::new(2), &[(bitmapish, [0x22u8; BLOCK_SIZE])]);
+        t2.forget_block(freed);
+        f.journal.state_write().running = Some(t2);
+        let reused_data = [0xEEu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
+            .unwrap();
+
+        // The pass steps over T1's revoke block, finds `freed` covered in
+        // the LATER descriptor, and defers: nothing applied, tail unmoved.
+        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+        assert_eq!(
+            read_final_block(&f, freed),
+            reused_data,
+            "the deferred transaction must not be applied over the reuse"
+        );
+        assert_eq!(read_final_block(&f, control), [0u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 1);
+        assert_eq!(f.journal.state_read().tail_block, Some(1));
+        assert_eq!(f.journal.state_read().tail_tid, Tid::new(1));
+
+        // T2 commits (its revoke publishes): the next pass walks the same
+        // revoke-led chain on the apply side — T1's image of `freed`
+        // suppressed, `control` applied — then applies T2 and reclaims the
+        // whole log. The cursor math held on both walks.
+        let t2 = f.journal.state_write().running.take().unwrap();
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        checkpoint(f.journal.as_ref(), device.as_ref(), None).unwrap();
+
+        assert_eq!(read_final_block(&f, freed), reused_data);
+        assert_eq!(read_final_block(&f, control), t1_control);
+        assert_eq!(read_final_block(&f, bitmapish), [0x22u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+    }
+
     /// The b2 residual (a forget landing after a pass's snapshot, the block
     /// reused and caller-thread-flushed mid-pass), now structurally
     /// unreachable: the forget's free PINS the block, so while the freeing

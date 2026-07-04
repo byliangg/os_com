@@ -1110,10 +1110,15 @@ mod tests {
         assert_eq!(sb.s_sequence.get(), 3);
     }
 
-    // --- a5 review MAJOR 1: the revoke refusal must sit BEHIND the magic
-    // check. A boundary slot holds arbitrary old logged data (escape
-    // sanitizes only bytes 0..4), so garbage whose type bytes read revoke is
-    // the ordinary boundary; only a valid-magic revoke block refuses. ---
+    // --- a5 review MAJOR 1, politics updated for PASS_REVOKE (P7b-3/4):
+    // the scan checks run magic → sequence → type, so revoke-typed bytes
+    // mean nothing until both earlier checks vouch for them. A boundary slot
+    // holds arbitrary old logged data (escape sanitizes only bytes 0..4), so
+    // garbage-magic bytes whose type reads revoke are the ordinary boundary;
+    // a valid-magic STALE-TID revoke block is the sequence-check boundary;
+    // and a valid same-tid revoke block is an ordinary chain member whose
+    // records PASS_REVOKE collects. The a5-era refusal of any valid-magic
+    // revoke block is retired — nothing refuses anymore. ---
 
     /// A boundary slot whose STALE bytes happen to read [`BLOCKTYPE_REVOKE`]
     /// — garbage magic, type word 5 — is the ordinary log boundary, never a

@@ -751,6 +751,14 @@ impl BlockGroup {
         self.metadata.read()
     }
 
+    /// Overwrites the in-memory free-block counter — the corrupted-counter
+    /// fixture that makes [`free_blocks`](Self::free_blocks)' count-overflow
+    /// arm deterministically reachable (a post-discharge failure arm).
+    #[cfg(ktest)]
+    pub(super) fn corrupt_free_blocks_count_for_test(&self, count: u32) {
+        self.metadata.write().desc.free_blocks_count = count;
+    }
+
     /// Attempts to allocate up to `count` contiguous blocks within this group,
     /// skipping the pinned freed runs (`pinned_frees`, filesystem-wide
     /// `(start, count)` pairs from
@@ -886,7 +894,12 @@ impl BlockGroup {
     /// Returns the number of blocks actually freed (allocated-to-free
     /// transitions). Returns `Err(EIO)` when the range overlaps the group's
     /// system zone — **after aborting the journal** (under a live handle):
-    /// see the comment at the refusal.
+    /// see the comment at the refusal. Every `Err` out of this function is
+    /// equally fatal under a handle: the caller (`Ext4::free_blocks`) has
+    /// already discharged the run's revoke duty and aborts the journal on
+    /// ANY post-discharge failure (discharge and the bitmap free are
+    /// atomic-or-dead), so a new failure arm added here needs no local
+    /// abort.
     pub(super) fn free_blocks(
         &self,
         bit_range: Range<u32>,
@@ -913,7 +926,10 @@ impl BlockGroup {
             // checkpoint/replay (silent rollback). The effects cannot be
             // unwound (the revoke may have evicted a retained image), so
             // abort loudly: an aborted journal accepts no further work, and
-            // the poisoned records can never act.
+            // the poisoned records can never act. The caller's atomic-or-dead
+            // wrap aborts on this `Err` too; this local abort stays as the
+            // corruption site's own response (double abort is idempotent —
+            // it stores a flag and wakes sleepers).
             if let Some(handle) = handle {
                 handle.abort_journal_on_fs_error();
             }
