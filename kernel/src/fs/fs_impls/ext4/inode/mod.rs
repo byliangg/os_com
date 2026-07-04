@@ -1059,10 +1059,10 @@ impl Inode {
     /// boundary.
     ///
     /// On a journaled volume the writeback is captured under a handle (see
-    /// [`sync_metadata`](Self::sync_metadata)); its commit is asynchronous — the
-    /// filesystem-level sync's log durability is a documented P4 limitation
-    /// (unmount reaches durability via `flush_on_unmount`; owner: P7, a
-    /// `log_wait_commit` at the `FileSystem::sync` boundary).
+    /// [`sync_metadata`](Self::sync_metadata)); the capture alone is not
+    /// durable yet — log durability lives at the `FileSystem::sync` boundary,
+    /// which waits on the commit via `commit_and_wait_running` before issuing
+    /// the single barrier (wired in P5), not per inode.
     pub(super) fn sync_data_and_meta_no_barrier(&self) -> Result<()> {
         let fs = self.fs()?;
         let mut inner = self.inner.write();

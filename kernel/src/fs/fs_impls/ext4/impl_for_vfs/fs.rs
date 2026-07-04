@@ -37,9 +37,11 @@ impl FileSystem for Ext4 {
         // into the running transaction, and returning before that transaction
         // reaches the log would silently drop the metadata on a crash — the
         // sync-then-cut-power baseline every crash harness builds on. No fs
-        // lock is held here, as `commit_and_wait_running` requires. (The
-        // free-count direct writes inside `sync_metadata` remain the known P7
-        // WAL-inversion debt; this closes only the "sync does not wait" half.)
+        // lock is held here, as `commit_and_wait_running` requires. (Free
+        // counts are not part of this durability point: with the journal live
+        // `sync_metadata` is a no-op, and the sb/GDT count words are written
+        // directly only at the unmount quiescent point — journaling them is
+        // the P7 `fs-sync-counts-direct-write` debt.)
         if let Some(journal) = self.journal() {
             journal.commit_and_wait_running()?;
         }

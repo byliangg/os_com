@@ -1308,8 +1308,8 @@ pub(super) enum ForgetKind {
     Data,
 }
 
-/// Records that a previously journaled metadata block is being freed. Phase 2:
-/// no-op. `kind`/`blocknr` are the Phase-7 revoke insertion point.
+/// Records that a previously journaled metadata block is being freed. Still a
+/// no-op; `kind`/`blocknr` are the Phase-7 revoke insertion point.
 pub(super) fn forget(_handle: Option<&Handle>, _kind: ForgetKind, _blocknr: Ext4Bid) -> Result<()> {
     Ok(())
 }
