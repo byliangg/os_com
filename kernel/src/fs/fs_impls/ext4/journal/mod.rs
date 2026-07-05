@@ -1958,6 +1958,17 @@ impl Journal {
     /// ktest age path goes through `force_expire_for_test` + an explicit
     /// wake instead of real timeouts).
     fn age_deadline(&self) -> (Option<Tid>, Option<Duration>) {
+        // RED-LINE ①: an aborted journal never commits again
+        // ([`advance_pipeline`](Self::advance_pipeline) refuses to stage on
+        // every wake). Arm NO age deadline for it, so a fired timeout cannot
+        // re-enter the commit loop to re-refuse a transaction that can never
+        // stage — a busy spin (arm-zero → timeout → refuse → arm-zero). The
+        // commit thread then sleeps untimed until `stop_commit_thread`;
+        // `poll_commit_action`'s is_aborted gate holds the request/immediate
+        // wakes the same way.
+        if self.is_aborted() {
+            return (None, None);
+        }
         let st = self.state_read();
         // The verdict and the transaction ride out together, so the deadline
         // reads off the same transaction the key names — no re-lookup, no
@@ -2102,6 +2113,18 @@ impl Journal {
     /// (the device lags this commit until its checkpoint). The commit I/O
     /// itself runs without the lock.
     fn advance_pipeline(&self, cause: CommitCause) -> PipelineStep {
+        // RED-LINE ①: an aborted journal must never stage a transaction on ANY
+        // wake path. The running/locking captures either describe device state a
+        // failed commit no longer matches, or metadata whose ordered data was
+        // never flushed (an op-thread `abort_for_fs_error`); committing them
+        // publishes records the abort discipline forbids. Refuse BEFORE taking
+        // the state lock or any seat — the post-`commit_one` is_aborted check
+        // only catches a commit that FAILED here, not the age-timeout `Advance`
+        // that stages a still-good-looking poisoned txn. (jbd2's
+        // `journal_commit_transaction` bails when the journal is aborted.)
+        if self.is_aborted() {
+            return PipelineStep::Idle;
+        }
         let mut st = self.state_write();
         if st.committing.is_some() {
             // Commits are serialized on the single committer (the commit
@@ -2574,8 +2597,22 @@ impl Journal {
     /// on a tid that will never commit, and (via
     /// [`is_aborted`](Self::is_aborted)) the filesystem's write entry points
     /// return `EROFS`. Sets only the in-memory flag; the on-disk `s_errno`
-    /// marker is a separate step ([`record_error_on_abort`](Self::record_error_on_abort)),
+    /// marker is a separate step ([`abort_with_error`](Self::abort_with_error)),
     /// so a deliberate shutdown can abort without stamping "fsck needed".
+    ///
+    /// # Invariant (RED-LINE ①)
+    ///
+    /// After an abort NO transaction — the running one, a draining locking one,
+    /// or any future one — reaches the log, on EVERY wake path:
+    /// [`advance_pipeline`](Self::advance_pipeline) refuses to stage an aborted
+    /// journal (so the age-timeout `Advance` and the force path stage nothing),
+    /// [`age_deadline`](Self::age_deadline) arms no timeout (so no age wake
+    /// fires), [`poll_commit_action`](Self::poll_commit_action) returns `None`
+    /// on the request/immediate wakes, [`flush_on_unmount`](Self::flush_on_unmount)
+    /// discards both seats at entry, and `journal_start` refuses `EIO` so no
+    /// successor is created. The poisoned captures sit inertly in
+    /// `st.running`/`st.locking` until the journal drops; nothing stages them,
+    /// so nothing reads their after-images either.
     fn abort(&self) {
         self.aborted.store(true, Ordering::Release);
         self.commit_wait_queue.wake_all();
@@ -2601,7 +2638,23 @@ impl Journal {
     /// (which restamps the superblock checksum and barriers). The read-modify-
     /// write preserves `s_start`/`s_sequence`, so the recovery pointer is
     /// unchanged — only the error marker is published.
+    ///
+    /// # Locking
+    ///
+    /// Serializes on [`j_checkpoint`](Journal::j_checkpoint), the mutex the
+    /// commit thread's own block-0 read-modify-writes already hold — the commit
+    /// pipeline's clean→dirty `s_start` stamp
+    /// ([`update_superblock_tail`](super::commit)) and the checkpoint pass's
+    /// clean rewrite. This call runs from OP threads (`abort_for_fs_error`, the
+    /// ordered-data-ENOMEM wrapper and the system-zone free) AND the commit
+    /// thread's commit-failure abort; without this lock an op-thread RMW could
+    /// interleave a commit's `s_start` advance and roll the recovery pointer
+    /// back, or lose the `s_errno` marker. Every caller holds NO checkpoint lock
+    /// at this point — the commit path scopes its clean→dirty stamp to that one
+    /// step and releases it before a failing commit aborts — so the acquire is
+    /// never re-entrant.
     fn write_errno_to_super(&self) -> Result<()> {
+        let _checkpoint = self.lock_checkpoint();
         let device = self.device.as_ref();
         let mut raw = self.geometry.read_raw_superblock(device)?;
         raw.s_errno = Be32::new(self.sb_error.load(Ordering::Acquire));
@@ -4308,6 +4361,102 @@ mod tests {
         // commit.
         let err = f.journal.log_wait_commit(Tid::new(2)).unwrap_err();
         assert_eq!(err.error(), Errno::EIO);
+    }
+
+    /// RED-LINE ①: after an op-thread `abort_for_fs_error`, the background
+    /// commit thread must NOT commit the poisoned running transaction via the
+    /// AGE-TIMEOUT wake path. `poll_commit_action` already refuses the
+    /// request/immediate wakes on an aborted journal, but the age deadline fires
+    /// through `Err(_expired) => Advance`, which historically bypassed that gate
+    /// and staged+committed the running txn one commit interval after the abort
+    /// — falsifying the RED-LINE ① discipline (an abort's captures never reach
+    /// the log) AND the system-zone-abort safety
+    /// ([`Handle::abort_journal_on_fs_error`](transaction::Handle)).
+    ///
+    /// The deterministic core drives the exact age-timeout action synchronously:
+    /// [`age_running_for_test`](Journal::age_running_for_test) back-dates the
+    /// deadline (the age trigger is now due) and
+    /// [`commit_if_due_for_test`](Journal::commit_if_due_for_test) is
+    /// `commit_one(CommitCause::WhenDue)` — precisely what the live thread's
+    /// `Err(_expired) => Advance` branch invokes (the async timer is inherently
+    /// racy for a *negative* assertion). BEFORE the fix the aborted running txn
+    /// stages and commits here (`commit_if_due_for_test` returns true,
+    /// `committed_tid` advances, a log block is written); after it,
+    /// `advance_pipeline` refuses. The coda then runs the REAL commit thread over
+    /// the same aborted+expired journal to prove it parks (arms no age timeout)
+    /// and tears down without committing or hanging.
+    #[ktest]
+    fn abort_stops_age_timer_from_committing_poisoned_txn() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        // A running transaction carrying a captured metadata block: committable,
+        // so an ungated commit path would carry it into the log.
+        let handle = journal_start(&f.journal, 4).unwrap();
+        let poisoned_tid = handle.tid();
+        get_write_access(Some(&handle), 500)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(b"POIS"))
+            .unwrap();
+        journal_stop(handle).unwrap();
+
+        // Snapshot the log tail (blocks 1..16): a poisoned commit would write a
+        // descriptor + data + commit block here. Block 0 is the journal
+        // superblock the abort stamps `s_errno` into, so it is excluded.
+        let log_off = usize::try_from(JOURNAL_START_BLOCK).unwrap() * BLOCK_SIZE;
+        let mut before = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(log_off, &mut before)
+            .unwrap();
+
+        // Production abort (the `abort_for_fs_error` path — a system-zone free or
+        // an ordered-data ENOMEM), then back-date the age deadline so the age
+        // trigger is due for the WhenDue advance below.
+        f.journal.abort_for_fs_error();
+        f.journal.age_running_for_test();
+
+        // Drive the age-timeout commit action. FAILS before the fix: the aborted
+        // running txn stages and commits, so this returns true.
+        assert!(
+            !f.journal.commit_if_due_for_test(),
+            "an aborted journal must refuse the age-timeout commit",
+        );
+
+        // The poisoned txn never committed: `committed_tid` still trails it and
+        // no log block was written for it.
+        assert!(!f.journal.committed_tid().geq(poisoned_tid));
+        let mut after = vec![0u8; 16 * BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .read_bytes(log_off, &mut after)
+            .unwrap();
+        assert_eq!(
+            before[BLOCK_SIZE..],
+            after[BLOCK_SIZE..],
+            "the aborted running txn must not write any log block",
+        );
+
+        // MINOR: the `s_errno` marker still reached disk — written under
+        // `j_checkpoint` on the aborting thread — so a later mount / e2fsck
+        // learns the filesystem needs checking.
+        assert_eq!(f.journal.recorded_errno(), S_ERRNO_ERROR_MARKER);
+        let on_disk: RawJournalSuperblock = f.fixture.disk.segment().read_val(log_off).unwrap();
+        assert_eq!(on_disk.s_errno.get(), S_ERRNO_ERROR_MARKER);
+
+        // Coda — the commit thread LIVE over the aborted+expired journal: it
+        // arms no age deadline (`age_deadline` returns none), so it parks rather
+        // than firing a timeout `Advance`, commits nothing, and joins cleanly
+        // (no spin, no hang).
+        f.journal.start_commit_thread();
+        f.journal.stop_commit_thread();
+        assert!(!f.journal.committed_tid().geq(poisoned_tid));
+        assert!(
+            f.journal.state_read().running.is_some(),
+            "the aborted running txn is discarded at drop, never staged",
+        );
     }
 
     /// T1 regression (the B-1 shared-block stale-seed class — the Task-8 guest
