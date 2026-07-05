@@ -311,23 +311,212 @@ impl Ext4 {
         self.journal.read().clone()
     }
 
-    /// Journal credits (an upper bound on the distinct metadata blocks the
-    /// operation may dirty) reserved per operation type.
-    ///
-    /// Phase 4 uses generous fixed estimates; a real `mke2fs` journal admits
-    /// hundreds of credits, so these never bind (and the tiny ktest journals
-    /// never run operations). Precise per-op credit accounting and `extend`/
-    /// `restart` for unbounded writes are a P7 refinement.
-    pub(super) const CREATE_CREDITS: usize = 16;
-    pub(super) const WRITE_CREDITS: usize = 16;
-    pub(super) const TRUNCATE_CREDITS: usize = 16;
-    pub(super) const RECLAIM_CREDITS: usize = 16;
-    pub(super) const UNLINK_CREDITS: usize = 16;
-    pub(super) const LINK_CREDITS: usize = 16;
-    pub(super) const RENAME_CREDITS: usize = 24;
-    /// An `fsync`/sync inode writeback captures exactly one inode-table block;
-    /// kept small so it also fits the deliberately tiny ktest journals.
+    // ===== Per-operation journal credit estimates (P7d-1) =====
+    //
+    // Each `*_credits` method returns a SAFE UPPER BOUND on the distinct metadata
+    // blocks the operation may capture — the reservation `begin_op` passes to
+    // `journal_start`. The bound is derived from OUR capture funnels (extent-tree
+    // node writes; per-allocation block-bitmap + group-descriptor; the shared
+    // superblock; the inode-table block; directory blocks; orphan-list splices),
+    // structured like Linux's `EXT4_*_TRANS_BLOCKS` macros (`ext4_jbd2.h`) but
+    // adapted to this module: no xattr blocks (`EXT4_XATTR_TRANS_BLOCKS` term is
+    // 0), no quota (`EXT4_MAXQUOTAS_*` term is 0), extents-only (never indirect).
+    //
+    // The bounded ops (create/unlink/rmdir/link/rename/symlink/mknod/fsync) touch
+    // a finite, size-independent set, so their estimate is a provable worst case
+    // (see each method's derivation). The UNBOUNDED ops (write/truncate/reclaim)
+    // reserve a per-chunk estimate exactly as Linux does (`ext4_chunk_trans_blocks`
+    // / `ext4_writepage_trans_blocks` assume one contiguous extent, independent of
+    // the byte count): a fragmented run that maps more extents than reserved grows
+    // the reservation mid-op through `journal_extend` (the enforced-credit path in
+    // `charge_fresh_capture`), which keeps the reservation ≥ captured at all times.
+    // The `nr_metadata_blocks`-based commit fit guard is the hard backstop either
+    // way (a capture beyond capacity aborts loud, never corrupts).
+
+    /// One superblock after-image. Every alloc/free/orphan op patches the shared
+    /// superblock counters; it is captured at most once per transaction, but each
+    /// op reserves one for it.
+    const SUPERBLOCK_CREDITS: usize = 1;
+    /// One inode-table block for the operation's own inode writeback
+    /// (`write_back_inode_desc`, Linux `ext4_mark_inode_dirty`).
+    const INODE_DESC_CREDITS: usize = 1;
+    /// Depth ceiling used for a *directory's* extent tree when an insert may have
+    /// to allocate a fresh directory block. Directory trees are shallow in
+    /// practice (a directory that needs a depth-2 extent tree holds on the order
+    /// of a million entries); using a fixed ceiling avoids plumbing the parent's
+    /// live depth into every namespace op, and over-estimating a directory's tree
+    /// depth only over-reserves (a perf cost), never under-bounds.
+    const DIR_DEPTH_CEIL: u16 = 2;
+
+    /// An `fsync`/`sync`/`setattr` inode writeback captures exactly one
+    /// inode-table block; a couple of blocks of slack cover a shared-superblock
+    /// touch and keep the bound comfortably above the worst case while still
+    /// fitting the deliberately tiny ktest journals.
     pub(super) const FSYNC_CREDITS: usize = 4;
+
+    /// Distinct group-descriptor (GDT) blocks — the clamp for how many GDT
+    /// blocks an op that allocates across many groups can dirty (Linux
+    /// `EXT4_SB(sb)->s_gdb_count`, the `gdpblocks` clamp in
+    /// `ext4_meta_trans_blocks`). `ceil(groups / descriptors_per_block)`.
+    fn nr_gdt_blocks(&self) -> usize {
+        let sb = self.super_block.read();
+        let descriptors_per_block = (sb.block_size() / sb.desc_size() as usize).max(1);
+        (sb.nr_block_groups() as usize).div_ceil(descriptors_per_block)
+    }
+
+    /// The number of block groups (Linux `ext4_get_groups_count`), the clamp for
+    /// how many distinct block bitmaps an op can dirty.
+    fn nr_groups(&self) -> usize {
+        self.super_block.read().nr_block_groups() as usize
+    }
+
+    /// Worst-case metadata blocks to map `pextents` physical extents into an
+    /// extent tree of depth `depth` — the extent-tree index/leaf writes plus the
+    /// block-bitmap and GDT block each allocation dirties (Linux
+    /// `ext4_meta_trans_blocks(inode, _, pextents)` composed with
+    /// `ext4_ext_index_trans_blocks`). Excludes the superblock and inode, which
+    /// the callers add explicitly.
+    ///
+    /// Worst-case derivation, mirroring `ext4_ext_index_trans_blocks`: inserting
+    /// one extent can split every tree level (each split rewrites the old node
+    /// AND allocates a new one → `2 * depth`), and can raise the tree by one
+    /// level (a new root → the `+1`), so `idx = 2 * (depth + 1)` index/leaf
+    /// blocks for a single extent, `3 * (depth + 1)` when several extents split
+    /// the tree repeatedly (Linux's `depth * 3` case). Each of those index blocks
+    /// and each data extent may fall in a distinct block group, so up to
+    /// `idx + pextents` block bitmaps and the same number of GDT blocks are
+    /// dirtied — but there are only `nr_groups()` bitmaps and `nr_gdt_blocks()`
+    /// GDT blocks in the whole filesystem, so both terms clamp there (this clamp
+    /// is what bounds the metadata of an arbitrarily fragmented map: Linux relies
+    /// on the identical `groups`/`gdpblocks` clamp).
+    fn map_credits(&self, pextents: usize, depth: u16) -> usize {
+        let depth = depth as usize;
+        let idx = if pextents <= 1 {
+            2 * (depth + 1)
+        } else {
+            3 * (depth + 1)
+        };
+        let touched = idx + pextents;
+        let bitmaps = touched.min(self.nr_groups());
+        let gdt = touched.min(self.nr_gdt_blocks());
+        idx + bitmaps + gdt
+    }
+
+    /// Credits to allocate & map one data/metadata block (Linux
+    /// `EXT4_SINGLEDATA_TRANS_BLOCKS` for extents = 20): one extent's worth of
+    /// tree + bitmap + GDT. The extra block a `mkdir` (its first directory
+    /// block) or a slow `symlink` (its target block) allocates on top of a plain
+    /// create is exactly this.
+    pub(super) fn single_block_map_credits(&self, depth: u16) -> usize {
+        self.map_credits(1, depth)
+    }
+
+    /// Credits to create a new inode and link it into its parent directory
+    /// (Linux `ext4_create` / `ext4_mknod`:
+    /// `EXT4_DATA_TRANS_BLOCKS + EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3`).
+    ///
+    /// Worst case: the new inode dirties its inode bitmap (1), its inode-table
+    /// block (1), its group descriptor (1, the free-inode/used-dir counts) and
+    /// the superblock (1); linking the name into the parent patches one existing
+    /// directory block (1) or, if the directory is full, allocates a fresh
+    /// directory block — one `single_block_map` — and the parent's inode-table
+    /// block records the new size/mtime (1).
+    pub(super) fn create_credits(&self) -> usize {
+        // New-inode side: inode bitmap + inode-table block + group descriptor +
+        // superblock.
+        let new_inode = 1 + Self::INODE_DESC_CREDITS + 1 + Self::SUPERBLOCK_CREDITS;
+        // Parent side: the entry lands in an existing block, or a freshly
+        // allocated one (the `single_block_map`), plus the parent inode writeback.
+        let parent = self.single_block_map_credits(Self::DIR_DEPTH_CEIL) + Self::INODE_DESC_CREDITS;
+        new_inode + parent
+    }
+
+    /// Credits to remove a name (`unlink`/`rmdir`, Linux `EXT4_DATA_TRANS_BLOCKS`).
+    ///
+    /// Worst case: patch the parent directory block the entry lives in (1), the
+    /// parent's inode-table block (mtime/link) (1), the removed child's
+    /// inode-table block (link count → 0, and its orphan-next pointer) (1), and
+    /// the superblock (the orphan-list head) (1). No allocation happens (the
+    /// child's blocks are freed later, by the reclaim path), so no bitmap/GDT.
+    pub(super) fn unlink_credits(&self) -> usize {
+        1 + Self::INODE_DESC_CREDITS + Self::INODE_DESC_CREDITS + Self::SUPERBLOCK_CREDITS
+    }
+
+    /// Credits to add a hard link (Linux `ext4_link`:
+    /// `EXT4_DATA_TRANS_BLOCKS + EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3`).
+    ///
+    /// Worst case: insert the name into the parent (an existing block, or a fresh
+    /// directory block — one `single_block_map`), plus the parent's inode-table
+    /// block (mtime) and the target's inode-table block (link count).
+    pub(super) fn link_credits(&self) -> usize {
+        self.single_block_map_credits(Self::DIR_DEPTH_CEIL)
+            + Self::INODE_DESC_CREDITS
+            + Self::INODE_DESC_CREDITS
+    }
+
+    /// Credits to rename (Linux `ext4_rename`:
+    /// `2 * EXT4_DATA_TRANS_BLOCKS + EXT4_INDEX_EXTRA_TRANS_BLOCKS + 2`).
+    ///
+    /// Worst case: remove the old name (old-dir block + old-dir inode), insert
+    /// the new name (new-dir block, possibly a freshly allocated one — one
+    /// `single_block_map` — + new-dir inode), rewrite the moved inode's
+    /// inode-table block (its `..` for a directory move, its ctime), and, when
+    /// the target name existed, unlink that inode (its inode-table block + the
+    /// superblock orphan head).
+    pub(super) fn rename_credits(&self) -> usize {
+        // Old dir: block patch + inode writeback.
+        let old_dir = 1 + Self::INODE_DESC_CREDITS;
+        // New dir: entry insert (existing or freshly allocated block) + inode.
+        let new_dir =
+            self.single_block_map_credits(Self::DIR_DEPTH_CEIL) + Self::INODE_DESC_CREDITS;
+        // Moved inode's own writeback + a displaced target's unlink.
+        let moved = Self::INODE_DESC_CREDITS;
+        let displaced = Self::INODE_DESC_CREDITS + Self::SUPERBLOCK_CREDITS;
+        old_dir + new_dir + moved + displaced
+    }
+
+    /// Credits for a data write's per-chunk metadata (Linux
+    /// `ext4_writepage_trans_blocks` = `ext4_meta_trans_blocks(inode, bpp, bpp)`;
+    /// our page is one block, so one contiguous chunk is one extent).
+    ///
+    /// A contiguous run allocates one extent, so `single_block_map(depth)` bounds
+    /// its extent-tree + bitmap + GDT captures; the superblock and inode complete
+    /// the reservation. A write that fragments into several extents captures more
+    /// than this, and `charge_fresh_capture` grows the reservation per extent via
+    /// `journal_extend` — the reservation stays ≥ captured, so the estimate is a
+    /// per-chunk starting point, not a whole-write bound (which is unbounded
+    /// without d2's `journal_restart`; see the module note).
+    pub(super) fn write_credits(&self, depth: u16) -> usize {
+        self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
+    }
+
+    /// Credits for a truncate's per-chunk metadata (Linux
+    /// `ext4_blocks_for_truncate` = `EXT4_DATA_TRANS_BLOCKS + bounded chunk`).
+    ///
+    /// A shrink frees data and extent-tree blocks: it rewrites the extent tree
+    /// (bounded by `single_block_map(depth)`), clears bitmaps and adjusts the GDT
+    /// and superblock for the freed groups, and writes back the inode. Like
+    /// `write_credits`, this is the per-chunk reservation; a truncate freeing
+    /// blocks spread over many groups grows via `journal_extend`.
+    pub(super) fn truncate_credits(&self, depth: u16) -> usize {
+        self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
+    }
+
+    /// Credits to reclaim (free) a deleted inode (Linux `ext4_evict_inode` →
+    /// `ext4_free_inode` + `ext4_truncate`).
+    ///
+    /// Worst case per chunk: free the inode's blocks (one `single_block_map`
+    /// worth of extent-tree + bitmap + GDT), free the inode itself (inode bitmap,
+    /// inode-table block, group descriptor), splice it off the orphan list (the
+    /// predecessor's inode-table block, or the superblock head), and update the
+    /// superblock counters. Like truncate, a large file's reclaim frees across
+    /// many groups and grows the reservation via `journal_extend`.
+    pub(super) fn reclaim_credits(&self, depth: u16) -> usize {
+        let free_blocks = self.single_block_map_credits(depth);
+        let free_inode = 1 + Self::INODE_DESC_CREDITS + 1;
+        let orphan = Self::INODE_DESC_CREDITS;
+        free_blocks + free_inode + orphan + Self::SUPERBLOCK_CREDITS
+    }
 
     /// Opens a journal handle for a metadata operation, reserving `credits`
     /// metadata blocks (jbd2 `jbd2_journal_start`), or a no-op handle on a

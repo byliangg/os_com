@@ -79,7 +79,7 @@ impl Inode {
         // captured like every other metadata write. (This path historically
         // ran handle-less; on a journaled volume that left the allocation
         // unjournaled.)
-        let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
+        let op = fs.begin_op(fs.write_credits(0))?;
         let wrote_slow_target = inner.write_link(&fs, target, op.get())?;
         inner.set_mtime_ctime(utils::now());
         // Same per-handle descriptor capture as `write_at`: the target (fast

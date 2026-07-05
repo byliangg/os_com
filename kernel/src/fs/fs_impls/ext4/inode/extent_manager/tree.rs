@@ -124,8 +124,8 @@ impl ExtentTree {
 
     /// Returns the tree depth (0 = inline leaf, 1 = one level of index blocks,
     /// 2 = two levels). Infallible: the root was validated at construction. Used
-    /// by tests to assert tree shape.
-    #[cfg(ktest)]
+    /// to assert tree shape in tests and to size the per-chunk journal credit
+    /// estimate for write/truncate/reclaim ([`ExtentManager::root_depth`]).
     pub(super) fn depth(&self) -> u16 {
         self.header().depth()
     }

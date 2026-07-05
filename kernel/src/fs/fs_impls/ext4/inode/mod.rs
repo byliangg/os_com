@@ -914,8 +914,15 @@ impl Inode {
         let mut inner = self.inner.write();
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images this write's
-        // allocations dirty. Dropped at return, closing the handle.
-        let op = fs.begin_op(Ext4::WRITE_CREDITS)?;
+        // allocations dirty. Dropped at return, closing the handle. The estimate
+        // is the per-chunk cost at the file's live extent depth; a write that
+        // fragments into several extents grows the reservation via journal_extend
+        // (see `Ext4::write_credits`).
+        let depth = inner
+            .extent_manager()
+            .map(|em| em.root_depth())
+            .unwrap_or(0);
+        let op = fs.begin_op(fs.write_credits(depth))?;
         let len = inner.write_at(&fs, offset, reader, op.get())?;
         // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
         // and — for an inline root — the extent mapping itself) must ride the
@@ -962,7 +969,13 @@ impl Inode {
         let mut inner = self.inner.write();
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images a shrink frees.
-        let op = fs.begin_op(Ext4::TRUNCATE_CREDITS)?;
+        // Per-chunk estimate at the file's live extent depth; a shrink freeing
+        // across many groups grows via journal_extend (see `Ext4::truncate_credits`).
+        let depth = inner
+            .extent_manager()
+            .map(|em| em.root_depth())
+            .unwrap_or(0);
+        let op = fs.begin_op(fs.truncate_credits(depth))?;
         // Truncate-orphan protection is deliberately absent (owner: P7
         // `journal_restart`). It must NOT reuse the delete path's fs-level
         // `orphan_add`/`orphan_del`: a truncated inode stays live (link count
@@ -1116,8 +1129,14 @@ impl Inode {
         let mut inner = self.inner.write();
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / inode-bitmap after-images freeing the
-        // inode's blocks and the inode itself dirty.
-        let op = fs.begin_op(Ext4::RECLAIM_CREDITS)?;
+        // inode's blocks and the inode itself dirty. Per-chunk estimate at the
+        // file's live extent depth; freeing a large file's blocks across many
+        // groups grows via journal_extend (see `Ext4::reclaim_credits`).
+        let depth = inner
+            .extent_manager()
+            .map(|em| em.root_depth())
+            .unwrap_or(0);
+        let op = fs.begin_op(fs.reclaim_credits(depth))?;
 
         // Unlink this inode from the on-disk orphan list BEFORE stamping the
         // real deletion time below — while on the list, `i_dtime` doubles as the

@@ -870,7 +870,15 @@ impl Inode {
         // Open the journal handle after the inner lock (lock order: inner ① →
         // handle ②); it captures the inode/block-bitmap, group-descriptor and
         // extent after-images the allocations below dirty, and closes on drop.
-        let op = fs.begin_op(Ext4::CREATE_CREDITS)?;
+        // A directory (`make_empty`'s first block) and a slow symlink (its target
+        // block) allocate one data block beyond a plain create; reserve for it
+        // (a fast symlink over-reserves by one block, released at handle close).
+        let credits = if matches!(type_, InodeType::Dir | InodeType::SymLink) {
+            fs.create_credits() + fs.single_block_map_credits(0)
+        } else {
+            fs.create_credits()
+        };
+        let op = fs.begin_op(credits)?;
         let slot = match parent_inner.find_dir_slot(name.len())? {
             Some(slot) => slot,
             None => parent_inner.grow_dir_block(&fs, op.get())?,
@@ -980,7 +988,7 @@ impl Inode {
         // `guards` so it drops first — this operation's transaction closes before
         // `guards` releases and before `child`'s Drop opens its own reclaim
         // transaction (keeping the two transactions separate).
-        let op = fs.begin_op(Ext4::UNLINK_CREDITS)?;
+        let op = fs.begin_op(fs.unlink_credits())?;
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() == InodeType::Dir {
@@ -1040,7 +1048,7 @@ impl Inode {
         // all related inodes in order, without rechecking the lookup result.
         let mut guards = MultiInodeInnerGuards::lock(&[self, child.as_ref()]);
         // Handle after the inner locks; declared after `guards` (see `unlink`).
-        let op = fs.begin_op(Ext4::UNLINK_CREDITS)?;
+        let op = fs.begin_op(fs.unlink_credits())?;
 
         let child_inner = guards.inner_mut(child.ino());
         if child_inner.inode_type() != InodeType::Dir {
@@ -1088,7 +1096,7 @@ impl Inode {
         let dir_entry_file_type = DirEntryFileType::from(old.inode_type());
         let mut guards = MultiInodeInnerGuards::lock(&[self, old]);
         // Handle after the inner locks (inner ① → handle ②).
-        let op = fs.begin_op(Ext4::LINK_CREDITS)?;
+        let op = fs.begin_op(fs.link_credits())?;
 
         if guards.inner(old.ino()).link_count() >= MAX_LINK_COUNT {
             return_errno!(Errno::EMLINK);
@@ -1190,7 +1198,7 @@ impl Inode {
         // Handle after the inner locks; declared after `guards` so it drops first,
         // before `guards` releases and before a replaced inode's Drop reclaim (see
         // unlink).
-        let op = fs.begin_op(Ext4::RENAME_CREDITS)?;
+        let op = fs.begin_op(fs.rename_credits())?;
 
         // Step 3: validate invariants under lock.
         self.validate_rename_invariants(&guards, &old_inode, replaced_inode.as_deref())?;
@@ -1942,6 +1950,53 @@ mod tests {
         assert!(dir.mtime() >= mtime_before);
         // The directory itself did not gain a link (only subdir creation does).
         assert_eq!(dir.link_count(), 2);
+    }
+
+    /// P7d-1 safe-upper-bound gate: a real journaled `create` captures no more
+    /// metadata than `Ext4::create_credits` reserves, and — being a bounded op —
+    /// never grows its reservation. Uses the enforced-credit path (a journaled
+    /// volume), so the captured count is the operation's true footprint.
+    #[ktest]
+    fn create_captures_within_estimate() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+
+        let journal = f.ext4.journal().unwrap();
+        // Keep the running transaction inspectable after the create's handle
+        // closes (group commit would otherwise let the committer retire it).
+        journal.stop_commit_thread();
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        // Seed the directory's `.`/`..` handle-less: this capture-free setup keeps
+        // the running transaction empty until the measured create.
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
+        assert_eq!(journal.running_nr_metadata_blocks(), 0);
+
+        let estimate = f.ext4.create_credits();
+        let child = dir.create("file.txt", InodeType::File, perm()).unwrap();
+        assert_eq!(child.inode_type(), InodeType::File);
+
+        let captured = journal.running_nr_metadata_blocks();
+        assert!(captured > 0, "create must capture metadata");
+        assert!(
+            captured <= estimate,
+            "create captured {captured} metadata blocks, exceeding its estimate {estimate}"
+        );
+
+        drop(f);
     }
 
     /// `create` of a subdirectory: it has `.`/`..` (empty_dir true, `..` -> the

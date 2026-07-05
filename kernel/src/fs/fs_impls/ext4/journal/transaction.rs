@@ -56,13 +56,19 @@
 // closed by `OpHandle::drop` → `journal_stop`), the capture half feeds the
 // metadata funnels, `Handle::tid` backs fsync's `sync_tid`, and the
 // [`CommitPhase`] walk is driven by the production commit pipeline (P7c-1).
-// Four members are still dead in a non-ktest build: `journal_extend` and
-// `journal_restart` (mid-op credit growth — ops use fixed conservative credits
-// until P7d's precise accounting), plus the `nr_ordered_data` and
-// `Handle::credits` inspection accessors (read only by ktest assertions). Each
-// carries its OWN narrow `#[cfg_attr(not(ktest), expect(dead_code))]` rather
-// than a module-wide marker, so future dead code surfaces instead of being
-// absorbed silently.
+// As of P7d-1 per-op reservations are PRECISE (per-op estimates, `Ext4::*_credits`)
+// and ENFORCED: a fresh capture spends one reserved credit
+// (`charge_fresh_capture`), growing the reservation in place
+// (`try_grow_reservation`) when a handle runs dry. The public `journal_extend`
+// and `journal_restart` entry points are still dead in a non-ktest build — the
+// enforcement path calls `try_grow_reservation` directly, and a true
+// commit-boundary `journal_restart` is d2's work — as are the `nr_ordered_data`
+// and `Handle::credits` inspection accessors (read only by ktest assertions).
+// Each carries its OWN narrow `#[cfg_attr(not(ktest), expect(dead_code))]`
+// rather than a module-wide marker, so future dead code surfaces instead of
+// being absorbed silently.
+
+use core::cell::Cell;
 
 use ostd::timer::{Jiffies, TIMER_FREQ};
 
@@ -72,6 +78,14 @@ use super::{
     format::TagLayout,
     revoke::RevokeTable,
 };
+
+/// The block granularity by which [`journal_extend`] grows an under-reserved
+/// handle mid-operation (Linux `EXT4_RESERVE_TRANS_BLOCKS`, the low-water at
+/// which a big write/truncate extends): larger than one so a fragmented write
+/// that maps many extents amortizes the grow over several captures instead of
+/// re-checking capacity per block. Falls back to a single-block grow when a
+/// whole batch would not fit the journal's remaining capacity.
+const EXTEND_BATCH_BLOCKS: usize = 8;
 
 /// How long a running transaction may age before the commit thread commits it
 /// (jbd2 `j_commit_interval`), in jiffies: 5 seconds, Linux's
@@ -365,10 +379,11 @@ impl Transaction {
     /// so far — its captured metadata blocks plus its whole revoke blocks under
     /// `layout` — the measure the batch-size commit trigger compares against
     /// [`Journal::batch_trigger_credits`](super::Journal). Deliberately NOT
-    /// `outstanding_credits`: reservations are fixed conservative worst
-    /// cases until P7d's precise accounting, so counting them would trigger
-    /// commits an order of magnitude early; captured work is the
-    /// transaction's real, already-incurred footprint.
+    /// `outstanding_credits`: even with P7d-1's precise, enforced reservations
+    /// the outstanding count is the still-UNSPENT reservation of open handles
+    /// (blocks that may yet be captured), not work already incurred — batching
+    /// on it would trigger commits on intent rather than on real log footprint;
+    /// captured work is the transaction's real, already-incurred footprint.
     pub(super) fn batch_footprint(&self, layout: TagLayout) -> usize {
         self.nr_metadata_blocks() + self.nr_revoke_blocks(layout)
     }
@@ -404,10 +419,21 @@ impl Transaction {
     }
 
     /// Returns the worst-case metadata log blocks this transaction would occupy
-    /// with `extra` more credits reserved: its already-captured metadata plus every
-    /// reservation's full worst case (`outstanding_credits + extra`, each
-    /// reservation counted at its whole credit until its handle closes). This
-    /// is the credit base BOTH reservation gates share — `check_capacity`
+    /// with `extra` more credits reserved: its already-captured metadata plus
+    /// every live handle's UNUSED reservation (`outstanding_credits + extra`).
+    ///
+    /// `outstanding_credits` counts each open handle's *remaining* credit — a
+    /// fresh capture moves one unit from the reservation into
+    /// [`nr_metadata_blocks`](Self::nr_metadata_blocks) (the single-point
+    /// decrement in [`consume_reserved_credit`](Self::consume_reserved_credit),
+    /// jbd2's `b_modified` accounting) — so a captured block is counted ONCE
+    /// here, not twice. The sum is therefore a tight upper bound: it stays at
+    /// the handles' total grant across captures (each `-1` reservation `+1`
+    /// captured) and never exceeds it, so it is always `≥ nr_metadata_blocks`,
+    /// i.e. `≥` the blocks actually captured (the safe-upper-bound invariant the
+    /// commit-time fit guard also checks, in captured terms).
+    ///
+    /// This is the credit base BOTH reservation gates share — `check_capacity`
     /// (against [`Journal::max_credits`](super::Journal::max_credits)) and the
     /// log-space gate ([`journal_start`], through
     /// [`Journal::reservation_footprint`](super::Journal::reservation_footprint))
@@ -417,6 +443,28 @@ impl Transaction {
     /// each gate exactly once.
     pub(super) fn reserved_metadata_blocks(&self, extra: usize) -> usize {
         self.nr_metadata_blocks() + self.outstanding_credits + extra
+    }
+
+    /// Whether `bid` already has a captured after-image in this transaction — so
+    /// a `get_*_access` about to capture it can tell a FRESH capture (which
+    /// consumes one reserved credit, [`consume_reserved_credit`](Self::consume_reserved_credit))
+    /// from an idempotent re-capture (which does not), exactly as jbd2 keys the
+    /// credit decrement on `jh->b_modified`. Cheap: an ordered-map membership test.
+    pub(super) fn is_captured(&self, bid: Ext4Bid) -> bool {
+        self.metadata.contains_key(&bid)
+    }
+
+    /// Consumes one of the transaction's reserved credits at the moment a handle
+    /// first captures a metadata block (jbd2 `t_outstanding_credits` bookkeeping,
+    /// paired with `handle->h_total_credits`). The credit reservation and the
+    /// captured-block count move in lockstep — this `-1` matches the `+1` the
+    /// capture added to [`nr_metadata_blocks`](Self::nr_metadata_blocks) — so the
+    /// shared footprint ([`reserved_metadata_blocks`](Self::reserved_metadata_blocks))
+    /// holds constant instead of double-counting the block. The caller
+    /// ([`charge_fresh_capture`]) guarantees at least one credit remains, having
+    /// grown the reservation first if the handle had exhausted it.
+    fn consume_reserved_credit(&mut self) {
+        self.outstanding_credits = self.outstanding_credits.saturating_sub(1);
     }
 
     /// Returns whether this transaction carries a durable obligation recorded
@@ -710,8 +758,21 @@ impl Transaction {
 pub(in crate::fs::fs_impls::ext4) struct Handle {
     /// The transaction this handle joined (`h_transaction->t_tid`).
     tid: Tid,
-    /// Blocks reserved for this handle (`h_buffer_credits`).
-    credits: usize,
+    /// Total blocks reserved for this handle so far (jbd2 `h_total_credits`
+    /// after each `jbd2_journal_extend`). Grows on [`journal_extend`]; the
+    /// starting value is `journal_start`'s estimate. A [`Cell`] because a
+    /// capture credential holds only `&Handle` (it must borrow it immutably —
+    /// see [`WriteAccess`](super::WriteAccess)) yet the capture path grows the
+    /// reservation when it runs dry; the handle is task-local, never shared
+    /// across threads, so a `Cell` is the right single-thread interior mutability.
+    credits: Cell<usize>,
+    /// Blocks still available to capture on this handle: `credits` minus the
+    /// distinct blocks this handle has first-captured (jbd2's live
+    /// `handle->h_total_credits`, decremented as buffers are dirtied). Hitting
+    /// zero on a fresh capture forces a [`journal_extend`] or a loud failure —
+    /// the advisory→enforced conversion. Released back to the transaction's
+    /// `outstanding_credits` at [`journal_stop`].
+    remaining: Cell<usize>,
     /// Weak back-reference to the owning journal.
     journal: Weak<Journal>,
 }
@@ -724,10 +785,32 @@ impl Handle {
         self.tid
     }
 
-    /// The blocks this handle has reserved.
+    /// The total blocks this handle has reserved (grows on [`journal_extend`]).
     #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn credits(&self) -> usize {
-        self.credits
+        self.credits.get()
+    }
+
+    /// The reserved blocks this handle has not yet spent on a capture — its live
+    /// jbd2 `h_total_credits`. Zero means the next fresh capture must extend the
+    /// reservation or fail.
+    fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
+
+    /// Grows this handle's reservation by `extra` blocks (both the total and the
+    /// live remaining move together): the handle-side half of [`journal_extend`]
+    /// / [`charge_fresh_capture`], paired with the transaction-side
+    /// `outstanding_credits += extra`.
+    fn grant_credits(&self, extra: usize) {
+        self.credits.set(self.credits.get() + extra);
+        self.remaining.set(self.remaining.get() + extra);
+    }
+
+    /// Spends one remaining credit on a fresh capture (the handle-side half of
+    /// [`consume_reserved_credit`](Transaction::consume_reserved_credit)).
+    fn spend_one_credit(&self) {
+        self.remaining.set(self.remaining.get().saturating_sub(1));
     }
 
     /// Upgrades this handle's weak back-reference to its owning [`Journal`].
@@ -908,7 +991,10 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
 
                     return Ok(Handle {
                         tid,
-                        credits,
+                        credits: Cell::new(credits),
+                        // Every reserved credit starts available; captures spend
+                        // them one at a time (see `charge_fresh_capture`).
+                        remaining: Cell::new(credits),
                         journal: Arc::downgrade(journal),
                     });
                 }
@@ -971,7 +1057,12 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
         } = &mut *st;
         if let Some(txn) = super::active_txn_mut(running, locking, handle.tid) {
             txn.t_updates = txn.t_updates.saturating_sub(1);
-            txn.outstanding_credits = txn.outstanding_credits.saturating_sub(handle.credits);
+            // Release only the credits this handle never spent: each fresh
+            // capture already returned its unit to the pool
+            // (`consume_reserved_credit`) as it moved into the captured count.
+            // Releasing the full grant here would double-subtract the spent
+            // ones and understate the transaction's footprint.
+            txn.outstanding_credits = txn.outstanding_credits.saturating_sub(handle.remaining());
             true
         } else {
             false
@@ -989,15 +1080,103 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
     Ok(())
 }
 
+/// The result of a [`journal_extend`] / [`try_grow_reservation`] attempt.
+///
+/// A typed outcome rather than an in-band sentinel (rust_rules ⑤): the
+/// no-room case is a distinct variant a caller must match, not a magic
+/// return code buried in a `usize`. Mirrors `jbd2_journal_extend`'s
+/// `0`/`1` contract — grow succeeded, or "no room, caller must restart".
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExtendOutcome {
+    /// The reservation grew: the transaction had capacity for the extra credits.
+    Granted,
+    /// The transaction cannot fit the extra credits within the journal's
+    /// per-transaction capacity ([`Journal::max_credits`](super::Journal::max_credits)),
+    /// so growing in place is impossible. The operation must close this handle
+    /// and rejoin a fresh transaction ([`journal_restart`], d2's work); until
+    /// that is wired, the capture path converts this to a loud `ENOSPC`/`EFBIG`
+    /// (the documented d1→d2 seam — an unbounded op larger than one whole
+    /// transaction).
+    NeedsRestart,
+}
+
+/// Grows `handle`'s reservation on the running `running` transaction by up to
+/// `extra` blocks if the journal has capacity, returning whether it fit.
+///
+/// Operates on the ALREADY-HELD journal state (the caller passes the running
+/// transaction it borrowed under `state_write`), so it can run from inside a
+/// capture funnel that holds the state lock — the enforcement path
+/// ([`charge_fresh_capture`]) needs exactly that. It must therefore be
+/// **wait-free**: it never blocks on a commit (iron law 1 — a capture runs
+/// mid-operation under the caller's inode locks, and the running transaction
+/// it would wait on includes this very handle, a self-deadlock). Capacity is
+/// the whole gate: `credits + revoke ≤ max_credits` guarantees (by the
+/// `max_credits` footprint proof) that a full checkpoint frees enough ring
+/// space, so granting up to capacity is always safe — the commit pipeline
+/// checkpoint-drives the tail forward on its own. Beyond capacity the extra
+/// can never fit one transaction, so the answer is [`ExtendOutcome::NeedsRestart`].
+fn try_grow_reservation(
+    journal: &Journal,
+    running: &mut Transaction,
+    handle: &Handle,
+    extra: usize,
+) -> ExtendOutcome {
+    let revoke_blocks = running.nr_revoke_blocks(journal.geometry().tag_layout());
+    if running.reserved_metadata_blocks(extra) + revoke_blocks > journal.max_credits() {
+        return ExtendOutcome::NeedsRestart;
+    }
+    running.outstanding_credits += extra;
+    handle.grant_credits(extra);
+    ExtendOutcome::Granted
+}
+
+/// Ensures `handle` has at least one reserved credit to spend on a fresh
+/// capture, then spends it — the SINGLE point where a capture consumes a
+/// reservation (jbd2 `handle->h_total_credits--` on a buffer's first dirty).
+///
+/// Called by [`get_write_access`](super::get_write_access) /
+/// [`get_create_access`](super::get_create_access) after a FRESH capture (one
+/// that grew [`nr_metadata_blocks`](Transaction::nr_metadata_blocks)); an
+/// idempotent re-capture skips it, since jbd2 charges a block only once per
+/// transaction. If the handle has run dry, its reservation is grown in place
+/// ([`try_grow_reservation`], a batch to amortize, falling back to a single
+/// block) — the advisory→enforced conversion: an under-estimated op no longer
+/// silently over-captures on a generous flat reservation. When even one more
+/// block does not fit the whole transaction, the block is already captured (the
+/// footprint stays a safe upper bound via `nr_metadata_blocks`), but the op is
+/// failed loud with `ENOSPC` rather than allowed to build a transaction that
+/// cannot commit — the [`ExtendOutcome::NeedsRestart`] seam d2 will turn into a
+/// real restart.
+pub(super) fn charge_fresh_capture(
+    journal: &Journal,
+    running: &mut Transaction,
+    handle: &Handle,
+) -> Result<()> {
+    if handle.remaining() == 0
+        && try_grow_reservation(journal, running, handle, EXTEND_BATCH_BLOCKS)
+            == ExtendOutcome::NeedsRestart
+        && try_grow_reservation(journal, running, handle, 1) == ExtendOutcome::NeedsRestart
+    {
+        return_errno_with_message!(
+            Errno::ENOSPC,
+            "operation captured more metadata than a single journal transaction holds"
+        );
+    }
+    handle.spend_one_credit();
+    running.consume_reserved_credit();
+    Ok(())
+}
+
 /// Grows a handle's reservation by `extra` blocks (jbd2 `jbd2_journal_extend`).
 ///
-/// Fails `ENOSPC` if the transaction cannot fit the extra credits, or if the
+/// Returns [`ExtendOutcome::Granted`] when the extra credits fit the running
+/// transaction's capacity, or [`ExtendOutcome::NeedsRestart`] when they do not
+/// (jbd2's `1` — the caller must restart). Errors `ENOSPC` only when the
 /// handle's transaction has been force-locked for commit (jbd2 refuses to
 /// extend any transaction not in `T_RUNNING`, fs/jbd2/transaction.c
-/// `jbd2_journal_extend`: the locked transaction must drain, not grow; the
-/// caller's move is a restart). `ENOSPC` covers both for Phase 4.
+/// `jbd2_journal_extend`: the locked transaction must drain, not grow).
 #[cfg_attr(not(ktest), expect(dead_code))]
-pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
+pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<ExtendOutcome> {
     let journal = handle
         .journal
         .upgrade()
@@ -1017,11 +1196,7 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
     let Some(running) = st.running.as_mut() else {
         return_errno_with_message!(Errno::EIO, "journal_extend without a running transaction");
     };
-    check_capacity(&journal, running, extra)?;
-
-    running.outstanding_credits += extra;
-    handle.credits += extra;
-    Ok(())
+    Ok(try_grow_reservation(&journal, running, handle, extra))
 }
 
 /// Re-reserves `credits` on this handle, dropping its old reservation (jbd2
@@ -1058,13 +1233,17 @@ pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()>
         return_errno_with_message!(Errno::EIO, "journal_restart without a running transaction");
     };
 
-    // Release the old reservation first, so the capacity check for the new one
-    // does not double-count this handle's credits.
-    running.outstanding_credits = running.outstanding_credits.saturating_sub(handle.credits);
+    // Release the old reservation's UNSPENT credits first (the spent ones were
+    // already returned to the pool by their captures), so the capacity check for
+    // the new reservation does not double-count this handle.
+    running.outstanding_credits = running
+        .outstanding_credits
+        .saturating_sub(handle.remaining());
     check_capacity(&journal, running, credits)?;
 
     running.outstanding_credits += credits;
-    handle.credits = credits;
+    handle.credits.set(credits);
+    handle.remaining.set(credits);
     Ok(())
 }
 
@@ -1295,16 +1474,19 @@ mod tests {
         let j = journaled_fixture(64, 1, 1);
         let mut h = journal_start(&j, 4).unwrap();
 
-        journal_extend(&mut h, 3).unwrap();
+        assert_eq!(journal_extend(&mut h, 3).unwrap(), ExtendOutcome::Granted);
         assert_eq!(h.credits(), 7);
         {
             let st = j.state_write();
             assert_eq!(st.running.as_ref().unwrap().outstanding_credits, 7);
         }
 
-        // Extending past capacity fails and does not change the reservation.
+        // Extending past capacity does not fit: NeedsRestart, reservation intact.
         let over = j.max_credits();
-        assert!(journal_extend(&mut h, over).is_err());
+        assert_eq!(
+            journal_extend(&mut h, over).unwrap(),
+            ExtendOutcome::NeedsRestart
+        );
         assert_eq!(h.credits(), 7);
 
         journal_stop(h).unwrap();
@@ -1361,11 +1543,122 @@ mod tests {
             );
         }
         // needed = 0 captures + 2 revoke blocks + 30 held + 28 extra = 60: fits.
-        journal_extend(&mut h, 28).unwrap();
+        assert_eq!(journal_extend(&mut h, 28).unwrap(), ExtendOutcome::Granted);
         // One more credit tips it to 61 > 60 — refused ONLY because of the
         // revoke charge (0 + 58 + 1 = 59 would fit without it).
-        let err = journal_extend(&mut h, 1).unwrap_err();
+        assert_eq!(
+            journal_extend(&mut h, 1).unwrap(),
+            ExtendOutcome::NeedsRestart
+        );
+        journal_stop(h).unwrap();
+    }
+
+    /// P7d-1 advisory→enforced: a FRESH capture spends exactly one reserved
+    /// credit, at ONE point, so the shared footprint counts a captured block
+    /// once (captured + still-unspent reservation), never twice — and an
+    /// idempotent re-capture spends nothing. Running dry grows the reservation
+    /// in place (`journal_extend`) rather than silently over-running, so the
+    /// footprint stays a safe upper bound (`reserved ≥ captured`) throughout.
+    #[ktest]
+    fn fresh_capture_spends_one_reserved_credit() {
+        let j = journaled_fixture(64, 1, 1); // max_credits = 60
+        let h = journal_start(&j, 4).unwrap();
+
+        // Nothing captured yet: the footprint IS the reservation.
+        {
+            let st = j.state_write();
+            let r = st.running.as_ref().unwrap();
+            assert_eq!(r.outstanding_credits, 4);
+            assert_eq!(r.nr_metadata_blocks(), 0);
+            assert_eq!(r.reserved_metadata_blocks(0), 4);
+        }
+
+        // Three distinct fresh captures through the enforced funnel.
+        for bid in 100..103u64 {
+            super::super::get_create_access(Some(&h), bid)
+                .unwrap()
+                .patch(|_| {})
+                .unwrap();
+        }
+        {
+            let st = j.state_write();
+            let r = st.running.as_ref().unwrap();
+            // Each fresh capture moved ONE credit from the reservation into the
+            // captured count: 3 captured, 1 unspent, footprint still 4 — NOT the
+            // 3 + 4 = 7 the advisory (double-counting) accounting produced.
+            assert_eq!(r.nr_metadata_blocks(), 3);
+            assert_eq!(r.outstanding_credits, 1);
+            assert_eq!(r.reserved_metadata_blocks(0), 4);
+        }
+
+        // Re-capturing block 100 is idempotent: no extra credit spent.
+        super::super::get_create_access(Some(&h), 100)
+            .unwrap()
+            .patch(|_| {})
+            .unwrap();
+        {
+            let st = j.state_write();
+            let r = st.running.as_ref().unwrap();
+            assert_eq!(r.nr_metadata_blocks(), 3);
+            assert_eq!(r.outstanding_credits, 1);
+        }
+
+        // A run of fresh captures exhausts the 4-credit reservation; the funnel
+        // grows it in place instead of over-running.
+        assert_eq!(h.credits(), 4);
+        for bid in 200..205u64 {
+            super::super::get_create_access(Some(&h), bid)
+                .unwrap()
+                .patch(|_| {})
+                .unwrap();
+        }
+        {
+            let st = j.state_write();
+            let r = st.running.as_ref().unwrap();
+            assert_eq!(r.nr_metadata_blocks(), 8);
+            // The safe-upper-bound invariant: the reservation still covers every
+            // captured block.
+            assert!(r.reserved_metadata_blocks(0) >= r.nr_metadata_blocks());
+        }
+        assert!(
+            h.credits() >= 8,
+            "reservation grew past the initial 4 to cover 8 captures, got {}",
+            h.credits()
+        );
+
+        journal_stop(h).unwrap();
+    }
+
+    /// P7d-1 enforcement is LOUD: capturing more distinct metadata than a whole
+    /// transaction can hold (`max_credits`) fails `ENOSPC` at the capture — the
+    /// `ExtendOutcome::NeedsRestart` seam d2 will turn into a real restart —
+    /// rather than silently building a transaction that cannot commit.
+    #[ktest]
+    fn over_capacity_capture_fails_loud() {
+        let j = journaled_fixture(64, 1, 1); // max_credits = 60
+        let h = journal_start(&j, 4).unwrap();
+
+        // Capture past capacity: the extend keeps granting up to max_credits,
+        // then the next fresh capture cannot fit even one more block.
+        let mut failure = None;
+        for bid in 1_000..1_080u64 {
+            match super::super::get_create_access(Some(&h), bid) {
+                Ok(access) => access.patch(|_| {}).unwrap(),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        let err = failure.expect("capturing past journal capacity must fail, not silently succeed");
         assert_eq!(err.error(), Errno::ENOSPC);
+        {
+            // The transaction filled to exactly its capacity, no further.
+            let st = j.state_write();
+            let r = st.running.as_ref().unwrap();
+            assert_eq!(r.nr_metadata_blocks(), j.max_credits());
+        }
+
         journal_stop(h).unwrap();
     }
 

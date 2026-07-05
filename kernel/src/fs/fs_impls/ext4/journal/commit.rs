@@ -1195,7 +1195,7 @@ mod tests {
         use super::super::super::test_utils::make_empty_file_inode;
         crate::time::clocks::init_for_ktest();
 
-        // A 32-block log so the write's handle (WRITE_CREDITS) fits.
+        // A 32-block log so the write's handle (write_credits) fits.
         let f = journaled_fixture(32, 1, 1);
         let device = f.fixture.ext4.block_device();
 

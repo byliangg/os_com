@@ -2911,7 +2911,15 @@ pub(super) fn get_write_access<'h>(
                 .get(&blocknr)
                 .map(transaction::UncheckpointedImage::image_bytes)
         });
+    // Decide freshness BEFORE the capture — a first capture of this block spends
+    // one of the handle's reserved credits, an idempotent re-capture does not
+    // (jbd2 `b_modified`). Charge only after the capture succeeds, so a failed
+    // device read leaves the reservation untouched.
+    let fresh = !txn.is_captured(blocknr);
     let generation = txn.capture_write(blocknr, seed, device.as_ref())?;
+    if fresh {
+        transaction::charge_fresh_capture(&journal, txn, handle)?;
+    }
     Ok(WriteAccess {
         live: Some(LiveAccess {
             handle,
@@ -2934,7 +2942,14 @@ pub(super) fn get_create_access<'h>(
     };
     let journal = handle.journal()?;
     let mut state = journal.state_write();
-    let generation = active_for(&mut state, handle)?.capture_create(blocknr);
+    let txn = active_for(&mut state, handle)?;
+    // See `get_write_access`: a first (fresh) capture spends one reserved
+    // credit; a re-create of an already-captured block does not.
+    let fresh = !txn.is_captured(blocknr);
+    let generation = txn.capture_create(blocknr);
+    if fresh {
+        transaction::charge_fresh_capture(&journal, txn, handle)?;
+    }
     Ok(WriteAccess {
         live: Some(LiveAccess {
             handle,

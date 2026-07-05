@@ -181,7 +181,10 @@ impl ExtentManager {
     }
 
     /// Returns the extent-tree depth (0 = inline leaf, 1 = one index level).
-    #[cfg(ktest)]
+    ///
+    /// Used by the write/truncate/reclaim credit estimates
+    /// ([`Ext4::write_credits`](super::super::fs::Ext4)) to size the per-chunk
+    /// extent-tree reservation to the tree's live depth.
     pub(super) fn root_depth(&self) -> u16 {
         self.state.read().depth()
     }
