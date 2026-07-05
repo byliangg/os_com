@@ -1145,7 +1145,23 @@ impl Inode {
                 fs.journal().map(|j| j.max_credits()),
                 inner.extent_manager(),
             ) {
-                (Some(max), Ok(em)) => em.truncate_credit_estimate(new_size)? > max,
+                (Some(max), Ok(em)) => {
+                    let plan = em.plan_shrink(new_size, max)?;
+                    let chunked = plan.whole_estimate > max;
+                    // A genuinely un-splittable shrink (the chunked route's EFBIG
+                    // floor) is rejected HERE, before `shrink_restartable` runs
+                    // `prepare_shrink` (which lowers `i_size` and re-zeros the
+                    // partial block) or `orphan_add`, so the in-memory inode is
+                    // left exactly as it was — the honest "nothing changed"
+                    // contract, symmetric to the write path's EFBIG.
+                    if chunked && plan.floor_efbig {
+                        return_errno_with_message!(
+                            Errno::EFBIG,
+                            "the extent tree cannot be shrunk within one journal transaction"
+                        );
+                    }
+                    chunked
+                }
                 _ => false,
             }
         } else {
@@ -3055,8 +3071,9 @@ mod write_tests {
             inner
                 .extent_manager()
                 .unwrap()
-                .truncate_credit_estimate(keep * BLOCK_SIZE)
+                .plan_shrink(keep * BLOCK_SIZE, journal.max_credits())
                 .unwrap()
+                .whole_estimate
         };
         assert!(
             est > journal.max_credits(),
@@ -3108,6 +3125,75 @@ mod write_tests {
         assert_eq!(inode.sector_count(), keep as u64 * SECTORS_PER_BLOCK);
     }
 
+    /// P7d-2cd (BLOCKING 1) — an INTERMEDIATE truncate chunk must serialize a
+    /// SORTED on-disk extent tree. `truncate_chunk` builds the survivor `kept`
+    /// out of logical order (ascending prefix ++ descending un-freed doomed ++
+    /// straddler); a non-terminal chunk that does not sort it before serializing
+    /// stamps a valid `metadata_csum` over an out-of-order leaf with a
+    /// non-monotonic index key, so a crash between chunks replays a tree e2fsck
+    /// reports dirty. The final state self-heals (the next chunk re-flattens and
+    /// sorts), so the multi-restart tests miss it — this drives exactly ONE
+    /// credit-bounded chunk, commits it (the crash boundary), and inspects the
+    /// committed tree: every logical block the survivor still references must
+    /// map. An unsorted survivor makes `search_entries` break early and report a
+    /// covered block as a false hole.
+    #[ktest]
+    fn intermediate_truncate_chunk_serializes_sorted_ondisk_tree() {
+        let f = journaled_multigroup_fixture(16);
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A 120-block file fragmented one extent per group → a multi-leaf tree
+        // whose whole free overruns one transaction, so a single credit-bounded
+        // chunk stops mid-truncate leaving un-freed doomed extents in the
+        // survivor (the only place the out-of-order-survivor bug can show).
+        const N_BLOCKS: usize = 120;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k * 31 + 7) as u8)
+            .collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        let keep_blocks = 5u32;
+        let max = journal.max_credits();
+
+        // Drive exactly ONE chunk of a truncate to `keep_blocks`, as the spine's
+        // first iteration does, then STOP before the outer loop restarts and its
+        // next chunk re-flattens+re-sorts (which self-heals a bad intermediate).
+        let em = inode.inner.read().extent_manager().unwrap().clone();
+        let reached = {
+            let op = f
+                .ext4
+                .begin_op(f.ext4.truncate_credits(em.root_depth()))
+                .unwrap();
+            let chunk = em
+                .truncate_chunk(keep_blocks as usize * BLOCK_SIZE, op.get(), max)
+                .unwrap();
+            chunk.reached
+        };
+        // Commit this chunk to the log — the exact crash boundary between chunks,
+        // so the read below sees what a replay would reconstruct.
+        journal.commit_and_wait_running().unwrap();
+
+        // The chunk stopped SHORT of `keep_blocks`: a genuine intermediate (a
+        // terminal chunk's survivor `[0, keep_blocks)` is already sorted).
+        assert!(
+            reached > keep_blocks,
+            "the chunk must stop mid-truncate to exercise an intermediate tree: reached={reached}"
+        );
+
+        // The file was written contiguously, so the survivor `[0, reached)` is a
+        // contiguous mapped prefix: every logical block in it MUST map. A false
+        // hole here is the unsorted-survivor corruption (a non-monotonic tree
+        // makes `search_entries` break early past a covered block).
+        for lb in 0..reached {
+            assert_ne!(
+                em.map_blocks(lb).unwrap().state(),
+                MapState::Hole,
+                "intermediate chunk left covered logical block {lb} a false hole (unsorted survivor)"
+            );
+        }
+    }
+
     /// P7 §E (G-3) — the single-transaction fast path. A small shrink whose whole
     /// truncate fits one transaction takes the atomic path: NO orphan_add/del, NO
     /// restart, byte-identical to before P7. The regression guard for the common
@@ -3128,8 +3214,9 @@ mod write_tests {
             inner
                 .extent_manager()
                 .unwrap()
-                .truncate_credit_estimate(target)
+                .plan_shrink(target, journal.max_credits())
                 .unwrap()
+                .whole_estimate
         };
         assert!(
             est <= journal.max_credits(),

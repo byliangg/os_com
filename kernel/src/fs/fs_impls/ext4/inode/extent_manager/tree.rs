@@ -415,6 +415,19 @@ impl ExtentTree {
         // The honest EFBIG floor (decision G-1, symmetric to the write path): if
         // one free plus the survivor reserialize cannot fit a whole transaction,
         // no restart ever can. Only a real free obligation trips it.
+        //
+        // `reserialize_headroom` is sized to `extents.len()` — the CURRENT tree,
+        // which is the survivor from the previous chunk (the whole tree only on
+        // the first chunk), so the floor shrinks per chunk and a delete frees
+        // down as far as the tree can be split. `free_cost + reserialize_headroom`
+        // is exactly the forward-progress boundary: `next_bound` (line ~516)
+        // reserves the same sum, and dropping the `free_cost` term would admit a
+        // chunk whose free-plus-reserialize overruns `max` and stalls at zero
+        // progress. The residual gap versus the write floor (write needs only
+        // `reserialize + INODE_DESC ≤ max`, truncate additionally `+ free_cost`)
+        // means a maximally fragmented file written at the write boundary can be
+        // a genuine, un-splittable EFBIG on delete — documented as the P9
+        // in-place-surgery debt, symmetric to the write path's.
         let has_work = !doomed.is_empty() || straddler.is_some();
         if let Some(max) = max_credits
             && has_work
@@ -481,6 +494,19 @@ impl ExtentTree {
             }
         }
 
+        // `kept` was assembled out of logical order: the fixed prefix ascends,
+        // the un-freed doomed tail was appended in the DESCENDING order `doomed`
+        // was freed in (high→low), and the straddler was appended last though its
+        // block is below `keep_blocks`. [`reserialize`] and [`search_entries`]
+        // require ASCENDING logical order — the index key of each leaf/interior
+        // node is `chunk[0].block()` and node scans break early past the first
+        // entry above the target. Serializing `kept` unsorted at a non-terminal
+        // chunk would stamp a valid metadata_csum over an out-of-order tree with
+        // a non-monotonic index key; a crash between chunks then replays a tree
+        // e2fsck reports dirty (our own remount self-heals by re-flattening, so
+        // only the on-disk intermediate is wrong). Sort before serializing.
+        kept.sort_by_key(|e| e.block());
+
         // The frontier: the highest logical block the survivor still references
         // (`keep_blocks` when the truncate completed, higher when a stop cut it
         // short). Zero when nothing survives (a truncate to zero).
@@ -490,6 +516,9 @@ impl ExtentTree {
             .max()
             .unwrap_or(0);
 
+        // The survivor is now sorted, so every entry `kept[i].block()` is
+        // strictly ascending — the invariant reserialize/search_entries rely on.
+        debug_assert!(kept.windows(2).all(|w| w[0].block() < w[1].block()));
         let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
         // The external-leaf count changes by exactly the mutation's delta.
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;

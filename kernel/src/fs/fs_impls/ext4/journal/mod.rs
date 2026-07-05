@@ -1576,6 +1576,15 @@ impl Journal {
         tags * usable.saturating_sub(2) / (tags + 1)
     }
 
+    /// Revoke-record entries that fit one whole revoke log block, from this
+    /// journal's tag geometry ([`TagLayout::revoke_entries_per_block`]). Exposed
+    /// so the truncate fast/slow gate (`Ext4::whole_truncate_credit_bound`) can
+    /// size its revoke-block upper bound; `TagLayout` itself stays
+    /// journal-internal.
+    pub(super) fn revoke_entries_per_block(&self) -> usize {
+        self.geometry.tag_layout().revoke_entries_per_block()
+    }
+
     /// Acquires the running-transaction state for writing.
     ///
     /// The transaction lifecycle operations ([`journal_start`](transaction::journal_start)

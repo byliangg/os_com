@@ -518,13 +518,26 @@ impl ExtentManager {
         )
     }
 
-    /// Conservative upper bound on the journal credits a WHOLE (single-
-    /// transaction) truncate to `new_size` would capture — the `Inode::resize`
-    /// fast/slow gate. Flattens once for the current tree's external-node count
-    /// (an upper bound on the survivor's) and the count of doomed extents (each
-    /// a distinct group's bitmap/GDT at worst); see
-    /// [`Ext4::whole_truncate_credit_bound`](super::super::fs::Ext4).
-    pub(super) fn truncate_credit_estimate(&self, new_size: usize) -> Result<usize> {
+    /// One flatten that routes a shrink to `new_size`: the whole-truncate credit
+    /// estimate (the fast/slow gate) AND the chunked-spine EFBIG floor, so the
+    /// caller can reject a genuinely un-splittable shrink BEFORE it mutates the
+    /// inode. Reuses one tree flatten for both — the gate estimate and the floor
+    /// are two reads of the same extent list.
+    ///
+    /// `floor_efbig` mirrors [`ExtentTree::truncate_chunk`]'s internal floor
+    /// exactly (`free_cost + reserialize_headroom > max`, on the CURRENT tree —
+    /// the survivor per chunk). Checking it here, before `prepare_shrink` lowers
+    /// `i_size` and before `orphan_add`, is what lets a genuine EFBIG leave the
+    /// in-memory inode unchanged (the "nothing changed" contract). It is only
+    /// meaningful on the chunked route: when the whole truncate fits one
+    /// transaction (`whole_estimate <= max`) there is no per-chunk floor.
+    ///
+    /// This flatten is separate from the one the first `truncate_chunk` /
+    /// `truncate_to_byte_len` runs — a shrink flattens twice (this gate plus the
+    /// first chunk). Folding the gate flatten into the first chunk (threading the
+    /// flattened extents down) is a P9 perf refinement, not correctness; a
+    /// flatten is a read-only tree walk.
+    pub(super) fn plan_shrink(&self, new_size: usize, max_credits: usize) -> Result<ShrinkPlan> {
         let fs = self.fs()?;
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
         let tree = self.state.read();
@@ -534,8 +547,34 @@ impl ExtentManager {
             .iter()
             .filter(|e| e.block() + e.len() as Iblock > keep_blocks)
             .count();
-        Ok(fs.whole_truncate_credit_bound(external, freed_extents))
+        let revoke_per_block = fs
+            .journal()
+            .map(|j| j.revoke_entries_per_block())
+            .unwrap_or(1);
+        let whole_estimate =
+            fs.whole_truncate_credit_bound(external, freed_extents, revoke_per_block);
+        // `freed_extents > 0` is the floor's `has_work` (a doomed extent or the
+        // straddler both extend past `keep_blocks`): a shrink freeing nothing
+        // (e.g. rounding within the last block) can never trip EFBIG.
+        let floor_efbig = freed_extents > 0
+            && fs.extent_free_credits() + fs.truncate_chunk_credits(external) > max_credits;
+        Ok(ShrinkPlan {
+            whole_estimate,
+            floor_efbig,
+        })
     }
+}
+
+/// The routing verdict for one shrink, from a single tree flatten
+/// ([`ExtentManager::plan_shrink`]).
+pub(super) struct ShrinkPlan {
+    /// Whole-truncate single-transaction credit upper bound — `> max_credits`
+    /// routes to the chunked, orphan-protected spine, else the atomic fast path.
+    pub(super) whole_estimate: usize,
+    /// The chunked spine's per-chunk EFBIG floor is unfittable on the current
+    /// tree: not even one free plus the survivor reserialize fits a transaction.
+    /// Meaningful only when `whole_estimate > max_credits` (the chunked route).
+    pub(super) floor_efbig: bool,
 }
 
 /// The outcome of one [`ExtentManager::truncate_chunk`]: the frontier the tree

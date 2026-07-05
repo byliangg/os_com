@@ -591,14 +591,34 @@ impl Ext4 {
     /// [`reserialize_credits`](Self::reserialize_credits)). At or below
     /// `max_credits` the atomic single-transaction path runs (no orphan, no
     /// restart); above it the chunked orphan-protected spine takes over.
+    ///
+    /// `revoke_entries_per_block` sizes the journal REVOKE-block term: the whole
+    /// truncate forgets (revokes) every freed extent-tree metadata block
+    /// (`free_meta_block`), so the single transaction the fast path uses writes
+    /// `ceil(external_nodes / revoke_entries_per_block)` revoke blocks on top of
+    /// its metadata footprint. The capacity gate that backs this estimate is
+    /// `reserved_metadata_blocks + revoke_blocks > max_credits`
+    /// ([`charge_fresh_capture`](super::journal)); omitting the revoke term let
+    /// the estimate under-count and route a truncate whose single transaction
+    /// actually overruns into the fast path, tripping a late `ENOSPC` instead of
+    /// the chunked spine. `external_nodes` upper-bounds the freed metadata blocks
+    /// (a truncate to zero frees them all); this gate serves regular files only
+    /// (directories are rejected `EISDIR` before it), whose DATA blocks carry no
+    /// forget duty, so no data-block revokes enter the bound.
     pub(super) fn whole_truncate_credit_bound(
         &self,
         external_nodes: usize,
         freed_extents: usize,
+        revoke_entries_per_block: usize,
     ) -> usize {
         let bitmaps = freed_extents.min(self.nr_groups());
         let gdt = freed_extents.min(self.nr_gdt_blocks());
-        self.reserialize_credits(external_nodes) + bitmaps + gdt + Self::INODE_DESC_CREDITS
+        let revoke_blocks = external_nodes.div_ceil(revoke_entries_per_block.max(1));
+        self.reserialize_credits(external_nodes)
+            + bitmaps
+            + gdt
+            + revoke_blocks
+            + Self::INODE_DESC_CREDITS
     }
 
     /// Credits to reclaim (free) a deleted inode (Linux `ext4_evict_inode` →
@@ -1291,6 +1311,14 @@ impl Ext4 {
         for &ino in &scan.to_free {
             suspect |= !self.reclaim_scanned_orphan(ino);
         }
+        // Each re-truncate pins its finished live inode in the cache
+        // (`retruncate_scanned_orphan`), so post-mount `read_inode` returns the
+        // truncated state rather than a stale device read. On-disk durability
+        // needs no extra checkpoint here: this session holds `INCOMPAT_RECOVER`,
+        // so a re-crash replays these committed transactions to the final inode
+        // table, and a clean unmount checkpoints them in `Ext4::drop` — the
+        // uncheckpointed window is never observed through a cache miss (the pin)
+        // nor through a bypass that outlives the mount (replay / checkpoint).
         for &ino in &scan.to_retruncate {
             suspect |= !self.retruncate_scanned_orphan(ino);
         }
@@ -1410,7 +1438,23 @@ impl Ext4 {
                 // frees nothing already freed — idempotent across a re-crash.
                 let target = inode.size();
                 match inode.retruncate_to(target) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        // Pin the re-truncated LIVE inode in its block group's
+                        // cache, exactly as every create path does. The
+                        // re-truncate committed to the journal but is not yet
+                        // checkpointed to the inode table; `read_inode` on a cache
+                        // MISS falls through to `read_inode_desc`, a DIRECT device
+                        // read that bypasses the uncheckpointed journal image and
+                        // would return the STALE pre-truncate tree — resurrecting
+                        // freed (now reallocatable) blocks. The strong `Arc` the
+                        // cache holds is the invariant that keeps a
+                        // committed-but-uncheckpointed live inode from a stale
+                        // device read; recovery must honor it too. (The delete
+                        // twin needs no such pin: a freed inode reads link_count 0
+                        // and `read_inode_desc` rejects it as ESTALE.)
+                        self.insert_inode(inode);
+                        true
+                    }
                     Err(e) => {
                         warn!("orphan cleanup could not re-truncate inode {ino}: {e:?}");
                         false
@@ -3612,9 +3656,6 @@ mod tests {
 
         // Re-truncated, not freed: the inode is live, the list drained, and the
         // doomed tail's bitmap bits are cleared while the kept prefix survives.
-        // These read the fresh in-memory bitmap / superblock (the inode-table is
-        // a direct device read that lags the uncheckpointed journal, so the
-        // persisted inode is asserted after the unmount checkpoint below).
         assert!(
             ext4.is_inode_allocated(ino),
             "the live inode must not be freed"
@@ -3627,25 +3668,38 @@ mod tests {
             assert!(!block_allocated(&ext4, b), "tail block {b} must be freed");
         }
 
-        // Unmount checkpoints the re-truncate to the inode table, then re-mount
-        // and read the persisted inode: `i_size` unchanged, `i_blocks` and the
-        // extent tree reflecting only the kept `[0, keep)` prefix.
-        drop(ext4);
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        // A REAL post-mount opener reads the re-truncated inode through the
+        // normal `read_inode` path on THIS mount — no drop+remount crutch (which
+        // would only mask a stale device read behind an unmount checkpoint).
+        // Recovery pinned the finished live inode in the cache, so this returns
+        // the truncated state: `i_size` unchanged, `i_blocks` and the extent tree
+        // reflecting only the kept `[0, keep)` prefix. Against the pre-fix,
+        // uncached code this read misses the cache and `read_inode_desc`
+        // device-reads the STALE full tree — `sector_count` and the tail mappings
+        // below then fail.
         let inode = ext4.read_inode(ino).unwrap();
         assert_eq!(inode.size(), target);
         assert_eq!(
             inode.sector_count(),
-            keep as u64 * (BLOCK_SIZE / SECTOR_SIZE) as u64,
+            keep as u64 * SECTORS_PER_BLOCK,
             "i_blocks reflects only the kept prefix"
         );
+        // The extent tree references only the kept blocks: logical `[0, keep)`
+        // map, the freed tail `[keep, full_len)` are now holes.
+        let keep_lb = u32::try_from(keep).unwrap();
+        for lb in 0..keep_lb {
+            assert!(
+                inode.data_block_of(lb).is_some(),
+                "kept logical block {lb} must still map"
+            );
+        }
+        for lb in keep_lb..u32::from(full_len) {
+            assert!(
+                inode.data_block_of(lb).is_none(),
+                "freed logical block {lb} must be a hole (stale full tree otherwise)"
+            );
+        }
         assert_eq!(ext4.super_block().last_orphan(), None, "stays drained");
-        for b in pblock..pblock + keep {
-            assert!(block_allocated(&ext4, b), "kept block {b} persists");
-        }
-        for b in pblock + keep..pblock + full_len as Ext4Bid {
-            assert!(!block_allocated(&ext4, b), "tail block {b} stays freed");
-        }
         drop(ext4);
     }
 
