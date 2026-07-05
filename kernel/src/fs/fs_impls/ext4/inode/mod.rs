@@ -866,6 +866,24 @@ impl Inode {
         Self::new(ino, type_, Dirty::new(desc), block_group_idx, fs)
     }
 
+    /// Builds a live inode (link count > 0) for a crash-recovery *re-truncate*
+    /// from its raw on-disk inode — a truncate interrupted mid-flight, whose
+    /// deletion was never intended. Unlike [`from_raw_for_recovery`](Self::from_raw_for_recovery)
+    /// it keeps the true (nonzero) link count, so `Drop` never reclaims it; the
+    /// caller drives [`retruncate_to`](Self::retruncate_to) to finish freeing the
+    /// tail and unlist. The on-disk `i_dtime` holds the orphan-chain successor
+    /// (decoded here as a bogus timestamp); `retruncate_to` resets it to live.
+    pub(super) fn from_raw_live(
+        ino: Ext4Ino,
+        raw: &RawInode,
+        block_group_idx: usize,
+        fs: Weak<Ext4>,
+    ) -> Result<Arc<Self>> {
+        let desc = InodeDesc::try_from(raw)?;
+        let type_ = desc.type_();
+        Self::new(ino, type_, Dirty::new(desc), block_group_idx, fs)
+    }
+
     pub(super) fn ino(&self) -> Ext4Ino {
         self.ino
     }
@@ -1111,27 +1129,45 @@ impl Inode {
         }
         let fs = self.fs()?;
         let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+
+        // Fast/slow gate (DECISION §E, G-3): a shrink whose worst-case
+        // whole-truncate estimate overruns one journal transaction takes the
+        // chunked, orphan-protected spine — a crash mid-truncate then leaves the
+        // inode on the orphan list with `i_size = new_size`, and recovery
+        // re-truncates to that size. The gate never predicts single-txn for a
+        // genuinely multi-txn truncate (it upper-bounds the free), so the fast
+        // path is correctness-equivalent to Linux's always-orphan while adding
+        // NO orphan_add/del and NO restart to the common case (grow, no-op, and
+        // a bounded shrink).
+        let chunked = if new_size < old_size {
+            match (
+                fs.journal().map(|j| j.max_credits()),
+                inner.extent_manager(),
+            ) {
+                (Some(max), Ok(em)) => em.truncate_credit_estimate(new_size)? > max,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        if chunked {
+            return self.shrink_restartable(&fs, &mut inner, old_size, new_size);
+        }
+
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images a shrink frees.
         // Per-chunk estimate at the file's live extent depth; a shrink freeing
-        // across many groups grows via journal_extend (see `Ext4::truncate_credits`).
+        // across a few groups grows in place via `charge_fresh_capture` (the
+        // gate proved the whole truncate fits one transaction).
         let depth = inner
             .extent_manager()
             .map(|em| em.root_depth())
             .unwrap_or(0);
         let mut op = fs.begin_op(fs.truncate_credits(depth))?;
-        // Truncate-orphan protection is deliberately absent (owner: P7
-        // `journal_restart`). It must NOT reuse the delete path's fs-level
-        // `orphan_add`/`orphan_del`: a truncated inode stays live (link count
-        // > 0) while the mount-time orphan scan *frees* everything on the list
-        // — recovery must *re-truncate* instead, a distinct mode. Under
-        // commit-per-op a whole truncate is one transaction — atomic across a
-        // crash — so nothing is needed yet; P7's multi-transaction truncate
-        // brings the fs-level re-truncate orphan machinery with it.
-        let old_size = inner.file_size();
-        // `get_mut`: the unbounded truncate spine holds the handle by `&mut` for
-        // a future commit-boundary `journal_restart` (P7d-2b); the descriptor
-        // capture below reverts to the shared `get`.
+        // `get_mut`: the resize spine holds the handle by `&mut` so the
+        // single-transaction shrink can grow its reservation in place; the
+        // descriptor capture below reverts to the shared `get`.
         inner.resize(&fs, new_size, op.get_mut())?;
         // Same per-handle descriptor capture as `write_at`: the new size and
         // truncated extent root must commit with the bitmap/GDT changes.
@@ -1153,6 +1189,150 @@ impl Inode {
                 pages.clone(),
                 inner.file_size(),
             )?;
+        }
+        Ok(())
+    }
+
+    /// The chunked, orphan-protected shrink spine — the multi-transaction
+    /// truncate (DECISION §A/§C). Up front, ONCE: flush the doomed tail pages,
+    /// zero+shrink the page cache, and publish `i_size = new_size` (the KEY
+    /// INSIGHT — the target IS `i_size`, published now and never advanced, so
+    /// recovery reads it and re-truncates to it). Then, in the first
+    /// transaction, link the inode onto the orphan list and persist that size;
+    /// loop freeing tail extents one credit-bounded chunk per transaction (a
+    /// `journal_restart` at each boundary, ③ released) until the tree references
+    /// only `[0, keep_blocks)`; in the LAST chunk unlink from the orphan list.
+    ///
+    /// Crash safety (report §5.1-5.2, DECISION §F): each chunk commits `i_size =
+    /// new_size`, a tree referencing `[0, reached)`, bitmaps freed for `[reached,
+    /// old)`, and matching `i_blocks` — atomically, with the inode listed. A
+    /// crash after chunk k leaves exactly that; recovery re-truncates to the
+    /// persisted `i_size` and unlists. No leak (freed ⟺ dropped-from-tree, one
+    /// txn), no double-free (a re-truncate frees only `[keep_blocks, reached)`,
+    /// the already-freed extents gone from the tree), idempotent recovery (a
+    /// crash mid-recovery re-scans the shorter frontier and resumes).
+    fn shrink_restartable(
+        &self,
+        fs: &Ext4,
+        inner: &mut InodeInner,
+        old_size: usize,
+        new_size: usize,
+    ) -> Result<()> {
+        // Up front, ONCE (never re-run across restarts).
+        inner.prepare_shrink(new_size, old_size)?;
+
+        let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
+        let em = inner.extent_manager()?.clone();
+
+        // First transaction: link onto the orphan list and persist `i_size =
+        // new_size`, its on-disk `i_dtime` stamped to the chain successor by the
+        // existing override in `write_back_inode_desc` (the inode stays live —
+        // link count untouched — and that override is link-count-agnostic).
+        // DECISION G-2: do NOT `persist_as_orphan` — its pointer written into the
+        // cached descriptor's `i_dtime` would go stale after `orphan_del`; the
+        // descriptor's `dtime` stays live (0), the chain override supplies the
+        // on-disk successor while listed.
+        let mut op = fs.begin_op(fs.truncate_credits(em.root_depth()))?;
+        // The `#[must_use]` link is deliberately dropped, not fed to
+        // `persist_as_orphan` (see G-2 above): the chain override already
+        // stamps `i_dtime` on every writeback while the inode is listed.
+        let _orphan_link = fs.orphan_add(self.ino, op.get())?;
+        inner.write_back_inode_desc(fs, self.ino, op.get())?;
+        // data=ordered: the kept partial block's re-zeroing (in `prepare_shrink`)
+        // must reach disk before this first transaction — which already
+        // publishes `i_size = new_size` — commits, or a later sparse extend over
+        // the tail could expose pre-truncate bytes after a replay. Registered
+        // once, in the first transaction; later chunks free blocks only.
+        if let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
+        {
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
+        }
+
+        loop {
+            // The per-transaction ceiling — the honest EFBIG floor inside
+            // `truncate_chunk`. Present on the journaled volume this path
+            // requires (the fast/slow gate only routes here with a journal).
+            let Some(max) = fs.journal().map(|j| j.max_credits()) else {
+                em.truncate_to_byte_len(new_size, op.get())?;
+                fs.orphan_del(self.ino, op.get())?;
+                inner.write_back_inode_desc(fs, self.ino, op.get())?;
+                break;
+            };
+            let chunk = em.truncate_chunk(new_size, op.get(), max)?;
+            if chunk.reached <= keep_blocks {
+                // Last chunk: unlink from the orphan list BEFORE the final
+                // writeback, so that writeback (dirtied by this chunk's
+                // reserialize) sees the inode off the chain and persists
+                // `i_dtime = 0` — a live truncated file's deletion time. The
+                // cached descriptor's `dtime` was never repointed (G-2), so it
+                // is still live.
+                fs.orphan_del(self.ino, op.get())?;
+                inner.write_back_inode_desc(fs, self.ino, op.get())?;
+                debug_assert!(inner.desc_dtime_is_live());
+                break;
+            }
+            // Not done: persist this chunk's frontier + `i_blocks` (SAME txn as
+            // its frees + reserialize), then restart onto a fresh transaction —
+            // `truncate_chunk` has returned, so the ExtentTree lock ③ is dropped
+            // (iron law 1: the restart's re-admission may wait, legal only under
+            // the inode lock alone).
+            inner.write_back_inode_desc(fs, self.ino, op.get())?;
+            if let Some(handle) = op.get_mut() {
+                journal::journal_restart(handle, chunk.next_bound)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes a crash-interrupted truncate on a LIVE (link-count > 0) orphan
+    /// found at mount time: re-truncates the extent tree to the persisted
+    /// `i_size` (`target`) — the original truncate published that size and never
+    /// advanced it, so the survivor frontier is exactly where to resume — then
+    /// unlinks from the orphan list (DECISION §D). Reuses the chunked spine; the
+    /// inode is ALREADY listed (the in-memory chain was primed by
+    /// `recover_orphan_list`), so it never re-adds. Purely an extent-tree
+    /// operation — the page cache is untouched (the partial-block zeroing already
+    /// reached disk in the crashed truncate's first, committed transaction).
+    pub(super) fn retruncate_to(&self, target: usize) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        // A live inode's `i_dtime` is 0; the crashed truncate left the on-disk
+        // field holding the chain successor, which `InodeDesc::try_from` decoded
+        // as a bogus timestamp. Reset it now: while listed the chain override
+        // re-stamps the successor on each writeback, and the final writeback
+        // (after `orphan_del`) persists this live 0.
+        inner.set_dtime(Duration::ZERO);
+
+        let keep_blocks = target.div_ceil(BLOCK_SIZE) as Iblock;
+        let em = inner.extent_manager()?.clone();
+        let mut op = fs.begin_op(fs.truncate_credits(em.root_depth()))?;
+        loop {
+            let Some(max) = fs.journal().map(|j| j.max_credits()) else {
+                em.truncate_to_byte_len(target, op.get())?;
+                fs.orphan_del(self.ino, op.get())?;
+                inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+                break;
+            };
+            let chunk = em.truncate_chunk(target, op.get(), max)?;
+            if chunk.reached <= keep_blocks {
+                // Unlink BEFORE the writeback so it (dirtied by this chunk's
+                // reserialize) persists the live `i_dtime = 0` rather than the
+                // stale successor pointer the crash left on disk.
+                fs.orphan_del(self.ino, op.get())?;
+                inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+                debug_assert!(inner.desc_dtime_is_live());
+                break;
+            }
+            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            if let Some(handle) = op.get_mut() {
+                journal::journal_restart(handle, chunk.next_bound)?;
+            }
         }
         Ok(())
     }
@@ -1253,15 +1433,19 @@ impl Inode {
         mapping.mapped_pblock()
     }
 
-    /// Reclaims a fully unlinked inode: frees its data blocks and inode bit.
+    /// Reclaims a fully unlinked inode: frees its data blocks and inode bit,
+    /// chunked and restartable so a large file's reclaim never overruns one
+    /// transaction (DECISION §D).
     ///
     /// Runs from `Drop` when the last `Arc<Inode>` is released. A no-op (returns
     /// `Ok(false)`) unless the inode's link count is 0 *and* its bitmap bit is
     /// still allocated — the latter guards against double-freeing an inode an
-    /// earlier reclaim already released. On reclaim it stamps `i_dtime`, drops
-    /// the data (page cache + extent-mapped blocks, only for data-backed
-    /// inodes — a fast symlink has no data block), persists the descriptor, and
-    /// frees the inode. Mirrors ext2 `try_reclaim_deleted_inode`, minus the
+    /// earlier reclaim already released. It keeps the inode on the orphan list
+    /// across the whole multi-transaction free and splices it off + frees the
+    /// inode bit in the LAST chunk's transaction, so a crash mid-free re-scans
+    /// (the inode still listed and allocated) and resumes, and a crash after
+    /// leaves it fully freed and off the chain. Mirrors ext2
+    /// `try_reclaim_deleted_inode` (plus ext4's orphan splice), minus the
     /// xattr-block deletion (ext4 has no xattr support yet; `file_acl` is unused).
     pub(super) fn try_reclaim_deleted_inode(&self) -> Result<bool> {
         if self.link_count() != 0 {
@@ -1278,22 +1462,19 @@ impl Inode {
         // block-bitmap / group-descriptor / inode-bitmap after-images freeing the
         // inode's blocks and the inode itself dirty. Per-chunk estimate at the
         // file's live extent depth; freeing a large file's blocks across many
-        // groups grows via journal_extend (see `Ext4::reclaim_credits`).
+        // groups chunks across transactions (see `Ext4::reclaim_credits`).
         let depth = inner
             .extent_manager()
             .map(|em| em.root_depth())
             .unwrap_or(0);
-        let op = fs.begin_op(fs.reclaim_credits(depth))?;
+        let mut op = fs.begin_op(fs.reclaim_credits(depth))?;
 
-        // Unlink this inode from the on-disk orphan list BEFORE stamping the
-        // real deletion time below — while on the list, `i_dtime` doubles as the
-        // orphan-next pointer, and this reclaim transaction must atomically both
-        // splice the chain and free the inode (crash before its commit leaves
-        // the inode chained and allocated, so recovery finishes the deletion;
-        // crash after leaves it fully freed and off the chain). The successor
-        // comes from the filesystem's in-memory chain; `orphan_del` of an inode
-        // that was never added (a non-journaled volume) is a no-op.
-        fs.orphan_del(self.ino, op.get())?;
+        // Keep the inode listed across the multi-transaction free (defensive):
+        // the normal delete and recovery paths already listed it (via `unlink`
+        // or the primed recovery chain), but the create-error path reaches Drop
+        // unlisted — a mid-free crash then could not resume. A no-op when
+        // already listed. Journal-only.
+        fs.orphan_add_if_absent(self.ino, op.get())?;
 
         let old_size = inner.file_size();
         // Only data-backed inodes (files, directories, slow symlinks) own a page
@@ -1304,19 +1485,50 @@ impl Inode {
         if extent_manager.is_some() {
             inner.resize_page_cache(0, old_size)?;
         }
+        // The real deletion time: while the inode stays listed the chain override
+        // in `write_back_inode_desc` re-stamps the on-disk `i_dtime` with the
+        // successor; only the final writeback (after `orphan_del` below) persists
+        // this deletion time.
         inner.set_dtime(super::utils::now());
         inner.set_file_size(0);
-        // Gate on the extent manager's live `sector_count`, not the descriptor's
-        // copy (which ext2 uses): the extent manager is the authority and the
-        // descriptor may be stale until writeback. This divergence from the ext2
-        // template is intentional — do not "fix" it back to `inner.desc`.
+
+        // Free the data blocks in credit-bounded chunks, each committed with its
+        // own tree reserialize + inode writeback (crash red-line: freed ⟺
+        // dropped-from-tree, one txn). Gate on the extent manager's live
+        // `sector_count`, not the descriptor's copy (which ext2 uses): the extent
+        // manager is the authority and the descriptor may be stale until
+        // writeback. This divergence from the ext2 template is intentional.
         if let Some(extent_manager) = extent_manager
             && extent_manager.sector_count() > 0
         {
-            extent_manager.truncate_to_byte_len(0, op.get())?;
+            loop {
+                let Some(max) = fs.journal().map(|j| j.max_credits()) else {
+                    extent_manager.truncate_to_byte_len(0, op.get())?;
+                    break;
+                };
+                let chunk = extent_manager.truncate_chunk(0, op.get(), max)?;
+                if chunk.reached == 0 {
+                    // The final chunk: its writeback is deferred past `orphan_del`
+                    // below so it persists the deletion time (unlisted), not the
+                    // successor pointer the chain override stamps while listed.
+                    break;
+                }
+                // Non-terminal: persist this chunk's frontier (SAME txn as its
+                // frees), then restart. While listed, the chain override stamps
+                // the on-disk `i_dtime` with the successor.
+                inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+                if let Some(handle) = op.get_mut() {
+                    journal::journal_restart(handle, chunk.next_bound)?;
+                }
+            }
         }
-        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
 
+        // Last chunk: splice off the orphan list and free the inode bit, both in
+        // this final transaction (with the deletion-time writeback, dirtied by
+        // the last chunk's reserialize / the `set_dtime` above), so the unlist +
+        // free are atomic against a crash.
+        fs.orphan_del(self.ino, op.get())?;
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         fs.free_inode(self.ino, self.type_, op.get())?;
         Ok(true)
     }
@@ -1746,9 +1958,9 @@ impl InodeInner {
             return Ok(());
         }
         if new_size < old_size {
-            // Hand the `&mut` handle to the shrink spine by move: this is the only
-            // sub-op that consumes it, so no reborrow is needed (a later
-            // `journal_restart` in `shrink` reaches it there).
+            // The single-transaction fast-path shrink; the multi-transaction
+            // spine (`Inode::shrink_restartable`) is a separate path selected by
+            // `Inode::resize`'s fast/slow gate.
             self.shrink(new_size, handle)?;
         } else {
             self.expand(fs, new_size)?;
@@ -1757,32 +1969,51 @@ impl InodeInner {
         Ok(())
     }
 
-    /// Shrinks the file: zeroes the kept partial last block in the page cache,
-    /// frees every data/metadata block past `new_size`, then publishes the size.
+    /// Shrinks the file in ONE transaction (the fast path): zeroes the kept
+    /// partial last block in the page cache, frees every data/metadata block
+    /// past `new_size`, and publishes the size. The chunked, orphan-protected
+    /// multi-transaction shrink lives in [`Inode::shrink_restartable`], reached
+    /// only when the whole truncate overruns one transaction.
     fn shrink(&mut self, new_size: usize, handle: Option<&mut journal::Handle>) -> Result<()> {
         let old_size = self.file_size();
-        // Ordered-data vs. truncate: discarding the doomed tail pages would
-        // orphan the flush obligation of an *earlier committing* transaction
-        // whose extents still reference them (its ordered flush only writes
-        // pages that are still dirty — a discarded page is silently gone, and
-        // replaying that transaction would then expose whatever the device
-        // holds). Flush the affected span to its final blocks first; rare and
-        // bounded (shrinks only), where Linux instead orders the truncate
-        // against the committing transaction (jbd2_journal_begin_ordered_truncate).
+        self.prepare_shrink(new_size, old_size)?;
+        self.extent_manager()?
+            .truncate_to_byte_len(new_size, handle.as_deref())?;
+        Ok(())
+    }
+
+    /// The up-front, once-per-truncate work shared by the fast [`shrink`](Self::shrink)
+    /// and the chunked [`Inode::shrink_restartable`]: flush the doomed tail
+    /// pages, zero + shrink the page cache, and publish `i_size = new_size`.
+    ///
+    /// Flush first (report §5.2, shrink): discarding the doomed tail pages would
+    /// orphan the flush obligation of an *earlier committing* transaction whose
+    /// extents still reference them (its ordered flush only writes pages still
+    /// dirty — a discarded page is silently gone, and replaying that transaction
+    /// would then expose whatever the device holds). Then zero + shrink the VMO
+    /// before the size drops (rule 4): `PageCache::resize` zeroes `[new_size,
+    /// block_end)` of the kept partial block when that block is mapped, so stale
+    /// tail bytes do not reappear on a later extend; a hole tail is left
+    /// untouched. Publishing `i_size = new_size` here is the chunked spine's KEY
+    /// INSIGHT — the target is committed once and never advanced, so recovery
+    /// reads it and re-truncates to it.
+    fn prepare_shrink(&mut self, new_size: usize, old_size: usize) -> Result<()> {
         if let Ok(page_cache) = self.page_cache() {
             let doomed_start = (new_size / BLOCK_SIZE) * BLOCK_SIZE;
             page_cache.flush_range(doomed_start..old_size)?;
         }
-        // Order (report §5.2 rule 4, shrink): zero + shrink the VMO before the
-        // size drops. `PageCache::resize` zeroes `[new_size, block_end)` of the
-        // kept partial block (BLOCK_SIZE == PAGE_SIZE) when that block is
-        // mapped, so stale tail bytes do not reappear if the file is later
-        // extended; a hole tail is left untouched by `resize_page_cache`.
         self.resize_page_cache(new_size, old_size)?;
-        self.extent_manager()?
-            .truncate_to_byte_len(new_size, handle.as_deref())?;
         self.set_file_size(new_size);
         Ok(())
+    }
+
+    /// Whether the cached descriptor's `i_dtime` still encodes a live inode
+    /// (on-disk 0). The chunked-truncate G-2 invariant: a truncate never repoints
+    /// the descriptor's `dtime` (it relies on the orphan chain override for the
+    /// on-disk successor while listed), so a truncated file's final writeback
+    /// persists `i_dtime = 0`.
+    fn desc_dtime_is_live(&self) -> bool {
+        self.desc.dtime.to_raw() == 0
     }
 
     /// Expands the file sparsely: grows the page cache and publishes the new
@@ -2793,6 +3024,141 @@ mod write_tests {
             inode.sector_count(),
             (N_BLOCKS as u64 + 1) * SECTORS_PER_BLOCK
         );
+    }
+
+    /// P7 §A/§C/§E — the multi-transaction truncate. A 120-block file fragmented
+    /// across ~11 groups (one distinct block bitmap per group) has a whole-free
+    /// that overruns one transaction, so the shrink takes the chunked,
+    /// orphan-protected spine: it lists the inode, frees the tail one
+    /// credit-bounded chunk per transaction (a real `journal_restart` at each
+    /// boundary), and unlists in the last chunk. The commit thread is live so the
+    /// restarts' re-admissions drain. Asserts a genuine truncate restart, a
+    /// drained orphan list, and a consistent tree / `i_blocks` / `i_size`.
+    #[ktest]
+    fn truncate_spans_multiple_transactions_and_restarts() {
+        let f = journaled_multigroup_fixture(16);
+        let journal = f.ext4.journal().unwrap();
+        assert_eq!(journal.max_credits(), 12);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const N_BLOCKS: usize = 120;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k * 31 + 7) as u8)
+            .collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        // The whole-truncate estimate overruns one transaction → the chunked
+        // orphan path (the write above already restarted, so measure the delta).
+        let keep = 5usize;
+        let est = {
+            let inner = inode.inner.read();
+            inner
+                .extent_manager()
+                .unwrap()
+                .truncate_credit_estimate(keep * BLOCK_SIZE)
+                .unwrap()
+        };
+        assert!(
+            est > journal.max_credits(),
+            "a many-group truncate must exceed one transaction: est={est} max={}",
+            journal.max_credits()
+        );
+
+        let restarts_before = journal.restart_count_for_test();
+        inode.resize(keep * BLOCK_SIZE).unwrap();
+
+        // A genuine mid-truncate restart occurred.
+        assert!(
+            journal.restart_count_for_test() > restarts_before,
+            "a many-group truncate must restart: {restarts_before} -> {}",
+            journal.restart_count_for_test()
+        );
+        // The orphan list drained: the last chunk unlisted the inode.
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            None,
+            "the truncate must drain the orphan list"
+        );
+
+        // Size, tree, and `i_blocks` are consistent, and the kept prefix reads
+        // back byte-exact.
+        assert_eq!(inode.size(), keep * BLOCK_SIZE);
+        assert_eq!(
+            read_back(&inode, 0, keep * BLOCK_SIZE),
+            payload[..keep * BLOCK_SIZE].to_vec()
+        );
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for i in 0..u32::try_from(keep).unwrap() {
+                assert_eq!(
+                    bm.map_blocks(i).unwrap().state(),
+                    MapState::Written,
+                    "kept block {i} must survive"
+                );
+            }
+            assert_eq!(
+                bm.map_blocks(u32::try_from(keep).unwrap()).unwrap().state(),
+                MapState::Hole,
+                "the freed tail must be a hole"
+            );
+        }
+        // The survivor `[0, 5)` collapses to an inline tree (no external leaf): 5
+        // data blocks, zero metadata.
+        assert_eq!(inode.sector_count(), keep as u64 * SECTORS_PER_BLOCK);
+    }
+
+    /// P7 §E (G-3) — the single-transaction fast path. A small shrink whose whole
+    /// truncate fits one transaction takes the atomic path: NO orphan_add/del, NO
+    /// restart, byte-identical to before P7. The regression guard for the common
+    /// case.
+    #[ktest]
+    fn single_txn_truncate_takes_no_orphan() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload: Vec<u8> = (0..4 * BLOCK_SIZE).map(|k| (k * 7 + 3) as u8).collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        let target = BLOCK_SIZE + 10;
+        // The gate routes this to the atomic fast path.
+        let est = {
+            let inner = inode.inner.read();
+            inner
+                .extent_manager()
+                .unwrap()
+                .truncate_credit_estimate(target)
+                .unwrap()
+        };
+        assert!(
+            est <= journal.max_credits(),
+            "a small truncate must fit one transaction: est={est} max={}",
+            journal.max_credits()
+        );
+
+        let restarts_before = journal.restart_count_for_test();
+        inode.resize(target).unwrap();
+
+        // Fast path: never listed on the orphan chain, never restarted.
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            None,
+            "the fast path must not touch the orphan list"
+        );
+        assert_eq!(
+            journal.restart_count_for_test(),
+            restarts_before,
+            "the fast path must not restart"
+        );
+
+        assert_eq!(inode.size(), target);
+        assert_eq!(
+            read_back(&inode, 0, BLOCK_SIZE + 10),
+            payload[..BLOCK_SIZE + 10].to_vec()
+        );
+        // Blocks 0 and 1 kept (1 is the partial last block).
+        assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
     }
 
     /// Serializes one depth-0 extent leaf node into a full block: a 12-byte

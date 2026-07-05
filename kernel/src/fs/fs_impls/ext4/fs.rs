@@ -549,6 +549,58 @@ impl Ext4 {
         self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
     }
 
+    /// Upper bound on the journal credits ONE doomed data extent's free
+    /// captures — its block bitmap and group descriptor, plus a revoke-record
+    /// slack for a forget-policy (directory / slow-symlink) extent. The shared
+    /// superblock is charged once by the chunk's reserialize headroom, not per
+    /// free; a short extent lies in one group, and the truncate spine's inner
+    /// probe backs this with `charge_fresh_capture`'s loud `ENOSPC` for the rare
+    /// multi-group single extent (never corruption).
+    ///
+    /// The truncate spine's per-free early stop
+    /// ([`ExtentTree::truncate_chunk`](super::inode::extent_manager)) reserves
+    /// this plus the survivor's reserialize before each free, so the chunk stops
+    /// before the accumulated frees plus the one end-of-chunk reserialize would
+    /// overflow a transaction.
+    pub(super) fn extent_free_credits(&self) -> usize {
+        // block bitmap + group descriptor + revoke-record slack.
+        1 + 1 + 1
+    }
+
+    /// The credit the chunked truncate spine reserves for one chunk: the
+    /// survivor tree's whole-tree reserialize onto its `external_nodes` external
+    /// (leaf + interior) blocks PLUS the inode-descriptor writeback that rides
+    /// the same transaction — sized exactly like
+    /// [`chunk_insert_credits`](Self::chunk_insert_credits) on the write side.
+    ///
+    /// Bounded by `max_credits`: the survivor `[0, reached)` is a subset of the
+    /// old tree, and the old tree was built under this same floor at its last
+    /// insert (`chunk_insert_credits == reserialize + INODE_DESC`), so a
+    /// survivor reserialize can never exceed one transaction. The chunk's frees
+    /// grow the reservation on top of this via the inner probe.
+    pub(super) fn truncate_chunk_credits(&self, external_nodes: usize) -> usize {
+        self.reserialize_credits(external_nodes) + Self::INODE_DESC_CREDITS
+    }
+
+    /// Conservative upper bound on the credits a WHOLE (single-transaction)
+    /// truncate captures — the [`Inode::resize`](super::inode::Inode) fast/slow
+    /// gate. `external_nodes` is the current tree's external-node count (the
+    /// survivor is a subset, so its reserialize is no larger), and
+    /// `freed_extents` upper-bounds the doomed extents, each of which may clear a
+    /// distinct group's bitmap and GDT block (clamped fs-wide, as in
+    /// [`reserialize_credits`](Self::reserialize_credits)). At or below
+    /// `max_credits` the atomic single-transaction path runs (no orphan, no
+    /// restart); above it the chunked orphan-protected spine takes over.
+    pub(super) fn whole_truncate_credit_bound(
+        &self,
+        external_nodes: usize,
+        freed_extents: usize,
+    ) -> usize {
+        let bitmaps = freed_extents.min(self.nr_groups());
+        let gdt = freed_extents.min(self.nr_gdt_blocks());
+        self.reserialize_credits(external_nodes) + bitmaps + gdt + Self::INODE_DESC_CREDITS
+    }
+
     /// Credits to reclaim (free) a deleted inode (Linux `ext4_evict_inode` →
     /// `ext4_free_inode` + `ext4_truncate`).
     ///
@@ -1108,6 +1160,30 @@ impl Ext4 {
         Ok(OrphanLink { old_head })
     }
 
+    /// Links `ino` onto the orphan list only if it is not already listed — the
+    /// reclaim path's guard for keeping an inode listed across a
+    /// multi-transaction free. A silent no-op (no warning) when already listed
+    /// (the normal unlink and recovery cases already added it); the only fresh
+    /// add is the create-error inode, which reaches `Drop` unlisted. Journal-only
+    /// (a no-op without a handle). The chain override in
+    /// [`write_back_inode_desc`](Self::write_back_inode_desc) stamps the on-disk
+    /// `i_dtime` successor on the reclaim's writebacks while listed, so the
+    /// minted [`OrphanLink`] needs no separate `persist_as_orphan`.
+    pub(super) fn orphan_add_if_absent(
+        &self,
+        ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        if handle.is_none() {
+            return Ok(());
+        }
+        if self.s_orphan_lock.lock().successor_of(ino).is_some() {
+            return Ok(());
+        }
+        let _link = self.orphan_add(ino, handle)?;
+        Ok(())
+    }
+
     /// Unlinks `ino` from the orphan list, the mirror of
     /// [`orphan_add`](Self::orphan_add) (Linux `ext4_orphan_del`).
     ///
@@ -1192,10 +1268,10 @@ impl Ext4 {
     /// ends the walk, and whatever remains unprocessed is cleared with a
     /// warning — dropping garbage loses at most already-freed-or-leaked blocks,
     /// which `e2fsck -p` reclaims, and never frees a live inode. A chain member
-    /// with a nonzero link count (a Linux crash-mid-truncate orphan — we never
-    /// produce one, the truncate seam is inert) is skipped, never freed:
-    /// freeing it would destroy a live file; the re-truncate recovery mode is a
-    /// P7 follow-up.
+    /// with a nonzero link count is an interrupted TRUNCATE (Linux
+    /// `ext4_truncate` lists a live file while it frees the tail): it is
+    /// RE-TRUNCATED to its persisted `i_size` and unlisted, never freed
+    /// (DECISION §D).
     ///
     /// Never fails the mount: every problem degrades to a warning and, at
     /// worst, a cleared head (Linux logs and continues the same way).
@@ -1204,15 +1280,19 @@ impl Ext4 {
             return;
         }
 
-        let (chain, to_free, mut suspect) = self.walk_orphan_chain();
+        let scan = self.walk_orphan_chain();
+        let mut suspect = scan.suspect;
 
-        // Prime the in-memory mirror, then finish each interrupted deletion in
-        // chain order. Every reclaim opens its own journaled transaction and its
-        // `orphan_del` advances/splices the on-disk chain, so the state after
-        // every step is a well-formed shorter chain.
-        self.s_orphan_lock.lock().replace(chain);
-        for &ino in &to_free {
+        // Prime the in-memory mirror, then finish each interrupted operation in
+        // chain order. Every reclaim/re-truncate opens its own journaled
+        // transaction(s) and its `orphan_del` advances/splices the on-disk
+        // chain, so the state after every step is a well-formed shorter chain.
+        self.s_orphan_lock.lock().replace(scan.chain);
+        for &ino in &scan.to_free {
             suspect |= !self.reclaim_scanned_orphan(ino);
+        }
+        for &ino in &scan.to_retruncate {
+            suspect |= !self.retruncate_scanned_orphan(ino);
         }
 
         // A truncated walk, a skipped (live or undecodable) member, or a failed
@@ -1233,49 +1313,48 @@ impl Ext4 {
 
     /// Walks the on-disk orphan chain into a defensive snapshot (the walk half
     /// of [`recover_orphan_list`](Self::recover_orphan_list)): returns the
-    /// full mirrored chain, the subset the scan may delete, and whether
-    /// anything looked suspect (truncated walk / live member).
-    fn walk_orphan_chain(&self) -> (Vec<Ext4Ino>, Vec<Ext4Ino>, bool) {
+    /// full mirrored chain, the link-count-0 subset to FREE (finish a
+    /// deletion), the link-count>0 subset to RE-TRUNCATE (finish an interrupted
+    /// truncate, DECISION §D), and whether anything looked suspect (truncated
+    /// walk / unreadable member).
+    fn walk_orphan_chain(&self) -> OrphanScan {
         let (first_ino, total_inodes) = {
             let sb = self.super_block.read();
             (sb.first_ino(), sb.total_inodes())
         };
-        let mut chain = Vec::new();
-        let mut to_free = Vec::new();
+        let mut scan = OrphanScan::default();
         let mut cursor = self.super_block.read().last_orphan();
-        let mut suspect = false;
         while let Some(cur) = cursor {
             // Reserved inodes (including the root) can never be orphans; a
             // revisit is a cycle; an unallocated inode's deletion completed and
             // its `i_dtime` is a deletion time, not a trustworthy pointer.
             let in_range = cur >= first_ino && cur <= total_inodes;
-            if !in_range || chain.contains(&cur) || !self.is_inode_allocated(cur) {
-                suspect = true;
+            if !in_range || scan.chain.contains(&cur) || !self.is_inode_allocated(cur) {
+                scan.suspect = true;
                 break;
             }
             let raw = match self.read_raw_inode(cur) {
                 Ok(raw) => raw,
                 Err(e) => {
                     warn!("orphan walk could not read inode {cur}: {e:?}");
-                    suspect = true;
+                    scan.suspect = true;
                     break;
                 }
             };
-            chain.push(cur);
+            scan.chain.push(cur);
             if raw.link_count == 0 {
-                to_free.push(cur);
+                // An interrupted deletion: free its blocks and the inode.
+                scan.to_free.push(cur);
             } else {
-                warn!(
-                    "orphan inode {cur} has link count {}; skipping (crash-mid-truncate \
-                     recovery is not supported yet)",
-                    raw.link_count
-                );
-                suspect = true;
+                // A live inode on the list is an interrupted TRUNCATE (Linux
+                // `ext4_truncate` orphans a live file across the freeing): finish
+                // it by re-truncating to the persisted `i_size`, then unlist.
+                scan.to_retruncate.push(cur);
             }
             // On disk `0` terminates the chain (decode boundary).
             cursor = (raw.dtime != 0).then_some(raw.dtime);
         }
-        (chain, to_free, suspect)
+        scan
     }
 
     /// Finishes one scanned orphan's interrupted deletion (truncate + free +
@@ -1305,6 +1384,41 @@ impl Ext4 {
                 if let Err(e) = self.orphan_del(ino, None) {
                     warn!("could not unlist orphan inode {ino}: {e:?}");
                 }
+                false
+            }
+        }
+    }
+
+    /// Finishes one scanned LIVE orphan's interrupted truncate (DECISION §D):
+    /// re-truncates the extent tree to the persisted `i_size` and unlists it,
+    /// leaving the file intact (never freed). Returns `false` when anything
+    /// degraded to a warning — the caller then clears the on-disk head.
+    fn retruncate_scanned_orphan(self: &Arc<Self>, ino: Ext4Ino) -> bool {
+        let raw = match self.read_raw_inode(ino) {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!("orphan re-truncate could not re-read inode {ino}: {e:?}");
+                return false;
+            }
+        };
+        let block_group_idx = ((ino - 1) / self.nr_inodes_per_group) as usize;
+        match Inode::from_raw_live(ino, &raw, block_group_idx, self.self_ref.clone()) {
+            Ok(inode) => {
+                // The persisted `i_size` IS the interrupted truncate's target;
+                // re-truncate down to it (freeing `[i_size, frontier)`), then
+                // unlist. The freed extents are gone from the tree, so this
+                // frees nothing already freed — idempotent across a re-crash.
+                let target = inode.size();
+                match inode.retruncate_to(target) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!("orphan cleanup could not re-truncate inode {ino}: {e:?}");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("skipping undecodable live orphan inode {ino}: {e:?}");
                 false
             }
         }
@@ -1760,6 +1874,19 @@ impl OrphanLink {
     }
 }
 
+/// The result of walking the on-disk orphan chain at mount time
+/// ([`Ext4::walk_orphan_chain`]): the mirrored chain plus the two disjoint
+/// interrupted-operation subsets it dispatches — link-count-0 inodes to FREE
+/// and link-count>0 inodes to RE-TRUNCATE — and whether the walk hit anything
+/// suspect (truncated / unreadable) so the caller clears the on-disk head.
+#[derive(Default)]
+struct OrphanScan {
+    chain: Vec<Ext4Ino>,
+    to_free: Vec<Ext4Ino>,
+    to_retruncate: Vec<Ext4Ino>,
+    suspect: bool,
+}
+
 /// What removing an inode from the [`OrphanChain`] must persist.
 enum OrphanSplice {
     /// The inode is the head: the superblock's `s_last_orphan` must advance to
@@ -1920,6 +2047,7 @@ mod tests {
             block_group::RawBlockGroup,
             test_utils::{
                 Ext4FixtureBuilder, Ext4MemoryDisk, make_empty_file_inode, make_file_inode,
+                make_unwritten_file_inode,
             },
         },
         *,
@@ -3379,11 +3507,13 @@ mod tests {
         assert_eq!(err.error(), Errno::EINVAL);
     }
 
-    /// The mount-time orphan scan must never free a chain member with a
-    /// nonzero link count — that is a Linux crash-mid-truncate orphan (a LIVE
-    /// file); it is skipped and the head is cleared instead.
+    /// The mount-time orphan scan RE-TRUNCATES a chain member with a nonzero
+    /// link count — a crash-mid-truncate orphan (a LIVE file) — to its persisted
+    /// `i_size`, then unlists it; it is never freed (DECISION §D). Here the tree
+    /// is already empty (`i_size = 0`), so the re-truncate frees nothing but must
+    /// still leave the inode live and the list drained.
     #[ktest]
-    fn mount_scan_skips_live_linked_orphan() {
+    fn mount_scan_retruncates_live_orphan() {
         crate::time::clocks::init_for_ktest();
         let first = Ext4FixtureBuilder::new(2048, 256, 2048)
             .with_block_bitmap_metadata_marked()
@@ -3393,8 +3523,8 @@ mod tests {
             .unwrap();
         let disk = first.disk.clone();
 
-        // A chained inode with link count 1 — the shape Linux leaves when it
-        // crashes mid-truncate (the file is still referenced!).
+        // A chained inode with link count 1 — the shape a crash mid-truncate
+        // leaves (the file is still referenced!).
         let live_ino: u32 = 15;
         let mut raw = make_empty_file_inode();
         raw.link_count = 1;
@@ -3412,7 +3542,223 @@ mod tests {
             ext4.is_inode_allocated(live_ino),
             "a linked (live) chain member must not be freed"
         );
-        assert_eq!(ext4.super_block().last_orphan(), None, "head cleared");
+        assert_eq!(ext4.super_block().last_orphan(), None, "list drained");
+        // The re-truncated inode is still live and re-readable.
+        assert_eq!(ext4.read_inode(live_ino).unwrap().link_count(), 1);
+        drop(ext4);
+    }
+
+    /// Marks physical block `pblock` allocated directly in group 0's on-disk
+    /// block bitmap (block 2 in the fixture layout) — fabricating the doomed
+    /// tail's allocated state for the re-truncate / reclaim mount-scan tests.
+    fn mark_block_bit_allocated_on_disk(disk: &Arc<Ext4MemoryDisk>, pblock: Ext4Bid) {
+        const BLOCK_BITMAP_BLOCK: usize = 2;
+        let bit = pblock as usize;
+        let byte_off = BLOCK_BITMAP_BLOCK * BLOCK_SIZE + bit / 8;
+        let mut byte = [0u8; 1];
+        disk.segment().read_bytes(byte_off, &mut byte).unwrap();
+        byte[0] |= 1 << (bit % 8);
+        disk.segment().write_bytes(byte_off, &byte).unwrap();
+    }
+
+    /// Whether physical block `pblock` is marked allocated in its group's
+    /// in-memory bitmap (group 0 in these single-group-ish fixtures).
+    fn block_allocated(ext4: &Ext4, pblock: Ext4Bid) -> bool {
+        let group = ext4.block_group(0);
+        group
+            .metadata()
+            .block_bitmap
+            .is_allocated((pblock - group.first_block()) as u16)
+    }
+
+    /// P7 §D — mount-time re-truncate frees the interrupted truncate's tail. A
+    /// LIVE (link 1) inode whose extent tree references `[0, 8)` but whose
+    /// persisted `i_size` is 3 blocks (the truncate published the size and listed
+    /// the inode, then crashed before freeing `[3, 8)`) is finished by the scan:
+    /// the tail blocks are freed, the kept prefix survives, the inode stays live,
+    /// and the list drains — never the free-and-forget path (DECISION §D/§F).
+    #[ktest]
+    fn crash_mid_truncate_recovers_by_retruncate() {
+        crate::time::clocks::init_for_ktest();
+        let first = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let disk = first.disk.clone();
+
+        let ino: u32 = 15;
+        let pblock: Ext4Bid = 400; // clear of metadata + the journal
+        let full_len: u16 = 8;
+        let keep: Ext4Bid = 3;
+        let target = keep as usize * BLOCK_SIZE;
+
+        // A live file listed as an orphan, tree `[0, 8)`, `i_size` = 3 blocks.
+        let raw = make_unwritten_file_inode(pblock as u32, full_len, target as u32);
+        first.write_raw_inode(ino, &raw);
+        mark_inode_bit_allocated_on_disk(&disk, ino);
+        for b in pblock..pblock + full_len as Ext4Bid {
+            mark_block_bit_allocated_on_disk(&disk, b);
+        }
+        let mut raw_sb: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        raw_sb.last_orphan = ino;
+        disk.segment()
+            .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
+            .unwrap();
+        drop(first);
+
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+
+        // Re-truncated, not freed: the inode is live, the list drained, and the
+        // doomed tail's bitmap bits are cleared while the kept prefix survives.
+        // These read the fresh in-memory bitmap / superblock (the inode-table is
+        // a direct device read that lags the uncheckpointed journal, so the
+        // persisted inode is asserted after the unmount checkpoint below).
+        assert!(
+            ext4.is_inode_allocated(ino),
+            "the live inode must not be freed"
+        );
+        assert_eq!(ext4.super_block().last_orphan(), None, "list drained");
+        for b in pblock..pblock + keep {
+            assert!(block_allocated(&ext4, b), "kept block {b} must survive");
+        }
+        for b in pblock + keep..pblock + full_len as Ext4Bid {
+            assert!(!block_allocated(&ext4, b), "tail block {b} must be freed");
+        }
+
+        // Unmount checkpoints the re-truncate to the inode table, then re-mount
+        // and read the persisted inode: `i_size` unchanged, `i_blocks` and the
+        // extent tree reflecting only the kept `[0, keep)` prefix.
+        drop(ext4);
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let inode = ext4.read_inode(ino).unwrap();
+        assert_eq!(inode.size(), target);
+        assert_eq!(
+            inode.sector_count(),
+            keep as u64 * (BLOCK_SIZE / SECTOR_SIZE) as u64,
+            "i_blocks reflects only the kept prefix"
+        );
+        assert_eq!(ext4.super_block().last_orphan(), None, "stays drained");
+        for b in pblock..pblock + keep {
+            assert!(block_allocated(&ext4, b), "kept block {b} persists");
+        }
+        for b in pblock + keep..pblock + full_len as Ext4Bid {
+            assert!(!block_allocated(&ext4, b), "tail block {b} stays freed");
+        }
+        drop(ext4);
+    }
+
+    /// P7 §D/§F — recovery re-truncate is idempotent. After the first mount
+    /// finishes the interrupted truncate and drains the list, re-listing the
+    /// (already-truncated) inode and mounting again must free nothing more (the
+    /// tail extents are gone from the tree) — no double-free — and still drain.
+    #[ktest]
+    fn retruncate_is_idempotent() {
+        crate::time::clocks::init_for_ktest();
+        let first = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let disk = first.disk.clone();
+
+        let ino: u32 = 15;
+        let pblock: Ext4Bid = 400;
+        let full_len: u16 = 8;
+        let keep: Ext4Bid = 3;
+        let target = keep as usize * BLOCK_SIZE;
+
+        let raw = make_unwritten_file_inode(pblock as u32, full_len, target as u32);
+        first.write_raw_inode(ino, &raw);
+        mark_inode_bit_allocated_on_disk(&disk, ino);
+        for b in pblock..pblock + full_len as Ext4Bid {
+            mark_block_bit_allocated_on_disk(&disk, b);
+        }
+        let set_head = |disk: &Arc<Ext4MemoryDisk>| {
+            let mut raw_sb: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+            raw_sb.last_orphan = ino;
+            disk.segment()
+                .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
+                .unwrap();
+        };
+        set_head(&disk);
+        drop(first);
+
+        // First recovery: frees `[3, 8)`.
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let free_after_first = ext4.super_block().free_blocks_count();
+        assert_eq!(ext4.super_block().last_orphan(), None);
+        drop(ext4);
+
+        // Re-list the already-truncated inode and mount again: a second
+        // re-truncate to the same `i_size` must find nothing past it.
+        set_head(&disk);
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        assert_eq!(ext4.super_block().last_orphan(), None, "list drained again");
+        assert_eq!(
+            ext4.super_block().free_blocks_count(),
+            free_after_first,
+            "a second re-truncate must free nothing (no double-free)"
+        );
+        // The kept prefix is intact; the tail stays freed.
+        for b in pblock..pblock + keep {
+            assert!(block_allocated(&ext4, b), "kept block {b} intact");
+        }
+        for b in pblock + keep..pblock + full_len as Ext4Bid {
+            assert!(!block_allocated(&ext4, b), "tail block {b} stays freed");
+        }
+        drop(ext4);
+    }
+
+    /// P7 §D — the delete-orphan reclaim twin: a link-0 orphan WITH data blocks
+    /// is reclaimed by the mount scan through the chunked, restartable free path —
+    /// its data blocks and its inode bit are freed and the list drains. Guards
+    /// the `orphan_del` + `free_inode` relocated to the last chunk.
+    #[ktest]
+    fn mount_scan_frees_crashed_orphan_with_blocks() {
+        crate::time::clocks::init_for_ktest();
+        let first = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let disk = first.disk.clone();
+        let free_inodes_before = first.ext4.super_block().free_inodes_count();
+
+        let ino: u32 = 15;
+        let pblock: Ext4Bid = 400;
+        let len: u16 = 6;
+        let mut raw = make_unwritten_file_inode(pblock as u32, len, len as u32 * BLOCK_SIZE as u32);
+        raw.link_count = 0; // a fully-unlinked orphan (deletion interrupted).
+        first.write_raw_inode(ino, &raw);
+        mark_inode_bit_allocated_on_disk(&disk, ino);
+        for b in pblock..pblock + len as Ext4Bid {
+            mark_block_bit_allocated_on_disk(&disk, b);
+        }
+        let mut raw_sb: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
+        raw_sb.last_orphan = ino;
+        disk.segment()
+            .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
+            .unwrap();
+        drop(first);
+
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        assert!(
+            !ext4.is_inode_allocated(ino),
+            "the orphan inode was freed by the mount scan"
+        );
+        assert_eq!(ext4.super_block().last_orphan(), None, "list drained");
+        assert_eq!(
+            ext4.super_block().free_inodes_count(),
+            free_inodes_before + 1,
+            "the freed inode returned to the free count"
+        );
+        for b in pblock..pblock + len as Ext4Bid {
+            assert!(!block_allocated(&ext4, b), "data block {b} must be freed");
+        }
         drop(ext4);
     }
 

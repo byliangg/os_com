@@ -320,13 +320,12 @@ impl ExtentTree {
 
     /// Frees every data block and extent-tree metadata block mapping a logical
     /// region at or beyond `new_size` bytes, rewriting the tree and updating
-    /// `i_blocks`.
+    /// `i_blocks`, in ONE transaction (the single-transaction truncate path).
     ///
-    /// `data_policy` is the owning inode's revoke rule for its DATA blocks
-    /// (Linux `get_default_free_blocks_flags`): directory blocks and
-    /// slow-symlink targets are forgotten (revoked) before their free,
-    /// regular-file data is not. The tree's own external nodes are always
-    /// forgotten ([`free_meta_block`]), independent of the policy.
+    /// A thin whole-tree wrapper over [`truncate_chunk`](Self::truncate_chunk)
+    /// with no credit bound: it frees every doomed extent and reserializes once.
+    /// Used by `rollback_write` and the `Inode::resize` fast path, whose gate
+    /// already proved the whole truncate fits one transaction.
     pub(super) fn truncate_to_byte_len(
         &mut self,
         fs: &Ext4,
@@ -335,6 +334,47 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
+        self.truncate_chunk(fs, new_size, handle, csum_seed, data_policy, None)?;
+        Ok(())
+    }
+
+    /// One credit-bounded step of shrinking the tree to `new_size` bytes: frees
+    /// doomed tail extents from the HIGH end downward, then reserializes the
+    /// survivor `[0, reached)` in the SAME transaction and returns the frontier.
+    ///
+    /// `max_credits` is `None` for the whole-tree (single-transaction) path — it
+    /// frees every doomed extent, reserializes once, and returns `keep_blocks`.
+    /// `Some(max)` is the chunked, orphan-protected spine: each free is preceded
+    /// by a wait-free credit probe reserving one free plus the end-of-chunk
+    /// reserialize headroom, and on [`ExtendOutcome::NeedsRestart`] the walk
+    /// STOPS with the progress made so far. The stop returns a `reached` above
+    /// `keep_blocks`; the OUTER spine `journal_restart`s (never under this ③
+    /// lock — iron law 1) and calls again, so the survivor of THIS chunk (the
+    /// un-freed doomed extents plus the kept prefix) is what the tree references
+    /// until the next chunk commits.
+    ///
+    /// Per-chunk (not per-truncate) reserialize is the crash red-line: the frees
+    /// and the reserialize that drops exactly those extents from the tree ride
+    /// one transaction, so a committed chunk never leaves the tree pointing at a
+    /// freed (reallocatable) block (double-alloc) or a freed block the tree
+    /// still names (leak). The freed run's pins (`free_blocks`) release at that
+    /// commit, after the reserialize dropped it — no freed-and-reallocated
+    /// window.
+    ///
+    /// `data_policy` is the owning inode's revoke rule for its DATA blocks
+    /// (Linux `get_default_free_blocks_flags`): directory blocks and
+    /// slow-symlink targets are forgotten (revoked) before their free,
+    /// regular-file data is not. The tree's own external nodes are always
+    /// forgotten ([`free_meta_block`]), independent of the policy.
+    pub(super) fn truncate_chunk(
+        &mut self,
+        fs: &Ext4,
+        new_size: usize,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
+        max_credits: Option<usize>,
+    ) -> Result<super::TruncateChunk> {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
@@ -342,36 +382,113 @@ impl ExtentTree {
         let (mut extents, old_external) = self.flatten(fs)?;
         extents.sort_by_key(|e| e.block());
 
-        let mut kept: Vec<Extent> = Vec::new();
-        let mut freed_data: u64 = 0;
-        for e in &extents {
-            let e_start = e.block();
-            let e_end = e_start + e.len() as Iblock;
-            if e_end <= keep_blocks {
-                kept.push(*e);
-                continue;
-            }
-            if e_start >= keep_blocks {
-                // Entire extent is beyond the new size; free all its blocks
-                // (the free discharges the forget when the inode's policy
-                // says its data is revoke-covered — dir blocks, slow-symlink
-                // targets). Per-extent authorization means an error on a
-                // later extent leaves this one fully freed-and-revoked and
-                // the later ones' journal state untouched.
-                let auth = data_policy.authorize(e.start(), e.len() as u32);
-                fs.free_blocks(auth, handle)?;
-                freed_data += e.len() as u64;
-                continue;
-            }
-            // The extent straddles `keep_blocks`: keep the head, free the tail.
-            // Lossless: the head lies inside this extent, whose length is u16.
-            let head_len = (keep_blocks - e_start) as u16;
-            let tail_len = e.len() - head_len;
-            let auth = data_policy.authorize(e.start() + head_len as Ext4Bid, tail_len as u32);
-            fs.free_blocks(auth, handle)?;
-            freed_data += tail_len as u64;
-            kept.push(Extent::new(e.block(), head_len, e.start(), e.kind()));
+        // The reserialize headroom the last surviving reserialize needs — sized
+        // to the WHOLE current tree, an upper bound on any survivor `[0,
+        // reached)` (a subset reserializes onto no more external nodes). The
+        // probe leaves this reserved after each free so the end-of-chunk
+        // reserialize plus the outer inode writeback (its `INODE_DESC` term)
+        // never overflow.
+        let reserialize_headroom = fs.truncate_chunk_credits(external_node_count(extents.len()));
+        let free_cost = fs.extent_free_credits();
+
+        // Fully-doomed extents (freed high-to-low) and the one extent straddling
+        // `keep_blocks` (head kept, tail freed last). Everything fully below
+        // `keep_blocks` is the fixed survivor prefix.
+        let mut kept: Vec<Extent> = extents
+            .iter()
+            .filter(|e| e.block() + e.len() as Iblock <= keep_blocks)
+            .copied()
+            .collect();
+        let straddler = extents
+            .iter()
+            .find(|e| e.block() < keep_blocks && e.block() + e.len() as Iblock > keep_blocks)
+            .copied();
+        let mut doomed: Vec<Extent> = extents
+            .iter()
+            .filter(|e| e.block() >= keep_blocks)
+            .copied()
+            .collect();
+        // Highest logical block first: a credit stop then leaves the LOW doomed
+        // extents (nearest `keep_blocks`) for the next chunk.
+        doomed.sort_by_key(|e| core::cmp::Reverse(e.block()));
+
+        // The honest EFBIG floor (decision G-1, symmetric to the write path): if
+        // one free plus the survivor reserialize cannot fit a whole transaction,
+        // no restart ever can. Only a real free obligation trips it.
+        let has_work = !doomed.is_empty() || straddler.is_some();
+        if let Some(max) = max_credits
+            && has_work
+            && reserialize_headroom + free_cost > max
+        {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "one truncate chunk's reserialize plus a free exceeds a journal transaction"
+            );
         }
+
+        let mut freed_data: u64 = 0;
+        let mut stopped = false;
+        let mut freed_up_to = 0usize; // count of `doomed` extents freed this chunk
+
+        for e in &doomed {
+            // Credit-aware early stop (chunked mode): if this free plus the
+            // survivor reserialize will not fit the transaction even after
+            // growing in place, stop with the progress made so far. Not
+            // restarting here is the ③-drop red line — the restart's
+            // re-admission may wait, illegal under this lock.
+            if let Some(h) = handle
+                && max_credits.is_some()
+                && stop_before_free(h, free_cost + reserialize_headroom)?
+            {
+                stopped = true;
+                break;
+            }
+            let auth = data_policy.authorize(e.start(), e.len() as u32);
+            fs.free_blocks(auth, handle)?;
+            freed_data += e.len() as u64;
+            freed_up_to += 1;
+        }
+
+        // The doomed extents not reached this chunk survive it (recovery
+        // re-truncates from the persisted `i_size` down to them).
+        for e in &doomed[freed_up_to..] {
+            kept.push(*e);
+        }
+
+        if let Some(s) = straddler {
+            let head_len = (keep_blocks - s.block()) as u16;
+            let tail_len = s.len() - head_len;
+            // The straddler tail is the LOWEST doomed run, freed last. A prior
+            // stop, or this free's own probe, leaves the whole straddler for the
+            // next chunk.
+            let mut free_it = !stopped;
+            if free_it
+                && let Some(h) = handle
+                && max_credits.is_some()
+                && stop_before_free(h, free_cost + reserialize_headroom)?
+            {
+                free_it = false;
+            }
+            if free_it {
+                let auth = data_policy.authorize(s.start() + head_len as Ext4Bid, tail_len as u32);
+                fs.free_blocks(auth, handle)?;
+                freed_data += tail_len as u64;
+                kept.push(Extent::new(s.block(), head_len, s.start(), s.kind()));
+            } else {
+                // The whole straddler survives this chunk; the next chunk frees
+                // its tail.
+                kept.push(s);
+            }
+        }
+
+        // The frontier: the highest logical block the survivor still references
+        // (`keep_blocks` when the truncate completed, higher when a stop cut it
+        // short). Zero when nothing survives (a truncate to zero).
+        let reached = kept
+            .iter()
+            .map(|e| e.block() + e.len() as Iblock)
+            .max()
+            .unwrap_or(0);
 
         let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
         // The external-leaf count changes by exactly the mutation's delta.
@@ -382,7 +499,26 @@ impl ExtentTree {
         debug_assert!(self.sector_count as i64 >= removed_sectors);
         self.sector_count = (self.sector_count as i64 - removed_sectors).max(0) as u64;
         self.dirty = true;
-        Ok(())
+
+        // The reservation the next chunk starts from: ONE free PLUS the
+        // survivor's reserialize headroom. Reserving the free (not just the
+        // reserialize) is load-bearing — [`journal_restart`](super::super::super::journal)
+        // RE-JOINS the current transaction whenever the requested credits still
+        // fit its remaining capacity, so a bound covering only the reserialize
+        // would hand the next chunk a transaction already holding this chunk's
+        // captures with NO room for even one more free — a 0-progress restart
+        // that never advances the frontier (a hang). This bound instead makes the
+        // next chunk's first probe (`free_cost + reserialize_headroom`) satisfied
+        // by the reservation alone, so it always frees ≥ 1 extent whether the
+        // restart rejoined or opened a fresh transaction. Still ≤ `max_credits`:
+        // the survivor `[0, reached)` is a subset of this tree, whose own
+        // `reserialize + free` cleared the EFBIG floor above.
+        let next_bound =
+            fs.extent_free_credits() + fs.truncate_chunk_credits(external_node_count(kept.len()));
+        Ok(super::TruncateChunk {
+            reached,
+            next_bound,
+        })
     }
 
     /// Parses the whole tree into a list of leaf extents, also returning the
@@ -772,7 +908,17 @@ struct TreeDelta {
 /// `ceil(nr_leaves / INTERIOR_MAX)` interior nodes. Used to size the write
 /// spine's per-chunk credit bound before an insert (an upper bound: a merge on
 /// insert can only lower the true count).
-fn external_node_count(extents: usize) -> usize {
+/// Whether the truncate chunk must stop before the next free: `true` when the
+/// handle cannot reserve `need` more credits (one free plus the survivor
+/// reserialize) in its current transaction even after growing in place. A
+/// wait-free probe under the ExtentTree lock ③ (never restarts here — the
+/// restart's re-admission may wait, illegal under this lock); the OUTER spine
+/// restarts with ③ released.
+fn stop_before_free(handle: &journal::Handle, need: usize) -> Result<bool> {
+    Ok(journal::try_reserve_next(handle, need)? == journal::ExtendOutcome::NeedsRestart)
+}
+
+pub(super) fn external_node_count(extents: usize) -> usize {
     if extents <= INLINE_MAX {
         return 0;
     }

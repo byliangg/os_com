@@ -492,6 +492,69 @@ impl ExtentManager {
             self.data_forget_policy,
         )
     }
+
+    /// One credit-bounded step of shrinking the tree to `new_size` bytes: frees
+    /// a bounded batch of doomed tail extents and reserializes the survivor in
+    /// the caller's transaction, returning the frontier the tree now references
+    /// and the reservation the next chunk should start from (see
+    /// [`ExtentTree::truncate_chunk`]). The
+    /// restartable-truncate spine calls this in a `journal_restart` loop until
+    /// the frontier reaches `keep_blocks(new_size)`; `max_credits` is the
+    /// journal's per-transaction ceiling, the honest `EFBIG` floor.
+    pub(super) fn truncate_chunk(
+        &self,
+        new_size: usize,
+        handle: Option<&journal::Handle>,
+        max_credits: usize,
+    ) -> Result<TruncateChunk> {
+        let fs = self.fs()?;
+        self.state.write().truncate_chunk(
+            &fs,
+            new_size,
+            handle,
+            self.csum_seed,
+            self.data_forget_policy,
+            Some(max_credits),
+        )
+    }
+
+    /// Conservative upper bound on the journal credits a WHOLE (single-
+    /// transaction) truncate to `new_size` would capture — the `Inode::resize`
+    /// fast/slow gate. Flattens once for the current tree's external-node count
+    /// (an upper bound on the survivor's) and the count of doomed extents (each
+    /// a distinct group's bitmap/GDT at worst); see
+    /// [`Ext4::whole_truncate_credit_bound`](super::super::fs::Ext4).
+    pub(super) fn truncate_credit_estimate(&self, new_size: usize) -> Result<usize> {
+        let fs = self.fs()?;
+        let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
+        let tree = self.state.read();
+        let extents = tree.extents(&fs)?;
+        let external = tree::external_node_count(extents.len());
+        let freed_extents = extents
+            .iter()
+            .filter(|e| e.block() + e.len() as Iblock > keep_blocks)
+            .count();
+        Ok(fs.whole_truncate_credit_bound(external, freed_extents))
+    }
+}
+
+/// The outcome of one [`ExtentManager::truncate_chunk`]: the frontier the tree
+/// now references and the reservation the next chunk's fresh transaction should
+/// start from.
+pub(super) struct TruncateChunk {
+    /// The lowest logical block boundary the survivor still fully retains:
+    /// `keep_blocks(new_size)` when the truncate is complete, higher when a
+    /// credit stop cut the chunk short (the outer spine restarts and calls
+    /// again).
+    pub(super) reached: Iblock,
+    /// The reservation the outer spine hands `journal_restart` for the next
+    /// chunk: one free PLUS the survivor's `truncate_chunk_credits` headroom.
+    /// Covering the free (not just the reserialize) is what guarantees forward
+    /// progress — `journal_restart` may rejoin the current, partly-captured
+    /// transaction, so the reservation must alone satisfy the next chunk's first
+    /// `free_cost + reserialize_headroom` probe. Always ≤ `max_credits` (a subset
+    /// of a tree that cleared the same EFBIG floor).
+    pub(super) next_bound: usize,
 }
 
 /// A contiguous run of unmapped logical blocks.
