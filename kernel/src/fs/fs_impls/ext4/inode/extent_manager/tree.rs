@@ -388,7 +388,8 @@ impl ExtentTree {
         // probe leaves this reserved after each free so the end-of-chunk
         // reserialize plus the outer inode writeback (its `INODE_DESC` term)
         // never overflow.
-        let reserialize_headroom = fs.truncate_chunk_credits(external_node_count(extents.len()));
+        let reserialize_headroom =
+            fs.truncate_chunk_credits(Self::external_node_count(extents.len()));
         let free_cost = fs.extent_free_credits();
 
         // Fully-doomed extents (freed high-to-low) and the one extent straddling
@@ -420,8 +421,9 @@ impl ExtentTree {
         // which is the survivor from the previous chunk (the whole tree only on
         // the first chunk), so the floor shrinks per chunk and a delete frees
         // down as far as the tree can be split. `free_cost + reserialize_headroom`
-        // is exactly the forward-progress boundary: `next_bound` (line ~516)
-        // reserves the same sum, and dropping the `free_cost` term would admit a
+        // is exactly the forward-progress boundary: the `next_bound` this
+        // function returns reserves the same sum, and dropping the `free_cost`
+        // term would admit a
         // chunk whose free-plus-reserialize overruns `max` and stalls at zero
         // progress. The residual gap versus the write floor (write needs only
         // `reserialize + INODE_DESC ≤ max`, truncate additionally `+ free_cost`)
@@ -542,8 +544,8 @@ impl ExtentTree {
         // restart rejoined or opened a fresh transaction. Still ≤ `max_credits`:
         // the survivor `[0, reached)` is a subset of this tree, whose own
         // `reserialize + free` cleared the EFBIG floor above.
-        let next_bound =
-            fs.extent_free_credits() + fs.truncate_chunk_credits(external_node_count(kept.len()));
+        let next_bound = fs.extent_free_credits()
+            + fs.truncate_chunk_credits(Self::external_node_count(kept.len()));
         Ok(super::TruncateChunk {
             reached,
             next_bound,
@@ -793,6 +795,50 @@ impl ExtentTree {
             bytes[off..off + ENTRY_SIZE].copy_from_slice(idx.as_bytes());
         }
     }
+
+    /// Returns the external (leaf + interior) node count of the on-disk tree
+    /// holding `extents` extents — the number of full-block nodes
+    /// [`reserialize`](Self::reserialize) writes for that count, following the
+    /// same inline / depth-1 / depth-2 shape.
+    ///
+    /// An inline (depth-0) root has no external nodes; a depth-1 tree has
+    /// `ceil(extents / LEAF_MAX)` leaves under the inline root; a depth-2 tree
+    /// adds `ceil(nr_leaves / INTERIOR_MAX)` interior nodes. Used to size the
+    /// write spine's per-chunk credit bound before an insert (an upper bound: a
+    /// merge on insert can only lower the true count).
+    pub(super) fn external_node_count(extents: usize) -> usize {
+        if extents <= INLINE_MAX {
+            return 0;
+        }
+        let nr_leaves = extents.div_ceil(LEAF_MAX);
+        let nr_interior = if nr_leaves <= INLINE_MAX {
+            0
+        } else {
+            nr_leaves.div_ceil(INTERIOR_MAX)
+        };
+        nr_leaves + nr_interior
+    }
+
+    /// Returns a safe upper bound on the metadata blocks the next
+    /// [`insert`](Self::insert) plus the per-chunk work that follows it will
+    /// capture when the tree ends up holding `projected_extents` extents — the
+    /// whole-tree reserialize's external-node writes plus the filesystem's
+    /// bitmap/GDT/superblock charge, AND the inode-descriptor writeback /
+    /// convert-to-written that ride the same chunk transaction
+    /// ([`Ext4::chunk_insert_credits`]).
+    ///
+    /// The write spine's [`ensure_allocated_chunk`](super::ExtentManager::ensure_allocated_chunk)
+    /// early stop compares this against the handle's transaction headroom: when
+    /// the next insert will not fit even after growing in place, it stops with
+    /// the progress made so far and reports this bound so the OUTER spine
+    /// restarts onto a fresh transaction reserving exactly it (the restart
+    /// cannot run under the ExtentTree lock). Reporting the same bound the
+    /// reservation was checked against — not the smaller per-chunk
+    /// `write_credits` estimate — is what keeps the restarted transaction able
+    /// to hold the insert that did not fit.
+    pub(super) fn next_insert_credit_bound(fs: &Ext4, projected_extents: usize) -> usize {
+        fs.chunk_insert_credits(Self::external_node_count(projected_extents))
+    }
 }
 
 /// The outcome of searching a single extent-tree node for `iblock`.
@@ -928,15 +974,6 @@ struct TreeDelta {
 /// ones) and, separately, just the freshly allocated blocks — the caller frees
 /// those if a later node write fails, since the in-memory root has not yet been
 /// pointed at the new layout.
-/// The external (leaf + interior) node count of the on-disk tree holding
-/// `extents` extents — the number of full-block nodes [`reserialize`](ExtentTree::reserialize)
-/// writes for that count, following the same inline / depth-1 / depth-2 shape.
-///
-/// An inline (depth-0) root has no external nodes; a depth-1 tree has
-/// `ceil(extents / LEAF_MAX)` leaves under the inline root; a depth-2 tree adds
-/// `ceil(nr_leaves / INTERIOR_MAX)` interior nodes. Used to size the write
-/// spine's per-chunk credit bound before an insert (an upper bound: a merge on
-/// insert can only lower the true count).
 /// Whether the truncate chunk must stop before the next free: `true` when the
 /// handle cannot reserve `need` more credits (one free plus the survivor
 /// reserialize) in its current transaction even after growing in place. A
@@ -945,38 +982,6 @@ struct TreeDelta {
 /// restarts with ③ released.
 fn stop_before_free(handle: &journal::Handle, need: usize) -> Result<bool> {
     Ok(journal::try_reserve_next(handle, need)? == journal::ExtendOutcome::NeedsRestart)
-}
-
-pub(super) fn external_node_count(extents: usize) -> usize {
-    if extents <= INLINE_MAX {
-        return 0;
-    }
-    let nr_leaves = extents.div_ceil(LEAF_MAX);
-    let nr_interior = if nr_leaves <= INLINE_MAX {
-        0
-    } else {
-        nr_leaves.div_ceil(INTERIOR_MAX)
-    };
-    nr_leaves + nr_interior
-}
-
-/// Safe upper bound on the metadata blocks the next [`insert`](ExtentTree::insert)
-/// plus the per-chunk work that follows it will capture when the tree ends up
-/// holding `projected_extents` extents — the whole-tree reserialize's
-/// external-node writes plus the filesystem's bitmap/GDT/superblock charge,
-/// AND the inode-descriptor writeback / convert-to-written that ride the same
-/// chunk transaction ([`Ext4::chunk_insert_credits`]).
-///
-/// The write spine's [`ensure_allocated_chunk`](super::ExtentManager::ensure_allocated_chunk)
-/// early stop compares this against the handle's transaction headroom: when the
-/// next insert will not fit even after growing in place, it stops with the
-/// progress made so far and reports this bound so the OUTER spine restarts onto
-/// a fresh transaction reserving exactly it (the restart cannot run under the
-/// ExtentTree lock). Reporting the same bound the reservation was checked
-/// against — not the smaller per-chunk `write_credits` estimate — is what keeps
-/// the restarted transaction able to hold the insert that did not fit.
-pub(super) fn next_insert_credit_bound(fs: &Ext4, projected_extents: usize) -> usize {
-    fs.chunk_insert_credits(external_node_count(projected_extents))
 }
 
 fn acquire_meta_blocks(

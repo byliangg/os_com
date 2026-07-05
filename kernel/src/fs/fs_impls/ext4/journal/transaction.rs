@@ -59,10 +59,13 @@
 // As of P7d-1 per-op reservations are PRECISE (per-op estimates, `Ext4::*_credits`)
 // and ENFORCED: a fresh capture spends one reserved credit
 // (`charge_fresh_capture`), growing the reservation in place
-// (`try_grow_reservation`) when a handle runs dry. The public `journal_extend`
-// and `journal_restart` entry points are still dead in a non-ktest build — the
-// enforcement path calls `try_grow_reservation` directly, and a true
-// commit-boundary `journal_restart` is d2's work — as are the `nr_ordered_data`
+// (`try_grow_reservation`) when a handle runs dry. As of P7d-2 the public
+// `journal_extend` and `journal_restart` entry points are ALSO production-live:
+// the unbounded write/truncate/reclaim paths chunk their work, and at each
+// commit boundary `ensure_chunk_credits` grows the reservation in place
+// (`journal_extend`) or closes onto a fresh transaction (`journal_restart`); the
+// truncate/reclaim spines also call `journal_restart` directly between chunks.
+// The only entry points still dead in a non-ktest build are the `nr_ordered_data`
 // and `Handle::credits` inspection accessors (read only by ktest assertions).
 // Each carries its OWN narrow `#[cfg_attr(not(ktest), expect(dead_code))]`
 // rather than a module-wide marker, so future dead code surfaces instead of
@@ -1098,7 +1101,7 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
 
 /// The result of a [`journal_extend`] / [`try_grow_reservation`] attempt.
 ///
-/// A typed outcome rather than an in-band sentinel (rust_rules ⑤): the
+/// A typed outcome rather than an in-band sentinel (rust_rules ④): the
 /// no-room case is a distinct variant a caller must match, not a magic
 /// return code buried in a `usize`. Mirrors `jbd2_journal_extend`'s
 /// `0`/`1` contract — grow succeeded, or "no room, caller must restart".
@@ -1108,11 +1111,12 @@ pub(in crate::fs::fs_impls::ext4) enum ExtendOutcome {
     Granted,
     /// The transaction cannot fit the extra credits within the journal's
     /// per-transaction capacity ([`Journal::max_credits`](super::Journal::max_credits)),
-    /// so growing in place is impossible. The operation must close this handle
-    /// and rejoin a fresh transaction ([`journal_restart`], d2's work); until
-    /// that is wired, the capture path converts this to a loud `ENOSPC`/`EFBIG`
-    /// (the documented d1→d2 seam — an unbounded op larger than one whole
-    /// transaction).
+    /// so growing in place is impossible. At a chunk boundary the operation
+    /// closes this handle and rejoins a fresh transaction ([`journal_restart`],
+    /// live since P7d-2 for the unbounded write/truncate/reclaim paths). A
+    /// mid-funnel capture that cannot restart with its locks held
+    /// ([`charge_fresh_capture`]) instead converts this to a loud `ENOSPC`/`EFBIG`
+    /// — an atomic burst larger than one whole transaction.
     NeedsRestart,
 }
 
@@ -1161,8 +1165,10 @@ fn try_grow_reservation(
 /// block does not fit the whole transaction, the block is already captured (the
 /// footprint stays a safe upper bound via `nr_metadata_blocks`), but the op is
 /// failed loud with `ENOSPC` rather than allowed to build a transaction that
-/// cannot commit — the [`ExtendOutcome::NeedsRestart`] seam d2 will turn into a
-/// real restart.
+/// cannot commit. Restarting is impossible HERE (a capture runs mid-funnel under
+/// the caller's locks); the unbounded paths instead handle
+/// [`ExtendOutcome::NeedsRestart`] at their chunk boundary with a real
+/// [`journal_restart`] (P7d-2).
 pub(super) fn charge_fresh_capture(
     journal: &Journal,
     running: &mut Transaction,
@@ -1302,8 +1308,10 @@ pub(in crate::fs::fs_impls::ext4) fn try_reserve_next(
 /// caller mutates anything. A refusal is `EFBIG`: the burst is larger than one
 /// transaction can hold (`captured + reserved + extra > max_credits`), the same
 /// single-atomic-capture ceiling the depth-2 extent reserialize lives under
-/// (`extent_manager::tree`); d2's [`journal_restart`] is the seam that would one
-/// day split an over-large burst across transactions. `ENOSPC` instead when the
+/// (`extent_manager::tree`). [`journal_restart`] (live since P7d-2) splits the
+/// unbounded write/truncate paths across transactions, but this burst is one
+/// indivisible unit — a half-rewritten index set corrupts the htree — so it
+/// cannot restart and fails `EFBIG` here. `ENOSPC` instead when the
 /// handle's transaction was force-locked for commit (like [`journal_extend`]: a
 /// locked transaction must drain, not grow).
 ///
@@ -1878,9 +1886,12 @@ mod tests {
     }
 
     /// P7d-1 enforcement is LOUD: capturing more distinct metadata than a whole
-    /// transaction can hold (`max_credits`) fails `ENOSPC` at the capture — the
-    /// `ExtendOutcome::NeedsRestart` seam d2 will turn into a real restart —
-    /// rather than silently building a transaction that cannot commit.
+    /// transaction can hold (`max_credits`) fails `ENOSPC` at the capture — a
+    /// mid-funnel capture cannot restart with its locks held, so the
+    /// `ExtendOutcome::NeedsRestart` here is a loud failure (the chunk-boundary
+    /// `journal_restart`, P7d-2, is what turns it into a real restart on the
+    /// unbounded paths) — rather than silently building a transaction that
+    /// cannot commit.
     #[ktest]
     fn over_capacity_capture_fails_loud() {
         let j = journaled_fixture(64, 1, 1); // max_credits = 60

@@ -20,7 +20,7 @@ use crate::{
     events::IoEvents,
     fs::{
         file::{AccessMode, InodeMode, InodeType, PerOpenFileOps, StatusFlags},
-        fs_impls::ext4::{FilePerm, Inode as Ext4Inode, fs::GoingDown},
+        fs_impls::ext4::{FilePerm, Inode as Ext4Inode, fs::GoingDown, inode::SyncScope},
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
@@ -200,7 +200,7 @@ impl Inode for Ext4Inode {
         // `fsync`: wait on the full `sync_tid`.
         let fs = self.fs()?;
         fs.sync_metadata()?;
-        self.sync_data_and_meta(false)
+        self.sync_data_and_meta(SyncScope::Full)
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -211,7 +211,7 @@ impl Inode for Ext4Inode {
         // the non-journaled path, and never waits on the running transaction.
         let fs = self.fs()?;
         fs.sync_metadata()?;
-        self.sync_data_and_meta(true)
+        self.sync_data_and_meta(SyncScope::DataOnly)
     }
 
     fn page_cache(&self) -> Option<PageCache> {

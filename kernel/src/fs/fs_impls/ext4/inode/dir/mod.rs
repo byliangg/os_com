@@ -420,8 +420,10 @@ impl InodeInner {
     /// `INDEX`-flagged directory whose root is a bare linear block (e2fsck
     /// "htree root corrupted"). The single-transaction ceiling is the same limit
     /// the depth-2 extent reserialize mega-capture lives under
-    /// ([`extent_manager::tree`]); d2's `journal_restart` is the seam that would
-    /// one day split an over-large degrade across transactions.
+    /// ([`extent_manager::tree`]). `journal_restart` (live since P7d-2) splits the
+    /// unbounded write/truncate paths across transactions, but an htree degrade is
+    /// one indivisible burst — a half-rewritten index set corrupts the htree — so
+    /// it cannot be split and fails `EFBIG` here rather than restarting.
     ///
     /// [`extent_manager::tree`]: super::extent_manager::tree
     fn degrade_htree_to_linear(

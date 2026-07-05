@@ -360,9 +360,9 @@ impl Ext4 {
     /// block of slack keeps the bound above that single-block worst case.
     pub(super) const SETATTR_CREDITS: usize = Self::INODE_DESC_CREDITS + 1;
 
-    /// Distinct group-descriptor (GDT) blocks — the clamp for how many GDT
-    /// blocks an op that allocates across many groups can dirty (Linux
-    /// `EXT4_SB(sb)->s_gdb_count`, the `gdpblocks` clamp in
+    /// Returns the number of distinct group-descriptor (GDT) blocks — the clamp
+    /// for how many GDT blocks an op that allocates across many groups can dirty
+    /// (Linux `EXT4_SB(sb)->s_gdb_count`, the `gdpblocks` clamp in
     /// `ext4_meta_trans_blocks`). `ceil(groups / descriptors_per_block)`.
     fn nr_gdt_blocks(&self) -> usize {
         let sb = self.super_block.read();
@@ -376,9 +376,9 @@ impl Ext4 {
         self.super_block.read().nr_block_groups() as usize
     }
 
-    /// Worst-case metadata blocks to map `pextents` physical extents into an
-    /// extent tree of depth `depth` — the extent-tree index/leaf writes plus the
-    /// block-bitmap and GDT block each allocation dirties (Linux
+    /// Returns the worst-case metadata blocks to map `pextents` physical extents
+    /// into an extent tree of depth `depth` — the extent-tree index/leaf writes
+    /// plus the block-bitmap and GDT block each allocation dirties (Linux
     /// `ext4_meta_trans_blocks(inode, _, pextents)` composed with
     /// `ext4_ext_index_trans_blocks`). Excludes the superblock and inode, which
     /// the callers add explicitly.
@@ -417,8 +417,8 @@ impl Ext4 {
         self.map_credits(1, depth)
     }
 
-    /// Credits to create a new inode and link it into its parent directory
-    /// (Linux `ext4_create` / `ext4_mknod`:
+    /// Returns the credits to create a new inode and link it into its parent
+    /// directory (Linux `ext4_create` / `ext4_mknod`:
     /// `EXT4_DATA_TRANS_BLOCKS + EXT4_INDEX_EXTRA_TRANS_BLOCKS + 3`).
     ///
     /// Worst case: the new inode dirties its inode bitmap (1), its inode-table
@@ -437,7 +437,8 @@ impl Ext4 {
         new_inode + parent
     }
 
-    /// Credits to remove a name (`unlink`/`rmdir`, Linux `EXT4_DATA_TRANS_BLOCKS`).
+    /// Returns the credits to remove a name (`unlink`/`rmdir`, Linux
+    /// `EXT4_DATA_TRANS_BLOCKS`).
     ///
     /// Worst case: patch the parent directory block the entry lives in (1), the
     /// parent's inode-table block (mtime/link) (1), the removed child's
@@ -490,8 +491,9 @@ impl Ext4 {
     /// the reservation. A write that fragments into several extents captures more
     /// than this, and `charge_fresh_capture` grows the reservation per extent via
     /// `journal_extend` — the reservation stays ≥ captured, so the estimate is a
-    /// per-chunk starting point, not a whole-write bound (which is unbounded
-    /// without d2's `journal_restart`; see the module note).
+    /// per-chunk starting point, not a whole-write bound: the write spine chunks
+    /// its work and `journal_restart`s at each commit boundary (P7d-2), bounding
+    /// the whole write across transactions.
     pub(super) fn write_credits(&self, depth: u16) -> usize {
         self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
     }
@@ -2095,6 +2097,7 @@ mod tests {
     use super::{
         super::{
             block_group::RawBlockGroup,
+            inode::SyncScope,
             test_utils::{
                 Ext4FixtureBuilder, Ext4MemoryDisk, make_empty_file_inode, make_file_inode,
                 make_unwritten_file_inode,
@@ -2673,14 +2676,14 @@ mod tests {
         // File A: write one block and fsync it (allocations persist to disk).
         let a = f.ext4.read_inode(11).unwrap();
         write_all(&a, 0, &[0xAA; BLOCK_SIZE]);
-        a.sync_data_and_meta(false).unwrap();
+        a.sync_data_and_meta(SyncScope::Full).unwrap();
 
         // File B: a 3-block file, then truncate to 1 block, freeing 2 trailing
         // blocks. The truncate updates the in-memory inode + the global bitmap
         // but does not, on its own, write B's inode back to disk.
         let b = f.ext4.read_inode(12).unwrap();
         write_all(&b, 0, &[0xBB; 3 * BLOCK_SIZE]);
-        b.sync_data_and_meta(false).unwrap(); // B's 3 blocks are on disk and allocated
+        b.sync_data_and_meta(SyncScope::Full).unwrap(); // B's 3 blocks are on disk and allocated
 
         let b2_pblock = ondisk_pblock_of(&f.read_raw_inode(12), 2).unwrap();
         assert!(block_is_allocated(&f, b2_pblock));
@@ -3308,7 +3311,7 @@ mod tests {
             .recorded_sync_tid_for_test()
             .expect("the atime change journaled a transaction");
 
-        inode.sync_data_and_meta(false).unwrap();
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
         // `fsync` returned only after the transaction carrying the change
         // committed.
         assert!(
@@ -3319,7 +3322,7 @@ mod tests {
 
         // A second fsync with nothing dirty must not hang (nothing to commit).
         let committed_after = journal.committed_tid();
-        inode.sync_data_and_meta(false).unwrap();
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
         assert_eq!(journal.committed_tid(), committed_after);
         drop(inode);
     }

@@ -797,6 +797,21 @@ pub struct Inode {
     extension: Extension,
 }
 
+/// How much of an inode's pending metadata a sync must wait on — the caller's
+/// `fsync`-vs-`fdatasync` intent named at the call site rather than a bare bool.
+/// Selects which recorded transaction [`sync_data_and_meta`](Inode::sync_data_and_meta)
+/// waits for (jbd2's `i_sync_tid` vs `i_datasync_tid`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SyncScope {
+    /// `fsync`: wait for the full `sync_tid`, so a pending pure-attribute change
+    /// (chmod/chown/utimens) is forced too.
+    Full,
+    /// `fdatasync`: wait only for the data-relevant `datasync_tid`, so a pending
+    /// pure-attribute change is not forced (POSIX "does not flush modified
+    /// metadata not needed to read the data").
+    DataOnly,
+}
+
 impl Inode {
     /// Builds a live inode; fails if a data-backed extent root does not parse
     /// (see [`InodePayload::new`]).
@@ -1260,7 +1275,8 @@ impl Inode {
         // Up front, ONCE (never re-run across restarts).
         inner.prepare_shrink(new_size, old_size)?;
 
-        let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
+        let keep_blocks = Iblock::try_from(new_size.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         let em = inner.extent_manager()?.clone();
 
         // First transaction: link onto the orphan list and persist `i_size =
@@ -1352,7 +1368,8 @@ impl Inode {
         // (after `orphan_del`) persists this live 0.
         inner.set_dtime(Duration::ZERO);
 
-        let keep_blocks = target.div_ceil(BLOCK_SIZE) as Iblock;
+        let keep_blocks = Iblock::try_from(target.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         let em = inner.extent_manager()?.clone();
         let mut op = fs.begin_op(fs.truncate_credits(em.root_depth()))?;
         loop {
@@ -1405,12 +1422,13 @@ impl Inode {
     /// durable before the metadata referencing it can commit), metadata
     /// recoverable from the log on return.
     ///
-    /// `datasync` narrows the metadata wait to `fdatasync` semantics: wait only
-    /// for the last **data-relevant** capture (`datasync_tid` — extent/`i_size`),
-    /// not the full `sync_tid`. A chmod/chown/utimens bumps `sync_tid` but not
-    /// `datasync_tid`, so an `fdatasync` after one does NOT force its commit —
-    /// POSIX's "does not flush modified metadata not needed to read the data."
-    pub(super) fn sync_data_and_meta(&self, datasync: bool) -> Result<()> {
+    /// [`SyncScope::DataOnly`] narrows the metadata wait to `fdatasync`
+    /// semantics: wait only for the last **data-relevant** capture
+    /// (`datasync_tid` — extent/`i_size`), not the full `sync_tid`. A
+    /// chmod/chown/utimens bumps `sync_tid` but not `datasync_tid`, so an
+    /// `fdatasync` after one does NOT force its commit — POSIX's "does not flush
+    /// modified metadata not needed to read the data."
+    pub(super) fn sync_data_and_meta(&self, scope: SyncScope) -> Result<()> {
         let fs = self.fs()?;
         let wait_tid = {
             let mut inner = self.inner.write();
@@ -1428,10 +1446,9 @@ impl Inode {
             // sleep forever. A dirty inode's fresh capture is waited on in full
             // by both (conservative: `fdatasync` may over-wait if the dirty
             // change was attribute-only, never under-wait).
-            let recorded = if datasync {
-                inner.datasync_tid
-            } else {
-                inner.sync_tid
+            let recorded = match scope {
+                SyncScope::DataOnly => inner.datasync_tid,
+                SyncScope::Full => inner.sync_tid,
             };
             let was_dirty = inner.is_dirty();
             let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
@@ -2822,7 +2839,7 @@ mod write_tests {
             let inode = f.ext4.read_inode(FILE_INO).unwrap();
             write_all(&inode, 0, content);
             // Full sync: data pages + inode metadata + block-side metadata.
-            inode.sync_data_and_meta(false).unwrap();
+            inode.sync_data_and_meta(SyncScope::Full).unwrap();
             f.ext4.sync_metadata().unwrap();
         }
 

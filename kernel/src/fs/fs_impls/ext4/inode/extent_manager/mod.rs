@@ -355,7 +355,7 @@ impl ExtentManager {
                 if bound == AllocBound::CreditChunk
                     && let Some(h) = handle
                 {
-                    let need = tree::next_insert_credit_bound(&fs, projected_extents + 1);
+                    let need = ExtentTree::next_insert_credit_bound(&fs, projected_extents + 1);
                     if journal::try_reserve_next(h, need)? == journal::ExtendOutcome::NeedsRestart {
                         // Report the bound the reservation was checked against —
                         // not the smaller per-chunk `write_credits` — so the
@@ -539,10 +539,11 @@ impl ExtentManager {
     /// flatten is a read-only tree walk.
     pub(super) fn plan_shrink(&self, new_size: usize, max_credits: usize) -> Result<ShrinkPlan> {
         let fs = self.fs()?;
-        let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
+        let keep_blocks = Iblock::try_from(new_size.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         let tree = self.state.read();
         let extents = tree.extents(&fs)?;
-        let external = tree::external_node_count(extents.len());
+        let external = ExtentTree::external_node_count(extents.len());
         let freed_extents = extents
             .iter()
             .filter(|e| e.block() + e.len() as Iblock > keep_blocks)
