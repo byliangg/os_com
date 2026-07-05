@@ -696,8 +696,12 @@ impl BlockGroup {
     /// read path itself). `journal` is `None` on a non-journaled volume, where
     /// the device is authoritative and the funnel reads it directly.
     ///
-    /// An inode never straddles a block: `s_inode_size` divides `BLOCK_SIZE`, so
-    /// the whole descriptor lies at `off_in_block` within one metadata block.
+    /// The fixed `size_of::<RawInode>()` (256-byte) read window never runs past
+    /// the block: mount admission requires a power-of-two `s_inode_size` that both
+    /// divides the 4 KiB block and is at least `size_of::<RawInode>()`
+    /// (`SuperBlock::try_from`), so each inode's slot is block-aligned and no
+    /// smaller than the window — `off_in_block + size_of::<RawInode>()` stays
+    /// within the one metadata block that holds the descriptor.
     pub(super) fn read_inode_desc(
         &self,
         ino: Ext4Ino,

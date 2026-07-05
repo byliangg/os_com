@@ -3548,10 +3548,20 @@ mod tests {
         }
         journal.commit_now_for_test();
 
+        // Pin the premise explicitly: the inode-table block carrying `ino` is in
+        // the committed-but-un-checkpointed set, so the funnel (not the device) is
+        // what serves the reread below. Without this a smaller journal or a fatter
+        // transaction could silently collapse the window into a false pass.
+        let slot = f.ext4.inode_table_offset(ino).unwrap();
+        let itb_bid = (slot / BLOCK_SIZE) as Ext4Bid;
+        assert!(
+            journal.uncheckpointed_blocks_for_test().contains(&itb_bid),
+            "the inode-table block must be committed-but-un-checkpointed for the funnel to be exercised"
+        );
+
         // Doctor the DEVICE slot to a value that is neither the old nor the new
         // link count — a bare device read would surface this; the funnel must
         // return the committed image instead.
-        let slot = f.ext4.inode_table_offset(ino).unwrap();
         let mut on_device: RawInode = f.disk.segment().read_val(slot).unwrap();
         on_device.link_count = 0xDEAD;
         f.disk.segment().write_val(slot, &on_device).unwrap();

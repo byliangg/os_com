@@ -17,6 +17,7 @@ use super::{
     feature::{
         FeatureCompatSet, FeatureIncompatSet, FeatureRoCompatSet, INCOMPAT_SUPP, RO_COMPAT_SUPP,
     },
+    inode::RawInode,
     journal,
     prelude::*,
 };
@@ -148,12 +149,28 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             RevLevel::GoodOld => (11, 128usize),
             RevLevel::Dynamic => {
                 let inode_size = sb.inode_size as usize;
-                if inode_size < 128 || inode_size > block_size || !inode_size.is_power_of_two() {
+                // Must divide the 4 KiB block (power of two, not exceeding it) so no
+                // inode straddles a block boundary.
+                if inode_size > block_size || !inode_size.is_power_of_two() {
                     return_errno_with_message!(Errno::EINVAL, "invalid inode size");
                 }
                 (sb.first_ino, inode_size)
             }
         };
+
+        // The inode decode reads and writes a fixed `size_of::<RawInode>()`
+        // (256-byte) slot — the modern ext4 inode including its extra-size region.
+        // A narrower slot (the legacy 128-byte inode, which is also the value
+        // `GoodOld` forces) would make the funnel read in `read_inode_desc` slice
+        // past its metadata block and the writeback clobber the following inode.
+        // This 256-centric port — metadata_csum, nanosecond timestamps and
+        // `extra_isize` all require >= 256 — admits only inodes wide enough to hold
+        // the whole `RawInode`, refusing smaller ones rather than misreading them.
+        // Checked after the rev-level match so it also covers the `GoodOld` path,
+        // which forces 128 and skips the `Dynamic` size validation above.
+        if inode_size < size_of::<RawInode>() {
+            return_errno_with_message!(Errno::EINVAL, "unsupported inode size below 256 bytes");
+        }
 
         // Reject any incompatible feature this phase cannot honor, rather than
         // silently misreading the volume.
@@ -982,6 +999,19 @@ mod tests {
     fn reject_non_4k_block() {
         let mut raw = minimal_raw(2048, 2048, 256);
         raw.log_block_size = 0; // 1 KiB
+        assert!(SuperBlock::try_from(raw).is_err());
+    }
+
+    /// A legacy 128-byte inode is refused at admission. The inode decode reads and
+    /// writes a fixed 256-byte `RawInode`, so a narrower slot would slice past its
+    /// metadata block on a cache-miss reload and clobber the next inode on
+    /// writeback; this 256-centric port admits only slots at least
+    /// `size_of::<RawInode>()` wide (rejecting the misread rather than panicking on
+    /// it, as a bare 256-byte slice of the block would).
+    #[ktest]
+    fn reject_sub_256_inode_size() {
+        let mut raw = minimal_raw(2048, 2048, 256);
+        raw.inode_size = 128;
         assert!(SuperBlock::try_from(raw).is_err());
     }
 
