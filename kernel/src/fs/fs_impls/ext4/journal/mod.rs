@@ -2959,6 +2959,24 @@ pub(super) fn get_create_access<'h>(
     })
 }
 
+/// Reserves `extra` more credits on `handle`'s running transaction for one
+/// indivisible burst of fresh captures the caller is about to make — an htree
+/// degrade's index-block rewrite ([`degrade_htree_to_linear`]) — so the burst
+/// either fits this transaction whole or fails HERE, before the caller mutates
+/// the page cache, never mid-way (which would leave a partial linearization the
+/// running transaction later commits). `EFBIG` when the burst exceeds one
+/// transaction's capacity; see [`transaction::extend_reservation_for_burst`].
+/// Inert without a handle: a non-journaled volume has no per-transaction
+/// ceiling for the burst to respect.
+///
+/// [`degrade_htree_to_linear`]: super::inode::dir
+pub(super) fn reserve_capture_burst(handle: Option<&Handle>, extra: usize) -> Result<()> {
+    match handle {
+        None => Ok(()),
+        Some(handle) => transaction::extend_reservation_for_burst(handle, extra),
+    }
+}
+
 /// Pins a just-freed block run out of the allocator until the freeing
 /// transaction commits ([`JournalState::pinned_frees`] holds the run;
 /// [`JournalState::release_pinned_frees`] releases it at commit step 6).

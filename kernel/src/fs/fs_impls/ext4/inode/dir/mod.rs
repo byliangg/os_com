@@ -402,11 +402,28 @@ impl InodeInner {
     /// index metadata, and every real entry already lives in a leaf block that is
     /// left untouched — and any dx_node blocks become empty linear blocks. So
     /// this touches O(index blocks) blocks (exactly one for the common depth-1
-    /// tree), always within one transaction, and never rewrites the O(n) leaves.
-    /// The `INDEX` flag is then cleared and persisted. (Rebuilding an htree —
-    /// `make_indexed_dir`/`do_split` — is deferred to a performance phase; a
-    /// degraded directory is a correct, if linearly-scanned, directory that
-    /// e2fsck accepts.)
+    /// tree), and never rewrites the O(n) leaves. The `INDEX` flag is then
+    /// cleared and persisted. (Rebuilding an htree — `make_indexed_dir` /
+    /// `do_split` — is deferred to a performance phase; a degraded directory is a
+    /// correct, if linearly-scanned, directory that e2fsck accepts.)
+    ///
+    /// **Atomic-or-fail-clean.** The rewrite is a single indivisible burst: the
+    /// whole degrade's journal footprint (one capture per index block plus this
+    /// inode's writeback) is reserved UP FRONT, before any page-cache mutation
+    /// (`reserve_capture_burst`). A depth-2 htree can carry hundreds of index
+    /// blocks, so this footprint is O(index blocks), not O(1) like the base
+    /// namespace op that opened the handle — the reservation `rename_credits`
+    /// took is not a bound for it. If the burst cannot fit one transaction
+    /// (`> max_credits`), we fail `EFBIG` HERE with the htree still fully intact
+    /// on disk, rather than rewrite block 0 into a linear block and then hit
+    /// `ENOSPC` part-way through the journaling loop — which would commit an
+    /// `INDEX`-flagged directory whose root is a bare linear block (e2fsck
+    /// "htree root corrupted"). The single-transaction ceiling is the same limit
+    /// the depth-2 extent reserialize mega-capture lives under
+    /// ([`extent_manager::tree`]); d2's `journal_restart` is the seam that would
+    /// one day split an over-large degrade across transactions.
+    ///
+    /// [`extent_manager::tree`]: super::extent_manager::tree
     fn degrade_htree_to_linear(
         &mut self,
         fs: &Ext4,
@@ -427,6 +444,15 @@ impl InodeInner {
             };
             htree::dx_index_blocks(read_block)?
         };
+
+        // Reserve the whole degrade's journal footprint BEFORE the first
+        // page-cache mutation below, so the linearization is all-or-nothing: one
+        // fresh capture per index block (the journaling loop) plus this inode's
+        // writeback. On a journal too small to hold the burst this fails `EFBIG`
+        // with block 0 still a valid dx_root on disk; without it a small journal
+        // would exhaust the handle mid-loop and commit a half-linearized,
+        // still-`INDEX`-flagged directory (see the method contract).
+        journal::reserve_capture_burst(handle, index_blocks.len() + 1)?;
 
         let page_cache = self.page_cache()?;
         // Preserve `.`/`..` from the dx_root's fake entries (byte-identical to a
@@ -1994,6 +2020,129 @@ mod tests {
         assert!(
             captured <= estimate,
             "create captured {captured} metadata blocks, exceeding its estimate {estimate}"
+        );
+
+        drop(f);
+    }
+
+    /// P7d-1 red-line regression: an htree degrade whose index-block rewrite
+    /// cannot fit one journal transaction must fail BEFORE mutating the page
+    /// cache, leaving the directory a valid htree — never a half-linearized,
+    /// still-`INDEX`-flagged directory the running transaction would then commit
+    /// (an e2fsck-rejected "htree root corrupted" state).
+    ///
+    /// The pre-fix `degrade_htree_to_linear` reserved only the base
+    /// `rename_credits` (O(1)); a depth-2 htree's index rewrite is O(index
+    /// blocks), so on a small journal it rewrote block 0 into a linear block,
+    /// captured index blocks until the reservation ran dry, then returned
+    /// `ENOSPC` mid-loop — a partial degrade that COMMITS. This drives the
+    /// degrade under a handle whose reservation cannot cover the burst and
+    /// asserts the atomic-or-fail-clean fix: `EFBIG` up front, block 0 still a
+    /// dx_root, `INDEX` still set, and zero partial captures in the transaction.
+    #[ktest]
+    fn degrade_htree_over_capacity_leaves_index_intact() {
+        use super::{FileFlags, htree};
+
+        // On-disk `dx_root` layout (Linux `struct dx_root`): `.`(12) then the
+        // `..` header, `dx_root_info` at offset 24 { reserved(4) hash_version(1)
+        // info_length(1) indirect_levels(1) unused_flags(1) }, and the `dx_entry`
+        // array at 32, each { hash(4) block(4) } — entry 0's hash word overlays
+        // the {limit, count} header.
+        const DX_ROOT_INFO_OFF: usize = 24;
+        const DX_ROOT_ENTRIES_OFF: usize = 32;
+        const DX_INFO_LEN: u8 = 8;
+        const DX_ENTRY_SIZE: usize = 8;
+
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        // An `INDEX`-flagged directory inode; the flag is what a real degrade
+        // clears, so the assertion below can detect a mid-degrade mutation.
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        raw.flags |= FileFlags::INDEX.bits();
+        f.write_raw_inode(DIR_INO, &raw);
+
+        let journal = f.ext4.journal().unwrap();
+        // Keep the running transaction inspectable after the degrade's handle
+        // closes (no committer to retire it).
+        journal.stop_commit_thread();
+        let max_credits = journal.max_credits();
+        assert!(max_credits >= 2, "test journal too small to distinguish");
+
+        // A degrade footprint one transaction cannot hold: block 0 plus
+        // `max_credits` dx_node blocks, so index_block_count + inode writeback
+        // (= max_credits + 2) exceeds `max_credits`.
+        let dx_nodes = max_credits;
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        {
+            let mut inner = dir.inner.write();
+            // Allocate logical blocks 0..=dx_nodes (0 = root, 1..=dx_nodes the
+            // dx_node blocks the root points at); handle-less, so the setup
+            // captures nothing and the running transaction starts empty.
+            inner.make_empty(&f.ext4, DIR_INO, 2, None).unwrap();
+            for _ in 0..dx_nodes {
+                inner.grow_dir_block(&f.ext4, None).unwrap();
+            }
+        }
+        // Rewrite block 0 into a depth-2 dx_root: keep the `.`/`..` `make_empty`
+        // wrote, overlay `dx_root_info` (indirect_levels = 1) and `dx_nodes`
+        // entries pointing at the mapped logical blocks 1..=dx_nodes.
+        let page_cache = dir.page_cache().unwrap();
+        let mut block0: [u8; BLOCK_SIZE] = page_cache.read_val(0).unwrap();
+        block0[DX_ROOT_INFO_OFF + 4] = 1; // hash_version = half-MD4
+        block0[DX_ROOT_INFO_OFF + 5] = DX_INFO_LEN;
+        block0[DX_ROOT_INFO_OFF + 6] = 1; // indirect_levels = 1 (depth-2)
+        block0[DX_ROOT_INFO_OFF + 7] = 0; // unused_flags
+        let count = u16::try_from(dx_nodes).unwrap();
+        let limit = count + 4; // headroom; only `count` entries are read
+        block0[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 2].copy_from_slice(&limit.to_le_bytes());
+        block0[DX_ROOT_ENTRIES_OFF + 2..DX_ROOT_ENTRIES_OFF + 4]
+            .copy_from_slice(&count.to_le_bytes());
+        for i in 0..dx_nodes {
+            // entry i.block = logical block i+1 (a mapped dx_node); entry 0's
+            // hash slot is the {limit, count} overlay above, so leave it.
+            let off = DX_ROOT_ENTRIES_OFF + i * DX_ENTRY_SIZE;
+            let blk = u32::try_from(i + 1).unwrap();
+            block0[off + 4..off + 8].copy_from_slice(&blk.to_le_bytes());
+        }
+        page_cache.write_val(0, &block0).unwrap();
+        // Sanity: the constructed block 0 is a valid dx_root before the degrade.
+        assert!(htree::parse_dx_root(&block0).is_ok());
+        assert_eq!(journal.running_nr_metadata_blocks(), 0);
+
+        // Drive the degrade under a minimally-reserved handle: the burst
+        // (index_block_count + inode = max_credits + 2) cannot fit `max_credits`.
+        let op = f.ext4.begin_op(1).unwrap();
+        let result = dir.inner.write().degrade_htree_to_linear(&f.ext4, op.get());
+        assert!(result.is_err(), "an over-capacity degrade must fail");
+        assert_eq!(result.unwrap_err().error(), Errno::EFBIG);
+        drop(op);
+
+        // The fix's guarantee — nothing was mutated: block 0 is still a dx_root,
+        // the INDEX flag is still set, and the transaction holds no partial
+        // rewrite. (The pre-fix code linearized block 0 and captured up to
+        // `max_credits` blocks before the mid-loop `ENOSPC`, failing all three.)
+        let block0_after: [u8; BLOCK_SIZE] = dir.page_cache().unwrap().read_val(0).unwrap();
+        assert!(
+            htree::parse_dx_root(&block0_after).is_ok(),
+            "block 0 must remain a valid dx_root after a failed degrade"
+        );
+        assert!(
+            dir.inner.read().desc.flags().contains(FileFlags::INDEX),
+            "the INDEX flag must survive a failed degrade"
+        );
+        assert_eq!(
+            journal.running_nr_metadata_blocks(),
+            0,
+            "a failed degrade must leave no partial captures in the transaction"
         );
 
         drop(f);

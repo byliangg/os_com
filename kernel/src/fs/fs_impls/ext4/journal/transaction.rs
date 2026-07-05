@@ -1199,6 +1199,59 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<Extend
     Ok(try_grow_reservation(&journal, running, handle, extra))
 }
 
+/// Reserves `extra` more credits on the running transaction for a caller about
+/// to make up to `extra` fresh captures in ONE indivisible burst — an htree
+/// degrade rewriting every index block ([`degrade_htree_to_linear`]) — so those
+/// captures cannot trip the mid-operation `ENOSPC` in [`charge_fresh_capture`]
+/// *after* the caller has already rewritten the page cache.
+///
+/// Grows the reservation in place ([`try_grow_reservation`]) when the burst fits
+/// one transaction's capacity, so the burst either fits WHOLE — every block
+/// journaled atomically in this transaction — or is refused HERE, before the
+/// caller mutates anything. A refusal is `EFBIG`: the burst is larger than one
+/// transaction can hold (`captured + reserved + extra > max_credits`), the same
+/// single-atomic-capture ceiling the depth-2 extent reserialize lives under
+/// (`extent_manager::tree`); d2's [`journal_restart`] is the seam that would one
+/// day split an over-large burst across transactions. `ENOSPC` instead when the
+/// handle's transaction was force-locked for commit (like [`journal_extend`]: a
+/// locked transaction must drain, not grow).
+///
+/// Takes `&Handle` (not `&mut`): the reservation grows through the handle's
+/// `Cell` credits, exactly as [`charge_fresh_capture`] does under a capture
+/// funnel's shared borrow. Distinct from [`journal_extend`] (jbd2's advisory
+/// `0`/`1` API) in that a no-room outcome is a hard error at the reservation
+/// point, not a value the caller may ignore.
+///
+/// [`degrade_htree_to_linear`]: super::super::inode::dir
+pub(super) fn extend_reservation_for_burst(handle: &Handle, extra: usize) -> Result<()> {
+    let journal = handle.journal()?;
+    let mut st = journal.state_write();
+
+    if st
+        .locking
+        .as_ref()
+        .is_some_and(|locked| locked.tid == handle.tid)
+    {
+        return_errno_with_message!(
+            Errno::ENOSPC,
+            "cannot extend a transaction locked for commit"
+        );
+    }
+    let Some(running) = st.running.as_mut() else {
+        return_errno_with_message!(
+            Errno::EIO,
+            "extend_reservation_for_burst without a running transaction"
+        );
+    };
+    match try_grow_reservation(&journal, running, handle, extra) {
+        ExtendOutcome::Granted => Ok(()),
+        ExtendOutcome::NeedsRestart => return_errno_with_message!(
+            Errno::EFBIG,
+            "htree degrade exceeds one journal transaction's capacity"
+        ),
+    }
+}
+
 /// Re-reserves `credits` on this handle, dropping its old reservation (jbd2
 /// `jbd2_journal_restart`).
 ///
