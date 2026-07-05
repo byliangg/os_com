@@ -1686,6 +1686,13 @@ impl Journal {
         &self.geometry
     }
 
+    /// The journal's total block footprint (`s_maxlen`, == jbd2 `j_total_len`):
+    /// the whole log, including its own superblock. `statfs` charges this to the
+    /// filesystem's metadata overhead (Linux `ext4_calculate_overhead`).
+    pub(super) fn total_log_blocks(&self) -> u64 {
+        u64::from(self.geometry.maxlen())
+    }
+
     /// The id of the most recently committed transaction (jbd2
     /// `journal_t.j_commit_sequence`).
     ///

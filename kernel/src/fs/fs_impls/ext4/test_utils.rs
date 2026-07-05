@@ -201,6 +201,11 @@ pub(super) struct Ext4FixtureBuilder {
     /// loads the journal. The log occupies `maxlen` physical blocks starting at
     /// [`JOURNAL_START_BLOCK`]. Implies `has_journal`.
     journal_inode: Option<u32>,
+    /// Blocks reserved for privileged processes (`s_r_blocks_count`); `statfs`
+    /// subtracts them from `bfree` to report `bavail`.
+    reserved_blocks: u32,
+    /// Volume UUID (`s_uuid`); `statfs` folds its low 8 bytes into `f_fsid`.
+    uuid: [u8; 16],
 }
 
 /// The physical block where the fixture places the journal (log block 0 → this
@@ -221,7 +226,22 @@ impl Ext4FixtureBuilder {
             reserved_inode: None,
             has_journal: false,
             journal_inode: None,
+            reserved_blocks: 0,
+            uuid: [0; 16],
         }
+    }
+
+    /// Sets `s_r_blocks_count` so `statfs` has reserved blocks to subtract from
+    /// `bfree` when reporting `bavail`.
+    pub(super) fn with_reserved_blocks(mut self, blocks: u32) -> Self {
+        self.reserved_blocks = blocks;
+        self
+    }
+
+    /// Sets `s_uuid` so `statfs` has a non-zero `f_fsid` (its low 8 bytes).
+    pub(super) fn with_uuid(mut self, uuid: [u8; 16]) -> Self {
+        self.uuid = uuid;
+        self
     }
 
     /// Lays down the journal inode (ino 8) and a *clean* journal superblock
@@ -362,6 +382,7 @@ impl Ext4FixtureBuilder {
         let raw_sb = RawSuperBlock {
             inodes_count,
             blocks_count: self.nblocks as u32,
+            reserved_blocks_count: self.reserved_blocks,
             free_blocks_count: total_free,
             free_inodes_count: total_free_inodes,
             first_data_block: 0,
@@ -383,6 +404,7 @@ impl Ext4FixtureBuilder {
             feature_compat: if self.has_journal { 0x4 } else { 0 },
             feature_incompat: 0x2 | 0x40, // FILETYPE | EXTENTS
             feature_ro_compat: 0x1,       // SPARSE_SUPER
+            uuid: self.uuid,
             // The mount contract requires the internal journal at the reserved
             // ino 8 (`s_journal_inum`); `mke2fs` writes the same.
             journal_ino: if self.has_journal { JOURNAL_INO } else { 0 },

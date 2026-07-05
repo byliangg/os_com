@@ -311,6 +311,19 @@ impl Ext4 {
         self.journal.read().clone()
     }
 
+    /// Refuses a remount-time filesystem-flag change with `EOPNOTSUPP`.
+    ///
+    /// Ext4 honors no runtime change to the filesystem flags (there is no
+    /// read-only mount mode yet), so `set_fs_flags` reports the change as
+    /// unsupported rather than accepting it and leaving the volume writable — a
+    /// lie a `remount,ro` caller would act on.
+    pub(super) fn refuse_fs_flags_change(&self) -> Result<()> {
+        return_errno_with_message!(
+            Errno::EOPNOTSUPP,
+            "ext4 does not support changing filesystem flags at remount"
+        );
+    }
+
     // ===== Per-operation journal credit estimates (P7d-1) =====
     //
     // Each `*_credits` method returns a SAFE UPPER BOUND on the distinct metadata
@@ -2165,6 +2178,48 @@ mod tests {
     fn read_inode_zero_fails() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
         assert!(f.ext4.read_inode_desc(0).is_err());
+    }
+
+    /// `statfs` reports usable capacity (raw blocks minus metadata + journal
+    /// overhead), reserved-block-adjusted `bavail`, and a UUID-derived `fsid`.
+    #[ktest]
+    fn statfs_reports_usable_space() {
+        use crate::fs::vfs::file_system::FileSystem;
+
+        // 3 groups of 2048 blocks, a 32-block journal, non-zero reserved blocks
+        // and UUID. The fixture sets `first_data_block == 0`, `sparse_super`, and
+        // no reserved GDT, so only groups 0 and 1 carry a superblock/GDT copy.
+        let uuid = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let f = Ext4FixtureBuilder::new(2048, 256, 3 * 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_reserved_blocks(500)
+            .with_uuid(uuid)
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let sb = f.ext4.sb();
+
+        // Overhead = 3 groups * (16 inode-table + 2 bitmaps) + 2 super-bearing
+        // groups * (1 super + 1 GDT) + the 32-block journal = 90 blocks.
+        let expected_overhead = 3 * (16 + 2) + 2 * (1 + 1) + 32;
+        assert_eq!(sb.blocks, 3 * 2048 - expected_overhead);
+
+        // `bavail` drops the 500 reserved blocks; `fsid` is the UUID's low 8 bytes.
+        assert!(f.ext4.journal().is_some());
+        assert_eq!(sb.bavail, sb.bfree - 500);
+        assert_eq!(sb.fsid, u64::from_le_bytes(uuid[..8].try_into().unwrap()));
+    }
+
+    /// A remount that asks to change filesystem flags is refused with
+    /// `EOPNOTSUPP` (ext4 honors no runtime change), not silently accepted.
+    #[ktest]
+    fn set_fs_flags_refuses_loudly() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+        let err = f.ext4.refuse_fs_flags_change().unwrap_err();
+        assert_eq!(err.error(), Errno::EOPNOTSUPP);
     }
 
     #[ktest]

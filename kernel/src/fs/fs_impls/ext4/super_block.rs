@@ -96,6 +96,9 @@ pub(super) struct SuperBlock {
     uuid: [u8; 16],
     last_orphan: Option<Ext4Ino>,
     reserved_blocks_count: u32,
+    /// `s_reserved_gdt_blocks` widened once at parse; consumed only by
+    /// [`Self::metadata_overhead`] (an image built with `^resize_inode` has none).
+    reserved_gdt_blocks: u32,
     journal_ino: u32,
     journal_dev: u32,
     /// `s_hash_seed`: the four seed words feeding the htree name hash. Consumed
@@ -271,6 +274,7 @@ impl TryFrom<RawSuperBlock> for SuperBlock {
             // `Option` and the sentinel stops at this parse boundary.
             last_orphan: (sb.last_orphan != 0).then_some(sb.last_orphan),
             reserved_blocks_count: sb.reserved_blocks_count,
+            reserved_gdt_blocks: u32::from(sb.reserved_gdt_blocks),
             journal_ino: sb.journal_ino,
             journal_dev: sb.journal_dev,
             hash_seed: sb.hash_seed,
@@ -480,6 +484,62 @@ impl SuperBlock {
         self.reserved_blocks_count
     }
 
+    /// Returns whether block group `group` carries a copy of the superblock and
+    /// group-descriptor table (Linux `ext4_bg_has_super`).
+    ///
+    /// Without `sparse_super` every group has one. With it, only groups 0 and 1
+    /// and the odd powers of 3, 5, and 7 do; the rest carry data only. The
+    /// unsupported `sparse_super2` layout (not in `RO_COMPAT_SUPP`) is refused at
+    /// the mount gate, so this mirrors the sparse/dense split alone.
+    fn bg_has_super(&self, group: u32) -> bool {
+        if group <= 1 {
+            return true;
+        }
+        if !self
+            .feature_ro_compat
+            .contains(FeatureRoCompatSet::SPARSE_SUPER)
+        {
+            return true;
+        }
+        if group.is_multiple_of(2) {
+            return false;
+        }
+        is_power_of(group, 3) || is_power_of(group, 5) || is_power_of(group, 7)
+    }
+
+    /// Computes the on-disk metadata overhead in blocks, excluding the journal
+    /// (Linux `ext4_calculate_overhead`, non-`bigalloc` path; `bigalloc` is not
+    /// in `RO_COMPAT_SUPP`, so every mounted volume takes this path).
+    ///
+    /// The sum is: the blocks before `first_data_block`, plus per group the block
+    /// bitmap, inode bitmap, and inode-table blocks — and, in each group that
+    /// carries a superblock/GDT copy, the superblock block, the group-descriptor
+    /// blocks, and the reserved GDT-growth blocks. `flex_bg` only relocates these
+    /// within a flex group without changing their count, so the geometry sum is
+    /// unchanged. `statfs` reports `f_blocks = total_blocks - overhead - journal`,
+    /// so unprivileged `df` sees usable capacity rather than the raw device size.
+    pub(super) fn metadata_overhead(&self) -> u64 {
+        // Number of group descriptors that fit in one block (`EXT4_DESC_PER_BLOCK`),
+        // hence the count of primary GDT blocks. `meta_bg` (not in `INCOMPAT_SUPP`)
+        // would spread the GDT differently, so its absence keeps this contiguous.
+        let desc_per_block = u64::try_from(self.block_size / usize::from(self.desc_size)).unwrap();
+        let gdt_blocks = u64::from(self.nr_block_groups).div_ceil(desc_per_block);
+
+        let per_group_data = u64::from(self.nr_inode_table_blocks_per_group) + 2;
+        let per_super_group = 1 + gdt_blocks + u64::from(self.reserved_gdt_blocks);
+
+        let groups_with_super = u64::try_from(
+            (0..self.nr_block_groups)
+                .filter(|&group| self.bg_has_super(group))
+                .count(),
+        )
+        .unwrap();
+
+        self.first_data_block
+            + per_group_data * u64::from(self.nr_block_groups)
+            + per_super_group * groups_with_super
+    }
+
     /// Returns the inode number of the internal journal (`s_journal_inum`);
     /// the mount contract accepts only the reserved ino 8.
     pub(super) const fn journal_ino(&self) -> u32 {
@@ -657,6 +717,20 @@ fn parse_desc_size(raw: u16, has_64bit: bool) -> Result<u16> {
     Ok(raw)
 }
 
+/// Whether `value` is a positive integer power of `base` (`value == base^k`,
+/// `k >= 1`), mirroring Linux `test_root`. Sparse-super backups live in groups
+/// that are powers of 3, 5, or 7, so [`SuperBlock::bg_has_super`] tests each base.
+fn is_power_of(value: u32, base: u32) -> bool {
+    let mut remaining = value;
+    while remaining > base {
+        if !remaining.is_multiple_of(base) {
+            return false;
+        }
+        remaining /= base;
+    }
+    remaining == base
+}
+
 /// Splices a superblock 64-bit block count's low and high halves into a `u64`.
 ///
 /// The one read-side boundary for `s_{blocks,free_blocks}_count{,_hi}`
@@ -770,7 +844,11 @@ pub(super) struct RawSuperBlock {
     pub algorithm_usage_bitmap: u32,
     pub prealloc_file_blocks: u8,
     pub prealloc_dir_blocks: u8,
-    pub(super) padding1: u16,
+    /// `s_reserved_gdt_blocks` (0xCE): blocks reserved after the group-descriptor
+    /// table so the GDT can grow on an online resize. They are filesystem
+    /// overhead in every group that carries a superblock/GDT copy, so
+    /// [`SuperBlock::metadata_overhead`] counts them there (Linux `count_overhead`).
+    pub reserved_gdt_blocks: u16,
     pub journal_uuid: [u8; 16],
     pub journal_ino: u32,
     pub journal_dev: u32,
@@ -1002,6 +1080,63 @@ mod tests {
         let sb = SuperBlock::try_from(raw).unwrap();
         assert_eq!(sb.nr_block_groups(), 3);
         assert_eq!(sb.total_blocks(), 3 * 2048);
+    }
+
+    /// `test_root`/`is_power_of` picks out the sparse-super backup groups.
+    #[ktest]
+    fn is_power_of_matches_test_root() {
+        assert!(is_power_of(3, 3) && is_power_of(9, 3) && is_power_of(81, 3));
+        assert!(is_power_of(5, 5) && is_power_of(125, 5));
+        assert!(is_power_of(7, 7) && is_power_of(49, 7));
+        // Not powers: composites and the identity/zero cases.
+        assert!(!is_power_of(15, 3) && !is_power_of(15, 5));
+        assert!(!is_power_of(1, 3) && !is_power_of(6, 3));
+    }
+
+    /// The `ext4_calculate_overhead` (non-bigalloc) geometry sum. `minimal_raw`
+    /// sets `sparse_super`, `first_data_block == 0`, inode size 256 (16 inodes
+    /// per 4 KiB block → 16 inode-table blocks per group), and no reserved GDT.
+    #[ktest]
+    fn metadata_overhead_sparse_super() {
+        // 10 groups of 2048 blocks. GDT fits in one block (10 <= 4096/32). The
+        // groups carrying a superblock/GDT copy are 0, 1 and the odd powers of
+        // 3/5/7 below 10 — i.e. 3, 5, 7, 9 — so six of the ten.
+        let raw = minimal_raw(10 * 2048, 2048, 256);
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.nr_block_groups(), 10);
+        // 10 * (16 inode-table + 2 bitmaps) + 6 * (1 super + 1 GDT + 0 reserved).
+        assert_eq!(sb.metadata_overhead(), 10 * (16 + 2) + 6 * (1 + 1));
+    }
+
+    /// Reserved GDT-growth blocks add to every superblock-bearing group.
+    #[ktest]
+    fn metadata_overhead_reserved_gdt() {
+        let mut raw = minimal_raw(10 * 2048, 2048, 256);
+        raw.reserved_gdt_blocks = 100;
+        let sb = SuperBlock::try_from(raw).unwrap();
+        // The six super-bearing groups each also carry 100 reserved GDT blocks.
+        assert_eq!(sb.metadata_overhead(), 10 * (16 + 2) + 6 * (1 + 1 + 100));
+    }
+
+    /// Without `sparse_super`, every group carries a superblock/GDT copy.
+    #[ktest]
+    fn metadata_overhead_dense_super() {
+        let mut raw = minimal_raw(10 * 2048, 2048, 256);
+        raw.feature_ro_compat = 0; // clear SPARSE_SUPER
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.metadata_overhead(), 10 * (16 + 2) + 10 * (1 + 1));
+    }
+
+    /// A GDT spanning more than one block: with 130 groups the primary GDT needs
+    /// `ceil(130 / (4096/32)) = 2` blocks, charged to each super-bearing group.
+    #[ktest]
+    fn metadata_overhead_multi_gdt_block() {
+        let raw = minimal_raw(130 * 2048, 2048, 256);
+        let sb = SuperBlock::try_from(raw).unwrap();
+        assert_eq!(sb.nr_block_groups(), 130);
+        // Super-bearing groups: 0, 1 plus powers of 3 (3,9,27,81), 5 (5,25,125),
+        // 7 (7,49) below 130 — eleven groups; each carries 1 super + 2 GDT blocks.
+        assert_eq!(sb.metadata_overhead(), 130 * (16 + 2) + 11 * (1 + 2));
     }
 
     /// A `0` on-disk `s_desc_size` (the mkfs default for non-64bit images)
