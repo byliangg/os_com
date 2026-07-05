@@ -786,17 +786,22 @@ fn external_node_count(extents: usize) -> usize {
 }
 
 /// Safe upper bound on the metadata blocks the next [`insert`](ExtentTree::insert)
-/// will capture when the tree ends up holding `projected_extents` extents —
-/// the whole-tree reserialize's external-node writes plus the filesystem's
-/// bitmap/GDT/superblock charge ([`Ext4::reserialize_credits`]).
+/// plus the per-chunk work that follows it will capture when the tree ends up
+/// holding `projected_extents` extents — the whole-tree reserialize's
+/// external-node writes plus the filesystem's bitmap/GDT/superblock charge,
+/// AND the inode-descriptor writeback / convert-to-written that ride the same
+/// chunk transaction ([`Ext4::chunk_insert_credits`]).
 ///
-/// The write spine's [`ensure_allocated`](super::ExtentManager::ensure_allocated)
+/// The write spine's [`ensure_allocated_chunk`](super::ExtentManager::ensure_allocated_chunk)
 /// early stop compares this against the handle's transaction headroom: when the
 /// next insert will not fit even after growing in place, it stops with the
-/// progress made so far and lets the OUTER spine restart onto a fresh
-/// transaction (the restart cannot run under the ExtentTree lock).
+/// progress made so far and reports this bound so the OUTER spine restarts onto
+/// a fresh transaction reserving exactly it (the restart cannot run under the
+/// ExtentTree lock). Reporting the same bound the reservation was checked
+/// against — not the smaller per-chunk `write_credits` estimate — is what keeps
+/// the restarted transaction able to hold the insert that did not fit.
 pub(super) fn next_insert_credit_bound(fs: &Ext4, projected_extents: usize) -> usize {
-    fs.reserialize_credits(external_node_count(projected_extents))
+    fs.chunk_insert_credits(external_node_count(projected_extents))
 }
 
 fn acquire_meta_blocks(

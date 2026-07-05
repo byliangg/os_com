@@ -513,6 +513,30 @@ impl Ext4 {
         external_nodes + bitmaps + gdt + Self::SUPERBLOCK_CREDITS
     }
 
+    /// The credit the chunked write spine reserves before each per-chunk extent
+    /// insert into a tree that will serialize to `external_nodes` external
+    /// (leaf + interior) nodes — the [`reserialize_credits`](Self::reserialize_credits)
+    /// of the insert itself PLUS the two captures that ride the SAME chunk
+    /// transaction after it:
+    ///
+    /// - the inode-descriptor writeback (`write_back_inode_desc`), one
+    ///   inode-table block distinct from the bitmap/GDT/superblock/extent-node
+    ///   blocks the reserialize charges — [`INODE_DESC_CREDITS`](Self::INODE_DESC_CREDITS);
+    /// - the convert-to-written of the just-inserted unwritten extents
+    ///   (`mark_range_written`), which re-serializes those same external nodes
+    ///   onto the *reused* metadata blocks (`ExtentTree::reserialize` reuses the
+    ///   old external pool) — an idempotent re-capture that adds no new
+    ///   after-image, so it costs zero credit in the append path.
+    ///
+    /// Reserving the inode descriptor here is what keeps a concurrent handle
+    /// that fills the transaction to the bare insert bound from leaving
+    /// `write_back_inode_desc` (or a boundary-splitting convert) no credit and
+    /// tripping [`charge_fresh_capture`](super::journal)'s `ENOSPC` *after* the
+    /// chunk's page write has already landed.
+    pub(super) fn chunk_insert_credits(&self, external_nodes: usize) -> usize {
+        self.reserialize_credits(external_nodes) + Self::INODE_DESC_CREDITS
+    }
+
     /// Credits for a truncate's per-chunk metadata (Linux
     /// `ext4_blocks_for_truncate` = `EXT4_DATA_TRANS_BLOCKS + bounded chunk`).
     ///

@@ -108,6 +108,25 @@ enum AllocBound {
     CreditChunk,
 }
 
+/// The outcome of a credit-bounded [`fill_holes`](ExtentManager::fill_holes):
+/// the whole requested range was allocated, or the fill stopped at a credit
+/// boundary and reports where it stopped and the reservation the insert that
+/// did not fit needs.
+pub(super) enum HoleFill {
+    /// Every hole in the requested range was allocated; its end block was
+    /// reached. Whole-range mode always reports this (it never early-stops).
+    Filled,
+    /// A credit-aware early stop (chunked mode only) halted before the range
+    /// end. `reached` is the first logical block NOT allocated — equal to the
+    /// range start when even the first insert did not fit, greater when partial
+    /// progress was made. `need` is the reservation the insert that triggered
+    /// the stop requires (the whole-tree reserialize plus the per-chunk inode
+    /// descriptor / convert), so the write spine restarts onto a fresh
+    /// transaction reserving exactly it rather than the smaller per-chunk
+    /// `write_credits` estimate.
+    Stopped { reached: Iblock, need: usize },
+}
+
 /// Maps an inode's logical blocks to physical blocks via its [`ExtentTree`],
 /// which owns the authoritative tree + `i_blocks` accounting.
 ///
@@ -245,30 +264,34 @@ impl ExtentManager {
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        // Whole-range mode never early-stops (it presses on and lets
+        // `charge_fresh_capture` be the backstop), so the fill always reports
+        // `Filled`; the outcome is discarded.
         self.fill_holes(start_iblock, end_iblock, handle, AllocBound::WholeRange)?;
         Ok(())
     }
 
     /// Allocates data blocks (as UNWRITTEN) for the holes in `[start_iblock,
-    /// end_iblock)` up to a credit boundary, returning the first logical block
-    /// NOT fully allocated — `end_iblock` when every hole was filled, or the
-    /// block where the credit-aware early stop halted (partial progress).
+    /// end_iblock)` up to a credit boundary, reporting either that the whole
+    /// range was filled or where the credit-aware early stop halted and the
+    /// reservation the insert that did not fit needs (see [`HoleFill`]).
     ///
-    /// The unbounded write spine allocates, writes, and converts only
-    /// `[start_iblock, reached)` this transaction and restarts for the rest: a
-    /// single insert's whole-tree reserialize can capture more than one
-    /// transaction holds, so the loop must be able to end a chunk BEFORE the
-    /// capture would overflow — and the restart cannot run here, under the
-    /// ExtentTree lock (③) the committer's ordered flush needs (it releases ③
-    /// by returning; the OUTER spine restarts). `reached == start_iblock` means
-    /// even one insert did not fit a whole transaction — the caller's `EFBIG`
-    /// floor.
+    /// The unbounded write spine allocates, writes, and converts only the filled
+    /// prefix this transaction and restarts for the rest: a single insert's
+    /// whole-tree reserialize can capture more than one transaction holds, so
+    /// the loop must be able to end a chunk BEFORE the capture would overflow —
+    /// and the restart cannot run here, under the ExtentTree lock (③) the
+    /// committer's ordered flush needs (it releases ③ by returning; the OUTER
+    /// spine restarts, reserving the reported `need`). A [`HoleFill::Stopped`]
+    /// whose `reached` equals `start_iblock` means even one insert did not fit;
+    /// the caller restarts unless that insert's `need` exceeds a whole
+    /// transaction's capacity — its `EFBIG` floor.
     pub(super) fn ensure_allocated_chunk(
         &self,
         start_iblock: Iblock,
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
-    ) -> Result<Iblock> {
+    ) -> Result<HoleFill> {
         self.fill_holes(start_iblock, end_iblock, handle, AllocBound::CreditChunk)
     }
 
@@ -282,9 +305,9 @@ impl ExtentManager {
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
         bound: AllocBound,
-    ) -> Result<Iblock> {
+    ) -> Result<HoleFill> {
         if start_iblock >= end_iblock {
-            return Ok(end_iblock);
+            return Ok(HoleFill::Filled);
         }
         let fs = self.fs()?;
         let mut tree = self.state.write();
@@ -334,7 +357,10 @@ impl ExtentManager {
                 {
                     let need = tree::next_insert_credit_bound(&fs, projected_extents + 1);
                     if journal::try_reserve_next(h, need)? == journal::ExtendOutcome::NeedsRestart {
-                        return Ok(ib);
+                        // Report the bound the reservation was checked against —
+                        // not the smaller per-chunk `write_credits` — so the
+                        // restart reserves enough for the insert that did not fit.
+                        return Ok(HoleFill::Stopped { reached: ib, need });
                     }
                 }
                 // Cap each allocation request at the widest length an *unwritten*
@@ -373,7 +399,7 @@ impl ExtentManager {
                 ib += got;
             }
         }
-        Ok(end_iblock)
+        Ok(HoleFill::Filled)
     }
 
     /// Converts every unwritten extent in the logical block range `[start,
