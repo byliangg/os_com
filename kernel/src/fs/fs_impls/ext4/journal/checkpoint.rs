@@ -452,8 +452,9 @@ fn chain_covers_unpublished(
 /// # The defer-prefix rule (unpublished revokes)
 ///
 /// The pass stops **in front of** the first transaction any of whose blocks
-/// carries an *unpublished* revoke — a forget in the running transaction, or
-/// in the committing slot's mid-flight transaction
+/// carries an *unpublished* revoke — a forget in the running transaction, in
+/// the locking seat's force-locked (draining) transaction, or in the
+/// committing slot's mid-flight transaction
 /// ([`JournalState::committing`](super::JournalState), occupied during the
 /// inline tail drain; empty for the post-commit and unmount passes, which
 /// run after retirement). Such a block is already freed (and possibly reused) in
@@ -680,10 +681,12 @@ pub(super) fn checkpoint_advance(
 /// transaction to its final location and clear the journal
 /// ([`checkpoint_advance`] with no space target). The full-reclaim entry the
 /// commit thread's demanded pass, the commit-time inline drain
-/// ([`Journal::commit_or_drain_tail`](super::Journal)), the unmount flush
-/// ([`Journal::flush_on_unmount`](super::Journal)), and mount-time recovery
-/// all use; the incremental low-water pass calls [`checkpoint_advance`]
-/// directly.
+/// ([`Journal::commit_or_drain_tail`](super::Journal)), and the unmount flush
+/// ([`Journal::flush_on_unmount`](super::Journal)) all use; the incremental
+/// low-water pass calls [`checkpoint_advance`] directly. Mount-time recovery
+/// ([`recover`](super::recovery::recover)) does NOT enter here — it replays the
+/// log without a checkpoint pass, sharing only the [`apply_log_transaction`]
+/// primitive.
 pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<()> {
     checkpoint_advance(journal, device, None).map(|_| ())
 }

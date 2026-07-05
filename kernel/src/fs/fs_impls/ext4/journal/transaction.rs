@@ -56,11 +56,13 @@
 // closed by `OpHandle::drop` → `journal_stop`), the capture half feeds the
 // metadata funnels, `Handle::tid` backs fsync's `sync_tid`, and the
 // [`CommitPhase`] walk is driven by the production commit pipeline (P7c-1).
-// Still dead in non-ktest builds: `journal_extend`/`journal_restart` (mid-op
-// credit growth — ops use fixed conservative credits until P7d's precise
-// accounting). This one module-level expectation absorbs those (avoiding a
-// marker on each); it is absent in ktest, where all of it is exercised.
-#![cfg_attr(not(ktest), expect(dead_code))]
+// Four members are still dead in a non-ktest build: `journal_extend` and
+// `journal_restart` (mid-op credit growth — ops use fixed conservative credits
+// until P7d's precise accounting), plus the `nr_ordered_data` and
+// `Handle::credits` inspection accessors (read only by ktest assertions). Each
+// carries its OWN narrow `#[cfg_attr(not(ktest), expect(dead_code))]` rather
+// than a module-wide marker, so future dead code surfaces instead of being
+// absorbed silently.
 
 use ostd::timer::{Jiffies, TIMER_FREQ};
 
@@ -353,14 +355,14 @@ impl Transaction {
         now.as_u64() >= self.expires_at.as_u64()
     }
 
-    /// The time remaining until this transaction's age deadline (zero once
-    /// expired) — what the commit thread arms its sleep timeout with.
+    /// Returns the time remaining until this transaction's age deadline (zero
+    /// once expired) — what the commit thread arms its sleep timeout with.
     pub(super) fn until_expiry(&self, now: Jiffies) -> Duration {
         Jiffies::new(self.expires_at.as_u64().saturating_sub(now.as_u64())).as_duration()
     }
 
-    /// The log blocks this transaction's captured work serializes into so
-    /// far — its captured metadata blocks plus its whole revoke blocks under
+    /// Returns the log blocks this transaction's captured work serializes into
+    /// so far — its captured metadata blocks plus its whole revoke blocks under
     /// `layout` — the measure the batch-size commit trigger compares against
     /// [`Journal::batch_trigger_credits`](super::Journal). Deliberately NOT
     /// `outstanding_credits`: reservations are fixed conservative worst
@@ -401,8 +403,8 @@ impl Transaction {
         self.metadata.len()
     }
 
-    /// The worst-case metadata log blocks this transaction would occupy with
-    /// `extra` more credits reserved: its already-captured metadata plus every
+    /// Returns the worst-case metadata log blocks this transaction would occupy
+    /// with `extra` more credits reserved: its already-captured metadata plus every
     /// reservation's full worst case (`outstanding_credits + extra`, each
     /// reservation counted at its whole credit until its handle closes). This
     /// is the credit base BOTH reservation gates share — `check_capacity`
@@ -417,8 +419,8 @@ impl Transaction {
         self.nr_metadata_blocks() + self.outstanding_credits + extra
     }
 
-    /// Whether this transaction carries a durable obligation recorded on the
-    /// transaction object itself: a captured metadata after-image or a revoke
+    /// Returns whether this transaction carries a durable obligation recorded
+    /// on the transaction object itself: a captured metadata after-image or a revoke
     /// record. A caller deciding "is this a non-empty transaction a commit must
     /// retire" must ALSO consult the state's pinned freed runs for this tid
     /// ([`JournalState::committable_running`](super::JournalState)) — a
@@ -693,6 +695,7 @@ impl Transaction {
 
     /// The number of registered ordered-data entries (including any whose inode
     /// may since have been dropped). Inspection/test accessor.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn nr_ordered_data(&self) -> usize {
         self.ordered_data.len()
     }
@@ -722,6 +725,7 @@ impl Handle {
     }
 
     /// The blocks this handle has reserved.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn credits(&self) -> usize {
         self.credits
     }
@@ -992,6 +996,7 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
 /// extend any transaction not in `T_RUNNING`, fs/jbd2/transaction.c
 /// `jbd2_journal_extend`: the locked transaction must drain, not grow; the
 /// caller's move is a restart). `ENOSPC` covers both for Phase 4.
+#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
     let journal = handle
         .journal
@@ -1031,6 +1036,7 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<()> {
 /// handle whose transaction was force-locked mid-operation is refused
 /// `ENOSPC` (a true restart would close out of the locked transaction and
 /// rejoin through `journal_start`'s locked barrier, jbd2's shape).
+#[cfg_attr(not(ktest), expect(dead_code))]
 pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()> {
     let journal = handle
         .journal
@@ -1069,7 +1075,7 @@ mod tests {
     use super::{
         super::{
             super::test_utils::{Ext4FixtureBuilder, make_multi_block_file_inode},
-            JOURNAL_INO,
+            JOURNAL_INO, MetadataCredits,
             format::{
                 BLOCKTYPE_SUPERBLOCK_V2, Be32, JBD2_MAGIC, RawJournalHeader, RawJournalSuperblock,
             },
@@ -1693,7 +1699,7 @@ mod tests {
             "revoke-bearing footprint fits the usable ring"
         );
         assert!(
-            j.worst_case_footprint(j.max_credits(), 0) <= usable,
+            j.worst_case_footprint(MetadataCredits(j.max_credits()), 0) <= usable,
             "max-credit footprint fits the ring — the reservation wait terminates"
         );
 

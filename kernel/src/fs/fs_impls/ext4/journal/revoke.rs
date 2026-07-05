@@ -54,9 +54,10 @@
 //! a freed buffer stays on the older transaction's checkpoint list until the
 //! freeing transaction commits.
 //!
-//! An **unpublished** revoke (the running transaction's, or the committing
-//! slot's on the drain path — both read out of the journal state in the
-//! pass's one snapshot window) is unsound to act on in *either* direction,
+//! An **unpublished** revoke (the running transaction's, a force-locked
+//! (draining) transaction's in the locking seat, or the committing slot's on
+//! the drain path — all three read out of the journal state in the pass's one
+//! snapshot window) is unsound to act on in *either* direction,
 //! which is why the checkpoint pass collects the unpublished sets separately
 //! and **defers** in front of them
 //! ([`checkpoint`](super::checkpoint::checkpoint)'s defer-prefix rule):

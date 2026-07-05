@@ -1376,35 +1376,48 @@ impl JournalState {
         self.pinned_frees.retain(|_, run| !committed.geq(run.tid));
     }
 
-    /// The running transaction paired with its tid, if it carries a durable
-    /// obligation a commit must retire — a captured metadata after-image, a
-    /// revoke record, or a pinned freed run — else `None` for an empty
-    /// transaction. This is the shared "committable transaction" gate behind
-    /// every commit trigger (age, request, batch, pipeline advance): an empty
-    /// transaction must never be made due, since committing it writes no log
-    /// block and a waiter on its tid would hang
-    /// ([`Journal::log_wait_commit`]).
-    ///
-    /// The obligation set is checked structurally — metadata OR revokes OR
-    /// pins — not "captured metadata alone" as the historical gate did. A
-    /// revoke/pin-only transaction (zero captures) is unreachable today only
-    /// because [`Ext4::free_blocks`](super::fs::Ext4) captures the group bitmap
-    /// before it pins/revokes, so the metadata count is incidentally non-zero
-    /// whenever pins or revokes exist; keying the gate on the obligation set
-    /// itself keeps "a transaction with durable obligations is always
-    /// committable" true structurally, not by that incidental capture. The
-    /// transaction ref rides out with the verdict so callers run their trigger
-    /// checks without re-deriving or re-unwrapping it.
+    /// Returns the running transaction paired with its tid, if it carries a
+    /// durable obligation a commit must retire
+    /// ([`has_durable_obligation`](Self::has_durable_obligation)) — else `None`
+    /// for an empty transaction. This is the shared "committable transaction"
+    /// gate behind every commit trigger (age, request, batch, pipeline
+    /// advance): an empty transaction must never be made due, since committing
+    /// it writes no log block and a waiter on its tid would hang
+    /// ([`Journal::log_wait_commit`]). The transaction ref rides out with the
+    /// verdict so callers run their trigger checks without re-deriving or
+    /// re-unwrapping it.
     fn committable_running(&self) -> Option<(&Transaction, Tid)> {
         let txn = self.running.as_ref()?;
         let tid = txn.tid();
-        (txn.has_recorded_work() || self.pins_charged_to(tid)).then_some((txn, tid))
+        self.has_durable_obligation(txn).then_some((txn, tid))
     }
 
-    /// Whether any pinned freed run is charged to `tid` — a durable obligation
-    /// that commit step 6 ([`release_pinned_frees`](Self::release_pinned_frees))
-    /// must discharge, independent of whether the freeing transaction also
-    /// captured metadata.
+    /// Returns whether `txn` carries a durable obligation a commit must retire:
+    /// a captured metadata after-image or a revoke record
+    /// ([`Transaction::has_recorded_work`]), or a pinned freed run charged to
+    /// its tid ([`pins_charged_to`](Self::pins_charged_to)). This is the single
+    /// predicate behind every durability gate — the commit trigger
+    /// ([`committable_running`](Self::committable_running)), the `sync(2)`
+    /// target ([`Journal::sync_durability_target`](super::Journal)), and the
+    /// unmount flush ([`Journal::flush_on_unmount`](super::Journal)) — so the
+    /// three cannot key durability on different obligation sets.
+    ///
+    /// The obligation set is checked structurally — metadata OR revokes OR
+    /// pins — not "captured metadata alone" as the historical gates did. A
+    /// revoke/pin-only transaction (zero captures) is unreachable today only
+    /// because [`Ext4::free_blocks`](super::fs::Ext4) captures the group bitmap
+    /// before it pins/revokes, so the metadata count is incidentally non-zero
+    /// whenever pins or revokes exist; keying on the obligation set itself
+    /// keeps "a transaction with durable obligations is always durable-tracked"
+    /// true structurally, not by that incidental capture.
+    fn has_durable_obligation(&self, txn: &Transaction) -> bool {
+        txn.has_recorded_work() || self.pins_charged_to(txn.tid())
+    }
+
+    /// Returns whether any pinned freed run is charged to `tid` — a durable
+    /// obligation that commit step 6
+    /// ([`release_pinned_frees`](Self::release_pinned_frees)) must discharge,
+    /// independent of whether the freeing transaction also captured metadata.
     fn pins_charged_to(&self, tid: Tid) -> bool {
         self.pinned_frees.values().any(|run| run.tid == tid)
     }
@@ -1693,7 +1706,7 @@ impl Journal {
             // pending; and a space-pressure wake with nothing to commit must
             // still reach the checkpoint below.
             loop {
-                let committed = j.commit_one(false);
+                let committed = j.commit_one(CommitCause::WhenDue);
                 if j.is_aborted() {
                     // A failed commit aborted the journal: the device state
                     // no longer matches the log; checkpointing would make it
@@ -1934,16 +1947,22 @@ impl Journal {
     /// commit-time footprint ([`try_commit_transaction`](commit::try_commit_transaction):
     /// `revoke + nr_data + descriptors + 1`). `revoke_blocks` is added exactly
     /// ONCE, and the descriptor count charges only the metadata tags — a
-    /// revoke block is a whole log block carrying no tag, so a caller must pass
-    /// metadata-only `credits` here (see [`reservation_footprint`](Self::reservation_footprint),
-    /// the sole non-test caller, which derives `credits` from
+    /// revoke block is a whole log block carrying no tag, so `credits` is a
+    /// [`MetadataCredits`]: the type forbids passing a revoke-inclusive sum by
+    /// mistake (see [`reservation_footprint`](Self::reservation_footprint), the
+    /// sole non-test caller, which derives it from
     /// [`Transaction::reserved_metadata_blocks`], never the revoke-inclusive
     /// capacity charge). `credits + revoke_blocks ≤ max_credits` (the capacity
     /// gate) makes this `≤ usable` by the `max_credits` formula, so a full
     /// checkpoint always frees enough — the reservation-time wait terminates. A
     /// footprint beyond a `u32` of blocks (unreachable — it is bounded by the
     /// ring) saturates, so the space check treats it as "needs the whole ring".
-    pub(super) fn worst_case_footprint(&self, credits: usize, revoke_blocks: usize) -> u32 {
+    pub(super) fn worst_case_footprint(
+        &self,
+        credits: MetadataCredits,
+        revoke_blocks: usize,
+    ) -> u32 {
+        let MetadataCredits(credits) = credits;
         let tags = self.geometry.tag_layout().tags_per_descriptor();
         let blocks = credits + revoke_blocks + credits.div_ceil(tags) + 1;
         u32::try_from(blocks).unwrap_or(u32::MAX)
@@ -1964,11 +1983,12 @@ impl Journal {
     pub(super) fn reservation_footprint(&self, txn: &Transaction, credits: usize) -> u32 {
         let revoke_blocks = txn.nr_revoke_blocks(self.geometry.tag_layout());
         let metadata_blocks = txn.reserved_metadata_blocks(credits);
-        self.worst_case_footprint(metadata_blocks, revoke_blocks)
+        self.worst_case_footprint(MetadataCredits(metadata_blocks), revoke_blocks)
     }
 
-    /// Whether a background commit thread is running to service checkpoint /
-    /// log-space waits (see [`commit_servicer`](Journal::commit_servicer)).
+    /// Returns whether a background commit thread is running to service
+    /// checkpoint / log-space waits (see
+    /// [`commit_servicer`](Journal::commit_servicer)).
     pub(super) fn has_commit_servicer(&self) -> bool {
         self.commit_servicer.load(Ordering::Acquire)
     }
@@ -1985,9 +2005,9 @@ impl Journal {
     /// state-lock window: stages the drained locking-seat transaction, or
     /// locks a due running transaction (staging it directly when it has no
     /// open handles — the zero-width `T_LOCKED` fast path; parking it in the
-    /// locking seat to drain otherwise). `force_due` treats the running
-    /// transaction as due regardless of policy (the ktest force-commit and
-    /// nothing else).
+    /// locking seat to drain otherwise). [`CommitCause::Forced`] treats the
+    /// running transaction as due regardless of policy (the ktest force-commit
+    /// and nothing else); [`CommitCause::WhenDue`] honors the batching triggers.
     ///
     /// Staging happens in the SAME critical section as the seat take — it
     /// stashes the transaction's after-images into
@@ -1997,7 +2017,7 @@ impl Journal {
     /// so the images must already be in place for its captures to seed from
     /// (the device lags this commit until its checkpoint). The commit I/O
     /// itself runs without the lock.
-    fn advance_pipeline(&self, force_due: bool) -> PipelineStep {
+    fn advance_pipeline(&self, cause: CommitCause) -> PipelineStep {
         let mut st = self.state_write();
         if st.committing.is_some() {
             // Commits are serialized on the single committer (the commit
@@ -2015,7 +2035,8 @@ impl Journal {
         }
         let due = match st.committable_running() {
             Some((txn, _tid)) => {
-                force_due || self.commit_triggered(txn, Jiffies::elapsed(), st.commit_request)
+                matches!(cause, CommitCause::Forced)
+                    || self.commit_triggered(txn, Jiffies::elapsed(), st.commit_request)
             }
             None => false,
         };
@@ -2042,8 +2063,8 @@ impl Journal {
     /// the commit loop back to its wait instead of into a pointless
     /// checkpoint pass. Runs on the commit thread (and, force-variant, the
     /// ktest committer).
-    fn commit_one(&self, force_due: bool) -> bool {
-        match self.advance_pipeline(force_due) {
+    fn commit_one(&self, cause: CommitCause) -> bool {
+        match self.advance_pipeline(cause) {
             PipelineStep::Staged(txn) => {
                 // The seats moved: wake the locked-barrier / capacity
                 // waiters in `journal_start` so a successor can be created
@@ -2094,7 +2115,8 @@ impl Journal {
         result
     }
 
-    /// The committing slot's current phase, `None` when nothing is staged.
+    /// Returns the committing slot's current phase, `None` when nothing is
+    /// staged.
     fn committing_phase(&self) -> Option<CommitPhase> {
         self.state_read()
             .committing
@@ -2532,11 +2554,8 @@ impl Journal {
         // waiting on the newest one with work covers them all (commits are
         // serial, and a running transaction can only exist once the locking
         // seat staged).
-        if let Some(txn) = st
-            .running
-            .as_ref()
-            .or(st.locking.as_ref())
-            .filter(|txn| txn.nr_metadata_blocks() > 0)
+        if let Some(txn) = st.running.as_ref().or(st.locking.as_ref())
+            && st.has_durable_obligation(txn)
         {
             return Ok(Some(txn.tid()));
         }
@@ -2686,9 +2705,9 @@ impl Journal {
                     // unmount, but the invariant is cheap and uniform: every
                     // transaction entering the pipeline is slot-resident
                     // with its images stashed).
-                    Some(txn) if txn.nr_metadata_blocks() > 0 => Some(st.stage_committing(txn)),
-                    // A captureless leftover is not committable; drop it and
-                    // look at the next seat.
+                    Some(txn) if st.has_durable_obligation(&txn) => Some(st.stage_committing(txn)),
+                    // An obligation-free leftover is not committable; drop it
+                    // and look at the next seat.
                     Some(_) => None,
                     // Both seats empty: flushing is done.
                     None => break,
@@ -2706,6 +2725,31 @@ impl Journal {
         // pass's snapshot finds no unpublished revokes.
         checkpoint::checkpoint(self, self.device.as_ref())
     }
+}
+
+/// A count of METADATA log blocks alone — captured metadata plus reserved
+/// metadata credits, excluding whole revoke blocks. The distinct type is what
+/// keeps [`Journal::worst_case_footprint`] from ever being handed a
+/// revoke-inclusive sum (which would double-count the revoke blocks it adds
+/// separately): the only way to make one is from
+/// [`Transaction::reserved_metadata_blocks`], which is revoke-exclusive by
+/// construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MetadataCredits(pub(super) usize);
+
+/// Whether a pipeline advance ([`Journal::advance_pipeline`]) may commit only a
+/// transaction whose batching trigger fired, or must treat the running
+/// transaction as due regardless of policy.
+enum CommitCause {
+    /// Commit only when a batching trigger (age / request / size) fired — the
+    /// commit thread's normal policy.
+    WhenDue,
+    /// Treat the running transaction as due regardless of trigger — the ktest
+    /// force-commit ([`commit_now_for_test`](Journal::commit_now_for_test),
+    /// [`stage_running_for_test`](Journal::stage_running_for_test)) and nothing
+    /// else, so it is never constructed in a non-ktest build.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    Forced,
 }
 
 /// What the commit thread should do after a wake (the decision made by
@@ -3107,7 +3151,7 @@ impl Journal {
     /// a transaction with open handles is parked to drain, not committed.
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn commit_now_for_test(&self) {
-        self.commit_one(true);
+        self.commit_one(CommitCause::Forced);
     }
 
     /// Test helper: one UNFORCED pipeline advance — exactly what the commit
@@ -3116,7 +3160,7 @@ impl Journal {
     /// whether a commit was attempted.
     #[cfg(ktest)]
     pub(in crate::fs::fs_impls::ext4) fn commit_if_due_for_test(&self) -> bool {
-        self.commit_one(false)
+        self.commit_one(CommitCause::WhenDue)
     }
 
     /// Test helper: FORCED staging without the commit I/O — the pipeline
@@ -3130,7 +3174,7 @@ impl Journal {
     pub(in crate::fs::fs_impls::ext4::journal) fn stage_running_for_test(
         &self,
     ) -> Option<Arc<Transaction>> {
-        match self.advance_pipeline(true) {
+        match self.advance_pipeline(CommitCause::Forced) {
             PipelineStep::Staged(txn) => Some(txn),
             PipelineStep::Parked | PipelineStep::Idle => None,
         }
@@ -4561,6 +4605,59 @@ mod tests {
         let f = journaled_fixture(16, 1, 1);
         assert_eq!(f.journal.sync_durability_target().unwrap(), None);
         f.journal.commit_and_wait_running().unwrap();
+    }
+
+    /// `sync(2)`'s durability probe (P7c close-out, finding 1): a running
+    /// transaction carrying a durable obligation with ZERO metadata captures —
+    /// a pin-only (plain-data free) or a revoke-only (journaled free)
+    /// transaction — is still a target the probe must wait on. The probe now
+    /// keys on the shared obligation predicate
+    /// ([`JournalState::has_durable_obligation`]) that `committable_running`
+    /// uses, so it cannot diverge from the commit trigger; the earlier
+    /// `nr_metadata_blocks() > 0` gate would have let `sync(2)` return early on
+    /// such a transaction, claiming durability for work not yet committed. (The
+    /// case is latent-only today — `free_blocks` captures the group bitmap
+    /// before it pins/revokes — so this uses a synthetic obligation, mirroring
+    /// `revoke_or_pin_only_transaction_is_committable`.)
+    #[ktest]
+    fn sync_probe_targets_a_revoke_or_pin_only_running_transaction() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(16, 1, 1);
+
+        let handle = journal_start(&f.journal, 4).unwrap();
+        let tid = handle.tid();
+
+        // Empty transaction: no obligation, nothing to make durable.
+        assert_eq!(f.journal.sync_durability_target().unwrap(), None);
+
+        // Pin-only (a plain-data free records no revoke, captures no metadata):
+        // the probe must still target it, via the pin branch of the predicate.
+        f.journal
+            .state_write()
+            .pinned_frees
+            .insert(500, PinnedRun { count: 1, tid });
+        assert_eq!(
+            f.journal.sync_durability_target().unwrap(),
+            Some(tid),
+            "a pin-only running transaction is a durability target",
+        );
+
+        // Revoke-only (a journaled free's forget, no pin): drop the pin and
+        // record a revoke — equally a target, still with zero captures.
+        f.journal.state_write().pinned_frees.clear();
+        f.journal
+            .state_write()
+            .running
+            .as_mut()
+            .unwrap()
+            .forget_block(90_000);
+        assert_eq!(
+            f.journal.sync_durability_target().unwrap(),
+            Some(tid),
+            "a revoke-only running transaction is a durability target",
+        );
+
+        journal_stop(handle).unwrap();
     }
 
     /// The committer's occupied-slot wait shape (P7c-1 review MINOR): with a
