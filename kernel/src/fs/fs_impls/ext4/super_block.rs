@@ -30,7 +30,7 @@ pub(super) const SUPER_BLOCK_OFFSET: usize = 1024;
 /// The device block that holds the primary superblock. With 4 KiB blocks the
 /// superblock lives at byte [`SUPER_BLOCK_OFFSET`] (1024) inside block 0, so
 /// journaling it means capturing block 0.
-const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
+pub(super) const SUPERBLOCK_BID: Ext4Bid = (SUPER_BLOCK_OFFSET / BLOCK_SIZE) as Ext4Bid;
 
 const SUPER_BLOCK_SIZE: usize = 1024;
 

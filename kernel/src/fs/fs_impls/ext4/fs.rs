@@ -2142,6 +2142,7 @@ mod tests {
         super::{
             block_group::RawBlockGroup,
             inode::SyncScope,
+            super_block::SUPERBLOCK_BID,
             test_utils::{
                 Ext4FixtureBuilder, Ext4MemoryDisk, make_empty_file_inode, make_file_inode,
                 make_unwritten_file_inode,
@@ -3031,6 +3032,133 @@ mod tests {
         assert_eq!(
             raw_sb.free_inodes_count,
             f.ext4.super_block().free_inodes_count()
+        );
+    }
+
+    /// The per-op allocator journals the free-count words into the SAME running
+    /// transaction as the bitmap it mutates: the superblock counters
+    /// (`s_free_blocks_count` / `s_free_inodes_count`, via
+    /// `SuperBlock::journal_capture`) and the owning group descriptor
+    /// (`bg_free_*`, via the descriptor `patch_into` funnel). Capturing the
+    /// count word alongside the bitmap is what makes the count WAL-ordered:
+    /// recovery replays both or neither, so a crash never leaves a count that
+    /// disagrees with the bitmap. This is the invariant behind the closed
+    /// `fs-sync-counts-direct-write` debt — there is no live-journal direct
+    /// write left to invert (see
+    /// [`sync_metadata_defers_counts_to_journal_while_live`]).
+    #[ktest]
+    fn free_count_words_journaled_with_bitmap() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        // Freeze the running transaction so its capture set stays inspectable.
+        journal.stop_commit_thread();
+
+        let group = f.ext4.block_group(0);
+        let first_block = group.first_block();
+        let block_bitmap_bid = group.block_bitmap_bid_for_test();
+        let inode_bitmap_bid = group.inode_bitmap_bid_for_test();
+        let desc_bid = group.desc_block_bid_for_test();
+
+        let op = f.ext4.begin_op(16).unwrap();
+
+        // A block allocation captures bitmap + GDT count + sb count, one txn.
+        f.ext4.alloc_blocks(1, first_block, op.get()).unwrap();
+        let captured = journal.running_captured_blocks_for_test();
+        assert!(
+            captured.contains(&block_bitmap_bid),
+            "block bitmap journaled"
+        );
+        assert!(
+            captured.contains(&desc_bid),
+            "bg_free_blocks_count journaled in the bitmap's transaction"
+        );
+        assert!(
+            captured.contains(&SUPERBLOCK_BID),
+            "s_free_blocks_count journaled in the bitmap's transaction"
+        );
+
+        // An inode allocation threads the same three blocks on the inode side.
+        f.ext4
+            .alloc_ino(ROOT_INO, InodeType::File, op.get())
+            .unwrap();
+        let captured = journal.running_captured_blocks_for_test();
+        assert!(
+            captured.contains(&inode_bitmap_bid),
+            "inode bitmap journaled"
+        );
+        assert!(
+            captured.contains(&desc_bid),
+            "bg_free_inodes_count journaled in the bitmap's transaction"
+        );
+        assert!(
+            captured.contains(&SUPERBLOCK_BID),
+            "s_free_inodes_count journaled in the bitmap's transaction"
+        );
+
+        drop(op);
+    }
+
+    /// While the journal is live, the sb/GDT free-count words reach disk ONLY
+    /// through the log (commit -> checkpoint), never a direct RMW that could
+    /// land ahead of an uncommitted transaction. `sync_metadata` early-returns
+    /// as a no-op until the journal is stopped, so the lone direct count write
+    /// is the unmount quiesce point (log already flushed empty — nothing to
+    /// invert). Regression guard for the closed `fs-sync-counts-direct-write`
+    /// WAL-inversion window.
+    #[ktest]
+    fn sync_metadata_defers_counts_to_journal_while_live() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(32)
+            .build()
+            .unwrap();
+
+        let on_disk_free = || {
+            f.disk
+                .segment()
+                .read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)
+                .unwrap()
+                .free_blocks_count
+        };
+        let before = on_disk_free();
+
+        // Allocate under an OPEN handle: the count drops in memory and is
+        // captured into the running transaction, but the open handle pins that
+        // transaction from committing, so nothing can reach disk yet.
+        let op = f.ext4.begin_op(8).unwrap();
+        let goal = f.ext4.block_group(0).first_block();
+        f.ext4.alloc_blocks(4, goal, op.get()).unwrap();
+        assert!(
+            f.ext4.super_block().free_blocks_count() < u64::from(before),
+            "in-memory count dropped"
+        );
+
+        // Journal live: sync_metadata must NOT push the new count to its final
+        // home; the on-disk count still reads the pre-alloc value.
+        f.ext4.sync_metadata().unwrap();
+        assert_eq!(
+            on_disk_free(),
+            before,
+            "live-journal sync_metadata is a no-op — no count written around the log"
+        );
+
+        // Release the handle and reach the quiesce point: the pinned
+        // transaction is flushed and the direct count write becomes legitimate.
+        drop(op);
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+        journal.flush_on_unmount().unwrap();
+        f.ext4.sync_metadata().unwrap();
+        assert_eq!(
+            u64::from(on_disk_free()),
+            f.ext4.super_block().free_blocks_count(),
+            "at the quiesce point the count reaches its final home"
         );
     }
 

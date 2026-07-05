@@ -733,6 +733,30 @@ impl BlockGroup {
         self.metadata.read().desc.free_blocks_count()
     }
 
+    /// The device block holding this group's block bitmap. Test-only inspection
+    /// for the free-count WAL-ordering assertion.
+    #[cfg(ktest)]
+    pub(super) fn block_bitmap_bid_for_test(&self) -> Ext4Bid {
+        self.metadata.read().desc.block_bitmap_bid()
+    }
+
+    /// The device block holding this group's inode bitmap. Test-only inspection
+    /// for the free-count WAL-ordering assertion.
+    #[cfg(ktest)]
+    pub(super) fn inode_bitmap_bid_for_test(&self) -> Ext4Bid {
+        self.metadata.read().desc.inode_bitmap_bid()
+    }
+
+    /// The device block holding this group's on-disk descriptor — the block a
+    /// per-op alloc/free journals its `bg_free_*` count word (and `bg_checksum`)
+    /// into, alongside the bitmap. Test-only inspection for the free-count
+    /// WAL-ordering assertion.
+    #[cfg(ktest)]
+    pub(super) fn desc_block_bid_for_test(&self) -> Ext4Bid {
+        Ext4Bid::try_from(self.desc_offset / BLOCK_SIZE)
+            .expect("descriptor block index fits Ext4Bid")
+    }
+
     /// Returns the number of free inodes in this group.
     #[cfg(ktest)]
     pub(super) fn free_inodes_count(&self) -> u32 {
