@@ -922,8 +922,11 @@ impl Inode {
             .extent_manager()
             .map(|em| em.root_depth())
             .unwrap_or(0);
-        let op = fs.begin_op(fs.write_credits(depth))?;
-        let len = inner.write_at(&fs, offset, reader, op.get())?;
+        let mut op = fs.begin_op(fs.write_credits(depth))?;
+        // `get_mut`: the unbounded write spine holds the handle by `&mut` so a
+        // future `journal_restart` (P7d-2b) is reachable at its safe seams; the
+        // per-handle descriptor capture below reverts to the shared `get`.
+        let len = inner.write_at(&fs, offset, reader, op.get_mut())?;
         // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
         // and — for an inline root — the extent mapping itself) must ride the
         // SAME transaction as the bitmap/GDT captures above, or a crash
@@ -975,7 +978,7 @@ impl Inode {
             .extent_manager()
             .map(|em| em.root_depth())
             .unwrap_or(0);
-        let op = fs.begin_op(fs.truncate_credits(depth))?;
+        let mut op = fs.begin_op(fs.truncate_credits(depth))?;
         // Truncate-orphan protection is deliberately absent (owner: P7
         // `journal_restart`). It must NOT reuse the delete path's fs-level
         // `orphan_add`/`orphan_del`: a truncated inode stays live (link count
@@ -985,7 +988,10 @@ impl Inode {
         // crash — so nothing is needed yet; P7's multi-transaction truncate
         // brings the fs-level re-truncate orphan machinery with it.
         let old_size = inner.file_size();
-        inner.resize(&fs, new_size, op.get())?;
+        // `get_mut`: the unbounded truncate spine holds the handle by `&mut` for
+        // a future commit-boundary `journal_restart` (P7d-2b); the descriptor
+        // capture below reverts to the shared `get`.
+        inner.resize(&fs, new_size, op.get_mut())?;
         // Same per-handle descriptor capture as `write_at`: the new size and
         // truncated extent root must commit with the bitmap/GDT changes.
         if op.get().is_some() {
@@ -1578,13 +1584,16 @@ impl InodeInner {
         &mut self,
         fs: &Ext4,
         new_size: usize,
-        handle: Option<&journal::Handle>,
+        handle: Option<&mut journal::Handle>,
     ) -> Result<()> {
         let old_size = self.file_size();
         if new_size == old_size {
             return Ok(());
         }
         if new_size < old_size {
+            // Hand the `&mut` handle to the shrink spine by move: this is the only
+            // sub-op that consumes it, so no reborrow is needed (a later
+            // `journal_restart` in `shrink` reaches it there).
             self.shrink(new_size, handle)?;
         } else {
             self.expand(fs, new_size)?;
@@ -1595,7 +1604,7 @@ impl InodeInner {
 
     /// Shrinks the file: zeroes the kept partial last block in the page cache,
     /// frees every data/metadata block past `new_size`, then publishes the size.
-    fn shrink(&mut self, new_size: usize, handle: Option<&journal::Handle>) -> Result<()> {
+    fn shrink(&mut self, new_size: usize, handle: Option<&mut journal::Handle>) -> Result<()> {
         let old_size = self.file_size();
         // Ordered-data vs. truncate: discarding the doomed tail pages would
         // orphan the flush obligation of an *earlier committing* transaction
@@ -1616,7 +1625,7 @@ impl InodeInner {
         // extended; a hole tail is left untouched by `resize_page_cache`.
         self.resize_page_cache(new_size, old_size)?;
         self.extent_manager()?
-            .truncate_to_byte_len(new_size, handle)?;
+            .truncate_to_byte_len(new_size, handle.as_deref())?;
         self.set_file_size(new_size);
         Ok(())
     }
@@ -1637,12 +1646,21 @@ impl InodeInner {
     }
 
     /// Writes file data at `offset` through the page cache.
+    ///
+    /// Holds the handle by `&mut` (not the shared `Option<&Handle>` the bounded
+    /// metadata ops thread) so a future commit-boundary `journal_restart`
+    /// (P7d-2b) is reachable at the safe seams between the allocate / page-write
+    /// / convert steps below — where the extent-tree lock is released and no
+    /// capture credential is live. The leaf spine (`prepare_write`,
+    /// `rollback_write`, `mark_range_written`) is shared with the bounded
+    /// dir/symlink paths and stays `Option<&Handle>`; each call reborrows
+    /// `handle.as_deref()`.
     fn write_at(
         &mut self,
         fs: &Ext4,
         offset: usize,
         reader: &mut VmReader,
-        handle: Option<&journal::Handle>,
+        handle: Option<&mut journal::Handle>,
     ) -> Result<usize> {
         let write_len = reader.remain();
         if write_len == 0 {
@@ -1653,12 +1671,12 @@ impl InodeInner {
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
 
-        if let Err(err) = self.prepare_write(fs, offset, end, handle) {
-            self.rollback_write(old_size, end, handle);
+        if let Err(err) = self.prepare_write(fs, offset, end, handle.as_deref()) {
+            self.rollback_write(old_size, end, handle.as_deref());
             return Err(err);
         }
         if let Err(err) = self.page_cache()?.write(offset, reader) {
-            self.rollback_write(old_size, end, handle);
+            self.rollback_write(old_size, end, handle.as_deref());
             return Err(err.into());
         }
         // Unwritten-first: the blocks this write covers were allocated as
@@ -1675,9 +1693,9 @@ impl InodeInner {
             .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         if let Err(err) = self
             .extent_manager()
-            .and_then(|em| em.mark_range_written(start_block, end_block, handle))
+            .and_then(|em| em.mark_range_written(start_block, end_block, handle.as_deref()))
         {
-            self.rollback_write(old_size, end, handle);
+            self.rollback_write(old_size, end, handle.as_deref());
             return Err(err);
         }
 

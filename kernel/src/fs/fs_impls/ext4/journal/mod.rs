@@ -395,6 +395,15 @@ impl OpHandle {
         self.handle.as_ref()
     }
 
+    /// Mutably borrows the handle for the unbounded write / truncate / reclaim
+    /// spine. Unlike [`get`](Self::get), this yields the `&mut Handle` that
+    /// `journal_restart` (P7d-2b) consumes at a commit boundary, so an operation
+    /// that owns its `OpHandle` can reach the restart entry point. `None` for a
+    /// non-journaled volume, exactly as `get`.
+    pub(in crate::fs::fs_impls::ext4) fn get_mut(&mut self) -> Option<&mut Handle> {
+        self.handle.as_mut()
+    }
+
     /// Returns the transaction id this handle joined, or `None` for the no-op
     /// handle of a non-journaled volume. An `fsync` records this before closing the
     /// handle, releases every filesystem lock, and then waits for the tid via
