@@ -1452,10 +1452,14 @@ impl Inode {
     /// Chunked + restarted like the append write path: a large preallocation maps
     /// more metadata than one transaction holds (a fragmented run, a deep tree),
     /// so it splits into credit-bounded chunks, each committing its extent-tree
-    /// changes + `i_blocks` (+ `i_size` for `Allocate`) in one transaction across a
-    /// `journal_restart` boundary. Crash safety mirrors a sparse extend: a crash
-    /// mid-preallocation leaves some blocks unwritten and the rest holes — both
-    /// read zero — so no orphan protection is needed.
+    /// changes + `i_blocks` in one transaction across a `journal_restart`
+    /// boundary. For `Allocate`, `i_size` is advanced ONCE at the end on success
+    /// (committed with the final descriptor writeback), not per chunk: a failed
+    /// allocation must leave `i_size` at its original value. Crash safety mirrors
+    /// a sparse extend: a crash mid-preallocation leaves some blocks unwritten and
+    /// the rest holes — both read zero, and `i_size` is still the pre-op value or
+    /// the final one, never a torn intermediate — so no orphan protection is
+    /// needed.
     fn preallocate(&self, offset: usize, len: usize, grow_size: bool) -> Result<()> {
         let end = offset
             .checked_add(len)
@@ -1470,13 +1474,18 @@ impl Inode {
         let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
 
-        // `Allocate` extends `i_size` to `end`; publish it and grow the page cache
-        // sparsely FIRST — while the range is still holes the grow-resize skips the
-        // boundary zero-fill (which over a hole plants a backing-block-less dirty
-        // page), and the blocks about to be allocated are UNWRITTEN, so a read of
-        // the extended range returns zeros either way.
+        // `Allocate` grows the page cache sparsely FIRST — while the range is
+        // still holes the grow-resize skips the boundary zero-fill (which over a
+        // hole plants a backing-block-less dirty page), and the blocks about to be
+        // allocated are UNWRITTEN, so a read of the extended range returns zeros
+        // either way. `i_size` is NOT advanced here: the on-disk/reported size may
+        // only move on SUCCESS (Linux extends it at the end of
+        // `ext4_alloc_file_blocks`), so an allocation failure below (`ENOSPC` /
+        // `EFBIG`) leaves it at `old_size`. The grown page cache past `old_size`
+        // is harmless residue — `read_at` clamps reads to `i_size`, and no page
+        // there was dirtied.
         if grow_size && end > old_size {
-            inner.expand(&fs, end)?;
+            inner.resize_page_cache(end, old_size)?;
         }
 
         let depth = inner
@@ -1485,6 +1494,13 @@ impl Inode {
             .unwrap_or(0);
         let mut op = fs.begin_op(fs.write_credits(depth))?;
         self.preallocate_chunked(&fs, &mut inner, start_block, end_block, &mut op)?;
+        // Allocation succeeded: NOW advance `i_size` to the range end (`Allocate`),
+        // committed in the same transaction as the final descriptor writeback
+        // below. Never reached on the failure path above, so a failed `Allocate`
+        // reports `old_size` unchanged.
+        if grow_size && end > old_size {
+            inner.set_file_size(end);
+        }
         // A pure metadata operation: `fallocate` bumps ctime/mtime like Linux.
         // The final descriptor capture also covers the sub-block and non-journaled
         // paths where the chunk loop did no writeback.
@@ -1603,10 +1619,28 @@ impl Inode {
         let aligned_end = (end / BLOCK_SIZE) * BLOCK_SIZE;
 
         // Zero the partial edges in the page cache (Linux ext4_zero_partial_blocks).
-        if aligned_start >= aligned_end {
-            // The whole punch lies within a single block: zero `[offset, end)`.
-            inner.zero_partial_block(offset, end)?;
+        // The single-block fast path is guarded by SAME-BLOCK (`offset` and the
+        // last punched byte `end - 1` in one block), NOT `aligned_start >=
+        // aligned_end`: the latter also holds for two ADJACENT partial blocks with
+        // no full block between (e.g. `offset = BLOCK_SIZE + 100`, `end = 2 *
+        // BLOCK_SIZE + 100`), where one merged `zero_partial_block(offset, end)`
+        // would span TWO blocks yet check only the first block's mapping — leaving
+        // the tail unzeroed when the head is a hole (stale data), or dirtying a
+        // page over a hole when the tail is a hole (a journaled-writeback abort).
+        // Each partial is zeroed against ITS OWN block's mapping.
+        if offset / BLOCK_SIZE == (end - 1) / BLOCK_SIZE {
+            // `offset` and `end - 1` share one block. Zero `[offset, end)` only
+            // when that block is partially covered; a fully-covered single block
+            // (`offset` and `end` both block-aligned) is freed below, not zeroed.
+            if offset < aligned_start || aligned_end < end {
+                inner.zero_partial_block(offset, end)?;
+            }
         } else {
+            // `offset` and `end - 1` lie in DIFFERENT blocks. Zero the head-partial
+            // (`[offset, aligned_start)`, within `offset`'s block) and the
+            // tail-partial (`[aligned_end, end)`, within `end - 1`'s block) as
+            // SEPARATE single-block calls — whether or not a full block sits
+            // between them — each checking its own block's mapping.
             if offset < aligned_start {
                 inner.zero_partial_block(offset, aligned_start)?;
             }
@@ -3912,6 +3946,179 @@ mod write_tests {
             read_back(&inode, 3 * BLOCK_SIZE + 100, BLOCK_SIZE - 100),
             payload[3 * BLOCK_SIZE + 100..4 * BLOCK_SIZE]
         );
+    }
+
+    /// P7e-3 (red-line ①) — a punch straddling TWO ADJACENT blocks with a partial
+    /// edge on EACH side and NO fully-covered block between them: each partial is
+    /// zeroed against its OWN block's mapping. Both blocks are Written here, so
+    /// both covered sub-ranges are zeroed and NOTHING is freed (no full block).
+    /// The single-block fast path must be keyed on same-block, not `aligned_start
+    /// >= aligned_end` (which also holds for this adjacent-partial geometry).
+    #[ktest]
+    fn fallocate_punch_two_adjacent_partials_both_mapped() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Blocks 0..3 Written with nonzero data; the punch touches only 1 and 2.
+        let payload = nonzero_pattern(3 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        // Punch [BLOCK+100, 2*BLOCK+100): block 1's tail + block 2's head, no
+        // fully-covered block between.
+        inode
+            .fallocate(FallocMode::PunchHoleKeepSize, BLOCK_SIZE + 100, BLOCK_SIZE)
+            .unwrap();
+
+        // No fully-covered block → nothing freed; both blocks stay Written.
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Written);
+        }
+        // Block 1: [0,100) intact, [100, BLOCK) zeroed.
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, 100),
+            payload[BLOCK_SIZE..BLOCK_SIZE + 100]
+        );
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            vec![0u8; BLOCK_SIZE - 100]
+        );
+        // Block 2: [0,100) zeroed, [100, BLOCK) intact.
+        assert_eq!(read_back(&inode, 2 * BLOCK_SIZE, 100), vec![0u8; 100]);
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            payload[2 * BLOCK_SIZE + 100..3 * BLOCK_SIZE]
+        );
+    }
+
+    /// P7e-3 (red-line ①, silent-stale) — two adjacent partials where the HEAD
+    /// block is a hole and the TAIL block is Written: the tail-partial must be
+    /// zeroed against ITS OWN mapping. The pre-fix merged call checked only the
+    /// head block (a hole) and returned WITHOUT zeroing, leaving the tail block's
+    /// covered head holding stale bytes (a read of a punched range returns data).
+    #[ktest]
+    fn fallocate_punch_two_adjacent_partials_head_hole() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // block 1 = hole, block 2 = Written nonzero (write only [2*BLOCK,3*BLOCK);
+        // blocks 0 and 1 stay holes, i_size = 3*BLOCK).
+        let payload = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, 2 * BLOCK_SIZE, &payload);
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Written);
+        }
+
+        // Punch [BLOCK+100, 2*BLOCK+100): head partial in the hole block 1, tail
+        // partial in the Written block 2.
+        inode
+            .fallocate(FallocMode::PunchHoleKeepSize, BLOCK_SIZE + 100, BLOCK_SIZE)
+            .unwrap();
+
+        // Block 2's covered head [2*BLOCK, 2*BLOCK+100) is now zeroed (the fix);
+        // its tail survives. The pre-fix code leaves the head at its stale bytes.
+        assert_eq!(read_back(&inode, 2 * BLOCK_SIZE, 100), vec![0u8; 100]);
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            payload[100..BLOCK_SIZE]
+        );
+    }
+
+    /// P7e-3 (red-line ①, journal-abort) — two adjacent partials where the HEAD
+    /// block is Written and the TAIL block is a hole: the head-partial is zeroed
+    /// but NO dirty page is planted over the tail hole. The pre-fix merged call
+    /// checked only the (mapped) head block and then `fill_zeros` dirtied BOTH
+    /// pages, including the hole's; the punch transaction's ordered-data flush
+    /// then hit that backing-block-less page — aborting the journal (fs read-only)
+    /// or spuriously allocating the tail block — all triggered by a punch that
+    /// already returned success. Drives a real commit to exercise the flush.
+    #[ktest]
+    fn fallocate_punch_two_adjacent_partials_tail_hole() {
+        let f = journaled_multigroup_fixture(64);
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // block 1 = Written nonzero, block 2 = hole, block 3 = Written (so i_size
+        // reaches 4*BLOCK while block 2 stays a hole). Commit the setup writes so
+        // the punch commits alone below.
+        let payload = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, BLOCK_SIZE, &payload);
+        write_all(&inode, 3 * BLOCK_SIZE, &payload);
+        journal.commit_now_for_test();
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Hole);
+        }
+
+        // Punch [BLOCK+100, 2*BLOCK+100): head partial in Written block 1, tail
+        // partial in the hole block 2.
+        inode
+            .fallocate(FallocMode::PunchHoleKeepSize, BLOCK_SIZE + 100, BLOCK_SIZE)
+            .unwrap();
+        // Block 1's tail is zeroed; its head survives.
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 100), payload[..100]);
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            vec![0u8; BLOCK_SIZE - 100]
+        );
+
+        // Force the punch transaction to commit and run its ordered-data flush.
+        // The fix left NO dirty page over block 2, so the flush touches nothing
+        // there: the journal stays healthy and block 2 stays a hole. The pre-fix
+        // dirty page over the hole would abort the commit or plant a block.
+        journal.commit_now_for_test();
+        assert!(
+            !journal.is_aborted(),
+            "a legitimate punch must not abort the journal"
+        );
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(
+                bm.map_blocks(2).unwrap().state(),
+                MapState::Hole,
+                "the tail hole must not be planted with a block"
+            );
+        }
+    }
+
+    /// P7e-3 (MINOR) — a failed `fallocate(Allocate)` must NOT advance `i_size`:
+    /// Linux extends the size only at the end of `ext4_alloc_file_blocks`, on
+    /// success. Here the allocator runs out of space partway; `i_size` must stay
+    /// at its original value. The pre-fix code grew `i_size` up front and left it
+    /// at the range end after the failed allocation.
+    #[ktest]
+    fn fallocate_allocate_failure_leaves_size_unchanged() {
+        clocks::init_for_ktest();
+        // A single-group fixture capped to a few free blocks: an `Allocate` over
+        // more blocks than that runs the allocator out of space partway.
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_free_blocks(4)
+            .build()
+            .unwrap();
+        f.write_raw_inode(FILE_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        assert_eq!(inode.size(), 0);
+
+        // Reserve 32 blocks with only 4 free → `ENOSPC` partway.
+        let err = inode
+            .fallocate(FallocMode::Allocate, 0, 32 * BLOCK_SIZE)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+
+        // i_size unchanged after the failed allocation.
+        assert_eq!(inode.size(), 0, "a failed Allocate must not advance i_size");
     }
 
     /// P7e-3 (red-line ①) — a large punch over a fragmented file spans multiple
