@@ -569,7 +569,12 @@ impl BlockGroup {
     /// state). The fast path hits the cache under the read lock; the slow path
     /// promotes to the write lock, re-checks (another thread may have inserted
     /// the inode in the gap), then loads the descriptor from disk and inserts it.
-    pub(super) fn lookup_inode(&self, ino: Ext4Ino, fs: Weak<Ext4>) -> Result<Arc<Inode>> {
+    pub(super) fn lookup_inode(
+        &self,
+        ino: Ext4Ino,
+        fs: Weak<Ext4>,
+        journal: Option<&journal::Journal>,
+    ) -> Result<Arc<Inode>> {
         let inode_idx = self.inode_idx_in_group(ino);
 
         // Fast path: cache hit under the read lock.
@@ -584,7 +589,7 @@ impl BlockGroup {
             return Ok(inode.clone());
         }
 
-        let desc = self.read_inode_desc(ino)?;
+        let desc = self.read_inode_desc(ino, journal)?;
         let type_ = desc.type_();
         let inode = Inode::new(ino, type_, Dirty::new(desc), self.group_idx, fs)?;
         inode_cache.insert(inode_idx, inode.clone());
@@ -679,14 +684,31 @@ impl BlockGroup {
 
     /// Loads and decodes an inode's on-disk descriptor from the inode table.
     ///
-    /// The inode-table read stays a direct device read (no page cache in
-    /// Phase 2); the cache built on top is only for inode identity and
-    /// enumeration.
-    pub(super) fn read_inode_desc(&self, ino: Ext4Ino) -> Result<InodeDesc> {
+    /// The inode-table block is read through [`journal::read_metadata_block`],
+    /// the WAL-suppressing funnel (newest wins: a running capture, then the
+    /// committed-but-un-checkpointed retained image, then the device). On a
+    /// journaled volume the device lags the log between an operation's commit
+    /// and its checkpoint; a bare device read of this block in that window would
+    /// decode a neighbor inode's stale slot. Routing through the funnel makes a
+    /// cache-miss reload see the committed image structurally — the residual
+    /// `extent-leaf-stale-read-window` for the inode table (the live `Arc` a
+    /// pinned inode holds in the cache was the only prior guard; this closes the
+    /// read path itself). `journal` is `None` on a non-journaled volume, where
+    /// the device is authoritative and the funnel reads it directly.
+    ///
+    /// An inode never straddles a block: `s_inode_size` divides `BLOCK_SIZE`, so
+    /// the whole descriptor lies at `off_in_block` within one metadata block.
+    pub(super) fn read_inode_desc(
+        &self,
+        ino: Ext4Ino,
+        journal: Option<&journal::Journal>,
+    ) -> Result<InodeDesc> {
         let idx_in_group = self.inode_idx_in_group(ino) as usize;
-        let offset =
-            self.inode_table_bid() as usize * self.block_size + idx_in_group * self.inode_size;
-        let raw = self.block_device.read_val::<RawInode>(offset)?;
+        let byte_off = idx_in_group * self.inode_size;
+        let block_bid = self.inode_table_bid() + (byte_off / self.block_size) as Ext4Bid;
+        let off_in_block = byte_off % self.block_size;
+        let block = journal::read_metadata_block(journal, self.block_device.as_ref(), block_bid)?;
+        let raw = RawInode::from_bytes(&block[off_in_block..off_in_block + size_of::<RawInode>()]);
         if let Some(seed) = self.csum_seed {
             InodeDesc::verify_inode_checksum(
                 &raw,

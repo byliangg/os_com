@@ -1505,18 +1505,18 @@ impl Ext4 {
                 match inode.retruncate_to(target) {
                     Ok(()) => {
                         // Pin the re-truncated LIVE inode in its block group's
-                        // cache, exactly as every create path does. The
-                        // re-truncate committed to the journal but is not yet
-                        // checkpointed to the inode table; `read_inode` on a cache
-                        // MISS falls through to `read_inode_desc`, a DIRECT device
-                        // read that bypasses the uncheckpointed journal image and
-                        // would return the STALE pre-truncate tree — resurrecting
-                        // freed (now reallocatable) blocks. The strong `Arc` the
-                        // cache holds is the invariant that keeps a
-                        // committed-but-uncheckpointed live inode from a stale
-                        // device read; recovery must honor it too. (The delete
-                        // twin needs no such pin: a freed inode reads link_count 0
-                        // and `read_inode_desc` rejects it as ESTALE.)
+                        // cache, exactly as every create path does, so all
+                        // readers share one in-memory inode (identity and dirty
+                        // state). The re-truncate committed to the journal but is
+                        // not yet checkpointed to the inode table; a cache MISS
+                        // would reload through `read_inode_desc`, which routes the
+                        // inode-table read through the WAL funnel and so decodes
+                        // the committed image, not the stale pre-truncate slot —
+                        // but the pin keeps that reload from minting a rival inode
+                        // that races the pinned one's writeback. Recovery must
+                        // honor the pin too. (The delete twin needs no such pin: a
+                        // freed inode reads link_count 0 and `read_inode_desc`
+                        // rejects it as ESTALE.)
                         self.insert_inode(inode);
                         true
                     }
@@ -1664,7 +1664,9 @@ impl Ext4 {
     /// The owning group performs the on-disk load; this method only routes the
     /// inode number to its group.
     pub(super) fn read_inode_desc(&self, ino: Ext4Ino) -> Result<InodeDesc> {
-        self.find_group(ino)?.read_inode_desc(ino)
+        let journal = self.journal();
+        self.find_group(ino)?
+            .read_inode_desc(ino, journal.as_deref())
     }
 
     /// Returns the block group that owns `ino`.
@@ -1880,8 +1882,9 @@ impl Ext4 {
     /// inode number the same in-memory inode (identity), which the
     /// filesystem-level sync relies on to enumerate and flush all dirty inodes.
     pub(super) fn read_inode(&self, ino: Ext4Ino) -> Result<Arc<Inode>> {
+        let journal = self.journal();
         self.find_group(ino)?
-            .lookup_inode(ino, self.self_ref.clone())
+            .lookup_inode(ino, self.self_ref.clone(), journal.as_deref())
     }
 
     /// Reads the root directory inode.
@@ -3509,6 +3512,143 @@ mod tests {
         assert_eq!(
             after.last_orphan, 0,
             "last_orphan patched from memory, not left at the (doctored) seed"
+        );
+    }
+
+    /// P7e-5 (`extent-leaf-stale-read-window`, inode-table residual): a reload
+    /// of an inode whose table block was committed but not yet checkpointed must
+    /// decode the committed image, not the lagging on-disk slot. `read_inode_desc`
+    /// routes the inode-table read through the WAL funnel; before this hardening
+    /// it bare-read the device and, under concurrency (a neighbor operation's
+    /// commit leaving this block un-checkpointed), would resurrect the stale slot.
+    #[ktest]
+    fn read_inode_desc_funnels_committed_but_uncheckpointed_slot() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // Give an inode a distinctive link count and journal the writeback, then
+        // commit WITHOUT checkpoint: the on-disk slot still holds the old value —
+        // the async-commit window the funnel must read across.
+        let ino = ROOT_INO;
+        let mut desc = f.ext4.read_inode_desc(ino).unwrap();
+        let new_link = desc.link_count() + 5;
+        desc.set_link_count(new_link);
+        let root = *desc.raw_block();
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            f.ext4
+                .write_back_inode_desc(ino, &desc, &root, op.get())
+                .unwrap();
+        }
+        journal.commit_now_for_test();
+
+        // Doctor the DEVICE slot to a value that is neither the old nor the new
+        // link count — a bare device read would surface this; the funnel must
+        // return the committed image instead.
+        let slot = f.ext4.inode_table_offset(ino).unwrap();
+        let mut on_device: RawInode = f.disk.segment().read_val(slot).unwrap();
+        on_device.link_count = 0xDEAD;
+        f.disk.segment().write_val(slot, &on_device).unwrap();
+
+        // The reload decodes txn 1's committed (un-checkpointed) image.
+        let reread = f.ext4.read_inode_desc(ino).unwrap();
+        assert_eq!(
+            reread.link_count(),
+            new_link,
+            "reload serves the committed image through the WAL funnel, not the device slot"
+        );
+
+        // Checkpoint makes the device authoritative; the funnel falls back to it
+        // and the (now correct) slot decodes to the same value.
+        journal.flush_on_unmount().unwrap();
+        let after: RawInode = f.disk.segment().read_val(slot).unwrap();
+        assert_eq!(
+            after.link_count, new_link,
+            "checkpoint wrote the committed image over the doctored slot"
+        );
+    }
+
+    /// P7e-5 (`gdt-frozen-data-concurrency`): a GDT block holds up to 128 group
+    /// descriptors, so operations in different transactions can touch the same
+    /// block through disjoint descriptor slots. A block allocation captures the
+    /// GDT block and patches only its own group's descriptor (`patch_into`),
+    /// leaving every neighbor slot at the capture's seed. Txn 2's capture must
+    /// seed that block from txn 1's committed-but-un-checkpointed image, not the
+    /// lagging device, or checkpoint (newest tid wins) would clobber a neighbor
+    /// descriptor a concurrent operation had committed. The frozen after-image —
+    /// already the B-1 seed source for every `get_write_access` — carries the
+    /// neighbor slot through unchanged; this test pins that window.
+    #[ktest]
+    fn gdt_neighbor_descriptor_survives_cross_transaction_capture() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        // The fixture's GDT is `first_data_block + 1`; group 0's descriptor sits
+        // at offset 0 in that block, so a neighbor descriptor slot lives at
+        // `desc_size` within the SAME block (untouched by `patch_into`).
+        let (gdt_bid, desc_size) = {
+            let sb = f.ext4.super_block.read();
+            (sb.first_data_block() as usize + 1, sb.desc_size() as usize)
+        };
+        let neighbor_off = gdt_bid * BLOCK_SIZE + desc_size;
+
+        // A recognizable neighbor byte pattern present when txn 1 captures the
+        // GDT block, so txn 1's frozen after-image carries exactly these bytes.
+        let sentinel = [0x5Au8; 8];
+        f.disk
+            .segment()
+            .write_bytes(neighbor_off, &sentinel)
+            .unwrap();
+
+        // Txn 1: allocate a block — patches group 0's descriptor and captures the
+        // whole GDT block (neighbor slot seeded from the device = the sentinel).
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            let range = f.ext4.alloc_blocks(1, 0, op.get()).unwrap();
+            assert_eq!(range.end - range.start, 1);
+        }
+        journal.commit_now_for_test();
+
+        // Make the device lag the log: overwrite the on-disk neighbor slot AFTER
+        // txn 1 committed. Txn 2's capture must NOT pick this up.
+        f.disk
+            .segment()
+            .write_bytes(neighbor_off, &[0xFFu8; 8])
+            .unwrap();
+
+        // Txn 2: a second allocation re-captures the same GDT block. Its seed is
+        // txn 1's retained image (neighbor = sentinel), not the doctored device.
+        {
+            let op = f.ext4.begin_op(4).unwrap();
+            let range = f.ext4.alloc_blocks(1, 0, op.get()).unwrap();
+            assert_eq!(range.end - range.start, 1);
+        }
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+
+        // The neighbor slot survives with txn 1's frozen bytes: checkpoint wrote
+        // txn 2's after-image, and txn 2 seeded the block from the uncheckpointed
+        // image, so the doctored device bytes never entered the log.
+        let mut after = [0u8; 8];
+        f.disk
+            .segment()
+            .read_bytes(neighbor_off, &mut after)
+            .unwrap();
+        assert_eq!(
+            after, sentinel,
+            "neighbor descriptor frozen through the B-1 seed, not resurrected from the lagging device"
         );
     }
 
