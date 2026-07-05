@@ -1485,6 +1485,13 @@ pub(super) struct JournalSuperblock {
     /// Log block where recovery starts (`s_start`); `None` when the journal
     /// is clean (the on-disk `0` sentinel, decoded once at parse).
     start: Option<u32>,
+    /// The error number the journal last recorded (`s_errno`), carried through
+    /// verbatim from the on-disk raw. jbd2 writes it in `jbd2_journal_abort`
+    /// and reads it at load (`journal->j_errno = be32_to_cpu(sb->s_errno)`,
+    /// fs/jbd2/journal.c:1487); a non-zero value means the filesystem hit an
+    /// error and a check is recommended. e2fsck only distinguishes zero from
+    /// non-zero, so the raw big-endian word is preserved rather than decoded.
+    errno: u32,
     /// Journal block size in bytes (`s_blocksize`).
     blocksize: u32,
     /// The descriptor-tag geometry the INCOMPAT feature bits select, derived
@@ -1589,6 +1596,7 @@ impl TryFrom<RawJournalSuperblock> for JournalSuperblock {
             // A dirty journal awaiting recovery records its start; the on-disk
             // 0-means-clean sentinel decodes to `None` (once, here).
             start: raw.recovery_start(),
+            errno: raw.s_errno.get(),
             blocksize,
             tag_layout,
             csum_seed,
@@ -1616,6 +1624,14 @@ impl JournalSuperblock {
     /// when the journal is clean (the on-disk `0` sentinel, decoded at parse).
     pub(super) const fn start(&self) -> Option<u32> {
         self.start
+    }
+
+    /// Returns the error number the journal last recorded (`s_errno`, the raw
+    /// big-endian word). A non-zero value means the filesystem hit an error on
+    /// an earlier mount and a check is recommended (jbd2 seeds `j_errno` from
+    /// it at load, fs/jbd2/journal.c:1487).
+    pub(super) const fn errno(&self) -> u32 {
+        self.errno
     }
 
     /// Returns the journal block size in bytes (`s_blocksize`).

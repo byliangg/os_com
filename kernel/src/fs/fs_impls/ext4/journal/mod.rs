@@ -529,6 +529,14 @@ impl JournalGeometry {
         self.superblock.sequence()
     }
 
+    /// Returns the error number the journal last recorded on disk (`s_errno`).
+    ///
+    /// Used by [`Journal::new`] to seed the in-memory `j_errno` mirror from the
+    /// image, so it is live even in non-ktest builds.
+    pub(super) fn errno(&self) -> u32 {
+        self.superblock.errno()
+    }
+
     /// Returns the descriptor-tag geometry this journal's feature bits select
     /// — the single source of truth for the tag byte layout, derived once at
     /// parse ([`format::TagLayout`]) and consumed by the commit writer, the
@@ -989,6 +997,14 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
 /// takes no inode lock at all: the ordered-data flush works on page-cache
 /// handles cloned in at registration time, the P5 deadlock invariant) —
 /// matching the leaf position the commit pipeline already documents.
+/// The `s_errno` value written on a genuine-error abort (commit failure or a
+/// detected inconsistency). jbd2 records the negative aborting errno and
+/// e2fsck only tests the field for non-zero, so this port persists `EIO`'s
+/// POSIX number (`5`) as the "filesystem error, fsck recommended" marker — a
+/// single stable non-zero value, the only error class this port produces. A
+/// deliberate shutdown records nothing (the field stays `0`).
+const S_ERRNO_ERROR_MARKER: u32 = 5;
+
 pub(super) struct Journal {
     /// The parsed on-disk geometry (the log block map + journal superblock).
     geometry: JournalGeometry,
@@ -1041,8 +1057,30 @@ pub(super) struct Journal {
     /// commits. So the journal refuses further work: `journal_start` returns
     /// `EIO`, `log_wait_commit` sleepers wake with `EIO` (instead of hanging
     /// forever on a tid that will never commit), and the commit thread stops
-    /// checkpointing. The full jbd2 abort/errno machinery is Phase 7.
+    /// checkpointing. An aborted journal additionally takes the whole
+    /// filesystem read-only at [`Ext4::begin_op`](super::fs::Ext4::begin_op)
+    /// (`EROFS`, matching Linux `ext4_journal_check_start` →
+    /// `is_journal_aborted`).
     aborted: AtomicBool,
+    /// The error number recorded for this journal (jbd2 `j_errno`), `0` when
+    /// healthy. Seeded at mount from the on-disk `s_errno` (Linux
+    /// fs/jbd2/journal.c:1487) so a fresh mount surfaces an error a prior mount
+    /// recorded, and set to [`S_ERRNO_ERROR_MARKER`] on a genuine-error abort
+    /// (commit failure or a detected inconsistency), which also writes it back
+    /// to `s_errno`. A deliberate `EXT4_IOC_SHUTDOWN` leaves it `0`: that abort
+    /// is a controlled crash simulation, not corruption, so it must not stamp
+    /// "fsck needed" (Linux maps `-ESHUTDOWN` to `0` in
+    /// `jbd2_journal_update_sb_errno`). The `0`-means-healthy sentinel is the
+    /// on-disk `s_errno` contract itself, not an invented one.
+    sb_error: AtomicU32,
+    /// ktest-only one-shot fault injection for the ordered-data registration
+    /// path (RED-LINE ①): armed by
+    /// [`arm_ordered_data_enomem`](Journal::arm_ordered_data_enomem), consumed
+    /// once by the next [`Handle::register_ordered_data`](transaction::Handle),
+    /// which then fails `ENOMEM` — exercising the abort that closes the
+    /// stale-data window.
+    #[cfg(ktest)]
+    fail_ordered_data_once: AtomicBool,
     /// The commit-thread handle, taken and joined by
     /// [`stop_commit_thread`](Journal::stop_commit_thread). A `Mutex<Option<_>>`
     /// so start/stop can move it in and out; it is **not** held while the thread
@@ -1478,6 +1516,15 @@ impl Journal {
         let tail_tid = geometry.sequence();
         // Nothing is committed yet; the first commit will bear `s_sequence`.
         let committed_tid = geometry.sequence().prev();
+        // Seed the in-memory error mirror from the image's `s_errno` (Linux
+        // fs/jbd2/journal.c:1487): a fresh mount surfaces an error a prior
+        // mount recorded. A non-zero value here means a check is recommended.
+        let recorded_errno = geometry.errno();
+        if recorded_errno != 0 {
+            warn!(
+                "ext4 journal was mounted with a recorded error (s_errno = {recorded_errno}); an e2fsck is recommended"
+            );
+        }
         // Fields are listed in struct-declaration order (clippy
         // `inconsistent_struct_constructor`); the geometry-derived values above
         // are pulled into locals so `geometry` can be moved in first.
@@ -1503,6 +1550,9 @@ impl Journal {
             credit_release_epoch: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
+            sb_error: AtomicU32::new(recorded_errno),
+            #[cfg(ktest)]
+            fail_ordered_data_once: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
             op_handle_owners: Mutex::new(BTreeSet::new()),
             j_checkpoint: Mutex::new(()),
@@ -2134,9 +2184,10 @@ impl Journal {
             // either way memory is ahead of the log and the device,
             // unrecoverably. Abort the journal (refuse further work and wake
             // sleepers with an error) rather than continue and publish
-            // fragments of the lost transaction through later commits. The
-            // full jbd2 abort/errno machinery is P7e.
-            self.abort();
+            // fragments of the lost transaction through later commits, and
+            // stamp `s_errno` so a later mount / e2fsck knows the filesystem
+            // needs checking (jbd2 records the errno on a commit abort).
+            self.abort_with_error();
         } else {
             // A successful pipeline run ends in `Finished` by construction
             // (step 6's phase advance would have errored otherwise).
@@ -2483,6 +2534,33 @@ impl Journal {
         self.aborted.load(Ordering::Acquire)
     }
 
+    /// Returns the error number recorded for this journal (jbd2 `j_errno`), `0`
+    /// when healthy. Seeded at mount from `s_errno` and set on a genuine-error
+    /// abort; a shutdown abort leaves it `0`. Consumed today by the abort
+    /// tests; the reserved production consumer is error surfacing (the
+    /// `sb-accessors-deferred` ledger note's "state for P7 error-flag
+    /// handling"), so it is dead only in a non-ktest build.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(in crate::fs::fs_impls::ext4) fn recorded_errno(&self) -> u32 {
+        self.sb_error.load(Ordering::Acquire)
+    }
+
+    /// Arms a one-shot `ENOMEM` fault for the next ordered-data registration
+    /// (RED-LINE ① regression), consumed by
+    /// [`take_ordered_data_enomem`](Self::take_ordered_data_enomem).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn arm_ordered_data_enomem(&self) {
+        self.fail_ordered_data_once.store(true, Ordering::Release);
+    }
+
+    /// Consumes the armed ordered-data `ENOMEM` fault, returning whether it
+    /// fired (disarming it). Checked by
+    /// [`Handle::register_ordered_data`](transaction::Handle).
+    #[cfg(ktest)]
+    pub(super) fn take_ordered_data_enomem(&self) -> bool {
+        self.fail_ordered_data_once.swap(false, Ordering::AcqRel)
+    }
+
     /// Returns whether [`stop_commit_thread`](Journal::stop_commit_thread) has
     /// been requested — the unmount quiesce point. Once true (and after
     /// `flush_on_unmount` empties the log), direct metadata writes are safe
@@ -2491,30 +2569,66 @@ impl Journal {
         self.stop.load(Ordering::Acquire)
     }
 
-    /// Aborts the journal after a failed commit: further `journal_start`s are
-    /// refused with `EIO`, and `log_wait_commit` sleepers are woken to fail
-    /// instead of waiting forever on a tid that will never commit.
+    /// Aborts the journal: further `journal_start`s are refused with `EIO`,
+    /// `log_wait_commit` sleepers are woken to fail instead of waiting forever
+    /// on a tid that will never commit, and (via
+    /// [`is_aborted`](Self::is_aborted)) the filesystem's write entry points
+    /// return `EROFS`. Sets only the in-memory flag; the on-disk `s_errno`
+    /// marker is a separate step ([`record_error_on_abort`](Self::record_error_on_abort)),
+    /// so a deliberate shutdown can abort without stamping "fsck needed".
     fn abort(&self) {
         self.aborted.store(true, Ordering::Release);
         self.commit_wait_queue.wake_all();
+    }
+
+    /// Aborts and records a genuine error: sets `j_errno` to
+    /// [`S_ERRNO_ERROR_MARKER`] and writes it to the on-disk `s_errno` so a
+    /// later mount and e2fsck know the filesystem needs checking (jbd2
+    /// `jbd2_journal_abort` → `jbd2_journal_update_sb_errno`). The superblock
+    /// write is best-effort: the abort has already happened, and a failed
+    /// write here cannot make the on-disk state worse than the failure it
+    /// records.
+    fn abort_with_error(&self) {
+        self.abort();
+        self.sb_error.store(S_ERRNO_ERROR_MARKER, Ordering::Release);
+        if let Err(e) = self.write_errno_to_super() {
+            warn!("ext4 journal: failed to persist s_errno after an abort: {e:?}");
+        }
+    }
+
+    /// Reads the on-disk journal superblock, patches `s_errno` from the
+    /// in-memory mirror, and writes it back through the superblock funnel
+    /// (which restamps the superblock checksum and barriers). The read-modify-
+    /// write preserves `s_start`/`s_sequence`, so the recovery pointer is
+    /// unchanged — only the error marker is published.
+    fn write_errno_to_super(&self) -> Result<()> {
+        let device = self.device.as_ref();
+        let mut raw = self.geometry.read_raw_superblock(device)?;
+        raw.s_errno = Be32::new(self.sb_error.load(Ordering::Acquire));
+        self.geometry.write_superblock(device, raw)
     }
 
     /// Aborts the journal on `EXT4_IOC_SHUTDOWN` (jbd2_journal_abort from
     /// `ext4_force_shutdown`): the running transaction is never committed and
     /// the log is left as-is — with `RECOVER` still stamped, the next mount
     /// replays exactly what had committed before the shutdown, which is the
-    /// "crash here" semantics the ioctl exists to simulate.
+    /// "crash here" semantics the ioctl exists to simulate. Records **no**
+    /// `s_errno`: the abort is a controlled crash simulation, not corruption
+    /// (Linux maps `-ESHUTDOWN` to a `0` marker), and stamping the superblock
+    /// after the "crash" would perturb the very on-disk state being frozen.
     pub(in crate::fs::fs_impls::ext4) fn abort_for_shutdown(&self) {
         self.abort();
     }
 
-    /// Aborts the journal on a filesystem-detected inconsistency (the
-    /// minimal Linux `ext4_error` → `jbd2_journal_abort` shape), reached
-    /// through [`Handle::abort_journal_on_fs_error`] by a site whose
-    /// irreversible journal effects (a discharged revoke duty) cannot be
-    /// unwound after the operation they served has failed.
+    /// Aborts the journal on a filesystem-detected inconsistency (the Linux
+    /// `ext4_error` → `jbd2_journal_abort` shape), reached through
+    /// [`Handle::abort_journal_on_fs_error`] by a site whose irreversible
+    /// journal effects (a discharged revoke duty, or an ordered-data flush
+    /// obligation that could not be recorded — RED-LINE ①) cannot be unwound
+    /// after the operation they served has failed. Records the error to
+    /// `s_errno`: this is corruption/loss, not a clean stop.
     pub(super) fn abort_for_fs_error(&self) {
-        self.abort();
+        self.abort_with_error();
     }
 
     /// Blocks until transaction `target` (and thus everything up to it) is
@@ -4137,7 +4251,9 @@ mod tests {
             .write_bytes(desc_off, &desc)
             .unwrap();
 
-        // Snapshot the whole log: the refused T2 must write NOTHING.
+        // Snapshot the whole log: the refused T2 must write no LOG block. (The
+        // abort separately stamps `s_errno` in the journal superblock at log
+        // block 0, checked below — so the comparison skips that first block.)
         let log_off = usize::try_from(JOURNAL_START_BLOCK).unwrap() * BLOCK_SIZE;
         let mut before = vec![0u8; 16 * BLOCK_SIZE];
         f.fixture
@@ -4159,8 +4275,8 @@ mod tests {
         f.journal.commit_now_for_test();
 
         // Aborted, not overwritten: the journal refuses further work, every
-        // log byte (the tail transaction included) is untouched, and no
-        // state advanced.
+        // LOG block (the tail transaction included, blocks 1..16) is untouched,
+        // and no state advanced.
         assert!(f.journal.is_aborted());
         let mut after = vec![0u8; 16 * BLOCK_SIZE];
         f.fixture
@@ -4168,13 +4284,25 @@ mod tests {
             .segment()
             .read_bytes(log_off, &mut after)
             .unwrap();
-        assert_eq!(before, after, "the refused commit must write nothing");
+        assert_eq!(
+            before[BLOCK_SIZE..],
+            after[BLOCK_SIZE..],
+            "the refused commit must not touch any log block"
+        );
         {
             let st = f.journal.state_read();
             assert_eq!(st.head, 4);
             assert_eq!(st.tail_block, Some(1));
         }
         assert_eq!(f.journal.committed_tid(), Tid::new(1));
+
+        // The genuine-error abort recorded `s_errno` both in memory and on
+        // disk (jbd2 `jbd2_journal_update_sb_errno`), so a later mount / e2fsck
+        // learns the filesystem needs checking. A fresh read of the journal
+        // superblock sees the marker.
+        assert_eq!(f.journal.recorded_errno(), S_ERRNO_ERROR_MARKER);
+        let on_disk: RawJournalSuperblock = f.fixture.disk.segment().read_val(log_off).unwrap();
+        assert_eq!(on_disk.s_errno.get(), S_ERRNO_ERROR_MARKER);
 
         // Waiters fail loudly instead of hanging on a tid that will never
         // commit.

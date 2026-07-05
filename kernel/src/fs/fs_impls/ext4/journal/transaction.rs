@@ -843,6 +843,19 @@ impl Handle {
     /// registration cannot land in a different transaction than the
     /// operation's own metadata captures. Takes the journal state lock
     /// transiently, exactly like the capture funnels (lock order unchanged).
+    ///
+    /// RED-LINE ① (crash-write-order): the caller has ALREADY captured the
+    /// metadata that references these data blocks (the extent tree and
+    /// `i_size`) into this transaction. If the flush obligation cannot be
+    /// recorded — an `ENOMEM` growing the ordered-data map — the transaction
+    /// must NOT stay committable: committing that metadata would publish
+    /// extents pointing at blocks whose data was never flushed to its final
+    /// location, so a crash after the commit exposes the recycled blocks' stale
+    /// bytes (another file's freed data) at the new file offset. So a failure
+    /// here aborts the journal, which discards the running transaction's
+    /// uncommitted captures (nothing reaches the log) — closing the window —
+    /// and takes the filesystem read-only. The operation then fails and rolls
+    /// back cleanly.
     pub(in crate::fs::fs_impls::ext4) fn register_ordered_data(
         &self,
         ino: Ext4Ino,
@@ -850,7 +863,27 @@ impl Handle {
         pages: PageCache,
         len: usize,
     ) -> Result<()> {
+        self.try_register_ordered_data(ino, inode, pages, len)
+            .inspect_err(|_| self.abort_journal_on_fs_error())
+    }
+
+    /// The fallible body of [`register_ordered_data`](Self::register_ordered_data),
+    /// split out so the wrapper can abort on ANY failure (the metadata is
+    /// already captured; see the wrapper's RED-LINE ① note).
+    fn try_register_ordered_data(
+        &self,
+        ino: Ext4Ino,
+        inode: Weak<Inode>,
+        pages: PageCache,
+        len: usize,
+    ) -> Result<()> {
         let journal = self.journal()?;
+        // The narrow `ENOMEM` window the RED-LINE closes has no natural trigger
+        // in a ktest, so the abort path is driven by this one-shot fault.
+        #[cfg(ktest)]
+        if journal.take_ordered_data_enomem() {
+            return_errno_with_message!(Errno::ENOMEM, "injected ordered-data registration failure");
+        }
         let mut st = journal.state_write();
         super::active_for(&mut st, self)?.register_ordered_data(ino, inode, pages, len);
         Ok(())

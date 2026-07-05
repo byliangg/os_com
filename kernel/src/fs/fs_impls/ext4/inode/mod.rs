@@ -3085,6 +3085,43 @@ mod write_tests {
         assert_eq!(journal.running_nr_ordered_data_for_test(), 1);
     }
 
+    /// RED-LINE ①: if the ordered-data registration fails AFTER the write's
+    /// extent/`i_size` metadata is captured (an `ENOMEM` growing the map), the
+    /// transaction must not stay committable — committing metadata that points
+    /// at blocks with no flush obligation would expose stale bytes on a
+    /// post-commit crash. The failure aborts the journal, discarding the
+    /// running transaction's captures (nothing can ever commit), and the write
+    /// fails; the filesystem is left read-only.
+    #[ktest]
+    fn ordered_data_enomem_aborts_the_transaction() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Arm the one-shot fault, then drive an allocating write: it maps and
+        // writes the data, captures the extent tree + i_size, then trips the
+        // fault at ordered-data registration.
+        journal.arm_ordered_data_enomem();
+        let data = [0x5au8; 2 * BLOCK_SIZE];
+        let mut reader = VmReader::from(&data[..]).to_fallible();
+        let err = inode.write_at(0, &mut reader).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOMEM);
+
+        // The journal aborted and recorded no ordered-data obligation; the
+        // captured metadata can never be made durable (the abort discards it),
+        // and every further write op is refused with EROFS.
+        assert!(journal.is_aborted());
+        assert_eq!(journal.running_nr_ordered_data_for_test(), 0);
+        assert_eq!(
+            journal.commit_and_wait_running().unwrap_err().error(),
+            Errno::EIO
+        );
+        assert_eq!(
+            f.ext4.begin_op(4).map(|_| ()).unwrap_err().error(),
+            Errno::EROFS
+        );
+    }
+
     /// Builds a journaled fixture with an empty regular file and a stopped
     /// commit thread (keeps every state transition inspectable).
     fn journaled_fixture_with_empty_file() -> Ext4Fixture {

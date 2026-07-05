@@ -660,7 +660,22 @@ impl Ext4 {
         // work, journaled or not.
         self.ensure_not_shutdown()?;
         match self.journal() {
-            Some(journal) => journal::OpHandle::start(&journal, credits),
+            Some(journal) => {
+                // An aborted journal takes the whole filesystem read-only
+                // (Linux `ext4_journal_check_start` → `is_journal_aborted` →
+                // `EROFS`): refuse every write op up front, before it mutates,
+                // rather than let it capture into a journal that will never
+                // commit. Reads take no handle and stay allowed. Distinct from
+                // the shutdown `EIO` above: a silent abort (a failed commit)
+                // degrades the fs, a deliberate shutdown freezes it.
+                if journal.is_aborted() {
+                    return_errno_with_message!(
+                        Errno::EROFS,
+                        "filesystem is read-only after a journal abort"
+                    );
+                }
+                journal::OpHandle::start(&journal, credits)
+            }
             None => Ok(journal::OpHandle::none()),
         }
     }
@@ -682,22 +697,45 @@ impl Ext4 {
     /// Shuts the filesystem down (`EXT4_IOC_SHUTDOWN`, Linux
     /// `ext4_force_shutdown`): after this, new operations fail `EIO` and the
     /// on-disk state is frozen as-is — the controlled "crash right here" the
-    /// crash tests are built on. Idempotent: a second call is a no-op.
+    /// crash tests are built on. Idempotent: a concurrent or repeat call finds
+    /// the flag already raised and returns cleanly, so only one caller runs the
+    /// flush/abort work (the `shutdown` flag's transition is single-winner via
+    /// compare-exchange, closing the check-then-set race).
     pub(super) fn shutdown(&self, going: GoingDown) -> Result<()> {
-        if self.is_shutdown() {
-            return Ok(());
-        }
+        // `Default` must flush BEFORE the flag is raised: its flush routes
+        // through `FileSystem::sync`, which no-ops once `is_shutdown` is set, so
+        // raising the flag first would skip the flush the mode exists to do.
+        // The compare-exchange therefore comes AFTER the flush for `Default`,
+        // and BEFORE the abort for the log-killing modes; in both it elects the
+        // single winner (a loser sees the flag already true and returns).
         match going {
             GoingDown::Default => {
-                // Flush everything (data, metadata, journal commit), then
-                // raise the flag. Linux freezes the fs around the flag so no
-                // write can slip in between; we have no freeze — the unfrozen
-                // window is a recorded deviation, fine for a test hook.
+                if self.is_shutdown() {
+                    return Ok(());
+                }
+                // Flush everything (data, metadata, journal commit) while the
+                // fs is still live, then raise the flag. Linux freezes the fs
+                // around the flag so no write can slip in between; we have no
+                // freeze — the unfrozen window is a recorded deviation, fine
+                // for a test hook. A racing `Default` either flushed already
+                // (its flag set makes this flush a no-op) or flushes redundantly
+                // before losing the compare-exchange; both are harmless.
                 <Self as crate::fs::vfs::file_system::FileSystem>::sync(self)?;
-                self.shutdown.store(true, Ordering::Release);
+                let _ = self.shutdown.compare_exchange(
+                    false,
+                    true,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
             GoingDown::LogFlush => {
-                self.shutdown.store(true, Ordering::Release);
+                if self
+                    .shutdown
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Ok(());
+                }
                 if let Some(journal) = self.journal() {
                     // Commit what is running, then kill the journal: committed
                     // operations survive the "crash", in-flight ones vanish.
@@ -706,7 +744,13 @@ impl Ext4 {
                 }
             }
             GoingDown::NoLogFlush => {
-                self.shutdown.store(true, Ordering::Release);
+                if self
+                    .shutdown
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Ok(());
+                }
                 if let Some(journal) = self.journal() {
                     journal.abort_for_shutdown();
                 }
@@ -3523,6 +3567,67 @@ mod tests {
         // shutdown is idempotent.
         crate::fs::vfs::file_system::FileSystem::sync(f.ext4.as_ref()).unwrap();
         f.ext4.shutdown(GoingDown::NoLogFlush).unwrap();
+    }
+
+    /// A journal that aborts behind the filesystem's back (a failed commit, or
+    /// a detected inconsistency) takes the whole filesystem read-only: write
+    /// entry points refuse with `EROFS` (Linux `ext4_journal_check_start` →
+    /// `is_journal_aborted`), reads still work, and the error is recorded so a
+    /// later mount / e2fsck knows a check is needed. Distinct from the shutdown
+    /// path, which freezes with `EIO`.
+    #[ktest]
+    fn journal_abort_takes_filesystem_read_only() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        journal.abort_for_fs_error();
+        assert!(journal.is_aborted());
+
+        // Writes are refused up front with EROFS, before mutating; reads take
+        // no journal handle and still succeed.
+        assert_eq!(
+            f.ext4.begin_op(4).map(|_| ()).unwrap_err().error(),
+            Errno::EROFS
+        );
+        f.ext4.read_inode_desc(ROOT_INO).unwrap();
+
+        // The error is recorded in memory (and persisted to on-disk s_errno,
+        // asserted directly in the journal module's abort test).
+        assert_ne!(journal.recorded_errno(), 0);
+    }
+
+    /// The shutdown flag transitions once (compare-exchange): a repeat call in
+    /// ANY mode — the single-threaded stand-in for a concurrent double
+    /// shutdown — finds the flag already raised and returns cleanly, never
+    /// re-running the mode's sync/abort work. The modes themselves still work.
+    #[ktest]
+    fn shutdown_is_single_winner_across_modes() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        // NoLogFlush wins: it raises the flag and aborts the journal.
+        f.ext4.shutdown(GoingDown::NoLogFlush).unwrap();
+        assert!(f.ext4.is_shutdown());
+        assert!(journal.is_aborted());
+
+        // Repeat, across every mode: each finds the flag set and returns Ok
+        // without re-running — no double sync, no double abort. (Default's
+        // fast path returns before its flush, so it does not hang.)
+        f.ext4.shutdown(GoingDown::Default).unwrap();
+        f.ext4.shutdown(GoingDown::LogFlush).unwrap();
+        f.ext4.shutdown(GoingDown::NoLogFlush).unwrap();
+        assert!(f.ext4.is_shutdown());
+        assert!(journal.is_aborted());
     }
 
     #[ktest]
