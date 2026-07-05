@@ -124,6 +124,22 @@
 //!   poll outcome sends it back to an untimed sleep), which holds no
 //!   filesystem lock — a user thread never waits for a drain it could be
 //!   blocking.
+//! - **`begin_op` reentrancy** is the one way a single task can wait on
+//!   itself here: a task holding an open handle that opens a SECOND handle
+//!   would park the nested [`journal_start`](transaction::journal_start) on
+//!   the locked barrier (or the capacity wait), whose drain/release can only
+//!   come from that same task closing its outer handle — a self-deadlock. c2
+//!   widened this from the pre-c2 narrower hazard (the Drop-reclaim path
+//!   re-taking `inner.write()` on an inode a still-held guard owns, a
+//!   re-entrant `RwMutex` deadlock) to ANY open handle on ANY inode. The call
+//!   sites are correct by declaration order — the op's handle closes before
+//!   the reclaim-triggering `Arc<Inode>` drops, so reclaim's `begin_op` opens
+//!   only after the outer handle closed — and [`OpHandle::start`] backstops
+//!   that discipline: it registers the task in [`Journal::op_handle_owners`]
+//!   at the operation boundary and refuses a nested open with `EDEADLK`
+//!   before `journal_start` can park (jbd2's `WARN_ON(current->journal_info)`
+//!   in `start_this_handle`, made a hard error since a hung kernel is worse
+//!   than a failed op).
 //!
 //! # Duality invariants (the running/locking/committing pipeline, P7c-1/2)
 //!
@@ -243,6 +259,17 @@ pub(in crate::fs::fs_impls::ext4) use self::revoke::{BlockFreeAuth, DataForgetPo
 /// this module; callers only borrow a handle for capture.
 pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
 
+/// The current task's identity for the nested-`begin_op` guard: its
+/// [`Task`](ostd::task::Task) address, stable for the guard's lifetime because
+/// a task holding an operation handle cannot be freed. `None` outside task
+/// context (bootstrap/IRQ), where no metadata operation runs — the guard is
+/// then inert.
+fn current_op_owner() -> Option<usize> {
+    let task = ostd::task::Task::current()?;
+    let ptr: *const ostd::task::Task = &*task;
+    Some(ptr.addr())
+}
+
 /// An operation's journal handle, scoped so [`journal_stop`](transaction::journal_stop)
 /// runs on **every** exit path (an early `?`, an error, or the normal return),
 /// not just the happy one.
@@ -256,22 +283,50 @@ pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
 /// `None`, so every funnel stays inert.
 pub(in crate::fs::fs_impls::ext4) struct OpHandle {
     handle: Option<Handle>,
+    /// This task's registration in [`Journal::op_handle_owners`], to release on
+    /// close. `Some` for a journaled handle opened in task context, `None` for
+    /// the no-op handle or outside task context (nothing to release).
+    owner: Option<usize>,
 }
 
 impl OpHandle {
     /// A handle for a non-journaled volume: `get()` yields `None`.
     pub(in crate::fs::fs_impls::ext4) fn none() -> Self {
-        Self { handle: None }
+        Self {
+            handle: None,
+            owner: None,
+        }
     }
 
     /// Opens a handle on `journal`'s running transaction, reserving `credits`
     /// metadata blocks (jbd2 `jbd2_journal_start`).
+    ///
+    /// Rejects a nested operation handle on the same task with `EDEADLK` — the
+    /// c2 self-deadlock: a task holding an open handle that opens a second one
+    /// would park [`journal_start`](transaction::journal_start) on the locked
+    /// barrier (or the capacity wait), whose drain/release waits on that very
+    /// task's outer handle to close. The check fires here, at the operation
+    /// boundary, before `journal_start` can park; it is the backstop to the
+    /// declaration-order discipline the call sites document (the reclaim path
+    /// opens its handle only after the outer one closed, so its owner slot is
+    /// clear by then). See the module deadlock audit.
     pub(in crate::fs::fs_impls::ext4) fn start(
         journal: &Arc<Journal>,
         credits: usize,
     ) -> Result<Self> {
+        let owner = journal.claim_op_handle()?;
+        let handle = match transaction::journal_start(journal, credits) {
+            Ok(handle) => handle,
+            Err(e) => {
+                if let Some(id) = owner {
+                    journal.release_op_handle(id);
+                }
+                return Err(e);
+            }
+        };
         Ok(Self {
-            handle: Some(transaction::journal_start(journal, credits)?),
+            handle: Some(handle),
+            owner,
         })
     }
 
@@ -292,10 +347,18 @@ impl OpHandle {
 
 impl Drop for OpHandle {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take()
-            && let Err(e) = transaction::journal_stop(handle)
-        {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // Grab the journal for the owner release before `journal_stop` consumes
+        // the handle. A dropped journal (`Err`) means teardown, where the owner
+        // set dies with it — nothing to release.
+        let journal = handle.journal();
+        if let Err(e) = transaction::journal_stop(handle) {
             error!("ext4 journal_stop at operation end failed: {:?}", e);
+        }
+        if let (Some(id), Ok(journal)) = (self.owner, journal) {
+            journal.release_op_handle(id);
         }
     }
 }
@@ -908,6 +971,18 @@ pub(super) struct Journal {
     /// runs (the thread itself lives on via the scheduler, referenced only weakly
     /// from its own closure).
     commit_thread: Mutex<Option<Arc<crate::thread::Thread>>>,
+    /// The tasks currently holding an operation handle on THIS journal, keyed
+    /// by [`Task`](ostd::task::Task) address — jbd2's per-task
+    /// `current->journal_info`, a set here because operations on distinct tasks
+    /// run concurrently. It backs the nested-`begin_op` deadlock guard: a task
+    /// already in the set that opens a second handle is the c2 self-deadlock
+    /// (see [`OpHandle::start`]). Populated only at the [`OpHandle`] boundary,
+    /// where the one-operation-per-task invariant lives; the lower-level
+    /// [`journal_start`](transaction::journal_start) primitive stays unguarded
+    /// so its transaction-mechanics tests can drive several handles from one
+    /// task. A leaf lock — taken alone, released before any other — so it adds
+    /// no edge to the journal lock order.
+    op_handle_owners: Mutex<BTreeSet<usize>>,
 }
 
 /// One pinned freed block run: `count` blocks whose free was discharged under
@@ -1197,6 +1272,39 @@ impl JournalState {
     pub(super) fn release_pinned_frees(&mut self, committed: Tid) {
         self.pinned_frees.retain(|_, run| !committed.geq(run.tid));
     }
+
+    /// The running transaction paired with its tid, if it carries a durable
+    /// obligation a commit must retire — a captured metadata after-image, a
+    /// revoke record, or a pinned freed run — else `None` for an empty
+    /// transaction. This is the shared "committable transaction" gate behind
+    /// every commit trigger (age, request, batch, pipeline advance): an empty
+    /// transaction must never be made due, since committing it writes no log
+    /// block and a waiter on its tid would hang
+    /// ([`Journal::log_wait_commit`]).
+    ///
+    /// The obligation set is checked structurally — metadata OR revokes OR
+    /// pins — not "captured metadata alone" as the historical gate did. A
+    /// revoke/pin-only transaction (zero captures) is unreachable today only
+    /// because [`Ext4::free_blocks`](super::fs::Ext4) captures the group bitmap
+    /// before it pins/revokes, so the metadata count is incidentally non-zero
+    /// whenever pins or revokes exist; keying the gate on the obligation set
+    /// itself keeps "a transaction with durable obligations is always
+    /// committable" true structurally, not by that incidental capture. The
+    /// transaction ref rides out with the verdict so callers run their trigger
+    /// checks without re-deriving or re-unwrapping it.
+    fn committable_running(&self) -> Option<(&Transaction, Tid)> {
+        let txn = self.running.as_ref()?;
+        let tid = txn.tid();
+        (txn.has_recorded_work() || self.pins_charged_to(tid)).then_some((txn, tid))
+    }
+
+    /// Whether any pinned freed run is charged to `tid` — a durable obligation
+    /// that commit step 6 ([`release_pinned_frees`](Self::release_pinned_frees))
+    /// must discharge, independent of whether the freeing transaction also
+    /// captured metadata.
+    fn pins_charged_to(&self, tid: Tid) -> bool {
+        self.pinned_frees.values().any(|run| run.tid == tid)
+    }
 }
 
 impl Journal {
@@ -1256,6 +1364,7 @@ impl Journal {
             stop: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
+            op_handle_owners: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -1540,10 +1649,8 @@ impl Journal {
             // of one of its handles wakes this queue.
             return (locked.nr_updates() == 0).then_some(CommitAction::Advance);
         }
-        if st
-            .running
-            .as_ref()
-            .is_some_and(|txn| j.transaction_is_due(txn, Jiffies::elapsed(), st.commit_request))
+        if let Some((txn, _tid)) = st.committable_running()
+            && j.commit_triggered(txn, Jiffies::elapsed(), st.commit_request)
         {
             return Some(CommitAction::Advance);
         }
@@ -1556,14 +1663,14 @@ impl Journal {
     }
 
     /// The identity the age trigger is armed against: the running
-    /// transaction's tid, if it has captured work to age (a captureless
-    /// transaction never becomes due, so arming a deadline for it would
-    /// spin the timeout against nothing).
+    /// transaction's tid, if it carries a durable obligation to age (a
+    /// non-committable transaction never becomes due, so arming a deadline for
+    /// it would spin the timeout against nothing). Delegates to
+    /// [`committable_running`](JournalState::committable_running) so the age
+    /// gate is the same obligation set (metadata OR revokes OR pins) as every
+    /// other commit trigger.
     fn age_key(st: &JournalState) -> Option<Tid> {
-        st.running
-            .as_ref()
-            .filter(|txn| txn.nr_metadata_blocks() > 0)
-            .map(Transaction::tid)
+        st.committable_running().map(|(_, tid)| tid)
     }
 
     /// Computes the commit thread's sleep arming: the age key (see
@@ -1576,32 +1683,30 @@ impl Journal {
     /// wake instead of real timeouts).
     fn age_deadline(&self) -> (Option<Tid>, Option<Duration>) {
         let st = self.state_read();
-        let key = Self::age_key(&st);
-        let timeout = if JIFFIES_TIMER_MANAGER.get().is_some() {
-            key.map(|_| {
-                st.running
-                    .as_ref()
-                    .expect("age_key names the running transaction")
-                    .until_expiry(Jiffies::elapsed())
-            })
-        } else {
-            None
+        // The verdict and the transaction ride out together, so the deadline
+        // reads off the same transaction the key names — no re-lookup, no
+        // guarded `expect`.
+        let Some((txn, tid)) = st.committable_running() else {
+            return (None, None);
         };
-        (key, timeout)
+        let timeout = JIFFIES_TIMER_MANAGER
+            .get()
+            .is_some()
+            .then(|| txn.until_expiry(Jiffies::elapsed()));
+        (Some(tid), timeout)
     }
 
-    /// The group-commit due test for the running transaction — the three
-    /// triggers (see the module docs): an explicit commit request covering
-    /// its tid (durability/escalation), its age deadline, or its captured
-    /// batch footprint reaching [`batch_trigger_credits`](Self::batch_trigger_credits).
-    /// A transaction with no captured metadata is never due: it writes no
-    /// log blocks, so committing it would be a no-op (and waiting on its
-    /// tid would hang — see [`log_wait_commit`](Self::log_wait_commit)'s
-    /// contract).
-    fn transaction_is_due(&self, txn: &Transaction, now: Jiffies, requested: Option<Tid>) -> bool {
-        if txn.nr_metadata_blocks() == 0 {
-            return false;
-        }
+    /// The group-commit trigger test for an already-committable running
+    /// transaction — the three triggers (see the module docs): an explicit
+    /// commit request covering its tid (durability/escalation), its age
+    /// deadline, or its captured batch footprint reaching
+    /// [`batch_trigger_credits`](Self::batch_trigger_credits). The "is this a
+    /// non-empty transaction a commit must retire" gate is applied once, by the
+    /// callers through [`committable_running`](JournalState::committable_running)
+    /// — an empty transaction never reaches here (committing it writes no log
+    /// block, and waiting on its tid would hang — see
+    /// [`log_wait_commit`](Self::log_wait_commit)'s contract).
+    fn commit_triggered(&self, txn: &Transaction, now: Jiffies, requested: Option<Tid>) -> bool {
         requested.is_some_and(|r| r.geq(txn.tid()))
             || txn.is_expired_at(now)
             || txn.batch_footprint(self.geometry.tag_layout()) >= self.batch_trigger_credits()
@@ -1655,18 +1760,19 @@ impl Journal {
         if st.locking.is_some() {
             return PipelineStep::Parked;
         }
-        let due = st.running.as_ref().is_some_and(|txn| {
-            txn.nr_metadata_blocks() > 0
-                && (force_due
-                    || self.transaction_is_due(txn, Jiffies::elapsed(), st.commit_request))
-        });
+        let due = match st.committable_running() {
+            Some((txn, _tid)) => {
+                force_due || self.commit_triggered(txn, Jiffies::elapsed(), st.commit_request)
+            }
+            None => false,
+        };
         if !due {
             return PipelineStep::Idle;
         }
         let txn = st
             .running
             .take()
-            .expect("due implies a running transaction");
+            .expect("committable_running implies a running transaction");
         if txn.nr_updates() == 0 {
             return PipelineStep::Staged(st.stage_committing(txn));
         }
@@ -1863,11 +1969,11 @@ impl Journal {
     pub(in crate::fs::fs_impls::ext4) fn request_commit_of_running(&self) {
         {
             let mut st = self.state_write();
-            if let Some(tid) = st
-                .running
-                .as_ref()
-                .filter(|txn| txn.nr_metadata_blocks() > 0)
-                .map(Transaction::tid)
+            // Extract the tid before mutating `commit_request`: the
+            // committable verdict borrows the running transaction, so it must
+            // be reduced to an owned `Tid` first.
+            let committable = st.committable_running().map(|(_, tid)| tid);
+            if let Some(tid) = committable
                 && !st.commit_request.is_some_and(|existing| existing.geq(tid))
             {
                 st.commit_request = Some(tid);
@@ -1894,6 +2000,31 @@ impl Journal {
     pub(super) fn note_credits_released(&self) {
         self.credit_release_epoch.fetch_add(1, Ordering::Release);
         self.commit_wait_queue.wake_all();
+    }
+
+    /// Registers the current task as holding an operation handle on this
+    /// journal, or `Err(EDEADLK)` if it already holds one (the nested-`begin_op`
+    /// self-deadlock; see [`OpHandle::start`]). `Ok(Some(id))` carries the
+    /// identity to hand back to [`release_op_handle`](Journal::release_op_handle)
+    /// at close; `Ok(None)` outside task context, where the guard is inert.
+    fn claim_op_handle(&self) -> Result<Option<usize>> {
+        let Some(id) = current_op_owner() else {
+            return Ok(None);
+        };
+        if !self.op_handle_owners.lock().insert(id) {
+            return_errno_with_message!(
+                Errno::EDEADLK,
+                "nested ext4 metadata operation on one task would deadlock the journal; \
+                 open the second (e.g. reclaim) handle only after the first has closed"
+            );
+        }
+        Ok(Some(id))
+    }
+
+    /// Releases a task's operation-handle registration (see
+    /// [`claim_op_handle`](Journal::claim_op_handle)).
+    fn release_op_handle(&self, id: usize) {
+        self.op_handle_owners.lock().remove(&id);
     }
 
     /// Blocks until the admission pressure that kept a `journal_start` out of
@@ -3124,6 +3255,87 @@ mod tests {
 
         // Teardown: stops and joins the commit thread. Returns (does not hang).
         f.journal.stop_commit_thread();
+    }
+
+    /// The nested-`begin_op` guard (c2 hardening): a task holding an operation
+    /// handle that opens a second one gets an immediate `EDEADLK` instead of the
+    /// self-deadlock (the nested `journal_start` would park on a barrier only
+    /// the first handle's close can clear). Structured so a regression that
+    /// dropped the guard would make the second `start` succeed — the
+    /// `unwrap_err` then FAILS the test loudly rather than hanging CI. The
+    /// [`journal_start`] primitive stays unguarded (this drives `OpHandle`, the
+    /// operation boundary, deliberately), so the transaction-sharing tests keep
+    /// working.
+    #[ktest]
+    fn nested_op_handle_on_one_task_is_rejected() {
+        let f = journaled_fixture(16, 1, 1);
+
+        // First operation handle registers this task as an owner.
+        let op1 = OpHandle::start(&f.journal, 4).unwrap();
+
+        // A second handle on the SAME task is the nested self-deadlock: refused.
+        let err = OpHandle::start(&f.journal, 4).map(|_| ()).unwrap_err();
+        assert_eq!(err.error(), Errno::EDEADLK);
+
+        // Closing the first clears the task's slot: a FRESH handle opened after
+        // the predecessor closed (the reclaim pattern) is admitted again — the
+        // guard does not false-positive on the legitimate declaration-order path.
+        drop(op1);
+        let op2 = OpHandle::start(&f.journal, 4).unwrap();
+        drop(op2);
+    }
+
+    /// A running transaction with only durable obligations that are NOT captured
+    /// metadata — a revoke record, or a pinned freed run — is still committable
+    /// (c2 hardening of the due/age/request gate). The historical gate tested
+    /// captured metadata alone and would have refused it; the widened gate
+    /// counts the obligation set structurally. Constructed synthetically because
+    /// `Ext4::free_blocks` always captures the group bitmap, so no real path
+    /// reaches zero captures with a live obligation.
+    #[ktest]
+    fn revoke_or_pin_only_transaction_is_committable() {
+        let f = journaled_fixture(64, 1, 1);
+        let handle = journal_start(&f.journal, 4).unwrap();
+        let tid = handle.tid();
+
+        // Empty transaction: no metadata, no revokes, no pins — never
+        // committable (committing it writes no log block; a `log_wait_commit`
+        // waiter on its tid would hang).
+        assert!(f.journal.state_read().committable_running().is_none());
+
+        // A pinned freed run alone (a plain-data free, which records no revoke)
+        // is a durable obligation commit step 6 must release: committable via
+        // the pin branch of the gate, with zero captures and zero revokes.
+        f.journal
+            .state_write()
+            .pinned_frees
+            .insert(500, PinnedRun { count: 1, tid });
+        assert_eq!(
+            f.journal.state_read().committable_running().map(|(_, t)| t),
+            Some(tid),
+            "a pin-only transaction is committable",
+        );
+
+        // A recorded revoke (a journaled free's revoke) is equally one, and the
+        // trigger test now fires the transaction for an explicit request.
+        f.journal
+            .state_write()
+            .running
+            .as_mut()
+            .unwrap()
+            .forget_block(90_000);
+        {
+            let st = f.journal.state_read();
+            let (txn, gated_tid) = st.committable_running().unwrap();
+            assert_eq!(gated_tid, tid);
+            assert!(
+                f.journal
+                    .commit_triggered(txn, Jiffies::elapsed(), Some(tid)),
+                "a committable transaction fires on a request covering its tid",
+            );
+        }
+
+        journal_stop(handle).unwrap();
     }
 
     /// `log_wait_commit` returns immediately for an already-committed tid, without

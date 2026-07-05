@@ -401,6 +401,17 @@ impl Transaction {
         self.metadata.len()
     }
 
+    /// Whether this transaction carries a durable obligation recorded on the
+    /// transaction object itself: a captured metadata after-image or a revoke
+    /// record. A caller deciding "is this a non-empty transaction a commit must
+    /// retire" must ALSO consult the state's pinned freed runs for this tid
+    /// ([`JournalState::committable_running`](super::JournalState)) — a
+    /// plain-data free pins its run there without recording a revoke here — so
+    /// this is only the transaction-local half of that gate.
+    pub(super) fn has_recorded_work(&self) -> bool {
+        self.nr_metadata_blocks() > 0 || !self.revoked.is_empty()
+    }
+
     /// Captures a freshly allocated metadata block as a zeroed after-image
     /// (jbd2 `get_create_access`): its prior device content is meaningless, so
     /// no read is needed. Idempotent — a block already captured (possibly with
