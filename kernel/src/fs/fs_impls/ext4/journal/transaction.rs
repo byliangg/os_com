@@ -401,6 +401,22 @@ impl Transaction {
         self.metadata.len()
     }
 
+    /// The worst-case metadata log blocks this transaction would occupy with
+    /// `extra` more credits reserved: its already-captured metadata plus every
+    /// reservation's full worst case (`outstanding_credits + extra`, each
+    /// reservation counted at its whole credit until its handle closes). This
+    /// is the credit base BOTH reservation gates share — `check_capacity`
+    /// (against [`Journal::max_credits`](super::Journal::max_credits)) and the
+    /// log-space gate ([`journal_start`], through
+    /// [`Journal::reservation_footprint`](super::Journal::reservation_footprint))
+    /// — computed in ONE place so the two cannot diverge. It EXCLUDES revoke
+    /// blocks: a whole revoke block is a log block carrying no descriptor tag
+    /// ([`nr_revoke_blocks`](Self::nr_revoke_blocks)), charged separately by
+    /// each gate exactly once.
+    pub(super) fn reserved_metadata_blocks(&self, extra: usize) -> usize {
+        self.nr_metadata_blocks() + self.outstanding_credits + extra
+    }
+
     /// Whether this transaction carries a durable obligation recorded on the
     /// transaction object itself: a captured metadata after-image or a revoke
     /// record. A caller deciding "is this a non-empty transaction a commit must
@@ -777,7 +793,7 @@ impl Handle {
 /// commit-time exact fit guard stays the hard line; see `max_credits`.
 fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Result<()> {
     let revoke_blocks = running.nr_revoke_blocks(journal.geometry().tag_layout());
-    let needed = running.nr_metadata_blocks() + revoke_blocks + running.outstanding_credits + extra;
+    let needed = running.reserved_metadata_blocks(extra) + revoke_blocks;
     if needed > journal.max_credits() {
         return_errno_with_message!(Errno::ENOSPC, "journal transaction is full");
     }
@@ -864,15 +880,11 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
                     // Only when a commit thread is running to service the wait;
                     // without one, admit and let the commit-time fit guard
                     // drain inline (no servicer to free space, so waiting would
-                    // spin). `credits ≤ max_credits` ⟹ this footprint ≤ usable,
-                    // so a full checkpoint frees enough (the wait terminates).
-                    let revoke_blocks = running.nr_revoke_blocks(journal.geometry().tag_layout());
-                    let reserved_credits = running.nr_metadata_blocks()
-                        + revoke_blocks
-                        + running.outstanding_credits
-                        + credits;
-                    let space_needed =
-                        journal.worst_case_footprint(reserved_credits, revoke_blocks);
+                    // spin). `check_capacity` above passed, so the reserved
+                    // credits are `≤ max_credits` ⟹ this footprint `≤ usable`
+                    // (the `max_credits` proof), so a full checkpoint frees
+                    // enough — the wait terminates.
+                    let space_needed = journal.reservation_footprint(running, credits);
                     space_needed > journal.geometry().free_log_blocks(head, tail_block)
                 } {
                     Admit::WaitSpace(journal.credit_release_epoch())
@@ -1610,5 +1622,81 @@ mod tests {
             "revoke footprint tips the trigger"
         );
         assert_eq!(j.committed_tid(), Tid::new(1));
+    }
+
+    /// Finding-1 regression (P7c-3 adversarial review): the reservation-time
+    /// log-space gate must charge a transaction's whole revoke blocks EXACTLY
+    /// ONCE. A running transaction carrying a captured metadata block AND a
+    /// whole revoke block (the metadata-`forget` free path) is measured through
+    /// the gate's own footprint helper ([`Journal::reservation_footprint`], the
+    /// `#[cfg(ktest)]`-observable value `journal_start` compares against the
+    /// free segment). It must equal the exact commit-time footprint (`metadata
+    /// + revoke + descriptors + commit`), NOT the value the pre-fix gate
+    /// produced by feeding `metadata + revoke` as the descriptor-bearing credit
+    /// arg — which re-added the revoke block and inflated the descriptor
+    /// divisor. The footprint also fits the usable ring at the capacity
+    /// boundary, so a full checkpoint always frees enough and the wait
+    /// terminates even with revoke_blocks > 0. (The original pressure tests all
+    /// had revoke_blocks == 0, so none exercised this term.)
+    #[ktest]
+    fn reservation_footprint_charges_revoke_blocks_once() {
+        // usable 63, max_credits 60, t = 508 (see `max_credits_matches_geometry`).
+        let j = journaled_fixture(64, 1, 1);
+        let layout = j.geometry().tag_layout();
+        let tags = layout.tags_per_descriptor();
+        let usable = j.geometry().maxlen() - j.geometry().first();
+
+        let h = journal_start(&j, 8).unwrap();
+        let (metadata, revoke_blocks, footprint) = {
+            let mut st = j.state_write();
+            let txn = st.running.as_mut().unwrap();
+            let generation = txn.capture_create(1500);
+            txn.apply_patch(1500, generation, |b| b[..4].copy_from_slice(b"META"))
+                .unwrap();
+            // A handful of metadata frees — one whole revoke block (5 far below
+            // the per-block entry count), the term the pre-fix gate double-counted.
+            for i in 0..5u64 {
+                txn.forget_block(30_000 + i);
+            }
+            let revoke_blocks = txn.nr_revoke_blocks(layout);
+            let metadata = txn.reserved_metadata_blocks(4);
+            (metadata, revoke_blocks, j.reservation_footprint(&*txn, 4))
+        };
+        assert_eq!(
+            revoke_blocks, 1,
+            "the forgets fill exactly one whole revoke block"
+        );
+
+        // Counted once: metadata data + 1 revoke + descriptors(metadata) + commit.
+        let expected = metadata + revoke_blocks + metadata.div_ceil(tags) + 1;
+        assert_eq!(
+            footprint as usize, expected,
+            "reservation footprint charges the revoke block exactly once"
+        );
+        // The pre-fix gate fed `metadata + revoke` as the credit arg, re-adding
+        // the revoke block (and inflating the descriptor divisor) — strictly more.
+        let double_counted = (metadata + revoke_blocks)
+            + revoke_blocks
+            + (metadata + revoke_blocks).div_ceil(tags)
+            + 1;
+        assert!(
+            (footprint as usize) < double_counted,
+            "corrected footprint is below the revoke-double-counted value"
+        );
+
+        // Termination with revoke_blocks > 0: the footprint fits a fully-drained
+        // ring, and at the capacity limit — the worst case, since revoke blocks
+        // add no descriptor — it still fits, so a parked journal_start always
+        // finds room after a full checkpoint and the op completes.
+        assert!(
+            footprint <= usable,
+            "revoke-bearing footprint fits the usable ring"
+        );
+        assert!(
+            j.worst_case_footprint(j.max_credits(), 0) <= usable,
+            "max-credit footprint fits the ring — the reservation wait terminates"
+        );
+
+        journal_stop(h).unwrap();
     }
 }

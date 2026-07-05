@@ -3401,6 +3401,42 @@ mod tests {
         assert_eq!(sb_after.last_orphan, 0, "cleared head persisted");
     }
 
+    /// Deterministically drives exactly one reservation-time log-space park and
+    /// proves it terminates (P7c-3, Finding 2). It commits a small transaction
+    /// so the ring carries a short un-checkpointed dirty tail — its free segment
+    /// stays above the lazy-checkpoint low-water mark, so the commit thread
+    /// leaves it in place — then reserves a max-credit handle whose worst-case
+    /// footprint (≈ usable − 1) cannot fit the now-smaller free segment.
+    /// `journal_start` must therefore wait on the commit thread to reclaim the
+    /// tail; it returns only once admitted. Asserts the log-space wait counter
+    /// advanced, i.e. the reservation gate — not the commit-time inline-drain
+    /// backstop — absorbed the pressure. Removing the reservation-time
+    /// backpressure makes this counter stay flat and the assert fire, which is
+    /// the guarantee the plain cycling/concurrent workloads could not give (they
+    /// hit the capacity gate first, or the corrected footprint simply fits).
+    fn drive_one_log_space_park(ext4: &Arc<Ext4>, journal: &Arc<journal::Journal>) {
+        let before = journal.log_space_wait_count();
+        // A committed transaction a handful of blocks long → a short dirty tail.
+        let op = ext4.begin_op(8).unwrap();
+        let tid = op.tid().unwrap();
+        for b in 700..706u64 {
+            journal::get_create_access(op.get(), b)
+                .unwrap()
+                .patch(|buf| buf.fill(0x5A))
+                .unwrap();
+        }
+        drop(op);
+        journal.log_wait_commit(tid).unwrap();
+        // A max-credit reservation (legal by capacity) whose footprint exceeds
+        // the shrunken free segment must park, then be admitted after the commit
+        // thread full-reclaims the tail — termination.
+        drop(ext4.begin_op(journal.max_credits()).unwrap());
+        assert!(
+            journal.log_space_wait_count() > before,
+            "the max-credit reservation parked on the reservation-time log-space gate"
+        );
+    }
+
     /// Small-journal pressure (P7c-3, the lazy-checkpoint gate): a DELIBERATELY
     /// tiny journal — real `mke2fs` journals (≥1024 blocks) never reach the
     /// capacity/space path (experience §10.4) — with the commit thread RUNNING,
@@ -3423,6 +3459,14 @@ mod tests {
             .build()
             .unwrap();
         let journal = f.ext4.journal().unwrap();
+
+        // On the freshly-built (clean) ring, deterministically drive ONE
+        // reservation-time park so this test proves the reservation gate
+        // genuinely fires (Finding 2), not merely the commit-time inline-drain
+        // backstop the cycling loop below exercises. Done first, before the
+        // loop leaves the ring in a residual state that would make the park
+        // racy.
+        drive_one_log_space_park(&f.ext4, &journal);
 
         // Each op is its own small transaction capturing two metadata blocks
         // (fixed device blocks in the data region — no allocation, so the
@@ -3471,6 +3515,12 @@ mod tests {
             .build()
             .unwrap();
         let journal = f.ext4.journal().unwrap();
+
+        // On the freshly-built (clean) ring, deterministically prove the
+        // reservation gate fires (Finding 2) before the concurrent workload —
+        // which alone may resolve entirely through the commit-time backstop —
+        // leaves the ring in a residual state that would make the park racy.
+        drive_one_log_space_park(&f.ext4, &journal);
 
         let worker = |ext4: Arc<Ext4>, base: u64| {
             move || {

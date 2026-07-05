@@ -1078,6 +1078,14 @@ pub(super) struct Journal {
     /// the commit-time fit guard drains inline instead, so the wait can
     /// never hang on an absent committer.
     commit_servicer: AtomicBool,
+    /// How many times a `journal_start` actually parked on the log-space gate
+    /// ([`wait_for_log_space`](Journal::wait_for_log_space)) — the count of
+    /// reservation-time backpressure events, distinct from the commit-time
+    /// inline-drain backstop. Bumped once at entry to the wait (past the
+    /// no-servicer bypass), so a nonzero value proves the reservation gate,
+    /// not the backstop, absorbed the pressure. Exists for the small-journal
+    /// pressure tests to assert backpressure genuinely fired.
+    log_space_waits: AtomicU64,
 }
 
 /// One pinned freed block run: `count` blocks whose free was discharged under
@@ -1463,6 +1471,7 @@ impl Journal {
             j_checkpoint: Mutex::new(()),
             space_pressure: AtomicBool::new(false),
             commit_servicer: AtomicBool::new(false),
+            log_space_waits: AtomicU64::new(0),
         })
     }
 
@@ -1913,21 +1922,49 @@ impl Journal {
         (usable / 4).max(1)
     }
 
-    /// The worst-case log footprint of a transaction reserving `credits`
-    /// metadata blocks with `revoke_blocks` whole revoke blocks: the metadata
-    /// and revoke blocks, one descriptor per [`TagLayout::tags_per_descriptor`]
-    /// metadata blocks, and the commit block — the free-segment space its
-    /// commit needs. The reservation-time space check
-    /// ([`journal_start`](transaction::journal_start)) waits for this much free
-    /// so the commit-time fit guard rarely fires. `credits ≤ max_credits`
-    /// (the capacity gate) makes this `≤ usable` by the `max_credits` formula,
-    /// so a full checkpoint always frees enough — the wait terminates. A
+    /// The worst-case log footprint of a transaction whose `credits` counts
+    /// its METADATA blocks alone (excluding revoke blocks) alongside its
+    /// `revoke_blocks` whole revoke blocks:
+    ///
+    /// ```text
+    /// credits data + revoke_blocks + ceil(credits / t) descriptors + 1 commit
+    /// ```
+    ///
+    /// — the free-segment space its commit needs, matching the exact
+    /// commit-time footprint ([`try_commit_transaction`](commit::try_commit_transaction):
+    /// `revoke + nr_data + descriptors + 1`). `revoke_blocks` is added exactly
+    /// ONCE, and the descriptor count charges only the metadata tags — a
+    /// revoke block is a whole log block carrying no tag, so a caller must pass
+    /// metadata-only `credits` here (see [`reservation_footprint`](Self::reservation_footprint),
+    /// the sole non-test caller, which derives `credits` from
+    /// [`Transaction::reserved_metadata_blocks`], never the revoke-inclusive
+    /// capacity charge). `credits + revoke_blocks ≤ max_credits` (the capacity
+    /// gate) makes this `≤ usable` by the `max_credits` formula, so a full
+    /// checkpoint always frees enough — the reservation-time wait terminates. A
     /// footprint beyond a `u32` of blocks (unreachable — it is bounded by the
     /// ring) saturates, so the space check treats it as "needs the whole ring".
     pub(super) fn worst_case_footprint(&self, credits: usize, revoke_blocks: usize) -> u32 {
         let tags = self.geometry.tag_layout().tags_per_descriptor();
         let blocks = credits + revoke_blocks + credits.div_ceil(tags) + 1;
         u32::try_from(blocks).unwrap_or(u32::MAX)
+    }
+
+    /// The worst-case log footprint of the running `txn` if `credits` more
+    /// metadata blocks were reserved — the free-segment space the
+    /// reservation-time log-space gate ([`journal_start`](transaction::journal_start))
+    /// waits for. Feeds the transaction's shared metadata base
+    /// ([`Transaction::reserved_metadata_blocks`]) and its whole revoke blocks
+    /// ([`Transaction::nr_revoke_blocks`]) through
+    /// [`worst_case_footprint`](Self::worst_case_footprint), so revoke blocks
+    /// are charged exactly once and descriptors only for the metadata. This is
+    /// the log-space sibling of `check_capacity` (which sums the same metadata
+    /// base plus revoke blocks against [`max_credits`](Self::max_credits));
+    /// routing both gates through `reserved_metadata_blocks` is what keeps their
+    /// footprint arithmetic from diverging.
+    pub(super) fn reservation_footprint(&self, txn: &Transaction, credits: usize) -> u32 {
+        let revoke_blocks = txn.nr_revoke_blocks(self.geometry.tag_layout());
+        let metadata_blocks = txn.reserved_metadata_blocks(credits);
+        self.worst_case_footprint(metadata_blocks, revoke_blocks)
     }
 
     /// Whether a background commit thread is running to service checkpoint /
@@ -2316,10 +2353,13 @@ impl Journal {
     ///
     /// # Termination
     ///
-    /// The `max_credits` capacity gate already passed, so the reservation is
-    /// `≤ usable` (the `max_credits` formula); a full checkpoint frees the
-    /// whole committed tail, so the retry eventually fits — unless the space
-    /// is held by an uncommitted transaction, which the force-request commits.
+    /// The `max_credits` capacity gate already passed, so the reserved credits
+    /// `n + v ≤ max_credits`, and the footprint the caller compared against the
+    /// free segment ([`reservation_footprint`](Self::reservation_footprint) =
+    /// `n + v + ceil(n/t) + 1`, revoke counted once) is therefore `≤ usable` by
+    /// the `max_credits` formula; a full checkpoint frees the whole committed
+    /// tail, so the retry eventually fits — unless the space is held by an
+    /// uncommitted transaction, which the force-request commits.
     ///
     /// # Locking
     ///
@@ -2335,6 +2375,10 @@ impl Journal {
         if !self.has_commit_servicer() {
             return Ok(());
         }
+        // Reservation-time backpressure genuinely fired: a servicer exists and
+        // this handle is about to park for it (as opposed to the commit-time
+        // inline-drain backstop). Counted once here, before the wait.
+        self.log_space_waits.fetch_add(1, Ordering::Relaxed);
         self.space_pressure.store(true, Ordering::Release);
         self.request_commit_of_running();
         self.commit_wait_queue.wait_until(|| {
@@ -2354,6 +2398,14 @@ impl Journal {
             }
             None
         })
+    }
+
+    /// The number of times a `journal_start` parked on the log-space gate
+    /// ([`log_space_waits`](Journal::log_space_waits)) — a nonzero value proves
+    /// reservation-time backpressure fired rather than the commit-time drain.
+    #[cfg(ktest)]
+    pub(super) fn log_space_wait_count(&self) -> u64 {
+        self.log_space_waits.load(Ordering::Relaxed)
     }
 
     /// Returns whether the journal has been aborted by a failed commit (see the
