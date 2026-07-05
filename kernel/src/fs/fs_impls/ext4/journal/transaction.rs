@@ -887,14 +887,22 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
     Ok(())
 }
 
-/// Opens a handle on the journal's running transaction, reserving `credits`
-/// metadata blocks (jbd2 `jbd2_journal_start`).
+/// Runs the jbd2 `add_transaction_credits` wait-and-retry admission loop until
+/// `credits` metadata blocks fit the journal's running transaction, charges the
+/// reservation onto it (`t_updates += 1`, `outstanding_credits += credits`), and
+/// returns the joined transaction's tid.
 ///
-/// If no transaction is running, a fresh one is created with the next tid —
-/// even while a committing transaction is mid-flight (the two-transaction
-/// pipeline): starting neither consults nor waits on the committing slot
-/// (iron law 1: the only waits here are for *space*, legal under inode
-/// locks). Two conditions block, both resolved by the same waker set:
+/// The single admission implementation shared by both entry points that reserve
+/// on the running transaction — [`journal_start`] (wraps the tid in a fresh
+/// [`Handle`]) and [`journal_restart`] (writes it into an existing handle in
+/// place after releasing the old reservation). Keeping one loop keeps the two in
+/// lockstep: a restart re-enters the *same* barrier a first start would.
+///
+/// If no transaction is running, a fresh one is created with the next tid — even
+/// while a committing transaction is mid-flight (the two-transaction pipeline):
+/// admitting neither consults nor waits on the committing slot (iron law 1: the
+/// only waits here are for *space*, legal under inode locks). Two conditions
+/// block, both resolved by the same waker set:
 ///
 /// - **The locked barrier** (jbd2 `add_transaction_credits`:
 ///   `t_state != T_RUNNING` → `wait_transaction_locked`,
@@ -911,7 +919,7 @@ fn check_capacity(journal: &Journal, running: &Transaction, extra: usize) -> Res
 ///   [`Journal::request_commit_for`], so under group commit the full
 ///   transaction is force-locked and drained rather than waited out
 ///   passively, then retries.
-pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
+fn admit(journal: &Arc<Journal>, credits: usize) -> Result<Tid> {
     // A reservation that exceeds an *empty* transaction's capacity can never
     // succeed no matter how many commits retire; refuse it outright so the
     // wait loop below always terminates.
@@ -989,14 +997,7 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
                         journal.request_commit();
                     }
 
-                    return Ok(Handle {
-                        tid,
-                        credits: Cell::new(credits),
-                        // Every reserved credit starts available; captures spend
-                        // them one at a time (see `charge_fresh_capture`).
-                        remaining: Cell::new(credits),
-                        journal: Arc::downgrade(journal),
-                    });
+                    return Ok(tid);
                 }
             }
         };
@@ -1012,9 +1013,24 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
     }
 }
 
-/// The outcome of one [`journal_start`] admission attempt: a handle was
-/// granted (returned directly), or the caller must wait — for transaction room
-/// (a full running transaction, or the locked barrier) or for log space (the
+/// Opens a handle on the journal's running transaction, reserving `credits`
+/// metadata blocks (jbd2 `jbd2_journal_start`): the shared [`admit`] loop grants
+/// the reservation, and the returned tid is wrapped in a fresh [`Handle`].
+pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Handle> {
+    let tid = admit(journal, credits)?;
+    Ok(Handle {
+        tid,
+        credits: Cell::new(credits),
+        // Every reserved credit starts available; captures spend them one at a
+        // time (see `charge_fresh_capture`).
+        remaining: Cell::new(credits),
+        journal: Arc::downgrade(journal),
+    })
+}
+
+/// The outcome of one [`admit`] attempt: the reservation was granted (the tid
+/// returned directly), or the caller must wait — for transaction room (a full
+/// running transaction, or the locked barrier) or for log space (the
 /// reservation does not fit the ring's free segment).
 enum Admit {
     WaitRoom(Tid, u64),
@@ -1087,7 +1103,7 @@ pub(super) fn journal_stop(handle: Handle) -> Result<()> {
 /// return code buried in a `usize`. Mirrors `jbd2_journal_extend`'s
 /// `0`/`1` contract — grow succeeded, or "no room, caller must restart".
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ExtendOutcome {
+pub(in crate::fs::fs_impls::ext4) enum ExtendOutcome {
     /// The reservation grew: the transaction had capacity for the extra credits.
     Granted,
     /// The transaction cannot fit the extra credits within the journal's
@@ -1170,12 +1186,14 @@ pub(super) fn charge_fresh_capture(
 /// Grows a handle's reservation by `extra` blocks (jbd2 `jbd2_journal_extend`).
 ///
 /// Returns [`ExtendOutcome::Granted`] when the extra credits fit the running
-/// transaction's capacity, or [`ExtendOutcome::NeedsRestart`] when they do not
-/// (jbd2's `1` — the caller must restart). Errors `ENOSPC` only when the
-/// handle's transaction has been force-locked for commit (jbd2 refuses to
-/// extend any transaction not in `T_RUNNING`, fs/jbd2/transaction.c
-/// `jbd2_journal_extend`: the locked transaction must drain, not grow).
-#[cfg_attr(not(ktest), expect(dead_code))]
+/// transaction's capacity, or [`ExtendOutcome::NeedsRestart`] when the caller
+/// must instead close this reservation onto a fresh transaction — jbd2's `1`.
+/// That covers both jbd2 no-grow cases uniformly: the extra does not fit this
+/// transaction's per-transaction capacity, OR the transaction has been
+/// force-locked for commit (jbd2 refuses to extend any transaction not in
+/// `T_RUNNING`, fs/jbd2/transaction.c `jbd2_journal_extend`: a locked
+/// transaction must drain, not grow — the caller restarts onto the successor).
+/// [`ensure_chunk_credits`] turns either `NeedsRestart` into a [`journal_restart`].
 pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<ExtendOutcome> {
     let journal = handle
         .journal
@@ -1188,15 +1206,88 @@ pub(super) fn journal_extend(handle: &mut Handle, extra: usize) -> Result<Extend
         .as_ref()
         .is_some_and(|locked| locked.tid == handle.tid)
     {
-        return_errno_with_message!(
-            Errno::ENOSPC,
-            "cannot extend a transaction locked for commit"
-        );
+        return Ok(ExtendOutcome::NeedsRestart);
     }
     let Some(running) = st.running.as_mut() else {
         return_errno_with_message!(Errno::EIO, "journal_extend without a running transaction");
     };
     Ok(try_grow_reservation(&journal, running, handle, extra))
+}
+
+/// Ensures `handle` can capture `need` metadata blocks for the next write chunk
+/// without overflowing its transaction — the write loop's per-chunk credit gate
+/// (jbd2/ext4 `ext4_datasem_ensure_credits`, the `ext4_journal_extend` →
+/// `ext4_truncate_restart_trans` idiom).
+///
+/// Fast path — the contiguous common case: the handle's live reservation already
+/// covers `need`, so nothing happens (zero behavior change and no restart from a
+/// single-chunk write). Otherwise grow the reservation in place
+/// ([`journal_extend`]); if the extra will not fit — the transaction is full or
+/// force-locked ([`ExtendOutcome::NeedsRestart`]) — force a commit boundary and
+/// rejoin a fresh transaction ([`journal_restart`]), which resets the
+/// reservation to exactly `need`.
+///
+/// The caller must hold no ExtentTree lock and keep no [`WriteAccess`] alive
+/// across this call (the borrow of `&mut Handle` enforces the latter): a
+/// restart's re-admission may wait for room, which is legal only under the inode
+/// lock alone (iron law 1).
+///
+/// [`WriteAccess`]: super::WriteAccess
+pub(in crate::fs::fs_impls::ext4) fn ensure_chunk_credits(
+    handle: &mut Handle,
+    need: usize,
+) -> Result<()> {
+    if handle.remaining() >= need {
+        return Ok(());
+    }
+    let extra = need - handle.remaining();
+    match journal_extend(handle, extra)? {
+        ExtendOutcome::Granted => Ok(()),
+        ExtendOutcome::NeedsRestart => journal_restart(handle, need),
+    }
+}
+
+/// Wait-free probe for the write spine's per-chunk early stop: reports whether
+/// `handle` can still capture `need` more metadata blocks in its current
+/// transaction, growing the reservation in place when it fits.
+///
+/// Called UNDER the ExtentTree lock (③) from
+/// [`ensure_allocated`](super::super::inode::extent_manager::ExtentManager::ensure_allocated),
+/// so — like [`charge_fresh_capture`] — it takes the journal state lock only
+/// transiently and NEVER waits (iron law 1: a wait here would sleep under ③,
+/// which the committer's ordered flush needs). Unlike [`ensure_chunk_credits`]
+/// it does not restart: an [`ExtendOutcome::NeedsRestart`] tells the caller to
+/// stop with partial progress and return so the OUTER spine restarts with ③
+/// released. A force-locked transaction (draining for commit) answers
+/// `NeedsRestart` too — a draining transaction must not grow.
+pub(in crate::fs::fs_impls::ext4) fn try_reserve_next(
+    handle: &Handle,
+    need: usize,
+) -> Result<ExtendOutcome> {
+    let remaining = handle.remaining();
+    if remaining >= need {
+        return Ok(ExtendOutcome::Granted);
+    }
+    let journal = handle.journal()?;
+    let mut st = journal.state_write();
+    let JournalState {
+        running, locking, ..
+    } = &mut *st;
+    if locking
+        .as_ref()
+        .is_some_and(|locked| locked.tid == handle.tid)
+    {
+        return Ok(ExtendOutcome::NeedsRestart);
+    }
+    let Some(running) = running.as_mut() else {
+        return_errno_with_message!(Errno::EIO, "try_reserve_next without a running transaction");
+    };
+    Ok(try_grow_reservation(
+        &journal,
+        running,
+        handle,
+        need - remaining,
+    ))
 }
 
 /// Reserves `extra` more credits on the running transaction for a caller about
@@ -1252,49 +1343,83 @@ pub(super) fn extend_reservation_for_burst(handle: &Handle, extra: usize) -> Res
     }
 }
 
-/// Re-reserves `credits` on this handle, dropping its old reservation (jbd2
-/// `jbd2_journal_restart`).
+/// Closes this handle's reservation onto its current transaction and re-reserves
+/// `credits` on a fresh one at a commit boundary (jbd2 `jbd2__journal_restart`).
 ///
-/// Phase-4 note: a real restart forces a commit boundary — it commits the
-/// current transaction and starts a fresh one so an unbounded operation (write /
-/// truncate) never overflows a single transaction. That needs multi-transaction
-/// operations (re-capture after the boundary, re-truncate orphan recovery),
-/// which are P7d's journal_restart work; this skeleton only releases the old
-/// reservation and re-reserves on the *still-running* transaction — so a
-/// handle whose transaction was force-locked mid-operation is refused
-/// `ENOSPC` (a true restart would close out of the locked transaction and
-/// rejoin through `journal_start`'s locked barrier, jbd2's shape).
-#[cfg_attr(not(ktest), expect(dead_code))]
-pub(super) fn journal_restart(handle: &mut Handle, credits: usize) -> Result<()> {
-    let journal = handle
-        .journal
-        .upgrade()
-        .ok_or_else(|| Error::with_message(Errno::EIO, "journal dropped"))?;
-    let mut st = journal.state_write();
+/// The two-transaction split of an unbounded operation: `stop_this_handle`'s
+/// detach-and-release followed by `start_this_handle`'s re-admission, WITHOUT
+/// dropping the [`Handle`] — the same object, same [`OpHandle`](super::OpHandle),
+/// same owner registration survive the exchange, so exactly one handle stays
+/// held throughout (going through [`journal_start`]/`OpHandle::start` would
+/// re-register the task and self-deadlock with `EDEADLK`). It is a `&mut`
+/// mutation, not a consuming exchange, precisely because the borrow checker then
+/// proves every [`WriteAccess`](super::WriteAccess) minted from the handle is
+/// dead at the call site — no capture credential can straddle the boundary.
+///
+/// # Locking (iron law 1)
+///
+/// The call site holds the inode lock ① but NO ExtentTree lock ③ and no live
+/// capture: the re-admission's wait for room needs only other handles to close
+/// (they took ① before their own `journal_start`, never re-take it) and the
+/// committer to stage/checkpoint (needs no ①/③ — ordered data is a cloned
+/// `PageCache`, the P5 invariant), so it cannot deadlock. This is why the write
+/// spine restarts BETWEEN chunks, never inside `ensure_allocated`.
+pub(in crate::fs::fs_impls::ext4) fn journal_restart(
+    handle: &mut Handle,
+    credits: usize,
+) -> Result<()> {
+    let journal = handle.journal()?;
 
-    if st
-        .locking
-        .as_ref()
-        .is_some_and(|locked| locked.tid == handle.tid)
-    {
-        return_errno_with_message!(
-            Errno::ENOSPC,
-            "cannot restart within a transaction locked for commit"
-        );
+    // An aborted journal accepts no new work and holds nothing worth releasing
+    // (the lost transaction's images are gone); leave the handle as-is — the
+    // next capture through it fails on the same abort check (jbd2's
+    // `is_journal_aborted` short-circuit in `jbd2__journal_restart`).
+    if journal.is_aborted() {
+        return Ok(());
     }
-    let Some(running) = st.running.as_mut() else {
-        return_errno_with_message!(Errno::EIO, "journal_restart without a running transaction");
-    };
 
-    // Release the old reservation's UNSPENT credits first (the spent ones were
-    // already returned to the pool by their captures), so the capacity check for
-    // the new reservation does not double-count this handle.
-    running.outstanding_credits = running
-        .outstanding_credits
-        .saturating_sub(handle.remaining());
-    check_capacity(&journal, running, credits)?;
+    let old_tid = handle.tid;
 
-    running.outstanding_credits += credits;
+    // stop_this_handle: detach this handle from its transaction and release
+    // only the credits it never spent, WITHOUT dropping the handle. The
+    // transaction may be in the running seat OR — if the committer force-locked
+    // it mid-operation — the locking seat; the central correction over the old
+    // skeleton, which wrongly refused when locked. Releasing from the locking
+    // seat is what lets the drain complete and the restart rejoin a successor
+    // (transaction.rs `journal_stop` releases from the same two seats).
+    {
+        let mut st = journal.state_write();
+        let JournalState {
+            running, locking, ..
+        } = &mut *st;
+        if let Some(txn) = super::active_txn_mut(running, locking, old_tid) {
+            txn.t_updates = txn.t_updates.saturating_sub(1);
+            // Only the UNSPENT credits: each fresh capture already returned its
+            // unit to the pool (`consume_reserved_credit`), so subtracting the
+            // full grant would double-count.
+            txn.outstanding_credits = txn.outstanding_credits.saturating_sub(handle.remaining());
+        }
+        // A miss means the handle outlived its transaction — impossible while it
+        // is held; nothing to release then.
+    }
+
+    // Publish the release (wake capacity-blocked admissions) and request the old
+    // transaction's commit — NON-BLOCKING and self-deduping (`request_commit_for`
+    // only advances `commit_request`), so a run of restarts collapses to one
+    // pending request. NEVER wait for the commit here: waiting under the inode
+    // lock for a transaction this task just left would be law-1 illegal, and
+    // `ensure_chunk_credits` keeps restarts rare enough that the commit rate
+    // tracks genuine-overflow, not per-chunk.
+    journal.note_credits_released();
+    journal.request_commit();
+    journal.request_commit_for(old_tid);
+    journal.note_restart();
+
+    // start_this_handle: re-admit through the SAME barrier a first start would
+    // (the locked seat blocks a successor until `old_tid` stages), then write the
+    // fresh reservation into the handle in place.
+    let new_tid = admit(&journal, credits)?;
+    handle.tid = new_tid;
     handle.credits.set(credits);
     handle.remaining.set(credits);
     Ok(())
@@ -1557,11 +1682,81 @@ mod tests {
             let running = st.running.as_ref().unwrap();
             // The old 10-credit reservation was released, only 3 remain.
             assert_eq!(running.outstanding_credits, 3);
-            // Still the same running transaction (no commit boundary yet).
+            // The commit request is non-blocking and, with no commit servicer in
+            // this fixture, nothing stages the transaction — so re-admission
+            // rejoins the SAME still-running transaction (a restart forces a
+            // boundary only when a committer is there to drain it; see
+            // `journal_restart_from_locking_seat_readmits_after_staging`).
             assert_eq!(running.tid(), Tid::new(1));
         }
+        // A restart still counts as a restart.
+        assert_eq!(j.restart_count_for_test(), 1);
 
         journal_stop(h).unwrap();
+    }
+
+    /// Risk 1 — restart from the LOCKING seat. A handle whose transaction the
+    /// committer force-locked (T_LOCKED, draining) must still restart: the
+    /// central correction over the old skeleton, which refused when locked.
+    /// `journal_restart` releases the handle's update from the locking seat
+    /// (completing the drain), requests the old commit, and re-admits — blocking
+    /// on the locked barrier until the seat stages, then joining the successor
+    /// tid. Disabling the release-first ordering would leave the seat's update
+    /// count nonzero, the drain would never complete, and this test would hang.
+    #[ktest]
+    fn journal_restart_from_locking_seat_readmits_after_staging() {
+        crate::time::clocks::init_for_ktest();
+        let j = journaled_fixture(64, 1, 1);
+
+        // h1 captures then closes; h2 stays open so the due transaction PARKS in
+        // the locking seat (T_LOCKED) instead of committing.
+        let h1 = journal_start(&j, 4).unwrap();
+        let tid = h1.tid();
+        super::super::get_write_access(Some(&h1), 520)
+            .unwrap()
+            .patch(|b| b[..4].copy_from_slice(&[0x11; 4]))
+            .unwrap();
+        let mut h2 = journal_start(&j, 4).unwrap();
+        journal_stop(h1).unwrap();
+        j.request_commit_for(tid);
+        assert!(!j.commit_if_due_for_test());
+        // (a precondition) the seat holds `tid` with h2's single open update.
+        assert_eq!(
+            j.locking_state_for_test().map(|(t, u, _)| (t, u)),
+            Some((tid, 1))
+        );
+
+        // A helper stages the seat once h2's restart releases it (drain done).
+        let journal = j.clone();
+        let stager = crate::thread::kernel_thread::ThreadOptions::new(move || {
+            loop {
+                crate::thread::Thread::yield_now();
+                if journal.commit_if_due_for_test() {
+                    break;
+                }
+            }
+        })
+        .spawn();
+
+        // Restart h2 FROM the locking seat: releases its update there (t_updates
+        // 1 → 0, drain completes), then re-admits — which blocks on the locked
+        // barrier until the helper stages, then joins the successor.
+        journal_restart(&mut h2, 4).unwrap();
+        stager.join();
+
+        // (a) the locked transaction's update was released and it committed;
+        assert_eq!(j.committed_tid(), tid);
+        // (b) h2 re-admitted onto a NEW tid — the successor — after staging;
+        assert_eq!(h2.tid(), tid.next());
+        assert!(j.locking_state_for_test().is_none());
+        {
+            let st = j.state_read();
+            let running = st.running.as_ref().unwrap();
+            assert_eq!(running.tid(), tid.next());
+            assert_eq!(running.nr_updates(), 1);
+        }
+        // (c) no hang: reaching here proves it.
+        journal_stop(h2).unwrap();
     }
 
     #[ktest]

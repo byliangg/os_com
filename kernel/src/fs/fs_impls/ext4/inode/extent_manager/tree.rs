@@ -763,6 +763,42 @@ struct TreeDelta {
 /// ones) and, separately, just the freshly allocated blocks — the caller frees
 /// those if a later node write fails, since the in-memory root has not yet been
 /// pointed at the new layout.
+/// The external (leaf + interior) node count of the on-disk tree holding
+/// `extents` extents — the number of full-block nodes [`reserialize`](ExtentTree::reserialize)
+/// writes for that count, following the same inline / depth-1 / depth-2 shape.
+///
+/// An inline (depth-0) root has no external nodes; a depth-1 tree has
+/// `ceil(extents / LEAF_MAX)` leaves under the inline root; a depth-2 tree adds
+/// `ceil(nr_leaves / INTERIOR_MAX)` interior nodes. Used to size the write
+/// spine's per-chunk credit bound before an insert (an upper bound: a merge on
+/// insert can only lower the true count).
+fn external_node_count(extents: usize) -> usize {
+    if extents <= INLINE_MAX {
+        return 0;
+    }
+    let nr_leaves = extents.div_ceil(LEAF_MAX);
+    let nr_interior = if nr_leaves <= INLINE_MAX {
+        0
+    } else {
+        nr_leaves.div_ceil(INTERIOR_MAX)
+    };
+    nr_leaves + nr_interior
+}
+
+/// Safe upper bound on the metadata blocks the next [`insert`](ExtentTree::insert)
+/// will capture when the tree ends up holding `projected_extents` extents —
+/// the whole-tree reserialize's external-node writes plus the filesystem's
+/// bitmap/GDT/superblock charge ([`Ext4::reserialize_credits`]).
+///
+/// The write spine's [`ensure_allocated`](super::ExtentManager::ensure_allocated)
+/// early stop compares this against the handle's transaction headroom: when the
+/// next insert will not fit even after growing in place, it stops with the
+/// progress made so far and lets the OUTER spine restart onto a fresh
+/// transaction (the restart cannot run under the ExtentTree lock).
+pub(super) fn next_insert_credit_bound(fs: &Ext4, projected_extents: usize) -> usize {
+    fs.reserialize_credits(external_node_count(projected_extents))
+}
+
 fn acquire_meta_blocks(
     fs: &Ext4,
     pool: &[Ext4Bid],

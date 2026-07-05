@@ -903,6 +903,17 @@ impl Inode {
     /// Allocates blocks for any holes the write covers, fills the page cache,
     /// and updates size and timestamps. Data and the inode become durable on a
     /// later `sync` / writeback.
+    ///
+    /// A large journaled **append** (`offset >= old_size`) is split into
+    /// credit-bounded chunks, each committed in its own transaction across a
+    /// [`journal_restart`](journal) boundary, so a write that maps more metadata
+    /// than one transaction holds (a fragmented run, a deep tree) never overflows
+    /// — jbd2's `ext4_alloc_file_blocks` chunk loop shape. Other writes (overwrites
+    /// and sparse fills within the existing file, and non-journaled volumes) take
+    /// the single-transaction path, whose `charge_fresh_capture` `ENOSPC` backstop
+    /// is unchanged; chunking them needs a re-windowable data source the page-cache
+    /// write API does not offer for an in-place bounded read (a P9 refinement,
+    /// ledger: `within-file-write-restart`).
     pub(super) fn write_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
         if self.type_ == InodeType::Dir {
             return_errno!(Errno::EISDIR);
@@ -910,22 +921,37 @@ impl Inode {
         if reader.remain() == 0 {
             return Ok(0);
         }
+        let write_len = reader.remain();
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let fs = self.fs()?;
         let mut inner = self.inner.write();
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images this write's
         // allocations dirty. Dropped at return, closing the handle. The estimate
-        // is the per-chunk cost at the file's live extent depth; a write that
-        // fragments into several extents grows the reservation via journal_extend
-        // (see `Ext4::write_credits`).
+        // is the per-chunk cost at the file's live extent depth; a chunk that
+        // fragments into several extents grows the reservation via journal_extend,
+        // and a whole chunk that fills grows the reservation until a restart
+        // rejoins a fresh transaction (see `Ext4::write_credits`).
         let depth = inner
             .extent_manager()
             .map(|em| em.root_depth())
             .unwrap_or(0);
         let mut op = fs.begin_op(fs.write_credits(depth))?;
-        // `get_mut`: the unbounded write spine holds the handle by `&mut` so a
-        // future `journal_restart` (P7d-2b) is reachable at its safe seams; the
-        // per-handle descriptor capture below reverts to the shared `get`.
+
+        // A journaled append restarts across chunks; every other write is one
+        // transaction (see the function docs). The append is where an unbounded
+        // sequential write (log files, `cp`/`dd`) fragments a deep tree past one
+        // transaction, and its per-chunk data write is bounded by growing the
+        // page cache to the chunk end — the bound the in-place overwrite lacks.
+        if op.get().is_some() && offset >= inner.file_size() {
+            return self.write_append_chunked(&fs, offset, end, reader, &mut op, &mut inner);
+        }
+
+        // `get_mut`: the write spine holds the handle by `&mut` so the
+        // `journal_restart` seam is reachable; the per-handle descriptor capture
+        // below reverts to the shared `get`.
         let len = inner.write_at(&fs, offset, reader, op.get_mut())?;
         // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
         // and — for an inline root — the extent mapping itself) must ride the
@@ -957,6 +983,95 @@ impl Inode {
             )?;
         }
         Ok(len)
+    }
+
+    /// The credit-bounded append loop (jbd2/ext4 `ext4_alloc_file_blocks`): map,
+    /// write, and convert one credit-bounded chunk per transaction, restarting
+    /// onto a fresh transaction at each boundary, until `[offset, end)` is
+    /// written. Assumes `offset >= old_size` (a pure append), so each chunk's
+    /// page-cache write is bounded by growing the page cache to the chunk end,
+    /// and a live journal handle (`op.get().is_some()`).
+    ///
+    /// Crash safety (report §5.1-5.2): each chunk's alloc(bitmap)+extent+inode
+    /// descriptor ride ONE transaction (`write_back_inode_desc` here), and the
+    /// restart boundary falls AFTER that writeback — never between a bitmap set
+    /// and the extent/inode capture — so a crash leaves chunks `0..K` committed
+    /// (a valid short write) and the rest untouched, with no leaked blocks and,
+    /// by Unwritten-first, no stale data.
+    fn write_append_chunked(
+        &self,
+        fs: &Ext4,
+        offset: usize,
+        end: usize,
+        reader: &mut VmReader,
+        op: &mut journal::OpHandle,
+        inner: &mut InodeInner,
+    ) -> Result<usize> {
+        let write_len = reader.remain();
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+
+        let mut cursor = start_block;
+        // Whether the current chunk already restarted onto a fresh transaction:
+        // if a chunk makes no progress even then, one insert's whole-tree
+        // reserialize exceeds a whole transaction — the `EFBIG` floor (P9's
+        // in-place B-tree surgery lifts it).
+        let mut restarted = false;
+        while cursor < end_block {
+            let depth = inner
+                .extent_manager()
+                .map(|em| em.root_depth())
+                .unwrap_or(0);
+            let need = fs.write_credits(depth);
+            if let Some(handle) = op.get_mut() {
+                journal::ensure_chunk_credits(handle, need)?;
+            }
+
+            let reached = inner.write_bounded_chunk(fs, offset, end, cursor, op.get(), reader)?;
+            if reached == cursor {
+                // No progress this chunk. A fresh transaction has full headroom,
+                // so if we already restarted, one insert genuinely exceeds a
+                // transaction — EFBIG; otherwise restart and retry the chunk.
+                if restarted {
+                    let written = write_len - reader.remain();
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return_errno_with_message!(
+                        Errno::EFBIG,
+                        "one extent insert's whole-tree reserialize exceeds a journal transaction"
+                    );
+                }
+                if let Some(handle) = op.get_mut() {
+                    journal::journal_restart(handle, need)?;
+                }
+                restarted = true;
+                continue;
+            }
+            restarted = false;
+
+            // This chunk's inode descriptor (size, i_blocks, extent root) must
+            // ride the SAME transaction as its bitmap/GDT/extent captures.
+            if op.get().is_some() {
+                inner.write_back_inode_desc(fs, self.ino, op.get())?;
+            }
+            // data=ordered per chunk: flush this chunk's pages (up to the newly
+            // published size) before its commit block.
+            if let Some(handle) = op.get()
+                && let Ok(pages) = inner.page_cache()
+            {
+                handle.register_ordered_data(
+                    self.ino,
+                    self.self_weak.clone(),
+                    pages.clone(),
+                    inner.file_size(),
+                )?;
+            }
+            cursor = reached;
+        }
+        Ok(write_len)
     }
 
     /// Truncates or extends a regular file to `new_size` bytes.
@@ -1704,6 +1819,89 @@ impl InodeInner {
             self.set_file_size(end);
         }
         Ok(write_len)
+    }
+
+    /// Maps, writes, and converts ONE credit-bounded append chunk starting at
+    /// `cursor_block`, in the caller's current transaction, returning the first
+    /// logical block NOT covered (`> cursor_block` on progress, `== cursor_block`
+    /// when even one insert would overflow the transaction — the caller's EFBIG
+    /// signal). The whole-write range is `[write_offset, write_end)`; this chunk
+    /// covers `[cursor_block, reached)`.
+    ///
+    /// The chunk's blocks are allocated UNWRITTEN, then the page-cache data is
+    /// written (a partial boundary block reads back as zeros — Unwritten-first),
+    /// then the range is converted to written IN THIS TRANSACTION, so the extent
+    /// metadata that makes the blocks readable-as-data commits no earlier than
+    /// the caller's ordered-data flush. Growing the page cache to the chunk end
+    /// bounds `PageCache::write` to exactly this chunk's bytes (the append
+    /// invariant: `chunk_end > file_size`). On error the chunk's partial
+    /// allocation and page-cache growth are rolled back to the pre-chunk size —
+    /// earlier chunks are already committed and untouched.
+    fn write_bounded_chunk(
+        &mut self,
+        fs: &Ext4,
+        write_offset: usize,
+        write_end: usize,
+        cursor_block: Iblock,
+        handle: Option<&journal::Handle>,
+        reader: &mut VmReader,
+    ) -> Result<Iblock> {
+        let size_before = self.file_size();
+        match self.try_write_chunk(fs, write_offset, write_end, cursor_block, handle, reader) {
+            Ok(reached) => Ok(reached),
+            Err(err) => {
+                // Free this chunk's just-allocated blocks and restore the page
+                // cache; the earlier chunks committed under prior transactions
+                // are durable and left alone.
+                self.rollback_write(size_before, write_end, handle);
+                Err(err)
+            }
+        }
+    }
+
+    /// The fallible body of [`write_bounded_chunk`](Self::write_bounded_chunk),
+    /// split out so the caller can roll back the chunk on any error.
+    fn try_write_chunk(
+        &mut self,
+        fs: &Ext4,
+        write_offset: usize,
+        write_end: usize,
+        cursor_block: Iblock,
+        handle: Option<&journal::Handle>,
+        reader: &mut VmReader,
+    ) -> Result<Iblock> {
+        let end_block = Iblock::try_from(write_end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let reached =
+            self.extent_manager()?
+                .ensure_allocated_chunk(cursor_block, end_block, handle)?;
+        if reached == cursor_block {
+            // No block allocated: even one insert would overflow the
+            // transaction. The caller restarts (or declares EFBIG); nothing
+            // was written, so leave the reader and size untouched.
+            return Ok(cursor_block);
+        }
+        // This chunk's byte range: the write start for the first chunk, the
+        // block-aligned cursor otherwise, up to the reached block (clamped to
+        // the write end for the final chunk).
+        let chunk_start = write_offset.max(cursor_block as usize * BLOCK_SIZE);
+        let chunk_end = write_end.min(reached as usize * BLOCK_SIZE);
+        let size_before = self.file_size();
+        // Grow the page cache to the chunk end. This bounds `PageCache::write`
+        // below to exactly this chunk's bytes (append invariant: the write
+        // starts at or beyond EOF, so `chunk_end > size_before`).
+        self.ensure_size_within_limit(fs, chunk_end)?;
+        self.resize_page_cache(chunk_end, size_before)?;
+        self.page_cache()?.write(chunk_start, reader)?;
+        // Convert this chunk's blocks to written, in this transaction. The write
+        // covers `[cursor_block, reached)` (the final block partially, its tail
+        // read back as zeros); converting the whole run makes them readable.
+        self.extent_manager()?
+            .mark_range_written(cursor_block, reached, handle)?;
+        self.set_mtime_ctime(super::utils::now());
+        // Publish this committed chunk's on-disk size (per-chunk, DECISION D-1).
+        self.set_file_size(chunk_end);
+        Ok(reached)
     }
 
     fn is_dirty(&self) -> bool {
@@ -2459,6 +2657,66 @@ mod write_tests {
         f.write_raw_inode(FILE_INO, &make_empty_file_inode());
         f.ext4.journal().unwrap().stop_commit_thread();
         f
+    }
+
+    /// P7d-2b — a journaled contiguous append fits one transaction: the chunked
+    /// append spine takes the fast path (`remaining >= need`) with ZERO
+    /// restarts, identical behavior to before d2-b. The regression guard for the
+    /// zero-overhead common case.
+    #[ktest]
+    fn contiguous_append_takes_the_no_restart_fast_path() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload: Vec<u8> = (0..5 * BLOCK_SIZE).map(|k| (k * 7 + 1) as u8).collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        // A single contiguous extent — one insert, one chunk, no restart.
+        assert_eq!(
+            journal.restart_count_for_test(),
+            0,
+            "a contiguous append must not restart"
+        );
+        assert_eq!(inode.size(), payload.len());
+        assert_eq!(read_back(&inode, 0, payload.len()), payload);
+        let inner = inode.inner.read();
+        let bm = inner.extent_manager().unwrap();
+        for i in 0..5u32 {
+            assert_eq!(bm.map_blocks(i).unwrap().state(), MapState::Written);
+        }
+    }
+
+    /// P7d-2b — a multi-block append that spans several logical blocks maps,
+    /// writes, and converts every block through the credit-bounded append spine
+    /// (`ensure_allocated_chunk` → per-chunk page write → `mark_range_written`).
+    /// A contiguous run stays one transaction (a multi-group image, which the
+    /// ktest fixture does not build, is needed to overflow one and force the
+    /// mid-write restart — that boundary is proven at the primitive level by
+    /// `journal_restart_from_locking_seat_readmits_after_staging` and end to end
+    /// by the crash matrix).
+    #[ktest]
+    fn multi_block_append_maps_writes_and_converts_every_block() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A first append, then a second contiguous append past EOF — two passes
+        // through the append spine, distinct byte patterns.
+        let first: Vec<u8> = (0..3 * BLOCK_SIZE).map(|k| (k * 5 + 1) as u8).collect();
+        let second: Vec<u8> = (0..2 * BLOCK_SIZE).map(|k| (k * 9 + 2) as u8).collect();
+        assert_eq!(write_all(&inode, 0, &first), first.len());
+        assert_eq!(write_all(&inode, first.len(), &second), second.len());
+
+        assert_eq!(inode.size(), first.len() + second.len());
+        assert_eq!(read_back(&inode, 0, first.len()), first);
+        assert_eq!(read_back(&inode, first.len(), second.len()), second);
+        // i_blocks counts the 5 data blocks, consistent after the writes.
+        assert_eq!(inode.sector_count(), 5 * SECTORS_PER_BLOCK);
+        let inner = inode.inner.read();
+        let bm = inner.extent_manager().unwrap();
+        for i in 0..5u32 {
+            assert_eq!(bm.map_blocks(i).unwrap().state(), MapState::Written);
+        }
     }
 
     /// Unwritten-first (`hole-alloc-stale-exposure`): a partial-block write into

@@ -490,6 +490,29 @@ impl Ext4 {
         self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
     }
 
+    /// Safe upper bound on the metadata blocks the NEXT extent-tree `insert`
+    /// captures, given the `external_nodes` (leaf + interior) count of the tree
+    /// that insert produces — the write spine's per-chunk credit early stop.
+    ///
+    /// Our extent tree is rebuilt by whole-tree re-serialization, not Linux's
+    /// depth-bounded in-place surgery, so a single insert rewrites EVERY external
+    /// node (`external_nodes` captures) — this is why one insert into a large
+    /// tree can exceed a whole transaction (the honest `EFBIG` floor). On top of
+    /// the node writes, each freshly allocated node and the data run may dirty a
+    /// distinct block bitmap and GDT block, both clamped at the filesystem-wide
+    /// counts (Linux's identical `groups`/`gdpblocks` clamp), plus the shared
+    /// superblock counters. It is an UPPER bound: an under-estimate would surface
+    /// as [`charge_fresh_capture`](super::journal)'s loud `ENOSPC` backstop (no
+    /// corruption), an over-estimate merely forces an extra restart.
+    pub(super) fn reserialize_credits(&self, external_nodes: usize) -> usize {
+        // The data run plus every external node may each land in a distinct
+        // block group.
+        let touched = external_nodes + 1;
+        let bitmaps = touched.min(self.nr_groups());
+        let gdt = touched.min(self.nr_gdt_blocks());
+        external_nodes + bitmaps + gdt + Self::SUPERBLOCK_CREDITS
+    }
+
     /// Credits for a truncate's per-chunk metadata (Linux
     /// `ext4_blocks_for_truncate` = `EXT4_DATA_TRANS_BLOCKS + bounded chunk`).
     ///

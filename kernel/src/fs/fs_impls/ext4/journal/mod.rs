@@ -318,6 +318,15 @@ pub(in crate::fs::fs_impls::ext4) use self::revoke::{BlockFreeAuth, DataForgetPo
 /// funnels. The handle lifecycle (`journal_start`/`journal_stop`) stays inside
 /// this module; callers only borrow a handle for capture.
 pub(in crate::fs::fs_impls::ext4) use self::transaction::Handle;
+/// Re-exported at the `ext4` level for the unbounded write/truncate spine's
+/// per-chunk restart machinery: [`ensure_chunk_credits`] grows or restarts the
+/// handle at a chunk boundary, [`journal_restart`] forces the commit boundary,
+/// [`try_reserve_next`] is the wait-free probe `ensure_allocated` runs under the
+/// ExtentTree lock to decide whether to keep allocating or stop and let the
+/// caller restart, and [`ExtendOutcome`] is its typed verdict.
+pub(in crate::fs::fs_impls::ext4) use self::transaction::{
+    ExtendOutcome, ensure_chunk_credits, journal_restart, try_reserve_next,
+};
 
 /// The current task's identity for the nested-`begin_op` guard: its
 /// [`Task`](ostd::task::Task) address, stable for the guard's lifetime because
@@ -1095,6 +1104,12 @@ pub(super) struct Journal {
     /// not the backstop, absorbed the pressure. Exists for the small-journal
     /// pressure tests to assert backpressure genuinely fired.
     log_space_waits: AtomicU64,
+    /// How many commit-boundary [`journal_restart`](transaction::journal_restart)s
+    /// have run — a write/truncate/reclaim spine that outgrew one transaction and
+    /// re-admitted onto a fresh one. Bumped once per restart; read only by ktest
+    /// to assert the contiguous common case takes ZERO restarts (the fast path)
+    /// while a fragmented write engineered to exhaust its credits takes ≥ 1.
+    restart_count: AtomicU64,
 }
 
 /// One pinned freed block run: `count` blocks whose free was discharged under
@@ -1494,6 +1509,7 @@ impl Journal {
             space_pressure: AtomicBool::new(false),
             commit_servicer: AtomicBool::new(false),
             log_space_waits: AtomicU64::new(0),
+            restart_count: AtomicU64::new(0),
         })
     }
 
@@ -2437,6 +2453,19 @@ impl Journal {
     #[cfg(ktest)]
     pub(super) fn log_space_wait_count(&self) -> u64 {
         self.log_space_waits.load(Ordering::Relaxed)
+    }
+
+    /// Records that a commit-boundary [`journal_restart`](transaction::journal_restart)
+    /// ran (see [`restart_count`](Journal::restart_count)).
+    pub(super) fn note_restart(&self) {
+        self.restart_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The number of commit-boundary restarts so far (see
+    /// [`restart_count`](Journal::restart_count)).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn restart_count_for_test(&self) -> u64 {
+        self.restart_count.load(Ordering::Relaxed)
     }
 
     /// Returns whether the journal has been aborted by a failed commit (see the

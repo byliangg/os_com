@@ -94,6 +94,20 @@ impl Mapping {
     }
 }
 
+/// Whether [`fill_holes`](ExtentManager::fill_holes) allocates the whole
+/// requested range in the caller's single transaction or stops at a credit
+/// boundary so the caller can restart onto a fresh one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AllocBound {
+    /// Allocate every hole in one transaction; an overflow is the loud
+    /// [`charge_fresh_capture`](journal) `ENOSPC` backstop. Used by the
+    /// single-transaction paths (`prepare_write`, non-journaled writes).
+    WholeRange,
+    /// Stop before an insert that would overflow the transaction, returning the
+    /// block reached; the unbounded write spine restarts and continues.
+    CreditChunk,
+}
+
 /// Maps an inode's logical blocks to physical blocks via its [`ExtentTree`],
 /// which owns the authoritative tree + `i_blocks` accounting.
 ///
@@ -219,14 +233,58 @@ impl ExtentManager {
     /// On an allocation error mid-way the partial allocation stays in `state`;
     /// the caller's `rollback_write` truncates it away (the just-allocated
     /// unwritten blocks read as zeros meanwhile, so nothing leaks).
+    ///
+    /// Allocates the WHOLE range in the caller's single transaction: if that
+    /// captures more metadata than the transaction holds,
+    /// [`charge_fresh_capture`](journal) fails it loud (`ENOSPC`). The chunked
+    /// write spine uses [`ensure_allocated_chunk`](Self::ensure_allocated_chunk)
+    /// instead, which stops at a credit boundary so the caller can restart.
     pub(super) fn ensure_allocated(
         &self,
         start_iblock: Iblock,
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        self.fill_holes(start_iblock, end_iblock, handle, AllocBound::WholeRange)?;
+        Ok(())
+    }
+
+    /// Allocates data blocks (as UNWRITTEN) for the holes in `[start_iblock,
+    /// end_iblock)` up to a credit boundary, returning the first logical block
+    /// NOT fully allocated — `end_iblock` when every hole was filled, or the
+    /// block where the credit-aware early stop halted (partial progress).
+    ///
+    /// The unbounded write spine allocates, writes, and converts only
+    /// `[start_iblock, reached)` this transaction and restarts for the rest: a
+    /// single insert's whole-tree reserialize can capture more than one
+    /// transaction holds, so the loop must be able to end a chunk BEFORE the
+    /// capture would overflow — and the restart cannot run here, under the
+    /// ExtentTree lock (③) the committer's ordered flush needs (it releases ③
+    /// by returning; the OUTER spine restarts). `reached == start_iblock` means
+    /// even one insert did not fit a whole transaction — the caller's `EFBIG`
+    /// floor.
+    pub(super) fn ensure_allocated_chunk(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<Iblock> {
+        self.fill_holes(start_iblock, end_iblock, handle, AllocBound::CreditChunk)
+    }
+
+    /// Shared hole-filling core of [`ensure_allocated`](Self::ensure_allocated)
+    /// and [`ensure_allocated_chunk`](Self::ensure_allocated_chunk): plans hole
+    /// runs from a single snapshot of the current tree and allocates them as
+    /// UNWRITTEN, honoring `bound` for whether to stop at a credit boundary.
+    fn fill_holes(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+        handle: Option<&journal::Handle>,
+        bound: AllocBound,
+    ) -> Result<Iblock> {
         if start_iblock >= end_iblock {
-            return Ok(());
+            return Ok(end_iblock);
         }
         let fs = self.fs()?;
         let mut tree = self.state.write();
@@ -246,7 +304,11 @@ impl ExtentManager {
         let extents = tree.extents(&fs)?;
         let holes = compute_holes(&extents, start_iblock, end_iblock);
 
-        for hole in holes {
+        // The tree's extent count, tracked as an upper bound (an insert's merge
+        // can only lower it) to size each insert's whole-tree reserialize cost.
+        let mut projected_extents = extents.len();
+
+        for hole in &holes {
             let mut ib = hole.start;
             // `goal` is the previous extent's physical end for locality; full
             // locality tuning is deferred to Phase 9.
@@ -257,6 +319,24 @@ impl ExtentManager {
                 .map(|e| e.start() + e.len() as Ext4Bid)
                 .unwrap_or(0);
             while ib < hole.end {
+                // Credit-aware early stop (chunked mode only): if the NEXT
+                // insert's whole-tree reserialize (a safe upper bound) will not
+                // fit the handle's transaction even after growing in place, stop
+                // with the progress made so far — `ib` is fully allocated up to
+                // here — and let the OUTER write spine restart onto a fresh
+                // transaction. Not restarting here is the ③-drop red line: the
+                // restart's re-admission may wait, which is illegal under this
+                // lock. Whole-range mode presses on and lets
+                // `charge_fresh_capture` be the loud backstop; a non-journaled
+                // volume (no handle) has no per-transaction ceiling either way.
+                if bound == AllocBound::CreditChunk
+                    && let Some(h) = handle
+                {
+                    let need = tree::next_insert_credit_bound(&fs, projected_extents + 1);
+                    if journal::try_reserve_next(h, need)? == journal::ExtendOutcome::NeedsRestart {
+                        return Ok(ib);
+                    }
+                }
                 // Cap each allocation request at the widest length an *unwritten*
                 // extent can bias-encode. Without this, a full-group run of
                 // `MAX_WRITTEN_LEN` (32768) blocks would encode as `len +
@@ -289,10 +369,11 @@ impl ExtentManager {
                     );
                     return Err(err);
                 }
+                projected_extents += 1;
                 ib += got;
             }
         }
-        Ok(())
+        Ok(end_iblock)
     }
 
     /// Converts every unwritten extent in the logical block range `[start,
