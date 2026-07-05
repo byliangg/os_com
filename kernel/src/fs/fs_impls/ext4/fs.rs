@@ -348,11 +348,17 @@ impl Ext4 {
     /// depth only over-reserves (a perf cost), never under-bounds.
     const DIR_DEPTH_CEIL: u16 = 2;
 
-    /// An `fsync`/`sync`/`setattr` inode writeback captures exactly one
-    /// inode-table block; a couple of blocks of slack cover a shared-superblock
-    /// touch and keep the bound comfortably above the worst case while still
-    /// fitting the deliberately tiny ktest journals.
+    /// An `fsync`/`sync` inode writeback captures exactly one inode-table block;
+    /// a couple of blocks of slack cover a shared-superblock touch and keep the
+    /// bound comfortably above the worst case while still fitting the
+    /// deliberately tiny ktest journals.
     pub(super) const FSYNC_CREDITS: usize = 4;
+
+    /// A pure-attribute change (chmod/chown/utimens) journals exactly its one
+    /// inode-table block (`write_back_inode_desc`, Linux `ext4_mark_inode_dirty`
+    /// under the setattr handle) — it touches no bitmap/GDT/superblock. One
+    /// block of slack keeps the bound above that single-block worst case.
+    pub(super) const SETATTR_CREDITS: usize = Self::INODE_DESC_CREDITS + 1;
 
     /// Distinct group-descriptor (GDT) blocks — the clamp for how many GDT
     /// blocks an op that allocates across many groups can dirty (Linux
@@ -2667,14 +2673,14 @@ mod tests {
         // File A: write one block and fsync it (allocations persist to disk).
         let a = f.ext4.read_inode(11).unwrap();
         write_all(&a, 0, &[0xAA; BLOCK_SIZE]);
-        a.sync_data_and_meta().unwrap();
+        a.sync_data_and_meta(false).unwrap();
 
         // File B: a 3-block file, then truncate to 1 block, freeing 2 trailing
         // blocks. The truncate updates the in-memory inode + the global bitmap
         // but does not, on its own, write B's inode back to disk.
         let b = f.ext4.read_inode(12).unwrap();
         write_all(&b, 0, &[0xBB; 3 * BLOCK_SIZE]);
-        b.sync_data_and_meta().unwrap(); // B's 3 blocks are on disk and allocated
+        b.sync_data_and_meta(false).unwrap(); // B's 3 blocks are on disk and allocated
 
         let b2_pblock = ondisk_pblock_of(&f.read_raw_inode(12), 2).unwrap();
         assert!(block_is_allocated(&f, b2_pblock));
@@ -3293,19 +3299,27 @@ mod tests {
         // The commit thread stays RUNNING: `log_wait_commit` sleeps on it.
 
         let inode = f.ext4.read_inode(ROOT_INO).unwrap();
+        // The attribute change journals immediately (P7 setattr) into some
+        // transaction; capture the tid carrying it. (The running commit thread
+        // may or may not have committed it yet — sampling `committed_tid` before
+        // the fsync would race it, so assert against this captured tid instead.)
         inode.set_atime(Duration::from_secs(12345));
+        let target = inode
+            .recorded_sync_tid_for_test()
+            .expect("the atime change journaled a transaction");
 
-        let committed_before = journal.committed_tid();
-        inode.sync_data_and_meta().unwrap();
-        // `fsync` returned only after its transaction committed.
-        let committed_after = journal.committed_tid();
+        inode.sync_data_and_meta(false).unwrap();
+        // `fsync` returned only after the transaction carrying the change
+        // committed.
         assert!(
-            committed_after.geq(committed_before.next()),
-            "fsync must wait for its commit (before={committed_before:?}, after={committed_after:?})"
+            journal.committed_tid().geq(target),
+            "fsync must wait for the setattr's commit (target={target:?}, committed={:?})",
+            journal.committed_tid()
         );
 
         // A second fsync with nothing dirty must not hang (nothing to commit).
-        inode.sync_data_and_meta().unwrap();
+        let committed_after = journal.committed_tid();
+        inode.sync_data_and_meta(false).unwrap();
         assert_eq!(journal.committed_tid(), committed_after);
         drop(inode);
     }

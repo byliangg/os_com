@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(link.sector_count(), (BLOCK_SIZE / SECTOR_SIZE) as u64);
 
         // The target survives a full sync + re-read from disk.
-        link.sync_data_and_meta().unwrap();
+        link.sync_data_and_meta(false).unwrap();
         let reread = f.ext4.read_inode(link.ino()).unwrap();
         assert!(!reread.inner.read().is_fast_symlink());
         assert_eq!(reread.read_link().unwrap(), target);

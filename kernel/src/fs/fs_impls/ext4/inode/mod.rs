@@ -903,6 +903,19 @@ impl Inode {
         }
     }
 
+    /// The transaction `fsync` waits on (the full `sync_tid`), for tests.
+    #[cfg(ktest)]
+    pub(super) fn recorded_sync_tid_for_test(&self) -> Option<Tid> {
+        self.inner.read().sync_tid
+    }
+
+    /// The transaction `fdatasync` waits on (the `datasync_tid` subset), for
+    /// tests. Distinct from `sync_tid` after a pure-attribute change.
+    #[cfg(ktest)]
+    pub(super) fn recorded_datasync_tid_for_test(&self) -> Option<Tid> {
+        self.inner.read().datasync_tid
+    }
+
     pub(super) fn inode_type(&self) -> InodeType {
         self.type_
     }
@@ -981,6 +994,9 @@ impl Inode {
         // equivalent.
         if op.get().is_some() {
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            // Data-relevant (this write may map blocks and/or grow `i_size`):
+            // `fdatasync` must commit this capture to retrieve the data.
+            inner.stamp_datasync_tid(op.get());
         }
         // data=ordered: this write's dirty pages must reach their final blocks
         // before the transaction's commit block, or recovery could replay
@@ -1115,6 +1131,10 @@ impl Inode {
             // clamped to the write end. The final chunk lands `write_len`.
             written = (reached as usize * BLOCK_SIZE).min(end) - offset;
         }
+        // Data-relevant: `op` holds the final chunk's transaction (each restart
+        // rejoins `op` onto a fresh tid), which carries this append's newest
+        // extent/`i_size` capture — the tid `fdatasync` must commit.
+        inner.stamp_datasync_tid(op.get());
         Ok(write_len)
     }
 
@@ -1189,6 +1209,9 @@ impl Inode {
         // truncated extent root must commit with the bitmap/GDT changes.
         if op.get().is_some() {
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            // Data-relevant (`i_size` and the extent tree changed): `fdatasync`
+            // must commit the new size to read the file's data correctly.
+            inner.stamp_datasync_tid(op.get());
         }
         // data=ordered on shrink: the kept partial block is re-zeroed in the
         // page cache, and that zeroing must reach the device before this
@@ -1303,6 +1326,10 @@ impl Inode {
                 journal::journal_restart(handle, chunk.next_bound)?;
             }
         }
+        // Data-relevant: the loop published `i_size = new_size` and rewrote the
+        // extent tree; `op` holds the final chunk's transaction. `fdatasync`
+        // must commit it to read the truncated file at its new size.
+        inner.stamp_datasync_tid(op.get());
         Ok(())
     }
 
@@ -1350,6 +1377,9 @@ impl Inode {
                 journal::journal_restart(handle, chunk.next_bound)?;
             }
         }
+        // Data-relevant (extent tree resumed to the persisted `i_size`): the
+        // recovered truncate is a data-relevant change like the live one.
+        inner.stamp_datasync_tid(op.get());
         Ok(())
     }
 
@@ -1374,7 +1404,13 @@ impl Inode {
     /// — the `fsync` contract: data first (ordered-data semantics — the data is
     /// durable before the metadata referencing it can commit), metadata
     /// recoverable from the log on return.
-    pub(super) fn sync_data_and_meta(&self) -> Result<()> {
+    ///
+    /// `datasync` narrows the metadata wait to `fdatasync` semantics: wait only
+    /// for the last **data-relevant** capture (`datasync_tid` — extent/`i_size`),
+    /// not the full `sync_tid`. A chmod/chown/utimens bumps `sync_tid` but not
+    /// `datasync_tid`, so an `fdatasync` after one does NOT force its commit —
+    /// POSIX's "does not flush modified metadata not needed to read the data."
+    pub(super) fn sync_data_and_meta(&self, datasync: bool) -> Result<()> {
         let fs = self.fs()?;
         let wait_tid = {
             let mut inner = self.inner.write();
@@ -1382,17 +1418,25 @@ impl Inode {
             // Journaled: capture instead of direct-writing (see
             // `sync_metadata`). Wait below on whichever transaction carries
             // this inode's newest capture: the one this writeback just made
-            // (dirty inode), else the recorded `sync_tid` of an earlier
-            // journaled capture — the dirty flag clears at capture time while
-            // the commit is asynchronous, so a "clean" inode may still sit in
-            // an uncommitted transaction. A clean inode with no recorded tid
-            // has nothing pending, and its fresh op captured nothing — a
-            // transaction with no captured blocks never becomes committable,
-            // so waiting on it would sleep forever.
+            // (dirty inode), else the recorded tid of an earlier journaled
+            // capture — `datasync_tid` for `fdatasync`, the full `sync_tid` for
+            // `fsync`. The dirty flag clears at capture time while the commit is
+            // asynchronous, so a "clean" inode may still sit in an uncommitted
+            // transaction. A clean inode with no recorded tid has nothing
+            // pending, and its fresh op captured nothing — a transaction with no
+            // captured blocks never becomes committable, so waiting on it would
+            // sleep forever. A dirty inode's fresh capture is waited on in full
+            // by both (conservative: `fdatasync` may over-wait if the dirty
+            // change was attribute-only, never under-wait).
+            let recorded = if datasync {
+                inner.datasync_tid
+            } else {
+                inner.sync_tid
+            };
             let was_dirty = inner.is_dirty();
             let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
-            if was_dirty { op.tid() } else { inner.sync_tid }
+            if was_dirty { op.tid() } else { recorded }
             // `op` closes here, then `inner` unlocks — the reverse of the
             // inner ① → handle ② acquisition order.
         };
@@ -1549,42 +1593,77 @@ impl Inode {
         Ok(true)
     }
 
-    /// Updates the permission bits (chmod) and bumps ctime. Persists on fsync.
-    pub(super) fn set_mode(&self, mode: InodeMode) {
+    /// Updates the permission bits (chmod) and bumps ctime, journaling the
+    /// change on a journaled volume ([`journal_attr_change`](InodeInner::journal_attr_change))
+    /// so it survives a crash before the deferred writeback.
+    pub(super) fn set_mode(&self, mode: InodeMode) -> Result<()> {
+        let fs = self.fs()?;
         let mut inner = self.inner.write();
         inner
             .desc
             .set_perm(FilePerm::from_bits_truncate(mode.bits()));
         inner.desc.set_ctime(super::utils::now());
+        inner.journal_attr_change(&fs, self.ino)
     }
 
-    /// Updates the owning uid (chown) and bumps ctime. Persists on fsync.
-    pub(super) fn set_owner(&self, uid: u32) {
+    /// Updates the owning uid (chown) and bumps ctime, journaled (see
+    /// [`set_mode`](Self::set_mode)).
+    pub(super) fn set_owner(&self, uid: u32) -> Result<()> {
+        let fs = self.fs()?;
         let mut inner = self.inner.write();
         inner.desc.set_uid(uid);
         inner.desc.set_ctime(super::utils::now());
+        inner.journal_attr_change(&fs, self.ino)
     }
 
-    /// Updates the owning gid (chgrp) and bumps ctime. Persists on fsync.
-    pub(super) fn set_group(&self, gid: u32) {
+    /// Updates the owning gid (chgrp) and bumps ctime, journaled (see
+    /// [`set_mode`](Self::set_mode)).
+    pub(super) fn set_group(&self, gid: u32) -> Result<()> {
+        let fs = self.fs()?;
         let mut inner = self.inner.write();
         inner.desc.set_gid(gid);
         inner.desc.set_ctime(super::utils::now());
+        inner.journal_attr_change(&fs, self.ino)
     }
 
-    /// Sets the last-access time. Persists on fsync.
+    /// Sets the last-access time, journaled (see [`set_mode`](Self::set_mode)).
+    /// The VFS time setters return `()`, so a journal failure is best-effort
+    /// (logged, not propagated) — Linux `ext4_dirty_inode` likewise drops the
+    /// update when the handle cannot start.
     pub(super) fn set_atime(&self, time: Duration) {
-        self.inner.write().desc.set_atime(time);
+        self.journal_time_change(|desc| desc.set_atime(time), "atime");
     }
 
-    /// Sets the last-modification time. Persists on fsync.
+    /// Sets the last-modification time, journaled best-effort (see
+    /// [`set_atime`](Self::set_atime)).
     pub(super) fn set_mtime(&self, time: Duration) {
-        self.inner.write().desc.set_mtime(time);
+        self.journal_time_change(|desc| desc.set_mtime(time), "mtime");
     }
 
-    /// Sets the last-metadata-change time. Persists on fsync.
+    /// Sets the last-metadata-change time, journaled best-effort (see
+    /// [`set_atime`](Self::set_atime)).
     pub(super) fn set_ctime(&self, time: Duration) {
-        self.inner.write().desc.set_ctime(time);
+        self.journal_time_change(|desc| desc.set_ctime(time), "ctime");
+    }
+
+    /// Applies a timestamp mutation to the descriptor and journals it on a
+    /// journaled volume, swallowing (only logging) a journal failure — the void
+    /// VFS time setters cannot propagate one. Non-journaled volumes keep the
+    /// buffered-writeback behavior unchanged (`journal_attr_change` no-ops).
+    fn journal_time_change(&self, mutate: impl FnOnce(&mut InodeDesc), what: &str) {
+        let Ok(fs) = self.fs() else {
+            return;
+        };
+        let mut inner = self.inner.write();
+        // The `&mut Dirty<InodeDesc>` derefs to `&mut InodeDesc` for the closure,
+        // marking the descriptor dirty (same as the direct `desc.set_*` setters).
+        mutate(&mut inner.desc);
+        if let Err(e) = inner.journal_attr_change(&fs, self.ino) {
+            warn!(
+                "could not journal {what} update for inode {}: {e:?}",
+                self.ino
+            );
+        }
     }
 
     pub(super) fn perm(&self) -> FilePerm {
@@ -1705,9 +1784,16 @@ struct InodeInner {
     /// `Option`, not a `0` sentinel: tids wrap (see `Tid::geq`), so `0` is a
     /// legal transaction id a wrapped journal could hand out.
     sync_tid: Option<Tid>,
-    /// The `fdatasync` subset (jbd2 `i_datasync_tid`). Phase 4 routes
-    /// `fdatasync` through the same full-sync path, so this stays unused.
-    #[expect(dead_code)]
+    /// The `fdatasync` subset (jbd2 `i_datasync_tid`): the transaction that
+    /// captured this inode's most recent **data-relevant** metadata change —
+    /// extent mapping or `i_size`, the metadata `fdatasync` must commit to
+    /// retrieve the data. Only the write/truncate paths stamp it (see
+    /// [`stamp_datasync_tid`](Self::stamp_datasync_tid)); a pure-attribute
+    /// change (chmod/chown/utimens) bumps `sync_tid` but not this, so
+    /// `fdatasync` does not force mode/owner/timestamp updates the data does
+    /// not depend on. A subset of `sync_tid` — `fdatasync` waits on it,
+    /// `fsync` on the full `sync_tid`. `None` (like `sync_tid`) on
+    /// non-journaled volumes and before any data-relevant capture.
     datasync_tid: Option<Tid>,
     /// This inode's `metadata_csum` seed `crc32c(crc32c(fs_seed, ino),
     /// generation)`, or `None` when the feature is off. Seeds the directory-block
@@ -2244,6 +2330,46 @@ impl InodeInner {
         Ok(())
     }
 
+    /// Stamps `datasync_tid` (jbd2 `i_datasync_tid`) with `handle`'s transaction
+    /// — the `fdatasync` wait target. Call it only from the write/truncate paths,
+    /// right after their [`write_back_inode_desc`](Self::write_back_inode_desc)
+    /// capture: those change the data-relevant metadata (extent mapping /
+    /// `i_size`) `fdatasync` must commit. Pure-attribute changes must NOT call it,
+    /// so `fdatasync` stays narrower than `fsync`. Mirrors Linux
+    /// `ext4_update_inode_fsync_trans(handle, inode, /* need_datasync */ 1)`.
+    ///
+    /// A no-op without a handle (non-journaled volume leaves `datasync_tid`
+    /// `None`, matching `sync_tid`). We stamp on every write/truncate capture
+    /// rather than only on block-allocating ones — broader than Linux's
+    /// allocation-precise gate (which needs `ensure_allocated` to report whether
+    /// it allocated, a P7/P9 refinement, the same precision the ordered-data
+    /// registration defers), but only ever conservative: `fdatasync` may commit
+    /// a hair more than the strict minimum, never less.
+    fn stamp_datasync_tid(&mut self, handle: Option<&journal::Handle>) {
+        if let Some(handle) = handle {
+            self.datasync_tid = Some(handle.tid());
+        }
+    }
+
+    /// On a journaled volume, captures this inode's descriptor into its own
+    /// single-block transaction so a pure-attribute change (chmod/chown/utimens)
+    /// survives a crash before the deferred writeback — Linux
+    /// `ext4_mark_inode_dirty` under the setattr handle. Stamps `sync_tid` (via
+    /// the capture, so `fsync` waits) but never `datasync_tid`: attributes are
+    /// not needed to retrieve the data, so `fdatasync` must not force them.
+    ///
+    /// Non-journaled volumes are unchanged: no handle, no shutdown gate — the
+    /// mutated descriptor stays dirty for the buffered fsync writeback, exactly
+    /// as before P7. The caller holds the inner lock; the handle opens under it
+    /// (① inner → ② handle).
+    fn journal_attr_change(&mut self, fs: &Ext4, ino: Ext4Ino) -> Result<()> {
+        if fs.journal().is_none() {
+            return Ok(());
+        }
+        let op = fs.begin_op(Ext4::SETATTR_CREDITS)?;
+        self.write_back_inode_desc(fs, ino, op.get())
+    }
+
     /// Flushes dirty data pages in `[0, file_size)`.
     fn sync_data_pages(&self, fs: &Ext4) -> Result<()> {
         // Journaled DIRECTORY blocks are metadata: every edit is captured
@@ -2696,7 +2822,7 @@ mod write_tests {
             let inode = f.ext4.read_inode(FILE_INO).unwrap();
             write_all(&inode, 0, content);
             // Full sync: data pages + inode metadata + block-side metadata.
-            inode.sync_data_and_meta().unwrap();
+            inode.sync_data_and_meta(false).unwrap();
             f.ext4.sync_metadata().unwrap();
         }
 
@@ -3632,5 +3758,155 @@ mod write_tests {
             read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
             vec![0u8; BLOCK_SIZE]
         );
+    }
+
+    // FILE_INO (11) lives in group 0's first inode-table block: base
+    // `INODE_TABLE_BID` (4) + (11 - 1) / (BLOCK_SIZE / INODE_SIZE = 16) = 4.
+    const FILE_INODE_TABLE_BID: Ext4Bid = 4;
+
+    /// P7d-4 Task 2: chmod/chown/utimens on a journaled volume open a handle and
+    /// capture the inode-table block, so the change survives a crash before the
+    /// deferred writeback. Every attribute folds into the one inode-table block,
+    /// bumping `sync_tid` (fsync waits) but not `datasync_tid` (fdatasync does
+    /// not force non-data metadata). Once committed, the after-image is durable
+    /// in the journal (recovery replays it).
+    #[ktest]
+    fn setattr_journals_inode_desc_and_survives_commit() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let before = journal.running_nr_metadata_blocks();
+        inode
+            .set_mode(InodeMode::from_bits_truncate(0o600))
+            .unwrap();
+        assert_eq!(
+            journal.running_nr_metadata_blocks(),
+            before + 1,
+            "chmod captures exactly the inode-table block"
+        );
+        assert!(
+            journal
+                .running_captured_blocks_for_test()
+                .contains(&FILE_INODE_TABLE_BID),
+            "the captured block is the inode's inode-table block"
+        );
+
+        // chown and utimens fold into the SAME inode-table block.
+        inode.set_owner(4242).unwrap();
+        inode.set_atime(Duration::from_secs(111));
+        inode.set_mtime(Duration::from_secs(222));
+        assert_eq!(
+            journal.running_nr_metadata_blocks(),
+            before + 1,
+            "further attribute changes reuse the one inode-table block"
+        );
+
+        // fsync waits on the bumped sync_tid; fdatasync's datasync_tid is
+        // untouched — a pure-attribute change is not data-relevant.
+        assert!(inode.recorded_sync_tid_for_test().is_some());
+        assert!(inode.recorded_datasync_tid_for_test().is_none());
+
+        // Crash-durability: once the transaction commits, the inode-desc
+        // after-image is durable in the journal (committed, awaiting
+        // checkpoint) — recovery would replay the attribute change.
+        journal.commit_now_for_test();
+        assert!(
+            journal
+                .uncheckpointed_blocks_for_test()
+                .contains(&FILE_INODE_TABLE_BID),
+            "the committed attribute change is durable in the journal"
+        );
+    }
+
+    /// P7d-4 Task 2: a non-journaled volume keeps the pre-P7 behavior — the
+    /// attribute change lives only in the dirty in-memory descriptor (no handle,
+    /// no recorded tid) and persists via the buffered metadata writeback.
+    #[ktest]
+    fn setattr_on_non_journaled_volume_stays_buffered() {
+        let f = fixture_with_empty_file();
+        assert!(f.ext4.journal().is_none());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        inode
+            .set_mode(InodeMode::from_bits_truncate(0o600))
+            .unwrap();
+        inode.set_owner(4242).unwrap();
+        inode.set_atime(Duration::from_secs(111));
+
+        // No handle opened: the change is only in the dirty descriptor, and no
+        // sync/datasync tid was recorded.
+        assert!(inode.inner.read().is_dirty());
+        assert!(inode.recorded_sync_tid_for_test().is_none());
+        assert!(inode.recorded_datasync_tid_for_test().is_none());
+
+        // It persists via the buffered metadata writeback, as before P7.
+        inode.sync_metadata().unwrap();
+        let reloaded = f.ext4.read_inode(FILE_INO).unwrap();
+        assert_eq!(reloaded.mode().bits() & 0o777, 0o600);
+        assert_eq!(reloaded.uid(), 4242);
+    }
+
+    /// P7d-4 Task 1: `fdatasync` narrows to `datasync_tid`. A data write stamps
+    /// both tids; a following chmod (committed into a strictly later
+    /// transaction) bumps only `sync_tid`. `fdatasync`'s target stays the
+    /// write's already-committed tid — it must NOT be dragged forward to force
+    /// the chmod's commit, which `fsync` would still wait for.
+    #[ktest]
+    fn fdatasync_narrows_to_datasync_tid_excluding_chmod() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A data write stamps BOTH tids with its transaction (T_w).
+        write_all(&inode, 0, &[0xAB; BLOCK_SIZE]);
+        let t_w = inode.recorded_datasync_tid_for_test().unwrap();
+        assert_eq!(inode.recorded_sync_tid_for_test(), Some(t_w));
+
+        // Commit the write, then chmod into a strictly later transaction (T_c).
+        journal.commit_now_for_test();
+        assert!(journal.committed_tid().geq(t_w));
+        inode
+            .set_mode(InodeMode::from_bits_truncate(0o600))
+            .unwrap();
+
+        let sync = inode.recorded_sync_tid_for_test().unwrap();
+        let dsync = inode.recorded_datasync_tid_for_test().unwrap();
+        assert_eq!(dsync, t_w, "datasync_tid stays at the write's transaction");
+        assert!(
+            sync.geq(t_w.next()),
+            "sync_tid advanced to the chmod's later transaction"
+        );
+        assert_ne!(sync, dsync);
+
+        // fdatasync's target (datasync_tid = T_w) is already durable, so it
+        // returns without forcing the chmod; fsync's target (sync_tid = T_c) is
+        // not yet committed.
+        assert!(journal.committed_tid().geq(dsync));
+        assert!(!journal.committed_tid().geq(sync));
+    }
+
+    /// P7d-4 Task 1: a truncate that changes `i_size` IS data-relevant (the size
+    /// is needed to read the data), so it advances `datasync_tid` together with
+    /// `sync_tid` — unlike a chmod. `fdatasync` after such a truncate waits for
+    /// it.
+    #[ktest]
+    fn fdatasync_follows_size_changing_truncate() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &[0xAB; 2 * BLOCK_SIZE]);
+        let t_w = inode.recorded_datasync_tid_for_test().unwrap();
+        journal.commit_now_for_test();
+
+        inode.resize(BLOCK_SIZE).unwrap();
+        let dsync = inode.recorded_datasync_tid_for_test().unwrap();
+        let sync = inode.recorded_sync_tid_for_test().unwrap();
+        assert!(
+            dsync.geq(t_w.next()),
+            "the size-changing truncate advanced datasync_tid past the write"
+        );
+        assert_eq!(dsync, sync, "a size change bumps both tids together");
     }
 }

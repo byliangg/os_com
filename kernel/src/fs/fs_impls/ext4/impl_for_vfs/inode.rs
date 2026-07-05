@@ -87,8 +87,9 @@ impl FileOps for Ext4Inode {
         // data (and for O_SYNC, the metadata) is durable — silently ignoring
         // the flags turns every O_SYNC write into a durability lie that a
         // crash harness immediately exposes. Linux opens O_SYNC as
-        // __O_SYNC|O_DSYNC, so the O_SYNC check must come first. (sync_data
-        // currently equals sync_all; it narrows when P7 enables datasync_tid.)
+        // __O_SYNC|O_DSYNC, so the O_SYNC check must come first. (O_DSYNC's
+        // `sync_data` waits on the narrower `datasync_tid`; O_SYNC's `sync_all`
+        // on the full `sync_tid`.)
         if status_flags.contains(StatusFlags::O_SYNC) {
             Inode::sync_all(self)?;
         } else if status_flags.contains(StatusFlags::O_DSYNC) {
@@ -150,8 +151,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_mode(&self, mode: InodeMode) -> Result<()> {
-        self.set_mode(mode);
-        Ok(())
+        self.set_mode(mode)
     }
 
     fn owner(&self) -> Result<Uid> {
@@ -159,8 +159,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_owner(&self, uid: Uid) -> Result<()> {
-        self.set_owner(u32::from(uid));
-        Ok(())
+        self.set_owner(u32::from(uid))
     }
 
     fn group(&self) -> Result<Gid> {
@@ -168,8 +167,7 @@ impl Inode for Ext4Inode {
     }
 
     fn set_group(&self, gid: Gid) -> Result<()> {
-        self.set_group(u32::from(gid));
-        Ok(())
+        self.set_group(u32::from(gid))
     }
 
     fn atime(&self) -> Duration {
@@ -199,15 +197,21 @@ impl Inode for Ext4Inode {
     fn sync_all(&self) -> Result<()> {
         // Flush the block-side metadata the allocator touched (bitmap/GDT/
         // superblock), then this inode's data pages + metadata with a barrier.
+        // `fsync`: wait on the full `sync_tid`.
         let fs = self.fs()?;
         fs.sync_metadata()?;
-        self.sync_data_and_meta()
+        self.sync_data_and_meta(false)
     }
 
     fn sync_data(&self) -> Result<()> {
+        // `fdatasync`: wait only on the data-relevant `datasync_tid`, so a
+        // pending pure-attribute change (chmod/chown/utimens) is not forced.
+        // On a journaled volume `fs.sync_metadata` is a no-op (the block-side
+        // metadata is already captured under its op's handle); it stays here for
+        // the non-journaled path, and never waits on the running transaction.
         let fs = self.fs()?;
         fs.sync_metadata()?;
-        self.sync_data_and_meta()
+        self.sync_data_and_meta(true)
     }
 
     fn page_cache(&self) -> Option<PageCache> {
