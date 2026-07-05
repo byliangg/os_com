@@ -24,7 +24,7 @@ use crate::{
         utils::DirentVisitor,
         vfs::{
             file_system::FileSystem,
-            inode::{Extension, FileOps, Inode, Metadata, MknodType, SymbolicLink},
+            inode::{Extension, FallocMode, FileOps, Inode, Metadata, MknodType, SymbolicLink},
         },
     },
     prelude::*,
@@ -337,6 +337,13 @@ impl Inode for Ext4Inode {
 
     fn write_link(&self, target: &str) -> Result<()> {
         self.write_link(target)
+    }
+
+    fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        // The handle layer (`inode_handle::fallocate`) already validated the fd's
+        // write right, the inode type, and the O_APPEND/O_DIRECT flag constraints;
+        // this forwards to the ext4 preallocate / punch-hole implementation.
+        self.fallocate(mode, offset, len)
     }
 
     fn fs(&self) -> Arc<dyn FileSystem> {

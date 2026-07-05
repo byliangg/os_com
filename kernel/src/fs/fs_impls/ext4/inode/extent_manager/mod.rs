@@ -518,6 +518,49 @@ impl ExtentManager {
         )
     }
 
+    /// One credit-bounded step of freeing the mapped blocks in the middle logical
+    /// range `[start_block, end_block)` (fallocate punch-hole), delegating to
+    /// [`ExtentTree::punch_chunk`]. The punch spine calls this in a
+    /// `journal_restart` loop until no doomed block remains; `max_credits` is the
+    /// journal's per-transaction ceiling (the EFBIG floor).
+    pub(super) fn punch_chunk(
+        &self,
+        start_block: Iblock,
+        end_block: Iblock,
+        handle: Option<&journal::Handle>,
+        max_credits: usize,
+    ) -> Result<PunchChunk> {
+        let fs = self.fs()?;
+        self.state.write().punch_chunk(
+            &fs,
+            start_block..end_block,
+            handle,
+            self.csum_seed,
+            self.data_forget_policy,
+            Some(max_credits),
+        )
+    }
+
+    /// Frees the mapped blocks in `[start_block, end_block)` in ONE transaction —
+    /// the non-journaled (or single-transaction) punch path, with no credit bound.
+    pub(super) fn punch_range(
+        &self,
+        start_block: Iblock,
+        end_block: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        let fs = self.fs()?;
+        self.state.write().punch_chunk(
+            &fs,
+            start_block..end_block,
+            handle,
+            self.csum_seed,
+            self.data_forget_policy,
+            None,
+        )?;
+        Ok(())
+    }
+
     /// One flatten that routes a shrink to `new_size`: the whole-truncate credit
     /// estimate (the fast/slow gate) AND the chunked-spine EFBIG floor, so the
     /// caller can reject a genuinely un-splittable shrink BEFORE it mutates the
@@ -594,6 +637,21 @@ pub(super) struct TruncateChunk {
     /// transaction, so the reservation must alone satisfy the next chunk's first
     /// `free_cost + reserialize_headroom` probe. Always ≤ `max_credits` (a subset
     /// of a tree that cleared the same EFBIG floor).
+    pub(super) next_bound: usize,
+}
+
+/// The outcome of one [`ExtentManager::punch_chunk`]: whether doomed blocks
+/// remain in the range (the outer spine restarts) and the reservation the next
+/// chunk's fresh transaction should start from.
+pub(super) struct PunchChunk {
+    /// `true` when a credit stop left doomed extents un-freed; the outer spine
+    /// `journal_restart`s (never under the ExtentTree lock — iron law 1) and
+    /// calls again, converging because each chunk frees ≥ 1 extent.
+    pub(super) more: bool,
+    /// The reservation the outer spine hands `journal_restart` for the next
+    /// chunk: one free PLUS the survivor's reserialize headroom, so the next
+    /// chunk's first probe is satisfied by the reservation alone (see
+    /// [`TruncateChunk::next_bound`]). Always ≤ `max_credits`.
     pub(super) next_bound: usize,
 }
 

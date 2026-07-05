@@ -49,7 +49,10 @@ use self::{
     extent_manager::{ExtentManager, ExtentTree},
     symlink::FastSymlinkTarget,
 };
-use crate::fs::{file::InodeMode, vfs::inode::Extension};
+use crate::fs::{
+    file::InodeMode,
+    vfs::inode::{Extension, FallocMode},
+};
 
 /// Number of 32-bit slots in `i_block` (60 bytes total).
 ///
@@ -1400,6 +1403,288 @@ impl Inode {
         Ok(())
     }
 
+    /// Preallocates or punches disk space over `[offset, offset + len)`
+    /// (`fallocate(2)`), dispatching on `mode`.
+    ///
+    /// Supported (the xfstests punch group this task targets):
+    /// - [`Allocate`](FallocMode::Allocate) / [`AllocateKeepSize`](FallocMode::AllocateKeepSize):
+    ///   reserve UNWRITTEN blocks over the range (the blocks read zero until a
+    ///   real write converts them), extending `i_size` only for `Allocate`.
+    /// - [`PunchHoleKeepSize`](FallocMode::PunchHoleKeepSize): free the mapped
+    ///   blocks in the range, leaving a hole (`i_size` unchanged).
+    ///
+    /// Deferred beyond P7 (ledger `a2-fallocate`): `ZeroRange`/`ZeroRangeKeepSize`
+    /// and the extent-shifting `CollapseRange`/`InsertRange`/`AllocateUnshareRange`
+    /// all return `EOPNOTSUPP`. `fallocate` is a regular-file operation; a
+    /// directory or special inode is rejected the same way (Linux ext4 gates on
+    /// `S_ISREG`).
+    pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
+        if self.type_ != InodeType::File {
+            return_errno_with_message!(
+                Errno::EOPNOTSUPP,
+                "fallocate is only supported on regular files"
+            );
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        match mode {
+            FallocMode::Allocate => self.preallocate(offset, len, true),
+            FallocMode::AllocateKeepSize => self.preallocate(offset, len, false),
+            FallocMode::PunchHoleKeepSize => self.punch_hole(offset, len),
+            FallocMode::ZeroRange
+            | FallocMode::ZeroRangeKeepSize
+            | FallocMode::CollapseRange
+            | FallocMode::InsertRange
+            | FallocMode::AllocateUnshareRange => {
+                return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported fallocate mode")
+            }
+        }
+    }
+
+    /// Reserves UNWRITTEN blocks over `[offset, offset + len)`: any hole in the
+    /// range is allocated as an unwritten extent (reads zero until a real write
+    /// converts it — the Unwritten-first protocol), pre-existing written and
+    /// unwritten extents are left as-is. `grow_size` extends `i_size` to the range
+    /// end (`Allocate`); otherwise `i_size` is unchanged and the blocks are
+    /// reserved past EOF (`KEEP_SIZE`).
+    ///
+    /// Chunked + restarted like the append write path: a large preallocation maps
+    /// more metadata than one transaction holds (a fragmented run, a deep tree),
+    /// so it splits into credit-bounded chunks, each committing its extent-tree
+    /// changes + `i_blocks` (+ `i_size` for `Allocate`) in one transaction across a
+    /// `journal_restart` boundary. Crash safety mirrors a sparse extend: a crash
+    /// mid-preallocation leaves some blocks unwritten and the rest holes — both
+    /// read zero — so no orphan protection is needed.
+    fn preallocate(&self, offset: usize, len: usize, grow_size: bool) -> Result<()> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "fallocate range overflow"))?;
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        inner.ensure_size_within_limit(&fs, end)?;
+
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+
+        // `Allocate` extends `i_size` to `end`; publish it and grow the page cache
+        // sparsely FIRST — while the range is still holes the grow-resize skips the
+        // boundary zero-fill (which over a hole plants a backing-block-less dirty
+        // page), and the blocks about to be allocated are UNWRITTEN, so a read of
+        // the extended range returns zeros either way.
+        if grow_size && end > old_size {
+            inner.expand(&fs, end)?;
+        }
+
+        let depth = inner
+            .extent_manager()
+            .map(|em| em.root_depth())
+            .unwrap_or(0);
+        let mut op = fs.begin_op(fs.write_credits(depth))?;
+        self.preallocate_chunked(&fs, &mut inner, start_block, end_block, &mut op)?;
+        // A pure metadata operation: `fallocate` bumps ctime/mtime like Linux.
+        // The final descriptor capture also covers the sub-block and non-journaled
+        // paths where the chunk loop did no writeback.
+        inner.set_mtime_ctime(super::utils::now());
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        // Data-relevant (blocks mapped and, for `Allocate`, `i_size` grew):
+        // `fdatasync` must commit this to observe the reservation.
+        inner.stamp_datasync_tid(op.get());
+        Ok(())
+    }
+
+    /// The credit-bounded preallocation loop (jbd2/ext4 `ext4_alloc_file_blocks`):
+    /// allocate one credit-bounded chunk of UNWRITTEN blocks per transaction,
+    /// restarting onto a fresh transaction at each boundary, until `[start_block,
+    /// end_block)` is fully mapped. On a non-journaled volume `ensure_allocated_chunk`
+    /// never early-stops, so this runs once.
+    fn preallocate_chunked(
+        &self,
+        fs: &Ext4,
+        inner: &mut InodeInner,
+        start_block: Iblock,
+        end_block: Iblock,
+        op: &mut journal::OpHandle,
+    ) -> Result<()> {
+        if start_block >= end_block {
+            return Ok(());
+        }
+        let em = inner.extent_manager()?.clone();
+        let max_credits = fs.journal().map(|j| j.max_credits());
+        let mut cursor = start_block;
+        while cursor < end_block {
+            let need = fs.write_credits(em.root_depth());
+            if let Some(handle) = op.get_mut() {
+                journal::ensure_chunk_credits(handle, need)?;
+            }
+            match em.ensure_allocated_chunk(cursor, end_block, op.get())? {
+                extent_manager::HoleFill::Filled => {
+                    // The rest of the range is mapped; persist this chunk's tree +
+                    // `i_blocks` (+ the already-published `i_size`) and finish.
+                    inner.write_back_inode_desc(fs, self.ino, op.get())?;
+                    cursor = end_block;
+                }
+                extent_manager::HoleFill::Stopped { reached, need } => {
+                    if reached > cursor {
+                        // Progress: `[cursor, reached)` is now mapped. Persist it,
+                        // then restart onto a fresh transaction — never under the
+                        // ExtentTree lock (iron law 1: it is released because
+                        // `ensure_allocated_chunk` returned).
+                        inner.write_back_inode_desc(fs, self.ino, op.get())?;
+                        cursor = reached;
+                        if let Some(handle) = op.get_mut() {
+                            journal::journal_restart(handle, need)?;
+                        }
+                    } else {
+                        // Zero progress: one insert needs more than this transaction
+                        // can grant. Above a whole transaction no restart ever fits
+                        // it — the EFBIG floor; otherwise restart reserving exactly
+                        // `need` and retry the same chunk.
+                        if max_credits.is_some_and(|max| need > max) {
+                            return_errno_with_message!(
+                                Errno::EFBIG,
+                                "one fallocate extent insert's reserialize exceeds a journal transaction"
+                            );
+                        }
+                        if let Some(handle) = op.get_mut() {
+                            journal::journal_restart(handle, need)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Frees the mapped blocks in `[offset, offset + len)`, leaving a hole
+    /// (`fallocate(2)` `FALLOC_FL_PUNCH_HOLE`, always with `KEEP_SIZE`): reads of
+    /// the range return zeros, the surrounding data is intact, and `i_size` is
+    /// unchanged. Mirrors Linux `ext4_punch_hole`.
+    ///
+    /// Partial-block edges are ZEROED in the page cache, not freed: a block only
+    /// partially covered by the range is kept (its uncovered bytes survive), so
+    /// the covered sub-range is zeroed through the page cache and only the
+    /// fully-covered blocks are freed via the truncate free machinery (per-block
+    /// forget/revoke + pin, chunked + restarted so a large punch spans
+    /// transactions).
+    ///
+    /// Crash safety (red-line ①): a crash mid-punch leaves some blocks freed and
+    /// some not — a partial hole, a VALID file state, because the size never
+    /// changes (no orphan protection needed, unlike truncate). The freed blocks
+    /// still go through revoke (so a replay does not resurrect stale data into a
+    /// reused block) and pin (so a freed block is not reallocated before its
+    /// freeing transaction commits) — the SAME funnels as the truncate free path.
+    fn punch_hole(&self, offset: usize, len: usize) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        // No hole beyond i_size (KEEP_SIZE never grows the file) — that range
+        // already reads zero (Linux ext4_punch_hole).
+        if offset >= old_size {
+            return Ok(());
+        }
+        // Clamp to i_size: a punch is always KEEP_SIZE, so blocks past EOF stay
+        // holes rather than being reserved.
+        let end = offset
+            .checked_add(len)
+            .map(|e| e.min(old_size))
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "punch range overflow"))?;
+        if end <= offset {
+            return Ok(());
+        }
+
+        // Block-aligned fully-covered range `[aligned_start, aligned_end)`; the
+        // partial edges `[offset, aligned_start)` and `[aligned_end, end)` fall in
+        // KEPT blocks that are zeroed, not freed.
+        let aligned_start = offset.align_up(BLOCK_SIZE);
+        let aligned_end = (end / BLOCK_SIZE) * BLOCK_SIZE;
+
+        // Zero the partial edges in the page cache (Linux ext4_zero_partial_blocks).
+        if aligned_start >= aligned_end {
+            // The whole punch lies within a single block: zero `[offset, end)`.
+            inner.zero_partial_block(offset, end)?;
+        } else {
+            if offset < aligned_start {
+                inner.zero_partial_block(offset, aligned_start)?;
+            }
+            if aligned_end < end {
+                inner.zero_partial_block(aligned_end, end)?;
+            }
+        }
+
+        let has_full_blocks = aligned_start < aligned_end;
+        let (first_block, stop_block) = if has_full_blocks {
+            (
+                Iblock::try_from(aligned_start / BLOCK_SIZE).map_err(|_| {
+                    Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
+                })?,
+                Iblock::try_from(aligned_end / BLOCK_SIZE).map_err(|_| {
+                    Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
+                })?,
+            )
+        } else {
+            (0, 0)
+        };
+
+        // Flush then evict the fully-covered page range so post-punch reads see
+        // the new hole as zeros (Linux truncate_pagecache_range); flush-first
+        // keeps an earlier committing transaction's ordered obligation from being
+        // orphaned (the `prepare_shrink` invariant).
+        if has_full_blocks && let Ok(pages) = inner.page_cache() {
+            pages.invalidate_range(aligned_start..aligned_end)?;
+        }
+
+        inner.set_mtime_ctime(super::utils::now());
+
+        let em = inner.extent_manager()?.clone();
+        let mut op = fs.begin_op(fs.truncate_credits(em.root_depth()))?;
+        // data=ordered: the partial-edge zeroing (kept blocks) must reach disk
+        // before this operation's freeing transaction commits, or a crash could
+        // leave an edge block holding its pre-punch bytes. Registered once.
+        if let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
+        {
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
+        }
+
+        if has_full_blocks {
+            loop {
+                // The per-transaction ceiling — the EFBIG floor inside
+                // `punch_chunk`. Present on the journaled volume this loop needs.
+                let Some(max) = fs.journal().map(|j| j.max_credits()) else {
+                    em.punch_range(first_block, stop_block, op.get())?;
+                    break;
+                };
+                let chunk = em.punch_chunk(first_block, stop_block, op.get(), max)?;
+                // This chunk's frees + reserialize + `i_blocks` ride ONE transaction.
+                inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+                if !chunk.more {
+                    break;
+                }
+                // Not done: restart onto a fresh transaction — `punch_chunk` has
+                // returned, so the ExtentTree lock is dropped (iron law 1).
+                if let Some(handle) = op.get_mut() {
+                    journal::journal_restart(handle, chunk.next_bound)?;
+                }
+            }
+        }
+        // Journal the ctime/mtime bump (and, on the non-journaled path, the freed
+        // tree); idempotent after the loop's last per-chunk writeback.
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        // Data-relevant (the extent tree changed): `fdatasync` must commit it to
+        // observe the hole.
+        inner.stamp_datasync_tid(op.get());
+        Ok(())
+    }
+
     /// Persists the inode's mutable metadata (size, `i_blocks`, extent root,
     /// timestamps) to disk if dirty. Data pages are flushed by
     /// [`sync_data_and_meta`](Self::sync_data_and_meta).
@@ -1995,6 +2280,32 @@ impl InodeInner {
             page_cache.resize(new_size.align_up(PAGE_SIZE), old_size.align_up(PAGE_SIZE))?;
         }
         extent_manager.set_npages(new_size.div_ceil(PAGE_SIZE));
+        Ok(())
+    }
+
+    /// Zeroes the byte sub-range `[start, end)` (within one block) of a KEPT
+    /// block in the page cache — the punch-hole partial-edge zeroing (Linux
+    /// `ext4_zero_partial_blocks`).
+    ///
+    /// Only zeroes when the block is MAPPED: a hole already reads zero, and
+    /// dirtying a page over a hole plants a backing-block-less dirty page the
+    /// journaled writeback cannot honor (the same guard [`resize_page_cache`](Self::resize_page_cache)
+    /// applies). Assumes `[start, end)` lies within one block (the caller splits
+    /// on block boundaries), so a single mapping lookup covers it.
+    fn zero_partial_block(&self, start: usize, end: usize) -> Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        let iblock = Iblock::try_from(start / BLOCK_SIZE).map_err(|_| {
+            Error::with_message(Errno::EFBIG, "punch edge beyond 32-bit block space")
+        })?;
+        let mapped = matches!(
+            self.extent_manager()?.map_blocks(iblock)?,
+            extent_manager::Mapping::Mapped { .. }
+        );
+        if mapped {
+            self.page_cache()?.fill_zeros(start..end)?;
+        }
         Ok(())
     }
 
@@ -3426,6 +3737,254 @@ mod write_tests {
         );
         // Blocks 0 and 1 kept (1 is the partial last block).
         assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
+    }
+
+    /// A byte pattern whose values are all NONZERO, so a read can tell original
+    /// data (nonzero) apart from a punched/preallocated hole (zero).
+    fn nonzero_pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|k| (k % 250 + 1) as u8).collect()
+    }
+
+    /// P7e-3 — `fallocate(Allocate)` reserves UNWRITTEN blocks and extends
+    /// `i_size`: the range reads zero (nothing written yet), and a later write
+    /// converts just the written block to written while its neighbours stay
+    /// reserved.
+    #[ktest]
+    fn fallocate_allocate_reserves_unwritten_and_extends_size() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let len = 3 * BLOCK_SIZE;
+        inode.fallocate(FallocMode::Allocate, 0, len).unwrap();
+
+        // i_size grew to the range end; three blocks are reserved.
+        assert_eq!(inode.size(), len);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for i in 0..3 {
+                let m = bm.map_blocks(i).unwrap();
+                assert_eq!(
+                    m.state(),
+                    MapState::Unwritten,
+                    "block {i} must be reserved-unwritten"
+                );
+                assert!(m.reads_as_zeros());
+            }
+        }
+        // The reserved range reads zero.
+        assert_eq!(read_back(&inode, 0, len), vec![0u8; len]);
+
+        // A real write into the reserved range converts THAT block to written and
+        // reads back the data; the neighbours stay unwritten.
+        let payload = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, BLOCK_SIZE, &payload);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), payload);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
+        }
+    }
+
+    /// P7e-3 — `fallocate(AllocateKeepSize)` reserves UNWRITTEN blocks WITHOUT
+    /// changing `i_size` (the KEEP_SIZE flag): the blocks are reserved past EOF.
+    #[ktest]
+    fn fallocate_allocate_keep_size_reserves_without_growing() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Seed one written block so old_size = BLOCK_SIZE, then reserve past EOF.
+        write_all(&inode, 0, &nonzero_pattern(BLOCK_SIZE));
+        assert_eq!(inode.size(), BLOCK_SIZE);
+
+        inode
+            .fallocate(FallocMode::AllocateKeepSize, BLOCK_SIZE, 2 * BLOCK_SIZE)
+            .unwrap();
+
+        // KEEP_SIZE: i_size is unchanged, but the two blocks past EOF are reserved.
+        assert_eq!(inode.size(), BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
+        }
+    }
+
+    /// P7e-3 — `fallocate(PunchHoleKeepSize)` over a BLOCK-ALIGNED middle range
+    /// frees the mapped blocks (leaving a hole that reads zero), keeps the
+    /// surrounding data, and does not change `i_size`. The freed blocks travel the
+    /// same forget/revoke + pin free funnel as truncate (data via `PlainData`,
+    /// tree nodes via `free_meta_block`).
+    #[ktest]
+    fn fallocate_punch_hole_middle_reads_zero_surrounding_intact() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(4 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+        assert_eq!(inode.sector_count(), 4 * SECTORS_PER_BLOCK);
+
+        // Punch the middle two blocks [1, 3).
+        inode
+            .fallocate(FallocMode::PunchHoleKeepSize, BLOCK_SIZE, 2 * BLOCK_SIZE)
+            .unwrap();
+
+        // i_size unchanged; the punched blocks are freed (a hole), the rest kept.
+        assert_eq!(inode.size(), 4 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Written);
+        }
+        // Block 0 and block 3 intact; the punched range reads zero.
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), payload[0..BLOCK_SIZE]);
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, 2 * BLOCK_SIZE),
+            vec![0u8; 2 * BLOCK_SIZE]
+        );
+        assert_eq!(
+            read_back(&inode, 3 * BLOCK_SIZE, BLOCK_SIZE),
+            payload[3 * BLOCK_SIZE..4 * BLOCK_SIZE]
+        );
+    }
+
+    /// P7e-3 — a punch whose edges are NOT block-aligned ZEROES the partial edge
+    /// blocks (they are kept, their uncovered bytes survive) and FREES only the
+    /// fully-covered block in between (Linux `ext4_zero_partial_blocks` +
+    /// `ext4_ext_remove_space`).
+    #[ktest]
+    fn fallocate_punch_partial_edges_zero_not_free() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(4 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        // Punch [BLOCK+100, 3*BLOCK+100): head partial in block 1, one fully
+        // covered block 2, tail partial in block 3.
+        let off = BLOCK_SIZE + 100;
+        let len = 2 * BLOCK_SIZE;
+        inode
+            .fallocate(FallocMode::PunchHoleKeepSize, off, len)
+            .unwrap();
+
+        assert_eq!(inode.size(), 4 * BLOCK_SIZE);
+        // Only the fully-covered block 2 is freed; the partial-edge blocks 1 and 3
+        // are kept.
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Written);
+        }
+
+        // Block 0 whole intact.
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), payload[0..BLOCK_SIZE]);
+        // Block 1: [0,100) original, [100, BLOCK) zeroed.
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, 100),
+            payload[BLOCK_SIZE..BLOCK_SIZE + 100]
+        );
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            vec![0u8; BLOCK_SIZE - 100]
+        );
+        // Block 2: whole hole.
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE]
+        );
+        // Block 3: [0,100) zeroed, [100, BLOCK) original.
+        assert_eq!(read_back(&inode, 3 * BLOCK_SIZE, 100), vec![0u8; 100]);
+        assert_eq!(
+            read_back(&inode, 3 * BLOCK_SIZE + 100, BLOCK_SIZE - 100),
+            payload[3 * BLOCK_SIZE + 100..4 * BLOCK_SIZE]
+        );
+    }
+
+    /// P7e-3 (red-line ①) — a large punch over a fragmented file spans multiple
+    /// journal transactions: the free reuses the truncate chunk+restart spine, so
+    /// a real mid-punch `journal_restart` fires. A crash between chunks leaves a
+    /// valid partial hole, so — unlike truncate — the punch NEVER touches the
+    /// orphan list.
+    #[ktest]
+    fn fallocate_large_punch_spans_transactions() {
+        let f = journaled_multigroup_fixture(16);
+        let journal = f.ext4.journal().unwrap();
+        assert_eq!(journal.max_credits(), 12);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const N_BLOCKS: usize = 120;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k % 250 + 1) as u8)
+            .collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        // Punch a large aligned middle range [10, 110): ~100 blocks fragmented
+        // across many groups (one distinct block bitmap per group), whose free
+        // overruns one transaction.
+        let restarts_before = journal.restart_count_for_test();
+        inode
+            .fallocate(
+                FallocMode::PunchHoleKeepSize,
+                10 * BLOCK_SIZE,
+                100 * BLOCK_SIZE,
+            )
+            .unwrap();
+
+        // A genuine mid-punch restart occurred (reusing the d2-cd machinery).
+        assert!(
+            journal.restart_count_for_test() > restarts_before,
+            "a large fragmented punch must restart: {restarts_before} -> {}",
+            journal.restart_count_for_test()
+        );
+        // Punch never lists the inode on the orphan chain (no i_size change).
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            None,
+            "a punch must not touch the orphan list"
+        );
+
+        // i_size unchanged; the surrounding data intact, the punched range zero.
+        assert_eq!(inode.size(), N_BLOCKS * BLOCK_SIZE);
+        assert_eq!(
+            read_back(&inode, 0, 10 * BLOCK_SIZE),
+            payload[0..10 * BLOCK_SIZE]
+        );
+        assert_eq!(
+            read_back(&inode, 10 * BLOCK_SIZE, 100 * BLOCK_SIZE),
+            vec![0u8; 100 * BLOCK_SIZE]
+        );
+        assert_eq!(
+            read_back(&inode, 110 * BLOCK_SIZE, 10 * BLOCK_SIZE),
+            payload[110 * BLOCK_SIZE..120 * BLOCK_SIZE]
+        );
+        // The punched-out blocks all map as holes.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for i in 10u32..110 {
+                assert_eq!(
+                    bm.map_blocks(i).unwrap().state(),
+                    MapState::Hole,
+                    "punched block {i} must be a hole"
+                );
+            }
+            assert_eq!(bm.map_blocks(9).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(110).unwrap().state(), MapState::Written);
+        }
     }
 
     /// Serializes one depth-0 extent leaf node into a full block: a 12-byte

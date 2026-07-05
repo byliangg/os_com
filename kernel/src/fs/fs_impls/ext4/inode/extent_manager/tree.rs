@@ -552,6 +552,174 @@ impl ExtentTree {
         })
     }
 
+    /// One credit-bounded step of freeing the mapped blocks in the MIDDLE logical
+    /// range `[start_block, end_block)` (a punch-hole), leaving a hole, then
+    /// reserializing the survivor in the caller's transaction. Returns whether
+    /// doomed blocks remain (the outer spine restarts and calls again) and the
+    /// reservation the next chunk's fresh transaction should start from.
+    ///
+    /// Unlike [`truncate_chunk`](Self::truncate_chunk) the file size is UNCHANGED
+    /// and there is no orphan protection: a crash between chunks leaves some of
+    /// the range freed and some still mapped — a partial hole, which is a valid
+    /// file state (reads return zero where freed, the original data where not),
+    /// so no orphan link is needed to make recovery re-converge. The freed
+    /// data/metadata blocks go through the SAME forget/revoke + pin funnels as
+    /// truncate (`data_policy` for data, [`free_meta_block`] for tree nodes), so
+    /// a replay never resurrects stale data into a reused block and a freed block
+    /// is not reallocated before its freeing transaction commits.
+    ///
+    /// An extent straddling either edge is split, keeping the head `[e.block,
+    /// start_block)` and/or the tail `[end_block, e.end)` at the same physical
+    /// mapping and kind, and freeing only the covered middle. A single extent
+    /// spanning the whole range splits into head + tail, so the survivor can hold
+    /// up to two more extents than the input; the reserialize headroom is sized
+    /// for that growth. `max_credits` is `None` for the whole-range
+    /// (single-transaction) path and `Some(max)` for the chunked spine — the same
+    /// per-free credit probe and EFBIG floor as truncate.
+    ///
+    /// Per-chunk (not per-punch) reserialize is the crash red-line, identical to
+    /// truncate: the frees and the reserialize that drops exactly those extents
+    /// ride one transaction, so a committed chunk never leaves the tree naming a
+    /// freed (reallocatable) block (double-alloc) or a freed block the tree still
+    /// names (leak).
+    pub(super) fn punch_chunk(
+        &mut self,
+        fs: &Ext4,
+        range: Range<Iblock>,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
+        max_credits: Option<usize>,
+    ) -> Result<super::PunchChunk> {
+        let Range {
+            start: start_block,
+            end: end_block,
+        } = range;
+        if start_block >= end_block {
+            return Ok(super::PunchChunk {
+                more: false,
+                next_bound: fs.extent_free_credits(),
+            });
+        }
+
+        let (mut extents, old_external) = self.flatten(fs)?;
+        extents.sort_by_key(|e| e.block());
+
+        // Decompose each extent into kept head/tail (outside the punch range) and
+        // a doomed middle (inside it). The three split lengths below narrow to
+        // `u16` losslessly: each lies inside one extent, whose length is a `u16`.
+        let mut kept: Vec<Extent> = Vec::with_capacity(extents.len() + 2);
+        let mut doomed: Vec<Extent> = Vec::new();
+        for e in &extents {
+            let e_start = e.block();
+            let e_end = e_start as u64 + e.len() as u64;
+            // Wholly outside the punch range: kept intact.
+            if e_end <= start_block as u64 || e_start as u64 >= end_block as u64 {
+                kept.push(*e);
+                continue;
+            }
+            let ov_start = e_start.max(start_block);
+            let ov_end = e_end.min(end_block as u64);
+            // Kept head `[e_start, start_block)`.
+            if e_start < start_block {
+                kept.push(Extent::new(
+                    e_start,
+                    (start_block - e_start) as u16,
+                    e.start(),
+                    e.kind(),
+                ));
+            }
+            // Doomed middle `[ov_start, ov_end)` at the same physical mapping.
+            doomed.push(Extent::new(
+                ov_start,
+                (ov_end - ov_start as u64) as u16,
+                e.start() + (ov_start - e_start) as Ext4Bid,
+                e.kind(),
+            ));
+            // Kept tail `[end_block, e_end)`.
+            if e_end > end_block as u64 {
+                kept.push(Extent::new(
+                    end_block,
+                    (e_end - end_block as u64) as u16,
+                    e.start() + (end_block - e_start) as Ext4Bid,
+                    e.kind(),
+                ));
+            }
+        }
+
+        // Highest logical block first: a credit stop then leaves the LOW doomed
+        // extents (nearest `start_block`) for the next chunk.
+        doomed.sort_by_key(|e| core::cmp::Reverse(e.block()));
+
+        // The reserialize headroom the last surviving reserialize needs — sized to
+        // the WHOLE decomposed extent set (`kept + doomed`), an upper bound on any
+        // survivor (a chunk that frees ≥ 1 doomed reserializes onto no more nodes).
+        let reserialize_headroom =
+            fs.truncate_chunk_credits(Self::external_node_count(kept.len() + doomed.len()));
+        let free_cost = fs.extent_free_credits();
+
+        // The honest EFBIG floor (symmetric to truncate): if one free plus the
+        // survivor reserialize cannot fit a whole transaction, no restart ever can.
+        if let Some(max) = max_credits
+            && !doomed.is_empty()
+            && reserialize_headroom + free_cost > max
+        {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "one punch chunk's reserialize plus a free exceeds a journal transaction"
+            );
+        }
+
+        let mut freed_data: u64 = 0;
+        let mut freed_up_to = 0usize; // count of `doomed` extents freed this chunk
+
+        for e in &doomed {
+            // Credit-aware early stop (chunked mode): if this free plus the
+            // survivor reserialize will not fit even after growing in place, stop
+            // with the progress made so far. Not restarting here is the ③-drop red
+            // line — the restart's re-admission may wait, illegal under this lock.
+            if let Some(h) = handle
+                && max_credits.is_some()
+                && stop_before_free(h, free_cost + reserialize_headroom)?
+            {
+                break;
+            }
+            let auth = data_policy.authorize(e.start(), e.len() as u32);
+            fs.free_blocks(auth, handle)?;
+            freed_data += e.len() as u64;
+            freed_up_to += 1;
+        }
+
+        // The doomed extents not reached this chunk survive it (the next chunk
+        // re-flattens and frees them; a crash meanwhile leaves a valid partial
+        // hole).
+        for e in &doomed[freed_up_to..] {
+            kept.push(*e);
+        }
+        // `reserialize`/`search_entries` require ascending logical order — `kept`
+        // mixes the ascending prefix, the descending un-freed doomed, and the
+        // split tails; sort before serializing (the truncate red-line).
+        kept.sort_by_key(|e| e.block());
+        debug_assert!(kept.windows(2).all(|w| w[0].block() < w[1].block()));
+
+        let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
+        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
+        let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
+        debug_assert!(self.sector_count as i64 >= removed_sectors);
+        self.sector_count = (self.sector_count as i64 - removed_sectors).max(0) as u64;
+        self.dirty = true;
+
+        // The next chunk starts from ONE free PLUS the survivor's reserialize
+        // headroom — exactly the next chunk's first probe, so the restart's
+        // reservation alone frees ≥ 1 extent (forward progress; see truncate).
+        let next_bound = fs.extent_free_credits()
+            + fs.truncate_chunk_credits(Self::external_node_count(kept.len()));
+        Ok(super::PunchChunk {
+            more: freed_up_to < doomed.len(),
+            next_bound,
+        })
+    }
+
     /// Parses the whole tree into a list of leaf extents, also returning the
     /// physical blocks of **every** external node — leaf blocks at depth 1, and
     /// both interior and leaf blocks at depth 2. The returned block list is the
