@@ -661,6 +661,12 @@ pub(super) fn try_commit_transaction(
     // final locations still hold the pre-transaction bytes, i.e. a consistent
     // pre-transaction state.
     if was_clean {
+        // Serialize this clean→dirty `s_start` write against a checkpoint
+        // pass's tail publication so the journal superblock has one writer at
+        // a time (jbd2 `j_checkpoint_mutex`; see [`Journal::j_checkpoint`]).
+        // Taken alone, released before the state lock below — no lock-order
+        // edge. Single-committer today, so it never contends.
+        let _checkpoint = journal.lock_checkpoint();
         journal.update_superblock_tail(device, start_head, tid)?;
     }
 

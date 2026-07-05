@@ -202,6 +202,66 @@
 //!    always; commits stay strictly serial (one slot), so waiting on a tid
 //!    still covers every earlier tid.
 //!
+//! # Lazy-checkpoint invariants (P7c-3)
+//!
+//! Checkpoint is no longer eager (one pass per commit). The commit thread
+//! reclaims the tail LAZILY — under space pressure only
+//! ([`run_lazy_checkpoint`](Journal::run_lazy_checkpoint)): a demanded reclaim
+//! from a `journal_start` blocked in
+//! [`wait_for_log_space`](Journal::wait_for_log_space), or the free segment
+//! falling below [`checkpoint_low_water`](Journal::checkpoint_low_water). Space
+//! backpressure moves to reservation time: `journal_start` refuses to build a
+//! transaction that will not fit the ring's free segment and waits for the
+//! committer to checkpoint first (jbd2 `__jbd2_log_wait_for_space` from
+//! `start_this_handle`), so the commit-time fit guard's inline drain
+//! ([`commit_or_drain_tail`](Journal::commit_or_drain_tail)) — and its loud
+//! `ENOSPC` abort backstop — become the exception, not the rule. Checkpoint
+//! stays SINGLE-DRIVER (the commit thread; the unmount flush after it stops):
+//! the space wait sets a flag and the committer services it, so no second
+//! thread ever runs a checkpoint pass — every duality invariant that rests on
+//! "one committer serializes commit and checkpoint" (1, 4) survives unchanged.
+//! With the tail now MANY transactions deep instead of one (the eager pass used
+//! to empty it every commit), each b/c-stack invariant is re-audited at depth:
+//!
+//! - **(a) Revoke suppression across a deep log.** The committed-revoke memory
+//!   ([`JournalState::revoked`], max-wins per block) holds EVERY committed
+//!   transaction's revokes until [`checkpoint`](checkpoint::checkpoint) retires
+//!   them — not just the last one's. A pass applies oldest-first, so when it
+//!   applies transaction `M` the table still holds the revokes of every
+//!   un-checkpointed `N > M` (all committed, each published at its own step 6),
+//!   and [`RevokeTable::suppresses`](revoke::RevokeTable) suppresses `M`'s image
+//!   of a block any `N ≥ M` freed. [`retire_through`](revoke::RevokeTable) drops
+//!   only records `≤ applied_through` — transactions this pass fully applied AND
+//!   advanced the tail past — so a record a still-unapplied older transaction
+//!   needs is never dropped. Depth-correct by the tid boundary, not by "one
+//!   deep".
+//! - **(b) Freed-block pinning is orthogonal to checkpoint laziness.**
+//!   [`release_pinned_frees`](JournalState::release_pinned_frees) runs at commit
+//!   step 6, keyed by the COMMITTED tid — never at checkpoint. Lazy checkpoint
+//!   delays checkpoint, not commit (group commit still commits on the size/age/
+//!   request triggers), so the pinned set does NOT grow with the un-checkpointed
+//!   tail; it holds only the not-yet-committed frees, bounded by one
+//!   transaction's `max_credits`. The allocator skip cost and the transient-
+//!   `ENOSPC` → `request_commit_of_running` retry are unchanged.
+//! - **(c) The retained-image map is now many-deep, and stays newest-wins.**
+//!   [`stash_uncheckpointed`](transaction::Transaction) inserts each staging
+//!   transaction's images tagged with its tid, overwriting any older entry —
+//!   and staging is tid-ordered (serial commits), so the map always holds the
+//!   NEWEST committed image of each block, however deep the tail. Seeding reads
+//!   that newest image; tid-keyed eviction
+//!   ([`is_checkpointed_by`](transaction::UncheckpointedImage)) drops only
+//!   images `≤ applied_through`, retaining a newer commit's image the device
+//!   still lags. The "≤ one transaction deep" note the eager design carried
+//!   (A1_ledger `lazy-checkpoint`) is void: correctness rests on the tid tag,
+//!   not the depth.
+//! - **(d) The defer-prefix pre-scan is bounded over the deep log.**
+//!   [`chain_covers_unpublished`](checkpoint) is SKIPPED entirely when no
+//!   forget is in flight (`unpublished.is_empty()`, the common case) — the deep
+//!   tail costs nothing then. When a forget IS in flight it reads only chain
+//!   blocks (descriptors + commit), returns at the first covered block, and is
+//!   bounded per transaction by `descriptors + 1` and overall by the anti-cycle
+//!   `maxlen` bound; it never reads a data block twice.
+//!
 //! Note (deviation, see `ext4_rebuild_report.md` §12): the report sketches a
 //! `MetaBuffer` handle owning the raw block bytes. We instead reuse ext2's
 //! typed-and-dirty-tracked metadata (`Dirty<IdBitmap>`, `Dirty<BlockGroupDesc>`,
@@ -983,6 +1043,41 @@ pub(super) struct Journal {
     /// task. A leaf lock — taken alone, released before any other — so it adds
     /// no edge to the journal lock order.
     op_handle_owners: Mutex<BTreeSet<usize>>,
+    /// Serializes the journal superblock's tail publication — jbd2
+    /// `j_checkpoint_mutex`. Held across a whole checkpoint pass
+    /// ([`checkpoint`](checkpoint::checkpoint), apply → barrier →
+    /// `s_start`/`s_sequence`/`s_head` rewrite → barrier) and around the
+    /// commit pipeline's clean→dirty `s_start` write (step 5), so the
+    /// on-disk journal superblock has ONE writer at a time.
+    ///
+    /// Today every writer runs on the single commit thread (the unmount
+    /// flush strictly after it stops), so the mutex never contends; it is
+    /// the designated serialization point that makes "one journal-superblock
+    /// writer" structural rather than incidental, and correct by
+    /// construction if a second checkpoint driver is ever added (P7d/P7e
+    /// concurrency). Lock order: `j_checkpoint` → `state` (a pass takes the
+    /// state lock only for its brief snapshot/publish windows, never the
+    /// reverse), it is NOT nested with the inode→handle→…→sb main chain
+    /// (checkpoint runs on the commit thread, holding no filesystem lock),
+    /// and it is NEVER held across a wait-for-commit.
+    j_checkpoint: Mutex<()>,
+    /// Set by a `journal_start` blocked on log space
+    /// ([`wait_for_log_space`](Journal::wait_for_log_space)) to demand the
+    /// commit thread checkpoint the tail forward NOW — the space
+    /// backpressure that keeps the commit-time fit guard's drain path the
+    /// exception (jbd2 `__jbd2_log_wait_for_space`). The commit thread
+    /// clears it and runs a full reclaim pass; a stale set only over-
+    /// checkpoints (harmless), and a waiter still short re-sets it.
+    space_pressure: AtomicBool,
+    /// Whether a background commit thread is running to service the
+    /// checkpoint / space-backpressure waits: set by
+    /// [`start_commit_thread`](Journal::start_commit_thread), cleared at the
+    /// entry of [`stop_commit_thread`](Journal::stop_commit_thread). A
+    /// `journal_start` only *waits* for log space when this is true; without
+    /// a servicer (a no-thread test fixture, or teardown) it proceeds and
+    /// the commit-time fit guard drains inline instead, so the wait can
+    /// never hang on an absent committer.
+    commit_servicer: AtomicBool,
 }
 
 /// One pinned freed block run: `count` blocks whose free was discharged under
@@ -1365,6 +1460,9 @@ impl Journal {
             aborted: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
             op_handle_owners: Mutex::new(BTreeSet::new()),
+            j_checkpoint: Mutex::new(()),
+            space_pressure: AtomicBool::new(false),
+            commit_servicer: AtomicBool::new(false),
         })
     }
 
@@ -1525,6 +1623,10 @@ impl Journal {
     /// Must be called once per journal, by the owner, right after construction;
     /// pair it with exactly one [`stop_commit_thread`](Journal::stop_commit_thread).
     pub(in crate::fs::fs_impls::ext4) fn start_commit_thread(self: &Arc<Journal>) {
+        // Announce the servicer BEFORE spawning: a `journal_start` may only
+        // wait for log space once a commit thread exists to service it (see
+        // [`commit_servicer`](Journal::commit_servicer)).
+        self.commit_servicer.store(true, Ordering::Release);
         let weak: Weak<Journal> = Arc::downgrade(self);
         let thread = crate::thread::kernel_thread::ThreadOptions::new(move || {
             Self::commit_thread_loop(&weak);
@@ -1575,38 +1677,97 @@ impl Journal {
 
             let Some(j) = weak.upgrade() else { break };
             // Drive the pipeline until nothing more is immediately
-            // committable: lock/stage/commit each due transaction, then
-            // checkpoint. The loop matters under batching — the size
-            // trigger can cross again while a commit's I/O runs, and no
-            // further wake is guaranteed to be pending.
+            // committable AND no checkpoint is owed: lock/stage/commit each
+            // due transaction, then reclaim the log LAZILY. The loop matters
+            // under batching — the size trigger can cross again while a
+            // commit's I/O runs, and no further wake is guaranteed to be
+            // pending; and a space-pressure wake with nothing to commit must
+            // still reach the checkpoint below.
             loop {
-                if !j.commit_one(false) {
-                    // Nothing staged: idle, or a parked transaction is
-                    // still draining (its last `journal_stop` wakes us).
-                    break;
-                }
+                let committed = j.commit_one(false);
                 if j.is_aborted() {
                     // A failed commit aborted the journal: the device state
                     // no longer matches the log; checkpointing would make it
                     // worse. Idle until teardown.
                     break;
                 }
-                // Reclaim the log right after committing. Checkpoint copies
-                // the committed after-images to their final locations and
-                // clears `s_start`. Failure is non-fatal — the log stays
-                // dirty and the next commit (or the unmount flush) retries;
-                // the dirty tail left behind is protected from being
-                // overwritten by the commit fit guard, which bounds every
-                // chain to the ring's free segment (`commit_or_drain_tail`).
-                // Lazy, space-pressure-driven checkpoint is P7c-3.
-                // The committing slot is empty here (`commit_one` retired
-                // it), so the pass's snapshot collects unpublished forgets
-                // only from the running/locking transactions.
-                if let Err(e) = checkpoint::checkpoint(j.as_ref(), j.device.as_ref()) {
-                    error!("ext4 journal checkpoint failed: {:?}", e);
+                // Lazy checkpoint (P7c-3): reclaim the tail only under space
+                // pressure — a `journal_start` demanding room (full pass), or
+                // the free segment below the low-water mark (incremental) —
+                // NOT after every commit. Failure is non-fatal: the log stays
+                // dirty and a later pass (or the unmount flush) retries; the
+                // dirty tail is protected from overwrite by the commit-time
+                // fit guard (`commit_or_drain_tail`). The committing slot is
+                // empty here (`commit_one` retired it), so the pass's snapshot
+                // collects unpublished forgets only from the running/locking
+                // transactions.
+                let checkpointed = match j.run_lazy_checkpoint() {
+                    Ok(did) => did,
+                    Err(e) => {
+                        error!("ext4 journal checkpoint failed: {:?}", e);
+                        false
+                    }
+                };
+                if !committed && !checkpointed {
+                    // Nothing staged and nothing to reclaim: idle, or a parked
+                    // transaction is still draining (its last `journal_stop`
+                    // wakes us).
+                    break;
                 }
             }
         }
+    }
+
+    /// The commit thread's lazy checkpoint step (jbd2 `__jbd2_log_wait_for_space`
+    /// / `jbd2_log_do_checkpoint`, driven from the committer rather than
+    /// per-commit). Runs a checkpoint pass ONLY under space pressure:
+    ///
+    /// - **A demanded reclaim** — a `journal_start` set
+    ///   [`space_pressure`](Journal::space_pressure) because a reservation did
+    ///   not fit the free segment: reclaim the WHOLE tail (`checkpoint`, full
+    ///   pass) so the largest correctly-reserved transaction (`≤ max_credits ≤
+    ///   usable`) then fits, and wake the waiter.
+    /// - **Steady low-water** — the free segment fell below
+    ///   [`checkpoint_low_water`](Journal::checkpoint_low_water): reclaim
+    ///   incrementally just up to the low-water mark, keeping ordinary commits
+    ///   fitting without a per-commit pass.
+    ///
+    /// Returns whether it ran a pass (so the caller's loop keeps servicing).
+    /// A pass that advances the tail wakes log-space waiters
+    /// ([`note_credits_released`](Journal::note_credits_released) bumps the
+    /// epoch they sleep on). Single-committer: this and every commit run on
+    /// this one thread, so no pass overlaps a commit's step-6 revoke
+    /// publication / pin release (duality invariant 1).
+    fn run_lazy_checkpoint(&self) -> Result<bool> {
+        let demanded = self.space_pressure.swap(false, Ordering::AcqRel);
+        // The free segment and whether the log is dirty, read once.
+        let (free, dirty) = {
+            let st = self.state_read();
+            (
+                self.geometry.free_log_blocks(st.head, st.tail_block),
+                st.tail_block.is_some(),
+            )
+        };
+        if !dirty {
+            return Ok(false);
+        }
+        let target = if demanded {
+            // A waiter needs room now: reclaim everything reclaimable so the
+            // largest correctly-reserved transaction then fits.
+            None
+        } else if free < self.checkpoint_low_water() {
+            // Steady state: advance the tail just past the low-water mark.
+            Some(self.checkpoint_low_water())
+        } else {
+            return Ok(false);
+        };
+        let advanced = checkpoint::checkpoint_advance(self, self.device.as_ref(), target)?;
+        if advanced {
+            // The freed tail may satisfy a `journal_start` blocked in
+            // `wait_for_log_space`; bump the epoch it sleeps on.
+            self.note_credits_released();
+        }
+        Ok(advanced)
     }
 
     /// The commit thread's wait condition: decides whether to exit, advance
@@ -1642,6 +1803,15 @@ impl Journal {
         // (it retires its own stage before re-polling); defense in depth.
         if st.committing.is_some() {
             return None;
+        }
+        // Space pressure (P7c-3): a `journal_start` blocked in
+        // [`wait_for_log_space`](Self::wait_for_log_space) set this to demand a
+        // reclaim pass. Advance so [`run_lazy_checkpoint`](Self::run_lazy_checkpoint)
+        // frees the tail even with nothing due to commit, and even while a
+        // locking seat drains (the tail is reclaimable independently of the
+        // drain). Transient — the pass clears it — so this cannot spin.
+        if j.space_pressure.load(Ordering::Acquire) {
+            return Some(CommitAction::Advance);
         }
         if let Some(locked) = st.locking.as_ref() {
             // A parked transaction stages the moment its drain completes;
@@ -1726,6 +1896,52 @@ impl Journal {
     /// method for why.
     fn batch_trigger_credits(&self) -> usize {
         (self.max_credits() / 4).max(1)
+    }
+
+    /// The free-log-block low-water mark the lazy checkpoint keeps the ring
+    /// above (jbd2 `__jbd2_log_wait_for_space`'s target,
+    /// `j_max_transaction_buffers`): once the free segment drops below it the
+    /// commit thread reclaims the tail forward, keeping ordinary (batch-sized)
+    /// commits fitting the free segment without the commit-time drain. A
+    /// quarter of the usable ring — the same fraction as
+    /// [`batch_trigger_credits`](Self::batch_trigger_credits), so the running +
+    /// committing transactions and a quarter of checkpoint slack sit inside the
+    /// ring at steady state. Clamped to a `u32` block count for
+    /// [`JournalGeometry::free_log_blocks`].
+    fn checkpoint_low_water(&self) -> u32 {
+        let usable = self.geometry.maxlen() - self.geometry.first();
+        (usable / 4).max(1)
+    }
+
+    /// The worst-case log footprint of a transaction reserving `credits`
+    /// metadata blocks with `revoke_blocks` whole revoke blocks: the metadata
+    /// and revoke blocks, one descriptor per [`TagLayout::tags_per_descriptor`]
+    /// metadata blocks, and the commit block — the free-segment space its
+    /// commit needs. The reservation-time space check
+    /// ([`journal_start`](transaction::journal_start)) waits for this much free
+    /// so the commit-time fit guard rarely fires. `credits ≤ max_credits`
+    /// (the capacity gate) makes this `≤ usable` by the `max_credits` formula,
+    /// so a full checkpoint always frees enough — the wait terminates. A
+    /// footprint beyond a `u32` of blocks (unreachable — it is bounded by the
+    /// ring) saturates, so the space check treats it as "needs the whole ring".
+    pub(super) fn worst_case_footprint(&self, credits: usize, revoke_blocks: usize) -> u32 {
+        let tags = self.geometry.tag_layout().tags_per_descriptor();
+        let blocks = credits + revoke_blocks + credits.div_ceil(tags) + 1;
+        u32::try_from(blocks).unwrap_or(u32::MAX)
+    }
+
+    /// Whether a background commit thread is running to service checkpoint /
+    /// log-space waits (see [`commit_servicer`](Journal::commit_servicer)).
+    pub(super) fn has_commit_servicer(&self) -> bool {
+        self.commit_servicer.load(Ordering::Acquire)
+    }
+
+    /// Acquires the checkpoint mutex (jbd2 `j_checkpoint_mutex`) — held across
+    /// a checkpoint pass and the commit pipeline's clean→dirty superblock
+    /// write, so the journal superblock has one writer at a time (see
+    /// [`j_checkpoint`](Journal::j_checkpoint)).
+    pub(super) fn lock_checkpoint(&self) -> MutexGuard<'_, ()> {
+        self.j_checkpoint.lock()
     }
 
     /// Advances the transaction pipeline by one step under a single
@@ -2080,6 +2296,66 @@ impl Journal {
         })
     }
 
+    /// Blocks until the commit thread has freed log space by checkpointing the
+    /// tail forward (the reservation-time half of jbd2
+    /// `__jbd2_log_wait_for_space`, called from `start_this_handle` before a
+    /// handle is granted): `journal_start` found a reservation that does not
+    /// fit the ring's free segment, so it waits here for room rather than
+    /// letting the transaction build and overflow the log at commit time.
+    ///
+    /// Entering escalates on both fronts the space can be held: it sets
+    /// [`space_pressure`](Journal::space_pressure) so the committer runs a
+    /// FULL reclaim pass, and force-requests the running transaction's commit
+    /// ([`request_commit_of_running`](Self::request_commit_of_running)) so
+    /// space held by an uncommitted transaction — or the tail's reclaim
+    /// blocked behind that transaction's unpublished revoke — is released
+    /// (jbd2's `__jbd2_log_wait_for_space` likewise commits when checkpoint
+    /// alone cannot free enough). The wait ends when a checkpoint pass (or a
+    /// handle close, or a staging) bumps the epoch, and the caller re-checks
+    /// the free segment and retries.
+    ///
+    /// # Termination
+    ///
+    /// The `max_credits` capacity gate already passed, so the reservation is
+    /// `≤ usable` (the `max_credits` formula); a full checkpoint frees the
+    /// whole committed tail, so the retry eventually fits — unless the space
+    /// is held by an uncommitted transaction, which the force-request commits.
+    ///
+    /// # Locking
+    ///
+    /// Same contract as [`wait_for_transaction_room`](Self::wait_for_transaction_room):
+    /// callers may hold inode `inner` locks (lock order ① → ②), never a
+    /// journal lock; the wait is for *space*, iron law 1's legal exception,
+    /// and everything that frees it — the commit thread's checkpoint/commit —
+    /// takes no inode lock. Returns `Ok(())` immediately when no commit thread
+    /// is running to service it ([`has_commit_servicer`](Self::has_commit_servicer)):
+    /// a no-thread test fixture or teardown proceeds and the commit-time fit
+    /// guard drains inline, so this can never hang on an absent committer.
+    pub(super) fn wait_for_log_space(&self, epoch: u64) -> Result<()> {
+        if !self.has_commit_servicer() {
+            return Ok(());
+        }
+        self.space_pressure.store(true, Ordering::Release);
+        self.request_commit_of_running();
+        self.commit_wait_queue.wait_until(|| {
+            if self.is_aborted() {
+                return Some(Err(Error::with_message(
+                    Errno::EIO,
+                    "journal aborted while waiting for log space",
+                )));
+            }
+            // The servicer withdrew (teardown): stop waiting and let the
+            // commit-time fit guard handle the reservation inline.
+            if !self.has_commit_servicer() {
+                return Some(Ok(()));
+            }
+            if self.credit_release_epoch() != epoch {
+                return Some(Ok(()));
+            }
+            None
+        })
+    }
+
     /// Returns whether the journal has been aborted by a failed commit (see the
     /// [`aborted`](Journal::aborted) field).
     pub(in crate::fs::fs_impls::ext4) fn is_aborted(&self) -> bool {
@@ -2262,8 +2538,16 @@ impl Journal {
     /// There is deliberately **no `join()` in a `Drop` impl** — a Drop-time join
     /// could, in principle, run on the commit thread and self-deadlock.
     pub(in crate::fs::fs_impls::ext4) fn stop_commit_thread(&self) {
+        // Withdraw the servicer FIRST: a `journal_start` racing teardown must
+        // not begin a log-space wait no committer will service (it proceeds
+        // and the commit-time fit guard drains inline instead).
+        self.commit_servicer.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         self.commit_trigger.wake_all();
+        // Wake any `journal_start` already parked in a log-space wait so it
+        // stops waiting on a servicer that is going away (it re-checks
+        // `commit_servicer` and proceeds).
+        self.commit_wait_queue.wake_all();
         // Take the handle out (so a second call is a no-op) and join outside the
         // lock — `join` blocks, and holding `commit_thread` across it is pointless
         // and would serialize any concurrent stopper on a sleeping join.

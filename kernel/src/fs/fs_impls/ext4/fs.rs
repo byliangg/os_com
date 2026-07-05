@@ -3400,4 +3400,184 @@ mod tests {
         let sb_after: RawSuperBlock = disk.segment().read_val(SUPER_BLOCK_OFFSET).unwrap();
         assert_eq!(sb_after.last_orphan, 0, "cleared head persisted");
     }
+
+    /// Small-journal pressure (P7c-3, the lazy-checkpoint gate): a DELIBERATELY
+    /// tiny journal — real `mke2fs` journals (≥1024 blocks) never reach the
+    /// capacity/space path (experience §10.4) — with the commit thread RUNNING,
+    /// driven by many metadata transactions that cycle the ring several times.
+    /// With eager checkpoint gone, the ring fills; the reservation-time log-space
+    /// wait ([`Journal::wait_for_log_space`]) and the commit thread's
+    /// tail-advance checkpoint must keep it from overflowing, so every op
+    /// completes without an `ENOSPC` journal abort, and the log flushes clean at
+    /// unmount. A backpressure deadlock would hang this test (a ktest timeout);
+    /// an overflow would abort the journal (the assert).
+    #[ktest]
+    fn small_journal_pressure_lazy_checkpoint_completes_clean() {
+        crate::time::clocks::init_for_ktest();
+        // usable ≈ 23 log blocks: room for only a few transactions at a time, so
+        // the ring genuinely fills. `build()` starts the commit thread; it stays
+        // RUNNING so it services the space waits and the lazy checkpoint.
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(24)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        // Each op is its own small transaction capturing two metadata blocks
+        // (fixed device blocks in the data region — no allocation, so the
+        // journal, not the filesystem, is the scarce resource). ~30 ops cycle
+        // the 23-block ring many times over.
+        for i in 0..30u32 {
+            let op = f.ext4.begin_op(4).unwrap();
+            let a = 512 + (i % 8) as u64;
+            let b = 540 + (i % 8) as u64;
+            journal::get_create_access(op.get(), a)
+                .unwrap()
+                .patch(|buf| buf.fill(i as u8))
+                .unwrap();
+            journal::get_create_access(op.get(), b)
+                .unwrap()
+                .patch(|buf| buf.fill(i as u8 ^ 0xFF))
+                .unwrap();
+            drop(op);
+            assert!(
+                !journal.is_aborted(),
+                "journal aborted under small-journal pressure at op {i}"
+            );
+        }
+
+        // Quiesce: stopping the commit thread + the unmount flush commits the
+        // last running transaction and checkpoints the whole log clean. No
+        // abort, and the on-disk journal is reclaimed (`s_start == 0`).
+        journal.stop_commit_thread();
+        journal.flush_on_unmount().unwrap();
+        assert!(!journal.is_aborted());
+        assert_eq!(journal.state_read().tail_block, None, "log flushed clean");
+    }
+
+    /// Small-journal pressure under CONCURRENT operations (P7c-3 red-line ④):
+    /// two threads drive metadata transactions on disjoint blocks against one
+    /// tiny journal while the single commit thread services both their
+    /// log-space waits. Concurrent `journal_start`s blocked on space must all
+    /// make progress (the committer frees the tail without any of their locks)
+    /// — no deadlock, no abort.
+    #[ktest]
+    fn small_journal_pressure_concurrent_ops() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(24)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        let worker = |ext4: Arc<Ext4>, base: u64| {
+            move || {
+                for i in 0..20u32 {
+                    let op = ext4.begin_op(4).unwrap();
+                    journal::get_create_access(op.get(), base + (i % 6) as u64)
+                        .unwrap()
+                        .patch(|buf| buf.fill(i as u8))
+                        .unwrap();
+                    drop(op);
+                }
+            }
+        };
+        let t1 =
+            crate::thread::kernel_thread::ThreadOptions::new(worker(f.ext4.clone(), 560)).spawn();
+        let t2 =
+            crate::thread::kernel_thread::ThreadOptions::new(worker(f.ext4.clone(), 580)).spawn();
+        t1.join();
+        t2.join();
+
+        assert!(
+            !journal.is_aborted(),
+            "journal aborted under concurrent pressure"
+        );
+        journal.stop_commit_thread();
+        journal.flush_on_unmount().unwrap();
+        assert_eq!(journal.state_read().tail_block, None, "log flushed clean");
+    }
+
+    /// The retained-image map stays newest-wins at DEPTH (P7c-3 audit (c)):
+    /// with lazy checkpoint the map now holds several committed transactions'
+    /// images at once, not one. Three transactions overwrite a shared block S
+    /// (each also capturing a private block, so the map is genuinely deep) and
+    /// commit WITHOUT checkpoint; a later `get_write_access(S)` must seed from
+    /// the NEWEST image, and the full checkpoint then lands that newest content.
+    #[ktest]
+    fn uncheckpointed_map_newest_wins_at_depth() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(40)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        // Drive commits by hand so the map is left deep (no eager reclaim).
+        journal.stop_commit_thread();
+
+        let shared = 520u64;
+        let privates = [521u64, 522, 523];
+        // op0 creates S; op1/op2 overwrite it — each its own committed,
+        // un-checkpointed transaction, so three sit in the deep tail at once.
+        for (i, &priv_b) in privates.iter().enumerate() {
+            let op = f.ext4.begin_op(4).unwrap();
+            let fill = 0xA1 + i as u8;
+            if i == 0 {
+                journal::get_create_access(op.get(), shared)
+                    .unwrap()
+                    .patch(|buf| buf.fill(fill))
+                    .unwrap();
+            } else {
+                journal::get_write_access(op.get(), shared)
+                    .unwrap()
+                    .patch(|buf| buf.fill(fill))
+                    .unwrap();
+            }
+            journal::get_create_access(op.get(), priv_b)
+                .unwrap()
+                .patch(|buf| buf.fill(0xB0 + i as u8))
+                .unwrap();
+            drop(op);
+            journal.commit_now_for_test();
+        }
+
+        // The map is deep: the shared block plus all three privates await
+        // checkpoint.
+        let mapped = journal.uncheckpointed_blocks_for_test();
+        assert!(mapped.contains(&shared));
+        for &p in &privates {
+            assert!(mapped.contains(&p), "deep map missing a private block");
+        }
+
+        // A fresh capture of the shared block seeds from the NEWEST image
+        // (0xA3), not a stale one or the lagging device.
+        let op = f.ext4.begin_op(4).unwrap();
+        journal::get_write_access(op.get(), shared)
+            .unwrap()
+            .patch(|buf| {
+                assert!(
+                    buf.iter().all(|&byte| byte == 0xA3),
+                    "deep map seeded a stale shared-block image"
+                );
+            })
+            .unwrap();
+        drop(op);
+        journal.commit_now_for_test();
+
+        // The full checkpoint lands the newest content and empties the map.
+        journal.flush_on_unmount().unwrap();
+        let mut on_disk = [0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(shared as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(
+            on_disk, [0xA3u8; BLOCK_SIZE],
+            "checkpoint landed the newest image"
+        );
+        assert!(journal.uncheckpointed_blocks_for_test().is_empty());
+    }
 }

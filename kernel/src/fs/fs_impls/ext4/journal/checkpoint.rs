@@ -87,10 +87,15 @@
 //!   rewrite restamps `s_checksum` through the
 //!   [`JournalGeometry::write_superblock`](super::JournalGeometry::write_superblock)
 //!   funnel.
-//! - Synchronous, driven inline by its production callers — the commit
-//!   thread's post-commit pass, `commit_or_drain_tail`'s inline tail drain,
-//!   and the unmount flush ([`Journal::flush_on_unmount`](super::Journal)) —
-//!   no background checkpoint thread yet.
+//! - Synchronous and single-driver: run only by the commit thread — LAZILY,
+//!   under space pressure ([`Journal::run_lazy_checkpoint`](super::Journal)),
+//!   not after every commit (P7c-3) — plus the commit-time inline tail drain
+//!   ([`Journal::commit_or_drain_tail`](super::Journal)) and the unmount flush
+//!   ([`Journal::flush_on_unmount`](super::Journal)), both on that same thread
+//!   (the flush after it stops). No second checkpoint driver, so a pass never
+//!   overlaps a commit; the whole pass holds
+//!   [`Journal::j_checkpoint`](super::Journal) (jbd2 `j_checkpoint_mutex`) so
+//!   the journal superblock has one writer even if one is ever added.
 
 use super::{
     super::prelude::*,
@@ -416,15 +421,33 @@ fn chain_covers_unpublished(
     }
 }
 
-/// Checkpoints committed-but-un-checkpointed transactions
-/// (jbd2 `jbd2_log_do_checkpoint` + `jbd2_journal_update_sb_log_tail`).
+/// Advances the log tail by checkpointing committed-but-un-checkpointed
+/// transactions (jbd2 `jbd2_log_do_checkpoint` + `jbd2_journal_update_sb_log_tail`),
+/// returning whether it advanced.
 ///
-/// Applies each transaction in `[tail_tid ..= committed_tid]` from the log to
-/// its final locations, barriers so those locations are durable, then advances
-/// the tail — normally all the way, making the journal clean (`s_start == 0`)
-/// and reclaiming the whole log, by updating both the in-memory tail and the
-/// on-disk journal superblock (`s_start`, `s_sequence`, `s_head`), with a
-/// trailing barrier.
+/// Applies transactions from `[tail_tid ..= committed_tid]` from the log to
+/// their final locations in tid order, barriers so those locations are durable,
+/// then advances the tail — updating both the in-memory tail and the on-disk
+/// journal superblock (`s_start`, `s_sequence`, `s_head`), with a trailing
+/// barrier. How far it advances is set by `target_free`:
+///
+/// - `None` — a **full pass**: reclaim the whole reclaimable log, clearing the
+///   journal (`s_start == 0`). The demanded-reclaim, inline-drain, unmount, and
+///   recovery entry (through [`checkpoint`]).
+/// - `Some(n)` — an **incremental pass**: stop once the free segment holds at
+///   least `n` blocks (jbd2 checkpoints only as far as space demands), leaving
+///   the newer tail dirty. The commit thread's steady low-water reclaim.
+///
+/// Either way it may **stop early** in front of an unpublished-revoke
+/// transaction (the defer-prefix rule below); a partial advance points
+/// `s_start` at the first unapplied transaction, exactly what recovery would
+/// replay. This pass is LAZY — the commit thread runs it only under space
+/// pressure ([`Journal::run_lazy_checkpoint`](super::Journal)), not per commit —
+/// so the un-checkpointed tail (and thus the retained-image map, the revoke
+/// table, and the deferred pre-scan) is now many transactions deep, not one;
+/// the module docs' *Lazy-checkpoint invariants* section audits that depth.
+/// The whole pass holds [`Journal::j_checkpoint`](super::Journal) so the journal
+/// superblock has one writer.
 ///
 /// # The defer-prefix rule (unpublished revokes)
 ///
@@ -453,7 +476,18 @@ fn chain_covers_unpublished(
 /// state (recovery re-applies, same bytes) or the post-checkpoint state —
 /// never a torn in-between. A partial (deferred) advance keeps `s_start` on
 /// the first unapplied transaction, which is exactly what recovery replays.
-pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<()> {
+pub(super) fn checkpoint_advance(
+    journal: &Journal,
+    device: &dyn BlockDevice,
+    target_free: Option<u32>,
+) -> Result<bool> {
+    // Serialize this pass against any other checkpoint driver and the commit
+    // pipeline's clean→dirty `s_start` write, so the journal superblock has
+    // one writer at a time (jbd2 `j_checkpoint_mutex`; see
+    // [`Journal::j_checkpoint`]). Held for the whole pass; taken before the
+    // state lock and never the reverse.
+    let _checkpoint = journal.lock_checkpoint();
+
     // Snapshot the tail / committed-tid / head, the committed-revoke memory
     // (cloned so the applies below run without the lock — the state lock is
     // never held across I/O), and the UNPUBLISHED revoke sets: the running
@@ -519,13 +553,23 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
 
     // A clean journal (no dirty tail) has nothing un-checkpointed.
     let Some(tail_block) = dirty_tail else {
-        return Ok(());
+        return Ok(false);
     };
 
-    // Apply each committed transaction in tid order, oldest first, deferring
-    // at the first one the unpublished revokes cover. Each is
-    // known-committed, so `apply_log_transaction` must find a valid commit block;
-    // a failure means log corruption (EUCLEAN/EIO), which we propagate.
+    // An incremental pass whose target is already met reclaims nothing.
+    if let Some(want_free) = target_free
+        && journal.geometry().free_log_blocks(head, Some(tail_block)) >= want_free
+    {
+        return Ok(false);
+    }
+
+    // Apply each committed transaction in tid order, oldest first, stopping
+    // EARLY in front of a transaction the unpublished revokes cover (defer),
+    // or once `target_free` log blocks are free (an incremental tail advance —
+    // jbd2 checkpoints only as far as space demands, not the whole log). Each
+    // applied transaction is known-committed, so `apply_log_transaction` must
+    // find a valid commit block; a failure means log corruption (EUCLEAN/EIO),
+    // which we propagate.
     //
     // Loop termination: `committed_tid.geq(tid)` is jbd2's wrapping-aware
     // "is committed_tid at or after tid?". `tid` starts at `tail_tid` and steps
@@ -536,40 +580,54 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     let mut log = tail_block;
     let mut tid = tail_tid;
     let mut applied_any = false;
-    let mut deferred = false;
+    let mut stopped_early = false;
     while committed_tid.geq(tid) {
         if !unpublished.is_empty()
             && chain_covers_unpublished(journal, device, log, tid, &unpublished)?
         {
-            deferred = true;
+            // Deferred: `log`/`tid` stop ON this (unapplied) transaction.
+            stopped_early = true;
             break;
         }
         log = apply_log_transaction(journal, device, log, tid, &revoked)?;
         applied_any = true;
         tid = tid.next();
+        // Incremental stop: enough freed, and more remain. `log`/`tid` now name
+        // the next (unapplied) transaction — the same partial-advance shape as
+        // a defer, so the tail is pointed there below. `head` is fixed for the
+        // whole pass (the single committer runs this, so no commit advances it),
+        // so the free-segment measure is exact.
+        if let Some(want_free) = target_free
+            && committed_tid.geq(tid)
+            && journal.geometry().free_log_blocks(head, Some(log)) >= want_free
+        {
+            stopped_early = true;
+            break;
+        }
     }
 
-    // Deferred at the tail itself: nothing was applied, so nothing may be
-    // retired — the pass is a pure no-op, and the next one (after the
-    // revoking transaction commits and publishes) makes progress.
+    // Nothing applied (deferred at the very tail, or a clean journal that a
+    // concurrent unmount already checkpointed): no retirement, a pure no-op —
+    // the next pass (after the revoking transaction commits and publishes)
+    // makes progress.
     if !applied_any {
-        return Ok(());
+        return Ok(false);
     }
 
     // Everything the retirement below may cover: the last applied tid. On a
-    // full pass this is `committed_tid`; on a deferred one, the deferred
-    // transaction's predecessor.
+    // full pass this is `committed_tid`; on a partial one (deferred or
+    // target-reached), the first-unapplied transaction's predecessor.
     let applied_through = tid.prev();
 
     // --- Barrier: every final-location write durable BEFORE we drop the log's
     // record of them by advancing s_start. ---
     barrier(device)?;
 
-    if deferred {
-        // --- Partial progress: point the on-disk tail AT the deferred
-        // transaction (`log`/`tid` stopped on it), never past it — its
-        // images are unapplied, so its log record must survive a crash. The
-        // journal stays dirty; `s_head` is only read on the clean fast path
+    if stopped_early {
+        // --- Partial progress: point the on-disk tail AT the first unapplied
+        // transaction (`log`/`tid` stopped on it), never past it — its images
+        // are unapplied, so its log record must survive a crash. The journal
+        // stays dirty; `s_head` is only read on the clean fast path
         // (`s_start == 0`) and stays untouched, like the commit path's
         // clean→dirty transition through this same funnel. ---
         journal.update_superblock_tail(device, log, tid)?;
@@ -593,7 +651,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // Publish the new tail in memory: cleared on a full pass (`head` is left
     // as-is — the ring continues from where commit left it; the next commit
     // sees a clean tail and re-establishes `s_start` at its own start block),
-    // or moved to the deferred transaction on a partial one.
+    // or moved to the first unapplied transaction on a partial one.
     //
     // The same critical section evicts the retained after-images this pass made
     // durable (their final-location writes are behind the barrier above, so the
@@ -602,7 +660,7 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
     // later capture the device's still-lagging bytes.
     {
         let mut st = journal.state_write();
-        st.tail_block = if deferred { Some(log) } else { None };
+        st.tail_block = if stopped_early { Some(log) } else { None };
         st.tail_tid = tid;
         st.uncheckpointed
             .retain(|_, image| !image.is_checkpointed_by(applied_through));
@@ -615,7 +673,19 @@ pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<
         st.revoked.retire_through(applied_through);
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// A full checkpoint pass: apply every committed-but-un-checkpointed
+/// transaction to its final location and clear the journal
+/// ([`checkpoint_advance`] with no space target). The full-reclaim entry the
+/// commit thread's demanded pass, the commit-time inline drain
+/// ([`Journal::commit_or_drain_tail`](super::Journal)), the unmount flush
+/// ([`Journal::flush_on_unmount`](super::Journal)), and mount-time recovery
+/// all use; the incremental low-water pass calls [`checkpoint_advance`]
+/// directly.
+pub(super) fn checkpoint(journal: &Journal, device: &dyn BlockDevice) -> Result<()> {
+    checkpoint_advance(journal, device, None).map(|_| ())
 }
 
 #[cfg(ktest)]
@@ -1412,6 +1482,115 @@ mod tests {
         assert_eq!(read_final_block(&f, control), t1_control);
         assert_eq!(read_final_block(&f, bitmapish), [0x22u8; BLOCK_SIZE]);
         assert_eq!(f.journal.state_read().tail_block, None);
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
+    }
+
+    /// Incremental tail advance (P7c-3, lazy checkpoint): with three committed
+    /// transactions un-checkpointed (the deep tail lazy checkpoint now leaves),
+    /// `checkpoint_advance(Some(target))` applies the OLDEST transactions
+    /// oldest-first only until the free segment reaches `target`, leaving the
+    /// newer tail dirty — not the whole-log reclaim the full pass does. A
+    /// second pass finishes it.
+    #[ktest]
+    fn checkpoint_advance_stops_at_the_free_target() {
+        crate::time::clocks::init_for_ktest();
+        // usable = 23; each single-block transaction occupies 3 log blocks
+        // (descriptor + data + commit): T1 log [1,2,3], T2 [4,5,6], T3 [7,8,9],
+        // head = 10, free = 23 - 9 = 14 with all three dirty.
+        let f = journaled_fixture(24, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let dests = [500u64, 501, 502];
+        let mut contents = [[0u8; BLOCK_SIZE]; 3];
+        for (i, c) in contents.iter_mut().enumerate() {
+            c[..8].copy_from_slice(&[0xA0 + i as u8; 8]);
+            let txn = make_txn(Tid::new(i as u32 + 1), &[(dests[i], *c)]);
+            commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
+        }
+        assert_eq!(f.journal.committed_tid(), Tid::new(3));
+        assert_eq!(f.journal.state_read().tail_block, Some(1));
+
+        // Free the ring up to 15 blocks: applying T1 alone lifts free from 14
+        // to 17, so the pass stops after T1 with the tail pointed at T2.
+        let advanced = checkpoint_advance(f.journal.as_ref(), device.as_ref(), Some(15)).unwrap();
+        assert!(advanced);
+        assert_eq!(read_final_block(&f, dests[0]), contents[0]);
+        assert_eq!(
+            read_final_block(&f, dests[1]),
+            [0u8; BLOCK_SIZE],
+            "T2 not yet"
+        );
+        let sb = read_journal_super(&f);
+        assert_ne!(sb.s_start.get(), 0, "journal still dirty (partial)");
+        assert_eq!(sb.s_sequence.get(), 2, "on-disk tail at T2");
+        assert_eq!(f.journal.state_read().tail_tid, Tid::new(2));
+
+        // Already at/above the target: an incremental pass reclaims nothing.
+        assert!(!checkpoint_advance(f.journal.as_ref(), device.as_ref(), Some(15)).unwrap());
+
+        // The full pass finishes: T2, T3 land and the journal cleans.
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(read_final_block(&f, dests[1]), contents[1]);
+        assert_eq!(read_final_block(&f, dests[2]), contents[2]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
+        assert_eq!(f.journal.state_read().tail_block, None);
+    }
+
+    /// Revoke suppression across a DEEP un-checkpointed log (P7c-3 audit (a)):
+    /// a block journaled by T1 and freed by T3 must be suppressed when a single
+    /// checkpoint pass applies FOUR committed-but-un-checkpointed transactions
+    /// oldest-first — the committed-revoke memory holds T3's revoke while T1
+    /// (two transactions older) is applied, and drops it only once the tail
+    /// advances past T3. A control block T1 journaled and no one revoked lands
+    /// normally, proving the deep-log skip is targeted.
+    #[ktest]
+    fn checkpoint_suppresses_across_a_deep_log() {
+        crate::time::clocks::init_for_ktest();
+        let f = journaled_fixture(40, 1, 1);
+        let device = f.fixture.ext4.block_device();
+
+        let (freed, control) = (500u64, 501u64);
+        let mut t1_freed = [0u8; BLOCK_SIZE];
+        t1_freed[..8].copy_from_slice(b"T1FREED!");
+        let mut t1_control = [0u8; BLOCK_SIZE];
+        t1_control[..8].copy_from_slice(b"T1KEEP00");
+
+        // T1 journals `freed` + `control`; T2 journals an unrelated block; T3
+        // frees `freed` (revoke) plus a bitmap-ish capture; T4 journals another
+        // unrelated block. None checkpointed — a four-deep dirty tail.
+        let t1 = make_txn(Tid::new(1), &[(freed, t1_freed), (control, t1_control)]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t1).unwrap();
+        let t2 = make_txn(Tid::new(2), &[(600, [0x22u8; BLOCK_SIZE])]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t2).unwrap();
+        let mut t3 = make_txn(Tid::new(3), &[(601, [0x33u8; BLOCK_SIZE])]);
+        t3.forget_block(freed);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t3).unwrap();
+        let t4 = make_txn(Tid::new(4), &[(602, [0x44u8; BLOCK_SIZE])]);
+        commit_transaction(f.journal.as_ref(), device.as_ref(), t4).unwrap();
+        assert_eq!(f.journal.committed_tid(), Tid::new(4));
+        assert_eq!(f.journal.committed_revoke_records_for_test(), 1);
+
+        // `freed` is reused as file data.
+        let reused_data = [0xEEu8; BLOCK_SIZE];
+        f.fixture
+            .disk
+            .segment()
+            .write_bytes(freed as usize * BLOCK_SIZE, &reused_data)
+            .unwrap();
+
+        // One deep pass: T1's image of `freed` is suppressed (revoke tid 3 ≥ 1),
+        // `control` lands, T2/T3/T4 land, the log cleans, the revoke retires.
+        checkpoint(f.journal.as_ref(), device.as_ref()).unwrap();
+        assert_eq!(
+            read_final_block(&f, freed),
+            reused_data,
+            "a deep-log pass replayed a revoked block's stale image over its reuse"
+        );
+        assert_eq!(read_final_block(&f, control), t1_control);
+        assert_eq!(read_final_block(&f, 600), [0x22u8; BLOCK_SIZE]);
+        assert_eq!(read_final_block(&f, 601), [0x33u8; BLOCK_SIZE]);
+        assert_eq!(read_final_block(&f, 602), [0x44u8; BLOCK_SIZE]);
+        assert_eq!(read_journal_super(&f).s_start.get(), 0);
         assert_eq!(f.journal.committed_revoke_records_for_test(), 0);
     }
 }

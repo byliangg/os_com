@@ -824,14 +824,14 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
             return_errno_with_message!(Errno::EIO, "journal aborted");
         }
 
-        let (tid, epoch) = {
+        let admit = {
             let mut st = journal.state_write();
 
             if let Some(locking) = st.locking.as_ref() {
                 // The locked barrier (see the function docs). Snapshot the
                 // epoch under this lock: staging bumps it, so the wake
                 // cannot be missed.
-                (locking.tid(), journal.credit_release_epoch())
+                Admit::WaitRoom(locking.tid(), journal.credit_release_epoch())
             } else {
                 let created = st.running.is_none();
                 if created {
@@ -840,13 +840,43 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
                     st.running = Some(Transaction::new(tid));
                 }
 
+                // Read the log-position fields before the mutable `running`
+                // borrow (disjoint fields, but the guard derefs as a whole).
+                let (head, tail_block) = (st.head, st.tail_block);
                 // Split the borrow: read the capacity bound off `journal`,
                 // then mutate the running transaction. `running` is `Some`
                 // by construction above.
                 let running = st.running.as_mut().unwrap();
                 let tid = running.tid;
 
-                if check_capacity(journal, running, credits).is_ok() {
+                if check_capacity(journal, running, credits).is_err() {
+                    // Full. Snapshot the release epoch under the same lock
+                    // that observed fullness so a release between dropping
+                    // the lock and sleeping still wakes us.
+                    Admit::WaitRoom(tid, journal.credit_release_epoch())
+                } else if journal.has_commit_servicer() && {
+                    // Log-space backpressure (P7c-3, jbd2
+                    // `__jbd2_log_wait_for_space`): the reservation fits the
+                    // whole ring (capacity), but does it fit the FREE segment
+                    // given the un-checkpointed tail? If not, wait for the
+                    // commit thread to checkpoint the tail forward rather than
+                    // let the transaction build and overflow at commit time.
+                    // Only when a commit thread is running to service the wait;
+                    // without one, admit and let the commit-time fit guard
+                    // drain inline (no servicer to free space, so waiting would
+                    // spin). `credits ≤ max_credits` ⟹ this footprint ≤ usable,
+                    // so a full checkpoint frees enough (the wait terminates).
+                    let revoke_blocks = running.nr_revoke_blocks(journal.geometry().tag_layout());
+                    let reserved_credits = running.nr_metadata_blocks()
+                        + revoke_blocks
+                        + running.outstanding_credits
+                        + credits;
+                    let space_needed =
+                        journal.worst_case_footprint(reserved_credits, revoke_blocks);
+                    space_needed > journal.geometry().free_log_blocks(head, tail_block)
+                } {
+                    Admit::WaitSpace(journal.credit_release_epoch())
+                } else {
                     running.t_updates += 1;
                     running.outstanding_credits += credits;
                     drop(st);
@@ -866,22 +896,27 @@ pub(super) fn journal_start(journal: &Arc<Journal>, credits: usize) -> Result<Ha
                         journal: Arc::downgrade(journal),
                     });
                 }
-
-                // Full. Snapshot the release epoch under the same lock that
-                // observed fullness so a release between dropping the lock
-                // and sleeping still wakes us (it must bump the epoch after
-                // this).
-                (tid, journal.credit_release_epoch())
             }
         };
 
         // Sleeping here can hold the caller's inode locks; see
-        // `wait_for_transaction_room`'s locking contract for why that cannot
-        // deadlock (open handles drain without our locks, and the commit
-        // thread takes no inode lock — its ordered flush uses page-cache
-        // handles cloned in at registration time).
-        journal.wait_for_transaction_room(tid, epoch)?;
+        // `wait_for_transaction_room`/`wait_for_log_space`'s locking contract
+        // for why that cannot deadlock (open handles drain and the commit
+        // thread reclaims log space, neither taking the caller's inode locks).
+        match admit {
+            Admit::WaitRoom(tid, epoch) => journal.wait_for_transaction_room(tid, epoch)?,
+            Admit::WaitSpace(epoch) => journal.wait_for_log_space(epoch)?,
+        }
     }
+}
+
+/// The outcome of one [`journal_start`] admission attempt: a handle was
+/// granted (returned directly), or the caller must wait — for transaction room
+/// (a full running transaction, or the locked barrier) or for log space (the
+/// reservation does not fit the ring's free segment).
+enum Admit {
+    WaitRoom(Tid, u64),
+    WaitSpace(u64),
 }
 
 /// Closes a handle, releasing its credit reservation (jbd2 `jbd2_journal_stop`).
