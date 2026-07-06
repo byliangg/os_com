@@ -951,6 +951,14 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
     }))
 }
 
+/// The `s_errno` value written on a genuine-error abort (commit failure or a
+/// detected inconsistency). jbd2 records the negative aborting errno and
+/// e2fsck only tests the field for non-zero, so this port persists `EIO`'s
+/// POSIX number (`5`) as the "filesystem error, fsck recommended" marker — a
+/// single stable non-zero value, the only error class this port produces. A
+/// deliberate shutdown records nothing (the field stays `0`).
+const S_ERRNO_ERROR_MARKER: u32 = 5;
+
 /// The in-memory journal: the parsed geometry, the running-transaction state,
 /// the committed-tid counter, and the background commit thread (jbd2
 /// `journal_t`).
@@ -997,14 +1005,6 @@ pub(in crate::fs::fs_impls::ext4) fn load_geometry(
 /// takes no inode lock at all: the ordered-data flush works on page-cache
 /// handles cloned in at registration time, the P5 deadlock invariant) —
 /// matching the leaf position the commit pipeline already documents.
-/// The `s_errno` value written on a genuine-error abort (commit failure or a
-/// detected inconsistency). jbd2 records the negative aborting errno and
-/// e2fsck only tests the field for non-zero, so this port persists `EIO`'s
-/// POSIX number (`5`) as the "filesystem error, fsck recommended" marker — a
-/// single stable non-zero value, the only error class this port produces. A
-/// deliberate shutdown records nothing (the field stays `0`).
-const S_ERRNO_ERROR_MARKER: u32 = 5;
-
 pub(super) struct Journal {
     /// The parsed on-disk geometry (the log block map + journal superblock).
     geometry: JournalGeometry,
@@ -1721,6 +1721,16 @@ impl Journal {
             .iter()
             .map(|(&start, run)| (start, run.count))
             .collect()
+    }
+
+    /// Whether any freed run is pinned awaiting its freeing transaction's
+    /// commit — the transient-`ENOSPC` predicate. When a fresh allocation fails
+    /// yet this is true, a commit would release reusable space, so the op layer
+    /// forces one and retries (Linux `ext4_should_retry_alloc`'s "there may be
+    /// free clusters pending release"). Cleared as each freeing transaction
+    /// commits (`release_pinned_frees`).
+    pub(in crate::fs::fs_impls::ext4) fn has_pinned_frees(&self) -> bool {
+        !self.state_read().pinned_frees.is_empty()
     }
 
     /// Spawns the background commit thread (jbd2 `kjournald`).

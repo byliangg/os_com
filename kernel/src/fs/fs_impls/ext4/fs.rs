@@ -902,6 +902,50 @@ impl Ext4 {
         return_errno_with_message!(Errno::ENOSPC, "no free blocks available in any group");
     }
 
+    /// Bounded retry count for a transient (pinned-freed-run) `ENOSPC`, matching
+    /// Linux `ext4_should_retry_alloc`'s `> 3` ceiling: after this many forced
+    /// commits fail to free space, the volume is treated as genuinely full.
+    pub(super) const ALLOC_ENOSPC_RETRIES: u32 = 3;
+
+    /// Whether a failed allocation should be retried after forcing a commit:
+    /// true exactly when a freed run is pinned to an uncommitted transaction, so
+    /// a commit would release reusable space (Linux `ext4_should_retry_alloc`).
+    pub(super) fn should_retry_alloc(&self) -> bool {
+        self.journal()
+            .is_some_and(|journal| journal.has_pinned_frees())
+    }
+
+    /// Runs an allocating operation, retrying a transient pinned-freed-run
+    /// `ENOSPC` after forcing the pinning transaction to commit — the op-level
+    /// half of `ext4_should_retry_alloc` (Linux retries `ext4_write_begin`
+    /// around `jbd2_journal_force_commit_nested`). `attempt` MUST surface a
+    /// retriable `ENOSPC` before durably mutating observable state, so each
+    /// re-run starts clean. The commit-and-wait runs here, between attempts,
+    /// with no filesystem lock and no open handle held — never a commit-wait
+    /// under a lock (iron law 1). A terminal `ENOSPC` (nothing pinned) and every
+    /// other error propagate on the first attempt.
+    pub(super) fn retry_on_pinned_enospc<T>(
+        &self,
+        mut attempt: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let mut retries = 0;
+        loop {
+            match attempt() {
+                Err(e)
+                    if e.error() == Errno::ENOSPC
+                        && retries < Self::ALLOC_ENOSPC_RETRIES
+                        && self.should_retry_alloc() =>
+                {
+                    self.journal()
+                        .expect("should_retry_alloc is true only on a journaled volume")
+                        .commit_and_wait_running()?;
+                    retries += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Frees the physical block run `auth` covers, splitting across groups —
     /// the sole consumption funnel of the forget-before-free protocol.
     ///
@@ -2529,6 +2573,9 @@ mod tests {
                 .unwrap();
         }
         assert!(!journal.pinned_frees_snapshot().is_empty());
+        // The op-layer retry predicate (`ext4_should_retry_alloc`) sees the
+        // pinned space, so a fresh allocation that fails here is retriable.
+        assert!(f.ext4.should_retry_alloc());
 
         // Free space exists (the superblock counter says so), but all of it
         // awaits the commit: ENOSPC — not a wrong block, not a wait.
@@ -2539,6 +2586,11 @@ mod tests {
 
         journal.commit_now_for_test();
         assert!(journal.pinned_frees_snapshot().is_empty());
+        // Commit released the runs: nothing to gain from a retry now, and the
+        // same allocation succeeds — the transition `write_at`/`fallocate`
+        // automate via `retry_on_pinned_enospc` (the loop itself is proven
+        // end-to-end by xfstests generic/102 and generic/371).
+        assert!(!f.ext4.should_retry_alloc());
         let op2 = f.ext4.begin_op(8).unwrap();
         assert!(f.ext4.alloc_blocks(1, 0, op2.get()).is_ok());
         drop(op2);

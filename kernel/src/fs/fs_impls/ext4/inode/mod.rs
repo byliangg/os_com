@@ -815,6 +815,17 @@ pub(super) enum SyncScope {
     DataOnly,
 }
 
+/// `Allocate`-vs-`AllocateKeepSize` intent named at the call site rather than a
+/// bare bool. Whether [`preallocate`](Inode::preallocate) extends `i_size` to
+/// the range end or leaves it unchanged with the blocks reserved past EOF.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeMode {
+    /// `Allocate`: advance `i_size` to the range end on success.
+    Grow,
+    /// `AllocateKeepSize`: leave `i_size` unchanged; blocks are reserved past EOF.
+    Keep,
+}
+
 impl Inode {
     /// Builds a live inode; fails if a data-backed extent root does not parse
     /// (see [`InodePayload::new`]).
@@ -970,11 +981,52 @@ impl Inode {
         if reader.remain() == 0 {
             return Ok(0);
         }
+        let fs = self.fs()?;
+        // `ext4_should_retry_alloc`: a write consuming the last unpinned blocks
+        // can hit a transient `ENOSPC` while a just-freed run (a prior
+        // `unlink`/`truncate`) is still pinned to its uncommitted transaction —
+        // the write/delete churn of generic/102, the write+fallocate race of
+        // generic/371. Force that transaction to commit (releasing the run) and
+        // retry the write, as Linux retries `ext4_write_begin`. Bounded, and only
+        // while a commit could actually free space. Re-running the whole write is
+        // safe because an allocation `ENOSPC` surfaces before any reader byte is
+        // consumed (`try_write_chunk` allocates before `page_cache().write`); the
+        // `remain()` guard refuses to retry a rare post-copy `ENOSPC` that already
+        // advanced the reader. `commit_and_wait_running` runs outside the inner
+        // lock and any open handle (`write_at_once` has returned), so it never
+        // waits for a commit under a filesystem lock (iron law 1).
+        let mut retries = 0;
+        loop {
+            let remain_before = reader.remain();
+            match self.write_at_once(&fs, offset, reader) {
+                Err(e)
+                    if e.error() == Errno::ENOSPC
+                        && reader.remain() == remain_before
+                        && retries < Ext4::ALLOC_ENOSPC_RETRIES
+                        && fs.should_retry_alloc() =>
+                {
+                    fs.journal()
+                        .expect("should_retry_alloc is true only on a journaled volume")
+                        .commit_and_wait_running()?;
+                    retries += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One attempt of [`write_at`](Self::write_at) — the allocating write itself,
+    /// wrapped by `write_at`'s `ext4_should_retry_alloc` retry loop. A transient
+    /// `ENOSPC` here (every free block pinned to an uncommitted freeing
+    /// transaction) is retried by the caller after a commit; a terminal one (the
+    /// volume is genuinely full) propagates. On any `ENOSPC` the reader is left
+    /// unconsumed — allocation precedes the page-cache copy — so the caller's
+    /// re-run is clean.
+    fn write_at_once(&self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
         let write_len = reader.remain();
         let end = offset
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
-        let fs = self.fs()?;
         let mut inner = self.inner.write();
         // Journal handle after the inner lock (inner ① → handle ②): captures the
         // block-bitmap / group-descriptor / extent after-images this write's
@@ -995,13 +1047,13 @@ impl Inode {
         // transaction, and its per-chunk data write is bounded by growing the
         // page cache to the chunk end — the bound the in-place overwrite lacks.
         if op.get().is_some() && offset >= inner.file_size() {
-            return self.write_append_chunked(&fs, offset, end, reader, &mut op, &mut inner);
+            return self.write_append_chunked(fs, offset, end, reader, &mut op, &mut inner);
         }
 
         // `get_mut`: the write spine holds the handle by `&mut` so the
         // `journal_restart` seam is reachable; the per-handle descriptor capture
         // below reverts to the shared `get`.
-        let len = inner.write_at(&fs, offset, reader, op.get_mut())?;
+        let len = inner.write_at(fs, offset, reader, op.get_mut())?;
         // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
         // and — for an inline root — the extent mapping itself) must ride the
         // SAME transaction as the bitmap/GDT captures above, or a crash
@@ -1011,7 +1063,7 @@ impl Inode {
         // inode under every handle (ext4_mark_inode_dirty); this is our
         // equivalent.
         if op.get().is_some() {
-            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            inner.write_back_inode_desc(fs, self.ino, op.get())?;
             // Data-relevant (this write may map blocks and/or grow `i_size`):
             // `fdatasync` must commit this capture to retrieve the data.
             inner.stamp_datasync_tid(op.get());
@@ -1429,8 +1481,17 @@ impl Inode {
             return Ok(());
         }
         match mode {
-            FallocMode::Allocate => self.preallocate(offset, len, true),
-            FallocMode::AllocateKeepSize => self.preallocate(offset, len, false),
+            // `ext4_should_retry_alloc` around the reservation too: generic/371
+            // races a `fallocate` against a `write`, and either can meet a
+            // transient `ENOSPC` while the other's freed run is pinned. Retrying
+            // is clean — `preallocate` advances `i_size` only on success, and the
+            // page-cache grow it does first is unobservable until then.
+            FallocMode::Allocate => self
+                .fs()?
+                .retry_on_pinned_enospc(|| self.preallocate(offset, len, SizeMode::Grow)),
+            FallocMode::AllocateKeepSize => self
+                .fs()?
+                .retry_on_pinned_enospc(|| self.preallocate(offset, len, SizeMode::Keep)),
             FallocMode::PunchHoleKeepSize => self.punch_hole(offset, len),
             FallocMode::ZeroRange
             | FallocMode::ZeroRangeKeepSize
@@ -1445,9 +1506,9 @@ impl Inode {
     /// Reserves UNWRITTEN blocks over `[offset, offset + len)`: any hole in the
     /// range is allocated as an unwritten extent (reads zero until a real write
     /// converts it — the Unwritten-first protocol), pre-existing written and
-    /// unwritten extents are left as-is. `grow_size` extends `i_size` to the range
-    /// end (`Allocate`); otherwise `i_size` is unchanged and the blocks are
-    /// reserved past EOF (`KEEP_SIZE`).
+    /// unwritten extents are left as-is. `SizeMode::Grow` extends `i_size` to the
+    /// range end (`Allocate`); `SizeMode::Keep` leaves `i_size` unchanged and the
+    /// blocks are reserved past EOF (`AllocateKeepSize`).
     ///
     /// Chunked + restarted like the append write path: a large preallocation maps
     /// more metadata than one transaction holds (a fragmented run, a deep tree),
@@ -1460,7 +1521,7 @@ impl Inode {
     /// the rest holes — both read zero, and `i_size` is still the pre-op value or
     /// the final one, never a torn intermediate — so no orphan protection is
     /// needed.
-    fn preallocate(&self, offset: usize, len: usize, grow_size: bool) -> Result<()> {
+    fn preallocate(&self, offset: usize, len: usize, size_mode: SizeMode) -> Result<()> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "fallocate range overflow"))?;
@@ -1484,7 +1545,7 @@ impl Inode {
         // `EFBIG`) leaves it at `old_size`. The grown page cache past `old_size`
         // is harmless residue — `read_at` clamps reads to `i_size`, and no page
         // there was dirtied.
-        if grow_size && end > old_size {
+        if size_mode == SizeMode::Grow && end > old_size {
             inner.resize_page_cache(end, old_size)?;
         }
 
@@ -1498,7 +1559,7 @@ impl Inode {
         // committed in the same transaction as the final descriptor writeback
         // below. Never reached on the failure path above, so a failed `Allocate`
         // reports `old_size` unchanged.
-        if grow_size && end > old_size {
+        if size_mode == SizeMode::Grow && end > old_size {
             inner.set_file_size(end);
         }
         // A pure metadata operation: `fallocate` bumps ctime/mtime like Linux.
@@ -1649,25 +1710,30 @@ impl Inode {
             }
         }
 
-        let has_full_blocks = aligned_start < aligned_end;
-        let (first_block, stop_block) = if has_full_blocks {
-            (
+        // The fully-covered block range, if any: `None` when the punch touches
+        // only partial edge blocks (no whole block to free), so the "no full
+        // blocks" state is unrepresentable rather than a `(0, 0)` placeholder
+        // kept valid by a parallel bool.
+        let full_blocks: Option<(Iblock, Iblock)> = if aligned_start < aligned_end {
+            Some((
                 Iblock::try_from(aligned_start / BLOCK_SIZE).map_err(|_| {
                     Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
                 })?,
                 Iblock::try_from(aligned_end / BLOCK_SIZE).map_err(|_| {
                     Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
                 })?,
-            )
+            ))
         } else {
-            (0, 0)
+            None
         };
 
         // Flush then evict the fully-covered page range so post-punch reads see
         // the new hole as zeros (Linux truncate_pagecache_range); flush-first
         // keeps an earlier committing transaction's ordered obligation from being
         // orphaned (the `prepare_shrink` invariant).
-        if has_full_blocks && let Ok(pages) = inner.page_cache() {
+        if full_blocks.is_some()
+            && let Ok(pages) = inner.page_cache()
+        {
             pages.invalidate_range(aligned_start..aligned_end)?;
         }
 
@@ -1689,7 +1755,7 @@ impl Inode {
             )?;
         }
 
-        if has_full_blocks {
+        if let Some((first_block, stop_block)) = full_blocks {
             loop {
                 // The per-transaction ceiling — the EFBIG floor inside
                 // `punch_chunk`. Present on the journaled volume this loop needs.
