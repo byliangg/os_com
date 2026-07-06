@@ -1,194 +1,99 @@
-<p align="center">
-    <img src="book/src/images/logo_en.svg" alt="asterinas-logo" width="620"><br>
-    Toward a production-grade Linux alternative—memory safe, high-performance, and more<br/>
-</p>
+# EXT4 on Asterinas · 面向 RustOS 的高性能强一致性文件系统
 
-<!-- Asterinas NixOS 0.18.0 demo. It is uploaded as a Github attachment
-so that GitHub will render that URL as a video player in Markdown.
-The original file name will be displayed up in the top bar of the video player.
-So make sure you give the video file a cool name before uploading it.
--->
-https://github.com/user-attachments/assets/eabf8674-8503-44f7-abcc-52395d2ca4a3
+在 **星绽(Asterinas)** framekernel 上,用 Rust 从零实现的 **ext4** 文件系统。不移植 Linux 的 C 代码,磁盘格式和算法对齐 Linux 6.6,代码风格贴 Asterinas 里已有的 ext2。
 
+> **2026 年全国大学生计算机系统能力大赛 · 操作系统设计赛 · OS 功能挑战赛道**
+> 赛题:面向 RustOS 的高性能强一致性文件系统研究(Research on High-Performance and Strong-Consistency File System for RustOS)
+>
+> 本仓库基于 [Asterinas](https://github.com/asterinas/asterinas)(上游 README 在 git 历史里)。ext4 的全部代码在 [`kernel/src/fs/fs_impls/ext4/`](kernel/src/fs/fs_impls/ext4/),约 3.9 万行 Rust。
 
+## 现在做到哪一步
 
-<p align="center">
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86.yml/badge.svg?event=push" alt="Test x86-64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_riscv.yml/badge.svg?event=push" alt="Test riscv64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_loongarch.yml/badge.svg?event=push" alt="Test loongarch64" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_x86_tdx.yml/badge.svg" alt="Test Intel TDX" style="max-width: 100%;"></a>
-    <a href="https://github.com/asterinas/asterinas/actions/workflows/test_nixos_full.yml"><img src="https://github.com/asterinas/asterinas/actions/workflows/test_nixos_full.yml/badge.svg?event=schedule" alt="Test AsterNixOS (full)" style="max-width: 100%;"></a>
-    <a href="https://asterinas.github.io/benchmark/x86-64/"><img src="https://github.com/asterinas/asterinas/actions/workflows/benchmark_x86.yml/badge.svg" alt="Benchmark x86-64" style="max-width: 100%;"></a>
-    <a href="https://asterinas.github.io/benchmark/tdx/"><img src="https://github.com/asterinas/asterinas/actions/workflows/benchmark_x86_tdx.yml/badge.svg" alt="Benchmark Intel TDX" style="max-width: 100%;"></a>
-    <br/>
-</p>
+赛题分基础 / 进阶 / 优秀三档。功能面已经覆盖到优秀档(完整 JBD2 日志 + 多文件并发),正确性达标,性能对标留到收尾阶段:
 
-**News:**
-* 2025-12-08: **FAST 2026** accepted a paper on a novel secure storage solution having been integrated into Asterinas: _MlsDisk: Trusted Block Storage for TEEs Based on Layered Secure Logging_.
-* 2025-10-17: **ICSE 2026** accepted yet another paper about Asterinas: _RusyFuzz: Unhandled Exception Guided Fuzzing for Rust OS Kernel_.
-* 2025-10-14: [*CortenMM: Efficient Memory Management with Strong Correctness Guarantees*](https://dl.acm.org/doi/10.1145/3731569.3764836) received the **Best Paper Award** at **SOSP 2025**.
-* 2025-07-23: **SOSP 2025** accepted another Asterinas paper: [*CortenMM: Efficient Memory Management with Strong Correctness Guarantees*](https://dl.acm.org/doi/10.1145/3731569.3764836).
-* 2025-06-18: **USENIX _;login:_ magazine** published [*Asterinas: A Rust-Based Framekernel to Reimagine Linux in the 2020s*](https://www.usenix.org/publications/loginonline/asterinas-rust-based-framekernel-reimagine-linux-2020s).
-* 2025-04-30: **USENIX ATC 2025** accepted two Asterinas papers:
-    1. [*Asterinas: A Linux ABI-Compatible, Rust-Based Framekernel OS with a Small and Sound TCB*](https://www.usenix.org/conference/atc25/presentation/peng-yuke);
-    2. [*Converos: Practical Model Checking for Verifying Rust OS Kernel Concurrency*](https://www.usenix.org/conference/atc25/presentation/tang).
+| 维度 | 优秀档门槛 | 现状 |
+|---|---|---|
+| 功能 | JBD2 完整 + 并发 | ✅ revoke / 组提交 / 懒 checkpoint / 日志校验和 / 64bit 全接线 |
+| 正确性 | xfstests ≥ 95% | ✅ **63 / 66 = 95.5%** |
+| 崩溃一致性 | 100% 一致 | ✅ 160 个 workload 掉电,e2fsck 全 CLEAN |
+| 性能 | ≥ Linux 90% + 一项 ≥5% 优化 | ◐ buffered 顺序写 21% / 暖读 75%,优化在收尾阶段 |
 
-Congratulations to the Asterinas community🎉🎉🎉
+## 实现了哪些功能
 
-## Introducing Asterinas
+**POSIX 接口**:create、open、close、read、write、truncate、lseek、mkdir、rmdir、unlink、rename、stat、mknod、symlink、link、readdir、fsync、fdatasync、fallocate、statfs 等。
 
-The future of operating systems (OSes) belongs to Rust—a modern systems programming language (PL)
-that delivers safety, efficiency, and productivity at once.
-The open question is not _whether_ OS kernels should transition from C to Rust,
-but _how_ we get there.
+**ext4 核心特性**:
 
-Linux follows an _incremental_ path.
-While the Rust for Linux project has successfully integrated Rust as an official second PL,
-this approach faces _inherent friction_.
-As a newcomer within a massive C codebase,
-Rust must often compromise on safety, efficiency, clarity, and ergonomics
-to maintain compatibility with legacy structures.
-And while new Rust code can improve what it touches,
-it cannot retroactively eliminate _vulnerabilities_ in decades of existing C code.
+- **Extent 块映射** —— depth≤2 的 extent 树;写洞时先分配成 unwritten(读出来是零),写完再在同一个事务里转成 written,避免崩溃后暴露别的文件释放掉的陈旧数据。
+- **JBD2 完整日志** —— ordered 数据模式;事务 / 组提交 / 懒 checkpoint / revoke;崩溃恢复三遍扫描(SCAN / REVOKE / REPLAY);日志校验和 v2/v3;64bit tag;精确的信用记账 + 空间背压;abort 后转只读;`EXT4_IOC_SHUTDOWN`。
+- **崩溃一致性** —— RECOVER 位的整个生命周期;孤儿链回收,以及把被中断的 truncate 续做完。
+- **目录** —— 线性目录的全套命名空间操作;htree 索引读 + 插入前降级为线性;目录哈希与 e2fsprogs 逐位对拍。
+- **块 / inode 分配** —— 位图 first-fit;flex_bg;BLOCK_UNINIT / INODE_UNINIT 惰性初始化;ENOSPC 后提交再重试。
+- **现代特性** —— metadata_csum(crc32c,校验超级块 / 组描述符 / inode / 位图 / extent / 目录六种结构)、64bit、flex_bg、HUGE_FILE。
+- **持久化** —— fsync / fdatasync(tid 级区分)、O_SYNC / O_DSYNC、整卷 sync。
 
-Asterinas takes a _clean-slate_ approach.
-By building a Linux-compatible, general-purpose OS kernel from the ground up in Rust,
-we are liberated from the constraints of a legacy C codebase—its interfaces, designs, and assumptions—and from the need to preserve historical compatibility for outdated platforms.
-**Languages—including PLs—shape our way of thinking**.
-Through the lens of a modern PL, Asterinas rethinks and modernizes the construction of OS kernels:
+镜像特性接近默认 `mke2fs`(`has_journal,extent,filetype,metadata_csum,dir_index,64bit,flex_bg`),块大小 4K、inode 256 字节。
 
-* **Modern architecture.**
-  Asterinas pioneers the [_framekernel_](https://asterinas.github.io/book/kernel/the-framekernel-architecture.html) architecture,
-  combining monolithic-kernel performance with microkernel-inspired separation.
-  Unsafe Rust is confined to a small, auditable framework called [OSTD](https://asterinas.github.io/api-docs-nightly/ostd/),
-  while the rest of the kernel is written in safe Rust,
-  keeping the memory-safety TCB intentionally minimal.
+## 性能(fio / SQLite)
 
-* **Modern design.**
-  Asterinas learns from Linux's hard-won engineering lessons,
-  but it is not afraid to deviate when the design warrants it.
-  For example, Asterinas improves the CPU scalability of its memory management subsystem
-  with a novel scheme called [CortenMM](https://dl.acm.org/doi/10.1145/3731569.3764836).
+对标 Linux 6.16,同一个容器、同一套 QEMU、同一块盘、同轮交替测,buffered(`-direct=0`),**串行跑**(并发会污染吞吐数):
 
-* **Modern code.**
-  Asterinas's codebase prioritizes safety, clarity, and maintainability.
-  Performance is pursued aggressively, but never by compromising safety guarantees.
-  Readability is treated as a feature, not a luxury,
-  and the codebase is structured to avoid hidden, cross-module coupling.
+| 用例 | 本实现 | Linux 6.16 | 比值 |
+|---|---:|---:|---:|
+| fio 顺序写(1M) | 162 MiB/s | 766 MiB/s | **21%** |
+| fio 顺序读(暖,命中页缓存) | 5020 MiB/s | 6693 MiB/s | **75%** |
+| fio 顺序读(冷) | 30.7 MiB/s | 5044 MiB/s | 口径污染,不采信 |
+| SQLite `speedtest1 --size 1000` | 未跑完 | 57.3s | — |
 
-* **Modern tooling.**
-  Asterinas ships a purpose-built toolkit, [OSDK](https://asterinas.github.io/book/osdk/guide/index.html),
-  to facilitate building, running, and testing Rust kernels or kernel components.
-  Powered by OSTD,
-  OSDK makes kernel development as easy and fluid as writing a standard Rust application, eliminating the traditional friction of OS engineering.
+两点要说清楚。冷读那一档,host 的 `drop_caches` 在容器里没权限,两侧都被宿主的页缓存污染,所以只有写(21%)和暖读(75%)的比值是干净的。SQLite 跑不完,是崩在 CREATE INDEX:带索引的插入会把 extent 树打碎,每插一条就重写整棵树(O(n²)),这正是下面"还没实现"里排第一的那笔。这些数字是**性能优化之前的地板基线**。
 
-Asterinas aims to become **a production-grade, memory-safe Linux alternative**,
-with performance that matches Linux—and in some scenarios, exceeds it.
-The project has been under active development for four years,
-supports 230+ Linux system calls,
-and has launched an experimental distribution,
-[Asterinas NixOS](https://asterinas.github.io/book/distro/index.html).
+## 还没实现
 
-In 2026, our priority is to advance project maturity toward production readiness,
-specifically targeting standard and confidential virtual machines on x86-64.
-Looking ahead, we will continue to expand functionality and 
-harden the system for **mission-critical deployments**
-in data centers, autonomous vehicles, and embodied AI.
+按赛题路线,下面这些留给收尾的两个阶段(崩溃穷举验证 / 性能优化 + 文档):
 
-## Getting Started
+- **extent 树就地增删** —— 现在每次插入都重写整棵树,高碎片或带索引的负载会崩(SQLite 的 CREATE INDEX 就是)。改成 Linux 那样就地改树,是最要紧的一笔。
+- **O_DIRECT** —— 写会返回 `EOPNOTSUPP`,读则静默走页缓存。ext2 已经有、我们还没做,算是对 ext2 的一处功能回退。
+- **块分配器优化** —— 现在只是 first-fit 骨架,Orlov 铺散和局部性都没做(这是赛题点名要的那项 ≥5% 优化)。
+- 其它:htree 的构建(让大目录插入保持 O(log n),现在是插入前降级线性)、冷读 readahead、mmap 写洞的回写、`minixdf` 版 statfs。
 
-### Supported CPU Architectures
+**明确不做**(带这些特性的镜像会被直接拒挂):fast_commit、bigalloc、casefold、加密 / verity、resize / migrate、mmp、inline_data、外部日志、`data=journal`。
 
-Asterinas targets modern, 64-bit platforms only.
+## 怎么测
 
-A **development platform** is where you build and test Asterinas
-(i.e., the host machine running the Docker-based development environment).
+所有构建和测试都在固定版本的 Docker 容器里跑,换台机器拉同一个镜像就能复现同样的结果:
 
-| Development Platform |
-| -------------------- |
-| x86-64               |
-| ARM64                |
+```bash
+docker run -it --privileged --network=host -v /dev:/dev \
+  -v $(pwd)/asterinas:/root/asterinas \
+  asterinas/asterinas:0.18.0-20260618
+# 进容器后,下面的命令都在 /root/asterinas 下跑
+```
 
-A **deployment platform** is a CPU architecture
-that Asterinas can run on as an OS kernel.
+测试分四层,职责不重叠:
 
-| Deployment Platform | Tier   |
-| ------------------- | ------ |
-| x86-64              | Tier 1 |
-| x86-64 (Intel TDX)  | Tier 2 |
-| RISC-V 64           | Tier 2 |
-| LoongArch 64        | Tier 3 |
+| 层 | 测什么 | 怎么跑 | 结果 |
+|---|---|---|---|
+| 单元(ktest) | extent 树、目录项、位图分配、日志、校验和等内部逻辑 | `make ktest` | **510** 全过 |
+| xfstests | POSIX 一致性,真实镜像端到端 | 由 Makefile 的 `XFSTESTS_RUNLIST` 指定清单(在 [`test/initramfs/src/conformance/xfstests/`](test/initramfs/src/conformance/xfstests/)),在 guest 里跑官方 `./check` | **63 / 66 = 95.5%** |
+| 崩溃一致性 | 掉电后日志重放是否一致 | `bash test/crash/run_matrix.sh` | 160 workload × 掉电点,e2fsck 全 CLEAN |
+| 性能 | 对标 Linux ext4 | `bash test/initramfs/src/benchmark/run_ext4_bench.sh <suite/job>` | 见上表 |
 
-Tier definitions:
-- **Tier 1:** Fully supported and tested.
-  CI runs the full test suite on every PR.
-- **Tier 2:** Actively developed with basic functionality working.
-  CI runs build checks and basic tests on a regular basis
-  (per PR for RISC-V and nightly for Intel TDX),
-  but the full test suite is not yet covered.
-- **Tier 3:** Early-stage or experimental.
-  The kernel can boot and perform basic operations,
-  but CI coverage is limited and
-  may not include automated runtime tests for every pull request.
+- **崩溃 harness**:QEMU 用 `blklogwrites` 录下写流,在每个 FLUSH 点做前缀重放,再用 e2fsck 严格模式(`-fy`)判一致。
+- **xfstests 口径**:清单继承自上游 Asterinas 的 ext2 CI。通过率 = PASS /(PASS + 真 FAIL),NOTRUN 和环境崩溃不计入分母,并逐条写明原因。95.5% 里唯一"跑不了"的一批,全是 O_DIRECT 用例,正好对应上面那处功能回退。
 
-### For End Users
+## 代码结构
 
-We provide [Asterinas NixOS ISO Installer](https://github.com/asterinas/asterinas/releases)
-to make the Asterinas kernel more accessible for early adopters and enthusiasts.
-We encourage you to try out Asterinas NixOS and share feedback.
-Instructions on how to use the ISO installer can be found [here](https://asterinas.github.io/book/distro/index.html#end-users).
+```
+kernel/src/fs/fs_impls/ext4/
+├── super_block.rs / feature.rs   挂载、特性门、几何校验
+├── block_group.rs                组描述符、位图、first-fit 分配、flex_bg
+├── inode/                        inode 编解码、读写、truncate、fallocate
+│   ├── extent_manager/           extent 树(逻辑块↔物理块映射)
+│   └── dir/                      目录项、htree 读、目录哈希
+├── journal/                      自研 JBD2(事务 / 提交 / 恢复 / revoke / checkpoint / 格式)
+└── impl_for_vfs/                 VFS trait 实现(FileOps / Inode / FileSystem)
+```
 
-**Disclaimer: Asterinas is an independent, community-led project.
-Asterinas NixOS is _not_ an official NixOS project and has _no_ affiliation with the NixOS Foundation. _No_ sponsorship or endorsement is implied.**
+## 说明
 
-### For Kernel Developers
-
-Follow the steps below to get Asterinas up and running.
-
-1. Download the latest source code on an x86-64 (or ARM64) Linux machine:
-
-    ```bash
-    git clone https://github.com/asterinas/asterinas
-    ```
-
-2. Run a Docker container as the development environment:
-
-    ```bash
-    docker run -it --privileged --network=host -v /dev:/dev -v $(pwd)/asterinas:/root/asterinas asterinas/asterinas:0.18.0-20260618
-    ```
-
-    Alternatively, if you use VS Code with the
-    [Dev Containers](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers)
-    extension, open the cloned folder and select "Reopen in Container".
-
-3. Inside the container,
-go to the project folder (`/root/asterinas`) and run:
-
-    ```bash
-    make kernel
-    make run_kernel
-    ```
-
-    This results in a VM running the Asterinas kernel with a small initramfs.
-
-4. To install and test real-world applications on Asterinas,
-build and run Asterinas NixOS in a VM:
-
-    ```bash
-    make nixos
-    make run_nixos
-    ```
-    
-    This boots into an interactive shell in Asterinas NixOS,
-    where you can use Nix to install and try more packages.
-
-## The Book
-
-See [The Asterinas Book](https://asterinas.github.io/book/) to learn more about the project.
-
-## License
-
-Asterinas's source code and documentation primarily use the
-[Mozilla Public License (MPL), Version 2.0](https://github.com/asterinas/asterinas/blob/main/LICENSE-MPL).
-Select components are under more permissive licenses,
-detailed [here](https://github.com/asterinas/asterinas/blob/main/.licenserc.yaml). For the rationales behind the choice of MPL, see [here](https://asterinas.github.io/book/index.html#licensing).
+本项目是在 [Asterinas](https://github.com/asterinas/asterinas)(星绽,一个 Rust framekernel)之上从零实现的 ext4,遵循 Asterinas 的代码规范,目标是能合入上游。除 ext4 之外的内核部分都是 Asterinas 上游代码。许可证沿用 Asterinas:MPL-2.0。
