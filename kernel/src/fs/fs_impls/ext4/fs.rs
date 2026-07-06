@@ -918,12 +918,18 @@ impl Ext4 {
     /// Runs an allocating operation, retrying a transient pinned-freed-run
     /// `ENOSPC` after forcing the pinning transaction to commit — the op-level
     /// half of `ext4_should_retry_alloc` (Linux retries `ext4_write_begin`
-    /// around `jbd2_journal_force_commit_nested`). `attempt` MUST surface a
-    /// retriable `ENOSPC` before durably mutating observable state, so each
-    /// re-run starts clean. The commit-and-wait runs here, between attempts,
-    /// with no filesystem lock and no open handle held — never a commit-wait
-    /// under a lock (iron law 1). A terminal `ENOSPC` (nothing pinned) and every
-    /// other error propagate on the first attempt.
+    /// around `jbd2_journal_force_commit_nested`). `attempt` MUST be safe to
+    /// re-run after a retriable `ENOSPC`: whatever a failed attempt already
+    /// committed (e.g. `preallocate` maps earlier chunks across a
+    /// `journal_restart` before a later chunk fails) must be idempotent under the
+    /// re-run — already-reserved ranges are reused (Unwritten-first leaves
+    /// pre-existing extents as-is) and observable size/contents advance only on
+    /// full success. (`write_at` re-runs instead on the guarantee that its reader
+    /// is untouched, so it open-codes its own `remain()`-guarded loop rather than
+    /// this helper.) The commit-and-wait runs here, between attempts, with no
+    /// filesystem lock and no open handle held — never a commit-wait under a lock
+    /// (iron law 1). A terminal `ENOSPC` (nothing pinned) and every other error
+    /// propagate on the first attempt.
     pub(super) fn retry_on_pinned_enospc<T>(
         &self,
         mut attempt: impl FnMut() -> Result<T>,
