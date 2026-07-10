@@ -37,7 +37,7 @@ fi
 
 manifest() { # $1 = image, output on stdout
     MD5="$MD5" python3 - "$1" <<'PYEOF'
-import os, re, subprocess, sys
+import hashlib, os, re, subprocess, sys
 
 img = sys.argv[1]
 want_md5 = os.environ.get("MD5") == "1"
@@ -131,7 +131,6 @@ for path, ino, mode in entries:
         c = subprocess.run(
             ["debugfs", "-R", "cat <%d>" % ino, img], capture_output=True, env=ENV
         )
-        import hashlib
 
         cols.append("md5=%s" % hashlib.md5(c.stdout).hexdigest())
     lines.append("\t".join(cols))

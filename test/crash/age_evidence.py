@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import walcheck as W  # noqa: E402
 
 MAGIC = b"X4CKPT1!"
-JBD2_MAGIC = b"\xc0\x3b\x39\x98"
+JBD2_MAGIC = W.JBD2_MAGIC_BYTES
 
 
 def main(argv):
@@ -60,7 +60,7 @@ def main(argv):
     commits = []  # (entry idx, sequence)
     nflush = 0
     for e in entries:
-        if e.flags & 0x1:
+        if e.flags & W.LOG_FLUSH_FLAG:
             nflush += 1
             continue
         if e.flags != 0:
@@ -74,7 +74,7 @@ def main(argv):
             continue
         if data[:4] == JBD2_MAGIC and len(data) >= 12:
             btype = struct.unpack(">I", data[4:8])[0]
-            if btype == 2:
+            if btype == W.BT_COMMIT:
                 commits.append((e.idx, struct.unpack(">I", data[8:12])[0]))
 
     print(f"age_evidence: {len(entries)} entries, {nflush} flushes, "

@@ -1,3 +1,5 @@
+# Corpus-shrink expectation: every name below must stay convertible by
+# jlang2sh.py; run_matrix.sh red-flags a shrink (converter regression).
 j-lang1
 j-lang10
 j-lang100

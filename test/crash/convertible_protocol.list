@@ -1,3 +1,5 @@
+# Corpus-shrink expectation: every name below must stay convertible by
+# jlang2sh.py; run_matrix.sh red-flags a shrink (converter regression).
 ace01-link-unlink
 ace05-generic034
 ace06-generic039

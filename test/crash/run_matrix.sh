@@ -51,6 +51,10 @@
 #                     its write log AND saves its pristine image, which
 #                     together re-derive every crash state).
 #
+# Environment: X4_SHM (staging root, default /dev/shm),
+#   X4_CONVERTIBLE_LIST (corpus-shrink expectation list, default
+#   convertible_<corpus-dir>.list next to this script).
+#
 # Continue-on-red: sweeps run in ledger mode (sweep.sh X4_LEDGER) — every
 # judged point lands in $BUILD/matrix.sK.progress.tsv, a red point is
 # recorded (with evidence under $BUILD/matrix-evidence/sK/) and the sweep
@@ -79,7 +83,7 @@
 set -eu
 
 usage() {
-    sed -n 's/^# \{0,1\}//p' "$0" | sed -n '3,60p' >&2
+    awk 'NR<3 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0" >&2
     exit 2
 }
 
@@ -231,7 +235,7 @@ printf '%s\n' ${raw_names[@]+"${raw_names[@]}"} | grep -v '^$' \
 # convertible-expectation list, every expected name must still convert.
 EXPECT_LIST=${X4_CONVERTIBLE_LIST:-$HERE/convertible_$(basename "$JLANG_DIR").list}
 if [ "$explicit" -eq 0 ] && [ -f "$EXPECT_LIST" ]; then
-    lost=$(comm -23 <(LC_ALL=C sort "$EXPECT_LIST") \
+    lost=$(comm -23 <(grep -v '^#' "$EXPECT_LIST" | LC_ALL=C sort) \
         <(printf '%s\n' ${taken_names[@]+"${taken_names[@]}"} \
                         ${raw_names[@]+"${raw_names[@]}"} | LC_ALL=C sort))
     if [ -n "$lost" ]; then

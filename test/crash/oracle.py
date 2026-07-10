@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: MPL-2.0
 """The crash-durability data oracle (B3 auto-checker, CrashMonkey-style).
 
+("X4" throughout this harness is the ext4 crash-suite namespace prefix —
+greppable and collision-free in guest consoles and on-disk markers.)
+
 Judges what e2fsck cannot: that every entity the workload *persisted*
 (fsync/fdatasync/sync, as instrumented by `jlang2sh.py --oracle`) survives
 the crash with exactly the promised content, and that no freed/stale bytes

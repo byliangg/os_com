@@ -219,10 +219,10 @@ for s in $ROWS; do
 done
 if [ $e2red -eq 0 ]; then
     echo "selfcheck_extra: WARNING — the strict e2fsck judge reddened NONE of" >&2
-    echo "  the corruption samples. Known cause: judge.sh matches e2fsck's" >&2
-    echo "  English output, but a non-English locale (e.g. zh_CN) makes e2fsck" >&2
-    echo "  print translated repair messages, greening real corruption. Run" >&2
-    echo "  sweeps under LC_ALL=C or inside the build container." >&2
+    echo "  the corruption samples. judge.sh pins LC_ALL=C internally, so a" >&2
+    echo "  caller locale can no longer cause this (historical cause, fixed" >&2
+    echo "  in the same commit that widened the repair-verb grep). If this" >&2
+    echo '  fires, suspect the e2fsck build or the "? yes" verdict grep.' >&2
 fi
 
 if [ $fail -ne 0 ]; then

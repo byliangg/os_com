@@ -24,7 +24,7 @@
 #   point  entry  verdict  workload-hint  signature  evidence
 # where `point` is the global judged-point ordinal ("final" for the
 # end-of-log state), `entry` the replay-log entry number of the FLUSH,
-# `verdict` GREEN or RED, `workload-hint` a best-effort attribution (the
+# `verdict` GREEN, RED, or OPERR (judge operational error — sweep refuses to resume past it), `workload-hint` a best-effort attribution (the
 # first corpus workload named in the judge output — the oracle names its
 # victim; structural reds usually cannot be attributed and stay "-"),
 # `signature` a digest of the judge output with volatile paths stripped
