@@ -330,11 +330,11 @@ def judge(table_path, img_path, final=False, expected_workloads=None):
 
     failures = []
     assertions = []  # (workload, ckpt_ord, path, kind, size, md5)
-    inforce_workloads = 0
+    in_force_workloads = 0
 
     for wl, ords in sorted(found.items()):
         top = max(ords)
-        inforce_workloads += 1
+        in_force_workloads += 1
         want = set(range(1, top + 1))
         if ords != want:
             missing = sorted(want - ords)
@@ -442,7 +442,7 @@ def judge(table_path, img_path, final=False, expected_workloads=None):
             print(f"  {f}")
         return 1
     print(
-        f"oracle {tag}: {inforce_workloads} workloads in force, "
+        f"oracle {tag}: {in_force_workloads} workloads in force, "
         f"{len(assertions)} assertions ok"
         + (f", {len(table.unavail)} UNAVAIL (skipped: {[w for w, _ in table.unavail]})"
            if table.unavail else "")
