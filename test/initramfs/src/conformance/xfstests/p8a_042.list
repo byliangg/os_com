@@ -1,0 +1,3 @@
+# P8a a7 task2: ext4/042 statfs bsddf/minixdf — rerun after wiring the
+# minixdf mount option through Ext4::open (mirror of ext2's option parsing).
+ext4/042

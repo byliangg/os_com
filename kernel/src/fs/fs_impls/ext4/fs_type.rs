@@ -30,7 +30,7 @@ impl FsType for Ext4Type {
 
     fn create(&self, fs_creation_ctx: &FsCreationCtx) -> Result<Arc<dyn FileSystem>> {
         let disk = fs_creation_ctx.resolve_block_device()?;
-        Ext4::open(disk).map(|fs| fs as Arc<dyn FileSystem>)
+        Ext4::open(disk, fs_creation_ctx.args()).map(|fs| fs as Arc<dyn FileSystem>)
     }
 
     fn sysnode(&self) -> Option<Arc<dyn SysNode>> {

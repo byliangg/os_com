@@ -525,7 +525,7 @@ impl Ext4FixtureBuilder {
             )?;
         }
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>)?;
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None)?;
         Ok(Ext4Fixture { disk, ext4, sb })
     }
 }

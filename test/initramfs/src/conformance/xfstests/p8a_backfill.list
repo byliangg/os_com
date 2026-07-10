@@ -1,0 +1,6 @@
+# P8a a7 task1: P5_blocked.tsv rows whose "fallocate unimplemented" exclusion
+# went stale after P7e-3 landed prealloc+punch. Quick trio; generic/619
+# (ENOSPC stress) runs in its own boot via p8a_enospc.list.
+generic/392
+generic/469
+generic/568

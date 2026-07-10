@@ -6,7 +6,7 @@ use aster_block::{BLOCK_SIZE, bio::BioStatus};
 
 use crate::{
     fs::{
-        fs_impls::ext4::{Ext4, super_block::MAGIC_NUM},
+        fs_impls::ext4::{Ext4, fs::StatBlockAccounting, super_block::MAGIC_NUM},
         utils::NAME_MAX,
         vfs::{
             file_system::{FileSystem, FsEventSubscriberStats, FsFlags, SuperBlock},
@@ -61,20 +61,28 @@ impl FileSystem for Ext4 {
 
     fn sb(&self) -> SuperBlock {
         let sb = self.super_block();
-        // `f_blocks` reports usable capacity, not the raw device size: the total
-        // block count minus the filesystem's metadata overhead — superblock/GDT
-        // copies, bitmaps, inode tables (`SuperBlock::metadata_overhead`), and the
-        // journal — matching Linux `ext4_statfs` (`ext4_blocks_count -
-        // s_overhead`). Linux caches `s_overhead_clusters` but recomputes it on
-        // every non-`bigalloc` mount (`super.c`: it zeroes the cached value unless
-        // `bigalloc`); `bigalloc` is not in `RO_COMPAT_SUPP`, so every volume we
-        // mount takes the recompute path, which is provably equal to the cached
-        // value here.
-        let journal_overhead = self
-            .journal()
-            .map_or(0, |journal| journal.total_log_blocks());
-        let overhead = sb.metadata_overhead().saturating_add(journal_overhead);
-        let usable_blocks = sb.total_blocks().saturating_sub(overhead);
+        // By default (`bsddf`), `f_blocks` reports usable capacity, not the raw
+        // device size: the total block count minus the filesystem's metadata
+        // overhead — superblock/GDT copies, bitmaps, inode tables
+        // (`SuperBlock::metadata_overhead`), and the journal — matching Linux
+        // `ext4_statfs` (`ext4_blocks_count - s_overhead`). Linux caches
+        // `s_overhead_clusters` but recomputes it on every non-`bigalloc` mount
+        // (`super.c`: it zeroes the cached value unless `bigalloc`); `bigalloc`
+        // is not in `RO_COMPAT_SUPP`, so every volume we mount takes the
+        // recompute path, which is provably equal to the cached value here.
+        //
+        // Under `minixdf`, Linux zeroes the overhead instead, so `f_blocks` is
+        // the raw total; `f_bfree`/`f_bavail` are unaffected either way.
+        let reported_blocks = match self.stat_block_accounting() {
+            StatBlockAccounting::IncludeOverhead => sb.total_blocks(),
+            StatBlockAccounting::ExcludeOverhead => {
+                let journal_overhead = self
+                    .journal()
+                    .map_or(0, |journal| journal.total_log_blocks());
+                let overhead = sb.metadata_overhead().saturating_add(journal_overhead);
+                sb.total_blocks().saturating_sub(overhead)
+            }
+        };
         // `bavail` excludes the root-reserved blocks (`s_r_blocks_count`), like
         // Linux `ext4_statfs`, so unprivileged `df` sees the space it can use.
         let bavail = sb
@@ -83,7 +91,7 @@ impl FileSystem for Ext4 {
         SuperBlock {
             magic: MAGIC_NUM as u64,
             bsize: BLOCK_SIZE,
-            blocks: usize::try_from(usable_blocks).unwrap(),
+            blocks: usize::try_from(reported_blocks).unwrap(),
             bfree: usize::try_from(sb.free_blocks_count()).unwrap(),
             bavail: usize::try_from(bavail).unwrap(),
             files: sb.total_inodes() as usize,

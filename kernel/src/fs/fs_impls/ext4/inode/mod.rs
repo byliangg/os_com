@@ -3278,7 +3278,7 @@ mod write_tests {
         }
 
         // Re-open the filesystem from the same on-disk image and read it back.
-        let ext4 = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(f.disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         let inode = ext4.read_inode(FILE_INO).unwrap();
         assert_eq!(inode.size(), content.len());
         assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);

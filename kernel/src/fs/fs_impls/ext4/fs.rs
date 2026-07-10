@@ -66,6 +66,58 @@ impl TryFrom<u32> for GoingDown {
     }
 }
 
+/// Policy for how `statfs` reports the total block count (`f_blocks`).
+///
+/// Mirrors ext2's option of the same name; Linux keeps it in
+/// `EXT4_MOUNT_MINIX_DF` and branches on it in `ext4_statfs`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum StatBlockAccounting {
+    /// Excludes filesystem overhead (superblock/GDT copies, bitmaps, inode
+    /// tables, and the journal) from the reported total.
+    ///
+    /// This is the default and corresponds to Linux's `bsddf` mount option.
+    #[default]
+    ExcludeOverhead,
+    /// Includes all blocks on the device in the reported total, regardless of
+    /// whether they hold metadata.
+    ///
+    /// This corresponds to Linux's `minixdf` mount option.
+    IncludeOverhead,
+}
+
+/// Runtime mount options, parsed once from the `mount(2)` data string.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Ext4MountOptions {
+    stat_block_accounting: StatBlockAccounting,
+}
+
+impl Ext4MountOptions {
+    /// Parses the comma-separated `mount(2)` data string.
+    ///
+    /// Recognizes `bsddf`/`minixdf` with last-one-wins, matching Linux's
+    /// `MOPT_SET`/`MOPT_CLEAR` pair on the `MINIX_DF` bit. Unknown tokens are
+    /// ignored (like ext2 here, unlike Linux's strict parser), so options this
+    /// implementation does not honor — e.g. the ubiquitous `noacl` — do not
+    /// fail the mount.
+    fn parse(data: Option<&CStr>) -> Self {
+        let mut options = Self::default();
+        let Some(data) = data else {
+            return options;
+        };
+
+        let data = data.to_string_lossy();
+        for token in data.split(',') {
+            match token.trim() {
+                "bsddf" => options.stat_block_accounting = StatBlockAccounting::ExcludeOverhead,
+                "minixdf" => options.stat_block_accounting = StatBlockAccounting::IncludeOverhead,
+                _ => {}
+            }
+        }
+
+        options
+    }
+}
+
 /// An ext4 filesystem instance.
 pub struct Ext4 {
     block_device: Arc<dyn BlockDevice>,
@@ -106,6 +158,8 @@ pub struct Ext4 {
     /// Empty on a non-journaled volume (the orphan machinery is journal-only,
     /// matching Linux).
     s_orphan_lock: Mutex<OrphanChain>,
+    /// Runtime mount options that affect block-count reporting.
+    mount_options: Ext4MountOptions,
     /// The JBD2 journal, present iff the volume carries the `HAS_JOURNAL` compat
     /// feature (jbd2 `journal_t`).
     ///
@@ -124,9 +178,13 @@ pub struct Ext4 {
 
 impl Ext4 {
     /// Mounts an ext4 volume from a block device.
-    pub(super) fn open(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>> {
+    ///
+    /// `data` is the raw `mount(2)` option string; see
+    /// [`Ext4MountOptions::parse`] for what is honored.
+    pub(super) fn open(device: Arc<dyn BlockDevice>, data: Option<&CStr>) -> Result<Arc<Self>> {
         let raw_super_block = device.read_val::<RawSuperBlock>(SUPER_BLOCK_OFFSET)?;
         let super_block = SuperBlock::try_from(raw_super_block)?;
+        let mount_options = Ext4MountOptions::parse(data);
         let nr_inodes_per_group = super_block.nr_inodes_per_group();
         let total_inodes = super_block.total_inodes();
 
@@ -141,6 +199,7 @@ impl Ext4 {
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
             shutdown: AtomicBool::new(false),
             s_orphan_lock: Mutex::new(OrphanChain::new()),
+            mount_options,
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             self_ref: weak.clone(),
@@ -309,6 +368,12 @@ impl Ext4 {
     /// Returns a clone of the loaded journal, or `None` on a non-journaled volume.
     pub(super) fn journal(&self) -> Option<Arc<journal::Journal>> {
         self.journal.read().clone()
+    }
+
+    /// Returns how `statfs` accounts the total block count, per the
+    /// `bsddf`/`minixdf` mount options.
+    pub(super) fn stat_block_accounting(&self) -> StatBlockAccounting {
+        self.mount_options.stat_block_accounting
     }
 
     /// Refuses a remount-time filesystem-flag change with `EOPNOTSUPP`.
@@ -2266,6 +2331,65 @@ mod tests {
         assert_eq!(sb.fsid, u64::from_le_bytes(uuid[..8].try_into().unwrap()));
     }
 
+    /// The mount-option parser: no data means the `bsddf` default, unknown
+    /// tokens (e.g. `noacl`) are ignored rather than failing the mount, and
+    /// on a `bsddf`/`minixdf` conflict the last one wins (Linux
+    /// `MOPT_SET`/`MOPT_CLEAR` parity).
+    #[ktest]
+    fn mount_options_parse_bsddf_minixdf() {
+        assert_eq!(
+            Ext4MountOptions::parse(None).stat_block_accounting,
+            StatBlockAccounting::ExcludeOverhead
+        );
+
+        let minixdf = CString::new("noacl,minixdf").unwrap();
+        assert_eq!(
+            Ext4MountOptions::parse(Some(minixdf.as_c_str())).stat_block_accounting,
+            StatBlockAccounting::IncludeOverhead
+        );
+
+        let last_wins = CString::new("minixdf,bsddf").unwrap();
+        assert_eq!(
+            Ext4MountOptions::parse(Some(last_wins.as_c_str())).stat_block_accounting,
+            StatBlockAccounting::ExcludeOverhead
+        );
+    }
+
+    /// Under `-o minixdf`, `statfs` reports the raw volume size in `f_blocks`
+    /// — no metadata/journal overhead subtraction — while an explicit `bsddf`
+    /// keeps the default usable-capacity accounting
+    /// (`statfs_reports_usable_space`). Free counts are unaffected.
+    #[ktest]
+    fn statfs_minixdf_reports_raw_total() {
+        use crate::fs::vfs::file_system::FileSystem;
+
+        let f = Ext4FixtureBuilder::new(2048, 256, 3 * 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let default_stat = f.ext4.sb();
+        assert!(default_stat.blocks < 3 * 2048);
+
+        let minixdf = CString::new("minixdf").unwrap();
+        let ext4 = Ext4::open(
+            f.disk.clone() as Arc<dyn BlockDevice>,
+            Some(minixdf.as_c_str()),
+        )
+        .unwrap();
+        let minix_stat = ext4.sb();
+        assert_eq!(minix_stat.blocks, 3 * 2048);
+        assert_eq!(minix_stat.bfree, default_stat.bfree);
+        assert_eq!(minix_stat.bavail, default_stat.bavail);
+
+        let bsddf = CString::new("bsddf").unwrap();
+        let ext4 = Ext4::open(
+            f.disk.clone() as Arc<dyn BlockDevice>,
+            Some(bsddf.as_c_str()),
+        )
+        .unwrap();
+        assert_eq!(ext4.sb().blocks, default_stat.blocks);
+    }
+
     /// A remount that asks to change filesystem flags is refused with
     /// `EOPNOTSUPP` (ext4 honors no runtime change), not silently accepted.
     #[ktest]
@@ -3835,7 +3959,7 @@ mod tests {
         drop(first);
 
         // Re-mount: `Ext4::open` must recover the dirty journal.
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
 
         // Recovery replayed the after-image to its final location.
         let mut recovered = [0u8; BLOCK_SIZE];
@@ -3905,7 +4029,7 @@ mod tests {
         core::mem::forget(f);
 
         // The next mount must replay the log (RECOVER was stamped at mount).
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         let replayed: RawInode = disk.segment().read_val(offset).unwrap();
         assert_eq!(
             replayed.link_count, new_link,
@@ -3967,7 +4091,7 @@ mod tests {
 
         // Recovery mount: the create that fdatasync acknowledged must be
         // replayed from the log.
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         let dir = ext4.read_inode(DIR_INO).unwrap();
         dir.lookup("durable.txt")
             .expect("a crash must not erase an fdatasync'd new file");
@@ -4171,7 +4295,7 @@ mod tests {
         raw.journal_ino = 12;
         disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw).unwrap();
 
-        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>) else {
+        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>, None) else {
             panic!("mount must reject s_journal_inum != 8");
         };
         assert_eq!(err.error(), Errno::EINVAL);
@@ -4194,7 +4318,7 @@ mod tests {
         raw.journal_dev = 0xff00;
         disk.segment().write_val(SUPER_BLOCK_OFFSET, &raw).unwrap();
 
-        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>) else {
+        let Err(err) = Ext4::open(disk as Arc<dyn BlockDevice>, None) else {
             panic!("mount must reject an external journal device");
         };
         assert_eq!(err.error(), Errno::EINVAL);
@@ -4230,7 +4354,7 @@ mod tests {
             .unwrap();
         drop(first);
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         assert!(
             ext4.is_inode_allocated(live_ino),
             "a linked (live) chain member must not be freed"
@@ -4301,7 +4425,7 @@ mod tests {
             .unwrap();
         drop(first);
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
 
         // Re-truncated, not freed: the inode is live, the list drained, and the
         // doomed tail's bitmap bits are cleared while the kept prefix survives.
@@ -4390,7 +4514,7 @@ mod tests {
         drop(first);
 
         // First recovery: frees `[3, 8)`.
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         let free_after_first = ext4.super_block().free_blocks_count();
         assert_eq!(ext4.super_block().last_orphan(), None);
         drop(ext4);
@@ -4398,7 +4522,7 @@ mod tests {
         // Re-list the already-truncated inode and mount again: a second
         // re-truncate to the same `i_size` must find nothing past it.
         set_head(&disk);
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         assert_eq!(ext4.super_block().last_orphan(), None, "list drained again");
         assert_eq!(
             ext4.super_block().free_blocks_count(),
@@ -4448,7 +4572,7 @@ mod tests {
             .unwrap();
         drop(first);
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         assert!(
             !ext4.is_inode_allocated(ino),
             "the orphan inode was freed by the mount scan"
@@ -4636,7 +4760,7 @@ mod tests {
         drop(first);
 
         // Re-mount: recovery must finish the interrupted deletion.
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         assert!(
             !ext4.is_inode_allocated(orphan_ino),
             "the orphan inode was freed by the mount scan"
@@ -4675,7 +4799,7 @@ mod tests {
             .write_val(SUPER_BLOCK_OFFSET, &raw_sb)
             .unwrap();
 
-        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
         assert_eq!(
             ext4.super_block().last_orphan(),
             None,

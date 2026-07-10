@@ -1,0 +1,4 @@
+# P8a a7 task1: generic/619 ENOSPC stress alone — isolated boot so a
+# memory-pressure VM crash (upstream family, cf. 275/320) cannot taint the
+# other three backfill verdicts; run with XFSTESTS_DISK_SIZE=2G.
+generic/619
