@@ -981,9 +981,12 @@ const S_ERRNO_ERROR_MARKER: u32 = 5;
 /// holds a [`Weak<Journal>`] so it never keeps the journal alive; this is what
 /// lets teardown work (see [`Journal::stop_commit_thread`]).
 ///
-/// Phase 4 does the ordered-data flush **synchronously inside the commit thread**
-/// (task context): there is no interrupt handoff / async-writeback-completion
-/// path — that jbd2 optimization is deferred to Phase 7.
+/// The ordered-data flush runs **synchronously inside the commit thread**
+/// (task context; since Phase 5 the ordered table holds PageCache clones, so
+/// the flush takes no inode locks): there is no interrupt handoff /
+/// async-writeback-completion path — that jbd2 optimization was ruled pure
+/// performance and deferred to Phase 9 (P7c-4 ruling, ledger
+/// `async-writeback-handoff`).
 ///
 /// # Teardown contract
 ///
@@ -1110,8 +1113,8 @@ pub(super) struct Journal {
     /// flush strictly after it stops), so the mutex never contends; it is
     /// the designated serialization point that makes "one journal-superblock
     /// writer" structural rather than incidental, and correct by
-    /// construction if a second checkpoint driver is ever added (P7d/P7e
-    /// concurrency). Lock order: `j_checkpoint` → `state` (a pass takes the
+    /// construction if a second checkpoint driver is ever added.
+    /// Lock order: `j_checkpoint` → `state` (a pass takes the
     /// state lock only for its brief snapshot/publish windows, never the
     /// reverse), it is NOT nested with the inode→handle→…→sb main chain
     /// (checkpoint runs on the commit thread, holding no filesystem lock),
@@ -1602,7 +1605,7 @@ impl Journal {
     /// operation freeing hundreds of thousands of blocks could therefore
     /// outgrow the admitted slack; the commit-time exact fit guard is the
     /// hard line there (refuse → drain → loud `ENOSPC` abort, never an
-    /// overwrite), and P7c's `journal_restart` commit boundaries bound the
+    /// overwrite), and P7d-2's `journal_restart` commit boundaries bound the
     /// per-transaction revoke set the way Linux's do.
     ///
     /// This bounds ONE transaction against the whole usable ring; it says
@@ -2298,7 +2301,8 @@ impl Journal {
     /// would turn the next crash into a silent under-replay of
     /// fsync-acknowledged metadata. jbd2 never reaches this state — writers
     /// block up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291) —
-    /// and P7c-3 builds that space backpressure; until then the commit refuses
+    /// and since P7c-3 `journal_start` reserves space up front the same way;
+    /// as the backstop behind that backpressure the commit still refuses
     /// to write ([`CommitAttempt::NeedsLogSpace`]), this drains the tail (an
     /// inline [`checkpoint`](checkpoint::checkpoint) — the same thread context
     /// as the post-commit checkpoint, so no new lock interaction) and retries
@@ -2577,9 +2581,10 @@ impl Journal {
     /// Returns the error number recorded for this journal (jbd2 `j_errno`), `0`
     /// when healthy. Seeded at mount from `s_errno` and set on a genuine-error
     /// abort; a shutdown abort leaves it `0`. Consumed today by the abort
-    /// tests; the reserved production consumer is error surfacing (the
-    /// `sb-accessors-deferred` ledger note's "state for P7 error-flag
-    /// handling"), so it is dead only in a non-ktest build.
+    /// tests; P7e-1's error surfacing (abort→EROFS) ended up not consuming
+    /// it, so the once-"reserved for P7" production consumer never arrived
+    /// (ledger `sb-accessors-expired-prophecy`: delete or wire at the P9
+    /// sweep). Dead only in a non-ktest build.
     #[cfg_attr(not(ktest), expect(dead_code))]
     pub(in crate::fs::fs_impls::ext4) fn recorded_errno(&self) -> u32 {
         self.sb_error.load(Ordering::Acquire)

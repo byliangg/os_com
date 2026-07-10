@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! crc32c (Castagnoli) — the checksum kernel behind `metadata_csum` (Phase 6b)
-//! and, later, the JBD2 journal checksums (Phase 7).
+//! and the JBD2 journal checksums (Phase 7a).
 //!
 //! This is the *raw* reflected CRC-32C used by ext4: [`crc32c`] runs the
 //! reflected polynomial `0x82F63B78` over the bytes with `seed` as the running

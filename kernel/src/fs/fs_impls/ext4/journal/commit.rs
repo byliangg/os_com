@@ -549,10 +549,11 @@ pub(super) fn try_commit_transaction(
     // in the way here — the commit thread's post-commit checkpoint is
     // non-fatal on failure, and `max_credits` bounds one transaction against
     // the whole ring only. jbd2 never reaches this point: it blocks writers
-    // up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291); until
-    // P7c builds that backpressure, refusing to write — letting the caller
-    // drain the tail and retry, or abort loudly — is the minimal safe
-    // behavior.
+    // up front on `jbd2_log_space_left` (fs/jbd2/transaction.c:291); we do
+    // the same since P7c-3 (`journal_start` reserves against
+    // `free_log_blocks`), so this refusal is the defense-in-depth exact-fit
+    // guard behind that backpressure — refuse to write, let the caller drain
+    // the tail and retry, or abort loudly; never overwrite.
     if footprint > journal.geometry.free_log_blocks(start_head, dirty_tail) {
         // The transaction stays `Locked` in the committing slot: nothing was
         // written, so the caller may drain the tail and retry it.

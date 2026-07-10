@@ -14,7 +14,9 @@
 //! This module only *decodes and descends* the index (path C of P6d): it never
 //! writes a dx block, so the per-block checksum trailer (`dx_tail`) is neither
 //! consulted nor produced here, matching the verify-on-read deferrals elsewhere
-//! in P6. Insert/build/flatten of the index is a later task.
+//! in P6. Inserts into an indexed directory go through degrade-to-linear
+//! first (P6d path C, `degrade_htree_to_linear` in `dir`); building the index
+//! is a later task (ledger `htree-build-and-insert`, P9).
 //!
 //! The byte layout is decoded field-by-field at the block boundary (never by
 //! overlaying a struct), because the count/limit of the first entry slot is

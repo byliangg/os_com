@@ -787,9 +787,10 @@ impl Inode {
 
     /// Creates a child inode and directory entry under this directory.
     ///
-    /// Only regular files, directories, and symlinks are supported; special
-    /// files (devices, FIFOs, sockets) are deferred to a later phase and rejected
-    /// with `EINVAL` (P3 plan §10.4). A freshly created symlink starts empty and
+    /// Only regular files, directories, and symlinks are supported here; special
+    /// files (devices, FIFOs, sockets) go through the VFS `mknod` entry point
+    /// (P5, `impl_for_vfs`) and are rejected with `EINVAL` on this path by
+    /// design. A freshly created symlink starts empty and
     /// extent-flagged; `write_link` later adjusts its payload/flag.
     ///
     /// Mirrors ext2 `Inode::create`.

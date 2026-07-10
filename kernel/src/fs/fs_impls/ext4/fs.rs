@@ -826,9 +826,9 @@ impl Ext4 {
     /// and — the deeper deadlock — the pinning transaction is typically the
     /// caller's own, uncommittable until the caller's handle closes (Linux
     /// retries around `jbd2_journal_force_commit_nested` from
-    /// `ext4_should_retry_alloc` at the op level, outside the handle; that
-    /// retry seam is P7c's group-commit batching work). Returns `Err(EINVAL)`
-    /// if `count` is zero.
+    /// `ext4_should_retry_alloc` at the op level, outside the handle; our
+    /// equivalent is `retry_on_pinned_enospc` at the op level, live since
+    /// P7e-6). Returns `Err(EINVAL)` if `count` is zero.
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
