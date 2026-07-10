@@ -1,0 +1,17 @@
+# ACE known-bug #5 (generic/034): two creates in a dir, sync between,
+# fsync(dir) — both entries must survive.
+
+# define
+test
+A
+A/foo
+A/bar
+
+# run
+mkdir A 0777
+creat Afoo 0777
+sync
+checkpoint 1
+creat Abar 0777
+fsync A
+checkpoint 2

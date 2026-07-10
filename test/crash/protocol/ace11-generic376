@@ -1,0 +1,17 @@
+# ACE known-bug #11 (generic/376): rename, recreate the source name,
+# fsync the RENAMED-TO file.
+
+# define
+test
+foo
+bar
+
+# run
+creat foo 0777
+write foo 0 4096
+sync
+checkpoint 1
+rename foo bar
+creat foo 0777
+fsync bar
+checkpoint 2

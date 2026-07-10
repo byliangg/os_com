@@ -277,11 +277,14 @@ VICTIM=foo
 WORKLOADS=(j-lang2 j-lang110 j-lang134 j-lang136)
 
 cd "$REPO"
-bash "$HERE/run_matrix.sh" "$JLANG_DIR" "${WORKLOADS[@]}"
+# --keep: green shards normally clean their images (disk discipline); this
+# leg needs the final image and the oracle table afterwards. Artifact names
+# follow run_matrix's per-shard scheme (matrix.s0.*).
+bash "$HERE/run_matrix.sh" --keep "$JLANG_DIR" "${WORKLOADS[@]}"
 echo "oracle-selfcheck: recorded run swept green with the oracle (as it must)"
 
-TABLE=$BUILD/oracle.table
-cp --sparse=always "$BUILD/xfstests_test.img" "$WORK"
+TABLE=$BUILD/matrix.s0.oracle.table
+cp --sparse=always "$BUILD/matrix.s0.final.img" "$WORK"
 e2fsck -fy "$WORK" > /dev/null 2>&1 || true
 
 if ! python3 "$HERE/oracle.py" final "$TABLE" "${#WORKLOADS[@]}" "$WORK"; then

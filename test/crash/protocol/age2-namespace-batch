@@ -1,0 +1,24 @@
+# age-commit variant: an UNCOMMITTED namespace batch (mkdir + creates +
+# rename) ages past 5s and must be committed by the age trigger during
+# the dwell; span law: 3 journal commits (data fsync + age + marker) vs
+# the control's 2 (age_evidence.py counts commit blocks, not barriers).
+
+# define
+test
+A
+A/f1
+A/f2
+A/f3
+A/g1
+zzz
+
+# run
+write zzz 0 4096
+fsync zzz
+mkdir A 0777
+creat Af1 0777
+creat Af2 0777
+creat Af3 0777
+rename Af1 Ag1
+sleep 7
+checkpoint 1

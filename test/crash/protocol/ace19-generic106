@@ -1,0 +1,20 @@
+# ACE known-bug #19 (generic/106), DEGRADED: original drops caches
+# between unlink and fsync (no such control here); link, sync, unlink
+# the link, fsync the survivor.
+
+# define
+test
+foo
+bar
+
+# run
+creat foo 0777
+write foo 0 4096
+sync
+checkpoint 1
+link foo bar
+sync
+checkpoint 2
+unlink bar
+fsync foo
+checkpoint 3

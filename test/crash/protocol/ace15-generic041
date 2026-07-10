@@ -1,0 +1,419 @@
+# ACE known-bug #15 (generic/041), REDUCED: 200 hard links (orig 3000;
+# enough to grow the dir past one block) synced, then unlink+relink
+# churn and fsync of the inode — link-count vs dirent recovery.
+
+# define
+test
+foo
+foo_0
+foo_1
+foo_2
+foo_3
+foo_4
+foo_5
+foo_6
+foo_7
+foo_8
+foo_9
+foo_10
+foo_11
+foo_12
+foo_13
+foo_14
+foo_15
+foo_16
+foo_17
+foo_18
+foo_19
+foo_20
+foo_21
+foo_22
+foo_23
+foo_24
+foo_25
+foo_26
+foo_27
+foo_28
+foo_29
+foo_30
+foo_31
+foo_32
+foo_33
+foo_34
+foo_35
+foo_36
+foo_37
+foo_38
+foo_39
+foo_40
+foo_41
+foo_42
+foo_43
+foo_44
+foo_45
+foo_46
+foo_47
+foo_48
+foo_49
+foo_50
+foo_51
+foo_52
+foo_53
+foo_54
+foo_55
+foo_56
+foo_57
+foo_58
+foo_59
+foo_60
+foo_61
+foo_62
+foo_63
+foo_64
+foo_65
+foo_66
+foo_67
+foo_68
+foo_69
+foo_70
+foo_71
+foo_72
+foo_73
+foo_74
+foo_75
+foo_76
+foo_77
+foo_78
+foo_79
+foo_80
+foo_81
+foo_82
+foo_83
+foo_84
+foo_85
+foo_86
+foo_87
+foo_88
+foo_89
+foo_90
+foo_91
+foo_92
+foo_93
+foo_94
+foo_95
+foo_96
+foo_97
+foo_98
+foo_99
+foo_100
+foo_101
+foo_102
+foo_103
+foo_104
+foo_105
+foo_106
+foo_107
+foo_108
+foo_109
+foo_110
+foo_111
+foo_112
+foo_113
+foo_114
+foo_115
+foo_116
+foo_117
+foo_118
+foo_119
+foo_120
+foo_121
+foo_122
+foo_123
+foo_124
+foo_125
+foo_126
+foo_127
+foo_128
+foo_129
+foo_130
+foo_131
+foo_132
+foo_133
+foo_134
+foo_135
+foo_136
+foo_137
+foo_138
+foo_139
+foo_140
+foo_141
+foo_142
+foo_143
+foo_144
+foo_145
+foo_146
+foo_147
+foo_148
+foo_149
+foo_150
+foo_151
+foo_152
+foo_153
+foo_154
+foo_155
+foo_156
+foo_157
+foo_158
+foo_159
+foo_160
+foo_161
+foo_162
+foo_163
+foo_164
+foo_165
+foo_166
+foo_167
+foo_168
+foo_169
+foo_170
+foo_171
+foo_172
+foo_173
+foo_174
+foo_175
+foo_176
+foo_177
+foo_178
+foo_179
+foo_180
+foo_181
+foo_182
+foo_183
+foo_184
+foo_185
+foo_186
+foo_187
+foo_188
+foo_189
+foo_190
+foo_191
+foo_192
+foo_193
+foo_194
+foo_195
+foo_196
+foo_197
+foo_198
+foo_199
+foo_200
+
+# run
+creat foo 0777
+write foo 0 4096
+link foo foo_0
+link foo foo_1
+link foo foo_2
+link foo foo_3
+link foo foo_4
+link foo foo_5
+link foo foo_6
+link foo foo_7
+link foo foo_8
+link foo foo_9
+link foo foo_10
+link foo foo_11
+link foo foo_12
+link foo foo_13
+link foo foo_14
+link foo foo_15
+link foo foo_16
+link foo foo_17
+link foo foo_18
+link foo foo_19
+link foo foo_20
+link foo foo_21
+link foo foo_22
+link foo foo_23
+link foo foo_24
+link foo foo_25
+link foo foo_26
+link foo foo_27
+link foo foo_28
+link foo foo_29
+link foo foo_30
+link foo foo_31
+link foo foo_32
+link foo foo_33
+link foo foo_34
+link foo foo_35
+link foo foo_36
+link foo foo_37
+link foo foo_38
+link foo foo_39
+link foo foo_40
+link foo foo_41
+link foo foo_42
+link foo foo_43
+link foo foo_44
+link foo foo_45
+link foo foo_46
+link foo foo_47
+link foo foo_48
+link foo foo_49
+link foo foo_50
+link foo foo_51
+link foo foo_52
+link foo foo_53
+link foo foo_54
+link foo foo_55
+link foo foo_56
+link foo foo_57
+link foo foo_58
+link foo foo_59
+link foo foo_60
+link foo foo_61
+link foo foo_62
+link foo foo_63
+link foo foo_64
+link foo foo_65
+link foo foo_66
+link foo foo_67
+link foo foo_68
+link foo foo_69
+link foo foo_70
+link foo foo_71
+link foo foo_72
+link foo foo_73
+link foo foo_74
+link foo foo_75
+link foo foo_76
+link foo foo_77
+link foo foo_78
+link foo foo_79
+link foo foo_80
+link foo foo_81
+link foo foo_82
+link foo foo_83
+link foo foo_84
+link foo foo_85
+link foo foo_86
+link foo foo_87
+link foo foo_88
+link foo foo_89
+link foo foo_90
+link foo foo_91
+link foo foo_92
+link foo foo_93
+link foo foo_94
+link foo foo_95
+link foo foo_96
+link foo foo_97
+link foo foo_98
+link foo foo_99
+link foo foo_100
+link foo foo_101
+link foo foo_102
+link foo foo_103
+link foo foo_104
+link foo foo_105
+link foo foo_106
+link foo foo_107
+link foo foo_108
+link foo foo_109
+link foo foo_110
+link foo foo_111
+link foo foo_112
+link foo foo_113
+link foo foo_114
+link foo foo_115
+link foo foo_116
+link foo foo_117
+link foo foo_118
+link foo foo_119
+link foo foo_120
+link foo foo_121
+link foo foo_122
+link foo foo_123
+link foo foo_124
+link foo foo_125
+link foo foo_126
+link foo foo_127
+link foo foo_128
+link foo foo_129
+link foo foo_130
+link foo foo_131
+link foo foo_132
+link foo foo_133
+link foo foo_134
+link foo foo_135
+link foo foo_136
+link foo foo_137
+link foo foo_138
+link foo foo_139
+link foo foo_140
+link foo foo_141
+link foo foo_142
+link foo foo_143
+link foo foo_144
+link foo foo_145
+link foo foo_146
+link foo foo_147
+link foo foo_148
+link foo foo_149
+link foo foo_150
+link foo foo_151
+link foo foo_152
+link foo foo_153
+link foo foo_154
+link foo foo_155
+link foo foo_156
+link foo foo_157
+link foo foo_158
+link foo foo_159
+link foo foo_160
+link foo foo_161
+link foo foo_162
+link foo foo_163
+link foo foo_164
+link foo foo_165
+link foo foo_166
+link foo foo_167
+link foo foo_168
+link foo foo_169
+link foo foo_170
+link foo foo_171
+link foo foo_172
+link foo foo_173
+link foo foo_174
+link foo foo_175
+link foo foo_176
+link foo foo_177
+link foo foo_178
+link foo foo_179
+link foo foo_180
+link foo foo_181
+link foo foo_182
+link foo foo_183
+link foo foo_184
+link foo foo_185
+link foo foo_186
+link foo foo_187
+link foo foo_188
+link foo foo_189
+link foo foo_190
+link foo foo_191
+link foo foo_192
+link foo foo_193
+link foo foo_194
+link foo foo_195
+link foo foo_196
+link foo foo_197
+link foo foo_198
+link foo foo_199
+sync
+checkpoint 1
+unlink foo_0
+link foo foo_200
+link foo foo_0
+fsync foo
+checkpoint 2

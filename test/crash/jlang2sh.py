@@ -14,6 +14,20 @@ path maps from its slash-stripped form; the root `test` is the script's CWD.
 For the standard seq-1 corpus this reproduces the historical hardcoded table
 exactly (checked byte-for-byte against the pre-generalization converter).
 
+Two ops beyond ACE's J-lang are accepted for the hand-written protocol
+corpus (test/crash/protocol/):
+
+  sleep N      emits a plain `sleep N` — dwells past the journal's 5s age
+               trigger so age-driven commits get crash coverage. No oracle
+               state changes (nothing is modified or persisted by sleeping).
+  symlink T L  emits `ln -s` (the link may dangle; a symlink is a name plus
+               a target blob, and the crash surface — dirent + inode — does
+               not need the target to resolve). The symlink's own content is
+               never DECLARED (fsync of a symlink path is refused loudly and
+               `sync` skips them): its existence is still asserted through
+               the parent directory's entry-set digest, which is what the
+               known-bug sequence exercising symlinks (generic_348) fsyncs.
+
 --oracle mode (test/crash/oracle.py, the crash-durability data oracle)
 additionally translates `checkpoint N` instead of dropping it:
 
@@ -226,6 +240,12 @@ class OracleState:
         self.live[path] = "d"
         self.revoke_name(parent_dir(path))
 
+    def symlink(self, path):
+        # A new NAME in the parent; the symlink itself is tracked so that
+        # persistence calls can refuse/skip it (see the docstring).
+        self.live[path] = "l"
+        self.revoke_name(parent_dir(path))
+
     def link(self, src, dst):
         group = self.aliases.setdefault(src, {src})
         group.add(dst)
@@ -289,12 +309,24 @@ class OracleState:
 
     def persist(self, path):
         """fsync/fdatasync returned for `path`: declare its runtime state."""
+        if self.live.get(path) == "l":
+            raise SystemExit(
+                "fsync of a symlink is not instrumentable "
+                f"(x4d cannot snapshot it): {path}"
+            )
         self.out.append(f'x4d {self.next_ckpt()} "{path}"')
         self.durable.add(path)
 
     def persist_all(self):
-        """sync returned: everything alive (and the root) is now durable."""
+        """sync returned: everything alive (and the root) is now durable.
+
+        Symlinks are skipped (never declared): their target blob is not
+        assertable through x4d, and their existence is already covered by
+        the parent directory's entry-set digest.
+        """
         for p in sorted(set(self.live) | {"."}):
+            if self.live.get(p) == "l":
+                continue
             self.persist(p)
 
     def checkpoint(self, ckpt):
@@ -408,6 +440,12 @@ def convert(lines, workload=None, oracle=False):
             out.append("sync")
             if st is not None:
                 st.persist_all()
+        elif op == "sleep":
+            out.append(f"sleep {int(args[0])}")
+        elif op == "symlink":
+            out.append(f'ln -s "{path(args[0])}" "{path(args[1])}"')
+            if st is not None:
+                st.symlink(path(args[1]))
         elif op == "checkpoint":
             if st is not None:
                 st.checkpoint(int(args[0]))

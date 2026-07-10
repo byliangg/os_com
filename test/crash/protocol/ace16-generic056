@@ -1,0 +1,20 @@
+# ACE known-bug #16 (generic/056): fsync data, add a link, fsync an
+# unrelated dir — data must survive through the link-only commit.
+
+# define
+test
+A
+foo
+bar
+
+# run
+creat foo 0777
+mkdir A 0777
+sync
+checkpoint 1
+write foo 0 4096
+fsync foo
+checkpoint 2
+link foo bar
+fsync A
+checkpoint 3

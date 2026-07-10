@@ -1,0 +1,17 @@
+# ACE known-bug #6 (generic/039): link, sync, remove the link, fsync
+# the surviving name — nlink accounting after crash.
+
+# define
+test
+foo
+bar
+
+# run
+creat foo 0777
+write foo 0 4096
+link foo bar
+sync
+checkpoint 1
+unlink bar
+fsync foo
+checkpoint 2

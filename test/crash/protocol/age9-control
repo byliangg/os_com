@@ -1,0 +1,15 @@
+# age-commit control (trailing): same shape as age1 minus the sleep.
+# Its span must show exactly 2 journal commits (data fsync + marker):
+# proves spans do not accumulate stray commits, so the +1 in the age
+# workloads' spans is the age trigger and nothing else.
+
+# define
+test
+foo
+zzz
+
+# run
+write zzz 0 4096
+fsync zzz
+write foo 0 4096
+checkpoint 1

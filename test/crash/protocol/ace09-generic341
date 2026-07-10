@@ -1,0 +1,18 @@
+# ACE known-bug #9 (generic/341): rename a populated dir away, recreate
+# the source dir, fsync it.
+
+# define
+test
+A
+B
+A/foo
+
+# run
+mkdir A 0777
+creat Afoo 0777
+sync
+checkpoint 1
+rename A B
+mkdir A 0777
+fsync A
+checkpoint 2

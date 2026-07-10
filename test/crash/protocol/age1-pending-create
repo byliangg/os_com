@@ -1,0 +1,22 @@
+# age-commit crash coverage (ledger `age-commit-crash-coverage-gap`):
+# after a leading data fsync (flush-density gate conformance), a write
+# is left UNCOMMITTED and the workload dwells 7s > the 5s age trigger,
+# so the journal commits it on age alone — no fsync/sync is issued
+# inside the dwell. Evidence: this workload's log segment must contain
+# exactly 3 journal commits (data fsync + age commit + marker fsync) vs
+# the control's 2 (see age_evidence.py; the law is stated in commit
+# blocks — this kernel emits 2-3 FLUSH barriers per commit).
+
+# define
+test
+foo
+bar
+zzz
+
+# run
+write zzz 0 4096
+fsync zzz
+write foo 0 4096
+sleep 7
+write bar 0 4096
+checkpoint 1

@@ -1,0 +1,650 @@
+# protocol point: checkpoint tail publication under a tiny journal.
+# 180 create+fsync transactions (~>1024 journal blocks) plus a 90-file
+# unlink wave wrap a `-J size=4` journal several times: journal_start
+# backpressure, lazy checkpoint eviction and the checkpoint's
+# final-location writes all happen mid-session and land in the log
+# where the sweep and walcheck.py can judge them. Generated file
+# (mechanical op list); run under run_matrix.sh --journal-size 4.
+
+# define
+test
+f001
+f002
+f003
+f004
+f005
+f006
+f007
+f008
+f009
+f010
+f011
+f012
+f013
+f014
+f015
+f016
+f017
+f018
+f019
+f020
+f021
+f022
+f023
+f024
+f025
+f026
+f027
+f028
+f029
+f030
+f031
+f032
+f033
+f034
+f035
+f036
+f037
+f038
+f039
+f040
+f041
+f042
+f043
+f044
+f045
+f046
+f047
+f048
+f049
+f050
+f051
+f052
+f053
+f054
+f055
+f056
+f057
+f058
+f059
+f060
+f061
+f062
+f063
+f064
+f065
+f066
+f067
+f068
+f069
+f070
+f071
+f072
+f073
+f074
+f075
+f076
+f077
+f078
+f079
+f080
+f081
+f082
+f083
+f084
+f085
+f086
+f087
+f088
+f089
+f090
+f091
+f092
+f093
+f094
+f095
+f096
+f097
+f098
+f099
+f100
+f101
+f102
+f103
+f104
+f105
+f106
+f107
+f108
+f109
+f110
+f111
+f112
+f113
+f114
+f115
+f116
+f117
+f118
+f119
+f120
+f121
+f122
+f123
+f124
+f125
+f126
+f127
+f128
+f129
+f130
+f131
+f132
+f133
+f134
+f135
+f136
+f137
+f138
+f139
+f140
+f141
+f142
+f143
+f144
+f145
+f146
+f147
+f148
+f149
+f150
+f151
+f152
+f153
+f154
+f155
+f156
+f157
+f158
+f159
+f160
+f161
+f162
+f163
+f164
+f165
+f166
+f167
+f168
+f169
+f170
+f171
+f172
+f173
+f174
+f175
+f176
+f177
+f178
+f179
+f180
+
+# run
+write f001 0 4096
+fsync f001
+write f002 0 4096
+fsync f002
+write f003 0 4096
+fsync f003
+write f004 0 4096
+fsync f004
+write f005 0 4096
+fsync f005
+write f006 0 4096
+fsync f006
+write f007 0 4096
+fsync f007
+write f008 0 4096
+fsync f008
+write f009 0 4096
+fsync f009
+write f010 0 4096
+fsync f010
+write f011 0 4096
+fsync f011
+write f012 0 4096
+fsync f012
+write f013 0 4096
+fsync f013
+write f014 0 4096
+fsync f014
+write f015 0 4096
+fsync f015
+write f016 0 4096
+fsync f016
+write f017 0 4096
+fsync f017
+write f018 0 4096
+fsync f018
+write f019 0 4096
+fsync f019
+write f020 0 4096
+fsync f020
+write f021 0 4096
+fsync f021
+write f022 0 4096
+fsync f022
+write f023 0 4096
+fsync f023
+write f024 0 4096
+fsync f024
+write f025 0 4096
+fsync f025
+write f026 0 4096
+fsync f026
+write f027 0 4096
+fsync f027
+write f028 0 4096
+fsync f028
+write f029 0 4096
+fsync f029
+write f030 0 4096
+fsync f030
+checkpoint 1
+write f031 0 4096
+fsync f031
+write f032 0 4096
+fsync f032
+write f033 0 4096
+fsync f033
+write f034 0 4096
+fsync f034
+write f035 0 4096
+fsync f035
+write f036 0 4096
+fsync f036
+write f037 0 4096
+fsync f037
+write f038 0 4096
+fsync f038
+write f039 0 4096
+fsync f039
+write f040 0 4096
+fsync f040
+write f041 0 4096
+fsync f041
+write f042 0 4096
+fsync f042
+write f043 0 4096
+fsync f043
+write f044 0 4096
+fsync f044
+write f045 0 4096
+fsync f045
+write f046 0 4096
+fsync f046
+write f047 0 4096
+fsync f047
+write f048 0 4096
+fsync f048
+write f049 0 4096
+fsync f049
+write f050 0 4096
+fsync f050
+write f051 0 4096
+fsync f051
+write f052 0 4096
+fsync f052
+write f053 0 4096
+fsync f053
+write f054 0 4096
+fsync f054
+write f055 0 4096
+fsync f055
+write f056 0 4096
+fsync f056
+write f057 0 4096
+fsync f057
+write f058 0 4096
+fsync f058
+write f059 0 4096
+fsync f059
+write f060 0 4096
+fsync f060
+checkpoint 2
+write f061 0 4096
+fsync f061
+write f062 0 4096
+fsync f062
+write f063 0 4096
+fsync f063
+write f064 0 4096
+fsync f064
+write f065 0 4096
+fsync f065
+write f066 0 4096
+fsync f066
+write f067 0 4096
+fsync f067
+write f068 0 4096
+fsync f068
+write f069 0 4096
+fsync f069
+write f070 0 4096
+fsync f070
+write f071 0 4096
+fsync f071
+write f072 0 4096
+fsync f072
+write f073 0 4096
+fsync f073
+write f074 0 4096
+fsync f074
+write f075 0 4096
+fsync f075
+write f076 0 4096
+fsync f076
+write f077 0 4096
+fsync f077
+write f078 0 4096
+fsync f078
+write f079 0 4096
+fsync f079
+write f080 0 4096
+fsync f080
+write f081 0 4096
+fsync f081
+write f082 0 4096
+fsync f082
+write f083 0 4096
+fsync f083
+write f084 0 4096
+fsync f084
+write f085 0 4096
+fsync f085
+write f086 0 4096
+fsync f086
+write f087 0 4096
+fsync f087
+write f088 0 4096
+fsync f088
+write f089 0 4096
+fsync f089
+write f090 0 4096
+fsync f090
+checkpoint 3
+write f091 0 4096
+fsync f091
+write f092 0 4096
+fsync f092
+write f093 0 4096
+fsync f093
+write f094 0 4096
+fsync f094
+write f095 0 4096
+fsync f095
+write f096 0 4096
+fsync f096
+write f097 0 4096
+fsync f097
+write f098 0 4096
+fsync f098
+write f099 0 4096
+fsync f099
+write f100 0 4096
+fsync f100
+write f101 0 4096
+fsync f101
+write f102 0 4096
+fsync f102
+write f103 0 4096
+fsync f103
+write f104 0 4096
+fsync f104
+write f105 0 4096
+fsync f105
+write f106 0 4096
+fsync f106
+write f107 0 4096
+fsync f107
+write f108 0 4096
+fsync f108
+write f109 0 4096
+fsync f109
+write f110 0 4096
+fsync f110
+write f111 0 4096
+fsync f111
+write f112 0 4096
+fsync f112
+write f113 0 4096
+fsync f113
+write f114 0 4096
+fsync f114
+write f115 0 4096
+fsync f115
+write f116 0 4096
+fsync f116
+write f117 0 4096
+fsync f117
+write f118 0 4096
+fsync f118
+write f119 0 4096
+fsync f119
+write f120 0 4096
+fsync f120
+checkpoint 4
+write f121 0 4096
+fsync f121
+write f122 0 4096
+fsync f122
+write f123 0 4096
+fsync f123
+write f124 0 4096
+fsync f124
+write f125 0 4096
+fsync f125
+write f126 0 4096
+fsync f126
+write f127 0 4096
+fsync f127
+write f128 0 4096
+fsync f128
+write f129 0 4096
+fsync f129
+write f130 0 4096
+fsync f130
+write f131 0 4096
+fsync f131
+write f132 0 4096
+fsync f132
+write f133 0 4096
+fsync f133
+write f134 0 4096
+fsync f134
+write f135 0 4096
+fsync f135
+write f136 0 4096
+fsync f136
+write f137 0 4096
+fsync f137
+write f138 0 4096
+fsync f138
+write f139 0 4096
+fsync f139
+write f140 0 4096
+fsync f140
+write f141 0 4096
+fsync f141
+write f142 0 4096
+fsync f142
+write f143 0 4096
+fsync f143
+write f144 0 4096
+fsync f144
+write f145 0 4096
+fsync f145
+write f146 0 4096
+fsync f146
+write f147 0 4096
+fsync f147
+write f148 0 4096
+fsync f148
+write f149 0 4096
+fsync f149
+write f150 0 4096
+fsync f150
+checkpoint 5
+write f151 0 4096
+fsync f151
+write f152 0 4096
+fsync f152
+write f153 0 4096
+fsync f153
+write f154 0 4096
+fsync f154
+write f155 0 4096
+fsync f155
+write f156 0 4096
+fsync f156
+write f157 0 4096
+fsync f157
+write f158 0 4096
+fsync f158
+write f159 0 4096
+fsync f159
+write f160 0 4096
+fsync f160
+write f161 0 4096
+fsync f161
+write f162 0 4096
+fsync f162
+write f163 0 4096
+fsync f163
+write f164 0 4096
+fsync f164
+write f165 0 4096
+fsync f165
+write f166 0 4096
+fsync f166
+write f167 0 4096
+fsync f167
+write f168 0 4096
+fsync f168
+write f169 0 4096
+fsync f169
+write f170 0 4096
+fsync f170
+write f171 0 4096
+fsync f171
+write f172 0 4096
+fsync f172
+write f173 0 4096
+fsync f173
+write f174 0 4096
+fsync f174
+write f175 0 4096
+fsync f175
+write f176 0 4096
+fsync f176
+write f177 0 4096
+fsync f177
+write f178 0 4096
+fsync f178
+write f179 0 4096
+fsync f179
+write f180 0 4096
+fsync f180
+checkpoint 6
+unlink f001
+unlink f002
+unlink f003
+unlink f004
+unlink f005
+unlink f006
+unlink f007
+unlink f008
+unlink f009
+unlink f010
+unlink f011
+unlink f012
+unlink f013
+unlink f014
+unlink f015
+unlink f016
+unlink f017
+unlink f018
+unlink f019
+unlink f020
+unlink f021
+unlink f022
+unlink f023
+unlink f024
+unlink f025
+unlink f026
+unlink f027
+unlink f028
+unlink f029
+unlink f030
+unlink f031
+unlink f032
+unlink f033
+unlink f034
+unlink f035
+unlink f036
+unlink f037
+unlink f038
+unlink f039
+unlink f040
+unlink f041
+unlink f042
+unlink f043
+unlink f044
+unlink f045
+unlink f046
+unlink f047
+unlink f048
+unlink f049
+unlink f050
+unlink f051
+unlink f052
+unlink f053
+unlink f054
+unlink f055
+unlink f056
+unlink f057
+unlink f058
+unlink f059
+unlink f060
+unlink f061
+unlink f062
+unlink f063
+unlink f064
+unlink f065
+unlink f066
+unlink f067
+unlink f068
+unlink f069
+unlink f070
+unlink f071
+unlink f072
+unlink f073
+unlink f074
+unlink f075
+unlink f076
+unlink f077
+unlink f078
+unlink f079
+unlink f080
+unlink f081
+unlink f082
+unlink f083
+unlink f084
+unlink f085
+unlink f086
+unlink f087
+unlink f088
+unlink f089
+unlink f090
+fsync test
+checkpoint 7

@@ -1,0 +1,23 @@
+# ACE known-bug #20 (generic/107): two links into a dir, sync, remove
+# one, fsync the inode.
+
+# define
+test
+A
+foo
+A/foo
+A/bar
+
+# run
+mkdir A 0777
+creat foo 0777
+write foo 0 4096
+sync
+checkpoint 1
+link foo Afoo
+link foo Abar
+sync
+checkpoint 2
+unlink Abar
+fsync foo
+checkpoint 3

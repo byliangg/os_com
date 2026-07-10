@@ -1,0 +1,62 @@
+# protocol point: group-commit batch boundaries (P7c-c2).
+# Back-to-back fsyncs of two files: each commit request lands while the
+# previous commit may still be in flight, exercising the T_LOCKED
+# locking seat and the request/batch merge windows at every boundary.
+
+# define
+test
+foo
+bar
+
+# run
+write foo 0 4096
+fsync foo
+write bar 0 4096
+fsync bar
+write foo 4096 4096
+fsync foo
+write bar 4096 4096
+fsync bar
+write foo 8192 4096
+fsync foo
+write bar 8192 4096
+fsync bar
+write foo 12288 4096
+fsync foo
+write bar 12288 4096
+fsync bar
+checkpoint 1
+write foo 16384 4096
+fsync foo
+write bar 16384 4096
+fsync bar
+write foo 20480 4096
+fsync foo
+write bar 20480 4096
+fsync bar
+write foo 24576 4096
+fsync foo
+write bar 24576 4096
+fsync bar
+write foo 28672 4096
+fsync foo
+write bar 28672 4096
+fsync bar
+checkpoint 2
+write foo 32768 4096
+fsync foo
+write bar 32768 4096
+fsync bar
+write foo 36864 4096
+fsync foo
+write bar 36864 4096
+fsync bar
+write foo 40960 4096
+fsync foo
+write bar 40960 4096
+fsync bar
+write foo 45056 4096
+fsync foo
+write bar 45056 4096
+fsync bar
+checkpoint 3

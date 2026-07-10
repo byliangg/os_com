@@ -1,0 +1,19 @@
+# ACE known-bug #18 (generic/104): two independent link additions, fsync
+# only one inode — the other's link must not leak into/out of the log.
+
+# define
+test
+foo
+bar
+foo1
+bar1
+
+# run
+creat foo 0777
+creat bar 0777
+sync
+checkpoint 1
+link foo foo1
+link bar bar1
+fsync bar
+checkpoint 2

@@ -1,0 +1,29 @@
+# ACE known-bug #25 (generic/336): cross-dir link, sync, unlink + a
+# third-dir rename, fsync the original inode.
+
+# define
+test
+A
+B
+C
+A/foo
+B/foo
+B/bar
+C/bar
+
+# run
+mkdir A 0777
+mkdir B 0777
+mkdir C 0777
+creat Afoo 0777
+write Afoo 0 4096
+sync
+checkpoint 1
+link Afoo Bfoo
+creat Bbar 0777
+sync
+checkpoint 2
+unlink Bfoo
+rename Bbar Cbar
+fsync Afoo
+checkpoint 3

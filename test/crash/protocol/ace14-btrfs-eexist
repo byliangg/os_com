@@ -1,0 +1,14 @@
+# ACE known-bug #14 (btrfs_EEXIST): fsync an empty create, write, fsync
+# again — recreate-after-crash must not EEXIST.
+
+# define
+test
+foo
+
+# run
+creat foo 0777
+fsync foo
+checkpoint 1
+write foo 0 4096
+fsync foo
+checkpoint 2

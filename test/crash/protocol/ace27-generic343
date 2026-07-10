@@ -1,0 +1,25 @@
+# ACE known-bug #27 (generic/343): link within a dir plus a cross-dir
+# rename landing next to it, fsync the linked inode.
+
+# define
+test
+A
+B
+A/foo
+A/bar
+B/foo_new
+A/foo_new
+
+# run
+mkdir A 0777
+mkdir B 0777
+creat Afoo 0777
+write Afoo 0 4096
+creat Bfoo_new 0777
+write Bfoo_new 0 4096
+sync
+checkpoint 1
+link Afoo Abar
+rename Bfoo_new Afoo_new
+fsync Afoo
+checkpoint 2

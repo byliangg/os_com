@@ -1,0 +1,37 @@
+# protocol point: revoke + freed-block reuse (P7b).
+# A directory's block is freed by rmdir (revoke record), then immediately
+# reallocated as file data before the crash: replay must not clobber the
+# reused block (PASS_REVOKE), and the freed->reused bytes must never
+# resurface through the old inode (0x52/stale oracle legs).
+
+# define
+test
+sub
+sub/f1
+sub/f2
+sub/f3
+sub/f4
+sub/f5
+sub/f6
+bar
+
+# run
+mkdir sub 0777
+creat subf1 0777
+creat subf2 0777
+creat subf3 0777
+creat subf4 0777
+creat subf5 0777
+creat subf6 0777
+sync
+checkpoint 1
+unlink subf1
+unlink subf2
+unlink subf3
+unlink subf4
+unlink subf5
+unlink subf6
+rmdir sub
+write bar 0 262144
+fsync bar
+checkpoint 2

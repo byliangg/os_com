@@ -1,0 +1,20 @@
+# ACE known-bug #24 (generic/335): rename OUT of a dir to the root,
+# create a sibling, fsync the root.
+
+# define
+test
+A
+A/foo
+foo
+bar
+
+# run
+mkdir A 0777
+creat Afoo 0777
+write Afoo 0 4096
+sync
+checkpoint 1
+rename Afoo foo
+creat bar 0777
+fsync test
+checkpoint 2

@@ -18,6 +18,24 @@
 # only up to one. replay-log is xfstests' official dm-log-writes replayer;
 # it invokes the judge at every FLUSH entry via --check flush.
 #
+# Two sweep modes:
+#
+#   Default (no X4_LEDGER): replay-log aborts at the first red point and this
+#   script exits non-zero there — the historical stop-on-first-fail gate.
+#
+#   Ledger mode (X4_LEDGER=<progress.tsv>): every judged point is recorded to
+#   the TSV (point / entry / verdict / workload-hint / signature / evidence,
+#   see judge_record.sh) and a RED DOES NOT STOP THE SWEEP — the remaining
+#   FLUSH points are still judged and the run ends with a "N green / M red"
+#   summary (exit 1 if any red). Red evidence (judge transcript + structdiff)
+#   is kept under X4_EVIDENCE (default: <ledger dir>/evidence). The ledger
+#   also makes the sweep RESUMABLE: X4_RESUME=1 with an existing ledger
+#   fast-forwards the replay (no judging) past the last recorded point and
+#   continues from there — an interrupted multi-hour sweep loses nothing.
+#   X4_WL_LIST names the corpus workloads for the ledger's attribution hints.
+#   A pre-existing ledger without X4_RESUME=1 is refused (fail-loud), so two
+#   sweeps cannot silently interleave rows.
+#
 # Coverage gates (the other half of the vacuity guard; run_matrix.sh sets
 # both): a kernel that stops emitting FLUSH barriers (fsync without a device
 # flush — the head-line bug class this harness exists for) would silently
@@ -31,7 +49,8 @@
 #                   ends with every workload's markers on disk).
 #
 # Exit 0 = every crash point judged consistent and the coverage gates hold;
-# non-zero = a failing point (replay-log names the entry) or a coverage hole.
+# non-zero = a failing point (named in the summary or by replay-log) or a
+# coverage hole.
 
 set -eu
 set -o pipefail
@@ -67,29 +86,122 @@ fi
 
 CRASH=$(mktemp "${TMPDIR:-/tmp}/crash-sweep-XXXXXX.img")
 SWEEP_LOG=$(mktemp "${TMPDIR:-/tmp}/crash-sweep-XXXXXX.out")
-trap 'rm -f "$CRASH" "$SWEEP_LOG"' EXIT
+STATE=
+trap 'rm -rf "$CRASH" "$SWEEP_LOG" "$STATE"' EXIT
 cp --sparse=always "$PRISTINE" "$CRASH"
 
-# Replay entry by entry; at every FLUSH, run the judge on the current state.
-# The judge copies the image before touching it, so the incremental replay
-# stays faithful. The judge output is teed so the in-force peak can be
-# audited after the sweep.
-"$REPLAY_LOG" --log "$LOG" --replay "$CRASH" \
-    --check flush --fsck "$HERE/judge.sh $CRASH $*" 2>&1 | tee "$SWEEP_LOG"
-
-# The final state (all writes applied, clean end of run) must judge clean too.
-"$HERE/judge.sh" "$CRASH" "$@" 2>&1 | tee -a "$SWEEP_LOG"
-
-if [ -n "${X4_EXPECT_WL:-}" ]; then
-    peak=$(sed -n 's/^oracle check: \([0-9]\{1,\}\) workloads in force.*/\1/p' \
-        "$SWEEP_LOG" | sort -n | tail -1)
-    peak=${peak:-0}
-    if [ "$peak" -ne "$X4_EXPECT_WL" ]; then
-        echo "sweep: in-force coverage hole: oracle peak $peak workloads in" \
-            "force != expected $X4_EXPECT_WL — markers never persisted or" \
-            "the oracle never saw them (vacuous sweep)" >&2
-        exit 1
+audit_coverage() {
+    # The judge output is teed into $SWEEP_LOG so the oracle in-force peak
+    # can be audited after the sweep. The peak is reached at the tail of the
+    # log (a healthy run ends with every marker on disk), so a resumed sweep
+    # still observes it even though earlier points' output is absent.
+    if [ -n "${X4_EXPECT_WL:-}" ]; then
+        peak=$(sed -n 's/^oracle check: \([0-9]\{1,\}\) workloads in force.*/\1/p' \
+            "$SWEEP_LOG" | sort -n | tail -1)
+        peak=${peak:-0}
+        if [ "$peak" -ne "$X4_EXPECT_WL" ]; then
+            echo "sweep: in-force coverage hole: oracle peak $peak workloads in" \
+                "force != expected $X4_EXPECT_WL — markers never persisted or" \
+                "the oracle never saw them (vacuous sweep)" >&2
+            exit 1
+        fi
+        echo "sweep: oracle in-force peak $peak == expected $X4_EXPECT_WL"
     fi
-    echo "sweep: oracle in-force peak $peak == expected $X4_EXPECT_WL"
+}
+
+if [ -z "${X4_LEDGER:-}" ]; then
+    # ---- default mode: stop at the first failing point ------------------
+    "$REPLAY_LOG" --log "$LOG" --replay "$CRASH" \
+        --check flush --fsck "$HERE/judge.sh $CRASH $*" 2>&1 | tee "$SWEEP_LOG"
+
+    # The final state (all writes applied, clean end of run) must judge
+    # clean too.
+    "$HERE/judge.sh" "$CRASH" "$@" 2>&1 | tee -a "$SWEEP_LOG"
+
+    audit_coverage
+    echo "sweep: all $NR_FLUSHES flush points + final state judged consistent"
+    exit 0
 fi
-echo "sweep: all $NR_FLUSHES flush points + final state judged consistent"
+
+# ---- ledger mode: record every point, survive reds, resumable -----------
+
+LEDGER=$X4_LEDGER
+EVIDENCE=${X4_EVIDENCE:-$(dirname "$LEDGER")/evidence}
+STATE=$(mktemp -d "${TMPDIR:-/tmp}/crash-sweep-state-XXXXXX")
+
+# The full-log FLUSH entry list: maps the k-th judged point to the log entry
+# number a re-run can --start-entry from (and the attribution anchor the
+# expected-red table keys on).
+"$REPLAY_LOG" --log "$LOG" --replay /dev/null -v 2>/dev/null \
+    | awk '/FLUSH/ { split($2, a, "@"); print a[1] }' > "$STATE/flush_entries"
+
+START_ENTRY=0
+POINT_BASE=0
+if [ -f "$LEDGER" ]; then
+    if [ "${X4_RESUME:-0}" != 1 ]; then
+        echo "sweep: ledger $LEDGER already exists (set X4_RESUME=1 to continue it)" >&2
+        exit 2
+    fi
+    if grep -q "OPERR" "$LEDGER"; then
+        echo "sweep: ledger records a judge operational error — fix the" \
+            "harness and start a fresh ledger instead of resuming" >&2
+        exit 2
+    fi
+    if awk -F'\t' '$1 == "final"' "$LEDGER" | grep -q .; then
+        echo "sweep: ledger already complete (final state judged); summarizing only"
+    else
+        done_points=$(awk -F'\t' '$1 ~ /^[0-9]+$/' "$LEDGER" | wc -l)
+        if [ "$done_points" -gt 0 ]; then
+            last_entry=$(awk -F'\t' '$1 ~ /^[0-9]+$/ { print $2 }' "$LEDGER" | sort -n | tail -1)
+            START_ENTRY=$((last_entry + 1))
+            POINT_BASE=$done_points
+        fi
+        echo "sweep: resuming — $done_points points already judged," \
+            "fast-forwarding to entry $START_ENTRY"
+    fi
+else
+    if [ "${X4_RESUME:-0}" = 1 ]; then
+        echo "sweep: X4_RESUME=1 but no ledger at $LEDGER — starting fresh"
+    fi
+    mkdir -p "$(dirname "$LEDGER")"
+    {
+        echo "# crash-sweep progress ledger (see judge_record.sh)"
+        echo "# log=$LOG pristine=$PRISTINE date=$(date -u +%FT%TZ)"
+        printf '# point\tentry\tverdict\twl\tsig\tevidence\n'
+    } > "$LEDGER"
+fi
+
+cat > "$STATE/config" <<EOF
+LEDGER=$LEDGER
+EVIDENCE=$EVIDENCE
+POINT_BASE=$POINT_BASE
+WL_LIST=${X4_WL_LIST:-}
+EOF
+echo 0 > "$STATE/counter"
+
+if ! awk -F'\t' '$1 == "final"' "$LEDGER" | grep -q .; then
+    if [ "$START_ENTRY" -gt 0 ]; then
+        # Fast-forward: replay the already-judged prefix without judging.
+        "$REPLAY_LOG" --log "$LOG" --replay "$CRASH" --limit "$START_ENTRY"
+    fi
+    "$REPLAY_LOG" --log "$LOG" --replay "$CRASH" --start-entry "$START_ENTRY" \
+        --check flush \
+        --fsck "$HERE/judge_record.sh $STATE $HERE/judge.sh $CRASH $*" \
+        2>&1 | tee "$SWEEP_LOG"
+
+    # The final state (all writes applied, clean end of run) is a ledger row
+    # of its own.
+    "$HERE/judge_record.sh" --final "$STATE" "$HERE/judge.sh" "$CRASH" "$@" \
+        2>&1 | tee -a "$SWEEP_LOG"
+
+    audit_coverage
+fi
+
+greens=$(awk -F'\t' '$3 == "GREEN"' "$LEDGER" | wc -l)
+reds=$(awk -F'\t' '$3 == "RED"' "$LEDGER" | wc -l)
+echo "sweep: ledger summary: $greens points green, $reds red ($LEDGER)"
+if [ "$reds" -gt 0 ]; then
+    echo "sweep: red points (point/entry/wl/sig):" >&2
+    awk -F'\t' '$3 == "RED" { print "  " $1 "\t" $2 "\t" $4 "\t" $5 }' "$LEDGER" >&2
+    exit 1
+fi

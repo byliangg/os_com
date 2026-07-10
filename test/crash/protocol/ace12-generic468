@@ -1,0 +1,15 @@
+# ACE known-bug #12 (generic/468): falloc KEEP_SIZE beyond EOF over
+# synced data, then fdatasync.
+
+# define
+test
+foo
+
+# run
+creat foo 0777
+write foo 0 65536
+sync
+checkpoint 1
+falloc foo FALLOC_FL_KEEP_SIZE 65536 65536
+fdatasync foo
+checkpoint 2

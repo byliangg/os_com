@@ -1,0 +1,15 @@
+# age-commit control twin (leading): identical to age9-control; runs
+# first in the session so mount-time noise is absorbed by ITS span and
+# the later spans are clean to count. Law: span commits = 2 (data
+# fsync + marker fsync).
+
+# define
+test
+foo
+zzz
+
+# run
+write zzz 0 4096
+fsync zzz
+write foo 0 4096
+checkpoint 1

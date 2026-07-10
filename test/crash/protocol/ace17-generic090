@@ -1,0 +1,19 @@
+# ACE known-bug #17 (generic/090): write+sync, link+sync, append, fsync
+# — nlink>1 append recovery.
+
+# define
+test
+foo
+bar
+
+# run
+creat foo 0777
+write foo 0 4096
+sync
+checkpoint 1
+link foo bar
+sync
+checkpoint 2
+write foo 4096 4096
+fsync foo
+checkpoint 3

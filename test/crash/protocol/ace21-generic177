@@ -1,0 +1,16 @@
+# ACE known-bug #21 (generic/177): synced 32K write, punch inside, punch
+# ACROSS EOF, fsync — extent tail recovery.
+
+# define
+test
+foo
+
+# run
+creat foo 0777
+write foo 0 32768
+sync
+checkpoint 1
+falloc foo FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE 24576 8192
+falloc foo FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE 4096 61440
+fsync foo
+checkpoint 2

@@ -1,0 +1,19 @@
+# ACE known-bug #1 (btrfs_link_unlink): link, sync, unlink the link,
+# recreate the name, fsync the new file — the recreated NAME must
+# survive, not resurrect the old link.
+
+# define
+test
+foo
+bar
+
+# run
+creat foo 0777
+write foo 0 4096
+link foo bar
+sync
+checkpoint 1
+unlink bar
+creat bar 0777
+fsync bar
+checkpoint 2
