@@ -922,13 +922,33 @@ impl Inode {
     /// descriptor was written under the creating op's handle before this
     /// `Inode` existed. A no-op without a handle.
     ///
+    /// Stamps BOTH wait targets, `sync_tid` and `datasync_tid`, mirroring
+    /// Linux `__ext4_new_inode` (v6.6 `fs/ext4/ialloc.c:1339-1342`): the
+    /// creating transaction is data-relevant — it carries the inode's very
+    /// existence (directory entry, empty extent root, `i_size`), so an
+    /// `fdatasync` of the just-created file must force its commit. Leaving
+    /// `datasync_tid` unstamped made that `fdatasync` wait on nothing and
+    /// return success while the create sat uncommitted; a crash then erased
+    /// the acknowledged file (the P8a data-oracle catch).
+    ///
     /// Taking `inner` here while the caller holds the op handle formally
     /// reverses the inner ① → handle ② order, but cannot deadlock: the inode
     /// is not yet published (no cache entry, no second reference), so this
     /// write lock is uncontended and participates in no cycle.
-    pub(super) fn record_sync_tid(&self, handle: Option<&journal::Handle>) {
+    ///
+    /// Invariant (review finding): the create op must NOT `journal_restart`
+    /// after this stamp — the directory entry and the child-descriptor
+    /// recapture that follow in `create` must land in the SAME transaction,
+    /// or an `fdatasync` waits on a tid that no longer carries the dirent
+    /// and a crash erases the acknowledged name. Today this is structural
+    /// (the create path only ever sees `&Handle`; `journal_restart` needs
+    /// `&mut Handle`), so the borrow checker enforces it — keep it that way
+    /// if the `&mut` spine ever creeps into the create path.
+    pub(super) fn record_create_tid(&self, handle: Option<&journal::Handle>) {
         if let Some(handle) = handle {
-            self.inner.write().sync_tid = Some(handle.tid());
+            let mut inner = self.inner.write();
+            inner.sync_tid = Some(handle.tid());
+            inner.datasync_tid = Some(handle.tid());
         }
     }
 
@@ -2189,13 +2209,15 @@ struct InodeInner {
     /// The `fdatasync` subset (jbd2 `i_datasync_tid`): the transaction that
     /// captured this inode's most recent **data-relevant** metadata change —
     /// extent mapping or `i_size`, the metadata `fdatasync` must commit to
-    /// retrieve the data. Only the write/truncate paths stamp it (see
-    /// [`stamp_datasync_tid`](Self::stamp_datasync_tid)); a pure-attribute
-    /// change (chmod/chown/utimens) bumps `sync_tid` but not this, so
-    /// `fdatasync` does not force mode/owner/timestamp updates the data does
-    /// not depend on. A subset of `sync_tid` — `fdatasync` waits on it,
-    /// `fsync` on the full `sync_tid`. `None` (like `sync_tid`) on
-    /// non-journaled volumes and before any data-relevant capture.
+    /// retrieve the data. The write/truncate paths stamp it (see
+    /// [`stamp_datasync_tid`](Self::stamp_datasync_tid)), as does inode
+    /// creation ([`Inode::record_create_tid`] — the create carries the file's
+    /// very existence); a pure-attribute change (chmod/chown/utimens) bumps
+    /// `sync_tid` but not this, so `fdatasync` does not force
+    /// mode/owner/timestamp updates the data does not depend on. A subset of
+    /// `sync_tid` — `fdatasync` waits on it, `fsync` on the full `sync_tid`.
+    /// `None` (like `sync_tid`) on non-journaled volumes and before any
+    /// data-relevant capture.
     datasync_tid: Option<Tid>,
     /// This inode's `metadata_csum` seed `crc32c(crc32c(fs_seed, ino),
     /// generation)`, or `None` when the feature is off. Seeds the directory-block
@@ -2763,7 +2785,8 @@ impl InodeInner {
     /// right after their [`write_back_inode_desc`](Self::write_back_inode_desc)
     /// capture: those change the data-relevant metadata (extent mapping /
     /// `i_size`) `fdatasync` must commit. Pure-attribute changes must NOT call it,
-    /// so `fdatasync` stays narrower than `fsync`. Mirrors Linux
+    /// so `fdatasync` stays narrower than `fsync`. (Inode creation stamps the
+    /// field too, via [`Inode::record_create_tid`].) Mirrors Linux
     /// `ext4_update_inode_fsync_trans(handle, inode, /* need_datasync */ 1)`.
     ///
     /// A no-op without a handle (non-journaled volume leaves `datasync_tid`

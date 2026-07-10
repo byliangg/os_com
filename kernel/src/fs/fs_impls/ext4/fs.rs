@@ -1209,11 +1209,11 @@ impl Ext4 {
             }
         };
         // The fresh descriptor was captured under the creating op's handle
-        // (before this `Inode` existed): record the transaction so an fsync of
-        // the just-created inode waits for its commit (see
-        // `InodeInner::sync_tid` — the inode starts "clean", and clean does
-        // not imply committed).
-        inode.record_sync_tid(handle);
+        // (before this `Inode` existed): record the transaction so an fsync —
+        // or an fdatasync, a create being data-relevant — of the just-created
+        // inode waits for its commit (see `Inode::record_create_tid` — the
+        // inode starts "clean", and clean does not imply committed).
+        inode.record_create_tid(handle);
         Ok(inode)
     }
 
@@ -3913,6 +3913,142 @@ mod tests {
         );
         assert_eq!(ext4.read_inode_desc(ino).unwrap().link_count(), new_link);
         drop(ext4);
+    }
+
+    /// P8a data-oracle regression (G1 first full sweep): `fdatasync` of a
+    /// freshly created, never-written file was a no-op. The create stamped only
+    /// `sync_tid`, so `SyncScope::DataOnly` found `datasync_tid == None` on a
+    /// clean inode, waited on no transaction, and returned success while the
+    /// creating transaction sat uncommitted — a crash then erased the
+    /// acknowledged file. Linux stamps BOTH tids under the creating handle
+    /// (`__ext4_new_inode`, v6.6 `fs/ext4/ialloc.c:1339-1342`): a create is
+    /// data-relevant, losing it loses the data wholesale.
+    #[ktest]
+    fn fdatasync_of_new_file_survives_crash() {
+        // A pre-placed empty directory to create in (the fixture root inode
+        // claims one block of dir data but maps none, so it cannot host a
+        // real create — the same reason the dir tests use this idiom).
+        const DIR_INO: u32 = 12;
+
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let disk = f.disk.clone();
+        let journal = f.ext4.journal().unwrap();
+        // The commit thread stays RUNNING: fdatasync's commit wait needs a
+        // committer to serve it.
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let file = dir
+            .create(
+                "durable.txt",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        // The real fdatasync path (what the VFS `sync_data` impl calls).
+        file.sync_data_and_meta(SyncScope::DataOnly).unwrap();
+
+        // Crash: stop the committer (so the leak below sheds no thread), then
+        // leak the mount — no unmount flush, no RECOVER clear.
+        journal.stop_commit_thread();
+        drop(file);
+        drop(dir);
+        core::mem::forget(f);
+
+        // Recovery mount: the create that fdatasync acknowledged must be
+        // replayed from the log.
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>).unwrap();
+        let dir = ext4.read_inode(DIR_INO).unwrap();
+        dir.lookup("durable.txt")
+            .expect("a crash must not erase an fdatasync'd new file");
+        drop(ext4);
+    }
+
+    /// Companion to `fdatasync_of_new_file_survives_crash`, guarding against
+    /// an over-broad fix: the create stamp must not blunt `fdatasync`'s
+    /// narrowing (P7d-4). On a created-then-written file the write advances
+    /// `datasync_tid` normally (the create stamp does not pin it), a later
+    /// pure-attribute change still bumps only `sync_tid`, and a real
+    /// `fdatasync` returns without forcing the attribute change's transaction
+    /// — on this stopped committer, a wait wrongly dragged to that
+    /// uncommitted transaction would hang the test rather than pass it.
+    #[ktest]
+    fn create_stamp_keeps_fdatasync_narrowing() {
+        const DIR_INO: u32 = 12;
+
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let journal = f.ext4.journal().unwrap();
+        // Stopped committer: every tid boundary below is deterministic.
+        journal.stop_commit_thread();
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let file = dir
+            .create(
+                "data.bin",
+                InodeType::File,
+                FilePerm::from_bits_truncate(0o644),
+            )
+            .unwrap();
+
+        // The creating transaction stamps both wait targets.
+        let t_create = file
+            .recorded_datasync_tid_for_test()
+            .expect("create stamps datasync_tid");
+        assert_eq!(file.recorded_sync_tid_for_test(), Some(t_create));
+
+        // Commit the create; a write lands in a strictly later transaction and
+        // advances both tids — the create stamp does not pin them.
+        journal.commit_now_for_test();
+        write_all(&file, 0, &[0xC7; 16]);
+        let t_write = file
+            .recorded_datasync_tid_for_test()
+            .expect("the write stamps datasync_tid");
+        assert!(
+            t_write.geq(t_create.next()),
+            "the write advanced datasync_tid past the create"
+        );
+        assert_eq!(file.recorded_sync_tid_for_test(), Some(t_write));
+
+        // Commit the write; a pure-attribute change in a strictly later
+        // transaction bumps only `sync_tid` (the P7d-4 narrowing).
+        journal.commit_now_for_test();
+        file.set_owner(4242).unwrap();
+        assert_eq!(
+            file.recorded_datasync_tid_for_test(),
+            Some(t_write),
+            "a pure-attribute change must not advance datasync_tid"
+        );
+        let t_attr = file.recorded_sync_tid_for_test().unwrap();
+        assert!(t_attr.geq(t_write.next()));
+
+        // A real fdatasync: its target (the write) is already durable, so it
+        // returns without forcing the attribute change's commit.
+        file.sync_data_and_meta(SyncScope::DataOnly).unwrap();
+        assert!(journal.committed_tid().geq(t_write));
+        assert!(
+            !journal.committed_tid().geq(t_attr),
+            "fdatasync must not force a pure-attribute transaction"
+        );
     }
 
     /// Mount contract (report §4.5): a superblock whose `s_journal_inum` names
