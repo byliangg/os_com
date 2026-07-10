@@ -22,7 +22,16 @@
 # masking exactly the crash-inconsistency this judge exists to catch — the
 # crash matrix was blind to a real `bg_itable_unused` bug for this reason. So we
 # run a single `-fy` pass and FAIL if it repaired ANYTHING beyond replaying the
-# journal (every repair prints `Fix? yes` / `FIXED`; journal recovery does not).
+# journal. Every interactive repair answers a prompt as `<Verb>? yes` — Fix,
+# Clear, Clear HTree index, Salvage, Truncate, Connect, Unlink, ... — while a
+# pure journal recovery prints no prompt at all, so the `? yes` grep is the
+# discriminator (matching only `Fix? yes` false-greened dangling-dirent and
+# torn-htree repairs). LC_ALL=C pins the English prompt text: a translated
+# locale (e.g. zh_CN) would green every repair.
+#
+# On every red verdict a structural manifest of the offending state is dumped
+# next to the image (<crash.img>.structdiff, judge_structdiff.sh format) for
+# attribution — the scratch copy is gone once this judge exits.
 
 set -u
 
@@ -34,35 +43,52 @@ fi
 IMG=$1
 shift
 
+HERE=$(dirname "$(readlink -f "$0")")
 WORK=$(mktemp "${TMPDIR:-/tmp}/crash-judge-XXXXXX.img")
 trap 'rm -f "$WORK"' EXIT
 cp --sparse=always "$IMG" "$WORK"
 
+forensics() { # dump a structdiff manifest of the (replayed) bad state
+    "$HERE/judge_structdiff.sh" "$WORK" > "$IMG.structdiff" 2>&1 || true
+    echo "CRASH-JUDGE: structural manifest dumped to $IMG.structdiff" >&2
+}
+
 # Replay the journal and check, in one strict non-interactive pass. `-fy`
 # auto-answers, so its exit code alone cannot distinguish journal replay from a
 # corruption repair (both set the "fixed" bit); we judge on the output instead.
-OUT=$(e2fsck -fy "$WORK" 2>&1)
+OUT=$(LC_ALL=C e2fsck -fy "$WORK" 2>&1)
 rc=$?
 if [ "$rc" -ge 8 ]; then
     echo "CRASH-JUDGE: e2fsck operational error (rc=$rc) on $IMG" >&2
     echo "$OUT" | head -20 >&2
+    forensics
     exit 1
 fi
 
 # The only repair allowed is journal recovery ("recovering journal", no
-# `Fix?`). Any `Fix? yes` / `FIXED` means the post-replay filesystem was NOT
-# crash-consistent — the state a real kernel would have mounted was corrupt.
-if echo "$OUT" | grep -qE "Fix\? yes|FIXED|CLEARED|RECONNECT"; then
+# prompt). Any answered `<Verb>? yes` (or a preen-style FIXED/CLEARED/
+# RECONNECT) means the post-replay filesystem was NOT crash-consistent —
+# the state a real kernel would have mounted was corrupt.
+if echo "$OUT" | grep -qE "\? yes|FIXED|CLEARED|RECONNECT"; then
     echo "CRASH-JUDGE: post-replay fsck repaired corruption on $IMG" >&2
-    echo "$OUT" | grep -iE "Fix\? yes|FIXED|CLEARED|RECONNECT|differences|wrong|invalid|overlaps|orphan|unused inodes" | head -20 >&2
+    echo "$OUT" | grep -iE "\? yes|FIXED|CLEARED|RECONNECT|differences|wrong|invalid|overlaps|orphan|unused inodes" | head -20 >&2
+    forensics
     exit 1
 fi
 
 # Optional data oracle (fsync-durability / content assertions), run against
-# the REPLAYED image via debugfs — no mount needed.
+# the REPLAYED image via debugfs — no mount needed. rc>=2 is an operational
+# error of the oracle itself (bad table/usage), not a durability verdict:
+# still red (fail-loud), but labeled so triage does not chase a phantom bug.
 if [ $# -ge 1 ]; then
     if ! "$@" "$WORK"; then
-        echo "CRASH-JUDGE: data oracle '$1' failed on $IMG" >&2
+        orc=$?
+        forensics
+        if [ "$orc" -ge 2 ]; then
+            echo "CRASH-JUDGE: data oracle '$1' operational error (rc=$orc) on $IMG" >&2
+        else
+            echo "CRASH-JUDGE: data oracle '$1' failed on $IMG" >&2
+        fi
         exit 1
     fi
 fi
