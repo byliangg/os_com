@@ -23,8 +23,8 @@ use super::{
         RAW_BLOCK_PTRS_LEN,
     },
     node::{
-        ENTRY_SIZE, EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_WRITTEN_LEN,
-        RawExtent, RawExtentHeader, RawExtentIdx,
+        ENTRY_SIZE, EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_DEPTH,
+        MAX_WRITTEN_LEN, RawExtent, RawExtentHeader, RawExtentIdx,
     },
     path::{self, ExtentPath, NodeBuf, PathLevel, Search},
 };
@@ -69,9 +69,22 @@ impl ExtentTree {
     /// This is the parse boundary: a bad magic / entry count / depth is
     /// rejected here, and every later method call trusts the root.
     pub(super) fn try_new(root: [u32; RAW_BLOCK_PTRS_LEN], sector_count: u64) -> Result<Self> {
-        ExtentHeader::try_from(&RawExtentHeader::from_bytes(
+        let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(
             &root.as_bytes()[0..ENTRY_SIZE],
         ))?;
+        // The inline root holds a 12-byte header plus at most `INLINE_MAX`
+        // 12-byte entries in the 60-byte `i_block`. `ExtentHeader::try_from`
+        // only checks `entries <= max`; bound both here so a crafted image
+        // with `entries`/`max` above the inline capacity is rejected at this
+        // parse boundary rather than overrunning `i_block` in a later scan
+        // (the root scanners read `root.as_bytes()[12*(1+i)..]` with no
+        // container length of their own).
+        if header.entries() as usize > INLINE_MAX || header.max() as usize > INLINE_MAX {
+            return_errno_with_message!(
+                Errno::EUCLEAN,
+                "inline extent root exceeds i_block capacity"
+            );
+        }
         Ok(Self {
             root,
             sector_count,
@@ -266,7 +279,7 @@ impl ExtentTree {
 
         let journal = fs.journal();
         let device = fs.block_device().as_ref();
-        for _ in 0..super::node::MAX_DEPTH {
+        for _ in 0..MAX_DEPTH {
             let block = journal::read_metadata_block(journal.as_deref(), device, next_bid)?;
             match search_node(&block, iblock)? {
                 Step::Found(extent) => return Ok(Some(extent)),
@@ -313,23 +326,30 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
-        // Fast path (surgery T2): when the landing leaf is external and can
-        // take the run without splitting, edit exactly that leaf (plus the
-        // index keys an at-position-0 insert corrects) instead of rebuilding
-        // the whole tree. A depth-0 root keeps the rebuild route — its inline
-        // rewrite is memory-only and free. A full leaf falls back to the
-        // rebuild too, until the split machinery lands (T3).
-        if self.header().depth() > 0
-            && self.try_insert_in_place(fs, iblock, pblock, len, kind, handle, csum_seed)?
-        {
-            // Data blocks only: the leaf was edited in place, no metadata
-            // block was allocated or freed.
-            self.sector_count =
-                (self.sector_count as i64 + len as i64 * SECTORS_PER_BLOCK as i64).max(0) as u64;
-            self.dirty = true;
-            return Ok(());
+        // Surgery route (T2 fast path + T3 room-making): edit exactly the
+        // landing leaf, splitting full nodes or growing the tree a level when
+        // the path has no room. Every `make_room_for` strictly adds capacity
+        // on the path (a split gives the landing leaf room; a grow adds a
+        // level the next round splits), so the retry bound is unreachable
+        // except on a corrupt tree — fail loud rather than spin.
+        if self.header().depth() > 0 {
+            for _ in 0..(MAX_DEPTH as usize + 2) {
+                if self.try_insert_in_place(fs, iblock, pblock, len, kind, handle, csum_seed)? {
+                    // Data blocks only: the leaf was edited in place; any
+                    // metadata the room-making allocated was accounted there.
+                    self.sector_count = (self.sector_count as i64
+                        + len as i64 * SECTORS_PER_BLOCK as i64)
+                        .max(0) as u64;
+                    self.dirty = true;
+                    return Ok(());
+                }
+                self.make_room_for(fs, iblock, handle, csum_seed)?;
+            }
+            return_errno_with_message!(Errno::EUCLEAN, "extent insert cannot make room");
         }
 
+        // Depth-0: the inline rebuild — memory-only up to INLINE_MAX extents,
+        // and the exact, cheap builder of the first external leaf beyond.
         let (mut extents, old_external) = self.flatten(fs)?;
         extents.push(Extent::new(iblock, len, pblock, kind));
         merge_extents(&mut extents);
@@ -457,6 +477,267 @@ impl ExtentTree {
         let mut raw = RawExtentIdx::from_bytes(&bytes[off..off + ENTRY_SIZE]);
         raw.block = key;
         bytes[off..off + ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+    }
+
+    /// Inserts index entry `idx` at root position `i`, shifting later entries
+    /// right — in-memory, like every root rewrite. Caller checked the root has
+    /// room ([`INLINE_MAX`]).
+    fn insert_root_index_at(&mut self, i: usize, idx: &RawExtentIdx) {
+        let header = self.header();
+        let n = header.entries() as usize;
+        debug_assert!(n < INLINE_MAX && i <= n);
+        let bytes = self.root.as_mut_bytes();
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        bytes.copy_within(start..end, start + ENTRY_SIZE);
+        bytes[start..start + ENTRY_SIZE].copy_from_slice(idx.as_bytes());
+        let mut raw = RawExtentHeader::from_bytes(&bytes[0..ENTRY_SIZE]);
+        raw.entries = (n + 1) as u16;
+        bytes[0..ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+    }
+
+    /// Grows the tree one level deeper (Linux `ext4_ext_grow_indepth`,
+    /// extents.c:1311): the root's entire content moves into a freshly
+    /// allocated full-block node, and the root becomes a one-entry index
+    /// pointing at it. The new node is written (journaled) BEFORE the
+    /// in-memory root flips, so an error leaves the old tree fully intact and
+    /// only the (rolled-back) allocation touched.
+    fn grow_root(
+        &mut self,
+        fs: &Ext4,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let header = self.header();
+        // Cap growth at depth 2 while the flatten-based consumers
+        // (`convert_unwritten`, `truncate_chunk`, `punch_chunk`, `extents`)
+        // still reject depth > 2: a deeper tree would read and insert fine but
+        // become un-truncatable and un-convertible (EUCLEAN), so a file could
+        // not be deleted or have its unwritten regions written. The cap lifts
+        // to `MAX_DEPTH` once those consumers go path-based (T5) and `flatten`
+        // is retired (T6); until then it matches the pre-surgery `reserialize`
+        // depth-2 ceiling — an honest ENOSPC, not a silently read-only tree.
+        const GROW_DEPTH_CAP: u16 = 2;
+        const { assert!(GROW_DEPTH_CAP <= MAX_DEPTH) };
+        if header.depth() >= GROW_DEPTH_CAP {
+            return_errno_with_message!(Errno::ENOSPC, "extent tree would exceed depth 2");
+        }
+        let n = header.entries() as usize;
+        debug_assert!(n > 0, "only a full root grows, and full is non-empty");
+        let root_bytes = self.root.as_bytes();
+        let first_key = if header.is_leaf() {
+            root_extent_at(root_bytes, 0).block()
+        } else {
+            root_index_at(root_bytes, 0).block()
+        };
+        // Goal: near the first child (interior root) or first data run (leaf
+        // root) for locality.
+        let goal = if header.is_leaf() {
+            root_extent_at(root_bytes, 0).start()
+        } else {
+            root_index_at(root_bytes, 0).leaf()
+        };
+
+        let bid = alloc_meta_block(fs, goal, handle)?;
+        let mut node = NodeBuf::fresh(bid, header.depth());
+        // The root's entries are a prefix-compatible layout (same 12-byte
+        // slabs); copy them verbatim under the full-block header.
+        node.adopt_entries(&root_bytes[ENTRY_SIZE..ENTRY_SIZE * (1 + n)], n);
+        if let Err(err) = node.write_back(fs.block_device().as_ref(), handle, csum_seed) {
+            rollback_meta_blocks(fs, &[bid], handle);
+            return Err(err);
+        }
+
+        // Publish: the root becomes a one-entry index one level up (in-memory,
+        // infallible; it rides the inode writeback).
+        self.write_index_root(&[make_index_entry(first_key, bid)], header.depth() + 1);
+        self.sector_count += SECTORS_PER_BLOCK;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Makes room on the path to `iblock` so the next in-place insert attempt
+    /// succeeds: splits the full nodes along the path (Linux
+    /// `ext4_ext_create_new_leaf`/`ext4_ext_split`, extents.c:1398/1052), or
+    /// grows the tree a level when the whole path up to the root is full.
+    /// Only reorganizes EXISTING entries — the new extent lands afterwards via
+    /// the ordinary in-place insert, so no intermediate state here references
+    /// the caller's new data blocks.
+    ///
+    /// Write ordering (the always-valid discipline): fresh nodes first (still
+    /// unreferenced), then the shrunk old nodes, then the one landing write
+    /// (or the in-memory root edit) that publishes the new subtree. Between
+    /// the shrink and the publish the moved entries live only in the
+    /// unpublished new nodes; if the single publish write fails, a best-effort
+    /// restore re-grows the old nodes. The alternative order (publish before
+    /// shrink) would expose a both-sides-referenced state whose escape on an
+    /// error return double-frees on the next truncate — strictly worse than
+    /// this order's worst case (a leak e2fsck reclaims).
+    fn make_room_for(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let Search::Gap { mut path, .. } = self.find(fs, iblock)? else {
+            return_errno_with_message!(Errno::EUCLEAN, "extent insert target is already mapped");
+        };
+        let leaf_level = path.levels.len() - 1;
+        if !path.levels[leaf_level].node.is_full() {
+            // Spurious call (already room): nothing to do.
+            return Ok(());
+        }
+
+        // The contiguous run of full nodes from the leaf upward; `land` is the
+        // first level with room above them (`None` = the root is the landing).
+        let mut top = leaf_level;
+        while top > 0 && path.levels[top - 1].node.is_full() {
+            top -= 1;
+        }
+        if top == 0 && self.header().entries() as usize >= INLINE_MAX {
+            // Full all the way through the root: grow a level and let the
+            // caller's loop retry (the copied-down root usually still needs a
+            // split, handled by the next round).
+            return self.grow_root(fs, handle, csum_seed);
+        }
+
+        let device = fs.block_device();
+        // Allocate one fresh node per full level, leaf-first (goal: next to
+        // the old leaf). On any failure the fresh blocks roll back; nothing
+        // was referenced yet.
+        let goal = path.levels[leaf_level].node.bid() + 1;
+        let mut fresh: Vec<NodeBuf> = Vec::with_capacity(leaf_level - top + 1);
+        let mut fresh_bids: Vec<Ext4Bid> = Vec::with_capacity(fresh.capacity());
+        for level in (top..=leaf_level).rev() {
+            let bid = match alloc_meta_block(fs, goal, handle) {
+                Ok(bid) => bid,
+                Err(err) => {
+                    rollback_meta_blocks(fs, &fresh_bids, handle);
+                    return Err(err);
+                }
+            };
+            fresh_bids.push(bid);
+            fresh.push(NodeBuf::fresh(bid, path.levels[level].node.depth()));
+        }
+
+        // Stage the reorganization in memory, leaf upward. `carry` is the
+        // index entry publishing each level's fresh node into the level above.
+        // The staging is pure memory: nothing durable happens until the write
+        // phase below.
+        let mut carry: Option<RawExtentIdx> = None;
+        for (i, level) in (top..=leaf_level).rev().enumerate() {
+            let at = if level == leaf_level {
+                // The leaf splits at the insertion point, but never at 0: a
+                // before-first insert (`pos == 0`) keeps the leaf's original
+                // first entry in the old node (Linux's `ext4_ext_split` moves
+                // from `p_ext + 1`). Splitting at 0 would empty the old leaf
+                // and key the fresh node at the same block as the old leaf's
+                // unchanged parent index entry — an out-of-order (duplicate-
+                // key) index a crash in the retry window could persist, which
+                // Linux's `ext4_valid_extent_entries` rejects on read.
+                path.levels[level].pos.max(1)
+            } else {
+                // An interior level keeps its descent child (position `pos`)
+                // on the old side.
+                path.levels[level].pos + 1
+            };
+            path.levels[level].node.move_upper_into(at, &mut fresh[i]);
+            if let Some(c) = carry.take() {
+                // The child carry keys between the old node's kept tail and
+                // the fresh node's first moved entry: append to old when it
+                // has room, else prepend to a (necessarily empty) fresh node.
+                // Both targets are proven to have room (old just passed the
+                // `!is_full` check; a full old means it kept every entry, so
+                // `at` moved none and fresh is empty) — a full-node `ENOSPC`
+                // is unreachable, so the failure would only mean a logic bug,
+                // not a runtime condition to leak `fresh_bids` on.
+                let old = &mut path.levels[level].node;
+                if !old.is_full() {
+                    let pos = old.entries();
+                    old.insert_index_at(pos, &c)
+                        .expect("carry into a non-full interior cannot overflow");
+                } else {
+                    fresh[i]
+                        .insert_index_at(0, &c)
+                        .expect("carry into an empty fresh interior cannot overflow");
+                }
+            }
+            // A split that keeps `>= 1` entry in the old node (the `at.max(1)`
+            // leaf case and every interior split) gives the fresh node its
+            // real first key; a pure-append leaf split (`pos == entries`)
+            // leaves the fresh node empty and keys it at the insertion target
+            // — a valid lower bound for the extent about to land there, above
+            // everything kept below it (Linux keys an append's new leaf the
+            // same way).
+            let key = if fresh[i].entries() > 0 {
+                fresh[i].first_key()
+            } else {
+                iblock
+            };
+            carry = Some(make_index_entry(key, fresh[i].bid()));
+        }
+        let final_carry = carry
+            .take()
+            .expect("the leaf split always produces a carry");
+
+        // WRITES. Phase 1 — fresh nodes: still unreferenced, so any failure
+        // rolls back to a fully intact old tree (the shrinks above live only
+        // in this function's buffers).
+        for node in fresh.iter_mut() {
+            if let Err(err) = node.write_back(device.as_ref(), handle, csum_seed) {
+                rollback_meta_blocks(fs, &fresh_bids, handle);
+                return Err(err);
+            }
+        }
+
+        // Phase 2 — the shrunk old nodes, then the landing publish. Until the
+        // FIRST shrink write lands the disk is still the fully intact old tree
+        // (the fresh nodes are written but referenced by nothing), so that one
+        // failure rolls back clean by freeing the fresh blocks. Once a shrunk
+        // node has landed the moved entries live only in the still-unpublished
+        // fresh nodes: the state is irreversible inside this transaction, and
+        // any later failure escalates through the P7e error funnel — the
+        // journal aborts, the captures never commit, and crash atomicity
+        // discards the half-state (Linux `ext4_std_error` posture). A
+        // non-journaled volume has no abort; the failure leaves the same
+        // torn-metadata exposure every multi-block mutation has there (P1–3).
+        let mut shrink_landed = false;
+        let publish = (|| -> Result<()> {
+            for level in top..=leaf_level {
+                path.levels[level]
+                    .node
+                    .write_back(device.as_ref(), handle, csum_seed)?;
+                shrink_landed = true;
+            }
+            if top == 0 {
+                // The root landing is an in-memory edit: infallible, closing
+                // the window with no fallible step after the shrink writes.
+                self.insert_root_index_at(path.root_pos + 1, &final_carry);
+            } else {
+                let landing = &mut path.levels[top - 1];
+                let pos = landing.pos + 1;
+                landing.node.insert_index_at(pos, &final_carry)?;
+                landing
+                    .node
+                    .write_back(device.as_ref(), handle, csum_seed)?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = publish {
+            if shrink_landed {
+                if let Some(h) = handle {
+                    h.abort_journal_on_fs_error();
+                }
+            } else {
+                rollback_meta_blocks(fs, &fresh_bids, handle);
+            }
+            return Err(err);
+        }
+
+        self.sector_count += fresh_bids.len() as u64 * SECTORS_PER_BLOCK;
+        self.dirty = true;
+        Ok(())
     }
 
     /// Converts the unwritten parts of the logical range `[iblock, iblock +
@@ -1311,7 +1592,7 @@ fn leaf_landing(
 /// The recursive child step of [`ExtentTree::walk_range`]: visits the extents
 /// of the subtree rooted at `bid` that overlap `range`, in ascending order.
 /// `expected_depth` enforces the one-step-down invariant ([`ExtentTree::find`]),
-/// which also bounds the recursion at [`MAX_DEPTH`](super::node::MAX_DEPTH).
+/// which also bounds the recursion at [`MAX_DEPTH`](MAX_DEPTH).
 fn walk_child(
     fs: &Ext4,
     bid: Ext4Bid,
@@ -1553,7 +1834,17 @@ fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) 
     // Zero-seed the fresh block's capture now; the capture lives in the
     // running transaction (the credential is proof, not owner), and
     // `write_leaf_node` re-mints its own when it fills the block.
-    let _create = journal::get_create_access(handle, bid)?;
+    //
+    // If seeding the capture fails (e.g. the transaction is at its credit
+    // ceiling), free the block before returning: it is allocated (its bitmap
+    // bit set and captured) but referenced by nothing, and the callers' own
+    // rollbacks only cover the bids they received — an unfreed one leaks until
+    // the next e2fsck. The free rides the same handle (its bitmap after-image
+    // is already captured, so it costs no new credit).
+    if let Err(err) = journal::get_create_access(handle, bid) {
+        let _ = fs.free_blocks(journal::BlockFreeAuth::without_revoke_duty(bid, 1), handle);
+        return Err(err);
+    }
     Ok(bid)
 }
 
@@ -2573,5 +2864,326 @@ mod tests {
         assert_eq!(extents.len(), 5);
 
         assert_matches_linear(&f, &tree, 110);
+    }
+
+    // ---- P9a-T3: 分裂与加深 ----
+
+    /// Builds a tree of `n` unmergeable single-block extents at blocks
+    /// `0,2,4,…` (odd physical parity kills merging) through the ordinary
+    /// insert path — ascending appends, so every split is a pure-boundary
+    /// (dense) one.
+    fn ascending_tree(
+        f: &crate::fs::fs_impls::ext4::test_utils::Ext4Fixture,
+        n: u32,
+    ) -> ExtentTree {
+        let mut tree = ExtentTree::empty();
+        for i in 0..n {
+            tree.insert(
+                &f.ext4,
+                i * 2,
+                200_000 + i as Ext4Bid * 2,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        tree
+    }
+
+    /// A full leaf split on the append boundary keeps the old leaf dense
+    /// (Linux's split-at-insert-point policy): the new leaf starts with just
+    /// the appended extent, and the root gains exactly one index entry.
+    #[ktest]
+    fn split_on_append_keeps_leaves_dense() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let tree_full = ascending_tree(&f, LEAF_MAX as u32);
+        assert_eq!((tree_full.depth(), root_entries(&tree_full)), (1, 1));
+
+        let mut tree = tree_full;
+        let sc = tree.sector_count();
+        // The 341st ascending extent: leaf full → split; new leaf holds it alone.
+        tree.insert(
+            &f.ext4,
+            LEAF_MAX as u32 * 2,
+            300_000,
+            1,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        // One fresh metadata block plus one data block.
+        assert_eq!(tree.sector_count(), sc + 2 * SECTORS_PER_BLOCK);
+        match tree.find(&f.ext4, LEAF_MAX as u32 * 2).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), 1);
+            }
+            _ => panic!("appended extent must be covered"),
+        }
+        match tree.find(&f.ext4, 0).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), LEAF_MAX);
+            }
+            _ => panic!("old extents must survive the split"),
+        }
+        assert_matches_linear(&f, &tree, LEAF_MAX as u32 * 2 + 4);
+    }
+
+    /// A mid-leaf split moves the tail entries to the new leaf and lands the
+    /// extent in the old one; a below-first-key insert into a full leaf moves
+    /// everything, lands in the emptied old leaf, and corrects the root key.
+    #[ktest]
+    fn split_mid_leaf_and_position_zero() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+
+        // Mid split: insert into the hole at block 401 (odd = unmapped).
+        let mut tree = ascending_tree(&f, LEAF_MAX as u32);
+        tree.insert(&f.ext4, 401, 400_000, 1, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        let m = tree.lookup(&f.ext4, 401).unwrap().unwrap();
+        assert_eq!(m.start(), 400_000);
+        assert_matches_linear(&f, &tree, LEAF_MAX as u32 * 2 + 4);
+
+        // Position-zero split: rebuild dense, then insert below every key.
+        // (Blocks start at 2 here so 0..2 is a hole below the first key.)
+        let mut tree = ExtentTree::empty();
+        for i in 0..LEAF_MAX as u32 {
+            tree.insert(
+                &f.ext4,
+                2 + i * 2,
+                500_000 + i as Ext4Bid * 2,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(root_index_key(&tree, 0), 2);
+        tree.insert(&f.ext4, 0, 600_000, 1, ExtentKind::Written, None, None)
+            .unwrap();
+        // The leaf's (and root's) first key dropped to 0.
+        assert_eq!(root_index_key(&tree, 0), 0);
+        assert_eq!(tree.lookup(&f.ext4, 0).unwrap().unwrap().start(), 600_000);
+        assert_matches_linear(&f, &tree, LEAF_MAX as u32 * 2 + 8);
+    }
+
+    /// Filling four dense leaves fills the inline root; the next append grows
+    /// the tree to depth 2 (the old root's content moves into a fresh interior
+    /// node) and the split cascade lands in it.
+    #[ktest]
+    fn grow_indepth_on_full_root() {
+        let f = Ext4FixtureBuilder::new(16384, 256, 16384)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let full = INLINE_MAX as u32 * LEAF_MAX as u32; // 4 × 340 = 1360
+        let mut tree = ascending_tree(&f, full);
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, INLINE_MAX as u16));
+
+        let sc = tree.sector_count();
+        tree.insert(
+            &f.ext4,
+            full * 2,
+            700_000,
+            1,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        // Depth grew; the root now holds the single index entry to the copied
+        // old root; the appended extent landed in a fresh dense leaf.
+        assert_eq!((tree.depth(), root_entries(&tree)), (2, 1));
+        // Two fresh metadata blocks (the copied-down root + the new leaf) plus
+        // one data block.
+        assert_eq!(tree.sector_count(), sc + 3 * SECTORS_PER_BLOCK);
+        let m = tree.lookup(&f.ext4, full * 2).unwrap().unwrap();
+        assert_eq!(m.start(), 700_000);
+
+        // Spot probes across the whole space agree with the linear reference
+        // (a full probe over 2700+ blocks would dominate the suite runtime).
+        for ib in (0..full * 2 + 4).step_by(7) {
+            let linear = tree.lookup_linear(&f.ext4, ib).unwrap().map(|e| e.block());
+            let path = tree.lookup(&f.ext4, ib).unwrap().map(|e| e.block());
+            assert_eq!(linear, path, "mismatch at block {ib}");
+        }
+
+        // And the tree keeps absorbing appends after the growth.
+        for i in 1..8u32 {
+            tree.insert(
+                &f.ext4,
+                (full + i) * 2,
+                700_000 + i as Ext4Bid * 2,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.depth(), 2);
+        let m = tree.lookup(&f.ext4, (full + 7) * 2).unwrap().unwrap();
+        assert_eq!(m.start(), 700_014);
+    }
+
+    /// Splits under a live journal: every touched node (fresh and old) rides
+    /// the transaction's captures, and post-flush lookups read the split tree
+    /// back consistently through the journal funnel. The commit thread stays
+    /// alive — 345 ops outgrow any fixture journal without its space reclaim,
+    /// and reads must stay correct across whatever running / committing /
+    /// checkpointed mix results.
+    #[ktest]
+    fn journaled_split_reads_back_consistently() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(256)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+
+        let mut tree = ExtentTree::empty();
+        let n = LEAF_MAX as u32 + 5; // forces one journaled split near the end
+        for i in 0..n {
+            let op = f.ext4.begin_op(8).unwrap();
+            tree.insert(
+                &f.ext4,
+                i * 2,
+                200_000 + i as Ext4Bid * 2,
+                1,
+                ExtentKind::Written,
+                op.get(),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+
+        // Reads through the journal stations see the split tree…
+        assert_matches_linear(&f, &tree, n * 2 + 4);
+        // …and after commit + checkpoint the device is authoritative and
+        // still agrees.
+        journal.flush_on_unmount().unwrap();
+        assert_matches_linear(&f, &tree, n * 2 + 4);
+    }
+
+    // ---- P9a-T3 收口审查 findings 回归钉 ----
+
+    /// `try_new` rejects an inline root whose `entries`/`max` exceed the
+    /// `i_block` capacity (INLINE_MAX). Without the bound the root scanners
+    /// would index past the 60-byte `i_block` on a crafted image — a release
+    /// slice panic, not the fail-loud EUCLEAN a corrupt mount owes.
+    #[ktest]
+    fn try_new_rejects_oversized_inline_root() {
+        let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
+        let header = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 5, // > INLINE_MAX (4): would overrun i_block at entry 4
+            max: 5,
+            depth: 0,
+            generation: 0,
+        };
+        root.as_mut_bytes()[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+        assert!(ExtentTree::try_new(root, 0).is_err());
+    }
+
+    /// A depth-1 root pointing at an entries==0 interior node is rejected at
+    /// the `NodeBuf::read` parse boundary (a childless interior is corruption);
+    /// the walker never reads its phantom entry-0 bytes.
+    #[ktest]
+    fn find_rejects_empty_interior_child() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+        // A depth-2 root would descend through an interior node; craft that
+        // interior as empty (entries=0, depth=1).
+        let empty_interior = 220u32;
+        let mut block = [0u8; BLOCK_SIZE];
+        let header = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 0,
+            max: INTERIOR_MAX as u16,
+            depth: 1,
+            generation: 0,
+        };
+        block[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+        f.write_data_block(empty_interior, &block);
+
+        // A depth-2 index root whose single child is that empty interior.
+        let mut rootb = [0u32; RAW_BLOCK_PTRS_LEN];
+        let rh = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 1,
+            max: 4,
+            depth: 2,
+            generation: 0,
+        };
+        rootb.as_mut_bytes()[0..ENTRY_SIZE].copy_from_slice(rh.as_bytes());
+        let idx = RawExtentIdx {
+            block: 0,
+            leaf_lo: empty_interior,
+            leaf_hi: 0,
+            unused: 0,
+        };
+        rootb.as_mut_bytes()[ENTRY_SIZE..2 * ENTRY_SIZE].copy_from_slice(idx.as_bytes());
+        let tree = ExtentTree::try_new(rootb, 0).unwrap();
+        assert!(tree.find(&f.ext4, 0).is_err());
+    }
+
+    /// A before-first insert into a full leaf splits keeping the old leaf's
+    /// original first entry (Linux `at.max(1)`): the old leaf never empties
+    /// and the fresh node's parent key is strictly greater, so no duplicate
+    /// index key is ever produced. The new extent lands in the old leaf and
+    /// corrects the root key downward.
+    #[ktest]
+    fn before_first_split_keeps_old_leaf_nonempty() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // A full leaf whose first block is 10 (so 0..10 is a before-first hole).
+        let mut tree = ExtentTree::empty();
+        for i in 0..LEAF_MAX as u32 {
+            tree.insert(
+                &f.ext4,
+                10 + i * 2,
+                800_000 + i as Ext4Bid * 2,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 1));
+        assert_eq!(root_index_key(&tree, 0), 10);
+
+        tree.insert(&f.ext4, 0, 900_000, 1, ExtentKind::Written, None, None)
+            .unwrap();
+        // Split happened; the two root index keys are strictly ordered (no
+        // duplicate), the first dropped to the new extent's block.
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        assert_eq!(root_index_key(&tree, 0), 0);
+        assert!(root_index_key(&tree, 0) < root_index_key(&tree, 1));
+        // Both leaves are non-empty (the old leaf kept its first entry).
+        for probe in [0u32, 10] {
+            match tree.find(&f.ext4, probe).unwrap() {
+                Search::Covered { path, .. } => {
+                    assert!(path.leaf().unwrap().node.entries() >= 1);
+                }
+                _ => panic!("block {probe} must be covered"),
+            }
+        }
+        assert_eq!(tree.lookup(&f.ext4, 0).unwrap().unwrap().start(), 900_000);
+        assert_matches_linear(&f, &tree, LEAF_MAX as u32 * 2 + 12);
     }
 }

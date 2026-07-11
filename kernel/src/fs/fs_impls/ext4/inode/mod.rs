@@ -1073,7 +1073,35 @@ impl Inode {
         // `get_mut`: the write spine holds the handle by `&mut` so the
         // `journal_restart` seam is reachable; the per-handle descriptor capture
         // below reverts to the shared `get`.
-        let len = inner.write_at(fs, offset, reader, op.get_mut())?;
+        let len = match inner.write_at(fs, offset, reader, op.get_mut()) {
+            Ok(len) => len,
+            Err(err) => {
+                // `write_at`'s cleanup (`rollback_write`) leaves a self-consistent
+                // tree — restored to `old_size`, or (for a within-file hole write
+                // it cannot truncate away) a benign unwritten over-allocation that
+                // reads as zeros. But a mutation may have edited the extent-tree
+                // ROOT (a split's root landing, a depth growth, or a position-0
+                // key correction), which lives in the in-memory `i_block` until
+                // `write_back_inode_desc` captures it. On the success path below
+                // that capture rides this transaction; on THIS error path it is
+                // skipped, so the leaf/bitmap after-images would commit while the
+                // root does not — a crash after commit then reads the old root
+                // over the new leaves, orphaning the moved extents (a torn split).
+                // Capture the consistent tree here so root and leaves agree. If
+                // even that fails, the transaction cannot be made consistent:
+                // abort so the half-state never commits.
+                if op.get().is_some()
+                    && inner.is_dirty()
+                    && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err()
+                    && let Some(handle) = op.get()
+                {
+                    handle.abort_journal_on_fs_error();
+                }
+                // Report the ORIGINAL failure either way — the capture error
+                // above is secondary (and the abort already speaks for it).
+                return Err(err);
+            }
+        };
         // Journaled: the descriptor this write mutated (size, mtime, i_blocks,
         // and — for an inline root — the extent mapping itself) must ride the
         // SAME transaction as the bitmap/GDT captures above, or a crash
@@ -1179,10 +1207,13 @@ impl Inode {
                     // One insert needs `need2` credits the current transaction
                     // cannot grant. If `need2` exceeds a whole transaction's
                     // capacity, no restart can ever fit it — the honest EFBIG
-                    // floor (P9's in-place B-tree surgery lifts it); otherwise
-                    // restart onto a fresh transaction reserving exactly `need2`,
-                    // whose first insert then fits, and retry the chunk (no
-                    // cursor advance).
+                    // floor. (The insert itself is in-place surgery now, but
+                    // `need2` is still the conservative whole-tree bound sized
+                    // for the flatten-based consumers that remain until T5/T6
+                    // — the floor lifts when the bound switches to O(depth).)
+                    // Otherwise restart onto a fresh transaction reserving
+                    // exactly `need2`, whose first insert then fits, and retry
+                    // the chunk (no cursor advance).
                     if max_credits.is_some_and(|max| need2 > max) {
                         if written > 0 {
                             return Ok(written);

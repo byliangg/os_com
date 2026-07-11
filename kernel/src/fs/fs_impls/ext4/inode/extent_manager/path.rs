@@ -42,6 +42,14 @@ impl NodeBuf {
         if ENTRY_SIZE * (1 + header.entries() as usize) > BLOCK_SIZE {
             return_errno_with_message!(Errno::EUCLEAN, "extent node entries overrun node");
         }
+        // A non-leaf external node must name at least one child: an empty
+        // interior is corruption (an inline root can be empty, but that never
+        // reaches here). Rejecting it loud is the parse boundary's job — the
+        // descent below would otherwise read a phantom entry (`index_pos`
+        // returns 0 on an empty node) and index into unvalidated bytes.
+        if !header.is_leaf() && header.entries() == 0 {
+            return_errno_with_message!(Errno::EUCLEAN, "interior extent node has no children");
+        }
         Ok(Self {
             bid,
             bytes: Box::new(bytes),
@@ -49,11 +57,91 @@ impl NodeBuf {
         })
     }
 
-    /// Returns the physical block this node was read from (the capture key of
-    /// the surgery write-back, P9a-T2).
-    #[expect(dead_code)]
+    /// Builds a fresh, empty node at `bid` for a split or a depth growth: a
+    /// zeroed block with a full-block-capacity header at `depth`. The caller
+    /// allocated `bid` under the handle (zero-seeded capture), and the node
+    /// stays unreferenced until an ancestor's index entry publishes it.
+    pub(super) fn fresh(bid: Ext4Bid, depth: u16) -> Self {
+        let mut bytes = Box::new([0u8; BLOCK_SIZE]);
+        let raw = RawExtentHeader {
+            magic: super::node::EXTENT_MAGIC,
+            entries: 0,
+            // Leaf and interior full-block nodes share the same geometry
+            // (12-byte entries after a 12-byte header).
+            max: ((BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE) as u16,
+            depth,
+            generation: 0,
+        };
+        bytes[0..ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+        Self {
+            bid,
+            bytes,
+            header: ExtentHeader::from_trusted(&raw),
+        }
+    }
+
+    /// Returns the physical block this node was read from (or will be written
+    /// to, for a [`fresh`](Self::fresh) node).
     pub(super) const fn bid(&self) -> Ext4Bid {
         self.bid
+    }
+
+    /// Returns whether the node has no room for one more entry.
+    pub(super) fn is_full(&self) -> bool {
+        self.entries() >= self.max_entries() || ENTRY_SIZE * (2 + self.entries()) > BLOCK_SIZE
+    }
+
+    /// Returns entry 0's logical-block key (either node kind). Caller
+    /// guarantees the node is non-empty.
+    pub(super) fn first_key(&self) -> Iblock {
+        debug_assert!(self.entries() > 0);
+        if self.is_leaf() {
+            self.extent_at(0).block()
+        } else {
+            self.index_at(0).block()
+        }
+    }
+
+    /// Adopts `n` entries' raw bytes (12-byte slabs, either kind) into this
+    /// empty node — the grow step's verbatim copy of the old root's entry
+    /// area. Memory-only; the node still needs [`write_back`](Self::write_back).
+    pub(super) fn adopt_entries(&mut self, entry_bytes: &[u8], n: usize) {
+        debug_assert_eq!(self.entries(), 0);
+        debug_assert_eq!(entry_bytes.len(), ENTRY_SIZE * n);
+        self.bytes[ENTRY_SIZE..ENTRY_SIZE + entry_bytes.len()].copy_from_slice(entry_bytes);
+        self.set_entries(n);
+    }
+
+    /// Moves entries `[at..entries)` into the (empty, same-kind) `into` node —
+    /// the split's reorganization step. Memory-only; both nodes still need
+    /// [`write_back`](Self::write_back).
+    pub(super) fn move_upper_into(&mut self, at: usize, into: &mut NodeBuf) {
+        debug_assert!(at <= self.entries());
+        debug_assert_eq!(into.entries(), 0);
+        debug_assert_eq!(into.is_leaf(), self.is_leaf());
+        let n = self.entries();
+        let start = ENTRY_SIZE * (1 + at);
+        let end = ENTRY_SIZE * (1 + n);
+        into.bytes[ENTRY_SIZE..ENTRY_SIZE + (end - start)].copy_from_slice(&self.bytes[start..end]);
+        into.set_entries(n - at);
+        self.set_entries(at);
+    }
+
+    /// Inserts index entry `idx` at position `i`, shifting later entries
+    /// right. Fails with `ENOSPC` when the node is full (the caller cascades
+    /// the split one level up).
+    pub(super) fn insert_index_at(&mut self, i: usize, idx: &RawExtentIdx) -> Result<()> {
+        debug_assert!(!self.is_leaf() && i <= self.entries());
+        let n = self.entries();
+        if self.is_full() {
+            return_errno_with_message!(Errno::ENOSPC, "extent index node is full");
+        }
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        self.bytes.copy_within(start..end, start + ENTRY_SIZE);
+        self.bytes[start..start + ENTRY_SIZE].copy_from_slice(idx.as_bytes());
+        self.set_entries(n + 1);
+        Ok(())
     }
 
     /// Returns whether this node is a leaf (depth 0).
