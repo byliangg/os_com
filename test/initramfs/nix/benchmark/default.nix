@@ -12,6 +12,9 @@
     };
   schbench = callPackage ./schbench.nix { };
   sqlite-speedtest1 = callPackage ./sqlite-speedtest1.nix { };
+  # The sqlite3 CLI rides along so the ext4 sqlite job can bind the
+  # performance run to data integrity (`PRAGMA integrity_check`, test.md §6.2).
+  sqlite-cli = pkgsHostTarget.sqlite.bin;
   sysbench = if hostPlatform.isx86_64 then pkgsHostTarget.sysbench else null;
 
   package = stdenvNoCC.mkDerivation {
@@ -32,6 +35,7 @@
       cp -r ${redis}/bin/redis-server $out/bin/
       cp -r ${schbench}/bin/schbench $out/bin/
       cp -r ${sqlite-speedtest1}/bin/sqlite-speedtest1 $out/bin/
+      cp -r ${sqlite-cli}/bin/sqlite3 $out/bin/
 
       mkdir -p $out/bin/lmbench
       cp -r ${lmbench}/bin/* $out/bin/lmbench/
