@@ -43,10 +43,11 @@ impl NodeBuf {
             return_errno_with_message!(Errno::EUCLEAN, "extent node entries overrun node");
         }
         // A non-leaf external node must name at least one child: an empty
-        // interior is corruption (an inline root can be empty, but that never
-        // reaches here). Rejecting it loud is the parse boundary's job — the
-        // descent below would otherwise read a phantom entry (`index_pos`
-        // returns 0 on an empty node) and index into unvalidated bytes.
+        // interior is corruption (its phantom entry 0 would drive the descent
+        // into unvalidated bytes). An empty external LEAF is legal — an
+        // append-split writes a fresh empty leaf, publishes it, then the retry
+        // insert reads it back and fills it (T3). The inline root may also be
+        // empty, but it never reaches here.
         if !header.is_leaf() && header.entries() == 0 {
             return_errno_with_message!(Errno::EUCLEAN, "interior extent node has no children");
         }
@@ -229,6 +230,17 @@ impl NodeBuf {
         self.set_entries(n - 1);
     }
 
+    /// Removes index entry `i`, shifting later entries left — the parent-side
+    /// step of pruning an emptied child (Linux `ext4_ext_rm_idx`).
+    pub(super) fn remove_index_at(&mut self, i: usize) {
+        debug_assert!(!self.is_leaf() && i < self.entries());
+        let n = self.entries();
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        self.bytes.copy_within(start + ENTRY_SIZE..end, start);
+        self.set_entries(n - 1);
+    }
+
     /// Rewrites index entry `i`'s key, keeping its child pointer — the
     /// `correct_indexes` step after an insert at a child's position 0.
     pub(super) fn set_index_key_at(&mut self, i: usize, key: Iblock) {
@@ -321,7 +333,6 @@ pub(super) struct ExtentPath {
 impl ExtentPath {
     /// Returns the leaf level, `None` on a depth-0 tree (the inline root is
     /// itself the leaf).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn leaf(&self) -> Option<&PathLevel> {
         self.levels.last()
     }
@@ -333,12 +344,7 @@ impl ExtentPath {
 pub(super) enum Search {
     /// `extent` covers the queried block; the path's landing position points
     /// at it.
-    Covered {
-        // The paths' production consumer is the surgery write path (P9a-T2).
-        #[cfg_attr(not(ktest), expect(dead_code))]
-        path: ExtentPath,
-        extent: Extent,
-    },
+    Covered { path: ExtentPath, extent: Extent },
     /// No extent covers the queried block — a hole. The path's landing
     /// position is the insertion point a new extent keyed at the block would
     /// take in the leaf, and `prev` is the in-leaf predecessor (`None` when

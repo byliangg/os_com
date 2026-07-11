@@ -568,13 +568,14 @@ impl ExtentManager {
     /// inode. Reuses one tree flatten for both — the gate estimate and the floor
     /// are two reads of the same extent list.
     ///
-    /// `floor_efbig` mirrors [`ExtentTree::truncate_chunk`]'s internal floor
-    /// exactly (`free_cost + reserialize_headroom > max`, on the CURRENT tree —
-    /// the survivor per chunk). Checking it here, before `prepare_shrink` lowers
-    /// `i_size` and before `orphan_add`, is what lets a genuine EFBIG leave the
-    /// in-memory inode unchanged (the "nothing changed" contract). It is only
-    /// meaningful on the chunked route: when the whole truncate fits one
-    /// transaction (`whole_estimate <= max`) there is no per-chunk floor.
+    /// `floor_efbig` mirrors [`ExtentTree::truncate_chunk`]'s internal O(depth)
+    /// floor exactly (`free_cost + (free_cost * depth + 2) > max` — one free plus
+    /// the node write-backs / prune cascade it can trigger). Checking it here,
+    /// before `prepare_shrink` lowers `i_size` and before `orphan_add`, is what
+    /// lets a genuine EFBIG leave the in-memory inode unchanged (the "nothing
+    /// changed" contract). It is only meaningful on the chunked route: when the
+    /// whole truncate fits one transaction (`whole_estimate <= max`) there is no
+    /// per-chunk floor.
     ///
     /// This flatten is separate from the one the first `truncate_chunk` /
     /// `truncate_to_byte_len` runs — a shrink flattens twice (this gate plus the
@@ -601,8 +602,18 @@ impl ExtentManager {
         // `freed_extents > 0` is the floor's `has_work` (a doomed extent or the
         // straddler both extend past `keep_blocks`): a shrink freeing nothing
         // (e.g. rounding within the last block) can never trip EFBIG.
-        let floor_efbig = freed_extents > 0
-            && fs.extent_free_credits() + fs.truncate_chunk_credits(external) > max_credits;
+        //
+        // The per-chunk floor mirrors the in-place `truncate_chunk` engine's
+        // own O(depth) floor (`free_cost + free_cost*depth + 2`), NOT the
+        // retired whole-tree reserialize bound: the in-place spine frees a
+        // bounded batch per chunk and prunes ≤ depth nodes, so a depth-2 file
+        // on a small journal that the old formula wrongly rejected as EFBIG
+        // now shrinks by chunking — the debt this surgery retires. (The
+        // `whole_estimate` above stays whole-tree-sized: the single-
+        // transaction fast path genuinely touches every freed node.)
+        let free_cost = fs.extent_free_credits();
+        let depth = tree.depth() as usize;
+        let floor_efbig = freed_extents > 0 && free_cost + (free_cost * depth + 2) > max_credits;
         Ok(ShrinkPlan {
             whole_estimate,
             floor_efbig,

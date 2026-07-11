@@ -290,6 +290,57 @@ impl ExtentTree {
         return_errno_with_message!(Errno::EUCLEAN, "extent tree deeper than maximum depth");
     }
 
+    /// Walks the right spine of the tree, descending into the LAST index entry
+    /// at each level, and returns the path down to the rightmost external
+    /// leaf. `None` on a depth-0 tree (the inline root is itself the leaf) or
+    /// an empty tree. Each child's depth must step down by exactly one (loop /
+    /// graft guard, as in [`find`](Self::find)).
+    ///
+    /// The tail-truncate spine reads the rightmost leaf, frees its doomed
+    /// entries, and (when it empties) prunes upward — re-walking here after
+    /// each prune, which reads the just-written-back parent through the
+    /// journal funnel.
+    fn rightmost_path(&self, fs: &Ext4) -> Result<Option<ExtentPath>> {
+        let header = self.header();
+        if header.is_leaf() {
+            return Ok(None);
+        }
+        let root_bytes = self.root.as_bytes();
+        let nr = header.entries() as usize;
+        // A well-formed non-leaf root has ≥ 1 child (an empty index root is
+        // reset to a depth-0 leaf by the pruning below). A crafted empty index
+        // root is corruption — fail loud rather than underflow `nr - 1`
+        // (matching `find`'s `unwrap_or(0)` robustness on the same input).
+        if nr == 0 {
+            return_errno_with_message!(Errno::EUCLEAN, "non-leaf extent root has no children");
+        }
+        let root_pos = nr - 1;
+        let mut next_bid = root_index_at(root_bytes, root_pos).leaf();
+        let mut levels: Vec<PathLevel> = Vec::with_capacity(header.depth() as usize);
+        for expected_depth in (0..header.depth()).rev() {
+            let node = NodeBuf::read(fs, next_bid)?;
+            if node.depth() != expected_depth {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "extent child depth does not step down by one"
+                );
+            }
+            // `NodeBuf::read` rejects an empty interior; a committed tree never
+            // keeps an empty external leaf either (a truncate prunes it), so an
+            // empty node here is corruption — fail loud, don't underflow `- 1`.
+            let Some(pos) = node.entries().checked_sub(1) else {
+                return_errno_with_message!(Errno::EUCLEAN, "rightmost extent node is empty");
+            };
+            if node.is_leaf() {
+                levels.push(PathLevel { node, pos });
+                return Ok(Some(ExtentPath { root_pos, levels }));
+            }
+            next_bid = node.index_at(pos).leaf();
+            levels.push(PathLevel { node, pos });
+        }
+        return_errno_with_message!(Errno::EUCLEAN, "extent walk fell through its own depth");
+    }
+
     /// Parses the whole tree into a list of leaf extents sorted by logical
     /// block. Used by the write path to plan hole runs from a tree snapshot.
     pub(super) fn extents(&self, fs: &Ext4) -> Result<Vec<Extent>> {
@@ -445,20 +496,7 @@ impl ExtentTree {
         // the leaf, the caller's on-error free of those blocks cannot strand a
         // mapped-but-freed extent.
         if insert_pos == 0 {
-            let mut level = leaf_level;
-            loop {
-                if level == 0 {
-                    self.set_root_index_key(path.root_pos, iblock);
-                    break;
-                }
-                let parent = &mut path.levels[level - 1];
-                parent.node.set_index_key_at(parent.pos, iblock);
-                parent.node.write_back(device.as_ref(), handle, csum_seed)?;
-                if parent.pos != 0 {
-                    break;
-                }
-                level -= 1;
-            }
+            self.correct_ancestor_keys(fs, &mut path, leaf_level, iblock, handle, csum_seed)?;
         }
 
         // The leaf lands last (see above).
@@ -466,6 +504,41 @@ impl ExtentTree {
             .node
             .write_back(device.as_ref(), handle, csum_seed)?;
         Ok(true)
+    }
+
+    /// Rewrites the ancestor index keys naming the subtree under
+    /// `path.levels[child_level]` to `new_key`, propagating upward while each
+    /// level sits at position 0 (Linux `ext4_ext_correct_indexes`,
+    /// extents.c:1705). Needed whenever a node's FIRST key changes — an insert
+    /// at position 0 lowers it, a punch that removes or re-keys position 0
+    /// raises it — because Linux's read-side validation demands the parent key
+    /// EQUAL the child's first key exactly, not merely lower-bound it.
+    fn correct_ancestor_keys(
+        &mut self,
+        fs: &Ext4,
+        path: &mut ExtentPath,
+        child_level: usize,
+        new_key: Iblock,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let device = fs.block_device();
+        let mut level = child_level;
+        loop {
+            if level == 0 {
+                self.set_root_index_key(path.root_pos, new_key);
+                self.dirty = true;
+                break;
+            }
+            let parent = &mut path.levels[level - 1];
+            parent.node.set_index_key_at(parent.pos, new_key);
+            parent.node.write_back(device.as_ref(), handle, csum_seed)?;
+            if parent.pos != 0 {
+                break;
+            }
+            level -= 1;
+        }
+        Ok(())
     }
 
     /// Rewrites root index entry `i`'s key, keeping its child pointer. The
@@ -867,28 +940,29 @@ impl ExtentTree {
         Ok(())
     }
 
-    /// One credit-bounded step of shrinking the tree to `new_size` bytes: frees
-    /// doomed tail extents from the HIGH end downward, then reserializes the
-    /// survivor `[0, reached)` in the SAME transaction and returns the frontier.
+    /// One credit-bounded step of shrinking the tree to `new_size` bytes: walks
+    /// the right spine, frees the doomed tail extents IN PLACE (P9a-T4a — the
+    /// covering leaf entry is trimmed or removed, an emptied leaf and its
+    /// emptied ancestors are pruned), and returns the frontier `reached` the
+    /// survivor still references.
     ///
     /// `max_credits` is `None` for the whole-tree (single-transaction) path — it
-    /// frees every doomed extent, reserializes once, and returns `keep_blocks`.
+    /// frees every doomed extent in one transaction and returns `keep_blocks`.
     /// `Some(max)` is the chunked, orphan-protected spine: each free is preceded
-    /// by a wait-free credit probe reserving one free plus the end-of-chunk
-    /// reserialize headroom, and on [`ExtendOutcome::NeedsRestart`] the walk
-    /// STOPS with the progress made so far. The stop returns a `reached` above
-    /// `keep_blocks`; the OUTER spine `journal_restart`s (never under this ③
-    /// lock — iron law 1) and calls again, so the survivor of THIS chunk (the
-    /// un-freed doomed extents plus the kept prefix) is what the tree references
-    /// until the next chunk commits.
+    /// by a wait-free credit probe reserving one free plus the O(depth) node
+    /// write-backs it can trigger, and on [`ExtendOutcome::NeedsRestart`] the
+    /// walk STOPS with the progress made so far. The stop returns a `reached`
+    /// above `keep_blocks`; the OUTER spine `journal_restart`s (never under this
+    /// ③ lock — iron law 1) and calls again, re-walking the right spine of the
+    /// smaller tree.
     ///
-    /// Per-chunk (not per-truncate) reserialize is the crash red-line: the frees
-    /// and the reserialize that drops exactly those extents from the tree ride
-    /// one transaction, so a committed chunk never leaves the tree pointing at a
-    /// freed (reallocatable) block (double-alloc) or a freed block the tree
-    /// still names (leak). The freed run's pins (`free_blocks`) release at that
-    /// commit, after the reserialize dropped it — no freed-and-reallocated
-    /// window.
+    /// Per-chunk (not per-truncate) crash red-line: the frees and the in-place
+    /// tree edits that drop exactly those extents ride ONE transaction, so a
+    /// committed chunk never leaves the tree pointing at a freed (reallocatable)
+    /// block (double-alloc) or a freed block the tree still names (leak). Any
+    /// failure after the first free aborts the journal (the frees are captured
+    /// and irreversible); the freed run's pins (`free_blocks`) release at commit,
+    /// after the edit dropped it — no freed-and-reallocated window.
     ///
     /// `data_policy` is the owning inode's revoke rule for its DATA blocks
     /// (Linux `get_default_free_blocks_flags`): directory blocks and
@@ -907,185 +981,303 @@ impl ExtentTree {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
-
-        let (mut extents, old_external) = self.flatten(fs)?;
-        extents.sort_by_key(|e| e.block());
-
-        // The reserialize headroom the last surviving reserialize needs — sized
-        // to the WHOLE current tree, an upper bound on any survivor `[0,
-        // reached)` (a subset reserializes onto no more external nodes). The
-        // probe leaves this reserved after each free so the end-of-chunk
-        // reserialize plus the outer inode writeback (its `INODE_DESC` term)
-        // never overflow.
-        let reserialize_headroom =
-            fs.truncate_chunk_credits(Self::external_node_count(extents.len()));
+        let depth = self.header().depth();
         let free_cost = fs.extent_free_credits();
+        // The follow-up credits ONE probed data free may consume, sized to the
+        // tree DEPTH (not its size): freeing the extent can empty the rightmost
+        // leaf and cascade a prune up to the root, freeing ≤ `depth` metadata
+        // blocks (the leaf plus up to `depth - 1` interior parents, each a
+        // `free_cost` bitmap/GDT/revoke), then writing back one surviving
+        // parent (1 capture) — or, on the terminal step, the boundary leaf (1
+        // capture) — and the inode descriptor the chunk transaction carries (1).
+        // `free_cost * depth + 2` bounds all of it. This O(depth) headroom is
+        // what retires the whole-tree `truncate-EFBIG-floor` debt: a real
+        // journal (thousands of credits) always clears `free_cost + this`.
+        let node_headroom = free_cost * depth as usize + 2;
 
-        // Fully-doomed extents (freed high-to-low) and the one extent straddling
-        // `keep_blocks` (head kept, tail freed last). Everything fully below
-        // `keep_blocks` is the fixed survivor prefix.
-        let mut kept: Vec<Extent> = extents
-            .iter()
-            .filter(|e| e.block() + e.len() as Iblock <= keep_blocks)
-            .copied()
-            .collect();
-        let straddler = extents
-            .iter()
-            .find(|e| e.block() < keep_blocks && e.block() + e.len() as Iblock > keep_blocks)
-            .copied();
-        let mut doomed: Vec<Extent> = extents
-            .iter()
-            .filter(|e| e.block() >= keep_blocks)
-            .copied()
-            .collect();
-        // Highest logical block first: a credit stop then leaves the LOW doomed
-        // extents (nearest `keep_blocks`) for the next chunk.
-        doomed.sort_by_key(|e| core::cmp::Reverse(e.block()));
+        // Depth-0 (inline root as a leaf): at most `INLINE_MAX` extents, so the
+        // whole truncate fits any transaction — free the doomed tail and
+        // rewrite the inline root in one step, no chunking, no pruning.
+        if depth == 0 {
+            let mut kept: Vec<Extent> = Vec::with_capacity(INLINE_MAX);
+            let mut freed_data: u64 = 0;
+            let root_bytes = self.root.as_bytes();
+            let n = self.header().entries() as usize;
+            for i in 0..n {
+                let e = root_extent_at(root_bytes, i);
+                let e_end = e.block() as u64 + e.len() as u64;
+                if e_end <= keep_blocks as u64 {
+                    kept.push(e);
+                } else if e.block() < keep_blocks {
+                    let head_len = (keep_blocks - e.block()) as u16;
+                    let auth = data_policy.authorize(
+                        e.start() + head_len as Ext4Bid,
+                        e.len() as u32 - head_len as u32,
+                    );
+                    fs.free_blocks(auth, handle)?;
+                    freed_data += (e.len() - head_len) as u64;
+                    kept.push(Extent::new(e.block(), head_len, e.start(), e.kind()));
+                } else {
+                    let auth = data_policy.authorize(e.start(), e.len() as u32);
+                    fs.free_blocks(auth, handle)?;
+                    freed_data += e.len() as u64;
+                }
+            }
+            self.write_inline_leaf_root(&kept);
+            let removed = freed_data as i64 * SECTORS_PER_BLOCK as i64;
+            debug_assert!(self.sector_count as i64 >= removed);
+            self.sector_count = (self.sector_count as i64 - removed).max(0) as u64;
+            self.dirty = true;
+            let reached = kept
+                .iter()
+                .map(|e| e.block() + e.len() as Iblock)
+                .max()
+                .unwrap_or(0);
+            return Ok(super::TruncateChunk {
+                reached,
+                next_bound: free_cost + node_headroom,
+            });
+        }
 
-        // The honest EFBIG floor (decision G-1, symmetric to the write path): if
-        // one free plus the survivor reserialize cannot fit a whole transaction,
-        // no restart ever can. Only a real free obligation trips it.
-        //
-        // `reserialize_headroom` is sized to `extents.len()` — the CURRENT tree,
-        // which is the survivor from the previous chunk (the whole tree only on
-        // the first chunk), so the floor shrinks per chunk and a delete frees
-        // down as far as the tree can be split. `free_cost + reserialize_headroom`
-        // is exactly the forward-progress boundary: the `next_bound` this
-        // function returns reserves the same sum, and dropping the `free_cost`
-        // term would admit a
-        // chunk whose free-plus-reserialize overruns `max` and stalls at zero
-        // progress. The residual gap versus the write floor (write needs only
-        // `reserialize + INODE_DESC ≤ max`, truncate additionally `+ free_cost`)
-        // means a maximally fragmented file written at the write boundary can be
-        // a genuine, un-splittable EFBIG on delete — documented as the P9
-        // in-place-surgery debt, symmetric to the write path's.
-        let has_work = !doomed.is_empty() || straddler.is_some();
+        // The honest EFBIG floor: one free plus the pruning/write-back it can
+        // trigger must fit a whole transaction, or no restart ever can. O(depth)
+        // now — a real journal always clears it (this is the debt's retirement).
+        // Only a real free obligation (a rightmost extent above `keep_blocks`)
+        // trips it.
+        let device = fs.block_device();
+        let rightmost_end = {
+            let p = self
+                .rightmost_path(fs)?
+                .expect("depth ≥ 1 has an external leaf");
+            let leaf = &p.leaf().expect("rightmost path ends in a leaf").node;
+            let n = leaf.entries();
+            // A well-formed non-root leaf is non-empty; guard anyway.
+            if n == 0 {
+                0
+            } else {
+                let e = leaf.extent_at(n - 1);
+                e.block() as u64 + e.len() as u64
+            }
+        };
+        let has_work = rightmost_end > keep_blocks as u64;
         if let Some(max) = max_credits
             && has_work
-            && reserialize_headroom + free_cost > max
+            && free_cost + node_headroom > max
         {
             return_errno_with_message!(
                 Errno::EFBIG,
-                "one truncate chunk's reserialize plus a free exceeds a journal transaction"
+                "one truncate chunk's free plus node writes exceeds a journal transaction"
             );
         }
 
         let mut freed_data: u64 = 0;
-        let mut stopped = false;
-        let mut freed_up_to = 0usize; // count of `doomed` extents freed this chunk
+        let mut freed_meta: u64 = 0;
 
-        for e in &doomed {
-            // Credit-aware early stop (chunked mode): if this free plus the
-            // survivor reserialize will not fit the transaction even after
-            // growing in place, stop with the progress made so far. Not
-            // restarting here is the ③-drop red line — the restart's
-            // re-admission may wait, illegal under this lock.
-            if let Some(h) = handle
-                && max_credits.is_some()
-                && stop_before_free(h, free_cost + reserialize_headroom)?
-            {
-                stopped = true;
-                break;
+        // Walk the right spine, freeing doomed tail extents in place. When the
+        // rightmost leaf empties, prune it and re-walk to the previous sibling.
+        // The loop is bounded: every iteration either frees ≥ 1 extent, prunes
+        // ≥ 1 node, hits the survivor boundary, or credit-stops.
+        //
+        // The whole spine runs inside an abort guard: once the first free
+        // captures into this transaction the chunk is irreversible, so any
+        // later failure — a node `write_back` (device EIO / OOM), a prune, or
+        // an ancestor-key correction — must abort the journal, or the freed
+        // data would commit while the tree still maps it (double allocation).
+        // The frees themselves self-abort; this catches the metadata writes
+        // that follow them. (A non-journaled volume has no abort; the failure
+        // leaves the same torn exposure every multi-block mutation has there.)
+        let spine = (|| -> Result<Iblock> {
+            let mut reached = keep_blocks;
+            'chunk: loop {
+                let mut path = self
+                    .rightmost_path(fs)?
+                    .expect("depth ≥ 1 keeps an external leaf until the root resets");
+                let leaf_level = path.levels.len() - 1;
+                let mut leaf_edited = false;
+
+                // Free doomed entries from this leaf's tail. `Break::Emptied`
+                // falls to the prune below; `Break::Done` ends the chunk (the
+                // boundary was reached or the credit probe stopped).
+                enum Break {
+                    Emptied,
+                    Done,
+                }
+                let outcome = loop {
+                    let leaf = &path.levels[leaf_level].node;
+                    let n = leaf.entries();
+                    if n == 0 {
+                        break Break::Emptied;
+                    }
+                    let last = leaf.extent_at(n - 1);
+                    let last_end = last.block() as u64 + last.len() as u64;
+                    if last_end <= keep_blocks as u64 {
+                        // Survivor boundary: this leaf's tail is entirely kept.
+                        reached = reached.max(last_end as Iblock);
+                        break Break::Done;
+                    }
+                    // A free is due; probe first (chunked mode).
+                    if let Some(h) = handle
+                        && max_credits.is_some()
+                        && stop_before_free(h, free_cost + node_headroom)?
+                    {
+                        reached = reached.max(last_end as Iblock);
+                        break Break::Done;
+                    }
+                    if last.block() < keep_blocks {
+                        // Straddler: keep the head, free the tail, done.
+                        let head_len = (keep_blocks - last.block()) as u16;
+                        let tail_len = last.len() - head_len;
+                        let auth = data_policy
+                            .authorize(last.start() + head_len as Ext4Bid, tail_len as u32);
+                        fs.free_blocks(auth, handle)?;
+                        freed_data += tail_len as u64;
+                        let head = Extent::new(last.block(), head_len, last.start(), last.kind());
+                        path.levels[leaf_level].node.replace_extent_at(n - 1, &head);
+                        leaf_edited = true;
+                        reached = reached.max(keep_blocks);
+                        break Break::Done;
+                    }
+                    // Fully doomed: free its data and drop it from the leaf.
+                    let auth = data_policy.authorize(last.start(), last.len() as u32);
+                    fs.free_blocks(auth, handle)?;
+                    freed_data += last.len() as u64;
+                    path.levels[leaf_level].node.remove_extent_at(n - 1);
+                    leaf_edited = true;
+                };
+
+                match outcome {
+                    Break::Done => {
+                        if leaf_edited {
+                            path.levels[leaf_level].node.write_back(
+                                device.as_ref(),
+                                handle,
+                                csum_seed,
+                            )?;
+                        }
+                        break 'chunk Ok(reached);
+                    }
+                    Break::Emptied => {
+                        // Prune the emptied leaf and every ancestor it empties,
+                        // writing each shrunk parent back BEFORE the next
+                        // re-walk reads it. A truncate to zero resets the root.
+                        freed_meta += self.prune_emptied_leaf(fs, &mut path, handle, csum_seed)?;
+                        if self.header().is_leaf() {
+                            break 'chunk Ok(0);
+                        }
+                        // Re-walk to the new rightmost leaf and continue.
+                    }
+                }
             }
-            let auth = data_policy.authorize(e.start(), e.len() as u32);
-            fs.free_blocks(auth, handle)?;
-            freed_data += e.len() as u64;
-            freed_up_to += 1;
-        }
-
-        // The doomed extents not reached this chunk survive it (recovery
-        // re-truncates from the persisted `i_size` down to them).
-        for e in &doomed[freed_up_to..] {
-            kept.push(*e);
-        }
-
-        if let Some(s) = straddler {
-            let head_len = (keep_blocks - s.block()) as u16;
-            let tail_len = s.len() - head_len;
-            // The straddler tail is the LOWEST doomed run, freed last. A prior
-            // stop, or this free's own probe, leaves the whole straddler for the
-            // next chunk.
-            let mut free_it = !stopped;
-            if free_it
-                && let Some(h) = handle
-                && max_credits.is_some()
-                && stop_before_free(h, free_cost + reserialize_headroom)?
-            {
-                free_it = false;
+        })();
+        let reached = match spine {
+            Ok(reached) => reached,
+            Err(err) => {
+                if let Some(h) = handle {
+                    h.abort_journal_on_fs_error();
+                }
+                return Err(err);
             }
-            if free_it {
-                let auth = data_policy.authorize(s.start() + head_len as Ext4Bid, tail_len as u32);
-                fs.free_blocks(auth, handle)?;
-                freed_data += tail_len as u64;
-                kept.push(Extent::new(s.block(), head_len, s.start(), s.kind()));
-            } else {
-                // The whole straddler survives this chunk; the next chunk frees
-                // its tail.
-                kept.push(s);
-            }
-        }
+        };
 
-        // `kept` was assembled out of logical order: the fixed prefix ascends,
-        // the un-freed doomed tail was appended in the DESCENDING order `doomed`
-        // was freed in (high→low), and the straddler was appended last though its
-        // block is below `keep_blocks`. [`reserialize`] and [`search_entries`]
-        // require ASCENDING logical order — the index key of each leaf/interior
-        // node is `chunk[0].block()` and node scans break early past the first
-        // entry above the target. Serializing `kept` unsorted at a non-terminal
-        // chunk would stamp a valid metadata_csum over an out-of-order tree with
-        // a non-monotonic index key; a crash between chunks then replays a tree
-        // e2fsck reports dirty (our own remount self-heals by re-flattening, so
-        // only the on-disk intermediate is wrong). Sort before serializing.
-        kept.sort_by_key(|e| e.block());
-
-        // The frontier: the highest logical block the survivor still references
-        // (`keep_blocks` when the truncate completed, higher when a stop cut it
-        // short). Zero when nothing survives (a truncate to zero).
-        let reached = kept
-            .iter()
-            .map(|e| e.block() + e.len() as Iblock)
-            .max()
-            .unwrap_or(0);
-
-        // The survivor is now sorted, so every entry `kept[i].block()` is
-        // strictly ascending — the invariant reserialize/search_entries rely on.
-        debug_assert!(kept.windows(2).all(|w| w[0].block() < w[1].block()));
-        let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
-        // The external-leaf count changes by exactly the mutation's delta.
-        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
-        let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
-        // `i_blocks` must never drop below zero; `max(0)` saturates, the assert
-        // catches a miscounted `sector_count` in debug builds.
+        let net_removed = freed_data + freed_meta;
+        let removed_sectors = net_removed as i64 * SECTORS_PER_BLOCK as i64;
         debug_assert!(self.sector_count as i64 >= removed_sectors);
         self.sector_count = (self.sector_count as i64 - removed_sectors).max(0) as u64;
         self.dirty = true;
 
-        // The reservation the next chunk starts from: ONE free PLUS the
-        // survivor's reserialize headroom. Reserving the free (not just the
-        // reserialize) is load-bearing — [`journal_restart`](super::super::super::journal)
-        // RE-JOINS the current transaction whenever the requested credits still
-        // fit its remaining capacity, so a bound covering only the reserialize
-        // would hand the next chunk a transaction already holding this chunk's
-        // captures with NO room for even one more free — a 0-progress restart
-        // that never advances the frontier (a hang). This bound instead makes the
-        // next chunk's first probe (`free_cost + reserialize_headroom`) satisfied
-        // by the reservation alone, so it always frees ≥ 1 extent whether the
-        // restart rejoined or opened a fresh transaction. Still ≤ `max_credits`:
-        // the survivor `[0, reached)` is a subset of this tree, whose own
-        // `reserialize + free` cleared the EFBIG floor above.
-        let next_bound = fs.extent_free_credits()
-            + fs.truncate_chunk_credits(Self::external_node_count(kept.len()));
         Ok(super::TruncateChunk {
             reached,
-            next_bound,
+            next_bound: free_cost + node_headroom,
         })
     }
 
+    /// Frees the (emptied) leaf `path` ends in and prunes every ancestor its
+    /// removal empties, returning the count of metadata blocks freed. Each
+    /// level removes ITS path position (the truncate spine's rightmost walk
+    /// puts every position at the last entry; a punch can empty any child).
+    /// Removing a parent's position 0 raises that parent's first key, so the
+    /// grandparents' keys are corrected to keep Linux's exact-first-key
+    /// invariant. Each shrunk parent is written back through the journal
+    /// funnel BEFORE returning, so a re-walk reads the pruned tree. When the
+    /// inline root's last index entry goes, the root resets to an empty
+    /// depth-0 leaf (in-memory, riding the inode writeback). Mirrors Linux
+    /// `ext4_ext_rm_idx` cascading to `ext4_ext_remove_space`'s root collapse.
+    fn prune_emptied_leaf(
+        &mut self,
+        fs: &Ext4,
+        path: &mut ExtentPath,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<u64> {
+        let device = fs.block_device();
+        let mut freed_meta = 0u64;
+
+        // Free the emptied leaf, then walk up removing each child's index entry;
+        // stop at the first parent that stays non-empty.
+        let leaf_bid = path.levels[path.levels.len() - 1].node.bid();
+        free_meta_block(fs, leaf_bid, handle)?;
+        freed_meta += 1;
+
+        let mut child_level = path.levels.len() - 1;
+        loop {
+            if child_level == 0 {
+                // The removed node's parent is the inline root.
+                let root_entries = self.header().entries() as usize;
+                if root_entries <= 1 {
+                    // Last child gone: the tree is now empty.
+                    self.write_inline_leaf_root(&[]);
+                } else {
+                    self.remove_root_index_at(path.root_pos);
+                }
+                self.dirty = true;
+                break;
+            }
+            let parent_level = child_level - 1;
+            let remove_at = path.levels[parent_level].pos;
+            let pn = path.levels[parent_level].node.entries();
+            if pn <= 1 {
+                // Parent empties too: free it and cascade to ITS parent.
+                let parent_bid = path.levels[parent_level].node.bid();
+                free_meta_block(fs, parent_bid, handle)?;
+                freed_meta += 1;
+                child_level = parent_level;
+                continue;
+            }
+            path.levels[parent_level].node.remove_index_at(remove_at);
+            path.levels[parent_level]
+                .node
+                .write_back(device.as_ref(), handle, csum_seed)?;
+            // Removing the parent's FIRST child raised its first key; the
+            // ancestors' keys must follow exactly (Linux read-side equality).
+            if remove_at == 0 {
+                let new_key = path.levels[parent_level].node.first_key();
+                self.correct_ancestor_keys(fs, path, parent_level, new_key, handle, csum_seed)?;
+            }
+            break;
+        }
+        Ok(freed_meta)
+    }
+
+    /// Removes root index entry `i`, shifting later entries left (in-memory,
+    /// like every root rewrite; it rides the inode writeback).
+    fn remove_root_index_at(&mut self, i: usize) {
+        let header = self.header();
+        let n = header.entries() as usize;
+        debug_assert!(!header.is_leaf() && i < n);
+        let bytes = self.root.as_mut_bytes();
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        bytes.copy_within(start + ENTRY_SIZE..end, start);
+        let mut raw = RawExtentHeader::from_bytes(&bytes[0..ENTRY_SIZE]);
+        raw.entries = (n - 1) as u16;
+        bytes[0..ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+    }
+
     /// One credit-bounded step of freeing the mapped blocks in the MIDDLE logical
-    /// range `[start_block, end_block)` (a punch-hole), leaving a hole, then
-    /// reserializing the survivor in the caller's transaction. Returns whether
-    /// doomed blocks remain (the outer spine restarts and calls again) and the
-    /// reservation the next chunk's fresh transaction should start from.
+    /// range `[start_block, end_block)` (a punch-hole), editing the covering
+    /// leaves IN PLACE (P9a-T4b). Returns whether doomed blocks remain (the outer
+    /// spine restarts and calls again) and the reservation the next chunk's fresh
+    /// transaction should start from.
     ///
     /// Unlike [`truncate_chunk`](Self::truncate_chunk) the file size is UNCHANGED
     /// and there is no orphan protection: a crash between chunks leaves some of
@@ -1097,20 +1289,21 @@ impl ExtentTree {
     /// a replay never resurrects stale data into a reused block and a freed block
     /// is not reallocated before its freeing transaction commits.
     ///
-    /// An extent straddling either edge is split, keeping the head `[e.block,
-    /// start_block)` and/or the tail `[end_block, e.end)` at the same physical
-    /// mapping and kind, and freeing only the covered middle. A single extent
-    /// spanning the whole range splits into head + tail, so the survivor can hold
-    /// up to two more extents than the input; the reserialize headroom is sized
-    /// for that growth. `max_credits` is `None` for the whole-range
-    /// (single-transaction) path and `Some(max)` for the chunked spine — the same
-    /// per-free credit probe and EFBIG floor as truncate.
+    /// The scan runs low→high; each overlapping extent is edited in place: an
+    /// edge-straddling extent is trimmed to its kept head or tail (a raised
+    /// first key corrects the ancestor index keys, leaf-write-first for
+    /// lower-bound safety), a fully-covered extent is removed (an emptied leaf
+    /// and its emptied ancestors are pruned), and an extent spanning BOTH edges
+    /// splits into head + tail — same-leaf shift-insert when there is room, else
+    /// a trim plus an insert through the split machinery. `max_credits` is `None`
+    /// for the whole-range path and `Some(max)` for the chunked spine — the same
+    /// O(depth) per-step credit probe and EFBIG floor as truncate.
     ///
-    /// Per-chunk (not per-punch) reserialize is the crash red-line, identical to
-    /// truncate: the frees and the reserialize that drops exactly those extents
-    /// ride one transaction, so a committed chunk never leaves the tree naming a
-    /// freed (reallocatable) block (double-alloc) or a freed block the tree still
-    /// names (leak).
+    /// Per-chunk (not per-punch) crash red-line, identical to truncate: the frees
+    /// and the in-place edits that drop exactly those extents ride one
+    /// transaction, and any failure after the first free aborts the journal, so
+    /// a committed chunk never leaves the tree naming a freed (reallocatable)
+    /// block (double-alloc) or a freed block the tree still names (leak).
     pub(super) fn punch_chunk(
         &mut self,
         fs: &Ext4,
@@ -1131,43 +1324,297 @@ impl ExtentTree {
             });
         }
 
-        let (mut extents, old_external) = self.flatten(fs)?;
-        extents.sort_by_key(|e| e.block());
+        let depth = self.header().depth();
+        let free_cost = fs.extent_free_credits();
+        // The same O(depth) follow-up bound as the truncate spine (a free may
+        // empty the leaf and prune a cascade; one boundary write; the inode
+        // descriptor)…
+        let node_headroom = free_cost * depth as usize + 2;
+        // …plus, for the one case that INSERTS (an extent spanning the whole
+        // punch range splits into head + tail through the insert machinery),
+        // the insert's own per-op worst case.
+        let split_headroom = node_headroom + fs.write_credits(depth);
 
-        // Decompose each extent into kept head/tail (outside the punch range) and
-        // a doomed middle (inside it). The three split lengths below narrow to
-        // `u16` losslessly: each lies inside one extent, whose length is a `u16`.
-        let mut kept: Vec<Extent> = Vec::with_capacity(extents.len() + 2);
-        let mut doomed: Vec<Extent> = Vec::new();
-        for e in &extents {
+        // Depth-0: at most INLINE_MAX entries — punch them in one pass over
+        // the inline root (any transaction fits it; a spans-both split may
+        // overflow the root and grow the tree through the insert path).
+        if depth == 0 {
+            return self.punch_inline_root(
+                fs,
+                start_block,
+                end_block,
+                handle,
+                csum_seed,
+                data_policy,
+            );
+        }
+
+        let mut freed_data: u64 = 0;
+        let mut freed_meta: u64 = 0;
+        let mut more = false;
+        // The reservation the outer spine restarts with: the common per-step
+        // bound, raised to a stopped step's own need (a full-leaf spans-both
+        // split) so the restarted transaction can run it.
+        let mut restart_bound = free_cost + node_headroom;
+
+        // The whole scan runs inside an abort guard, like the truncate spine:
+        // once the first free captures into this transaction, any later
+        // failure — a node `write_back`, an ancestor-key correction, a prune,
+        // or the spans-both tail re-insert — must abort the journal, or the
+        // freed data would commit while the tree still maps it.
+        let device = fs.block_device();
+        let scan = (|| -> Result<()> {
+            // Scan low→high: find the first extent overlapping the remaining
+            // range, classify, edit in place, continue. (The old spine freed
+            // high→low, but every chunk re-scans the whole range, so the
+            // direction is immaterial to the contract — `more` just says "call
+            // again" — and a partial hole is a valid crash/restart state.)
+            let mut cursor = start_block;
+            'scan: while (cursor as u64) < end_block as u64 {
+                let mut hit: Option<Extent> = None;
+                self.walk_range(fs, cursor as u64..end_block as u64, &mut |e| {
+                    hit = Some(*e);
+                    ControlFlow::Break(())
+                })?;
+                let Some(e) = hit else {
+                    break 'scan; // no mapped extent left in the range
+                };
+                let e_start = e.block();
+                let e_end = e_start as u64 + e.len() as u64;
+
+                let spans_both = e_start < start_block && e_end > end_block as u64;
+                // A spans-both split usually fits the SAME leaf (head shrinks
+                // in place, the tail shift-inserts beside it): probe the small
+                // bound. Only a FULL leaf needs the insert split budget.
+                let mut need = free_cost + node_headroom;
+                let mut spans_slow = false;
+                if spans_both {
+                    let Search::Covered {
+                        path: probe_path, ..
+                    } = self.find(fs, e_start)?
+                    else {
+                        return_errno_with_message!(
+                            Errno::EUCLEAN,
+                            "walked extent vanished under the extent lock"
+                        );
+                    };
+                    let leaf = &probe_path.levels[probe_path.levels.len() - 1].node;
+                    if leaf.is_full() {
+                        spans_slow = true;
+                        need = free_cost + split_headroom;
+                    }
+                }
+                // The honest EFBIG floor — O(depth), a real journal always
+                // clears it (the whole-tree floor retired with the reserialize).
+                if let Some(max) = max_credits
+                    && need > max
+                {
+                    return_errno_with_message!(
+                        Errno::EFBIG,
+                        "one punch step's free plus node writes exceeds a journal transaction"
+                    );
+                }
+                // Credit-aware early stop (chunked mode): never restart under
+                // this ③ lock — report `more` and let the outer spine restart.
+                if let Some(h) = handle
+                    && max_credits.is_some()
+                    && stop_before_free(h, need)?
+                {
+                    more = true;
+                    restart_bound = restart_bound.max(need);
+                    break 'scan;
+                }
+
+                // The covered middle to free.
+                let mid_start = e_start.max(start_block);
+                let mid_end = e_end.min(end_block as u64) as Iblock;
+                let mid_len = (mid_end - mid_start) as u16; // inside one extent
+                let mid_phys = e.start() + (mid_start - e_start) as Ext4Bid;
+
+                // Locate the covering leaf entry for the in-place edit.
+                let Search::Covered { mut path, .. } = self.find(fs, e_start)? else {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "walked extent vanished under the extent lock"
+                    );
+                };
+                let leaf_level = path.levels.len() - 1;
+                let pos = path.levels[leaf_level].pos;
+
+                if spans_both {
+                    let head_len = (start_block - e_start) as u16;
+                    let tail_len = (e_end - end_block as u64) as u16;
+                    let tail_phys = e.start() + (end_block - e_start) as Ext4Bid;
+                    let head = Extent::new(e_start, head_len, e.start(), e.kind());
+                    let tail = Extent::new(end_block, tail_len, tail_phys, e.kind());
+                    if !spans_slow {
+                        // Same-leaf fast path: shrink to the head and
+                        // shift-insert the tail beside it — one write.
+                        let leaf = &mut path.levels[leaf_level].node;
+                        leaf.replace_extent_at(pos, &head);
+                        leaf.insert_extent_at(pos + 1, &tail)
+                            .expect("probed leaf had room for the split tail");
+                        leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    } else {
+                        // Full leaf: trim to the head in place; the tail range
+                        // is then a hole and re-enters through the ordinary
+                        // insert (the split machinery). All in ONE transaction;
+                        // the abort guard covers a re-insert failure.
+                        path.levels[leaf_level].node.replace_extent_at(pos, &head);
+                        path.levels[leaf_level].node.write_back(
+                            device.as_ref(),
+                            handle,
+                            csum_seed,
+                        )?;
+                        self.insert(
+                            fs,
+                            end_block,
+                            tail_phys,
+                            tail_len,
+                            e.kind(),
+                            handle,
+                            csum_seed,
+                        )?;
+                        // `insert` accounted the tail as NEW data; its blocks
+                        // were already counted before the split.
+                        self.sector_count = self
+                            .sector_count
+                            .saturating_sub(tail_len as u64 * SECTORS_PER_BLOCK);
+                    }
+                    let auth = data_policy.authorize(mid_phys, mid_len as u32);
+                    fs.free_blocks(auth, handle)?;
+                    freed_data += mid_len as u64;
+                    cursor = end_block;
+                    continue 'scan;
+                }
+
+                // Single-sided straddles and fully-covered extents: one
+                // in-place edit, no insert. Free first (probed above), then
+                // edit.
+                let auth = data_policy.authorize(mid_phys, mid_len as u32);
+                fs.free_blocks(auth, handle)?;
+                freed_data += mid_len as u64;
+                if e_start < start_block {
+                    // Straddles the start: keep the head (first key unchanged).
+                    let head_len = (start_block - e_start) as u16;
+                    let head = Extent::new(e_start, head_len, e.start(), e.kind());
+                    path.levels[leaf_level].node.replace_extent_at(pos, &head);
+                    path.levels[leaf_level]
+                        .node
+                        .write_back(device.as_ref(), handle, csum_seed)?;
+                } else if e_end > end_block as u64 {
+                    // Straddles the end: keep the tail, re-keyed to `end_block`.
+                    // A position-0 edit raises the leaf's first key; write the
+                    // LEAF first, THEN correct the ancestors — the risen key
+                    // goes up only after the leaf actually holds it, so every
+                    // intermediate state has an ancestor key that is a valid
+                    // lower bound (never above the leaf's real first block).
+                    let tail_len = (e_end - end_block as u64) as u16;
+                    let tail_phys = e.start() + (end_block - e_start) as Ext4Bid;
+                    let tail = Extent::new(end_block, tail_len, tail_phys, e.kind());
+                    path.levels[leaf_level].node.replace_extent_at(pos, &tail);
+                    path.levels[leaf_level]
+                        .node
+                        .write_back(device.as_ref(), handle, csum_seed)?;
+                    if pos == 0 {
+                        self.correct_ancestor_keys(
+                            fs, &mut path, leaf_level, end_block, handle, csum_seed,
+                        )?;
+                    }
+                } else {
+                    // Fully covered: drop the entry; prune if the leaf empties,
+                    // else write the leaf and (on a risen first key) correct
+                    // the ancestors AFTER the leaf write (lower-bound-safe
+                    // order, as above).
+                    path.levels[leaf_level].node.remove_extent_at(pos);
+                    if path.levels[leaf_level].node.entries() == 0 {
+                        freed_meta += self.prune_emptied_leaf(fs, &mut path, handle, csum_seed)?;
+                    } else {
+                        let rose = pos == 0;
+                        let new_key = path.levels[leaf_level].node.first_key();
+                        path.levels[leaf_level].node.write_back(
+                            device.as_ref(),
+                            handle,
+                            csum_seed,
+                        )?;
+                        if rose {
+                            self.correct_ancestor_keys(
+                                fs, &mut path, leaf_level, new_key, handle, csum_seed,
+                            )?;
+                        }
+                    }
+                }
+                cursor = mid_end;
+            }
+            Ok(())
+        })();
+        if let Err(err) = scan {
+            if let Some(h) = handle {
+                h.abort_journal_on_fs_error();
+            }
+            return Err(err);
+        }
+
+        // `i_blocks` drops by the freed data plus the pruned tree nodes.
+        let removed_sectors = (freed_data + freed_meta) as i64 * SECTORS_PER_BLOCK as i64;
+        debug_assert!(self.sector_count as i64 >= removed_sectors);
+        self.sector_count = (self.sector_count as i64 - removed_sectors).max(0) as u64;
+        self.dirty = true;
+
+        Ok(super::PunchChunk {
+            more,
+            next_bound: restart_bound,
+        })
+    }
+
+    /// The depth-0 punch: at most [`INLINE_MAX`] inline entries, decomposed in
+    /// one pass (any transaction holds it). A spans-both split can push the
+    /// survivor count past the inline capacity; the tail then re-enters via
+    /// the ordinary insert, which grows the tree as needed.
+    fn punch_inline_root(
+        &mut self,
+        fs: &Ext4,
+        start_block: Iblock,
+        end_block: Iblock,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
+    ) -> Result<super::PunchChunk> {
+        let free_cost = fs.extent_free_credits();
+        let root_bytes = self.root.as_bytes();
+        let n = self.header().entries() as usize;
+
+        // Decompose in logical order. A single extent spanning BOTH edges
+        // yields head + tail (+1 survivor), so the survivor list can reach
+        // `INLINE_MAX + 1`; every other case nets zero or fewer.
+        let mut survivors: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 1);
+        let mut doomed: Vec<Extent> = Vec::new(); // freed after the root rewrite
+        for i in 0..n {
+            let e = root_extent_at(root_bytes, i);
             let e_start = e.block();
             let e_end = e_start as u64 + e.len() as u64;
-            // Wholly outside the punch range: kept intact.
             if e_end <= start_block as u64 || e_start as u64 >= end_block as u64 {
-                kept.push(*e);
+                survivors.push(e);
                 continue;
             }
-            let ov_start = e_start.max(start_block);
-            let ov_end = e_end.min(end_block as u64);
-            // Kept head `[e_start, start_block)`.
+            let mid_start = e_start.max(start_block);
+            let mid_end = e_end.min(end_block as u64) as Iblock;
+            doomed.push(Extent::new(
+                mid_start,
+                (mid_end - mid_start) as u16,
+                e.start() + (mid_start - e_start) as Ext4Bid,
+                e.kind(),
+            ));
             if e_start < start_block {
-                kept.push(Extent::new(
+                survivors.push(Extent::new(
                     e_start,
                     (start_block - e_start) as u16,
                     e.start(),
                     e.kind(),
                 ));
             }
-            // Doomed middle `[ov_start, ov_end)` at the same physical mapping.
-            doomed.push(Extent::new(
-                ov_start,
-                (ov_end - ov_start as u64) as u16,
-                e.start() + (ov_start - e_start) as Ext4Bid,
-                e.kind(),
-            ));
-            // Kept tail `[end_block, e_end)`.
             if e_end > end_block as u64 {
-                kept.push(Extent::new(
+                survivors.push(Extent::new(
                     end_block,
                     (e_end - end_block as u64) as u16,
                     e.start() + (end_block - e_start) as Ext4Bid,
@@ -1176,76 +1623,55 @@ impl ExtentTree {
             }
         }
 
-        // Highest logical block first: a credit stop then leaves the LOW doomed
-        // extents (nearest `start_block`) for the next chunk.
-        doomed.sort_by_key(|e| core::cmp::Reverse(e.block()));
+        // At most one extent overflows the inline root; peel the last survivor
+        // (they stay sorted) and re-insert it after the rewrite, growing the
+        // tree to depth 1. `survivors` never exceeds `INLINE_MAX + 1`.
+        debug_assert!(survivors.len() <= INLINE_MAX + 1);
+        let overflow_tail = if survivors.len() > INLINE_MAX {
+            survivors.pop()
+        } else {
+            None
+        };
 
-        // The reserialize headroom the last surviving reserialize needs — sized to
-        // the WHOLE decomposed extent set (`kept + doomed`), an upper bound on any
-        // survivor (a chunk that frees ≥ 1 doomed reserializes onto no more nodes).
-        let reserialize_headroom =
-            fs.truncate_chunk_credits(Self::external_node_count(kept.len() + doomed.len()));
-        let free_cost = fs.extent_free_credits();
-
-        // The honest EFBIG floor (symmetric to truncate): if one free plus the
-        // survivor reserialize cannot fit a whole transaction, no restart ever can.
-        if let Some(max) = max_credits
-            && !doomed.is_empty()
-            && reserialize_headroom + free_cost > max
-        {
-            return_errno_with_message!(
-                Errno::EFBIG,
-                "one punch chunk's reserialize plus a free exceeds a journal transaction"
+        self.write_inline_leaf_root(&survivors);
+        self.dirty = true;
+        if let Some(tail) = overflow_tail {
+            // The rewrite dropped the tail from the root; a failure before the
+            // insert lands would strand it unmapped-but-allocated — escalate.
+            let reattach = self.insert(
+                fs,
+                tail.block(),
+                tail.start(),
+                tail.len(),
+                tail.kind(),
+                handle,
+                csum_seed,
             );
+            if let Err(err) = reattach {
+                if let Some(h) = handle {
+                    h.abort_journal_on_fs_error();
+                }
+                return Err(err);
+            }
+            // `insert` counted the tail as new data; it was already accounted.
+            self.sector_count = self
+                .sector_count
+                .saturating_sub(tail.len() as u64 * SECTORS_PER_BLOCK);
         }
 
         let mut freed_data: u64 = 0;
-        let mut freed_up_to = 0usize; // count of `doomed` extents freed this chunk
-
-        for e in &doomed {
-            // Credit-aware early stop (chunked mode): if this free plus the
-            // survivor reserialize will not fit even after growing in place, stop
-            // with the progress made so far. Not restarting here is the ③-drop red
-            // line — the restart's re-admission may wait, illegal under this lock.
-            if let Some(h) = handle
-                && max_credits.is_some()
-                && stop_before_free(h, free_cost + reserialize_headroom)?
-            {
-                break;
-            }
-            let auth = data_policy.authorize(e.start(), e.len() as u32);
+        for d in &doomed {
+            let auth = data_policy.authorize(d.start(), d.len() as u32);
             fs.free_blocks(auth, handle)?;
-            freed_data += e.len() as u64;
-            freed_up_to += 1;
+            freed_data += d.len() as u64;
         }
-
-        // The doomed extents not reached this chunk survive it (the next chunk
-        // re-flattens and frees them; a crash meanwhile leaves a valid partial
-        // hole).
-        for e in &doomed[freed_up_to..] {
-            kept.push(*e);
-        }
-        // `reserialize`/`search_entries` require ascending logical order — `kept`
-        // mixes the ascending prefix, the descending un-freed doomed, and the
-        // split tails; sort before serializing (the truncate red-line).
-        kept.sort_by_key(|e| e.block());
-        debug_assert!(kept.windows(2).all(|w| w[0].block() < w[1].block()));
-
-        let delta = self.reserialize(fs, &kept, &old_external, handle, csum_seed)?;
-        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
-        let removed_sectors = (freed_data as i64 - net_meta) * SECTORS_PER_BLOCK as i64;
+        let removed_sectors = freed_data as i64 * SECTORS_PER_BLOCK as i64;
         debug_assert!(self.sector_count as i64 >= removed_sectors);
         self.sector_count = (self.sector_count as i64 - removed_sectors).max(0) as u64;
-        self.dirty = true;
 
-        // The next chunk starts from ONE free PLUS the survivor's reserialize
-        // headroom — exactly the next chunk's first probe, so the restart's
-        // reservation alone frees ≥ 1 extent (forward progress; see truncate).
-        let next_bound = fs.extent_free_credits()
-            + fs.truncate_chunk_credits(Self::external_node_count(kept.len()));
         Ok(super::PunchChunk {
-            more: freed_up_to < doomed.len(),
-            next_bound,
+            more: false,
+            next_bound: free_cost + 2,
         })
     }
 
@@ -3185,5 +3611,348 @@ mod tests {
         }
         assert_eq!(tree.lookup(&f.ext4, 0).unwrap().unwrap().start(), 900_000);
         assert_matches_linear(&f, &tree, LEAF_MAX as u32 * 2 + 12);
+    }
+
+    // ---- P9a-T4a: in-place tail truncate ----
+
+    /// Like [`ascending_tree`], but the data blocks are REALLY allocated from
+    /// the fixture's bitmap — a truncate test frees them, and freeing a
+    /// fictional block panics the group lookup. Returns the per-extent
+    /// physical blocks for mapping assertions.
+    fn ascending_tree_allocated(
+        f: &crate::fs::fs_impls::ext4::test_utils::Ext4Fixture,
+        n: u32,
+    ) -> (ExtentTree, Vec<Ext4Bid>) {
+        let mut tree = ExtentTree::empty();
+        let mut pblocks = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let range = f.ext4.alloc_blocks(1, 0, None).unwrap();
+            let pb = range.start;
+            tree.insert(&f.ext4, i * 2, pb, 1, ExtentKind::Written, None, None)
+                .unwrap();
+            pblocks.push(pb);
+        }
+        (tree, pblocks)
+    }
+
+    /// Truncating a depth-2 tree frees the doomed tail extents in place and
+    /// prunes the emptied leaves and interior nodes (Linux rm_leaf/rm_idx
+    /// cascade), leaving the survivor prefix mapped and the tree still valid.
+    #[ktest]
+    fn truncate_prunes_depth2_cascade() {
+        let f = Ext4FixtureBuilder::new(16384, 256, 16384)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // Grow to depth 2: > INLINE_MAX × LEAF_MAX = 1360 unmergeable extents.
+        let n = INLINE_MAX as u32 * LEAF_MAX as u32 + 200; // 1560
+        let (mut tree, pblocks) = ascending_tree_allocated(&f, n);
+        assert_eq!(tree.depth(), 2);
+        let sc_full = tree.sector_count();
+
+        // Truncate to keep only the first 100 blocks (50 extents at even
+        // blocks). The doomed tail spans many leaves and whole interiors.
+        let keep = 100usize;
+        tree.truncate_to_byte_len(
+            &f.ext4,
+            keep * BLOCK_SIZE,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+
+        // Survivor prefix reads correctly; the freed tail is holes.
+        for b in (0..100u32).step_by(2) {
+            let m = tree.lookup(&f.ext4, b).unwrap().unwrap();
+            assert_eq!(m.start(), pblocks[(b / 2) as usize]);
+        }
+        assert!(tree.lookup(&f.ext4, 100).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, n * 2 - 2).unwrap().is_none());
+        assert_matches_linear(&f, &tree, 130);
+        // i_blocks dropped: 50 survivor data blocks + a handful of surviving
+        // metadata nodes, far below the full tree.
+        assert!(tree.sector_count() < sc_full);
+        assert!(tree.sector_count() >= 50 * SECTORS_PER_BLOCK);
+        // The tree stays valid and re-truncatable to zero.
+        tree.truncate_to_byte_len(&f.ext4, 0, None, None, journal::DataForgetPolicy::PlainData)
+            .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (0, 0));
+        assert_eq!(tree.sector_count(), 0);
+        assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
+    }
+
+    /// Truncating a depth-1 tree to zero frees every leaf and resets the root
+    /// to an empty inline depth-0 node.
+    #[ktest]
+    fn truncate_to_zero_resets_root() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let (mut tree, _pblocks) = ascending_tree_allocated(&f, LEAF_MAX as u32 + 50); // depth 1
+        assert_eq!(tree.depth(), 1);
+        tree.truncate_to_byte_len(&f.ext4, 0, None, None, journal::DataForgetPolicy::PlainData)
+            .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (0, 0));
+        assert_eq!(tree.sector_count(), 0);
+        // Reusable: inserts after a full truncate rebuild normally.
+        tree.insert(&f.ext4, 0, 5000, 3, ExtentKind::Written, None, None)
+            .unwrap();
+        let m = tree.lookup(&f.ext4, 1).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (0, 3, 5000));
+    }
+
+    /// A chunked (credit-bounded) truncate frees a bounded batch per call and
+    /// reports a frontier the outer spine drives down; the survivor after each
+    /// chunk stays consistent with the linear reference.
+    #[ktest]
+    fn truncate_chunk_frontier_and_consistency() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 100; // depth 1, 2 leaves
+        let (mut tree, _pblocks) = ascending_tree_allocated(&f, n);
+
+        // Drive chunks with a tiny per-chunk budget until the frontier reaches
+        // keep_blocks, mimicking the outer restart spine (sans journal).
+        let keep = 10usize;
+        let keep_blocks = keep as Iblock;
+        let mut guard = 0;
+        loop {
+            let chunk = tree
+                .truncate_chunk(
+                    &f.ext4,
+                    keep * BLOCK_SIZE,
+                    None,
+                    None,
+                    journal::DataForgetPolicy::PlainData,
+                    Some(64),
+                )
+                .unwrap();
+            // After each chunk the tree is a valid survivor.
+            assert_matches_linear(&f, &tree, n * 2 + 4);
+            if chunk.reached <= keep_blocks {
+                break;
+            }
+            guard += 1;
+            assert!(guard < 10_000, "truncate frontier must converge");
+        }
+        // Kept prefix survives, tail is holes.
+        for b in (0..keep as u32).step_by(2) {
+            assert!(tree.lookup(&f.ext4, b).unwrap().is_some());
+        }
+        assert!(tree.lookup(&f.ext4, keep as u32).unwrap().is_none());
+    }
+
+    // ---- P9a-T4b: in-place punch ----
+
+    /// Punching the middle of an inline (depth-0) extent splits it into head +
+    /// tail in the root and frees exactly the covered run.
+    #[ktest]
+    fn punch_inline_middle_splits() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        let range = f.ext4.alloc_blocks(20, 0, None).unwrap();
+        let p = range.start;
+        let got = (range.end - range.start) as u16;
+        assert_eq!(got, 20, "fixture must satisfy a 20-block run");
+        tree.insert(&f.ext4, 0, p, 20, ExtentKind::Written, None, None)
+            .unwrap();
+        let sc = tree.sector_count();
+
+        tree.punch_chunk(
+            &f.ext4,
+            5..9,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        let head = tree.lookup(&f.ext4, 4).unwrap().unwrap();
+        assert_eq!((head.block(), head.len(), head.start()), (0, 5, p));
+        assert!(tree.lookup(&f.ext4, 5).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, 8).unwrap().is_none());
+        let tail = tree.lookup(&f.ext4, 9).unwrap().unwrap();
+        assert_eq!((tail.block(), tail.len(), tail.start()), (9, 11, p + 9));
+        assert_eq!(tree.sector_count(), sc - 4 * SECTORS_PER_BLOCK);
+    }
+
+    /// A depth-0 root already holding [`INLINE_MAX`] extents overflows when a
+    /// punch splits one of them; the tail re-enters through insert and the
+    /// tree grows to depth 1 with every mapping intact.
+    #[ktest]
+    fn punch_inline_overflow_grows_tree() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        let mut runs = Vec::new();
+        for i in 0..INLINE_MAX as u32 {
+            let r = f.ext4.alloc_blocks(6, 0, None).unwrap();
+            assert_eq!((r.end - r.start) as u16, 6);
+            tree.insert(&f.ext4, i * 10, r.start, 6, ExtentKind::Written, None, None)
+                .unwrap();
+            runs.push(r.start);
+        }
+        assert_eq!(tree.depth(), 0);
+
+        // Punch the middle of extent #1: head+tail push the root past
+        // INLINE_MAX → the tail re-insert grows the tree.
+        tree.punch_chunk(
+            &f.ext4,
+            12..14,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tree.depth(), 1);
+        let head = tree.lookup(&f.ext4, 11).unwrap().unwrap();
+        assert_eq!((head.block(), head.len()), (10, 2));
+        assert!(tree.lookup(&f.ext4, 12).unwrap().is_none());
+        let tail = tree.lookup(&f.ext4, 14).unwrap().unwrap();
+        assert_eq!(
+            (tail.block(), tail.len(), tail.start()),
+            (14, 2, runs[1] + 4)
+        );
+        // Untouched neighbours survive.
+        for i in [0u32, 2, 3] {
+            let m = tree.lookup(&f.ext4, i * 10 + 1).unwrap().unwrap();
+            assert_eq!(m.start(), runs[i as usize]);
+        }
+        assert_matches_linear(&f, &tree, 40);
+    }
+
+    /// Punching the head of a non-first leaf removes its first entries; the
+    /// leaf's risen first key must propagate into the parent index (Linux's
+    /// exact-first-key invariant), and lookups stay correct.
+    #[ktest]
+    fn punch_leaf_head_corrects_parent_key() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 30;
+        let (mut tree, _p) = ascending_tree_allocated(&f, n);
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        let leaf2_first = LEAF_MAX as u32 * 2; // block 680
+        assert_eq!(root_index_key(&tree, 1), leaf2_first);
+
+        // Punch the second leaf's first 5 extents: [680, 690).
+        tree.punch_chunk(
+            &f.ext4,
+            leaf2_first..leaf2_first + 10,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        // The parent key follows the leaf's new first entry exactly.
+        assert_eq!(root_index_key(&tree, 1), leaf2_first + 10);
+        assert!(tree.lookup(&f.ext4, leaf2_first).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, leaf2_first + 10).unwrap().is_some());
+        assert_matches_linear(&f, &tree, n * 2 + 4);
+    }
+
+    /// A punch that covers a whole leaf's range empties and prunes it from the
+    /// middle of the tree; the sibling leaves survive untouched.
+    #[ktest]
+    fn punch_empties_and_prunes_middle_leaf() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 30;
+        let (mut tree, _p) = ascending_tree_allocated(&f, n);
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        let sc = tree.sector_count();
+
+        // Punch the ENTIRE first leaf's range [0, 680).
+        tree.punch_chunk(
+            &f.ext4,
+            0..LEAF_MAX as u32 * 2,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 1));
+        assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, 678).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, LEAF_MAX as u32 * 2).unwrap().is_some());
+        // 340 data blocks + the pruned leaf node left i_blocks.
+        assert_eq!(
+            tree.sector_count(),
+            sc - (LEAF_MAX as u64 + 1) * SECTORS_PER_BLOCK
+        );
+        assert_matches_linear(&f, &tree, n * 2 + 4);
+    }
+
+    /// Punching inside one extent of a FULL leaf takes the slow spans-both
+    /// path: trim to the head, re-insert the tail through the split machinery
+    /// (the leaf splits), every mapping intact.
+    #[ktest]
+    fn punch_full_leaf_spans_both_splits() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // 339 singles + one 5-block run = exactly LEAF_MAX entries, depth 1.
+        let (mut tree, _p) = ascending_tree_allocated(&f, LEAF_MAX as u32 - 1);
+        let big = f.ext4.alloc_blocks(5, 0, None).unwrap();
+        assert_eq!((big.end - big.start) as u16, 5);
+        let big_block = (LEAF_MAX as u32 - 1) * 2; // 678, covers 678..683
+        tree.insert(
+            &f.ext4,
+            big_block,
+            big.start,
+            5,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 1));
+        match tree.find(&f.ext4, big_block).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), LEAF_MAX)
+            }
+            _ => panic!("big extent must be mapped"),
+        }
+
+        // Punch [679, 681): head 678..679, tail 681..683, leaf FULL → split.
+        tree.punch_chunk(
+            &f.ext4,
+            big_block + 1..big_block + 3,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 2));
+        let head = tree.lookup(&f.ext4, big_block).unwrap().unwrap();
+        assert_eq!(
+            (head.block(), head.len(), head.start()),
+            (big_block, 1, big.start)
+        );
+        assert!(tree.lookup(&f.ext4, big_block + 1).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, big_block + 2).unwrap().is_none());
+        let tail = tree.lookup(&f.ext4, big_block + 3).unwrap().unwrap();
+        assert_eq!(
+            (tail.block(), tail.len(), tail.start()),
+            (big_block + 3, 2, big.start + 3)
+        );
+        assert_matches_linear(&f, &tree, big_block + 8);
     }
 }

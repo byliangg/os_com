@@ -3765,9 +3765,18 @@ mod write_tests {
                 "the freed tail must be a hole"
             );
         }
-        // The survivor `[0, 5)` collapses to an inline tree (no external leaf): 5
-        // data blocks, zero metadata.
-        assert_eq!(inode.sector_count(), keep as u64 * SECTORS_PER_BLOCK);
+        // The survivor `[0, 5)` keeps its external leaf: the in-place truncate
+        // (P9a-T4) frees the doomed tail entries and prunes emptied leaves, but
+        // does NOT reduce the tree's depth or pull a small survivor back inline
+        // — Linux-parity (`ext4_ext_remove_space` leaves the depth). So the
+        // kept prefix is 5 data blocks plus the one surviving leaf block. (The
+        // pre-surgery reserialize collapsed it to inline; that over-compaction
+        // was the divergence from Linux, now gone.)
+        assert_eq!(
+            inode.sector_count(),
+            (keep as u64 + 1) * SECTORS_PER_BLOCK,
+            "5 data blocks + 1 surviving external leaf"
+        );
     }
 
     /// P7d-2cd (BLOCKING 1) — an INTERMEDIATE truncate chunk must serialize a

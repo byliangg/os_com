@@ -653,21 +653,6 @@ impl Ext4 {
         1 + 1 + 1
     }
 
-    /// The credit the chunked truncate spine reserves for one chunk: the
-    /// survivor tree's whole-tree reserialize onto its `external_nodes` external
-    /// (leaf + interior) blocks PLUS the inode-descriptor writeback that rides
-    /// the same transaction — sized exactly like
-    /// [`chunk_insert_credits`](Self::chunk_insert_credits) on the write side.
-    ///
-    /// Bounded by `max_credits`: the survivor `[0, reached)` is a subset of the
-    /// old tree, and the old tree was built under this same floor at its last
-    /// insert (`chunk_insert_credits == reserialize + INODE_DESC`), so a
-    /// survivor reserialize can never exceed one transaction. The chunk's frees
-    /// grow the reservation on top of this via the inner probe.
-    pub(super) fn truncate_chunk_credits(&self, external_nodes: usize) -> usize {
-        self.reserialize_credits(external_nodes) + Self::INODE_DESC_CREDITS
-    }
-
     /// Conservative upper bound on the credits a WHOLE (single-transaction)
     /// truncate captures — the [`Inode::resize`](super::inode::Inode) fast/slow
     /// gate. `external_nodes` is the current tree's external-node count (the
