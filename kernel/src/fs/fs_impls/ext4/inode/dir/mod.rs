@@ -22,7 +22,7 @@ use self::{
 };
 use super::{
     super::{checksum, fs::Ext4, journal, prelude::*, utils},
-    FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
+    DIR_NLINK_MAX, FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
 };
 use crate::fs::utils::NAME_MAX;
 
@@ -896,6 +896,23 @@ impl Inode {
         // layer has already validated that `name` is absent.
         let fs = self.fs()?;
         let mut parent_inner = self.inner.write();
+        // The linear-directory subdirectory ceiling (Linux `EXT4_DIR_LINK_MAX`,
+        // ext4.h): a parent at DIR_NLINK_MAX cannot take another `..` back
+        // reference without wrapping its on-disk u16 link count. Linux escapes
+        // through the htree `is_dx` pin (nlink = 1, "many"), which e2fsck only
+        // accepts on an INDEX-flagged directory — and our directories are
+        // linear until htree build lands, so the honest answer is EMLINK
+        // before anything is allocated. A foreign, Linux-written pinned
+        // directory (count 1) stays pinned and never hits this gate.
+        if is_dir {
+            let parent_links = parent_inner.link_count();
+            if parent_links != 1 && parent_links >= DIR_NLINK_MAX {
+                return_errno_with_message!(
+                    Errno::EMLINK,
+                    "a linear directory cannot hold more than 64998 subdirectories"
+                );
+            }
+        }
         // Open the journal handle after the inner lock (lock order: inner ① →
         // handle ②); it captures the inode/block-bitmap, group-descriptor and
         // extent after-images the allocations below dirty, and closes on drop.
@@ -1088,8 +1105,11 @@ impl Inode {
         }
 
         child_inner.set_ctime(utils::now());
-        // The child loses its own `.` self-link and the parent's directory entry.
-        child_inner.dec_link_count(2);
+        // The child loses its own `.` self-link and the parent's directory
+        // entry — cleared outright (Linux `clear_nlink` in `ext4_rmdir`), not
+        // decremented, so a `dir_nlink`-pinned child (count 1, "many") also
+        // reaches 0 and reclaims.
+        child_inner.set_link_count(0);
         if child_inner.link_count() == 0 {
             // Link onto the orphan list and persist the child (`i_dtime` =
             // orphan-next pointer) in this transaction (see `unlink`).
@@ -1327,6 +1347,20 @@ impl Inode {
         let moved_file_type = DirEntryFileType::from(old_inode.inode_type());
         let fs = self.fs()?;
 
+        // A directory moving into a new parent adds a `..` back reference: the
+        // linear-directory subdirectory ceiling applies (Linux
+        // `EXT4_DIR_LINK_MAX`; see `create_with_seed_and_init`). Checked before
+        // any mutation so EMLINK leaves both directories untouched.
+        if old_is_dir && !has_replaced && !is_same_dir {
+            let target_links = guards.inner_mut(target.ino()).link_count();
+            if target_links != 1 && target_links >= DIR_NLINK_MAX {
+                return_errno_with_message!(
+                    Errno::EMLINK,
+                    "a linear directory cannot hold more than 64998 subdirectories"
+                );
+            }
+        }
+
         // Step 4.1: apply the directory-entry mutations.
         if is_same_dir {
             let dir_inner = guards.inner_mut(self.ino());
@@ -1397,11 +1431,14 @@ impl Inode {
             let replaced_inner = guards.inner_mut(replaced.ino());
             replaced_inner.set_ctime(utils::now());
             // A replaced directory loses both its own `.` self-link and the
-            // entry; a replaced non-directory loses only the entry.
+            // entry — cleared outright (Linux `clear_nlink`, see `rmdir`) so a
+            // `dir_nlink`-pinned directory also reclaims; a replaced
+            // non-directory loses only the entry.
             if old_is_dir {
+                replaced_inner.set_link_count(0);
+            } else {
                 replaced_inner.dec_link_count(1);
             }
-            replaced_inner.dec_link_count(1);
 
             if replaced_inner.link_count() == 0 {
                 // Link onto the orphan list and persist the replaced inode

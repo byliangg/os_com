@@ -70,6 +70,15 @@ pub(super) const MAX_FAST_SYMLINK_LEN: usize = RAW_BLOCK_PTRS_LEN * 4;
 /// a request that would exceed this. Mirrors ext2 `MAX_LINK_COUNT`.
 pub(super) const MAX_LINK_COUNT: u16 = 32000;
 
+/// The `dir_nlink` threshold (Linux `EXT4_LINK_MAX` = 65000): a directory
+/// whose subdirectory count pushes its link count past this pins the count at
+/// 1 — "many, no longer tracked" — instead of wrapping the on-disk u16
+/// (ext4/045 creates 65000+ subdirectories and caught the wrap: the parent's
+/// count rolled over toward 0 and e2fsck read it as a deleted inode with live
+/// entries). A pinned count never decrements. Linux `ext4_inc_count` /
+/// `ext4_dec_count` (namei.c).
+pub(super) const DIR_NLINK_MAX: u16 = 65000;
+
 /// Logical (file-relative) block index (Linux `ext4_lblk_t`, 32-bit).
 pub(super) type Iblock = u32;
 
@@ -2394,13 +2403,36 @@ impl InodeInner {
 
     /// Adds `delta` to the link count. Used by the create path to bump the
     /// parent directory's count for a new subdirectory's `..` reference.
+    ///
+    /// Directory semantics (`dir_nlink`, Linux `ext4_inc_count`): a FOREIGN
+    /// pinned directory (count 1 = "many", written by a Linux htree mount)
+    /// stays pinned, and the count saturates at [`DIR_NLINK_MAX`] instead of
+    /// wrapping the on-disk u16 — the mkdir/rename EMLINK gates keep the
+    /// saturation unreachable for directories we grew ourselves (Linux
+    /// escapes through the htree `is_dx` pin, which e2fsck only accepts on
+    /// an INDEX-flagged directory; ours are linear until htree build lands).
     fn inc_link_count(&mut self, delta: u16) {
+        if self.desc.type_() == InodeType::Dir {
+            let count = self.desc.link_count();
+            if count == 1 || count >= DIR_NLINK_MAX {
+                return;
+            }
+        }
         self.desc.inc_link_count(delta);
     }
 
     /// Subtracts `delta` from the link count. Used by the unlink/rmdir path to
     /// drop a name's reference; reaching 0 triggers reclaim on the last `Drop`.
+    ///
+    /// A directory pinned at the `dir_nlink` sentinel (count 1, "many") no
+    /// longer tracks its subdirectories and never decrements (Linux
+    /// `ext4_dec_count`); `rmdir`/`rename` clear a removed directory's own
+    /// count outright instead of decrementing (Linux `clear_nlink`), so a
+    /// pinned directory still reclaims.
     fn dec_link_count(&mut self, delta: u16) {
+        if self.desc.type_() == InodeType::Dir && self.desc.link_count() == 1 {
+            return;
+        }
         self.desc.dec_link_count(delta);
     }
 
@@ -4608,6 +4640,49 @@ mod write_tests {
     /// case must stay a bounded read-only probe (P9a-T5) that touches and
     /// journals no node. Here we pin the invariant on a small file — the
     /// mapping stays written and `i_blocks` is unchanged.
+    /// `dir_nlink` semantics (Linux `ext4_inc_count`/`ext4_dec_count`,
+    /// namei.c, adapted to linear directories): a directory's link count
+    /// saturates at [`DIR_NLINK_MAX`] (never wraps the on-disk u16 — ext4/045
+    /// creates 65000+ subdirectories and caught the wrap reading back as a
+    /// deleted inode with live entries), and a FOREIGN pinned directory
+    /// (count 1, written by a Linux htree mount) neither increments nor
+    /// decrements (P9a-a5).
+    #[ktest]
+    fn dir_nlink_saturates_and_foreign_pin_holds() {
+        let f = journaled_fixture_with_empty_file();
+        let root = f
+            .ext4
+            .read_inode(crate::fs::fs_impls::ext4::fs::ROOT_INO)
+            .unwrap();
+        let mut inner = root.inner.write();
+
+        // Saturation at the ceiling (the EMLINK gates keep this unreachable
+        // for directories we grew ourselves; saturating is the no-wrap net).
+        inner.set_link_count(DIR_NLINK_MAX);
+        inner.inc_link_count(1);
+        assert_eq!(inner.link_count(), DIR_NLINK_MAX, "saturates, never wraps");
+        inner.dec_link_count(1);
+        assert_eq!(
+            inner.link_count(),
+            DIR_NLINK_MAX - 1,
+            "below the cap counts"
+        );
+
+        // A foreign dir_nlink pin (count 1) holds both ways.
+        inner.set_link_count(1);
+        inner.inc_link_count(1);
+        assert_eq!(inner.link_count(), 1, "the pin never increments");
+        inner.dec_link_count(1);
+        assert_eq!(inner.link_count(), 1, "the pin never decrements");
+
+        // Ordinary counting below the threshold.
+        inner.set_link_count(100);
+        inner.inc_link_count(1);
+        assert_eq!(inner.link_count(), 101);
+        inner.dec_link_count(1);
+        assert_eq!(inner.link_count(), 100);
+    }
+
     #[ktest]
     fn overwrite_of_written_block_converts_nothing() {
         let f = journaled_fixture_with_empty_file();

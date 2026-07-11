@@ -1067,10 +1067,16 @@ impl BlockGroup {
         if type_.is_directory() {
             metadata.desc.used_dirs_count = metadata.desc.used_dirs_count() + 1;
         }
-        // Keep `bg_itable_unused` in step with the bitmap so e2fsck does not flag
-        // a stale count on a metadata_csum volume.
-        metadata.desc.itable_unused =
-            Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
+        // Keep `bg_itable_unused` in step with the bitmap so e2fsck does not
+        // flag a stale count on a metadata_csum volume. Feature-gated: without
+        // `metadata_csum`/`gdt_csum` the field must stay 0 — e2fsck reads a
+        // nonzero count on such a volume as "group descriptor marked
+        // uninitialized without feature set" (ext4/045 caught exactly this on
+        // a featureless guest-mkfs scratch).
+        if self.csum_seed.is_some() {
+            metadata.desc.itable_unused =
+                Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
+        }
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;
@@ -1132,8 +1138,12 @@ impl BlockGroup {
         if let Some(new_used_dirs) = new_used_dirs {
             metadata.desc.used_dirs_count = new_used_dirs;
         }
-        metadata.desc.itable_unused =
-            Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
+        // Feature-gated like the allocation side: stays 0 without the
+        // checksum feature (see `try_alloc_inode`).
+        if self.csum_seed.is_some() {
+            metadata.desc.itable_unused =
+                Self::itable_unused_from_bitmap(&metadata.inode_bitmap, self.nr_inodes_per_group);
+        }
 
         let desc_block_bid = (self.desc_offset / BLOCK_SIZE) as Ext4Bid;
         bitmap_access.patch(|buf| buf.copy_from_slice(metadata.inode_bitmap.as_bytes()))?;

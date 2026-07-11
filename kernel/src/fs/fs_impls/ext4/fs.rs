@@ -3187,6 +3187,39 @@ mod tests {
         assert_eq!(gen_b, gen_a.wrapping_add(1));
     }
 
+    /// On a volume WITHOUT `metadata_csum`, inode allocation must leave
+    /// `bg_itable_unused` at 0 (and `bg_flags` clear): e2fsck reads a nonzero
+    /// unused count on a featureless volume as "group descriptor marked
+    /// uninitialized without feature set" — ext4/045's guest-mkfs scratch
+    /// caught exactly this (P9a-a5).
+    #[ktest]
+    fn featureless_volume_keeps_itable_unused_zero() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_inode_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+
+        let perm = FilePerm::from_bits_truncate(0o644);
+        let a = f
+            .ext4
+            .create_inode(ROOT_INO, InodeType::File, perm, InodeSeed::ExtentRoot, None)
+            .unwrap();
+        drop(a);
+
+        let gdt_offset = (f.ext4.super_block().first_data_block() as usize + 1) * BLOCK_SIZE;
+        let raw = f
+            .disk
+            .segment()
+            .read_val::<RawBlockGroup>(gdt_offset)
+            .unwrap();
+        assert_eq!(
+            raw.itable_unused_lo, 0,
+            "a featureless volume must not track unused inodes"
+        );
+        assert_eq!(raw.flags, 0, "no lazy-init flags without the feature");
+    }
+
     /// create_inode rolls back the inode allocation when the on-disk writeback
     /// fails: the bitmap bit is cleared and the superblock counter restored.
     #[ktest]
