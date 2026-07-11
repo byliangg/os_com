@@ -121,10 +121,10 @@ pub(super) enum HoleFill {
     /// end. `reached` is the first logical block NOT allocated — equal to the
     /// range start when even the first insert did not fit, greater when partial
     /// progress was made. `need` is the reservation the insert that triggered
-    /// the stop requires (the whole-tree reserialize plus the per-chunk inode
-    /// descriptor / convert), so the write spine restarts onto a fresh
-    /// transaction reserving exactly it rather than the smaller per-chunk
-    /// `write_credits` estimate.
+    /// the stop requires (the in-place insert's O(depth) bound plus the
+    /// per-chunk inode descriptor / convert, `chunk_insert_credits`), so the
+    /// write spine restarts onto a fresh transaction reserving exactly it
+    /// rather than the smaller per-chunk `write_credits` estimate.
     Stopped { reached: Iblock, need: usize },
 }
 
@@ -278,9 +278,9 @@ impl ExtentManager {
     /// reservation the insert that did not fit needs (see [`HoleFill`]).
     ///
     /// The unbounded write spine allocates, writes, and converts only the filled
-    /// prefix this transaction and restarts for the rest: a single insert's
-    /// whole-tree reserialize can capture more than one transaction holds, so
-    /// the loop must be able to end a chunk BEFORE the capture would overflow —
+    /// prefix this transaction and restarts for the rest: the chunk's inserts
+    /// accumulate captures a single transaction eventually cannot hold, so
+    /// the loop must be able to end a chunk BEFORE a capture would overflow —
     /// and the restart cannot run here, under the ExtentTree lock (③) the
     /// committer's ordered flush needs (it releases ③ by returning; the OUTER
     /// spine restarts, reserving the reported `need`). A [`HoleFill::Stopped`]
@@ -313,8 +313,16 @@ impl ExtentManager {
         let fs = self.fs()?;
         let mut tree = self.state.write();
 
-        // Plan hole runs from a snapshot of the current tree by interval-
-        // subtracting the existing (sorted, non-overlapping) extents.
+        // Plan hole runs from a snapshot of the current tree — a BOUNDED one
+        // (P9a-T6): instead of flattening the whole tree into a Vec on every
+        // write (an O(file-size) buffer — the SQLite mega-allocation), walk
+        // only the extents overlapping the range and stream the gaps between
+        // them into the hole list. Each hole carries its allocation `goal`
+        // (the preceding extent's physical end, for locality); the first
+        // hole's predecessor may live before the walked range, so it comes
+        // from the landing search instead — its in-leaf predecessor, with a
+        // predecessor in an earlier leaf falling back to goal 0 (an allocator
+        // hint, not a correctness input; full locality tuning is P9b).
         //
         // Fresh holes are allocated as UNWRITTEN, not written: the block stays
         // read-as-zeros until the caller's data lands and `write_at` converts
@@ -325,38 +333,66 @@ impl ExtentManager {
         // file, on disk or across a crash (ledger: hole-alloc-stale-exposure).
         // Any pre-existing unwritten extent in range (e.g. from a future
         // fallocate) is likewise left unwritten here and converted post-write.
-        let extents = tree.extents(&fs)?;
-        let holes = compute_holes(&extents, start_iblock, end_iblock);
-
-        // The tree's extent count, tracked as an upper bound (an insert's merge
-        // can only lower it) to size each insert's whole-tree reserialize cost.
-        let mut projected_extents = extents.len();
+        let mut last_phys_end = match tree.find(&fs, start_iblock)? {
+            path::Search::Gap { prev, .. } => prev.map(|p| p.start() + p.len() as Ext4Bid),
+            path::Search::Covered { .. } => None, // the walk sees the covering extent
+        };
+        let mut holes: Vec<PlannedHole> = Vec::new();
+        let mut cursor = start_iblock as u64;
+        tree.walk_range(
+            &fs,
+            start_iblock as u64..end_iblock as u64,
+            &mut |e: &node::Extent| {
+                let e_start = e.block() as u64;
+                if e_start > cursor {
+                    holes.push(PlannedHole {
+                        // Lossless: pushed only while `cursor < e_start`, and
+                        // an extent's start key is a u32 block index.
+                        run: HoleRun {
+                            start: cursor as Iblock,
+                            end: e_start as Iblock,
+                        },
+                        goal: last_phys_end,
+                    });
+                }
+                cursor = cursor.max(e_start + e.len() as u64);
+                last_phys_end = Some(e.start() + e.len() as Ext4Bid);
+                core::ops::ControlFlow::Continue(())
+            },
+        )?;
+        if cursor < end_iblock as u64 {
+            holes.push(PlannedHole {
+                // Lossless: guarded by `cursor < end_iblock` (an Iblock).
+                run: HoleRun {
+                    start: cursor as Iblock,
+                    end: end_iblock,
+                },
+                goal: last_phys_end,
+            });
+        }
 
         for hole in &holes {
-            let mut ib = hole.start;
-            // `goal` is the previous extent's physical end for locality; full
-            // locality tuning is deferred to Phase 9.
-            let goal = extents
-                .iter()
-                .rev()
-                .find(|e| e.block() < ib)
-                .map(|e| e.start() + e.len() as Ext4Bid)
-                .unwrap_or(0);
-            while ib < hole.end {
+            let mut ib = hole.run.start;
+            // `alloc_blocks`'s 0-as-no-hint is that signature's own debt; the
+            // plan keeps "no predecessor" explicit until this boundary.
+            let goal = hole.goal.unwrap_or(0);
+            while ib < hole.run.end {
                 // Credit-aware early stop (chunked mode only): if the NEXT
-                // insert's whole-tree reserialize (a safe upper bound) will not
-                // fit the handle's transaction even after growing in place, stop
-                // with the progress made so far — `ib` is fully allocated up to
-                // here — and let the OUTER write spine restart onto a fresh
-                // transaction. Not restarting here is the ③-drop red line: the
-                // restart's re-admission may wait, which is illegal under this
-                // lock. Whole-range mode presses on and lets
-                // `charge_fresh_capture` be the loud backstop; a non-journaled
-                // volume (no handle) has no per-transaction ceiling either way.
+                // insert will not fit the handle's transaction even after
+                // growing in place, stop with the progress made so far — `ib`
+                // is fully allocated up to here — and let the OUTER write
+                // spine restart onto a fresh transaction. Not restarting here
+                // is the ③-drop red line: the restart's re-admission may wait,
+                // which is illegal under this lock. Whole-range mode presses
+                // on and lets `charge_fresh_capture` be the loud backstop; a
+                // non-journaled volume (no handle) has no per-transaction
+                // ceiling either way. The bound is the in-place insert's
+                // O(depth) cost (P9a-T6) — the whole-tree reserialize bound
+                // retired with the rebuild path it priced.
                 if bound == AllocBound::CreditChunk
                     && let Some(h) = handle
                 {
-                    let need = ExtentTree::next_insert_credit_bound(&fs, projected_extents + 1);
+                    let need = fs.chunk_insert_credits(tree.depth());
                     if journal::try_reserve_next(h, need)? == journal::ExtendOutcome::NeedsRestart {
                         // Report the bound the reservation was checked against —
                         // not the smaller per-chunk `write_credits` — so the
@@ -370,7 +406,7 @@ impl ExtentManager {
                 // MAX_WRITTEN_LEN` = 65536, wrap the 16-bit `ee_len` to 0, and
                 // silently drop the whole run on decode (Linux clamps identically
                 // in `ext4_ext_map_blocks`).
-                let want = (hole.end - ib).min(node::MAX_UNWRITTEN_LEN as u32);
+                let want = (hole.run.end - ib).min(node::MAX_UNWRITTEN_LEN as u32);
                 let range = fs.alloc_blocks(want, goal, handle)?;
                 let got = (range.end - range.start) as u32;
                 debug_assert!(got > 0 && got <= want);
@@ -396,7 +432,6 @@ impl ExtentManager {
                     );
                     return Err(err);
                 }
-                projected_extents += 1;
                 ib += got;
             }
         }
@@ -495,8 +530,9 @@ impl ExtentManager {
     }
 
     /// One credit-bounded step of shrinking the tree to `new_size` bytes: frees
-    /// a bounded batch of doomed tail extents and reserializes the survivor in
-    /// the caller's transaction, returning the frontier the tree now references
+    /// a bounded batch of doomed tail extents IN PLACE (trimming the covering
+    /// leaves and pruning emptied nodes) in the caller's transaction,
+    /// returning the frontier the tree now references
     /// and the reservation the next chunk should start from (see
     /// [`ExtentTree::truncate_chunk`]). The
     /// restartable-truncate spine calls this in a `journal_restart` loop until
@@ -562,11 +598,13 @@ impl ExtentManager {
         Ok(())
     }
 
-    /// One flatten that routes a shrink to `new_size`: the whole-truncate credit
-    /// estimate (the fast/slow gate) AND the chunked-spine EFBIG floor, so the
-    /// caller can reject a genuinely un-splittable shrink BEFORE it mutates the
-    /// inode. Reuses one tree flatten for both — the gate estimate and the floor
-    /// are two reads of the same extent list.
+    /// One counting walk that routes a shrink to `new_size`: the whole-truncate
+    /// credit estimate (the fast/slow gate) AND the chunked-spine EFBIG floor,
+    /// so the caller can reject a genuinely un-splittable shrink BEFORE it
+    /// mutates the inode. The walk streams (P9a-T6, retiring the whole-tree
+    /// flatten Vec): two counters — the tree's extent count for the gate's
+    /// conservative whole-tree shape, and the doomed count past `keep_blocks` —
+    /// with O(1) memory.
     ///
     /// `floor_efbig` mirrors [`ExtentTree::truncate_chunk`]'s internal O(depth)
     /// floor exactly (`free_cost + (free_cost * depth + 2) > max` — one free plus
@@ -576,23 +614,21 @@ impl ExtentManager {
     /// changed" contract). It is only meaningful on the chunked route: when the
     /// whole truncate fits one transaction (`whole_estimate <= max`) there is no
     /// per-chunk floor.
-    ///
-    /// This flatten is separate from the one the first `truncate_chunk` /
-    /// `truncate_to_byte_len` runs — a shrink flattens twice (this gate plus the
-    /// first chunk). Folding the gate flatten into the first chunk (threading the
-    /// flattened extents down) is a P9 perf refinement, not correctness; a
-    /// flatten is a read-only tree walk.
     pub(super) fn plan_shrink(&self, new_size: usize, max_credits: usize) -> Result<ShrinkPlan> {
         let fs = self.fs()?;
         let keep_blocks = Iblock::try_from(new_size.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         let tree = self.state.read();
-        let extents = tree.extents(&fs)?;
-        let external = ExtentTree::external_node_count(extents.len());
-        let freed_extents = extents
-            .iter()
-            .filter(|e| e.block() + e.len() as Iblock > keep_blocks)
-            .count();
+        let mut total_extents = 0usize;
+        let mut freed_extents = 0usize;
+        tree.walk_range(&fs, 0..u64::MAX, &mut |e: &node::Extent| {
+            total_extents += 1;
+            if e.block() as u64 + e.len() as u64 > keep_blocks as u64 {
+                freed_extents += 1;
+            }
+            core::ops::ControlFlow::Continue(())
+        })?;
+        let external = ExtentTree::external_node_count(total_extents);
         let revoke_per_block = fs
             .journal()
             .map(|j| j.revoke_entries_per_block())
@@ -621,14 +657,15 @@ impl ExtentManager {
     }
 }
 
-/// The routing verdict for one shrink, from a single tree flatten
+/// The routing verdict for one shrink, from a single counting tree walk
 /// ([`ExtentManager::plan_shrink`]).
 pub(super) struct ShrinkPlan {
     /// Whole-truncate single-transaction credit upper bound — `> max_credits`
     /// routes to the chunked, orphan-protected spine, else the atomic fast path.
     pub(super) whole_estimate: usize,
     /// The chunked spine's per-chunk EFBIG floor is unfittable on the current
-    /// tree: not even one free plus the survivor reserialize fits a transaction.
+    /// tree: not even one free plus its O(depth) node write-backs fits a
+    /// transaction.
     /// Meaningful only when `whole_estimate > max_credits` (the chunked route).
     pub(super) floor_efbig: bool,
 }
@@ -643,12 +680,12 @@ pub(super) struct TruncateChunk {
     /// again).
     pub(super) reached: Iblock,
     /// The reservation the outer spine hands `journal_restart` for the next
-    /// chunk: one free PLUS the survivor's `truncate_chunk_credits` headroom.
-    /// Covering the free (not just the reserialize) is what guarantees forward
-    /// progress — `journal_restart` may rejoin the current, partly-captured
-    /// transaction, so the reservation must alone satisfy the next chunk's first
-    /// `free_cost + reserialize_headroom` probe. Always ≤ `max_credits` (a subset
-    /// of a tree that cleared the same EFBIG floor).
+    /// chunk: one free PLUS the O(depth) node headroom its prune cascade and
+    /// write-backs can need. Covering the free (not just the node writes) is
+    /// what guarantees forward progress — `journal_restart` may rejoin the
+    /// current, partly-captured transaction, so the reservation must alone
+    /// satisfy the next chunk's first `free_cost + node_headroom` probe.
+    /// Always ≤ `max_credits` (a tree that cleared the same EFBIG floor).
     pub(super) next_bound: usize,
 }
 
@@ -661,7 +698,7 @@ pub(super) struct PunchChunk {
     /// calls again, converging because each chunk frees ≥ 1 extent.
     pub(super) more: bool,
     /// The reservation the outer spine hands `journal_restart` for the next
-    /// chunk: one free PLUS the survivor's reserialize headroom, so the next
+    /// chunk: one free PLUS the O(depth) node headroom, so the next
     /// chunk's first probe is satisfied by the reservation alone (see
     /// [`TruncateChunk::next_bound`]). Always ≤ `max_credits`.
     pub(super) next_bound: usize,
@@ -673,35 +710,12 @@ struct HoleRun {
     end: Iblock,
 }
 
-/// Computes the hole runs (unmapped logical blocks) within `[start, end)` by
-/// interval-subtracting the sorted, non-overlapping `extents`.
-fn compute_holes(extents: &[node::Extent], start: Iblock, end: Iblock) -> Vec<HoleRun> {
-    let mut holes = Vec::new();
-    let mut cursor = start;
-    for e in extents {
-        let e_start = e.block();
-        let e_end = e_start + e.len() as Iblock;
-        if e_end <= cursor {
-            continue;
-        }
-        if e_start >= end {
-            break;
-        }
-        if e_start > cursor {
-            holes.push(HoleRun {
-                start: cursor,
-                end: e_start.min(end),
-            });
-        }
-        cursor = cursor.max(e_end);
-        if cursor >= end {
-            break;
-        }
-    }
-    if cursor < end {
-        holes.push(HoleRun { start: cursor, end });
-    }
-    holes
+/// One hole the fill plan will allocate, with the goal its filler should hint:
+/// the preceding extent's physical end for locality, `None` when no
+/// predecessor is known (the allocator then picks).
+struct PlannedHole {
+    run: HoleRun,
+    goal: Option<Ext4Bid>,
 }
 
 impl BlockAsPageCacheBackend for ExtentManager {

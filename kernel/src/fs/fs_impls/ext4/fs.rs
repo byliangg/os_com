@@ -576,20 +576,16 @@ impl Ext4 {
         self.single_block_map_credits(depth) + Self::SUPERBLOCK_CREDITS + Self::INODE_DESC_CREDITS
     }
 
-    /// Safe upper bound on the metadata blocks the NEXT extent-tree `insert`
-    /// captures, given the `external_nodes` (leaf + interior) count of the tree
-    /// that insert produces — the write spine's per-chunk credit early stop.
-    ///
-    /// Our extent tree is rebuilt by whole-tree re-serialization, not Linux's
-    /// depth-bounded in-place surgery, so a single insert rewrites EVERY external
-    /// node (`external_nodes` captures) — this is why one insert into a large
-    /// tree can exceed a whole transaction (the honest `EFBIG` floor). On top of
-    /// the node writes, each freshly allocated node and the data run may dirty a
-    /// distinct block bitmap and GDT block, both clamped at the filesystem-wide
-    /// counts (Linux's identical `groups`/`gdpblocks` clamp), plus the shared
-    /// superblock counters. It is an UPPER bound: an under-estimate would surface
-    /// as [`charge_fresh_capture`](super::journal)'s loud `ENOSPC` backstop (no
-    /// corruption), an over-estimate merely forces an extra restart.
+    /// Conservative credit bound for the WHOLE-truncate gate's reserialize
+    /// term ([`whole_truncate_credit_bound`](Self::whole_truncate_credit_bound)
+    /// is its only consumer): `external_nodes` node captures, each freshly
+    /// allocated node and the data run possibly dirtying a distinct block
+    /// bitmap and GDT block, both clamped at the filesystem-wide counts
+    /// (Linux's identical `groups`/`gdpblocks` clamp), plus the shared
+    /// superblock counters. The change paths themselves are in-place surgery
+    /// (P9a) and use the O(depth) bounds; this whole-tree shape survives only
+    /// as the fast/slow routing estimate, where an over-estimate merely
+    /// routes a big truncate to the chunked spine it needs anyway.
     pub(super) fn reserialize_credits(&self, external_nodes: usize) -> usize {
         // The data run plus every external node may each land in a distinct
         // block group.
@@ -599,28 +595,53 @@ impl Ext4 {
         external_nodes + bitmaps + gdt + Self::SUPERBLOCK_CREDITS
     }
 
+    /// Safe upper bound on the metadata blocks ONE in-place extent insert
+    /// captures into a tree of the given `depth` (P9a-T6, retiring the
+    /// whole-tree reserialize bound): at worst one depth growth (a fresh node
+    /// write), a full-path split (`make_room_for`: ≤ depth+1 fresh nodes plus
+    /// their shrunk old siblings and the landing publish), and the insert's
+    /// own leaf edit with its ancestor key corrections — `3 * (depth+1) + 2`
+    /// node captures at the grown depth, mirroring Linux's
+    /// `ext4_meta_trans_blocks` shape. Only the ALLOCATIONS dirty a block
+    /// bitmap and GDT pair — the grown node, the split's fresh nodes, and
+    /// the data run; an in-place node rewrite touches no bitmap — clamped
+    /// fs-wide (Linux's identical `groups`/`gdpblocks` clamp), plus the
+    /// shared superblock. An under-estimate would surface as
+    /// [`charge_fresh_capture`](super::journal)'s loud `ENOSPC` backstop
+    /// (no corruption); an over-estimate merely forces an extra restart.
+    pub(super) fn insert_credit_bound(&self, depth: u16) -> usize {
+        let grown = depth as usize + 1;
+        let node_writes = 3 * grown + 2;
+        let allocs = grown + 2;
+        let bitmaps = allocs.min(self.nr_groups());
+        let gdt = allocs.min(self.nr_gdt_blocks());
+        node_writes + bitmaps + gdt + Self::SUPERBLOCK_CREDITS
+    }
+
     /// The credit the chunked write spine reserves before each per-chunk extent
-    /// insert into a tree that will serialize to `external_nodes` external
-    /// (leaf + interior) nodes — the [`reserialize_credits`](Self::reserialize_credits)
-    /// of the insert itself PLUS the two captures that ride the SAME chunk
-    /// transaction after it:
+    /// insert at the tree's live `depth` — the
+    /// [`insert_credit_bound`](Self::insert_credit_bound) of the insert itself
+    /// PLUS the two captures that ride the SAME chunk transaction after it:
     ///
     /// - the inode-descriptor writeback (`write_back_inode_desc`), one
     ///   inode-table block distinct from the bitmap/GDT/superblock/extent-node
-    ///   blocks the reserialize charges — [`INODE_DESC_CREDITS`](Self::INODE_DESC_CREDITS);
+    ///   blocks the insert charges — [`INODE_DESC_CREDITS`](Self::INODE_DESC_CREDITS);
     /// - the convert-to-written of the just-inserted unwritten extents
     ///   (`mark_range_written`), which edits IN PLACE the same leaf the insert
     ///   just captured (P9a-T5) — a re-patch that adds no new after-image, so
-    ///   it costs zero credit in the append path (a boundary split that needs
-    ///   a leaf reorganization draws on this same reserve).
+    ///   it costs zero credit in the append path. (A rare boundary split — a
+    ///   chunk edge landing inside a pre-existing unwritten extent whose leaf
+    ///   is full — can exceed what is left of this reserve; `journal_extend`
+    ///   via [`charge_fresh_capture`](super::journal) grows it in place, and
+    ///   a genuinely full transaction fails the convert cleanly.)
     ///
     /// Reserving the inode descriptor here is what keeps a concurrent handle
     /// that fills the transaction to the bare insert bound from leaving
     /// `write_back_inode_desc` (or a boundary-splitting convert) no credit and
     /// tripping [`charge_fresh_capture`](super::journal)'s `ENOSPC` *after* the
     /// chunk's page write has already landed.
-    pub(super) fn chunk_insert_credits(&self, external_nodes: usize) -> usize {
-        self.reserialize_credits(external_nodes) + Self::INODE_DESC_CREDITS
+    pub(super) fn chunk_insert_credits(&self, depth: u16) -> usize {
+        self.insert_credit_bound(depth) + Self::INODE_DESC_CREDITS
     }
 
     /// Credits for a truncate's per-chunk metadata (Linux

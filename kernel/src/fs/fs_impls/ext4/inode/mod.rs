@@ -1042,6 +1042,48 @@ impl Inode {
     /// volume is genuinely full) propagates. On any `ENOSPC` the reader is left
     /// unconsumed — allocation precedes the page-cache copy — so the caller's
     /// re-run is clean.
+    /// Seals a FAILED journaled write's transaction so it can commit
+    /// consistently (both write spines' error arms; the success paths do the
+    /// same two steps inline):
+    ///
+    /// - the cleanup (`rollback_write`) leaves a self-consistent tree, but a
+    ///   mutation may have edited the extent-tree ROOT (a split's landing, a
+    ///   depth growth, a position-0 key correction), which lives in the
+    ///   in-memory `i_block` until `write_back_inode_desc` captures it —
+    ///   without the capture the leaf/bitmap after-images would commit while
+    ///   the root does not, and a crash after commit reads the old root over
+    ///   the new leaves (a torn split);
+    /// - the failed write may still have CONVERTED extents to written before
+    ///   erring (each flip is a landed, self-consistent leaf edit that
+    ///   commits with this transaction); their data sits in the page cache
+    ///   and must reach the platter before the commit block, exactly like a
+    ///   successful write's — the Unwritten-first exposure otherwise.
+    ///
+    /// If either step fails the transaction cannot be made consistent: abort,
+    /// so the half-state never commits. The caller reports its ORIGINAL
+    /// failure either way — these errors are secondary and the abort already
+    /// speaks for them.
+    fn seal_failed_write_txn(&self, fs: &Ext4, inner: &mut InodeInner, op: &journal::OpHandle) {
+        let Some(handle) = op.get() else {
+            return;
+        };
+        if inner.is_dirty() && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err() {
+            handle.abort_journal_on_fs_error();
+        }
+        if let Ok(pages) = inner.page_cache()
+            && handle
+                .register_ordered_data(
+                    self.ino,
+                    self.self_weak.clone(),
+                    pages.clone(),
+                    inner.file_size(),
+                )
+                .is_err()
+        {
+            handle.abort_journal_on_fs_error();
+        }
+    }
+
     fn write_at_once(&self, fs: &Ext4, offset: usize, reader: &mut VmReader) -> Result<usize> {
         let write_len = reader.remain();
         let end = offset
@@ -1076,52 +1118,13 @@ impl Inode {
         let len = match inner.write_at(fs, offset, reader, op.get_mut()) {
             Ok(len) => len,
             Err(err) => {
-                // `write_at`'s cleanup (`rollback_write`) leaves a self-consistent
-                // tree — restored to `old_size`, or (for a within-file hole write
-                // it cannot truncate away) a benign unwritten over-allocation that
-                // reads as zeros. But a mutation may have edited the extent-tree
-                // ROOT (a split's root landing, a depth growth, or a position-0
-                // key correction), which lives in the in-memory `i_block` until
-                // `write_back_inode_desc` captures it. On the success path below
-                // that capture rides this transaction; on THIS error path it is
-                // skipped, so the leaf/bitmap after-images would commit while the
-                // root does not — a crash after commit then reads the old root
-                // over the new leaves, orphaning the moved extents (a torn split).
-                // Capture the consistent tree here so root and leaves agree. If
-                // even that fails, the transaction cannot be made consistent:
-                // abort so the half-state never commits.
-                if op.get().is_some()
-                    && inner.is_dirty()
-                    && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err()
-                    && let Some(handle) = op.get()
-                {
-                    handle.abort_journal_on_fs_error();
-                }
-                // The failed write may still have CONVERTED extents to written
-                // before erring (each flip is a landed, self-consistent leaf
-                // edit that commits with this transaction). Their data sits in
-                // the page cache and must reach the platter before the commit
-                // block, exactly like a successful write's — or a crash after
-                // commit reads the flipped extents' stale device bytes (the
-                // Unwritten-first exposure). If even the registration fails,
-                // that ordering is unenforceable: abort rather than let the
-                // flips commit unordered.
-                if let Some(handle) = op.get()
-                    && let Ok(pages) = inner.page_cache()
-                    && handle
-                        .register_ordered_data(
-                            self.ino,
-                            self.self_weak.clone(),
-                            pages.clone(),
-                            inner.file_size(),
-                        )
-                        .is_err()
-                {
-                    handle.abort_journal_on_fs_error();
-                }
-                // Report the ORIGINAL failure either way — the capture and
-                // registration errors above are secondary (and the abort
-                // already speaks for them).
+                // `write_at`'s cleanup leaves a self-consistent tree —
+                // restored to `old_size`, or (for a within-file hole write it
+                // cannot truncate away) a benign unwritten over-allocation
+                // that reads as zeros — but the transaction still needs the
+                // root capture and the ordered-data registration to commit
+                // consistently; see `seal_failed_write_txn`.
+                self.seal_failed_write_txn(fs, &mut inner, &op);
                 return Err(err);
             }
         };
@@ -1217,34 +1220,13 @@ impl Inode {
                 // landed. Only a failure before ANY chunk committed propagates
                 // the raw error.
                 Err(err) => {
-                    // Mirror `write_at_once`'s error arm: the failed chunk's
-                    // cleanup may have edited the extent ROOT in memory (a
-                    // rollback truncate, a split landing) while its leaf and
-                    // bitmap captures already sit in this transaction — capture
-                    // the descriptor so root and leaves commit together; and
-                    // any extents the chunk converted before failing still need
-                    // their ordered-data flush (the Unwritten-first coupling).
-                    // If either fails the half-state must not commit: abort.
-                    if op.get().is_some()
-                        && inner.is_dirty()
-                        && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err()
-                        && let Some(handle) = op.get()
-                    {
-                        handle.abort_journal_on_fs_error();
-                    }
-                    if let Some(handle) = op.get()
-                        && let Ok(pages) = inner.page_cache()
-                        && handle
-                            .register_ordered_data(
-                                self.ino,
-                                self.self_weak.clone(),
-                                pages.clone(),
-                                inner.file_size(),
-                            )
-                            .is_err()
-                    {
-                        handle.abort_journal_on_fs_error();
-                    }
+                    // The failed chunk's cleanup may have edited the extent
+                    // ROOT in memory (a rollback truncate, a split landing)
+                    // while its leaf and bitmap captures already sit in this
+                    // transaction, and any extents it converted before
+                    // failing still need their ordered-data flush — seal the
+                    // transaction (see `seal_failed_write_txn`).
+                    self.seal_failed_write_txn(fs, inner, op);
                     if written > 0 {
                         return Ok(written);
                     }
@@ -1258,20 +1240,20 @@ impl Inode {
                     // One insert needs `need2` credits the current transaction
                     // cannot grant. If `need2` exceeds a whole transaction's
                     // capacity, no restart can ever fit it — the honest EFBIG
-                    // floor. (Insert and convert are in-place surgery now, but
-                    // `need2` is still the conservative whole-tree bound sized
-                    // for the `extents()`-based hole planning that remains
-                    // until T6 — the floor lifts when the bound switches to
-                    // O(depth).) Otherwise restart onto a fresh transaction
-                    // reserving exactly `need2`, whose first insert then fits,
-                    // and retry the chunk (no cursor advance).
+                    // floor. `need2` is the in-place insert's O(depth) bound
+                    // (P9a-T6), so the floor only trips on a journal too small
+                    // to hold one bounded insert — a tiny-journal condition, no
+                    // longer a function of file size. Otherwise restart onto a
+                    // fresh transaction reserving exactly `need2`, whose first
+                    // insert then fits, and retry the chunk (no cursor
+                    // advance).
                     if max_credits.is_some_and(|max| need2 > max) {
                         if written > 0 {
                             return Ok(written);
                         }
                         return_errno_with_message!(
                             Errno::EFBIG,
-                            "one extent insert's whole-tree reserialize exceeds a journal transaction"
+                            "one bounded extent insert exceeds a journal transaction"
                         );
                     }
                     if let Some(handle) = op.get_mut() {
@@ -1480,7 +1462,7 @@ impl Inode {
             if chunk.reached <= keep_blocks {
                 // Last chunk: unlink from the orphan list BEFORE the final
                 // writeback, so that writeback (dirtied by this chunk's
-                // reserialize) sees the inode off the chain and persists
+                // in-place tree edits) sees the inode off the chain and persists
                 // `i_dtime = 0` — a live truncated file's deletion time. The
                 // cached descriptor's `dtime` was never repointed (G-2), so it
                 // is still live.
@@ -1490,7 +1472,7 @@ impl Inode {
                 break;
             }
             // Not done: persist this chunk's frontier + `i_blocks` (SAME txn as
-            // its frees + reserialize), then restart onto a fresh transaction —
+            // its frees + tree edits), then restart onto a fresh transaction —
             // `truncate_chunk` has returned, so the ExtentTree lock ③ is dropped
             // (iron law 1: the restart's re-admission may wait, legal only under
             // the inode lock alone).
@@ -1539,7 +1521,7 @@ impl Inode {
             let chunk = em.truncate_chunk(target, op.get(), max)?;
             if chunk.reached <= keep_blocks {
                 // Unlink BEFORE the writeback so it (dirtied by this chunk's
-                // reserialize) persists the live `i_dtime = 0` rather than the
+                // tree edits) persists the live `i_dtime = 0` rather than the
                 // stale successor pointer the crash left on disk.
                 fs.orphan_del(self.ino, op.get())?;
                 inner.write_back_inode_desc(&fs, self.ino, op.get())?;
@@ -1725,7 +1707,7 @@ impl Inode {
                         if max_credits.is_some_and(|max| need > max) {
                             return_errno_with_message!(
                                 Errno::EFBIG,
-                                "one fallocate extent insert's reserialize exceeds a journal transaction"
+                                "one bounded fallocate extent insert exceeds a journal transaction"
                             );
                         }
                         if let Some(handle) = op.get_mut() {
@@ -1866,7 +1848,7 @@ impl Inode {
                     break;
                 };
                 let chunk = em.punch_chunk(first_block, stop_block, op.get(), max)?;
-                // This chunk's frees + reserialize + `i_blocks` ride ONE transaction.
+                // This chunk's frees + tree edits + `i_blocks` ride ONE transaction.
                 inner.write_back_inode_desc(&fs, self.ino, op.get())?;
                 if !chunk.more {
                     break;
@@ -2057,7 +2039,7 @@ impl Inode {
         inner.set_file_size(0);
 
         // Free the data blocks in credit-bounded chunks, each committed with its
-        // own tree reserialize + inode writeback (crash red-line: freed ⟺
+        // own in-place tree edits + inode writeback (crash red-line: freed ⟺
         // dropped-from-tree, one txn). Gate on the extent manager's live
         // `sector_count`, not the descriptor's copy (which ext2 uses): the extent
         // manager is the authority and the descriptor may be stale until
@@ -2089,7 +2071,7 @@ impl Inode {
 
         // Last chunk: splice off the orphan list and free the inode bit, both in
         // this final transaction (with the deletion-time writeback, dirtied by
-        // the last chunk's reserialize / the `set_dtime` above), so the unlist +
+        // the last chunk's tree edits / the `set_dtime` above), so the unlist +
         // free are atomic against a crash.
         fs.orphan_del(self.ino, op.get())?;
         inner.write_back_inode_desc(&fs, self.ino, op.get())?;
@@ -3688,14 +3670,15 @@ mod write_tests {
     /// mapped written and `i_blocks`/size consistent.
     #[ktest]
     fn append_spanning_many_groups_forces_journal_restart() {
-        // `max_credits` = 12 here (journal usable = 15): equal to
-        // `write_credits(depth 1)`, so once the append's tree reaches depth 1 a
-        // chunk fits only a fresh transaction — a captured predecessor forces a
+        // `max_credits` = 20 here: one depth-1 chunk reserves 12
+        // (`write_credits(1)`) and the per-insert stop bound is 15
+        // (`chunk_insert_credits(1)`, the T6 O(depth) worst case), so a chunk
+        // fits a fresh transaction but a captured predecessor forces a
         // restart. The 120-block append fragments across ~11 groups (≈ 14
         // distinct captures), comfortably past the ceiling.
-        let f = journaled_multigroup_fixture(16);
+        let f = journaled_multigroup_fixture(24);
         let journal = f.ext4.journal().unwrap();
-        assert_eq!(journal.max_credits(), 12);
+        assert_eq!(journal.max_credits(), 20);
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
 
         const N_BLOCKS: usize = 120;
@@ -3748,9 +3731,12 @@ mod write_tests {
     /// drained orphan list, and a consistent tree / `i_blocks` / `i_size`.
     #[ktest]
     fn truncate_spans_multiple_transactions_and_restarts() {
-        let f = journaled_multigroup_fixture(16);
+        // `max_credits` = 16: above the T6 per-insert stop bound (15, so the
+        // 120-block write lands), below the ~19-credit whole-truncate estimate
+        // — the shrink must take the chunked orphan route.
+        let f = journaled_multigroup_fixture(20);
         let journal = f.ext4.journal().unwrap();
-        assert_eq!(journal.max_credits(), 12);
+        assert_eq!(journal.max_credits(), 16);
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
 
         const N_BLOCKS: usize = 120;
@@ -3830,22 +3816,30 @@ mod write_tests {
         );
     }
 
-    /// P7d-2cd (BLOCKING 1) — an INTERMEDIATE truncate chunk must serialize a
-    /// SORTED on-disk extent tree. `truncate_chunk` builds the survivor `kept`
-    /// out of logical order (ascending prefix ++ descending un-freed doomed ++
-    /// straddler); a non-terminal chunk that does not sort it before serializing
-    /// stamps a valid `metadata_csum` over an out-of-order leaf with a
-    /// non-monotonic index key, so a crash between chunks replays a tree e2fsck
-    /// reports dirty. The final state self-heals (the next chunk re-flattens and
-    /// sorts), so the multi-restart tests miss it — this drives exactly ONE
-    /// credit-bounded chunk, commits it (the crash boundary), and inspects the
-    /// committed tree: every logical block the survivor still references must
-    /// map. An unsorted survivor makes `search_entries` break early and report a
-    /// covered block as a false hole.
+    /// P7d-2cd (BLOCKING 1) — an INTERMEDIATE truncate chunk must leave a
+    /// SORTED on-disk extent tree. Historically (the pre-surgery rebuild)
+    /// the survivor list was assembled out of logical order and could be
+    /// serialized unsorted, stamping a valid `metadata_csum` over a leaf
+    /// with a non-monotonic key — a crash between chunks then replayed a
+    /// tree e2fsck reports dirty, while the FINAL state self-healed so the
+    /// multi-restart tests missed it. The in-place spine (P9a-T4) edits
+    /// leaves without reordering them, and this pin remains its regression
+    /// guard: drive exactly ONE credit-bounded chunk, commit it (the crash
+    /// boundary), and inspect the committed tree — every logical block the
+    /// survivor still references must map (an unsorted survivor makes
+    /// `search_entries` break early and report a covered block as a false
+    /// hole).
     #[ktest]
     fn intermediate_truncate_chunk_serializes_sorted_ondisk_tree() {
-        let f = journaled_multigroup_fixture(16);
+        // `max_credits` = 16: the 120-block write lands (per-insert bound 15),
+        // but the ~10-extent free's accumulated captures overrun one
+        // transaction, so the chunk's credit probe stops it mid-truncate —
+        // the intermediate survivor this test pins. (The probe measures the
+        // transaction's real capacity; the `max` argument below only feeds
+        // the EFBIG floor.)
+        let f = journaled_multigroup_fixture(20);
         let journal = f.ext4.journal().unwrap();
+        assert_eq!(journal.max_credits(), 16);
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
 
         // A 120-block file fragmented one extent per group → a multi-leaf tree
@@ -3861,9 +3855,17 @@ mod write_tests {
         let keep_blocks = 5u32;
         let max = journal.max_credits();
 
+        // Close out the write's transactions first: this drives the extent
+        // manager DIRECTLY (no `resize`, so no page-cache shrink), and joining
+        // the write's still-running transaction would let its ordered-data
+        // registration flush pages whose blocks this chunk frees — an
+        // unallocated-block writeback the production path never sees (resize
+        // drops the pages before the free).
+        journal.commit_and_wait_running().unwrap();
+
         // Drive exactly ONE chunk of a truncate to `keep_blocks`, as the spine's
-        // first iteration does, then STOP before the outer loop restarts and its
-        // next chunk re-flattens+re-sorts (which self-heals a bad intermediate).
+        // first iteration does, then STOP before the outer loop restarts and
+        // its next chunk continues (which would self-heal a bad intermediate).
         let em = inode.inner.read().extent_manager().unwrap().clone();
         let reached = {
             let op = f
@@ -4308,9 +4310,9 @@ mod write_tests {
     /// orphan list.
     #[ktest]
     fn fallocate_large_punch_spans_transactions() {
-        let f = journaled_multigroup_fixture(16);
+        let f = journaled_multigroup_fixture(24);
         let journal = f.ext4.journal().unwrap();
-        assert_eq!(journal.max_credits(), 12);
+        assert_eq!(journal.max_credits(), 20);
         let inode = f.ext4.read_inode(FILE_INO).unwrap();
 
         const N_BLOCKS: usize = 120;
@@ -4397,17 +4399,17 @@ mod write_tests {
         block
     }
 
-    /// P7d-2b (Fix C) — the EFBIG floor. When one extent insert's whole-tree
-    /// reserialize needs more credits than a whole transaction holds, no restart
-    /// can ever fit it, so the append fails `EFBIG` — but WITHOUT leaking blocks,
-    /// because the credit check precedes any allocation. A depth-1 tree with 1360
-    /// extents (4 full leaves) sits one insert below a fifth leaf: appending one
-    /// more block projects to 6 external nodes, whose reserialize (`need2` = 10)
-    /// exceeds this journal's `max_credits` (9) while the tree's own
-    /// `write_credits` (8) still admits the handle — the exact window the floor
-    /// guards. This tree is too large to build through the allocator (each depth
-    /// increase would itself EFBIG once the journal is this small), so it is laid
-    /// down directly on disk.
+    /// P7d-2b (Fix C) — the EFBIG floor. When one bounded extent insert needs
+    /// more credits than a whole transaction holds, no restart can ever fit
+    /// it, so the append fails `EFBIG` — but WITHOUT leaking blocks, because
+    /// the credit check precedes any allocation. Since P9a-T6 the bound is the
+    /// in-place insert's O(depth) cost, so the floor no longer scales with
+    /// file size — only a journal too small for one bounded insert trips it:
+    /// at depth 1 the chunk bound (`chunk_insert_credits(1)` = 12 on this
+    /// single-group fixture) exceeds this journal's `max_credits` (9) while
+    /// the tree's own `write_credits` (8) still admits the handle — the exact
+    /// window the floor guards. The depth-1 tree (4 full leaves, 1360 extents)
+    /// is laid down directly on disk as a compact way to hold that depth.
     #[ktest]
     fn append_insert_exceeding_one_transaction_is_efbig_with_no_leak() {
         clocks::init_for_ktest();

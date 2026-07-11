@@ -68,8 +68,9 @@ impl NodeBuf {
             magic: super::node::EXTENT_MAGIC,
             entries: 0,
             // Leaf and interior full-block nodes share the same geometry
-            // (12-byte entries after a 12-byte header).
-            max: ((BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE) as u16,
+            // (12-byte entries after a 12-byte header). Lossless: the
+            // capacity is 340 at any supported block size.
+            max: super::node::NODE_CAPACITY as u16,
             depth,
             generation: 0,
         };
@@ -191,9 +192,10 @@ impl NodeBuf {
         last_key_le(self.entries(), |i| self.extent_at(i).block(), iblock)
     }
 
-    // ---- 编辑器（surgery 写路径，P9a-T2 起）----
-    // 每个编辑器维护"头/项一致"的节点不变量；改完的节点必须经
-    // [`write_back`](Self::write_back) 的捕获漏斗落盘，编辑本身只动内存字节。
+    // ---- Editors (the surgery write path, P9a-T2 onward) ----
+    // Every editor maintains the header/entries-consistent node invariant;
+    // an edited node must reach disk through [`write_back`](Self::write_back)'s
+    // capture funnel — the edit itself only touches in-memory bytes.
 
     /// Overwrites leaf entry `i` in place (a merge bump or an unwritten flip).
     pub(super) fn replace_extent_at(&mut self, i: usize, e: &Extent) {
@@ -204,11 +206,11 @@ impl NodeBuf {
 
     /// Inserts leaf entry `e` at position `i`, shifting later entries right.
     /// Fails with `ENOSPC` when the node is full — the caller then takes the
-    /// split path (T3; until then, the whole-tree rebuild fallback).
+    /// split path (`make_room_for`) and retries.
     pub(super) fn insert_extent_at(&mut self, i: usize, e: &Extent) -> Result<()> {
         debug_assert!(self.is_leaf() && i <= self.entries());
         let n = self.entries();
-        if n + 1 > self.max_entries() || ENTRY_SIZE * (2 + n) > BLOCK_SIZE {
+        if self.is_full() {
             return_errno_with_message!(Errno::ENOSPC, "extent leaf node is full");
         }
         let start = ENTRY_SIZE * (1 + i);

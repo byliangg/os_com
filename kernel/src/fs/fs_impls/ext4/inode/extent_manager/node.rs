@@ -17,6 +17,10 @@ pub(super) const ENTRY_SIZE: usize = 12;
 /// Maximum extent-tree depth, mirroring `EXT4_MAX_EXTENT_DEPTH`.
 pub(super) const MAX_DEPTH: u16 = 5;
 
+/// Entry capacity of one full-block external node. Leaf and interior nodes
+/// share the geometry: 12-byte entries after a 12-byte header.
+pub(super) const NODE_CAPACITY: usize = (BLOCK_SIZE - ENTRY_SIZE) / ENTRY_SIZE;
+
 /// Maximum logical length encodable in a single extent. A length above this
 /// marks the extent as unwritten (preallocated but not yet written).
 pub(super) const MAX_WRITTEN_LEN: u16 = 32768;
