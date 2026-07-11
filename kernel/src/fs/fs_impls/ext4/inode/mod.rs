@@ -1097,8 +1097,31 @@ impl Inode {
                 {
                     handle.abort_journal_on_fs_error();
                 }
-                // Report the ORIGINAL failure either way — the capture error
-                // above is secondary (and the abort already speaks for it).
+                // The failed write may still have CONVERTED extents to written
+                // before erring (each flip is a landed, self-consistent leaf
+                // edit that commits with this transaction). Their data sits in
+                // the page cache and must reach the platter before the commit
+                // block, exactly like a successful write's — or a crash after
+                // commit reads the flipped extents' stale device bytes (the
+                // Unwritten-first exposure). If even the registration fails,
+                // that ordering is unenforceable: abort rather than let the
+                // flips commit unordered.
+                if let Some(handle) = op.get()
+                    && let Ok(pages) = inner.page_cache()
+                    && handle
+                        .register_ordered_data(
+                            self.ino,
+                            self.self_weak.clone(),
+                            pages.clone(),
+                            inner.file_size(),
+                        )
+                        .is_err()
+                {
+                    handle.abort_journal_on_fs_error();
+                }
+                // Report the ORIGINAL failure either way — the capture and
+                // registration errors above are secondary (and the abort
+                // already speaks for them).
                 return Err(err);
             }
         };
@@ -1194,6 +1217,34 @@ impl Inode {
                 // landed. Only a failure before ANY chunk committed propagates
                 // the raw error.
                 Err(err) => {
+                    // Mirror `write_at_once`'s error arm: the failed chunk's
+                    // cleanup may have edited the extent ROOT in memory (a
+                    // rollback truncate, a split landing) while its leaf and
+                    // bitmap captures already sit in this transaction — capture
+                    // the descriptor so root and leaves commit together; and
+                    // any extents the chunk converted before failing still need
+                    // their ordered-data flush (the Unwritten-first coupling).
+                    // If either fails the half-state must not commit: abort.
+                    if op.get().is_some()
+                        && inner.is_dirty()
+                        && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err()
+                        && let Some(handle) = op.get()
+                    {
+                        handle.abort_journal_on_fs_error();
+                    }
+                    if let Some(handle) = op.get()
+                        && let Ok(pages) = inner.page_cache()
+                        && handle
+                            .register_ordered_data(
+                                self.ino,
+                                self.self_weak.clone(),
+                                pages.clone(),
+                                inner.file_size(),
+                            )
+                            .is_err()
+                    {
+                        handle.abort_journal_on_fs_error();
+                    }
                     if written > 0 {
                         return Ok(written);
                     }
@@ -1207,13 +1258,13 @@ impl Inode {
                     // One insert needs `need2` credits the current transaction
                     // cannot grant. If `need2` exceeds a whole transaction's
                     // capacity, no restart can ever fit it — the honest EFBIG
-                    // floor. (The insert itself is in-place surgery now, but
+                    // floor. (Insert and convert are in-place surgery now, but
                     // `need2` is still the conservative whole-tree bound sized
-                    // for the flatten-based consumers that remain until T5/T6
-                    // — the floor lifts when the bound switches to O(depth).)
-                    // Otherwise restart onto a fresh transaction reserving
-                    // exactly `need2`, whose first insert then fits, and retry
-                    // the chunk (no cursor advance).
+                    // for the `extents()`-based hole planning that remains
+                    // until T6 — the floor lifts when the bound switches to
+                    // O(depth).) Otherwise restart onto a fresh transaction
+                    // reserving exactly `need2`, whose first insert then fits,
+                    // and retry the chunk (no cursor advance).
                     if max_credits.is_some_and(|max| need2 > max) {
                         if written > 0 {
                             return Ok(written);
@@ -4550,10 +4601,10 @@ mod write_tests {
         );
     }
 
-    /// A pure overwrite of already-written blocks must convert nothing: on a
-    /// large/fragmented file the extent-tree rewrite that a needless
-    /// `convert_unwritten` would trigger re-journals every external node and can
-    /// abort a legal write. Here we pin the invariant on a small file — the
+    /// A pure overwrite of already-written blocks must convert nothing:
+    /// `write_at` calls `convert_unwritten` on EVERY write, so the all-written
+    /// case must stay a bounded read-only probe (P9a-T5) that touches and
+    /// journals no node. Here we pin the invariant on a small file — the
     /// mapping stays written and `i_blocks` is unchanged.
     #[ktest]
     fn overwrite_of_written_block_converts_nothing() {

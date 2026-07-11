@@ -609,10 +609,10 @@ impl Ext4 {
     ///   inode-table block distinct from the bitmap/GDT/superblock/extent-node
     ///   blocks the reserialize charges — [`INODE_DESC_CREDITS`](Self::INODE_DESC_CREDITS);
     /// - the convert-to-written of the just-inserted unwritten extents
-    ///   (`mark_range_written`), which re-serializes those same external nodes
-    ///   onto the *reused* metadata blocks (`ExtentTree::reserialize` reuses the
-    ///   old external pool) — an idempotent re-capture that adds no new
-    ///   after-image, so it costs zero credit in the append path.
+    ///   (`mark_range_written`), which edits IN PLACE the same leaf the insert
+    ///   just captured (P9a-T5) — a re-patch that adds no new after-image, so
+    ///   it costs zero credit in the append path (a boundary split that needs
+    ///   a leaf reorganization draws on this same reserve).
     ///
     /// Reserving the inode descriptor here is what keeps a concurrent handle
     /// that fills the transaction to the bare insert bound from leaving
