@@ -11,6 +11,12 @@ use super::super::super::prelude::*;
 /// Extent header magic (`eh_magic`).
 pub(super) const EXTENT_MAGIC: u16 = 0xF30A;
 
+/// Size of one extent-tree entry (header, index, or leaf), in bytes.
+pub(super) const ENTRY_SIZE: usize = 12;
+
+/// Maximum extent-tree depth, mirroring `EXT4_MAX_EXTENT_DEPTH`.
+pub(super) const MAX_DEPTH: u16 = 5;
+
 /// Maximum logical length encodable in a single extent. A length above this
 /// marks the extent as unwritten (preallocated but not yet written).
 pub(super) const MAX_WRITTEN_LEN: u16 = 32768;
@@ -118,7 +124,7 @@ impl TryFrom<&RawExtentHeader> for ExtentHeader {
         if raw.entries > raw.max {
             return_errno_with_message!(Errno::EUCLEAN, "extent header entries exceed max");
         }
-        if raw.depth > 5 {
+        if raw.depth > MAX_DEPTH {
             return_errno_with_message!(Errno::EUCLEAN, "extent tree too deep");
         }
         Ok(Self {

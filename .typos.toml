@@ -41,4 +41,7 @@ extend-exclude = [
     "test/initramfs/build/initramfs/opt/gvisor/blocklists/pty_test",
     "test/initramfs/src/conformance/gvisor/blocklists/sync_test",
     "test/initramfs/build/initramfs/opt/gvisor/blocklists/sync_test",
+    # Versioned raw benchmark evidence (verbatim qemu/fio/sqlite console
+    # output, e.g. fio's "overwriteable") — not prose we author.
+    "test/bench/evidence/",
 ]

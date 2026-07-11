@@ -21,6 +21,7 @@ use super::{
 };
 
 mod node;
+mod path;
 mod tree;
 
 pub(super) use self::tree::ExtentTree;

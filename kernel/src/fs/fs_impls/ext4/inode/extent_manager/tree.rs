@@ -10,6 +10,8 @@
 //! operation is a method, so only a constructed (i.e. proven well-formed) tree
 //! can be searched or mutated. Mirrors ext2's `BlockPtrTree`.
 
+use core::ops::ControlFlow;
+
 use super::{
     super::{
         super::{
@@ -21,16 +23,11 @@ use super::{
         RAW_BLOCK_PTRS_LEN,
     },
     node::{
-        EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_WRITTEN_LEN, RawExtent,
-        RawExtentHeader, RawExtentIdx,
+        ENTRY_SIZE, EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_WRITTEN_LEN,
+        RawExtent, RawExtentHeader, RawExtentIdx,
     },
+    path::{self, ExtentPath, NodeBuf, PathLevel, Search},
 };
-
-/// Size of one extent-tree entry (header, index, or leaf), in bytes.
-const ENTRY_SIZE: usize = 12;
-
-/// Maximum extent-tree depth, mirroring `EXT4_MAX_EXTENT_DEPTH`.
-const MAX_DEPTH: u32 = 5;
 
 /// Maximum extents in the inline (depth-0) root: the 60-byte `i_block` holds a
 /// 12-byte header plus four 12-byte entries.
@@ -139,13 +136,127 @@ impl ExtentTree {
     }
 
     /// Walks the tree to find the extent covering `iblock`, returning `None`
-    /// for a hole.
-    ///
-    /// External nodes are read through [`journal::read_metadata_block`]: on a
-    /// journaled volume a node's newest bytes may still sit in a journal
-    /// capture (WAL suppresses the direct write until checkpoint), so a bare
-    /// device read here would walk a stale tree.
+    /// for a hole. A thin wrapper over [`find`](Self::find) that drops the
+    /// path (the read-only callers need just the verdict).
     pub(super) fn lookup(&self, fs: &Ext4, iblock: Iblock) -> Result<Option<Extent>> {
+        match self.find(fs, iblock)? {
+            Search::Covered { extent, .. } => Ok(Some(extent)),
+            Search::Gap { .. } => Ok(None),
+        }
+    }
+
+    /// Walks the tree to the leaf landing position for `iblock`: the covering
+    /// extent, or the hole's insertion point with its in-leaf predecessor
+    /// (see [`Search`]) — the path-recording walker the in-place surgery
+    /// (P9a) edits through.
+    ///
+    /// External nodes are read through the journal funnel ([`NodeBuf::read`]):
+    /// on a journaled volume a node's newest bytes may still sit in a journal
+    /// capture (WAL suppresses the direct write until checkpoint), so a bare
+    /// device read here would walk a stale tree. Each child's depth must step
+    /// down by exactly one from its parent's, so a corrupt (loopy or grafted)
+    /// tree fails loud instead of walking forever. When `iblock` precedes a
+    /// node's first entry the walk descends into child 0 (Linux-style); on a
+    /// well-formed tree no leaf under child 0 maps anything below its first
+    /// key, so the landing is the same hole answer the old short-circuit gave.
+    pub(super) fn find(&self, fs: &Ext4, iblock: Iblock) -> Result<Search> {
+        let header = self.header();
+        let root_bytes = self.root.as_bytes();
+        let nr = header.entries() as usize;
+
+        if header.is_leaf() {
+            let chosen = path::last_key_le(nr, |i| root_extent_at(root_bytes, i).block(), iblock);
+            let (pos, landing) = leaf_landing(chosen, |i| root_extent_at(root_bytes, i), iblock);
+            let path = ExtentPath {
+                root_pos: pos,
+                levels: Vec::new(),
+            };
+            return Ok(landing.into_search(path));
+        }
+
+        let root_pos =
+            path::last_key_le(nr, |i| root_index_at(root_bytes, i).block(), iblock).unwrap_or(0);
+        let mut next_bid = root_index_at(root_bytes, root_pos).leaf();
+        let mut levels: Vec<PathLevel> = Vec::with_capacity(header.depth() as usize);
+
+        for expected_depth in (0..header.depth()).rev() {
+            let node = NodeBuf::read(fs, next_bid)?;
+            if node.depth() != expected_depth {
+                return_errno_with_message!(
+                    Errno::EUCLEAN,
+                    "extent child depth does not step down by one"
+                );
+            }
+            if node.is_leaf() {
+                let chosen = node.leaf_pos(iblock);
+                let (pos, landing) = leaf_landing(chosen, |i| node.extent_at(i), iblock);
+                levels.push(PathLevel { node, pos });
+                let path = ExtentPath { root_pos, levels };
+                return Ok(landing.into_search(path));
+            }
+            let pos = node.index_pos(iblock).unwrap_or(0);
+            next_bid = node.index_at(pos).leaf();
+            levels.push(PathLevel { node, pos });
+        }
+        // The countdown ends at depth 0, whose node is a leaf and returned above.
+        return_errno_with_message!(Errno::EUCLEAN, "extent walk fell through its own depth");
+    }
+
+    /// Calls `visit_fn` on each extent overlapping `[range.start, range.end)`
+    /// in ascending logical order, descending only the subtrees the range
+    /// touches — the bounded replacement for whole-tree flattens on the read
+    /// paths. The range is `u64` because a length-derived end (`iblock + len`)
+    /// can exceed the 32-bit logical space by up to one extent.
+    pub(super) fn walk_range(
+        &self,
+        fs: &Ext4,
+        range: Range<u64>,
+        visit_fn: &mut impl FnMut(&Extent) -> ControlFlow<()>,
+    ) -> Result<()> {
+        if range.start >= range.end {
+            return Ok(());
+        }
+        // Nothing maps at or above 2^32 logical blocks: an out-of-space start
+        // has nothing to visit.
+        let Ok(start_key) = Iblock::try_from(range.start) else {
+            return Ok(());
+        };
+        let header = self.header();
+        let root_bytes = self.root.as_bytes();
+        let nr = header.entries() as usize;
+
+        if header.is_leaf() {
+            for i in 0..nr {
+                let e = root_extent_at(root_bytes, i);
+                if e.block() as u64 >= range.end {
+                    break;
+                }
+                if e.block() as u64 + e.len() as u64 > range.start && visit_fn(&e).is_break() {
+                    return Ok(());
+                }
+            }
+            return Ok(());
+        }
+
+        let first =
+            path::last_key_le(nr, |i| root_index_at(root_bytes, i).block(), start_key).unwrap_or(0);
+        for i in first..nr {
+            let child = root_index_at(root_bytes, i);
+            if child.block() as u64 >= range.end {
+                break;
+            }
+            if walk_child(fs, child.leaf(), header.depth() - 1, &range, visit_fn)?.is_break() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The pre-surgery linear walker, kept verbatim as the ktest
+    /// cross-verification reference for [`find`](Self::find): both must give
+    /// the same covered-extent / hole verdict on every probe of any tree.
+    #[cfg(ktest)]
+    pub(super) fn lookup_linear(&self, fs: &Ext4, iblock: Iblock) -> Result<Option<Extent>> {
         let root_bytes = self.root.as_bytes();
         let mut next_bid = match search_entries(&self.header(), root_bytes, iblock)? {
             Step::Found(extent) => return Ok(Some(extent)),
@@ -155,7 +266,7 @@ impl ExtentTree {
 
         let journal = fs.journal();
         let device = fs.block_device().as_ref();
-        for _ in 0..MAX_DEPTH {
+        for _ in 0..super::node::MAX_DEPTH {
             let block = journal::read_metadata_block(journal.as_deref(), device, next_bid)?;
             match search_node(&block, iblock)? {
                 Step::Found(extent) => return Ok(Some(extent)),
@@ -240,27 +351,33 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
-        let (extents, old_external) = self.flatten(fs)?;
-
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
 
         // No unwritten extent overlaps the range → nothing to convert. Return
-        // before `reserialize`, which would re-journal every external node of
-        // the tree. `write_at` calls this on EVERY write, so without this gate
-        // a plain overwrite of already-written blocks (no allocation, no size
-        // change) would flatten-and-rebuild a large file's whole extent tree:
-        // pure write amplification, and on a depth-2 file the rewrite can
-        // capture more metadata blocks than one transaction's descriptor holds
-        // and abort a legal write. (The old pre-write gate in `ensure_allocated`
-        // did this check; it moved here with the conversion.)
-        if !extents.iter().any(|e| {
-            e.is_unwritten()
-                && (e.block() as u64) < range_end
-                && e.block() as u64 + e.len() as u64 > range_start as u64
-        }) {
+        // before the flatten AND the `reserialize` (which would re-journal
+        // every external node of the tree). `write_at` calls this on EVERY
+        // write, so this gate must be cheap: a bounded [`walk_range`] probe
+        // over just the leaves the range touches (P9a-T1) — the previous
+        // whole-tree flatten gate made even a plain overwrite of written
+        // blocks O(tree) node reads plus a tree-sized `Vec`, the direct cause
+        // of the SQLite 110/120 pathology. Without the gate itself, a depth-2
+        // file's rewrite can also capture more metadata blocks than one
+        // transaction holds and abort a legal write.
+        let mut any_unwritten = false;
+        self.walk_range(fs, range_start as u64..range_end, &mut |e| {
+            if e.is_unwritten() {
+                any_unwritten = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
+        if !any_unwritten {
             return Ok(());
         }
+
+        // The conversion itself is still flatten-and-rebuild until P9a-T5.
+        let (extents, old_external) = self.flatten(fs)?;
 
         // The `as u16` narrowings on the three split lengths below are
         // lossless: each split lies inside one extent, whose length is a u16
@@ -1009,7 +1126,107 @@ impl ExtentTree {
     }
 }
 
-/// The outcome of searching a single extent-tree node for `iblock`.
+/// Decodes leaf entry `i` of the trusted inline root.
+fn root_extent_at(root_bytes: &[u8], i: usize) -> Extent {
+    let off = ENTRY_SIZE * (1 + i);
+    Extent::from(&RawExtent::from_bytes(&root_bytes[off..off + ENTRY_SIZE]))
+}
+
+/// Decodes index entry `i` of the trusted inline root.
+fn root_index_at(root_bytes: &[u8], i: usize) -> ExtentIdx {
+    let off = ENTRY_SIZE * (1 + i);
+    ExtentIdx::from(&RawExtentIdx::from_bytes(
+        &root_bytes[off..off + ENTRY_SIZE],
+    ))
+}
+
+/// Where a leaf scan landed, before the path is attached.
+enum LeafLanding {
+    Covered(Extent),
+    Gap(Option<Extent>),
+}
+
+impl LeafLanding {
+    fn into_search(self, path: ExtentPath) -> Search {
+        match self {
+            LeafLanding::Covered(extent) => Search::Covered { path, extent },
+            LeafLanding::Gap(prev) => Search::Gap { path, prev },
+        }
+    }
+}
+
+/// Resolves a leaf scan into its landing position and verdict: `chosen` is the
+/// last entry with first block `<= iblock` (`None` = before the first entry).
+/// The returned position is the covering entry on a hit, or the insertion
+/// point a new entry keyed at `iblock` would take on a miss.
+fn leaf_landing(
+    chosen: Option<usize>,
+    extent_at_fn: impl Fn(usize) -> Extent,
+    iblock: Iblock,
+) -> (usize, LeafLanding) {
+    match chosen {
+        None => (0, LeafLanding::Gap(None)),
+        Some(i) => {
+            let e = extent_at_fn(i);
+            if e.covers(iblock) {
+                (i, LeafLanding::Covered(e))
+            } else {
+                (i + 1, LeafLanding::Gap(Some(e)))
+            }
+        }
+    }
+}
+
+/// The recursive child step of [`ExtentTree::walk_range`]: visits the extents
+/// of the subtree rooted at `bid` that overlap `range`, in ascending order.
+/// `expected_depth` enforces the one-step-down invariant ([`ExtentTree::find`]),
+/// which also bounds the recursion at [`MAX_DEPTH`](super::node::MAX_DEPTH).
+fn walk_child(
+    fs: &Ext4,
+    bid: Ext4Bid,
+    expected_depth: u16,
+    range: &Range<u64>,
+    visit_fn: &mut impl FnMut(&Extent) -> ControlFlow<()>,
+) -> Result<ControlFlow<()>> {
+    let node = NodeBuf::read(fs, bid)?;
+    if node.depth() != expected_depth {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "extent child depth does not step down by one"
+        );
+    }
+    if node.is_leaf() {
+        for i in 0..node.entries() {
+            let e = node.extent_at(i);
+            if e.block() as u64 >= range.end {
+                break;
+            }
+            if e.block() as u64 + e.len() as u64 > range.start && visit_fn(&e).is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+        return Ok(ControlFlow::Continue(()));
+    }
+    // `range.start` fits an `Iblock` (walk_range early-returns otherwise) and
+    // only shrinks along the recursion.
+    let start_key = range.start as Iblock;
+    let first = node.index_pos(start_key).unwrap_or(0);
+    for i in first..node.entries() {
+        let child = node.index_at(i);
+        if child.block() as u64 >= range.end {
+            break;
+        }
+        if walk_child(fs, child.leaf(), expected_depth - 1, range, visit_fn)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
+/// The outcome of searching a single extent-tree node for `iblock` — retained
+/// (with the linear walker below) as the ktest cross-verification reference
+/// for the path-based [`ExtentTree::find`].
+#[cfg(ktest)]
 enum Step {
     /// A leaf extent that covers `iblock`.
     Found(Extent),
@@ -1021,6 +1238,7 @@ enum Step {
 
 /// Parses and searches one freshly read (untrusted) node — the parse boundary
 /// for device bytes.
+#[cfg(ktest)]
 fn search_node(bytes: &[u8], iblock: Iblock) -> Result<Step> {
     let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&bytes[0..ENTRY_SIZE]))?;
     search_entries(&header, bytes, iblock)
@@ -1029,8 +1247,8 @@ fn search_node(bytes: &[u8], iblock: Iblock) -> Result<Step> {
 /// Searches one node's entries for `iblock`, `header` already decoded.
 ///
 /// Entries are sorted by logical block, so the covering entry is the last one
-/// whose starting block is `<= iblock`. Phase 1 scans linearly (nodes hold at
-/// most a few hundred entries); a binary search is a later optimization.
+/// whose starting block is `<= iblock`.
+#[cfg(ktest)]
 fn search_entries(header: &ExtentHeader, bytes: &[u8], iblock: Iblock) -> Result<Step> {
     let nr_entries = header.entries() as usize;
 
@@ -1824,5 +2042,256 @@ mod tests {
             stored,
             checksum::crc32c(seed.get(), &block[..EXTENT_TAIL_OFFSET])
         );
+    }
+
+    // ---- P9a-T1: path 手术读侧（find / walk_range）互证与语义钉 ----
+
+    /// `find` must agree with the pre-surgery linear walker on every probe,
+    /// and `walk_range` over the whole space must reproduce the flatten list,
+    /// at every tree shape from inline through depth-2 — the path-based read
+    /// side is only trusted through this equivalence.
+    #[ktest]
+    fn find_and_walk_match_linear_reference_across_shapes() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+
+        // 1450 single-block extents with one-block gaps (unmergeable) force
+        // growth through inline → depth-1 → depth-2 (5 leaves + 1 interior).
+        // Checkpoints along the way exercise each shape; unwritten kind every
+        // third extent exercises kind fidelity.
+        let checkpoints = [3usize, 4, 300, 1400, 1450];
+        let mut inserted = 0usize;
+        for &target in &checkpoints {
+            while inserted < target {
+                let i = inserted as u32;
+                let kind = if i.is_multiple_of(3) {
+                    ExtentKind::Unwritten
+                } else {
+                    ExtentKind::Written
+                };
+                tree.insert(
+                    &f.ext4,
+                    i * 2,
+                    100_000 + i as Ext4Bid * 2,
+                    1,
+                    kind,
+                    None,
+                    None,
+                )
+                .unwrap();
+                inserted += 1;
+            }
+
+            // Probe every logical block up to past the last extent.
+            for ib in 0..(inserted as u32 * 2 + 4) {
+                let linear = tree.lookup_linear(&f.ext4, ib).unwrap();
+                match (linear, tree.find(&f.ext4, ib).unwrap()) {
+                    (Some(l), Search::Covered { extent: e, .. }) => {
+                        assert_eq!(
+                            (l.block(), l.len(), l.start(), l.kind()),
+                            (e.block(), e.len(), e.start(), e.kind())
+                        );
+                    }
+                    (None, Search::Gap { .. }) => {}
+                    (l, _) => panic!("find/linear disagree at block {ib} (linear: {l:?})"),
+                }
+            }
+
+            // walk_range over everything == flatten, order and fields.
+            let (mut flat, _) = tree.flatten(&f.ext4).unwrap();
+            flat.sort_by_key(|e| e.block());
+            let mut walked = Vec::new();
+            tree.walk_range(&f.ext4, 0..u64::MAX, &mut |e| {
+                walked.push(*e);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+            assert_eq!(flat.len(), walked.len());
+            for (a, b) in flat.iter().zip(walked.iter()) {
+                assert_eq!(
+                    (a.block(), a.len(), a.start(), a.kind()),
+                    (b.block(), b.len(), b.start(), b.kind())
+                );
+            }
+        }
+        assert_eq!(tree.depth(), 2);
+
+        // Bounded walk: exactly the extents overlapping [101, 140) — blocks
+        // are even, so extents 51..=69 qualify (block 102..=138).
+        let mut seen = Vec::new();
+        tree.walk_range(&f.ext4, 101..140, &mut |e| {
+            seen.push(e.block());
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        let want: Vec<Iblock> = (51..70).map(|i| i * 2).collect();
+        assert_eq!(seen, want);
+
+        // Early break stops the walk mid-tree.
+        let mut count = 0;
+        tree.walk_range(&f.ext4, 0..u64::MAX, &mut |_| {
+            count += 1;
+            if count == 3 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    /// A gap's landing carries the insertion point and the in-leaf
+    /// predecessor (the allocation-goal donor) — the rule-6 payload inserts
+    /// consume without a second walk.
+    #[ktest]
+    fn find_gap_reports_insertion_point_and_prev() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+
+        // Inline root: extents [0,2)→100 and [5,8)→400.
+        let tree = inline_tree(&[
+            RawExtent {
+                block: 0,
+                len: 2,
+                start_hi: 0,
+                start_lo: 100,
+            },
+            RawExtent {
+                block: 5,
+                len: 3,
+                start_hi: 0,
+                start_lo: 400,
+            },
+        ]);
+        match tree.find(&f.ext4, 3).unwrap() {
+            Search::Gap { path, prev } => {
+                assert!(path.levels.is_empty());
+                assert_eq!(path.root_pos, 1); // between the two entries
+                assert_eq!(prev.unwrap().block(), 0);
+            }
+            _ => panic!("block 3 must be a gap"),
+        }
+        match tree.find(&f.ext4, 6).unwrap() {
+            Search::Covered { path, extent } => {
+                assert_eq!(path.root_pos, 1);
+                assert_eq!(extent.block(), 5);
+            }
+            _ => panic!("block 6 must be covered"),
+        }
+
+        // External leaf via a depth-1 root: same landings, one path level.
+        let leaf_block = 200u32;
+        let leaf = leaf_node(&[
+            RawExtent {
+                block: 5,
+                len: 3,
+                start_hi: 0,
+                start_lo: 400,
+            },
+            RawExtent {
+                block: 20,
+                len: 1,
+                start_hi: 0,
+                start_lo: 500,
+            },
+        ]);
+        f.write_data_block(leaf_block, &leaf);
+        let tree = index_tree(leaf_block);
+
+        // Before the leaf's first entry: insertion point 0, no predecessor.
+        match tree.find(&f.ext4, 2).unwrap() {
+            Search::Gap { path, prev } => {
+                assert_eq!(path.levels.len(), 1);
+                assert_eq!(path.leaf().unwrap().pos, 0);
+                assert!(prev.is_none());
+            }
+            _ => panic!("block 2 must be a gap"),
+        }
+        // Past the last entry: insertion point = entry count, prev = last.
+        match tree.find(&f.ext4, 100).unwrap() {
+            Search::Gap { path, prev } => {
+                assert_eq!(path.leaf().unwrap().pos, 2);
+                assert_eq!(prev.unwrap().block(), 20);
+            }
+            _ => panic!("block 100 must be a gap"),
+        }
+    }
+
+    /// The path walker rejects structurally corrupt children loud: a child
+    /// whose depth does not step down by one, and a node whose entry count
+    /// overruns the block.
+    #[ktest]
+    fn find_rejects_corrupt_children() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+
+        // A depth-1 root must point at leaves; hand it an interior node.
+        let bogus_block = 210u32;
+        let mut interior = [0u8; BLOCK_SIZE];
+        let header = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 0,
+            max: INTERIOR_MAX as u16,
+            depth: 1,
+            generation: 0,
+        };
+        interior[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+        f.write_data_block(bogus_block, &interior);
+        let tree = index_tree(bogus_block);
+        assert!(tree.find(&f.ext4, 0).is_err());
+        let mut visited = 0;
+        assert!(
+            tree.walk_range(&f.ext4, 0..u64::MAX, &mut |_| {
+                visited += 1;
+                ControlFlow::Continue(())
+            })
+            .is_err()
+        );
+        assert_eq!(visited, 0);
+
+        // An entry count that overruns the 4K node (forged max admits it past
+        // the header check) must be rejected at the NodeBuf parse boundary.
+        let overrun_block = 211u32;
+        let mut overrun = [0u8; BLOCK_SIZE];
+        let header = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 400,
+            max: 500,
+            depth: 0,
+            generation: 0,
+        };
+        overrun[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+        f.write_data_block(overrun_block, &overrun);
+        let tree = index_tree(overrun_block);
+        assert!(tree.find(&f.ext4, 0).is_err());
+    }
+
+    /// The every-write convert gate must stay semantics-identical after the
+    /// bounded-probe rewrite: a written-only range returns untouched (no
+    /// dirtying, no rebuild), an unwritten overlap still converts.
+    #[ktest]
+    fn convert_gate_bounded_probe_keeps_semantics() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 4, ExtentKind::Written, None, None)
+            .unwrap();
+        tree.insert(&f.ext4, 10, 200, 2, ExtentKind::Unwritten, None, None)
+            .unwrap();
+        tree.clear_dirty();
+
+        // Written-only range: the gate returns before any rebuild.
+        tree.convert_unwritten(&f.ext4, 0, 4, None, None).unwrap();
+        assert!(!tree.is_dirty());
+
+        // Unwritten overlap: conversion still runs and splits at the range end.
+        tree.convert_unwritten(&f.ext4, 10, 1, None, None).unwrap();
+        assert!(tree.is_dirty());
+        assert!(!tree.lookup(&f.ext4, 10).unwrap().unwrap().is_unwritten());
+        assert!(tree.lookup(&f.ext4, 11).unwrap().unwrap().is_unwritten());
     }
 }
