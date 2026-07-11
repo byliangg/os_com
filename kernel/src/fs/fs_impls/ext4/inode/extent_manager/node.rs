@@ -83,7 +83,6 @@ impl ExtentHeader {
         self.entries
     }
 
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) const fn max(&self) -> u16 {
         self.max
     }

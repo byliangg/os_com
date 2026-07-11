@@ -313,6 +313,23 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        // Fast path (surgery T2): when the landing leaf is external and can
+        // take the run without splitting, edit exactly that leaf (plus the
+        // index keys an at-position-0 insert corrects) instead of rebuilding
+        // the whole tree. A depth-0 root keeps the rebuild route — its inline
+        // rewrite is memory-only and free. A full leaf falls back to the
+        // rebuild too, until the split machinery lands (T3).
+        if self.header().depth() > 0
+            && self.try_insert_in_place(fs, iblock, pblock, len, kind, handle, csum_seed)?
+        {
+            // Data blocks only: the leaf was edited in place, no metadata
+            // block was allocated or freed.
+            self.sector_count =
+                (self.sector_count as i64 + len as i64 * SECTORS_PER_BLOCK as i64).max(0) as u64;
+            self.dirty = true;
+            return Ok(());
+        }
+
         let (mut extents, old_external) = self.flatten(fs)?;
         extents.push(Extent::new(iblock, len, pblock, kind));
         merge_extents(&mut extents);
@@ -326,6 +343,120 @@ impl ExtentTree {
             (self.sector_count as i64 + added_blocks * SECTORS_PER_BLOCK as i64).max(0) as u64;
         self.dirty = true;
         Ok(())
+    }
+
+    /// Attempts the in-place leaf insert of `[iblock, iblock+len) → pblock`:
+    /// merge onto the in-leaf predecessor (absorbing a bridged successor), or
+    /// shift-insert into free space, correcting ancestor index keys when the
+    /// leaf's first key drops. Returns `false` — tree untouched — when the
+    /// leaf is full, and the caller falls back to the whole-tree rebuild.
+    ///
+    /// The caller guarantees the whole range is a hole (the write path plans
+    /// from a snapshot under this same ③ lock), so the landing must be a
+    /// [`Search::Gap`]; a covered landing means the tree contradicts the plan
+    /// — fail loud rather than corrupt.
+    #[expect(clippy::too_many_arguments)]
+    fn try_insert_in_place(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        pblock: Ext4Bid,
+        len: u16,
+        kind: ExtentKind,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<bool> {
+        let e = Extent::new(iblock, len, pblock, kind);
+        let Search::Gap { mut path, prev } = self.find(fs, iblock)? else {
+            return_errno_with_message!(Errno::EUCLEAN, "extent insert target is already mapped");
+        };
+        let device = fs.block_device();
+        // The caller gated on depth ≥ 1, so the path ends in an external leaf.
+        let leaf_level = path.levels.len() - 1;
+        let insert_pos = path.levels[leaf_level].pos;
+
+        // Merge onto the predecessor: entry count unchanged, first key
+        // unchanged (a predecessor exists, so the position is ≥ 1) — no index
+        // correction, one leaf write.
+        if let Some(p) = prev
+            && can_merge(&p, &e)
+        {
+            let leaf = &mut path.levels[leaf_level].node;
+            let mut merged = merged_pair(&p, &e);
+            // The grown run may now bridge flush against the old successor
+            // (still named by `insert_pos`: nothing shifted).
+            if insert_pos < leaf.entries() {
+                let next = leaf.extent_at(insert_pos);
+                if can_merge(&merged, &next) {
+                    merged = merged_pair(&merged, &next);
+                    leaf.remove_extent_at(insert_pos);
+                }
+            }
+            leaf.replace_extent_at(insert_pos - 1, &merged);
+            leaf.write_back(device.as_ref(), handle, csum_seed)?;
+            return Ok(true);
+        }
+
+        // Shift-insert into free space; a full leaf is the rebuild fallback.
+        // The capacity check (and the in-buffer edit) precedes every durable
+        // write, so a `false` return leaves the tree untouched.
+        {
+            let leaf = &mut path.levels[leaf_level].node;
+            if leaf.insert_extent_at(insert_pos, &e).is_err() {
+                return Ok(false);
+            }
+            // The new run may bridge flush against its successor.
+            if insert_pos + 1 < leaf.entries() {
+                let next = leaf.extent_at(insert_pos + 1);
+                if can_merge(&e, &next) {
+                    leaf.replace_extent_at(insert_pos, &merged_pair(&e, &next));
+                    leaf.remove_extent_at(insert_pos + 1);
+                }
+            }
+        }
+
+        // Inserted at the leaf's position 0: the leaf's first key dropped, so
+        // the ancestor index keys naming this subtree drop with it (Linux
+        // `ext4_ext_correct_indexes`, extents.c:1705 — propagate upward while
+        // each level sits at position 0). The ancestors are written BEFORE the
+        // leaf: a key alone (old or new) is a valid lower bound either way, so
+        // every intermediate error state is a well-formed tree that does NOT
+        // yet reference the new data blocks — if any write fails here or at
+        // the leaf, the caller's on-error free of those blocks cannot strand a
+        // mapped-but-freed extent.
+        if insert_pos == 0 {
+            let mut level = leaf_level;
+            loop {
+                if level == 0 {
+                    self.set_root_index_key(path.root_pos, iblock);
+                    break;
+                }
+                let parent = &mut path.levels[level - 1];
+                parent.node.set_index_key_at(parent.pos, iblock);
+                parent.node.write_back(device.as_ref(), handle, csum_seed)?;
+                if parent.pos != 0 {
+                    break;
+                }
+                level -= 1;
+            }
+        }
+
+        // The leaf lands last (see above).
+        path.levels[leaf_level]
+            .node
+            .write_back(device.as_ref(), handle, csum_seed)?;
+        Ok(true)
+    }
+
+    /// Rewrites root index entry `i`'s key, keeping its child pointer. The
+    /// root lives in the in-memory `i_block` and reaches disk with the inode
+    /// writeback (no block capture of its own), like every other root rewrite.
+    fn set_root_index_key(&mut self, i: usize, key: Iblock) {
+        let off = ENTRY_SIZE * (1 + i);
+        let bytes = self.root.as_mut_bytes();
+        let mut raw = RawExtentIdx::from_bytes(&bytes[off..off + ENTRY_SIZE]);
+        raw.block = key;
+        bytes[off..off + ENTRY_SIZE].copy_from_slice(raw.as_bytes());
     }
 
     /// Converts the unwritten parts of the logical range `[iblock, iblock +
@@ -1447,7 +1578,7 @@ const EXTENT_TAIL_OFFSET: usize = ENTRY_SIZE * (1 + LEAF_MAX);
 /// crc32c of the node up to the tail, seeded with the owning inode's seed. Only
 /// external (full-block) leaf/interior nodes carry this tail; the inline root is
 /// covered by the inode checksum instead.
-fn stamp_extent_tail(block: &mut [u8], seed: InodeCsumSeed) {
+pub(super) fn stamp_extent_tail(block: &mut [u8], seed: InodeCsumSeed) {
     let csum = checksum::crc32c(seed.get(), &block[..EXTENT_TAIL_OFFSET]);
     block[EXTENT_TAIL_OFFSET..EXTENT_TAIL_OFFSET + size_of::<u32>()]
         .copy_from_slice(&csum.to_le_bytes());
@@ -1540,35 +1671,45 @@ fn write_interior_node(
     Ok(())
 }
 
+/// Returns whether `right` can coalesce onto the end of `left`: logically and
+/// physically contiguous, the same written/unwritten state, and the combined
+/// length still encodable. Unwritten extents cap one below the written limit:
+/// the length is bias-encoded as `len + MAX_WRITTEN_LEN`, so an unwritten run
+/// of `MAX_WRITTEN_LEN` would overflow `ee_len` (Linux uses the distinct
+/// `EXT_UNWRITTEN_MAX_LEN = 32767`).
+fn can_merge(left: &Extent, right: &Extent) -> bool {
+    let max_len = if left.is_unwritten() {
+        MAX_WRITTEN_LEN as u32 - 1
+    } else {
+        MAX_WRITTEN_LEN as u32
+    };
+    left.block() as u64 + left.len() as u64 == right.block() as u64
+        && left.start() + left.len() as u64 == right.start()
+        && left.is_unwritten() == right.is_unwritten()
+        && left.len() as u32 + right.len() as u32 <= max_len
+}
+
+/// Coalesces `left` and `right`; caller proved [`can_merge`].
+fn merged_pair(left: &Extent, right: &Extent) -> Extent {
+    Extent::new(
+        left.block(),
+        left.len() + right.len(),
+        left.start(),
+        left.kind(),
+    )
+}
+
 /// Sorts `extents` by logical block and coalesces runs that are logically and
 /// physically contiguous and share the same written/unwritten state.
 fn merge_extents(extents: &mut Vec<Extent>) {
     extents.sort_by_key(|e| e.block());
     let mut merged: Vec<Extent> = Vec::with_capacity(extents.len());
     for e in extents.iter() {
-        if let Some(last) = merged.last() {
-            // Unwritten extents cap one below the written limit: the length is
-            // bias-encoded as `len + MAX_WRITTEN_LEN`, so an unwritten run of
-            // `MAX_WRITTEN_LEN` would overflow `ee_len` (Linux uses the distinct
-            // `EXT_UNWRITTEN_MAX_LEN = 32767`).
-            let max_len = if last.is_unwritten() {
-                MAX_WRITTEN_LEN as u32 - 1
-            } else {
-                MAX_WRITTEN_LEN as u32
-            };
-            let contiguous = last.block() as u64 + last.len() as u64 == e.block() as u64
-                && last.start() + last.len() as u64 == e.start()
-                && last.is_unwritten() == e.is_unwritten()
-                && last.len() as u32 + e.len() as u32 <= max_len;
-            if contiguous {
-                *merged.last_mut().unwrap() = Extent::new(
-                    last.block(),
-                    last.len() + e.len(),
-                    last.start(),
-                    last.kind(),
-                );
-                continue;
-            }
+        if let Some(last) = merged.last().copied()
+            && can_merge(&last, e)
+        {
+            *merged.last_mut().unwrap() = merged_pair(&last, e);
+            continue;
         }
         merged.push(*e);
     }
@@ -2293,5 +2434,144 @@ mod tests {
         assert!(tree.is_dirty());
         assert!(!tree.lookup(&f.ext4, 10).unwrap().unwrap().is_unwritten());
         assert!(tree.lookup(&f.ext4, 11).unwrap().unwrap().is_unwritten());
+    }
+
+    // ---- P9a-T2: insert 快路（原位叶编辑）----
+
+    /// Decodes root index entry `i`'s key (test-side check of correct_indexes).
+    fn root_index_key(tree: &ExtentTree, i: usize) -> Iblock {
+        let bytes = tree.root_bytes().as_bytes();
+        let off = ENTRY_SIZE * (1 + i);
+        ExtentIdx::from(&RawExtentIdx::from_bytes(&bytes[off..off + ENTRY_SIZE])).block()
+    }
+
+    /// Probes every block in `0..limit` against the linear reference.
+    fn assert_matches_linear(
+        f: &crate::fs::fs_impls::ext4::test_utils::Ext4Fixture,
+        tree: &ExtentTree,
+        limit: Iblock,
+    ) {
+        for ib in 0..limit {
+            let linear = tree.lookup_linear(&f.ext4, ib).unwrap();
+            let new = tree.lookup(&f.ext4, ib).unwrap();
+            match (linear, new) {
+                (Some(l), Some(n)) => assert_eq!(
+                    (l.block(), l.len(), l.start(), l.kind()),
+                    (n.block(), n.len(), n.start(), n.kind()),
+                    "mismatch at block {ib}"
+                ),
+                (None, None) => {}
+                (l, n) => panic!("verdicts differ at block {ib}: linear {l:?} vs path {n:?}"),
+            }
+        }
+    }
+
+    /// The in-place insert fast path on an external leaf: mid-leaf shift
+    /// insert, left merge, bridging absorb, and a position-0 insert that
+    /// corrects the root index key — each leaving `i_blocks` with a pure-data
+    /// delta (no metadata block churn, the fast-path signature) and the whole
+    /// tree agreeing with the linear reference.
+    #[ktest]
+    fn insert_fast_path_edits_leaf_in_place() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+
+        // Six unmergeable extents overflow the inline root → depth 1, one leaf.
+        for (b, p) in [
+            (10, 1000),
+            (20, 2000),
+            (30, 3000),
+            (40, 4000),
+            (50, 5000),
+            (60, 6000),
+        ] {
+            tree.insert(&f.ext4, b, p, 2, ExtentKind::Written, None, None)
+                .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+
+        // Mid-leaf shift insert (no merge partner): pure-data i_blocks delta.
+        let sc = tree.sector_count();
+        tree.insert(&f.ext4, 25, 9000, 2, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!(tree.sector_count(), sc + 2 * SECTORS_PER_BLOCK);
+        let m = tree.lookup(&f.ext4, 26).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (25, 2, 9000));
+
+        // Left merge: physically contiguous extension of [10,12)→1000.
+        let sc = tree.sector_count();
+        tree.insert(&f.ext4, 12, 1002, 2, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!(tree.sector_count(), sc + 2 * SECTORS_PER_BLOCK);
+        let m = tree.lookup(&f.ext4, 13).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (10, 4, 1000));
+
+        // Bridging absorb: two physically consecutive runs with a hole flush
+        // between them; filling it fuses all three into one extent.
+        tree.insert(&f.ext4, 70, 8000, 2, ExtentKind::Written, None, None)
+            .unwrap();
+        tree.insert(&f.ext4, 75, 8005, 3, ExtentKind::Written, None, None)
+            .unwrap();
+        let sc = tree.sector_count();
+        tree.insert(&f.ext4, 72, 8002, 3, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!(tree.sector_count(), sc + 3 * SECTORS_PER_BLOCK);
+        let m = tree.lookup(&f.ext4, 77).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (70, 8, 8000));
+
+        // Position-0 insert: the leaf's first key drops from 10 to 4 and the
+        // root index key follows (correct_indexes at the root).
+        assert_eq!(root_index_key(&tree, 0), 10);
+        tree.insert(&f.ext4, 4, 7000, 2, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!(root_index_key(&tree, 0), 4);
+        assert_eq!(tree.lookup(&f.ext4, 4).unwrap().unwrap().start(), 7000);
+        // Blocks below the new first key stay holes.
+        assert!(tree.lookup(&f.ext4, 3).unwrap().is_none());
+
+        assert_matches_linear(&f, &tree, 90);
+    }
+
+    /// The sequential-append pattern (fio seq write, SQLite growth): every
+    /// extension left-merges onto the tail extent in place — extent count and
+    /// metadata footprint stay constant while only data blocks accrue.
+    #[ktest]
+    fn insert_fast_path_appends_without_rebuild() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        for (b, p) in [(0, 500), (10, 600), (20, 700), (30, 800), (40, 900)] {
+            tree.insert(&f.ext4, b, p, 2, ExtentKind::Written, None, None)
+                .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+
+        // 60 contiguous appends onto the tail run [40,42)→900.
+        let sc = tree.sector_count();
+        for i in 0..60u32 {
+            tree.insert(
+                &f.ext4,
+                42 + i,
+                902 + i as Ext4Bid,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        // Pure data growth (no metadata churn), one merged tail extent.
+        assert_eq!(tree.sector_count(), sc + 60 * SECTORS_PER_BLOCK);
+        let m = tree.lookup(&f.ext4, 101).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (40, 62, 900));
+        let (extents, _) = tree.flatten(&f.ext4).unwrap();
+        assert_eq!(extents.len(), 5);
+
+        assert_matches_linear(&f, &tree, 110);
     }
 }

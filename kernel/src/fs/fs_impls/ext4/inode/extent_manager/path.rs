@@ -11,7 +11,7 @@
 //! work, deliberately out of scope for the surgery).
 
 use super::{
-    super::super::{fs::Ext4, journal, prelude::*},
+    super::super::{checksum::InodeCsumSeed, fs::Ext4, journal, prelude::*},
     node::{ENTRY_SIZE, Extent, ExtentHeader, ExtentIdx, RawExtent, RawExtentHeader, RawExtentIdx},
 };
 
@@ -101,6 +101,93 @@ impl NodeBuf {
     pub(super) fn leaf_pos(&self, iblock: Iblock) -> Option<usize> {
         last_key_le(self.entries(), |i| self.extent_at(i).block(), iblock)
     }
+
+    // ---- 编辑器（surgery 写路径，P9a-T2 起）----
+    // 每个编辑器维护"头/项一致"的节点不变量；改完的节点必须经
+    // [`write_back`](Self::write_back) 的捕获漏斗落盘，编辑本身只动内存字节。
+
+    /// Overwrites leaf entry `i` in place (a merge bump or an unwritten flip).
+    pub(super) fn replace_extent_at(&mut self, i: usize, e: &Extent) {
+        debug_assert!(self.is_leaf() && i < self.entries());
+        let off = ENTRY_SIZE * (1 + i);
+        self.bytes[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(e).as_bytes());
+    }
+
+    /// Inserts leaf entry `e` at position `i`, shifting later entries right.
+    /// Fails with `ENOSPC` when the node is full — the caller then takes the
+    /// split path (T3; until then, the whole-tree rebuild fallback).
+    pub(super) fn insert_extent_at(&mut self, i: usize, e: &Extent) -> Result<()> {
+        debug_assert!(self.is_leaf() && i <= self.entries());
+        let n = self.entries();
+        if n + 1 > self.max_entries() || ENTRY_SIZE * (2 + n) > BLOCK_SIZE {
+            return_errno_with_message!(Errno::ENOSPC, "extent leaf node is full");
+        }
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        self.bytes.copy_within(start..end, start + ENTRY_SIZE);
+        self.bytes[start..start + ENTRY_SIZE].copy_from_slice(RawExtent::from(e).as_bytes());
+        self.set_entries(n + 1);
+        Ok(())
+    }
+
+    /// Removes leaf entry `i`, shifting later entries left (a right-neighbor
+    /// absorb after a merge).
+    pub(super) fn remove_extent_at(&mut self, i: usize) {
+        debug_assert!(self.is_leaf() && i < self.entries());
+        let n = self.entries();
+        let start = ENTRY_SIZE * (1 + i);
+        let end = ENTRY_SIZE * (1 + n);
+        self.bytes.copy_within(start + ENTRY_SIZE..end, start);
+        self.set_entries(n - 1);
+    }
+
+    /// Rewrites index entry `i`'s key, keeping its child pointer — the
+    /// `correct_indexes` step after an insert at a child's position 0.
+    pub(super) fn set_index_key_at(&mut self, i: usize, key: Iblock) {
+        debug_assert!(!self.is_leaf() && i < self.entries());
+        let off = ENTRY_SIZE * (1 + i);
+        let mut raw = RawExtentIdx::from_bytes(&self.bytes[off..off + ENTRY_SIZE]);
+        raw.block = key;
+        self.bytes[off..off + ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+    }
+
+    /// Patches the edited node back through its journal capture and, without a
+    /// live capture (non-journaled volume), writes it to the device — the same
+    /// funnel discipline as the rebuild's node writers (WAL: metadata never
+    /// precedes its commit). With `metadata_csum` on, the extent-block tail is
+    /// recomputed over the edited bytes first (patch-time funnel, P6b D4).
+    pub(super) fn write_back(
+        &mut self,
+        device: &dyn BlockDevice,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        if let Some(seed) = csum_seed {
+            super::tree::stamp_extent_tail(self.bytes.as_mut(), seed);
+        }
+        let access = journal::get_write_access(handle, self.bid)?;
+        access.patch(|buf| buf.copy_from_slice(self.bytes.as_ref()))?;
+        if !access.is_live() {
+            device.write_val(Bid::new(self.bid).to_offset(), self.bytes.as_ref())?;
+        }
+        Ok(())
+    }
+
+    /// Returns this node's entry capacity (`eh_max`), additionally bounded by
+    /// the block size at [`read`](Self::read).
+    fn max_entries(&self) -> usize {
+        self.header.max() as usize
+    }
+
+    /// Updates the entry count in both the on-disk header bytes and the cached
+    /// decoded header — the single funnel every editor above goes through.
+    fn set_entries(&mut self, n: usize) {
+        let mut raw = RawExtentHeader::from_bytes(&self.bytes[0..ENTRY_SIZE]);
+        // Lossless: bounded by `max_entries()` (a u16) at every growth site.
+        raw.entries = n as u16;
+        self.bytes[0..ENTRY_SIZE].copy_from_slice(raw.as_bytes());
+        self.header = ExtentHeader::from_trusted(&raw);
+    }
 }
 
 /// Returns the last position in `0..n` whose key (per `key_at_fn`) is
@@ -127,12 +214,7 @@ pub(super) fn last_key_le(
 /// entry index it chose there (interior: the child descended into; leaf: see
 /// [`Search`] for the covered/insertion-point encoding).
 pub(super) struct PathLevel {
-    // The path payload's production consumer is the surgery write path
-    // (P9a-T2 `insert_at` edits exactly the nodes the path names); T1 builds
-    // the read side and cross-verifies it in ktest.
-    #[expect(dead_code)]
     pub(super) node: NodeBuf,
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) pos: usize,
 }
 
@@ -144,7 +226,6 @@ pub(super) struct PathLevel {
 pub(super) struct ExtentPath {
     /// Entry index chosen at the inline root (on a depth-0 Gap: the insertion
     /// point a new entry would take there).
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) root_pos: usize,
     pub(super) levels: Vec<PathLevel>,
 }
@@ -175,9 +256,7 @@ pub(super) enum Search {
     /// take in the leaf, and `prev` is the in-leaf predecessor (`None` when
     /// the block precedes the leaf's first entry).
     Gap {
-        #[cfg_attr(not(ktest), expect(dead_code))]
         path: ExtentPath,
-        #[cfg_attr(not(ktest), expect(dead_code))]
         prev: Option<Extent>,
     },
 }
