@@ -5445,4 +5445,192 @@ mod write_tests {
             &written[..2 * PAGE_SIZE]
         );
     }
+
+    /// v2 run merging — fragment boundary: a physically FRAGMENTED but logically
+    /// dense file (two disjoint extents) prefetches byte-correctly. The prefetch
+    /// must split the logically contiguous request at the physical discontinuity
+    /// into two separate multi-segment BIOs.
+    #[ktest]
+    fn prefetch_fragmented_extents_is_byte_correct() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // First extent: logical blocks 0..2.
+        const HALF_BLOCKS: usize = 2;
+        const SPLIT: usize = HALF_BLOCKS * BLOCK_SIZE;
+        let mut written = vec![0u8; 2 * SPLIT];
+        written[..SPLIT].fill(0xA1);
+        written[SPLIT..].fill(0xB2);
+        write_all(&inode, 0, &written[..SPLIT]);
+
+        // Occupy the block that would extend the first extent contiguously so
+        // the second write must land in a disjoint extent (the b2 checkerboard
+        // technique: fragment via the fs-level allocator). Goal-directed
+        // allocation takes exactly the free goal block.
+        let first_pblock = {
+            let inner = inode.inner.read();
+            inner
+                .extent_manager()
+                .unwrap()
+                .map_blocks(0)
+                .unwrap()
+                .mapped_pblock()
+                .unwrap()
+        };
+        let gap = first_pblock + HALF_BLOCKS as u64;
+        let occupied = f.ext4.alloc_blocks(1, gap, None).unwrap();
+        assert_eq!(
+            occupied.start, gap,
+            "goal-directed alloc should take the gap block"
+        );
+
+        // Second extent: logical blocks 2..4, forced off the occupied gap.
+        write_all(&inode, SPLIT, &written[SPLIT..]);
+
+        // The file is now two physically disjoint extents but logically dense.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(
+                bm.map_blocks(0).unwrap().len(),
+                HALF_BLOCKS as u32,
+                "the first extent must cover only the first half — the file is fragmented"
+            );
+            let second = bm
+                .map_blocks(HALF_BLOCKS as u32)
+                .unwrap()
+                .mapped_pblock()
+                .unwrap();
+            assert_ne!(
+                first_pblock + HALF_BLOCKS as u64,
+                second,
+                "the two extents must be physically disjoint"
+            );
+        }
+
+        // Drop the cache and prefetch the whole file; the run splits at the
+        // physical discontinuity into two BIOs.
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.invalidate_range(0..written.len()).unwrap();
+        page_cache.prefetch_range(0..written.len()).unwrap();
+
+        assert_eq!(read_back(&inode, 0, written.len()), written);
+    }
+
+    /// v2 run merging — a gap in the collected batch: warming one page in the
+    /// middle makes the prefetch batch skip it, so the surrounding pages read as
+    /// two runs split at the cached gap. Every page still reads back correctly.
+    #[ktest]
+    fn prefetch_with_cached_gap_is_byte_correct() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NPAGES: usize = 8;
+        let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+        for p in 0..NPAGES {
+            written[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill((0x10 + p) as u8);
+        }
+        write_all(&inode, 0, &written);
+
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.invalidate_range(0..written.len()).unwrap();
+
+        // Warm page 4 alone (a cold single-page read is a detector miss, so it
+        // prefetches only its own page): the batch below now has a gap there.
+        assert_eq!(
+            read_back(&inode, 4 * PAGE_SIZE, PAGE_SIZE),
+            &written[4 * PAGE_SIZE..5 * PAGE_SIZE]
+        );
+
+        // Prefetch the whole range: the cached page 4 is skipped, the pages
+        // before and after it form two separate runs.
+        page_cache.prefetch_range(0..written.len()).unwrap();
+
+        assert_eq!(read_back(&inode, 0, written.len()), written);
+    }
+
+    /// v2 run merging — a run longer than one BIO can hold: an 80-page contiguous
+    /// extent exceeds the per-BIO segment cap, so the override splits it into
+    /// back-to-back multi-segment BIOs. A sequential scan reads every byte back
+    /// correctly.
+    #[ktest]
+    fn prefetch_run_exceeding_bio_segment_cap_splits() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NPAGES: usize = 80; // > the 61-segment per-BIO cap.
+        let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+        for p in 0..NPAGES {
+            written[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill(p as u8);
+        }
+        // Contiguous appends coalesce into one extent; write in small batches.
+        const BATCH: usize = 16;
+        let mut off = 0;
+        while off < written.len() {
+            let end = (off + BATCH * PAGE_SIZE).min(written.len());
+            write_all(&inode, off, &written[off..end]);
+            off = end;
+        }
+        // Sanity: a single contiguous extent spans the whole file.
+        {
+            let inner = inode.inner.read();
+            assert_eq!(
+                inner.extent_manager().unwrap().map_blocks(0).unwrap().len(),
+                NPAGES as u32,
+                "the appends must coalesce into one extent to exercise the split"
+            );
+        }
+
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.invalidate_range(0..written.len()).unwrap();
+
+        // Sequential scan: the detector prefetches the run, which the override
+        // splits across several BIOs.
+        let mut readback = vec![0u8; written.len()];
+        for p in 0..NPAGES {
+            let mut writer =
+                VmWriter::from(&mut readback[p * PAGE_SIZE..(p + 1) * PAGE_SIZE]).to_fallible();
+            assert_eq!(
+                inode.read_at(p * PAGE_SIZE, &mut writer).unwrap(),
+                PAGE_SIZE
+            );
+        }
+        assert_eq!(readback, written);
+    }
+
+    /// v2 run merging — a sparse file: holes and data interleaved. After a
+    /// whole-file prefetch, the hole pages read back all-zeros (filled in process
+    /// context, no device I/O) and the data pages read back correctly.
+    #[ktest]
+    fn prefetch_sparse_file_zeros_holes_and_fills_data() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Data at pages 0..2 and 5..7, holes at pages 2, 3, 4.
+        const NPAGES: usize = 7;
+        let mut expected = vec![0u8; NPAGES * PAGE_SIZE];
+        expected[0..2 * PAGE_SIZE].fill(0x71);
+        expected[5 * PAGE_SIZE..7 * PAGE_SIZE].fill(0x93);
+        write_all(&inode, 0, &expected[0..2 * PAGE_SIZE]);
+        write_all(
+            &inode,
+            5 * PAGE_SIZE,
+            &expected[5 * PAGE_SIZE..7 * PAGE_SIZE],
+        );
+
+        // Confirm the middle blocks really are holes (not allocated).
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for blk in 2..5 {
+                assert_eq!(bm.map_blocks(blk).unwrap().state(), MapState::Hole);
+            }
+        }
+
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.invalidate_range(0..expected.len()).unwrap();
+        page_cache.prefetch_range(0..expected.len()).unwrap();
+
+        assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
 }

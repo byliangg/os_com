@@ -410,6 +410,27 @@ pub trait PageCacheBackend: Sync + Send {
         locked_page: LockedCachePage,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Reads a batch of pages from the backend into `io_batch`, coalescing the
+    /// submission where the backend can.
+    ///
+    /// `pages` is a set of `(page index, locked uninitialized page)` pairs
+    /// sorted by index but possibly with gaps (the caller skips pages already
+    /// cached). This is the batched entry point the sequential-read prefetch
+    /// uses; it is best-effort, so it swallows every per-page error — a page
+    /// left uninitialized is transparently re-read by the next synchronous
+    /// reader through the normal commit path — and therefore returns nothing.
+    ///
+    /// The default implementation submits every page individually through
+    /// [`read_page_async`](Self::read_page_async), exactly as a per-page prefetch
+    /// loop would; a backend that knows its on-disk layout can override it to
+    /// merge physically contiguous pages into multi-segment BIOs (the block
+    /// backends do so via [`BlockAsPageCacheBackend::submit_read_pages`]).
+    fn read_pages_async_batch(&self, pages: Vec<(usize, LockedCachePage)>, io_batch: &mut IoBatch) {
+        for (idx, page) in pages {
+            let _ = self.read_page_async(idx, page, io_batch);
+        }
+    }
 }
 
 impl dyn PageCacheBackend {
@@ -474,6 +495,71 @@ pub trait BlockAsPageCacheBackend: Sync + Send {
         complete_fn: BioCompleteFn,
         io_batch: &mut IoBatch,
     ) -> Result<()>;
+
+    /// Submits read I/O for a batch of pages, coalescing physically contiguous
+    /// ones where the backend can.
+    ///
+    /// `pages` is `(page index, locked uninitialized page)` sorted by index,
+    /// with gaps where a page was already cached. This is the block-backed hook
+    /// that the blanket [`PageCacheBackend::read_pages_async_batch`] forwards to,
+    /// and it is a best-effort prefetch entry point: every per-page error is
+    /// swallowed (an unsubmitted page stays uninitialized and is re-read on
+    /// demand), so it returns nothing.
+    ///
+    /// The default implementation submits one single-page BIO per page — the
+    /// batch shell around the blanket single-page read behavior. A backend that
+    /// knows its on-device layout (e.g. ext4's extent map) overrides it to merge
+    /// a physically contiguous run into one multi-segment BIO.
+    fn submit_read_pages(&self, pages: Vec<(usize, LockedCachePage)>, io_batch: &mut IoBatch) {
+        for (idx, page) in pages {
+            let bio_segment = BioSegment::new_from_segment(
+                Segment::from(page.deref().clone()).into(),
+                BioDirection::FromDevice,
+            );
+            let complete_fn = read_run_complete_fn(vec![page]);
+            let _ = self.submit_read_bio(idx, bio_segment, complete_fn, io_batch);
+        }
+    }
+}
+
+/// Builds the completion callback for a batched run of prefetch reads that share
+/// one BIO.
+///
+/// The returned callback runs in interrupt context — it only stores atomics,
+/// fills zeros, and drops the page locks (no allocation, no blocking lock) — and
+/// applies to *every* page in the run the same per-page state transition the
+/// single-page read callback in [`read_page_async`](PageCacheBackend::read_page_async)
+/// applies to its one page:
+///
+/// - [`BioStatus::Complete`]: the device filled the frames, so mark each page
+///   up to date.
+/// - [`BioStatus::Zeros`]: the run reads as zeros (a hole or unwritten extent),
+///   so zero every page and mark it up to date.
+/// - anything else (a failed read): do nothing, leaving every page
+///   uninitialized for the next synchronous reader to re-read; dropping the
+///   locks unlocks the pages.
+///
+/// This deliberately duplicates the single-page closure rather than sharing code
+/// with it: the batched prefetch path must not perturb the established
+/// single-page read path.
+pub(crate) fn read_run_complete_fn(pages: Vec<LockedCachePage>) -> BioCompleteFn {
+    Box::new(move |status| {
+        match status {
+            BioStatus::Complete => {
+                for page in &pages {
+                    page.set_up_to_date();
+                }
+            }
+            BioStatus::Zeros => {
+                for page in &pages {
+                    page.fill_zeros(0, PAGE_SIZE).unwrap();
+                    page.set_up_to_date();
+                }
+            }
+            _ => {}
+        }
+        // The page locks are released as `pages` is dropped here.
+    })
 }
 
 impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
@@ -549,5 +635,10 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
         }
 
         res
+    }
+
+    fn read_pages_async_batch(&self, pages: Vec<(usize, LockedCachePage)>, io_batch: &mut IoBatch) {
+        // A block backend coalesces the run itself (see `submit_read_pages`).
+        self.submit_read_pages(pages, io_batch);
     }
 }

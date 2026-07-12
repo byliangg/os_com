@@ -781,6 +781,7 @@ impl<'a> BackedVmo<'a> {
         }
 
         let mut io_batch = IoBatch::with_capacity(pages_to_read.len());
+        let mut locked_pages = Vec::with_capacity(pages_to_read.len());
         for (idx, page) in pages_to_read {
             // Do not block on a page another task is already initializing;
             // prefetch is best-effort.
@@ -792,13 +793,17 @@ impl<'a> BackedVmo<'a> {
             if !locked_page.is_uninit() {
                 continue;
             }
-            // Swallow a submission error (e.g., `EINVAL` past a concurrent
-            // truncation): the page stays present and uninitialized, and the
-            // next reader re-reads it.
-            let _ = self
-                .backend
-                .read_page_async(idx, locked_page.into_owned(), &mut io_batch);
+            locked_pages.push((idx, locked_page.into_owned()));
         }
+
+        // Hand the whole locked batch to the backend in one call. A block-backed
+        // backend coalesces physically contiguous pages into multi-segment
+        // BIOs; the default backend forwards to per-page reads. Every per-page
+        // error is swallowed at the batch entry point (best-effort prefetch): an
+        // unread page stays present and uninitialized, and the next reader
+        // re-reads it.
+        self.backend
+            .read_pages_async_batch(locked_pages, &mut io_batch);
 
         // Wait for the whole batch. A completion error is swallowed for the
         // same reason: the failed page is left uninitialized and re-read on

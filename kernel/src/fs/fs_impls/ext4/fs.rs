@@ -876,6 +876,23 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Submits an asynchronous read that scatters a physically contiguous run
+    /// starting at `bid` across `segments` in one BIO — the multi-segment
+    /// counterpart of [`read_blocks_async`](Self::read_blocks_async), used by the
+    /// extent-map prefetch to coalesce a run of pages into a single device round
+    /// trip.
+    pub(super) fn read_segments_async(
+        &self,
+        bid: Ext4Bid,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        self.block_device
+            .read_segments_async(Bid::new(bid), segments, complete_fn, io_batch)?;
+        Ok(())
+    }
+
     /// Submits an asynchronous write of one or more blocks starting at `bid`.
     pub(super) fn write_blocks_async(
         &self,

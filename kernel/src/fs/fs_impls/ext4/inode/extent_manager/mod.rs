@@ -15,10 +15,17 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use aster_block::bio::BioDirection;
+// `Segment` is re-exported by the module prelude only under `ktest`; the
+// prefetch override below needs it in production builds too.
+#[cfg(not(ktest))]
+use ostd::mm::Segment;
+
 use super::{
     super::{checksum::InodeCsumSeed, journal, prelude::*},
     RAW_BLOCK_PTRS_LEN,
 };
+use crate::vm::page_cache::{LockedCachePage, read_run_complete_fn};
 
 mod node;
 mod path;
@@ -728,6 +735,13 @@ struct PlannedHole {
     goal: Option<Ext4Bid>,
 }
 
+/// The largest number of page-sized segments packed into one prefetch read BIO.
+/// The virtio block queue refuses a BIO once its segment count reaches the
+/// device's per-BIO limit (`QUEUE_SIZE - 2`, currently 62), so a run is kept
+/// strictly below it; a longer physically contiguous extent is issued as several
+/// back-to-back BIOs (the request queue may still merge adjacent ones).
+const MAX_RUN_SEGMENTS: usize = 61;
+
 impl BlockAsPageCacheBackend for ExtentManager {
     fn submit_read_bio(
         &self,
@@ -783,6 +797,113 @@ impl BlockAsPageCacheBackend for ExtentManager {
             Mapping::Hole { .. } => self.allocate_one(iblock)?,
         };
         fs.write_blocks_async(pblock, bio_segment, Some(complete_fn), io_batch)
+    }
+
+    /// Coalesces a batched prefetch into as few BIOs as the extent map allows.
+    ///
+    /// `pages` is `(page index, locked uninitialized page)` sorted ascending but
+    /// possibly with gaps (already-cached pages the caller skipped). Each maximal
+    /// run of input-consecutive pages that maps to a physically contiguous
+    /// written extent becomes one multi-segment read BIO (split at the per-BIO
+    /// segment cap); an unwritten extent or a hole reads as zeros and is filled
+    /// in process context with no device I/O. A gap in the input, a physical
+    /// discontinuity, or a mapping-kind change all break a run.
+    ///
+    /// Best-effort like the single-page path: an out-of-bounds page, a mapping
+    /// error, or a submission failure just leaves the page(s) uninitialized for
+    /// the next synchronous reader to re-read.
+    ///
+    /// Lock discipline: this is called on the prefetch path with no inode `inner`
+    /// held. It only consults the extent tree (via `map_blocks`, which takes the
+    /// tree read lock) and submits through the fs read funnel — never the journal
+    /// write funnel, never `inner`.
+    fn submit_read_pages(&self, pages: Vec<(usize, LockedCachePage)>, io_batch: &mut IoBatch) {
+        let Ok(fs) = self.fs() else {
+            // Filesystem dropped: dropping `pages` releases every page lock,
+            // leaving them uninitialized for on-demand re-read.
+            return;
+        };
+        let npages = self.npages.load(Ordering::Acquire);
+        let mut pages = pages.into_iter().peekable();
+
+        while let Some((start_idx, first_page)) = pages.next() {
+            // Out-of-bounds guard, mirroring `submit_read_bio`'s EINVAL: dropping
+            // `first_page` here leaves the page uninitialized.
+            if start_idx >= npages {
+                continue;
+            }
+            let Ok(iblock) = Iblock::try_from(start_idx) else {
+                continue;
+            };
+            let Ok(mapping) = self.map_blocks(iblock) else {
+                continue;
+            };
+
+            match mapping {
+                Mapping::Mapped {
+                    pblock,
+                    len,
+                    written: true,
+                } => {
+                    // A device-backed run: physically contiguous for `len` blocks
+                    // from `pblock`, capped by the per-BIO segment ceiling.
+                    // Extend it only across input-consecutive pages — a gap would
+                    // break both the segment layout and the physical contiguity.
+                    let cap = (len as usize).min(MAX_RUN_SEGMENTS);
+                    let mut segments = Vec::with_capacity(cap);
+                    let mut run_pages = Vec::with_capacity(cap);
+                    segments.push(BioSegment::new_from_segment(
+                        Segment::from(first_page.deref().clone()).into(),
+                        BioDirection::FromDevice,
+                    ));
+                    run_pages.push(first_page);
+                    let mut next_idx = start_idx + 1;
+                    while run_pages.len() < cap
+                        && pages.peek().is_some_and(|&(idx, _)| idx == next_idx)
+                    {
+                        let (_, page) = pages.next().unwrap();
+                        segments.push(BioSegment::new_from_segment(
+                            Segment::from(page.deref().clone()).into(),
+                            BioDirection::FromDevice,
+                        ));
+                        run_pages.push(page);
+                        next_idx += 1;
+                    }
+                    // On a submission error the BIO drops both `segments` and the
+                    // completion callback without invoking it, so the run's page
+                    // locks are released and the pages stay uninitialized — the
+                    // next reader re-reads them.
+                    let complete_fn = read_run_complete_fn(run_pages);
+                    let _ = fs.read_segments_async(pblock, segments, Some(complete_fn), io_batch);
+                }
+                Mapping::Mapped {
+                    written: false,
+                    len,
+                    ..
+                } => {
+                    // Preallocated-unwritten: reads as zeros with no device I/O.
+                    // Gather the input-consecutive pages the mapping covers and
+                    // apply the zero transition in place (reusing the shared
+                    // completion helper, which fills and marks them up to date).
+                    let run_end = start_idx.saturating_add(len as usize);
+                    let mut run_pages = vec![first_page];
+                    let mut next_idx = start_idx + 1;
+                    while next_idx < run_end
+                        && pages.peek().is_some_and(|&(idx, _)| idx == next_idx)
+                    {
+                        run_pages.push(pages.next().unwrap().1);
+                        next_idx += 1;
+                    }
+                    read_run_complete_fn(run_pages)(BioStatus::Zeros);
+                }
+                Mapping::Hole { .. } => {
+                    // A hole reads as zeros; the mapping reports one block at a
+                    // time, so fill just this page (the next hole page maps on its
+                    // own next iteration).
+                    read_run_complete_fn(vec![first_page])(BioStatus::Zeros);
+                }
+            }
+        }
     }
 }
 
