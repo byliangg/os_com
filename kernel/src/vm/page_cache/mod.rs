@@ -283,10 +283,13 @@ impl PageCache {
     ///
     /// This is a best-effort optimization for sequential reads: it populates
     /// absent or uninitialized pages in the range from the backend in one
-    /// batched submission, leaving already-cached pages untouched. Any error
-    /// is swallowed — a page left uninitialized is transparently re-read by the
-    /// next synchronous reader — so this returns `Ok` unless a page allocation
-    /// fails. Prefetched pages are clean (`UpToDate`), so a later
+    /// batched submission, leaving already-cached pages untouched. The call
+    /// returns once the reads are *submitted*, not completed — a reader that
+    /// reaches a page still in flight waits on that page through the normal
+    /// commit path, so readers only ever block on the pages they need. Any
+    /// error is swallowed — a page left uninitialized is transparently re-read
+    /// by the next synchronous reader — so this returns `Ok` unless a page
+    /// allocation fails. Prefetched pages are clean (`UpToDate`), so a later
     /// [`PageCache::flush_range`] over the same range writes nothing back.
     ///
     /// The range is clamped to the current page-cache capacity; the portion

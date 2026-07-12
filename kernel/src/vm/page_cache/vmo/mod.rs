@@ -805,10 +805,14 @@ impl<'a> BackedVmo<'a> {
         self.backend
             .read_pages_async_batch(locked_pages, &mut io_batch);
 
-        // Wait for the whole batch. A completion error is swallowed for the
-        // same reason: the failed page is left uninitialized and re-read on
-        // demand.
-        let _ = io_batch.wait_all();
+        // Fire and forget: dropping the batch does not cancel the submitted
+        // reads — each BIO owns its segments and completion callback, and the
+        // callback releases the page locks. A reader that reaches a page still
+        // in flight blocks on that page's lock through the normal
+        // `WaitUntilInit` path and wakes when its read completes, so readers
+        // only ever wait for the pages they actually need while the rest of
+        // the window fills in the background.
+        drop(io_batch);
         Ok(())
     }
 

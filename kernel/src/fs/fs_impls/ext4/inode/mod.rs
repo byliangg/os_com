@@ -833,35 +833,53 @@ impl RaState {
 
     /// Records a read of `len` bytes at byte `offset` and returns the
     /// page-aligned byte range to prefetch now, or `None` if this stream's
-    /// frontier already covers it.
+    /// frontier still has enough runway.
     ///
     /// A read whose starting page lands within one page of `next_expected_page`
-    /// is sequential: the candidate range is `[offset, offset + len + window)`
-    /// (the request plus a look-ahead) and the window doubles for the next hit
-    /// (capped at [`RA_MAX`]). Any other read (including the first) is a miss:
-    /// the window resets to [`RA_MIN`], the frontier restarts at this read's
-    /// page, and the candidate covers the request alone — still batching a
-    /// large request, but never inflating a random 4K read into a whole
-    /// window (Linux's on-demand readahead makes the same distinction). Only
-    /// the part of the candidate past the already-issued frontier is returned.
+    /// is sequential. A sequential stream extends its prefetch frontier in
+    /// window-sized chunks with hysteresis: only when the remaining runway
+    /// (frontier minus the read's end) falls below half the window does the
+    /// frontier jump forward by a whole window — and the window then doubles
+    /// (capped at [`RA_MAX`]) for the next extension. Chunking is what keeps
+    /// the device efficient: extending the frontier on every read would trickle
+    /// out one `bs`-sized BIO per call, resurrecting the per-request wall this
+    /// detector exists to amortize.
+    ///
+    /// Any other read (including the first) is a miss: the window resets to
+    /// [`RA_MIN`], the frontier restarts at this read's page, and the candidate
+    /// covers the request alone — still batching a large request, but never
+    /// inflating a random 4K read into a whole window (Linux's on-demand
+    /// readahead makes the same distinction). Only the part of the candidate
+    /// past the already-issued frontier is returned.
     fn on_read(&mut self, offset: usize, len: usize) -> Option<Range<usize>> {
         let cur_page = offset / PAGE_SIZE;
         let sequential = self
             .next_expected_page
             .is_some_and(|expected| cur_page.abs_diff(expected) <= 1);
-        let lookahead = if sequential {
-            let lookahead = self.window;
+        self.next_expected_page = Some((offset + len) / PAGE_SIZE);
+        let end_page = offset.saturating_add(len).div_ceil(PAGE_SIZE);
+
+        let candidate_end_page = if sequential {
+            let runway_pages = self.prefetched_until.saturating_sub(end_page);
+            if runway_pages * PAGE_SIZE >= self.window / 2 {
+                // Plenty of runway: everything this read needs is already
+                // issued (or will be found cached); do not trickle.
+                return None;
+            }
+            // Runway is low: extend past both the frontier and this request by
+            // a whole window, then grow the window for the next extension.
+            let extended = self
+                .prefetched_until
+                .max(end_page)
+                .saturating_add(self.window / PAGE_SIZE);
             self.window = (self.window * 2).min(RA_MAX);
-            lookahead
+            extended
         } else {
             self.window = RA_MIN;
             self.prefetched_until = cur_page;
-            0
+            end_page
         };
-        self.next_expected_page = Some((offset + len) / PAGE_SIZE);
 
-        let candidate_end = offset.saturating_add(len).saturating_add(lookahead);
-        let candidate_end_page = candidate_end.div_ceil(PAGE_SIZE);
         let start_page = cur_page.max(self.prefetched_until);
         if start_page >= candidate_end_page {
             return None;
@@ -3354,21 +3372,40 @@ mod tests {
         }
     }
 
-    /// Consecutive sequential reads double the window until it saturates at the
-    /// maximum.
+    /// A long sequential stream extends the frontier in window-sized chunks
+    /// (doubling the window per extension up to the maximum), and between
+    /// extensions it requests nothing — no per-read trickle.
     #[ktest]
     fn ra_state_sequential_hits_double_window_to_max() {
         let mut ra = RaState::cold();
-        ra.on_read(0, PAGE_SIZE); // miss -> window = RA_MIN
-        let mut expected = RA_MIN;
+        ra.on_read(0, PAGE_SIZE); // miss -> window = RA_MIN, frontier = 1 page
+
+        let mut frontier = PAGE_SIZE;
+        let mut extensions = 0;
         let mut offset = PAGE_SIZE;
-        for _ in 0..6 {
-            ra.on_read(offset, PAGE_SIZE);
-            expected = (expected * 2).min(RA_MAX);
-            assert_eq!(ra.window, expected);
+        // Scan far enough to saturate the window at RA_MAX.
+        for _ in 0..4096 {
+            if let Some(range) = ra.on_read(offset, PAGE_SIZE) {
+                // Every extension continues exactly at the issued frontier and
+                // never walks backwards.
+                assert_eq!(range.start, frontier);
+                assert!(range.end > range.start);
+                frontier = range.end;
+                extensions += 1;
+            }
             offset += PAGE_SIZE;
         }
-        assert_eq!(ra.window, RA_MAX);
+
+        assert_eq!(ra.window, RA_MAX, "the window must saturate at the cap");
+        // Chunked, not trickled: consuming 16 MiB with a window growing
+        // 256K -> 2M takes a handful of extensions, far fewer than one per
+        // read.
+        assert!(
+            extensions < 32,
+            "expected chunked frontier extensions, got {extensions}"
+        );
+        // The frontier keeps a look-ahead beyond everything read so far.
+        assert!(frontier >= offset);
     }
 
     /// A non-sequential jump resets the window to the minimum and restarts the
