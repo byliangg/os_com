@@ -172,6 +172,21 @@ impl MockPageCacheBackend {
         }
     }
 
+    /// Sets whether write-BIO submission for `page_idx` fails with `EIO` — the
+    /// write twin of [`set_read_submit_failure`](Self::set_read_submit_failure).
+    ///
+    /// A failing submission returns before any BIO is queued, modeling a
+    /// synchronous submit-time error, so writeback must re-dirty the page and
+    /// propagate the error.
+    pub(super) fn set_write_submit_failure(&self, page_idx: usize, fail: bool) {
+        let mut state = self.state.lock();
+        if fail {
+            state.write_submit_failures.insert(page_idx);
+        } else {
+            state.write_submit_failures.remove(&page_idx);
+        }
+    }
+
     /// Waits until the backend has queued `expected_count` deferred BIOs.
     ///
     /// Tests use this to freeze the backend at the "BIO submitted but not yet

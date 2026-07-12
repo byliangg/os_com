@@ -97,6 +97,31 @@ impl dyn BlockDevice {
         bio.submit(self, io_batch)
     }
 
+    /// Asynchronously writes several memory segments with one scatter/gather
+    /// BIO, starting from the `bid`.
+    ///
+    /// This is the multi-segment counterpart of [`write_blocks_async`], the write
+    /// twin of [`read_segments_async`]: instead of one segment it takes a whole
+    /// `Vec<BioSegment>`. The segments are laid out contiguously on the device
+    /// starting at `bid` — the first segment covers `bid`, the next the blocks
+    /// immediately after it, and so on — so a caller with a physically contiguous
+    /// run can drain several page snapshots in a single device round trip. The
+    /// per-BIO segment ceiling of the target device still applies; an over-long
+    /// run must be split by the caller.
+    ///
+    /// [`write_blocks_async`]: Self::write_blocks_async
+    /// [`read_segments_async`]: Self::read_segments_async
+    pub fn write_segments_async(
+        &self,
+        bid: Bid,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<(), BioEnqueueError> {
+        let bio = Bio::new(BioType::Write, Sid::from(bid), segments, complete_fn);
+        bio.submit(self, io_batch)
+    }
+
     /// Issues a sync request
     pub fn sync(&self) -> Result<BioStatus, BioEnqueueError> {
         let bio = Bio::new(BioType::Flush, Sid::from(Bid::from_offset(0)), vec![], None);

@@ -906,6 +906,23 @@ impl Ext4 {
         Ok(())
     }
 
+    /// Submits an asynchronous write that drains a physically contiguous run of
+    /// page snapshots starting at `bid` across `segments` in one BIO — the
+    /// multi-segment counterpart of
+    /// [`write_blocks_async`](Self::write_blocks_async), used by the extent-map
+    /// writeback to coalesce a run of dirty pages into a single device round trip.
+    pub(super) fn write_segments_async(
+        &self,
+        bid: Ext4Bid,
+        segments: Vec<BioSegment>,
+        complete_fn: Option<BioCompleteFn>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        self.block_device
+            .write_segments_async(Bid::new(bid), segments, complete_fn, io_batch)?;
+        Ok(())
+    }
+
     pub(super) fn this(&self) -> Weak<Ext4> {
         self.self_ref.clone()
     }

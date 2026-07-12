@@ -278,6 +278,24 @@ impl PageCache {
         vmo.flush_dirty_pages(&range)
     }
 
+    /// Writes back dirty pages in the specified byte range, coalescing physically
+    /// contiguous ones into multi-segment BIOs where the backend can.
+    ///
+    /// This is the batched sibling of [`flush_range`](Self::flush_range): same
+    /// contract (durable-on-return, `fsync` error propagation, caller holds the
+    /// filesystem-level lock; an out-of-range portion is ignored; an anonymous
+    /// cache is a no-op), the sole difference being that a block-backed backend
+    /// merges a physically contiguous run of dirty pages into one BIO instead of
+    /// one BIO per page. Because it still waits on the whole batch before
+    /// returning, any barrier a caller builds around it is preserved.
+    pub fn flush_range_batched(&self, range: Range<usize>) -> Result<()> {
+        let Some(vmo) = self.0.as_backed_vmo() else {
+            return Ok(());
+        };
+
+        vmo.flush_dirty_pages_batched(&range)
+    }
+
     /// Reads ahead the pages in the specified byte range from the backend into
     /// the page cache.
     ///
@@ -434,6 +452,38 @@ pub trait PageCacheBackend: Sync + Send {
             let _ = self.read_page_async(idx, page, io_batch);
         }
     }
+
+    /// Writes back a batch of dirty pages to the backend into `io_batch`,
+    /// coalescing the submission where the backend can.
+    ///
+    /// `pages` is a set of `(page index, dirty page)` pairs sorted by index but
+    /// possibly with gaps (a clean page between two dirty ones is skipped). This
+    /// is the batched entry point [`flush_dirty_pages`] uses. Unlike the prefetch
+    /// counterpart it is *not* best-effort: it carries `fsync` semantics, so the
+    /// first per-page submission error is propagated (the loop stops there, as
+    /// the single-page loop does with `?`) and the caller must still
+    /// [`IoBatch::wait_all`] and propagate any completion error.
+    ///
+    /// The default implementation locks and submits every page individually
+    /// through [`write_page_async`](Self::write_page_async), byte-for-byte the
+    /// pre-batch [`flush_dirty_pages`] loop, so a network filesystem and every
+    /// non-overriding backend keep exact single-page behavior. A backend that
+    /// knows its on-disk layout can override it to merge physically contiguous
+    /// pages into multi-segment BIOs (the block backends do so via
+    /// [`BlockAsPageCacheBackend::submit_write_pages`]).
+    ///
+    /// [`flush_dirty_pages`]: crate::vm::page_cache::vmo::BackedVmo::flush_dirty_pages
+    fn write_pages_async_batch(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        for (idx, page) in pages {
+            let locked_page = page.lock();
+            self.write_page_async(idx, locked_page, io_batch)?;
+        }
+        Ok(())
+    }
 }
 
 impl dyn PageCacheBackend {
@@ -523,6 +573,59 @@ pub trait BlockAsPageCacheBackend: Sync + Send {
             let _ = self.submit_read_bio(idx, bio_segment, complete_fn, io_batch);
         }
     }
+
+    /// Submits write I/O for a batch of dirty pages, coalescing physically
+    /// contiguous ones where the backend can.
+    ///
+    /// `pages` is `(page index, dirty page)` sorted by index, with gaps where a
+    /// clean page was skipped. This is the block-backed hook that the blanket
+    /// [`PageCacheBackend::write_pages_async_batch`] forwards to. It carries
+    /// `fsync` semantics, not the prefetch's best-effort one: the first
+    /// submission error is propagated (re-dirtying the page it failed to queue,
+    /// as the single-page path does), and the caller waits on the batch and
+    /// propagates any completion error.
+    ///
+    /// The default implementation locks each page and reproduces the single-page
+    /// [`write_page_async`](PageCacheBackend::write_page_async) state machine —
+    /// wait out any in-flight writeback, snapshot the page into a fresh to-device
+    /// DMA segment, mark it writing-back and up-to-date, then submit one
+    /// single-page BIO whose completion is the shared [`write_run_complete_fn`]
+    /// over just this page. A backend that knows its on-device layout (e.g.
+    /// ext4's extent map) overrides it to merge a physically contiguous run into
+    /// one multi-segment BIO.
+    fn submit_write_pages(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        for (idx, page) in pages {
+            let locked_page = page.lock();
+            locked_page.wait_until_finish_writing_back();
+
+            let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
+            bio_segment
+                .writer()
+                .unwrap()
+                .write(&mut locked_page.reader());
+
+            locked_page.set_writing_back();
+            locked_page.set_up_to_date();
+
+            let page = locked_page.unlock();
+            let complete_fn = write_run_complete_fn(vec![(idx, page.clone())]);
+            let res = self.submit_write_bio(idx, bio_segment, complete_fn, io_batch);
+            if let Err(e) = res {
+                // Submission failed: re-dirty the page so the next writeback can
+                // retry the data that never reached the device queue, then
+                // propagate the first error (fsync must not report success).
+                let locked_page = page.lock();
+                locked_page.set_dirty();
+                locked_page.clear_writing_back();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Builds the completion callback for a batched run of prefetch reads that share
@@ -562,6 +665,44 @@ pub(crate) fn read_run_complete_fn(pages: Vec<LockedCachePage>) -> BioCompleteFn
             _ => {}
         }
         // The page locks are released as `pages` is dropped here.
+    })
+}
+
+/// Builds the completion callback for a batched run of writeback writes that
+/// share one BIO.
+///
+/// `pages` is the run's `(page index, page)` pairs. The pages were already
+/// unlocked before submission (their stable snapshots live in the BIO's
+/// segments), so the returned callback runs in interrupt context touching only
+/// atomics and a log — no allocation, no blocking lock — and applies to *every*
+/// page in the run the same completion transition the single-page write
+/// callback in [`write_page_async`](PageCacheBackend::write_page_async) applies
+/// to its one page:
+///
+/// - clear the writing-back flag (waking anyone blocked in
+///   [`LockedCachePage::wait_until_finish_writing_back`]) regardless of status;
+/// - on a non-[`BioStatus::Complete`] status log the failure and, following
+///   Linux, deliberately do *not* re-dirty — a persistent device fault must not
+///   spin writeback forever; the data is considered lost and a later sync
+///   syscall is expected to surface the error the caller propagates from
+///   [`IoBatch::wait_all`].
+///
+/// This deliberately duplicates the single-page closure rather than sharing
+/// code with it: the batched writeback path must not perturb the established
+/// single-page write path.
+pub(crate) fn write_run_complete_fn(pages: Vec<(usize, CachePage)>) -> BioCompleteFn {
+    Box::new(move |status| {
+        for (idx, page) in &pages {
+            page.clear_writing_back();
+            if status != BioStatus::Complete {
+                // TODO: Record the writeback error (e.g., EIO) in the VMO
+                // (or the corresponding inode) so that a subsequent sync syscall
+                // can detect and report it to userspace.
+                ostd::error!(
+                    "writeback I/O failed for page index {idx} with status {status:?}; data may be lost"
+                );
+            }
+        }
     })
 }
 
@@ -643,5 +784,14 @@ impl<T: BlockAsPageCacheBackend> PageCacheBackend for T {
     fn read_pages_async_batch(&self, pages: Vec<(usize, LockedCachePage)>, io_batch: &mut IoBatch) {
         // A block backend coalesces the run itself (see `submit_read_pages`).
         self.submit_read_pages(pages, io_batch);
+    }
+
+    fn write_pages_async_batch(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        // A block backend coalesces the run itself (see `submit_write_pages`).
+        self.submit_write_pages(pages, io_batch)
     }
 }

@@ -597,3 +597,137 @@ fn prefetch_failure_leaves_page_for_retry() {
     page_cache.read_bytes(0, &mut read_buffer).unwrap();
     assert_eq!(read_buffer, vec![0x55; PAGE_SIZE]);
 }
+
+/// Batched writeback persists every dirty page byte-for-byte, exactly as the
+/// per-page `flush_range` would. The mock backend caps a BIO at one segment, so
+/// this exercises the default per-page fan-out of the batched path (the
+/// multi-segment run merge is device-specific and covered end-to-end in ext4).
+#[ktest]
+fn flush_batched_persists_all_dirty_pages() {
+    const NPAGES: usize = 5;
+    let backend = MockPageCacheBackend::new(NPAGES);
+    let page_cache = new_backend_page_cache(&backend, NPAGES);
+
+    let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+    for p in 0..NPAGES {
+        written[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill(0x10 + p as u8);
+    }
+    page_cache.write_bytes(0, &written).unwrap();
+
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+
+    // Every page is persisted once, byte-for-byte.
+    for p in 0..NPAGES {
+        assert_eq!(backend.write_count(p), 1);
+        assert_eq!(
+            backend.persisted_page_bytes(p),
+            written[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].to_vec()
+        );
+    }
+
+    // The pages are now clean: a second batched flush writes nothing back.
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+    for p in 0..NPAGES {
+        assert_eq!(backend.write_count(p), 1);
+    }
+}
+
+/// A clean page between dirty ones is a gap in the collected batch: the batched
+/// flush skips it (never writing it) and persists the surrounding dirty pages.
+#[ktest]
+fn flush_batched_skips_clean_gap() {
+    const NPAGES: usize = 5;
+    let backend = MockPageCacheBackend::new(NPAGES);
+    let page_cache = new_backend_page_cache(&backend, NPAGES);
+
+    // Dirty pages 0, 1, 3, 4 with full-page writes; page 2 is never touched, so
+    // it is absent from the cache — a gap the collection skips.
+    let pattern = |p: usize| vec![0x20 + p as u8; PAGE_SIZE];
+    page_cache.write_bytes(0, &pattern(0)).unwrap();
+    page_cache.write_bytes(PAGE_SIZE, &pattern(1)).unwrap();
+    page_cache.write_bytes(3 * PAGE_SIZE, &pattern(3)).unwrap();
+    page_cache.write_bytes(4 * PAGE_SIZE, &pattern(4)).unwrap();
+
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+
+    // The gap page was never written; the others persisted correctly.
+    assert_eq!(backend.write_count(2), 0);
+    assert_eq!(backend.persisted_page_bytes(2), vec![0u8; PAGE_SIZE]);
+    for p in [0, 1, 3, 4] {
+        assert_eq!(backend.write_count(p), 1);
+        assert_eq!(backend.persisted_page_bytes(p), pattern(p));
+    }
+}
+
+/// A batched flush whose backend write submission fails propagates the error
+/// (fsync must not lie), re-dirties the page it could not queue, stops there
+/// (later pages stay dirty), and leaves the pages before it persisted — byte
+/// for byte the per-page `flush_range` behavior. Recovering the backend and
+/// re-flushing then persists everything.
+#[ktest]
+fn flush_batched_propagates_submit_error_and_redirties() {
+    const NPAGES: usize = 3;
+    let backend = MockPageCacheBackend::new(NPAGES);
+    let page_cache = new_backend_page_cache(&backend, NPAGES);
+
+    let pattern = |p: usize| vec![0x30 + p as u8; PAGE_SIZE];
+    for p in 0..NPAGES {
+        page_cache.write_bytes(p * PAGE_SIZE, &pattern(p)).unwrap();
+    }
+
+    // Fail the write submission for the middle page.
+    backend.set_write_submit_failure(1, true);
+    let result = page_cache.flush_range_batched(0..NPAGES * PAGE_SIZE);
+    assert!(result.is_err());
+
+    // Page 0 (before the failure) is persisted; page 1's data never reached the
+    // backend; page 2 (after the failure) was never submitted.
+    assert_eq!(backend.write_count(0), 1);
+    assert_eq!(backend.persisted_page_bytes(0), pattern(0));
+    assert_eq!(backend.persisted_page_bytes(1), vec![0u8; PAGE_SIZE]);
+    assert_eq!(backend.write_count(2), 0);
+
+    // Recover and re-flush: the re-dirtied page 1 and the untouched page 2 are
+    // both collected and persisted; page 0 is clean, so it is not rewritten.
+    backend.set_write_submit_failure(1, false);
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+    assert_eq!(backend.write_count(0), 1);
+    for p in 0..NPAGES {
+        assert_eq!(backend.persisted_page_bytes(p), pattern(p));
+    }
+}
+
+/// A batched flush over a range with no dirty pages is a no-op: it submits no
+/// writes and returns `Ok`.
+#[ktest]
+fn flush_batched_all_clean_is_noop() {
+    const NPAGES: usize = 4;
+    let backend = MockPageCacheBackend::new(NPAGES);
+    let page_cache = new_backend_page_cache(&backend, NPAGES);
+
+    // Dirty then flush so every page is clean (UpToDate) going in.
+    let all = vec![0x7e; NPAGES * PAGE_SIZE];
+    page_cache.write_bytes(0, &all).unwrap();
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+    for p in 0..NPAGES {
+        assert_eq!(backend.write_count(p), 1);
+    }
+
+    // A second batched flush over the same clean range writes nothing.
+    page_cache
+        .flush_range_batched(0..NPAGES * PAGE_SIZE)
+        .unwrap();
+    for p in 0..NPAGES {
+        assert_eq!(backend.write_count(p), 1);
+    }
+}

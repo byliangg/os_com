@@ -587,7 +587,11 @@ pub(super) fn try_commit_transaction(
     // holding its `inner.write()`, waiting on this very commit.
     let mut flushed_any = false;
     for (pages, len) in txn.ordered_data() {
-        pages.flush_range(0..len)?;
+        // Batched writeback: coalesce each ordered inode's physically contiguous
+        // dirty data into multi-segment BIOs. The explicit `barrier` below is
+        // unchanged, so "data durable before metadata" holds exactly as before —
+        // `flush_range_batched` still waits on the whole batch before returning.
+        pages.flush_range_batched(0..len)?;
         flushed_any = true;
     }
     if flushed_any {

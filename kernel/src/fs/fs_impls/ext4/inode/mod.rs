@@ -2786,7 +2786,10 @@ impl InodeInner {
     fn prepare_shrink(&mut self, new_size: usize, old_size: usize) -> Result<()> {
         if let Ok(page_cache) = self.page_cache() {
             let doomed_start = (new_size / BLOCK_SIZE) * BLOCK_SIZE;
-            page_cache.flush_range(doomed_start..old_size)?;
+            // Batched writeback of the doomed tail — file data, same barrier
+            // (durable-on-return) as `flush_range` so the crash-safety obligation
+            // documented above is preserved.
+            page_cache.flush_range_batched(doomed_start..old_size)?;
         }
         self.resize_page_cache(new_size, old_size)?;
         self.set_file_size(new_size);
@@ -3086,7 +3089,13 @@ impl InodeInner {
             return Ok(());
         }
         match &self.payload {
-            InodePayload::DataBacked { page_cache, .. } => page_cache.flush_range(0..file_size),
+            // Batched writeback: coalesce physically contiguous dirty pages into
+            // multi-segment BIOs. Same durable-on-return / fsync error contract as
+            // `flush_range`; only file data reaches here (journaled directory
+            // blocks returned early above).
+            InodePayload::DataBacked { page_cache, .. } => {
+                page_cache.flush_range_batched(0..file_size)
+            }
             _ => Ok(()),
         }
     }
@@ -5667,6 +5676,87 @@ mod write_tests {
         let page_cache = inode.page_cache().unwrap();
         page_cache.invalidate_range(0..expected.len()).unwrap();
         page_cache.prefetch_range(0..expected.len()).unwrap();
+
+        assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
+
+    /// Write-side run merging — a run longer than one BIO can hold: an 80-page
+    /// contiguous extent exceeds the per-BIO segment cap, so the batched flush
+    /// splits it into back-to-back multi-segment write BIOs. Flushing through the
+    /// batched path, dropping the now-clean pages, and reading straight from disk
+    /// returns every byte correctly.
+    #[ktest]
+    fn flush_batched_run_exceeding_bio_segment_cap_round_trips() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NPAGES: usize = 80; // > the 61-segment per-BIO cap.
+        let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+        for p in 0..NPAGES {
+            written[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill(p as u8);
+        }
+        // Contiguous appends coalesce into one extent; write in small batches.
+        const BATCH: usize = 16;
+        let mut off = 0;
+        while off < written.len() {
+            let end = (off + BATCH * PAGE_SIZE).min(written.len());
+            write_all(&inode, off, &written[off..end]);
+            off = end;
+        }
+        // Sanity: a single contiguous extent spans the whole file, so the flush
+        // sees one physical run and must split it at the segment cap.
+        {
+            let inner = inode.inner.read();
+            assert_eq!(
+                inner.extent_manager().unwrap().map_blocks(0).unwrap().len(),
+                NPAGES as u32,
+                "the appends must coalesce into one extent to exercise the split"
+            );
+        }
+
+        let page_cache = inode.page_cache().unwrap();
+        // Flush through the batched path (the code under test), then drop the
+        // now-clean pages so the read reaches the device.
+        page_cache.flush_range_batched(0..written.len()).unwrap();
+        page_cache.evict_range(0..written.len()).unwrap();
+
+        assert_eq!(read_back(&inode, 0, written.len()), written);
+    }
+
+    /// Write-side run merging — a sparse file: data pages surround a hole, so the
+    /// batched flush collects two disjoint runs (a gap breaks a run) and skips the
+    /// hole pages entirely. After a batched flush + evict, the data pages read
+    /// back from disk correctly and the holes read back as zeros.
+    #[ktest]
+    fn flush_batched_sparse_file_round_trips() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Data at pages 0..2 and 5..7, holes at pages 2, 3, 4.
+        const NPAGES: usize = 7;
+        let mut expected = vec![0u8; NPAGES * PAGE_SIZE];
+        expected[0..2 * PAGE_SIZE].fill(0x71);
+        expected[5 * PAGE_SIZE..7 * PAGE_SIZE].fill(0x93);
+        write_all(&inode, 0, &expected[0..2 * PAGE_SIZE]);
+        write_all(
+            &inode,
+            5 * PAGE_SIZE,
+            &expected[5 * PAGE_SIZE..7 * PAGE_SIZE],
+        );
+
+        // Confirm the middle blocks really are holes: the flush must not touch
+        // them (they are not dirty pages), and they read back as zeros.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for blk in 2..5 {
+                assert_eq!(bm.map_blocks(blk).unwrap().state(), MapState::Hole);
+            }
+        }
+
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.flush_range_batched(0..expected.len()).unwrap();
+        page_cache.evict_range(0..expected.len()).unwrap();
 
         assert_eq!(read_back(&inode, 0, expected.len()), expected);
     }

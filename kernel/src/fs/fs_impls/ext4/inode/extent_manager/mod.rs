@@ -20,12 +20,17 @@ use aster_block::bio::BioDirection;
 // prefetch override below needs it in production builds too.
 #[cfg(not(ktest))]
 use ostd::mm::Segment;
+// The writeback override snapshots each page into a to-device segment, which
+// needs `reader`/`writer` from this trait (as the single-page write path does).
+use ostd::mm::io::util::HasVmReaderWriter;
 
 use super::{
     super::{checksum::InodeCsumSeed, journal, prelude::*},
     RAW_BLOCK_PTRS_LEN,
 };
-use crate::vm::page_cache::{LockedCachePage, read_run_complete_fn};
+use crate::vm::page_cache::{
+    CachePage, CachePageExt, LockedCachePage, read_run_complete_fn, write_run_complete_fn,
+};
 
 mod node;
 mod path;
@@ -904,6 +909,124 @@ impl BlockAsPageCacheBackend for ExtentManager {
                 }
             }
         }
+    }
+
+    /// Coalesces a batched writeback into as few BIOs as the extent map allows —
+    /// the write twin of [`submit_read_pages`](Self::submit_read_pages).
+    ///
+    /// `pages` is `(page index, dirty page)` sorted ascending but possibly with
+    /// gaps (clean pages the caller skipped). Each maximal run of
+    /// input-consecutive pages that maps to a physically contiguous written
+    /// extent is snapshotted into one multi-segment write BIO (split at the
+    /// per-BIO segment cap) with a single completion callback owning the run's
+    /// pages. A gap in the input, a physical discontinuity (a fresh mapping),
+    /// or the segment cap all break a run.
+    ///
+    /// A dirty page maps to a written extent in the steady state — the write path
+    /// converts unwritten-first and pre-allocates in `prepare_write`. The
+    /// remaining cases (an unwritten extent, a hole from an mmap-dirtied page, an
+    /// out-of-bounds index, or a mapping error) each fall back to one page through
+    /// the blanket single-page [`write_page_async`], which re-derives the mapping
+    /// (allocating a hole) and reproduces the exact single-page state machine —
+    /// never a silent drop.
+    ///
+    /// Unlike the best-effort prefetch, this carries `fsync` semantics: the first
+    /// submission error is propagated after re-dirtying the run it failed to queue
+    /// (the single-page submit-error arm), and the caller waits on the batch and
+    /// propagates any completion error.
+    ///
+    /// Lock discipline: only the extent tree (via `map_blocks`, tree read lock)
+    /// and the fs write-data funnel are touched — never the journal metadata
+    /// funnel, never the inode `inner`.
+    fn submit_write_pages(
+        &self,
+        pages: Vec<(usize, CachePage)>,
+        io_batch: &mut IoBatch,
+    ) -> Result<()> {
+        let fs = self.fs()?;
+        let npages = self.npages.load(Ordering::Acquire);
+        let mut pages = pages.into_iter().peekable();
+
+        while let Some((start_idx, first_page)) = pages.next() {
+            // Identify a physically contiguous *written* run starting here. Any
+            // other outcome routes this one page through the single-page path.
+            let run = (start_idx < npages)
+                .then(|| Iblock::try_from(start_idx).ok())
+                .flatten()
+                .and_then(|iblock| self.map_blocks(iblock).ok())
+                .and_then(|mapping| match mapping {
+                    Mapping::Mapped {
+                        pblock,
+                        len,
+                        written: true,
+                    } => Some((pblock, len)),
+                    _ => None,
+                });
+
+            let Some((pblock, len)) = run else {
+                // Single-page fallback (hole / unwritten / out-of-bounds / mapping
+                // error): the blanket write path re-derives the mapping through
+                // `submit_write_bio` — allocating for an mmap-dirtied hole — and
+                // reproduces the single-page failure/completion semantics exactly.
+                let locked_page = first_page.lock();
+                <Self as PageCacheBackend>::write_page_async(
+                    self,
+                    start_idx,
+                    locked_page,
+                    io_batch,
+                )?;
+                continue;
+            };
+
+            // Gather the run's input-consecutive pages, capped by the per-BIO
+            // segment ceiling and the extent's contiguous length. A gap breaks the
+            // run: a skipped page would break both the segment layout and the
+            // physical contiguity (page `start_idx + k` maps to `pblock + k`).
+            let cap = (len as usize).min(MAX_RUN_SEGMENTS);
+            let mut run_input: Vec<(usize, CachePage)> = Vec::with_capacity(cap);
+            run_input.push((start_idx, first_page));
+            let mut next_idx = start_idx + 1;
+            while run_input.len() < cap && pages.peek().is_some_and(|&(idx, _)| idx == next_idx) {
+                run_input.push(pages.next().unwrap());
+                next_idx += 1;
+            }
+
+            // Snapshot each page into its own to-device DMA segment — the blanket
+            // single-page write's segment construction — driving the identical
+            // per-page state transitions (wait out in-flight writeback, snapshot,
+            // set writing-back, set up-to-date, unlock).
+            let mut segments = Vec::with_capacity(run_input.len());
+            let mut run_pages: Vec<(usize, CachePage)> = Vec::with_capacity(run_input.len());
+            for (idx, page) in run_input {
+                let locked_page = page.lock();
+                locked_page.wait_until_finish_writing_back();
+                let bio_segment = BioSegment::alloc(1, BioDirection::ToDevice);
+                bio_segment
+                    .writer()
+                    .unwrap()
+                    .write(&mut locked_page.reader());
+                locked_page.set_writing_back();
+                locked_page.set_up_to_date();
+                segments.push(bio_segment);
+                run_pages.push((idx, locked_page.unlock()));
+            }
+
+            // Submit the run as one BIO. On a submission error the BIO drops both
+            // `segments` and the completion callback without invoking it, so
+            // re-dirty every page in the run (the single-page submit-error arm)
+            // and propagate the first error — fsync must not report as durable a
+            // write it never queued.
+            let complete_fn = write_run_complete_fn(run_pages.clone());
+            if let Err(e) = fs.write_segments_async(pblock, segments, Some(complete_fn), io_batch) {
+                for (_, page) in &run_pages {
+                    let locked_page = page.lock_guard();
+                    locked_page.set_dirty();
+                    locked_page.clear_writing_back();
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 

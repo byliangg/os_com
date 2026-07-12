@@ -711,6 +711,38 @@ impl<'a> BackedVmo<'a> {
         io_batch.wait_all().map_err(Into::into)
     }
 
+    /// Writes back dirty pages in the specified byte range, coalescing physically
+    /// contiguous ones into multi-segment BIOs where the backend can.
+    ///
+    /// This is the batched sibling of [`flush_dirty_pages`](Self::flush_dirty_pages):
+    /// the collection (same `collect_pages_if` over the dirty pages), the per-page
+    /// locking, snapshot, and writing-back bookkeeping all happen exactly as the
+    /// per-page path does — the sole difference is that the whole collected batch
+    /// is handed to the backend in one [`write_pages_async_batch`] call, so a
+    /// block-backed backend can merge a physically contiguous run into one BIO
+    /// (the default backend forwards to per-page writes). Its `fsync` contract is
+    /// identical: the first submission error is propagated, then the batch is
+    /// awaited and any completion error propagated, so callers get the same
+    /// barrier and error semantics as [`flush_dirty_pages`](Self::flush_dirty_pages).
+    ///
+    /// [`write_pages_async_batch`]: crate::vm::page_cache::PageCacheBackend::write_pages_async_batch
+    pub(super) fn flush_dirty_pages_batched(&self, range: &Range<usize>) -> Result<()> {
+        let locked_pages = self.vmo.pages.lock();
+        if range.start >= self.size() {
+            return Ok(());
+        }
+
+        let page_idx_range = get_page_idx_range(range);
+        let dirty_pages =
+            self.collect_pages_if(locked_pages, page_idx_range, |_, page| page.is_dirty());
+
+        let mut io_batch = IoBatch::with_capacity(dirty_pages.len());
+        self.backend
+            .write_pages_async_batch(dirty_pages, &mut io_batch)?;
+
+        io_batch.wait_all().map_err(Into::into)
+    }
+
     /// Reads ahead the pages in the specified byte range from the backend into
     /// the page cache in a single batched submission.
     ///
