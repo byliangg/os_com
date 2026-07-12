@@ -33,6 +33,9 @@
 //! while syncing an inode (`sync_inodes` clones the `Arc`s out and drops the read
 //! lock first).
 
+use aster_block::bio::BioDirection;
+use ostd::mm::io::util::HasVmReaderWriter;
+
 use super::{
     checksum::{self, InodeCsumSeed},
     fs::{Ext4, OrphanLink},
@@ -1113,6 +1116,63 @@ impl Inode {
             }
         }
         self.inner.read().read_at(offset, writer)
+    }
+
+    /// Reads file data at `offset` bypassing the page cache (`O_DIRECT`).
+    ///
+    /// This port's `O_DIRECT` is a *copy-out*, not a page-frame handoff: the
+    /// read funnels the same [`map_blocks`](ExtentManager::map_blocks) the
+    /// buffered path uses, DMAs each physically contiguous written run straight
+    /// from the device into a freshly allocated buffer, and copies the bytes out
+    /// to `writer`. Holes and preallocated-unwritten extents read as zeros with
+    /// no device I/O.
+    ///
+    /// `offset` and the buffer length must both be filesystem-block-aligned (the
+    /// constraint Linux's `ext4_dio_supported` enforces); an unaligned request is
+    /// rejected `EINVAL` rather than silently served from the cache. The read is
+    /// clamped to `i_size`.
+    ///
+    /// Coherency: overlapping dirty pages are flushed to the device *before* the
+    /// device read, so a preceding buffered write is visible even without an
+    /// intervening `fsync`. The flush runs before the inner read lock is taken:
+    /// the outer [`page_cache`](Self::page_cache) accessor briefly takes `inner`,
+    /// so flushing under the lock would nest the leaf lock — the same reason the
+    /// buffered [`read_at`](Self::read_at) drops the read-ahead lock before
+    /// `page_cache`. The read-ahead detector is deliberately *not* fed here: a
+    /// direct read must not perturb the sequential-stream state the buffered
+    /// path tracks.
+    pub(super) fn read_direct_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        let avail = writer.avail();
+        if !is_block_aligned(offset) || !is_block_aligned(avail) {
+            // No unaligned fallback yet (Linux would buffer-copy the ragged
+            // head/tail block); reject like ext2's direct path.
+            return_errno_with_message!(Errno::EINVAL, "O_DIRECT read is not block-aligned");
+        }
+        if avail == 0 {
+            return Ok(0);
+        }
+        let fs = self.fs()?;
+
+        // Size the flush from a preliminary EOF read; the authoritative clamp
+        // happens under the read lock below. An out-of-range flush portion is
+        // ignored, so a truncate racing between here and the lock is harmless.
+        let file_size = self.inner.read().file_size();
+        if offset >= file_size {
+            return Ok(0);
+        }
+        let flush_end = offset + avail.min(file_size - offset);
+        if let Some(page_cache) = self.page_cache() {
+            page_cache.flush_range(offset..flush_end)?;
+        }
+
+        // The read lock spans map + DMA + copy so a concurrent write/truncate
+        // cannot re-map the run mid-read. Only the extent-tree lock (via
+        // `map_blocks`) and the device read funnel are touched under it — never
+        // the journal write funnel.
+        self.inner.read().read_direct_at(&fs, offset, writer)
     }
 
     /// Writes file data at `offset` through the inode's page cache.
@@ -2390,6 +2450,32 @@ impl Drop for Inode {
     }
 }
 
+/// The most blocks one `O_DIRECT` read DMAs into a single contiguous device
+/// buffer (1 MiB at a 4-KiB block). A physically contiguous run longer than
+/// this is issued as several back-to-back BIOs rather than demanding one giant
+/// contiguous frame allocation — the same "don't allocate one huge buffer"
+/// discipline the buffered prefetch path applies with its per-BIO segment cap.
+const DIRECT_MAX_RUN_BLOCKS: usize = 256;
+
+/// One logical segment of an `O_DIRECT` read, laid out in file order: either a
+/// device buffer already submitted for a written run, or a span that reads as
+/// zeros (a hole or a preallocated-unwritten extent) with no device I/O. The
+/// read collects a plan of these, waits on every submitted BIO once, then
+/// copies each segment out in order (see [`InodeInner::read_direct_blocks`]).
+enum DirectRun {
+    /// A written run: its DMA buffer, submitted to the batch, is copied out once
+    /// the batch completes.
+    Data(BioSegment),
+    /// A hole / unwritten run of this many bytes, filled with zeros.
+    Zeros(usize),
+}
+
+/// Whether `value` (a byte offset or length) is a whole number of filesystem
+/// blocks — the alignment `O_DIRECT` requires of its offset and buffer length.
+fn is_block_aligned(value: usize) -> bool {
+    value.is_multiple_of(BLOCK_SIZE)
+}
+
 /// The outcome of one [`write_bounded_chunk`](InodeInner::write_bounded_chunk):
 /// the chunk mapped, wrote, and converted a prefix of the remaining range, or it
 /// could not fit even the first insert into the current transaction.
@@ -2477,6 +2563,108 @@ impl InodeInner {
         writer.limit(read_len);
         self.page_cache()?.read(offset, writer)?;
         Ok(read_len)
+    }
+
+    /// Direct read under the inode read lock: clamps to `i_size`, then maps the
+    /// range and DMAs its written runs while zero-filling holes and unwritten
+    /// extents. The caller ([`Inode::read_direct_at`]) has already flushed the
+    /// overlapping page range, so the device holds the latest bytes.
+    fn read_direct_at(&self, fs: &Ext4, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        let file_size = self.file_size();
+        if offset >= file_size || writer.avail() == 0 {
+            return Ok(0);
+        }
+        let read_len = writer.avail().min(file_size - offset);
+        writer.limit(read_len);
+        let end = offset + read_len;
+        self.read_direct_blocks(fs, offset, end, writer)?;
+        Ok(read_len)
+    }
+
+    /// Maps `[offset, end)` to physical runs and reads them directly into
+    /// `writer` (`offset` is block-aligned; `end` is clamped to `i_size` and may
+    /// end mid-block). Every device read for the range is submitted into one
+    /// [`IoBatch`] and awaited once; the bytes are then copied out in file order.
+    /// A written run DMAs from the device — split so a single contiguous buffer
+    /// never exceeds [`DIRECT_MAX_RUN_BLOCKS`] — while a hole or unwritten extent
+    /// contributes zeros with no device I/O. The `writer` was limited to the
+    /// clamped length by the caller, so a partial tail block copies only its
+    /// in-file bytes.
+    fn read_direct_blocks(
+        &self,
+        fs: &Ext4,
+        offset: usize,
+        end: usize,
+        writer: &mut VmWriter,
+    ) -> Result<()> {
+        debug_assert_eq!(offset % BLOCK_SIZE, 0);
+        let extent_manager = self.extent_manager()?;
+        let start_ib = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+        let end_ib = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EINVAL, "logical block number overflow"))?;
+
+        // Build the in-order plan and submit every written run's read, then wait
+        // on the whole batch once before copying anything out.
+        let mut plan: Vec<DirectRun> = Vec::new();
+        let mut io_batch = IoBatch::new();
+        let mut iblock = start_ib;
+        while iblock < end_ib {
+            let remaining = end_ib - iblock;
+            match extent_manager.map_blocks(iblock)? {
+                extent_manager::Mapping::Mapped {
+                    pblock,
+                    len,
+                    written: true,
+                } => {
+                    let mut run = len.min(remaining);
+                    let mut run_pblock = pblock;
+                    // Split a long physically contiguous run into device buffers
+                    // no larger than `DIRECT_MAX_RUN_BLOCKS`, each its own BIO.
+                    while run > 0 {
+                        let chunk = run.min(DIRECT_MAX_RUN_BLOCKS as u32);
+                        let bio_segment =
+                            BioSegment::alloc(chunk as usize, BioDirection::FromDevice);
+                        fs.read_blocks_async(run_pblock, bio_segment.clone(), None, &mut io_batch)?;
+                        plan.push(DirectRun::Data(bio_segment));
+                        run -= chunk;
+                        run_pblock += chunk as Ext4Bid;
+                    }
+                    iblock += len.min(remaining);
+                }
+                // Unwritten (allocated but never written): reads as zeros.
+                extent_manager::Mapping::Mapped {
+                    len,
+                    written: false,
+                    ..
+                } => {
+                    let run = len.min(remaining);
+                    plan.push(DirectRun::Zeros(run as usize * BLOCK_SIZE));
+                    iblock += run;
+                }
+                // A hole; `map_blocks` reports one unmapped block at a time.
+                extent_manager::Mapping::Hole { .. } => {
+                    plan.push(DirectRun::Zeros(BLOCK_SIZE));
+                    iblock += 1;
+                }
+            }
+        }
+
+        // One barrier for every submitted read, then copy out in file order. A
+        // `Zeros` span or a partial tail block is clamped by the writer's limit.
+        io_batch.wait_all()?;
+        for run in plan {
+            match run {
+                DirectRun::Data(bio_segment) => {
+                    let mut segment_reader = bio_segment.reader()?;
+                    segment_reader.read_fallible(writer)?;
+                }
+                DirectRun::Zeros(n_bytes) => {
+                    writer.fill_zeros(n_bytes)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn set_file_size(&mut self, new_size: usize) {
@@ -3481,7 +3669,8 @@ mod write_tests {
 
     use super::{
         super::test_utils::{
-            Ext4Fixture, Ext4FixtureBuilder, make_empty_file_inode, make_unwritten_file_inode,
+            Ext4Fixture, Ext4FixtureBuilder, make_dir_block, make_dir_inode, make_empty_file_inode,
+            make_unwritten_file_inode,
         },
         extent_manager::MapState,
         *,
@@ -5759,5 +5948,203 @@ mod write_tests {
         page_cache.evict_range(0..expected.len()).unwrap();
 
         assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
+
+    // ---- O_DIRECT read (P9b-b4-T1) ----
+
+    /// Reads `[offset, offset+len)` through the direct path into a fresh buffer.
+    fn read_direct(inode: &Inode, offset: usize, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let mut writer = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let read = inode.read_direct_at(offset, &mut writer).unwrap();
+        buf.truncate(read);
+        buf
+    }
+
+    /// The `Errno` a rejected direct read returns.
+    fn direct_read_err(inode: &Inode, offset: usize, len: usize) -> Errno {
+        let mut buf = vec![0u8; len.max(1)];
+        let mut writer = VmWriter::from(&mut buf[..len]).to_fallible();
+        inode
+            .read_direct_at(offset, &mut writer)
+            .unwrap_err()
+            .error()
+    }
+
+    /// (1) A directory rejects the direct read with `EISDIR` (the type check
+    /// wins even when the request is also unaligned), and a non-block-aligned
+    /// offset or buffer length on a regular file rejects with `EINVAL`.
+    #[ktest]
+    fn direct_read_rejects_dir_and_unaligned() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        write_all(&inode, 0, &[0xAB; 2 * BLOCK_SIZE]);
+
+        // Unaligned offset, then unaligned length, on a regular file.
+        assert_eq!(direct_read_err(&inode, 100, BLOCK_SIZE), Errno::EINVAL);
+        assert_eq!(direct_read_err(&inode, 0, BLOCK_SIZE + 100), Errno::EINVAL);
+
+        // A directory: EISDIR, even for an otherwise-unaligned request.
+        f.write_data_block(102, &make_dir_block(&[(12, ".", 2), (2, "..", 2)]));
+        f.write_raw_inode(12, &make_dir_inode(102));
+        let dir = f.ext4.read_inode(12).unwrap();
+        assert_eq!(direct_read_err(&dir, 100, BLOCK_SIZE + 7), Errno::EISDIR);
+    }
+
+    /// (2) A fragmented multi-extent file: the direct read equals the buffered
+    /// read byte-for-byte across every extent boundary. The many-small-group
+    /// image fragments a contiguous append into one physically discontiguous
+    /// extent per group (the b3 fragmentation shape), so the direct path must
+    /// stitch several `map_blocks` runs back into one logical stream.
+    #[ktest]
+    fn direct_read_matches_buffered_across_fragmented_extents() {
+        let f = journaled_multigroup_fixture(24);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const N_BLOCKS: usize = 120;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k * 37 + 11) as u8)
+            .collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        // The file really is fragmented: the first run stops short of the end.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert!(
+                (bm.map_blocks(0).unwrap().len() as usize) < N_BLOCKS,
+                "fixture did not fragment the file into multiple extents",
+            );
+        }
+
+        let direct = read_direct(&inode, 0, payload.len());
+        assert_eq!(direct, payload);
+        assert_eq!(direct, read_back(&inode, 0, payload.len()));
+    }
+
+    /// (3) A sparse file read directly: the hole region reads all zeros and the
+    /// data regions read the real bytes, matching the buffered view.
+    #[ktest]
+    fn direct_read_holes_read_zeros_data_reads_bytes() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 data, blocks 1..5 hole, block 5 data.
+        let head = vec![0x11u8; BLOCK_SIZE];
+        let tail = vec![0x22u8; BLOCK_SIZE];
+        write_all(&inode, 0, &head);
+        write_all(&inode, 5 * BLOCK_SIZE, &tail);
+
+        let got = read_direct(&inode, 0, 6 * BLOCK_SIZE);
+        let mut expected = vec![0u8; 6 * BLOCK_SIZE];
+        expected[0..BLOCK_SIZE].copy_from_slice(&head);
+        expected[5 * BLOCK_SIZE..6 * BLOCK_SIZE].copy_from_slice(&tail);
+        assert_eq!(got, expected);
+        assert_eq!(got, read_back(&inode, 0, 6 * BLOCK_SIZE));
+    }
+
+    /// (3b) A preallocated-unwritten extent reads as zeros directly, with no
+    /// device read of its blocks: the backing blocks are poisoned on the device
+    /// yet the read still returns zeros. After a write converts the middle
+    /// block, only that block reads real bytes.
+    #[ktest]
+    fn direct_read_unwritten_extent_reads_zeros() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let len = 4u16;
+        f.write_raw_inode(
+            FILE_INO,
+            &make_unwritten_file_inode(200, len, (len as u32) * BLOCK_SIZE as u32),
+        );
+        // Poison the unwritten blocks: a correct direct read never touches them.
+        for b in 200..200 + len as u32 {
+            f.write_data_block(b, &[0xEE; BLOCK_SIZE]);
+        }
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        assert_eq!(
+            read_direct(&inode, 0, len as usize * BLOCK_SIZE),
+            vec![0u8; len as usize * BLOCK_SIZE]
+        );
+
+        // Convert the middle block (logical block 1, pblock 201) to written.
+        let mid = vec![0x77u8; BLOCK_SIZE];
+        write_all(&inode, BLOCK_SIZE, &mid);
+        let got = read_direct(&inode, 0, len as usize * BLOCK_SIZE);
+        let mut expected = vec![0u8; len as usize * BLOCK_SIZE];
+        expected[BLOCK_SIZE..2 * BLOCK_SIZE].copy_from_slice(&mid);
+        assert_eq!(got, expected);
+    }
+
+    /// (4) EOF clamping: an aligned request straddling `i_size` returns only up
+    /// to EOF (with a partial tail block), matching the buffered read; an
+    /// aligned request at or past EOF returns 0.
+    #[ktest]
+    fn direct_read_clamps_to_eof() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // One block plus a 100-byte tail: i_size is not block-aligned.
+        let size = BLOCK_SIZE + 100;
+        let content: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
+        write_all(&inode, 0, &content);
+        assert_eq!(inode.size(), size);
+
+        // Aligned 2-block request from 0 clamps to i_size (partial tail block).
+        let got = read_direct(&inode, 0, 2 * BLOCK_SIZE);
+        assert_eq!(got.len(), size);
+        assert_eq!(got, content);
+        assert_eq!(got, read_back(&inode, 0, 2 * BLOCK_SIZE));
+
+        // An aligned offset at/after i_size returns 0.
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut w = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        assert_eq!(inode.read_direct_at(2 * BLOCK_SIZE, &mut w).unwrap(), 0);
+    }
+
+    /// (5) A buffered write that has NOT been fsync'd is visible to a subsequent
+    /// direct read: `read_direct_at` flushes the overlapping dirty pages to the
+    /// device before bypassing the cache.
+    #[ktest]
+    fn direct_read_sees_unflushed_buffered_write() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Establish block 0 on disk, then overwrite it buffered with no sync.
+        write_all(&inode, 0, &[0x00; BLOCK_SIZE]);
+        read_direct(&inode, 0, BLOCK_SIZE); // flush the initial state to disk
+
+        let fresh = vec![0xA5u8; BLOCK_SIZE];
+        write_all(&inode, 0, &fresh); // dirties the page, no fsync
+        assert_eq!(read_direct(&inode, 0, BLOCK_SIZE), fresh);
+    }
+
+    /// (6) A physically contiguous run longer than `DIRECT_MAX_RUN_BLOCKS` reads
+    /// back correctly across the multi-BIO split.
+    #[ktest]
+    fn direct_read_splits_large_contiguous_run() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const N_BLOCKS: usize = DIRECT_MAX_RUN_BLOCKS + 44;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k * 7 + 3) as u8)
+            .collect();
+        write_all(&inode, 0, &payload);
+
+        // One contiguous extent longer than the per-buffer split cap.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert!(
+                bm.map_blocks(0).unwrap().len() as usize > DIRECT_MAX_RUN_BLOCKS,
+                "fixture did not lay the file out as one long contiguous run",
+            );
+        }
+
+        assert_eq!(read_direct(&inode, 0, payload.len()), payload);
     }
 }

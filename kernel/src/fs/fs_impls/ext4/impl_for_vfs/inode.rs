@@ -62,10 +62,17 @@ impl FileOps for Ext4Inode {
         &self,
         offset: usize,
         writer: &mut VmWriter,
-        _status_flags: StatusFlags,
+        status_flags: StatusFlags,
     ) -> Result<usize> {
-        // Phase 1 serves O_DIRECT reads through the page cache as well.
-        let len = self.read_at(offset, writer)?;
+        // O_DIRECT bypasses the page cache (block-aligned, copy-out); the
+        // buffered path is byte-for-byte unchanged, including the read-ahead
+        // detector, which the direct path deliberately does not feed. atime is
+        // touched the same way on both.
+        let len = if status_flags.contains(StatusFlags::O_DIRECT) {
+            self.read_direct_at(offset, writer)?
+        } else {
+            self.read_at(offset, writer)?
+        };
         touch_atime_relatime(self);
         Ok(len)
     }
@@ -465,8 +472,9 @@ mod ioctl_defs {
 
 #[cfg(ktest)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{sync::Arc, vec, vec::Vec};
 
+    use aster_block::BLOCK_SIZE;
     use ostd::{mm::VmWriter, prelude::*};
 
     use crate::{
@@ -477,6 +485,7 @@ mod tests {
             },
             vfs::{file_system::FileSystem, inode::Inode},
         },
+        prelude::Errno,
         process::{Gid, Uid},
     };
 
@@ -551,5 +560,43 @@ mod tests {
         assert_eq!(reloaded.gid(), 8484);
         // chmod's RMW kept the on-disk type bits: still a regular file.
         assert_eq!(reloaded.inode_type(), InodeType::File);
+    }
+
+    /// `FileOps::read_at` routes an `O_DIRECT` request to the cache-bypassing
+    /// direct path (block-aligned only) while a plain request stays on the
+    /// buffered path: the direct path rejects an unaligned length that the
+    /// buffered path serves without complaint.
+    #[ktest]
+    fn read_at_routes_o_direct_flag() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
+        let content: Vec<u8> = (0..BLOCK_SIZE).map(|i| (i * 5 + 1) as u8).collect();
+        f.write_data_block(103, &content);
+        f.write_raw_inode(11, &make_file_inode(103, content.len() as u32));
+        let inode: Arc<dyn Inode> = f.ext4.read_inode(11).unwrap();
+
+        // O_DIRECT, block-aligned: reads the real bytes back from the device.
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        let mut w = VmWriter::from(buf.as_mut_slice()).to_fallible();
+        let n = inode.read_at(0, &mut w, StatusFlags::O_DIRECT).unwrap();
+        assert_eq!(n, BLOCK_SIZE);
+        assert_eq!(buf, content);
+
+        // O_DIRECT with an unaligned length is rejected `EINVAL`...
+        let mut small = vec![0u8; 100];
+        let mut w = VmWriter::from(small.as_mut_slice()).to_fallible();
+        assert_eq!(
+            inode
+                .read_at(0, &mut w, StatusFlags::O_DIRECT)
+                .unwrap_err()
+                .error(),
+            Errno::EINVAL
+        );
+
+        // ...while the buffered path serves the same unaligned length.
+        let mut small = vec![0u8; 100];
+        let mut w = VmWriter::from(small.as_mut_slice()).to_fallible();
+        let n = inode.read_at(0, &mut w, StatusFlags::empty()).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(small, content[..100]);
     }
 }
