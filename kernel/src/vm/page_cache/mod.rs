@@ -278,6 +278,32 @@ impl PageCache {
         vmo.flush_dirty_pages(&range)
     }
 
+    /// Reads ahead the pages in the specified byte range from the backend into
+    /// the page cache.
+    ///
+    /// This is a best-effort optimization for sequential reads: it populates
+    /// absent or uninitialized pages in the range from the backend in one
+    /// batched submission, leaving already-cached pages untouched. Any error
+    /// is swallowed — a page left uninitialized is transparently re-read by the
+    /// next synchronous reader — so this returns `Ok` unless a page allocation
+    /// fails. Prefetched pages are clean (`UpToDate`), so a later
+    /// [`PageCache::flush_range`] over the same range writes nothing back.
+    ///
+    /// The range is clamped to the current page-cache capacity; the portion
+    /// beyond the end is silently ignored. An anonymous (backend-less) page
+    /// cache is a no-op.
+    ///
+    /// This path is internally synchronized (the `XArray` lock plus per-page
+    /// locks) and only ever adds clean pages, so unlike the buffered read/write
+    /// APIs it does not require the caller to hold the filesystem-level lock.
+    pub fn prefetch_range(&self, range: Range<usize>) -> Result<()> {
+        let Some(vmo) = self.0.as_backed_vmo() else {
+            return Ok(());
+        };
+
+        vmo.prefetch_pages(&range)
+    }
+
     /// Evicts clean pages within the specified range from the page cache.
     ///
     /// Only pages in the `UpToDate` state are removed. Dirty and uninitialized

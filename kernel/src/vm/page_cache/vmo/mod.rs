@@ -711,6 +711,102 @@ impl<'a> BackedVmo<'a> {
         io_batch.wait_all().map_err(Into::into)
     }
 
+    /// Reads ahead the pages in the specified byte range from the backend into
+    /// the page cache in a single batched submission.
+    ///
+    /// This is a best-effort prefetch for sequential reads. Absent slots are
+    /// populated with fresh uninitialized pages and, together with any pages
+    /// that are already present but still uninitialized, submitted to the
+    /// backend; pages that are already up-to-date or dirty are left untouched.
+    /// A page whose lock is already held (another task is initializing it) is
+    /// skipped rather than waited on, and any read that fails to submit or
+    /// complete simply leaves its page uninitialized for the next synchronous
+    /// reader to re-read through the normal commit path. Read errors are
+    /// therefore swallowed, not propagated.
+    ///
+    /// Prefetched pages become clean (`UpToDate`, never `Dirty`), so a later
+    /// `flush_range` over the same range writes nothing back.
+    ///
+    /// The range is clamped to the current page-cache capacity, which is
+    /// page-aligned, so no page is ever created past the end of the cache; the
+    /// portion of the range beyond the end is silently dropped. The capacity
+    /// is re-read under the `XArray` lock (the lock `resize` updates it
+    /// under), so a concurrent shrink can never see this path re-create a
+    /// page that `resize` has already decommitted.
+    pub(super) fn prefetch_pages(&self, range: &Range<usize>) -> Result<()> {
+        let page_idx_range = get_page_idx_range(range);
+
+        // Populate the range in bounded chunks so a large window does not pin
+        // the `XArray` lock across hundreds of page allocations.
+        const INSERT_CHUNK_PAGES: usize = 32;
+
+        let mut pages_to_read = Vec::new();
+        let mut chunk_start = page_idx_range.start;
+        while chunk_start < page_idx_range.end {
+            let mut locked_pages = self.pages.lock();
+            // Clamp under the lock: `resize` stores the new capacity under
+            // this same lock before decommitting, so every page stored here is
+            // within bounds at the instant it is stored — a later shrink then
+            // removes it like any other page (`commit_on_internal` follows the
+            // same discipline). Unlike `flush_dirty_pages`, this path *creates*
+            // pages, so it must not manufacture one past the end of the cache.
+            let end = page_idx_range
+                .end
+                .min(self.size().div_ceil(PAGE_SIZE))
+                .min(chunk_start + INSERT_CHUNK_PAGES);
+            if chunk_start >= end {
+                break;
+            }
+            let mut cursor = locked_pages.cursor_mut(chunk_start as u64);
+            while (cursor.index() as usize) < end {
+                let page_idx = cursor.index() as usize;
+                if let Some(page) = cursor.load() {
+                    // A page a previous population left uninitialized is worth
+                    // re-reading; a readable (up-to-date or dirty) one is not.
+                    if page.is_uninit() {
+                        pages_to_read.push((page_idx, page.clone()));
+                    }
+                } else {
+                    let uninit_page = CachePage::alloc_uninit()?;
+                    cursor.store(uninit_page.clone());
+                    pages_to_read.push((page_idx, uninit_page));
+                }
+                cursor.next();
+            }
+            chunk_start = end;
+        }
+
+        if pages_to_read.is_empty() {
+            return Ok(());
+        }
+
+        let mut io_batch = IoBatch::with_capacity(pages_to_read.len());
+        for (idx, page) in pages_to_read {
+            // Do not block on a page another task is already initializing;
+            // prefetch is best-effort.
+            let Some(locked_page) = page.try_lock_guard() else {
+                continue;
+            };
+            // Re-check under the page lock: another task may have finished the
+            // read between collection and locking (the `ensure_init` dedup).
+            if !locked_page.is_uninit() {
+                continue;
+            }
+            // Swallow a submission error (e.g., `EINVAL` past a concurrent
+            // truncation): the page stays present and uninitialized, and the
+            // next reader re-reads it.
+            let _ = self
+                .backend
+                .read_page_async(idx, locked_page.into_owned(), &mut io_batch);
+        }
+
+        // Wait for the whole batch. A completion error is swallowed for the
+        // same reason: the failed page is left uninitialized and re-read on
+        // demand.
+        let _ = io_batch.wait_all();
+        Ok(())
+    }
+
     /// Removes up-to-date (clean) pages in the specified byte range from the page cache.
     ///
     /// Only pages in the `UpToDate` state are removed. Dirty and uninitialized

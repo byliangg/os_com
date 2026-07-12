@@ -790,6 +790,87 @@ impl Default for InodeTail {
     }
 }
 
+/// Minimum sequential read-ahead window: the first detected sequential read
+/// reads this much ahead (Linux `VM_READAHEAD_PAGES` order of magnitude).
+const RA_MIN: usize = 256 * 1024;
+/// Maximum sequential read-ahead window: the window doubles per consecutive
+/// sequential read up to this ceiling.
+const RA_MAX: usize = 2 * 1024 * 1024;
+
+/// Per-inode sequential read-ahead detector.
+///
+/// Tracks one file's read stream so [`Inode::read_at`] can grow a read-ahead
+/// window on consecutive sequential reads and reset it on a seek. All state
+/// transitions live on this type (no free function pokes at its fields):
+/// [`on_read`](Self::on_read) is the sole entry point, returning the
+/// page-aligned byte range that should be prefetched now — only the *new*
+/// frontier past what this stream has already issued, so a warm sequential
+/// scan does not re-walk the whole window on every read.
+struct RaState {
+    /// The page index the next read must start at (within a one-page tolerance)
+    /// to count as sequential: `(offset + len) / PAGE_SIZE` of the previous
+    /// read. `None` on a cold inode — deliberately not `0`, which is a legal
+    /// page index.
+    next_expected_page: Option<usize>,
+    /// Current read-ahead window in bytes. Doubles per sequential hit up to
+    /// [`RA_MAX`]; resets to [`RA_MIN`] on a miss.
+    window: usize,
+    /// The page index (exclusive) up to which this sequential stream has
+    /// already issued prefetch. Only the frontier past it is prefetched again,
+    /// so each page of a sequential stream is scanned at most once.
+    prefetched_until: usize,
+}
+
+impl RaState {
+    /// A cold detector: no stream seen yet.
+    const fn cold() -> Self {
+        Self {
+            next_expected_page: None,
+            window: RA_MIN,
+            prefetched_until: 0,
+        }
+    }
+
+    /// Records a read of `len` bytes at byte `offset` and returns the
+    /// page-aligned byte range to prefetch now, or `None` if this stream's
+    /// frontier already covers it.
+    ///
+    /// A read whose starting page lands within one page of `next_expected_page`
+    /// is sequential: the candidate range is `[offset, offset + len + window)`
+    /// (the request plus a look-ahead) and the window doubles for the next hit
+    /// (capped at [`RA_MAX`]). Any other read (including the first) is a miss:
+    /// the window resets to [`RA_MIN`], the frontier restarts at this read's
+    /// page, and the candidate covers the request alone — still batching a
+    /// large request, but never inflating a random 4K read into a whole
+    /// window (Linux's on-demand readahead makes the same distinction). Only
+    /// the part of the candidate past the already-issued frontier is returned.
+    fn on_read(&mut self, offset: usize, len: usize) -> Option<Range<usize>> {
+        let cur_page = offset / PAGE_SIZE;
+        let sequential = self
+            .next_expected_page
+            .is_some_and(|expected| cur_page.abs_diff(expected) <= 1);
+        let lookahead = if sequential {
+            let lookahead = self.window;
+            self.window = (self.window * 2).min(RA_MAX);
+            lookahead
+        } else {
+            self.window = RA_MIN;
+            self.prefetched_until = cur_page;
+            0
+        };
+        self.next_expected_page = Some((offset + len) / PAGE_SIZE);
+
+        let candidate_end = offset.saturating_add(len).saturating_add(lookahead);
+        let candidate_end_page = candidate_end.div_ceil(PAGE_SIZE);
+        let start_page = cur_page.max(self.prefetched_until);
+        if start_page >= candidate_end_page {
+            return None;
+        }
+        self.prefetched_until = candidate_end_page;
+        Some((start_page * PAGE_SIZE)..(candidate_end_page * PAGE_SIZE))
+    }
+}
+
 /// A single ext4 inode: shared metadata plus type-specific payload.
 pub struct Inode {
     ino: Ext4Ino,
@@ -805,6 +886,11 @@ pub struct Inode {
     /// The in-memory pipe object backing a named-pipe (FIFO) inode; `None`
     /// for every other type. Created with the inode, like ext2's.
     pipe: Option<crate::fs::pipe::Pipe>,
+    /// Sequential read-ahead detector for the buffered read path. A leaf
+    /// `SpinLock`: `read_at` holds it only for the detector's arithmetic (no
+    /// I/O, no allocation, no other lock) and drops it before touching the
+    /// page cache, so it never nests under `inner`.
+    ra: SpinLock<RaState>,
     /// The VFS extension slot (flock, POSIX locks, inotify); must exist from
     /// day one or the VFS layer panics on inodes that use these features.
     extension: Extension,
@@ -880,6 +966,7 @@ impl Inode {
             fs,
             self_weak: self_weak.clone(),
             pipe,
+            ra: SpinLock::new(RaState::cold()),
             extension: Extension::new(),
         }))
     }
@@ -987,7 +1074,26 @@ impl Inode {
     }
 
     /// Reads file data at `offset` through the inode's page cache.
+    ///
+    /// Before taking the read lock, the sequential read-ahead detector inspects
+    /// this read in the lock-free window and, on a sequential stream, prefetches
+    /// the window's new frontier so the page cache is warm by the time later
+    /// reads arrive. The detector lock is dropped before [`page_cache`] (which
+    /// briefly takes `inner`), so the two never nest; the prefetch is
+    /// best-effort and its errors are swallowed.
     pub(super) fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
+        let len = writer.avail();
+        if len > 0 {
+            // Take the detector lock only for `on_read`; the trailing `;` drops
+            // the guard before `page_cache()` (which briefly takes `inner`) and
+            // the prefetch I/O, so the leaf lock never nests.
+            let prefetch = self.ra.lock().on_read(offset, len);
+            if let Some(range) = prefetch
+                && let Some(page_cache) = self.page_cache()
+            {
+                let _ = page_cache.prefetch_range(range);
+            }
+        }
         self.inner.read().read_at(offset, writer)
     }
 
@@ -3217,6 +3323,110 @@ mod tests {
         raw.link_count = 0;
         assert!(InodeDesc::try_from(&raw).is_err());
     }
+
+    /// A cold detector misses on its first read: the prefetch covers exactly
+    /// the request (no look-ahead yet), the minimum window is armed for the
+    /// next hit, and the next expected page is set.
+    #[ktest]
+    fn ra_state_cold_miss_opens_min_window() {
+        let mut ra = RaState::cold();
+        let range = ra.on_read(0, PAGE_SIZE).unwrap();
+
+        assert_eq!(ra.window, RA_MIN);
+        // A miss batches the request itself and nothing more.
+        assert_eq!(range, 0..PAGE_SIZE);
+        assert_eq!(ra.next_expected_page, Some(1));
+    }
+
+    /// A miss never inflates the request: a random 4K read prefetches one
+    /// page, not a whole window — only a sequential hit reads ahead.
+    #[ktest]
+    fn ra_state_miss_does_not_amplify_random_reads() {
+        let mut ra = RaState::cold();
+        ra.on_read(0, PAGE_SIZE);
+        ra.on_read(PAGE_SIZE, PAGE_SIZE); // hit: the stream is warm
+
+        // Random jumps: each covers exactly its own page.
+        for &page in &[500usize, 7, 9000] {
+            let range = ra.on_read(page * PAGE_SIZE, PAGE_SIZE).unwrap();
+            assert_eq!(range, page * PAGE_SIZE..(page + 1) * PAGE_SIZE);
+            assert_eq!(ra.window, RA_MIN);
+        }
+    }
+
+    /// Consecutive sequential reads double the window until it saturates at the
+    /// maximum.
+    #[ktest]
+    fn ra_state_sequential_hits_double_window_to_max() {
+        let mut ra = RaState::cold();
+        ra.on_read(0, PAGE_SIZE); // miss -> window = RA_MIN
+        let mut expected = RA_MIN;
+        let mut offset = PAGE_SIZE;
+        for _ in 0..6 {
+            ra.on_read(offset, PAGE_SIZE);
+            expected = (expected * 2).min(RA_MAX);
+            assert_eq!(ra.window, expected);
+            offset += PAGE_SIZE;
+        }
+        assert_eq!(ra.window, RA_MAX);
+    }
+
+    /// A non-sequential jump resets the window to the minimum and restarts the
+    /// prefetch frontier at the seek target.
+    #[ktest]
+    fn ra_state_seek_resets_window() {
+        let mut ra = RaState::cold();
+        ra.on_read(0, PAGE_SIZE);
+        ra.on_read(PAGE_SIZE, PAGE_SIZE); // sequential hit grows the window
+        assert!(ra.window > RA_MIN);
+
+        let far = 100 * PAGE_SIZE;
+        let range = ra.on_read(far, PAGE_SIZE).unwrap();
+        assert_eq!(ra.window, RA_MIN);
+        assert_eq!(range.start, far);
+        assert_eq!(ra.next_expected_page, Some(101));
+    }
+
+    /// The one-page tolerance keeps a read that lands just before or just after
+    /// the expected page counted as sequential.
+    #[ktest]
+    fn ra_state_plus_minus_one_page_tolerance() {
+        // Expected + 1 page still counts as sequential.
+        let mut ra = RaState::cold();
+        ra.on_read(0, PAGE_SIZE); // next expected page = 1
+        ra.on_read(2 * PAGE_SIZE, PAGE_SIZE); // page 2 = expected + 1 -> hit
+        assert_eq!(ra.window, RA_MIN * 2);
+
+        // Expected - 1 page still counts as sequential.
+        let mut ra = RaState::cold();
+        ra.on_read(0, PAGE_SIZE); // next expected page = 1
+        ra.on_read(0, PAGE_SIZE); // page 0 = expected - 1 -> hit
+        assert_eq!(ra.window, RA_MIN * 2);
+    }
+
+    /// The prefetch frontier never walks backwards: a sequential read's new
+    /// range starts exactly where the previous one ended.
+    #[ktest]
+    fn ra_state_frontier_does_not_go_backwards() {
+        let mut ra = RaState::cold();
+        let first = ra.on_read(0, PAGE_SIZE).unwrap();
+        let second = ra.on_read(PAGE_SIZE, PAGE_SIZE).unwrap();
+        assert_eq!(second.start, first.end);
+        assert!(second.start < second.end);
+    }
+
+    /// A read that lands entirely behind an already-issued frontier asks for no
+    /// new prefetch, and does not walk the frontier backwards.
+    #[ktest]
+    fn ra_state_read_within_frontier_requests_nothing() {
+        let mut ra = RaState {
+            next_expected_page: Some(5),
+            window: RA_MIN,
+            prefetched_until: 10_000,
+        };
+        assert!(ra.on_read(5 * PAGE_SIZE, PAGE_SIZE).is_none());
+        assert_eq!(ra.prefetched_until, 10_000);
+    }
 }
 
 #[cfg(ktest)]
@@ -5157,5 +5367,82 @@ mod write_tests {
             "the size-changing truncate advanced datasync_tid past the write"
         );
         assert_eq!(dsync, sync, "a size change bumps both tids together");
+    }
+
+    /// End to end: a sequential scan of a multi-page file drives the read-ahead
+    /// detector and prefetch path, and every byte reads back correctly even
+    /// after the cache is dropped so each read must refault through the backend.
+    #[ktest]
+    fn sequential_read_through_readahead_is_byte_correct() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A file with distinct per-page bytes.
+        const NPAGES: usize = 8;
+        let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+        for page in 0..NPAGES {
+            written[page * PAGE_SIZE..(page + 1) * PAGE_SIZE].fill((0xC0 + page) as u8);
+        }
+        write_all(&inode, 0, &written);
+
+        // Flush and drop the cached pages so the scan below refaults through the
+        // backend, exercising the detector and prefetch for real.
+        inode
+            .page_cache()
+            .unwrap()
+            .invalidate_range(0..NPAGES * PAGE_SIZE)
+            .unwrap();
+
+        // Read the whole file one page at a time: a sequential stream that grows
+        // the window and prefetches ahead. Every page reads back correctly.
+        let mut readback = vec![0u8; NPAGES * PAGE_SIZE];
+        for page in 0..NPAGES {
+            let mut writer =
+                VmWriter::from(&mut readback[page * PAGE_SIZE..(page + 1) * PAGE_SIZE])
+                    .to_fallible();
+            assert_eq!(
+                inode.read_at(page * PAGE_SIZE, &mut writer).unwrap(),
+                PAGE_SIZE
+            );
+        }
+        assert_eq!(readback, written);
+    }
+
+    /// A large prefetch followed by a shrink must not panic and must read back
+    /// correct bytes within the new size; prefetching the stale (now
+    /// out-of-bounds) range on the shrunk file is a silent no-op.
+    #[ktest]
+    fn prefetch_then_shrink_reads_correctly() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NPAGES: usize = 8;
+        let mut written = vec![0u8; NPAGES * PAGE_SIZE];
+        for page in 0..NPAGES {
+            written[page * PAGE_SIZE..(page + 1) * PAGE_SIZE].fill((0x40 + page) as u8);
+        }
+        write_all(&inode, 0, &written);
+        let page_cache = inode.page_cache().unwrap();
+        page_cache.invalidate_range(0..NPAGES * PAGE_SIZE).unwrap();
+
+        // Prefetch the whole (large) range, then shrink the file under it.
+        page_cache.prefetch_range(0..NPAGES * PAGE_SIZE).unwrap();
+        inode.resize(2 * PAGE_SIZE).unwrap();
+
+        // Reads within the new size are byte-correct; a read past EOF returns 0.
+        assert_eq!(
+            read_back(&inode, 0, 2 * PAGE_SIZE),
+            &written[..2 * PAGE_SIZE]
+        );
+        let mut tail = vec![0u8; PAGE_SIZE];
+        let mut writer = VmWriter::from(tail.as_mut_slice()).to_fallible();
+        assert_eq!(inode.read_at(3 * PAGE_SIZE, &mut writer).unwrap(), 0);
+
+        // Prefetching the stale large range on the shrunk file is a no-op.
+        page_cache.prefetch_range(0..NPAGES * PAGE_SIZE).unwrap();
+        assert_eq!(
+            read_back(&inode, 0, 2 * PAGE_SIZE),
+            &written[..2 * PAGE_SIZE]
+        );
     }
 }

@@ -495,3 +495,105 @@ fn delayed_io_completion() {
     assert!(second_flush_result.lock().take().unwrap().is_ok());
     assert_eq!(backend.persisted_page_bytes(0), latest_dirty_pattern);
 }
+
+/// Prefetching a range reads every absent page once, leaves the pages clean
+/// (`UpToDate`, not `Dirty`) so a following flush writes nothing back, and
+/// makes a later read a cache hit.
+#[ktest]
+fn prefetch_fills_clean_pages() {
+    let backend = MockPageCacheBackend::new(4);
+    let patterns = [
+        vec![0xa1; PAGE_SIZE],
+        vec![0xb2; PAGE_SIZE],
+        vec![0xc3; PAGE_SIZE],
+        vec![0xd4; PAGE_SIZE],
+    ];
+    for (idx, pattern) in patterns.iter().enumerate() {
+        backend.set_persisted_page_bytes(idx, pattern);
+    }
+    let page_cache = new_backend_page_cache(&backend, 4);
+
+    // Prefetch the whole file; default (immediate) completion fills the pages.
+    page_cache.prefetch_range(0..4 * PAGE_SIZE).unwrap();
+    for idx in 0..4 {
+        assert_eq!(backend.read_count(idx), 1);
+    }
+
+    // The prefetched pages are clean: a flush over the same range writes
+    // nothing back to the backend.
+    page_cache.flush_range(0..4 * PAGE_SIZE).unwrap();
+    for idx in 0..4 {
+        assert_eq!(backend.write_count(idx), 0);
+    }
+
+    // Contents match the backend, and reading does not trigger another read.
+    for (idx, pattern) in patterns.iter().enumerate() {
+        let mut read_buffer = vec![0; PAGE_SIZE];
+        page_cache
+            .read_bytes(idx * PAGE_SIZE, &mut read_buffer)
+            .unwrap();
+        assert_eq!(&read_buffer, pattern);
+        assert_eq!(backend.read_count(idx), 1);
+    }
+}
+
+/// Prefetching a range whose pages are already cached issues no backend reads.
+#[ktest]
+fn prefetch_skips_cached_pages() {
+    let backend = MockPageCacheBackend::new(2);
+    backend.set_persisted_page_bytes(0, &[0x11; PAGE_SIZE]);
+    backend.set_persisted_page_bytes(1, &[0x22; PAGE_SIZE]);
+    let page_cache = new_backend_page_cache(&backend, 2);
+
+    // Warm both pages, then prefetch the same range: no additional reads.
+    let mut read_buffer = vec![0; 2 * PAGE_SIZE];
+    page_cache.read_bytes(0, &mut read_buffer).unwrap();
+    assert_eq!(backend.read_count(0), 1);
+    assert_eq!(backend.read_count(1), 1);
+
+    page_cache.prefetch_range(0..2 * PAGE_SIZE).unwrap();
+    assert_eq!(backend.read_count(0), 1);
+    assert_eq!(backend.read_count(1), 1);
+}
+
+/// Prefetching a range that runs past the page-cache size clamps to the valid
+/// region: no panic, and only in-bounds pages are populated.
+#[ktest]
+fn prefetch_clamps_out_of_bounds_range() {
+    let backend = MockPageCacheBackend::new(2);
+    backend.set_persisted_page_bytes(0, &[0x33; PAGE_SIZE]);
+    backend.set_persisted_page_bytes(1, &[0x44; PAGE_SIZE]);
+    // The page cache holds two pages; the prefetch range asks for four.
+    let page_cache = new_backend_page_cache(&backend, 2);
+
+    page_cache.prefetch_range(0..4 * PAGE_SIZE).unwrap();
+    assert_eq!(backend.read_count(0), 1);
+    assert_eq!(backend.read_count(1), 1);
+
+    let mut read_buffer = vec![0; 2 * PAGE_SIZE];
+    page_cache.read_bytes(0, &mut read_buffer).unwrap();
+    assert_eq!(&read_buffer[..PAGE_SIZE], &[0x33; PAGE_SIZE]);
+    assert_eq!(&read_buffer[PAGE_SIZE..], &[0x44; PAGE_SIZE]);
+}
+
+/// A prefetch whose backend read fails to submit swallows the error and leaves
+/// the page uninitialized, so a later synchronous read re-reads it through the
+/// normal commit path and succeeds once the backend recovers.
+#[ktest]
+fn prefetch_failure_leaves_page_for_retry() {
+    let backend = MockPageCacheBackend::new(1);
+    backend.set_persisted_page_bytes(0, &[0x55; PAGE_SIZE]);
+    // Fail the prefetch's read submission for page 0.
+    backend.set_read_submit_failure(0, true);
+    let page_cache = new_backend_page_cache(&backend, 1);
+
+    // Prefetch swallows the submission error and returns `Ok`; page 0 is left
+    // uninitialized.
+    page_cache.prefetch_range(0..PAGE_SIZE).unwrap();
+
+    // Recover the backend; a synchronous read re-reads the page and succeeds.
+    backend.set_read_submit_failure(0, false);
+    let mut read_buffer = vec![0; PAGE_SIZE];
+    page_cache.read_bytes(0, &mut read_buffer).unwrap();
+    assert_eq!(read_buffer, vec![0x55; PAGE_SIZE]);
+}

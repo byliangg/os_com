@@ -159,6 +159,19 @@ impl MockPageCacheBackend {
         self.state.lock().set_completion(kind, completion);
     }
 
+    /// Sets whether read-BIO submission for `page_idx` fails with `EIO`.
+    ///
+    /// A failing submission returns before any BIO is queued, modeling a
+    /// synchronous submit-time error (e.g., a backend that rejects the read).
+    pub(super) fn set_read_submit_failure(&self, page_idx: usize, fail: bool) {
+        let mut state = self.state.lock();
+        if fail {
+            state.read_submit_failures.insert(page_idx);
+        } else {
+            state.read_submit_failures.remove(&page_idx);
+        }
+    }
+
     /// Waits until the backend has queued `expected_count` deferred BIOs.
     ///
     /// Tests use this to freeze the backend at the "BIO submitted but not yet
