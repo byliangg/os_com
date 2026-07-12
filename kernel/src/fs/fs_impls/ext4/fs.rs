@@ -9,6 +9,8 @@
 //! writes the mutated metadata back. `Ext4` also owns the per-group inode cache,
 //! the orphan chain, and inode-descriptor writeback (`write_back_inode_desc`).
 
+#[cfg(ktest)]
+use core::sync::atomic::AtomicI64;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use device_id::DeviceId;
@@ -173,6 +175,12 @@ pub struct Ext4 {
     /// `RwMutex<Option<_>>` (no interior invariants to uphold) suffices.
     journal: RwMutex<Option<Arc<journal::Journal>>>,
     fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Fault injection (G9 error-path gates): `Some(n)` fails the (n+1)-th
+    /// subsequent `alloc_blocks` call with `ENOSPC`, counting down per call
+    /// and disarming after firing — the "disk fills mid-operation" fault the
+    /// crash gates cannot stage naturally.
+    #[cfg(ktest)]
+    fail_alloc_blocks_after: AtomicI64,
     self_ref: Weak<Ext4>,
 }
 
@@ -202,6 +210,8 @@ impl Ext4 {
             mount_options,
             journal: RwMutex::new(None),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
+            #[cfg(ktest)]
+            fail_alloc_blocks_after: AtomicI64::new(-1),
             self_ref: weak.clone(),
         });
 
@@ -900,6 +910,14 @@ impl Ext4 {
     /// `ext4_should_retry_alloc` at the op level, outside the handle; our
     /// equivalent is `retry_on_pinned_enospc` at the op level, live since
     /// P7e-6). Returns `Err(EINVAL)` if `count` is zero.
+    /// Arms the G9 allocation fault: the `after`-th subsequent
+    /// [`alloc_blocks`](Self::alloc_blocks) call (0 = the very next) fails
+    /// `ENOSPC`, then the fault disarms. One-shot, test-only.
+    #[cfg(ktest)]
+    pub(super) fn arm_alloc_blocks_enospc(&self, after: i64) {
+        self.fail_alloc_blocks_after.store(after, Ordering::Release);
+    }
+
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
@@ -908,6 +926,17 @@ impl Ext4 {
     ) -> Result<Range<Ext4Bid>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
+        }
+        #[cfg(ktest)]
+        {
+            let n = self.fail_alloc_blocks_after.load(Ordering::Acquire);
+            if n >= 0 {
+                if n == 0 {
+                    self.fail_alloc_blocks_after.store(-1, Ordering::Release);
+                    return_errno_with_message!(Errno::ENOSPC, "injected allocation fault (G9)");
+                }
+                self.fail_alloc_blocks_after.store(n - 1, Ordering::Release);
+            }
         }
 
         let mut sb = self.super_block.write();

@@ -960,6 +960,16 @@ impl Inode {
         };
 
         if let Err(err) = result {
+            // The failed step may follow a successful `grow_dir_block`, whose
+            // leaf/bitmap captures already sit in this transaction while the
+            // parent's grown size and any split's root landing live only in
+            // the in-memory descriptor — capture the parent so root and
+            // leaves commit together (the P9a-a5 audit's H-6; the capture
+            // aborts the journal itself if it cannot land). The original
+            // error is reported either way.
+            if parent_inner.is_dirty() {
+                let _ = parent_inner.write_back_inode_desc(&fs, self.ino, op.get());
+            }
             // Clear the link count so other resources are reclaimed by `Drop`
             // (Task 4). The half-built inode is never inserted into the cache.
             {

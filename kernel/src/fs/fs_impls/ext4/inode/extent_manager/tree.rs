@@ -4549,6 +4549,51 @@ mod tests {
         assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
     }
 
+    /// G9-8 (P9a-a5, the T5 review's ENOSPC pin): a partial conversion whose
+    /// leaf reorganization hits a genuinely full disk (injected: the very
+    /// next allocation fails) is a CLEAN error — nothing edited, the tree
+    /// still maps every block with the target still unwritten. The old
+    /// trim-then-reinsert design aborted the whole volume here.
+    #[ktest]
+    fn convert_in_full_leaf_enospc_is_clean() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        for i in 0..LEAF_MAX as u32 {
+            tree.insert(
+                &f.ext4,
+                i * 4,
+                20_000 + (i as Ext4Bid) * 4,
+                2,
+                ExtentKind::Unwritten,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let sc = tree.sector_count();
+
+        // The split needs one metadata block; the injected fault denies it.
+        f.ext4.arm_alloc_blocks_enospc(0);
+        let err = tree
+            .convert_unwritten(&f.ext4, 601, 1, None, None)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+
+        // Nothing landed: same accounting, same mapping, still unwritten.
+        assert_eq!(tree.sector_count(), sc);
+        let m = tree.lookup(&f.ext4, 601).unwrap().unwrap();
+        assert!(m.is_unwritten());
+        assert_eq!((m.block(), m.len(), m.start()), (600, 2, 20600));
+        assert_matches_linear(&f, &tree, 1400);
+
+        // The fault disarmed: the conversion now succeeds.
+        tree.convert_unwritten(&f.ext4, 601, 1, None, None).unwrap();
+        assert!(!tree.lookup(&f.ext4, 601).unwrap().unwrap().is_unwritten());
+    }
+
     /// `grow_root` grows past the old depth-2 cap (T6): a full depth-2 root
     /// copies down under a one-entry depth-3 index, and only the on-disk
     /// format ceiling [`MAX_DEPTH`] refuses (grow never dereferences the

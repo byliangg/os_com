@@ -1647,7 +1647,17 @@ impl Inode {
             .map(|em| em.root_depth())
             .unwrap_or(0);
         let mut op = fs.begin_op(fs.write_credits(depth))?;
-        self.preallocate_chunked(&fs, &mut inner, start_block, end_block, &mut op)?;
+        if let Err(err) = self.preallocate_chunked(&fs, &mut inner, start_block, end_block, &mut op)
+        {
+            // The failed chunk may have inserted earlier holes and split
+            // leaves — captures already in this transaction that depend on
+            // the in-memory root. Seal before reporting (the P9a-a5 audit's
+            // H-4: a plain ENOSPC on a nearly full disk used to commit the
+            // torn state; `retry_on_pinned_enospc` even committed it
+            // actively between retries).
+            self.seal_failed_write_txn(&fs, &mut inner, &op);
+            return Err(err);
+        }
         // Allocation succeeded: NOW advance `i_size` to the range end (`Allocate`),
         // committed in the same transaction as the final descriptor writeback
         // below. Never reached on the failure path above, so a failed `Allocate`
@@ -2865,7 +2875,19 @@ impl InodeInner {
         };
         // Mirror the authoritative `i_blocks` into the descriptor before writing.
         self.desc.set_sector_count(sector_count);
-        fs.write_back_inode_desc(ino, &self.desc, &root, handle)?;
+        if let Err(err) = fs.write_back_inode_desc(ino, &self.desc, &root, handle) {
+            // A journaled descriptor capture that fails cannot be shrugged
+            // off: the transaction may already carry leaf/bitmap after-images
+            // that depend on this in-memory root and count — committing them
+            // without the descriptor is a torn split / freed-but-mapped
+            // exposure (Linux `ext4_mark_inode_dirty` failure funnels into
+            // `ext4_std_error`, which aborts the journal; the P9a-a5
+            // audit's cross-cutting fix).
+            if let Some(handle) = handle {
+                handle.abort_journal_on_fs_error();
+            }
+            return Err(err);
+        }
         if let Some(handle) = handle {
             // Record the transaction carrying this capture BEFORE clearing the
             // dirty flag: the flag clears now but the commit is asynchronous,
@@ -4640,6 +4662,64 @@ mod write_tests {
     /// case must stay a bounded read-only probe (P9a-T5) that touches and
     /// journals no node. Here we pin the invariant on a small file — the
     /// mapping stays written and `i_blocks` is unchanged.
+    /// G9-1 (P9a-a5 audit, H-4): a preallocation that fills the disk MID-WAY
+    /// (injected: the second hole's allocation fails) seals its transaction —
+    /// the descriptor commits together with the leaf/bitmap captures that
+    /// depend on it, so the on-disk tree stays coherent across a crash right
+    /// after that commit. Before the seal, the captures committed while the
+    /// root stayed stale (torn on ENOSPC — a plain nearly-full-disk trigger).
+    #[ktest]
+    fn fallocate_enospc_midway_seals_the_transaction() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Two written islands leave two holes for the fallocate to fill.
+        write_all(&inode, 0, &[0x11; 4 * BLOCK_SIZE]);
+        write_all(&inode, 8 * BLOCK_SIZE, &[0x22; 4 * BLOCK_SIZE]);
+        journal.commit_now_for_test();
+
+        // Hole [4,8) allocates (one call); hole [12,16) hits the injected
+        // full disk.
+        f.ext4.arm_alloc_blocks_enospc(1);
+        let err = inode
+            .fallocate(FallocMode::Allocate, 0, 16 * BLOCK_SIZE)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        assert_eq!(
+            inode.size(),
+            12 * BLOCK_SIZE,
+            "a failed Allocate must not grow i_size"
+        );
+        let sc = inode.sector_count();
+
+        // The seal captured the descriptor; the commit carries a coherent
+        // root + leaves + bitmap set (an aborted journal would refuse it).
+        journal.commit_now_for_test();
+
+        // Crash-face: reopen from disk and re-check coherence.
+        let disk = f.disk.clone();
+        core::mem::forget(f);
+        let ext4 = Ext4::open(disk as Arc<dyn BlockDevice>, None).unwrap();
+        let inode2 = ext4.read_inode(FILE_INO).unwrap();
+        assert_eq!(
+            inode2.sector_count(),
+            sc,
+            "descriptor and leaves must commit together"
+        );
+        {
+            let inner = inode2.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            for b in 4..8u32 {
+                assert_eq!(bm.map_blocks(b).unwrap().state(), MapState::Unwritten);
+            }
+            for b in 12..16u32 {
+                assert_eq!(bm.map_blocks(b).unwrap().state(), MapState::Hole);
+            }
+        }
+        drop(ext4);
+    }
+
     /// `dir_nlink` semantics (Linux `ext4_inc_count`/`ext4_dec_count`,
     /// namei.c, adapted to linear directories): a directory's link count
     /// saturates at [`DIR_NLINK_MAX`] (never wraps the on-disk u16 — ext4/045
