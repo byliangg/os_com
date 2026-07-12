@@ -495,6 +495,7 @@ impl InodeDesc {
             fs,
             nblocks as usize,
             None,
+            0, // read-only mapping: the goal is never consulted
             journal::DataForgetPolicy::PlainData,
         )?;
         let mut map = Vec::with_capacity(nblocks as usize);
@@ -854,7 +855,10 @@ impl Inode {
             sb.has_metadata_csum()
                 .then(|| sb.metadata_csum_seed().derive_inode(ino, desc.generation()))
         });
-        let payload = InodePayload::new(&desc, fs.clone(), csum_seed)?;
+        // The inode-affinity fallback goal (P9b-b2): hint-less allocations
+        // land in the inode's own group instead of group 0.
+        let inode_goal = fs.upgrade().map(|f| f.inode_goal_block(ino)).unwrap_or(0);
+        let payload = InodePayload::new(&desc, fs.clone(), csum_seed, inode_goal)?;
         let pipe = match type_ {
             InodeType::NamedPipe => Some(crate::fs::pipe::Pipe::new()),
             _ => None,
@@ -2989,7 +2993,12 @@ enum InodePayload {
 impl InodePayload {
     /// Builds the payload for `desc`; fails if a data-backed inode's extent
     /// root does not parse (`ExtentTree::try_new` — the parse-once boundary).
-    fn new(desc: &InodeDesc, fs: Weak<Ext4>, csum_seed: Option<InodeCsumSeed>) -> Result<Self> {
+    fn new(
+        desc: &InodeDesc,
+        fs: Weak<Ext4>,
+        csum_seed: Option<InodeCsumSeed>,
+        inode_goal: Ext4Bid,
+    ) -> Result<Self> {
         Ok(match desc.type_() {
             // The freed-data revoke policy keys off the inode type, exactly
             // Linux `get_default_free_blocks_flags` (fs/ext4/extents.c:
@@ -3003,6 +3012,7 @@ impl InodePayload {
                 desc.sector_count(),
                 fs,
                 csum_seed,
+                inode_goal,
                 journal::DataForgetPolicy::PlainData,
             )?,
             InodeType::Dir => Self::new_data_backed(
@@ -3011,6 +3021,7 @@ impl InodePayload {
                 desc.sector_count(),
                 fs,
                 csum_seed,
+                inode_goal,
                 journal::DataForgetPolicy::Forget,
             )?,
             // A symlink is fast (inline) when it is not extent-based and its
@@ -3032,6 +3043,7 @@ impl InodePayload {
                         desc.sector_count(),
                         fs,
                         csum_seed,
+                        inode_goal,
                         journal::DataForgetPolicy::Forget,
                     )?
                 }
@@ -3048,6 +3060,7 @@ impl InodePayload {
         sector_count: u64,
         fs: Weak<Ext4>,
         csum_seed: Option<InodeCsumSeed>,
+        inode_goal: Ext4Bid,
         data_forget_policy: journal::DataForgetPolicy,
     ) -> Result<Self> {
         let page_cache_size = size.align_up(PAGE_SIZE);
@@ -3058,6 +3071,7 @@ impl InodePayload {
             fs,
             page_count,
             csum_seed,
+            inode_goal,
             data_forget_policy,
         )?);
         let backend: Weak<dyn PageCacheBackend> = Arc::downgrade(&extent_manager) as _;
@@ -4657,11 +4671,84 @@ mod write_tests {
         );
     }
 
-    /// A pure overwrite of already-written blocks must convert nothing:
-    /// `write_at` calls `convert_unwritten` on EVERY write, so the all-written
-    /// case must stay a bounded read-only probe (P9a-T5) that touches and
-    /// journals no node. Here we pin the invariant on a small file — the
-    /// mapping stays written and `i_blocks` is unchanged.
+    /// P9b-b2's discriminating witness: appends into a CHECKERBOARDED group
+    /// must skip the small holes and land as one contiguous run. The retired
+    /// halving allocator first-fit its way into the 2-block fragments (the
+    /// 045 verdict's length-1/2 extents); the two-pass ring's first pass
+    /// takes whole runs only. (The fresh-disk sequential witness below stays
+    /// as the outcome pin; the baseline passed it too — this one it fails.)
+    #[ktest]
+    fn appends_skip_checkerboard_fragments() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+
+        // Checkerboard the low space at the allocator level: 24 two-block
+        // runs, every other one freed, frees committed (pins release).
+        let runs: Vec<_> = {
+            let op = f.ext4.begin_op(16).unwrap();
+            (0..24)
+                .map(|_| f.ext4.alloc_blocks(2, 0, op.get()).unwrap())
+                .collect()
+        };
+        {
+            let op = f.ext4.begin_op(16).unwrap();
+            for run in runs.iter().step_by(2) {
+                f.ext4
+                    .free_blocks(
+                        journal::BlockFreeAuth::without_revoke_duty(
+                            run.start,
+                            (run.end - run.start) as u32,
+                        ),
+                        op.get(),
+                    )
+                    .unwrap();
+            }
+        }
+        journal.commit_now_for_test();
+
+        // 4-block appends cannot fit the 2-block holes: pass 1 must ring
+        // forward past the checkerboard and stay contiguous.
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+        for i in 0..8usize {
+            write_all(&inode, i * 4 * BLOCK_SIZE, &[i as u8 + 1; 4 * BLOCK_SIZE]);
+        }
+        let inner = inode.inner.read();
+        let bm = inner.extent_manager().unwrap();
+        let m = bm.map_blocks(0).unwrap();
+        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(
+            m.len(),
+            32,
+            "appends must skip the checkerboard and stay one extent"
+        );
+    }
+
+    /// P9b-b2 extent-contiguity witness (the 045 verdict's regression pin):
+    /// a file appended in many separate writes must stay ONE physically
+    /// contiguous extent — the goal now advances with each allocation and a
+    /// nearly-full goal group answers NoFit instead of handing back halved
+    /// fragments (the old allocator produced length-1 extents at stride 16).
+    #[ktest]
+    fn sequential_appends_stay_one_contiguous_extent() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // 16 separate 4-block appends = 16 allocator round-trips.
+        for i in 0..16usize {
+            write_all(&inode, i * 4 * BLOCK_SIZE, &[i as u8 + 1; 4 * BLOCK_SIZE]);
+        }
+
+        let inner = inode.inner.read();
+        let bm = inner.extent_manager().unwrap();
+        let m = bm.map_blocks(0).unwrap();
+        assert_eq!(m.state(), MapState::Written);
+        assert_eq!(
+            m.len(),
+            64,
+            "16 sequential appends must coalesce into one 64-block extent"
+        );
+    }
+
     /// G9-1 (P9a-a5 audit, H-4): a preallocation that fills the disk MID-WAY
     /// (injected: the second hole's allocation fails) seals its transaction —
     /// the descriptor commits together with the leaf/bitmap captures that
@@ -4763,6 +4850,11 @@ mod write_tests {
         assert_eq!(inner.link_count(), 100);
     }
 
+    /// A pure overwrite of already-written blocks must convert nothing:
+    /// `write_at` calls `convert_unwritten` on EVERY write, so the all-written
+    /// case must stay a bounded read-only probe (P9a-T5) that touches and
+    /// journals no node. Here we pin the invariant on a small file — the
+    /// mapping stays written and `i_blocks` is unchanged.
     #[ktest]
     fn overwrite_of_written_block_converts_nothing() {
         let f = journaled_fixture_with_empty_file();

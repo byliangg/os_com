@@ -151,6 +151,107 @@ impl IdBitmap {
         Some(allocated_range)
     }
 
+    /// Allocates the first `count`-long run of free IDs at or after `hint` —
+    /// goal-directed first fit. Returns `None` when `[hint, len)` holds no
+    /// such run: the request is neither wrapped below `hint` (the caller's
+    /// ring loop owns moving on) nor shrunk (a downsized run would defeat the
+    /// contiguity the hint asks for).
+    pub fn alloc_consecutive_from(&mut self, hint: u16, count: u16) -> Option<Range<u16>> {
+        if count == 0 || hint >= self.len {
+            return None;
+        }
+        // Everything below `first_available_id` is allocated, so the scan may
+        // fast-forward to it when the hint lies below.
+        let start = hint.max(self.first_available_id);
+        let allocated_range = {
+            let bit_slice = self.bit_slice();
+            // Invariant: all bits within `curr_range` are 0's.
+            let mut curr_range = start..start;
+            while curr_range.len() < count as usize && curr_range.end < self.len {
+                if !bit_slice[curr_range.end as usize] {
+                    curr_range.end += 1;
+                } else {
+                    curr_range = curr_range.end + 1..curr_range.end + 1;
+                }
+            }
+            if curr_range.len() < count as usize {
+                return None;
+            }
+            curr_range
+        };
+        self.set_allocated(allocated_range)
+    }
+
+    /// Allocates the longest run of free IDs anywhere in the bitmap, stopping
+    /// early at `cap` — the fallback pass when no group holds the full
+    /// request: take the best piece available instead of rescanning one
+    /// group with halved counts. Returns `None` when no ID is free.
+    pub fn alloc_longest_run(&mut self, cap: u16) -> Option<Range<u16>> {
+        if cap == 0 {
+            return None;
+        }
+        let best = {
+            let bit_slice = self.bit_slice();
+            let mut best: Option<Range<u16>> = None;
+            let mut curr = self.first_available_id..self.first_available_id;
+            loop {
+                if curr.end < self.len && !bit_slice[curr.end as usize] {
+                    curr.end += 1;
+                    if curr.len() >= cap as usize {
+                        best = Some(curr);
+                        break;
+                    }
+                    continue;
+                }
+                if !curr.is_empty() && best.as_ref().is_none_or(|b| curr.len() > b.len()) {
+                    best = Some(curr.clone());
+                }
+                if curr.end >= self.len {
+                    break;
+                }
+                curr = curr.end + 1..curr.end + 1;
+            }
+            best?
+        };
+        self.set_allocated(best)
+    }
+
+    /// Allocates exactly `[at, at + count)`, or `None` when any bit in the
+    /// range is already set (or out of bounds) — the pin-hold and
+    /// preallocation-carve primitive: the caller names the exact bits.
+    pub fn alloc_exact_at(&mut self, at: u16, count: u16) -> Option<Range<u16>> {
+        if count == 0 {
+            return None;
+        }
+        let end = at.checked_add(count)?;
+        if end > self.len {
+            return None;
+        }
+        {
+            let bit_slice = self.bit_slice();
+            if (at..end).any(|i| bit_slice[i as usize]) {
+                return None;
+            }
+        }
+        self.set_allocated(at..end)
+    }
+
+    /// Marks `range` allocated and maintains the `first_available_id`
+    /// invariant — the shared tail of every range allocator above.
+    fn set_allocated(&mut self, range: Range<u16>) -> Option<Range<u16>> {
+        let bit_slice_mut = self.bit_slice_mut();
+        for id in range.clone() {
+            bit_slice_mut.set(id as usize, true);
+        }
+        let bit_slice = self.bit_slice();
+        if bit_slice[self.first_available_id as usize] {
+            self.first_available_id = (range.end..self.len)
+                .find(|&i| !bit_slice[i as usize])
+                .map_or(self.len, |i| i);
+        }
+        Some(range)
+    }
+
     /// Releases the allocated `id`.
     ///
     /// # Panics
@@ -220,5 +321,41 @@ mod test {
         // Allocating one more ID should fail since the
         // bitmap's `first_available_id` + `count` is out of bounds.
         assert!(bitmap.alloc_consecutive(1).is_none());
+    }
+
+    #[ktest]
+    fn alloc_consecutive_from_is_goal_directed_and_never_shrinks() {
+        let mut bm = IdBitmap::from_buf(vec![0; BLOCK_SIZE].into_boxed_slice(), 64);
+        // Occupy [10, 20) so runs exist on both sides of a mid hint.
+        assert_eq!(bm.alloc_consecutive_from(10, 10), Some(10..20));
+
+        // Goal-directed: from 16 the run lands after the occupied span, not
+        // in the (larger) free head below the hint.
+        assert_eq!(bm.alloc_consecutive_from(16, 4), Some(20..24));
+        // Never wraps below the hint and never shrinks: a request larger
+        // than the tail fails outright even though the head could hold it.
+        assert_eq!(bm.alloc_consecutive_from(30, 40), None);
+        // The head stays reachable through a low hint.
+        assert_eq!(bm.alloc_consecutive_from(0, 10), Some(0..10));
+        // `first_available_id` stayed exact throughout: the next single
+        // allocation lands in the lowest hole.
+        assert_eq!(bm.alloc(), Some(24));
+    }
+
+    #[ktest]
+    fn alloc_longest_run_takes_the_best_piece() {
+        let mut bm = IdBitmap::from_buf(vec![0; BLOCK_SIZE].into_boxed_slice(), 64);
+        // Carve free runs of 3, 8, and 5: [0,3) [6,14) [20,25), rest occupied.
+        assert!(bm.alloc_consecutive_from(3, 3).is_some()); // [3,6)
+        assert!(bm.alloc_consecutive_from(14, 6).is_some()); // [14,20)
+        assert!(bm.alloc_consecutive_from(25, 39).is_some()); // [25,64)
+
+        // A capped request early-stops at the first run that satisfies it…
+        assert_eq!(bm.alloc_longest_run(3), Some(0..3));
+        // …and an uncappable one takes the longest available piece.
+        assert_eq!(bm.alloc_longest_run(16), Some(6..14));
+        assert_eq!(bm.alloc_longest_run(16), Some(20..25));
+        // Nothing free → None.
+        assert_eq!(bm.alloc_longest_run(1), None);
     }
 }

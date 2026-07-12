@@ -147,6 +147,11 @@ pub(super) struct ExtentManager {
     /// a correct extent-block tail checksum (`ext4_extent_block_csum`); `None`
     /// leaves those blocks byte-identical to the pre-feature layout.
     csum_seed: Option<InodeCsumSeed>,
+    /// The fallback allocation goal (the inode's own group's first block,
+    /// [`Ext4::inode_goal_block`]): used when a hole has no in-range
+    /// predecessor to hint locality from — files stay near their inodes
+    /// instead of piling into group 0.
+    inode_goal: Ext4Bid,
     /// The owning inode's revoke rule for its freed DATA blocks (Linux
     /// `get_default_free_blocks_flags`): [`Forget`](journal::DataForgetPolicy::Forget)
     /// for directories (journaled dir blocks) and symlinks (Linux-conservative
@@ -164,6 +169,7 @@ impl ExtentManager {
         fs: Weak<super::super::fs::Ext4>,
         npages: usize,
         csum_seed: Option<InodeCsumSeed>,
+        inode_goal: Ext4Bid,
         data_forget_policy: journal::DataForgetPolicy,
     ) -> Result<Self> {
         Ok(Self {
@@ -171,6 +177,7 @@ impl ExtentManager {
             npages: AtomicUsize::new(npages),
             fs,
             csum_seed,
+            inode_goal,
             data_forget_policy,
         })
     }
@@ -321,8 +328,8 @@ impl ExtentManager {
         // (the preceding extent's physical end, for locality); the first
         // hole's predecessor may live before the walked range, so it comes
         // from the landing search instead — its in-leaf predecessor, with a
-        // predecessor in an earlier leaf falling back to goal 0 (an allocator
-        // hint, not a correctness input; full locality tuning is P9b).
+        // predecessor in an earlier leaf falling back to the inode-affinity
+        // goal (an allocator hint, not a correctness input; P9b-b2).
         //
         // Fresh holes are allocated as UNWRITTEN, not written: the block stays
         // read-as-zeros until the caller's data lands and `write_at` converts
@@ -373,9 +380,11 @@ impl ExtentManager {
 
         for hole in &holes {
             let mut ib = hole.run.start;
-            // `alloc_blocks`'s 0-as-no-hint is that signature's own debt; the
-            // plan keeps "no predecessor" explicit until this boundary.
-            let goal = hole.goal.unwrap_or(0);
+            // No in-range predecessor → the inode-affinity fallback (P9b-b2
+            // goal rule 3); and the goal ADVANCES with each allocation
+            // (rule 1) so a hole filled in several pieces stays physically
+            // contiguous instead of re-hinting the same spot.
+            let mut goal = hole.goal.unwrap_or(self.inode_goal);
             while ib < hole.run.end {
                 // Credit-aware early stop (chunked mode only): if the NEXT
                 // insert will not fit the handle's transaction even after
@@ -432,6 +441,7 @@ impl ExtentManager {
                     );
                     return Err(err);
                 }
+                goal = range.end;
                 ib += got;
             }
         }
@@ -490,7 +500,7 @@ impl ExtentManager {
         }
         let mut tree = self.state.write();
         // The page-cache writeback fallback has no open handle to thread.
-        let range = fs.alloc_blocks(1, 0, None)?;
+        let range = fs.alloc_blocks(1, self.inode_goal, None)?;
         let pblock = range.start;
         if let Err(err) = tree.insert(
             &fs,
@@ -819,6 +829,7 @@ mod tests {
             f.ext4.this(),
             4,
             None,
+            0,
             journal::DataForgetPolicy::PlainData,
         )
         .unwrap();
@@ -854,6 +865,7 @@ mod tests {
             f.ext4.this(),
             2,
             None,
+            0,
             journal::DataForgetPolicy::PlainData,
         )
         .unwrap();
@@ -906,6 +918,7 @@ mod tests {
             f.ext4.this(),
             8,
             None,
+            0,
             journal::DataForgetPolicy::PlainData,
         )
         .unwrap();
@@ -954,6 +967,7 @@ mod tests {
             f.ext4.this(),
             0,
             None,
+            0,
             journal::DataForgetPolicy::PlainData,
         )
         .unwrap();
@@ -998,6 +1012,7 @@ mod tests {
             f.ext4.this(),
             0,
             None,
+            0,
             journal::DataForgetPolicy::PlainData,
         )
         .unwrap();

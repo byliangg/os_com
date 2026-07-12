@@ -352,6 +352,24 @@ impl Debug for BlockGroupMetadata {
     }
 }
 
+/// The per-group allocation policy for one ring pass (P9b-b2): the halved
+/// first-fit rescans this replaces gave a nearly-full goal group a 1-block
+/// fragment instead of moving on — the 045 verdict's 1360 length-1 extents.
+pub(super) enum AllocPolicy {
+    /// First pass: the whole (group-clamped) run or nothing. `goal_offset`
+    /// (the goal's group-local bit when the goal lands here) seeds a
+    /// goal-directed first fit before the group-head scan — Linux
+    /// `ext4_mb_find_by_goal`'s shape without the buddy machinery.
+    FullRunOnly {
+        /// Group-local bit of the caller's goal, `None` off-goal-group.
+        goal_offset: Option<u16>,
+    },
+    /// Second pass: the longest free run available (early-stop at the
+    /// request) — the fallback that takes the best piece instead of
+    /// hammering one group with halved rescans.
+    BestEffort,
+}
+
 /// The outcome of one group's block-allocation attempt
 /// ([`BlockGroup::alloc_blocks`]).
 pub(super) enum GroupBlockAlloc {
@@ -825,6 +843,7 @@ impl BlockGroup {
         count: u32,
         sb_free_blocks: u64,
         pinned_frees: &[(Ext4Bid, u32)],
+        policy: AllocPolicy,
         handle: Option<&journal::Handle>,
     ) -> Result<GroupBlockAlloc> {
         let group_size = (self.last_block - self.first_block + 1) as u32;
@@ -847,43 +866,80 @@ impl BlockGroup {
 
         let mut metadata = self.metadata.write();
 
-        let mut requested_count = count
-            .min(group_size)
-            .min(metadata.desc.free_blocks_count())
-            .min(sb_free_blocks.min(u32::MAX as u64) as u32)
-            as u16;
-
-        let block_bitmap_bid = metadata.desc.block_bitmap_bid();
-        let bitmap_access = journal::get_write_access(handle, block_bitmap_bid)?;
-
-        // TODO(P9, allocator work): improve bitmap allocation to reduce
-        // fragmentation (e.g. find the first free run directly instead of
-        // retrying with halved counts).
-        //
-        // A candidate overlapping a pinned run is HELD (left allocated) so the
-        // first-fit scan moves past it instead of finding it again; every hold
-        // is released below, before the bitmap is read or serialized. This is
-        // the scan-local mirror of Linux's "mark the pending frees used when
-        // generating the buddy" (mballoc.c `ext4_mb_generate_from_freelist`).
-        // Holding the WHOLE candidate (not just the overlap) is what makes the
-        // scan terminate; the free capacity it hides is transient — the pins
-        // release when the freeing transaction commits.
-        let mut pinned_held: Vec<Range<u16>> = Vec::new();
-        let mut allocated_range = None;
-        'search: while requested_count > 0 {
-            while let Some(candidate) = metadata.block_bitmap.alloc_consecutive(requested_count) {
-                if pinned_bits
-                    .iter()
-                    .any(|pin| pin.start < candidate.end && candidate.start < pin.end)
-                {
-                    pinned_held.push(candidate);
-                    continue;
-                }
-                allocated_range = Some(candidate);
-                break 'search;
+        // Cheap prechecks BEFORE the journal capture: a ring pass visits many
+        // groups, and `get_write_access` charges the transaction per capture —
+        // a group that cannot possibly fit must answer `NoFit` without
+        // touching the journal.
+        let precheck_fits = match policy {
+            AllocPolicy::FullRunOnly { .. } => {
+                let want = count.min(group_size) as u64;
+                (metadata.desc.free_blocks_count() as u64) >= want && sb_free_blocks >= want
             }
-            requested_count /= 2;
+            AllocPolicy::BestEffort => metadata.desc.free_blocks_count() > 0 && sb_free_blocks > 0,
+        };
+        if !precheck_fits {
+            return Ok(GroupBlockAlloc::NoFit {
+                pinned_in_group: !pinned_bits.is_empty(),
+            });
         }
+
+        // Hold (mark allocated) every pinned bit BEFORE the scan, so the
+        // policy scans below run exactly once over a bitmap where "free"
+        // means "allocatable" — Linux's "mark the pending frees used when
+        // generating the buddy" (mballoc.c `ext4_mb_generate_from_freelist`).
+        // Every hold is released below, before the bitmap is read or
+        // serialized. The retired shape — scan, test the candidate against
+        // the pin list, hold the overlap, rescan — restarted the scan from
+        // its hint after every hold: O(pinned²) per call under generic/371's
+        // rm churn (tens of thousands of pinned bits), which stretched even
+        // a single-block allocation to tens of milliseconds UNDER THE
+        // SUPERBLOCK WRITE LOCK and starved the pwrite side's
+        // pinned-`ENOSPC` retries into a surfaced `ENOSPC` (the freed-space
+        // windows its commit-and-retry protocol opened were always consumed
+        // by the concurrent fallocate loop first). Pre-holding is O(pinned)
+        // once, and each policy scan is one linear pass.
+        let mut pinned_held: Vec<Range<u16>> = Vec::new();
+        for pin in &pinned_bits {
+            if let Some(held) = metadata
+                .block_bitmap
+                .alloc_exact_at(pin.start, pin.end - pin.start)
+            {
+                pinned_held.push(held);
+            } else {
+                // A pin names free bits (its free cleared them, and the
+                // allocator refuses pinned bits), but pin entries can
+                // overlap each other transiently; hold each still-free bit
+                // individually so coverage stays exact without double-holds.
+                for bit in pin.clone() {
+                    if let Some(held) = metadata.block_bitmap.alloc_exact_at(bit, 1) {
+                        pinned_held.push(held);
+                    }
+                }
+            }
+        }
+        let allocated_range = match policy {
+            AllocPolicy::FullRunOnly { goal_offset } => {
+                // The whole (group-clamped) run or nothing: no halving, no
+                // silent shrink to the free count (the precheck above already
+                // excluded a group that cannot hold it). Goal-directed first
+                // (runs at or after the goal bit), then the group head — the
+                // head scan also covers the below-goal runs the first pass
+                // skipped.
+                let want = count.min(group_size) as u16;
+                let mut hints = goal_offset.into_iter().chain(core::iter::once(0));
+                hints.find_map(|hint| metadata.block_bitmap.alloc_consecutive_from(hint, want))
+            }
+            AllocPolicy::BestEffort => {
+                // The longest run available, early-stopping at the (fully
+                // clamped) request.
+                let cap = count
+                    .min(group_size)
+                    .min(metadata.desc.free_blocks_count())
+                    .min(sb_free_blocks.min(u32::MAX as u64) as u32)
+                    as u16;
+                metadata.block_bitmap.alloc_longest_run(cap)
+            }
+        };
         // The pinned bits must stay clear everywhere but inside this scan: the
         // capture patch below serializes the whole bitmap, so a hold leaking
         // past this point would journal freed blocks as allocated.
@@ -893,10 +949,14 @@ impl BlockGroup {
 
         let Some(range) = allocated_range else {
             let pinned_in_group = !pinned_bits.is_empty();
-            // With pins in the group, "free count > 0 but nothing fits" is the
-            // expected transient, not corruption — the heuristic is suspended
-            // for the pins' lifetime.
-            if metadata.desc.free_blocks_count() > 0 && !pinned_in_group {
+            // The corruption heuristic ("free count > 0 yet not one block
+            // allocatable") belongs to the exhaustive pass only: a
+            // `FullRunOnly` NoFit is the normal ring-forward answer, and with
+            // pins in the group the mismatch is the expected transient.
+            if matches!(policy, AllocPolicy::BestEffort)
+                && metadata.desc.free_blocks_count() > 0
+                && !pinned_in_group
+            {
                 return_errno_with_message!(Errno::EIO, "block bitmap corruption detected");
             }
             return Ok(GroupBlockAlloc::NoFit { pinned_in_group });
@@ -904,6 +964,22 @@ impl BlockGroup {
 
         let range_start = range.start as Ext4Bid;
         let alloc_count = range.len() as u32;
+
+        // The journal capture happens only for a group that actually
+        // allocates: a ring pass visits many groups, and capturing every
+        // scanned-but-empty-handed bitmap would both waste credits (each
+        // fresh capture charges the transaction — a fragmented disk could
+        // trip the capacity backstop with space still available) and write
+        // untouched bitmaps into the log. On a capture failure the in-memory
+        // allocation rolls back; nothing was journaled.
+        let block_bitmap_bid = metadata.desc.block_bitmap_bid();
+        let bitmap_access = match journal::get_write_access(handle, block_bitmap_bid) {
+            Ok(access) => access,
+            Err(err) => {
+                metadata.block_bitmap.free_consecutive(range);
+                return Err(err);
+            }
+        };
 
         let abs_range = (self.first_block + range_start)
             ..(self.first_block + range_start + alloc_count as Ext4Bid);

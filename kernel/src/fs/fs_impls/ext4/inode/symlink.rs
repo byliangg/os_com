@@ -158,6 +158,9 @@ impl InodeInner {
                     // so its extent tree never grows an external node — the
                     // node kind that would carry a tail checksum. No seed needed.
                     None,
+                    // One-block target: the allocator's default placement is
+                    // fine, no inode-affinity goal threaded here.
+                    0,
                     // Symlink data blocks are revoked on free, mirroring
                     // Linux's unconditional S_ISLNK → METADATA | FORGET
                     // (fs/ext4/extents.c:2415-2417).

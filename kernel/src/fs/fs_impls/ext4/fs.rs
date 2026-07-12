@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use device_id::DeviceId;
 
 use super::{
-    block_group::{BlockGroup, GroupBlockAlloc},
+    block_group::{AllocPolicy, BlockGroup, GroupBlockAlloc},
     checksum::FsCsumSeed,
     feature::FeatureIncompatSet,
     inode,
@@ -893,6 +893,24 @@ impl Ext4 {
         self.self_ref.clone()
     }
 
+    /// Returns the fallback allocation goal for an inode with no better hint:
+    /// the first block of the inode's own block group (Linux
+    /// `ext4_inode_to_goal_block`) — keeping a file's data near its inode
+    /// instead of piling every hint-less allocation into group 0.
+    pub(super) fn inode_goal_block(&self, ino: Ext4Ino) -> Ext4Bid {
+        let sb = self.super_block.read();
+        let group = ((ino - 1) / self.nr_inodes_per_group) as Ext4Bid;
+        sb.first_data_block() + group * sb.nr_blocks_per_group() as Ext4Bid
+    }
+
+    /// Arms the G9 allocation fault: the `after`-th subsequent
+    /// [`alloc_blocks`](Self::alloc_blocks) call (0 = the very next) fails
+    /// `ENOSPC`, then the fault disarms. One-shot, test-only.
+    #[cfg(ktest)]
+    pub(super) fn arm_alloc_blocks_enospc(&self, after: i64) {
+        self.fail_alloc_blocks_after.store(after, Ordering::Release);
+    }
+
     /// Allocates up to `count` contiguous blocks, preferring the group that owns
     /// `goal`.
     ///
@@ -910,14 +928,6 @@ impl Ext4 {
     /// `ext4_should_retry_alloc` at the op level, outside the handle; our
     /// equivalent is `retry_on_pinned_enospc` at the op level, live since
     /// P7e-6). Returns `Err(EINVAL)` if `count` is zero.
-    /// Arms the G9 allocation fault: the `after`-th subsequent
-    /// [`alloc_blocks`](Self::alloc_blocks) call (0 = the very next) fails
-    /// `ENOSPC`, then the fault disarms. One-shot, test-only.
-    #[cfg(ktest)]
-    pub(super) fn arm_alloc_blocks_enospc(&self, after: i64) {
-        self.fail_alloc_blocks_after.store(after, Ordering::Release);
-    }
-
     pub(super) fn alloc_blocks(
         &self,
         count: u32,
@@ -965,19 +975,44 @@ impl Ext4 {
         }
         .min(nr_block_groups - 1);
 
-        let mut pinned_blocked = false;
-        for group_search_offset in 0..nr_block_groups {
-            let group_idx = (goal_group + group_search_offset) % nr_block_groups;
-            let group = &self.block_groups[group_idx];
+        // The goal's group-local bit, seeding the goal group's in-group scan
+        // (Linux `ext4_mb_find_by_goal`'s shape). `goal == 0` carries no hint.
+        let goal_offset_in_group = (goal > first_data_block).then(|| {
+            // Lossless: a group holds at most 32768 bits.
+            ((goal - first_data_block) % nr_blocks_per_group) as u16
+        });
 
-            match group.alloc_blocks(count, sb_free_blocks, &pinned_frees, handle)? {
-                GroupBlockAlloc::Allocated(range) => {
-                    let allocated_count = range.end - range.start;
-                    sb.dec_free_blocks(allocated_count)?;
-                    sb.journal_capture(handle, sb.last_orphan())?;
-                    return Ok(range);
+        // Two ring passes from the goal group (P9b-b2): first the whole run
+        // or nothing per group (goal-directed inside the goal group), then —
+        // only with every group empty-handed — the longest piece available.
+        // The halved rescans this replaces handed a nearly-full goal group a
+        // 1-block fragment instead of moving to the next group's open run.
+        let mut pinned_blocked = false;
+        for policy_pass in 0..2u8 {
+            for group_search_offset in 0..nr_block_groups {
+                let group_idx = (goal_group + group_search_offset) % nr_block_groups;
+                let group = &self.block_groups[group_idx];
+                let policy = if policy_pass == 0 {
+                    AllocPolicy::FullRunOnly {
+                        goal_offset: if group_search_offset == 0 {
+                            goal_offset_in_group
+                        } else {
+                            None
+                        },
+                    }
+                } else {
+                    AllocPolicy::BestEffort
+                };
+
+                match group.alloc_blocks(count, sb_free_blocks, &pinned_frees, policy, handle)? {
+                    GroupBlockAlloc::Allocated(range) => {
+                        let allocated_count = range.end - range.start;
+                        sb.dec_free_blocks(allocated_count)?;
+                        sb.journal_capture(handle, sb.last_orphan())?;
+                        return Ok(range);
+                    }
+                    GroupBlockAlloc::NoFit { pinned_in_group } => pinned_blocked |= pinned_in_group,
                 }
-                GroupBlockAlloc::NoFit { pinned_in_group } => pinned_blocked |= pinned_in_group,
             }
         }
 
