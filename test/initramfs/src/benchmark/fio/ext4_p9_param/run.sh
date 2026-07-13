@@ -80,7 +80,26 @@ read)
         -ioengine=sync -direct=0 -numjobs="$NJ"
     echo "P9DONE read-warm"
     ;;
-# direct-read / direct-write 模式等 P9b-b4 O_DIRECT 实装后加（-direct=1 sweep）。
+directwrite)
+    mkdir -p /ext4
+    mount -t ext4 /dev/vdc /ext4
+    echo "P9CASE direct-write"
+    $FIO -rw=write -filename=/ext4/fio-test -name=p9dwrite -size="$SIZE" -bs="$BS" \
+        -ioengine=sync -direct=1 -numjobs="$NJ" $FSYNC_OPT
+    echo "P9DONE direct-write"
+    ;;
+directread)
+    mkdir -p /ext4
+    mount -t ext4 /dev/vdc /ext4
+    # Buffered prep lays the file down; the measured read is O_DIRECT, which
+    # bypasses the page cache by construction — no cold/warm split.
+    $FIO -rw=write -filename=/ext4/fio-test -name=prep -size="$SIZE" -bs=1M \
+        -ioengine=sync -direct=0 -numjobs=1 -fsync_on_close=1 > /dev/null
+    echo "P9CASE direct-read"
+    $FIO -rw=read -filename=/ext4/fio-test -name=p9dread -size="$SIZE" -bs="$BS" \
+        -ioengine=sync -direct=1 -numjobs="$NJ"
+    echo "P9DONE direct-read"
+    ;;
 *)
     echo "P9ERR unknown MODE=$MODE"
     exit 1

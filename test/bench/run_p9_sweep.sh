@@ -81,6 +81,10 @@ raw_write|$FIO_JOB|raw|write|1M|1|0|1G|raw
 raw_read|$FIO_JOB|raw|read|1M|1|0|1G|raw
 nj_write_1m|$FIO_JOB|write|write|1M|1|0|1G|nojournal
 nj_read_1m|$FIO_JOB|read|read|1M|1|0|1G|nojournal
+g_direct_write_1m|$FIO_JOB|directwrite|write|1M|1|0|1G|journaled
+g_direct_read_1m|$FIO_JOB|directread|read|1M|1|0|1G|journaled
+g_direct_write_4k|$FIO_JOB|directwrite|write|4K|1|0|1G|journaled
+g_direct_read_4k|$FIO_JOB|directread|read|4K|1|0|1G|journaled
 sqlite_speedtest|$SQLITE_JOB|sqlite|-|-|-|-|1000|journaled
 selfcheck_hang|$FIO_JOB|hang|-|-|-|-|-|journaled
 "

@@ -1,0 +1,16 @@
+these 3 derivations will be built:
+  /nix/store/8xdnjm85ag8s8dirma5p7pr3jxp7mda2-benchmark-0.1.0.drv
+  /nix/store/gf61gqnr8afjagchlzzsjrga78r0pzdn-runtime-deps.drv
+  /nix/store/8qlv4qp99v604agzg9zpxzyqzicaixaf-initramfs.drv
+building '/nix/store/8xdnjm85ag8s8dirma5p7pr3jxp7mda2-benchmark-0.1.0.drv'...
+building '/nix/store/gf61gqnr8afjagchlzzsjrga78r0pzdn-runtime-deps.drv'...
+structuredAttrs is enabled
+building '/nix/store/8qlv4qp99v604agzg9zpxzyqzicaixaf-initramfs.drv'...
+/nix/store/2mvv4dzvh055dgcswki9g5q7xymw4a8z-initramfs
+this derivation will be built:
+  /nix/store/33jl92fm6iil2rba2c0a0qzdp1r3bhai-initramfs-image.drv
+building '/nix/store/33jl92fm6iil2rba2c0a0qzdp1r3bhai-initramfs-image.drv'...
+/build/tmp.5vyQRNnwoI /build
+180035 blocks
+/build
+/nix/store/qf9dcpqfhz8qghahar7k9z6vi8jfgrj3-initramfs-image
