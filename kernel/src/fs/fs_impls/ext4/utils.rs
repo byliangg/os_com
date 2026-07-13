@@ -4,42 +4,10 @@
 //!
 //! - `Dirty` — a wrapper that tracks whether its inner value has been mutated,
 //!   for writeback scheduling.
-//! - `IsPowerOf` — a trait for testing whether a number is a power of another;
-//!   currently unused (kept for sparse-superblock backup-group detection —
-//!   backups live in groups that are powers of 3/5/7 — if the allocator ever
-//!   needs it; the block-side lazy-group reconstruction derives its overhead
-//!   from the descriptor's free count instead).
 //! - `now` — reads the real-time coarse clock.
-
-use core::ops::MulAssign;
 
 use super::prelude::*;
 use crate::prelude::warn;
-
-#[expect(dead_code)] // Currently unused; kept for sparse-superblock backup-group detection.
-pub(super) trait IsPowerOf: Copy + Sized + MulAssign + PartialOrd {
-    /// Returns whether `self` equals `x^k` for some `k > 0`.
-    ///
-    /// `x` must be greater than 1.
-    fn is_power_of(&self, x: Self) -> bool {
-        let mut power = x;
-        while power < *self {
-            power *= x;
-        }
-
-        power == *self
-    }
-}
-
-macro_rules! impl_ipo_for {
-    ($($ipo_ty:ty),*) => {
-        $(impl IsPowerOf for $ipo_ty {})*
-    };
-}
-
-impl_ipo_for!(
-    u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, isize, usize
-);
 
 /// A value with dirty tracking.
 pub(super) struct Dirty<T: Debug> {

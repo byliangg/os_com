@@ -80,16 +80,20 @@ pub(super) struct SuperBlock {
     nr_block_groups: u32,
     nr_inodes_per_group: u32,
     // The fields below are decoded from the raw superblock and consumed by the
-    // allocation, journal, and checksum paths. A few not yet read by any path
-    // (e.g. `rev_level`, `state`) still carry an `#[expect(dead_code)]` marker on
-    // their accessor.
+    // allocation, journal, and checksum paths.
     nr_inode_table_blocks_per_group: u32,
     inode_size: usize,
     /// Effective group-descriptor size in bytes (32 or 64), already resolved
     /// from the raw `s_desc_size` sentinel by [`parse_desc_size`].
     desc_size: u16,
     first_ino: u32,
+    // `rev_level` and `state` are decoded and retained as part of the validated
+    // superblock, but no path reads them back yet (`rev_level` also drives
+    // `first_ino`/`inode_size` transiently at parse time). The marker sits on the
+    // field — its dead-code entry point — not on an accessor kept only to hold it.
+    #[expect(dead_code)]
     rev_level: RevLevel,
+    #[expect(dead_code)]
     state: FsState,
     feature_compat: FeatureCompatSet,
     feature_incompat: FeatureIncompatSet,
@@ -441,16 +445,6 @@ impl SuperBlock {
         (self.block_size / self.inode_size) as u32
     }
 
-    #[expect(dead_code)]
-    pub(super) const fn rev_level(&self) -> RevLevel {
-        self.rev_level
-    }
-
-    #[expect(dead_code)]
-    pub(super) const fn state(&self) -> FsState {
-        self.state
-    }
-
     pub(super) const fn uuid(&self) -> &[u8; 16] {
         &self.uuid
     }
@@ -662,11 +656,6 @@ impl SuperBlock {
     /// silently discarding every committed (fsync-acknowledged) transaction.
     pub(super) fn set_recover(&mut self) {
         self.feature_incompat.insert(FeatureIncompatSet::RECOVER);
-    }
-
-    #[expect(dead_code)]
-    pub(super) const fn feature_ro_compat(&self) -> FeatureRoCompatSet {
-        self.feature_ro_compat
     }
 
     /// Returns the four-word htree name-hash seed (`s_hash_seed`).
