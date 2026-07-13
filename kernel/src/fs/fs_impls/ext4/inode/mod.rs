@@ -1979,18 +1979,23 @@ impl Inode {
     /// Preallocates or punches disk space over `[offset, offset + len)`
     /// (`fallocate(2)`), dispatching on `mode`.
     ///
-    /// Supported (the xfstests punch group this task targets):
+    /// Supported:
     /// - [`Allocate`](FallocMode::Allocate) / [`AllocateKeepSize`](FallocMode::AllocateKeepSize):
     ///   reserve UNWRITTEN blocks over the range (the blocks read zero until a
     ///   real write converts them), extending `i_size` only for `Allocate`.
     /// - [`PunchHoleKeepSize`](FallocMode::PunchHoleKeepSize): free the mapped
     ///   blocks in the range, leaving a hole (`i_size` unchanged).
+    /// - [`ZeroRange`](FallocMode::ZeroRange) / [`ZeroRangeKeepSize`](FallocMode::ZeroRangeKeepSize):
+    ///   make the range read back zeros (block-aligned middle turned unwritten,
+    ///   partial edges zeroed), keeping blocks allocated; grows `i_size` unless
+    ///   KEEP_SIZE (Linux `ext4_zero_range`).
+    /// - [`CollapseRange`](FallocMode::CollapseRange) / [`InsertRange`](FallocMode::InsertRange):
+    ///   block-aligned extent-tree shifts that remove or open a gap and adjust
+    ///   `i_size` (Linux `ext4_collapse_range` / `ext4_insert_range`).
     ///
-    /// Deferred beyond P7 (ledger `a2-fallocate`): `ZeroRange`/`ZeroRangeKeepSize`
-    /// and the extent-shifting `CollapseRange`/`InsertRange`/`AllocateUnshareRange`
-    /// all return `EOPNOTSUPP`. `fallocate` is a regular-file operation; a
-    /// directory or special inode is rejected the same way (Linux ext4 gates on
-    /// `S_ISREG`).
+    /// Still `EOPNOTSUPP`: `AllocateUnshareRange` (no reflink/shared extents).
+    /// `fallocate` is a regular-file operation; a directory or special inode is
+    /// rejected the same way (Linux ext4 gates on `S_ISREG`).
     pub(super) fn fallocate(&self, mode: FallocMode, offset: usize, len: usize) -> Result<()> {
         if self.type_ != InodeType::File {
             return_errno_with_message!(
@@ -2014,11 +2019,18 @@ impl Inode {
                 .fs()?
                 .retry_on_pinned_enospc(|| self.preallocate(offset, len, SizeMode::Keep)),
             FallocMode::PunchHoleKeepSize => self.punch_hole(offset, len),
-            FallocMode::ZeroRange
-            | FallocMode::ZeroRangeKeepSize
-            | FallocMode::CollapseRange
-            | FallocMode::InsertRange
-            | FallocMode::AllocateUnshareRange => {
+            // ZERO_RANGE reserves/converts blocks, so `ext4_should_retry_alloc`
+            // around it too (a transient pinned-freed ENOSPC retries clean, like
+            // `Allocate`).
+            FallocMode::ZeroRange => self
+                .fs()?
+                .retry_on_pinned_enospc(|| self.zero_range(offset, len, false)),
+            FallocMode::ZeroRangeKeepSize => self
+                .fs()?
+                .retry_on_pinned_enospc(|| self.zero_range(offset, len, true)),
+            FallocMode::CollapseRange => self.collapse_range(offset, len),
+            FallocMode::InsertRange => self.insert_range(offset, len),
+            FallocMode::AllocateUnshareRange => {
                 return_errno_with_message!(Errno::EOPNOTSUPP, "unsupported fallocate mode")
             }
         }
@@ -2316,6 +2328,322 @@ impl Inode {
         inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         // Data-relevant (the extent tree changed): `fdatasync` must commit it to
         // observe the hole.
+        inner.stamp_datasync_tid(op.get());
+        Ok(())
+    }
+
+    /// Makes `[offset, offset + len)` read back as zeros while keeping the blocks
+    /// allocated (`fallocate` ZERO_RANGE — Linux `ext4_zero_range`). The
+    /// block-aligned middle becomes UNWRITTEN (reads zero with no device I/O:
+    /// holes are allocated unwritten, already-written blocks are converted in
+    /// place, keeping their physical mapping); the sub-block partial edges are
+    /// zeroed in the page cache. Without KEEP_SIZE the file grows to `offset +
+    /// len` if that is past EOF.
+    ///
+    /// Crash safety: no block is freed, so a crash mid-operation leaves a partial
+    /// zeroing — a valid file state (some of the range zero, some not, all blocks
+    /// allocated), with no orphan protection needed (like a sparse extend). The
+    /// edge zeroing is registered as ordered data so it reaches disk before the
+    /// transaction that references it commits.
+    fn zero_range(&self, offset: usize, len: usize, keep_size: bool) -> Result<()> {
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "zero-range overflow"))?;
+
+        // The range end is bounded whether or not the size grows (a KEEP_SIZE
+        // reservation past EOF must still fit the format), like `preallocate`.
+        inner.ensure_size_within_limit(&fs, end)?;
+        // Without KEEP_SIZE, a range past EOF extends the file to its end.
+        let new_size = (!keep_size && end > old_size).then_some(end);
+
+        // Byte boundaries: the edge-inclusive allocation range (round-down offset
+        // .. round-up end) and the block-aligned zeroed middle (round-up offset
+        // .. round-down end). The middle is empty when `offset` and `end` share a
+        // block or lie in adjacent partial blocks.
+        let alloc_start = (offset / BLOCK_SIZE) * BLOCK_SIZE;
+        let alloc_end = end.div_ceil(BLOCK_SIZE) * BLOCK_SIZE;
+        let mid_start = offset.align_up(BLOCK_SIZE);
+        let mid_end = (end / BLOCK_SIZE) * BLOCK_SIZE;
+
+        // Grow the page cache first when extending (sparsely — the new blocks are
+        // allocated unwritten below and read as zeros); `i_size` is published only
+        // on success at the end, so a failure leaves it unchanged.
+        if let Some(ns) = new_size {
+            inner.resize_page_cache(ns, old_size)?;
+        }
+
+        // Evict the aligned middle so post-zero reads see zeros (the extents turn
+        // unwritten below); flush-first keeps an earlier committing transaction's
+        // ordered obligation from being orphaned.
+        if mid_end > mid_start
+            && let Ok(pages) = inner.page_cache()
+        {
+            pages.invalidate_range(mid_start..mid_end)?;
+        }
+
+        let em = inner.extent_manager()?.clone();
+        let op = fs.begin_op(fs.write_credits(em.root_depth()))?;
+
+        let edits = (|| -> Result<()> {
+            // 1. Allocate every hole in the edge-inclusive range as UNWRITTEN, so
+            //    the whole range (edges included) is backed by blocks (Linux
+            //    preallocates the unaligned edges too). Existing written and
+            //    unwritten extents stay.
+            let alloc_start_blk = Iblock::try_from(alloc_start / BLOCK_SIZE)
+                .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+            let alloc_end_blk = Iblock::try_from(alloc_end / BLOCK_SIZE)
+                .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+            let mut throwaway = extent_manager::NewMappings::default();
+            em.ensure_allocated(alloc_start_blk, alloc_end_blk, op.get(), &mut throwaway)?;
+
+            // 2. Convert the block-aligned middle's WRITTEN parts to unwritten so
+            //    it reads zeros without device I/O (holes there were just
+            //    allocated unwritten in step 1; already-unwritten extents stay).
+            if mid_end > mid_start {
+                let m_start = Iblock::try_from(mid_start / BLOCK_SIZE).map_err(|_| {
+                    Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
+                })?;
+                let m_end = Iblock::try_from(mid_end / BLOCK_SIZE).map_err(|_| {
+                    Error::with_message(Errno::EFBIG, "block index exceeds 32 bits")
+                })?;
+                em.mark_range_unwritten(m_start, m_end, op.get())?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = edits {
+            // A failed chunk may have inserted holes and split leaves — captures
+            // in this transaction that depend on the in-memory root. Seal before
+            // reporting (the same H-4 posture as `preallocate`); the partial
+            // allocation stays as benign unwritten blocks (read zero).
+            self.seal_failed_write_txn(&fs, &mut inner, &op);
+            return Err(err);
+        }
+
+        // 3. Zero the sub-block partial edges in the page cache (Linux
+        //    `ext4_zero_partial_blocks`). Same same-block / different-block split
+        //    as `punch_hole`: each partial is zeroed against ITS OWN block's
+        //    mapping (all mapped now after step 1). An edge at/past the visible
+        //    size is skipped: a KEEP_SIZE range past EOF has no page-cache page
+        //    to zero — its blocks are unwritten and read zero by definition.
+        let visible = new_size.unwrap_or(old_size);
+        if offset / BLOCK_SIZE == (end - 1) / BLOCK_SIZE {
+            if (offset < mid_start || mid_end < end) && offset < visible {
+                inner.zero_partial_block(offset, end)?;
+            }
+        } else {
+            if offset < mid_start && offset < visible {
+                inner.zero_partial_block(offset, mid_start)?;
+            }
+            if mid_end < end && mid_end < visible {
+                inner.zero_partial_block(mid_end, end)?;
+            }
+        }
+
+        // 4. Publish the new size (success only), timestamps, and the descriptor.
+        if let Some(ns) = new_size {
+            inner.set_file_size(ns);
+        }
+        inner.set_mtime_ctime(super::utils::now());
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        inner.stamp_datasync_tid(op.get());
+
+        // data=ordered: the edge zeroing must reach disk before this transaction
+        // commits, or a crash could leave an edge block holding pre-zero bytes.
+        if let Some(handle) = op.get()
+            && let Ok(pages) = inner.page_cache()
+        {
+            handle.register_ordered_data(
+                self.ino,
+                self.self_weak.clone(),
+                pages.clone(),
+                inner.file_size(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Removes `[offset, offset + len)` and shifts the rest of the file left to
+    /// close the gap (`fallocate` COLLAPSE_RANGE — Linux `ext4_collapse_range`).
+    /// `offset` and `len` must be block-aligned and `offset + len` must be below
+    /// `i_size` (`EINVAL` otherwise — a collapse at EOF is a truncate); `i_size`
+    /// shrinks by `len`.
+    ///
+    /// The extent-tree shift is one atomic transaction (see
+    /// [`ExtentTree::collapse_range`]): the removed window's blocks are freed and
+    /// every later extent's logical key drops by `len`'s block count, committed
+    /// all-or-nothing. A tree too large to rewrite in one transaction is rejected
+    /// (`EFBIG`) before anything changes — never a half-shifted tree. Data pages
+    /// from the shifted region are flushed (durable) then evicted, so post-shift
+    /// reads re-read the same physical blocks at their new logical offsets.
+    fn collapse_range(&self, offset: usize, len: usize) -> Result<()> {
+        if !offset.is_multiple_of(BLOCK_SIZE) || !len.is_multiple_of(BLOCK_SIZE) {
+            return_errno_with_message!(Errno::EINVAL, "collapse range must be block-aligned");
+        }
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "collapse range overflow"))?;
+        // A collapse must not reach EOF (that would be a plain truncate).
+        if end >= old_size {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "collapse range reaches or passes end of file"
+            );
+        }
+        let new_size = old_size - len;
+        let punch_start = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let punch_stop = Iblock::try_from(end / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+
+        let em = inner.extent_manager()?.clone();
+        // The atomic rebuild reads the whole tree through `flatten`, which speaks
+        // depth ≤ 2 (up to ~460k extents); reject a deeper tree HERE, before any
+        // page-cache or journal side effect, so it fails clean instead of
+        // erroring after `begin_op` (which would abort the journal).
+        if em.root_depth() > 2 {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the extent tree is too deep to collapse-shift atomically"
+            );
+        }
+        // Credit gate: the atomic whole-tree rebuild must fit one transaction, or
+        // we reject up front (EFBIG) rather than tear the tree — the "nothing
+        // changed" contract. Under-estimates grow in place (`charge_fresh_capture`);
+        // a genuinely over-max tree is rejected here.
+        let credits = fs.reserialize_credits(em.external_node_count()?)
+            + fs.truncate_credits(em.root_depth());
+        if let Some(max) = fs.journal().map(|j| j.max_credits())
+            && credits > max
+        {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the extent tree cannot be collapse-shifted within one journal transaction"
+            );
+        }
+
+        // Flush + evict the affected tail so the shifted data is durable and its
+        // stale logical-indexed pages are dropped (re-read from the shifted tree);
+        // Linux writes the pages then `truncate_pagecache(ioffset)`.
+        let ioffset = (offset / PAGE_SIZE) * PAGE_SIZE;
+        if let Ok(pages) = inner.page_cache() {
+            pages.invalidate_range(ioffset..old_size)?;
+        }
+
+        let op = fs.begin_op(credits)?;
+        // Atomic: on any tree error abort the journal so the rebuild's reused-node
+        // overwrites (captured but unpublished) never commit.
+        if let Err(err) = em.collapse_range(punch_start, punch_stop, op.get()) {
+            if let Some(handle) = op.get() {
+                handle.abort_journal_on_fs_error();
+            }
+            return Err(err);
+        }
+        // Publish the shrunk size + timestamps + tree in the SAME transaction
+        // (mtime only once the shift has succeeded, like Linux).
+        inner.set_file_size(new_size);
+        inner.set_mtime_ctime(super::utils::now());
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        inner.stamp_datasync_tid(op.get());
+
+        // Shrink the page-cache capacity WITHOUT the boundary zero-fill (the tail
+        // was evicted; a later extend re-zeros the partial tail through `expand`,
+        // Linux-style). Passing an aligned first argument skips `resize`'s fill.
+        if let Ok(pages) = inner.page_cache() {
+            pages.resize(new_size.align_up(PAGE_SIZE), old_size)?;
+        }
+        em.set_npages(new_size.div_ceil(PAGE_SIZE));
+        Ok(())
+    }
+
+    /// Opens a hole `[offset, offset + len)` by shifting the file from `offset`
+    /// onward right (`fallocate` INSERT_RANGE — Linux `ext4_insert_range`).
+    /// `offset` and `len` must be block-aligned, `offset` must be below `i_size`
+    /// (`EINVAL` otherwise), and the new size must not exceed the maximum file
+    /// size (`EFBIG`); `i_size` grows by `len`.
+    ///
+    /// Same atomic single-transaction shift as [`collapse_range`](Self::collapse_range)
+    /// (see [`ExtentTree::insert_range`]): every extent at/after `offset` gains
+    /// `len`'s block count on its logical key (one straddling extent splits), no
+    /// data block moves, and `i_size` grows in the same transaction. A tree too
+    /// large for one transaction is rejected (`EFBIG`) before anything changes.
+    fn insert_range(&self, offset: usize, len: usize) -> Result<()> {
+        if !offset.is_multiple_of(BLOCK_SIZE) || !len.is_multiple_of(BLOCK_SIZE) {
+            return_errno_with_message!(Errno::EINVAL, "insert range must be block-aligned");
+        }
+        let fs = self.fs()?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+        // An insert at/past EOF is a plain extend, not a shift (Linux EINVAL).
+        if offset >= old_size {
+            return_errno_with_message!(Errno::EINVAL, "insert range at or past end of file");
+        }
+        let new_size = old_size
+            .checked_add(len)
+            .ok_or_else(|| Error::with_message(Errno::EFBIG, "insert range overflow"))?;
+        inner.ensure_size_within_limit(&fs, new_size)?;
+
+        let offset_blk = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let len_blk = Iblock::try_from(len / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+
+        let em = inner.extent_manager()?.clone();
+        // Depth ≤ 2 gate, then the credit gate — the same up-front "nothing
+        // changed" rejections as `collapse_range` (see there).
+        if em.root_depth() > 2 {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the extent tree is too deep to insert-shift atomically"
+            );
+        }
+        let credits = fs.reserialize_credits(em.external_node_count()?)
+            + fs.truncate_credits(em.root_depth());
+        if let Some(max) = fs.journal().map(|j| j.max_credits())
+            && credits > max
+        {
+            return_errno_with_message!(
+                Errno::EFBIG,
+                "the extent tree cannot be insert-shifted within one journal transaction"
+            );
+        }
+
+        // Flush + evict from `offset` onward — every page there shifts right.
+        let ioffset = (offset / PAGE_SIZE) * PAGE_SIZE;
+        if let Ok(pages) = inner.page_cache() {
+            pages.invalidate_range(ioffset..old_size)?;
+        }
+
+        // Grow the page-cache capacity first (so shifted reads past old EOF land),
+        // WITHOUT the boundary zero-fill that would corrupt shifted data (an
+        // aligned second argument skips `resize`'s grow-fill).
+        if let Ok(pages) = inner.page_cache() {
+            pages.resize(new_size, old_size.align_up(PAGE_SIZE))?;
+        }
+        em.set_npages(new_size.div_ceil(PAGE_SIZE));
+
+        let op = fs.begin_op(credits)?;
+        if let Err(err) = em.insert_range(offset_blk, len_blk, op.get()) {
+            if let Some(handle) = op.get() {
+                handle.abort_journal_on_fs_error();
+            }
+            // Roll the speculative page-cache grow back on failure.
+            if let Ok(pages) = inner.page_cache() {
+                let _ = pages.resize(old_size.align_up(PAGE_SIZE), new_size);
+            }
+            em.set_npages(old_size.div_ceil(PAGE_SIZE));
+            return Err(err);
+        }
+        // Publish the grown size + timestamps + tree in the SAME transaction
+        // (mtime only once the shift has succeeded, like Linux's success path).
+        inner.set_file_size(new_size);
+        inner.set_mtime_ctime(super::utils::now());
+        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         inner.stamp_datasync_tid(op.get());
         Ok(())
     }
@@ -5152,6 +5480,366 @@ mod write_tests {
             read_back(&inode, 3 * BLOCK_SIZE + 100, BLOCK_SIZE - 100),
             payload[3 * BLOCK_SIZE + 100..4 * BLOCK_SIZE]
         );
+    }
+
+    /// P9 debt (`fallocate-zero-range-collapse-insert`) — `fallocate(ZeroRange)`
+    /// over a block-aligned middle converts it to UNWRITTEN (reads zero, blocks
+    /// KEPT — unlike a punch, `i_blocks` is unchanged) while the neighbours keep
+    /// their data (Linux `ext4_zero_range`).
+    #[ktest]
+    fn fallocate_zero_range_aligned_reads_zero_keeps_blocks() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(4 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+        assert_eq!(inode.sector_count(), 4 * SECTORS_PER_BLOCK);
+
+        // Zero the middle two blocks [1, 3), block-aligned.
+        inode
+            .fallocate(FallocMode::ZeroRange, BLOCK_SIZE, 2 * BLOCK_SIZE)
+            .unwrap();
+
+        // i_size unchanged (range inside the file), and — unlike punch — the
+        // blocks stay allocated (unwritten).
+        assert_eq!(inode.size(), 4 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 4 * SECTORS_PER_BLOCK);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Written);
+        }
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), payload[0..BLOCK_SIZE]);
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, 2 * BLOCK_SIZE),
+            vec![0u8; 2 * BLOCK_SIZE]
+        );
+        assert_eq!(
+            read_back(&inode, 3 * BLOCK_SIZE, BLOCK_SIZE),
+            payload[3 * BLOCK_SIZE..4 * BLOCK_SIZE]
+        );
+    }
+
+    /// P9 debt — a ZERO_RANGE with UNALIGNED edges zeroes the partial edge bytes
+    /// in place (the edge blocks stay written, their uncovered bytes survive)
+    /// and converts only the fully-covered block between (Linux
+    /// `ext4_zero_partial_blocks` over the edges).
+    #[ktest]
+    fn fallocate_zero_range_partial_edges_zero_in_place() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(3 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        // Zero [100, 2*BLOCK+200): head partial in block 0, covered block 1,
+        // tail partial in block 2.
+        let off = 100;
+        let len = 2 * BLOCK_SIZE + 100;
+        inode.fallocate(FallocMode::ZeroRange, off, len).unwrap();
+
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Written);
+        }
+        // Block 0: [0,100) original, [100, BLOCK) zeroed.
+        assert_eq!(read_back(&inode, 0, 100), payload[0..100]);
+        assert_eq!(
+            read_back(&inode, 100, BLOCK_SIZE - 100),
+            vec![0u8; BLOCK_SIZE - 100]
+        );
+        // Block 1: all zero (unwritten).
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE]
+        );
+        // Block 2: [0,200) zeroed, rest original.
+        assert_eq!(read_back(&inode, 2 * BLOCK_SIZE, 200), vec![0u8; 200]);
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE + 200, BLOCK_SIZE - 200),
+            payload[2 * BLOCK_SIZE + 200..3 * BLOCK_SIZE]
+        );
+    }
+
+    /// P9 debt — ZERO_RANGE past EOF grows `i_size` to the range end;
+    /// ZeroRangeKeepSize reserves the blocks but leaves `i_size` alone (the
+    /// KEEP_SIZE split, same as prealloc).
+    #[ktest]
+    fn fallocate_zero_range_grow_vs_keep_size() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &nonzero_pattern(BLOCK_SIZE));
+        assert_eq!(inode.size(), BLOCK_SIZE);
+
+        // KEEP_SIZE past EOF: blocks reserved, size unchanged.
+        inode
+            .fallocate(FallocMode::ZeroRangeKeepSize, 2 * BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(inode.size(), BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
+        }
+
+        // Without KEEP_SIZE the same range grows i_size to its end.
+        inode
+            .fallocate(FallocMode::ZeroRange, 2 * BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        // The grown range reads zero; the original data survives.
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE]
+        );
+    }
+
+    /// P9 debt — ZERO_RANGE over already-written data that later gets REWRITTEN:
+    /// the write converts the zeroed (unwritten) blocks back to written and the
+    /// new data reads back — the Unwritten-first round trip.
+    #[ktest]
+    fn fallocate_zero_range_then_rewrite_round_trips() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &nonzero_pattern(2 * BLOCK_SIZE));
+        inode
+            .fallocate(FallocMode::ZeroRange, 0, 2 * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(
+            read_back(&inode, 0, 2 * BLOCK_SIZE),
+            vec![0u8; 2 * BLOCK_SIZE]
+        );
+
+        let fresh = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, BLOCK_SIZE, &fresh);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), fresh);
+        // Block 0 still zero, block 1 written again.
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), vec![0u8; BLOCK_SIZE]);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+        }
+    }
+
+    /// P9 debt — a ZERO_RANGE whose allocation hits ENOSPC fails clean: `i_size`
+    /// and the mappings are unchanged (the H-4 seal posture shared with
+    /// `preallocate`).
+    #[ktest]
+    fn fallocate_zero_range_enospc_is_clean() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &nonzero_pattern(BLOCK_SIZE));
+        // The range covers a hole past EOF, so it needs an allocation — fail it.
+        f.ext4.arm_alloc_blocks_enospc(0);
+        let err = inode
+            .fallocate(FallocMode::ZeroRange, BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+        assert_eq!(
+            inode.size(),
+            BLOCK_SIZE,
+            "a failed zero-range must not grow"
+        );
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+        }
+    }
+
+    /// P9 debt — `fallocate(CollapseRange)` removes the window and shifts the
+    /// tail left: the data after the window moves down by `len`, byte-for-byte,
+    /// and `i_size` shrinks (Linux `ext4_collapse_range`).
+    #[ktest]
+    fn fallocate_collapse_shifts_data_left_byte_exact() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(4 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        // Collapse block 1 ([BLOCK, 2*BLOCK)): blocks 2,3 shift to 1,2.
+        inode
+            .fallocate(FallocMode::CollapseRange, BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        // Byte-exact: [0,BLOCK) intact, then the old [2*BLOCK, 4*BLOCK).
+        let mut expect = payload[0..BLOCK_SIZE].to_vec();
+        expect.extend_from_slice(&payload[2 * BLOCK_SIZE..4 * BLOCK_SIZE]);
+        assert_eq!(read_back(&inode, 0, 3 * BLOCK_SIZE), expect);
+    }
+
+    /// P9 debt — a collapse window containing a HOLE: the hole is simply removed
+    /// with the window (nothing to free there) and the tail still shifts left.
+    #[ktest]
+    fn fallocate_collapse_window_with_hole() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 written; block 1 a hole; blocks 2,3 written.
+        let b0 = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, 0, &b0);
+        let tail = nonzero_pattern(2 * BLOCK_SIZE);
+        write_all(&inode, 2 * BLOCK_SIZE, &tail);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+
+        // Collapse the hole block [1, 2).
+        inode
+            .fallocate(FallocMode::CollapseRange, BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 3 * SECTORS_PER_BLOCK);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), b0);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, 2 * BLOCK_SIZE), tail);
+    }
+
+    /// P9 debt — collapse argument validation (Linux `ext4_collapse_range`):
+    /// unaligned offset or length is `EINVAL`; a window reaching EOF is `EINVAL`
+    /// (that would be a truncate); nothing changes on rejection.
+    #[ktest]
+    fn fallocate_collapse_rejects_unaligned_and_eof() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(3 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        for (off, len) in [
+            (100, BLOCK_SIZE),            // unaligned offset
+            (BLOCK_SIZE, 100),            // unaligned length
+            (BLOCK_SIZE, 2 * BLOCK_SIZE), // reaches EOF exactly
+            (0, 4 * BLOCK_SIZE),          // passes EOF
+        ] {
+            let err = inode
+                .fallocate(FallocMode::CollapseRange, off, len)
+                .unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL, "off={off} len={len}");
+        }
+        // Nothing changed.
+        assert_eq!(inode.size(), 3 * BLOCK_SIZE);
+        assert_eq!(read_back(&inode, 0, 3 * BLOCK_SIZE), payload);
+    }
+
+    /// P9 debt — `fallocate(InsertRange)` opens a hole at the offset and shifts
+    /// the rest right: the shifted data reads back byte-for-byte at its new
+    /// offset, the hole reads zero, and `i_size` grows (Linux
+    /// `ext4_insert_range`).
+    #[ktest]
+    fn fallocate_insert_opens_hole_preserves_content() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(3 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+        let sc_before = inode.sector_count();
+
+        // Insert one block at offset BLOCK: blocks 1,2 shift to 2,3.
+        inode
+            .fallocate(FallocMode::InsertRange, BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+
+        assert_eq!(inode.size(), 4 * BLOCK_SIZE);
+        // No data block allocated or freed (only keys shifted).
+        assert_eq!(inode.sector_count(), sc_before);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), payload[0..BLOCK_SIZE]);
+        assert_eq!(
+            read_back(&inode, BLOCK_SIZE, BLOCK_SIZE),
+            vec![0u8; BLOCK_SIZE],
+            "the inserted range must read zero"
+        );
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE, 2 * BLOCK_SIZE),
+            payload[BLOCK_SIZE..3 * BLOCK_SIZE]
+        );
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+        }
+
+        // A later write into the hole lands normally and neighbours survive.
+        let fresh = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, BLOCK_SIZE, &fresh);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), fresh);
+        assert_eq!(
+            read_back(&inode, 2 * BLOCK_SIZE, 2 * BLOCK_SIZE),
+            payload[BLOCK_SIZE..3 * BLOCK_SIZE]
+        );
+    }
+
+    /// P9 debt — insert argument validation (Linux `ext4_insert_range`):
+    /// unaligned offset or length is `EINVAL`, an offset at/past EOF is `EINVAL`
+    /// (a plain extend, not a shift); nothing changes on rejection.
+    #[ktest]
+    fn fallocate_insert_rejects_unaligned_and_past_eof() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload = nonzero_pattern(2 * BLOCK_SIZE);
+        write_all(&inode, 0, &payload);
+
+        for (off, len) in [
+            (100, BLOCK_SIZE),            // unaligned offset
+            (BLOCK_SIZE, 100),            // unaligned length
+            (2 * BLOCK_SIZE, BLOCK_SIZE), // offset at EOF
+            (3 * BLOCK_SIZE, BLOCK_SIZE), // offset past EOF
+        ] {
+            let err = inode
+                .fallocate(FallocMode::InsertRange, off, len)
+                .unwrap_err();
+            assert_eq!(err.error(), Errno::EINVAL, "off={off} len={len}");
+        }
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
+        assert_eq!(read_back(&inode, 0, 2 * BLOCK_SIZE), payload);
+    }
+
+    /// P9 debt — collapse/insert interact with a KEEP_SIZE preallocation: the
+    /// insert shift moves a reserved-unwritten extent past EOF right along with
+    /// everything else (it stays reserved), and Linux's SHIFT_RIGHT overflow
+    /// guard (tree-level `insert_range` EINVAL) keeps the shifted keys inside
+    /// the 32-bit logical space.
+    #[ktest]
+    fn fallocate_insert_shifts_keepsize_preallocation() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        write_all(&inode, 0, &nonzero_pattern(BLOCK_SIZE));
+        inode
+            .fallocate(FallocMode::AllocateKeepSize, 2 * BLOCK_SIZE, BLOCK_SIZE)
+            .unwrap();
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
+        }
+
+        // Insert one block at 0: the written block and the reservation shift.
+        inode
+            .fallocate(FallocMode::InsertRange, 0, BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Unwritten);
+        }
     }
 
     /// P7e-3 (red-line ①) — a punch straddling TWO ADJACENT blocks with a partial

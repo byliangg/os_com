@@ -5,7 +5,8 @@
 //! A writable, journaled ext4 built as a sibling to `ext2`, mirroring its
 //! layering and visibility discipline. Implemented so far: read-write mount;
 //! extent-mapped file I/O (extent trees up to depth 2, Unwritten-first
-//! allocation, fallocate prealloc/punch); the full directory namespace
+//! allocation, fallocate prealloc/punch/zero-range/collapse/insert); the full
+//! directory namespace
 //! (create/unlink/rename/link/mknod/symlink, htree reads with
 //! degrade-on-insert); full JBD2 journaling (ordered-data, SCAN/REPLAY
 //! recovery, orphan list, revoke, journal checksums v2/v3, group commit, lazy

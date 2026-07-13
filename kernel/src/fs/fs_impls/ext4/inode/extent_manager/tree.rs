@@ -1079,6 +1079,385 @@ impl ExtentTree {
         Ok(())
     }
 
+    /// Converts the WRITTEN parts of the logical range `[iblock, iblock + len)`
+    /// to unwritten (reads-as-zero), splitting any overlapping written extent so
+    /// only the covered sub-range flips while its physical mapping stays put. The
+    /// mirror image of [`convert_unwritten`](Self::convert_unwritten), used by
+    /// `fallocate` ZERO_RANGE to make an already-written middle read back zeros
+    /// without freeing or moving its blocks (Linux `ext4_zero_range`'s
+    /// `CONVERT_UNWRITTEN` over the block-aligned middle). Holes and
+    /// already-unwritten extents are left alone (they read zero already).
+    ///
+    /// Each overlapping written extent is edited in place, one boundary per
+    /// round, each round ONE self-consistent leaf edit — the same staged-split
+    /// discipline as `convert_unwritten`: a full leaf is reorganized FIRST
+    /// (`make_room_for`, a clean failure point that edits nothing in the range),
+    /// so an error mid-range leaves a valid tree that still maps every block with
+    /// the conversion simply cut short. No data blocks are allocated or freed;
+    /// `i_blocks` changes only by the metadata a leaf reorganization may add.
+    pub(super) fn mark_range_unwritten(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        len: u32,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let range_start = iblock;
+        let range_end = iblock as u64 + len as u64;
+
+        // Depth-0 (inline root as a leaf): rewrite the root in memory, delegated
+        // like the punch/convert because edge splits can overflow the inline
+        // capacity and re-enter `insert`.
+        if self.header().is_leaf() {
+            return self.mark_inline_root_unwritten(fs, range_start, range_end, handle, csum_seed);
+        }
+
+        let device = fs.block_device();
+        let mut edited = false;
+        let mut cursor = range_start as u64;
+        'scan: while cursor < range_end {
+            // The first WRITTEN extent overlapping the remaining range.
+            let mut hit: Option<Extent> = None;
+            self.walk_range(fs, cursor..range_end, &mut |e| {
+                if !e.is_unwritten() {
+                    hit = Some(*e);
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            })?;
+            let Some(e) = hit else {
+                break 'scan;
+            };
+            edited = true;
+            let e_start = e.block();
+            let e_end = e_start as u64 + e.len() as u64;
+            let ov_start = e_start.max(range_start);
+            // Lossless: `e_end` is a mapped extent's end, kept below 2^32 by the
+            // callers' EFBIG gates.
+            let ov_end = e_end.min(range_end) as Iblock;
+
+            for _ in 0..(MAX_DEPTH as usize + 2) {
+                let Search::Covered { mut path, extent } = self.find(fs, e_start)? else {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "walked extent vanished under the extent lock"
+                    );
+                };
+                if extent.block() != e_start
+                    || extent.len() != e.len()
+                    || extent.start() != e.start()
+                    || extent.is_unwritten()
+                {
+                    return_errno_with_message!(
+                        Errno::EUCLEAN,
+                        "extent walk and path search disagree"
+                    );
+                }
+                let leaf_level = path.levels.len() - 1;
+                let pos = path.levels[leaf_level].pos;
+                let leaf = &mut path.levels[leaf_level].node;
+
+                if ov_start == e_start && ov_end as u64 == e_end {
+                    // Fully covered: flip the kind and coalesce with in-leaf
+                    // neighbours (a freshly zeroed run continues the previous
+                    // unwritten one).
+                    let unwritten = Extent::new(e_start, e.len(), e.start(), ExtentKind::Unwritten);
+                    leaf.replace_extent_at(pos, &unwritten);
+                    merge_leaf_neighbors(leaf, pos);
+                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    cursor = e_end;
+                    continue 'scan;
+                }
+
+                // A partial cover splits the entry inside its leaf — one free
+                // slot needed; reorganize and re-land when the leaf is full.
+                if leaf.is_full() {
+                    self.make_room_for(fs, e_start, handle, csum_seed)?;
+                    continue;
+                }
+
+                if ov_start > e_start {
+                    // Kind-preserving split at the range start: the entry keeps
+                    // its written head and the remainder shift-inserts behind it,
+                    // both in ONE leaf write; the cursor stays so the next round
+                    // lands on the remainder head-free.
+                    let head_len = (ov_start - e_start) as u16;
+                    let head = Extent::new(e_start, head_len, e.start(), ExtentKind::Written);
+                    let remainder = Extent::new(
+                        ov_start,
+                        (e_end - ov_start as u64) as u16,
+                        e.start() + head_len as Ext4Bid,
+                        ExtentKind::Written,
+                    );
+                    leaf.replace_extent_at(pos, &head);
+                    leaf.insert_extent_at(pos + 1, &remainder)
+                        .expect("a free slot was checked above");
+                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    continue 'scan;
+                }
+
+                // No head: the entry becomes the unwritten middle (same first
+                // key) and the written tail shift-inserts behind it, ONE leaf
+                // write; the middle then coalesces leftward like a full cover.
+                let mid_len = (ov_end as u64 - ov_start as u64) as u16;
+                let mid = Extent::new(ov_start, mid_len, e.start(), ExtentKind::Unwritten);
+                let tail = Extent::new(
+                    ov_end,
+                    (e_end - ov_end as u64) as u16,
+                    e.start() + mid_len as Ext4Bid,
+                    ExtentKind::Written,
+                );
+                leaf.replace_extent_at(pos, &mid);
+                leaf.insert_extent_at(pos + 1, &tail)
+                    .expect("a free slot was checked above");
+                merge_leaf_neighbors(leaf, pos);
+                leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                cursor = ov_end as u64;
+                continue 'scan;
+            }
+            return_errno_with_message!(Errno::EUCLEAN, "extent zero-convert cannot make room");
+        }
+
+        if edited {
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// The depth-0 counterpart of [`mark_range_unwritten`](Self::mark_range_unwritten):
+    /// rewrites the inline root, flipping the written sub-range to unwritten. A
+    /// partial cover at each range edge adds one entry apiece, so the list can
+    /// exceed the inline capacity by up to two and then rebuilds as a depth-1
+    /// tree (atomic under failure — the fresh leaf lands before the root flips).
+    fn mark_inline_root_unwritten(
+        &mut self,
+        fs: &Ext4,
+        range_start: Iblock,
+        range_end: u64,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let n = self.header().entries() as usize;
+        let mut out: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 2);
+        let mut edited = false;
+        for i in 0..n {
+            let e = self.root_extent_at(i);
+            let e_start = e.block();
+            let e_end = e_start as u64 + e.len() as u64;
+            let overlaps = e_end > range_start as u64 && (e_start as u64) < range_end;
+            if e.is_unwritten() || !overlaps {
+                out.push(e);
+                continue;
+            }
+            edited = true;
+            let ov_start = e_start.max(range_start);
+            let ov_end = e_end.min(range_end) as Iblock;
+            if ov_start > e_start {
+                out.push(Extent::new(
+                    e_start,
+                    (ov_start - e_start) as u16,
+                    e.start(),
+                    ExtentKind::Written,
+                ));
+            }
+            out.push(Extent::new(
+                ov_start,
+                (ov_end as u64 - ov_start as u64) as u16,
+                e.start() + (ov_start - e_start) as Ext4Bid,
+                ExtentKind::Unwritten,
+            ));
+            if (ov_end as u64) < e_end {
+                out.push(Extent::new(
+                    ov_end,
+                    (e_end - ov_end as u64) as u16,
+                    e.start() + (ov_end - e_start) as Ext4Bid,
+                    ExtentKind::Written,
+                ));
+            }
+        }
+        if !edited {
+            return Ok(());
+        }
+        merge_extents(&mut out);
+        if out.len() > INLINE_MAX {
+            let delta = self.reserialize(fs, &out, &[], handle, csum_seed)?;
+            let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
+            self.sector_count =
+                (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
+        } else {
+            self.write_inline_leaf_root(&out);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Removes the block-aligned logical range `[punch_start, punch_stop)` and
+    /// shifts every later extent LEFT by `punch_stop - punch_start` blocks
+    /// (`fallocate` COLLAPSE_RANGE — Linux `ext4_collapse_range` /
+    /// `ext4_ext_shift_extents(SHIFT_LEFT)`), returning the freed physical data
+    /// blocks so the caller can drop them through the revoke/pin funnel.
+    ///
+    /// Whole-tree, single-transaction rebuild (the caller's atomic contract):
+    /// [`flatten`](Self::flatten) reads the tree, the range is removed and the
+    /// tail re-keyed IN MEMORY, and [`reserialize`](Self::reserialize) writes the
+    /// new tree — fresh nodes before the in-memory root flips, so a failure
+    /// leaves the old tree intact (the caller aborts the journal to discard any
+    /// reused-node overwrites). The caller's credit gate keeps the rebuild inside
+    /// one transaction (a genuinely huge tree is rejected before this runs), so
+    /// the crash intermediate state is always all-or-nothing — never a
+    /// half-shifted tree.
+    ///
+    /// `i_blocks` drops by the freed data blocks plus the net metadata delta; the
+    /// physical blocks of the surviving extents never move (only their logical
+    /// keys shift), so no data relocation or extra allocation is needed.
+    pub(super) fn collapse_range(
+        &mut self,
+        fs: &Ext4,
+        punch_start: Iblock,
+        punch_stop: Iblock,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
+    ) -> Result<()> {
+        debug_assert!(punch_start < punch_stop);
+        let shift = punch_stop - punch_start;
+        let (extents, old_external) = self.flatten(fs)?;
+
+        let mut survivors: Vec<Extent> = Vec::with_capacity(extents.len());
+        // The freed physical runs of the removed window, dropped after the tree
+        // is rewritten to no longer reference them.
+        let mut freed: Vec<(Ext4Bid, u32)> = Vec::new();
+        for e in &extents {
+            let e_start = e.block();
+            let e_end = e_start as u64 + e.len() as u64;
+            // Entirely before the removed window: unchanged.
+            if e_end <= punch_start as u64 {
+                survivors.push(*e);
+                continue;
+            }
+            // Entirely at/after the removed window: shift left.
+            if e_start >= punch_stop {
+                survivors.push(Extent::new(e_start - shift, e.len(), e.start(), e.kind()));
+                continue;
+            }
+            // Straddles the window: keep the head before `punch_start`, free the
+            // covered middle, shift the tail at/after `punch_stop` left.
+            if e_start < punch_start {
+                let head_len = (punch_start - e_start) as u16;
+                survivors.push(Extent::new(e_start, head_len, e.start(), e.kind()));
+            }
+            let mid_start = e_start.max(punch_start);
+            let mid_end = (e_end.min(punch_stop as u64)) as Iblock;
+            if mid_end > mid_start {
+                freed.push((
+                    e.start() + (mid_start - e_start) as Ext4Bid,
+                    mid_end - mid_start,
+                ));
+            }
+            if e_end > punch_stop as u64 {
+                let tail_start = punch_stop; // e_start < punch_stop here
+                let tail_len = (e_end - tail_start as u64) as u16;
+                survivors.push(Extent::new(
+                    tail_start - shift,
+                    tail_len,
+                    e.start() + (tail_start - e_start) as Ext4Bid,
+                    e.kind(),
+                ));
+            }
+        }
+        // Coalesce the boundary: the shifted tail may now abut the kept head of
+        // an earlier extent physically and logically.
+        merge_extents(&mut survivors);
+
+        // Free the removed window's data blocks (revoke/pin per policy) BEFORE
+        // the rebuild reuses metadata nodes; the pins keep a freed block from
+        // being grabbed as a fresh metadata node this same transaction.
+        let mut freed_data: u64 = 0;
+        for &(pblock, count) in &freed {
+            fs.free_blocks(data_policy.authorize(pblock, count), handle)?;
+            freed_data += count as u64;
+        }
+
+        let delta = self.reserialize(fs, &survivors, &old_external, handle, csum_seed)?;
+        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
+        let removed = freed_data as i64 - net_meta;
+        self.sector_count =
+            (self.sector_count as i64 - removed * SECTORS_PER_BLOCK as i64).max(0) as u64;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Shifts every extent at/after `offset` RIGHT by `len` blocks, opening a
+    /// hole `[offset, offset + len)` (`fallocate` INSERT_RANGE — Linux
+    /// `ext4_insert_range` / `ext4_ext_shift_extents(SHIFT_RIGHT)`). An extent
+    /// straddling `offset` is split so its head stays and its tail shifts.
+    ///
+    /// Same whole-tree, single-transaction atomic rebuild as
+    /// [`collapse_range`](Self::collapse_range) (see that method's crash
+    /// contract): no data block is allocated or freed — only the logical keys
+    /// move and one straddling extent may split — so `i_blocks` changes solely by
+    /// the net metadata delta. The caller grows `i_size` in the SAME transaction.
+    pub(super) fn insert_range(
+        &mut self,
+        fs: &Ext4,
+        offset: Iblock,
+        len: Iblock,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        debug_assert!(len > 0);
+        let (extents, old_external) = self.flatten(fs)?;
+
+        // The shifted last extent must stay inside the 32-bit logical space
+        // (Linux `ext4_ext_shift_extents`: `shift > EXT_MAX_BLOCKS - (stop +
+        // len)` is `EINVAL`). A `fallocate` KEEP_SIZE preallocation can park
+        // extents far past `i_size`, so the caller's size gate alone does not
+        // bound this — and without it the shifted-key arithmetic below would
+        // wrap. Checked BEFORE any mutation (the "nothing changed" contract).
+        if let Some(last) = extents.last()
+            && last.block() as u64 + last.len() as u64 + len as u64 > u32::MAX as u64
+        {
+            return_errno_with_message!(
+                Errno::EINVAL,
+                "insert range would shift extents past the maximum logical block"
+            );
+        }
+
+        let mut shifted: Vec<Extent> = Vec::with_capacity(extents.len() + 1);
+        for e in &extents {
+            let e_start = e.block();
+            let e_end = e_start as u64 + e.len() as u64;
+            // Entirely before the insert point: unchanged.
+            if e_end <= offset as u64 {
+                shifted.push(*e);
+                continue;
+            }
+            // Entirely at/after: shift right.
+            if e_start >= offset {
+                shifted.push(Extent::new(e_start + len, e.len(), e.start(), e.kind()));
+                continue;
+            }
+            // Straddles `offset`: head stays, tail shifts right past the new hole.
+            let head_len = (offset - e_start) as u16;
+            shifted.push(Extent::new(e_start, head_len, e.start(), e.kind()));
+            let tail_len = (e_end - offset as u64) as u16;
+            shifted.push(Extent::new(
+                offset + len,
+                tail_len,
+                e.start() + head_len as Ext4Bid,
+                e.kind(),
+            ));
+        }
+
+        let delta = self.reserialize(fs, &shifted, &old_external, handle, csum_seed)?;
+        let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
+        self.sector_count =
+            (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Frees every data block and extent-tree metadata block mapping a logical
     /// region at or beyond `new_size` bytes, rewriting the tree and updating
     /// `i_blocks`, in ONE transaction (the single-transaction truncate path).
@@ -1839,12 +2218,15 @@ impl ExtentTree {
     /// physical blocks of **every** external node — leaf blocks at depth 1, and
     /// both interior and leaf blocks at depth 2.
     ///
-    /// Test-only since P9a-T6: every production path is in-place surgery (the
-    /// last flatten consumers — hole planning, the shrink gate, the depth-0
-    /// insert rebuild — walk or read the root directly), and this stays as the
-    /// tests' whole-tree reference reader. It still speaks only the depth ≤ 2
-    /// shapes those tests build; deeper trees are read through the walker.
-    #[cfg(ktest)]
+    /// The write/truncate/punch hot paths are all in-place surgery (P9a-T6):
+    /// hole planning, the shrink gate, and the depth-0 insert rebuild walk or
+    /// read the root directly, never flattening. This survives as the
+    /// whole-tree reader for the RARE [`collapse_range`](Self::collapse_range) /
+    /// [`insert_range`](Self::insert_range) rebuilds and as the tests'
+    /// cross-verification reference; both bound the tree to one journal
+    /// transaction, so it still speaks only the depth ≤ 2 shapes (the callers
+    /// reject a deeper tree with `EFBIG` before it reaches here — see
+    /// `Inode::collapse_range` / `Inode::insert_range`'s depth gate).
     fn flatten(&self, fs: &Ext4) -> Result<(Vec<Extent>, Vec<Ext4Bid>)> {
         let root_bytes = self.root.as_bytes();
         let header = self.header();
@@ -2369,9 +2751,8 @@ fn search_entries(header: &ExtentHeader, bytes: &[u8], iblock: Iblock) -> Result
 
 /// Parses one freshly read (untrusted) external leaf node into its extents —
 /// the parse boundary for a depth-0 node's device bytes. Rejects a non-leaf
-/// header or an entry count that overruns the block. (Test-only with
-/// [`ExtentTree::flatten`], its one consumer.)
-#[cfg(ktest)]
+/// header or an entry count that overruns the block. Used by
+/// [`ExtentTree::flatten`].
 fn parse_leaf_node(block: &[u8]) -> Result<Vec<Extent>> {
     let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
     if !header.is_leaf() {
@@ -2394,9 +2775,7 @@ fn parse_leaf_node(block: &[u8]) -> Result<Vec<Extent>> {
 /// Parses one freshly read (untrusted) external interior node (a depth-2 tree's
 /// middle level) into its child leaf-block ids — the parse boundary for a
 /// depth-1 node's device bytes. Rejects a node that is not a depth-1 interior or
-/// an entry count that overruns the block. (Test-only with
-/// [`ExtentTree::flatten`], its one consumer.)
-#[cfg(ktest)]
+/// an entry count that overruns the block. Used by [`ExtentTree::flatten`].
 fn parse_interior_node(block: &[u8]) -> Result<Vec<Ext4Bid>> {
     let header = ExtentHeader::try_from(&RawExtentHeader::from_bytes(&block[0..ENTRY_SIZE]))?;
     if header.is_leaf() || header.depth() != 1 {
@@ -4862,6 +5241,303 @@ mod tests {
         assert_eq!(
             deep.grow_root(&f.ext4, None, None).unwrap_err().error(),
             Errno::ENOSPC
+        );
+    }
+
+    // ---- fallocate ZERO_RANGE (mark_range_unwritten) ----
+
+    /// ZERO_RANGE over a written extent's middle flips the covered sub-range to
+    /// unwritten (reads-as-zero) while keeping its physical mapping, splitting
+    /// the written head and tail off around it.
+    #[ktest]
+    fn zero_range_inline_flips_written_middle_to_unwritten() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 10, ExtentKind::Written, None, None)
+            .unwrap();
+        // Zero blocks [3, 7): head [0,3) written, mid [3,7) unwritten, tail [7,10).
+        tree.mark_range_unwritten(&f.ext4, 3, 4, None, None)
+            .unwrap();
+
+        let head = tree.lookup(&f.ext4, 0).unwrap().unwrap();
+        assert!(!head.is_unwritten());
+        let mid = tree.lookup(&f.ext4, 5).unwrap().unwrap();
+        assert!(mid.is_unwritten());
+        // Physical mapping of block 5 preserved (no data moved): 100 + 5.
+        assert_eq!(mid.start() + (5 - mid.block()) as Ext4Bid, 105);
+        let tail = tree.lookup(&f.ext4, 8).unwrap().unwrap();
+        assert!(!tail.is_unwritten());
+        assert_eq!(tail.start() + (8 - tail.block()) as Ext4Bid, 108);
+        assert_matches_linear(&f, &tree, 12);
+    }
+
+    /// A ZERO_RANGE that fully covers a written extent flips it and coalesces
+    /// with an adjacent unwritten run (they become one unwritten extent).
+    #[ktest]
+    fn zero_range_full_extent_coalesces_with_unwritten_neighbor() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // Unwritten [0,4)@100 then physically contiguous written [4,8)@104.
+        tree.insert(&f.ext4, 0, 100, 4, ExtentKind::Unwritten, None, None)
+            .unwrap();
+        tree.insert(&f.ext4, 4, 104, 4, ExtentKind::Written, None, None)
+            .unwrap();
+        assert_eq!(root_entries(&tree), 2);
+        tree.mark_range_unwritten(&f.ext4, 4, 4, None, None)
+            .unwrap();
+        // The flipped run merges with its unwritten neighbour into one extent.
+        assert_eq!(root_entries(&tree), 1);
+        let m = tree.lookup(&f.ext4, 6).unwrap().unwrap();
+        assert!(m.is_unwritten());
+        assert_eq!((m.block(), m.len(), m.start()), (0, 8, 100));
+    }
+
+    /// ZERO_RANGE on a depth-1 tree flips the written extents in the range to
+    /// unwritten in place, keeping their mappings; blocks outside stay written.
+    #[ktest]
+    fn zero_range_depth1_converts_written_run() {
+        let f = Ext4FixtureBuilder::new(16384, 256, 16384)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 50; // depth 1
+        let (mut tree, pblocks) = ascending_tree_allocated(&f, n);
+        assert_eq!(tree.depth(), 1);
+        // Zero span [10, 20): the written extents at even logical blocks flip.
+        tree.mark_range_unwritten(&f.ext4, 10, 10, None, None)
+            .unwrap();
+        let m = tree.lookup(&f.ext4, 10).unwrap().unwrap();
+        assert!(m.is_unwritten());
+        assert_eq!(m.start(), pblocks[5]); // logical 10 = extent index 5
+        // Outside the range stays written.
+        assert!(!tree.lookup(&f.ext4, 8).unwrap().unwrap().is_unwritten());
+        assert_matches_linear(&f, &tree, n * 2);
+    }
+
+    /// The every-op gate: a ZERO_RANGE over an already-unwritten range edits
+    /// nothing and leaves the tree clean.
+    #[ktest]
+    fn zero_range_noop_on_already_unwritten() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 8, ExtentKind::Unwritten, None, None)
+            .unwrap();
+        tree.clear_dirty();
+        tree.mark_range_unwritten(&f.ext4, 2, 4, None, None)
+            .unwrap();
+        assert!(!tree.is_dirty());
+        assert_eq!(root_entries(&tree), 1);
+    }
+
+    // ---- fallocate COLLAPSE_RANGE ----
+
+    /// COLLAPSE_RANGE frees the removed window's blocks and shifts the tail left,
+    /// closing the logical gap; `i_blocks` and the free count drop by exactly the
+    /// freed data blocks.
+    #[ktest]
+    fn collapse_frees_window_and_shifts_tail_left_inline() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // Three REAL 2-block runs (the free-count assertion below needs the
+        // bitmap to genuinely hold them) at logical 0 / 4 / 8.
+        let mut runs = Vec::new();
+        for ib in [0u32, 4, 8] {
+            let r = f.ext4.alloc_blocks(2, 0, None).unwrap();
+            assert_eq!(r.end - r.start, 2);
+            tree.insert(&f.ext4, ib, r.start, 2, ExtentKind::Written, None, None)
+                .unwrap();
+            runs.push(r.start);
+        }
+        let free_before = f.ext4.super_block().free_blocks_count();
+        let sc_before = tree.sector_count();
+        // Collapse blocks [4, 8): frees run 1, shifts [8,10) → [4,6) (run 2).
+        tree.collapse_range(
+            &f.ext4,
+            4,
+            8,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+        assert_eq!(tree.lookup(&f.ext4, 0).unwrap().unwrap().start(), runs[0]);
+        let m = tree.lookup(&f.ext4, 4).unwrap().unwrap();
+        assert_eq!((m.block(), m.len(), m.start()), (4, 2, runs[2]));
+        assert!(tree.lookup(&f.ext4, 8).unwrap().is_none());
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before + 2);
+        assert_eq!(sc_before - tree.sector_count(), 2 * SECTORS_PER_BLOCK);
+        assert_matches_linear(&f, &tree, 12);
+    }
+
+    /// COLLAPSE_RANGE inside one extent splits off the head, frees the covered
+    /// middle, and shifts the tail left — the head and shifted tail stay separate
+    /// (a physical gap remains where the middle was freed).
+    #[ktest]
+    fn collapse_straddling_extent_splits_and_shifts() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // One REAL 10-block run (the free-count assertion needs the bitmap to
+        // genuinely hold it) mapped at logical [0, 10).
+        let r = f.ext4.alloc_blocks(10, 0, None).unwrap();
+        assert_eq!(r.end - r.start, 10);
+        let p = r.start;
+        tree.insert(&f.ext4, 0, p, 10, ExtentKind::Written, None, None)
+            .unwrap();
+        let free_before = f.ext4.super_block().free_blocks_count();
+        // Collapse [2,6): head [0,2)@p kept, [2,6)@p+2 freed, tail [6,10)→[2,6)@p+6.
+        tree.collapse_range(
+            &f.ext4,
+            2,
+            6,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+        let head = tree.lookup(&f.ext4, 0).unwrap().unwrap();
+        assert_eq!((head.block(), head.len(), head.start()), (0, 2, p));
+        let tail = tree.lookup(&f.ext4, 2).unwrap().unwrap();
+        assert_eq!((tail.block(), tail.len(), tail.start()), (2, 4, p + 6));
+        assert!(tree.lookup(&f.ext4, 6).unwrap().is_none());
+        assert_eq!(f.ext4.super_block().free_blocks_count(), free_before + 4);
+        assert_matches_linear(&f, &tree, 12);
+    }
+
+    /// COLLAPSE_RANGE on a depth-1 tree rebuilds it (flatten + reserialize) with
+    /// the tail shifted left; the survivor stays consistent with the reference.
+    #[ktest]
+    fn collapse_depth1_rebuilds_and_shifts() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 50; // depth 1
+        let (mut tree, pblocks) = ascending_tree_allocated(&f, n);
+        assert_eq!(tree.depth(), 1);
+        let free_before = f.ext4.super_block().free_blocks_count();
+        let sc_before = tree.sector_count();
+        // Collapse [0,2): frees logical-0 block, shifts everything left by 2.
+        tree.collapse_range(
+            &f.ext4,
+            0,
+            2,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+        assert_eq!(
+            tree.lookup(&f.ext4, 0).unwrap().unwrap().start(),
+            pblocks[1]
+        );
+        assert_eq!(
+            tree.lookup(&f.ext4, 2).unwrap().unwrap().start(),
+            pblocks[2]
+        );
+        // At least the one freed data block was returned; i_blocks dropped.
+        assert!(f.ext4.super_block().free_blocks_count() > free_before);
+        assert!(tree.sector_count() < sc_before);
+        assert_matches_linear(&f, &tree, n * 2);
+    }
+
+    // ---- fallocate INSERT_RANGE ----
+
+    /// INSERT_RANGE opens a hole and shifts the tail right, splitting the extent
+    /// straddling the insertion point; no data block moves.
+    #[ktest]
+    fn insert_opens_hole_and_shifts_tail_right_inline() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 4, ExtentKind::Written, None, None)
+            .unwrap();
+        let sc_before = tree.sector_count();
+        // Insert 2 blocks at offset 2: head [0,2)@100, hole [2,4), tail [4,6)@102.
+        tree.insert_range(&f.ext4, 2, 2, None, None).unwrap();
+        let head = tree.lookup(&f.ext4, 0).unwrap().unwrap();
+        assert_eq!((head.block(), head.len(), head.start()), (0, 2, 100));
+        assert!(tree.lookup(&f.ext4, 2).unwrap().is_none());
+        assert!(tree.lookup(&f.ext4, 3).unwrap().is_none());
+        let tail = tree.lookup(&f.ext4, 4).unwrap().unwrap();
+        assert_eq!((tail.block(), tail.len(), tail.start()), (4, 2, 102));
+        // No data allocated or freed (only logical keys moved).
+        assert_eq!(tree.sector_count(), sc_before);
+        assert_matches_linear(&f, &tree, 8);
+    }
+
+    /// INSERT_RANGE on a depth-1 tree shifts every extent right; the leading
+    /// range becomes a hole and the tail keeps its physical blocks.
+    #[ktest]
+    fn insert_depth1_rebuilds_and_shifts() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 50; // depth 1
+        let (mut tree, pblocks) = ascending_tree_allocated(&f, n);
+        assert_eq!(tree.depth(), 1);
+        // Insert 4 blocks at offset 0: everything shifts right by 4.
+        tree.insert_range(&f.ext4, 0, 4, None, None).unwrap();
+        assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
+        assert_eq!(
+            tree.lookup(&f.ext4, 4).unwrap().unwrap().start(),
+            pblocks[0]
+        );
+        assert_eq!(
+            tree.lookup(&f.ext4, 6).unwrap().unwrap().start(),
+            pblocks[1]
+        );
+        assert_matches_linear(&f, &tree, n * 2 + 8);
+    }
+
+    /// INSERT_RANGE whose shift would push the last extent past the 32-bit
+    /// logical space is rejected `EINVAL` with the tree untouched (Linux
+    /// `ext4_ext_shift_extents`'s SHIFT_RIGHT `EXT_MAX_BLOCKS` guard) — without
+    /// it the shifted-key arithmetic would wrap and corrupt the tree.
+    #[ktest]
+    fn insert_rejects_shift_past_logical_max() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 2, ExtentKind::Written, None, None)
+            .unwrap();
+        // An extent parked near the top of the logical space (a KEEP_SIZE
+        // preallocation can create this shape).
+        let high = u32::MAX - 4;
+        tree.insert(&f.ext4, high, 200, 2, ExtentKind::Unwritten, None, None)
+            .unwrap();
+
+        // Shifting right by 4 would push its end (MAX - 2) past u32::MAX.
+        let err = tree.insert_range(&f.ext4, 0, 4, None, None).unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+        // Nothing changed.
+        assert_eq!(tree.lookup(&f.ext4, 0).unwrap().unwrap().start(), 100);
+        assert_eq!(tree.lookup(&f.ext4, high).unwrap().unwrap().start(), 200);
+
+        // A shift that exactly reaches the boundary still succeeds.
+        tree.insert_range(&f.ext4, 0, 2, None, None).unwrap();
+        assert_eq!(
+            tree.lookup(&f.ext4, high + 2).unwrap().unwrap().start(),
+            200
         );
     }
 }

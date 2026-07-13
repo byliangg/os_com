@@ -515,6 +515,79 @@ impl ExtentManager {
         )
     }
 
+    /// Converts every WRITTEN extent in `[start_iblock, end_iblock)` to
+    /// unwritten (reads-as-zero) in place, keeping the physical mapping — the
+    /// mirror of [`mark_range_written`](Self::mark_range_written), used by
+    /// `fallocate` ZERO_RANGE over its block-aligned middle. Holes and
+    /// already-unwritten extents are untouched.
+    pub(super) fn mark_range_unwritten(
+        &self,
+        start_iblock: Iblock,
+        end_iblock: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        if start_iblock >= end_iblock {
+            return Ok(());
+        }
+        let fs = self.fs()?;
+        self.state.write().mark_range_unwritten(
+            &fs,
+            start_iblock,
+            end_iblock - start_iblock,
+            handle,
+            self.csum_seed,
+        )
+    }
+
+    /// Removes `[punch_start, punch_stop)` and shifts the tail left (`fallocate`
+    /// COLLAPSE_RANGE), freeing the removed window's data blocks; delegates to
+    /// [`ExtentTree::collapse_range`], a single-transaction atomic rebuild.
+    pub(super) fn collapse_range(
+        &self,
+        punch_start: Iblock,
+        punch_stop: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        let fs = self.fs()?;
+        self.state.write().collapse_range(
+            &fs,
+            punch_start,
+            punch_stop,
+            handle,
+            self.csum_seed,
+            self.data_forget_policy,
+        )
+    }
+
+    /// Shifts the extents at/after `offset` right by `len`, opening a hole
+    /// (`fallocate` INSERT_RANGE); delegates to [`ExtentTree::insert_range`], a
+    /// single-transaction atomic rebuild.
+    pub(super) fn insert_range(
+        &self,
+        offset: Iblock,
+        len: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        let fs = self.fs()?;
+        self.state
+            .write()
+            .insert_range(&fs, offset, len, handle, self.csum_seed)
+    }
+
+    /// The tree's current external-node count — the input the collapse/insert
+    /// credit gate reserves against (a whole-tree rebuild captures one write per
+    /// external node). Zero for a depth-0 inline tree.
+    pub(super) fn external_node_count(&self) -> Result<usize> {
+        let fs = self.fs()?;
+        // `keep_blocks = u32::MAX` frees nothing, so the walk yields only the
+        // external-node count (the shape input we want).
+        Ok(self
+            .state
+            .read()
+            .shrink_shape(&fs, Iblock::MAX)?
+            .external_nodes)
+    }
+
     /// Allocates a single data block for logical block `iblock` (assumed a hole)
     /// and records it. Used by the `submit_write_bio` hole fallback.
     fn allocate_one(&self, iblock: Iblock) -> Result<Ext4Bid> {
