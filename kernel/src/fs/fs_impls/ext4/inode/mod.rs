@@ -798,7 +798,7 @@ impl Default for InodeTail {
 const RA_MIN: usize = 256 * 1024;
 /// Maximum sequential read-ahead window: the window doubles per consecutive
 /// sequential read up to this ceiling.
-const RA_MAX: usize = 2 * 1024 * 1024;
+const RA_MAX: usize = 8 * 1024 * 1024;
 
 /// Per-inode sequential read-ahead detector.
 ///
