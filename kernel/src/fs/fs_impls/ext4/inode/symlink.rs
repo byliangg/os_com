@@ -16,7 +16,7 @@
 use super::{
     super::{fs::Ext4, journal, prelude::*, utils},
     FileFlags, Inode, InodeInner, InodePayload, MAX_FAST_SYMLINK_LEN, RAW_BLOCK_PTRS_LEN,
-    extent_manager::ExtentTree,
+    extent_manager::{ExtentTree, NewMappings},
 };
 
 /// Inline fast-symlink target stored in the raw `i_block` byte area.
@@ -172,7 +172,11 @@ impl InodeInner {
                 // e2fsck would read the root as ext2 indirect block pointers.
                 self.desc.insert_flags(FileFlags::EXTENTS);
             }
-            self.prepare_write(fs, 0, target_len, handle)?;
+            // A failed slow-symlink write does not roll back here: it rides the
+            // create transaction, which the caller seals/aborts on error, so the
+            // recorded runs are unused.
+            let mut new_mappings = NewMappings::default();
+            self.prepare_write(fs, 0, target_len, handle, &mut new_mappings)?;
             let mut reader = VmReader::from(target.as_bytes()).to_fallible();
             self.page_cache()?.write(0, &mut reader)?;
             // `prepare_write` allocated the target block UNWRITTEN

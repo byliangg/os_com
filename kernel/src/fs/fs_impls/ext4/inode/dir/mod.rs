@@ -23,6 +23,7 @@ use self::{
 use super::{
     super::{checksum, fs::Ext4, journal, prelude::*, utils},
     DIR_NLINK_MAX, FileFlags, FilePerm, Inode, InodeInner, InodeSeed, MAX_LINK_COUNT,
+    extent_manager::NewMappings,
 };
 use crate::fs::utils::NAME_MAX;
 
@@ -209,8 +210,10 @@ impl InodeInner {
         let old_size = self.file_size();
         let new_size = old_size + BLOCK_SIZE;
 
-        // Map and allocate the new logical block through the extent engine.
-        self.prepare_write(fs, old_size, new_size, handle)?;
+        // Map and allocate the new logical block through the extent engine,
+        // recording the run so a failed init rolls back exactly it.
+        let mut new_mappings = NewMappings::default();
+        self.prepare_write(fs, old_size, new_size, handle, &mut new_mappings)?;
 
         // Initialize the new block as one empty entry spanning the whole block
         // before publishing the new size, so any reader that observes the grown
@@ -240,7 +243,7 @@ impl InodeInner {
         })();
 
         if let Err(err) = init_result {
-            self.rollback_write(old_size, new_size, handle);
+            self.rollback_write(&new_mappings, old_size, new_size, handle);
             return Err(err);
         }
 
@@ -255,7 +258,7 @@ impl InodeInner {
             .extent_manager()
             .and_then(|em| em.mark_range_written(start_block, start_block + 1, handle))
         {
-            self.rollback_write(old_size, new_size, handle);
+            self.rollback_write(&new_mappings, old_size, new_size, handle);
             return Err(err);
         }
 

@@ -2128,7 +2128,11 @@ impl Inode {
             if let Some(handle) = op.get_mut() {
                 journal::ensure_chunk_credits(handle, need)?;
             }
-            match em.ensure_allocated_chunk(cursor, end_block, op.get())? {
+            // A failed preallocation seals the transaction and keeps its partial
+            // allocation (a crash-safe sparse extend), so the recorded runs are
+            // unused; a fresh per-chunk recorder keeps memory bounded (P9a-T6).
+            let mut new_mappings = extent_manager::NewMappings::default();
+            match em.ensure_allocated_chunk(cursor, end_block, op.get(), &mut new_mappings)? {
                 extent_manager::HoleFill::Filled => {
                     // The rest of the range is mapped; persist this chunk's tree +
                     // `i_blocks` (+ the already-published `i_size`) and finish.
@@ -3125,6 +3129,7 @@ impl InodeInner {
         offset: usize,
         end: usize,
         handle: Option<&journal::Handle>,
+        new_mappings: &mut extent_manager::NewMappings,
     ) -> Result<()> {
         let old_size = self.file_size();
         let start_block = Iblock::try_from(offset / BLOCK_SIZE)
@@ -3136,11 +3141,27 @@ impl InodeInner {
             self.resize_page_cache(end, old_size)?;
         }
         self.extent_manager()?
-            .ensure_allocated(start_block, end_block, handle)
+            .ensure_allocated(start_block, end_block, handle, new_mappings)
     }
 
-    /// Restores page-cache capacity and frees blocks allocated past `old_size`
-    /// after a failed write.
+    /// Restores page-cache capacity and frees the blocks THIS write newly
+    /// allocated past `old_size` after a failed write — the runs recorded in
+    /// `new_mappings`, not everything past the old size.
+    ///
+    /// Freeing only the write's own fresh allocations is what keeps a `fallocate`
+    /// KEEP_SIZE preallocation (reserved unwritten blocks past EOF, or overlapping
+    /// the write range) alive across the rollback: it was never recorded as a new
+    /// mapping, so it survives — the blunt `truncate_to_byte_len(old_size)` this
+    /// replaces swallowed it wholesale (ledger:
+    /// `fallocate-keepsize-swallowed-by-rollback`).
+    ///
+    /// A within-file write (`end <= old_size`) grew no page cache, so its fresh
+    /// allocations stay as benign unwritten over-allocations — freeing them would
+    /// strand their still-dirty pages over holes (see `write_at_once`). Only past
+    /// `old_size`, where `resize_page_cache` discards the write's pages, is it safe
+    /// to free; [`free_new_mappings`](extent_manager::ExtentManager::free_new_mappings)
+    /// clips at the first block fully past `old_size` so a hole this write also
+    /// filled below EOF keeps that same benign treatment.
     ///
     /// The shrink-resize skips the boundary fill over a hole: a boundary block
     /// that is still a hole here was never reached by the failed write (its
@@ -3148,7 +3169,13 @@ impl InodeInner {
     /// dirty page over a hole), while a mapped one either predates the write
     /// (a legitimate device read) or was committed as zeros by
     /// `prepare_write`'s covered-boundary fill before allocation.
-    fn rollback_write(&mut self, old_size: usize, end: usize, handle: Option<&journal::Handle>) {
+    fn rollback_write(
+        &mut self,
+        new_mappings: &extent_manager::NewMappings,
+        old_size: usize,
+        end: usize,
+        handle: Option<&journal::Handle>,
+    ) {
         if end <= old_size {
             return;
         }
@@ -3158,10 +3185,18 @@ impl InodeInner {
                 old_size, err
             );
         }
+        // The first block fully past `old_size`: freeing starts here so the
+        // partial last data block (and any hole filled below EOF) is left alone.
+        let keep_blocks = match Iblock::try_from(old_size.div_ceil(BLOCK_SIZE)) {
+            Ok(keep_blocks) => keep_blocks,
+            // `old_size < end`, and `prepare_write` already bounded `end` to 32-bit
+            // blocks, so this is unreachable; skip the free rather than panic.
+            Err(_) => return,
+        };
         if let Ok(extent_manager) = self.extent_manager()
-            && let Err(err) = extent_manager.truncate_to_byte_len(old_size, handle)
+            && let Err(err) = extent_manager.free_new_mappings(new_mappings, keep_blocks, handle)
         {
-            error!("write_at: cleanup block truncate failed: {:?}", err);
+            error!("write_at: cleanup block free failed: {:?}", err);
         }
     }
 
@@ -3284,13 +3319,17 @@ impl InodeInner {
             .checked_add(write_len)
             .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
         let old_size = self.file_size();
+        // Records the runs `prepare_write` newly allocates, so a failed write
+        // rolls back exactly them (never a KEEP_SIZE preallocation).
+        let mut new_mappings = extent_manager::NewMappings::default();
 
-        if let Err(err) = self.prepare_write(fs, offset, end, handle.as_deref()) {
-            self.rollback_write(old_size, end, handle.as_deref());
+        if let Err(err) = self.prepare_write(fs, offset, end, handle.as_deref(), &mut new_mappings)
+        {
+            self.rollback_write(&new_mappings, old_size, end, handle.as_deref());
             return Err(err);
         }
         if let Err(err) = self.page_cache()?.write(offset, reader) {
-            self.rollback_write(old_size, end, handle.as_deref());
+            self.rollback_write(&new_mappings, old_size, end, handle.as_deref());
             return Err(err.into());
         }
         // Unwritten-first: the blocks this write covers were allocated as
@@ -3309,7 +3348,7 @@ impl InodeInner {
             .extent_manager()
             .and_then(|em| em.mark_range_written(start_block, end_block, handle.as_deref()))
         {
-            self.rollback_write(old_size, end, handle.as_deref());
+            self.rollback_write(&new_mappings, old_size, end, handle.as_deref());
             return Err(err);
         }
 
@@ -3346,13 +3385,24 @@ impl InodeInner {
         reader: &mut VmReader,
     ) -> Result<ChunkWrite> {
         let size_before = self.file_size();
-        match self.try_write_chunk(fs, write_offset, write_end, cursor_block, handle, reader) {
+        // Records the runs this chunk newly allocates, so its rollback frees
+        // exactly them (an append into a KEEP_SIZE preallocation converts, never
+        // allocates, those blocks — they stay out of `new_mappings` and survive).
+        let mut new_mappings = extent_manager::NewMappings::default();
+        match self.try_write_chunk(
+            fs,
+            write_offset..write_end,
+            cursor_block,
+            handle,
+            reader,
+            &mut new_mappings,
+        ) {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 // Free this chunk's just-allocated blocks and restore the page
                 // cache; the earlier chunks committed under prior transactions
                 // are durable and left alone.
-                self.rollback_write(size_before, write_end, handle);
+                self.rollback_write(&new_mappings, size_before, write_end, handle);
                 Err(err)
             }
         }
@@ -3363,38 +3413,39 @@ impl InodeInner {
     fn try_write_chunk(
         &mut self,
         fs: &Ext4,
-        write_offset: usize,
-        write_end: usize,
+        write: Range<usize>,
         cursor_block: Iblock,
         handle: Option<&journal::Handle>,
         reader: &mut VmReader,
+        new_mappings: &mut extent_manager::NewMappings,
     ) -> Result<ChunkWrite> {
-        let end_block = Iblock::try_from(write_end.div_ceil(BLOCK_SIZE))
+        let end_block = Iblock::try_from(write.end.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
-        let reached =
-            match self
-                .extent_manager()?
-                .ensure_allocated_chunk(cursor_block, end_block, handle)?
-            {
-                extent_manager::HoleFill::Filled => end_block,
-                // No block allocated: even the first insert would overflow the
-                // transaction. Report the reservation it needs so the spine restarts
-                // (or declares EFBIG); nothing was written, so leave the reader and
-                // size untouched.
-                extent_manager::HoleFill::Stopped { reached, need } if reached == cursor_block => {
-                    return Ok(ChunkWrite::Stalled { need });
-                }
-                // Partial progress: `[cursor_block, reached)` was allocated before
-                // the early stop. Map/write/convert what was allocated; the outer
-                // spine's per-chunk `ensure_chunk_credits` starts the next chunk on a
-                // fresh transaction.
-                extent_manager::HoleFill::Stopped { reached, .. } => reached,
-            };
+        let reached = match self.extent_manager()?.ensure_allocated_chunk(
+            cursor_block,
+            end_block,
+            handle,
+            new_mappings,
+        )? {
+            extent_manager::HoleFill::Filled => end_block,
+            // No block allocated: even the first insert would overflow the
+            // transaction. Report the reservation it needs so the spine restarts
+            // (or declares EFBIG); nothing was written, so leave the reader and
+            // size untouched.
+            extent_manager::HoleFill::Stopped { reached, need } if reached == cursor_block => {
+                return Ok(ChunkWrite::Stalled { need });
+            }
+            // Partial progress: `[cursor_block, reached)` was allocated before
+            // the early stop. Map/write/convert what was allocated; the outer
+            // spine's per-chunk `ensure_chunk_credits` starts the next chunk on a
+            // fresh transaction.
+            extent_manager::HoleFill::Stopped { reached, .. } => reached,
+        };
         // This chunk's byte range: the write start for the first chunk, the
         // block-aligned cursor otherwise, up to the reached block (clamped to
         // the write end for the final chunk).
-        let chunk_start = write_offset.max(cursor_block as usize * BLOCK_SIZE);
-        let chunk_end = write_end.min(reached as usize * BLOCK_SIZE);
+        let chunk_start = write.start.max(cursor_block as usize * BLOCK_SIZE);
+        let chunk_end = write.end.min(reached as usize * BLOCK_SIZE);
         let size_before = self.file_size();
         // Grow the page cache to the chunk end. This bounds `PageCache::write`
         // below to exactly this chunk's bytes (append invariant: the write
@@ -3440,24 +3491,28 @@ impl InodeInner {
     ) -> Result<ChunkWrite> {
         // Allocate the chunk's holes as UNWRITTEN up to the credit early stop; a
         // pre-existing written extent (an overwrite) needs no allocation and
-        // presses on to `window_end`.
-        let reached =
-            match self
-                .extent_manager()?
-                .ensure_allocated_chunk(cursor_block, window_end, handle)?
-            {
-                extent_manager::HoleFill::Filled => window_end,
-                // No block allocated: even the first insert would overflow. Report the
-                // reservation so the spine restarts (or declares EFBIG); nothing was
-                // written, so leave the reader untouched.
-                extent_manager::HoleFill::Stopped { reached, need } if reached == cursor_block => {
-                    return Ok(ChunkWrite::Stalled { need });
-                }
-                // Partial progress: `[cursor_block, reached)` was allocated before the
-                // early stop. DMA/convert what was allocated; the spine's per-chunk
-                // `ensure_chunk_credits` starts the next chunk on a fresh transaction.
-                extent_manager::HoleFill::Stopped { reached, .. } => reached,
-            };
+        // presses on to `window_end`. On error this path LEAVES the chunk's
+        // blocks unwritten (no `rollback_write`), so the recorded runs are
+        // discarded.
+        let mut new_mappings = extent_manager::NewMappings::default();
+        let reached = match self.extent_manager()?.ensure_allocated_chunk(
+            cursor_block,
+            window_end,
+            handle,
+            &mut new_mappings,
+        )? {
+            extent_manager::HoleFill::Filled => window_end,
+            // No block allocated: even the first insert would overflow. Report the
+            // reservation so the spine restarts (or declares EFBIG); nothing was
+            // written, so leave the reader untouched.
+            extent_manager::HoleFill::Stopped { reached, need } if reached == cursor_block => {
+                return Ok(ChunkWrite::Stalled { need });
+            }
+            // Partial progress: `[cursor_block, reached)` was allocated before the
+            // early stop. DMA/convert what was allocated; the spine's per-chunk
+            // `ensure_chunk_credits` starts the next chunk on a fresh transaction.
+            extent_manager::HoleFill::Stopped { reached, .. } => reached,
+        };
         // DMA the reader's next `[cursor_block, reached)` blocks straight to the
         // device and WAIT before converting (direct-ordered law: data on the
         // device before the metadata that exposes it).
@@ -4926,6 +4981,72 @@ mod write_tests {
             assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Unwritten);
             assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Unwritten);
         }
+    }
+
+    /// P9 debt (`fallocate-keepsize-swallowed-by-rollback`): a cross-EOF write
+    /// that FAILS must not free a `fallocate` KEEP_SIZE preallocation reserved
+    /// past EOF. The pre-fix `rollback_write` truncated everything past the old
+    /// size, swallowing the reservation; now it frees only the run the write
+    /// itself allocated, so the untouched preallocation (and the old data)
+    /// survive.
+    #[ktest]
+    fn failed_cross_eof_write_keeps_keepsize_preallocation() {
+        // Non-journaled: the rollback frees blocks synchronously, so the assertion
+        // is deterministic (no pinned-free retry loop to reason about).
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // One written block: old_size = BLOCK_SIZE (block 0 written, block 1 a
+        // hole the failing write will target).
+        let block0 = nonzero_pattern(BLOCK_SIZE);
+        write_all(&inode, 0, &block0);
+        assert_eq!(inode.size(), BLOCK_SIZE);
+
+        // Reserve two UNWRITTEN blocks past EOF (KEEP_SIZE) at [4, 6); i_size
+        // stays at BLOCK_SIZE.
+        inode
+            .fallocate(FallocMode::AllocateKeepSize, 4 * BLOCK_SIZE, 2 * BLOCK_SIZE)
+            .unwrap();
+        assert_eq!(inode.size(), BLOCK_SIZE);
+        let reserved_sc = inode.sector_count();
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(4).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(5).unwrap().state(), MapState::Unwritten);
+        }
+
+        // A cross-EOF write over block 1 (offset < old_size takes the
+        // single-transaction `write_at`; end > old_size makes rollback fire).
+        // Inject the very next allocation to fail, so the write errors after
+        // `prepare_write` began but before committing.
+        f.ext4.arm_alloc_blocks_enospc(0);
+        let payload = nonzero_pattern(2 * BLOCK_SIZE);
+        let mut reader = VmReader::from(&payload[..]).to_fallible();
+        let err = inode.write_at(0, &mut reader).unwrap_err();
+        assert_eq!(err.error(), Errno::ENOSPC);
+
+        // i_size unchanged, and — the fix — the KEEP_SIZE preallocation and the
+        // original block-0 data both survive the failed rollback.
+        assert_eq!(
+            inode.size(),
+            BLOCK_SIZE,
+            "a failed write must not grow i_size"
+        );
+        assert_eq!(
+            inode.sector_count(),
+            reserved_sc,
+            "the failed rollback must not free the KEEP_SIZE preallocation"
+        );
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(4).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(5).unwrap().state(), MapState::Unwritten);
+        }
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), block0);
     }
 
     /// P7e-3 — `fallocate(PunchHoleKeepSize)` over a BLOCK-ALIGNED middle range

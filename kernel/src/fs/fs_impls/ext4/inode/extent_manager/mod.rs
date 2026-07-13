@@ -283,11 +283,19 @@ impl ExtentManager {
         start_iblock: Iblock,
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
+        new_mappings: &mut NewMappings,
     ) -> Result<()> {
         // Whole-range mode never early-stops (it presses on and lets
         // `charge_fresh_capture` be the backstop), so the fill always reports
-        // `Filled`; the outcome is discarded.
-        self.fill_holes(start_iblock, end_iblock, handle, AllocBound::WholeRange)?;
+        // `Filled`; the outcome is discarded. The runs it allocates are recorded
+        // into `new_mappings` for a failed write's precise rollback.
+        self.fill_holes(
+            start_iblock,
+            end_iblock,
+            handle,
+            AllocBound::WholeRange,
+            new_mappings,
+        )?;
         Ok(())
     }
 
@@ -311,8 +319,15 @@ impl ExtentManager {
         start_iblock: Iblock,
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
+        new_mappings: &mut NewMappings,
     ) -> Result<HoleFill> {
-        self.fill_holes(start_iblock, end_iblock, handle, AllocBound::CreditChunk)
+        self.fill_holes(
+            start_iblock,
+            end_iblock,
+            handle,
+            AllocBound::CreditChunk,
+            new_mappings,
+        )
     }
 
     /// Shared hole-filling core of [`ensure_allocated`](Self::ensure_allocated)
@@ -325,6 +340,7 @@ impl ExtentManager {
         end_iblock: Iblock,
         handle: Option<&journal::Handle>,
         bound: AllocBound,
+        new_mappings: &mut NewMappings,
     ) -> Result<HoleFill> {
         if start_iblock >= end_iblock {
             return Ok(HoleFill::Filled);
@@ -389,6 +405,15 @@ impl ExtentManager {
                 goal: last_phys_end,
             });
         }
+
+        // Report the runs this fill will newly allocate — the true holes, never
+        // a pre-existing extent, so never old data or a fallocate KEEP_SIZE
+        // preallocation. A failed write's `rollback_write` frees exactly these
+        // (ledger: fallocate-keepsize-swallowed-by-rollback). Recorded UP FRONT
+        // so a mid-fill allocation error still hands the caller every run it may
+        // have touched; freeing a planned run the fill never reached is a no-op
+        // (the range stays a hole).
+        new_mappings.runs.extend(holes.iter().map(|hole| hole.run));
 
         for hole in &holes {
             let mut ib = hole.run.start;
@@ -549,6 +574,36 @@ impl ExtentManager {
             self.csum_seed,
             self.data_forget_policy,
         )
+    }
+
+    /// Frees exactly the blocks a failed write newly allocated — the runs
+    /// [`ensure_allocated`](Self::ensure_allocated) recorded into `new_mappings`
+    /// — restoring them to holes, and skipping any run below `keep_blocks`.
+    ///
+    /// Only the write's own fresh allocations are recorded, so pre-existing
+    /// extents — old file data and any `fallocate` KEEP_SIZE preallocation in or
+    /// past the write range — are never touched (ledger:
+    /// `fallocate-keepsize-swallowed-by-rollback`, the swallow the blunt
+    /// `truncate_to_byte_len(old_size)` this replaces caused). `keep_blocks` is
+    /// the first block fully past the pre-write `i_size`: a hole this write also
+    /// filled BELOW EOF is left as a benign unwritten over-allocation (its dirty
+    /// page keeps a backing block — see `write_at`'s cleanup), matching the old
+    /// truncate, which only freed past the old size. Each surviving run is
+    /// punched, so an edge that merged with adjacent preallocation is split back
+    /// and no block outside the run is disturbed.
+    pub(super) fn free_new_mappings(
+        &self,
+        new_mappings: &NewMappings,
+        keep_blocks: Iblock,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        for run in &new_mappings.runs {
+            let start = run.start.max(keep_blocks);
+            if start < run.end {
+                self.punch_range(start, run.end, handle)?;
+            }
+        }
+        Ok(())
     }
 
     /// One credit-bounded step of shrinking the tree to `new_size` bytes: frees
@@ -728,6 +783,7 @@ pub(super) struct PunchChunk {
 }
 
 /// A contiguous run of unmapped logical blocks.
+#[derive(Clone, Copy)]
 struct HoleRun {
     start: Iblock,
     end: Iblock,
@@ -739,6 +795,18 @@ struct HoleRun {
 struct PlannedHole {
     run: HoleRun,
     goal: Option<Ext4Bid>,
+}
+
+/// The logical block runs a single [`ensure_allocated`](ExtentManager::ensure_allocated)
+/// pass newly allocated — the true holes it filled, never a pre-existing
+/// extent. A failed write's `rollback_write` frees EXACTLY these (via
+/// [`free_new_mappings`](ExtentManager::free_new_mappings)) instead of
+/// truncating everything past the old size, so old file data and any
+/// `fallocate` KEEP_SIZE preallocation in or past the write range survive the
+/// rollback (ledger: `fallocate-keepsize-swallowed-by-rollback`).
+#[derive(Default)]
+pub(super) struct NewMappings {
+    runs: Vec<HoleRun>,
 }
 
 /// The largest number of page-sized segments packed into one prefetch read BIO.
@@ -1183,7 +1251,8 @@ mod tests {
     fn grow_to_depth_1(f: &super::super::super::test_utils::Ext4Fixture, em: &ExtentManager) {
         let op = f.ext4.begin_op(8).unwrap();
         for ib in [0u32, 2, 4, 6, 8] {
-            em.ensure_allocated(ib, ib + 1, op.get()).unwrap();
+            em.ensure_allocated(ib, ib + 1, op.get(), &mut NewMappings::default())
+                .unwrap();
         }
         drop(op);
         assert_eq!(em.root_depth(), 1, "tree grew an external leaf");
@@ -1270,7 +1339,8 @@ mod tests {
 
         {
             let op = f.ext4.begin_op(8).unwrap();
-            em.ensure_allocated(10, 11, op.get()).unwrap();
+            em.ensure_allocated(10, 11, op.get(), &mut NewMappings::default())
+                .unwrap();
         }
         // `ensure_allocated` yields unwritten extents (Unwritten-first); the
         // point here is that the reused leaf was captured and the mapping is
