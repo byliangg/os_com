@@ -620,13 +620,13 @@ impl ExtentManager {
         Ok(())
     }
 
-    /// One counting walk that routes a shrink to `new_size`: the whole-truncate
+    /// One structural walk that routes a shrink to `new_size`: the whole-truncate
     /// credit estimate (the fast/slow gate) AND the chunked-spine EFBIG floor,
     /// so the caller can reject a genuinely un-splittable shrink BEFORE it
-    /// mutates the inode. The walk streams (P9a-T6, retiring the whole-tree
-    /// flatten Vec): two counters — the tree's extent count for the gate's
-    /// conservative whole-tree shape, and the doomed count past `keep_blocks` —
-    /// with O(1) memory.
+    /// mutates the inode. The walk ([`ExtentTree::shrink_shape`]) streams (P9a-T6,
+    /// retiring the whole-tree flatten Vec): it counts the tree's exact external
+    /// nodes for the gate's whole-tree reserialize shape and the doomed extents
+    /// past `keep_blocks`, with O(1) memory.
     ///
     /// `floor_efbig` mirrors [`ExtentTree::truncate_chunk`]'s internal O(depth)
     /// floor exactly (`free_cost + (free_cost * depth + 2) > max` — one free plus
@@ -641,22 +641,22 @@ impl ExtentManager {
         let keep_blocks = Iblock::try_from(new_size.div_ceil(BLOCK_SIZE))
             .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
         let tree = self.state.read();
-        let mut total_extents = 0usize;
-        let mut freed_extents = 0usize;
-        tree.walk_range(&fs, 0..u64::MAX, &mut |e: &node::Extent| {
-            total_extents += 1;
-            if e.block() as u64 + e.len() as u64 > keep_blocks as u64 {
-                freed_extents += 1;
-            }
-            core::ops::ControlFlow::Continue(())
-        })?;
-        let external = ExtentTree::external_node_count(total_extents);
+        // One structural walk yields the EXACT external-node count and the
+        // doomed-extent count — the two shape inputs the gate reserves against.
+        // Counting the real nodes (not a dense `ceil(extents / fanout)` lower
+        // bound) is what keeps a sparse or depth-3+ tree from under-reserving
+        // and misrouting a big truncate into a single transaction that then
+        // stops mid-truncate on a tiny journal.
+        let shape = tree.shrink_shape(&fs, keep_blocks)?;
         let revoke_per_block = fs
             .journal()
             .map(|j| j.revoke_entries_per_block())
             .unwrap_or(1);
-        let whole_estimate =
-            fs.whole_truncate_credit_bound(external, freed_extents, revoke_per_block);
+        let whole_estimate = fs.whole_truncate_credit_bound(
+            shape.external_nodes,
+            shape.freed_extents,
+            revoke_per_block,
+        );
         // `freed_extents > 0` is the floor's `has_work` (a doomed extent or the
         // straddler both extend past `keep_blocks`): a shrink freeing nothing
         // (e.g. rounding within the last block) can never trip EFBIG.
@@ -671,7 +671,8 @@ impl ExtentManager {
         // transaction fast path genuinely touches every freed node.)
         let free_cost = fs.extent_free_credits();
         let depth = tree.depth() as usize;
-        let floor_efbig = freed_extents > 0 && free_cost + (free_cost * depth + 2) > max_credits;
+        let floor_efbig =
+            shape.freed_extents > 0 && free_cost + (free_cost * depth + 2) > max_credits;
         Ok(ShrinkPlan {
             whole_estimate,
             floor_efbig,

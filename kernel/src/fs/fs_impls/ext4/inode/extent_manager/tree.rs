@@ -1506,8 +1506,13 @@ impl ExtentTree {
         let node_headroom = free_cost * depth as usize + 2;
         // …plus, for the one case that INSERTS (an extent spanning the whole
         // punch range splits into head + tail through the insert machinery),
-        // the insert's own per-op worst case.
-        let split_headroom = node_headroom + fs.write_credits(depth);
+        // the insert's own per-op worst case. This is `insert_credit_bound`
+        // (the `3*(depth+1)+2` split shape), NOT `write_credits` (the smaller
+        // `2*(depth+1)` single-map estimate): a spans-both split re-enters the
+        // full leaf through `self.insert`, whose worst case is a full-path split
+        // plus a depth growth. The inode descriptor rides `node_headroom`'s `+2`,
+        // so it is not double-charged here.
+        let split_headroom = node_headroom + fs.insert_credit_bound(depth);
 
         // Depth-0: at most INLINE_MAX entries — punch them in one pass over
         // the inline root (any transaction fits it; a spans-both split may
@@ -2079,35 +2084,53 @@ impl ExtentTree {
         }
     }
 
-    /// Returns the external (leaf + interior) node count of the on-disk tree
-    /// holding `extents` extents — the number of full-block nodes
-    /// [`reserialize`](Self::reserialize) writes for that count, following the
-    /// same inline / depth-1 / depth-2 shape.
+    /// Counts, in one structural descent of the whole tree, the two shape
+    /// inputs the whole-truncate routing gate ([`ExtentManager::plan_shrink`])
+    /// reserves against: the real external-node count and how many extents end
+    /// past `keep_blocks` (the doomed set).
     ///
-    /// An inline (depth-0) root has no external nodes; a depth-1 tree has
-    /// `ceil(extents / LEAF_MAX)` leaves under the inline root; a depth-2 tree
-    /// adds `ceil(nr_leaves / INTERIOR_MAX)` interior nodes. Used to size the
-    /// whole-truncate routing gate (`plan_shrink`), the one whole-tree-shaped
-    /// estimate left after the in-place surgery.
-    ///
-    /// HONESTY: this is the DENSE depth ≤ 2 shape. The in-place surgery can
-    /// leave half-filled leaves (more real nodes than the dense count) and,
-    /// with the depth cap lifted, a depth-3+ tree adds top levels this
-    /// undercounts — the gate's slack (`whole_truncate_credit_bound` double
-    /// charges the freed extents' bitmaps) covers realistic geometries, and a
-    /// misroute only costs the fast path a loud mid-truncate stop on a tiny
-    /// journal (ledger: `whole-truncate-gate-underestimate`).
-    pub(super) fn external_node_count(extents: usize) -> usize {
-        if extents <= INLINE_MAX {
-            return 0;
+    /// The node count is EXACT — every interior node and leaf below the inline
+    /// root — not the dense `ceil(extents / fanout)` lower bound a two-level
+    /// formula gives. The in-place surgery can leave half-filled leaves (more
+    /// nodes than a dense pack) and, with the depth cap lifted, a depth-3+ tree
+    /// adds interior levels a two-level formula never counts. Reserving against
+    /// the real node count is what keeps the fast/slow gate from under-reserving
+    /// and misrouting a big truncate into the single transaction that then
+    /// stops mid-truncate on a tiny journal (retiring the ledger debt
+    /// `whole-truncate-gate-underestimate`). This is `plan_shrink`'s one whole-
+    /// tree walk (it replaced the extent-only scan), so the read cost stays
+    /// O(tree) — no extra pass — with O(1) memory (two counters).
+    pub(super) fn shrink_shape(&self, fs: &Ext4, keep_blocks: Iblock) -> Result<ShrinkShape> {
+        let header = self.header();
+        let nr = header.entries() as usize;
+        if header.is_leaf() {
+            // Depth-0: the extents live in the inline root; no external nodes.
+            let mut freed_extents = 0;
+            for i in 0..nr {
+                let e = self.root_extent_at(i);
+                if e.block() as u64 + e.len() as u64 > keep_blocks as u64 {
+                    freed_extents += 1;
+                }
+            }
+            return Ok(ShrinkShape {
+                external_nodes: 0,
+                freed_extents,
+            });
         }
-        let nr_leaves = extents.div_ceil(LEAF_MAX);
-        let nr_interior = if nr_leaves <= INLINE_MAX {
-            0
-        } else {
-            nr_leaves.div_ceil(INTERIOR_MAX)
+        let mut shape = ShrinkShape {
+            external_nodes: 0,
+            freed_extents: 0,
         };
-        nr_leaves + nr_interior
+        for i in 0..nr {
+            count_subtree(
+                fs,
+                self.root_index_at(i).leaf(),
+                header.depth() - 1,
+                keep_blocks,
+                &mut shape,
+            )?;
+        }
+        Ok(shape)
     }
 
     /// Decodes leaf entry `i` of the trusted inline root.
@@ -2176,6 +2199,58 @@ fn leaf_landing(
 /// ascending order — the recursive child step of [`ExtentTree::walk_range`].
 /// `expected_depth` enforces the one-step-down invariant ([`ExtentTree::find`]),
 /// which also bounds the recursion at [`MAX_DEPTH`](MAX_DEPTH).
+/// The tree-shape inputs the whole-truncate routing gate reserves against,
+/// gathered in one structural descent ([`ExtentTree::shrink_shape`]).
+pub(super) struct ShrinkShape {
+    /// Every external (out-of-inode) node: each interior node and each leaf
+    /// below the inline root. Counted exactly, so the credit bound tracks the
+    /// tree's real (possibly sparse or depth-3+) shape.
+    pub(super) external_nodes: usize,
+    /// Extents ending past `keep_blocks`: the doomed set, each free of which may
+    /// clear a distinct group's block bitmap and GDT block.
+    pub(super) freed_extents: usize,
+}
+
+/// The counting companion of [`walk_child`]: adds one subtree's external nodes
+/// and its extents ending past `keep_blocks` into `shape`. Descends every node
+/// the subtree holds (the whole-range shape the truncate gate reserves against),
+/// enforcing the same step-down-by-one depth invariant the read walk does.
+fn count_subtree(
+    fs: &Ext4,
+    bid: Ext4Bid,
+    expected_depth: u16,
+    keep_blocks: Iblock,
+    shape: &mut ShrinkShape,
+) -> Result<()> {
+    let node = NodeBuf::read(fs, bid)?;
+    if node.depth() != expected_depth {
+        return_errno_with_message!(
+            Errno::EUCLEAN,
+            "extent child depth does not step down by one"
+        );
+    }
+    shape.external_nodes += 1;
+    if node.is_leaf() {
+        for i in 0..node.entries() {
+            let e = node.extent_at(i);
+            if e.block() as u64 + e.len() as u64 > keep_blocks as u64 {
+                shape.freed_extents += 1;
+            }
+        }
+        return Ok(());
+    }
+    for i in 0..node.entries() {
+        count_subtree(
+            fs,
+            node.index_at(i).leaf(),
+            expected_depth - 1,
+            keep_blocks,
+            shape,
+        )?;
+    }
+    Ok(())
+}
+
 fn walk_child(
     fs: &Ext4,
     bid: Ext4Bid,
@@ -4143,6 +4218,78 @@ mod tests {
         assert_matches_linear(&f, &tree, big_block + 8);
     }
 
+    /// P9 debt `punch-spans-slow-headroom-shape`: a spans-both punch through a
+    /// FULL leaf re-inserts the tail via the split machinery, whose worst case
+    /// is `insert_credit_bound` (the `3*(depth+1)+2` split shape), not the
+    /// smaller `write_credits`. The per-step EFBIG floor must reserve the larger
+    /// bound, so a journal big enough only for the retired (under-counted)
+    /// estimate refuses the step up front instead of admitting it and
+    /// overrunning mid-punch.
+    #[ktest]
+    fn punch_spans_slow_floor_reserves_insert_bound() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // A full depth-1 leaf ending in a 5-block run (the spans-both shape).
+        let (mut tree, _p) = ascending_tree_allocated(&f, LEAF_MAX as u32 - 1);
+        let big = f.ext4.alloc_blocks(5, 0, None).unwrap();
+        let big_block = (LEAF_MAX as u32 - 1) * 2;
+        tree.insert(
+            &f.ext4,
+            big_block,
+            big.start,
+            5,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!((tree.depth(), root_entries(&tree)), (1, 1));
+        match tree.find(&f.ext4, big_block).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), LEAF_MAX)
+            }
+            _ => panic!("big extent must be mapped"),
+        }
+
+        // The spans-both step's reservation, both ways (depth 1).
+        let depth = 1u16;
+        let free_cost = f.ext4.extent_free_credits();
+        let node_headroom = free_cost * depth as usize + 2;
+        // Retired undercount (2*(depth+1) single-map shape).
+        let old_need = free_cost + node_headroom + f.ext4.write_credits(depth);
+        // Correct bound (3*(depth+1)+2 split shape).
+        let new_need = free_cost + node_headroom + f.ext4.insert_credit_bound(depth);
+        assert!(
+            new_need > old_need,
+            "the fix must raise the reservation: {new_need} vs {old_need}"
+        );
+
+        // A journal sized at the OLD need: the retired code admitted the step and
+        // would overrun; the fix stops it with a clean EFBIG before any free, so
+        // the leaf is left intact. (`PunchChunk` is not `Debug`, so match rather
+        // than `unwrap_err`.)
+        let err = match tree.punch_chunk(
+            &f.ext4,
+            big_block + 1..big_block + 3,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            Some(old_need),
+        ) {
+            Ok(_) => panic!("a step sized only for the retired estimate must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(err.error(), Errno::EFBIG);
+        match tree.find(&f.ext4, big_block).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), LEAF_MAX)
+            }
+            _ => panic!("a floor refusal must leave the leaf intact"),
+        }
+    }
+
     // ---- P9a-T5: in-place unwritten→written conversion ----
 
     /// Converting a whole unwritten extent flips its kind in place (no data
@@ -4547,6 +4694,86 @@ mod tests {
         assert_eq!(tree.depth(), 0);
         assert_eq!(tree.sector_count(), 0);
         assert!(tree.lookup(&f.ext4, 0).unwrap().is_none());
+    }
+
+    /// P9 debt `whole-truncate-gate-underestimate`: the whole-truncate routing
+    /// gate must reserve against the tree's REAL external-node count, not a
+    /// dense `ceil(extents / fanout)` lower bound. A depth-3 spine holding only
+    /// two extents has THREE external nodes (top + mid + leaf); the retired
+    /// dense `external_node_count(2)` returned 0 for a `<= INLINE_MAX`-extent
+    /// tree, so `plan_shrink` would under-reserve and misroute this whole
+    /// truncate to the single-transaction fast path on a tiny journal.
+    #[ktest]
+    fn plan_shrink_reserves_for_deep_sparse_tree() {
+        let f = Ext4FixtureBuilder::new(4096, 256, 4096)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let device = f.ext4.block_device();
+        let alloc = |n: u32| f.ext4.alloc_blocks(n, 0, None).unwrap().start;
+        let (data0, data1) = (alloc(1), alloc(1));
+        let (leaf_bid, mid_bid, top_bid) = (alloc(1), alloc(1), alloc(1));
+
+        // Two extents (logical 0 and 2), well under INLINE_MAX, hung off a full
+        // three-level spine — the shape the dense count is blind to.
+        let mut leaf = NodeBuf::fresh(leaf_bid, 0);
+        leaf.insert_extent_at(0, &Extent::new(0, 1, data0, ExtentKind::Written))
+            .unwrap();
+        leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written))
+            .unwrap();
+        leaf.write_back(device.as_ref(), None, None).unwrap();
+        let mut mid = NodeBuf::fresh(mid_bid, 1);
+        mid.insert_index_at(0, &make_index_entry(0, leaf_bid))
+            .unwrap();
+        mid.write_back(device.as_ref(), None, None).unwrap();
+        let mut top = NodeBuf::fresh(top_bid, 2);
+        top.insert_index_at(0, &make_index_entry(0, mid_bid))
+            .unwrap();
+        top.write_back(device.as_ref(), None, None).unwrap();
+
+        let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
+        let header = RawExtentHeader {
+            magic: EXTENT_MAGIC,
+            entries: 1,
+            max: INLINE_MAX as u16,
+            depth: 3,
+            generation: 0,
+        };
+        root.as_mut_bytes()[0..ENTRY_SIZE].copy_from_slice(header.as_bytes());
+        root.as_mut_bytes()[ENTRY_SIZE..2 * ENTRY_SIZE]
+            .copy_from_slice(make_index_entry(0, top_bid).as_bytes());
+
+        // The exact structural count sees all three external nodes and both
+        // doomed extents; the dense `external_node_count(2)` returned 0.
+        let tree = ExtentTree::try_new(root, 5 * SECTORS_PER_BLOCK).unwrap();
+        let shape = tree.shrink_shape(&f.ext4, 0).unwrap();
+        assert_eq!((shape.external_nodes, shape.freed_extents), (3, 2));
+
+        // `plan_shrink`'s estimate is independent of `max_credits` (that only
+        // gates the chunked floor), so compare it against the dense-0 undercount
+        // the retired formula produced (no journal here → `revoke_entries_per_block`
+        // = 1). The exact count must reserve strictly more, so a tiny journal
+        // sized at the dense estimate takes the chunked orphan spine instead of
+        // an overrunning single transaction.
+        let dense_est = f
+            .ext4
+            .whole_truncate_credit_bound(0, shape.freed_extents, 1);
+        let em = super::super::ExtentManager::try_new(
+            root,
+            5 * SECTORS_PER_BLOCK,
+            Arc::downgrade(&f.ext4),
+            5,
+            None,
+            0,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+        let plan = em.plan_shrink(0, dense_est).unwrap();
+        assert!(
+            plan.whole_estimate > dense_est,
+            "exact node count must overrun the dense-0 undercount: est={} dense={dense_est}",
+            plan.whole_estimate,
+        );
     }
 
     /// G9-8 (P9a-a5, the T5 review's ENOSPC pin): a partial conversion whose
