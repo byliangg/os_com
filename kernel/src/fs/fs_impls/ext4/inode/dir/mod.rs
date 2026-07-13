@@ -317,18 +317,53 @@ impl InodeInner {
     /// torn or missing directory entry (a dangling or lost name). `dir_offset` is
     /// any byte offset within the modified block.
     ///
-    /// A whole-block capture: `get_create_access` seeds zeros (irrelevant, since
-    /// the `dirty_metadata` closure overwrites the whole block with the page
-    /// cache's current content), so no device read is issued for a block we fully
-    /// replace.
+    /// The caller has ALREADY mutated this block in the page cache (added, split,
+    /// deleted, repointed, or linearized an entry), so lookup and readdir serve
+    /// the change the instant this returns. On a journaled volume a capture that
+    /// cannot land therefore leaves the transaction inconsistent with the live
+    /// volume: its OTHER captures (the child inode, the delete half of a rename,
+    /// a grown parent's size) would commit WITHOUT this block's after-image — a
+    /// torn or lost name on crash — or the log and the page cache fork
+    /// permanently. Neither is recoverable by re-issuing the op, so any failure
+    /// here aborts the journal (EROFS), the same cross-cutting discipline
+    /// [`InodeInner::write_back_inode_desc`] applies to a failed descriptor
+    /// capture (Linux routes a dir-block journaling failure through
+    /// `ext4_handle_dirty_metadata` → `ext4_std_error` → journal abort). This
+    /// single funnel closes the `dir-block-capture-failure-family` (P9a-a5
+    /// residual H-6b/c + H-7): every entry mutation — add, split, delete, `..`
+    /// repoint, htree degrade — journals its block through here.
     fn journal_dir_block(&self, dir_offset: usize, handle: Option<&journal::Handle>) -> Result<()> {
         let logical = (dir_offset / BLOCK_SIZE) as Iblock;
-        // Seal the checksum tail (into the page cache) whether or not the volume
-        // is journaled, so the block that later reaches disk — via checkpoint of
-        // this capture, or a direct page-cache flush — carries a valid checksum.
+        let Some(handle) = handle else {
+            // Non-journaled volume: seal the checksum tail into the page cache so
+            // the block that later reaches disk via a direct flush carries a valid
+            // checksum. No transaction exists, so there is no log to fork.
+            return self.seal_dir_block(logical);
+        };
+        self.capture_dir_block(logical, handle)
+            .inspect_err(|_| handle.abort_journal_on_fs_error())
+    }
+
+    /// Seals the checksum tail and captures the directory block's after-image
+    /// into `handle`'s transaction. Split out of [`journal_dir_block`] so its
+    /// whole fallible body is covered by that funnel's single journal abort.
+    ///
+    /// A whole-block capture: `get_create_access` seeds zeros (irrelevant, since
+    /// the `patch` closure overwrites the whole block with the page cache's
+    /// current content), so no device read is issued for a block we fully
+    /// replace.
+    ///
+    /// [`journal_dir_block`]: Self::journal_dir_block
+    fn capture_dir_block(&self, logical: Iblock, handle: &journal::Handle) -> Result<()> {
+        // Seal the checksum tail (into the page cache) so the block that later
+        // reaches disk — via checkpoint of this capture, or a direct page-cache
+        // flush — carries a valid checksum.
         self.seal_dir_block(logical)?;
-        if handle.is_none() {
-            return Ok(());
+        // ktest-only: the EIO/ENOMEM capture failure the funnel abort closes has
+        // no natural ktest trigger (mirrors `register_ordered_data`'s ENOMEM).
+        #[cfg(ktest)]
+        if handle.take_dir_block_capture_fault() {
+            return_errno_with_message!(Errno::EIO, "injected directory-block capture failure");
         }
         let Some(phys) = self.extent_manager()?.map_blocks(logical)?.mapped_pblock() else {
             return_errno_with_message!(Errno::EIO, "directory block not mapped for journaling");
@@ -339,7 +374,7 @@ impl InodeInner {
             .map_err(|_| {
                 Error::with_message(Errno::EIO, "failed to read directory block for journaling")
             })?;
-        journal::get_create_access(handle, phys)?.patch(|buf| buf.copy_from_slice(&block))
+        journal::get_create_access(Some(handle), phys)?.patch(|buf| buf.copy_from_slice(&block))
     }
 
     /// Writes a new entry into the selected slot, splitting the predecessor's
@@ -975,9 +1010,34 @@ impl Inode {
             }
             // Clear the link count so other resources are reclaimed by `Drop`
             // (Task 4). The half-built inode is never inserted into the cache.
+            // On a journaled volume, ALSO list it on the orphan chain in THIS
+            // transaction: `create_inode` captured the child (and `make_empty` /
+            // `init_child` may have grown it — a directory's first block, a slow
+            // symlink's target), so a crash after this transaction commits but
+            // before the synchronous `Drop` reclaim runs would otherwise leave a
+            // committed, allocated, NAMELESS inode off any list — an unreferenced
+            // inode e2fsck must repair. The link-0 orphan writeback carries the
+            // child's CURRENT extent root, so recovery frees a slow symlink's
+            // target block too (no freed-but-mapped leak), exactly as Linux
+            // `ext4_add_nondir` / `ext4_symlink` do on failure (clear_nlink +
+            // ext4_orphan_add). `Drop`'s reclaim then finds it already listed
+            // (`orphan_add_if_absent` no-op) and splices it off as it frees it.
             {
                 let mut child_inner = child.inner.write();
                 child_inner.set_link_count(0);
+                if op.get().is_some()
+                    && let Err(orphan_err) = fs.orphan_add(child_ino, op.get()).and_then(|link| {
+                        child_inner.persist_as_orphan(&fs, child_ino, link, op.get())
+                    })
+                {
+                    // Listing/persisting the orphan is itself journaled; if it
+                    // cannot land the transaction is inconsistent — abort (the
+                    // caller still reports the ORIGINAL error).
+                    warn!("failed to orphan-list create-error inode {child_ino}: {orphan_err:?}");
+                    if let Some(handle) = op.get() {
+                        handle.abort_journal_on_fs_error();
+                    }
+                }
             }
             // Close this operation's handle BEFORE `child` drops at scope end:
             // the Drop-reclaim opens its own `begin_op`, and with the blocking
@@ -1374,6 +1434,30 @@ impl Inode {
             }
         }
 
+        // A cross-directory directory move repoints the moved directory's `..`
+        // at its new parent (step 4.3 below). If it carries an htree index,
+        // flatten it to linear FIRST — and do so HERE, before any entry
+        // mutation, so the ONE step that can fail `EFBIG` (a depth-2 degrade
+        // whose index-block burst exceeds one transaction) leaves BOTH
+        // directories untouched, like the EMLINK gate above. Deferring the
+        // degrade to step 4.3 — its former home, after the source/target
+        // entries are already captured — would, on that `EFBIG`, commit a moved
+        // directory whose `..` still names the OLD parent: an e2fsck-fixable
+        // `..` mismatch a tiny journal could reach
+        // (`rename-dirmove-efbig-mid-mutation`, P7-d1 residual). A degrade is an
+        // indivisible burst that cannot itself chunk-restart (see
+        // `degrade_htree_to_linear`), so hoisting it — not splitting it — is the
+        // fail-clean fix. On a benign LATER failure (e.g. `grow_dir_block`
+        // ENOSPC) the moved directory is left correctly linearized but unmoved,
+        // which e2fsck accepts; a torn later failure aborts the journal and
+        // unwinds this degrade with it.
+        if old_is_dir && !is_same_dir && fs.super_block().has_dir_index() {
+            let old_inner = guards.inner_mut(old_ino);
+            if old_inner.desc.flags().contains(FileFlags::INDEX) {
+                old_inner.degrade_htree_to_linear(&fs, handle)?;
+            }
+        }
+
         // Step 4.1: apply the directory-entry mutations.
         if is_same_dir {
             let dir_inner = guards.inner_mut(self.ino());
@@ -1467,23 +1551,13 @@ impl Inode {
             }
         }
 
-        // Step 4.3: repoint a moved directory's `..` at its new parent.
+        // Step 4.3: repoint a moved directory's `..` at its new parent. Any
+        // htree index was already flattened to linear before step 4.1 (see the
+        // hoisted degrade above), so block 0 is a valid linear block here and
+        // this repoint is a single bounded dirent patch — it cannot fail
+        // `EFBIG` after the entry mutations have already been captured.
         let old_inner = guards.inner_mut(old_ino);
         if old_is_dir && !is_same_dir {
-            // If the directory carries an htree index, flatten it to linear
-            // *before* repointing `..`. A bare `INDEX`-flag clear would leave
-            // block 0 in `dx_root` shape — its `..` `rec_len` spanning the now
-            // dead index array, with no checksum tail reserved — which e2fsck
-            // rejects (and on a metadata_csum volume the `..` repoint below would
-            // then stamp a dirent checksum onto a block that has none). Clearing
-            // the flag would also gate out the degrade `add_new_entry` performs,
-            // so the stale index would never be reclaimed.
-            // `degrade_htree_to_linear` rewrites block 0 into a valid linear
-            // block, writes the correct tail, and clears `INDEX` itself.
-            if old_inner.desc.flags().contains(FileFlags::INDEX) && fs.super_block().has_dir_index()
-            {
-                old_inner.degrade_htree_to_linear(&fs, handle)?;
-            }
             let dotdot_entry_info = old_inner.find_entry_info("..", None)?;
             old_inner.set_entry_target(
                 &dotdot_entry_info,
@@ -1971,7 +2045,7 @@ mod tests {
         assert!(!dir.inner.read().empty_dir(DIR_INO));
     }
 
-    use super::super::FilePerm;
+    use super::super::{super::fs::Ext4, FilePerm};
 
     /// A fixture whose block *and* inode bitmaps are marked, with a `.`/`..`
     /// directory at `DIR_INO` ready to receive `create`d children. `DIR_INO`'s
@@ -2199,6 +2273,204 @@ mod tests {
         );
 
         drop(f);
+    }
+
+    /// A journaled fixture with the `dir_index` feature and a `.`/`..` directory
+    /// at `DIR_INO`, ready to host `create`d subdirectories the tests then
+    /// fabricate an htree index onto (there is no htree *build* yet).
+    fn journaled_dir_index_fixture(journal_blocks: u32) -> Ext4Fixture {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_dir_index()
+            .with_journal_inode(journal_blocks)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        f.ext4
+            .read_inode(DIR_INO)
+            .unwrap()
+            .inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
+        f
+    }
+
+    /// Turns `dir` (a freshly created linear subdirectory) into a depth-2 htree:
+    /// grows `dx_nodes` dx_node blocks, then overlays block 0's `.`/`..` with a
+    /// `dx_root` pointing at them and sets the `INDEX` flag. The same on-disk
+    /// `dx_root` shape as `degrade_htree_over_capacity_leaves_index_intact`; the
+    /// `.`/`..` fake entries survive so a linear `..` scan still finds the parent.
+    fn fabricate_dx_root(dir: &Inode, fs: &Ext4, dx_nodes: usize) {
+        use super::{FileFlags, htree};
+
+        const DX_ROOT_INFO_OFF: usize = 24;
+        const DX_ROOT_ENTRIES_OFF: usize = 32;
+        const DX_INFO_LEN: u8 = 8;
+        const DX_ENTRY_SIZE: usize = 8;
+
+        {
+            let mut inner = dir.inner.write();
+            for _ in 0..dx_nodes {
+                inner.grow_dir_block(fs, None).unwrap();
+            }
+            inner.desc.insert_flags(FileFlags::INDEX);
+        }
+        let page_cache = dir.page_cache().unwrap();
+        let mut block0: [u8; BLOCK_SIZE] = page_cache.read_val(0).unwrap();
+        block0[DX_ROOT_INFO_OFF + 4] = 1; // hash_version = half-MD4
+        block0[DX_ROOT_INFO_OFF + 5] = DX_INFO_LEN;
+        block0[DX_ROOT_INFO_OFF + 6] = 1; // indirect_levels = 1 (depth-2)
+        block0[DX_ROOT_INFO_OFF + 7] = 0; // unused_flags
+        let count = u16::try_from(dx_nodes).unwrap();
+        let limit = count + 4; // headroom; only `count` entries are read
+        block0[DX_ROOT_ENTRIES_OFF..DX_ROOT_ENTRIES_OFF + 2].copy_from_slice(&limit.to_le_bytes());
+        block0[DX_ROOT_ENTRIES_OFF + 2..DX_ROOT_ENTRIES_OFF + 4]
+            .copy_from_slice(&count.to_le_bytes());
+        for i in 0..dx_nodes {
+            let off = DX_ROOT_ENTRIES_OFF + i * DX_ENTRY_SIZE;
+            let blk = u32::try_from(i + 1).unwrap();
+            block0[off + 4..off + 8].copy_from_slice(&blk.to_le_bytes());
+        }
+        page_cache.write_val(0, &block0).unwrap();
+        assert!(htree::parse_dx_root(&block0).is_ok());
+    }
+
+    /// `dir-block-capture-failure-family` funnel (P9a-a5 residual): a directory
+    /// block capture that fails AFTER the entry is staged in the page cache must
+    /// ABORT the journal, never leaving the transaction free to commit its other
+    /// captures (the child inode, a grown parent) without this block's
+    /// after-image — a torn or lost name on crash — nor forking the live volume
+    /// (which lookup already serves) from the log. Driven by the one-shot
+    /// capture fault (the EIO/ENOMEM window has no natural ktest trigger).
+    #[ktest]
+    fn dir_block_capture_failure_aborts_the_journal() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let journal = f.ext4.journal().unwrap();
+        // Deterministic: no committer retiring the running transaction under us.
+        journal.stop_commit_thread();
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
+        // A committed baseline entry so the directory's first block is live.
+        dir.create("seed", InodeType::File, perm()).unwrap();
+        journal.commit_now_for_test();
+        assert!(!journal.is_aborted());
+
+        // Arm the one-shot fault: the NEXT directory-block capture fails.
+        journal.arm_dir_block_capture_fault();
+        let err = dir
+            .create("victim", InodeType::File, perm())
+            .map(|_| ())
+            .expect_err("the armed dir-block capture fault must fail the create");
+        assert_eq!(err.error(), Errno::EIO);
+        assert!(
+            journal.is_aborted(),
+            "a directory-block capture failure must abort the journal"
+        );
+
+        drop(f);
+    }
+
+    /// `rename-dirmove-efbig-mid-mutation` fix — success path: a cross-directory
+    /// move of an htree-indexed directory degrades it to linear (the P6d path-C
+    /// degrade-on-mutate) and repoints its `..`. Guards the regression risk of
+    /// hoisting the degrade ahead of the entry mutations: the moved directory
+    /// still linearizes, moves, and repoints correctly.
+    #[ktest]
+    fn cross_dir_move_of_htree_dir_degrades_and_repoints() {
+        use super::FileFlags;
+
+        let f = journaled_dir_index_fixture(64);
+        let (dir1, dir2) = two_subdirs(&f);
+
+        let moved = dir1.create("sub", InodeType::Dir, perm()).unwrap();
+        let moved_ino = moved.ino();
+        // A small depth-2 htree whose degrade fits one transaction.
+        fabricate_dx_root(&moved, &f.ext4, 1);
+        assert!(moved.inner.read().desc.flags().contains(FileFlags::INDEX));
+        assert_eq!(
+            moved.inner.read().find_entry_info("..", None).unwrap().ino,
+            dir1.ino()
+        );
+
+        dir1.rename("sub", &dir2, "sub").unwrap();
+
+        // Moved to dir2, gone from dir1.
+        assert!(dir1.lookup("sub").is_err());
+        assert_eq!(dir2.lookup("sub").unwrap().ino(), moved_ino);
+        // Linearized (INDEX cleared) and `..` repointed at the new parent.
+        assert!(
+            !moved.inner.read().desc.flags().contains(FileFlags::INDEX),
+            "the cross-dir move must degrade the htree to linear"
+        );
+        assert_eq!(
+            moved.inner.read().find_entry_info("..", None).unwrap().ino,
+            dir2.ino()
+        );
+    }
+
+    /// `rename-dirmove-efbig-mid-mutation` fix — fail-clean path: when the moved
+    /// directory's htree degrade cannot fit one journal transaction, the whole
+    /// cross-directory move fails `EFBIG` with BOTH directories untouched — never
+    /// the pre-fix mid-mutation state where the source lost the name and the
+    /// target gained it but `..` was never repointed (an e2fsck-fixable `..`
+    /// mismatch). Hoisting the degrade ahead of the entry mutations makes the one
+    /// `EFBIG`-capable step the first, so it leaves nothing behind.
+    #[ktest]
+    fn cross_dir_move_efbig_degrade_leaves_both_dirs_intact() {
+        use super::FileFlags;
+
+        let f = journaled_dir_index_fixture(64);
+        let (dir1, dir2) = two_subdirs(&f);
+
+        let moved = dir1.create("sub", InodeType::Dir, perm()).unwrap();
+        let moved_ino = moved.ino();
+        // A degrade burst one transaction cannot hold: `max_credits` dx_node
+        // blocks, so index_block_count + inode writeback exceeds `max_credits`.
+        let dx_nodes = f.ext4.journal().unwrap().max_credits();
+        fabricate_dx_root(&moved, &f.ext4, dx_nodes);
+
+        let err = dir1
+            .rename("sub", &dir2, "sub")
+            .expect_err("an over-capacity htree degrade must fail the move");
+        assert_eq!(err.error(), Errno::EFBIG);
+
+        // Fail-clean: the source keeps the name, the target never gained it, and
+        // the moved directory's `..` still names its ORIGINAL parent.
+        assert_eq!(dir1.lookup("sub").unwrap().ino(), moved_ino);
+        assert!(dir2.lookup("sub").is_err());
+        assert_eq!(
+            moved.inner.read().find_entry_info("..", None).unwrap().ino,
+            dir1.ino(),
+            "a failed move must not repoint `..`"
+        );
+        assert!(
+            moved.inner.read().desc.flags().contains(FileFlags::INDEX),
+            "a failed degrade must leave the htree index intact"
+        );
+        // The journal is not aborted — EFBIG is a clean refusal, not corruption.
+        assert!(!f.ext4.journal().unwrap().is_aborted());
     }
 
     /// `create` of a subdirectory: it has `.`/`..` (empty_dir true, `..` -> the

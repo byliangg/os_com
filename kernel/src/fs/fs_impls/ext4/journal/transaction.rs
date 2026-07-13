@@ -901,6 +901,19 @@ impl Handle {
             journal.abort_for_fs_error();
         }
     }
+
+    /// Consumes the armed one-shot directory-block capture fault
+    /// (`dir-block-capture-failure-family` regression), returning whether it
+    /// fired. Checked by `journal_dir_block`; the `EIO`/`ENOMEM` capture
+    /// failure the funnel abort closes has no natural ktest trigger (mirrors
+    /// [`register_ordered_data`](Self::register_ordered_data)'s injected
+    /// `ENOMEM`).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn take_dir_block_capture_fault(&self) -> bool {
+        self.journal()
+            .map(|journal| journal.take_dir_block_capture_fault())
+            .unwrap_or(false)
+    }
 }
 
 /// Ensures adding `extra` credits keeps the running transaction within the

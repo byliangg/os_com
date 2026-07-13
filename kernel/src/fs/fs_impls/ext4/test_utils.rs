@@ -196,6 +196,10 @@ pub(super) struct Ext4FixtureBuilder {
     /// When set, OR the `HAS_JOURNAL` compat feature bit into the superblock so
     /// the journal geometry loader treats the volume as journaled.
     has_journal: bool,
+    /// When set, OR the `DIR_INDEX` (htree) compat feature bit into the
+    /// superblock so `SuperBlock::has_dir_index` reports true — the gate a
+    /// directory must clear for the htree read / degrade paths to engage.
+    has_dir_index: bool,
     /// When set to `Some(maxlen)`, lay down the journal inode (ino 8) and a clean
     /// journal superblock on disk *before* `Ext4::open`, so the mount path itself
     /// loads the journal. The log occupies `maxlen` physical blocks starting at
@@ -225,6 +229,7 @@ impl Ext4FixtureBuilder {
             no_free_inodes: false,
             reserved_inode: None,
             has_journal: false,
+            has_dir_index: false,
             journal_inode: None,
             reserved_blocks: 0,
             uuid: [0; 16],
@@ -270,6 +275,17 @@ impl Ext4FixtureBuilder {
         if self.journal_inode.is_none() {
             self.journal_inode = Some(2);
         }
+        self
+    }
+
+    /// Sets the `DIR_INDEX` (htree) compat feature bit in the superblock, so
+    /// `SuperBlock::has_dir_index` reports true. The htree read and
+    /// `degrade_htree_to_linear` paths are gated on it; fixtures that fabricate
+    /// an `INDEX`-flagged directory (there is no htree *build* yet) enable it so
+    /// the rename / insert paths engage the degrade instead of treating the
+    /// dx_root as a linear block.
+    pub(super) fn with_dir_index(mut self) -> Self {
+        self.has_dir_index = true;
         self
     }
 
@@ -398,10 +414,12 @@ impl Ext4FixtureBuilder {
             rev_level: 1,  // Dynamic
             first_ino: 11,
             inode_size: INODE_SIZE as u16,
-            // HAS_JOURNAL (0x4) when the volume is journaled; else no compat
-            // features. (Listed before the incompat/ro_compat fields to match the
-            // struct declaration order — clippy `inconsistent_struct_constructor`.)
-            feature_compat: if self.has_journal { 0x4 } else { 0 },
+            // HAS_JOURNAL (0x4) when journaled, DIR_INDEX (0x20) when htree is
+            // enabled; else no compat features. (Listed before the
+            // incompat/ro_compat fields to match the struct declaration order —
+            // clippy `inconsistent_struct_constructor`.)
+            feature_compat: (if self.has_journal { 0x4 } else { 0 })
+                | (if self.has_dir_index { 0x20 } else { 0 }),
             feature_incompat: 0x2 | 0x40, // FILETYPE | EXTENTS
             feature_ro_compat: 0x1,       // SPARSE_SUPER
             uuid: self.uuid,

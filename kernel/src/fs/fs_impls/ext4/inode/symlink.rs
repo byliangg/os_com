@@ -80,11 +80,26 @@ impl Inode {
         // ran handle-less; on a journaled volume that left the allocation
         // unjournaled.)
         let op = fs.begin_op(fs.write_credits(0))?;
-        let wrote_slow_target = inner.write_link(&fs, target, op.get())?;
+        let wrote_slow_target = match inner.write_link(&fs, target, op.get()) {
+            Ok(wrote_slow_target) => wrote_slow_target,
+            Err(err) => {
+                // The slow path may have allocated and captured a target block
+                // whose extent root has not yet reached the descriptor (the
+                // writeback is below); committing that half-state is a
+                // freed-but-mapped leak. Abort so it cannot commit (P9a-a5
+                // residual, H-8), matching the funnel discipline the other
+                // metadata mutators follow.
+                if let Some(handle) = op.get() {
+                    handle.abort_journal_on_fs_error();
+                }
+                return Err(err);
+            }
+        };
         inner.set_mtime_ctime(utils::now());
         // Same per-handle descriptor capture as `write_at`: the target (fast
         // path) or the extent root (slow path) and the new size must commit
-        // with this transaction's allocation captures.
+        // with this transaction's allocation captures (aborts on its own
+        // failure).
         if op.get().is_some() {
             inner.write_back_inode_desc(&fs, self.ino, op.get())?;
         }
@@ -94,12 +109,18 @@ impl Inode {
             && let Some(handle) = op.get()
             && let Ok(pages) = inner.page_cache()
         {
-            handle.register_ordered_data(
-                self.ino,
-                self.self_weak.clone(),
-                pages.clone(),
-                inner.file_size(),
-            )?;
+            // The extent root already committed pointing at this block; if its
+            // data never reaches the platter before the commit the link reads
+            // back as zeros. Abort on a registration failure (P9a-a5 residual,
+            // H-8), mirroring `seal_failed_write_txn`'s ordered-data seal.
+            handle
+                .register_ordered_data(
+                    self.ino,
+                    self.self_weak.clone(),
+                    pages.clone(),
+                    inner.file_size(),
+                )
+                .inspect_err(|_| handle.abort_journal_on_fs_error())?;
         }
         Ok(())
     }

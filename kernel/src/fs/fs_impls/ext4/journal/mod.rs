@@ -1084,6 +1084,15 @@ pub(super) struct Journal {
     /// stale-data window.
     #[cfg(ktest)]
     fail_ordered_data_once: AtomicBool,
+    /// ktest-only one-shot fault injection for the directory-block capture
+    /// path (`dir-block-capture-failure-family`): armed by
+    /// [`arm_dir_block_capture_fault`](Journal::arm_dir_block_capture_fault),
+    /// consumed once by the next
+    /// [`journal_dir_block`](super::inode::InodeInner) capture, which then
+    /// fails `EIO` — exercising the abort that closes the phantom-entry
+    /// (live volume vs log) fork.
+    #[cfg(ktest)]
+    fail_dir_block_capture_once: AtomicBool,
     /// The commit-thread handle, taken and joined by
     /// [`stop_commit_thread`](Journal::stop_commit_thread). A `Mutex<Option<_>>`
     /// so start/stop can move it in and out; it is **not** held while the thread
@@ -1556,6 +1565,8 @@ impl Journal {
             sb_error: AtomicU32::new(recorded_errno),
             #[cfg(ktest)]
             fail_ordered_data_once: AtomicBool::new(false),
+            #[cfg(ktest)]
+            fail_dir_block_capture_once: AtomicBool::new(false),
             commit_thread: Mutex::new(None),
             op_handle_owners: Mutex::new(BTreeSet::new()),
             j_checkpoint: Mutex::new(()),
@@ -2604,6 +2615,23 @@ impl Journal {
     #[cfg(ktest)]
     pub(super) fn take_ordered_data_enomem(&self) -> bool {
         self.fail_ordered_data_once.swap(false, Ordering::AcqRel)
+    }
+
+    /// Arms a one-shot `EIO` fault for the next directory-block capture
+    /// (`dir-block-capture-failure-family` regression), consumed by
+    /// [`take_dir_block_capture_fault`](Self::take_dir_block_capture_fault).
+    #[cfg(ktest)]
+    pub(in crate::fs::fs_impls::ext4) fn arm_dir_block_capture_fault(&self) {
+        self.fail_dir_block_capture_once
+            .store(true, Ordering::Release);
+    }
+
+    /// Consumes the armed directory-block capture fault, returning whether it
+    /// fired (disarming it). Checked by `journal_dir_block`.
+    #[cfg(ktest)]
+    pub(super) fn take_dir_block_capture_fault(&self) -> bool {
+        self.fail_dir_block_capture_once
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Returns whether [`stop_commit_thread`](Journal::stop_commit_thread) has

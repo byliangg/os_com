@@ -181,6 +181,14 @@ pub struct Ext4 {
     /// crash gates cannot stage naturally.
     #[cfg(ktest)]
     fail_alloc_blocks_after: AtomicI64,
+    /// Fault injection (`dir-block-capture-failure-family`, H-6a): when armed,
+    /// the next [`try_reclaim_deleted_inode`](InodeInner::try_reclaim_deleted_inode)
+    /// returns without reclaiming — simulating a crash in the window between a
+    /// failed create's transaction committing and the synchronous `Drop`
+    /// reclaim, so a test can then check recovery reclaims the orphan-listed
+    /// inode. One-shot, test-only.
+    #[cfg(ktest)]
+    skip_reclaim_once: AtomicBool,
     self_ref: Weak<Ext4>,
 }
 
@@ -212,6 +220,8 @@ impl Ext4 {
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
             #[cfg(ktest)]
             fail_alloc_blocks_after: AtomicI64::new(-1),
+            #[cfg(ktest)]
+            skip_reclaim_once: AtomicBool::new(false),
             self_ref: weak.clone(),
         });
 
@@ -943,6 +953,24 @@ impl Ext4 {
     #[cfg(ktest)]
     pub(super) fn arm_alloc_blocks_enospc(&self, after: i64) {
         self.fail_alloc_blocks_after.store(after, Ordering::Release);
+    }
+
+    /// Arms the H-6a reclaim-skip fault: the next
+    /// [`try_reclaim_deleted_inode`](InodeInner::try_reclaim_deleted_inode)
+    /// returns without reclaiming, then the fault disarms. Lets a test freeze
+    /// the "create failed, transaction committed, `Drop` reclaim not yet run"
+    /// window so recovery — not `Drop` — reclaims the orphan-listed inode.
+    /// One-shot, test-only.
+    #[cfg(ktest)]
+    pub(super) fn arm_skip_reclaim(&self) {
+        self.skip_reclaim_once.store(true, Ordering::Release);
+    }
+
+    /// Consumes the armed reclaim-skip fault, returning whether it fired
+    /// (disarming it). Checked at the top of `try_reclaim_deleted_inode`.
+    #[cfg(ktest)]
+    pub(super) fn take_skip_reclaim(&self) -> bool {
+        self.skip_reclaim_once.swap(false, Ordering::AcqRel)
     }
 
     /// Allocates up to `count` contiguous blocks, preferring the group that owns
@@ -4232,6 +4260,89 @@ mod tests {
         let dir = ext4.read_inode(DIR_INO).unwrap();
         dir.lookup("durable.txt")
             .expect("a crash must not erase an fdatasync'd new file");
+        drop(ext4);
+    }
+
+    /// H-6a (`dir-block-capture-failure-family`, child side): a `create` that
+    /// fails after allocating its child inode must ORPHAN-LIST the half-built
+    /// inode in the SAME transaction, so a crash between that transaction's
+    /// commit and the synchronous `Drop` reclaim still lets recovery reclaim the
+    /// nameless inode — never a committed, allocated, unreferenced inode e2fsck
+    /// must repair (Linux `ext4_add_nondir` / `ext4_symlink` failure:
+    /// clear_nlink + ext4_orphan_add). The reclaim-skip fault freezes exactly
+    /// that crash window; before the fix the child was left off the orphan list
+    /// and recovery could not reclaim it.
+    #[ktest]
+    fn failed_create_orphans_child_so_recovery_reclaims_it() {
+        const DIR_INO: u32 = 12;
+
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let disk = f.disk.clone();
+        let journal = f.ext4.journal().unwrap();
+        // Deterministic: drive the create transaction's commit by hand so it
+        // lands with the child still orphan-listed (the crash window).
+        journal.stop_commit_thread();
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        // A committed baseline so the directory's first block is live before the
+        // failure (`create` grows it; the fixture root maps no directory block).
+        let good = dir
+            .create("good", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        journal.commit_now_for_test();
+        let good_ino = good.ino();
+
+        // Which inodes are allocated before the doomed create.
+        let allocated_before: Vec<u32> = (good_ino + 1..good_ino + 40)
+            .filter(|&i| f.ext4.is_inode_allocated(i))
+            .collect();
+
+        // Freeze the Drop reclaim (simulating a crash before it runs) and fill
+        // the disk so the doomed subdirectory's first-block allocation fails
+        // AFTER `create_inode` allocated its inode.
+        f.ext4.arm_skip_reclaim();
+        f.ext4.arm_alloc_blocks_enospc(0);
+        let err = dir
+            .create(
+                "doomed",
+                InodeType::Dir,
+                FilePerm::from_bits_truncate(0o755),
+            )
+            .map(|_| ())
+            .expect_err("the injected ENOSPC must fail the subdir create");
+        assert_eq!(err.error(), Errno::ENOSPC);
+
+        // The doomed create allocated exactly its child inode; the reclaim-skip
+        // left it allocated (link 0, orphan-listed on the fixed path).
+        let doomed_ino = (good_ino + 1..good_ino + 40)
+            .find(|&i| f.ext4.is_inode_allocated(i) && !allocated_before.contains(&i))
+            .expect("the doomed create must have allocated a child inode");
+
+        // Commit the create transaction with the child still orphan-listed, then
+        // crash: leak the mount (no unmount flush, no orphan cleanup here).
+        journal.commit_now_for_test();
+        drop(good);
+        drop(dir);
+        core::mem::forget(f);
+
+        // Recovery mount: the committed create left the child on the orphan list,
+        // so recovery reclaims the nameless inode.
+        let ext4 = Ext4::open(disk.clone() as Arc<dyn BlockDevice>, None).unwrap();
+        assert!(
+            !ext4.is_inode_allocated(doomed_ino),
+            "recovery must reclaim the orphan-listed create-error inode {doomed_ino}"
+        );
         drop(ext4);
     }
 

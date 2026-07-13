@@ -2450,6 +2450,13 @@ impl Inode {
         }
 
         let fs = self.fs()?;
+        // ktest-only (H-6a): freeze the "create failed and committed, `Drop`
+        // reclaim not yet run" window by skipping this reclaim, so a test can
+        // verify recovery — not `Drop` — cleans up the orphan-listed inode.
+        #[cfg(ktest)]
+        if fs.take_skip_reclaim() {
+            return Ok(false);
+        }
         if !fs.is_inode_allocated(self.ino) {
             return Ok(false);
         }
