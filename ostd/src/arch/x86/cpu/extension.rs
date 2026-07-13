@@ -102,6 +102,9 @@ enum Reg {
 
 define_isa_extensions! {
     leaf 1, subleaf 0 => {
+        SSE4_2,       Ecx(20), "The processor supports the SSE4.2 instruction \
+                                set, including the CRC32 instruction used for \
+                                hardware-accelerated crc32c.";
         X2APIC,       Ecx(21), "The processor supports x2APIC feature.";
         TSC_DEADLINE, Ecx(24), "The processor's local APIC timer supports \
                                 one-shot operation using a TSC deadline value.";

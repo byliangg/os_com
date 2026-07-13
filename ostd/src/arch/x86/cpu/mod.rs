@@ -4,5 +4,6 @@
 
 pub mod context;
 pub mod cpuid;
+pub mod crc32;
 pub mod extension;
 pub mod local;
