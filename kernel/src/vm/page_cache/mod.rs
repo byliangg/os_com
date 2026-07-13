@@ -508,9 +508,13 @@ impl dyn PageCacheBackend {
 /// The `complete_fn` passed to submit methods may run from interrupt context,
 /// so implementations must not allocate, take blocking locks, or hold a lock
 /// that a waiter on the page wait queue may already hold.
-//
-// TODO: This trait should provide interfaces for reading or writing multiple
-// pages in a single BIO to improve efficiency for sequential I/O.
+///
+/// Sequential I/O coalescing is served by the batch entry points
+/// [`submit_read_pages`](Self::submit_read_pages) and
+/// [`submit_write_pages`](Self::submit_write_pages): their default
+/// implementations fall back to one single-page BIO per page, and a backend that
+/// knows its on-device layout overrides them to merge a physically contiguous
+/// run into one multi-segment BIO.
 pub trait BlockAsPageCacheBackend: Sync + Send {
     /// Submits read I/O for the page at `idx`.
     ///

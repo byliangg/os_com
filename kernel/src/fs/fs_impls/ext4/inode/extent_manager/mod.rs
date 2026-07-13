@@ -539,39 +539,66 @@ impl ExtentManager {
         )
     }
 
-    /// Removes `[punch_start, punch_stop)` and shifts the tail left (`fallocate`
-    /// COLLAPSE_RANGE), freeing the removed window's data blocks; delegates to
-    /// [`ExtentTree::collapse_range`], a single-transaction atomic rebuild.
-    pub(super) fn collapse_range(
+    /// Plans a COLLAPSE_RANGE (`fallocate`) with no journal handle — reads the
+    /// tree and computes the post-shift survivors and freed runs; delegates to
+    /// [`ExtentTree::plan_collapse_range`]. The caller runs this BEFORE `begin_op`
+    /// so a malformed-tree read fails without aborting the journal, then feeds the
+    /// plan to [`apply_collapse_range`](Self::apply_collapse_range).
+    pub(super) fn plan_collapse_range(
         &self,
         punch_start: Iblock,
         punch_stop: Iblock,
+    ) -> Result<tree::CollapsePlan> {
+        let fs = self.fs()?;
+        self.state
+            .read()
+            .plan_collapse_range(&fs, punch_start, punch_stop)
+    }
+
+    /// Applies a planned COLLAPSE_RANGE under `handle`: frees the removed window's
+    /// data blocks and rewrites the tree in one transaction; delegates to
+    /// [`ExtentTree::apply_collapse_range`]. Any error here has captured journaled
+    /// writes, so the caller aborts.
+    pub(super) fn apply_collapse_range(
+        &self,
+        plan: tree::CollapsePlan,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let fs = self.fs()?;
-        self.state.write().collapse_range(
+        self.state.write().apply_collapse_range(
             &fs,
-            punch_start,
-            punch_stop,
+            plan,
             handle,
             self.csum_seed,
             self.data_forget_policy,
         )
     }
 
-    /// Shifts the extents at/after `offset` right by `len`, opening a hole
-    /// (`fallocate` INSERT_RANGE); delegates to [`ExtentTree::insert_range`], a
-    /// single-transaction atomic rebuild.
-    pub(super) fn insert_range(
+    /// Plans an INSERT_RANGE (`fallocate`) with no journal handle — reads the tree,
+    /// validates the SHIFT_RIGHT overflow bound, and computes the shifted extents;
+    /// delegates to [`ExtentTree::plan_insert_range`]. Run BEFORE `begin_op` so the
+    /// benign overflow `EINVAL` never aborts the journal.
+    pub(super) fn plan_insert_range(
         &self,
         offset: Iblock,
         len: Iblock,
+    ) -> Result<tree::InsertPlan> {
+        let fs = self.fs()?;
+        self.state.read().plan_insert_range(&fs, offset, len)
+    }
+
+    /// Applies a planned INSERT_RANGE under `handle`: rewrites the tree in one
+    /// transaction; delegates to [`ExtentTree::apply_insert_range`]. Any error here
+    /// has captured journaled writes, so the caller aborts.
+    pub(super) fn apply_insert_range(
+        &self,
+        plan: tree::InsertPlan,
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
         let fs = self.fs()?;
         self.state
             .write()
-            .insert_range(&fs, offset, len, handle, self.csum_seed)
+            .apply_insert_range(&fs, plan, handle, self.csum_seed)
     }
 
     /// The tree's current external-node count — the input the collapse/insert

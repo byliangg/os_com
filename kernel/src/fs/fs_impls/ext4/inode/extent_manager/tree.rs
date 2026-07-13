@@ -24,7 +24,8 @@ use super::{
     },
     node::{
         ENTRY_SIZE, EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_DEPTH,
-        MAX_WRITTEN_LEN, NODE_CAPACITY, RawExtent, RawExtentHeader, RawExtentIdx,
+        MAX_UNWRITTEN_LEN, MAX_WRITTEN_LEN, NODE_CAPACITY, RawExtent, RawExtentHeader,
+        RawExtentIdx,
     },
     path::{self, ExtentPath, NodeBuf, PathLevel, Search},
 };
@@ -1159,9 +1160,45 @@ impl ExtentTree {
                 let leaf = &mut path.levels[leaf_level].node;
 
                 if ov_start == e_start && ov_end as u64 == e_end {
-                    // Fully covered: flip the kind and coalesce with in-leaf
-                    // neighbours (a freshly zeroed run continues the previous
-                    // unwritten one).
+                    // Fully covered: flip the kind. A written extent can be a full
+                    // `MAX_WRITTEN_LEN` (32768) run, but an unwritten `ee_len`
+                    // bias-encodes as `len + MAX_WRITTEN_LEN`, so an unwritten run
+                    // must stay at or below `MAX_UNWRITTEN_LEN` (32767) or the sum
+                    // wraps the 16-bit field to a bogus zero-length extent on
+                    // decode — a silently dropped mapping (Linux caps identically
+                    // in `ext4_ext_map_blocks`). Split an over-long run into a
+                    // capped head plus a short tail; that needs one free slot, so
+                    // reorganize and re-land when the leaf is full.
+                    if e.len() > MAX_UNWRITTEN_LEN {
+                        if leaf.is_full() {
+                            self.make_room_for(fs, e_start, handle, csum_seed)?;
+                            continue;
+                        }
+                        let head = Extent::new(
+                            e_start,
+                            MAX_UNWRITTEN_LEN,
+                            e.start(),
+                            ExtentKind::Unwritten,
+                        );
+                        let tail = Extent::new(
+                            e_start + MAX_UNWRITTEN_LEN as Iblock,
+                            e.len() - MAX_UNWRITTEN_LEN,
+                            e.start() + MAX_UNWRITTEN_LEN as Ext4Bid,
+                            ExtentKind::Unwritten,
+                        );
+                        leaf.replace_extent_at(pos, &head);
+                        leaf.insert_extent_at(pos + 1, &tail)
+                            .expect("a free slot was checked above");
+                        // Coalesce the head leftward only; `can_merge` caps
+                        // unwritten runs at `MAX_UNWRITTEN_LEN`, so the head and
+                        // its own tail never re-merge into the wrapping length.
+                        merge_leaf_neighbors(leaf, pos);
+                        leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                        cursor = e_end;
+                        continue 'scan;
+                    }
+                    // Coalesce with in-leaf neighbours (a freshly zeroed run
+                    // continues the previous unwritten one).
                     let unwritten = Extent::new(e_start, e.len(), e.start(), ExtentKind::Unwritten);
                     leaf.replace_extent_at(pos, &unwritten);
                     merge_leaf_neighbors(leaf, pos);
@@ -1261,12 +1298,22 @@ impl ExtentTree {
                     ExtentKind::Written,
                 ));
             }
-            out.push(Extent::new(
-                ov_start,
-                (ov_end as u64 - ov_start as u64) as u16,
-                e.start() + (ov_start - e_start) as Ext4Bid,
-                ExtentKind::Unwritten,
-            ));
+            // Emit the covered middle as unwritten, splitting it into runs of at
+            // most `MAX_UNWRITTEN_LEN`: a full `MAX_WRITTEN_LEN` (32768) written
+            // extent would otherwise bias-encode to a wrapped zero-length extent
+            // (see `mark_range_unwritten` / `can_merge`).
+            let mid_phys_base = e.start() + (ov_start - e_start) as Ext4Bid;
+            let mut mid = ov_start;
+            while (mid as u64) < ov_end as u64 {
+                let run = ((ov_end as u64 - mid as u64).min(MAX_UNWRITTEN_LEN as u64)) as u16;
+                out.push(Extent::new(
+                    mid,
+                    run,
+                    mid_phys_base + (mid - ov_start) as Ext4Bid,
+                    ExtentKind::Unwritten,
+                ));
+                mid += run as Iblock;
+            }
             if (ov_end as u64) < e_end {
                 out.push(Extent::new(
                     ov_end,
@@ -1311,6 +1358,14 @@ impl ExtentTree {
     /// `i_blocks` drops by the freed data blocks plus the net metadata delta; the
     /// physical blocks of the surviving extents never move (only their logical
     /// keys shift), so no data relocation or extra allocation is needed.
+    ///
+    /// Split into a read-only [`plan_collapse_range`](Self::plan_collapse_range)
+    /// and a journaled [`apply_collapse_range`](Self::apply_collapse_range) so a
+    /// caller runs the plan BEFORE opening a transaction — a malformed-tree read
+    /// error then surfaces cleanly instead of aborting the journal. This combined
+    /// form is the test convenience; production callers stage plan → `begin_op` →
+    /// apply.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn collapse_range(
         &mut self,
         fs: &Ext4,
@@ -1320,6 +1375,21 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
+        let plan = self.plan_collapse_range(fs, punch_start, punch_stop)?;
+        self.apply_collapse_range(fs, plan, handle, csum_seed, data_policy)
+    }
+
+    /// Plans a COLLAPSE_RANGE with NO journal handle: reads the tree
+    /// ([`flatten`](Self::flatten)), computes the post-shift survivors and the
+    /// removed window's freed physical runs IN MEMORY, and returns them. Purely a
+    /// read — a malformed-tree error surfaces here, before the caller opens a
+    /// transaction, so a benign read failure never has to abort the journal.
+    pub(super) fn plan_collapse_range(
+        &self,
+        fs: &Ext4,
+        punch_start: Iblock,
+        punch_stop: Iblock,
+    ) -> Result<CollapsePlan> {
         debug_assert!(punch_start < punch_stop);
         let shift = punch_stop - punch_start;
         let (extents, old_external) = self.flatten(fs)?;
@@ -1370,6 +1440,32 @@ impl ExtentTree {
         // an earlier extent physically and logically.
         merge_extents(&mut survivors);
 
+        Ok(CollapsePlan {
+            survivors,
+            freed,
+            old_external,
+        })
+    }
+
+    /// Applies a planned COLLAPSE_RANGE under `handle`: frees the removed window's
+    /// data blocks and rewrites the tree, all journaled in one transaction. Any
+    /// error here means captured journaled writes are in flight, so the caller
+    /// aborts. The plan was computed from the same tree the caller has held frozen
+    /// (`inner` write lock), so its `old_external` node list is still exact.
+    pub(super) fn apply_collapse_range(
+        &mut self,
+        fs: &Ext4,
+        plan: CollapsePlan,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        data_policy: journal::DataForgetPolicy,
+    ) -> Result<()> {
+        let CollapsePlan {
+            survivors,
+            freed,
+            old_external,
+        } = plan;
+
         // Free the removed window's data blocks (revoke/pin per policy) BEFORE
         // the rebuild reuses metadata nodes; the pins keep a freed block from
         // being grabbed as a fresh metadata node this same transaction.
@@ -1398,6 +1494,14 @@ impl ExtentTree {
     /// contract): no data block is allocated or freed — only the logical keys
     /// move and one straddling extent may split — so `i_blocks` changes solely by
     /// the net metadata delta. The caller grows `i_size` in the SAME transaction.
+    ///
+    /// Split into read-only [`plan_insert_range`](Self::plan_insert_range) and
+    /// journaled [`apply_insert_range`](Self::apply_insert_range) for the same
+    /// reason as [`collapse_range`](Self::collapse_range): the SHIFT_RIGHT
+    /// overflow `EINVAL` (a benign user error) is decided in the plan, before the
+    /// caller opens a transaction, so it never aborts the journal. This combined
+    /// form is the test convenience.
+    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn insert_range(
         &mut self,
         fs: &Ext4,
@@ -1406,6 +1510,21 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        let plan = self.plan_insert_range(fs, offset, len)?;
+        self.apply_insert_range(fs, plan, handle, csum_seed)
+    }
+
+    /// Plans an INSERT_RANGE with NO journal handle: reads the tree, validates the
+    /// SHIFT_RIGHT overflow bound, and computes the right-shifted extents IN
+    /// MEMORY. The overflow `EINVAL` and any malformed-tree read error surface
+    /// here — before the caller opens a transaction — so a benign rejection leaves
+    /// the journal untouched.
+    pub(super) fn plan_insert_range(
+        &self,
+        fs: &Ext4,
+        offset: Iblock,
+        len: Iblock,
+    ) -> Result<InsertPlan> {
         debug_assert!(len > 0);
         let (extents, old_external) = self.flatten(fs)?;
 
@@ -1450,6 +1569,26 @@ impl ExtentTree {
             ));
         }
 
+        Ok(InsertPlan {
+            shifted,
+            old_external,
+        })
+    }
+
+    /// Applies a planned INSERT_RANGE under `handle`: rewrites the tree with the
+    /// shifted extents, journaled in one transaction. Any error here has captured
+    /// journaled writes in flight, so the caller aborts.
+    pub(super) fn apply_insert_range(
+        &mut self,
+        fs: &Ext4,
+        plan: InsertPlan,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        let InsertPlan {
+            shifted,
+            old_external,
+        } = plan;
         let delta = self.reserialize(fs, &shifted, &old_external, handle, csum_seed)?;
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         self.sector_count =
@@ -2802,6 +2941,27 @@ fn parse_interior_node(block: &[u8]) -> Result<Vec<Ext4Bid>> {
 struct TreeDelta {
     meta_allocated: u32,
     meta_freed: u32,
+}
+
+/// The read-only result of planning a COLLAPSE_RANGE: the survivor extents after
+/// the left shift, the removed window's freed physical runs, and the external
+/// nodes the rebuild will reuse/free. Produced by
+/// [`ExtentTree::plan_collapse_range`] with no journal handle and consumed by
+/// [`ExtentTree::apply_collapse_range`]; opaque to the [`ExtentManager`] wrapper
+/// and its `Inode` caller, which only carry it between the two phases (hence the
+/// through-`inode` visibility).
+pub(in crate::fs::fs_impls::ext4::inode) struct CollapsePlan {
+    survivors: Vec<Extent>,
+    freed: Vec<(Ext4Bid, u32)>,
+    old_external: Vec<Ext4Bid>,
+}
+
+/// The read-only result of planning an INSERT_RANGE: the right-shifted extents
+/// and the external nodes the rebuild will reuse/free. See [`CollapsePlan`] for
+/// why planning is split from applying.
+pub(in crate::fs::fs_impls::ext4::inode) struct InsertPlan {
+    shifted: Vec<Extent>,
+    old_external: Vec<Ext4Bid>,
 }
 
 /// Returns whether the truncate chunk must stop before the next free: `true`
@@ -5336,6 +5496,135 @@ mod tests {
             .unwrap();
         assert!(!tree.is_dirty());
         assert_eq!(root_entries(&tree), 1);
+    }
+
+    /// Regression (P9b review): a ZERO_RANGE fully covering a `MAX_WRITTEN_LEN`
+    /// (32768) written extent in the INLINE root must split the unwritten flip at
+    /// `MAX_UNWRITTEN_LEN`. A single unwritten run of 32768 bias-encodes to a
+    /// wrapped zero-length `ee_len` (`RawExtent::from` debug_asserts pre-fix).
+    #[ktest]
+    fn zero_range_full_max_written_extent_splits_inline() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // One written extent spanning the full MAX_WRITTEN_LEN (physical blocks
+        // are notional — `mark_range_unwritten` moves no data).
+        tree.insert(
+            &f.ext4,
+            0,
+            100,
+            MAX_WRITTEN_LEN,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(root_entries(&tree), 1);
+
+        // Flip the whole run to unwritten (would wrap `ee_len` without the split).
+        tree.mark_range_unwritten(&f.ext4, 0, MAX_WRITTEN_LEN as u32, None, None)
+            .unwrap();
+
+        // Two unwritten extents: a capped head plus a one-block tail, both keeping
+        // their physical mapping.
+        let (extents, _) = tree.flatten(&f.ext4).unwrap();
+        assert_eq!(extents.len(), 2);
+        assert_eq!(
+            (
+                extents[0].block(),
+                extents[0].len(),
+                extents[0].start(),
+                extents[0].is_unwritten()
+            ),
+            (0, MAX_UNWRITTEN_LEN, 100, true)
+        );
+        assert_eq!(
+            (
+                extents[1].block(),
+                extents[1].len(),
+                extents[1].start(),
+                extents[1].is_unwritten()
+            ),
+            (
+                MAX_UNWRITTEN_LEN as Iblock,
+                1,
+                100 + MAX_UNWRITTEN_LEN as Ext4Bid,
+                true
+            )
+        );
+        // A block deep inside the head round-trips through the on-disk encoding.
+        let mid = tree.lookup(&f.ext4, 20000).unwrap().unwrap();
+        assert!(mid.is_unwritten());
+        assert_eq!(mid.start() + (20000 - mid.block()) as Ext4Bid, 100 + 20000);
+    }
+
+    /// Regression (P9b review), depth-1 counterpart: a ZERO_RANGE fully covering a
+    /// `MAX_WRITTEN_LEN` run inside an EXTERNAL leaf must split the in-place kind
+    /// flip at `MAX_UNWRITTEN_LEN` too, or the leaf write-back bias-encodes a
+    /// wrapped zero-length `ee_len`.
+    #[ktest]
+    fn zero_range_full_max_written_extent_splits_depth1() {
+        let f = Ext4FixtureBuilder::new(16384, 256, 16384)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // A full MAX_WRITTEN_LEN written run at logical 0 (physical notional).
+        tree.insert(
+            &f.ext4,
+            0,
+            100,
+            MAX_WRITTEN_LEN,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        // Overflow the inline root so the run lands in an external leaf (depth 1).
+        for k in 0..INLINE_MAX as u32 + 1 {
+            tree.insert(
+                &f.ext4,
+                40000 + k * 2,
+                500 + k as Ext4Bid,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+
+        tree.mark_range_unwritten(&f.ext4, 0, MAX_WRITTEN_LEN as u32, None, None)
+            .unwrap();
+
+        // The 32768 run flipped to two capped unwritten extents, mappings kept.
+        let head = tree.lookup(&f.ext4, 0).unwrap().unwrap();
+        assert_eq!(
+            (head.block(), head.len(), head.start(), head.is_unwritten()),
+            (0, MAX_UNWRITTEN_LEN, 100, true)
+        );
+        let tail = tree
+            .lookup(&f.ext4, MAX_UNWRITTEN_LEN as u32)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (tail.block(), tail.len(), tail.start(), tail.is_unwritten()),
+            (
+                MAX_UNWRITTEN_LEN as Iblock,
+                1,
+                100 + MAX_UNWRITTEN_LEN as Ext4Bid,
+                true
+            )
+        );
+        // A block inside the head reads its preserved physical mapping.
+        let mid = tree.lookup(&f.ext4, 20000).unwrap().unwrap();
+        assert!(mid.is_unwritten());
+        assert_eq!(mid.start() + (20000 - mid.block()) as Ext4Bid, 100 + 20000);
+        // The unrelated small extents survive untouched.
+        assert!(!tree.lookup(&f.ext4, 40000).unwrap().unwrap().is_unwritten());
     }
 
     // ---- fallocate COLLAPSE_RANGE ----

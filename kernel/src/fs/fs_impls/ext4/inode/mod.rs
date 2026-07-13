@@ -2527,6 +2527,12 @@ impl Inode {
             );
         }
 
+        // Plan the shift with NO journal handle first: `flatten` reads the tree
+        // and a malformed-tree error surfaces HERE, before `begin_op` and before
+        // any page-cache side effect — a benign read error returns cleanly instead
+        // of aborting the whole filesystem.
+        let plan = em.plan_collapse_range(punch_start, punch_stop)?;
+
         // Flush + evict the affected tail so the shifted data is durable and its
         // stale logical-indexed pages are dropped (re-read from the shifted tree);
         // Linux writes the pages then `truncate_pagecache(ioffset)`.
@@ -2536,9 +2542,10 @@ impl Inode {
         }
 
         let op = fs.begin_op(credits)?;
-        // Atomic: on any tree error abort the journal so the rebuild's reused-node
-        // overwrites (captured but unpublished) never commit.
-        if let Err(err) = em.collapse_range(punch_start, punch_stop, op.get()) {
+        // Atomic: on any apply error abort the journal so the rebuild's reused-node
+        // overwrites (captured but unpublished) never commit. Only the journaled
+        // apply can fail here; the read-only plan already succeeded above.
+        if let Err(err) = em.apply_collapse_range(plan, op.get()) {
             if let Some(handle) = op.get() {
                 handle.abort_journal_on_fs_error();
             }
@@ -2613,6 +2620,13 @@ impl Inode {
             );
         }
 
+        // Plan the shift with NO journal handle first: the SHIFT_RIGHT overflow
+        // `EINVAL` (a KEEP_SIZE reservation parked near the 32-bit logical limit)
+        // and any malformed-tree read are decided HERE — before `begin_op` and
+        // before the speculative page-cache grow — so a benign rejection touches
+        // nothing and never aborts the journal.
+        let plan = em.plan_insert_range(offset_blk, len_blk)?;
+
         // Flush + evict from `offset` onward — every page there shifts right.
         let ioffset = (offset / PAGE_SIZE) * PAGE_SIZE;
         if let Ok(pages) = inner.page_cache() {
@@ -2628,7 +2642,7 @@ impl Inode {
         em.set_npages(new_size.div_ceil(PAGE_SIZE));
 
         let op = fs.begin_op(credits)?;
-        if let Err(err) = em.insert_range(offset_blk, len_blk, op.get()) {
+        if let Err(err) = em.apply_insert_range(plan, op.get()) {
             if let Some(handle) = op.get() {
                 handle.abort_journal_on_fs_error();
             }
@@ -5840,6 +5854,45 @@ mod write_tests {
             assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
             assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Unwritten);
         }
+    }
+
+    /// Regression (P9b review): a benign INSERT_RANGE rejection must NOT abort the
+    /// journal. A KEEP_SIZE reservation parked near the 32-bit logical limit makes
+    /// the SHIFT_RIGHT overflow `EINVAL` fire; because that check now runs in the
+    /// read-only plan BEFORE `begin_op`, the filesystem stays writable. Pre-fix
+    /// the check fired under the handle and the caller escalated it to a whole-FS
+    /// journal abort.
+    #[ktest]
+    fn fallocate_insert_overflow_rejection_does_not_abort_journal() {
+        let f = journaled_fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // A small live file establishes `old_size` (INSERT_RANGE needs offset < EOF).
+        write_all(&inode, 0, &nonzero_pattern(2 * BLOCK_SIZE));
+        // Park a one-block KEEP_SIZE reservation just below the 32-bit logical
+        // limit, so any right shift overflows the last extent's logical key.
+        let far_off = (u32::MAX as usize - 100) * BLOCK_SIZE;
+        inode
+            .fallocate(FallocMode::AllocateKeepSize, far_off, BLOCK_SIZE)
+            .unwrap();
+
+        let journal = f.ext4.journal().unwrap();
+        assert!(!journal.is_aborted());
+
+        // INSERT_RANGE at 0 by 200 blocks would shift the parked extent past
+        // `u32::MAX` — a benign `EINVAL`.
+        let err = inode
+            .fallocate(FallocMode::InsertRange, 0, 200 * BLOCK_SIZE)
+            .unwrap_err();
+        assert_eq!(err.error(), Errno::EINVAL);
+
+        // The journal is untouched and the filesystem is still writable.
+        assert!(
+            !journal.is_aborted(),
+            "a benign INSERT_RANGE overflow rejection must not abort the journal"
+        );
+        write_all(&inode, 0, &nonzero_pattern(BLOCK_SIZE));
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
     }
 
     /// P7e-3 (red-line ①) — a punch straddling TWO ADJACENT blocks with a partial

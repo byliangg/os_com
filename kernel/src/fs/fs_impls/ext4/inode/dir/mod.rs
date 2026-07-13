@@ -262,6 +262,21 @@ impl InodeInner {
             return Err(err);
         }
 
+        // Journal the freshly initialized (empty-chain) block into THIS
+        // transaction right away. The caller (`make_empty` / `add_entry`)
+        // re-journals it once the real entry lands — an idempotent re-capture of
+        // the same block, no extra credit — but if a LATER step in the operation
+        // fails while the transaction still commits the grown size and written
+        // extent (e.g. a `create` that orphans its half-built child via
+        // `write_back_inode_desc`), the block's after-image must ALREADY be in the
+        // log. Otherwise recovery replays a grown directory whose new block still
+        // holds stale on-disk bytes — a garbage entry chain e2fsck rejects (and a
+        // zero `rec_len` spins the entry iterator).
+        if let Err(err) = self.journal_dir_block(old_size, handle) {
+            self.rollback_write(&new_mappings, old_size, new_size, handle);
+            return Err(err);
+        }
+
         self.set_file_size(new_size);
 
         Ok(DirSlotInfo {
@@ -1661,8 +1676,11 @@ mod tests {
     };
 
     use super::{
-        super::super::test_utils::{
-            Ext4FixtureBuilder, make_dir_block, make_dir_inode, make_file_inode,
+        super::{
+            super::test_utils::{
+                Ext4FixtureBuilder, make_dir_block, make_dir_inode, make_file_inode,
+            },
+            Iblock,
         },
         DirEntryFileType, Inode,
     };
@@ -2389,6 +2407,67 @@ mod tests {
             "a directory-block capture failure must abort the journal"
         );
 
+        drop(f);
+    }
+
+    /// Regression (P9b review): `grow_dir_block` must journal the freshly
+    /// initialized (empty-chain) block into the running transaction RIGHT AWAY,
+    /// not leave it for the caller's later entry write. Otherwise a `create` that
+    /// grows the directory but then orphans its half-built child commits the grown
+    /// size + written extent WITHOUT the new block's after-image, and recovery
+    /// replays a grown directory whose new block still holds stale on-disk bytes.
+    #[ktest]
+    fn grow_dir_block_journals_new_block_immediately() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_inode_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+        let journal = f.ext4.journal().unwrap();
+        // Deterministic: no committer retiring the running transaction under us.
+        journal.stop_commit_thread();
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        // Block 0 written directly (handle-less setup) and committed, so the
+        // running transaction starts empty.
+        dir.inner
+            .write()
+            .make_empty(&f.ext4, DIR_INO, 2, None)
+            .unwrap();
+        journal.commit_now_for_test();
+        assert!(journal.running_captured_blocks_for_test().is_empty());
+
+        // Grow one more directory block under a fresh transaction; its physical
+        // block must appear in the running transaction's capture set BEFORE any
+        // entry is written into it.
+        let credits = f.ext4.create_credits() + f.ext4.single_block_map_credits(0);
+        let op = f.ext4.begin_op(credits).unwrap();
+        let new_pblock = {
+            let mut inner = dir.inner.write();
+            let logical = (inner.file_size() / BLOCK_SIZE) as Iblock;
+            inner.grow_dir_block(&f.ext4, op.get()).unwrap();
+            inner
+                .extent_manager()
+                .unwrap()
+                .map_blocks(logical)
+                .unwrap()
+                .mapped_pblock()
+                .unwrap()
+        };
+        assert!(
+            journal
+                .running_captured_blocks_for_test()
+                .contains(&new_pblock),
+            "grow_dir_block must journal the new block's after-image immediately"
+        );
+        drop(op);
         drop(f);
     }
 

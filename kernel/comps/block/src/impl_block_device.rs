@@ -15,8 +15,9 @@ use crate::{
 };
 
 /// Implements several commonly used APIs for the block device to conveniently
-/// read and write block(s).
-// TODO: Add API to submit bio with multiple segments in scatter/gather manner.
+/// read and write block(s), including the scatter/gather multi-segment variants
+/// [`read_segments_async`](Self::read_segments_async) and
+/// [`write_segments_async`](Self::write_segments_async).
 impl dyn BlockDevice {
     /// Synchronously reads contiguous blocks starting from the `bid`.
     pub fn read_blocks(
