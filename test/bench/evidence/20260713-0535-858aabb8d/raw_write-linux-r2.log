@@ -1,0 +1,57 @@
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD1900+7EF31900 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.304427] kvm_intel: VMX not supported by CPU 0
+Running benchmark: fio/ext4_p9_param on linux
+The VM is ready for the benchmark.
+P9CFG mode=raw rw=write bs=1M nj=1 fsync=0 size=1G
+P9CASE raw-write
+raw-write: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+Jobs: 1 (f=1)
+raw-write: (groupid=0, jobs=1): err= 0: pid=95: Mon Jul 13 05:46:38 2026
+  write: IOPS=4179, BW=4180MiB/s (4383MB/s)(1024MiB/245msec); 0 zone resets
+    clat (usec): min=53, max=3389, avg=222.55, stdev=240.86
+     lat (usec): min=62, max=3437, avg=238.03, stdev=243.85
+    clat percentiles (usec):
+     |  1.00th=[   55],  5.00th=[   56], 10.00th=[   57], 20.00th=[   71],
+     | 30.00th=[   75], 40.00th=[   99], 50.00th=[  231], 60.00th=[  255],
+     | 70.00th=[  273], 80.00th=[  297], 90.00th=[  359], 95.00th=[  482],
+     | 99.00th=[ 1074], 99.50th=[ 1631], 99.90th=[ 2704], 99.95th=[ 3392],
+     | 99.99th=[ 3392]
+   bw (  MiB/s): min= 2048, max= 2048, per=49.00%, avg=2048.00, stdev= 0.00, samples=1
+   iops        : min= 2048, max= 2048, avg=2048.00, stdev= 0.00, samples=1
+  lat (usec)   : 100=40.23%, 250=17.48%, 500=37.70%, 750=2.15%, 1000=1.27%
+  lat (msec)   : 2=0.78%, 4=0.39%
+  cpu          : usr=5.33%, sys=81.56%, ctx=123, majf=0, minf=0
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,1024,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=4180MiB/s (4383MB/s), 4180MiB/s-4180MiB/s (4383MB/s-4383MB/s), io=1024MiB (1074MB), run=245-245msec
+P9DONE raw-write
+P9ALLDONE
+[    2.610754] reboot: Power down
