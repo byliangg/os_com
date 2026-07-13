@@ -1489,6 +1489,246 @@ impl Inode {
         Ok(write_len)
     }
 
+    /// Writes file data at `offset` bypassing the page cache (`O_DIRECT`).
+    ///
+    /// The data is DMA'd straight to the device and the extent that maps it is
+    /// converted to *written* only AFTER the DMA lands — the Unwritten-first
+    /// ordering ([`write_direct_chunk`](InodeInner::write_direct_chunk)) — so a
+    /// crash before the converting transaction commits leaves the range unwritten
+    /// (reads as zeros, never another file's stale bytes), and a crash after it
+    /// commits reads back the data the commit's pre-commit device flush already
+    /// forced to the platter. There is thus no ordered-data registration: unlike
+    /// the buffered path there is no dirty page for the commit thread to flush;
+    /// the DMA-before-convert construction discharges the same duty inline.
+    ///
+    /// `offset` and the buffer length must both be filesystem-block-aligned (the
+    /// constraint Linux's `ext4_dio_supported` enforces); an unaligned request is
+    /// rejected `EINVAL` rather than silently buffered. Directories are rejected
+    /// `EISDIR`. A plain `O_DIRECT` write returns before its converting
+    /// transaction commits (Linux's semantics); durability needs `fsync` /
+    /// `O_SYNC` / `O_DSYNC`, whose [`FileOps::write_at`](crate::fs::vfs::inode)
+    /// tail runs for the direct path too.
+    ///
+    /// The `ext4_should_retry_alloc` retry loop mirrors [`write_at`](Self::write_at):
+    /// a transient `ENOSPC` (every free block pinned to an uncommitted freeing
+    /// transaction) forces that transaction to commit and retries, but only while
+    /// the reader is untouched — allocation precedes any reader byte, so an
+    /// allocation `ENOSPC` on the first chunk leaves the reader intact and the
+    /// re-run clean, while the `remain()` guard refuses to re-run a write that
+    /// already DMA'd (and thus consumed) some bytes. `commit_and_wait_running`
+    /// runs outside the inner lock and any open handle (iron law 1).
+    pub(super) fn write_direct_at(&self, offset: usize, reader: &mut VmReader) -> Result<usize> {
+        if self.type_ == InodeType::Dir {
+            return_errno!(Errno::EISDIR);
+        }
+        let write_len = reader.remain();
+        if !is_block_aligned(offset) || !is_block_aligned(write_len) {
+            // No unaligned fallback yet (Linux would buffer-copy the ragged
+            // head/tail block); reject like the direct read and ext2.
+            return_errno_with_message!(Errno::EINVAL, "O_DIRECT write is not block-aligned");
+        }
+        if write_len == 0 {
+            return Ok(0);
+        }
+        // Fail an overflowing range here, before taking any lock (the attempt
+        // recomputes and trusts this).
+        offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let fs = self.fs()?;
+        let mut retries = 0;
+        loop {
+            let remain_before = reader.remain();
+            match self.write_direct_at_once(&fs, offset, reader) {
+                Err(e)
+                    if e.error() == Errno::ENOSPC
+                        && reader.remain() == remain_before
+                        && retries < Ext4::ALLOC_ENOSPC_RETRIES
+                        && fs.should_retry_alloc() =>
+                {
+                    fs.journal()
+                        .expect("should_retry_alloc is true only on a journaled volume")
+                        .commit_and_wait_running()?;
+                    retries += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// One attempt of [`write_direct_at`](Self::write_direct_at): under the inner
+    /// write lock, invalidate the overlapping cached pages (the direct-IO
+    /// coherency step), open the write handle, and drive the chunk loop.
+    fn write_direct_at_once(
+        &self,
+        fs: &Ext4,
+        offset: usize,
+        reader: &mut VmReader,
+    ) -> Result<usize> {
+        let write_len = reader.remain();
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| Error::with_message(Errno::EINVAL, "write range overflow"))?;
+        let mut inner = self.inner.write();
+        let old_size = inner.file_size();
+
+        // Coherency (direct-IO rule): flush overlapping dirty pages to the device
+        // and evict the clean copies, UNDER the inner write lock so no concurrent
+        // writer can re-dirty the range before the DMA. After this, to the write
+        // lock's release the page cache holds no stale page over `[offset, end)`:
+        // a racing buffered read either saw the old data before the invalidate
+        // (legal) or misses afterward and re-reads the device (the new data).
+        // Only pages that overlap the EXISTING file can be stale, so clamp to
+        // `old_size`; a pure append (`offset >= old_size`) yields an empty range.
+        let discard_end = end.min(old_size);
+        if offset < discard_end {
+            inner.page_cache()?.invalidate_range(offset..discard_end)?;
+        }
+
+        // Journal handle after the inner lock (inner ① → handle ②): captures the
+        // block-bitmap / group-descriptor / extent after-images the direct
+        // write's allocations dirty (the DATA itself never enters the journal —
+        // it is DMA'd straight to the device). Same per-chunk estimate as the
+        // buffered write.
+        let depth = inner
+            .extent_manager()
+            .map(|em| em.root_depth())
+            .unwrap_or(0);
+        let mut op = fs.begin_op(fs.write_credits(depth))?;
+        self.write_direct_chunked(fs, offset, end, reader, &mut op, &mut inner)
+    }
+
+    /// The credit- and memory-bounded direct-write loop: for each chunk of
+    /// `[offset, end)` (both block-aligned), allocate any holes UNWRITTEN, DMA the
+    /// data to the device, wait, convert the run to written, and capture the inode
+    /// descriptor — all in one transaction — then advance. A chunk is bounded both
+    /// by [`DIRECT_WRITE_CHUNK_BLOCKS`] (the staged-buffer memory ceiling, which is
+    /// the only bound a pure overwrite hits) and by the journal's per-chunk credit
+    /// early stop (an allocating write); consecutive chunks share a transaction
+    /// until [`ensure_chunk_credits`](journal::ensure_chunk_credits) must restart.
+    ///
+    /// Crash safety (report §5.1-5.2, the six direct-ordered laws): each chunk's
+    /// convert rides the SAME transaction as its bitmap/extent/descriptor
+    /// captures, and the DMA + `wait_all` complete BEFORE that convert, so the
+    /// commit's device-wide pre-commit flush forces this chunk's data to the
+    /// platter ahead of its commit block. A crash leaves committed-prefix chunks
+    /// (a valid short write) and the rest untouched; a chunk whose transaction did
+    /// not commit reads its range back as unwritten zeros, never stale.
+    fn write_direct_chunked(
+        &self,
+        fs: &Ext4,
+        offset: usize,
+        end: usize,
+        reader: &mut VmReader,
+        op: &mut journal::OpHandle,
+        inner: &mut InodeInner,
+    ) -> Result<usize> {
+        let write_len = reader.remain();
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let max_credits = fs.journal().map(|j| j.max_credits());
+
+        let mut cursor = start_block;
+        // Bytes durably written so far (committed-prefix chunks only): the
+        // short-write count a later chunk error reports, distinct from reader
+        // consumption — a failed chunk may have DMA'd (consumed) bytes it never
+        // converted, and those never count.
+        let mut written = 0usize;
+        while cursor < end_block {
+            // Memory ceiling on this chunk's staged device buffers; the credit
+            // early stop inside `write_direct_chunk` may shrink it further.
+            let window_end = (cursor + DIRECT_WRITE_CHUNK_BLOCKS as u32).min(end_block);
+            let depth = inner
+                .extent_manager()
+                .map(|em| em.root_depth())
+                .unwrap_or(0);
+            let need = fs.write_credits(depth);
+            if let Some(handle) = op.get_mut() {
+                journal::ensure_chunk_credits(handle, need)?;
+            }
+
+            let outcome = match inner.write_direct_chunk(fs, cursor, window_end, op.get(), reader) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // A chunk error after earlier chunks committed durably is a
+                    // POSIX short write; only a failure before ANY chunk
+                    // committed propagates the raw error. Either way the failed
+                    // chunk's just-allocated blocks stay UNWRITTEN (read as zeros,
+                    // like a fallocate that outlived its data write) — no
+                    // rollback — but the transaction still needs the extent-root
+                    // capture to commit consistently (see `seal_failed_direct_write`).
+                    self.seal_failed_direct_write(fs, inner, op);
+                    if written > 0 {
+                        return Ok(written);
+                    }
+                    return Err(err);
+                }
+            };
+
+            let reached = match outcome {
+                ChunkWrite::Wrote(reached) => reached,
+                ChunkWrite::Stalled { need: need2 } => {
+                    // Even the first insert overflows the transaction. If it
+                    // exceeds a whole transaction's capacity, no restart can fit
+                    // it — the honest EFBIG floor (a tiny-journal condition, no
+                    // longer a function of file size). Otherwise restart onto a
+                    // fresh transaction reserving `need2` and retry the chunk
+                    // (no cursor advance).
+                    if max_credits.is_some_and(|max| need2 > max) {
+                        if written > 0 {
+                            return Ok(written);
+                        }
+                        return_errno_with_message!(
+                            Errno::EFBIG,
+                            "one bounded extent insert exceeds a journal transaction"
+                        );
+                    }
+                    if let Some(handle) = op.get_mut() {
+                        journal::journal_restart(handle, need2)?;
+                    }
+                    continue;
+                }
+            };
+
+            // This chunk's inode descriptor (size, i_blocks, extent root, mtime)
+            // must ride the SAME transaction as its bitmap/extent/convert captures.
+            if op.get().is_some() {
+                inner.write_back_inode_desc(fs, self.ino, op.get())?;
+            }
+            // Deliberately NO `register_ordered_data`: the direct data has no
+            // page-cache copy for the commit thread to flush; the per-chunk
+            // DMA + `wait_all` before the convert already put it on the device
+            // ahead of the commit block.
+            cursor = reached;
+            written = (reached as usize * BLOCK_SIZE).min(end) - offset;
+        }
+        // Data-relevant: `op` holds the final chunk's transaction, carrying this
+        // write's newest extent/`i_size` capture — the tid `fdatasync` commits.
+        inner.stamp_datasync_tid(op.get());
+        Ok(write_len)
+    }
+
+    /// Seals a FAILED direct-write chunk's transaction so it commits
+    /// consistently: the failed chunk's `ensure_allocated_chunk` may have edited
+    /// the extent ROOT in memory (a split landing, a depth growth) while its
+    /// leaf/bitmap after-images already sit in this transaction — without the root
+    /// capture the leaves would commit over a stale root (a torn tree). The chunk's
+    /// allocated-but-unconverted blocks stay UNWRITTEN (read as zeros, harmless),
+    /// so unlike the buffered seal there is neither a rollback nor an ordered-data
+    /// registration. If the capture itself fails the transaction cannot be made
+    /// consistent: abort, so the half-state never commits. The caller reports its
+    /// original error either way.
+    fn seal_failed_direct_write(&self, fs: &Ext4, inner: &mut InodeInner, op: &journal::OpHandle) {
+        let Some(handle) = op.get() else {
+            return;
+        };
+        if inner.is_dirty() && inner.write_back_inode_desc(fs, self.ino, op.get()).is_err() {
+            handle.abort_journal_on_fs_error();
+        }
+    }
+
     /// Truncates or extends a regular file to `new_size` bytes.
     ///
     /// Shrinking frees the trailing data/metadata blocks and zeroes the kept
@@ -2457,6 +2697,14 @@ impl Drop for Inode {
 /// discipline the buffered prefetch path applies with its per-BIO segment cap.
 const DIRECT_MAX_RUN_BLOCKS: usize = 256;
 
+/// The most blocks one `O_DIRECT` write stages into device buffers before it
+/// waits and converts — the memory ceiling on a single write chunk. An
+/// allocating write is chunked by the journal's credit early stop, but a pure
+/// overwrite allocates nothing, so that stop never fires; this cap keeps even a
+/// huge overwrite's staged `BioSegment`s bounded (256 blocks = 1 MiB) and lands
+/// each chunk's convert + descriptor writeback in its own committed transaction.
+const DIRECT_WRITE_CHUNK_BLOCKS: usize = DIRECT_MAX_RUN_BLOCKS;
+
 /// One logical segment of an `O_DIRECT` read, laid out in file order: either a
 /// device buffer already submitted for a written run, or a span that reads as
 /// zeros (a hole or a preallocated-unwritten extent) with no device I/O. The
@@ -2476,9 +2724,12 @@ fn is_block_aligned(value: usize) -> bool {
     value.is_multiple_of(BLOCK_SIZE)
 }
 
-/// The outcome of one [`write_bounded_chunk`](InodeInner::write_bounded_chunk):
-/// the chunk mapped, wrote, and converted a prefix of the remaining range, or it
-/// could not fit even the first insert into the current transaction.
+/// The outcome of one credit-bounded write chunk —
+/// [`write_bounded_chunk`](InodeInner::write_bounded_chunk) on the buffered
+/// append spine and [`write_direct_chunk`](InodeInner::write_direct_chunk) on the
+/// `O_DIRECT` spine: the chunk mapped, wrote, and converted a prefix of the
+/// remaining range, or it could not fit even the first insert into the current
+/// transaction.
 enum ChunkWrite {
     /// The chunk covered `[cursor, reached)` (`reached > cursor`); the spine
     /// advances the cursor to `reached`.
@@ -3160,6 +3411,138 @@ impl InodeInner {
         // Publish this committed chunk's on-disk size (per-chunk, DECISION D-1).
         self.set_file_size(chunk_end);
         Ok(ChunkWrite::Wrote(reached))
+    }
+
+    /// Maps, DMA-writes, and converts ONE direct-write chunk of the block range
+    /// `[cursor_block, window_end)` (both block-aligned), in the caller's current
+    /// transaction. `window_end` is the memory-bounded chunk cap; a
+    /// [`ChunkWrite::Wrote(reached)`] covers `[cursor_block, reached)` and a
+    /// [`ChunkWrite::Stalled`] means even the first insert would overflow the
+    /// transaction and reports the reservation it needs so the spine can restart.
+    ///
+    /// The chunk's holes are allocated UNWRITTEN, the reader's bytes are DMA'd
+    /// straight to the (written or freshly-unwritten) device blocks and awaited,
+    /// then the range is converted to written IN THIS TRANSACTION — so the extent
+    /// metadata that makes the blocks readable-as-data commits no earlier than the
+    /// data landed on the device (the direct-ordered red line, the DMA-side
+    /// analogue of `write_bounded_chunk`'s ordered-data flush). `i_size` grows only
+    /// if this chunk extended EOF (a plain overwrite never shrinks it). On error
+    /// the chunk's just-allocated blocks are LEFT unwritten (read as zeros,
+    /// harmless) — the caller seals the root; earlier chunks are committed and
+    /// untouched.
+    fn write_direct_chunk(
+        &mut self,
+        fs: &Ext4,
+        cursor_block: Iblock,
+        window_end: Iblock,
+        handle: Option<&journal::Handle>,
+        reader: &mut VmReader,
+    ) -> Result<ChunkWrite> {
+        // Allocate the chunk's holes as UNWRITTEN up to the credit early stop; a
+        // pre-existing written extent (an overwrite) needs no allocation and
+        // presses on to `window_end`.
+        let reached =
+            match self
+                .extent_manager()?
+                .ensure_allocated_chunk(cursor_block, window_end, handle)?
+            {
+                extent_manager::HoleFill::Filled => window_end,
+                // No block allocated: even the first insert would overflow. Report the
+                // reservation so the spine restarts (or declares EFBIG); nothing was
+                // written, so leave the reader untouched.
+                extent_manager::HoleFill::Stopped { reached, need } if reached == cursor_block => {
+                    return Ok(ChunkWrite::Stalled { need });
+                }
+                // Partial progress: `[cursor_block, reached)` was allocated before the
+                // early stop. DMA/convert what was allocated; the spine's per-chunk
+                // `ensure_chunk_credits` starts the next chunk on a fresh transaction.
+                extent_manager::HoleFill::Stopped { reached, .. } => reached,
+            };
+        // DMA the reader's next `[cursor_block, reached)` blocks straight to the
+        // device and WAIT before converting (direct-ordered law: data on the
+        // device before the metadata that exposes it).
+        self.write_direct_blocks(fs, cursor_block, reached, reader)?;
+        // Convert the just-written run to written, in THIS transaction. A plain
+        // overwrite of already-written extents is a no-op; a freshly-allocated
+        // unwritten run becomes readable-as-data.
+        self.extent_manager()?
+            .mark_range_written(cursor_block, reached, handle)?;
+        self.set_mtime_ctime(super::utils::now());
+        // Grow `i_size` only when this chunk extended EOF; an overwrite within the
+        // file leaves the size alone (the block-aligned reach never exceeds the
+        // write end, so no clamp is needed). Growing must also extend the
+        // page-cache VMO and the writeback `npages` bound to cover the new size,
+        // or a later BUFFERED read of the just-written range trips
+        // `submit_read_bio`'s `idx >= npages` guard and reads past-EOF zeros
+        // instead of the bytes the DMA put on the device. The VMO is resized with
+        // PAGE-ALIGNED bounds (not `resize_page_cache`, which would zero-fill a
+        // non-block-aligned old tail page): the device holds the authoritative
+        // data, so a page-cache fill here would shadow it and, once flushed,
+        // clobber it. The new pages carry no data — they fault lazily from the
+        // device on the next buffered read. (A pure overwrite needs none of this:
+        // the VMO already covers it and the pre-loop `invalidate_range` evicted
+        // the stale pages, so a later buffered read re-faults them from the device.)
+        let reached_bytes = reached as usize * BLOCK_SIZE;
+        let size_before = self.file_size();
+        if reached_bytes > size_before {
+            self.ensure_size_within_limit(fs, reached_bytes)?;
+            self.page_cache()?
+                .resize(reached_bytes, size_before.align_up(PAGE_SIZE))?;
+            self.extent_manager()?
+                .set_npages(reached_bytes.div_ceil(PAGE_SIZE));
+            self.set_file_size(reached_bytes);
+        }
+        Ok(ChunkWrite::Wrote(reached))
+    }
+
+    /// DMAs the reader's next `(end_block - start_block)` blocks straight to the
+    /// device blocks that map `[start_block, end_block)`, bypassing the page
+    /// cache. A physically contiguous run is split into buffers no larger than
+    /// [`DIRECT_MAX_RUN_BLOCKS`], each drained from `reader` and submitted into one
+    /// [`IoBatch`]; the whole batch is awaited once so every byte is on the device
+    /// before the caller converts the extents. The caller has allocated every
+    /// block in the range (written or unwritten), so a [`Mapping::Hole`](extent_manager::Mapping)
+    /// here is a bug — fail loud (ext2's identical direct-write defense), never a
+    /// stale-read risk because the inner write lock serializes readers after this.
+    fn write_direct_blocks(
+        &self,
+        fs: &Ext4,
+        start_block: Iblock,
+        end_block: Iblock,
+        reader: &mut VmReader,
+    ) -> Result<()> {
+        let extent_manager = self.extent_manager()?;
+        let mut io_batch = IoBatch::new();
+        let mut iblock = start_block;
+        while iblock < end_block {
+            let remaining = end_block - iblock;
+            match extent_manager.map_blocks(iblock)? {
+                // Written OR freshly-unwritten: both have a physical block to
+                // write into (an unwritten block's data lands here, then the
+                // caller's `mark_range_written` makes it readable).
+                extent_manager::Mapping::Mapped { pblock, len, .. } => {
+                    let mut run = len.min(remaining);
+                    let mut run_pblock = pblock;
+                    while run > 0 {
+                        let chunk = run.min(DIRECT_MAX_RUN_BLOCKS as u32);
+                        let bio_segment = BioSegment::alloc(chunk as usize, BioDirection::ToDevice);
+                        bio_segment.writer()?.write_fallible(reader)?;
+                        fs.write_blocks_async(run_pblock, bio_segment, None, &mut io_batch)?;
+                        run -= chunk;
+                        run_pblock += chunk as Ext4Bid;
+                    }
+                    iblock += len.min(remaining);
+                }
+                extent_manager::Mapping::Hole { .. } => {
+                    return_errno_with_message!(
+                        Errno::EIO,
+                        "unexpected hole in O_DIRECT write path"
+                    );
+                }
+            }
+        }
+        io_batch.wait_all()?;
+        Ok(())
     }
 
     fn is_dirty(&self) -> bool {
@@ -6146,5 +6529,243 @@ mod write_tests {
         }
 
         assert_eq!(read_direct(&inode, 0, payload.len()), payload);
+    }
+
+    // ---- O_DIRECT write (P9b-b4-T2) ----
+
+    /// Writes `data` at `offset` through the direct path, returning the count.
+    fn write_direct(inode: &Inode, offset: usize, data: &[u8]) -> usize {
+        let mut reader = VmReader::from(data).to_fallible();
+        inode.write_direct_at(offset, &mut reader).unwrap()
+    }
+
+    /// The `Errno` a rejected direct write returns.
+    fn write_direct_err(inode: &Inode, offset: usize, len: usize) -> Errno {
+        let buf = vec![0xABu8; len.max(1)];
+        let mut reader = VmReader::from(&buf[..len]).to_fallible();
+        inode
+            .write_direct_at(offset, &mut reader)
+            .unwrap_err()
+            .error()
+    }
+
+    /// (7) A directory rejects the direct write with `EISDIR` (the type check
+    /// wins even when the request is also unaligned), and a non-block-aligned
+    /// offset or buffer length on a regular file rejects with `EINVAL`.
+    #[ktest]
+    fn direct_write_rejects_dir_and_unaligned() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Unaligned offset, then unaligned length, on a regular file.
+        assert_eq!(write_direct_err(&inode, 100, BLOCK_SIZE), Errno::EINVAL);
+        assert_eq!(write_direct_err(&inode, 0, BLOCK_SIZE + 100), Errno::EINVAL);
+
+        // A directory: EISDIR, even for an otherwise-unaligned request.
+        f.write_data_block(102, &make_dir_block(&[(12, ".", 2), (2, "..", 2)]));
+        f.write_raw_inode(12, &make_dir_inode(102));
+        let dir = f.ext4.read_inode(12).unwrap();
+        assert_eq!(write_direct_err(&dir, 100, BLOCK_SIZE + 7), Errno::EISDIR);
+    }
+
+    /// (2) The direct-IO coherency step: a buffered write leaves a dirty (then
+    /// clean) cached page; a direct overwrite of the same block must invalidate
+    /// that page, so a subsequent BUFFERED read re-reads the device and returns
+    /// the direct bytes, not the stale cached ones.
+    #[ktest]
+    fn direct_write_invalidates_stale_cached_page() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 established buffered (dirty page, no fsync).
+        write_all(&inode, 0, &[0x11u8; BLOCK_SIZE]);
+        // Overwrite it DIRECT; the stale cached page must be evicted.
+        let fresh = vec![0xC7u8; BLOCK_SIZE];
+        assert_eq!(write_direct(&inode, 0, &fresh), BLOCK_SIZE);
+        // A buffered read now sees the direct bytes (proof the page was invalidated).
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), fresh);
+        // And so does a direct read.
+        assert_eq!(read_direct(&inode, 0, BLOCK_SIZE), fresh);
+    }
+
+    /// (3) A multi-block direct write round-trips through both the direct and the
+    /// buffered read paths byte-for-byte, and publishes the block-aligned size.
+    #[ktest]
+    fn direct_write_read_round_trips() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let payload: Vec<u8> = (0..4 * BLOCK_SIZE).map(|k| (k * 29 + 7) as u8).collect();
+        assert_eq!(write_direct(&inode, 0, &payload), payload.len());
+        assert_eq!(inode.size(), payload.len());
+        assert_eq!(read_direct(&inode, 0, payload.len()), payload);
+        assert_eq!(read_back(&inode, 0, payload.len()), payload);
+    }
+
+    /// (4) Buffered and direct writes interleaved across a file — including each
+    /// mode overwriting a block the other mode wrote — read back identical
+    /// through both read paths, proving the two stay coherent block by block.
+    #[ktest]
+    fn direct_and_buffered_interleaved_round_trip() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NB: usize = 6;
+        let mut expected = vec![0u8; NB * BLOCK_SIZE];
+        for b in 0..NB {
+            let val = (b as u8).wrapping_mul(17).wrapping_add(3);
+            expected[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE].fill(val);
+            let blk = vec![val; BLOCK_SIZE];
+            if b % 2 == 0 {
+                write_all(&inode, b * BLOCK_SIZE, &blk);
+            } else {
+                write_direct(&inode, b * BLOCK_SIZE, &blk);
+            }
+        }
+        // Cross-overwrite: direct over a buffered block, buffered over a direct one.
+        expected[0..BLOCK_SIZE].fill(0xEE);
+        write_direct(&inode, 0, &[0xEEu8; BLOCK_SIZE]);
+        expected[3 * BLOCK_SIZE..4 * BLOCK_SIZE].fill(0xEE);
+        write_all(&inode, 3 * BLOCK_SIZE, &[0xEEu8; BLOCK_SIZE]);
+
+        assert_eq!(read_direct(&inode, 0, expected.len()), expected);
+        assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
+
+    /// (5a) A direct write over a sparse HOLE region allocates and converts the
+    /// blocks (a hole in the direct-write range is not a bug — the write path
+    /// allocates it, unlike ext2's pre-allocated direct write): afterwards the
+    /// filled blocks are `Written` and the file reads back correct.
+    #[ktest]
+    fn direct_write_fills_hole() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Block 0 data, then block 3 data — leaving blocks 1,2 as holes.
+        write_all(&inode, 0, &[0x11u8; BLOCK_SIZE]);
+        write_all(&inode, 3 * BLOCK_SIZE, &[0x33u8; BLOCK_SIZE]);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Hole);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Hole);
+        }
+
+        // Direct-write the two-block hole in the middle.
+        let fill = vec![0x22u8; 2 * BLOCK_SIZE];
+        assert_eq!(write_direct(&inode, BLOCK_SIZE, &fill), 2 * BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(2).unwrap().state(), MapState::Written);
+        }
+
+        let mut expected = vec![0u8; 4 * BLOCK_SIZE];
+        expected[0..BLOCK_SIZE].fill(0x11);
+        expected[BLOCK_SIZE..3 * BLOCK_SIZE].fill(0x22);
+        expected[3 * BLOCK_SIZE..4 * BLOCK_SIZE].fill(0x33);
+        assert_eq!(read_direct(&inode, 0, expected.len()), expected);
+        assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
+
+    /// (5b) A direct write into the middle of a preallocated-UNWRITTEN extent
+    /// converts only the written block: the poisoned backing blocks of the
+    /// still-unwritten edges keep reading as zeros, so the write crossed the
+    /// unwritten boundary without touching its neighbours' device contents.
+    #[ktest]
+    fn direct_write_converts_unwritten_extent() {
+        clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let len = 4u16;
+        f.write_raw_inode(
+            FILE_INO,
+            &make_unwritten_file_inode(200, len, (len as u32) * BLOCK_SIZE as u32),
+        );
+        // Poison the unwritten blocks: only the block we write reads real bytes.
+        for b in 200..200 + len as u32 {
+            f.write_data_block(b, &[0xEEu8; BLOCK_SIZE]);
+        }
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Direct-write logical block 1 (inside the unwritten extent).
+        let mid = vec![0x77u8; BLOCK_SIZE];
+        assert_eq!(write_direct(&inode, BLOCK_SIZE, &mid), BLOCK_SIZE);
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            assert_eq!(bm.map_blocks(0).unwrap().state(), MapState::Unwritten);
+            assert_eq!(bm.map_blocks(1).unwrap().state(), MapState::Written);
+            assert_eq!(bm.map_blocks(3).unwrap().state(), MapState::Unwritten);
+        }
+
+        let got = read_direct(&inode, 0, len as usize * BLOCK_SIZE);
+        let mut expected = vec![0u8; len as usize * BLOCK_SIZE];
+        expected[BLOCK_SIZE..2 * BLOCK_SIZE].copy_from_slice(&mid);
+        assert_eq!(got, expected);
+        assert_eq!(read_back(&inode, 0, len as usize * BLOCK_SIZE), expected);
+    }
+
+    /// (6) Successive direct appends past EOF each grow `i_size` to the
+    /// block-aligned end, and the file reads back the concatenation. On full
+    /// success every block is converted, so the readable prefix equals the
+    /// converted prefix (the crash-window analogue is exercised by the crash
+    /// matrix, not this static test).
+    #[ktest]
+    fn direct_write_append_extends_size() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let a = vec![0xA1u8; 2 * BLOCK_SIZE];
+        assert_eq!(write_direct(&inode, 0, &a), a.len());
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
+
+        let b = vec![0xB2u8; 3 * BLOCK_SIZE];
+        assert_eq!(write_direct(&inode, 2 * BLOCK_SIZE, &b), b.len());
+        assert_eq!(inode.size(), 5 * BLOCK_SIZE);
+
+        let mut expected = vec![0u8; 5 * BLOCK_SIZE];
+        expected[0..2 * BLOCK_SIZE].fill(0xA1);
+        expected[2 * BLOCK_SIZE..5 * BLOCK_SIZE].fill(0xB2);
+        assert_eq!(read_direct(&inode, 0, expected.len()), expected);
+        assert_eq!(read_back(&inode, 0, expected.len()), expected);
+    }
+
+    /// (9) A large direct write over a many-small-group image fragments into one
+    /// extent per group, filling the transaction and forcing a mid-write
+    /// `journal_restart` (the same shape the buffered append test uses). It
+    /// completes byte-exact with EVERY block converted to written — the
+    /// converted-prefix-equals-readable-prefix invariant, fully met on success —
+    /// and `i_size`/`i_blocks` consistent.
+    #[ktest]
+    fn direct_write_spanning_many_groups_forces_restart() {
+        let f = journaled_multigroup_fixture(24);
+        let journal = f.ext4.journal().unwrap();
+        assert_eq!(journal.max_credits(), 20);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const NB: usize = 120;
+        let payload: Vec<u8> = (0..NB * BLOCK_SIZE).map(|k| (k * 23 + 9) as u8).collect();
+        assert_eq!(write_direct(&inode, 0, &payload), payload.len());
+        assert_eq!(inode.size(), payload.len());
+
+        // Every block converted to written (no unwritten/hole remnant): the whole
+        // written range is readable, the success-case form of the crash invariant.
+        {
+            let inner = inode.inner.read();
+            let bm = inner.extent_manager().unwrap();
+            let mut b: u32 = 0;
+            while (b as usize) < NB {
+                let m = bm.map_blocks(b).unwrap();
+                assert_eq!(m.state(), MapState::Written, "block {b} not converted");
+                b += m.len();
+            }
+        }
+
+        assert_eq!(read_direct(&inode, 0, payload.len()), payload);
+        assert_eq!(read_back(&inode, 0, payload.len()), payload);
     }
 }

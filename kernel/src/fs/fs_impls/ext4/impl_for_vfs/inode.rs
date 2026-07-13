@@ -83,13 +83,14 @@ impl FileOps for Ext4Inode {
         reader: &mut VmReader,
         status_flags: StatusFlags,
     ) -> Result<usize> {
-        if status_flags.contains(StatusFlags::O_DIRECT) {
-            // Buffered-only: real O_DIRECT (bypassing the page cache) is P9
-            // performance work at the earliest, and outside the current
-            // requirements. P5's xfstests runs exclude the direct-IO groups.
-            return_errno_with_message!(Errno::EOPNOTSUPP, "ext4 O_DIRECT write unimplemented");
-        }
-        let len = self.write_at(offset, reader)?;
+        // O_DIRECT bypasses the page cache: the data is DMA'd to the device and
+        // the extent converted to written only after it lands, so a crash never
+        // exposes stale bytes. The buffered path is byte-for-byte unchanged.
+        let len = if status_flags.contains(StatusFlags::O_DIRECT) {
+            self.write_direct_at(offset, reader)?
+        } else {
+            self.write_at(offset, reader)?
+        };
         // O_SYNC/O_DSYNC: write(2) on such an fd must not return before the
         // data (and for O_SYNC, the metadata) is durable — silently ignoring
         // the flags turns every O_SYNC write into a durability lie that a
