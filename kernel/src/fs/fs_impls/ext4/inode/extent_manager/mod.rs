@@ -368,12 +368,16 @@ impl ExtentManager {
         // file, on disk or across a crash (ledger: hole-alloc-stale-exposure).
         // Any pre-existing unwritten extent in range (e.g. from a future
         // fallocate) is likewise left unwritten here and converted post-write.
-        let mut last_phys_end = match tree.find(&fs, start_iblock)? {
-            path::Search::Gap { prev, .. } => prev.map(|p| p.start() + p.len() as Ext4Bid),
-            path::Search::Covered { .. } => None, // the walk sees the covering extent
-        };
+        // One descent, not two (P9b b-ext 1b): the old code opened with a
+        // `find(start_iblock)` purely to seed the FIRST hole's goal with the
+        // predecessor's physical end, then walked the range separately. Here the
+        // walk streams the holes with a `None` leading goal, and the predecessor
+        // is recovered by a single landing search AFTER the walk — only when a
+        // leading hole at `start_iblock` actually needs it, so the common
+        // (covered / no-leading-hole) case never pays a second descent.
         let mut holes: Vec<PlannedHole> = Vec::new();
         let mut cursor = start_iblock as u64;
+        let mut last_phys_end: Option<Ext4Bid> = None;
         tree.walk_range(
             &fs,
             start_iblock as u64..end_iblock as u64,
@@ -404,6 +408,23 @@ impl ExtentManager {
                 },
                 goal: last_phys_end,
             });
+        }
+
+        // A hole beginning exactly at `start_iblock` has no in-range predecessor
+        // (its goal came out `None`); its true predecessor is the extent just
+        // before the range, which the landing search reports as `Gap`'s `prev`.
+        // Recover it with the one descent the old code always paid up front —
+        // now taken only when a leading hole exists (a `Covered` landing means
+        // `start_iblock` is mapped, so there is no leading hole to fix, and the
+        // condition below short-circuits before the search). A predecessor in an
+        // earlier leaf (`prev == None`) keeps the inode-affinity fallback, as
+        // before — the goal is an allocator hint, not a correctness input.
+        if let Some(first) = holes.first_mut()
+            && first.run.start == start_iblock
+            && first.goal.is_none()
+            && let path::Search::Gap { prev: Some(p), .. } = tree.find(&fs, start_iblock)?
+        {
+            first.goal = Some(p.start() + p.len() as Ext4Bid);
         }
 
         // Report the runs this fill will newly allocate — the true holes, never

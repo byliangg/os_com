@@ -88,6 +88,27 @@ impl NodeBuf {
         self.bid
     }
 
+    /// Returns the node's raw block bytes — the source the [`NodeCache`] copies
+    /// on a write-back refresh, and the debug coherence net's comparison target.
+    ///
+    /// [`NodeCache`]: super::tree::NodeCache
+    pub(super) fn bytes(&self) -> &[u8; BLOCK_SIZE] {
+        &self.bytes
+    }
+
+    /// Rebuilds a node from bytes served by the [`NodeCache`](super::tree::NodeCache).
+    ///
+    /// The bytes passed a full [`read`](Self::read) parse on their way into the
+    /// cache and only this tree's own validity-preserving editors (each
+    /// re-`write_back`ing the same bytes into the cache) have rewritten them
+    /// since — so the header decodes through the trusted path, skipping the
+    /// re-validation a device-boundary read owes.
+    pub(super) fn from_cached(bid: Ext4Bid, bytes: Box<[u8; BLOCK_SIZE]>) -> Self {
+        let header =
+            ExtentHeader::from_trusted(&RawExtentHeader::from_bytes(&bytes[0..ENTRY_SIZE]));
+        Self { bid, bytes, header }
+    }
+
     /// Returns whether the node has no room for one more entry.
     pub(super) fn is_full(&self) -> bool {
         self.entries() >= self.max_entries() || ENTRY_SIZE * (2 + self.entries()) > BLOCK_SIZE
@@ -258,11 +279,22 @@ impl NodeBuf {
     /// funnel discipline as the rebuild's node writers (WAL: metadata never
     /// precedes its commit). With `metadata_csum` on, the extent-block tail is
     /// recomputed over the edited bytes first (patch-time funnel, P6b D4).
+    ///
+    /// On success the node's now-final bytes are pushed into `cache` (when the
+    /// caller supplies its tree's [`NodeCache`](super::tree::NodeCache)): the
+    /// slot for this `bid` becomes exactly what the next read would fetch, so
+    /// the cache never serves a stale node after an edit. This is the cache's
+    /// first coherence rule; the tree's every write-back call passes the cache
+    /// so the refresh cannot be forgotten (test-only writers, which have no
+    /// tree and whose bids are never cached, pass `None`). Refreshing only on
+    /// success is what keeps it coherent: a failed patch/write leaves the disk
+    /// bytes unchanged, and the cache's untouched old copy still matches them.
     pub(super) fn write_back(
         &mut self,
         device: &dyn BlockDevice,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        cache: Option<&super::tree::NodeCache>,
     ) -> Result<()> {
         if let Some(seed) = csum_seed {
             super::tree::stamp_extent_tail(self.bytes.as_mut(), seed);
@@ -271,6 +303,9 @@ impl NodeBuf {
         access.patch(|buf| buf.copy_from_slice(self.bytes.as_ref()))?;
         if !access.is_live() {
             device.write_val(Bid::new(self.bid).to_offset(), self.bytes.as_ref())?;
+        }
+        if let Some(cache) = cache {
+            cache.store(self.bid, self.bytes.as_ref());
         }
         Ok(())
     }

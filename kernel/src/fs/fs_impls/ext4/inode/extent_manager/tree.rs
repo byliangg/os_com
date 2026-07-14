@@ -45,6 +45,153 @@ const INTERIOR_MAX: usize = NODE_CAPACITY;
 /// 512-byte sectors per filesystem block; the unit `i_blocks` is counted in.
 const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
 
+/// One cached external node: the physical block it was read from and a copy of
+/// its full-block bytes (already validated at the [`NodeBuf::read`] that filled
+/// it, and kept coherent by [`NodeBuf::write_back`]).
+struct CachedNode {
+    bid: Ext4Bid,
+    bytes: Box<[u8; BLOCK_SIZE]>,
+}
+
+/// A tiny per-inode cache of recently walked external extent-tree nodes, living
+/// inside the position-③ lock content ([`ExtentTree`]).
+///
+/// One write op descends the same leaf up to four times (`fill_holes`'
+/// walk-and-search, then `convert_unwritten`'s walk-and-search), each otherwise
+/// a full journal read funnel: a state lock, a `BTreeMap` probe, and a 4 KiB
+/// copy. Two slots hold the last external nodes touched (a depth-2 op alternates
+/// interior + leaf, so two keeps both live), turning the repeats into a byte
+/// clone and — since [`NodeBuf::write_back`] refreshes the slot — keeping the
+/// hot leaf resident across ops (steady state: no funnel read).
+///
+/// # Coherence
+///
+/// A slot for `bid` always holds exactly the bytes [`NodeBuf::read`] would
+/// return for it, or `bid` is absent. Two rules maintain this: every
+/// [`NodeBuf::write_back`] [`store`](Self::store)s the node's final bytes, and
+/// every free of an external node ([`free_meta_block`], the reused-block rebuild
+/// in [`ExtentTree::reserialize`]) [`clear`](Self::clear)s the whole cache
+/// (conservative — clearing only costs a refill). A tree metadata block is
+/// mutated only by this inode's own `write_back` and freed only through those
+/// funnels, so nothing else can desync a slot. `#[cfg(debug_assertions)]` reads
+/// (every ktest) cross-check each hit against a fresh funnel read.
+///
+/// # Concurrency
+///
+/// The ③ `RwMutex` already serializes writers against all readers; the inner
+/// `SpinLock` only guards the reader-vs-reader fill race (a shared-③ lookup may
+/// populate a slot). It is a leaf lock — taken and dropped within a single slot
+/// probe / store / clear, never held across [`NodeBuf::read`] (which can sleep)
+/// or any other lock — so it adds no edge to the lock order at position ③.
+///
+/// Memory cost: at most two 4 KiB blocks per open inode.
+pub(super) struct NodeCache {
+    inner: SpinLock<NodeCacheInner>,
+}
+
+struct NodeCacheInner {
+    slots: [Option<Box<CachedNode>>; 2],
+    /// Round-robin victim when both slots are full and neither matches.
+    victim: usize,
+}
+
+impl NodeCache {
+    /// An empty cache. `const` so [`ExtentTree::empty`] stays `const`.
+    pub(super) const fn new() -> Self {
+        Self {
+            inner: SpinLock::new(NodeCacheInner {
+                slots: [None, None],
+                victim: 0,
+            }),
+        }
+    }
+
+    /// Returns a clone of the cached bytes for `bid`, or `None` on a miss. The
+    /// lock is dropped before the caller reconstructs the node, so it is never
+    /// held across a device read.
+    fn get(&self, bid: Ext4Bid) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        let inner = self.inner.lock();
+        for slot in inner.slots.iter() {
+            if let Some(cached) = slot
+                && cached.bid == bid
+            {
+                return Some(cached.bytes.clone());
+            }
+        }
+        None
+    }
+
+    /// Installs `bytes` for `bid`: overwrites the same-`bid` slot in place if
+    /// present, else fills an empty slot, else evicts the round-robin victim.
+    pub(super) fn store(&self, bid: Ext4Bid, bytes: &[u8; BLOCK_SIZE]) {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        for slot in inner.slots.iter_mut() {
+            if let Some(cached) = slot
+                && cached.bid == bid
+            {
+                cached.bytes.copy_from_slice(bytes);
+                return;
+            }
+        }
+        for slot in inner.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(Box::new(CachedNode {
+                    bid,
+                    bytes: boxed_block(bytes),
+                }));
+                return;
+            }
+        }
+        let victim = inner.victim;
+        inner.slots[victim] = Some(Box::new(CachedNode {
+            bid,
+            bytes: boxed_block(bytes),
+        }));
+        inner.victim = (victim + 1) % inner.slots.len();
+    }
+
+    /// Drops every slot — the conservative invalidation any node free or
+    /// whole-tree rebuild takes (clearing only loses a refill, never coherence).
+    fn clear(&self) {
+        let mut inner = self.inner.lock();
+        inner.slots = [None, None];
+        inner.victim = 0;
+    }
+}
+
+/// Heap-allocates a block-sized copy of `bytes` without a 4 KiB stack temporary
+/// (`Box::new([..])` would build the array on the stack first).
+fn boxed_block(bytes: &[u8; BLOCK_SIZE]) -> Box<[u8; BLOCK_SIZE]> {
+    let mut boxed = Box::new([0u8; BLOCK_SIZE]);
+    boxed.copy_from_slice(bytes);
+    boxed
+}
+
+/// Reads external node `bid` through `cache`: a hit clones the cached bytes
+/// (skipping the journal read funnel), a miss reads through [`NodeBuf::read`]
+/// and fills the slot. In debug builds a hit is verified against a fresh funnel
+/// read — the coherence net every ktest exercises, since ktest is a debug build.
+fn read_node_cached(fs: &Ext4, bid: Ext4Bid, cache: &NodeCache) -> Result<NodeBuf> {
+    if let Some(bytes) = cache.get(bid) {
+        // A transient funnel error here proves nothing about cache staleness
+        // (the miss path would surface the same error as a plain `Err`), so an
+        // unverifiable hit is skipped rather than escalated to a panic.
+        #[cfg(debug_assertions)]
+        if let Ok(fresh) = NodeBuf::read(fs, bid) {
+            debug_assert_eq!(
+                bytes.as_ref(),
+                fresh.bytes(),
+                "stale extent-node cache at bid {bid}"
+            );
+        }
+        return Ok(NodeBuf::from_cached(bid, bytes));
+    }
+    let node = NodeBuf::read(fs, bid)?;
+    cache.store(bid, node.bytes());
+    Ok(node)
+}
+
 /// The validated, mutable extent tree of one inode, plus the `i_blocks`
 /// accounting that every tree mutation must keep in step.
 ///
@@ -62,6 +209,10 @@ pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     root: [u32; RAW_BLOCK_PTRS_LEN],
     sector_count: u64,
     dirty: bool,
+    /// The two-slot cache of recently walked external nodes (see [`NodeCache`]).
+    /// Interior mutability so `&self` walks may fill it; refreshed by
+    /// `write_back` and cleared by any node free, all under the ③ lock.
+    node_cache: NodeCache,
 }
 
 impl ExtentTree {
@@ -90,6 +241,7 @@ impl ExtentTree {
             root,
             sector_count,
             dirty: false,
+            node_cache: NodeCache::new(),
         })
     }
 
@@ -106,6 +258,7 @@ impl ExtentTree {
             root,
             sector_count: 0,
             dirty: false,
+            node_cache: NodeCache::new(),
         }
     }
 
@@ -193,7 +346,7 @@ impl ExtentTree {
         let mut levels: Vec<PathLevel> = Vec::with_capacity(header.depth() as usize);
 
         for expected_depth in (0..header.depth()).rev() {
-            let node = NodeBuf::read(fs, next_bid)?;
+            let node = read_node_cached(fs, next_bid, &self.node_cache)?;
             if node.depth() != expected_depth {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
@@ -257,7 +410,16 @@ impl ExtentTree {
             if child.block() as u64 >= range.end {
                 break;
             }
-            if walk_child(fs, child.leaf(), header.depth() - 1, &range, visit_fn)?.is_break() {
+            if walk_child(
+                fs,
+                child.leaf(),
+                header.depth() - 1,
+                &range,
+                visit_fn,
+                &self.node_cache,
+            )?
+            .is_break()
+            {
                 return Ok(());
             }
         }
@@ -316,7 +478,7 @@ impl ExtentTree {
         let mut next_bid = self.root_index_at(root_pos).leaf();
         let mut levels: Vec<PathLevel> = Vec::with_capacity(header.depth() as usize);
         for expected_depth in (0..header.depth()).rev() {
-            let node = NodeBuf::read(fs, next_bid)?;
+            let node = read_node_cached(fs, next_bid, &self.node_cache)?;
             if node.depth() != expected_depth {
                 return_errno_with_message!(
                     Errno::EUCLEAN,
@@ -464,7 +626,7 @@ impl ExtentTree {
                 }
             }
             leaf.replace_extent_at(insert_pos - 1, &merged);
-            leaf.write_back(device.as_ref(), handle, csum_seed)?;
+            leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
             return Ok(InPlaceInsert::Inserted);
         }
 
@@ -500,9 +662,12 @@ impl ExtentTree {
         }
 
         // The leaf lands last (see above).
-        path.levels[leaf_level]
-            .node
-            .write_back(device.as_ref(), handle, csum_seed)?;
+        path.levels[leaf_level].node.write_back(
+            device.as_ref(),
+            handle,
+            csum_seed,
+            Some(&self.node_cache),
+        )?;
         Ok(InPlaceInsert::Inserted)
     }
 
@@ -532,7 +697,9 @@ impl ExtentTree {
             }
             let parent = &mut path.levels[level - 1];
             parent.node.set_index_key_at(parent.pos, new_key);
-            parent.node.write_back(device.as_ref(), handle, csum_seed)?;
+            parent
+                .node
+                .write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
             if parent.pos != 0 {
                 break;
             }
@@ -612,8 +779,13 @@ impl ExtentTree {
         // The root's entries are a prefix-compatible layout (same 12-byte
         // slabs); copy them verbatim under the full-block header.
         node.adopt_entries(&root_bytes[ENTRY_SIZE..ENTRY_SIZE * (1 + n)], n);
-        if let Err(err) = node.write_back(fs.block_device().as_ref(), handle, csum_seed) {
-            rollback_meta_blocks(fs, &[bid], handle);
+        if let Err(err) = node.write_back(
+            fs.block_device().as_ref(),
+            handle,
+            csum_seed,
+            Some(&self.node_cache),
+        ) {
+            rollback_meta_blocks(fs, &[bid], handle, &self.node_cache);
             return Err(err);
         }
 
@@ -683,7 +855,7 @@ impl ExtentTree {
             let bid = match alloc_meta_block(fs, goal, handle) {
                 Ok(bid) => bid,
                 Err(err) => {
-                    rollback_meta_blocks(fs, &fresh_bids, handle);
+                    rollback_meta_blocks(fs, &fresh_bids, handle, &self.node_cache);
                     return Err(err);
                 }
             };
@@ -755,8 +927,10 @@ impl ExtentTree {
         // rolls back to a fully intact old tree (the shrinks above live only
         // in this function's buffers).
         for node in fresh.iter_mut() {
-            if let Err(err) = node.write_back(device.as_ref(), handle, csum_seed) {
-                rollback_meta_blocks(fs, &fresh_bids, handle);
+            if let Err(err) =
+                node.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))
+            {
+                rollback_meta_blocks(fs, &fresh_bids, handle, &self.node_cache);
                 return Err(err);
             }
         }
@@ -775,9 +949,12 @@ impl ExtentTree {
         let mut shrink_landed = false;
         let publish = (|| -> Result<()> {
             for level in top..=leaf_level {
-                path.levels[level]
-                    .node
-                    .write_back(device.as_ref(), handle, csum_seed)?;
+                path.levels[level].node.write_back(
+                    device.as_ref(),
+                    handle,
+                    csum_seed,
+                    Some(&self.node_cache),
+                )?;
                 shrink_landed = true;
             }
             if top == 0 {
@@ -788,9 +965,12 @@ impl ExtentTree {
                 let landing = &mut path.levels[top - 1];
                 let pos = landing.pos + 1;
                 landing.node.insert_index_at(pos, &final_carry)?;
-                landing
-                    .node
-                    .write_back(device.as_ref(), handle, csum_seed)?;
+                landing.node.write_back(
+                    device.as_ref(),
+                    handle,
+                    csum_seed,
+                    Some(&self.node_cache),
+                )?;
             }
             Ok(())
         })();
@@ -800,7 +980,7 @@ impl ExtentTree {
                     h.abort_journal_on_fs_error();
                 }
             } else {
-                rollback_meta_blocks(fs, &fresh_bids, handle);
+                rollback_meta_blocks(fs, &fresh_bids, handle, &self.node_cache);
             }
             return Err(err);
         }
@@ -927,7 +1107,7 @@ impl ExtentTree {
                     let written = Extent::new(e_start, e.len(), e.start(), ExtentKind::Written);
                     leaf.replace_extent_at(pos, &written);
                     merge_leaf_neighbors(leaf, pos);
-                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     cursor = e_end;
                     continue 'scan;
                 }
@@ -959,7 +1139,7 @@ impl ExtentTree {
                     leaf.replace_extent_at(pos, &head);
                     leaf.insert_extent_at(pos + 1, &remainder)
                         .expect("a free slot was checked above");
-                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     continue 'scan;
                 }
 
@@ -981,7 +1161,7 @@ impl ExtentTree {
                 leaf.insert_extent_at(pos + 1, &tail)
                     .expect("a free slot was checked above");
                 merge_leaf_neighbors(leaf, pos);
-                leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                 cursor = ov_end as u64;
                 continue 'scan;
             }
@@ -1193,7 +1373,12 @@ impl ExtentTree {
                         // unwritten runs at `MAX_UNWRITTEN_LEN`, so the head and
                         // its own tail never re-merge into the wrapping length.
                         merge_leaf_neighbors(leaf, pos);
-                        leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                        leaf.write_back(
+                            device.as_ref(),
+                            handle,
+                            csum_seed,
+                            Some(&self.node_cache),
+                        )?;
                         cursor = e_end;
                         continue 'scan;
                     }
@@ -1202,7 +1387,7 @@ impl ExtentTree {
                     let unwritten = Extent::new(e_start, e.len(), e.start(), ExtentKind::Unwritten);
                     leaf.replace_extent_at(pos, &unwritten);
                     merge_leaf_neighbors(leaf, pos);
-                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     cursor = e_end;
                     continue 'scan;
                 }
@@ -1230,7 +1415,7 @@ impl ExtentTree {
                     leaf.replace_extent_at(pos, &head);
                     leaf.insert_extent_at(pos + 1, &remainder)
                         .expect("a free slot was checked above");
-                    leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                    leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     continue 'scan;
                 }
 
@@ -1249,7 +1434,7 @@ impl ExtentTree {
                 leaf.insert_extent_at(pos + 1, &tail)
                     .expect("a free slot was checked above");
                 merge_leaf_neighbors(leaf, pos);
-                leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                 cursor = ov_end as u64;
                 continue 'scan;
             }
@@ -1844,6 +2029,7 @@ impl ExtentTree {
                                 device.as_ref(),
                                 handle,
                                 csum_seed,
+                                Some(&self.node_cache),
                             )?;
                         }
                         break 'chunk Ok(reached);
@@ -1907,7 +2093,7 @@ impl ExtentTree {
         // Free the emptied leaf, then walk up removing each child's index entry;
         // stop at the first parent that stays non-empty.
         let leaf_bid = path.levels[path.levels.len() - 1].node.bid();
-        free_meta_block(fs, leaf_bid, handle)?;
+        free_meta_block(fs, leaf_bid, handle, &self.node_cache)?;
         freed_meta += 1;
 
         let mut child_level = path.levels.len() - 1;
@@ -1930,15 +2116,18 @@ impl ExtentTree {
             if pn <= 1 {
                 // Parent empties too: free it and cascade to ITS parent.
                 let parent_bid = path.levels[parent_level].node.bid();
-                free_meta_block(fs, parent_bid, handle)?;
+                free_meta_block(fs, parent_bid, handle, &self.node_cache)?;
                 freed_meta += 1;
                 child_level = parent_level;
                 continue;
             }
             path.levels[parent_level].node.remove_index_at(remove_at);
-            path.levels[parent_level]
-                .node
-                .write_back(device.as_ref(), handle, csum_seed)?;
+            path.levels[parent_level].node.write_back(
+                device.as_ref(),
+                handle,
+                csum_seed,
+                Some(&self.node_cache),
+            )?;
             // Removing the parent's FIRST child raised its first key; the
             // ancestors' keys must follow exactly (Linux read-side equality).
             if remove_at == 0 {
@@ -2151,7 +2340,12 @@ impl ExtentTree {
                         leaf.replace_extent_at(pos, &head);
                         leaf.insert_extent_at(pos + 1, &tail)
                             .expect("probed leaf had room for the split tail");
-                        leaf.write_back(device.as_ref(), handle, csum_seed)?;
+                        leaf.write_back(
+                            device.as_ref(),
+                            handle,
+                            csum_seed,
+                            Some(&self.node_cache),
+                        )?;
                     } else {
                         // Full leaf: trim to the head in place; the tail range
                         // is then a hole and re-enters through the ordinary
@@ -2162,6 +2356,7 @@ impl ExtentTree {
                             device.as_ref(),
                             handle,
                             csum_seed,
+                            Some(&self.node_cache),
                         )?;
                         self.insert(
                             fs,
@@ -2196,9 +2391,12 @@ impl ExtentTree {
                     let head_len = (start_block - e_start) as u16;
                     let head = Extent::new(e_start, head_len, e.start(), e.kind());
                     path.levels[leaf_level].node.replace_extent_at(pos, &head);
-                    path.levels[leaf_level]
-                        .node
-                        .write_back(device.as_ref(), handle, csum_seed)?;
+                    path.levels[leaf_level].node.write_back(
+                        device.as_ref(),
+                        handle,
+                        csum_seed,
+                        Some(&self.node_cache),
+                    )?;
                 } else if e_end > end_block as u64 {
                     // Straddles the end: keep the tail, re-keyed to `end_block`.
                     // A position-0 edit raises the leaf's first key; write the
@@ -2210,9 +2408,12 @@ impl ExtentTree {
                     let tail_phys = e.start() + (end_block - e_start) as Ext4Bid;
                     let tail = Extent::new(end_block, tail_len, tail_phys, e.kind());
                     path.levels[leaf_level].node.replace_extent_at(pos, &tail);
-                    path.levels[leaf_level]
-                        .node
-                        .write_back(device.as_ref(), handle, csum_seed)?;
+                    path.levels[leaf_level].node.write_back(
+                        device.as_ref(),
+                        handle,
+                        csum_seed,
+                        Some(&self.node_cache),
+                    )?;
                     if pos == 0 {
                         self.correct_ancestor_keys(
                             fs, &mut path, leaf_level, end_block, handle, csum_seed,
@@ -2233,6 +2434,7 @@ impl ExtentTree {
                             device.as_ref(),
                             handle,
                             csum_seed,
+                            Some(&self.node_cache),
                         )?;
                         if rose {
                             self.correct_ancestor_keys(
@@ -2450,12 +2652,19 @@ impl ExtentTree {
     ) -> Result<TreeDelta> {
         let device = fs.block_device().as_ref();
 
+        // A whole-tree rebuild reuses the surviving external blocks in place
+        // (`write_leaf_node`/`write_interior_node` overwrite them without the
+        // cache-refreshing `write_back` funnel) and frees the rest. Drop every
+        // cached node up front so no reused block is later read as its stale
+        // pre-rebuild self; the reads after this repopulate from the new bytes.
+        self.node_cache.clear();
+
         if extents.len() <= INLINE_MAX {
             self.write_inline_leaf_root(extents);
             // The root no longer references any external block; free them all.
             let mut meta_freed = 0;
             for &bid in old_external {
-                free_meta_block(fs, bid, handle)?;
+                free_meta_block(fs, bid, handle, &self.node_cache)?;
                 meta_freed += 1;
             }
             return Ok(TreeDelta {
@@ -2471,14 +2680,14 @@ impl ExtentTree {
             // Depth-1: the inline root indexes `nr_leaves` external leaf blocks.
             let reuse = nr_leaves.min(old_external.len());
             let (leaf_bids, newly_allocated) =
-                acquire_meta_blocks(fs, old_external, nr_leaves, goal, handle)?;
+                acquire_meta_blocks(fs, old_external, nr_leaves, goal, handle, &self.node_cache)?;
 
             // Write each leaf node. On failure, roll back the freshly allocated
             // blocks (the in-memory root is not yet updated, so the old tree
             // stays referenced).
             for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
                 if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
-                    rollback_meta_blocks(fs, &newly_allocated, handle);
+                    rollback_meta_blocks(fs, &newly_allocated, handle, &self.node_cache);
                     return Err(err);
                 }
             }
@@ -2494,7 +2703,7 @@ impl ExtentTree {
             // Free surplus old external blocks the root no longer references.
             let mut meta_freed = 0;
             for &bid in &old_external[reuse..] {
-                free_meta_block(fs, bid, handle)?;
+                free_meta_block(fs, bid, handle, &self.node_cache)?;
                 meta_freed += 1;
             }
 
@@ -2517,14 +2726,15 @@ impl ExtentTree {
         // interiors.
         let total = nr_leaves + nr_interior;
         let reuse = total.min(old_external.len());
-        let (blocks, newly_allocated) = acquire_meta_blocks(fs, old_external, total, goal, handle)?;
+        let (blocks, newly_allocated) =
+            acquire_meta_blocks(fs, old_external, total, goal, handle, &self.node_cache)?;
         let (leaf_bids, interior_bids) = blocks.split_at(nr_leaves);
 
         // Write leaves, then interiors. On any failure, roll back the freshly
         // allocated blocks (the in-memory root is not yet updated).
         for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
             if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
-                rollback_meta_blocks(fs, &newly_allocated, handle);
+                rollback_meta_blocks(fs, &newly_allocated, handle, &self.node_cache);
                 return Err(err);
             }
         }
@@ -2539,7 +2749,7 @@ impl ExtentTree {
 
         for (chunk, &interior_bid) in leaf_index.chunks(INTERIOR_MAX).zip(interior_bids.iter()) {
             if let Err(err) = write_interior_node(device, interior_bid, chunk, handle, csum_seed) {
-                rollback_meta_blocks(fs, &newly_allocated, handle);
+                rollback_meta_blocks(fs, &newly_allocated, handle, &self.node_cache);
                 return Err(err);
             }
         }
@@ -2556,7 +2766,7 @@ impl ExtentTree {
         // Free surplus old external blocks the tree no longer references.
         let mut meta_freed = 0;
         for &bid in &old_external[reuse..] {
-            free_meta_block(fs, bid, handle)?;
+            free_meta_block(fs, bid, handle, &self.node_cache)?;
             meta_freed += 1;
         }
 
@@ -2649,6 +2859,7 @@ impl ExtentTree {
                 header.depth() - 1,
                 keep_blocks,
                 &mut shape,
+                &self.node_cache,
             )?;
         }
         Ok(shape)
@@ -2742,8 +2953,9 @@ fn count_subtree(
     expected_depth: u16,
     keep_blocks: Iblock,
     shape: &mut ShrinkShape,
+    cache: &NodeCache,
 ) -> Result<()> {
-    let node = NodeBuf::read(fs, bid)?;
+    let node = read_node_cached(fs, bid, cache)?;
     if node.depth() != expected_depth {
         return_errno_with_message!(
             Errno::EUCLEAN,
@@ -2767,6 +2979,7 @@ fn count_subtree(
             expected_depth - 1,
             keep_blocks,
             shape,
+            cache,
         )?;
     }
     Ok(())
@@ -2778,8 +2991,9 @@ fn walk_child(
     expected_depth: u16,
     range: &Range<u64>,
     visit_fn: &mut impl FnMut(&Extent) -> ControlFlow<()>,
+    cache: &NodeCache,
 ) -> Result<ControlFlow<()>> {
-    let node = NodeBuf::read(fs, bid)?;
+    let node = read_node_cached(fs, bid, cache)?;
     if node.depth() != expected_depth {
         return_errno_with_message!(
             Errno::EUCLEAN,
@@ -2807,7 +3021,7 @@ fn walk_child(
         if child.block() as u64 >= range.end {
             break;
         }
-        if walk_child(fs, child.leaf(), expected_depth - 1, range, visit_fn)?.is_break() {
+        if walk_child(fs, child.leaf(), expected_depth - 1, range, visit_fn, cache)?.is_break() {
             return Ok(ControlFlow::Break(()));
         }
     }
@@ -2989,6 +3203,7 @@ fn acquire_meta_blocks(
     count: usize,
     goal: Ext4Bid,
     handle: Option<&journal::Handle>,
+    cache: &NodeCache,
 ) -> Result<(Vec<Ext4Bid>, Vec<Ext4Bid>)> {
     let reuse = count.min(pool.len());
     let mut blocks: Vec<Ext4Bid> = pool[..reuse].to_vec();
@@ -2997,7 +3212,7 @@ fn acquire_meta_blocks(
         match alloc_meta_block(fs, goal, handle) {
             Ok(bid) => newly_allocated.push(bid),
             Err(err) => {
-                rollback_meta_blocks(fs, &newly_allocated, handle);
+                rollback_meta_blocks(fs, &newly_allocated, handle, cache);
                 return Err(err);
             }
         }
@@ -3008,9 +3223,16 @@ fn acquire_meta_blocks(
 
 /// Frees blocks allocated during a rebuild that then failed, on a best-effort
 /// basis (the mutation is already returning an error).
-fn rollback_meta_blocks(fs: &Ext4, blocks: &[Ext4Bid], handle: Option<&journal::Handle>) {
+fn rollback_meta_blocks(
+    fs: &Ext4,
+    blocks: &[Ext4Bid],
+    handle: Option<&journal::Handle>,
+    cache: &NodeCache,
+) {
     for &bid in blocks {
-        let _ = free_meta_block(fs, bid, handle);
+        // Each free clears the cache — a fresh split node written back (and thus
+        // cached) before a later sibling's write failed must not survive here.
+        let _ = free_meta_block(fs, bid, handle, cache);
     }
 }
 
@@ -3056,7 +3278,20 @@ fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) 
 /// handle, so the revoke record and the clear commit together — and a
 /// rebuild that errors before reaching this block's free leaves its journal
 /// state untouched (no revoke for a still-referenced node).
-fn free_meta_block(fs: &Ext4, bid: Ext4Bid, handle: Option<&journal::Handle>) -> Result<()> {
+fn free_meta_block(
+    fs: &Ext4,
+    bid: Ext4Bid,
+    handle: Option<&journal::Handle>,
+    cache: &NodeCache,
+) -> Result<()> {
+    // The node leaves the tree and its block becomes reusable at commit; drop
+    // every cached node so a later read of a reallocated block can never be
+    // served this (or any sibling) node's stale bytes. This is the sole choke
+    // point every committed tree-node free passes through — the truncate/punch
+    // prune, the `reserialize` surplus, and (via `rollback_meta_blocks`) a
+    // failed split's fresh nodes — so clearing here alone covers them all (the
+    // cache's second coherence rule).
+    cache.clear();
     fs.free_blocks(journal::forget(bid, 1), handle)
 }
 
@@ -5007,6 +5242,129 @@ mod tests {
         check(&tree);
     }
 
+    // ---- P9b b-ext: the external-node cache (1a) ----
+
+    /// The cache's first rule (refresh): priming a slot with a read, then
+    /// editing that leaf (a `convert_unwritten` whose `write_back` refreshes the
+    /// slot), then reading again must observe the WRITTEN bytes. A stale slot
+    /// would replay the primed-unwritten node — a data-corruption-class bug this
+    /// nails on observable content, independent of the debug coherence net that
+    /// also cross-checks every hit.
+    #[ktest]
+    fn node_cache_refreshes_on_writeback() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // Five unmergeable unwritten extents overflow the inline root → depth 1,
+        // so the conversion edits (and the reads walk) an EXTERNAL leaf — the
+        // only node kind the cache holds.
+        for (b, p) in [
+            (10, 1000),
+            (40, 4000),
+            (100, 7000),
+            (200, 8000),
+            (300, 9000),
+        ] {
+            tree.insert(&f.ext4, b, p, 10, ExtentKind::Unwritten, None, None)
+                .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+
+        // Prime: this read walks the covering external leaf into a cache slot.
+        assert!(tree.lookup(&f.ext4, 105).unwrap().unwrap().is_unwritten());
+        // Edit in place; the leaf's `write_back` must refresh the primed slot.
+        tree.convert_unwritten(&f.ext4, 100, 10, None, None)
+            .unwrap();
+        // The cached slot must now serve the WRITTEN bytes, not the stale ones.
+        assert!(!tree.lookup(&f.ext4, 105).unwrap().unwrap().is_unwritten());
+        assert_matches_linear(&f, &tree, 320);
+    }
+
+    /// The two slots are sized for a depth-2 descent's interior + leaf: walking
+    /// each of the five leaves under the shared interior keeps that interior
+    /// resident in one slot while the leaves rotate through the other (no mutual
+    /// eviction), and every verdict still matches the linear reference (the
+    /// debug net cross-checks each hit for byte equality on top).
+    #[ktest]
+    fn node_cache_holds_interior_and_leaf_across_depth2() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        const N: u32 = 1400; // > INLINE_MAX × LEAF_MAX (1360) → depth 2
+        const DATA_BASE: Ext4Bid = 100_000;
+        for k in 0..N {
+            tree.insert(
+                &f.ext4,
+                k * 2,
+                DATA_BASE + k as Ext4Bid,
+                1,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.depth(), 2);
+
+        // Probe one block from each of the five leaves, twice around, so the
+        // shared interior is re-hit while the leaf slot turns over. Every probe
+        // resolves correctly (a stale interior or leaf slot would diverge here
+        // or trip the debug net).
+        let leaf_reps = [0u32, 340, 680, 1020, 1360];
+        for _ in 0..2 {
+            for &k in &leaf_reps {
+                let m = tree.lookup(&f.ext4, k * 2).unwrap().unwrap();
+                assert_eq!((m.block(), m.start()), (k * 2, DATA_BASE + k as Ext4Bid));
+                assert!(tree.lookup(&f.ext4, k * 2 + 1).unwrap().is_none());
+            }
+        }
+    }
+
+    /// The cache's second rule (invalidation): a whole-tree rebuild
+    /// (`reserialize`, reached here through `collapse_range`) REUSES external
+    /// leaf blocks in place through `write_leaf_node` — a writer that does NOT
+    /// pass through the slot-refreshing `write_back` — so the rebuild must clear
+    /// the cache, or a later read would replay a reused leaf's pre-rebuild
+    /// bytes. Prime a slot with the leaf, collapse, and confirm the shifted
+    /// mapping is what the read returns.
+    #[ktest]
+    fn node_cache_invalidated_by_reserialize_reuse() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let n = LEAF_MAX as u32 + 20; // depth 1, ≥ 2 external leaves
+        let (mut tree, pblocks) = ascending_tree_allocated(&f, n);
+        assert_eq!(tree.depth(), 1);
+
+        // Prime the cache with the first leaf: block 0 maps `pblocks[0]`.
+        assert_eq!(
+            tree.lookup(&f.ext4, 0).unwrap().unwrap().start(),
+            pblocks[0]
+        );
+        // Collapse [0,2): reserialize rewrites the reused leaves with shifted
+        // keys (logical 0 now maps what was logical 2 = `pblocks[1]`).
+        tree.collapse_range(
+            &f.ext4,
+            0,
+            2,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+        )
+        .unwrap();
+        // The reused leaf's cache slot must not serve its stale pre-shift bytes.
+        assert_eq!(
+            tree.lookup(&f.ext4, 0).unwrap().unwrap().start(),
+            pblocks[1]
+        );
+        assert_matches_linear(&f, &tree, n * 2);
+    }
+
     /// A depth-1 partial conversion splits inside the external leaf: the
     /// middle of an unwritten extent becomes head-U + mid-W + tail-U in
     /// staged single-leaf edits, preserving the physical mapping block for
@@ -5186,15 +5544,15 @@ mod tests {
             .unwrap();
         leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written))
             .unwrap();
-        leaf.write_back(device.as_ref(), None, None).unwrap();
+        leaf.write_back(device.as_ref(), None, None, None).unwrap();
         let mut mid = NodeBuf::fresh(mid_bid, 1);
         mid.insert_index_at(0, &make_index_entry(0, leaf_bid))
             .unwrap();
-        mid.write_back(device.as_ref(), None, None).unwrap();
+        mid.write_back(device.as_ref(), None, None, None).unwrap();
         let mut top = NodeBuf::fresh(top_bid, 2);
         top.insert_index_at(0, &make_index_entry(0, mid_bid))
             .unwrap();
-        top.write_back(device.as_ref(), None, None).unwrap();
+        top.write_back(device.as_ref(), None, None, None).unwrap();
 
         let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
         let header = RawExtentHeader {
@@ -5260,15 +5618,15 @@ mod tests {
             .unwrap();
         leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written))
             .unwrap();
-        leaf.write_back(device.as_ref(), None, None).unwrap();
+        leaf.write_back(device.as_ref(), None, None, None).unwrap();
         let mut mid = NodeBuf::fresh(mid_bid, 1);
         mid.insert_index_at(0, &make_index_entry(0, leaf_bid))
             .unwrap();
-        mid.write_back(device.as_ref(), None, None).unwrap();
+        mid.write_back(device.as_ref(), None, None, None).unwrap();
         let mut top = NodeBuf::fresh(top_bid, 2);
         top.insert_index_at(0, &make_index_entry(0, mid_bid))
             .unwrap();
-        top.write_back(device.as_ref(), None, None).unwrap();
+        top.write_back(device.as_ref(), None, None, None).unwrap();
 
         let mut root = [0u32; RAW_BLOCK_PTRS_LEN];
         let header = RawExtentHeader {
