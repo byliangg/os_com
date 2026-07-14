@@ -85,23 +85,24 @@
 //! specific reason:
 //!
 //! 0. **Ordered data first (jbd2 `data=ordered`).** Flush every ordered inode's
-//!    dirty **data** to its final on-disk location, then **barrier**. A file's
-//!    data must be durable *before* the metadata that references it is committed
-//!    to the log; otherwise recovery could replay an inode whose size/extents now
-//!    cover a block whose data never reached the platter, exposing stale/garbage
-//!    bytes or leaking. This is a *separate* barrier from step 2 on purpose: it
-//!    makes "data durable before metadata" hold regardless of `flush_range`'s
-//!    submit-vs-complete timing, matching jbd2's explicit wait-for-data step
-//!    before the journal write. Skipped (no barrier) when the transaction has no
-//!    ordered inodes. (Merging this barrier with step 2 is a valid Phase-7 perf
-//!    optimization once `flush_dirty_pages` completion semantics are pinned down.)
+//!    dirty **data** to its final on-disk location and wait for the whole batch
+//!    (`flush_range` completes every BIO before returning). A file's data must
+//!    be durable *before* the commit record seals the metadata that references
+//!    it; otherwise recovery could replay an inode whose size/extents now cover
+//!    a block whose data never reached the platter, exposing stale/garbage
+//!    bytes or leaking. No barrier of its own: with the flush COMPLETE, the
+//!    data sits in the device cache before any log block is submitted, and the
+//!    single step-2 barrier makes data and log blocks durable together, ahead
+//!    of the commit record — the only ordering the recovery contract needs
+//!    (nothing requires data durable before the log *writes*). This is jbd2's
+//!    shape too: wait for data, then one flush guarding the commit record.
 //! 1. Write the transaction's log blocks: its revoke blocks (if any), then
 //!    the descriptor chain — every descriptor and all N metadata blocks.
-//! 2. **Barrier.** The revoke blocks, descriptors and data must be durable
-//!    *before* the commit block; otherwise a crash could leave a commit record
-//!    pointing at data that never reached the platter, and recovery would
-//!    replay garbage — or, for a torn revoke block, under-suppress a freed
-//!    block's stale image.
+//! 2. **Barrier.** The ordered data, revoke blocks and descriptors must be
+//!    durable *before* the commit block; otherwise a crash could leave a commit
+//!    record pointing at data that never reached the platter, and recovery
+//!    would replay garbage — or, for a torn revoke block, under-suppress a
+//!    freed block's stale image.
 //! 3. Write the commit block.
 //! 4. **Barrier.** Once the commit block is durable the transaction is
 //!    committed: recovery will now see a complete (and, on a csum journal,
@@ -503,9 +504,9 @@ pub(super) fn commit_transaction(
 /// On `Err` the transaction is lost mid-write and the caller must abort.
 ///
 /// Implements the log layout and crash-safe write ordering documented at the
-/// module level: fit guard → ordered data → barrier → log (descriptors +
-/// metadata) → barrier → commit → barrier → (superblock → barrier if the
-/// journal was clean) → in-memory state.
+/// module level: fit guard → ordered data (flushed and awaited) → log
+/// (descriptors + metadata) → barrier → commit → barrier → (superblock →
+/// barrier if the journal was clean) → in-memory state.
 pub(super) fn try_commit_transaction(
     journal: &Journal,
     device: &dyn BlockDevice,
@@ -567,38 +568,36 @@ pub(super) fn try_commit_transaction(
     journal.advance_committing_phase(tid, CommitPhase::Flush)?;
 
     // --- Step 0: ordered-data mode. Every ordered inode's dirty data must reach
-    // its final location and be durable BEFORE any log block (and thus the commit
-    // record) is written, so recovery never replays metadata (an inode whose
-    // size/extents now cover a block) that references data which never hit the
-    // platter — which would expose stale/garbage bytes or leak. This mirrors
-    // jbd2's `data=ordered` step, which flushes and waits on the transaction's
-    // ordered inodes (`journal_submit_inode_data_buffers` /
-    // `journal_finish_inode_data_buffers`) before the commit phase.
+    // its final location and be durable BEFORE the commit record is written, so
+    // recovery never replays metadata (an inode whose size/extents now cover a
+    // block) that references data which never hit the platter — which would
+    // expose stale/garbage bytes or leak. This mirrors jbd2's `data=ordered`
+    // step, which flushes and waits on the transaction's ordered inodes
+    // (`journal_submit_inode_data_buffers` / `journal_finish_inode_data_buffers`)
+    // before the commit phase.
     //
-    // This is a SEPARATE barrier, not merged with the pre-commit metadata barrier
-    // in step 2: `flush_range`'s exact submit-vs-complete timing is not something
-    // we depend on here — an explicit barrier right after the data flush makes
-    // "data durable before metadata" unconditionally correct regardless of when
-    // `flush_dirty_pages` completes. (Merging it with the step-2 metadata barrier
-    // is a valid Phase-7 perf optimization once `flush_dirty_pages` completion
-    // semantics are pinned down.) The flush works on page-cache handles cloned
-    // into the transaction at registration time and takes NO inode or journal
-    // lock — an operation may be sleeping in `journal_start`'s capacity wait
-    // holding its `inner.write()`, waiting on this very commit.
-    let mut flushed_any = false;
+    // No barrier of its own: `flush_range` WAITS on every submitted BIO before
+    // returning (the whole batch completes), so all ordered data sits in the
+    // device cache before the first log block below is even submitted, and the
+    // step-2 barrier — a device-wide flush ordered before the commit record —
+    // makes data and log blocks durable together. The recovery contract needs
+    // exactly that ("data and log durable before the commit record"); it never
+    // needs data durable before the log WRITES. This is the barrier merge the
+    // previous comment deferred pending `flush_dirty_pages` completion
+    // semantics, which are now pinned: it waits on the whole batch (see
+    // `PageCache::flush_range`). jbd2 shape is the same — data wait, then one
+    // pre-flush guarding the commit record. The flush works on page-cache
+    // handles cloned into the transaction at registration time and takes NO
+    // inode or journal lock — an operation may be sleeping in `journal_start`'s
+    // capacity wait holding its `inner.write()`, waiting on this very commit.
     for (pages, len) in txn.ordered_data() {
         // `flush_range` coalesces each ordered inode's physically contiguous
-        // dirty data into multi-segment BIOs. The explicit `barrier` below is
-        // unchanged, so "data durable before metadata" holds exactly as before —
-        // `flush_range` still waits on the whole batch before returning.
+        // dirty data into multi-segment BIOs and waits on the whole batch.
         pages.flush_range(0..len)?;
-        flushed_any = true;
-    }
-    if flushed_any {
-        barrier(device)?;
     }
 
-    // Ordered data is durable; the log writes begin (`T_FLUSH` → `T_COMMIT`).
+    // Ordered data has fully left the page cache (its durability rides the
+    // step-2 barrier); the log writes begin (`T_FLUSH` → `T_COMMIT`).
     journal.advance_committing_phase(tid, CommitPhase::Commit)?;
 
     // --- Step 1: write the transaction's log blocks. Its revoke blocks go
@@ -640,9 +639,10 @@ pub(super) fn try_commit_transaction(
     // The chain (which borrows `txn`'s captures) is fully written.
     drop(chain);
 
-    // --- Step 2: barrier. Revoke blocks + descriptors + data durable BEFORE
-    // the commit block, so a commit record never certifies log content that
-    // never reached the platter.
+    // --- Step 2: barrier. Ordered data (step 0, already fully in the device
+    // cache) + revoke blocks + descriptors durable BEFORE the commit block, so
+    // a commit record never certifies data or log content that never reached
+    // the platter. This is the single pre-commit flush (step 0 rides it).
     barrier(device)?;
 
     // The chain is durable; the commit record is next (`T_COMMIT` →
@@ -1186,8 +1186,9 @@ mod tests {
         let txn = make_txn(Tid::new(1), &[(500u64, content)]);
         commit_transaction(f.journal.as_ref(), device.as_ref(), txn).unwrap();
 
-        // At least the two data/commit barriers fired (a clean-journal commit
-        // adds a third for the superblock update).
+        // At least the pre-commit (metadata + ordered data) and post-commit
+        // barriers fired (a clean-journal commit adds a third for the
+        // superblock update).
         let issued = f.fixture.disk.flush_count() - before;
         assert!(issued >= 2, "expected >= 2 barriers, got {issued}");
     }
@@ -1263,10 +1264,11 @@ mod tests {
             .unwrap();
         assert_eq!(on_disk, data, "ordered data must be on disk after commit");
 
-        // Barriers: data + metadata + commit = 3, plus the superblock barrier
-        // (this is a clean-journal commit) = 4.
+        // Barriers: the ordered data rides the pre-commit barrier (no barrier
+        // of its own), so: pre-commit + post-commit = 2, plus the superblock
+        // barrier (this is a clean-journal commit) = 3 exactly.
         let issued = f.fixture.disk.flush_count() - before;
-        assert!(issued >= 3, "expected >= 3 barriers, got {issued}");
+        assert_eq!(issued, 3, "expected exactly 3 barriers, got {issued}");
     }
 
     /// A forgotten block leaves no trace in the committed log's DESCRIPTORS
@@ -1352,8 +1354,10 @@ mod tests {
         assert_eq!(read_log_block(&f, 1), before);
     }
 
-    /// An empty ordered set issues no data barrier: only the metadata + commit
-    /// barriers (2), plus the superblock barrier on a clean-journal commit (3).
+    /// The barrier count does not depend on ordered data: with or without
+    /// ordered inodes a commit issues the pre-commit + post-commit barriers
+    /// (2), plus the superblock barrier on a clean-journal commit (3) — the
+    /// ordered flush rides the pre-commit barrier instead of adding one.
     #[ktest]
     fn commit_without_ordered_data_skips_data_barrier() {
         let f = journaled_fixture(16, 1, 1);
