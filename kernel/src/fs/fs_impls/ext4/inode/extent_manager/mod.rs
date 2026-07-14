@@ -227,6 +227,58 @@ impl ExtentManager {
         self.state.read().sector_count()
     }
 
+    /// Whether the extent tree's overwrite fast-path hint currently covers
+    /// `[start, end)` — every block in that range is known mapped by a single
+    /// written extent, so [`InodeInner::write_at`](super::super::InodeInner) may
+    /// skip both the hole-fill probe and the unwritten→written convert (P9b
+    /// knife 2). A one-shot ③ read.
+    ///
+    /// The caller MUST hold the owning inode's `inner` write lock (①) so the
+    /// answer stays valid through the ensuing page-cache write: every tree
+    /// mutation for this inode takes ① before touching the ③ tree and clears the
+    /// hint, so the hint cannot flip between this read and the write —
+    /// EXCEPT [`allocate_one`](Self::allocate_one), the `submit_write_bio` hole
+    /// fallback, which writeback/commit threads reach with no ① held. That lone
+    /// unlocked-① mutator cannot break this fast path today, for three
+    /// independent reasons: its `insert` only fills a Gap, and a live hint's
+    /// range is covered by one written extent (no Gap inside it to insert);
+    /// `insert`'s entry invalidation can only CLEAR the hint, never forge
+    /// coverage; and on a journaled volume the path fails `EIO` before touching
+    /// the tree. **A future mmap-hole-writeback implementation (ledger:
+    /// `mmap-hole-writeback`) must re-justify or remove this carve-out before
+    /// letting that path allocate.** Distinct inodes never share an
+    /// `ExtentManager`.
+    pub(super) fn written_hint_covers(&self, start: Iblock, end: Iblock) -> bool {
+        self.state.read().written_hint_covers(start, end)
+    }
+
+    /// Debug-only cross-check for the overwrite fast path: walks `[start, end)`
+    /// read-only and returns whether every block is mapped by a WRITTEN extent
+    /// (no hole, no unwritten). `write_at` asserts this whenever it took the
+    /// `written_hint` shortcut, so a hint that outlived a mutation that should
+    /// have cleared it turns a silent Unwritten-first violation into a loud
+    /// ktest failure (ktest is a debug build) rather than latent corruption.
+    #[cfg(debug_assertions)]
+    pub(super) fn debug_range_all_written(&self, start: Iblock, end: Iblock) -> Result<bool> {
+        let fs = self.fs()?;
+        let tree = self.state.read();
+        let end = end as u64;
+        // Read-only walk (no side effects): track how far written coverage
+        // reaches and whether any gap or unwritten extent breaks it.
+        let mut covered_upto = start as u64;
+        let mut gap_or_unwritten = false;
+        tree.walk_range(&fs, start as u64..end, &mut |e| {
+            let e_start = e.block() as u64;
+            if e_start > covered_upto || e.is_unwritten() {
+                gap_or_unwritten = true;
+                return core::ops::ControlFlow::Break(());
+            }
+            covered_upto = covered_upto.max(e_start + e.len() as u64);
+            core::ops::ControlFlow::Continue(())
+        })?;
+        Ok(!gap_or_unwritten && covered_upto >= end)
+    }
+
     /// Returns a copy of the inode's 60-byte `i_block` (extent-tree root),
     /// snapshotted under the lock — the inode-writeback serialization boundary.
     pub(super) fn root_snapshot(&self) -> [u32; RAW_BLOCK_PTRS_LEN] {

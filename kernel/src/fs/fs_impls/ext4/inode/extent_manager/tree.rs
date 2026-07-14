@@ -59,10 +59,14 @@ struct CachedNode {
 /// One write op descends the same leaf up to four times (`fill_holes`'
 /// walk-and-search, then `convert_unwritten`'s walk-and-search), each otherwise
 /// a full journal read funnel: a state lock, a `BTreeMap` probe, and a 4 KiB
-/// copy. Two slots hold the last external nodes touched (a depth-2 op alternates
-/// interior + leaf, so two keeps both live), turning the repeats into a byte
-/// clone and — since [`NodeBuf::write_back`] refreshes the slot — keeping the
-/// hot leaf resident across ops (steady state: no funnel read).
+/// copy. [`NODE_CACHE_SLOTS`] slots hold the last external nodes touched,
+/// turning the repeats into a byte clone and — since [`NodeBuf::write_back`]
+/// refreshes the slot — keeping the hot nodes resident across ops (steady
+/// state: no funnel read). Two slots suffice for one op's own repeats (a
+/// depth-2 op alternates interior + leaf), but a workload hopping between
+/// several hot leaves thrashes them — the SQLite probe (2026-07-14) measured
+/// ~1 miss/op with 2 slots because the database file's hot pages spread across
+/// multiple extent leaves — so the capacity is sized to hold that working set.
 ///
 /// # Coherence
 ///
@@ -84,14 +88,20 @@ struct CachedNode {
 /// probe / store / clear, never held across [`NodeBuf::read`] (which can sleep)
 /// or any other lock — so it adds no edge to the lock order at position ③.
 ///
-/// Memory cost: at most two 4 KiB blocks per open inode.
+/// Memory cost: at most [`NODE_CACHE_SLOTS`] 4 KiB blocks (32 KiB) per open
+/// inode.
 pub(super) struct NodeCache {
     inner: SpinLock<NodeCacheInner>,
 }
 
+/// The node-cache capacity. Sized for SQLite's multi-hot-leaf working set (see
+/// [`NodeCache`]); the replacement policy (same-`bid` overwrite in place, else
+/// round-robin) is capacity-agnostic.
+const NODE_CACHE_SLOTS: usize = 8;
+
 struct NodeCacheInner {
-    slots: [Option<Box<CachedNode>>; 2],
-    /// Round-robin victim when both slots are full and neither matches.
+    slots: [Option<Box<CachedNode>>; NODE_CACHE_SLOTS],
+    /// Round-robin victim when every slot is full and none matches.
     victim: usize,
 }
 
@@ -100,7 +110,7 @@ impl NodeCache {
     pub(super) const fn new() -> Self {
         Self {
             inner: SpinLock::new(NodeCacheInner {
-                slots: [None, None],
+                slots: [const { None }; NODE_CACHE_SLOTS],
                 victim: 0,
             }),
         }
@@ -155,7 +165,7 @@ impl NodeCache {
     /// whole-tree rebuild takes (clearing only loses a refill, never coherence).
     fn clear(&self) {
         let mut inner = self.inner.lock();
-        inner.slots = [None, None];
+        inner.slots = [const { None }; NODE_CACHE_SLOTS];
         inner.victim = 0;
     }
 }
@@ -192,6 +202,51 @@ fn read_node_cached(fs: &Ext4, bid: Ext4Bid, cache: &NodeCache) -> Result<NodeBu
     Ok(node)
 }
 
+/// One cached fact about the tree: the half-open logical block range `[start,
+/// end)` is currently covered by a SINGLE written extent. The overwrite fast
+/// path in [`InodeInner::write_at`](super::super::InodeInner) reads it to skip
+/// the hole-fill probe and the unwritten→written convert for any write wholly
+/// inside it (P9b knife 2).
+///
+/// This is a fact, never a sentinel (rule 4): its absence is `Option::None`,
+/// and its bounds are the actual boundaries of a real written extent, so the
+/// range can never over-claim past that one extent.
+///
+/// LOAD-BEARING INVARIANT (knife-2 red line): while an [`ExtentTree`] holds
+/// `Some` hint, every block in `[start, end)` is mapped by a WRITTEN extent. A
+/// stale hint would let `write_at` skip the convert and a later crash could
+/// then read zeros where data was written — the Unwritten-first crash-safety
+/// guarantee broken. The hint is therefore set from ONE place only
+/// ([`record_written_hint`](ExtentTree::record_written_hint), after a walk that
+/// just proved the range written) and dropped on entry to EVERY tree mutator
+/// ([`invalidate_written_hint`](ExtentTree::invalidate_written_hint)), so no
+/// mapping- or kind-change can outlive it.
+#[derive(Clone, Copy, Debug)]
+struct WrittenHint {
+    start: Iblock,
+    end: Iblock,
+}
+
+impl WrittenHint {
+    /// Builds a hint spanning the written `extent`'s own logical range, or
+    /// `None` if that range's exclusive end overflows the 32-bit logical space
+    /// (an extreme near-max-size extent — the fast path simply declines to
+    /// remember it). The caller guarantees `extent` is written.
+    fn for_written_extent(extent: &Extent) -> Option<Self> {
+        debug_assert!(!extent.is_unwritten());
+        let start = extent.block();
+        let end = Iblock::try_from(start as u64 + extent.len() as u64).ok()?;
+        Some(Self { start, end })
+    }
+
+    /// Whether `[range_start, range_end)` lies wholly inside this hint — the
+    /// fast-path gate. A backwards or empty query is trivially covered but the
+    /// caller never asks (an empty write returns earlier).
+    fn covers(&self, range_start: Iblock, range_end: Iblock) -> bool {
+        range_start >= self.start && range_end <= self.end
+    }
+}
+
 /// The validated, mutable extent tree of one inode, plus the `i_blocks`
 /// accounting that every tree mutation must keep in step.
 ///
@@ -209,10 +264,16 @@ pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     root: [u32; RAW_BLOCK_PTRS_LEN],
     sector_count: u64,
     dirty: bool,
-    /// The two-slot cache of recently walked external nodes (see [`NodeCache`]).
+    /// The small cache of recently walked external nodes (see [`NodeCache`]).
     /// Interior mutability so `&self` walks may fill it; refreshed by
     /// `write_back` and cleared by any node free, all under the ③ lock.
     node_cache: NodeCache,
+    /// The overwrite fast-path hint (see [`WrittenHint`] for its load-bearing
+    /// invariant). Set only by [`record_written_hint`](Self::record_written_hint)
+    /// from the no-conversion arm of the convert paths; cleared on entry to
+    /// every mapping-/kind-changing mutator by
+    /// [`invalidate_written_hint`](Self::invalidate_written_hint).
+    written_hint: Option<WrittenHint>,
 }
 
 impl ExtentTree {
@@ -242,6 +303,7 @@ impl ExtentTree {
             sector_count,
             dirty: false,
             node_cache: NodeCache::new(),
+            written_hint: None,
         })
     }
 
@@ -259,6 +321,7 @@ impl ExtentTree {
             sector_count: 0,
             dirty: false,
             node_cache: NodeCache::new(),
+            written_hint: None,
         }
     }
 
@@ -282,8 +345,50 @@ impl ExtentTree {
     }
 
     /// Clears the dirty flag after a successful inode writeback.
+    ///
+    /// This does NOT touch [`written_hint`](Self::written_hint): a writeback
+    /// changes no mapping or kind, and dropping the hint here would defeat the
+    /// fast path after every writeback for nothing.
     pub(super) fn clear_dirty(&mut self) {
         self.dirty = false;
+    }
+
+    /// Drops the overwrite fast-path hint (see [`WrittenHint`]). Called at the
+    /// top of EVERY mapping- or kind-changing mutator so a stale hint can never
+    /// outlive the tree change it described (the knife-2 red line). Clearing too
+    /// often is always safe; clearing too rarely is a data-corruption bug — so
+    /// when in doubt, a mutator clears.
+    fn invalidate_written_hint(&mut self) {
+        self.written_hint = None;
+    }
+
+    /// Whether the overwrite fast-path hint currently covers `[start, end)` —
+    /// every block in that range is known mapped by one written extent, so
+    /// `write_at` may skip the fill/convert probe. Read under the ③ lock.
+    pub(super) fn written_hint_covers(&self, start: Iblock, end: Iblock) -> bool {
+        self.written_hint
+            .is_some_and(|hint| hint.covers(start, end))
+    }
+
+    /// Establishes the overwrite fast-path hint from `extent` — the WRITTEN
+    /// extent covering the converted range's start, captured in passing by the
+    /// caller's own no-conversion walk (the walk visits it anyway, so no extra
+    /// descent is paid; the earlier re-`find` here cost SQLite's fragmented
+    /// db file a net regression). The SOLE setter of
+    /// [`written_hint`](Self::written_hint): called only from the
+    /// no-conversion arm of the convert paths, where the walk has just proven
+    /// the range needs no unwritten→written flip. The hint is anchored to the
+    /// extent's OWN boundaries, so the recorded range never over-claims past
+    /// it — even if the caller's write range spilled into a hole or a
+    /// neighbouring extent, the fast path's ⊆ check then only fires for
+    /// writes genuinely inside written data.
+    fn record_written_hint(&mut self, extent: &Extent) {
+        // The entry-clear of the calling mutator ran before this, so the slot is
+        // empty; this is a set from proven-clean state, never an overwrite of a
+        // possibly-stale hint.
+        debug_assert!(self.written_hint.is_none());
+        debug_assert!(!extent.is_unwritten());
+        self.written_hint = WrittenHint::for_written_extent(extent);
     }
 
     /// Returns the tree depth (0 = inline leaf, 1 = one level of index blocks,
@@ -532,6 +637,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         // Surgery route (T2 fast path + T3 room-making): edit exactly the
         // landing leaf, splitting full nodes or growing the tree a level when
         // the path has no room. Every `make_room_for` strictly adds capacity
@@ -599,6 +705,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<InPlaceInsert> {
+        self.invalidate_written_hint();
         let e = Extent::new(iblock, len, pblock, kind);
         let Search::Gap { mut path, prev } = self.find(fs, iblock)? else {
             return_errno_with_message!(Errno::EUCLEAN, "extent insert target is already mapped");
@@ -687,6 +794,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let device = fs.block_device();
         let mut level = child_level;
         loop {
@@ -712,6 +820,7 @@ impl ExtentTree {
     /// root lives in the in-memory `i_block` and reaches disk with the inode
     /// writeback (no block capture of its own), like every other root rewrite.
     fn set_root_index_key(&mut self, i: usize, key: Iblock) {
+        self.invalidate_written_hint();
         let off = ENTRY_SIZE * (1 + i);
         let bytes = self.root.as_mut_bytes();
         let mut raw = RawExtentIdx::from_bytes(&bytes[off..off + ENTRY_SIZE]);
@@ -723,6 +832,7 @@ impl ExtentTree {
     /// right — in-memory, like every root rewrite. Caller checked the root has
     /// room ([`INLINE_MAX`]).
     fn insert_root_index_at(&mut self, i: usize, idx: &RawExtentIdx) {
+        self.invalidate_written_hint();
         let header = self.header();
         let n = header.entries() as usize;
         debug_assert!(n < INLINE_MAX && i <= n);
@@ -748,6 +858,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let header = self.header();
         // The on-disk format's depth ceiling (every consumer went path-based
         // with the P9a surgery — T3 capped growth at 2 while flatten-based
@@ -823,6 +934,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let (Search::Gap { mut path, .. } | Search::Covered { mut path, .. }) =
             self.find(fs, iblock)?;
         let leaf_level = path.levels.len() - 1;
@@ -1019,6 +1131,11 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        // Any real flip below changes an extent's kind; drop the fast-path hint
+        // up front so a mid-range error can never leave it describing the
+        // pre-conversion tree. The no-conversion arm re-establishes it at the
+        // end (see `record_written_hint`).
+        self.invalidate_written_hint();
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
 
@@ -1049,6 +1166,11 @@ impl ExtentTree {
         // coupling) — see `write_at_once`.
         let device = fs.block_device();
         let mut edited = false;
+        // The written extent covering `range_start`, captured in passing by the
+        // first walk below (which visits it anyway): the anchor for the
+        // overwrite fast-path hint if the whole range turns out all-written.
+        // Later rounds only run after an edit, which forfeits the hint.
+        let mut anchor: Option<Extent> = None;
         let mut cursor = range_start as u64;
         'scan: while cursor < range_end {
             // The first UNWRITTEN extent overlapping the remaining range.
@@ -1057,6 +1179,9 @@ impl ExtentTree {
                 if e.is_unwritten() {
                     hit = Some(*e);
                     return ControlFlow::Break(());
+                }
+                if e.covers(range_start) {
+                    anchor = Some(*e);
                 }
                 ControlFlow::Continue(())
             })?;
@@ -1172,6 +1297,14 @@ impl ExtentTree {
         // plain overwrite calls this on every chunk).
         if edited {
             self.dirty = true;
+        } else if let Some(anchor) = anchor {
+            // Nothing was unwritten: the range is a plain overwrite. Remember
+            // the written extent covering its start (captured by the walk above
+            // at zero extra cost) so the next overwrite can skip this walk
+            // entirely (the knife-2 fast path). Sole setter of the hint. A
+            // `None` anchor means `range_start` sits in a hole — nothing to
+            // remember.
+            self.record_written_hint(&anchor);
         }
         Ok(())
     }
@@ -1191,15 +1324,26 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        // Same discipline as `convert_unwritten`: clear the hint before any
+        // flip, re-establish it only on the no-conversion arm below. (Reached
+        // only through `convert_unwritten`, which already cleared — belt and
+        // braces against any future direct caller.)
+        self.invalidate_written_hint();
         let n = self.header().entries() as usize;
         let mut out: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 2);
         let mut edited = false;
+        // The written extent covering `range_start`, captured in passing by the
+        // scan below: the fast-path hint anchor if nothing needed converting.
+        let mut anchor: Option<Extent> = None;
         for i in 0..n {
             let e = self.root_extent_at(i);
             let e_start = e.block();
             let e_end = e_start as u64 + e.len() as u64;
             let overlaps = e_end > range_start as u64 && (e_start as u64) < range_end;
             if !e.is_unwritten() || !overlaps {
+                if !e.is_unwritten() && e.covers(range_start) {
+                    anchor = Some(e);
+                }
                 out.push(e);
                 continue;
             }
@@ -1235,6 +1379,14 @@ impl ExtentTree {
         }
         // The every-write gate: an all-written range must not even dirty.
         if !edited {
+            // Plain overwrite of an inline (depth-0) file — the SQLite hot case.
+            // Remember the covering written extent (captured by the scan above
+            // at zero extra cost) for the next overwrite's fast path, then
+            // return without dirtying. A `None` anchor means `range_start` sits
+            // in a hole — nothing to remember.
+            if let Some(anchor) = anchor {
+                self.record_written_hint(&anchor);
+            }
             return Ok(());
         }
         // A freshly converted run coalesces with its written neighbours —
@@ -1284,6 +1436,9 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        // This flips written extents to unwritten: the fast path must never see
+        // a hint over a range this touched.
+        self.invalidate_written_hint();
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
 
@@ -1460,6 +1615,9 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        // Flips written inline extents to unwritten (reached only through
+        // `mark_range_unwritten`, which already cleared — defensive re-clear).
+        self.invalidate_written_hint();
         let n = self.header().entries() as usize;
         let mut out: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 2);
         let mut edited = false;
@@ -1560,6 +1718,7 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let plan = self.plan_collapse_range(fs, punch_start, punch_stop)?;
         self.apply_collapse_range(fs, plan, handle, csum_seed, data_policy)
     }
@@ -1645,6 +1804,7 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let CollapsePlan {
             survivors,
             freed,
@@ -1695,6 +1855,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let plan = self.plan_insert_range(fs, offset, len)?;
         self.apply_insert_range(fs, plan, handle, csum_seed)
     }
@@ -1770,6 +1931,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         let InsertPlan {
             shifted,
             old_external,
@@ -1798,6 +1960,7 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
+        self.invalidate_written_hint();
         self.truncate_chunk(fs, new_size, handle, csum_seed, data_policy, None)?;
         Ok(())
     }
@@ -1840,6 +2003,7 @@ impl ExtentTree {
         data_policy: journal::DataForgetPolicy,
         max_credits: Option<usize>,
     ) -> Result<super::TruncateChunk> {
+        self.invalidate_written_hint();
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
@@ -2087,6 +2251,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<u64> {
+        self.invalidate_written_hint();
         let device = fs.block_device();
         let mut freed_meta = 0u64;
 
@@ -2142,6 +2307,7 @@ impl ExtentTree {
     /// Removes root index entry `i`, shifting later entries left (in-memory,
     /// like every root rewrite; it rides the inode writeback).
     fn remove_root_index_at(&mut self, i: usize) {
+        self.invalidate_written_hint();
         let header = self.header();
         let n = header.entries() as usize;
         debug_assert!(!header.is_leaf() && i < n);
@@ -2194,6 +2360,7 @@ impl ExtentTree {
         data_policy: journal::DataForgetPolicy,
         max_credits: Option<usize>,
     ) -> Result<super::PunchChunk> {
+        self.invalidate_written_hint();
         let Range {
             start: start_block,
             end: end_block,
@@ -2480,6 +2647,7 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
         data_policy: journal::DataForgetPolicy,
     ) -> Result<super::PunchChunk> {
+        self.invalidate_written_hint();
         let free_cost = fs.extent_free_credits();
         let n = self.header().entries() as usize;
 
@@ -2650,6 +2818,7 @@ impl ExtentTree {
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<TreeDelta> {
+        self.invalidate_written_hint();
         let device = fs.block_device().as_ref();
 
         // A whole-tree rebuild reuses the surviving external blocks in place
@@ -2779,6 +2948,7 @@ impl ExtentTree {
     /// Rewrites the root as a depth-0 inline leaf (header + up to
     /// [`INLINE_MAX`] extents).
     fn write_inline_leaf_root(&mut self, extents: &[Extent]) {
+        self.invalidate_written_hint();
         let bytes = self.root.as_mut_bytes();
         bytes.fill(0);
         let header = RawExtentHeader {
@@ -2799,6 +2969,7 @@ impl ExtentTree {
     /// index entry per child (an external leaf at depth 1, an interior node at
     /// depth 2). The inline root's capacity is [`INLINE_MAX`] at either depth.
     fn write_index_root(&mut self, entries: &[RawExtentIdx], depth: u16) {
+        self.invalidate_written_hint();
         let bytes = self.root.as_mut_bytes();
         bytes.fill(0);
         let header = RawExtentHeader {
@@ -5282,11 +5453,12 @@ mod tests {
         assert_matches_linear(&f, &tree, 320);
     }
 
-    /// The two slots are sized for a depth-2 descent's interior + leaf: walking
-    /// each of the five leaves under the shared interior keeps that interior
-    /// resident in one slot while the leaves rotate through the other (no mutual
-    /// eviction), and every verdict still matches the linear reference (the
-    /// debug net cross-checks each hit for byte equality on top).
+    /// A depth-2 descent alternates interior + leaf slots: walking each of the
+    /// five leaves under the shared interior keeps that interior resident while
+    /// the leaves rotate through the remaining slots (with [`NODE_CACHE_SLOTS`]
+    /// = 8 the whole working set stays resident), and every verdict still
+    /// matches the linear reference (the debug net cross-checks each hit for
+    /// byte equality on top).
     #[ktest]
     fn node_cache_holds_interior_and_leaf_across_depth2() {
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
@@ -6186,5 +6358,153 @@ mod tests {
             tree.lookup(&f.ext4, high + 2).unwrap().unwrap().start(),
             200
         );
+    }
+
+    // ---- P9b knife 2: overwrite fast-path written-hint ----
+
+    /// The no-conversion arm of `convert_unwritten` records the overwrite
+    /// fast-path hint, anchored to the covering written extent's OWN bounds (not
+    /// the queried sub-range) — the inline (depth-0) path.
+    #[ktest]
+    fn written_hint_set_by_noop_convert_inline() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // A written run [0,8) @ 100 in the inline root.
+        tree.insert(&f.ext4, 0, 100, 8, ExtentKind::Written, None, None)
+            .unwrap();
+        assert!(tree.written_hint.is_none(), "insert clears the hint");
+
+        // Converting an all-written sub-range is a no-op that establishes the
+        // hint over the WHOLE covering extent, not just the queried [2,6).
+        tree.convert_unwritten(&f.ext4, 2, 4, None, None).unwrap();
+        assert!(tree.written_hint_covers(2, 6));
+        assert!(tree.written_hint_covers(0, 8));
+        // The recorded end is exclusive at the extent's real boundary: a query
+        // that would spill one block past it is not covered.
+        assert!(!tree.written_hint_covers(0, 9));
+    }
+
+    /// Same discipline on an external (depth-1) tree: a no-op convert over a
+    /// written singleton extent records a hint bounded to that extent, so a
+    /// query spilling into the neighbouring hole is rejected.
+    #[ktest]
+    fn written_hint_set_by_noop_convert_external() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // Written singletons at even blocks 0,2,4,... → depth 1 with holes
+        // between every extent.
+        let (mut tree, _pblocks) = ascending_tree_allocated(&f, 400);
+        assert_eq!(tree.depth(), 1);
+
+        // Block 20 maps a written [20,21); block 21 is a hole.
+        tree.convert_unwritten(&f.ext4, 20, 1, None, None).unwrap();
+        assert!(tree.written_hint_covers(20, 21));
+        // Spilling into the following hole is not covered (false-positive guard).
+        assert!(!tree.written_hint_covers(20, 22));
+    }
+
+    /// A convert that actually flips unwritten→written (its `edited` arm) never
+    /// records a hint covering the still-unwritten remainder — the false-positive
+    /// red line. A later no-op convert then hints only the written prefix.
+    #[ktest]
+    fn written_hint_not_set_over_unwritten() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        // An unwritten run [0,8).
+        tree.insert(&f.ext4, 0, 100, 8, ExtentKind::Unwritten, None, None)
+            .unwrap();
+
+        // Convert [0,4): a real flip (edited) — the hint stays cleared, never
+        // describing the [4,8) that is still unwritten.
+        tree.convert_unwritten(&f.ext4, 0, 4, None, None).unwrap();
+        assert!(
+            tree.written_hint.is_none(),
+            "a real conversion must not leave a hint"
+        );
+        assert!(tree.lookup(&f.ext4, 4).unwrap().unwrap().is_unwritten());
+
+        // Now [0,4) is written; a no-op convert over it hints exactly that
+        // prefix and never the unwritten tail.
+        tree.convert_unwritten(&f.ext4, 0, 4, None, None).unwrap();
+        assert!(tree.written_hint_covers(0, 4));
+        assert!(
+            !tree.written_hint_covers(0, 8),
+            "the hint must never cover the unwritten tail"
+        );
+    }
+
+    /// Every mapping-/kind-changing mutator clears a live hint on entry, so no
+    /// stale hint can outlive the change it described (the invalidation nail).
+    #[ktest]
+    fn written_hint_invalidated_by_mutators() {
+        // A helper: build a fixture with a written run, prime the hint via a
+        // no-op convert, run `mutate`, and assert the hint was cleared.
+        fn assert_clears(mutate: impl FnOnce(&Ext4, &mut ExtentTree)) {
+            let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+                .with_block_bitmap_metadata_marked()
+                .build()
+                .unwrap();
+            let mut tree = ExtentTree::empty();
+            let run = f.ext4.alloc_blocks(8, 0, None).unwrap();
+            tree.insert(&f.ext4, 0, run.start, 8, ExtentKind::Written, None, None)
+                .unwrap();
+            tree.convert_unwritten(&f.ext4, 0, 8, None, None).unwrap();
+            assert!(tree.written_hint_covers(0, 8), "hint primed");
+            mutate(&f.ext4, &mut tree);
+            assert!(
+                tree.written_hint.is_none(),
+                "a mutator must clear the hint on entry"
+            );
+        }
+
+        // insert (a fresh mapping past the run).
+        assert_clears(|fs, tree| {
+            let r = fs.alloc_blocks(1, 0, None).unwrap();
+            tree.insert(fs, 100, r.start, 1, ExtentKind::Written, None, None)
+                .unwrap();
+        });
+        // mark_range_unwritten (a written→unwritten flip in range).
+        assert_clears(|fs, tree| {
+            tree.mark_range_unwritten(fs, 2, 4, None, None).unwrap();
+        });
+        // punch_chunk (frees a middle run).
+        assert_clears(|fs, tree| {
+            tree.punch_chunk(
+                fs,
+                2..4,
+                None,
+                None,
+                journal::DataForgetPolicy::PlainData,
+                None,
+            )
+            .unwrap();
+        });
+        // truncate_to_byte_len (frees the tail).
+        assert_clears(|fs, tree| {
+            tree.truncate_to_byte_len(
+                fs,
+                4 * BLOCK_SIZE,
+                None,
+                None,
+                journal::DataForgetPolicy::PlainData,
+            )
+            .unwrap();
+        });
+        // A real convert (edited arm) also clears and does not re-set.
+        assert_clears(|fs, tree| {
+            // Re-introduce an unwritten block inside the run, then convert it:
+            // the flip is a real edit, so the entry-clear stands.
+            tree.mark_range_unwritten(fs, 3, 1, None, None).unwrap();
+            assert!(tree.written_hint.is_none());
+            tree.convert_unwritten(fs, 3, 1, None, None).unwrap();
+        });
     }
 }

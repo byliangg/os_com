@@ -3671,7 +3671,58 @@ impl InodeInner {
         // rolls back exactly them (never a KEEP_SIZE preallocation).
         let mut new_mappings = extent_manager::NewMappings::default();
 
-        if let Err(err) = self.prepare_write(fs, offset, end, handle.as_deref(), &mut new_mappings)
+        // The write's logical block span (end-exclusive). Hoisted above
+        // `prepare_write` so the overwrite fast path can test it against the
+        // extent tree's written-hint before deciding whether to fill/convert. A
+        // range past the 32-bit logical space is EFBIG for either path (nothing
+        // has been allocated yet, so no rollback is owed), so hoisting the check
+        // changes only its position.
+        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
+            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
+
+        // Overwrite fast path (P9b knife 2, the SQLite hot case): a write that
+        // does NOT extend the file (`end <= old_size`) into a range wholly
+        // inside one written extent — recorded in the extent tree's
+        // `written_hint` — skips BOTH `prepare_write`'s hole-fill probe and the
+        // unwritten→written `mark_range_written` convert. Each is already a
+        // no-op when the range is mapped+written, but each still walks and
+        // clones the tree; the hint lets a plain overwrite avoid the walk. The
+        // page-cache write, timestamps, and the caller's ordered-data / iwb
+        // registration all stay exactly as on the slow path.
+        //
+        // Concurrency: `write_at` holds the inode's `inner` write lock (①)
+        // across this whole body, and every extent-tree mutation for this inode
+        // — save one carve-out below — acquires ① before touching the ③ tree
+        // (and clears the hint there), so the hint cannot change between this
+        // read and the page write below. Distinct inodes never share an
+        // `ExtentManager`.
+        //
+        // The carve-out is `ExtentManager::allocate_one` (the `submit_write_bio`
+        // hole fallback): writeback/commit threads run it with no ① to hold. It
+        // cannot break this fast path today, for three independent reasons: its
+        // `insert` only fills a Gap, and every block inside a live hint is
+        // covered by one written extent (no Gap in there to insert); `insert`'s
+        // entry invalidation can only CLEAR the hint, never forge coverage; and
+        // on a journaled volume the path fails EIO before touching the tree.
+        // Anyone wiring up real mmap-hole writeback (ledger:
+        // `mmap-hole-writeback`) must revisit this carve-out before letting
+        // that path allocate.
+        //
+        // Red line: a false-positive hint would skip the convert and a later
+        // crash could then read zeros where data was written (Unwritten-first
+        // broken). The hint is set ONLY from a walk that proved the range
+        // written, and cleared on entry to every tree mutator — see
+        // `ExtentTree::written_hint`. Debug builds re-verify the promise below.
+        let fast_overwrite = end <= old_size
+            && self
+                .extent_manager()?
+                .written_hint_covers(start_block, end_block);
+
+        if !fast_overwrite
+            && let Err(err) =
+                self.prepare_write(fs, offset, end, handle.as_deref(), &mut new_mappings)
         {
             self.rollback_write(&new_mappings, old_size, end, handle.as_deref());
             return Err(err);
@@ -3687,17 +3738,30 @@ impl InodeInner {
         // metadata that makes the blocks readable-as-data thus commits together
         // with (never before) the ordered-data flush the caller registers. A
         // crash before this transaction commits leaves the blocks unwritten:
-        // read-as-zeros, never another file's freed data.
-        let start_block = Iblock::try_from(offset / BLOCK_SIZE)
-            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
-        let end_block = Iblock::try_from(end.div_ceil(BLOCK_SIZE))
-            .map_err(|_| Error::with_message(Errno::EFBIG, "block index exceeds 32 bits"))?;
-        if let Err(err) = self
-            .extent_manager()
-            .and_then(|em| em.mark_range_written(start_block, end_block, handle.as_deref()))
+        // read-as-zeros, never another file's freed data. Skipped on the
+        // overwrite fast path, where the range is already written and the hint
+        // let us prove the convert is a no-op without walking.
+        if !fast_overwrite
+            && let Err(err) = self
+                .extent_manager()
+                .and_then(|em| em.mark_range_written(start_block, end_block, handle.as_deref()))
         {
             self.rollback_write(&new_mappings, old_size, end, handle.as_deref());
             return Err(err);
+        }
+
+        // Debug cross-check: the fast path skipped the convert on the promise
+        // that `[start_block, end_block)` was already all-written. Re-walk it
+        // read-only (a ③ pass with no side effects) and assert the promise held,
+        // so a hint that outlived a mutation it should have cleared fails loud in
+        // the (debug-build) ktest suite instead of silently corrupting on crash.
+        #[cfg(debug_assertions)]
+        if fast_overwrite {
+            assert!(
+                self.extent_manager()?
+                    .debug_range_all_written(start_block, end_block)?,
+                "overwrite fast path took a written_hint that no longer holds: [{start_block}, {end_block})"
+            );
         }
 
         self.set_mtime_ctime(super::utils::now());
@@ -4559,6 +4623,77 @@ mod write_tests {
         assert_eq!(inode.sector_count(), sc_before);
         assert_eq!(f.ext4.super_block().free_blocks_count(), free_before);
         assert_eq!(read_back(&inode, 0, BLOCK_SIZE), new_data);
+    }
+
+    /// Reads the extent tree's overwrite fast-path hint coverage for `[start,
+    /// end)` — the observable proxy for "the next non-extending write here takes
+    /// the fast path" (P9b knife 2).
+    fn hint_covers(inode: &Inode, start: Iblock, end: Iblock) -> bool {
+        let inner = inode.inner.read();
+        inner
+            .extent_manager()
+            .unwrap()
+            .written_hint_covers(start, end)
+    }
+
+    /// Knife 2 end-to-end: an extending write leaves no hint, the first plain
+    /// overwrite establishes it, and the next overwrite takes the fast path (the
+    /// debug net re-verifies the range is all-written) and round-trips correctly.
+    #[ktest]
+    fn overwrite_fast_path_round_trips_and_sets_hint() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Extend-write block 0: the convert flips unwritten→written (an edit), so
+        // no hint is left behind.
+        write_all(&inode, 0, &[0x11; BLOCK_SIZE]);
+        assert!(
+            !hint_covers(&inode, 0, 1),
+            "an extending write sets no hint"
+        );
+
+        // First overwrite: no hint yet → slow path; its no-op convert records the
+        // hint over the covering written extent.
+        write_all(&inode, 0, &[0x22; BLOCK_SIZE]);
+        assert!(
+            hint_covers(&inode, 0, 1),
+            "a plain overwrite establishes the hint"
+        );
+
+        // Second overwrite: the hint covers [0,1) → fast path (prepare_write and
+        // the convert are skipped; the debug net asserts the range is all-written).
+        let latest = vec![0x33u8; BLOCK_SIZE];
+        write_all(&inode, 0, &latest);
+        assert_eq!(read_back(&inode, 0, BLOCK_SIZE), latest);
+        // Still one block; the fast path allocated and converted nothing.
+        assert_eq!(inode.sector_count(), SECTORS_PER_BLOCK);
+        // The hint survives a fast-path overwrite (no mutator cleared it).
+        assert!(hint_covers(&inode, 0, 1));
+    }
+
+    /// An extending write (`end > file_size`) never consults the hint, and its
+    /// allocation clears any prior hint — nail 4.
+    #[ktest]
+    fn extending_write_bypasses_fast_path_and_clears_hint() {
+        let f = fixture_with_empty_file();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Prime a hint over block 0 (extend-write then overwrite).
+        write_all(&inode, 0, &[0x11; BLOCK_SIZE]);
+        write_all(&inode, 0, &[0x22; BLOCK_SIZE]);
+        assert!(hint_covers(&inode, 0, 1));
+
+        // Append a second block past EOF: end > old_size, so the fast path is not
+        // taken; allocating the new block clears the hint.
+        let appended = vec![0xBBu8; BLOCK_SIZE];
+        write_all(&inode, BLOCK_SIZE, &appended);
+        assert_eq!(inode.size(), 2 * BLOCK_SIZE);
+        assert_eq!(inode.sector_count(), 2 * SECTORS_PER_BLOCK);
+        assert_eq!(read_back(&inode, BLOCK_SIZE, BLOCK_SIZE), appended);
+        assert!(
+            !hint_covers(&inode, 0, 1),
+            "the extending write's insert cleared the hint"
+        );
     }
 
     #[ktest]
