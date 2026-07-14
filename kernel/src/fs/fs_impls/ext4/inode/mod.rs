@@ -3609,10 +3609,9 @@ impl InodeInner {
     fn prepare_shrink(&mut self, new_size: usize, old_size: usize) -> Result<()> {
         if let Ok(page_cache) = self.page_cache() {
             let doomed_start = (new_size / BLOCK_SIZE) * BLOCK_SIZE;
-            // Batched writeback of the doomed tail — file data, same barrier
-            // (durable-on-return) as `flush_range` so the crash-safety obligation
-            // documented above is preserved.
-            page_cache.flush_range_batched(doomed_start..old_size)?;
+            // Writeback of the doomed tail (file data), durable on return so the
+            // crash-safety obligation documented above is preserved.
+            page_cache.flush_range(doomed_start..old_size)?;
         }
         self.resize_page_cache(new_size, old_size)?;
         self.set_file_size(new_size);
@@ -4064,13 +4063,11 @@ impl InodeInner {
             return Ok(());
         }
         match &self.payload {
-            // Batched writeback: coalesce physically contiguous dirty pages into
-            // multi-segment BIOs. Same durable-on-return / fsync error contract as
-            // `flush_range`; only file data reaches here (journaled directory
-            // blocks returned early above).
-            InodePayload::DataBacked { page_cache, .. } => {
-                page_cache.flush_range_batched(0..file_size)
-            }
+            // `flush_range` coalesces physically contiguous dirty pages into
+            // multi-segment BIOs; durable-on-return / fsync error contract. Only
+            // file data reaches here (journaled directory blocks returned early
+            // above).
+            InodePayload::DataBacked { page_cache, .. } => page_cache.flush_range(0..file_size),
             _ => Ok(()),
         }
     }
@@ -7156,9 +7153,9 @@ mod write_tests {
         }
 
         let page_cache = inode.page_cache().unwrap();
-        // Flush through the batched path (the code under test), then drop the
-        // now-clean pages so the read reaches the device.
-        page_cache.flush_range_batched(0..written.len()).unwrap();
+        // Flush through the coalescing writeback path (the code under test), then
+        // drop the now-clean pages so the read reaches the device.
+        page_cache.flush_range(0..written.len()).unwrap();
         page_cache.evict_range(0..written.len()).unwrap();
 
         assert_eq!(read_back(&inode, 0, written.len()), written);
@@ -7196,7 +7193,7 @@ mod write_tests {
         }
 
         let page_cache = inode.page_cache().unwrap();
-        page_cache.flush_range_batched(0..expected.len()).unwrap();
+        page_cache.flush_range(0..expected.len()).unwrap();
         page_cache.evict_range(0..expected.len()).unwrap();
 
         assert_eq!(read_back(&inode, 0, expected.len()), expected);

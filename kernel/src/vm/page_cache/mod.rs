@@ -255,11 +255,17 @@ impl PageCache {
         Ok(())
     }
 
-    /// Flushes dirty pages in the specified range to the backend storage.
+    /// Flushes dirty pages in the specified range to the backend storage,
+    /// coalescing physically contiguous ones into multi-segment BIOs where the
+    /// backend can.
     ///
     /// This walks the current cache contents, submits writeback for pages that
     /// are dirty when this pass reaches them, and waits for the submitted I/O
-    /// to complete.
+    /// to complete. A block-backed backend that knows its on-disk layout merges
+    /// a physically contiguous run of dirty pages into one BIO; a backend that
+    /// does not override the batch hook writes one BIO per page. Because it waits
+    /// on the whole batch before returning, any barrier a caller builds around it
+    /// is preserved.
     ///
     /// Filesystems that need `fsync`-like guarantees must still exclude
     /// concurrent writers or repeat the operation until their own ordering
@@ -276,24 +282,6 @@ impl PageCache {
         };
 
         vmo.flush_dirty_pages(&range)
-    }
-
-    /// Writes back dirty pages in the specified byte range, coalescing physically
-    /// contiguous ones into multi-segment BIOs where the backend can.
-    ///
-    /// This is the batched sibling of [`flush_range`](Self::flush_range): same
-    /// contract (durable-on-return, `fsync` error propagation, caller holds the
-    /// filesystem-level lock; an out-of-range portion is ignored; an anonymous
-    /// cache is a no-op), the sole difference being that a block-backed backend
-    /// merges a physically contiguous run of dirty pages into one BIO instead of
-    /// one BIO per page. Because it still waits on the whole batch before
-    /// returning, any barrier a caller builds around it is preserved.
-    pub fn flush_range_batched(&self, range: Range<usize>) -> Result<()> {
-        let Some(vmo) = self.0.as_backed_vmo() else {
-            return Ok(());
-        };
-
-        vmo.flush_dirty_pages_batched(&range)
     }
 
     /// Reads ahead the pages in the specified byte range from the backend into
@@ -465,9 +453,9 @@ pub trait PageCacheBackend: Sync + Send {
     /// [`IoBatch::wait_all`] and propagate any completion error.
     ///
     /// The default implementation locks and submits every page individually
-    /// through [`write_page_async`](Self::write_page_async), byte-for-byte the
-    /// pre-batch [`flush_dirty_pages`] loop, so a network filesystem and every
-    /// non-overriding backend keep exact single-page behavior. A backend that
+    /// through [`write_page_async`](Self::write_page_async), so a network
+    /// filesystem and every non-overriding backend keep exact single-page
+    /// writeback behavior. A backend that
     /// knows its on-disk layout can override it to merge physically contiguous
     /// pages into multi-segment BIOs (the block backends do so via
     /// [`BlockAsPageCacheBackend::submit_write_pages`]).
