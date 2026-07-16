@@ -38,7 +38,7 @@ use ostd::mm::io::util::HasVmReaderWriter;
 
 use super::{
     checksum::{self, InodeCsumSeed},
-    fs::{Ext4, InodeCaptureOutcome, OrphanLink},
+    fs::{Ext4, InodeCaptureOutcome, OrphanLink, SpliceEpoch},
     journal,
     journal::Tid,
     prelude::*,
@@ -3100,30 +3100,39 @@ enum ChunkWrite {
 }
 
 /// This inode's most recent journaled descriptor capture: which transaction it
-/// landed in and the captured after-image basis — the **post-orphan-override,
-/// pre-checksum** 256-byte image (`Ext4::capture_inode_desc` explains why that
-/// exact stage closes the orphan add/del/splice cases without invalidation
-/// hooks). [`covers`](Self::covers) is the skip predicate of the writeback
-/// dedup: a same-transaction, byte-identical writeback is a no-op the funnel
-/// may skip whole.
+/// landed in, the [`SpliceEpoch`] it was minted under, and the captured
+/// after-image basis — the **post-orphan-override, pre-checksum** 256-byte
+/// image (`Ext4::capture_inode_desc` explains why that exact stage closes the
+/// orphan add/del cases, and why the epoch — not the bytes — closes the
+/// splice-ABA case). [`covers`](Self::covers) is the skip predicate of the
+/// writeback dedup: a same-transaction, same-epoch, byte-identical writeback
+/// is a no-op the funnel may skip whole.
 pub(super) struct InodeCaptureRecord {
     tid: Tid,
+    splice_epoch: SpliceEpoch,
     basis: Box<RawInode>,
 }
 
 impl InodeCaptureRecord {
-    /// Records a full capture: the transaction it joined and the image basis
-    /// [`Ext4::capture_inode_desc`] handed back.
-    pub(super) fn new(tid: Tid, basis: Box<RawInode>) -> Self {
-        Self { tid, basis }
+    /// Records a full capture: the transaction it joined, plus the image
+    /// basis and splice epoch [`Ext4::capture_inode_desc`] handed back.
+    pub(super) fn new(tid: Tid, splice_epoch: SpliceEpoch, basis: Box<RawInode>) -> Self {
+        Self {
+            tid,
+            splice_epoch,
+            basis,
+        }
     }
 
-    /// The skip predicate: same transaction and a byte-identical candidate
-    /// image. Only meaningful under `s_orphan_lock` — the candidate's orphan
-    /// override and the transaction's in-slot `i_dtime` are in sync only
-    /// there (`Ext4::capture_inode_desc`'s locking contract).
-    pub(super) fn covers(&self, tid: Tid, candidate: &RawInode) -> bool {
-        self.tid == tid && self.basis.as_bytes() == candidate.as_bytes()
+    /// The skip predicate: same transaction, same splice epoch, and a
+    /// byte-identical candidate image. Only meaningful under `s_orphan_lock`
+    /// — the candidate's orphan override, the epoch, and the transaction's
+    /// in-slot `i_dtime` are in sync only there
+    /// (`Ext4::capture_inode_desc`'s locking contract).
+    pub(super) fn covers(&self, tid: Tid, splice_epoch: SpliceEpoch, candidate: &RawInode) -> bool {
+        self.tid == tid
+            && self.splice_epoch == splice_epoch
+            && self.basis.as_bytes() == candidate.as_bytes()
     }
 }
 
@@ -4142,9 +4151,15 @@ impl InodeInner {
                 CapturePolicy::Forced => None,
             };
             match fs.capture_inode_desc(ino, &self.desc, &root, handle, last) {
-                Ok(InodeCaptureOutcome::Captured { basis }) => {
-                    self.last_capture =
-                        Some(Box::new(InodeCaptureRecord::new(handle.tid(), basis)));
+                Ok(InodeCaptureOutcome::Captured {
+                    basis,
+                    splice_epoch,
+                }) => {
+                    self.last_capture = Some(Box::new(InodeCaptureRecord::new(
+                        handle.tid(),
+                        splice_epoch,
+                        basis,
+                    )));
                 }
                 Ok(InodeCaptureOutcome::Deduped) => {
                     // Nothing new entered the transaction; the record stays
@@ -7434,11 +7449,16 @@ mod write_tests {
         assert_eq!(raw.size_lo as usize, BLOCK_SIZE);
     }
 
-    /// P10-T2.2 pin 6 (restart boundary): `journal_restart` moves an open
-    /// handle onto a successor transaction (staged via the locking seat, as in
-    /// the transaction-layer restart test); an identical writeback through the
-    /// restarted handle must recapture — chunk N+1's image belongs to chunk
-    /// N+1's transaction — and the record then covers the new transaction.
+    /// P10-T2.2 pin 6 (restart boundary): a `journal_restart` changes
+    /// generations only when the committer has force-locked the running
+    /// transaction — its `request_commit_for` is non-blocking, so an
+    /// un-locked restart legally rejoins the SAME tid, where the record still
+    /// covers (the image really is in that transaction; the same-transaction
+    /// theorem applies). This test stages the force-lock via the locking seat
+    /// (as in the transaction-layer restart test) so the handle re-admits
+    /// onto a successor: an identical writeback through the restarted handle
+    /// must then recapture — chunk N+1's image belongs to chunk N+1's
+    /// transaction — and the record rolls over to the new transaction.
     #[ktest]
     fn inode_capture_record_rolls_over_across_journal_restart() {
         let f = journaled_fixture_with_empty_file();
@@ -7619,6 +7639,86 @@ mod write_tests {
         assert_eq!(
             raw.dtime, NEIGHBOR_INO,
             "the on-chain writeback carries its successor in the transaction"
+        );
+    }
+
+    /// P10-T2.3 review pin (the splice-epoch ABA, Finding-1): an orphan del +
+    /// re-add can return `successor_of(X)` to exactly the value a capture
+    /// record's basis holds, while an intermediate non-head `orphan_del`
+    /// SPLICED X's in-transaction slot bytes (`journal_patch_dtime`) — so a
+    /// byte-identical candidate no longer proves the transaction holds the
+    /// right image. The attack: chain [X → Y], capture X (basis dtime = Y),
+    /// del(Y) (splices X's slot to 0 in the transaction), del(X), re-add(Y),
+    /// re-add(X) (successor numerically Y again). The next byte-identical
+    /// writeback matches tid AND bytes; only the splice epoch knows the slot
+    /// moved — it must MISS and recapture dtime = Y (a skip would commit the
+    /// spliced 0, cutting Y off the on-disk chain).
+    #[ktest]
+    fn splice_epoch_forces_recapture_after_orphan_del_and_readd() {
+        const NEIGHBOR_INO: u32 = 12;
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        f.write_raw_inode(NEIGHBOR_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let op = f.ext4.begin_op(8).unwrap();
+        // Chain [FILE_INO → NEIGHBOR_INO].
+        let _y = f.ext4.orphan_add(NEIGHBOR_INO, op.get()).unwrap();
+        let _x = f.ext4.orphan_add(FILE_INO, op.get()).unwrap();
+
+        // The on-chain capture: its basis carries dtime = NEIGHBOR_INO.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        // del(Y): a MIDDLE removal, so it splices X's slot in the transaction
+        // (dtime := 0, Y's successor) — the out-of-funnel patch under test.
+        f.ext4.orphan_del(NEIGHBOR_INO, op.get()).unwrap();
+        // del(X), re-add(Y), re-add(X): the chain is [X → Y] again, so the
+        // candidate's override reproduces the basis bytes exactly.
+        f.ext4.orphan_del(FILE_INO, op.get()).unwrap();
+        let _y = f.ext4.orphan_add(NEIGHBOR_INO, op.get()).unwrap();
+        let _x = f.ext4.orphan_add(FILE_INO, op.get()).unwrap();
+
+        // Byte-identical writeback, same tid: only the epoch mismatch may —
+        // and must — force the full recapture.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "a del + re-add ABA must not dedup against the pre-splice basis"
+        );
+
+        // The refreshed record carries the current epoch: the fence is a
+        // one-shot invalidation, not a permanent dedup kill.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "the post-splice record dedups again within the same epoch"
+        );
+
+        drop(op);
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(
+            raw.dtime, NEIGHBOR_INO,
+            "the recapture must land the successor, not the spliced-stale 0"
         );
     }
 

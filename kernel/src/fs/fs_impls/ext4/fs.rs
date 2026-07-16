@@ -1557,7 +1557,7 @@ impl Ext4 {
                 predecessor,
                 successor,
             } => {
-                self.patch_orphan_next_on_disk(predecessor, successor, handle)?;
+                self.patch_orphan_next_on_disk(&mut chain, predecessor, successor, handle)?;
             }
         }
         chain.commit_remove(ino);
@@ -1573,8 +1573,14 @@ impl Ext4 {
     /// `UncheckpointedImage` in `journal/transaction.rs`), and only the 4
     /// `i_dtime` bytes are overwritten, so every other field — and every
     /// neighboring inode — keeps its committed content.
+    ///
+    /// `chain` is the held `s_orphan_lock` guard: this patch rewrites an
+    /// inode slot's transaction bytes OUTSIDE the capture funnel, so it must
+    /// advance the [`SpliceEpoch`] in the same lock window — taking the
+    /// mirror by `&mut` makes forgetting the lock, or the bump, ill-typed.
     fn patch_orphan_next_on_disk(
         &self,
+        chain: &mut OrphanChain,
         ino: Ext4Ino,
         next: Option<Ext4Ino>,
         handle: Option<&journal::Handle>,
@@ -1589,7 +1595,11 @@ impl Ext4 {
         };
         // `0 = end of chain` is the on-disk convention (encode boundary).
         self.inode_slot(ino)?
-            .journal_patch_dtime(handle, next.unwrap_or(0), csum)
+            .journal_patch_dtime(handle, next.unwrap_or(0), csum)?;
+        // The patch landed (`journal_patch_dtime` errors precede application):
+        // every capture record's basis is now potentially stale, fence them.
+        chain.bump_splice_epoch();
+        Ok(())
     }
 
     /// Finishes deletions interrupted by a crash, by walking the on-disk orphan
@@ -2096,14 +2106,22 @@ impl Ext4 {
     /// a byte-identical pre-checksum image — the whole capture is skipped
     /// ([`InodeCaptureOutcome::Deduped`]). The comparison basis is the
     /// **post-orphan-override, pre-checksum** image: the override folds the
-    /// authoritative chain state into the candidate, so any orphan add/del/
-    /// splice since the record was taken changes the candidate and forces a
-    /// full capture (no invalidation hooks anywhere); and the inode checksum
-    /// is a pure function of the image bytes, so equal bases imply equal
-    /// stamped images without paying the crc. `None` ⇒ unconditional capture
-    /// (first writeback, or a durability funnel's forced variant). Same-tid
-    /// equality shares jbd2's `tid_geq` assumption that a handle and its
-    /// record are never exactly 2^32 transactions apart (see [`Tid::geq`]).
+    /// authoritative chain state into the candidate, so an orphan add or del
+    /// of THIS inode since the record was taken changes the candidate and
+    /// forces a full capture; and the inode checksum is a pure function of
+    /// the image bytes, so equal bases imply equal stamped images without
+    /// paying the crc. Byte equality alone is NOT sufficient, though: a
+    /// non-head `orphan_del` splice patches this slot's transaction bytes
+    /// outside this funnel, and a del + re-add can return the successor to
+    /// exactly its recorded value — candidate == basis while the
+    /// transaction's slot bytes have moved on (the 2026-07-17
+    /// adversarial-review ABA). The record therefore also carries the
+    /// [`SpliceEpoch`] it was minted under, which every out-of-funnel slot
+    /// patch advances; a stale epoch forces the full capture. `None` ⇒
+    /// unconditional capture (first writeback, or a durability funnel's
+    /// forced variant). Same-tid equality shares jbd2's `tid_geq` assumption
+    /// that a handle and its record are never exactly 2^32 transactions
+    /// apart (see [`Tid::geq`]).
     ///
     /// # Locking
     ///
@@ -2147,8 +2165,9 @@ impl Ext4 {
             // `0 = end of chain` is the on-disk convention (encode boundary).
             raw.dtime = next.unwrap_or(0);
         }
+        let splice_epoch = chain.splice_epoch();
         if let Some(last) = last
-            && last.covers(handle.tid(), &raw)
+            && last.covers(handle.tid(), splice_epoch, &raw)
         {
             #[cfg(ktest)]
             self.inode_capture_dedup_hits
@@ -2169,6 +2188,7 @@ impl Ext4 {
         self.inode_slot(ino)?.journal_write(Some(handle), &raw)?;
         Ok(InodeCaptureOutcome::Captured {
             basis: Box::new(basis),
+            splice_epoch,
         })
     }
 
@@ -2294,7 +2314,50 @@ impl Drop for Ext4 {
 /// a removal must persist (journaled, fallible) without mutating, and only
 /// after that succeeds does [`commit_remove`](Self::commit_remove) update the
 /// mirror — an error leaves mirror, head, and transaction mutually consistent.
-struct OrphanChain(Vec<Ext4Ino>);
+struct OrphanChain {
+    /// Entry 0 mirrors the superblock's `s_last_orphan`; entry `i`'s on-disk
+    /// successor is entry `i + 1` (see the type docs).
+    chain: Vec<Ext4Ino>,
+    /// The filesystem-wide [`SpliceEpoch`]. It lives here because the lock
+    /// that guards it IS `s_orphan_lock`: every splice patch and every dedup
+    /// predicate already holds this mirror, so the epoch travels with it.
+    splice_epoch: SpliceEpoch,
+}
+
+/// The filesystem-wide orphan-splice epoch, guarded by
+/// [`s_orphan_lock`](Ext4::s_orphan_lock): a counter advanced on every
+/// inode-slot patch that bypasses the capture funnel — today only the
+/// non-head `orphan_del` splice ([`InodeSlot::journal_patch_dtime`] via
+/// [`Ext4::patch_orphan_next_on_disk`]).
+///
+/// It fences the writeback dedup ([`Ext4::capture_inode_desc`]) against an
+/// ABA its byte comparison cannot see: an [`inode::InodeCaptureRecord`]'s
+/// basis mirrors what its capture wrote into the transaction, but a later
+/// splice patches the slot's transaction bytes behind the record's back — and
+/// an orphan del + re-add can then return the inode's chain successor to
+/// exactly its recorded value, making the candidate byte-identical to the
+/// basis while the transaction's slot holds the spliced bytes (the 2026-07-17
+/// adversarial-review finding). A record is therefore valid only while the
+/// epoch it was minted under still stands; a bump invalidates every record
+/// filesystem-wide. The false-miss cost is one full recapture per live
+/// record, and splices are rare (a non-head `orphan_del`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SpliceEpoch(u64);
+
+impl SpliceEpoch {
+    /// The mount-time epoch (no splice has happened yet).
+    const fn initial() -> Self {
+        Self(0)
+    }
+
+    /// The epoch after one more splice. Wrapping is fine: records compare
+    /// epochs for equality only, and surviving exactly 2^64 splices is beyond
+    /// even the tid-wrap assumption (`Tid::geq`) the record's same-tid check
+    /// already makes.
+    const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
 
 /// Proof that an inode was linked onto the orphan chain, carrying the
 /// previous head its `i_dtime` must record.
@@ -2347,7 +2410,10 @@ enum OrphanSplice {
 
 impl OrphanChain {
     const fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            chain: Vec::new(),
+            splice_epoch: SpliceEpoch::initial(),
+        }
     }
 
     /// Returns whether `ino` is on the chain and, if listed, its successor —
@@ -2355,14 +2421,14 @@ impl OrphanChain {
     /// One query, so the two states cannot be conflated by a missed
     /// pre-check.
     fn successor_of(&self, ino: Ext4Ino) -> Option<Option<Ext4Ino>> {
-        let idx = self.0.iter().position(|&i| i == ino)?;
-        Some(self.0.get(idx + 1).copied())
+        let idx = self.chain.iter().position(|&i| i == ino)?;
+        Some(self.chain.get(idx + 1).copied())
     }
 
     /// Prepends a new head. The caller has already persisted it as
     /// `s_last_orphan` (journaled) — see the two-phase note on the type.
     fn push_head(&mut self, ino: Ext4Ino) {
-        self.0.insert(0, ino);
+        self.chain.insert(0, ino);
     }
 
     /// Returns what removing `ino` must persist, or `None` when it is not
@@ -2370,13 +2436,13 @@ impl OrphanChain {
     /// Read-only; pair with [`commit_remove`](Self::commit_remove) once the
     /// persist step succeeded.
     fn splice_for(&self, ino: Ext4Ino) -> Option<OrphanSplice> {
-        let idx = self.0.iter().position(|&i| i == ino)?;
-        let successor = self.0.get(idx + 1).copied();
+        let idx = self.chain.iter().position(|&i| i == ino)?;
+        let successor = self.chain.get(idx + 1).copied();
         Some(if idx == 0 {
             OrphanSplice::Head { successor }
         } else {
             OrphanSplice::Middle {
-                predecessor: self.0[idx - 1],
+                predecessor: self.chain[idx - 1],
                 successor,
             }
         })
@@ -2384,22 +2450,36 @@ impl OrphanChain {
 
     /// Removes `ino` from the mirror after its splice was persisted.
     fn commit_remove(&mut self, ino: Ext4Ino) {
-        let Some(idx) = self.0.iter().position(|&i| i == ino) else {
+        let Some(idx) = self.chain.iter().position(|&i| i == ino) else {
             debug_assert!(false, "commit_remove of an unlisted orphan inode");
             return;
         };
-        self.0.remove(idx);
+        self.chain.remove(idx);
     }
 
     /// Replaces the whole mirror with a freshly walked on-disk chain (the
     /// mount-time orphan scan).
     fn replace(&mut self, chain: Vec<Ext4Ino>) {
-        self.0 = chain;
+        self.chain = chain;
     }
 
     /// Empties the mirror (the on-disk head was cleared).
     fn clear(&mut self) {
-        self.0.clear();
+        self.chain.clear();
+    }
+
+    /// The current [`SpliceEpoch`]. Read by the capture funnel in the same
+    /// lock window as its successor lookup and skip predicate.
+    const fn splice_epoch(&self) -> SpliceEpoch {
+        self.splice_epoch
+    }
+
+    /// Advances the [`SpliceEpoch`]. MUST be called — under `s_orphan_lock`,
+    /// which holding `&mut self` proves — whenever an inode-table slot's
+    /// transaction bytes are patched outside the capture funnel (today only
+    /// [`Ext4::patch_orphan_next_on_disk`]).
+    fn bump_splice_epoch(&mut self) {
+        self.splice_epoch = self.splice_epoch.next();
     }
 }
 
@@ -2413,8 +2493,12 @@ pub(super) enum InodeCaptureOutcome {
     /// written.
     Deduped,
     /// A full capture landed in the transaction; `basis` is the comparison
-    /// basis for the caller to record.
-    Captured { basis: Box<RawInode> },
+    /// basis for the caller to record, and `splice_epoch` the epoch that
+    /// basis is valid under.
+    Captured {
+        basis: Box<RawInode>,
+        splice_epoch: SpliceEpoch,
+    },
 }
 
 /// The device location of one on-disk `RawInode` slot: its inode-table block
@@ -3858,10 +3942,14 @@ mod tests {
             .ext4
             .capture_inode_desc(ino, &desc, &root, handle, None)
             .unwrap();
-        let InodeCaptureOutcome::Captured { basis } = outcome else {
+        let InodeCaptureOutcome::Captured {
+            basis,
+            splice_epoch,
+        } = outcome
+        else {
             panic!("the first capture must be a full capture");
         };
-        let record = inode::InodeCaptureRecord::new(handle.tid(), basis);
+        let record = inode::InodeCaptureRecord::new(handle.tid(), splice_epoch, basis);
         let captured_before = journal.running_nr_metadata_blocks();
 
         // Byte-identical, same transaction: skipped whole.
