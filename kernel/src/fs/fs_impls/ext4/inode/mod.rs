@@ -38,7 +38,7 @@ use ostd::mm::io::util::HasVmReaderWriter;
 
 use super::{
     checksum::{self, InodeCsumSeed},
-    fs::{Ext4, OrphanLink},
+    fs::{Ext4, InodeCaptureOutcome, OrphanLink},
     journal,
     journal::Tid,
     prelude::*,
@@ -982,6 +982,7 @@ impl Inode {
                 sync_tid: None,
                 datasync_tid: None,
                 csum_seed,
+                last_capture: None,
             }),
             block_group_idx,
             fs,
@@ -2674,8 +2675,9 @@ impl Inode {
         // which lags a suppressed-but-not-yet-checkpointed write — stale — and
         // writing the final location outside the journal breaks WAL ordering).
         // Non-journaled volumes get the no-op handle and the Phase-3 direct RMW.
+        // Forced: a durability funnel never dedups (policy — see the wrapper).
         let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
-        inner.write_back_inode_desc(&fs, self.ino, op.get())
+        inner.write_back_inode_desc_forced(&fs, self.ino, op.get())
     }
 
     /// Flushes dirty data pages, journals/writes the inode metadata, waits for
@@ -2714,7 +2716,9 @@ impl Inode {
             };
             let was_dirty = inner.is_dirty();
             let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
-            inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+            // Forced: a durability funnel never dedups (policy — see the
+            // wrapper).
+            inner.write_back_inode_desc_forced(&fs, self.ino, op.get())?;
             if was_dirty { op.tid() } else { recorded }
             // `op` closes here, then `inner` unlocks — the reverse of the
             // inner ① → handle ② acquisition order.
@@ -2749,7 +2753,8 @@ impl Inode {
         let mut inner = self.inner.write();
         inner.sync_data_pages(&fs)?;
         let op = fs.begin_op(Ext4::FSYNC_CREDITS)?;
-        inner.write_back_inode_desc(&fs, self.ino, op.get())?;
+        // Forced: a durability funnel never dedups (policy — see the wrapper).
+        inner.write_back_inode_desc_forced(&fs, self.ino, op.get())?;
         Ok(())
     }
 
@@ -3109,7 +3114,6 @@ pub(super) struct InodeCaptureRecord {
 impl InodeCaptureRecord {
     /// Records a full capture: the transaction it joined and the image basis
     /// [`Ext4::capture_inode_desc`] handed back.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn new(tid: Tid, basis: Box<RawInode>) -> Self {
         Self { tid, basis }
     }
@@ -3121,6 +3125,16 @@ impl InodeCaptureRecord {
     pub(super) fn covers(&self, tid: Tid, candidate: &RawInode) -> bool {
         self.tid == tid && self.basis.as_bytes() == candidate.as_bytes()
     }
+}
+
+/// Whether a journaled writeback may consult the inode's [`InodeCaptureRecord`]
+/// to skip a byte-identical same-transaction capture, or must capture
+/// unconditionally. `Forced` is the durability funnels' policy (see
+/// [`write_back_inode_desc`](InodeInner::write_back_inode_desc)); every other
+/// writeback dedups.
+enum CapturePolicy {
+    Dedup,
+    Forced,
 }
 
 struct InodeInner {
@@ -3154,6 +3168,17 @@ struct InodeInner {
     /// and inode checksums this inner computes on writeback; the same value
     /// threads into the extent manager for the extent-node tail checksums.
     csum_seed: Option<InodeCsumSeed>,
+    /// The most recent journaled capture of this inode's descriptor
+    /// ([`InodeCaptureRecord`]): which transaction holds it and the exact
+    /// bytes it carries. The journaled writeback consults it to skip a
+    /// byte-identical same-transaction recapture, refreshes it on every full
+    /// capture, and clears it on a capture error (conservative — a lost
+    /// record only costs the next writeback a full capture; the same holds
+    /// for a record lost with an evicted-and-reloaded inode). `None` before
+    /// the first journaled writeback, and forever on a non-journaled volume
+    /// (only the journaled arm ever stores one). Boxed so a cold inode pays
+    /// one pointer, not 264 bytes.
+    last_capture: Option<Box<InodeCaptureRecord>>,
 }
 
 impl InodeInner {
@@ -4060,11 +4085,46 @@ impl InodeInner {
     /// Persists the inode's mutable metadata to its on-disk `RawInode` if dirty,
     /// pulling the extent root and `i_blocks` from the block manager, and clears
     /// the dirty flags.
+    ///
+    /// A journaled writeback consults [`last_capture`](InodeInner::last_capture):
+    /// when the record proves this transaction already holds a byte-identical
+    /// image, the capture is skipped whole ([`Ext4::capture_inode_desc`]). The
+    /// durability funnels (`fsync`/`fdatasync`/fs-level sync) call
+    /// [`write_back_inode_desc_forced`](Self::write_back_inode_desc_forced)
+    /// instead — a policy choice, not a correctness need: a skip implies the
+    /// image already sits in the transaction `sync_tid` names, so the wait
+    /// targets are identical, but forcing keeps the durability path's audit
+    /// trivially full-path.
     fn write_back_inode_desc(
         &mut self,
         fs: &Ext4,
         ino: Ext4Ino,
         handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        self.write_back_inode_desc_with(fs, ino, handle, CapturePolicy::Dedup)
+    }
+
+    /// The unconditional-capture variant of
+    /// [`write_back_inode_desc`](Self::write_back_inode_desc): never consults
+    /// the dedup record. Reserved for the durability funnels (see there).
+    fn write_back_inode_desc_forced(
+        &mut self,
+        fs: &Ext4,
+        ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+    ) -> Result<()> {
+        self.write_back_inode_desc_with(fs, ino, handle, CapturePolicy::Forced)
+    }
+
+    /// The shared writeback implementation behind the two variants above; the
+    /// policy only decides whether the journaled arm hands the funnel the
+    /// dedup record.
+    fn write_back_inode_desc_with(
+        &mut self,
+        fs: &Ext4,
+        ino: Ext4Ino,
+        handle: Option<&journal::Handle>,
+        policy: CapturePolicy,
     ) -> Result<()> {
         if !self.is_dirty() {
             return Ok(());
@@ -4075,25 +4135,49 @@ impl InodeInner {
         };
         // Mirror the authoritative `i_blocks` into the descriptor before writing.
         self.desc.set_sector_count(sector_count);
-        if let Err(err) = fs.write_back_inode_desc(ino, &self.desc, &root, handle) {
-            // A journaled descriptor capture that fails cannot be shrugged
-            // off: the transaction may already carry leaf/bitmap after-images
-            // that depend on this in-memory root and count — committing them
-            // without the descriptor is a torn split / freed-but-mapped
-            // exposure (Linux `ext4_mark_inode_dirty` failure funnels into
-            // `ext4_std_error`, which aborts the journal; the P9a-a5
-            // audit's cross-cutting fix).
-            if let Some(handle) = handle {
-                handle.abort_journal_on_fs_error();
-            }
-            return Err(err);
-        }
+
         if let Some(handle) = handle {
+            let last = match policy {
+                CapturePolicy::Dedup => self.last_capture.as_deref(),
+                CapturePolicy::Forced => None,
+            };
+            match fs.capture_inode_desc(ino, &self.desc, &root, handle, last) {
+                Ok(InodeCaptureOutcome::Captured { basis }) => {
+                    self.last_capture =
+                        Some(Box::new(InodeCaptureRecord::new(handle.tid(), basis)));
+                }
+                Ok(InodeCaptureOutcome::Deduped) => {
+                    // Nothing new entered the transaction; the record stays
+                    // the valid basis.
+                }
+                Err(err) => {
+                    // A journaled descriptor capture that fails cannot be
+                    // shrugged off: the transaction may already carry
+                    // leaf/bitmap after-images that depend on this in-memory
+                    // root and count — committing them without the descriptor
+                    // is a torn split / freed-but-mapped exposure (Linux
+                    // `ext4_mark_inode_dirty` failure funnels into
+                    // `ext4_std_error`, which aborts the journal; the P9a-a5
+                    // audit's cross-cutting fix). The record is cleared as
+                    // conservative hygiene — the abort makes the volume
+                    // read-only, so it can never be consulted again anyway.
+                    self.last_capture = None;
+                    handle.abort_journal_on_fs_error();
+                    return Err(err);
+                }
+            }
             // Record the transaction carrying this capture BEFORE clearing the
             // dirty flag: the flag clears now but the commit is asynchronous,
-            // so `fsync` needs this tid to wait on (clean != committed).
+            // so `fsync` needs this tid to wait on (clean != committed). On a
+            // dedup skip the stamp is idempotent — the skip predicate requires
+            // the record's tid to equal this handle's, and that tid is exactly
+            // what the record's full capture stamped here.
             self.sync_tid = Some(handle.tid());
+            self.clear_dirty();
+            return Ok(());
         }
+
+        fs.write_back_inode_desc(ino, &self.desc, &root, None)?;
         self.clear_dirty();
         Ok(())
     }
@@ -7156,6 +7240,431 @@ mod write_tests {
             "the size-changing truncate advanced datasync_tid past the write"
         );
         assert_eq!(dsync, sync, "a size change bumps both tids together");
+    }
+
+    /// Spins `commit_if_due_for_test` on a helper thread until one commit
+    /// lands — a hand-cranked commit servicer for a stopped-commit-thread
+    /// fixture, so a `log_wait_commit` (fsync) or a locked-barrier
+    /// re-admission (`journal_restart`) in the test body has something to
+    /// drain it. Join it after the waiting call returns.
+    fn spawn_commit_servicer(journal: &Arc<journal::Journal>) -> Arc<crate::thread::Thread> {
+        let journal = journal.clone();
+        crate::thread::kernel_thread::ThreadOptions::new(move || {
+            loop {
+                crate::thread::Thread::yield_now();
+                if journal.commit_if_due_for_test() {
+                    break;
+                }
+            }
+        })
+        .spawn()
+    }
+
+    /// Re-marks the descriptor dirty without changing any serialized byte (a
+    /// same-value touch): `Dirty`'s `DerefMut` sets the flag regardless of the
+    /// value written, which is exactly how a byte-identical writeback arises.
+    fn touch_desc_same_value(inode: &Inode) {
+        let mut inner = inode.inner.write();
+        let link_count = inner.desc.link_count();
+        inner.desc.set_link_count(link_count);
+        assert!(inner.is_dirty());
+    }
+
+    /// P10-T2.2 pin 1 (same-tick hit): two byte-identical journaled writebacks
+    /// in one transaction — same coarse-clock tick, same size, same extent
+    /// root — dedup the second capture, and the flushed on-disk inode is
+    /// correct.
+    #[ktest]
+    fn inode_capture_dedups_identical_writeback_within_transaction() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = [0xA5u8; BLOCK_SIZE];
+        write_all(&inode, 0, &content);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        // Identical range, same tick: the descriptor re-serializes to the
+        // same bytes, so the second writeback's capture is skipped whole.
+        write_all(&inode, 0, &content);
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "the byte-identical same-transaction writeback deduped"
+        );
+
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.size_lo as usize, BLOCK_SIZE);
+        assert_eq!(raw.link_count, 1);
+    }
+
+    /// P10-T2.2 pin 2 (byte change misses): after a hit-able record exists, a
+    /// same-transaction writeback whose serialized bytes changed (the mode
+    /// bits here) must capture in full, and the change reaches the disk.
+    #[ktest]
+    fn inode_capture_does_not_dedup_changed_bytes() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = [0x5Au8; BLOCK_SIZE];
+        write_all(&inode, 0, &content);
+        write_all(&inode, 0, &content);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+        assert!(hits >= 1, "the hit-able state is real");
+
+        // Same transaction, different bytes: never skipped.
+        inode
+            .set_mode(InodeMode::from_bits_truncate(0o600))
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "changed bytes must not dedup"
+        );
+
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.mode & 0o7777, 0o600, "the mode change reached the disk");
+    }
+
+    /// P10-T2.2 pin 3 (size change misses): pinned separately from pin 2 so a
+    /// future "compare all but the size" regression cannot slip past — an
+    /// `i_size` change alone must break coverage and land on disk.
+    #[ktest]
+    fn inode_capture_does_not_dedup_size_change() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = [0xC3u8; BLOCK_SIZE];
+        write_all(&inode, 0, &content);
+        write_all(&inode, 0, &content);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+        assert!(hits >= 1, "the hit-able state is real");
+
+        // A sparse grow changes only `i_size` in the serialized image: still a
+        // miss.
+        inode.resize(2 * BLOCK_SIZE).unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "a size change must not dedup"
+        );
+
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.size_lo as usize, 2 * BLOCK_SIZE);
+    }
+
+    /// P10-T2.2 pin 4 (fsync is forced): with a hit-able record and a
+    /// byte-identical dirty descriptor, `sync_data_and_meta(Full)` — the
+    /// fsync funnel — must NOT dedup (the durability path is policy-forced),
+    /// and the flushed state is correct.
+    #[ktest]
+    fn fsync_writeback_is_forced_never_deduped() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = [0x3Cu8; BLOCK_SIZE];
+        write_all(&inode, 0, &content);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        // Byte-identical dirty state: the dedup record covers it, so a plain
+        // writeback would skip — the fsync funnel must not.
+        touch_desc_same_value(&inode);
+        let servicer = spawn_commit_servicer(&journal);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        servicer.join();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "the durability funnel never dedups"
+        );
+
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.size_lo as usize, BLOCK_SIZE);
+        assert_eq!(raw.link_count, 1);
+    }
+
+    /// P10-T2.2 pin 5 (tid boundary): identical bytes do NOT dedup across a
+    /// transaction boundary — the old transaction's image is out of reach —
+    /// and the record rolls over to the new transaction (a subsequent
+    /// identical writeback inside it dedups again).
+    #[ktest]
+    fn inode_capture_record_rolls_over_at_transaction_boundary() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let content = [0x77u8; BLOCK_SIZE];
+        write_all(&inode, 0, &content);
+        write_all(&inode, 0, &content);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+        assert!(hits >= 1, "hit-able within the first transaction");
+
+        // Commit: the next op joins a NEW transaction, so identical bytes must
+        // recapture there.
+        journal.commit_now_for_test();
+        write_all(&inode, 0, &content);
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "no dedup across the transaction boundary"
+        );
+
+        // ... and the refreshed record (new tid) dedups within the new
+        // transaction.
+        write_all(&inode, 0, &content);
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "the record rolled over to the new transaction"
+        );
+
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.size_lo as usize, BLOCK_SIZE);
+    }
+
+    /// P10-T2.2 pin 6 (restart boundary): `journal_restart` moves an open
+    /// handle onto a successor transaction (staged via the locking seat, as in
+    /// the transaction-layer restart test); an identical writeback through the
+    /// restarted handle must recapture — chunk N+1's image belongs to chunk
+    /// N+1's transaction — and the record then covers the new transaction.
+    #[ktest]
+    fn inode_capture_record_rolls_over_across_journal_restart() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        // Our own op (the test plays the write spine, holding the handle
+        // across the restart). Taking `inner` inside each block below while
+        // the op stays open formally reverses inner ① → handle ②, but both
+        // are uncontended here (see `Inode::record_create_tid` for the same
+        // test-shape argument).
+        let mut op = f.ext4.begin_op(8).unwrap();
+        let t1 = op.tid().unwrap();
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "hit-able before the restart"
+        );
+
+        // Force a REAL transaction boundary under the open handle: park t1 in
+        // the locking seat (the drain blocks on our update), then restart —
+        // the release completes the drain, the servicer stages the seat, and
+        // the handle re-admits onto the successor tid.
+        journal.request_commit_for(t1);
+        assert!(!journal.commit_if_due_for_test());
+        let servicer = spawn_commit_servicer(&journal);
+        journal::journal_restart(op.get_mut().unwrap(), 8).unwrap();
+        servicer.join();
+        assert_ne!(op.tid().unwrap(), t1, "the restart joined a successor");
+
+        // Identical bytes, new tid: a full recapture.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "no dedup across a restart boundary"
+        );
+
+        // ... and the refreshed record covers the successor transaction.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 2,
+            "the record rolled over to the restarted transaction"
+        );
+        drop(op);
+    }
+
+    /// P10-T2.2 pin 7, the orphan-del resurrection regression — the most
+    /// important pin. An inode captured while ON the orphan chain records a
+    /// basis whose `i_dtime` carries its chain successor. After `orphan_del`,
+    /// a descriptor-unchanged writeback must MISS (candidate `i_dtime` is the
+    /// live 0, no longer overridden) and rewrite the slot: a predicate built
+    /// on the pre-override bytes would compare 0 against 0, skip, and leave
+    /// the stale chain pointer on disk — e2fsck's "inode in use but has dtime
+    /// set".
+    #[ktest]
+    fn orphan_del_writeback_is_not_deduped_against_on_chain_basis() {
+        const NEIGHBOR_INO: u32 = 12;
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        // A second inode so FILE_INO has a real (nonzero) chain successor.
+        f.write_raw_inode(NEIGHBOR_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let op = f.ext4.begin_op(8).unwrap();
+        // Chain [FILE_INO → NEIGHBOR_INO].
+        let _y = f.ext4.orphan_add(NEIGHBOR_INO, op.get()).unwrap();
+        let _x = f.ext4.orphan_add(FILE_INO, op.get()).unwrap();
+
+        // The on-chain capture: its basis carries dtime = NEIGHBOR_INO.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        // Unlist FILE_INO. Its slot image in the transaction still holds
+        // dtime = NEIGHBOR_INO from the capture above.
+        f.ext4.orphan_del(FILE_INO, op.get()).unwrap();
+
+        // Descriptor-unchanged writeback: post-override candidate (dtime 0)
+        // differs from the on-chain basis (dtime = NEIGHBOR_INO) → a full
+        // capture rewrites the live dtime.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "the unlisted writeback must not dedup against the on-chain basis"
+        );
+
+        f.ext4.orphan_del(NEIGHBOR_INO, op.get()).unwrap();
+        drop(op);
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(
+            raw.dtime, 0,
+            "a live inode must not resurrect a stale orphan-chain pointer"
+        );
+    }
+
+    /// P10-T2.2 pin 8 (orphan-add lands the successor): after a live captured
+    /// writeback, adding the inode to the orphan chain and writing it back
+    /// unchanged must MISS (the override now yields the successor) and land
+    /// `i_dtime` = successor in the SAME transaction — the shrink first-txn
+    /// contract that makes a crashed truncate's chain walkable.
+    #[ktest]
+    fn orphan_add_writeback_lands_successor_despite_prior_capture() {
+        const NEIGHBOR_INO: u32 = 12;
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        f.write_raw_inode(NEIGHBOR_INO, &make_empty_file_inode());
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let op = f.ext4.begin_op(8).unwrap();
+        // A live (off-chain) capture: basis dtime = 0.
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+
+        // Chain [FILE_INO → NEIGHBOR_INO], then a descriptor-unchanged
+        // writeback: the override makes the candidate differ → full capture
+        // carrying the successor.
+        let _y = f.ext4.orphan_add(NEIGHBOR_INO, op.get()).unwrap();
+        let _x = f.ext4.orphan_add(FILE_INO, op.get()).unwrap();
+        touch_desc_same_value(&inode);
+        inode
+            .inner
+            .write()
+            .write_back_inode_desc(&f.ext4, FILE_INO, op.get())
+            .unwrap();
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits,
+            "the on-chain writeback must not dedup against the live basis"
+        );
+
+        drop(op);
+        journal.commit_now_for_test();
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(
+            raw.dtime, NEIGHBOR_INO,
+            "the on-chain writeback carries its successor in the transaction"
+        );
+    }
+
+    /// P10-T2.2 pin 9 (dedup + fsync): a captured write followed by a
+    /// same-tick byte-identical write (whose inode capture dedups but whose
+    /// DATA differs), then a real fsync — the commit the fsync forces must
+    /// leave the final on-disk state carrying both writes' effect: the inode
+    /// from the first capture, the data from the second write.
+    #[ktest]
+    fn fsync_after_deduped_writeback_persists_both_writes() {
+        let f = journaled_fixture_with_empty_file();
+        let journal = f.ext4.journal().unwrap();
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        let first = [0x11u8; BLOCK_SIZE];
+        let second = [0x22u8; BLOCK_SIZE];
+        write_all(&inode, 0, &first);
+        let hits = f.ext4.inode_capture_dedup_hits_for_test();
+        write_all(&inode, 0, &second);
+        assert_eq!(
+            f.ext4.inode_capture_dedup_hits_for_test(),
+            hits + 1,
+            "the second write's inode capture deduped"
+        );
+
+        // A real fsync: waits on the recorded sync_tid (the deduped writeback
+        // stamped the SAME tid the record's capture rode), serviced by the
+        // hand-cranked committer.
+        let servicer = spawn_commit_servicer(&journal);
+        inode.sync_data_and_meta(SyncScope::Full).unwrap();
+        servicer.join();
+
+        journal.flush_on_unmount().unwrap();
+        let raw = f.read_raw_inode(FILE_INO);
+        assert_eq!(raw.size_lo as usize, BLOCK_SIZE);
+        let pblock = inode.data_block_of(0).unwrap();
+        let mut data = vec![0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(pblock as usize * BLOCK_SIZE, &mut data)
+            .unwrap();
+        assert_eq!(
+            data.as_slice(),
+            &second[..],
+            "the deduped inode capture must not cost the data its durability"
+        );
     }
 
     /// End to end: a sequential scan of a multi-page file drives the read-ahead

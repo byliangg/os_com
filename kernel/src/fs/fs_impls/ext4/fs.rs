@@ -9,9 +9,9 @@
 //! writes the mutated metadata back. `Ext4` also owns the per-group inode cache,
 //! the orphan chain, and inode-descriptor writeback (`write_back_inode_desc`).
 
-#[cfg(ktest)]
-use core::sync::atomic::AtomicI64;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(ktest)]
+use core::sync::atomic::{AtomicI64, AtomicU64};
 
 use device_id::DeviceId;
 
@@ -189,6 +189,12 @@ pub struct Ext4 {
     /// inode. One-shot, test-only.
     #[cfg(ktest)]
     skip_reclaim_once: AtomicBool,
+    /// Dedup hits of the journaled inode-capture funnel
+    /// ([`capture_inode_desc`](Self::capture_inode_desc)): captures skipped
+    /// because a byte-identical image already sat in the same transaction.
+    /// Test-only observability — the dedup pins assert exact hit deltas.
+    #[cfg(ktest)]
+    inode_capture_dedup_hits: AtomicU64,
     self_ref: Weak<Ext4>,
 }
 
@@ -222,6 +228,8 @@ impl Ext4 {
             fail_alloc_blocks_after: AtomicI64::new(-1),
             #[cfg(ktest)]
             skip_reclaim_once: AtomicBool::new(false),
+            #[cfg(ktest)]
+            inode_capture_dedup_hits: AtomicU64::new(0),
             self_ref: weak.clone(),
         });
 
@@ -1967,6 +1975,14 @@ impl Ext4 {
         Ok(self.inode_slot(ino)?.device_offset())
     }
 
+    /// The number of journaled inode captures the dedup record skipped so far
+    /// ([`capture_inode_desc`](Self::capture_inode_desc)); the dedup pins
+    /// assert exact hit deltas through it.
+    #[cfg(ktest)]
+    pub(super) fn inode_capture_dedup_hits_for_test(&self) -> u64 {
+        self.inode_capture_dedup_hits.load(Ordering::Relaxed)
+    }
+
     /// Persists `desc` into `ino`'s on-disk `RawInode` slot — the writeback
     /// dispatch. A journaled writeback delegates to
     /// [`capture_inode_desc`](Self::capture_inode_desc) with `last: None`
@@ -2134,6 +2150,9 @@ impl Ext4 {
         if let Some(last) = last
             && last.covers(handle.tid(), &raw)
         {
+            #[cfg(ktest)]
+            self.inode_capture_dedup_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(InodeCaptureOutcome::Deduped);
         }
         // The dedup basis: post-override, pre-checksum (see the type docs).
@@ -2395,11 +2414,7 @@ pub(super) enum InodeCaptureOutcome {
     Deduped,
     /// A full capture landed in the transaction; `basis` is the comparison
     /// basis for the caller to record.
-    Captured {
-        // TODO(T2.2): production reads this once the wrapper records it.
-        #[cfg_attr(not(ktest), expect(dead_code))]
-        basis: Box<RawInode>,
-    },
+    Captured { basis: Box<RawInode> },
 }
 
 /// The device location of one on-disk `RawInode` slot: its inode-table block
