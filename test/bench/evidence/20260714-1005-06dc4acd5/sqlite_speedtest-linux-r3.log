@@ -1,0 +1,69 @@
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD1900+7EF31900 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.363822] kvm_intel: VMX not supported by CPU 0
+Running benchmark: sqlite/ext4_benchmarks on linux
+The VM is ready for the benchmark.
+P9CASE sqlite-speedtest1
+-- Speedtest1 for SQLite 3.48.0 2025-01-14 11:05:00 d2fe6b05f38d9d7cd78c5d252e99
+ 100 - 500000 INSERTs into table with no index.....................    0.297s
+ 110 - 500000 ordered INSERTS with one index/PK....................    0.440s
+ 120 - 500000 unordered INSERTS with one index/PK..................    1.094s
+ 130 - 25 SELECTS, numeric BETWEEN, unindexed......................    0.402s
+ 140 - 10 SELECTS, LIKE, unindexed.................................    0.752s
+ 142 - 10 SELECTS w/ORDER BY, unindexed............................    1.264s
+ 145 - 10 SELECTS w/ORDER BY and LIMIT, unindexed..................    0.560s
+ 150 - CREATE INDEX five times.....................................    1.055s
+ 160 - 100000 SELECTS, numeric BETWEEN, indexed....................    1.975s
+ 161 - 100000 SELECTS, numeric BETWEEN, PK.........................    2.000s
+ 170 - 100000 SELECTS, text BETWEEN, indexed.......................    2.268s
+ 180 - 500000 INSERTS with three indexes...........................    2.814s
+ 190 - DELETE and REFILL one table.................................    2.856s
+ 200 - VACUUM......................................................    1.925s
+ 210 - ALTER TABLE ADD COLUMN, and query...........................    0.023s
+ 230 - 100000 UPDATES, numeric BETWEEN, indexed....................    1.952s
+ 240 - 500000 UPDATES of individual rows...........................    1.589s
+ 250 - One big UPDATE of the whole 500000-row table................    0.210s
+ 260 - Query added column after filling............................    0.028s
+ 270 - 100000 DELETEs, numeric BETWEEN, indexed....................    2.789s
+ 280 - 500000 DELETEs of individual rows...........................    2.693s
+ 290 - Refill two 500000-row tables using REPLACE..................    4.757s
+ 300 - Refill a 500000-row table using (b&1)==(a&1)................    2.602s
+ 310 - 100000 four-ways joins......................................    4.265s
+ 320 - subquery in result set......................................    7.642s
+ 400 - 700000 REPLACE ops on an IPK................................    1.779s
+ 410 - 700000 SELECTS on an IPK....................................    2.460s
+ 500 - 700000 REPLACE on TEXT PK...................................    2.178s
+ 510 - 700000 SELECTS on a TEXT PK.................................    3.041s
+ 520 - 700000 SELECT DISTINCT......................................    0.724s
+ 980 - PRAGMA integrity_check......................................    4.666s
+ 990 - ANALYZE.....................................................    0.203s
+       TOTAL.......................................................   63.303s
+real	1m 3.33s
+user	0m 36.54s
+sys	0m 23.86s
+P9DONE sqlite-speedtest1
+P9CASE sqlite-integrity
+ok
+P9DONE sqlite-integrity
+P9ALLDONE
+[   68.578565] reboot: Power down

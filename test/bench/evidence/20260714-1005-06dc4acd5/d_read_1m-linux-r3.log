@@ -1,0 +1,82 @@
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD1900+7EF31900 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.327905] kvm_intel: VMX not supported by CPU 0
+Running benchmark: fio/ext4_p9_param on linux
+The VM is ready for the benchmark.
+P9CFG mode=read rw=read bs=1M nj=1 fsync=0 size=1G
+P9CASE read-cold
+p9read-cold: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+p9read-cold: (groupid=0, jobs=1): err= 0: pid=107: Tue Jul 14 10:20:38 2026
+  read: IOPS=4394, BW=4395MiB/s (4608MB/s)(1024MiB/233msec)
+    clat (usec): min=62, max=4401, avg=225.43, stdev=200.64
+     lat (usec): min=62, max=4401, avg=225.59, stdev=200.73
+    clat percentiles (usec):
+     |  1.00th=[   70],  5.00th=[   81], 10.00th=[   91], 20.00th=[  118],
+     | 30.00th=[  145], 40.00th=[  165], 50.00th=[  186], 60.00th=[  206],
+     | 70.00th=[  235], 80.00th=[  281], 90.00th=[  371], 95.00th=[  529],
+     | 99.00th=[  938], 99.50th=[ 1037], 99.90th=[ 1352], 99.95th=[ 4424],
+     | 99.99th=[ 4424]
+  lat (usec)   : 100=13.87%, 250=60.16%, 500=20.21%, 750=4.10%, 1000=1.07%
+  lat (msec)   : 2=0.49%, 10=0.10%
+  cpu          : usr=1.29%, sys=54.74%, ctx=828, majf=0, minf=256
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=4395MiB/s (4608MB/s), 4395MiB/s-4395MiB/s (4608MB/s-4608MB/s), io=1024MiB (1074MB), run=233-233msec
+P9DONE read-cold
+P9CASE read-warm
+p9read-warm: (g=0): rw=read, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+
+p9read-warm: (groupid=0, jobs=1): err= 0: pid=110: Tue Jul 14 10:20:39 2026
+  read: IOPS=8062, BW=8063MiB/s (8455MB/s)(1024MiB/127msec)
+    clat (usec): min=83, max=1920, avg=122.49, stdev=83.92
+     lat (usec): min=83, max=1920, avg=122.58, stdev=83.98
+    clat percentiles (usec):
+     |  1.00th=[   87],  5.00th=[   90], 10.00th=[   92], 20.00th=[   94],
+     | 30.00th=[   96], 40.00th=[   98], 50.00th=[  101], 60.00th=[  105],
+     | 70.00th=[  110], 80.00th=[  119], 90.00th=[  163], 95.00th=[  265],
+     | 99.00th=[  424], 99.50th=[  465], 99.90th=[  652], 99.95th=[ 1926],
+     | 99.99th=[ 1926]
+  lat (usec)   : 100=46.68%, 250=47.75%, 500=5.18%, 750=0.29%
+  lat (msec)   : 2=0.10%
+  cpu          : usr=0.00%, sys=96.03%, ctx=37, majf=0, minf=256
+  IO depths    : 1=100.0%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=1024,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+   READ: bw=8063MiB/s (8455MB/s), 8063MiB/s-8063MiB/s (8455MB/s-8455MB/s), io=1024MiB (1074MB), run=127-127msec
+P9DONE read-warm
+P9ALLDONE
+[    3.047971] reboot: Power down
