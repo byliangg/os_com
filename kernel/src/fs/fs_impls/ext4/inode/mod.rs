@@ -4652,7 +4652,11 @@ mod write_tests {
         // extending write ran its convert on the external tree, whose real
         // flip records the written fact it just proved.
         for k in 0..5usize {
-            write_all(&inode, k * 2 * BLOCK_SIZE, &[(0x40 + k as u8); BLOCK_SIZE]);
+            write_all(
+                &inode,
+                k * 2 * BLOCK_SIZE,
+                &[(0x40 + u8::try_from(k).unwrap()); BLOCK_SIZE],
+            );
         }
         assert!(
             es_known_written(&inode, 8, 9),
@@ -4719,7 +4723,11 @@ mod write_tests {
         // Depth-1 tree (five scattered blocks), then prime block 0's fact
         // with one slow overwrite (its fill walk records it — R1).
         for k in 0..5usize {
-            write_all(&inode, k * 2 * BLOCK_SIZE, &[(0x40 + k as u8); BLOCK_SIZE]);
+            write_all(
+                &inode,
+                k * 2 * BLOCK_SIZE,
+                &[(0x40 + u8::try_from(k).unwrap()); BLOCK_SIZE],
+            );
         }
         write_all(&inode, 0, &[0x22; BLOCK_SIZE]);
         assert!(es_known_written(&inode, 0, 1));
@@ -4763,7 +4771,11 @@ mod write_tests {
         // Depth-1 tree first: the inline (depth-0) convert has no R3, and a
         // depth-0 insert would rebuild the root and clear the cache.
         for k in 0..5usize {
-            write_all(&inode, k * 2 * BLOCK_SIZE, &[(0x40 + k as u8); BLOCK_SIZE]);
+            write_all(
+                &inode,
+                k * 2 * BLOCK_SIZE,
+                &[(0x40 + u8::try_from(k).unwrap()); BLOCK_SIZE],
+            );
         }
         let size_before = inode.size();
 
@@ -4974,7 +4986,11 @@ mod write_tests {
 
         // Five scattered single blocks force a depth-1 tree with an external leaf.
         for k in 0..5usize {
-            write_all(&inode, k * 2 * BLOCK_SIZE, &[(0x40 + k as u8); BLOCK_SIZE]);
+            write_all(
+                &inode,
+                k * 2 * BLOCK_SIZE,
+                &[(0x40 + u8::try_from(k).unwrap()); BLOCK_SIZE],
+            );
         }
         // 5 data blocks + 1 external leaf block.
         assert_eq!(inode.sector_count(), 6 * SECTORS_PER_BLOCK);

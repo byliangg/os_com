@@ -253,7 +253,7 @@ impl ExtentManager {
     /// letting that path allocate.** Distinct inodes never share an
     /// `ExtentManager`.
     pub(super) fn range_known_written(&self, start: Iblock, end: Iblock) -> bool {
-        self.state.read().es_cache.range_state(start, end) == EsCoverage::AllWritten
+        self.state.read().es_cache().range_state(start, end) == EsCoverage::AllWritten
     }
 
     /// Debug-only cross-check for the overwrite fast path: walks `[start, end)`
@@ -411,13 +411,13 @@ impl ExtentManager {
         // skip the planning walk, record no runs into `new_mappings` (nothing
         // will be newly allocated, so a rollback is owed nothing), seed no
         // goal (nothing to allocate).
-        let coverage = tree.es_cache.range_state(start_iblock, end_iblock);
+        let coverage = tree.es_cache().range_state(start_iblock, end_iblock);
         if coverage != EsCoverage::Unknown {
             // The debug double-read net (`es` module docs, layer 3): re-walk
             // behind the hit — the es lock is already released — and panic on
             // any over-claim. Every ktest is a debug build.
             #[cfg(debug_assertions)]
-            tree.debug_assert_es_coverage(&fs, start_iblock, end_iblock, coverage)?;
+            tree.debug_assert_es_coverage(&fs, start_iblock, end_iblock, coverage);
             return Ok(HoleFill::Filled);
         }
 
@@ -456,7 +456,7 @@ impl ExtentManager {
         // at zero extra descent. The inserts below invalidate only the HOLES
         // they fill (disjoint from the visited extents), and a neighbour
         // merge preserves per-block truth, so these facts survive the fill.
-        let es_cache = &tree.es_cache;
+        let es_cache = tree.es_cache();
         tree.walk_range(
             &fs,
             start_iblock as u64..end_iblock as u64,

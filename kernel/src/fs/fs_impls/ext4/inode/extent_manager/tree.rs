@@ -107,7 +107,7 @@ struct NodeCacheInner {
 }
 
 impl NodeCache {
-    /// An empty cache. `const` so [`ExtentTree::empty`] stays `const`.
+    /// Creates an empty cache. `const` so [`ExtentTree::empty`] stays `const`.
     pub(super) const fn new() -> Self {
         Self {
             inner: SpinLock::new(NodeCacheInner {
@@ -232,8 +232,8 @@ pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     /// only invalidation mints — and `reserialize` clears it whole beside the
     /// node cache. `pub(super)` so the `fill_holes` planning walk (R1, in the
     /// manager) can record its visited extents and probe its no-hole fast
-    /// path (Q3).
-    pub(super) es_cache: EsCache,
+    /// path (Q3) — via [`Self::es_cache`], the field itself stays private.
+    es_cache: EsCache,
 }
 
 impl ExtentTree {
@@ -1071,7 +1071,7 @@ impl ExtentTree {
             // behind the hit — the es lock is already released — and panic on
             // any over-claim. Every ktest is a debug build.
             #[cfg(debug_assertions)]
-            self.debug_assert_es_coverage(fs, range_start, end, EsCoverage::AllWritten)?;
+            self.debug_assert_es_coverage(fs, range_start, end, EsCoverage::AllWritten);
             return Ok(());
         }
         // es: entry-invalidation discipline — a mid-range error then leaves
@@ -3016,16 +3016,25 @@ impl ExtentTree {
         Ok(shape)
     }
 
-    /// The debug double-read net behind a non-`Unknown` es-cache verdict (the
-    /// Q2/Q3 side of the three-layer consistency contract, `es` module docs):
-    /// re-walks `[start, end)` read-only and panics when `claim` overstates
-    /// the tree — `AllWritten` demands gap-free coverage with zero unwritten
+    /// Read access to the extent-status cache for the manager-side query
+    /// (Q3) and population (R1) sites; the field itself stays private.
+    pub(super) fn es_cache(&self) -> &EsCache {
+        &self.es_cache
+    }
+
+    /// Re-walks `[start, end)` read-only and panics when `claim` overstates
+    /// the tree — the debug double-read net behind a non-`Unknown` es-cache
+    /// verdict (the Q2/Q3 side of the three-layer consistency contract, `es`
+    /// module docs) — `AllWritten` demands gap-free coverage with zero unwritten
     /// blocks, `AllMapped` demands gap-free coverage, `Unknown` claims
-    /// nothing. The es lock is NOT held here (the verdict was copied out);
-    /// a walk error propagates (a transient funnel failure proves nothing
-    /// about staleness — same posture as `read_node_cached`'s net). The
-    /// query points — Q2 (`convert_unwritten`) and Q3 (`fill_holes`) — run
-    /// this behind every hit in debug builds (every ktest is one).
+    /// nothing. The es lock is NOT held here (the verdict was copied out).
+    /// A walk error skips the verification instead of failing the caller: a
+    /// transient funnel failure proves nothing about staleness, and the
+    /// release build would have taken the pure-memory hit unconditionally —
+    /// an unverifiable hit is skipped rather than escalated, the same
+    /// posture as `read_node_cached`'s net. The query points — Q2
+    /// (`convert_unwritten`) and Q3 (`fill_holes`) — run this behind every
+    /// hit in debug builds (every ktest is one).
     #[cfg(debug_assertions)]
     pub(super) fn debug_assert_es_coverage(
         &self,
@@ -3033,13 +3042,13 @@ impl ExtentTree {
         start: Iblock,
         end: Iblock,
         claim: EsCoverage,
-    ) -> Result<()> {
+    ) {
         if claim == EsCoverage::Unknown {
-            return Ok(());
+            return;
         }
         let mut covered_upto = start as u64;
         let mut saw_unwritten = false;
-        self.walk_range(fs, start as u64..end as u64, &mut |e| {
+        let walked = self.walk_range(fs, start as u64..end as u64, &mut |e| {
             if e.block() as u64 > covered_upto {
                 // A gap: the walk is ordered, so nothing later covers it.
                 return ControlFlow::Break(());
@@ -3047,13 +3056,15 @@ impl ExtentTree {
             saw_unwritten |= e.is_unwritten();
             covered_upto = covered_upto.max(e.block() as u64 + e.len() as u64);
             ControlFlow::Continue(())
-        })?;
+        });
+        if walked.is_err() {
+            return;
+        }
         let fully_mapped = covered_upto >= end as u64;
         assert!(
             fully_mapped && (claim == EsCoverage::AllMapped || !saw_unwritten),
             "stale es-cache: claimed {claim:?} over [{start}, {end}) but the tree disagrees"
         );
-        Ok(())
     }
 
     /// Decodes leaf entry `i` of the trusted inline root.
@@ -6714,12 +6725,9 @@ mod tests {
         tree.insert(&f.ext4, 4, 200, 4, ExtentKind::Unwritten, None, None)
             .unwrap();
 
-        tree.debug_assert_es_coverage(&f.ext4, 0, 4, EsCoverage::AllWritten)
-            .unwrap();
-        tree.debug_assert_es_coverage(&f.ext4, 0, 8, EsCoverage::AllMapped)
-            .unwrap();
+        tree.debug_assert_es_coverage(&f.ext4, 0, 4, EsCoverage::AllWritten);
+        tree.debug_assert_es_coverage(&f.ext4, 0, 8, EsCoverage::AllMapped);
         // `Unknown` claims nothing — legal even over a plain hole.
-        tree.debug_assert_es_coverage(&f.ext4, 100, 200, EsCoverage::Unknown)
-            .unwrap();
+        tree.debug_assert_es_coverage(&f.ext4, 100, 200, EsCoverage::Unknown);
     }
 }

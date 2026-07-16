@@ -35,6 +35,14 @@
 //! return zeros over live data), and no authorized query consumes hole facts
 //! — the three-state view lives at the answer layer ([`EsCoverage`]) instead.
 //!
+//! **Payload caveat**: today's consumers (Q1–Q3) read only the coverage
+//! tier; the per-entry payload (`pblock`, per-block `kind` detail) is NOT
+//! machine-verified by the debug net, which re-derives coverage from the
+//! tree but never compares the cached mapping itself. Any future consumer
+//! that trusts the payload (e.g. revisiting the read-path decision, spec
+//! D5) must first extend the net with a per-block `pblock`/`kind`
+//! comparison — a wrong payload today would sail through every layer.
+//!
 //! # Locking
 //!
 //! The cache is a field of [`ExtentTree`](super::tree::ExtentTree) — content
@@ -67,7 +75,7 @@ struct EsInner {
 
 /// The answer of a range-coverage query: the STRONGEST statement about
 /// `[start, end)` the cached facts support. The three-state view lives at
-/// this answer layer (`AllWritten ⊃ AllMapped`); a hole or an unrecorded
+/// this answer layer (`AllWritten` implies `AllMapped`); a hole or an unrecorded
 /// block is `Unknown` — holes are never stored as facts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EsCoverage {
@@ -107,7 +115,7 @@ impl EsCache {
     /// wide scan over a heavily fragmented file ever trips it.
     const CAPACITY: usize = 512;
 
-    /// An empty cache. `const` so
+    /// Creates an empty cache. `const` so
     /// [`ExtentTree::empty`](super::tree::ExtentTree) stays `const`.
     pub(super) const fn new() -> Self {
         Self {
@@ -172,7 +180,7 @@ impl EsCache {
         EsInvalidated { _priv: () }
     }
 
-    /// The coverage verdict for `[start, end)`: one ordered scan, starting at
+    /// Returns the coverage verdict for `[start, end)`: one ordered scan, starting at
     /// the entry covering `start` (found via the predecessor when it
     /// straddles) and advancing a cursor across abutting facts; any coverage
     /// gap is `Unknown`. O(overlapping entries).
@@ -247,8 +255,8 @@ mod tests {
 
     use super::{super::node::ExtentKind, *};
 
-    /// A written fact, the tests' shorthand.
-    fn w(block: Iblock, len: u16, start: Ext4Bid) -> Extent {
+    /// Builds a written fact for the tests.
+    fn written(block: Iblock, len: u16, start: Ext4Bid) -> Extent {
         Extent::new(block, len, start, ExtentKind::Written)
     }
 
@@ -258,8 +266,8 @@ mod tests {
     #[ktest]
     fn straddler_across_span_start_is_invalidated_whole() {
         let es = EsCache::new();
-        es.record(&w(0, 8, 100));
-        es.record(&w(10, 4, 200));
+        es.record(&written(0, 8, 100));
+        es.record(&written(10, 4, 200));
         assert_eq!(es.range_state(0, 8), EsCoverage::AllWritten);
 
         // [4,6) begins inside [0,8): the straddler goes whole, not trimmed.
@@ -278,12 +286,12 @@ mod tests {
     #[ktest]
     fn record_on_full_cache_clears_then_seeds() {
         let es = EsCache::new();
-        for i in 0..EsCache::CAPACITY as u32 {
-            es.record(&w(i * 2, 1, 1000 + i as Ext4Bid));
+        for i in 0..u32::try_from(EsCache::CAPACITY).unwrap() {
+            es.record(&written(i * 2, 1, 1000 + i as Ext4Bid));
         }
         assert_eq!(es.range_state(0, 1), EsCoverage::AllWritten);
 
-        es.record(&w(5000, 1, 9000));
+        es.record(&written(5000, 1, 9000));
         assert_eq!(es.range_state(0, 1), EsCoverage::Unknown);
         assert_eq!(es.range_state(5000, 5001), EsCoverage::AllWritten);
     }
@@ -293,7 +301,7 @@ mod tests {
     #[ktest]
     fn record_removes_overlapping_facts_first() {
         let es = EsCache::new();
-        es.record(&w(0, 8, 100));
+        es.record(&written(0, 8, 100));
         es.record(&Extent::new(4, 8, 200, ExtentKind::Unwritten));
         assert_eq!(es.range_state(4, 12), EsCoverage::AllMapped);
         // The old [0,8) went whole; its head is no longer claimed.
@@ -306,9 +314,9 @@ mod tests {
     #[ktest]
     fn range_state_returns_strongest_true_tier() {
         let es = EsCache::new();
-        es.record(&w(0, 4, 100));
+        es.record(&written(0, 4, 100));
         es.record(&Extent::new(4, 4, 104, ExtentKind::Unwritten));
-        es.record(&w(10, 2, 300));
+        es.record(&written(10, 2, 300));
         assert_eq!(es.range_state(0, 4), EsCoverage::AllWritten);
         assert_eq!(es.range_state(0, 8), EsCoverage::AllMapped);
         // A straddler covers the query start; the unwritten member caps the
@@ -324,9 +332,9 @@ mod tests {
     #[ktest]
     fn tail_span_invalidation_clears_tail_and_spares_head() {
         let es = EsCache::new();
-        es.record(&w(0, 4, 100));
-        es.record(&w(100, 4, 200));
-        es.record(&w(200, 4, 300));
+        es.record(&written(0, 4, 100));
+        es.record(&written(100, 4, 200));
+        es.record(&written(200, 4, 300));
         es.invalidate_range(100..u64::MAX);
         assert_eq!(es.range_state(0, 4), EsCoverage::AllWritten);
         assert_eq!(es.range_state(100, 104), EsCoverage::Unknown);
@@ -337,8 +345,8 @@ mod tests {
     #[ktest]
     fn clear_all_drops_every_fact() {
         let es = EsCache::new();
-        es.record(&w(0, 4, 100));
-        es.record(&w(100, 4, 200));
+        es.record(&written(0, 4, 100));
+        es.record(&written(100, 4, 200));
         es.clear_all();
         assert_eq!(es.range_state(0, 4), EsCoverage::Unknown);
         assert_eq!(es.range_state(100, 104), EsCoverage::Unknown);
