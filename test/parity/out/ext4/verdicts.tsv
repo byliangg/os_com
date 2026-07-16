@@ -1,0 +1,795 @@
+generic/001	PASS	
+generic/002	PASS	
+generic/005	PASS	
+generic/003	FAIL	       - output mismatch (see /opt/xfstests/results//generic/003.out.bad)
+generic/004	NOTRUN	O_TMPFILE is not supported
+generic/006	PASS	
+generic/007	PASS	
+generic/008	PASS	
+generic/009	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/010	NOTRUN	/opt/xfstests/src/dbtest not built
+generic/011	PASS	
+generic/012	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/013	PASS	
+generic/014	PASS	
+generic/015	FAIL	       - output mismatch (see /opt/xfstests/results//generic/015.out.bad)
+generic/016	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/017	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/018	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/019	NOTRUN	/sys/kernel/debug/fail_make_request  not found. Seems that CONFIG_FAULT_INJECTION_DEBUG_FS kernel config option not enabled
+generic/020	NOTRUN	attr command not found
+generic/021	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/022	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/023	PASS	
+generic/024	NOTRUN	kernel doesn't support renameat2 syscall
+generic/025	NOTRUN	kernel doesn't support renameat2 syscall
+generic/026	NOTRUN	chacl command not found
+generic/027	PASS	
+generic/028	PASS	
+generic/029	FAIL	       - output mismatch (see /opt/xfstests/results//generic/029.out.bad)
+generic/030	PASS	
+generic/031	PASS	
+generic/032	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/033	PASS	
+generic/034	NOTRUN	dmsetup utility required, skipped this test
+generic/035	PASS	
+generic/036	NOTRUN	kernel does not support asynchronous I/O
+generic/037	NOTRUN	attr command not found
+generic/038	FAIL	       - output mismatch (see /opt/xfstests/results//generic/038.out.bad)
+generic/039	NOTRUN	dmsetup utility required, skipped this test
+generic/040	NOTRUN	dmsetup utility required, skipped this test
+generic/041	NOTRUN	dmsetup utility required, skipped this test
+generic/042	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/042.out.bad)
+generic/043	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/044	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/045	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/046	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/047	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/048	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/049	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/050	FAIL	       - output mismatch (see /opt/xfstests/results//generic/050.out.bad)
+generic/051	PASS	
+generic/052	PASS	
+generic/053	NOTRUN	chacl command not found
+generic/054	FAIL	       - output mismatch (see /opt/xfstests/results//generic/054.out.bad)
+generic/055	FAIL	       - output mismatch (see /opt/xfstests/results//generic/055.out.bad)
+generic/056	NOTRUN	dmsetup utility required, skipped this test
+generic/057	NOTRUN	dmsetup utility required, skipped this test
+generic/058	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/059	NOTRUN	dmsetup utility required, skipped this test
+generic/060	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/061	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/062	NOTRUN	attr command not found
+generic/063	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/064	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/065	NOTRUN	dmsetup utility required, skipped this test
+generic/066	NOTRUN	dmsetup utility required, skipped this test
+generic/067	NOTRUN	This test requires loopback device support
+generic/068	NOTRUN	ext4 does not support freezing
+generic/069	PASS	
+generic/070	NOTRUN	attr command not found
+generic/071	PASS	
+generic/072	PASS	
+generic/073	NOTRUN	dmsetup utility required, skipped this test
+generic/074	PASS	
+generic/075	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/075.out.bad)
+generic/076	FAIL	       - output mismatch (see /opt/xfstests/results//generic/076.out.bad)
+generic/077	NOTRUN	attr command not found
+generic/078	NOTRUN	kernel doesn't support renameat2 syscall
+generic/079	NOTRUN	file system doesn't support chattr +ia
+generic/080	FAIL	       [failed, exit status 2]- output mismatch (see /opt/xfstests/results//generic/080.out.bad)
+generic/081	NOTRUN	dmsetup utility required, skipped this test
+generic/082	NOTRUN	Quota user tools not installed
+generic/083	FAIL	       - output mismatch (see /opt/xfstests/results//generic/083.out.bad)
+generic/084	EXPUNGED	
+generic/085	NOTRUN	dmsetup utility required, skipped this test
+generic/086	FAIL	       - output mismatch (see /opt/xfstests/results//generic/086.out.bad)
+generic/087	FAIL	       - output mismatch (see /opt/xfstests/results//generic/087.out.bad)
+generic/088	FAIL	       - output mismatch (see /opt/xfstests/results//generic/088.out.bad)
+generic/089	PASS	
+generic/090	NOTRUN	dmsetup utility required, skipped this test
+generic/091	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/091.out.bad)
+generic/092	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/093	NOTRUN	attr command not found
+generic/094	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/095	NOTRUN	kernel does not support asynchronous I/O
+generic/096	PASS	
+generic/097	NOTRUN	attr command not found
+generic/098	PASS	
+generic/099	NOTRUN	chacl command not found
+generic/100	PASS	
+generic/101	NOTRUN	dmsetup utility required, skipped this test
+generic/102	PASS	
+generic/103	NOTRUN	attr command not found
+generic/104	NOTRUN	dmsetup utility required, skipped this test
+generic/105	NOTRUN	chacl command not found
+generic/106	NOTRUN	dmsetup utility required, skipped this test
+generic/107	NOTRUN	dmsetup utility required, skipped this test
+generic/108	NOTRUN	scsi_debug module not found
+generic/109	PASS	
+generic/110	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/111	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/112	NOTRUN	kernel does not support asynchronous I/O
+generic/113	NOTRUN	kernel does not support asynchronous I/O
+generic/114	NOTRUN	kernel does not support asynchronous I/O
+generic/115	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/116	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/117	NOTRUN	attr command not found
+generic/118	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/119	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/120	FAIL	       - output mismatch (see /opt/xfstests/results//generic/120.out.bad)
+generic/121	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/122	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/123	NOTRUN	fsgqa user not defined.
+generic/124	PASS	
+generic/125	NOTRUN	fsgqa user not defined.
+generic/126	PASS	
+generic/127	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/127.out.bad)
+generic/128	NOTRUN	fsgqa user not defined.
+generic/129	PASS	
+generic/130	PASS	
+generic/131	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/131.out.bad)
+generic/132	PASS	
+generic/133	PASS	
+generic/134	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/135	PASS	
+generic/136	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/137	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/138	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/139	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/140	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/141	PASS	
+generic/142	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/143	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/144	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/145	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/146	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/147	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/148	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/149	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/150	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/151	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/152	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/153	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/154	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/155	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/156	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/157	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/158	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/159	NOTRUN	file system doesn't support chattr +i
+generic/160	NOTRUN	file system doesn't support chattr +i
+generic/161	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/162	NOTRUN	Dedupe not supported by scratch filesystem type: ext4
+generic/163	NOTRUN	Dedupe not supported by scratch filesystem type: ext4
+generic/164	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/165	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/166	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/167	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/168	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/169	FAIL	       - output mismatch (see /opt/xfstests/results//generic/169.out.bad)
+generic/170	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/171	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/172	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/173	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/174	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/175	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/176	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/177	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/178	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/179	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/180	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/181	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/182	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/183	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/184	PASS	
+generic/185	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/186	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/187	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/188	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/189	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/190	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/191	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/192	PASS	
+generic/193	NOTRUN	fsgqa user not defined.
+generic/194	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/195	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/196	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/197	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/198	NOTRUN	kernel does not support asynchronous I/O
+generic/199	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/200	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/201	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/202	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/203	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/204	PASS	
+generic/205	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/206	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/207	NOTRUN	kernel does not support asynchronous I/O
+generic/208	NOTRUN	kernel does not support asynchronous I/O
+generic/209	NOTRUN	kernel does not support asynchronous I/O
+generic/210	NOTRUN	kernel does not support asynchronous I/O
+generic/211	NOTRUN	kernel does not support asynchronous I/O
+generic/212	NOTRUN	kernel does not support asynchronous I/O
+generic/213	PASS	
+generic/214	PASS	
+generic/215	FAIL	       - output mismatch (see /opt/xfstests/results//generic/215.out.bad)
+generic/216	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/217	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/218	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/219	NOTRUN	Quota user tools not installed
+generic/220	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/221	PASS	
+generic/222	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/223	FAIL	       - output mismatch (see /opt/xfstests/results//generic/223.out.bad)
+generic/224	PASS	
+generic/225	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/226	EXPUNGED	
+generic/227	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/228	FAIL	       - output mismatch (see /opt/xfstests/results//generic/228.out.bad)
+generic/229	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/230	NOTRUN	Quota user tools not installed
+generic/231	NOTRUN	Quota user tools not installed
+generic/232	NOTRUN	Quota user tools not installed
+generic/233	NOTRUN	Quota user tools not installed
+generic/234	NOTRUN	Quota user tools not installed
+generic/235	NOTRUN	Quota user tools not installed
+generic/236	PASS	
+generic/237	NOTRUN	chacl command not found
+generic/238	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/239	NOTRUN	kernel does not support asynchronous I/O
+generic/240	NOTRUN	kernel does not support asynchronous I/O
+generic/241	NOTRUN	dbench not found
+generic/242	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/243	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/244	NOTRUN	Quota user tools not installed
+generic/245	FAIL	       - output mismatch (see /opt/xfstests/results//generic/245.out.bad)
+generic/246	PASS	
+generic/247	PASS	
+generic/248	PASS	
+generic/249	PASS	
+generic/250	NOTRUN	dmsetup utility required, skipped this test
+generic/251	FAIL	       [32m[    62.788][0m [31mERROR [0m: [39m[0m[39mFailed to allocate a large slot[0m
+generic/254	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/255	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/256	NOTRUN	fsgqa user not defined.
+generic/257	PASS	
+generic/258	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/258.out.bad)
+generic/259	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/260	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/260.out.bad)
+generic/261	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/262	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/263	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/263.out.bad)
+generic/264	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/265	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/266	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/267	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/268	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/269	PASS	
+generic/270	NOTRUN	Quota user tools not installed
+generic/271	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/272	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/273	PASS	
+generic/274	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/274.out.bad)
+generic/275	PASS	
+generic/276	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/277	NOTRUN	file system doesn't support chattr +A
+generic/278	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/279	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/280	NOTRUN	Quota user tools not installed
+generic/281	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/282	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/283	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/284	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/285	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/286	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/287	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/288	FAIL	       - output mismatch (see /opt/xfstests/results//generic/288.out.bad)
+generic/289	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/290	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/291	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/292	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/293	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/294	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/294.out.bad)
+generic/295	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/296	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/297	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/298	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/299	NOTRUN	kernel does not support asynchronous I/O
+generic/300	NOTRUN	kernel does not support asynchronous I/O
+generic/301	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/302	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/303	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/304	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/305	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/306	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/306.out.bad)
+generic/307	NOTRUN	chacl command not found
+generic/308	PASS	
+generic/309	PASS	
+generic/310	FAIL	       - output mismatch (see /opt/xfstests/results//generic/310.out.bad)
+generic/311	NOTRUN	dmsetup utility required, skipped this test
+generic/312	PASS	
+generic/313	PASS	
+generic/314	NOTRUN	fsgqa user not defined.
+generic/315	PASS	
+generic/316	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/317	NOTRUN	fsgqa user not defined.
+generic/318	NOTRUN	chacl command not found
+generic/319	NOTRUN	chacl command not found
+generic/320	PASS	
+generic/321	NOTRUN	dmsetup utility required, skipped this test
+generic/322	NOTRUN	dmsetup utility required, skipped this test
+generic/323	NOTRUN	kernel does not support asynchronous I/O
+generic/324	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/325	NOTRUN	dmsetup utility required, skipped this test
+generic/326	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/327	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/328	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/329	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/330	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/331	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/332	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/333	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/334	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/335	NOTRUN	dmsetup utility required, skipped this test
+generic/336	NOTRUN	dmsetup utility required, skipped this test
+generic/337	NOTRUN	attr command not found
+generic/338	NOTRUN	dmsetup utility required, skipped this test
+generic/339	PASS	
+generic/340	PASS	
+generic/341	NOTRUN	dmsetup utility required, skipped this test
+generic/342	NOTRUN	dmsetup utility required, skipped this test
+generic/343	NOTRUN	dmsetup utility required, skipped this test
+generic/344	PASS	
+generic/345	PASS	
+generic/346	PASS	
+generic/347	NOTRUN	dmsetup utility required, skipped this test
+generic/348	NOTRUN	dmsetup utility required, skipped this test
+generic/349	NOTRUN	scsi_debug module not found
+generic/350	NOTRUN	scsi_debug module not found
+generic/351	NOTRUN	scsi_debug module not found
+generic/352	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/353	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/354	PASS	
+generic/355	NOTRUN	fsgqa user not defined.
+generic/356	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/356.out.bad)
+generic/357	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/357.out.bad)
+generic/358	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/359	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/360	PASS	
+generic/361	NOTRUN	This test requires loopback device support
+generic/362	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/363	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/364	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/365	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/366	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/367	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/368	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/369	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/370	NOTRUN	can't mkfs ext4 with option -O richacl
+generic/371	PASS	
+generic/372	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/373	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/374	NOTRUN	Dedupe not supported by scratch filesystem type: ext4
+generic/375	NOTRUN	chacl command not found
+generic/376	NOTRUN	dmsetup utility required, skipped this test
+generic/377	NOTRUN	attr command not found
+generic/378	NOTRUN	fsgqa user not defined.
+generic/379	NOTRUN	Quota user tools not installed
+generic/380	NOTRUN	Quota user tools not installed
+generic/381	NOTRUN	Quota user tools not installed
+generic/382	NOTRUN	Quota user tools not installed
+generic/383	NOTRUN	Quota user tools not installed
+generic/384	NOTRUN	Quota user tools not installed
+generic/385	NOTRUN	Quota user tools not installed
+generic/386	NOTRUN	Quota user tools not installed
+generic/387	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/388	PASS	
+generic/389	NOTRUN	O_TMPFILE is not supported
+generic/390	NOTRUN	ext4 does not support freezing
+generic/391	FAIL	       - output mismatch (see /opt/xfstests/results//generic/391.out.bad)
+generic/392	PASS	
+generic/393	PASS	
+generic/394	FAIL	       - output mismatch (see /opt/xfstests/results//generic/394.out.bad)
+generic/395	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/396	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/397	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/398	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/399	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/400	NOTRUN	Quota user tools not installed
+generic/401	PASS	
+generic/402	NOTRUN	Test requires writable /dev/kmsg.
+generic/403	NOTRUN	attr command not found
+generic/404	PASS	
+generic/405	NOTRUN	dmsetup utility required, skipped this test
+generic/406	PASS	
+generic/407	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/408	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/409	FAIL	       [32m[    13.120][0m [31mERROR [0m: [39mext4: [0m[39mjournal unmount flush failed: Error { errno: EUCLEAN, msg: Some("journal chain block has an unexpected tid") }[0m
+generic/410	FAIL	       [32m[    20.147][0m [31mERROR [0m: [39mext4: [0m[39mjournal unmount flush failed: Error { errno: EUCLEAN, msg: Some("journal chain block has an unexpected tid") }[0m
+generic/411	FAIL	       _check_generic_filesystem: filesystem on /dev/vdd is inconsistent
+generic/412	PASS	
+generic/413	NOTRUN	/dev/vdd ext4 does not support -o dax
+generic/414	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/415	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/416	PASS	
+generic/417	FAIL	       - output mismatch (see /opt/xfstests/results//generic/417.out.bad)
+generic/418	PASS	
+generic/419	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/420	FAIL	       - output mismatch (see /opt/xfstests/results//generic/420.out.bad)
+generic/421	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/422	PASS	
+generic/423	FAIL	       - output mismatch (see /opt/xfstests/results//generic/423.out.bad)
+generic/424	NOTRUN	file system doesn't support any of /nix/store/cx6fbilhj4nmq9dl8c8c73mimm08x60z-e2fsprogs-1.47.2-bin/bin/chattr +a/+c/+d/+i
+generic/425	NOTRUN	attr command not found
+generic/426	NOTRUN	ext4 does not support NFS export
+generic/427	NOTRUN	kernel does not support asynchronous I/O
+generic/428	PASS	
+generic/429	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/430	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/431	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/432	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/433	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/434	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/435	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/436	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/437	PASS	
+generic/438	PASS	
+generic/439	PASS	
+generic/440	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/441	NOTRUN	dmsetup utility required, skipped this test
+generic/442	NOTRUN	dmsetup utility required, skipped this test
+generic/443	PASS	
+generic/444	NOTRUN	chacl command not found
+generic/445	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/446	PASS	
+generic/447	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/448	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/449	NOTRUN	chacl command not found
+generic/450	NOTRUN	Only test on sector size < half of block size
+generic/451	NOTRUN	kernel does not support asynchronous I/O
+generic/452	FAIL	       - output mismatch (see /opt/xfstests/results//generic/452.out.bad)
+generic/453	PASS	
+generic/454	NOTRUN	attr command not found
+generic/455	NOTRUN	This test requires a valid $LOGWRITES_DEV
+generic/456	NOTRUN	dmsetup utility required, skipped this test
+generic/457	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/458	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/459	NOTRUN	dmsetup utility required, skipped this test
+generic/460	FAIL	       - output mismatch (see /opt/xfstests/results//generic/460.out.bad)
+generic/461	PASS	
+generic/462	NOTRUN	/dev/vdd ext4 does not support -o dax
+generic/463	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/464	EXPUNGED	
+generic/465	NOTRUN	kernel does not support asynchronous I/O
+generic/466	PASS	
+generic/467	NOTRUN	ext4 does not support NFS export
+generic/468	PASS	
+generic/469	PASS	
+generic/470	NOTRUN	This test requires a valid $LOGWRITES_DEV
+generic/471	FAIL	       - output mismatch (see /opt/xfstests/results//generic/471.out.bad)
+generic/472	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/472.out.bad)
+generic/473	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/474	FAIL	       - output mismatch (see /opt/xfstests/results//generic/474.out.bad)
+generic/475	NOTRUN	dmsetup utility required, skipped this test
+generic/476	FAIL	       - output mismatch (see /opt/xfstests/results//generic/476.out.bad)
+generic/477	NOTRUN	ext4 does not support NFS export
+generic/478	NOTRUN	Require OFD locks support
+generic/479	NOTRUN	dmsetup utility required, skipped this test
+generic/480	NOTRUN	dmsetup utility required, skipped this test
+generic/481	NOTRUN	dmsetup utility required, skipped this test
+generic/482	NOTRUN	This test requires a valid $LOGWRITES_DEV
+generic/483	NOTRUN	dmsetup utility required, skipped this test
+generic/484	NOTRUN	dmsetup utility required, skipped this test
+generic/485	PASS	
+generic/486	NOTRUN	attr command not found
+generic/487	NOTRUN	This test requires a valid $SCRATCH_LOGDEV
+generic/488	PASS	
+generic/489	NOTRUN	dmsetup utility required, skipped this test
+generic/490	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/491	NOTRUN	ext4 does not support freezing
+generic/492	NOTRUN	xfs_io label  failed (old kernel/wrong fs?)
+generic/493	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/493.out.bad)
+generic/494	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/494.out.bad)
+generic/495	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/495.out.bad)
+generic/496	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/496.out.bad)
+generic/497	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/497.out.bad)
+generic/498	NOTRUN	dmsetup utility required, skipped this test
+generic/499	PASS	
+generic/500	NOTRUN	dmsetup utility required, skipped this test
+generic/501	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/502	NOTRUN	dmsetup utility required, skipped this test
+generic/503	FAIL	       - output mismatch (see /opt/xfstests/results//generic/503.out.bad)
+generic/504	FAIL	       - output mismatch (see /opt/xfstests/results//generic/504.out.bad)
+generic/505	PASS	
+generic/506	NOTRUN	Quota user tools not installed
+generic/507	NOTRUN	file system doesn't support chattr +ASai
+generic/508	NOTRUN	lsattr not supported by test filesystem type: ext4
+generic/509	NOTRUN	O_TMPFILE is not supported
+generic/510	NOTRUN	dmsetup utility required, skipped this test
+generic/511	PASS	
+generic/512	NOTRUN	dmsetup utility required, skipped this test
+generic/513	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/514	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/515	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/516	NOTRUN	Dedupe not supported by test filesystem type: ext4
+generic/517	NOTRUN	Dedupe not supported by scratch filesystem type: ext4
+generic/518	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/519	NOTRUN	FIBMAP not supported by this filesystem
+generic/520	NOTRUN	dmsetup utility required, skipped this test
+generic/521	FAIL	       - output mismatch (see /opt/xfstests/results//generic/521.out.bad)
+generic/522	FAIL	       - output mismatch (see /opt/xfstests/results//generic/522.out.bad)
+generic/523	NOTRUN	attr command not found
+generic/524	EXPUNGED	
+generic/525	NOTRUN	filesystem does not support huge file size
+generic/526	NOTRUN	dmsetup utility required, skipped this test
+generic/527	NOTRUN	dmsetup utility required, skipped this test
+generic/528	FAIL	       - output mismatch (see /opt/xfstests/results//generic/528.out.bad)
+generic/529	NOTRUN	chacl command not found
+generic/530	FAIL	       - output mismatch (see /opt/xfstests/results//generic/530.out.bad)
+generic/531	NOTRUN	O_TMPFILE is not supported
+generic/532	PASS	
+generic/533	NOTRUN	attr command not found
+generic/534	NOTRUN	dmsetup utility required, skipped this test
+generic/535	NOTRUN	dmsetup utility required, skipped this test
+generic/536	PASS	
+generic/537	NOTRUN	FSTRIM not supported
+generic/538	NOTRUN	kernel does not support asynchronous I/O
+generic/539	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/540	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/541	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/542	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/543	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/544	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/545	NOTRUN	file system doesn't support chattr +i
+generic/546	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/547	NOTRUN	dmsetup utility required, skipped this test
+generic/548	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/549	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/550	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/551	NOTRUN	kernel does not support asynchronous I/O
+generic/552	NOTRUN	dmsetup utility required, skipped this test
+generic/553	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/554	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/555	NOTRUN	xfs_io chattr +ia failed (old kernel/wrong fs?)
+generic/556	NOTRUN	ext4 does not support casefold feature
+generic/557	NOTRUN	dmsetup utility required, skipped this test
+generic/558	EXPUNGED	
+generic/559	NOTRUN	duperemove utility required, skipped this test
+generic/560	NOTRUN	duperemove utility required, skipped this test
+generic/561	NOTRUN	duperemove utility required, skipped this test
+generic/562	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/563	NOTRUN	Cgroup2 doesn't support io controller io
+generic/564	NOTRUN	This test requires loopback device support
+generic/565	NOTRUN	xfs_io copy_range  support is missing (missing syscall?)
+generic/566	NOTRUN	Quota user tools not installed
+generic/567	FAIL	       - output mismatch (see /opt/xfstests/results//generic/567.out.bad)
+generic/568	PASS	
+generic/569	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/569.out.bad)
+generic/570	FAIL	       - output mismatch (see /opt/xfstests/results//generic/570.out.bad)
+generic/571	NOTRUN	Require fcntl setlease support
+generic/572	NOTRUN	fsverity utility required, skipped this test
+generic/573	NOTRUN	fsverity utility required, skipped this test
+generic/574	NOTRUN	fsverity utility required, skipped this test
+generic/575	NOTRUN	fsverity utility required, skipped this test
+generic/576	NOTRUN	fsverity utility required, skipped this test
+generic/577	NOTRUN	fsverity utility required, skipped this test
+generic/578	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/579	NOTRUN	fsverity utility required, skipped this test
+generic/580	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/581	NOTRUN	fsgqa user not defined.
+generic/582	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/583	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/584	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/585	NOTRUN	kernel doesn't support renameat2 syscall
+generic/586	NOTRUN	kernel does not support asynchronous I/O
+generic/587	NOTRUN	fsgqa user not defined.
+generic/588	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/589	FAIL	       [32m[     6.170][0m [31mERROR [0m: [39mext4: [0m[39mjournal unmount flush failed: Error { errno: EUCLEAN, msg: Some("journal chain block has an unexpected tid") }[0m
+generic/590	EXPUNGED	
+generic/591	FAIL	       - output mismatch (see /opt/xfstests/results//generic/591.out.bad)
+generic/592	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/593	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/594	NOTRUN	setquota doesn't support project quota (-P)
+generic/595	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/596	NOTRUN	accton utility required, skipped this test
+generic/597	NOTRUN	fs.protected_symlinks sysctl unavailable
+generic/598	NOTRUN	fs.protected_regular sysctl unavailable
+generic/599	FAIL	       - output mismatch (see /opt/xfstests/results//generic/599.out.bad)
+generic/600	NOTRUN	Quota user tools not installed
+generic/601	NOTRUN	Quota user tools not installed
+generic/602	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/603	NOTRUN	setquota doesn't support project quota (-P)
+generic/604	EXPUNGED	
+generic/605	NOTRUN	/dev/vdd ext4 does not support -o dax=always
+generic/606	NOTRUN	/dev/vdd ext4 does not support -o dax=always
+generic/607	NOTRUN	xfs_io chattr +x failed (old kernel/wrong fs?)
+generic/608	NOTRUN	/dev/vdd ext4 does not support -o dax=always
+generic/609	PASS	
+generic/610	PASS	
+generic/611	NOTRUN	attr command not found
+generic/612	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/613	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/614	NOTRUN	test requires delayed allocation buffered writes
+generic/615	PASS	
+generic/616	NOTRUN	kernel does not support IO_URING
+generic/617	NOTRUN	kernel does not support IO_URING
+generic/618	NOTRUN	attr command not found
+generic/619	PASS	
+generic/620	NOTRUN	dmsetup utility required, skipped this test
+generic/621	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/622	FAIL	       - output mismatch (see /opt/xfstests/results//generic/622.out.bad)
+generic/623	FAIL	       - output mismatch (see /opt/xfstests/results//generic/623.out.bad)
+generic/624	NOTRUN	fsverity utility required, skipped this test
+generic/625	NOTRUN	fsverity utility required, skipped this test
+generic/626	NOTRUN	kernel doesn't support renameat2 syscall
+generic/627	NOTRUN	kernel does not support asynchronous I/O
+generic/628	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/629	NOTRUN	dmsetup utility required, skipped this test
+generic/630	NOTRUN	Dedupe not supported by scratch filesystem type: ext4
+generic/631	NOTRUN	attr command not found
+generic/632	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/632.out.bad)
+generic/633	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/633.out.bad)
+generic/634	FAIL	       - output mismatch (see /opt/xfstests/results//generic/634.out.bad)
+generic/635	FAIL	       - output mismatch (see /opt/xfstests/results//generic/635.out.bad)
+generic/636	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/636.out.bad)
+generic/637	PASS	
+generic/638	PASS	
+generic/639	PASS	
+generic/640	NOTRUN	dmsetup utility required, skipped this test
+generic/641	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/641.out.bad)
+generic/642	FAIL	       - output mismatch (see /opt/xfstests/results//generic/642.out.bad)
+generic/643	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/643.out.bad)
+generic/644	NOTRUN	kernel does not support mount_setattr syscall
+generic/645	NOTRUN	kernel does not support mount_setattr syscall
+generic/646	PASS	
+generic/654	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/655	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/656	NOTRUN	kernel does not support mount_setattr syscall
+generic/657	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/658	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/659	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/660	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/661	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/662	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/663	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/664	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/665	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/666	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/667	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/668	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/669	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/670	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/671	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/672	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/673	NOTRUN	fsgqa user not defined.
+generic/674	NOTRUN	fsgqa user not defined.
+generic/675	NOTRUN	fsgqa user not defined.
+generic/676	PASS	
+generic/677	NOTRUN	dmsetup utility required, skipped this test
+generic/678	NOTRUN	kernel does not support IO_URING
+generic/679	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/680	NOTRUN	fsgqa user not defined.
+generic/681	NOTRUN	Quota user tools not installed
+generic/682	NOTRUN	Quota user tools not installed
+generic/683	NOTRUN	fsgqa user not defined.
+generic/684	NOTRUN	fsgqa user not defined.
+generic/685	NOTRUN	fsgqa user not defined.
+generic/686	NOTRUN	fsgqa user not defined.
+generic/687	NOTRUN	fsgqa user not defined.
+generic/688	NOTRUN	fsgqa user not defined.
+generic/689	NOTRUN	kernel does not support mount_setattr syscall
+generic/690	NOTRUN	dmsetup utility required, skipped this test
+generic/691	NOTRUN	Quota user tools not installed
+generic/692	NOTRUN	fsverity utility required, skipped this test
+generic/693	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+generic/694	PASS	
+generic/695	NOTRUN	dmsetup utility required, skipped this test
+generic/696	PASS	
+generic/697	NOTRUN	chacl command not found
+generic/698	NOTRUN	kernel does not support mount_setattr syscall
+generic/699	NOTRUN	kernel does not support mount_setattr syscall
+generic/700	NOTRUN	attr command not found
+generic/701	PASS	
+generic/702	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/703	NOTRUN	kernel does not support IO_URING
+ext4/001	FAIL	       - output mismatch (see /opt/xfstests/results//ext4/001.out.bad)
+generic/704	NOTRUN	scsi_debug module not found
+generic/705	FAIL	       - output mismatch (see /opt/xfstests/results//generic/705.out.bad)
+generic/706	NOTRUN	File system does not support llseek(2) SEEK_DATA/HOLE
+generic/707	PASS	
+generic/708	PASS	
+generic/709	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/710	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/711	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/712	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/713	NOTRUN	xfs_io swapext -v vfs -s 64k -l 64k not supported on ext4
+generic/714	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/715	NOTRUN	xfs_io swapext -v vfs -s 64k -l 64k not supported on ext4
+generic/716	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/717	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/718	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/719	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/720	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/721	NOTRUN	xfs_io startupdate  not supported on ext4
+generic/722	NOTRUN	xfs_io swapext -v vfs -a not supported on ext4
+generic/723	NOTRUN	xfs_io swapext -v vfs not supported on ext4
+generic/724	NOTRUN	xfs_io swapext -v vfs -a not supported on ext4
+generic/725	NOTRUN	xfs_io swapext -v vfs -a not supported on ext4
+generic/726	NOTRUN	fsgqa user not defined.
+generic/727	NOTRUN	fsgqa user not defined.
+ext4/002	NOTRUN	This test requires a valid $SCRATCH_LOGDEV
+ext4/003	NOTRUN	Kernel doesn't support the ext4 feature(s): bigalloc
+ext4/004	NOTRUN	dump utility required, skipped this test
+ext4/005	NOTRUN	Clearing extent flag not supported, old chattr and/or kernel?
+ext4/006	NOTRUN	Couldn't find e2fuzz
+ext4/007	NOTRUN	metadata_csum not supported by this filesystem
+ext4/008	NOTRUN	metadata_csum not supported by this filesystem
+ext4/009	NOTRUN	metadata_csum not supported by this filesystem
+ext4/010	NOTRUN	metadata_csum not supported by this filesystem
+ext4/011	NOTRUN	metadata_csum not supported by this filesystem
+ext4/012	NOTRUN	metadata_csum not supported by this filesystem
+ext4/013	NOTRUN	metadata_csum not supported by this filesystem
+ext4/014	NOTRUN	metadata_csum not supported by this filesystem
+ext4/015	NOTRUN	metadata_csum not supported by this filesystem
+ext4/016	NOTRUN	metadata_csum not supported by this filesystem
+ext4/017	NOTRUN	metadata_csum not supported by this filesystem
+ext4/018	NOTRUN	metadata_csum not supported by this filesystem
+ext4/019	NOTRUN	metadata_csum not supported by this filesystem
+ext4/020	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/021	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/021.out.bad)
+ext4/022	NOTRUN	attr command not found
+ext4/023	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/023.out.bad)
+ext4/024	NOTRUN	kernel is unaware of ext4 encryption feature, or mkfs options are not compatible with encryption
+ext4/025	NOTRUN	Kernel doesn't support the ext4 feature(s): bigalloc,meta_bg,^resize_inode
+ext4/026	NOTRUN	attr command not found
+ext4/027	NOTRUN	xfs_io fsmap support is missing
+ext4/028	NOTRUN	xfs_io fsmap support is missing
+ext4/029	NOTRUN	This test requires a valid $SCRATCH_LOGDEV
+ext4/030	NOTRUN	/dev/vdd ext4 does not support -o dax
+ext4/031	NOTRUN	/dev/vdd ext4 does not support -o dax
+ext4/032	NOTRUN	This test requires loopback device support
+ext4/033	NOTRUN	dmsetup utility required, skipped this test
+ext4/034	NOTRUN	Quota user tools not installed
+ext4/035	NOTRUN	Can't make file system with a block size of 1024
+ext4/036	PASS	
+ext4/037	PASS	
+ext4/038	PASS	
+ext4/039	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/039.out.bad)
+ext4/040	PASS	
+ext4/041	PASS	
+ext4/042	PASS	
+ext4/043	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/043.out.bad)
+ext4/044	PASS	
+ext4/045	FAIL	       - output mismatch (see /opt/xfstests/results//ext4/045.out.bad)
+ext4/046	NOTRUN	Test requires writable /dev/kmsg.
+ext4/047	NOTRUN	/dev/vdd ext4 does not support -o dax=always
+ext4/048	NOTRUN	filename wipe not supported
+ext4/049	FAIL	       - output mismatch (see /opt/xfstests/results//ext4/049.out.bad)
+ext4/050	NOTRUN	journal checkpoint ioctl not present on device
+ext4/051	PASS	
+ext4/052	NOTRUN	This test requires loopback device support
+ext4/053	NOTRUN	Quota user tools not installed
+ext4/054	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/054.out.bad)
+ext4/055	NOTRUN	fsgqa user not defined.
+ext4/056	PASS	
+ext4/057	NOTRUN	UUID ioctls are not supported by kernel.
+ext4/058	PASS	
+ext4/059	PASS	
+ext4/271	FAIL	       - output mismatch (see /opt/xfstests/results//ext4/271.out.bad)
+ext4/301	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/302	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/303	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/304	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/305	PASS	
+ext4/306	FAIL	       [failed, exit status 1]- output mismatch (see /opt/xfstests/results//ext4/306.out.bad)
+ext4/307	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+ext4/308	NOTRUN	xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/252	NOTRUN	dmsetup utility required, skipped this test
+generic/253	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/650	NOTRUN	CPU hotplugging not supported
+generic/651	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/652	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/653	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/648	NOTRUN	Reflink not supported by scratch filesystem type: ext4
+generic/649	NOTRUN	Reflink not supported by test filesystem type: ext4
+generic/647	HANG	no verdict after solo boot (vm hang or crash)
