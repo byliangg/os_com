@@ -32,6 +32,7 @@ use crate::vm::page_cache::{
     CachePage, CachePageExt, LockedCachePage, read_run_complete_fn, write_run_complete_fn,
 };
 
+mod es;
 mod node;
 mod path;
 mod tree;
@@ -430,10 +431,17 @@ impl ExtentManager {
         let mut holes: Vec<PlannedHole> = Vec::new();
         let mut cursor = start_iblock as u64;
         let mut last_phys_end: Option<Ext4Bid> = None;
+        // R1 (es-cache population): every extent this planning walk visits is
+        // a fact just proven under the ③ write lock — record it in passing,
+        // at zero extra descent. The inserts below invalidate only the HOLES
+        // they fill (disjoint from the visited extents), and a neighbour
+        // merge preserves per-block truth, so these facts survive the fill.
+        let es_cache = &tree.es_cache;
         tree.walk_range(
             &fs,
             start_iblock as u64..end_iblock as u64,
             &mut |e: &node::Extent| {
+                es_cache.record(e);
                 let e_start = e.block() as u64;
                 if e_start > cursor {
                     holes.push(PlannedHole {

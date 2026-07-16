@@ -12,6 +12,8 @@
 
 use core::ops::ControlFlow;
 
+#[cfg(any(ktest, debug_assertions))]
+use super::es::EsCoverage;
 use super::{
     super::{
         super::{
@@ -22,6 +24,7 @@ use super::{
         },
         RAW_BLOCK_PTRS_LEN,
     },
+    es::{EsCache, EsInvalidated},
     node::{
         ENTRY_SIZE, EXTENT_MAGIC, Extent, ExtentHeader, ExtentIdx, ExtentKind, MAX_DEPTH,
         MAX_UNWRITTEN_LEN, MAX_WRITTEN_LEN, NODE_CAPACITY, RawExtent, RawExtentHeader,
@@ -268,6 +271,15 @@ pub(in crate::fs::fs_impls::ext4::inode) struct ExtentTree {
     /// Interior mutability so `&self` walks may fill it; refreshed by
     /// `write_back` and cleared by any node free, all under the ③ lock.
     node_cache: NodeCache,
+    /// The extent-status cache (see [`EsCache`]): the tree's per-block-truth
+    /// fact set, the `NodeCache`'s logical-layer sibling. Interior mutability
+    /// (an inner leaf `SpinLock` of the same discipline) so `&self` walks may
+    /// record facts in passing; every LOGICAL mutator invalidates its span on
+    /// entry — the leaf-entry editors demand the [`EsInvalidated`] credential
+    /// only invalidation mints — and `reserialize` clears it whole beside the
+    /// node cache. `pub(super)` so the `fill_holes` planning walk (R1, in the
+    /// manager) can record its visited extents.
+    pub(super) es_cache: EsCache,
     /// The overwrite fast-path hint (see [`WrittenHint`] for its load-bearing
     /// invariant). Set only by [`record_written_hint`](Self::record_written_hint)
     /// from the no-conversion arm of the convert paths; cleared on entry to
@@ -303,6 +315,7 @@ impl ExtentTree {
             sector_count,
             dirty: false,
             node_cache: NodeCache::new(),
+            es_cache: EsCache::new(),
             written_hint: None,
         })
     }
@@ -321,6 +334,7 @@ impl ExtentTree {
             sector_count: 0,
             dirty: false,
             node_cache: NodeCache::new(),
+            es_cache: EsCache::new(),
             written_hint: None,
         }
     }
@@ -638,6 +652,12 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         self.invalidate_written_hint();
+        // es: the new mapping's own span. A neighbour merge changes extent
+        // boundaries but no block's mapping or kind, so per-block truth owes
+        // it no wider span (see the `es` module docs).
+        let es = self
+            .es_cache
+            .invalidate_range(iblock as u64..iblock as u64 + len as u64);
         // Surgery route (T2 fast path + T3 room-making): edit exactly the
         // landing leaf, splitting full nodes or growing the tree a level when
         // the path has no room. Every `make_room_for` strictly adds capacity
@@ -647,7 +667,7 @@ impl ExtentTree {
         if self.header().depth() > 0 {
             for _ in 0..(MAX_DEPTH as usize + 2) {
                 if let InPlaceInsert::Inserted =
-                    self.try_insert_in_place(fs, iblock, pblock, len, kind, handle, csum_seed)?
+                    self.try_insert_in_place(fs, iblock, pblock, len, kind, handle, csum_seed, &es)?
                 {
                     // Data blocks only: the leaf was edited in place; any
                     // metadata the room-making allocated was accounted there.
@@ -704,6 +724,7 @@ impl ExtentTree {
         kind: ExtentKind,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        es: &EsInvalidated,
     ) -> Result<InPlaceInsert> {
         self.invalidate_written_hint();
         let e = Extent::new(iblock, len, pblock, kind);
@@ -729,10 +750,10 @@ impl ExtentTree {
                 let next = leaf.extent_at(insert_pos);
                 if can_merge(&merged, &next) {
                     merged = merged_pair(&merged, &next);
-                    leaf.remove_extent_at(insert_pos);
+                    leaf.remove_extent_at(insert_pos, es);
                 }
             }
-            leaf.replace_extent_at(insert_pos - 1, &merged);
+            leaf.replace_extent_at(insert_pos - 1, &merged, es);
             leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
             return Ok(InPlaceInsert::Inserted);
         }
@@ -742,15 +763,15 @@ impl ExtentTree {
         // write, so a `false` return leaves the tree untouched.
         {
             let leaf = &mut path.levels[leaf_level].node;
-            if leaf.insert_extent_at(insert_pos, &e).is_err() {
+            if leaf.insert_extent_at(insert_pos, &e, es).is_err() {
                 return Ok(InPlaceInsert::LeafFull);
             }
             // The new run may bridge flush against its successor.
             if insert_pos + 1 < leaf.entries() {
                 let next = leaf.extent_at(insert_pos + 1);
                 if can_merge(&e, &next) {
-                    leaf.replace_extent_at(insert_pos, &merged_pair(&e, &next));
-                    leaf.remove_extent_at(insert_pos + 1);
+                    leaf.replace_extent_at(insert_pos, &merged_pair(&e, &next), es);
+                    leaf.remove_extent_at(insert_pos + 1, es);
                 }
             }
         }
@@ -1138,6 +1159,12 @@ impl ExtentTree {
         self.invalidate_written_hint();
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
+        // es: same entry discipline — a mid-range error then leaves the cache
+        // only too empty, never too true. The scan below re-records what it
+        // proves (R2) and each landed flip backfills its written fact (R3).
+        let es = self
+            .es_cache
+            .invalidate_range(range_start as u64..range_end);
 
         // Depth-0 (inline root as a leaf, the common small-file shape): there
         // is no external node to edit — rewrite the root in memory, riding the
@@ -1175,11 +1202,20 @@ impl ExtentTree {
         'scan: while cursor < range_end {
             // The first UNWRITTEN extent overlapping the remaining range.
             let mut hit: Option<Extent> = None;
+            let es_cache = &self.es_cache;
             self.walk_range(fs, cursor..range_end, &mut |e| {
                 if e.is_unwritten() {
                     hit = Some(*e);
                     return ControlFlow::Break(());
                 }
+                // R2 (es population): a WRITTEN extent this scan just visited
+                // is a proven fact — record it in passing, at zero extra
+                // descent (the multi-range generalization of the single
+                // `anchor` below). Safe even when a later round edits: this
+                // op only flips or splits UNWRITTEN entries (and merges,
+                // which preserve per-block truth), so a recorded written fact
+                // cannot be falsified within this call.
+                es_cache.record(e);
                 if e.covers(range_start) {
                     anchor = Some(*e);
                 }
@@ -1230,9 +1266,18 @@ impl ExtentTree {
                     // every write chunk would leave one extent behind forever —
                     // the old whole-tree rebuild merged globally).
                     let written = Extent::new(e_start, e.len(), e.start(), ExtentKind::Written);
-                    leaf.replace_extent_at(pos, &written);
-                    merge_leaf_neighbors(leaf, pos);
+                    leaf.replace_extent_at(pos, &written, &es);
+                    merge_leaf_neighbors(leaf, pos, &es);
                     leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
+                    // R3 (es population): the flip just landed — record the
+                    // written fact it produced so the NEXT overwrite of these
+                    // blocks hits without a walk. Recorded AFTER `write_back`
+                    // returned (its node-cache store has unlocked; the two
+                    // leaf locks are never held together), and the fact is the
+                    // flip's own bounds, not the possibly merged leaf entry:
+                    // narrower-than-the-tree is fine under per-block truth,
+                    // and skipping the leaf re-read keeps population free.
+                    self.es_cache.record(&written);
                     cursor = e_end;
                     continue 'scan;
                 }
@@ -1261,8 +1306,8 @@ impl ExtentTree {
                         e.start() + head_len as Ext4Bid,
                         ExtentKind::Unwritten,
                     );
-                    leaf.replace_extent_at(pos, &head);
-                    leaf.insert_extent_at(pos + 1, &remainder)
+                    leaf.replace_extent_at(pos, &head, &es);
+                    leaf.insert_extent_at(pos + 1, &remainder, &es)
                         .expect("a free slot was checked above");
                     leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     continue 'scan;
@@ -1282,11 +1327,13 @@ impl ExtentTree {
                     e.start() + mid_len as Ext4Bid,
                     ExtentKind::Unwritten,
                 );
-                leaf.replace_extent_at(pos, &mid);
-                leaf.insert_extent_at(pos + 1, &tail)
+                leaf.replace_extent_at(pos, &mid, &es);
+                leaf.insert_extent_at(pos + 1, &tail, &es)
                     .expect("a free slot was checked above");
-                merge_leaf_neighbors(leaf, pos);
+                merge_leaf_neighbors(leaf, pos, &es);
                 leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
+                // R3: the flipped middle's own bounds (see the full-cover arm).
+                self.es_cache.record(&mid);
                 cursor = ov_end as u64;
                 continue 'scan;
             }
@@ -1329,6 +1376,10 @@ impl ExtentTree {
         // only through `convert_unwritten`, which already cleared — belt and
         // braces against any future direct caller.)
         self.invalidate_written_hint();
+        // es: the same belt-and-braces re-invalidation for the same reason.
+        let es = self
+            .es_cache
+            .invalidate_range(range_start as u64..range_end);
         let n = self.header().entries() as usize;
         let mut out: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 2);
         let mut edited = false;
@@ -1341,8 +1392,15 @@ impl ExtentTree {
             let e_end = e_start as u64 + e.len() as u64;
             let overlaps = e_end > range_start as u64 && (e_start as u64) < range_end;
             if !e.is_unwritten() || !overlaps {
-                if !e.is_unwritten() && e.covers(range_start) {
-                    anchor = Some(e);
+                if !e.is_unwritten() {
+                    // R2 (es population): a written entry this scan visits is
+                    // a proven fact — safe to record even when another entry
+                    // flips below, since this op never falsifies a WRITTEN
+                    // fact (see `convert_unwritten`'s walk).
+                    self.es_cache.record(&e);
+                    if e.covers(range_start) {
+                        anchor = Some(e);
+                    }
                 }
                 out.push(e);
                 continue;
@@ -1406,7 +1464,7 @@ impl ExtentTree {
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
         } else {
-            self.write_inline_leaf_root(&out);
+            self.write_inline_leaf_root(&out, &es);
         }
         self.dirty = true;
         Ok(())
@@ -1441,6 +1499,12 @@ impl ExtentTree {
         self.invalidate_written_hint();
         let range_start = iblock;
         let range_end = iblock as u64 + len as u64;
+        // es: written facts in this range are about to be falsified — drop
+        // them on entry. No population here: the W→U direction records
+        // nothing (a visited written extent may be flipped moments later).
+        let es = self
+            .es_cache
+            .invalidate_range(range_start as u64..range_end);
 
         // Depth-0 (inline root as a leaf): rewrite the root in memory, delegated
         // like the punch/convert because edge splits can overflow the inline
@@ -1521,13 +1585,13 @@ impl ExtentTree {
                             e.start() + MAX_UNWRITTEN_LEN as Ext4Bid,
                             ExtentKind::Unwritten,
                         );
-                        leaf.replace_extent_at(pos, &head);
-                        leaf.insert_extent_at(pos + 1, &tail)
+                        leaf.replace_extent_at(pos, &head, &es);
+                        leaf.insert_extent_at(pos + 1, &tail, &es)
                             .expect("a free slot was checked above");
                         // Coalesce the head leftward only; `can_merge` caps
                         // unwritten runs at `MAX_UNWRITTEN_LEN`, so the head and
                         // its own tail never re-merge into the wrapping length.
-                        merge_leaf_neighbors(leaf, pos);
+                        merge_leaf_neighbors(leaf, pos, &es);
                         leaf.write_back(
                             device.as_ref(),
                             handle,
@@ -1540,8 +1604,8 @@ impl ExtentTree {
                     // Coalesce with in-leaf neighbours (a freshly zeroed run
                     // continues the previous unwritten one).
                     let unwritten = Extent::new(e_start, e.len(), e.start(), ExtentKind::Unwritten);
-                    leaf.replace_extent_at(pos, &unwritten);
-                    merge_leaf_neighbors(leaf, pos);
+                    leaf.replace_extent_at(pos, &unwritten, &es);
+                    merge_leaf_neighbors(leaf, pos, &es);
                     leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     cursor = e_end;
                     continue 'scan;
@@ -1567,8 +1631,8 @@ impl ExtentTree {
                         e.start() + head_len as Ext4Bid,
                         ExtentKind::Written,
                     );
-                    leaf.replace_extent_at(pos, &head);
-                    leaf.insert_extent_at(pos + 1, &remainder)
+                    leaf.replace_extent_at(pos, &head, &es);
+                    leaf.insert_extent_at(pos + 1, &remainder, &es)
                         .expect("a free slot was checked above");
                     leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                     continue 'scan;
@@ -1585,10 +1649,10 @@ impl ExtentTree {
                     e.start() + mid_len as Ext4Bid,
                     ExtentKind::Written,
                 );
-                leaf.replace_extent_at(pos, &mid);
-                leaf.insert_extent_at(pos + 1, &tail)
+                leaf.replace_extent_at(pos, &mid, &es);
+                leaf.insert_extent_at(pos + 1, &tail, &es)
                     .expect("a free slot was checked above");
-                merge_leaf_neighbors(leaf, pos);
+                merge_leaf_neighbors(leaf, pos, &es);
                 leaf.write_back(device.as_ref(), handle, csum_seed, Some(&self.node_cache))?;
                 cursor = ov_end as u64;
                 continue 'scan;
@@ -1618,6 +1682,10 @@ impl ExtentTree {
         // Flips written inline extents to unwritten (reached only through
         // `mark_range_unwritten`, which already cleared — defensive re-clear).
         self.invalidate_written_hint();
+        // es: the same belt-and-braces re-invalidation; no population (W→U).
+        let es = self
+            .es_cache
+            .invalidate_range(range_start as u64..range_end);
         let n = self.header().entries() as usize;
         let mut out: Vec<Extent> = Vec::with_capacity(INLINE_MAX + 2);
         let mut edited = false;
@@ -1676,7 +1744,7 @@ impl ExtentTree {
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
         } else {
-            self.write_inline_leaf_root(&out);
+            self.write_inline_leaf_root(&out, &es);
         }
         self.dirty = true;
         Ok(())
@@ -1719,6 +1787,9 @@ impl ExtentTree {
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
         self.invalidate_written_hint();
+        // es: the left shift falsifies every fact at/past `punch_start` — one
+        // whole-tail drop (the apply's `reserialize` clears the rest anyway).
+        self.es_cache.invalidate_range(punch_start as u64..u64::MAX);
         let plan = self.plan_collapse_range(fs, punch_start, punch_stop)?;
         self.apply_collapse_range(fs, plan, handle, csum_seed, data_policy)
     }
@@ -1805,6 +1876,11 @@ impl ExtentTree {
         data_policy: journal::DataForgetPolicy,
     ) -> Result<()> {
         self.invalidate_written_hint();
+        // es: the plan carries no `punch_start`, and this apply is a
+        // whole-tree rebuild whose `reserialize` clears the cache anyway —
+        // clear it all at entry (a superset of the shift's `[punch_start,
+        // MAX)` span; over-invalidation is the safe direction).
+        self.es_cache.clear_all();
         let CollapsePlan {
             survivors,
             freed,
@@ -1856,6 +1932,8 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         self.invalidate_written_hint();
+        // es: the right shift falsifies every fact at/past `offset`.
+        self.es_cache.invalidate_range(offset as u64..u64::MAX);
         let plan = self.plan_insert_range(fs, offset, len)?;
         self.apply_insert_range(fs, plan, handle, csum_seed)
     }
@@ -1932,6 +2010,9 @@ impl ExtentTree {
         csum_seed: Option<InodeCsumSeed>,
     ) -> Result<()> {
         self.invalidate_written_hint();
+        // es: clear whole at entry, like `apply_collapse_range` (the plan
+        // carries no `offset`; the rebuild's `reserialize` clears anyway).
+        self.es_cache.clear_all();
         let InsertPlan {
             shifted,
             old_external,
@@ -2007,6 +2088,11 @@ impl ExtentTree {
         // Lossless: callers bound `new_size` by `ensure_size_within_limit` /
         // `max_file_size` (≤ `u32::MAX` logical blocks — see `fs.rs`).
         let keep_blocks = new_size.div_ceil(BLOCK_SIZE) as Iblock;
+        // es: everything at/past the keep boundary is (about to be) unmapped;
+        // one conservative whole-tail drop also covers a chunked stop's
+        // partial progress. This mint serves `truncate_to_byte_len` too (its
+        // only work happens here).
+        let es = self.es_cache.invalidate_range(keep_blocks as u64..u64::MAX);
         let depth = self.header().depth();
         let free_cost = fs.extent_free_credits();
         // The follow-up credits ONE probed data free may consume, sized to the
@@ -2064,7 +2150,7 @@ impl ExtentTree {
                 }
                 return Err(err);
             }
-            self.write_inline_leaf_root(&kept);
+            self.write_inline_leaf_root(&kept, &es);
             let removed = freed_data as i64 * SECTORS_PER_BLOCK as i64;
             debug_assert!(self.sector_count as i64 >= removed);
             self.sector_count = (self.sector_count as i64 - removed).max(0) as u64;
@@ -2173,7 +2259,9 @@ impl ExtentTree {
                         fs.free_blocks(auth, handle)?;
                         freed_data += tail_len as u64;
                         let head = Extent::new(last.block(), head_len, last.start(), last.kind());
-                        path.levels[leaf_level].node.replace_extent_at(n - 1, &head);
+                        path.levels[leaf_level]
+                            .node
+                            .replace_extent_at(n - 1, &head, &es);
                         leaf_edited = true;
                         reached = reached.max(keep_blocks);
                         break Break::Done;
@@ -2182,7 +2270,7 @@ impl ExtentTree {
                     let auth = data_policy.authorize(last.start(), last.len() as u32);
                     fs.free_blocks(auth, handle)?;
                     freed_data += last.len() as u64;
-                    path.levels[leaf_level].node.remove_extent_at(n - 1);
+                    path.levels[leaf_level].node.remove_extent_at(n - 1, &es);
                     leaf_edited = true;
                 };
 
@@ -2202,7 +2290,8 @@ impl ExtentTree {
                         // Prune the emptied leaf and every ancestor it empties,
                         // writing each shrunk parent back BEFORE the next
                         // re-walk reads it. A truncate to zero resets the root.
-                        freed_meta += self.prune_emptied_leaf(fs, &mut path, handle, csum_seed)?;
+                        freed_meta +=
+                            self.prune_emptied_leaf(fs, &mut path, handle, csum_seed, &es)?;
                         if self.header().is_leaf() {
                             break 'chunk Ok(0);
                         }
@@ -2250,6 +2339,7 @@ impl ExtentTree {
         path: &mut ExtentPath,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        es: &EsInvalidated,
     ) -> Result<u64> {
         self.invalidate_written_hint();
         let device = fs.block_device();
@@ -2268,7 +2358,7 @@ impl ExtentTree {
                 let root_entries = self.header().entries() as usize;
                 if root_entries <= 1 {
                     // Last child gone: the tree is now empty.
-                    self.write_inline_leaf_root(&[]);
+                    self.write_inline_leaf_root(&[], es);
                 } else {
                     self.remove_root_index_at(path.root_pos);
                 }
@@ -2371,6 +2461,11 @@ impl ExtentTree {
                 next_bound: fs.extent_free_credits(),
             });
         }
+        // es: the punched range's mappings are about to go; facts outside the
+        // span stay (an edge split preserves the neighbouring blocks' truth).
+        let es = self
+            .es_cache
+            .invalidate_range(start_block as u64..end_block as u64);
 
         let depth = self.header().depth();
         let free_cost = fs.extent_free_credits();
@@ -2504,8 +2599,8 @@ impl ExtentTree {
                         // Same-leaf fast path: shrink to the head and
                         // shift-insert the tail beside it — one write.
                         let leaf = &mut path.levels[leaf_level].node;
-                        leaf.replace_extent_at(pos, &head);
-                        leaf.insert_extent_at(pos + 1, &tail)
+                        leaf.replace_extent_at(pos, &head, &es);
+                        leaf.insert_extent_at(pos + 1, &tail, &es)
                             .expect("probed leaf had room for the split tail");
                         leaf.write_back(
                             device.as_ref(),
@@ -2518,7 +2613,9 @@ impl ExtentTree {
                         // is then a hole and re-enters through the ordinary
                         // insert (the split machinery). All in ONE transaction;
                         // the abort guard covers a re-insert failure.
-                        path.levels[leaf_level].node.replace_extent_at(pos, &head);
+                        path.levels[leaf_level]
+                            .node
+                            .replace_extent_at(pos, &head, &es);
                         path.levels[leaf_level].node.write_back(
                             device.as_ref(),
                             handle,
@@ -2557,7 +2654,9 @@ impl ExtentTree {
                     // Straddles the start: keep the head (first key unchanged).
                     let head_len = (start_block - e_start) as u16;
                     let head = Extent::new(e_start, head_len, e.start(), e.kind());
-                    path.levels[leaf_level].node.replace_extent_at(pos, &head);
+                    path.levels[leaf_level]
+                        .node
+                        .replace_extent_at(pos, &head, &es);
                     path.levels[leaf_level].node.write_back(
                         device.as_ref(),
                         handle,
@@ -2574,7 +2673,9 @@ impl ExtentTree {
                     let tail_len = (e_end - end_block as u64) as u16;
                     let tail_phys = e.start() + (end_block - e_start) as Ext4Bid;
                     let tail = Extent::new(end_block, tail_len, tail_phys, e.kind());
-                    path.levels[leaf_level].node.replace_extent_at(pos, &tail);
+                    path.levels[leaf_level]
+                        .node
+                        .replace_extent_at(pos, &tail, &es);
                     path.levels[leaf_level].node.write_back(
                         device.as_ref(),
                         handle,
@@ -2591,9 +2692,10 @@ impl ExtentTree {
                     // else write the leaf and (on a risen first key) correct
                     // the ancestors AFTER the leaf write (lower-bound-safe
                     // order, as above).
-                    path.levels[leaf_level].node.remove_extent_at(pos);
+                    path.levels[leaf_level].node.remove_extent_at(pos, &es);
                     if path.levels[leaf_level].node.entries() == 0 {
-                        freed_meta += self.prune_emptied_leaf(fs, &mut path, handle, csum_seed)?;
+                        freed_meta +=
+                            self.prune_emptied_leaf(fs, &mut path, handle, csum_seed, &es)?;
                     } else {
                         let rose = pos == 0;
                         let new_key = path.levels[leaf_level].node.first_key();
@@ -2648,6 +2750,11 @@ impl ExtentTree {
         data_policy: journal::DataForgetPolicy,
     ) -> Result<super::PunchChunk> {
         self.invalidate_written_hint();
+        // es: belt-and-braces re-invalidation (reached only through
+        // `punch_chunk`, which already dropped this span).
+        let es = self
+            .es_cache
+            .invalidate_range(start_block as u64..end_block as u64);
         let free_cost = fs.extent_free_credits();
         let n = self.header().entries() as usize;
 
@@ -2703,7 +2810,7 @@ impl ExtentTree {
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
         } else {
-            self.write_inline_leaf_root(&survivors);
+            self.write_inline_leaf_root(&survivors, &es);
         }
         self.dirty = true;
 
@@ -2826,10 +2933,13 @@ impl ExtentTree {
         // cache-refreshing `write_back` funnel) and frees the rest. Drop every
         // cached node up front so no reused block is later read as its stale
         // pre-rebuild self; the reads after this repopulate from the new bytes.
+        // The es-cache clears whole at the same choke point: the rebuild
+        // rewrites the entire logical layout, so no fact may outlive it.
         self.node_cache.clear();
+        let es = self.es_cache.clear_all();
 
         if extents.len() <= INLINE_MAX {
-            self.write_inline_leaf_root(extents);
+            self.write_inline_leaf_root(extents, &es);
             // The root no longer references any external block; free them all.
             let mut meta_freed = 0;
             for &bid in old_external {
@@ -2855,7 +2965,7 @@ impl ExtentTree {
             // blocks (the in-memory root is not yet updated, so the old tree
             // stays referenced).
             for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
-                if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
+                if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed, &es) {
                     rollback_meta_blocks(fs, &newly_allocated, handle, &self.node_cache);
                     return Err(err);
                 }
@@ -2902,7 +3012,7 @@ impl ExtentTree {
         // Write leaves, then interiors. On any failure, roll back the freshly
         // allocated blocks (the in-memory root is not yet updated).
         for (chunk, &leaf_bid) in extents.chunks(LEAF_MAX).zip(leaf_bids.iter()) {
-            if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed) {
+            if let Err(err) = write_leaf_node(device, leaf_bid, chunk, handle, csum_seed, &es) {
                 rollback_meta_blocks(fs, &newly_allocated, handle, &self.node_cache);
                 return Err(err);
             }
@@ -2946,8 +3056,9 @@ impl ExtentTree {
     }
 
     /// Rewrites the root as a depth-0 inline leaf (header + up to
-    /// [`INLINE_MAX`] extents).
-    fn write_inline_leaf_root(&mut self, extents: &[Extent]) {
+    /// [`INLINE_MAX`] extents). A whole-root leaf-entry rewrite, so it demands
+    /// the es-cache credential like the per-entry editors (see `path.rs`).
+    fn write_inline_leaf_root(&mut self, extents: &[Extent], _es: &EsInvalidated) {
         self.invalidate_written_hint();
         let bytes = self.root.as_mut_bytes();
         bytes.fill(0);
@@ -3034,6 +3145,47 @@ impl ExtentTree {
             )?;
         }
         Ok(shape)
+    }
+
+    /// The debug double-read net behind a non-`Unknown` es-cache verdict (the
+    /// Q2/Q3 side of the three-layer consistency contract, `es` module docs):
+    /// re-walks `[start, end)` read-only and panics when `claim` overstates
+    /// the tree — `AllWritten` demands gap-free coverage with zero unwritten
+    /// blocks, `AllMapped` demands gap-free coverage, `Unknown` claims
+    /// nothing. The es lock is NOT held here (the verdict was copied out);
+    /// a walk error propagates (a transient funnel failure proves nothing
+    /// about staleness — same posture as `read_node_cached`'s net). The query
+    /// points wired in T1b run this behind every hit in debug builds; until
+    /// then a ktest exercises it directly.
+    #[cfg(debug_assertions)]
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn debug_assert_es_coverage(
+        &self,
+        fs: &Ext4,
+        start: Iblock,
+        end: Iblock,
+        claim: EsCoverage,
+    ) -> Result<()> {
+        if claim == EsCoverage::Unknown {
+            return Ok(());
+        }
+        let mut covered_upto = start as u64;
+        let mut saw_unwritten = false;
+        self.walk_range(fs, start as u64..end as u64, &mut |e| {
+            if e.block() as u64 > covered_upto {
+                // A gap: the walk is ordered, so nothing later covers it.
+                return ControlFlow::Break(());
+            }
+            saw_unwritten |= e.is_unwritten();
+            covered_upto = covered_upto.max(e.block() as u64 + e.len() as u64);
+            ControlFlow::Continue(())
+        })?;
+        let fully_mapped = covered_upto >= end as u64;
+        assert!(
+            fully_mapped && (claim == EsCoverage::AllMapped || !saw_unwritten),
+            "stale es-cache: claimed {claim:?} over [{start}, {end}) but the tree disagrees"
+        );
+        Ok(())
     }
 
     /// Decodes leaf entry `i` of the trusted inline root.
@@ -3482,13 +3634,17 @@ pub(super) fn stamp_extent_tail(block: &mut [u8], seed: InodeCsumSeed) {
         .copy_from_slice(&csum.to_le_bytes());
 }
 
-/// Serializes `extents` into a full-block external leaf node at `bid`.
+/// Serializes `extents` into a full-block external leaf node at `bid` — the
+/// rebuild's leaf writer, so it demands the es-cache credential like the
+/// per-entry editors (see `path.rs`). Its interior sibling below does not:
+/// index entries are structure, not logical facts.
 fn write_leaf_node(
     device: &dyn BlockDevice,
     bid: Ext4Bid,
     extents: &[Extent],
     handle: Option<&journal::Handle>,
     csum_seed: Option<InodeCsumSeed>,
+    _es: &EsInvalidated,
 ) -> Result<()> {
     let mut block = [0u8; BLOCK_SIZE];
     let header = RawExtentHeader {
@@ -3604,21 +3760,21 @@ fn merged_pair(left: &Extent, right: &Extent) -> Extent {
 /// first (so `pos` stays valid), then the left. Only touches this one leaf;
 /// runs split across a leaf boundary stay separate (a benign fragment the old
 /// whole-tree rebuild would have merged — acceptable, and rare).
-fn merge_leaf_neighbors(leaf: &mut NodeBuf, pos: usize) {
+fn merge_leaf_neighbors(leaf: &mut NodeBuf, pos: usize, es: &EsInvalidated) {
     if pos + 1 < leaf.entries() {
         let cur = leaf.extent_at(pos);
         let next = leaf.extent_at(pos + 1);
         if can_merge(&cur, &next) {
-            leaf.replace_extent_at(pos, &merged_pair(&cur, &next));
-            leaf.remove_extent_at(pos + 1);
+            leaf.replace_extent_at(pos, &merged_pair(&cur, &next), es);
+            leaf.remove_extent_at(pos + 1, es);
         }
     }
     if pos > 0 {
         let prev = leaf.extent_at(pos - 1);
         let cur = leaf.extent_at(pos);
         if can_merge(&prev, &cur) {
-            leaf.replace_extent_at(pos - 1, &merged_pair(&prev, &cur));
-            leaf.remove_extent_at(pos);
+            leaf.replace_extent_at(pos - 1, &merged_pair(&prev, &cur), es);
+            leaf.remove_extent_at(pos, es);
         }
     }
 }
@@ -3646,6 +3802,13 @@ mod tests {
 
     use super::*;
     use crate::fs::fs_impls::ext4::test_utils::Ext4FixtureBuilder;
+
+    /// Mints an es-cache invalidation credential for tests that drive the
+    /// leaf editors directly (no tree in play, hence no real cache to
+    /// invalidate — a scratch cache's `clear_all` is the honest stand-in).
+    fn es_token() -> EsInvalidated {
+        EsCache::new().clear_all()
+    }
 
     /// Builds a validated tree over a depth-0 root (header + extents).
     fn inline_tree(extents: &[RawExtent]) -> ExtentTree {
@@ -5632,6 +5795,7 @@ mod tests {
     /// length caps live in `can_merge`, pinned separately).
     #[ktest]
     fn merge_leaf_neighbors_coalesces_both_sides_and_respects_kind() {
+        let es = es_token();
         let mut leaf = NodeBuf::fresh(999, 0);
         for (i, e) in [
             Extent::new(0, 2, 100, ExtentKind::Written),
@@ -5641,20 +5805,20 @@ mod tests {
         .iter()
         .enumerate()
         {
-            leaf.insert_extent_at(i, e).unwrap();
+            leaf.insert_extent_at(i, e, &es).unwrap();
         }
-        merge_leaf_neighbors(&mut leaf, 1);
+        merge_leaf_neighbors(&mut leaf, 1, &es);
         assert_eq!(leaf.entries(), 1);
         let m = leaf.extent_at(0);
         assert_eq!((m.block(), m.len(), m.start()), (0, 6, 100));
         assert!(!m.is_unwritten());
 
         // A kind mismatch on either side refuses to merge.
-        leaf.insert_extent_at(1, &Extent::new(6, 2, 106, ExtentKind::Unwritten))
+        leaf.insert_extent_at(1, &Extent::new(6, 2, 106, ExtentKind::Unwritten), &es)
             .unwrap();
-        leaf.insert_extent_at(2, &Extent::new(8, 2, 108, ExtentKind::Written))
+        leaf.insert_extent_at(2, &Extent::new(8, 2, 108, ExtentKind::Written), &es)
             .unwrap();
-        merge_leaf_neighbors(&mut leaf, 1);
+        merge_leaf_neighbors(&mut leaf, 1, &es);
         assert_eq!(
             leaf.entries(),
             3,
@@ -5711,10 +5875,11 @@ mod tests {
         let (data0, data1) = (alloc(1), alloc(1));
         let (leaf_bid, mid_bid, top_bid) = (alloc(1), alloc(1), alloc(1));
 
+        let es = es_token();
         let mut leaf = NodeBuf::fresh(leaf_bid, 0);
-        leaf.insert_extent_at(0, &Extent::new(0, 1, data0, ExtentKind::Unwritten))
+        leaf.insert_extent_at(0, &Extent::new(0, 1, data0, ExtentKind::Unwritten), &es)
             .unwrap();
-        leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written))
+        leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written), &es)
             .unwrap();
         leaf.write_back(device.as_ref(), None, None, None).unwrap();
         let mut mid = NodeBuf::fresh(mid_bid, 1);
@@ -5785,10 +5950,11 @@ mod tests {
 
         // Two extents (logical 0 and 2), well under INLINE_MAX, hung off a full
         // three-level spine — the shape the dense count is blind to.
+        let es = es_token();
         let mut leaf = NodeBuf::fresh(leaf_bid, 0);
-        leaf.insert_extent_at(0, &Extent::new(0, 1, data0, ExtentKind::Written))
+        leaf.insert_extent_at(0, &Extent::new(0, 1, data0, ExtentKind::Written), &es)
             .unwrap();
-        leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written))
+        leaf.insert_extent_at(1, &Extent::new(2, 1, data1, ExtentKind::Written), &es)
             .unwrap();
         leaf.write_back(device.as_ref(), None, None, None).unwrap();
         let mut mid = NodeBuf::fresh(mid_bid, 1);
@@ -6506,5 +6672,215 @@ mod tests {
             assert!(tree.written_hint.is_none());
             tree.convert_unwritten(fs, 3, 1, None, None).unwrap();
         });
+    }
+
+    // ---- P10-T1a: es-cache invalidation, population, and debug net ----
+
+    /// Builds a depth-1 tree of unmergeable written runs `[b, b+4) @ 1000+b`
+    /// for `b` in 0,10,20,30,40 — five inserts overflow the inline root into
+    /// one external leaf, so later mutations are in-place surgery (a depth-0
+    /// insert would rebuild through `reserialize` and clear the es-cache).
+    fn depth1_written_tree(f: &crate::fs::fs_impls::ext4::test_utils::Ext4Fixture) -> ExtentTree {
+        let mut tree = ExtentTree::empty();
+        for b in [0u32, 10, 20, 30, 40] {
+            tree.insert(
+                &f.ext4,
+                b,
+                1000 + b as Ext4Bid,
+                4,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(tree.depth(), 1);
+        tree
+    }
+
+    /// An in-leaf merge preserves per-block truth, so a recorded fact about
+    /// the merge's left side SURVIVES an adjacent insert (which invalidates
+    /// only its own span) and still agrees with the tree block for block —
+    /// the es-cache's core increment over the whole-clearing written hint.
+    #[ktest]
+    fn es_facts_survive_in_leaf_merge_with_per_block_truth() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = depth1_written_tree(&f);
+
+        // Prime: a no-op convert over [20,24) records the visited fact (R2).
+        tree.convert_unwritten(&f.ext4, 20, 4, None, None).unwrap();
+        assert_eq!(tree.es_cache.range_state(20, 24), EsCoverage::AllWritten);
+
+        // Insert the logically AND physically adjacent [24,25) @ 1024: the
+        // leaf merges it onto [20,24) in place, widening the entry to [20,25).
+        tree.insert(&f.ext4, 24, 1024, 1, ExtentKind::Written, None, None)
+            .unwrap();
+        let merged = tree.lookup(&f.ext4, 20).unwrap().unwrap();
+        assert_eq!(
+            (merged.block(), merged.len(), merged.start()),
+            (20, 5, 1020)
+        );
+
+        // The recorded fact survived the insert and is still true per block.
+        assert_eq!(tree.es_cache.range_state(20, 24), EsCoverage::AllWritten);
+        for b in 20u32..24 {
+            let m = tree.lookup(&f.ext4, b).unwrap().unwrap();
+            assert!(!m.is_unwritten());
+            assert_eq!(m.start() + (b - m.block()) as u64, 1000 + b as u64);
+        }
+        // The freshly inserted block was invalidated, not re-recorded (no R4):
+        // `Unknown`, never a manufactured claim.
+        assert_eq!(tree.es_cache.range_state(24, 25), EsCoverage::Unknown);
+    }
+
+    /// Every logical mutator drops the facts its span falsifies on entry, so
+    /// no over-strong answer survives the change (the invalidation sweep —
+    /// the es counterpart of `written_hint_invalidated_by_mutators`).
+    #[ktest]
+    fn es_invalidated_by_mutators() {
+        // Prime a written [0,8) fact via a no-op convert (R2), run `mutate`,
+        // then require the probed span to answer `Unknown` — the strongest
+        // claim the cache may make about blocks whose mapping or kind just
+        // changed is nothing at all.
+        fn assert_probe_unknown(
+            probe: (Iblock, Iblock),
+            mutate: impl FnOnce(&Ext4, &mut ExtentTree),
+        ) {
+            let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+                .with_block_bitmap_metadata_marked()
+                .build()
+                .unwrap();
+            let mut tree = ExtentTree::empty();
+            let run = f.ext4.alloc_blocks(8, 0, None).unwrap();
+            tree.insert(&f.ext4, 0, run.start, 8, ExtentKind::Written, None, None)
+                .unwrap();
+            tree.convert_unwritten(&f.ext4, 0, 8, None, None).unwrap();
+            assert_eq!(
+                tree.es_cache.range_state(0, 8),
+                EsCoverage::AllWritten,
+                "es primed"
+            );
+            mutate(&f.ext4, &mut tree);
+            assert_eq!(
+                tree.es_cache.range_state(probe.0, probe.1),
+                EsCoverage::Unknown,
+                "a mutator left an over-strong answer over its span"
+            );
+        }
+
+        // insert: the fresh mapping's own span claims nothing (R4 unbuilt).
+        assert_probe_unknown((100, 101), |fs, tree| {
+            let r = fs.alloc_blocks(1, 0, None).unwrap();
+            tree.insert(fs, 100, r.start, 1, ExtentKind::Written, None, None)
+                .unwrap();
+        });
+        // mark_range_unwritten: the W→U flip falsifies the written fact.
+        assert_probe_unknown((2, 6), |fs, tree| {
+            tree.mark_range_unwritten(fs, 2, 4, None, None).unwrap();
+        });
+        // punch: the range is now a hole; any claim would be false.
+        assert_probe_unknown((2, 4), |fs, tree| {
+            tree.punch_chunk(
+                fs,
+                2..4,
+                None,
+                None,
+                journal::DataForgetPolicy::PlainData,
+                None,
+            )
+            .unwrap();
+        });
+        // truncate: the dropped tail (`[keep, MAX)` span).
+        assert_probe_unknown((4, 8), |fs, tree| {
+            tree.truncate_to_byte_len(
+                fs,
+                4 * BLOCK_SIZE,
+                None,
+                None,
+                journal::DataForgetPolicy::PlainData,
+            )
+            .unwrap();
+        });
+        // collapse (shift left): the whole tail from the punch start.
+        assert_probe_unknown((2, 8), |fs, tree| {
+            tree.collapse_range(fs, 2, 4, None, None, journal::DataForgetPolicy::PlainData)
+                .unwrap();
+        });
+        // insert_range (shift right): the whole tail from the offset.
+        assert_probe_unknown((2, 8), |fs, tree| {
+            tree.insert_range(fs, 2, 2, None, None).unwrap();
+        });
+        // A real convert re-flips [3,4): the pre-flip fact is gone and the
+        // inline (depth-0) edited arm records nothing over the flipped span
+        // (R3 lives on the external path only) — `Unknown`, never stale.
+        assert_probe_unknown((3, 4), |fs, tree| {
+            tree.mark_range_unwritten(fs, 3, 1, None, None).unwrap();
+            tree.convert_unwritten(fs, 3, 1, None, None).unwrap();
+        });
+    }
+
+    /// R3: a landed unwritten→written flip backfills exactly the written fact
+    /// it produced — the full-cover arm records the whole run, the mid arm
+    /// records only the flipped middle (the surviving unwritten tail stays
+    /// unclaimed), and a staged head split records nothing until its
+    /// remainder actually flips.
+    #[ktest]
+    fn es_r3_backfills_converted_range() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // External (depth-1) tree: the inline convert path has no R3 by design.
+        let mut tree = depth1_written_tree(&f);
+
+        // Full-cover flip.
+        tree.insert(&f.ext4, 50, 2000, 8, ExtentKind::Unwritten, None, None)
+            .unwrap();
+        tree.convert_unwritten(&f.ext4, 50, 8, None, None).unwrap();
+        assert_eq!(tree.es_cache.range_state(50, 58), EsCoverage::AllWritten);
+        assert!(!tree.lookup(&f.ext4, 50).unwrap().unwrap().is_unwritten());
+
+        // Mid flip (no head, unwritten tail survives).
+        tree.insert(&f.ext4, 70, 3000, 8, ExtentKind::Unwritten, None, None)
+            .unwrap();
+        tree.convert_unwritten(&f.ext4, 70, 4, None, None).unwrap();
+        assert_eq!(tree.es_cache.range_state(70, 74), EsCoverage::AllWritten);
+        assert_eq!(tree.es_cache.range_state(74, 78), EsCoverage::Unknown);
+        assert_eq!(tree.es_cache.range_state(70, 78), EsCoverage::Unknown);
+        assert!(tree.lookup(&f.ext4, 74).unwrap().unwrap().is_unwritten());
+
+        // Head-split round, then the remainder's full-cover flip: only the
+        // genuinely converted [76,78) is claimed written.
+        tree.convert_unwritten(&f.ext4, 76, 2, None, None).unwrap();
+        assert_eq!(tree.es_cache.range_state(76, 78), EsCoverage::AllWritten);
+        assert_eq!(tree.es_cache.range_state(74, 76), EsCoverage::Unknown);
+        assert_matches_linear(&f, &tree, 100);
+    }
+
+    /// The debug double-read net accepts verdicts the tree supports (and
+    /// `Unknown` vacuously) — the Q2/Q3-side assertion T1b's query points run
+    /// behind every hit.
+    #[ktest]
+    fn es_debug_net_accepts_true_verdicts() {
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        let mut tree = ExtentTree::empty();
+        tree.insert(&f.ext4, 0, 100, 4, ExtentKind::Written, None, None)
+            .unwrap();
+        tree.insert(&f.ext4, 4, 200, 4, ExtentKind::Unwritten, None, None)
+            .unwrap();
+
+        tree.debug_assert_es_coverage(&f.ext4, 0, 4, EsCoverage::AllWritten)
+            .unwrap();
+        tree.debug_assert_es_coverage(&f.ext4, 0, 8, EsCoverage::AllMapped)
+            .unwrap();
+        // `Unknown` claims nothing — legal even over a plain hole.
+        tree.debug_assert_es_coverage(&f.ext4, 100, 200, EsCoverage::Unknown)
+            .unwrap();
     }
 }

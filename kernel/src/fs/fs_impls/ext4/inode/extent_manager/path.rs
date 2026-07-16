@@ -12,6 +12,7 @@
 
 use super::{
     super::super::{checksum::InodeCsumSeed, fs::Ext4, journal, prelude::*},
+    es::EsInvalidated,
     node::{ENTRY_SIZE, Extent, ExtentHeader, ExtentIdx, RawExtent, RawExtentHeader, RawExtentIdx},
 };
 
@@ -217,9 +218,21 @@ impl NodeBuf {
     // Every editor maintains the header/entries-consistent node invariant;
     // an edited node must reach disk through [`write_back`](Self::write_back)'s
     // capture funnel — the edit itself only touches in-memory bytes.
+    //
+    // The LEAF-entry editors additionally demand the es-cache invalidation
+    // credential ([`EsInvalidated`]): rewriting a leaf entry is what changes
+    // which per-block facts are true, so the mutator must have made its
+    // invalidation decision before the edit — "changed the tree but forgot
+    // the cache" then fails to compile. The index editors below take no
+    // credential: index entries are structure, not logical facts (moving or
+    // re-keying them changes no block's mapping or kind), which is the
+    // es-cache's layering — it caches the logical view, unlike the byte-level
+    // `NodeCache`. The bulk movers (`adopt_entries`, `move_upper_into`) are
+    // exempt for the same reason: they relocate entries verbatim between
+    // nodes, changing no fact.
 
     /// Overwrites leaf entry `i` in place (a merge bump or an unwritten flip).
-    pub(super) fn replace_extent_at(&mut self, i: usize, e: &Extent) {
+    pub(super) fn replace_extent_at(&mut self, i: usize, e: &Extent, _es: &EsInvalidated) {
         debug_assert!(self.is_leaf() && i < self.entries());
         let off = ENTRY_SIZE * (1 + i);
         self.bytes[off..off + ENTRY_SIZE].copy_from_slice(RawExtent::from(e).as_bytes());
@@ -228,7 +241,12 @@ impl NodeBuf {
     /// Inserts leaf entry `e` at position `i`, shifting later entries right.
     /// Fails with `ENOSPC` when the node is full — the caller then takes the
     /// split path (`make_room_for`) and retries.
-    pub(super) fn insert_extent_at(&mut self, i: usize, e: &Extent) -> Result<()> {
+    pub(super) fn insert_extent_at(
+        &mut self,
+        i: usize,
+        e: &Extent,
+        _es: &EsInvalidated,
+    ) -> Result<()> {
         debug_assert!(self.is_leaf() && i <= self.entries());
         let n = self.entries();
         if self.is_full() {
@@ -244,7 +262,7 @@ impl NodeBuf {
 
     /// Removes leaf entry `i`, shifting later entries left (a right-neighbor
     /// absorb after a merge).
-    pub(super) fn remove_extent_at(&mut self, i: usize) {
+    pub(super) fn remove_extent_at(&mut self, i: usize, _es: &EsInvalidated) {
         debug_assert!(self.is_leaf() && i < self.entries());
         let n = self.entries();
         let start = ENTRY_SIZE * (1 + i);
