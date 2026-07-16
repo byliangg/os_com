@@ -176,8 +176,6 @@ impl EsCache {
     /// the entry covering `start` (found via the predecessor when it
     /// straddles) and advancing a cursor across abutting facts; any coverage
     /// gap is `Unknown`. O(overlapping entries).
-    // Queried only by the ktests until T1b wires the Q1–Q3 consumers.
-    #[cfg_attr(not(ktest), expect(dead_code))]
     pub(super) fn range_state(&self, start: Iblock, end: Iblock) -> EsCoverage {
         debug_assert!(start < end);
         if start >= end {

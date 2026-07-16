@@ -7,8 +7,10 @@
 //!
 //! A path is a cursor private to one [`ExtentTree`](super::tree::ExtentTree)
 //! operation: it is created and consumed under the tree's position-③ lock and
-//! never cached across calls (cross-call caching is the extent-status-cache
-//! work, deliberately out of scope for the surgery).
+//! never cached across calls. Cross-call caching lives in the extent-status
+//! cache ([`es`](super::es), P10-T1) — a WRITE-path cache by explicit
+//! decision: the read paths (`map_blocks` / `submit_read_pages` / `lookup`)
+//! run without the inode's ① lock and are deliberately not wired to it.
 
 use super::{
     super::super::{checksum::InodeCsumSeed, fs::Ext4, journal, prelude::*},

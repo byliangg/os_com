@@ -37,6 +37,7 @@ mod node;
 mod path;
 mod tree;
 
+use self::es::EsCoverage;
 pub(super) use self::tree::ExtentTree;
 
 /// State of a mapped logical block — the three-way view tests assert against
@@ -228,37 +229,40 @@ impl ExtentManager {
         self.state.read().sector_count()
     }
 
-    /// Whether the extent tree's overwrite fast-path hint currently covers
-    /// `[start, end)` — every block in that range is known mapped by a single
-    /// written extent, so [`InodeInner::write_at`](super::super::InodeInner) may
-    /// skip both the hole-fill probe and the unwritten→written convert (P9b
-    /// knife 2). A one-shot ③ read.
+    /// Whether the extent-status cache currently proves every block of
+    /// `[start, end)` mapped by WRITTEN extents (Q1, the overwrite fast
+    /// path's gate): [`InodeInner::write_at`](super::super::InodeInner) may
+    /// then skip both the hole-fill probe and the unwritten→written convert
+    /// (P10-T1, generalizing P9b knife 2's single-extent hint into the
+    /// multi-range cache). One ③ read around one es probe.
     ///
     /// The caller MUST hold the owning inode's `inner` write lock (①) so the
     /// answer stays valid through the ensuing page-cache write: every tree
-    /// mutation for this inode takes ① before touching the ③ tree and clears the
-    /// hint, so the hint cannot flip between this read and the write —
-    /// EXCEPT [`allocate_one`](Self::allocate_one), the `submit_write_bio` hole
-    /// fallback, which writeback/commit threads reach with no ① held. That lone
-    /// unlocked-① mutator cannot break this fast path today, for three
-    /// independent reasons: its `insert` only fills a Gap, and a live hint's
-    /// range is covered by one written extent (no Gap inside it to insert);
-    /// `insert`'s entry invalidation can only CLEAR the hint, never forge
-    /// coverage; and on a journaled volume the path fails `EIO` before touching
-    /// the tree. **A future mmap-hole-writeback implementation (ledger:
+    /// mutation for this inode takes ① before touching the ③ tree and drops
+    /// its span from the es-cache there, so the verdict cannot be overtaken
+    /// between this read and the write — EXCEPT
+    /// [`allocate_one`](Self::allocate_one), the `submit_write_bio` hole
+    /// fallback, which writeback/commit threads reach with no ① held. That
+    /// lone unlocked-① mutator cannot break this fast path today, for three
+    /// independent reasons: its `insert` only fills a Gap, and every block an
+    /// `AllWritten` verdict covers is mapped (no Gap in there to insert); its
+    /// entry invalidation can only REMOVE facts, never forge coverage; and on
+    /// a journaled volume the path fails `EIO` before touching the tree. **A
+    /// future mmap-hole-writeback implementation (ledger:
     /// `mmap-hole-writeback`) must re-justify or remove this carve-out before
     /// letting that path allocate.** Distinct inodes never share an
     /// `ExtentManager`.
-    pub(super) fn written_hint_covers(&self, start: Iblock, end: Iblock) -> bool {
-        self.state.read().written_hint_covers(start, end)
+    pub(super) fn range_known_written(&self, start: Iblock, end: Iblock) -> bool {
+        self.state.read().es_cache.range_state(start, end) == EsCoverage::AllWritten
     }
 
     /// Debug-only cross-check for the overwrite fast path: walks `[start, end)`
     /// read-only and returns whether every block is mapped by a WRITTEN extent
     /// (no hole, no unwritten). `write_at` asserts this whenever it took the
-    /// `written_hint` shortcut, so a hint that outlived a mutation that should
-    /// have cleared it turns a silent Unwritten-first violation into a loud
-    /// ktest failure (ktest is a debug build) rather than latent corruption.
+    /// es-cache (Q1) shortcut, so a stale fact that outlived a mutation that
+    /// should have dropped it turns a silent Unwritten-first violation into a
+    /// loud ktest failure (ktest is a debug build) rather than latent
+    /// corruption.
     #[cfg(debug_assertions)]
     pub(super) fn debug_range_all_written(&self, start: Iblock, end: Iblock) -> Result<bool> {
         let fs = self.fs()?;
@@ -400,6 +404,22 @@ impl ExtentManager {
         }
         let fs = self.fs()?;
         let mut tree = self.state.write();
+
+        // Q3 (es-cache): a range already proven fully mapped — written or
+        // unwritten, `AllMapped` is enough (written-ness is the convert's
+        // business, not the fill's) — has no holes, so the fill is a no-op:
+        // skip the planning walk, record no runs into `new_mappings` (nothing
+        // will be newly allocated, so a rollback is owed nothing), seed no
+        // goal (nothing to allocate).
+        let coverage = tree.es_cache.range_state(start_iblock, end_iblock);
+        if coverage != EsCoverage::Unknown {
+            // The debug double-read net (`es` module docs, layer 3): re-walk
+            // behind the hit — the es lock is already released — and panic on
+            // any over-claim. Every ktest is a debug build.
+            #[cfg(debug_assertions)]
+            tree.debug_assert_es_coverage(&fs, start_iblock, end_iblock, coverage)?;
+            return Ok(HoleFill::Filled);
+        }
 
         // Plan hole runs from a snapshot of the current tree — a BOUNDED one
         // (P9a-T6): instead of flattening the whole tree into a Vec on every
