@@ -3094,6 +3094,35 @@ enum ChunkWrite {
     Stalled { need: usize },
 }
 
+/// This inode's most recent journaled descriptor capture: which transaction it
+/// landed in and the captured after-image basis — the **post-orphan-override,
+/// pre-checksum** 256-byte image (`Ext4::capture_inode_desc` explains why that
+/// exact stage closes the orphan add/del/splice cases without invalidation
+/// hooks). [`covers`](Self::covers) is the skip predicate of the writeback
+/// dedup: a same-transaction, byte-identical writeback is a no-op the funnel
+/// may skip whole.
+pub(super) struct InodeCaptureRecord {
+    tid: Tid,
+    basis: Box<RawInode>,
+}
+
+impl InodeCaptureRecord {
+    /// Records a full capture: the transaction it joined and the image basis
+    /// [`Ext4::capture_inode_desc`] handed back.
+    #[cfg_attr(not(ktest), expect(dead_code))]
+    pub(super) fn new(tid: Tid, basis: Box<RawInode>) -> Self {
+        Self { tid, basis }
+    }
+
+    /// The skip predicate: same transaction and a byte-identical candidate
+    /// image. Only meaningful under `s_orphan_lock` — the candidate's orphan
+    /// override and the transaction's in-slot `i_dtime` are in sync only
+    /// there (`Ext4::capture_inode_desc`'s locking contract).
+    pub(super) fn covers(&self, tid: Tid, candidate: &RawInode) -> bool {
+        self.tid == tid && self.basis.as_bytes() == candidate.as_bytes()
+    }
+}
+
 struct InodeInner {
     desc: Dirty<InodeDesc>,
     payload: InodePayload,

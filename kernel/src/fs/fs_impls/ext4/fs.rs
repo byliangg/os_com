@@ -1967,10 +1967,15 @@ impl Ext4 {
         Ok(self.inode_slot(ino)?.device_offset())
     }
 
-    /// Read-modify-writes the on-disk `RawInode` for `ino`, patching only the
-    /// fields that buffered writes can mutate (size, `i_blocks`, the extent
-    /// root, timestamps, flags, and link count) and preserving everything else
-    /// (`extra_isize`, checksums, generation, xattr tail, osd fields) losslessly.
+    /// Persists `desc` into `ino`'s on-disk `RawInode` slot — the writeback
+    /// dispatch. A journaled writeback delegates to
+    /// [`capture_inode_desc`](Self::capture_inode_desc) with `last: None`
+    /// (unconditional capture; the dedup record threading lives in
+    /// `InodeInner`'s wrapper). A non-journaled writeback read-modify-writes
+    /// the slot directly, patching only the fields buffered writes can mutate
+    /// (size, `i_blocks`, the extent root, timestamps, flags, and link count)
+    /// and preserving everything else (`extra_isize`, checksums, generation,
+    /// xattr tail, osd fields) losslessly.
     pub(super) fn write_back_inode_desc(
         &self,
         ino: Ext4Ino,
@@ -1978,6 +1983,12 @@ impl Ext4 {
         root: &[u32; inode::RAW_BLOCK_PTRS_LEN],
         handle: Option<&journal::Handle>,
     ) -> Result<()> {
+        if let Some(handle) = handle {
+            return self
+                .capture_inode_desc(ino, desc, root, handle, None)
+                .map(|_| ());
+        }
+
         let slot = self.inode_slot(ino)?;
 
         // On a metadata_csum volume, stamp i_checksum_lo/hi over the final raw
@@ -1988,41 +1999,6 @@ impl Ext4 {
             sb.has_metadata_csum()
                 .then(|| (sb.metadata_csum_seed(), sb.inode_size()))
         };
-
-        // Journaled path: the on-disk inode may be **stale** — a prior write to it
-        // was suppressed (WAL) and has not yet been checkpointed — so a
-        // read-modify-write from the device would resurrect that block's zeroed
-        // `i_mode` type bits / `extra_isize` / `generation` (exactly the
-        // corruption the guest e2fsck caught after a rename touched a
-        // not-yet-checkpointed directory). Encode the whole inode from the
-        // in-memory descriptor instead and capture it; checkpoint applies it to
-        // the final location after the transaction commits.
-        if handle.is_some() {
-            let mut raw = desc.to_raw_inode(root);
-            // An on-orphan-list inode carries its chain successor in `i_dtime`,
-            // and the authoritative successor is the in-memory chain — a
-            // non-head splice repoints the on-disk chain without reaching this
-            // (possibly stale) cached descriptor. Serializing the descriptor's
-            // value here could resurrect a spliced-out pointer.
-            //
-            // `s_orphan_lock` is held across BOTH the lookup and the capture: a
-            // concurrent `orphan_del` splice runs entirely under the lock, so
-            // without this span it could land between the two and be
-            // overwritten by this whole-slot patch carrying the pre-splice
-            // successor. Lock order: inner ① (held by the caller) → handle ②
-            // → `s_orphan_lock` → journal state (leaf), the same nesting as
-            // `patch_orphan_next_on_disk`.
-            let chain = self.s_orphan_lock.lock();
-            if let Some(next) = chain.successor_of(ino) {
-                // `0 = end of chain` is the on-disk convention (encode boundary).
-                raw.dtime = next.unwrap_or(0);
-            }
-            if let Some((fs_seed, inode_size)) = inode_csum {
-                let iseed = fs_seed.derive_inode(ino, raw.generation);
-                InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
-            }
-            return slot.journal_write(handle, &raw);
-        }
 
         // Non-journaled (or the sync path): read-modify-write the on-disk inode,
         // patching only the fields buffered writes mutate (size, `i_blocks`, the
@@ -2084,6 +2060,97 @@ impl Ext4 {
             .write_val(slot.device_offset(), &raw)
             .map_err(|_| Error::with_message(Errno::EIO, "failed to write inode"))?;
         Ok(())
+    }
+
+    /// Serializes `desc` and captures the resulting after-image into `handle`'s
+    /// transaction — the journaled inode-writeback funnel.
+    ///
+    /// The image is encoded from the in-memory descriptor, never
+    /// read-modify-written from the device: under WAL the on-disk inode may be
+    /// **stale** — a prior write to it was suppressed and has not yet been
+    /// checkpointed — so a device RMW would resurrect that block's zeroed
+    /// `i_mode` type bits / `extra_isize` / `generation` (exactly the
+    /// corruption the guest e2fsck caught after a rename touched a
+    /// not-yet-checkpointed directory). Checkpoint applies the captured image
+    /// to the final location after the transaction commits.
+    ///
+    /// `last` is the inode's most recent capture record
+    /// ([`inode::InodeCaptureRecord`]): when it proves the exact bytes this
+    /// call would capture are already in `handle`'s transaction — same tid and
+    /// a byte-identical pre-checksum image — the whole capture is skipped
+    /// ([`InodeCaptureOutcome::Deduped`]). The comparison basis is the
+    /// **post-orphan-override, pre-checksum** image: the override folds the
+    /// authoritative chain state into the candidate, so any orphan add/del/
+    /// splice since the record was taken changes the candidate and forces a
+    /// full capture (no invalidation hooks anywhere); and the inode checksum
+    /// is a pure function of the image bytes, so equal bases imply equal
+    /// stamped images without paying the crc. `None` ⇒ unconditional capture
+    /// (first writeback, or a durability funnel's forced variant). Same-tid
+    /// equality shares jbd2's `tid_geq` assumption that a handle and its
+    /// record are never exactly 2^32 transactions apart (see [`Tid::geq`]).
+    ///
+    /// # Locking
+    ///
+    /// Call order: inner ① (held by the caller) → handle ② →
+    /// [`s_orphan_lock`](Self::s_orphan_lock) → `super_block` read (the csum
+    /// probe and the slot geometry) → journal state (leaf, inside
+    /// `journal_write`); the s_orphan → superblock nesting is the same
+    /// direction as [`orphan_add`](Self::orphan_add). **A path that calls
+    /// this funnel must not hold the superblock lock.**
+    ///
+    /// `s_orphan_lock` is held across the successor lookup, the skip
+    /// predicate, and the capture:
+    ///
+    /// - An on-orphan-list inode carries its chain successor in `i_dtime`, and
+    ///   the authoritative successor is the in-memory chain — a non-head
+    ///   splice repoints the on-disk chain without reaching this (possibly
+    ///   stale) cached descriptor, so serializing the descriptor's value could
+    ///   resurrect a spliced-out pointer. A concurrent `orphan_del` splice
+    ///   runs entirely under the lock, so without this span it could land
+    ///   between the lookup and the capture and be overwritten by this
+    ///   whole-slot patch carrying the pre-splice successor (the same nesting
+    ///   as `patch_orphan_next_on_disk`).
+    /// - The skip predicate must be evaluated in the same window: the chain
+    ///   mirror and the transaction's in-slot `i_dtime` are only known to be
+    ///   in sync under this lock, so comparing outside it would race a
+    ///   concurrent splice.
+    ///
+    /// On a skip the lock window ends at the predicate — no superblock read,
+    /// no journal-state lock is ever taken.
+    pub(super) fn capture_inode_desc(
+        &self,
+        ino: Ext4Ino,
+        desc: &InodeDesc,
+        root: &[u32; inode::RAW_BLOCK_PTRS_LEN],
+        handle: &journal::Handle,
+        last: Option<&inode::InodeCaptureRecord>,
+    ) -> Result<InodeCaptureOutcome> {
+        let mut raw = desc.to_raw_inode(root);
+        let chain = self.s_orphan_lock.lock();
+        if let Some(next) = chain.successor_of(ino) {
+            // `0 = end of chain` is the on-disk convention (encode boundary).
+            raw.dtime = next.unwrap_or(0);
+        }
+        if let Some(last) = last
+            && last.covers(handle.tid(), &raw)
+        {
+            return Ok(InodeCaptureOutcome::Deduped);
+        }
+        // The dedup basis: post-override, pre-checksum (see the type docs).
+        let basis = raw;
+        let inode_csum = {
+            let sb = self.super_block.read();
+            sb.has_metadata_csum()
+                .then(|| (sb.metadata_csum_seed(), sb.inode_size()))
+        };
+        if let Some((fs_seed, inode_size)) = inode_csum {
+            let iseed = fs_seed.derive_inode(ino, raw.generation);
+            InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
+        }
+        self.inode_slot(ino)?.journal_write(Some(handle), &raw)?;
+        Ok(InodeCaptureOutcome::Captured {
+            basis: Box::new(basis),
+        })
     }
 
     /// Writes the complete on-disk `RawInode` for a freshly created inode.
@@ -2315,6 +2382,24 @@ impl OrphanChain {
     fn clear(&mut self) {
         self.0.clear();
     }
+}
+
+/// What [`Ext4::capture_inode_desc`] did with the serialized after-image.
+///
+/// The full-capture arm hands back the image it already built (`basis`, the
+/// post-orphan-override pre-checksum bytes) so the caller can store it as the
+/// next writeback's dedup basis without a second serialization.
+pub(super) enum InodeCaptureOutcome {
+    /// A byte-identical image is already in this transaction — nothing was
+    /// written.
+    Deduped,
+    /// A full capture landed in the transaction; `basis` is the comparison
+    /// basis for the caller to record.
+    Captured {
+        // TODO(T2.2): production reads this once the wrapper records it.
+        #[cfg_attr(not(ktest), expect(dead_code))]
+        basis: Box<RawInode>,
+    },
 }
 
 /// The device location of one on-disk `RawInode` slot: its inode-table block
@@ -3730,6 +3815,71 @@ mod tests {
         assert_eq!(after.extra_isize, 32, "extra_isize preserved");
         assert_eq!(after.generation, generation, "generation preserved");
         assert_eq!(after.link_count, desc.link_count(), "link count written");
+    }
+
+    /// P10-T2.1: the journaled capture funnel's dedup contract, at the fs
+    /// level. A record built from a full capture's basis covers a
+    /// byte-identical same-transaction recapture (`Deduped` — nothing new
+    /// enters the transaction); any byte change (the link count here) breaks
+    /// coverage and lands a full capture whose bytes reach the disk.
+    #[ktest]
+    fn capture_inode_desc_dedups_only_identical_bytes_within_transaction() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(16)
+            .build()
+            .unwrap();
+        let journal = f.ext4.journal().unwrap();
+        journal.stop_commit_thread();
+
+        let ino = ROOT_INO;
+        let mut desc = f.ext4.read_inode_desc(ino).unwrap();
+        let root = *desc.raw_block();
+
+        let op = f.ext4.begin_op(4).unwrap();
+        let handle = op.get().unwrap();
+        let outcome = f
+            .ext4
+            .capture_inode_desc(ino, &desc, &root, handle, None)
+            .unwrap();
+        let InodeCaptureOutcome::Captured { basis } = outcome else {
+            panic!("the first capture must be a full capture");
+        };
+        let record = inode::InodeCaptureRecord::new(handle.tid(), basis);
+        let captured_before = journal.running_nr_metadata_blocks();
+
+        // Byte-identical, same transaction: skipped whole.
+        assert!(matches!(
+            f.ext4
+                .capture_inode_desc(ino, &desc, &root, handle, Some(&record))
+                .unwrap(),
+            InodeCaptureOutcome::Deduped
+        ));
+        assert_eq!(
+            journal.running_nr_metadata_blocks(),
+            captured_before,
+            "a dedup hit captures nothing"
+        );
+
+        // Any byte change breaks coverage: a full capture, and its bytes (not
+        // the stale basis) are what checkpoint applies.
+        let new_link = desc.link_count() + 1;
+        desc.set_link_count(new_link);
+        assert!(matches!(
+            f.ext4
+                .capture_inode_desc(ino, &desc, &root, handle, Some(&record))
+                .unwrap(),
+            InodeCaptureOutcome::Captured { .. }
+        ));
+        drop(op);
+        journal.flush_on_unmount().unwrap();
+        let after: RawInode = f
+            .disk
+            .segment()
+            .read_val(f.ext4.inode_table_offset(ino).unwrap())
+            .unwrap();
+        assert_eq!(after.link_count, new_link);
     }
 
     /// T1 regression (the Task-8 guest silent data loss, B-1 class): an inode
