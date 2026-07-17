@@ -2675,10 +2675,14 @@ mod tests {
     #[ktest]
     fn create_error_path_clears_link_count() {
         clocks::init_for_ktest();
-        // Cap the image to exactly one free block, which the parent directory's
-        // `make_empty` then consumes — leaving zero for the child's.
+        // Cap the image to exactly ONE ordinarily-allocatable free block —
+        // the metadata reserve floor plus one, since a `Normal` allocation
+        // (a directory block) may not draw the floor itself. The parent
+        // directory's `make_empty` then consumes it, leaving zero for the
+        // child's.
+        let one_above_reserve = u32::try_from(Ext4::metadata_reserve_floor(2048)).unwrap() + 1;
         let f = Ext4FixtureBuilder::new(2048, 256, 2048)
-            .with_free_blocks(1)
+            .with_free_blocks(one_above_reserve)
             .with_inode_bitmap_metadata_marked()
             .build()
             .unwrap();

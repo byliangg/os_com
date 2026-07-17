@@ -549,6 +549,12 @@ impl ExtentTree {
     /// ([`journal::read_metadata_block`], capture + patch), so WAL order
     /// holds; without one they are read and written directly (Phases 1–3
     /// semantics).
+    ///
+    /// Metadata blocks a split/growth needs come from [`AllocIntent::Normal`]
+    /// — a fresh mapping is ordinary work that must not eat the reserve. The
+    /// punch spans-both slow path re-enters through
+    /// [`insert_with_intent`](Self::insert_with_intent) instead: a free-side
+    /// op may draw the reserve (Linux `EXT4_EX_NOFAIL`).
     #[expect(clippy::too_many_arguments)]
     pub(super) fn insert(
         &mut self,
@@ -559,6 +565,36 @@ impl ExtentTree {
         kind: ExtentKind,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+    ) -> Result<()> {
+        self.insert_with_intent(
+            fs,
+            iblock,
+            pblock,
+            len,
+            kind,
+            handle,
+            csum_seed,
+            AllocIntent::Normal,
+        )
+    }
+
+    /// [`insert`](Self::insert) with an explicit [`AllocIntent`] for the
+    /// metadata blocks its splits/growth may allocate. `MetadataReserve` is
+    /// for re-entries from a *freeing* operation — the punch spans-both slow
+    /// path, whose tail re-insert must not fail `ENOSPC` on a full volume
+    /// ("no space, so nothing can be deleted"; Linux passes `EXT4_EX_NOFAIL`
+    /// through `ext4_ext_remove_space`'s split for exactly this).
+    #[expect(clippy::too_many_arguments)]
+    pub(super) fn insert_with_intent(
+        &mut self,
+        fs: &Ext4,
+        iblock: Iblock,
+        pblock: Ext4Bid,
+        len: u16,
+        kind: ExtentKind,
+        handle: Option<&journal::Handle>,
+        csum_seed: Option<InodeCsumSeed>,
+        intent: AllocIntent,
     ) -> Result<()> {
         // es: the new mapping's own span. A neighbour merge changes extent
         // boundaries but no block's mapping or kind, so per-block truth owes
@@ -585,7 +621,7 @@ impl ExtentTree {
                     self.dirty = true;
                     return Ok(());
                 }
-                self.make_room_for(fs, iblock, handle, csum_seed, AllocIntent::Normal)?;
+                self.make_room_for(fs, iblock, handle, csum_seed, intent)?;
             }
             return_errno_with_message!(Errno::EUCLEAN, "extent insert cannot make room");
         }
@@ -600,7 +636,7 @@ impl ExtentTree {
         };
         extents.push(Extent::new(iblock, len, pblock, kind));
         merge_extents(&mut extents);
-        let delta = self.reserialize(fs, &extents, &[], handle, csum_seed, AllocIntent::Normal)?;
+        let delta = self.reserialize(fs, &extents, &[], handle, csum_seed, intent)?;
 
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let added_blocks = len as i64 + net_meta;
@@ -2000,6 +2036,13 @@ impl ExtentTree {
     /// slow-symlink targets are forgotten (revoked) before their free,
     /// regular-file data is not. The tree's own external nodes are always
     /// forgotten ([`free_meta_block`]), independent of the policy.
+    ///
+    /// No [`AllocIntent`] appears here because a truncate never allocates: a
+    /// boundary-straddling extent is trimmed to its kept head IN PLACE (one
+    /// side survives — never a head+tail split like the punch), and everything
+    /// else is removal and pruning. With no allocation there is no `ENOSPC`
+    /// and nothing to draw the metadata reserve for — the punch's
+    /// `MetadataReserve` re-insert has no truncate counterpart.
     pub(super) fn truncate_chunk(
         &mut self,
         fs: &Ext4,
@@ -2531,9 +2574,16 @@ impl ExtentTree {
                         )?;
                     } else {
                         // Full leaf: trim to the head in place; the tail range
-                        // is then a hole and re-enters through the ordinary
-                        // insert (the split machinery). All in ONE transaction;
-                        // the abort guard covers a re-insert failure.
+                        // is then a hole and re-enters through the insert
+                        // (the split machinery). All in ONE transaction;
+                        // the abort guard covers a re-insert failure. The
+                        // split's fresh node may draw the metadata reserve
+                        // (`MetadataReserve`): a punch is a *freeing* op, and
+                        // on a full volume a `Normal` ENOSPC here would mean
+                        // "no space, so no hole can be punched" — Linux runs
+                        // this split under `EXT4_EX_NOFAIL`
+                        // (`ext4_ext_remove_space` → `ext4_split_extent_at`,
+                        // extents.c).
                         path.levels[leaf_level]
                             .node
                             .replace_extent_at(pos, &head, &es);
@@ -2543,7 +2593,7 @@ impl ExtentTree {
                             csum_seed,
                             Some(&self.node_cache),
                         )?;
-                        self.insert(
+                        self.insert_with_intent(
                             fs,
                             end_block,
                             tail_phys,
@@ -2551,6 +2601,7 @@ impl ExtentTree {
                             e.kind(),
                             handle,
                             csum_seed,
+                            AllocIntent::MetadataReserve,
                         )?;
                         // `insert` accounted the tail as NEW data; its blocks
                         // were already counted before the split.
@@ -2725,8 +2776,18 @@ impl ExtentTree {
         // still counted but mapped nowhere, on a failed insert.
         debug_assert!(survivors.len() <= INLINE_MAX + 1);
         if survivors.len() > INLINE_MAX {
-            let delta =
-                self.reserialize(fs, &survivors, &[], handle, csum_seed, AllocIntent::Normal)?;
+            // The rebuild's fresh leaf may draw the metadata reserve: this is
+            // the depth-0 face of the punch spans-both split (a freeing op
+            // must not fail `ENOSPC` for lack of a tree block on a full
+            // volume — Linux `EXT4_EX_NOFAIL`, see `punch_chunk`'s slow arm).
+            let delta = self.reserialize(
+                fs,
+                &survivors,
+                &[],
+                handle,
+                csum_seed,
+                AllocIntent::MetadataReserve,
+            )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -5276,6 +5337,143 @@ mod tests {
             (big_block + 3, 2, big.start + 3)
         );
         assert_matches_linear(&f, &tree, big_block + 8);
+    }
+
+    /// A punch on a FULL volume (ordinary allocations exhausted, only the
+    /// metadata reserve left): the spans-both slow path's tail re-insert
+    /// splits a full leaf, needing a fresh tree node — which must come from
+    /// the reserve, or "no space" would mean "no hole can be punched" (Linux
+    /// `EXT4_EX_NOFAIL` on `ext4_ext_remove_space`'s split).
+    #[ktest]
+    fn punch_full_leaf_draws_metadata_reserve_when_full() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // The spans-both shape: a full depth-1 leaf ending in a 5-block run.
+        let (mut tree, _p) = ascending_tree_allocated(&f, LEAF_MAX as u32 - 1);
+        let big = f.ext4.alloc_blocks(5, 0, None).unwrap();
+        assert_eq!((big.end - big.start) as u16, 5);
+        let big_block = (LEAF_MAX as u32 - 1) * 2;
+        tree.insert(
+            &f.ext4,
+            big_block,
+            big.start,
+            5,
+            ExtentKind::Written,
+            None,
+            None,
+        )
+        .unwrap();
+        match tree.find(&f.ext4, big_block).unwrap() {
+            Search::Covered { path, .. } => {
+                assert_eq!(path.leaf().unwrap().node.entries(), LEAF_MAX)
+            }
+            _ => panic!("big extent must be mapped"),
+        }
+
+        // Exhaust ordinary space; the reserve remains but `Normal` is ENOSPC.
+        loop {
+            match f.ext4.alloc_blocks(4096, 0, None) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+        let reserve = f.ext4.super_block().free_blocks_count();
+        assert!(reserve > 0);
+        assert_eq!(
+            f.ext4.alloc_blocks(1, 0, None).unwrap_err().error(),
+            Errno::ENOSPC
+        );
+
+        // Punch [679, 681): the tail re-insert splits the full leaf via the
+        // reserve — the punch must succeed, every surviving mapping intact.
+        tree.punch_chunk(
+            &f.ext4,
+            big_block + 1..big_block + 3,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        let head = tree.lookup(&f.ext4, big_block).unwrap().unwrap();
+        assert_eq!(
+            (head.block(), head.len(), head.start()),
+            (big_block, 1, big.start)
+        );
+        assert!(tree.lookup(&f.ext4, big_block + 1).unwrap().is_none());
+        let tail = tree.lookup(&f.ext4, big_block + 3).unwrap().unwrap();
+        assert_eq!(
+            (tail.block(), tail.len(), tail.start()),
+            (big_block + 3, 2, big.start + 3)
+        );
+    }
+
+    /// The depth-0 face of the same guarantee: punching the middle of one
+    /// inline extent on a full volume pushes the survivors past the inline
+    /// capacity, and the depth-1 rebuild's fresh leaf must come from the
+    /// metadata reserve.
+    #[ktest]
+    fn punch_inline_overflow_draws_metadata_reserve_when_full() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // A full inline root (INLINE_MAX extents); punching mid-extent yields
+        // INLINE_MAX + 1 survivors → the reserialize path.
+        let mut tree = ExtentTree::empty();
+        for i in 0..INLINE_MAX as u32 {
+            let run = f.ext4.alloc_blocks(5, 0, None).unwrap();
+            tree.insert(
+                &f.ext4,
+                i * 10,
+                run.start,
+                5,
+                ExtentKind::Written,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!((tree.depth(), root_entries(&tree)), (0, INLINE_MAX as u16));
+
+        // Exhaust ordinary space (reserve intact, `Normal` ENOSPC).
+        loop {
+            match f.ext4.alloc_blocks(4096, 0, None) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+        assert!(f.ext4.super_block().free_blocks_count() > 0);
+        assert_eq!(
+            f.ext4.alloc_blocks(1, 0, None).unwrap_err().error(),
+            Errno::ENOSPC
+        );
+
+        // Punch [12, 13): extent [10, 15) splits head + tail, overflowing the
+        // inline root; the rebuild draws the reserve and the punch succeeds.
+        tree.punch_chunk(
+            &f.ext4,
+            12..13,
+            None,
+            None,
+            journal::DataForgetPolicy::PlainData,
+            None,
+        )
+        .unwrap();
+        assert_eq!(tree.depth(), 1);
+        assert!(tree.lookup(&f.ext4, 12).unwrap().is_none());
+        let head = tree.lookup(&f.ext4, 10).unwrap().unwrap();
+        assert_eq!((head.block(), head.len()), (10, 2));
+        let tail = tree.lookup(&f.ext4, 13).unwrap().unwrap();
+        assert_eq!((tail.block(), tail.len()), (13, 2));
     }
 
     /// P9 debt `punch-spans-slow-headroom-shape`: a spans-both punch through a

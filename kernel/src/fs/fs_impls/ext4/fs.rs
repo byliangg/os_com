@@ -1137,7 +1137,7 @@ impl Ext4 {
     /// [`AllocIntent::MetadataReserve`] one — an unwritten→written conversion's
     /// tree split on a full volume — can still find a block. No cluster feature
     /// here, so a cluster is one block and no on-disk field changes.
-    const fn metadata_reserve_floor(total_blocks: u64) -> u64 {
+    pub(super) const fn metadata_reserve_floor(total_blocks: u64) -> u64 {
         let two_percent = total_blocks / 50;
         if two_percent < 4096 {
             two_percent
@@ -3306,9 +3306,16 @@ mod tests {
         journal.stop_commit_thread();
 
         // Fill the volume (non-journaled allocs keep the fixture small).
+        // `MetadataReserve` drains the bitmap INCLUDING the reserve floor:
+        // this test's premise is "every free block on the volume is pinned",
+        // which requires zero unpinned free bits — a `Normal` fill would stop
+        // at the floor and leave the reserve blocks genuinely allocatable.
         let mut filled: Vec<Range<Ext4Bid>> = Vec::new();
         loop {
-            match f.ext4.alloc_blocks(64, 0, None) {
+            match f
+                .ext4
+                .alloc_blocks_with_intent(64, 0, None, AllocIntent::MetadataReserve)
+            {
                 Ok(range) => filled.push(range),
                 Err(e) => {
                     // Truly full: the plain ENOSPC leg, unchanged.
