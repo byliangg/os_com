@@ -49,6 +49,15 @@ use crate::{
 /// strict `<` tolerates second-granularity timestamps: a file created and
 /// written within one second must still get its first-access update.
 fn touch_atime_relatime(inode: &Ext4Inode) {
+    // A read-only mount never updates atime on disk (Linux skips the bump under
+    // `sb_rdonly`). Skipping it here keeps a read/readdir/exec on a
+    // `remount,ro` volume — generic/452's post-remount exec — from dirtying the
+    // inode: the write-back would only fail `EROFS` at `begin_op` (swallowed by
+    // the void time setter), and a dirtied inode would then make a later
+    // `sync(2)` under the read-only mount fail instead of no-op.
+    if inode.fs().is_ok_and(|fs| fs.is_rdonly()) {
+        return;
+    }
     const A_DAY: Duration = Duration::from_secs(24 * 60 * 60);
     let atime = inode.atime();
     let now = crate::fs::fs_impls::ext4::utils::now();
@@ -207,6 +216,13 @@ impl Inode for Ext4Inode {
         // superblock), then this inode's data pages + metadata with a barrier.
         // `fsync`: wait on the full `sync_tid`.
         let fs = self.fs()?;
+        // A read-only mount holds nothing unflushed (writes are refused since
+        // the rw->ro flush), so fsync is a no-op — and proceeding would only
+        // fail `EROFS` at the `begin_op` in the writeback path. Reachable
+        // because Linux allows fsync on any fd, even a read-only one.
+        if fs.is_rdonly() {
+            return Ok(());
+        }
         fs.sync_metadata()?;
         self.sync_data_and_meta(SyncScope::Full)
     }
@@ -218,6 +234,10 @@ impl Inode for Ext4Inode {
         // metadata is already captured under its op's handle); it stays here for
         // the non-journaled path, and never waits on the running transaction.
         let fs = self.fs()?;
+        // A read-only mount holds nothing unflushed; no-op like `sync_all`.
+        if fs.is_rdonly() {
+            return Ok(());
+        }
         fs.sync_metadata()?;
         self.sync_data_and_meta(SyncScope::DataOnly)
     }

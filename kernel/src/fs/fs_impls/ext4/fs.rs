@@ -143,6 +143,13 @@ pub struct Ext4 {
     /// no clean-shutdown writes, freezing the on-disk state the way a power
     /// cut would.
     shutdown: AtomicBool,
+    /// Raised by `mount -o remount,ro` (Linux `SB_RDONLY`): the filesystem is
+    /// read-only — every write op, journaled or not, fails `EROFS` at
+    /// `begin_op` (the same single funnel a journal abort uses). Lowered again
+    /// by `remount,rw`. Unlike `shutdown` this is not a death: reads stay
+    /// allowed, the journal stays loaded, and the mount can go back to
+    /// read-write. See [`set_read_only`](Self::set_read_only).
+    rdonly: AtomicBool,
     /// The orphan list: the guarded [`OrphanChain`] is the **in-memory mirror
     /// of the on-disk chain** (the position invariant lives on the type), and
     /// the lock is jbd2's `s_orphan_lock`.
@@ -220,6 +227,7 @@ impl Ext4 {
             total_inodes,
             next_generation: AtomicU32::new(utils::now().as_secs() as u32),
             shutdown: AtomicBool::new(false),
+            rdonly: AtomicBool::new(false),
             s_orphan_lock: Mutex::new(OrphanChain::new()),
             mount_options,
             journal: RwMutex::new(None),
@@ -404,17 +412,98 @@ impl Ext4 {
         self.mount_options.stat_block_accounting
     }
 
-    /// Refuses a remount-time filesystem-flag change with `EOPNOTSUPP`.
+    /// Switches the filesystem between read-write and read-only at remount
+    /// (`mount -o remount,ro` / `remount,rw`), driving the `set_fs_flags` VFS
+    /// hook's `RDONLY` bit.
     ///
-    /// Ext4 honors no runtime change to the filesystem flags (there is no
-    /// read-only mount mode yet), so `set_fs_flags` reports the change as
-    /// unsupported rather than accepting it and leaving the volume writable — a
-    /// lie a `remount,ro` caller would act on.
-    pub(super) fn refuse_fs_flags_change(&self) -> Result<()> {
-        return_errno_with_message!(
-            Errno::EOPNOTSUPP,
-            "ext4 does not support changing filesystem flags at remount"
-        );
+    /// ## rw -> ro
+    ///
+    /// Winds down the write side exactly like a clean unmount does — WITHOUT
+    /// tearing the journal down, so the mount stays live and can go back to
+    /// read-write. It reuses [`FileSystem::sync`](crate::fs::vfs::file_system::FileSystem::sync)
+    /// (the same durability an unmount drives through `Mount::sync`): flush
+    /// every dirty page and all block-side metadata, commit and wait for the
+    /// running transaction, and barrier the device. Only THEN is the read-only
+    /// flag raised, so the flush's own `begin_op`/`sync` calls run while the
+    /// volume is still writable — raising the flag first would make them
+    /// `EROFS` and strand the very state this is flushing.
+    ///
+    /// The `RECOVER` incompat bit is deliberately LEFT stamped (it is stamped
+    /// for the whole writable session and cleared only by [`Ext4::drop`] at a
+    /// genuine clean unmount). Clearing it here would be unsafe: this wind-down
+    /// commits the log but does not checkpoint it empty, so
+    /// committed-but-un-checkpointed transactions may remain, and a crash after
+    /// `remount,ro` must still replay them — which needs `RECOVER` set. The
+    /// on-disk state on return is therefore a durability point, not the literal
+    /// clean-unmount surface: everything is durable and replay-recoverable
+    /// (e2fsck reports CLEAN after the recovery replay), no worse than a crash
+    /// right after any `sync(2)`, which the crash harness validates
+    /// continuously. (Linux additionally checkpoints the log empty under
+    /// `jbd2_journal_lock_updates` before clearing `RECOVER`; keeping the bit
+    /// stamped is the conservative choice for a resumable remount that does not
+    /// fully drain the log — a recorded deviation. This also matches the spike
+    /// design "clean unmount 语义照旧（ro 下无新脏）": the clean-unmount clear
+    /// stays in `Ext4::drop`.)
+    ///
+    /// Like the shutdown hook, there is no `jbd2_journal_lock_updates`-style
+    /// freeze, so a write racing between the flush and the flag can slip in and
+    /// be left for `Ext4::drop` to flush — the same recorded no-freeze window
+    /// `shutdown` documents. Benign: such a write either committed (durable) or
+    /// did not (lost, POSIX-permitted for an unsynced write).
+    ///
+    /// ## ro -> rw
+    ///
+    /// The journal was never torn down and `RECOVER` stayed stamped, so
+    /// restoring writes is just lowering the flag — no recovery to run. It is
+    /// refused (`EROFS`) if the journal has aborted (a failed commit already
+    /// took the fs read-only for real; going back to rw would let writes build
+    /// on a log that will never commit — Linux `ext4_clear_journal_err` refuses
+    /// rw on a journal that recorded an error) or the fs was shut down (`EIO`).
+    ///
+    /// Idempotent in both directions: a remount to the state it is already in
+    /// is a no-op.
+    pub(super) fn set_read_only(&self, read_only: bool) -> Result<()> {
+        if read_only {
+            if self.is_rdonly() {
+                return Ok(());
+            }
+            // Flush everything durable while the volume is still writable.
+            <Self as crate::fs::vfs::file_system::FileSystem>::sync(self)?;
+            self.rdonly.store(true, Ordering::Release);
+            Ok(())
+        } else {
+            if !self.is_rdonly() {
+                return Ok(());
+            }
+            self.ensure_not_shutdown()?;
+            if let Some(journal) = self.journal()
+                && journal.is_aborted()
+            {
+                return_errno_with_message!(
+                    Errno::EROFS,
+                    "cannot remount read-write: the journal has aborted"
+                );
+            }
+            self.rdonly.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    /// Returns whether this filesystem is mounted read-only (`remount,ro`).
+    pub(super) fn is_rdonly(&self) -> bool {
+        self.rdonly.load(Ordering::Acquire)
+    }
+
+    /// Errors `EROFS` once the filesystem has been remounted read-only,
+    /// refusing every write the way Linux's `sb_rdonly` gate in
+    /// `ext4_journal_check_start` does. Called from [`begin_op`](Self::begin_op),
+    /// the single funnel every write — data (even a pure overwrite opens a
+    /// handle) or metadata, journaled or not — passes through.
+    pub(super) fn ensure_writable(&self) -> Result<()> {
+        if self.is_rdonly() {
+            return_errno_with_message!(Errno::EROFS, "filesystem is mounted read-only");
+        }
+        Ok(())
     }
 
     // ===== Per-operation journal credit estimates (P7d-1) =====
@@ -771,6 +860,14 @@ impl Ext4 {
         // `ext4_journal_check_start`): a shut-down filesystem accepts no new
         // work, journaled or not.
         self.ensure_not_shutdown()?;
+        // A read-only remount (`mount -o remount,ro`) takes the whole
+        // filesystem read-only the same way a journal abort does (below):
+        // refuse every write op up front with `EROFS`, before it mutates.
+        // Placed before the journal match so it also covers non-journaled
+        // volumes, whose writes funnel through this same `begin_op`. The flag
+        // is raised only after `set_read_only` flushed everything durable, so
+        // nothing dirty is stranded behind this gate.
+        self.ensure_writable()?;
         match self.journal() {
             Some(journal) => {
                 // An aborted journal takes the whole filesystem read-only
@@ -2734,13 +2831,128 @@ mod tests {
         assert_eq!(ext4.sb().blocks, default_stat.blocks);
     }
 
-    /// A remount that asks to change filesystem flags is refused with
-    /// `EOPNOTSUPP` (ext4 honors no runtime change), not silently accepted.
+    /// `mount -o remount,ro` takes the filesystem read-only for real: every
+    /// write (data and metadata) is refused `EROFS` while reads stay allowed,
+    /// and `remount,rw` restores writing. Idempotent in both directions.
+    /// (generic/452 exercises this whole switch.)
     #[ktest]
-    fn set_fs_flags_refuses_loudly() {
-        let f = Ext4FixtureBuilder::new(2048, 256, 2048).build().unwrap();
-        let err = f.ext4.refuse_fs_flags_change().unwrap_err();
-        assert_eq!(err.error(), Errno::EOPNOTSUPP);
+    fn remount_read_only_blocks_writes_reads_stay_allowed() {
+        const DIR_INO: u32 = 12;
+
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_reserved_inode(DIR_INO)
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        // A pre-placed empty directory to create in (the fixture root inode
+        // maps no data block, so it cannot host a real create — the same idiom
+        // the create/fdatasync tests use).
+        let mut raw = make_empty_file_inode();
+        raw.mode = 0o040755; // S_IFDIR | 0755
+        raw.link_count = 2;
+        f.write_raw_inode(DIR_INO, &raw);
+
+        let dir = f.ext4.read_inode(DIR_INO).unwrap();
+        let file = dir
+            .create("f", InodeType::File, FilePerm::from_bits_truncate(0o644))
+            .unwrap();
+        write_all(&file, 0, &[0xC7; 32]);
+
+        // Switch to read-only.
+        f.ext4.set_read_only(true).unwrap();
+        assert!(f.ext4.is_rdonly());
+        // Idempotent: remounting ro again is a clean no-op.
+        f.ext4.set_read_only(true).unwrap();
+
+        // A data write is now refused with EROFS...
+        let mut reader = VmReader::from(&[0u8; 32][..]).to_fallible();
+        assert_eq!(
+            file.write_at(0, &mut reader).unwrap_err().error(),
+            Errno::EROFS
+        );
+        // ...and so is a metadata op (create funnels through `begin_op` too).
+        // (`map` to `()` first: `unwrap_err` needs the success arm `Debug`,
+        // which `Arc<Inode>` does not implement.)
+        assert_eq!(
+            dir.create("g", InodeType::File, FilePerm::from_bits_truncate(0o644))
+                .map(|_| ())
+                .unwrap_err()
+                .error(),
+            Errno::EROFS
+        );
+        // A pure-attribute change (chown) funnels through `journal_attr_change`
+        // -> `begin_op` too.
+        assert_eq!(file.set_owner(4242).unwrap_err().error(), Errno::EROFS);
+
+        // Reads stay allowed under the read-only mount.
+        let mut buf = [0u8; 32];
+        let mut writer = VmWriter::from(&mut buf[..]).to_fallible();
+        assert_eq!(file.read_at(0, &mut writer).unwrap(), 32);
+        assert_eq!(buf, [0xC7; 32]);
+
+        // Switch back to read-write: writes resume.
+        f.ext4.set_read_only(false).unwrap();
+        assert!(!f.ext4.is_rdonly());
+        f.ext4.set_read_only(false).unwrap(); // idempotent
+        let mut reader = VmReader::from(&[0x5E; 32][..]).to_fallible();
+        assert_eq!(file.write_at(0, &mut reader).unwrap(), 32);
+    }
+
+    /// The rw->ro switch flushes dirty file data to the device before raising
+    /// the read-only gate (it reuses `FileSystem::sync`): an overwrite still in
+    /// the page cache is on the platter once `remount,ro` returns.
+    #[ktest]
+    fn remount_read_only_flushes_dirty_data_to_disk() {
+        const FILE_INO: u32 = 11;
+        // A block outside the fixture metadata, pre-mapped by the file's extent
+        // and carrying a known OLD image on disk.
+        const DATA_BLOCK: u32 = 103;
+
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        f.write_data_block(DATA_BLOCK, &[0xA1; BLOCK_SIZE]);
+        f.write_raw_inode(FILE_INO, &make_file_inode(DATA_BLOCK, BLOCK_SIZE as u32));
+
+        // Overwrite the block through the page cache (dirty, not yet flushed).
+        let file = f.ext4.read_inode(FILE_INO).unwrap();
+        let new = [0x5E; BLOCK_SIZE];
+        write_all(&file, 0, &new);
+
+        // Remount read-only must make that dirty data durable.
+        f.ext4.set_read_only(true).unwrap();
+
+        let mut on_disk = [0u8; BLOCK_SIZE];
+        f.disk
+            .segment()
+            .read_bytes(DATA_BLOCK as usize * BLOCK_SIZE, &mut on_disk)
+            .unwrap();
+        assert_eq!(on_disk, new, "remount,ro must flush dirty data to disk");
+    }
+
+    /// Going back to read-write is refused (`EROFS`) when the journal has
+    /// aborted: a failed commit already took the fs read-only for real, and
+    /// letting writes resume would build on a log that can never commit (Linux
+    /// `ext4_clear_journal_err`).
+    #[ktest]
+    fn remount_read_write_refused_after_journal_abort() {
+        crate::time::clocks::init_for_ktest();
+        let f = Ext4FixtureBuilder::new(2048, 256, 2048)
+            .with_block_bitmap_metadata_marked()
+            .with_journal_inode(64)
+            .build()
+            .unwrap();
+        f.ext4.set_read_only(true).unwrap();
+        f.ext4.journal().unwrap().abort_for_shutdown();
+        assert_eq!(
+            f.ext4.set_read_only(false).unwrap_err().error(),
+            Errno::EROFS
+        );
     }
 
     #[ktest]

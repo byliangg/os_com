@@ -28,6 +28,17 @@ impl FileSystem for Ext4 {
         if self.is_shutdown() {
             return Ok(());
         }
+        // A read-only mount holds nothing dirty (writes are refused at
+        // `begin_op`, atime bumps are skipped), so `sync(2)` on it is a no-op —
+        // Linux `sync_filesystem` returns early on `sb_rdonly` before calling
+        // `sync_fs`. Skipping the flush also keeps it from failing: `sync_all`'s
+        // per-inode writeback opens a `begin_op`, which a read-only mount
+        // refuses `EROFS`. (The rw->ro switch itself flushes while still
+        // writable, before raising the flag — see `Ext4::set_read_only` — so
+        // this early return is only ever taken by a *later* external sync.)
+        if self.is_rdonly() {
+            return Ok(());
+        }
         // Flush every cached inode together with the block-side metadata, then
         // issue a single device barrier. Unmount drives durability through this
         // hook (`Path::unmount` -> `Mount::sync` -> `FileSystem::sync`), so a
@@ -106,13 +117,24 @@ impl FileSystem for Ext4 {
         }
     }
 
-    fn set_fs_flags(&self, _flags: FsFlags, _data: Option<CString>, _ctx: &Context) -> Result<()> {
-        // Refuse loudly instead of inheriting the VFS default, which logs a
-        // warning and returns `Ok(())` — a fake success that would let
-        // `mount -o remount,ro` report a read-only volume while it stayed
-        // writable. Ext4 here honors no runtime filesystem-flag change (there is
-        // no read-only mount mode yet), so any change is `EOPNOTSUPP`.
-        self.refuse_fs_flags_change()
+    fn flags(&self) -> FsFlags {
+        // Report the read-only bit so the VFS view matches the write gate.
+        if self.is_rdonly() {
+            FsFlags::RDONLY
+        } else {
+            FsFlags::empty()
+        }
+    }
+
+    fn set_fs_flags(&self, flags: FsFlags, _data: Option<CString>, _ctx: &Context) -> Result<()> {
+        // Honor the RDONLY bit for real instead of inheriting the VFS default,
+        // which logs a warning and returns `Ok(())` — a fake success that would
+        // let `mount -o remount,ro` report a read-only volume while it stayed
+        // writable. On rw->ro this flushes everything durable before switching
+        // the write gate; see `Ext4::set_read_only`. The other fs flags (sync,
+        // dirsync, lazytime, ...) are not modeled here — `remount,ro`/`remount,rw`
+        // is the one xfstests (generic/452) and a `remount` exercise.
+        self.set_read_only(flags.contains(FsFlags::RDONLY))
     }
 
     fn fs_event_subscriber_stats(&self) -> &FsEventSubscriberStats {
