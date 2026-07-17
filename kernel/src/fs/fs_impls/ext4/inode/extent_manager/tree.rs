@@ -16,7 +16,7 @@ use super::{
     super::{
         super::{
             checksum::{self, InodeCsumSeed},
-            fs::Ext4,
+            fs::{AllocIntent, Ext4},
             journal,
             prelude::*,
         },
@@ -585,7 +585,7 @@ impl ExtentTree {
                     self.dirty = true;
                     return Ok(());
                 }
-                self.make_room_for(fs, iblock, handle, csum_seed)?;
+                self.make_room_for(fs, iblock, handle, csum_seed, AllocIntent::Normal)?;
             }
             return_errno_with_message!(Errno::EUCLEAN, "extent insert cannot make room");
         }
@@ -600,7 +600,7 @@ impl ExtentTree {
         };
         extents.push(Extent::new(iblock, len, pblock, kind));
         merge_extents(&mut extents);
-        let delta = self.reserialize(fs, &extents, &[], handle, csum_seed)?;
+        let delta = self.reserialize(fs, &extents, &[], handle, csum_seed, AllocIntent::Normal)?;
 
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let added_blocks = len as i64 + net_meta;
@@ -782,6 +782,7 @@ impl ExtentTree {
         fs: &Ext4,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        intent: AllocIntent,
     ) -> Result<()> {
         let header = self.header();
         // The on-disk format's depth ceiling (every consumer went path-based
@@ -809,7 +810,7 @@ impl ExtentTree {
             self.root_index_at(0).leaf()
         };
 
-        let bid = alloc_meta_block(fs, goal, handle)?;
+        let bid = alloc_meta_block(fs, goal, handle, intent)?;
         let mut node = NodeBuf::fresh(bid, header.depth());
         // The root's entries are a prefix-compatible layout (same 12-byte
         // slabs); copy them verbatim under the full-block header.
@@ -857,6 +858,7 @@ impl ExtentTree {
         iblock: Iblock,
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        intent: AllocIntent,
     ) -> Result<()> {
         let (Search::Gap { mut path, .. } | Search::Covered { mut path, .. }) =
             self.find(fs, iblock)?;
@@ -876,7 +878,7 @@ impl ExtentTree {
             // Full all the way through the root: grow a level and let the
             // caller's loop retry (the copied-down root usually still needs a
             // split, handled by the next round).
-            return self.grow_root(fs, handle, csum_seed);
+            return self.grow_root(fs, handle, csum_seed, intent);
         }
 
         let device = fs.block_device();
@@ -887,7 +889,7 @@ impl ExtentTree {
         let mut fresh: Vec<NodeBuf> = Vec::with_capacity(leaf_level - top + 1);
         let mut fresh_bids: Vec<Ext4Bid> = Vec::with_capacity(fresh.capacity());
         for level in (top..=leaf_level).rev() {
-            let bid = match alloc_meta_block(fs, goal, handle) {
+            let bid = match alloc_meta_block(fs, goal, handle, intent) {
                 Ok(bid) => bid,
                 Err(err) => {
                     rollback_meta_blocks(fs, &fresh_bids, handle, &self.node_cache);
@@ -1192,7 +1194,13 @@ impl ExtentTree {
                 // A partial cover splits the entry inside its leaf — one free
                 // slot needed; reorganize and re-land when the leaf is full.
                 if leaf.is_full() {
-                    self.make_room_for(fs, e_start, handle, csum_seed)?;
+                    self.make_room_for(
+                        fs,
+                        e_start,
+                        handle,
+                        csum_seed,
+                        AllocIntent::MetadataReserve,
+                    )?;
                     continue;
                 }
 
@@ -1345,7 +1353,14 @@ impl ExtentTree {
             // still mapping every block — rewriting the root first and
             // re-inserting the overflow would strand already-counted runs on
             // a failed insert.
-            let delta = self.reserialize(fs, &out, &[], handle, csum_seed)?;
+            let delta = self.reserialize(
+                fs,
+                &out,
+                &[],
+                handle,
+                csum_seed,
+                AllocIntent::MetadataReserve,
+            )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -1453,7 +1468,13 @@ impl ExtentTree {
                     // reorganize and re-land when the leaf is full.
                     if e.len() > MAX_UNWRITTEN_LEN {
                         if leaf.is_full() {
-                            self.make_room_for(fs, e_start, handle, csum_seed)?;
+                            self.make_room_for(
+                                fs,
+                                e_start,
+                                handle,
+                                csum_seed,
+                                AllocIntent::MetadataReserve,
+                            )?;
                             continue;
                         }
                         let head = Extent::new(
@@ -1497,7 +1518,13 @@ impl ExtentTree {
                 // A partial cover splits the entry inside its leaf — one free
                 // slot needed; reorganize and re-land when the leaf is full.
                 if leaf.is_full() {
-                    self.make_room_for(fs, e_start, handle, csum_seed)?;
+                    self.make_room_for(
+                        fs,
+                        e_start,
+                        handle,
+                        csum_seed,
+                        AllocIntent::MetadataReserve,
+                    )?;
                     continue;
                 }
 
@@ -1621,7 +1648,14 @@ impl ExtentTree {
         }
         merge_extents(&mut out);
         if out.len() > INLINE_MAX {
-            let delta = self.reserialize(fs, &out, &[], handle, csum_seed)?;
+            let delta = self.reserialize(
+                fs,
+                &out,
+                &[],
+                handle,
+                csum_seed,
+                AllocIntent::MetadataReserve,
+            )?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -1776,7 +1810,14 @@ impl ExtentTree {
             freed_data += count as u64;
         }
 
-        let delta = self.reserialize(fs, &survivors, &old_external, handle, csum_seed)?;
+        let delta = self.reserialize(
+            fs,
+            &survivors,
+            &old_external,
+            handle,
+            csum_seed,
+            AllocIntent::Normal,
+        )?;
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         let removed = freed_data as i64 - net_meta;
         self.sector_count =
@@ -1895,7 +1936,14 @@ impl ExtentTree {
             shifted,
             old_external,
         } = plan;
-        let delta = self.reserialize(fs, &shifted, &old_external, handle, csum_seed)?;
+        let delta = self.reserialize(
+            fs,
+            &shifted,
+            &old_external,
+            handle,
+            csum_seed,
+            AllocIntent::Normal,
+        )?;
         let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
         self.sector_count =
             (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -2677,7 +2725,8 @@ impl ExtentTree {
         // still counted but mapped nowhere, on a failed insert.
         debug_assert!(survivors.len() <= INLINE_MAX + 1);
         if survivors.len() > INLINE_MAX {
-            let delta = self.reserialize(fs, &survivors, &[], handle, csum_seed)?;
+            let delta =
+                self.reserialize(fs, &survivors, &[], handle, csum_seed, AllocIntent::Normal)?;
             let net_meta = delta.meta_allocated as i64 - delta.meta_freed as i64;
             self.sector_count =
                 (self.sector_count as i64 + net_meta * SECTORS_PER_BLOCK as i64).max(0) as u64;
@@ -2796,6 +2845,7 @@ impl ExtentTree {
         old_external: &[Ext4Bid],
         handle: Option<&journal::Handle>,
         csum_seed: Option<InodeCsumSeed>,
+        intent: AllocIntent,
     ) -> Result<TreeDelta> {
         let device = fs.block_device().as_ref();
 
@@ -2829,8 +2879,15 @@ impl ExtentTree {
         if nr_leaves <= INLINE_MAX {
             // Depth-1: the inline root indexes `nr_leaves` external leaf blocks.
             let reuse = nr_leaves.min(old_external.len());
-            let (leaf_bids, newly_allocated) =
-                acquire_meta_blocks(fs, old_external, nr_leaves, goal, handle, &self.node_cache)?;
+            let (leaf_bids, newly_allocated) = acquire_meta_blocks(
+                fs,
+                old_external,
+                nr_leaves,
+                goal,
+                handle,
+                &self.node_cache,
+                intent,
+            )?;
 
             // Write each leaf node. On failure, roll back the freshly allocated
             // blocks (the in-memory root is not yet updated, so the old tree
@@ -2876,8 +2933,15 @@ impl ExtentTree {
         // interiors.
         let total = nr_leaves + nr_interior;
         let reuse = total.min(old_external.len());
-        let (blocks, newly_allocated) =
-            acquire_meta_blocks(fs, old_external, total, goal, handle, &self.node_cache)?;
+        let (blocks, newly_allocated) = acquire_meta_blocks(
+            fs,
+            old_external,
+            total,
+            goal,
+            handle,
+            &self.node_cache,
+            intent,
+        )?;
         let (leaf_bids, interior_bids) = blocks.split_at(nr_leaves);
 
         // Write leaves, then interiors. On any failure, roll back the freshly
@@ -3406,12 +3470,13 @@ fn acquire_meta_blocks(
     goal: Ext4Bid,
     handle: Option<&journal::Handle>,
     cache: &NodeCache,
+    intent: AllocIntent,
 ) -> Result<(Vec<Ext4Bid>, Vec<Ext4Bid>)> {
     let reuse = count.min(pool.len());
     let mut blocks: Vec<Ext4Bid> = pool[..reuse].to_vec();
     let mut newly_allocated: Vec<Ext4Bid> = Vec::new();
     for _ in reuse..count {
-        match alloc_meta_block(fs, goal, handle) {
+        match alloc_meta_block(fs, goal, handle, intent) {
             Ok(bid) => newly_allocated.push(bid),
             Err(err) => {
                 rollback_meta_blocks(fs, &newly_allocated, handle, cache);
@@ -3452,9 +3517,17 @@ fn make_index_entry(block: Iblock, child_bid: Ext4Bid) -> RawExtentIdx {
     }
 }
 
-/// Allocates one metadata block for an external extent-tree node.
-fn alloc_meta_block(fs: &Ext4, goal: Ext4Bid, handle: Option<&journal::Handle>) -> Result<Ext4Bid> {
-    let range = fs.alloc_blocks(1, goal, handle)?;
+/// Allocates one metadata block for an external extent-tree node. `intent`
+/// decides whether it may draw the reserve pool: a normal insert's tree growth
+/// passes [`AllocIntent::Normal`], a conversion split
+/// [`AllocIntent::MetadataReserve`].
+fn alloc_meta_block(
+    fs: &Ext4,
+    goal: Ext4Bid,
+    handle: Option<&journal::Handle>,
+    intent: AllocIntent,
+) -> Result<Ext4Bid> {
+    let range = fs.alloc_blocks_with_intent(1, goal, handle, intent)?;
     let bid = range.start;
     // Zero-seed the fresh block's capture now; the capture lives in the
     // running transaction (the credential is proof, not owner), and
@@ -5935,6 +6008,66 @@ mod tests {
         assert!(!tree.lookup(&f.ext4, 601).unwrap().unwrap().is_unwritten());
     }
 
+    /// A write into a `fallocate`d region on a genuinely full volume: the
+    /// unwritten→written conversion splits a full leaf, needing a fresh tree
+    /// node, yet the space was already reserved so the write must not fail
+    /// `ENOSPC` (xfstests generic/274). The metadata reserve makes that split
+    /// succeed where an ordinary allocation — held back from the reserve — is
+    /// already `ENOSPC`.
+    #[ktest]
+    fn convert_split_draws_metadata_reserve_when_full() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+        // A single full leaf of unwritten extents (a fallocate'd region): a
+        // partial convert splits it and forces one new tree node.
+        let mut tree = ExtentTree::empty();
+        for i in 0..LEAF_MAX as u32 {
+            tree.insert(
+                &f.ext4,
+                i * 4,
+                20_000 + (i as Ext4Bid) * 4,
+                2,
+                ExtentKind::Unwritten,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        // Drain the volume with ordinary allocations. Each stops at the reserve
+        // floor, so the loop ends with only the reserve left free — the exact
+        // state generic/274 reaches by filling the disk from userspace.
+        loop {
+            match f.ext4.alloc_blocks(4096, 0, None) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+
+        // The reserve is intact and untouchable by ordinary work: free blocks
+        // remain, yet a `Normal` allocation is `ENOSPC` (the reserve is never
+        // eaten by ordinary allocations).
+        let reserve = f.ext4.super_block().free_blocks_count();
+        assert!(reserve > 0);
+        assert_eq!(
+            f.ext4.alloc_blocks(1, 0, None).unwrap_err().error(),
+            Errno::ENOSPC
+        );
+
+        // The conversion draws the reserve for its split and succeeds — the
+        // write into the preallocated region keeps its no-ENOSPC promise.
+        tree.convert_unwritten(&f.ext4, 601, 1, None, None).unwrap();
+        assert!(!tree.lookup(&f.ext4, 601).unwrap().unwrap().is_unwritten());
+        // The split consumed reserve blocks (free dropped) that the `Normal`
+        // path above could never reach.
+        assert!(f.ext4.super_block().free_blocks_count() < reserve);
+    }
+
     /// `grow_root` grows past the old depth-2 cap (T6): a full depth-2 root
     /// copies down under a one-entry depth-3 index, and only the on-disk
     /// format ceiling [`MAX_DEPTH`] refuses (grow never dereferences the
@@ -5966,7 +6099,8 @@ mod tests {
 
         // depth 2 → 3: allowed since T6.
         let mut tree = craft_full_root(2);
-        tree.grow_root(&f.ext4, None, None).unwrap();
+        tree.grow_root(&f.ext4, None, None, AllocIntent::Normal)
+            .unwrap();
         assert_eq!(tree.depth(), 3);
         assert_eq!(tree.header().entries(), 1);
         assert_eq!(root_index_key(&tree, 0), 0);
@@ -5974,7 +6108,9 @@ mod tests {
         // The format ceiling holds: a MAX_DEPTH root refuses to grow.
         let mut deep = craft_full_root(MAX_DEPTH);
         assert_eq!(
-            deep.grow_root(&f.ext4, None, None).unwrap_err().error(),
+            deep.grow_root(&f.ext4, None, None, AllocIntent::Normal)
+                .unwrap_err()
+                .error(),
             Errno::ENOSPC
         );
     }

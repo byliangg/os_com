@@ -68,6 +68,33 @@ impl TryFrom<u32> for GoingDown {
     }
 }
 
+/// Whether a block allocation may draw from the metadata reserve pool (Linux's
+/// `s_resv_clusters`, admitted via `EXT4_MB_USE_RESERVED` in
+/// `ext4_has_free_clusters`).
+///
+/// The reserve is a purely in-core admission floor — nothing on disk records it
+/// — held back from ordinary allocations so a *must-succeed* metadata operation
+/// over already-reserved space can still find a tree block on an otherwise full
+/// volume. Its reason for existing is the write into a `fallocate`d region: the
+/// space was already reserved as an unwritten extent, so the write owes no new
+/// data block, yet converting it to *written* can split the extent and force a
+/// fresh tree node. Without the reserve that split fails `ENOSPC` on a full
+/// volume, breaking `fallocate`'s no-ENOSPC-on-write promise (xfstests
+/// generic/274).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum AllocIntent {
+    /// An ordinary allocation — data blocks, directory blocks, or the extent
+    /// tree growth a *normal write* (a fresh mapping) forces. Must leave the
+    /// reserve intact: it fails `ENOSPC` once only the reserve remains, so the
+    /// reserve is never eaten by ordinary work.
+    Normal,
+    /// A must-succeed metadata allocation for an operation over already-reserved
+    /// space: the extent-tree split or growth an unwritten→written conversion
+    /// (or its `ZERO_RANGE` mirror) forces. May draw the reserve down to empty
+    /// (Linux `EXT4_GET_BLOCKS_METADATA_NOFAIL` → `EXT4_MB_USE_RESERVED`).
+    MetadataReserve,
+}
+
 /// Policy for how `statfs` reports the total block count (`f_blocks`).
 ///
 /// Mirrors ext2's option of the same name; Linux keeps it in
@@ -1101,6 +1128,34 @@ impl Ext4 {
         goal: Ext4Bid,
         handle: Option<&journal::Handle>,
     ) -> Result<Range<Ext4Bid>> {
+        self.alloc_blocks_with_intent(count, goal, handle, AllocIntent::Normal)
+    }
+
+    /// The runtime metadata reserve floor (Linux `s_resv_clusters`, set by
+    /// `ext4_set_resv_clusters`): 2% of the volume, capped at 4096 blocks. Held
+    /// back from [`AllocIntent::Normal`] allocations so an
+    /// [`AllocIntent::MetadataReserve`] one — an unwritten→written conversion's
+    /// tree split on a full volume — can still find a block. No cluster feature
+    /// here, so a cluster is one block and no on-disk field changes.
+    const fn metadata_reserve_floor(total_blocks: u64) -> u64 {
+        let two_percent = total_blocks / 50;
+        if two_percent < 4096 {
+            two_percent
+        } else {
+            4096
+        }
+    }
+
+    /// [`alloc_blocks`](Self::alloc_blocks) with an explicit
+    /// [`AllocIntent`]. `Normal` may consume only free blocks *above* the
+    /// metadata reserve floor; `MetadataReserve` may draw the reserve to empty.
+    pub(super) fn alloc_blocks_with_intent(
+        &self,
+        count: u32,
+        goal: Ext4Bid,
+        handle: Option<&journal::Handle>,
+        intent: AllocIntent,
+    ) -> Result<Range<Ext4Bid>> {
         if count == 0 {
             return_errno_with_message!(Errno::EINVAL, "zero block allocation requested");
         }
@@ -1121,9 +1176,29 @@ impl Ext4 {
         let sb_free_blocks = sb.free_blocks_count();
         let first_data_block = sb.first_data_block();
         let nr_blocks_per_group = sb.nr_blocks_per_group() as Ext4Bid;
-        if sb_free_blocks == 0 {
-            return_errno_with_message!(Errno::ENOSPC, "no free blocks on device");
+
+        // Reserve gate (Linux `ext4_has_free_clusters` + the `ar->len` halving
+        // in `ext4_mb_new_blocks`): a `Normal` request may consume only the
+        // free blocks *above* the reserve floor, and — like Linux clamping the
+        // request down until the claim passes — the count is trimmed to fit
+        // rather than failing outright, preserving the partial-run behavior a
+        // near-full data write already relies on. A `MetadataReserve` request
+        // ignores the floor entirely. Nothing left to hand out (only the
+        // reserve remains, for `Normal`; genuinely empty, for either) is
+        // `ENOSPC`.
+        let allocatable = match intent {
+            AllocIntent::Normal => {
+                sb_free_blocks.saturating_sub(Self::metadata_reserve_floor(sb.total_blocks()))
+            }
+            AllocIntent::MetadataReserve => sb_free_blocks,
+        };
+        if allocatable == 0 {
+            return_errno_with_message!(Errno::ENOSPC, "no free blocks available above the reserve");
         }
+        // Trim the request to what the reserve leaves. Widen to u64 for the min
+        // so a huge `allocatable` never truncates; the result is `≤ count`, a
+        // u32, so the narrowing back is lossless.
+        let count = (count as u64).min(allocatable) as u32;
 
         // The pinned freed runs, snapshotted once per allocation. A transient
         // journal-state read under the superblock write lock — a leaf edge
@@ -3343,6 +3418,66 @@ mod tests {
                 .error(),
             Errno::EINVAL
         );
+    }
+
+    /// The metadata reserve floor (Linux `s_resv_clusters`): once only the
+    /// reserve is left, a `Normal` allocation is `ENOSPC` while a
+    /// `MetadataReserve` one still succeeds — and the reserve, once exhausted by
+    /// reserved allocations, is `ENOSPC` for both.
+    #[ktest]
+    fn metadata_reserve_gates_normal_but_not_reserved() {
+        let f = Ext4FixtureBuilder::new(8192, 256, 8192)
+            .with_block_bitmap_metadata_marked()
+            .build()
+            .unwrap();
+
+        // 8192 blocks → a 163-block reserve (2%, under the 4096 cap): non-zero,
+        // so the gate is actually exercised.
+        assert_eq!(Ext4::metadata_reserve_floor(8192), 163);
+
+        // Drain every ordinary-allocatable block; a `Normal` request stops at
+        // the reserve floor.
+        loop {
+            match f.ext4.alloc_blocks(4096, 0, None) {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+
+        // The reserve remains free but is off-limits to ordinary work.
+        let reserve = f.ext4.super_block().free_blocks_count();
+        assert!(reserve > 0);
+        assert_eq!(
+            f.ext4.alloc_blocks(1, 0, None).unwrap_err().error(),
+            Errno::ENOSPC
+        );
+
+        // A must-succeed metadata allocation draws the reserve down.
+        let one = f
+            .ext4
+            .alloc_blocks_with_intent(1, 0, None, AllocIntent::MetadataReserve)
+            .unwrap();
+        assert_eq!(one.end - one.start, 1);
+        assert_eq!(f.ext4.super_block().free_blocks_count(), reserve - 1);
+
+        // Exhaust the rest of the reserve, then even the reserved path is
+        // `ENOSPC` — genuinely empty, no phantom space.
+        loop {
+            match f
+                .ext4
+                .alloc_blocks_with_intent(4096, 0, None, AllocIntent::MetadataReserve)
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    assert_eq!(e.error(), Errno::ENOSPC);
+                    break;
+                }
+            }
+        }
+        assert_eq!(f.ext4.super_block().free_blocks_count(), 0);
     }
 
     #[ktest]
