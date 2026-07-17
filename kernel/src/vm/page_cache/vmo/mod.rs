@@ -828,23 +828,34 @@ impl<'a> BackedVmo<'a> {
         Ok(())
     }
 
-    /// Removes up-to-date (clean) pages in the specified byte range from the page cache.
+    /// Removes every NON-DIRTY page in the byte range from the page cache: clean
+    /// (`UpToDate`) pages and in-flight (`Uninit`) pages alike, draining any
+    /// in-flight read to completion first. Dirty pages are left in place — a
+    /// caller that must drop them flushes first (see `invalidate_range`).
     ///
-    /// Only pages in the `UpToDate` state are removed. Dirty and uninitialized
-    /// pages are left in place.
+    /// Evicting the `Uninit` pages closes a stale-read window behind a range
+    /// mutation (`collapse_range` / `insert_range` / `punch_hole`): a read-ahead
+    /// BIO submitted before the mutation, whose physical target was fixed from
+    /// the PRE-mutation mapping, otherwise survives the eviction (an `Uninit`
+    /// page was skipped), completes afterwards, and plants an `UpToDate` page
+    /// holding the moved block's old contents at the new logical offset
+    /// (generic/127). `wait_for_writeback_and_remove_pages` blocks on each
+    /// page's lock — an in-flight read holds it until its BIO completes — so the
+    /// page is drained, not dropped mid-flight, before removal.
     //
-    // TODO: Returns `Err` if any up-to-date page has been mapped.
+    // TODO: Returns `Err` if any page in the range has been mapped.
     // TODO: Integrate reverse mappings or an explicit invalidation lock so this
     // path can coordinate with page faults.
-    pub(super) fn evict_up_to_date_pages(&self, range: &Range<usize>) -> Result<()> {
+    pub(super) fn evict_non_dirty_pages(&self, range: &Range<usize>) -> Result<()> {
         let locked_pages = self.vmo.pages.lock();
         if range.start >= self.size() {
             return Ok(());
         }
 
         let page_idx_range = get_page_idx_range(range);
-        let pages_to_evict =
-            self.collect_pages_if(locked_pages, page_idx_range, |_, page| page.is_up_to_date());
+        let pages_to_evict = self.collect_pages_if(locked_pages, page_idx_range, |_, page| {
+            page.is_up_to_date() || page.is_uninit()
+        });
         self.wait_for_writeback_and_remove_pages(pages_to_evict);
 
         Ok(())

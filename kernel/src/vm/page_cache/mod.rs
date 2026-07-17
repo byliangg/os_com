@@ -336,21 +336,25 @@ impl PageCache {
             return Ok(());
         };
 
-        vmo.evict_up_to_date_pages(&range)
+        vmo.evict_non_dirty_pages(&range)
     }
 
-    /// Flushes dirty pages and then evicts clean pages in the specified range.
+    /// Flushes dirty pages and then evicts every non-dirty page (clean and
+    /// in-flight) in the specified range, draining any in-flight read first.
     ///
     /// This is the standard preparation step before issuing direct I/O that must
-    /// bypass the page cache. It uses the same locking requirements as
-    /// [`PageCache::flush_range`] and [`PageCache::evict_range`].
+    /// bypass the page cache, and the range mutation ops (`collapse_range` /
+    /// `insert_range` / `punch_hole`) use it so a read-ahead started before the
+    /// mutation cannot survive to plant a stale page (see
+    /// [`BackedVmo::evict_non_dirty_pages`]). It uses the same locking
+    /// requirements as [`PageCache::flush_range`] and [`PageCache::evict_range`].
     pub fn invalidate_range(&self, range: Range<usize>) -> Result<()> {
         let Some(vmo) = self.0.as_backed_vmo() else {
             return Ok(());
         };
 
         vmo.flush_dirty_pages(&range)?;
-        vmo.evict_up_to_date_pages(&range)
+        vmo.evict_non_dirty_pages(&range)
     }
 
     /// Fills the specified range of the page cache with zeros.
