@@ -1479,8 +1479,12 @@ impl Ext4 {
             return Ok(OrphanLink { old_head: None });
         }
         let mut chain = self.s_orphan_lock.lock();
-        // Already listed (defensive — no current call site can re-add a listed
-        // inode; Linux guards the same way): keep the existing successor.
+        // Already listed: keep the existing successor. Paths that can
+        // legitimately meet a listed inode (the reclaim and chunked-truncate
+        // spines — an unlink-of-open file arrives at both already listed) go
+        // through `orphan_add_if_absent`, which pre-filters; a re-add landing
+        // HERE is a caller that lost track, so warn but stay consistent
+        // (Linux `ext4_orphan_add` guards the same way).
         if let Some(next) = chain.successor_of(ino) {
             warn!("inode {ino} is already on the orphan list");
             return Ok(OrphanLink { old_head: next });
@@ -1501,13 +1505,15 @@ impl Ext4 {
     }
 
     /// Links `ino` onto the orphan list only if it is not already listed — the
-    /// reclaim path's guard for keeping an inode listed across a
-    /// multi-transaction free. A silent no-op (no warning) when already listed
-    /// (the normal unlink and recovery cases already added it); the only fresh
-    /// add is the create-error inode, which reaches `Drop` unlisted. Journal-only
-    /// (a no-op without a handle). The chain override in
-    /// [`write_back_inode_desc`](Self::write_back_inode_desc) stamps the on-disk
-    /// `i_dtime` successor on the reclaim's writebacks while listed, so the
+    /// guard the multi-transaction spines (the reclaim's free and the chunked
+    /// truncate) use to keep an inode listed without disturbing an existing
+    /// listing. A silent no-op (no warning) when already listed: the reclaim
+    /// arrives after the unlink/recovery add, and the chunked truncate after
+    /// an unlink-of-open file was listed by `unlink` (the fresh-add cases are
+    /// a live file's truncate and the create-error inode reaching `Drop`
+    /// unlisted). Journal-only (a no-op without a handle). The chain override
+    /// in [`write_back_inode_desc`](Self::write_back_inode_desc) stamps the
+    /// on-disk `i_dtime` successor on every writeback while listed, so the
     /// minted [`OrphanLink`] needs no separate `persist_as_orphan`.
     pub(super) fn orphan_add_if_absent(
         &self,
@@ -1991,6 +1997,14 @@ impl Ext4 {
     #[cfg(ktest)]
     pub(super) fn inode_capture_dedup_hits_for_test(&self) -> u64 {
         self.inode_capture_dedup_hits.load(Ordering::Relaxed)
+    }
+
+    /// Whether `ino` sits on the in-memory orphan-chain mirror and, if so,
+    /// its successor (`Some(None)` = listed as the last member) — the
+    /// truncate/reclaim pins peek the chain state through it.
+    #[cfg(ktest)]
+    pub(super) fn orphan_successor_for_test(&self, ino: Ext4Ino) -> Option<Option<Ext4Ino>> {
+        self.s_orphan_lock.lock().successor_of(ino)
     }
 
     /// Persists `desc` into `ino`'s on-disk `RawInode` slot — the writeback

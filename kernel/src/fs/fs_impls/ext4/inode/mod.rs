@@ -1829,19 +1829,25 @@ impl Inode {
     /// zero+shrink the page cache, and publish `i_size = new_size` (the KEY
     /// INSIGHT — the target IS `i_size`, published now and never advanced, so
     /// recovery reads it and re-truncates to it). Then, in the first
-    /// transaction, link the inode onto the orphan list and persist that size;
-    /// loop freeing tail extents one credit-bounded chunk per transaction (a
-    /// `journal_restart` at each boundary, ③ released) until the tree references
-    /// only `[0, keep_blocks)`; in the LAST chunk unlink from the orphan list.
+    /// transaction, link the inode onto the orphan list (keeping an existing
+    /// listing — an unlinked-but-open file arrives here already listed by
+    /// `unlink`) and persist that size; loop freeing tail extents one
+    /// credit-bounded chunk per transaction (a `journal_restart` at each
+    /// boundary, ③ released) until the tree references only
+    /// `[0, keep_blocks)`; in the LAST chunk unlink from the orphan list —
+    /// but only a LIVE inode (Linux `ext4_truncate`'s `if (inode->i_nlink)`):
+    /// a zero-link inode stays listed for its reclaim to consume.
     ///
     /// Crash safety (report §5.1-5.2, DECISION §F): each chunk commits `i_size =
     /// new_size`, a tree referencing `[0, reached)`, bitmaps freed for `[reached,
     /// old)`, and matching `i_blocks` — atomically, with the inode listed. A
-    /// crash after chunk k leaves exactly that; recovery re-truncates to the
-    /// persisted `i_size` and unlists. No leak (freed ⟺ dropped-from-tree, one
-    /// txn), no double-free (a re-truncate frees only `[keep_blocks, reached)`,
-    /// the already-freed extents gone from the tree), idempotent recovery (a
-    /// crash mid-recovery re-scans the shorter frontier and resumes).
+    /// crash after chunk k leaves exactly that; recovery re-truncates a live
+    /// member to the persisted `i_size` and unlists it, and FREES a zero-link
+    /// member — which is why the tail must never unlist one. No leak (freed ⟺
+    /// dropped-from-tree, one txn), no double-free (a re-truncate frees only
+    /// `[keep_blocks, reached)`, the already-freed extents gone from the
+    /// tree), idempotent recovery (a crash mid-recovery re-scans the shorter
+    /// frontier and resumes).
     fn shrink_restartable(
         &self,
         fs: &Ext4,
@@ -1858,17 +1864,19 @@ impl Inode {
 
         // First transaction: link onto the orphan list and persist `i_size =
         // new_size`, its on-disk `i_dtime` stamped to the chain successor by the
-        // existing override in `write_back_inode_desc` (the inode stays live —
-        // link count untouched — and that override is link-count-agnostic).
-        // DECISION G-2: do NOT `persist_as_orphan` — its pointer written into the
-        // cached descriptor's `i_dtime` would go stale after `orphan_del`; the
-        // descriptor's `dtime` stays live (0), the chain override supplies the
-        // on-disk successor while listed.
+        // existing override in `write_back_inode_desc` (the override is
+        // link-count-agnostic). `orphan_add_if_absent`, not `orphan_add`: an
+        // unlinked-but-open file (`unlink` listed it; an open fd keeps it
+        // alive) can be ftruncated down this spine, and its unlink listing —
+        // chain position and successor — must stay untouched. DECISION G-2:
+        // do NOT `persist_as_orphan` — its pointer written into the cached
+        // descriptor's `i_dtime` would go stale after `orphan_del`; the
+        // descriptor's `dtime` stays as it was (live 0, or the unlink's
+        // orphan-next), the chain override supplies the on-disk successor
+        // while listed (which is also why no `OrphanLink` needs consuming
+        // here — same as the reclaim's use of the same guard).
         let mut op = fs.begin_op(fs.truncate_credits(em.root_depth()))?;
-        // The `#[must_use]` link is deliberately dropped, not fed to
-        // `persist_as_orphan` (see G-2 above): the chain override already
-        // stamps `i_dtime` on every writeback while the inode is listed.
-        let _orphan_link = fs.orphan_add(self.ino, op.get())?;
+        fs.orphan_add_if_absent(self.ino, op.get())?;
         inner.write_back_inode_desc(fs, self.ino, op.get())?;
         // data=ordered: the kept partial block's re-zeroing (in `prepare_shrink`)
         // must reach disk before this first transaction — which already
@@ -1892,7 +1900,9 @@ impl Inode {
             // requires (the fast/slow gate only routes here with a journal).
             let Some(max) = fs.journal().map(|j| j.max_credits()) else {
                 em.truncate_to_byte_len(new_size, op.get())?;
-                fs.orphan_del(self.ino, op.get())?;
+                if inner.link_count() != 0 {
+                    fs.orphan_del(self.ino, op.get())?;
+                }
                 inner.write_back_inode_desc(fs, self.ino, op.get())?;
                 break;
             };
@@ -1903,10 +1913,20 @@ impl Inode {
                 // in-place tree edits) sees the inode off the chain and persists
                 // `i_dtime = 0` — a live truncated file's deletion time. The
                 // cached descriptor's `dtime` was never repointed (G-2), so it
-                // is still live.
-                fs.orphan_del(self.ino, op.get())?;
+                // is still live. ONLY a live inode unlists (Linux
+                // `ext4_truncate`'s `if (inode->i_nlink)` guard): an
+                // unlinked-but-open inode was listed by `unlink` for the
+                // `Drop` reclaim — or, after a crash, the recovery scan — to
+                // consume, and splicing it off here would leave a crash
+                // between this commit and the reclaim with a permanently
+                // leaked inode (recovery no longer sees it; strict e2fsck: an
+                // unattached zero-link inode). Its writeback keeps the chain
+                // override instead, persisting the successor while listed.
+                if inner.link_count() != 0 {
+                    fs.orphan_del(self.ino, op.get())?;
+                }
                 inner.write_back_inode_desc(fs, self.ino, op.get())?;
-                debug_assert!(inner.desc_dtime_is_live());
+                debug_assert!(inner.link_count() == 0 || inner.desc_dtime_is_live());
                 break;
             }
             // Not done: persist this chunk's frontier + `i_blocks` (SAME txn as
@@ -1952,7 +1972,9 @@ impl Inode {
         loop {
             let Some(max) = fs.journal().map(|j| j.max_credits()) else {
                 em.truncate_to_byte_len(target, op.get())?;
-                fs.orphan_del(self.ino, op.get())?;
+                if inner.link_count() != 0 {
+                    fs.orphan_del(self.ino, op.get())?;
+                }
                 inner.write_back_inode_desc(&fs, self.ino, op.get())?;
                 break;
             };
@@ -1960,8 +1982,14 @@ impl Inode {
             if chunk.reached <= keep_blocks {
                 // Unlink BEFORE the writeback so it (dirtied by this chunk's
                 // tree edits) persists the live `i_dtime = 0` rather than the
-                // stale successor pointer the crash left on disk.
-                fs.orphan_del(self.ino, op.get())?;
+                // stale successor pointer the crash left on disk. The
+                // `i_nlink` guard is Linux-parity defense (`ext4_truncate`):
+                // the recovery walk routes only live members here — a
+                // zero-link member goes to the reclaim, which owns its
+                // unlisting.
+                if inner.link_count() != 0 {
+                    fs.orphan_del(self.ino, op.get())?;
+                }
                 inner.write_back_inode_desc(&fs, self.ino, op.get())?;
                 debug_assert!(inner.desc_dtime_is_live());
                 break;
@@ -5515,6 +5543,98 @@ mod write_tests {
             (keep as u64 + 1) * SECTORS_PER_BLOCK,
             "5 data blocks + 1 surviving external leaf"
         );
+    }
+
+    /// P10-T2.3 review pin (Finding-2, an existing bug since P7d): a chunked
+    /// truncate of an UNLINKED-but-open inode must not splice it off the
+    /// orphan list at its tail (Linux `ext4_truncate`'s `if (inode->i_nlink)`
+    /// guard). `unlink` listed the zero-link inode for the `Drop` reclaim —
+    /// or, after a crash, the recovery scan — to consume; the unguarded
+    /// `orphan_del` unlisted it, so a crash between the truncate's commit and
+    /// the reclaim leaked the inode permanently (recovery no longer saw it;
+    /// strict e2fsck: an unattached zero-link inode). Pins: the inode stays
+    /// on the mirror AND the superblock head with its `OrphanNext` descriptor
+    /// dtime intact (the recovery-consumable shape: head -> ino, link 0), and
+    /// the tail's `debug_assert` tolerates the still-listed state.
+    #[ktest]
+    fn chunked_truncate_keeps_unlinked_open_inode_on_orphan_list() {
+        // Same geometry as the multi-transaction truncate test: the shrink
+        // estimate must overrun one transaction to take the chunked spine.
+        let f = journaled_multigroup_fixture(20);
+        let journal = f.ext4.journal().unwrap();
+        assert_eq!(journal.max_credits(), 16);
+        let inode = f.ext4.read_inode(FILE_INO).unwrap();
+
+        const N_BLOCKS: usize = 120;
+        let payload: Vec<u8> = (0..N_BLOCKS * BLOCK_SIZE)
+            .map(|k| (k * 31 + 7) as u8)
+            .collect();
+        assert_eq!(write_all(&inode, 0, &payload), payload.len());
+
+        // Unlink-of-open, mechanism level (this `Arc` plays the open fd):
+        // drop the link count to 0 and orphan-list the inode exactly as
+        // `unlink` does — add + persist_as_orphan in one transaction.
+        {
+            let mut inner = inode.inner.write();
+            let op = f.ext4.begin_op(8).unwrap();
+            inner.set_link_count(0);
+            let link = f.ext4.orphan_add(FILE_INO, op.get()).unwrap();
+            inner
+                .persist_as_orphan(&f.ext4, FILE_INO, link, op.get())
+                .unwrap();
+        }
+
+        // The shrink overruns one transaction, so `resize` takes the chunked,
+        // orphan-protected spine — whose tail used to unlist unconditionally.
+        let keep = 5usize;
+        let est = {
+            let inner = inode.inner.read();
+            inner
+                .extent_manager()
+                .unwrap()
+                .plan_shrink(keep * BLOCK_SIZE, journal.max_credits())
+                .unwrap()
+                .whole_estimate
+        };
+        assert!(
+            est > journal.max_credits(),
+            "the truncate must take the chunked spine: est={est} max={}",
+            journal.max_credits()
+        );
+        inode.resize(keep * BLOCK_SIZE).unwrap();
+
+        // The zero-link inode is still listed: mirror, superblock head, and
+        // the descriptor's untouched OrphanNext dtime (empty chain at add
+        // time = end-of-chain) all keep the unlink's listing.
+        assert_eq!(
+            f.ext4.orphan_successor_for_test(FILE_INO),
+            Some(None),
+            "an unlinked-open inode must stay orphan-listed across a chunked truncate"
+        );
+        assert_eq!(
+            f.ext4.super_block().last_orphan(),
+            Some(FILE_INO),
+            "the on-disk head must still reach the zero-link inode"
+        );
+        {
+            let inner = inode.inner.read();
+            assert_eq!(inner.link_count(), 0);
+            assert!(
+                matches!(inner.desc.dtime, Dtime::OrphanNext(None)),
+                "the truncate must not repoint the descriptor's orphan-next dtime"
+            );
+        }
+        assert_eq!(inode.size(), keep * BLOCK_SIZE);
+
+        // Commit everything: the durable state is exactly the shape the
+        // recovery scan consumes — head -> FILE_INO, link count 0, dtime =
+        // end-of-chain — so a crash here FREES the inode instead of leaking
+        // it (`walk_orphan_chain` routes zero-link members to `to_free`).
+        journal.commit_and_wait_running().unwrap();
+
+        // Teardown: `inode` drops before `f`, so the `Drop` reclaim — the
+        // no-crash owner of a zero-link unlisting — frees it via the same
+        // `orphan_add_if_absent` no-op the spine now shares.
     }
 
     /// P7d-2cd (BLOCKING 1) — an INTERMEDIATE truncate chunk must leave a
