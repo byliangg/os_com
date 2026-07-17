@@ -3170,7 +3170,9 @@ impl InodeCaptureRecord {
 /// [`write_back_inode_desc`](InodeInner::write_back_inode_desc)); every other
 /// writeback dedups.
 enum CapturePolicy {
+    /// Consult the capture record and skip a covered, byte-identical capture.
     Dedup,
+    /// Always capture — the durability funnels' policy.
     Forced,
 }
 
@@ -3213,9 +3215,10 @@ struct InodeInner {
     /// record only costs the next writeback a full capture; the same holds
     /// for a record lost with an evicted-and-reloaded inode). `None` before
     /// the first journaled writeback, and forever on a non-journaled volume
-    /// (only the journaled arm ever stores one). Boxed so a cold inode pays
-    /// one pointer, not 264 bytes.
-    last_capture: Option<Box<InodeCaptureRecord>>,
+    /// (only the journaled arm ever stores one). The 256-byte basis lives
+    /// behind its own `Box` inside the record, so the inline `Option` costs
+    /// the tid, the epoch and one pointer — no second indirection.
+    last_capture: Option<InodeCaptureRecord>,
 }
 
 impl InodeInner {
@@ -4175,7 +4178,7 @@ impl InodeInner {
 
         if let Some(handle) = handle {
             let last = match policy {
-                CapturePolicy::Dedup => self.last_capture.as_deref(),
+                CapturePolicy::Dedup => self.last_capture.as_ref(),
                 CapturePolicy::Forced => None,
             };
             match fs.capture_inode_desc(ino, &self.desc, &root, handle, last) {
@@ -4183,11 +4186,8 @@ impl InodeInner {
                     basis,
                     splice_epoch,
                 }) => {
-                    self.last_capture = Some(Box::new(InodeCaptureRecord::new(
-                        handle.tid(),
-                        splice_epoch,
-                        basis,
-                    )));
+                    self.last_capture =
+                        Some(InodeCaptureRecord::new(handle.tid(), splice_epoch, basis));
                 }
                 Ok(InodeCaptureOutcome::Deduped) => {
                     // Nothing new entered the transaction; the record stays

@@ -1580,10 +1580,11 @@ impl Ext4 {
     /// `i_dtime` bytes are overwritten, so every other field — and every
     /// neighboring inode — keeps its committed content.
     ///
-    /// `chain` is the held `s_orphan_lock` guard: this patch rewrites an
-    /// inode slot's transaction bytes OUTSIDE the capture funnel, so it must
-    /// advance the [`SpliceEpoch`] in the same lock window — taking the
-    /// mirror by `&mut` makes forgetting the lock, or the bump, ill-typed.
+    /// `chain` is the held `s_orphan_lock` guard, passed through to
+    /// [`InodeSlot::journal_patch_dtime`], which advances the [`SpliceEpoch`]
+    /// itself right after the patch lands — no slot-byte writer outside the
+    /// capture funnel can compile without the mirror, and none can forget
+    /// the bump.
     fn patch_orphan_next_on_disk(
         &self,
         chain: &mut OrphanChain,
@@ -1601,10 +1602,7 @@ impl Ext4 {
         };
         // `0 = end of chain` is the on-disk convention (encode boundary).
         self.inode_slot(ino)?
-            .journal_patch_dtime(handle, next.unwrap_or(0), csum)?;
-        // The patch landed (`journal_patch_dtime` errors precede application):
-        // every capture record's basis is now potentially stale, fence them.
-        chain.bump_splice_epoch();
+            .journal_patch_dtime(handle, next.unwrap_or(0), csum, chain)?;
         Ok(())
     }
 
@@ -2135,7 +2133,7 @@ impl Ext4 {
     /// unconditional capture (first writeback, or a durability funnel's
     /// forced variant). Same-tid equality shares jbd2's `tid_geq` assumption
     /// that a handle and its record are never exactly 2^32 transactions
-    /// apart (see [`Tid::geq`]).
+    /// apart (see [`journal::Tid::geq`]).
     ///
     /// # Locking
     ///
@@ -2165,6 +2163,14 @@ impl Ext4 {
     ///
     /// On a skip the lock window ends at the predicate — no superblock read,
     /// no journal-state lock is ever taken.
+    ///
+    /// # Errors
+    ///
+    /// A journaled capture failure is transaction-fatal: the transaction may
+    /// already carry leaf/bitmap after-images that depend on this inode
+    /// image, so the caller must funnel the error into a journal abort — see
+    /// the abort rider in `write_back_inode_desc_with` (`inode/mod.rs`), the
+    /// P9a-a5 cross-cutting obligation.
     pub(super) fn capture_inode_desc(
         &self,
         ino: Ext4Ino,
@@ -2575,11 +2581,17 @@ impl InodeSlot {
     /// decoded from the seeded image, re-stamped, and written back (Linux
     /// `ext4_orphan_del` rewrites the predecessor via `ext4_inode_csum_set`).
     /// Without it, the minimal 4-byte patch stands (Phases 1-5 verbatim).
+    ///
+    /// `chain` is the held `s_orphan_lock` mirror: this is the one slot-byte
+    /// writer outside the capture funnel, so the [`SpliceEpoch`] advances
+    /// HERE, after the patch lands (errors precede application) — demanding
+    /// the mirror makes a bump-less patch, by any future caller, ill-typed.
     fn journal_patch_dtime(
         &self,
         handle: Option<&journal::Handle>,
         next: u32,
         csum: Option<(Ext4Ino, FsCsumSeed, usize)>,
+        chain: &mut OrphanChain,
     ) -> Result<()> {
         let off = self.offset_in_block;
         let dtime_off = off + core::mem::offset_of!(RawInode, dtime);
@@ -2591,7 +2603,9 @@ impl InodeSlot {
                 InodeDesc::stamp_inode_checksum(&mut raw, iseed, inode_size);
                 buf[off..off + size_of::<RawInode>()].copy_from_slice(raw.as_bytes());
             }
-        })
+        })?;
+        chain.bump_splice_epoch();
+        Ok(())
     }
 }
 
