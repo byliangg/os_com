@@ -69,9 +69,31 @@ fi
 # prompt). Any answered `<Verb>? yes` (or a preen-style FIXED/CLEARED/
 # RECONNECT) means the post-replay filesystem was NOT crash-consistent —
 # the state a real kernel would have mounted was corrupt.
-if echo "$OUT" | grep -qE "\? yes|FIXED|CLEARED|RECONNECT"; then
+#
+# One documented exception: e2fsck's extent-tree minimization ("Inode N
+# extent tree (at level M) could be shorter/narrower.  Optimize? yes") is a
+# COSMETIC rewrite of a VALID tree, not a crash-consistency repair — the tree
+# reads back correctly and journal replay is what produced it. Linux ext4
+# leaves such non-minimal trees too: truncate / punch-hole free the extents
+# but do NOT collapse the tree's depth, so an inode that grew past 4 extents
+# and shrank back keeps its now-redundant leaf level. Verified on the host
+# ext4 driver — fragment-a-file-then-punch-back-down reproduces the identical
+# "could be shorter" on a Linux-written image — so e2fsck greets both kernels'
+# states with it and it is not a divergence. Strip ONLY that exact line before
+# the corruption grep; every other answered prompt (Fix/Clear/Salvage/Connect/
+# Truncate/...) still reds, and a mixed state that also optimizes stays red on
+# its real repair (its Fix?/Clear? line survives the strip). The pattern is
+# fully anchored (^Inode … yes$): e2fsck suppresses the progress bar on the
+# captured/non-tty output the sweep feeds it, so the message always starts at
+# column 0, and every prompt ends its own physical line ("? %s\n\n") — so a
+# real Fix? can never share a line with, and be stripped alongside, the
+# optimize text. The sibling over-depth message ("could be more shallow") is
+# deliberately NOT matched: it flags a tree deeper than the depth cap and must
+# stay red.
+SCRUBBED=$(echo "$OUT" | grep -vE "^Inode [0-9]+ extent tree \(at level [0-9]+\) could be (shorter|narrower)\.[[:space:]]+Optimize\? yes$")
+if echo "$SCRUBBED" | grep -qE "\? yes|FIXED|CLEARED|RECONNECT"; then
     echo "CRASH-JUDGE: post-replay fsck repaired corruption on $IMG" >&2
-    echo "$OUT" | grep -iE "\? yes|FIXED|CLEARED|RECONNECT|differences|wrong|invalid|overlaps|orphan|unused inodes" | head -20 >&2
+    echo "$SCRUBBED" | grep -iE "\? yes|FIXED|CLEARED|RECONNECT|differences|wrong|invalid|overlaps|orphan|unused inodes" | head -20 >&2
     forensics
     exit 1
 fi
