@@ -1,0 +1,65 @@
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.hle [bit 4]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.rtm [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512f [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512dq [bit 17]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512cd [bit 28]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512bw [bit 30]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].EBX.avx512vl [bit 31]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi [bit 1]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vbmi2 [bit 6]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512vnni [bit 11]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512bitalg [bit 12]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.avx512-vpopcntdq [bit 14]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=07h,ecx=00h].ECX.la57 [bit 16]
+qemu-system-x86_64: warning: host doesn't support requested feature: CPUID[eax=80000008h].EBX.wbnoinvd [bit 9]
+c[?7l[2J[0mSeaBIOS (version rel-1.17.0-0-gb52ca86e094d-prebuilt.qemu.org)
+
+
+iPXE (http://ipxe.org) 00:02.0 CA00 PCI2.10 PnP PMM+7EFD1900+7EF31900 CA00
+Press Ctrl-B to configure iPXE (PCI 00:02.0)...                                                                               
+
+
+Booting from ROM...
+c[?7l[2J[    0.297882] kvm_intel: VMX not supported by CPU 0
+Running benchmark: fio/ext4_p9_param on linux
+The VM is ready for the benchmark.
+P9CFG mode=write rw=write bs=1M nj=1 fsync=64 size=1G
+P9CASE write
+p9write: (g=0): rw=write, bs=(R) 1024KiB-1024KiB, (W) 1024KiB-1024KiB, (T) 1024KiB-1024KiB, ioengine=sync, iodepth=1
+fio-3.39
+Starting 1 thread
+p9write: Laying out IO file (1 file / 1024MiB)
+Jobs: 1 (f=1)
+p9write: (groupid=0, jobs=1): err= 0: pid=100: Sat Jul 18 02:35:07 2026
+  write: IOPS=576, BW=576MiB/s (604MB/s)(1024MiB/1777msec); 0 zone resets
+    clat (usec): min=58, max=938, avg=233.05, stdev=159.57
+     lat (usec): min=67, max=976, avg=253.29, stdev=162.96
+    clat percentiles (usec):
+     |  1.00th=[   60],  5.00th=[   62], 10.00th=[   64], 20.00th=[   76],
+     | 30.00th=[  102], 40.00th=[  141], 50.00th=[  237], 60.00th=[  265],
+     | 70.00th=[  293], 80.00th=[  351], 90.00th=[  453], 95.00th=[  523],
+     | 99.00th=[  717], 99.50th=[  758], 99.90th=[  889], 99.95th=[  938],
+     | 99.99th=[  938]
+   bw (  KiB/s): min=587776, max=654051, per=100.00%, avg=611233.00, stdev=37137.99, samples=3
+   iops        : min=  574, max=  638, avg=596.67, stdev=35.85, samples=3
+  lat (usec)   : 100=29.30%, 250=25.98%, 500=38.67%, 750=5.47%, 1000=0.59%
+  fsync/fdatasync/sync_file_range:
+    sync (msec): min=46, max=122, avg=93.09, stdev=23.87
+    sync percentiles (msec):
+     |  1.00th=[   47],  5.00th=[   47], 10.00th=[   64], 20.00th=[   69],
+     | 30.00th=[   77], 40.00th=[   79], 50.00th=[  107], 60.00th=[  108],
+     | 70.00th=[  111], 80.00th=[  116], 90.00th=[  116], 95.00th=[  123],
+     | 99.00th=[  123], 99.50th=[  123], 99.90th=[  123], 99.95th=[  123],
+     | 99.99th=[  123]
+  cpu          : usr=1.13%, sys=13.91%, ctx=174, majf=0, minf=0
+  IO depths    : 1=101.5%, 2=0.0%, 4=0.0%, 8=0.0%, 16=0.0%, 32=0.0%, >=64=0.0%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     issued rwts: total=0,1024,0,15 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=1
+
+Run status group 0 (all jobs):
+  WRITE: bw=576MiB/s (604MB/s), 576MiB/s-576MiB/s (604MB/s-604MB/s), io=1024MiB (1074MB), run=1777-1777msec
+P9DONE write
+P9ALLDONE
+[    2.866901] reboot: Power down
