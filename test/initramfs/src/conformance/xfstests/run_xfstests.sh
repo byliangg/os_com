@@ -48,17 +48,24 @@ fi
 # judged on the host from the blklogwrites log, not in here.
 if [ -n "${CRASH_WORKLOADS:-}" ]; then
     cd "$XFSTESTS_DIR/test"
+    fails=0
     for w in .crash/*.sh; do
         [ -f "$w" ] || continue
         wd="wd_$(basename "$w" .sh)"
         mkdir "$wd"
+        # A single workload script failing (e.g. GNU mv refusing a same-inode
+        # rename, or any op a translation can't express faithfully) must NOT
+        # abort the whole recording: the writes it already emitted are on the
+        # log and every crash prefix is still judged on the host, and the
+        # oracle marks an unfinished workload UNAVAIL rather than green. Log it
+        # and keep going so one quirky workload cannot lose the other hundreds.
         if ! (cd "$wd" && sh "../$w"); then
-            echo "crash workload $w failed" >&2
-            exit 1
+            echo "crash workload $w failed (continuing)" >&2
+            fails=$((fails + 1))
         fi
     done
     cd /
-    echo "crash workloads done"
+    echo "crash workloads done ($fails script failure(s))"
     exit 0
 fi
 
