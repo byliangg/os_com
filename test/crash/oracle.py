@@ -153,7 +153,10 @@ def collect(log_path, table_path):
             for f in rows:
                 if f[2] != "D":
                     continue
-                _, _, _, ckpt, kind, size, md5, path = f
+                ckpt, kind, size, md5, path = f[3], f[4], f[5], f[6], f[7]
+                # x4dor declarations carry a 9th field: the pre-rename path the
+                # entity may still be at (the rename is not yet durable).
+                alt = f[8] if len(f) > 8 else ""
                 if int(ckpt) not in ckpt_ids and kind != "x":
                     # d/f declared past the last checkpoint: never in force.
                     # Revocations (kind x) with the sentinel id ARE kept:
@@ -161,7 +164,10 @@ def collect(log_path, table_path):
                     # checkpoint's assertions (a post-checkpoint write must
                     # not be judged against the pre-write snapshot).
                     continue
-                out.write(f"DECL\t{wl}\t{ckpt}\t{kind}\t{size}\t{md5}\t{path}\n")
+                alt_field = f"\t{alt}" if alt else ""
+                out.write(
+                    f"DECL\t{wl}\t{ckpt}\t{kind}\t{size}\t{md5}\t{path}{alt_field}\n"
+                )
 
     print(
         f"oracle collect: {len(avail)} workloads available, "
@@ -190,6 +196,9 @@ class Table:
                     )
                 elif t[0] == "DECL":
                     wl, ckpt, kind, size, md5, p = t[1], int(t[2]), t[3], t[4], t[5], t[6]
+                    # Optional pre-rename path (x4dor): the entity may still be
+                    # at `alt` because its parent rename is not yet durable.
+                    alt = t[7] if len(t) > 7 else None
                     lst = self.ckpts.get(wl, [])
                     ords = [o for o, cid, _ in lst if cid == ckpt]
                     if ords:
@@ -202,7 +211,7 @@ class Table:
                     else:
                         continue  # never in force (defensive; collect drops these)
                     self.events.setdefault(wl, {}).setdefault(p, []).append(
-                        (ord_, kind, size, md5)
+                        (ord_, kind, size, md5, alt)
                     )
 
     def all_markers(self):
@@ -358,7 +367,7 @@ def judge(table_path, img_path, final=False, expected_workloads=None):
                 continue
             if nxt is not None and nxt[0] == top + 1:
                 continue  # modified in the unknown N..N+1 window: old-or-new
-            assertions.append((wl, e[0], path, e[1], e[2], e[3]))
+            assertions.append((wl, e[0], path, e[1], e[2], e[3], e[4]))
 
     if final:
         seen = {wl for wl, _ in table.unavail} | set(table.ckpts)
@@ -379,59 +388,81 @@ def judge(table_path, img_path, final=False, expected_workloads=None):
                     f"persisted data never reached the disk (vacuous oracle)"
                 )
 
-    # Verify all assertions in one debugfs session.
-    dumps = {}
+    # Verify all assertions in one debugfs session. An x4dor assertion is a
+    # rename-moved entity whose rename is not yet durable, so it is satisfied
+    # if the entity is found CLEAN at EITHER its new OR its old path; both
+    # candidates are fetched and the assertion passes if either matches.
+    dumps = {}      # (assertion index, abspath) -> dumped file, for kind "f"
     cmds = []
     dumpdir = tempfile.mkdtemp(prefix="x4oracle-")
+
+    def candidate_paths(wl, path, alt):
+        cs = [wd_path(wl, path)]
+        if alt:
+            cs.append(wd_path(wl, alt))
+        return cs
+
     try:
-        for i, (wl, _ord, path, kind, size, md5) in enumerate(assertions):
-            abspath = wd_path(wl, path)
-            if kind == "f":
-                out = os.path.join(dumpdir, str(i))
-                cmds.append(f"dump {abspath} {out}")
-                dumps[i] = out
-            else:
-                cmds.append(f"stat {abspath}")
-                if kind == "d" and md5 != "-":
-                    cmds.append(f"ls -p {abspath}")
+        for i, (wl, _ord, path, kind, size, md5, alt) in enumerate(assertions):
+            for ap in candidate_paths(wl, path, alt):
+                if kind == "f":
+                    out = os.path.join(dumpdir, f"{i}_{len(dumps)}")
+                    cmds.append(f"dump {ap} {out}")
+                    dumps[(i, ap)] = out
+                else:
+                    cmds.append(f"stat {ap}")
+                    if kind == "d" and md5 != "-":
+                        cmds.append(f"ls -p {ap}")
         segments = run_debugfs(img_path, cmds) if cmds else {}
 
-        for i, (wl, ord_, path, kind, size, md5) in enumerate(assertions):
-            abspath = wd_path(wl, path)
-            where = f"{wl} ckpt#{ord_} {abspath}"
+        def eval_at(i, ap, kind, size, md5):
+            """Failure strings for the asserted entity at one candidate path
+            (empty list = this candidate satisfies the assertion)."""
             if kind == "f":
-                out = dumps[i]
-                if not os.path.exists(out):
-                    failures.append(f"{where}: fsynced file MISSING (expected {size}B md5={md5})")
-                    continue
+                out = dumps.get((i, ap))
+                if not out or not os.path.exists(out):
+                    return [f"fsynced file MISSING (expected {size}B md5={md5})"]
                 with open(out, "rb") as f:
                     content = f.read()
                 if str(len(content)) != size:
-                    failures.append(f"{where}: size {len(content)} != expected {size}")
-                    continue
+                    return [f"size {len(content)} != expected {size}"]
+                fails = []
                 got = md5_hex(content)
                 if got != md5 and md5 != "-":
-                    failures.append(f"{where}: content md5 {got} != expected {md5}")
+                    fails.append(f"content md5 {got} != expected {md5}")
                 for off in stale_dye_blocks(content):
-                    failures.append(
-                        f"{where}: STALE 0x52 dye block at offset {off} — "
-                        f"freed/never-written block resurfaced through this file"
+                    fails.append(
+                        f"STALE 0x52 dye block at offset {off} — freed/"
+                        f"never-written block resurfaced through this file"
                     )
-            else:  # d (and any future existence-only kinds)
-                seg = segments.get(f"stat {abspath}", "")
-                m = re.search(r"Type:\s+(\w+)", seg)
-                if "Inode:" not in seg or not m:
-                    failures.append(f"{where}: fsynced directory MISSING")
-                elif kind == "d" and m.group(1) != "directory":
-                    failures.append(f"{where}: expected directory, found {m.group(1)}")
-                elif kind == "d" and md5 != "-":
-                    got = dir_digest(segments.get(f"ls -p {abspath}", ""))
-                    if got != md5:
-                        failures.append(
-                            f"{where}: fsynced directory ENTRY SET changed "
-                            f"(digest {got} != declared {md5}) — a promised "
-                            f"dirent was lost or a phantom entry appeared"
-                        )
+                return fails
+            seg = segments.get(f"stat {ap}", "")
+            m = re.search(r"Type:\s+(\w+)", seg)
+            if "Inode:" not in seg or not m:
+                return ["fsynced directory MISSING"]
+            if kind == "d" and m.group(1) != "directory":
+                return [f"expected directory, found {m.group(1)}"]
+            if kind == "d" and md5 != "-":
+                got = dir_digest(segments.get(f"ls -p {ap}", ""))
+                if got != md5:
+                    return [
+                        "fsynced directory ENTRY SET changed "
+                        f"(digest {got} != declared {md5}) — a promised "
+                        "dirent was lost or a phantom entry appeared"
+                    ]
+            return []
+
+        for i, (wl, ord_, path, kind, size, md5, alt) in enumerate(assertions):
+            cands = candidate_paths(wl, path, alt)
+            results = [(ap, eval_at(i, ap, kind, size, md5)) for ap in cands]
+            if any(not res for _ap, res in results):
+                continue  # a candidate matched clean -> assertion satisfied
+            ap0, res0 = results[0]  # report the expected (new) path's failure
+            where = f"{wl} ckpt#{ord_} {ap0}"
+            alt_note = (f" (also absent/mismatched at pre-rename path "
+                        f"{wd_path(wl, alt)})") if alt else ""
+            for msg in res0:
+                failures.append(f"{where}: {msg}{alt_note}")
     finally:
         for out in dumps.values():
             if os.path.exists(out):

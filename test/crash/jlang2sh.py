@@ -193,6 +193,17 @@ x4d() {{ # x4d <ckpt> <path> — declare <path>'s just-persisted state
     else k=missing; sz=-; m=-; fi
     x4emit "D|$1|$k|$sz|$m|$2"
 }}
+x4dor() {{ # x4dor <ckpt> <new> <old> — declare <new>, also acceptable at <old>
+    # State from the runtime (new) path where the entity now lives; the rename
+    # that moved it here is not yet durable (only a global sync makes it so),
+    # so on crash the entity may instead be at <old>. oracle.py tries both.
+    if [ -d "$2" ]; then
+        k=d; sz=$(stat -c %h "$2")
+        m=$(ls -A "$2" | grep -v "^ckpt_" | LC_ALL=C sort | md5sum); m=${{m%% *}}
+    elif [ -f "$2" ]; then k=f; sz=$(stat -c %s "$2"); m=$(md5sum < "$2"); m=${{m%% *}}
+    else k=missing; sz=-; m=-; fi
+    x4emit "D|$1|$k|$sz|$m|$2|$3"
+}}
 x4x() {{ # x4x <ckpt> <path> — revoke: <path> modified after last declaration
     x4emit "D|$1|x|-|-|$2"
 }}\
@@ -222,6 +233,13 @@ class OracleState:
         # same inode. A content modification through ANY name invalidates
         # the declared snapshot of EVERY name, so revocation fans out.
         self.aliases = {}
+        # Entities moved by a rename whose durability a later fsync of the
+        # entity will NOT establish (only a global sync does — verified against
+        # the Linux ext4 driver: fsync of a file whose PARENT was renamed leaves
+        # the file at its OLD path on crash, because the file's inode is clean).
+        # Maps current(new) path -> pre-rename(old) path; a persist of such a
+        # path declares it durable at EITHER location. Cleared by sync.
+        self.rename_pending = {}
         self.out = []
 
     def next_ckpt(self):
@@ -297,7 +315,13 @@ class OracleState:
         moved = {}
         for p in list(self.live):
             if p == src or p.startswith(src + "/"):
-                moved[dst + p[len(src):]] = self.live.pop(p)
+                new_p = dst + p[len(src):]
+                moved[new_p] = self.live.pop(p)
+                # old-or-new: remember the pre-rename location so a later
+                # persist tolerates the entity there (rename not yet durable).
+                # Chain through an earlier un-synced move so the ORIGINAL
+                # location survives successive renames.
+                self.rename_pending[new_p] = self.rename_pending.pop(p, p)
         self.live.update(moved)
         for p in list(self.aliases):
             if p == src or p.startswith(src + "/"):
@@ -314,7 +338,13 @@ class OracleState:
                 "fsync of a symlink is not instrumentable "
                 f"(x4d cannot snapshot it): {path}"
             )
-        self.out.append(f'x4d {self.next_ckpt()} "{path}"')
+        old = self.rename_pending.get(path)
+        if old is not None:
+            # fsync persists the entity's content+inode but NOT the parent
+            # rename that moved it; it may be at its old or new path on crash.
+            self.out.append(f'x4dor {self.next_ckpt()} "{path}" "{old}"')
+        else:
+            self.out.append(f'x4d {self.next_ckpt()} "{path}"')
         self.durable.add(path)
 
     def persist_all(self):
@@ -324,6 +354,9 @@ class OracleState:
         assertable through x4d, and their existence is already covered by
         the parent directory's entry-set digest.
         """
+        # A global sync flushes the journal, so every pending rename is now
+        # durable: entities are at their new path, no longer old-or-new.
+        self.rename_pending.clear()
         for p in sorted(set(self.live) | {"."}):
             if self.live.get(p) == "l":
                 continue
@@ -344,10 +377,16 @@ class OracleState:
 def convert(lines, workload=None, oracle=False):
     ops = run_ops(lines)
     names = parse_names(lines)
+    # Live name->path map: parse_names gives each entity its ORIGINAL location,
+    # but a rename moves it (and everything beneath a renamed directory), so
+    # path() must follow. current is updated in the rename op below, mirroring
+    # the move the oracle model already applies, so the emitted shell and the
+    # oracle stay consistent.
+    current = dict(names)
 
     def path(name):
         try:
-            return names[name]
+            return current[name]
         except KeyError:
             raise SystemExit(f"unknown ACE name: {name}")
 
@@ -421,9 +460,28 @@ def convert(lines, workload=None, oracle=False):
             if st is not None:
                 st.remove(path(args[0]))
         elif op == "rename":
-            out.append(f'mv "{path(args[0])}" "{path(args[1])}"')
+            src, dst = path(args[0]), path(args[1])
+            # rename(2) between two names of the SAME inode (hard links) is a
+            # no-op success, but GNU mv refuses "are the same file". Under the
+            # workload's `set -e` that non-zero exit would abort the whole
+            # script, losing every crash point after it (and, worse, tempting a
+            # blanket skip that would also swallow kernel-induced failures).
+            # Guard ONLY the same-inode case with -ef so it becomes the
+            # syscall-faithful no-op; a real rename still runs mv, and any other
+            # mv failure still aborts loudly (-> the workload is judged UNAVAIL,
+            # never a silently-dropped durability promise).
+            out.append(f'[ "{src}" -ef "{dst}" ] || mv "{src}" "{dst}"')
             if st is not None:
-                st.rename(path(args[0]), path(args[1]))
+                st.rename(src, dst)
+            # Follow the move so later ops on the entity (or, for a directory,
+            # its children) resolve to the new path instead of the stale
+            # original. Same shape as st.rename's live-path move above.
+            if src != dst:
+                for nm, p in list(current.items()):
+                    if p == src:
+                        current[nm] = dst
+                    elif p.startswith(src + "/"):
+                        current[nm] = dst + p[len(src):]
         elif op == "fsync":
             out.append(f'xfs_io -r -c "fsync" "{path(args[0])}"')
             if st is not None:
