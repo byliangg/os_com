@@ -1,0 +1,5 @@
+# FSX_FORENSIC
+# P10 T-m0 fsx op-log forensics marker. When run_xfstests.sh sees this marker
+# on the first line of the runlist it runs the inline fsx forensic block
+# (direct fsx -X first-divergence + op-family bisection) instead of ./check.
+# Targets: generic/127 (std-nommap), generic/075, generic/522.
