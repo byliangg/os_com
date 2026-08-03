@@ -14,6 +14,7 @@ OVMF ?= on
 RELEASE ?= 0
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
+EXT4_POWER_PROTECTED ?= 0
 SCHEME ?= ""
 SMP ?= 1
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
@@ -103,6 +104,7 @@ CARGO_OSDK := ~/.cargo/bin/cargo-osdk
 CARGO_OSDK_COMMON_ARGS :=
 # The build arguments also apply to the `cargo osdk run` command.
 CARGO_OSDK_BUILD_ARGS := --kcmd-args="ostd.log_level=$(LOG_LEVEL)"
+CARGO_OSDK_BUILD_ARGS += --kcmd-args="ext4.power_protected=$(EXT4_POWER_PROTECTED)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="console=$(CONSOLE)"
 CARGO_OSDK_TEST_ARGS :=
 

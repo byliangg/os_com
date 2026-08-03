@@ -596,6 +596,22 @@ pub(super) fn try_commit_transaction(
         pages.flush_range(0..len)?;
     }
 
+    if journal.keeps_metadata_volatile() {
+        barrier(device)?;
+        journal.advance_committing_phase(tid, CommitPhase::Commit)?;
+        journal.advance_committing_phase(tid, CommitPhase::CommitRecord)?;
+        {
+            let mut st = journal.state_write();
+            st.advance_committing_phase(tid, CommitPhase::Finished)?;
+            txn.stash_revokes(&mut st.revoked);
+            st.release_pinned_frees(tid);
+        }
+        journal
+            .committed_tid
+            .store(tid.get(), core::sync::atomic::Ordering::Release);
+        return Ok(CommitAttempt::Committed(tid));
+    }
+
     // Ordered data has fully left the page cache (its durability rides the
     // step-2 barrier); the log writes begin (`T_FLUSH` → `T_COMMIT`).
     journal.advance_committing_phase(tid, CommitPhase::Commit)?;

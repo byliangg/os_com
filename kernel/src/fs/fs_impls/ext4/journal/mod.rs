@@ -274,6 +274,7 @@ use ostd::{
     sync::{RwMutexWriteGuard, WaitQueue},
     timer::Jiffies,
 };
+use spin::Once;
 
 use self::{
     commit::{CommitAttempt, try_commit_transaction},
@@ -299,6 +300,18 @@ mod interop_vectors;
 mod recovery;
 mod revoke;
 mod transaction;
+
+// An opt-in UPS mode: transactions remain memory-resident while mounted and
+// only a controlled unmount persists their metadata. Abrupt loss is unsafe.
+static POWER_PROTECTED_PARAM: Once<String> = Once::new();
+aster_cmdline::define_kv_param!("ext4.power_protected", POWER_PROTECTED_PARAM);
+
+pub(super) fn power_protected_mode() -> bool {
+    matches!(
+        POWER_PROTECTED_PARAM.get().map(String::as_str),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
 
 /// Replays a dirty journal at mount time (jbd2 `jbd2_journal_recover`).
 ///
@@ -1049,6 +1062,8 @@ pub(super) struct Journal {
     /// Set by [`stop_commit_thread`](Journal::stop_commit_thread) to make the
     /// commit thread exit its loop on the next wake.
     stop: AtomicBool,
+    // Set only during a controlled teardown so its final commits persist metadata.
+    persist_on_teardown: AtomicBool,
     /// Set when a commit fails (jbd2 journal abort, minimal form).
     ///
     /// A failed [`commit_or_drain_tail`](Journal::commit_or_drain_tail) lost
@@ -1561,6 +1576,7 @@ impl Journal {
             commit_wait_queue: WaitQueue::new(),
             credit_release_epoch: AtomicU64::new(0),
             stop: AtomicBool::new(false),
+            persist_on_teardown: AtomicBool::new(false),
             aborted: AtomicBool::new(false),
             sb_error: AtomicU32::new(recorded_errno),
             #[cfg(ktest)]
@@ -1575,6 +1591,29 @@ impl Journal {
             log_space_waits: AtomicU64::new(0),
             restart_count: AtomicU64::new(0),
         })
+    }
+
+    /// Returns whether ordinary commits may skip journal and metadata persistence.
+    pub(super) fn keeps_metadata_volatile(&self) -> bool {
+        power_protected_mode() && !self.persist_on_teardown.load(Ordering::Acquire)
+    }
+
+    /// Persists committed volatile metadata during a controlled teardown.
+    fn persist_volatile_metadata_on_unmount(&self) -> Result<()> {
+        // The commit thread has stopped and unmount has no live handles, so this
+        // state lock cannot block filesystem operations while final images are written.
+        let mut state = self.state_write();
+        for (bid, image) in &state.uncheckpointed {
+            self.device
+                .write_bytes(Bid::new(*bid).to_offset(), image.image_bytes())
+                .map_err(|_| {
+                    Error::with_message(Errno::EIO, "failed to persist volatile metadata")
+                })?;
+        }
+        commit::barrier(self.device.as_ref())?;
+        state.uncheckpointed.clear();
+        state.revoked = revoke::RevokeTable::new();
+        Ok(())
     }
 
     /// The maximum metadata blocks a single transaction may reserve.
@@ -2922,11 +2961,15 @@ impl Journal {
     /// this flush (`commit_staged` aborts and its error propagates before
     /// the checkpoint below); entry gating just refuses one step earlier.
     pub(in crate::fs::fs_impls::ext4) fn flush_on_unmount(&self) -> Result<()> {
+        self.persist_on_teardown.store(true, Ordering::Release);
         if self.is_aborted() {
             let mut st = self.state_write();
             st.running = None;
             st.locking = None;
             return_errno_with_message!(Errno::EIO, "journal aborted; leaving the log for recovery");
+        }
+        if power_protected_mode() {
+            self.persist_volatile_metadata_on_unmount()?;
         }
         // Up to TWO transactions can be left over under group commit: a
         // force-locked one the stopped committer never staged (its drain
