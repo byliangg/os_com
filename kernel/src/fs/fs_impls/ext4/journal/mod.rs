@@ -1642,6 +1642,24 @@ impl Journal {
         // replace an entry in `uncheckpointed` while the rollback classifies it.
         self.stop_commit_thread();
 
+        // A commit error aborts the journal after its images were staged but
+        // before a `Finished` publication is guaranteed. Such a staged image
+        // must never be mistaken for a completed power-protected transaction.
+        // Keep the last disk checkpoint instead of writing an uncertain image.
+        if self.is_aborted() {
+            let mut state = self.state_write();
+            state.running = None;
+            state.locking = None;
+            state.committing = None;
+            state.uncheckpointed.clear();
+            state.revoked = revoke::RevokeTable::new();
+            state.pinned_frees.clear();
+            return_errno_with_message!(
+                Errno::EIO,
+                "journal was aborted before power-protected rollback"
+            );
+        }
+
         let discard_all_retained = {
             let mut state = self.state_write();
 
