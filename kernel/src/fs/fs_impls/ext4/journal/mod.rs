@@ -301,8 +301,9 @@ mod recovery;
 mod revoke;
 mod transaction;
 
-// An opt-in UPS mode: transactions remain memory-resident while mounted and
-// only a controlled unmount persists their metadata. Abrupt loss is unsafe.
+// An opt-in UPS mode: transactions remain memory-resident while mounted.
+// An external power-loss notification freezes the journal, discards every
+// incomplete transaction, and persists only the completed metadata image set.
 static POWER_PROTECTED_PARAM: Once<String> = Once::new();
 aster_cmdline::define_kv_param!("ext4.power_protected", POWER_PROTECTED_PARAM);
 
@@ -1616,6 +1617,74 @@ impl Journal {
         Ok(())
     }
 
+    /// Rolls back the incomplete in-memory batch after a UPS power-loss
+    /// notification, then persists the completed volatile metadata set.
+    ///
+    /// This is the deliberately small recovery contract of
+    /// `ext4.power_protected=1`: normal commits keep their metadata in
+    /// [`JournalState::uncheckpointed`], while a running or locking
+    /// transaction still owns only private after-images. The power event stops
+    /// admission through the filesystem shutdown gate, joins the sole commit
+    /// thread, drops the incomplete seats, and writes only the image set of
+    /// transactions that reached [`CommitPhase::Finished`]. Thus a half-built
+    /// extent/inode/bitmap update never reaches a home block.
+    ///
+    /// A group-commit batch that has not reached `Finished` is intentionally
+    /// lost as a whole. This is conservative: it can lose recent successful
+    /// operations from the open batch, but it never promotes a partial one.
+    /// The UPS budget is used for this bounded in-memory rollback followed by
+    /// data-safe metadata writeback, not for waiting on a failed user task.
+    fn rollback_incomplete_on_power_failure(&self) -> Result<()> {
+        debug_assert!(power_protected_mode());
+
+        // `Ext4::shutdown` has already closed the filesystem entry gate before
+        // reaching here. Stop and join the one committer so no transaction can
+        // replace an entry in `uncheckpointed` while the rollback classifies it.
+        self.stop_commit_thread();
+
+        let discard_all_retained = {
+            let mut state = self.state_write();
+
+            // These seats are not committed. Their after-images have not been
+            // written to home blocks, so dropping them restores the disk view
+            // without attempting to resume the owning user operation.
+            state.running = None;
+            state.locking = None;
+
+            match state.committing.take() {
+                None => false,
+                Some(committing) if committing.phase() == CommitPhase::Finished => {
+                    // Step 6 already published this transaction's metadata
+                    // images and revoke effects. Its retained images are a
+                    // complete filesystem state and may be flushed below.
+                    false
+                }
+                Some(_) => {
+                    // `stage_committing` retains images before the pipeline
+                    // reaches its terminal state, so an interrupted committer
+                    // may have overwritten an older retained image for the
+                    // same block. The predecessor cannot safely be reconstructed
+                    // from this one-entry map; fall back to the last on-disk
+                    // consistent checkpoint rather than write uncertain bytes.
+                    state.uncheckpointed.clear();
+                    state.revoked = revoke::RevokeTable::new();
+                    state.pinned_frees.clear();
+                    true
+                }
+            }
+        };
+
+        if !discard_all_retained {
+            self.persist_volatile_metadata_on_unmount()?;
+        }
+
+        // This is a terminal power-failure path. Existing handles that race
+        // after the state seats were discarded observe an aborted journal and
+        // cannot reintroduce their partial after-images.
+        self.abort();
+        Ok(())
+    }
+
     /// The maximum metadata blocks a single transaction may reserve.
     ///
     /// A transaction of `n` captured blocks and `v` revoke blocks
@@ -2750,16 +2819,27 @@ impl Journal {
         self.geometry.write_superblock(device, raw)
     }
 
-    /// Aborts the journal on `EXT4_IOC_SHUTDOWN` (jbd2_journal_abort from
-    /// `ext4_force_shutdown`): the running transaction is never committed and
-    /// the log is left as-is — with `RECOVER` still stamped, the next mount
-    /// replays exactly what had committed before the shutdown, which is the
-    /// "crash here" semantics the ioctl exists to simulate. Records **no**
-    /// `s_errno`: the abort is a controlled crash simulation, not corruption
-    /// (Linux maps `-ESHUTDOWN` to a `0` marker), and stamping the superblock
-    /// after the "crash" would perturb the very on-disk state being frozen.
+    /// Handles `EXT4_IOC_SHUTDOWN` (jbd2_journal_abort from
+    /// `ext4_force_shutdown`). Standard mode preserves the crash-here
+    /// semantics: the running transaction is never committed and recovery
+    /// replays only earlier committed log records. In power-protected mode this
+    /// is the UPS notification entry point: discard incomplete in-memory work,
+    /// persist only completed volatile metadata, then stop further writes.
+    ///
+    /// Records **no** `s_errno`: shutdown is a controlled event, not a
+    /// corruption marker (Linux maps `-ESHUTDOWN` to `0`).
     pub(in crate::fs::fs_impls::ext4) fn abort_for_shutdown(&self) {
-        self.abort();
+        if power_protected_mode() {
+            if let Err(e) = self.rollback_incomplete_on_power_failure() {
+                // The recovery path is terminal even when its final writeback
+                // fails: leave the filesystem shut down rather than permit a
+                // stale handle to continue from the discarded batch.
+                error!("ext4 power-protected rollback failed: {e:?}");
+                self.abort();
+            }
+        } else {
+            self.abort();
+        }
     }
 
     /// Aborts the journal on a filesystem-detected inconsistency (the Linux
