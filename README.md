@@ -79,9 +79,9 @@
 
 - [决赛设计文档](决赛文档.pdf)：项目完整设计、实现和测试说明。
 - [决赛答辩幻灯片](决赛幻灯片.pptx)：决赛展示材料。
-- [benchmark](test/bench/README.md)：性能测试脚本、结果口径与复现说明。
-- `docs/image/`：README 使用的架构图、测试流程与性能图表。
-- `docs/aiuse/`：AI 使用说明与各阶段使用记录，后续由参赛队补充维护。
+- [xfstests 测试清单与运行脚本](test/initramfs/src/conformance/xfstests/)：文件系统兼容性测试。
+- [test/initramfs/src/benchmark/README.md](test/initramfs/src/benchmark/README.md)：测试目录中的 fio、SQLite 等性能测试组织方式。
+- `docs/aiuse/`：AI 使用说明与阶段记录，后续由参赛队补充维护。
 
 ## 二、项目背景与目标
 
@@ -153,7 +153,7 @@ O_DIRECT 根据 Extent 映射直接构造 IoBatch/BIO，不传输 PageCache 中�
 
 每个元数据操作经 `Ext4::begin_op(credits)` 申请 credits 并取得 `OpHandle`，再纳入当前 `Transaction`。credits 是本次操作可能修改的元数据块数的保守预留；预留不足、日志空间不可恢复或设备 I/O 失败时，文件系统会中止 journal 并拒绝后续写操作，而非带着静默丢失元数据的状态继续运行。文件创建、Extent 分配、位图修改和 inode 更新等跨块变更因此拥有共同事务边界。
 
-JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Running 阶段由 Handle 在 credits 范围内捕获元数据 after-image，并登记 ordered 数据写回；Commit 阶段由 group commit 汇集运行事务，依次写入 descriptor、metadata payload、revoke 记录和带校验和的 commit block；Checkpoint 阶段以 lazy checkpoint 的方式按事务顺序将已提交元数据写回 home blocks，淘汰已不再需要的 after-image 并释放日志空间。提交线程不持有 inode 锁，而 checkpoint 和 journal 空间背压共同平衡吞吐、内存占用与可恢复性。
+JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Running 阶段由 Handle 在 credits 范围内捕获元数据 after-image，并登记 ordered 数据写回；Commit 阶段由 group commit 汇集运行事务，依次写入 descriptor、metadata payload、revoke 记录和带校验和的 commit block；Checkpoint 阶段以 lazy checkpoint 的方式按事务顺序将已提交元数据写回 home blocks，淘汰已不再需要的 after-image 并释放日志空间。
 
 | 日志记录 | 作用 | 恢复语义 |
 | --- | --- | --- |
@@ -163,29 +163,19 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 | Commit block | 记录 transaction 序号、提交时间和校验和 | 校验通过才建立提交边界，不完整事务被忽略 |
 | Journal superblock | 保存环形日志起点、序号和特性信息 | 定位扫描窗口，checkpoint 推进后更新可回收起点 |
 
-### 3.7 挂载恢复与异常处理
+### 3.7 挂载恢复、并发与外部电源保护
 
-系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。恢复完成后重新读取 superblock 与块组元数据，恢复提交线程并清理 orphan 链。
+系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败时，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。
 
-如果日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。通过“只重放完整提交事务”和“异常后停止写入”两道边界，避免仅看到 descriptor 或 payload 时误判事务已提交。
+运行时锁分别保护 inode 状态、目录命名空间、ExtentTree、block group 和 journal state。多 inode 操作按 inode 号固定顺序加锁，Journal state 作为叶锁最后获取；EsCache 和 NodeCache 的临界区不跨设备 I/O 或日志调用。这样避免 rename、link 等跨 inode 操作形成 ABBA 死锁，也避免提交与前台 I/O 相互等待。
 
-### 3.8 并发控制与锁序
-
-运行时锁分别保护 inode 状态、目录命名空间、ExtentTree、block group 和 journal state。多 inode 操作按 inode 号固定顺序加锁，避免 rename、link 等跨 inode 操作形成 ABBA 死锁；Journal state 作为叶锁最后获取；EsCache 和 NodeCache 的临界区不跨设备 I/O 或日志调用。提交线程在等待 ordered 数据写回时不反向取得 inode 锁，避免提交与前台 I/O 相互等待。
-
-同文件 O_DIRECT 写保留保护结构变化的 inode 写锁，但通过减少锁内重复映射查询、限制分块大小、连续 BIO 提交和缩短事务持有时间改善并发写扩展性。映射状态只在数据 I/O 成功后提交，始终保持 unwritten Extent 转换和 inode 元数据更新的顺序约束。
-
-### 3.9 外部电源保护模式
-
-标准模式遵循 JBD2 持久化语义，支持突然掉电后的日志恢复。面向 UPS、机架级电池等可靠供电场景，项目设计可选外部电源保护模式：运行期间优先完成文件数据写回，日志和部分元数据保留在内存，允许后续事务继续执行；收到掉电通知后，文件系统关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的元数据和数据。
-
-该模式默认关闭，只有掉电通知能够可靠送达、备用供电足以完成回滚和写回、并且用户态与内核仍可正常执行时才能启用。默认模式的突然掉电恢复语义不受影响；无法满足这些条件时必须使用标准 JBD2 模式。
+外部电源保护模式面向可靠 UPS 或备用电源场景：运行期间优先完成文件数据写回，日志和部分元数据保留在内存；收到掉电通知后关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的数据和元数据。该模式默认关闭，只有掉电通知可靠送达、备用供电足以完成回滚和写回时才能启用。
 
 ![标准 JBD2 与外部电源保护模式对比](./docs/image/power-protection-mode.png)
 
 ## 四、测试与评估
 
-### 4.1 测试环境
+### 4.1 测试环境与验证策略
 
 | 项目 | 配置 |
 | --- | --- |
@@ -196,66 +186,54 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 | 对照系统 | 相同虚拟化与块设备环境下的 Linux EXT4 |
 | 测试类型 | xfstests、并发正确性、崩溃一致性、Linux 互操作、fio、SQLite speedtest1 |
 
-### 4.2 验证策略与判定原则
+项目建立“接口行为、运行时一致性、崩溃恢复、独立 oracle、Linux 互操作”的验证链。xfstests 检查用户可见的 POSIX/EXT4 语义；并发与缓存测试检查不同 I/O 路径的可见性；崩溃矩阵枚举每个工作负载的持久化前缀；oracle、accounting、checksum 和 walcheck 分别独立验证数据、空间记账、元数据校验和与日志写序；Linux 双向互操作检查磁盘格式没有形成只能由本实现读取的私有状态。
 
-项目不以单一吞吐指标替代正确性判断，而是建立“接口行为、运行时一致性、崩溃恢复、独立 oracle、Linux 互操作”的验证链。xfstests 检查用户可见的 POSIX/EXT4 语义；并发与缓存测试检查不同 I/O 路径的可见性；崩溃矩阵枚举每个工作负载的持久化前缀；oracle、accounting、checksum 和 walcheck 分别独立验证数据、空间记账、元数据校验和与日志写序；Linux 双向互操作检查磁盘格式没有形成只能由本实现读取的私有状态。
+### 4.2 xfstests 功能与兼容性评估
 
-### 4.3 xfstests 功能与兼容性评估
-
-本次 xfstests 共 81 项：**78 项 PASS、2 项稳定 FAIL、1 项 FLAKY**，通过率为 **96.3%**。78 个通过用例按主要功能只计入一个类别，覆盖如下。
+本次 xfstests 共 81 项：**78 项 PASS、2 项稳定 FAIL、1 项 FLAKY**，通过率为 **96.3%**。78 个通过用例按主要功能只计入一个类别。
 
 | 测试类别 | 通过数量 | 代表用例 | 覆盖能力 |
-| --- | --- | --- | --- |
-| 文件与目录命名空间、链接、权限和元数据 | 27 PASS | `generic/002`、`generic/035`、`generic/401` | create/unlink、rename、硬/符号链接、目录压力、目录 seek、权限、umask、时间戳、`mknod`、`statx` 与 Unicode 文件名 |
-| 常规读写、截断、追加与数据完整性 | 15 PASS | `generic/001`、`generic/014`、`generic/639` | 随机读写校验、fsstress、truncate、洞文件、`O_APPEND`、向量 I/O、splice、高偏移 I/O、orphan 和卸载重挂后的继续写入 |
+| --- | --- | --- |
+| 文件与目录命名空间、链接、权限和元数据 | 27 PASS | `generic/002`、`generic/035`、`generic/401` | create/unlink、rename、硬/符号链接、目录压力、权限、时间戳、`mknod`、`statx` 与 Unicode 文件名 |
+| 常规读写、截断、追加与数据完整性 | 15 PASS | `generic/001`、`generic/014`、`generic/639` | 随机读写校验、fsstress、truncate、洞文件、`O_APPEND`、向量 I/O、splice、高偏移 I/O、orphan 和卸载重挂 |
 | Extent、预分配、`fallocate` 与 ENOSPC | 12 PASS | `generic/102`、`generic/213`、`generic/619` | unwritten Extent、预分配、对齐、空间预约、满盘重试、并发 ENOSPC 与块分配一致性 |
-| O_DIRECT 与 buffered/direct 一致性 | 10 PASS | `generic/130`、`generic/133`、`generic/214`、`generic/609` | 向量直接读写、同文件并发 I/O、unwritten Extent 直接写、大请求分段、direct/buffered 混合访问、PageCache 失效与 `O_DSYNC` |
-| mmap、页缓存一致性与虚拟内存竞争 | 13 PASS | `generic/030`、`generic/346`、`generic/638` | 映射写、remap/truncate、mmap 与 `pwrite` 竞争、prefault、零填充、stale mmap read、PMD/PTE 竞争与多页重叠复制 |
-| EXT4 挂载统计语义 | 1 PASS | `ext4/042` | `statfs` 的 df/overhead 输出以及 `minixdf`、`bsd df` 等挂载选项行为 |
+| O_DIRECT 与 buffered/direct 一致性 | 10 PASS | `generic/130`、`generic/133`、`generic/214`、`generic/609` | 向量直接读写、同文件并发 I/O、unwritten Extent 直接写、大请求分段、混合访问、PageCache 失效与 `O_DSYNC` |
+| mmap、页缓存一致性与虚拟内存竞争 | 13 PASS | `generic/030`、`generic/346`、`generic/638` | 映射写、remap/truncate、mmap 与 `pwrite` 竞争、零填充、stale mmap read 与多页重叠复制 |
+| EXT4 挂载统计语义 | 1 PASS | `ext4/042` | `statfs` 的 df/overhead 输出以及相关挂载选项行为 |
 
-稳定失败的 `generic/127` 和 `generic/452` 集中在 mmap 实现边界；`generic/371` 在并发写与 `fallocate` 的 ENOSPC 竞争中表现为 FLAKY。上述状态在统计中如实保留，不将环境异常或未执行用例混入通过率分母。
+稳定失败的 `generic/127` 和 `generic/452` 集中在 mmap 实现边界；`generic/371` 在并发写与 `fallocate` 的 ENOSPC 竞争中表现为 FLAKY，统计中如实保留。
 
-### 4.4 并发与缓存一致性验证
+### 4.3 并发与缓存一致性验证
 
 并发测试使用确定性数据模式驱动多个 worker 读写，结束后校验每个文件的长度和内容 hash；xfstests 的 fsstress 与并发用例补充命名空间和空间操作。缓存一致性测试交叉组合 Buffered I/O、O_DIRECT、mmap、truncate 与 `fallocate`，重点确认路径切换后不会读到旧副本。
 
 | 测试族 | 检查内容 | 判定方式 |
 | --- | --- | --- |
-| 多 worker 文件写入 | 并发过程是否出现错写、漏写或文件大小错误 | 结束后逐文件核对确定性 hash 和长度 |
+| 多 worker 文件写入 | 是否出现错写、漏写或文件大小错误 | 结束后逐文件核对确定性 hash 和长度 |
 | Buffered 写后直接读 | direct read 能否观察到 PageCache 中尚未写回的新内容 | 对重叠范围先写回，再逐字节比较 |
 | 直接写后 Buffered 读 | 缓存是否保留 direct write 之前的旧副本 | direct write 完成后从普通 `read` 路径读回比较 |
-| mmap 基本路径 | 映射页修改与 `read`、`write`、`fsync` 间的可见性 | 对照读取内容和同步结果，并明确平台边界 |
+| mmap 基本路径 | 映射页修改与 `read`、`write`、`fsync` 间的可见性 | 对照读取内容和同步结果 |
 | namespace 与空间压力 | `rename`、`unlink`、truncate、`fallocate`、ENOSPC 的并发组合 | xfstests、fsstress、无 panic 与盘后检查 |
 
-### 4.5 崩溃矩阵与 JBD2 恢复验证
+### 4.4 崩溃矩阵、oracle 与格式验证
 
-崩溃矩阵不是随机终止虚拟机，而是记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法可直接覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
+崩溃矩阵记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
 
 ![块写记录驱动的崩溃矩阵验证流程](./docs/image/crash-validation-flow.png)
 
-| 矩阵 | 覆盖与主要压力 | 结果 |
+| 验证项 | 覆盖与检查内容 | 结果 |
 | --- | --- | --- |
 | 标准日志矩阵 | 232 个工作负载的常规提交、恢复、revoke 与 checkpoint 组合 | 931 个崩溃点，0 red |
-| 4 MiB 小日志矩阵 | 同类语料下更频繁的 journal wrap、空间背压、checkpoint 与多事务状态 | 1629 个崩溃点，0 red |
-| 合计 | 所有持久化前缀均通过对应恢复与检查链 | 2560 个崩溃点，0 red |
-
-### 4.6 数据持久化 oracle 与 Linux 双向互操作
-
-仅靠 `e2fsck` 无法证明 `fsync`/`fdatasync` 承诺的数据在掉电后仍完整存在，也无法独立判断空间记账和 WAL 写序。因此项目为每个工作负载定义可持久化的文件与字节范围，并使用多组独立检查器交叉验证。
-
-| 检查项 | 检查问题 | 结果 |
-| --- | --- | --- |
-| 数据持久化 oracle | `fsync` 或 `fdatasync` 承诺的数据在任意掉电前缀后是否完整存在 | 232 个工作负载生效，308 条断言全部通过 |
-| strict `e2fsck` | 目录、inode、Extent、位图和引用关系是否需要结构修复 | 标准与小日志矩阵均为 0 red |
-| accounting | 空闲块、空闲 inode 和目录计数是否与重新扫描一致 | 两类矩阵检查全部通过 |
-| checksum judge | superblock、块组及相关元数据校验和是否与独立重算一致 | 全部 MATCH |
+| 4 MiB 小日志矩阵 | journal wrap、空间背压、频繁 checkpoint 与多事务状态 | 1629 个崩溃点，0 red |
+| 数据持久化 oracle | `fsync`/`fdatasync` 承诺的数据在任意掉电前缀后是否完整存在 | 232 个工作负载生效，308 条断言全部通过 |
+| strict `e2fsck`、accounting、checksum | 目录、inode、Extent、位图、记账和校验和 | 标准与小日志矩阵均通过 |
 | walcheck | home block 元数据写入是否具有已提交事务 after-image 来源 | 2360 项匹配，无 violation |
 
-Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜像由 Asterinas 挂载、读取并继续修改；Asterinas 创建或修改、卸载后的镜像由 Linux 重新挂载、逐项读取并用 `e2fsck` 检查。测试同时核对 `metadata_csum`、journal checksum v2/v3、64-bit journal tag、descriptor 和 commit record，并以相同操作或特定崩溃语义比较双方可见结果。
+Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜像由 Asterinas 挂载、读取并继续修改；Asterinas 创建或修改、卸载后的镜像由 Linux 重新挂载、逐项读取并用 `e2fsck` 检查。测试同时核对 `metadata_csum`、journal checksum v2/v3、64-bit journal tag、descriptor 和 commit record。
 
-### 4.7 性能评估方法与结果
+### 4.5 性能评估方法与结果
 
-性能测试在与 Linux EXT4 相同的 QEMU/KVM + virtio-blk 环境下进行，以平均吞吐（MB/s）和总耗时（s）为指标。顺序 O_DIRECT fio 测试覆盖 4 KiB、16 KiB、64 KiB、256 KiB 和 1 MiB 五种块大小；同文件并发写比较 `numjobs=2/4`；外部电源保护模式使用每次写入后执行 `fsync` 的顺序写负载，以放大日志同步路径的差异。完整脚本、原始记录和结果口径见 [benchmark](test/bench/README.md)。
+性能测试在与 Linux EXT4 相同的 QEMU/KVM + virtio-blk 环境下进行，以平均吞吐（MB/s）和总耗时（s）为指标。顺序 O_DIRECT fio 测试覆盖 4 KiB、16 KiB、64 KiB、256 KiB 和 1 MiB 五种块大小；同文件并发写比较 `numjobs=2/4`；外部电源保护模式使用每次写入后执行 `fsync` 的顺序写负载，以放大日志同步路径的差异。相关测试脚本组织在 `test/initramfs/src/benchmark/`。
 
 | 场景 | Asterinas EXT4 | Linux EXT4 / 基线 | 相对结果 |
 | --- | ---: | ---: | --- |
@@ -264,8 +242,6 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 | 同文件并发写，`numjobs=2` | 1380 MB/s | 1340 MB/s | 103% |
 | 同文件并发写，`numjobs=4` | 2446 MB/s | 2194 MB/s | 111% |
 | SQLite speedtest1 | 86.2 s | 初赛阶段 234.9 s | 耗时降低 63.3%，速度约 2.73 倍 |
-
-#### 4.7.1 顺序 O_DIRECT 读写
 
 <p align="center">
   <img src="./docs/image/sequential-write-throughput.png" width="48%" alt="顺序写吞吐对比" />
@@ -279,18 +255,14 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 
 五种块大小下，Asterinas EXT4 的读写平均吞吐均高于同环境 Linux EXT4 对照。随着块大小增大，两侧吞吐都持续提升；读路径为 Linux 的 110.0%-113.4%，写路径为 105.1%-110.4%。
 
-#### 4.7.2 同文件并发写
-
 <p align="center">
   <img src="./docs/image/concurrent-write-throughput.png" width="48%" alt="同文件并发写吞吐对比" />
   <img src="./docs/image/concurrent-write-ratio.png" width="48%" alt="同文件并发写性能比例" />
 </p>
 
-`numjobs=2` 时吞吐为 1380 MB/s，对照 Linux 为 1340 MB/s；`numjobs=4` 时分别为 2446 MB/s 与 2194 MB/s。该结果用于说明写回、映射和设备提交路径能够随并发度扩展，同时仍受第 4.4 节的一致性验证约束。
+`numjobs=2` 时吞吐为 1380 MB/s，对照 Linux 为 1340 MB/s；`numjobs=4` 时分别为 2446 MB/s 与 2194 MB/s。这说明写回、映射和设备提交路径能够随并发度扩展，同时仍受上一节一致性验证约束。
 
-#### 4.7.3 外部电源保护模式下的高频 fsync 写
-
-该模式与标准 JBD2 模式使用相同代码、QEMU/KVM 环境、EXT4 镜像参数和 `virtio-blk` 设备，仅切换 `EXT4_POWER_PROTECTED` 开关。每个用例以 `direct=1`、`numjobs=1`、`fsync=1` 进行顺序写，并固定总写入量：4 KiB 用例包含 4096 次同步写，从而持续触发 JBD2 提交路径；掉电通知后的冻结、回滚和批量写回不计入 fio 运行时间。
+外部电源保护模式与标准 JBD2 模式使用相同代码、QEMU/KVM 环境、EXT4 镜像参数和 `virtio-blk` 设备，仅切换 `EXT4_POWER_PROTECTED` 开关。每个用例以 `direct=1`、`numjobs=1`、`fsync=1` 进行顺序写；掉电通知后的冻结、回滚和批量写回不计入 fio 运行时间。
 
 <p align="center">
   <img src="./docs/image/power-protected-fsync-throughput.png" width="48%" alt="高频 fsync 写吞吐对比" />
@@ -305,11 +277,7 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 | 256 KiB | 74.2 MB/s | 134.0 MB/s | 180.59% | 80.59% |
 | 1 MiB | 197.0 MB/s | 357.0 MB/s | 181.22% | 81.22% |
 
-这组结果量化的是正常运行阶段减少日志 I/O 的收益，而不包含掉电通知后的处理时间。默认 JBD2 模式继续用于 xfstests、崩溃矩阵与 Linux 互操作；只有通知可靠送达且备用供电窗口充足时才启用该模式。
-
-#### 4.7.4 SQLite 真实负载
-
-SQLite speedtest1 同时覆盖文件增长、索引更新、PageCache、目录项变更、journal 文件创建删除和高频 `fsync`，比顺序 fio 更能反映真实应用的综合成本。两轮对比使用相同 workload，并将总时间与 `integrity_check` 结果绑定。耗时由 234.9 s 降至 86.2 s，降低约 63.3%。
+SQLite speedtest1 同时覆盖文件增长、索引更新、PageCache、目录项变更、journal 文件创建删除和高频 `fsync`。两轮对比使用相同 workload，并将总时间与 `integrity_check` 结果绑定。耗时由 234.9 s 降至 86.2 s，降低约 63.3%。
 
 ![SQLite speedtest1 优化效果](./docs/image/sqlite-speedtest1.png)
 
@@ -321,11 +289,11 @@ ExtentManager 汇总三条 I/O 路径的逻辑块到物理块映射。项目通�
 
 ### 5.2 三路径一致性协议
 
-Buffered I/O、mmap 和 O_DIRECT 的实现不是三套彼此独立的读写逻辑，而是在同一 Extent 映射基础上定义缓存写回、排空与失效顺序。该设计将“性能路径”和“正确性边界”放在同一协议内处理，使缓存命中、混合 I/O 和映射更新可被统一验证。
+Buffered I/O、mmap 和 O_DIRECT 的实现不是三套彼此独立的读写逻辑，而是在同一 Extent 映射基础上定义缓存写回、排空与失效顺序。该设计将性能路径和正确性边界放在同一协议内处理，使缓存命中、混合 I/O 和映射更新可被统一验证。
 
-### 5.3 JBD2 完整生命周期与可验证恢复
+### 5.3 完整 JBD2 生命周期与可验证恢复
 
-项目实现从 credits、Handle、Transaction 到 ordered commit、checkpoint、revoke 与 recovery 的完整日志生命周期。再以 flush 点故障注入、严格 `e2fsck` 与数据 oracle 验证恢复结果，将日志设计从功能实现延伸到可重复的崩溃一致性证明。
+项目实现从 credits、Handle、Transaction 到 ordered commit、checkpoint、revoke 与 recovery 的完整日志生命周期。再以 FLUSH 点故障注入、严格 `e2fsck` 与数据 oracle 验证恢复结果，将日志设计从功能实现延伸到可重复的崩溃一致性证明。
 
 ### 5.4 面向可靠供电环境的持久化优化
 
@@ -333,7 +301,7 @@ Buffered I/O、mmap 和 O_DIRECT 的实现不是三套彼此独立的读写逻�
 
 ## 六、运行与复现
 
-常用入口如下。性能测试的完整环境、脚本与台账见 [benchmark](test/bench/README.md)。
+常用的构建和兼容性测试入口如下。性能用例及其 `run.sh`、结果描述文件组织在 `test/initramfs/src/benchmark/` 下。
 
 ```bash
 # 基础检查
@@ -345,11 +313,8 @@ make run_kernel AUTO_TEST=conformance \
   XFSTESTS_RUNLIST=/opt/xfstests/full.list \
   XFSTESTS_DISK_SIZE=12G MEM=8G RELEASE=1
 
-# JBD2 崩溃矩阵（<jlang-corpus-dir> 为已准备的工作负载目录）
-bash test/crash/run_matrix.sh --keep <jlang-corpus-dir>
-
-# 性能计分板跑批
-bash test/bench/run_p9_sweep.sh
+# 进入测试目录查看 fio、SQLite 等用例及其运行脚本
+cd test/initramfs/src/benchmark
 ```
 
 不同设备上的绝对耗时与带宽可能存在差异；复现时应以 PASS/FAIL、崩溃恢复结果、同口径 Linux 对照趋势和脚本记录的配置为准。
@@ -371,21 +336,15 @@ bash test/bench/run_p9_sweep.sh
 │       │   └── extent_manager/           # ExtentTree、EsCache、NodeCache 与映射路径
 │       └── journal/                      # JBD2 transaction、commit、checkpoint、revoke、recovery
 ├── test/
-│   ├── crash/                            # 崩溃矩阵、oracle、walcheck 与协议点测试
-│   │   ├── run_matrix.sh                 # 崩溃矩阵入口
-│   │   ├── oracle.py / walcheck.py       # 数据与 WAL 一致性判定
-│   │   └── protocol/                     # JBD2 协议点和工作负载集合
-│   ├── bench/                            # 性能跑批、结果台账与原始证据
-│   │   ├── README.md                     # benchmark 使用与口径说明
-│   │   ├── run_p9_sweep.sh               # 性能计分板入口
-│   │   └── evidence/                     # fio、SQLite 等原始日志
-│   └── initramfs/src/conformance/xfstests/
-│       ├── full.list                     # xfstests 完整回归清单
-│       ├── *.list                        # 分阶段与专项测试清单
-│       └── run_xfstests.sh               # guest 内 xfstests 执行脚本
+│   └── initramfs/
+│       ├── src/conformance/xfstests/     # xfstests 用例清单与 guest 运行脚本
+│       ├── src/benchmark/                # fio、SQLite 等测试用例、run.sh 与结果描述
+│       └── nix/                          # initramfs 测试与 benchmark 配置
 ├── docs/
 │   ├── image/                            # README 使用的校徽、架构图与性能图表
-│   └── aiuse/                            # AI 使用说明与阶段记录（待补充）
+│   └── AI_usage/                         # AI 使用说明与阶段记录
+├── 决赛文档.pdf                           # 决赛完整设计、实现与测试文档
+├── 决赛幻灯片.pptx                        # 决赛展示材料
 └── Makefile                              # 构建、内核运行和自动化测试入口
 ```
 
@@ -401,7 +360,7 @@ bash test/bench/run_p9_sweep.sh
 | 主要用途 | 实现思路讨论、代码风险检查、panic/timeout 日志分析、测试脚本辅助、重复测试执行和数据整理 |
 | 人工责任 | 代码实现、关键修改决策、测试设计、结果复核、文档与最终提交均由队伍成员负责 |
 
-完整 AI 使用说明与阶段记录将维护在 `docs/aiuse/` 目录。提交前请补充每个阶段的工具、模型、用途、人工审查过程和对应记录，使 README 中的说明可以追溯。
+完整 AI 使用说明与阶段记录将维护在 `docs/aiuse/` 目录。
 
 ## 九、参考资料
 
