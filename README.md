@@ -36,9 +36,17 @@
 
 ### 1.2 项目摘要
 
-本项目在 Asterinas Rust framekernel 操作系统中实现原生 EXT4 文件系统，使 RustOS 能够直接使用标准 EXT4 磁盘格式承载真实 Linux 应用负载。系统完成 POSIX 核心文件语义、目录操作、inode 与块分配、Extent 映射、PageCache、Buffered I/O、mmap、O_DIRECT、`fsync`/`fdatasync`，以及 JBD2 ordered 日志、检查点和崩溃恢复等主路径。
+本项目面向 2026 年全国大学生计算机系统能力大赛操作系统设计赛，在 Safe Rust 操作系统 Asterinas 中设计并实现原生 EXT4 文件系统。系统支持 POSIX 核心接口、Extent 块管理和 JBD2 日志，可读写标准 EXT4 磁盘格式，并支持 fio、SQLite 等应用运行。
 
-项目关注的不只是“能够读写文件”，而是同时保障三类一致性：元数据在崩溃后的可恢复性，Buffered I/O、mmap 与 O_DIRECT 之间的数据可见性，以及多线程读写时的运行时安全性。在此基础上，项目优化 Extent 映射、缓存、批量 I/O、事务持有时间与高频 `fsync` 路径，并通过 xfstests、崩溃矩阵、数据 oracle、Linux 双向互操作、fio 和 SQLite speedtest1 建立验证闭环。
+在完成 EXT4 基本读写的基础上，项目进一步处理真实运行中必须面对的应用兼容、崩溃恢复、并发访问、缓存一致性和 I/O 性能问题。系统实现 Buffered I/O、基础 mmap、`fsync`/`fdatasync`、O_DIRECT 和并发读写，建立完整的 JBD2 事务提交、检查点与挂载恢复流程；同时围绕 Extent 管理、缓存访问和日志提交等瓶颈进行优化。
+
+针对带有 UPS 或备用电源的受控环境，项目提供可选的外部电源保护模式：正常运行时减少日志和元数据的同步写盘；收到掉电通知后停止新的文件系统操作、回滚未完成事务，并在供电窗口内将已完成修改统一写回磁盘。这一模式只在可靠供电和可受控卸载的前提下启用，默认的标准 JBD2 模式仍用于任意时刻可能突然掉电的场景。
+
+项目围绕四项目标展开：完成 Asterinas EXT4 主体功能与 VFS/块设备适配；实现 JBD2 日志和崩溃恢复；完成同口径 Linux EXT4 对照与 SQLite 真实负载评估；围绕 Extent、EsCache、NodeCache、写回、O_DIRECT 一致性、并发和受控供电进行性能优化。
+
+正确性验证覆盖功能、并发、崩溃恢复和磁盘格式四个层面：xfstests 有 78 项通过，O_DIRECT 专项 10 项全部通过；标准日志和 4 MiB 小日志的崩溃矩阵合计覆盖 2560 个崩溃点，均为 0 red；数据持久化 oracle 覆盖 232 个工作负载、308 条断言，walcheck 核对 2360 个已提交元数据 after-image；并完成 Linux 双向互操作验证。
+
+性能方面，fio 顺序 O_DIRECT 读吞吐为 Linux EXT4 的 110.0%-113.4%，顺序写为 105.1%-110.4%；同文件并发写在 `numjobs=2/4` 下分别达到 1380 MB/s 和 2446 MB/s，对应 Linux EXT4 的 103% 和 111%。SQLite speedtest1 耗时由初赛阶段的 234.9 s 缩短至 86.2 s，降低约 63.3%。在外部电源保护模式下，高频 `fsync` 顺序写吞吐达到标准 JBD2 的 180.59%-254.81%，对应提升 80.59%-154.81%。
 
 ### 1.3 已实现功能
 
@@ -103,45 +111,73 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 ### 3.1 总体架构
 
-系统以 VFS 为上层接口，以统一 Extent 映射和 JBD2 事务为核心，将用户态负载连接到 virtio-blk 块设备。Buffered I/O、mmap 与 O_DIRECT 共享映射语义；JBD2 负责元数据更新的持久化顺序和挂载恢复；测试与验证体系从内核路径外侧形成闭环。
+系统从上到下分为用户负载、Asterinas 系统调用/VFS/VM 层、原生 EXT4 VFS 接入层、EXT4 核心和块设备层。fio、SQLite、xfstests 等负载通过 `read`、`write`、`mmap`、`fsync` 等接口进入 VFS；VFS 将路径解析、文件描述符和页缓存语义交由 EXT4 的 `FileSystem`、`Inode` 与 `FileOps` 实现。底层通过 Asterinas block layer、virtio-blk 和 QEMU 虚拟盘访问 EXT4 home blocks 与 JBD2 journal 区域。
+
+设计的核心是把三个原本容易割裂的问题放在同一条数据路径中处理：ExtentManager 是逻辑块到物理块映射的统一事实来源；PageCache 为 Buffered I/O 与 mmap 提供共享缓存页；JBD2 规定元数据和相关数据的提交顺序，并在重新挂载时完成恢复。内核单元测试、xfstests、崩溃矩阵、数据 oracle 和 Linux 互操作位于架构外侧，对每层实现施加可观察的验证。
 
 ![Asterinas EXT4 总体架构](./docs/image/system-architecture.png)
 
-代码位于 `kernel/src/fs/fs_impls/ext4/`。`fs.rs` 管理 EXT4 运行时对象和事务入口，`impl_for_vfs/` 提供 VFS 适配，`inode/extent_manager/` 维护 Extent 映射，`journal/` 实现提交、检查点、revoke 与恢复。
+代码位于 `kernel/src/fs/fs_impls/ext4/`。`fs.rs` 管理挂载后的 EXT4 对象、同步和事务入口；`impl_for_vfs/` 提供 VFS 适配；`inode/` 负责文件、目录、截断和同步；`inode/extent_manager/` 维护 ExtentTree 与缓存；`journal/` 实现 JBD2 的提交、检查点、revoke 与恢复；`super_block.rs`、`block_group.rs`、`feature.rs` 与 `checksum.rs` 负责盘面解析、分配和格式校验。
 
-### 3.2 文件读写与 Extent 管理
+### 3.2 VFS 接入与 EXT4 盘面对象
 
-三条文件访问路径汇合到 ExtentManager：Buffered I/O 修改 PageCache 页并标记脏页，mmap 通过 VMO 使用共享缓存页，O_DIRECT 绕过 PageCache 的数据传输但仍使用同一套 Extent 映射。ExtentManager 统一负责查找、插入、删除、分裂与合并 Extent，并为空间分配、缓存更新和 journal 事务提供一致的边界。
+挂载阶段，系统读取 superblock、特性位、块大小和块组描述符，并建立块设备与 journal 的运行时对象。随后 `Ext4FileSystem`、`Ext4Inode` 与文件操作实现将 Asterinas VFS 的路径解析、创建、查找、读写、重命名、截断、同步和统计请求映射为 EXT4 的 inode、目录项、位图与 Extent 更新。
 
-对于写洞和预分配，系统先使用 unwritten Extent 表示已分配但尚未完成数据写入的区间。只有数据 I/O 成功后才将其转换为 written，避免崩溃时暴露其他文件残留的数据。
+盘面层覆盖 superblock、block group、inode、目录项、块与 inode 位图、Extent、journal 等对象。所有会修改 inode、位图、目录项或 ExtentTree 的操作都要进入 journal 事务；数据页的传输则按 Buffered I/O、mmap 或 O_DIRECT 路径执行。这样既保留标准 EXT4 格式可被 Linux 工具识别的能力，也将内核 VFS 语义和块设备持久化连接起来。
+
+### 3.3 ExtentManager 与空间管理
+
+三条文件访问路径最终都通过 ExtentManager 取得逻辑块到物理块的映射。它负责查找、插入、删除、分裂和合并 Extent，并协调块分配、缓存更新与 journal 元数据修改。对空洞写入或预分配，系统先分配 unwritten Extent；数据 BIO 成功完成后，再在对应事务中将其转换为 written，避免崩溃后把其他文件释放块中的旧内容暴露给应用。
+
+ExtentTree 是权威映射来源。EsCache 只缓存已经证实的区间状态：`AllWritten` 表示区间被 written Extent 完整覆盖，`AllMapped` 表示存在完整映射但可能含 unwritten 区间，`Unknown` 则要求重新遍历 ExtentTree。NodeCache 缓存热点外部节点，减少树遍历的块读，但不作为映射真值。该划分保证缓存失效最多退化为慢路径，而不会把不确定映射当成正确结果。
 
 ![三条 I/O 路径与 ExtentManager](./docs/image/extent-io-path.png)
 
-### 3.3 PageCache、mmap 与 O_DIRECT 一致性
+### 3.4 Buffered I/O、mmap 与 PageCache
 
-PageCache 支撑 Buffered I/O 与 mmap。O_DIRECT 虽不传输 PageCache 中的数据，但必须维护缓存边界：直接读前写回重叠脏页，直接写前排空并失效重叠页，随后才经 ExtentManager 构造 IoBatch 和 BIO。该协议保证不同路径不会读到旧数据，也不会绕过必要的映射更新。
+普通 `read`/`write` 走 VFS、PageCache、ExtentManager 与 BIO。Buffered read 对空洞和 unwritten Extent 返回零；Buffered write 对已有稳定映射可直接更新缓存页并标记为 dirty。若写入引起文件扩展、空洞填充或块分配，系统先在事务内完成 Extent 与 inode 元数据更新，再将数据写入 PageCache。连续写回区间可合并为批量 BIO，减少逐页映射查询和设备提交开销。
 
-映射缓存中，EsCache 只保存已确认的映射事实，以 `AllWritten`、`AllMapped` 与 `Unknown` 表示区间覆盖状态；当状态为 `Unknown` 时，系统重新遍历权威的 ExtentTree。NodeCache 缓存热点外部 Extent 节点，但不替代真实映射判断。缓存失效时退回慢路径，而不会改变文件系统语义。
+mmap 通过 VMO 与同一套 PageCache 基础设施共享页面，因此 mmap 写、普通写、读取和 `fsync` 需看到一致的文件内容。`fsync`/`fdatasync` 推进与本次文件变化有关的 journal 事务：创建 inode、目录项、写入、truncate 或 Extent 变化均需要等待对应事务；纯属性变化由 `fsync` 覆盖而不强制 `fdatasync` 等待。同步完成后只清除脏状态，按一致性边界失效必要页面，而不是清空整个文件缓存，从而避免 SQLite 等高频同步负载反复从设备读取仍有效的 clean 页。
+
+### 3.5 O_DIRECT 与缓存一致性协议
+
+O_DIRECT 根据 Extent 映射直接构造 IoBatch/BIO，不传输 PageCache 中的数据，但“绕过缓存”不意味着可以忽略缓存状态。所有 O_DIRECT 请求先校验文件偏移和长度的文件系统块对齐，不满足时返回 `EINVAL`；随后在 inode 写锁保护的顺序下完成缓存协调、映射更新和数据 I/O。
+
+对于 direct read，若重叠范围仍有脏页，先执行 `flush_range` 将脏页写回，再从块设备读取，避免 direct read 得到落后于缓存的新数据。对于 direct write，先写回重叠脏页，再通过 `invalidate_range` 逐页排空并失效重叠缓存页，防止后续 Buffered read 继续读取旧副本。空洞 direct write 先分配 unwritten Extent，连续物理区间合并为 IoBatch，待全部数据 BIO 成功后才将相应区间转为 written 并记录 inode after-image；事务提交前的 barrier 由此形成 O_DIRECT 下的 ordered-data 约束。
 
 ![PageCache、mmap 与 O_DIRECT 协同](./docs/image/cache-coherency.png)
 
-### 3.4 JBD2 事务与崩溃恢复
+### 3.6 JBD2 事务、提交与检查点
 
-所有元数据修改经 `Ext4::begin_op(credits)` 申请 journal credits 并取得 `OpHandle`，再纳入 `Transaction` 统一管理。文件创建、Extent 分配、位图更新和 inode 修改等跨块变更在同一事务边界内完成，避免只落盘部分元数据而遗留不一致盘面。
+每个元数据操作经 `Ext4::begin_op(credits)` 申请 credits 并取得 `OpHandle`，再纳入当前 `Transaction`。credits 是本次操作可能修改的元数据块数的保守预留；预留不足、日志空间不可恢复或设备 I/O 失败时，文件系统会中止 journal 并拒绝后续写操作，而非带着静默丢失元数据的状态继续运行。文件创建、Extent 分配、位图修改和 inode 更新等跨块变更因此拥有共同事务边界。
 
-系统采用 JBD2 ordered 模式：关联数据先写回，再按 descriptor、metadata payload 和 commit block 的顺序完成日志提交；仅已持久化 commit block 的事务具备恢复资格。挂载恢复执行 `PASS_SCAN`、`PASS_REVOKE` 与 `PASS_REPLAY`，只重放有效且未被 revoke 取消的元数据版本。checkpoint 将已提交事务逐步写回 home blocks，以回收 journal 空间。
+JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Running 阶段由 Handle 在 credits 范围内捕获元数据 after-image，并登记 ordered 数据写回；Commit 阶段由 group commit 汇集运行事务，依次写入 descriptor、metadata payload、revoke 记录和带校验和的 commit block；Checkpoint 阶段以 lazy checkpoint 的方式按事务顺序将已提交元数据写回 home blocks，淘汰已不再需要的 after-image 并释放日志空间。提交线程不持有 inode 锁，而 checkpoint 和 journal 空间背压共同平衡吞吐、内存占用与可恢复性。
 
-### 3.5 并发控制
+| 日志记录 | 作用 | 恢复语义 |
+| --- | --- | --- |
+| Descriptor | 记录 transaction 序号与一个或多个目标 home block tag | 指定后续 payload 的归属，不代表事务提交 |
+| Metadata payload | 保存 inode、位图、块组描述符、目录项或 Extent 节点的 after-image | 仅在同事务存在有效 commit block 时进入重放候选 |
+| Revoke | 标识被释放或复用的元数据块及其事务序号 | `PASS_REVOKE` 收集后，抑制较旧事务对该块的重放 |
+| Commit block | 记录 transaction 序号、提交时间和校验和 | 校验通过才建立提交边界，不完整事务被忽略 |
+| Journal superblock | 保存环形日志起点、序号和特性信息 | 定位扫描窗口，checkpoint 推进后更新可回收起点 |
 
-运行时对象锁保护 inode 状态、目录命名空间、ExtentTree 和 block group；JBD2 事务保证提交和恢复顺序。多 inode 操作按 inode 号稳定加锁，Journal state 作为叶锁最后获取，避免形成 ABBA 死锁。EsCache 与 NodeCache 的临界区不跨设备 I/O 或日志操作。
+### 3.7 挂载恢复与异常处理
 
-同文件 O_DIRECT 写仍保留保护结构变化的 inode 写锁，同时通过减少锁内重复映射查询、限制分块大小、连续 BIO 提交和缩短事务持有时间改善并发写效率。映射状态仅在数据 I/O 成功后提交，保持 unwritten Extent 转换的正确顺序。
+系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。恢复完成后重新读取 superblock 与块组元数据，恢复提交线程并清理 orphan 链。
 
-### 3.6 外部电源保护模式
+如果日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。通过“只重放完整提交事务”和“异常后停止写入”两道边界，避免仅看到 descriptor 或 payload 时误判事务已提交。
 
-标准模式遵循 JBD2 持久化语义，支持突然掉电后的日志恢复。面向 UPS、机架级电池等可靠供电场景，项目设计可选外部电源保护模式：运行期间优先完成文件数据写回，日志和部分元数据保留在内存，在受控同步或卸载时统一持久化，从而降低高频 `fsync` 的重复 I/O 开销。
+### 3.8 并发控制与锁序
 
-该模式默认关闭，只有在可靠供电且可保证受控同步、卸载时才能启用；默认模式的突然掉电恢复语义不受影响。
+运行时锁分别保护 inode 状态、目录命名空间、ExtentTree、block group 和 journal state。多 inode 操作按 inode 号固定顺序加锁，避免 rename、link 等跨 inode 操作形成 ABBA 死锁；Journal state 作为叶锁最后获取；EsCache 和 NodeCache 的临界区不跨设备 I/O 或日志调用。提交线程在等待 ordered 数据写回时不反向取得 inode 锁，避免提交与前台 I/O 相互等待。
+
+同文件 O_DIRECT 写保留保护结构变化的 inode 写锁，但通过减少锁内重复映射查询、限制分块大小、连续 BIO 提交和缩短事务持有时间改善并发写扩展性。映射状态只在数据 I/O 成功后提交，始终保持 unwritten Extent 转换和 inode 元数据更新的顺序约束。
+
+### 3.9 外部电源保护模式
+
+标准模式遵循 JBD2 持久化语义，支持突然掉电后的日志恢复。面向 UPS、机架级电池等可靠供电场景，项目设计可选外部电源保护模式：运行期间优先完成文件数据写回，日志和部分元数据保留在内存，允许后续事务继续执行；收到掉电通知后，文件系统关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的元数据和数据。
+
+该模式默认关闭，只有掉电通知能够可靠送达、备用供电足以完成回滚和写回、并且用户态与内核仍可正常执行时才能启用。默认模式的突然掉电恢复语义不受影响；无法满足这些条件时必须使用标准 JBD2 模式。
 
 ![标准 JBD2 与外部电源保护模式对比](./docs/image/power-protection-mode.png)
 
@@ -158,63 +194,122 @@ PageCache 支撑 Buffered I/O 与 mmap。O_DIRECT 虽不传输 PageCache 中的�
 | 对照系统 | 相同虚拟化与块设备环境下的 Linux EXT4 |
 | 测试类型 | xfstests、并发正确性、崩溃一致性、Linux 互操作、fio、SQLite speedtest1 |
 
-### 4.2 功能与兼容性测试
+### 4.2 验证策略与判定原则
 
-xfstests 按能力域覆盖 EXT4 主路径，当前汇总为 **78 PASS、2 FAIL、1 FLAKY**，通过率为 **96.3%**。
+项目不以单一吞吐指标替代正确性判断，而是建立“接口行为、运行时一致性、崩溃恢复、独立 oracle、Linux 互操作”的验证链。xfstests 检查用户可见的 POSIX/EXT4 语义；并发与缓存测试检查不同 I/O 路径的可见性；崩溃矩阵枚举每个工作负载的持久化前缀；oracle、accounting、checksum 和 walcheck 分别独立验证数据、空间记账、元数据校验和与日志写序；Linux 双向互操作检查磁盘格式没有形成只能由本实现读取的私有状态。
 
-| 测试类别 | 通过数量 | 覆盖能力 |
+### 4.3 xfstests 功能与兼容性评估
+
+本次 xfstests 共 81 项：**78 项 PASS、2 项稳定 FAIL、1 项 FLAKY**，通过率为 **96.3%**。78 个通过用例按主要功能只计入一个类别，覆盖如下。
+
+| 测试类别 | 通过数量 | 代表用例 | 覆盖能力 |
+| --- | --- | --- | --- |
+| 文件与目录命名空间、链接、权限和元数据 | 27 PASS | `generic/002`、`generic/035`、`generic/401` | create/unlink、rename、硬/符号链接、目录压力、目录 seek、权限、umask、时间戳、`mknod`、`statx` 与 Unicode 文件名 |
+| 常规读写、截断、追加与数据完整性 | 15 PASS | `generic/001`、`generic/014`、`generic/639` | 随机读写校验、fsstress、truncate、洞文件、`O_APPEND`、向量 I/O、splice、高偏移 I/O、orphan 和卸载重挂后的继续写入 |
+| Extent、预分配、`fallocate` 与 ENOSPC | 12 PASS | `generic/102`、`generic/213`、`generic/619` | unwritten Extent、预分配、对齐、空间预约、满盘重试、并发 ENOSPC 与块分配一致性 |
+| O_DIRECT 与 buffered/direct 一致性 | 10 PASS | `generic/130`、`generic/133`、`generic/214`、`generic/609` | 向量直接读写、同文件并发 I/O、unwritten Extent 直接写、大请求分段、direct/buffered 混合访问、PageCache 失效与 `O_DSYNC` |
+| mmap、页缓存一致性与虚拟内存竞争 | 13 PASS | `generic/030`、`generic/346`、`generic/638` | 映射写、remap/truncate、mmap 与 `pwrite` 竞争、prefault、零填充、stale mmap read、PMD/PTE 竞争与多页重叠复制 |
+| EXT4 挂载统计语义 | 1 PASS | `ext4/042` | `statfs` 的 df/overhead 输出以及 `minixdf`、`bsd df` 等挂载选项行为 |
+
+稳定失败的 `generic/127` 和 `generic/452` 集中在 mmap 实现边界；`generic/371` 在并发写与 `fallocate` 的 ENOSPC 竞争中表现为 FLAKY。上述状态在统计中如实保留，不将环境异常或未执行用例混入通过率分母。
+
+### 4.4 并发与缓存一致性验证
+
+并发测试使用确定性数据模式驱动多个 worker 读写，结束后校验每个文件的长度和内容 hash；xfstests 的 fsstress 与并发用例补充命名空间和空间操作。缓存一致性测试交叉组合 Buffered I/O、O_DIRECT、mmap、truncate 与 `fallocate`，重点确认路径切换后不会读到旧副本。
+
+| 测试族 | 检查内容 | 判定方式 |
 | --- | --- | --- |
-| 文件与目录命名空间 | 24 PASS | create、open、read、write、mkdir、rmdir、rename、unlink、权限、atime、ENOSPC 等主路径 |
-| 并发与压力测试 | 10 PASS | 多进程 fsstress、并发文件操作、路径压力、近满盘压力与恢复场景 |
-| PageCache / O_DIRECT / mmap 一致性 | 9 PASS | buffered I/O、direct I/O、mmap 写入、truncate 后页缓存失效及混合读写 |
-| JBD2 日志恢复 | 6 PASS | 日志提交、replay、元数据恢复和 EXT4 日志相关场景 |
-| `fsync` / `fdatasync` 持久化语义 | 11 PASS | 文件大小与数据持久化、元数据边界、shutdown 后日志恢复等 |
-| 其他 EXT4 主路径 | 18 PASS | Extent、预分配、链接、时间戳和挂载后检查等补充场景 |
+| 多 worker 文件写入 | 并发过程是否出现错写、漏写或文件大小错误 | 结束后逐文件核对确定性 hash 和长度 |
+| Buffered 写后直接读 | direct read 能否观察到 PageCache 中尚未写回的新内容 | 对重叠范围先写回，再逐字节比较 |
+| 直接写后 Buffered 读 | 缓存是否保留 direct write 之前的旧副本 | direct write 完成后从普通 `read` 路径读回比较 |
+| mmap 基本路径 | 映射页修改与 `read`、`write`、`fsync` 间的可见性 | 对照读取内容和同步结果，并明确平台边界 |
+| namespace 与空间压力 | `rename`、`unlink`、truncate、`fallocate`、ENOSPC 的并发组合 | xfstests、fsstress、无 panic 与盘后检查 |
 
-### 4.3 崩溃一致性与数据 oracle
+### 4.5 崩溃矩阵与 JBD2 恢复验证
 
-崩溃测试在 JBD2 descriptor、metadata payload、commit block 与 checkpoint 等关键位置逐个注入断电，随后重启同一 EXT4 镜像，执行 JBD2 recovery、严格 `e2fsck` 与 oracle 检查。流程同时覆盖常规提交、日志空间紧张和频繁 checkpoint 等压力场景。
+崩溃矩阵不是随机终止虚拟机，而是记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法可直接覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
 
-| 验证项 | 结果 |
-| --- | --- |
-| 标准 journal 崩溃矩阵 | 931 个崩溃点，0 red |
-| 4 MiB 小 journal 崩溃矩阵 | 1629 个崩溃点，0 red |
-| 崩溃矩阵合计 | 2560 个崩溃点，0 red |
-| WAL 检查 | 2360 个 home block after-image 匹配，无 violation |
-| 盘面检查 | accounting、checksum、严格 `e2fsck` 均通过 |
+![块写记录驱动的崩溃矩阵验证流程](./docs/image/crash-validation-flow.png)
 
-![JBD2 崩溃恢复验证流程](./docs/image/crash-validation-flow.png)
+| 矩阵 | 覆盖与主要压力 | 结果 |
+| --- | --- | --- |
+| 标准日志矩阵 | 232 个工作负载的常规提交、恢复、revoke 与 checkpoint 组合 | 931 个崩溃点，0 red |
+| 4 MiB 小日志矩阵 | 同类语料下更频繁的 journal wrap、空间背压、checkpoint 与多事务状态 | 1629 个崩溃点，0 red |
+| 合计 | 所有持久化前缀均通过对应恢复与检查链 | 2560 个崩溃点，0 red |
 
-### 4.4 并发正确性与 Linux 互操作
+### 4.6 数据持久化 oracle 与 Linux 双向互操作
 
-并发测试覆盖四进程 fsstress 下的 rename、unlink、mkdir、rmdir 等命名空间操作，同文件 direct writer / buffered reader 竞争，同文件 direct、sync、async I/O 死锁压力，以及持续覆盖写期间的元数据状态观察，重点场景均 PASS。
+仅靠 `e2fsck` 无法证明 `fsync`/`fdatasync` 承诺的数据在掉电后仍完整存在，也无法独立判断空间记账和 WAL 写序。因此项目为每个工作负载定义可持久化的文件与字节范围，并使用多组独立检查器交叉验证。
 
-Linux 创建的 EXT4 镜像可由 Asterinas 挂载、读写并继续执行文件系统操作；Asterinas 修改后的镜像也可由 Linux 挂载并通过一致性检查。该验证覆盖 `metadata_csum`、journal checksum v2/v3、64-bit journal tag、descriptor 与 commit record 等标准盘面语义。
+| 检查项 | 检查问题 | 结果 |
+| --- | --- | --- |
+| 数据持久化 oracle | `fsync` 或 `fdatasync` 承诺的数据在任意掉电前缀后是否完整存在 | 232 个工作负载生效，308 条断言全部通过 |
+| strict `e2fsck` | 目录、inode、Extent、位图和引用关系是否需要结构修复 | 标准与小日志矩阵均为 0 red |
+| accounting | 空闲块、空闲 inode 和目录计数是否与重新扫描一致 | 两类矩阵检查全部通过 |
+| checksum judge | superblock、块组及相关元数据校验和是否与独立重算一致 | 全部 MATCH |
+| walcheck | home block 元数据写入是否具有已提交事务 after-image 来源 | 2360 项匹配，无 violation |
 
-### 4.5 性能评估
+Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜像由 Asterinas 挂载、读取并继续修改；Asterinas 创建或修改、卸载后的镜像由 Linux 重新挂载、逐项读取并用 `e2fsck` 检查。测试同时核对 `metadata_csum`、journal checksum v2/v3、64-bit journal tag、descriptor 和 commit record，并以相同操作或特定崩溃语义比较双方可见结果。
 
-性能测试在与 Linux EXT4 相同的 QEMU/KVM + virtio-blk 环境进行，以 I/O 总带宽和运行耗时为指标。详细脚本、原始记录与结果口径见 [benchmark](test/bench/README.md)。
+### 4.7 性能评估方法与结果
 
-| 场景 | 结果 |
-| --- | --- |
-| fio 顺序写 | 达到 Linux EXT4 的 105.1%-110.4% |
-| fio 顺序读 | 达到 Linux EXT4 的 110.0%-113.4% |
-| 同文件并发写，`numjobs=2` | 1380 MB/s，约为 Linux EXT4 的 103% |
-| 同文件并发写，`numjobs=4` | 2446 MB/s，约为 Linux EXT4 的 111% |
-| SQLite speedtest1 | 从 234.9 s 优化至 86.2 s，整体提升 2.73 倍 |
-| 外部电源保护模式下的高频 `fsync` 写 | 相比标准 JBD2 提升 80.59%-154.81% |
+性能测试在与 Linux EXT4 相同的 QEMU/KVM + virtio-blk 环境下进行，以平均吞吐（MB/s）和总耗时（s）为指标。顺序 O_DIRECT fio 测试覆盖 4 KiB、16 KiB、64 KiB、256 KiB 和 1 MiB 五种块大小；同文件并发写比较 `numjobs=2/4`；外部电源保护模式使用每次写入后执行 `fsync` 的顺序写负载，以放大日志同步路径的差异。完整脚本、原始记录和结果口径见 [benchmark](test/bench/README.md)。
+
+| 场景 | Asterinas EXT4 | Linux EXT4 / 基线 | 相对结果 |
+| --- | ---: | ---: | --- |
+| 顺序写，4 KiB 至 1 MiB | 41、146、498、712、743 MB/s | 39、137、466、646、673 MB/s | 105.1%-110.4% |
+| 顺序读，4 KiB 至 1 MiB | 44、161、618、1898、3750 MB/s | 40、144、552、1705、3308 MB/s | 110.0%-113.4% |
+| 同文件并发写，`numjobs=2` | 1380 MB/s | 1340 MB/s | 103% |
+| 同文件并发写，`numjobs=4` | 2446 MB/s | 2194 MB/s | 111% |
+| SQLite speedtest1 | 86.2 s | 初赛阶段 234.9 s | 耗时降低 63.3%，速度约 2.73 倍 |
+
+#### 4.7.1 顺序 O_DIRECT 读写
+
+<p align="center">
+  <img src="./docs/image/sequential-write-throughput.png" width="48%" alt="顺序写吞吐对比" />
+  <img src="./docs/image/sequential-read-throughput.png" width="48%" alt="顺序读吞吐对比" />
+</p>
 
 <p align="center">
   <img src="./docs/image/sequential-write-ratio.png" width="48%" alt="顺序写性能比例" />
   <img src="./docs/image/sequential-read-ratio.png" width="48%" alt="顺序读性能比例" />
 </p>
 
+五种块大小下，Asterinas EXT4 的读写平均吞吐均高于同环境 Linux EXT4 对照。随着块大小增大，两侧吞吐都持续提升；读路径为 Linux 的 110.0%-113.4%，写路径为 105.1%-110.4%。
+
+#### 4.7.2 同文件并发写
+
 <p align="center">
-  <img src="./docs/image/concurrent-write-ratio.png" width="48%" alt="并发写性能比例" />
-  <img src="./docs/image/sqlite-speedtest1.png" width="48%" alt="SQLite speedtest1 优化效果" />
+  <img src="./docs/image/concurrent-write-throughput.png" width="48%" alt="同文件并发写吞吐对比" />
+  <img src="./docs/image/concurrent-write-ratio.png" width="48%" alt="同文件并发写性能比例" />
 </p>
 
-![外部电源保护模式下高频 fsync 写性能提升](./docs/image/power-protected-fsync-ratio.png)
+`numjobs=2` 时吞吐为 1380 MB/s，对照 Linux 为 1340 MB/s；`numjobs=4` 时分别为 2446 MB/s 与 2194 MB/s。该结果用于说明写回、映射和设备提交路径能够随并发度扩展，同时仍受第 4.4 节的一致性验证约束。
+
+#### 4.7.3 外部电源保护模式下的高频 fsync 写
+
+该模式与标准 JBD2 模式使用相同代码、QEMU/KVM 环境、EXT4 镜像参数和 `virtio-blk` 设备，仅切换 `EXT4_POWER_PROTECTED` 开关。每个用例以 `direct=1`、`numjobs=1`、`fsync=1` 进行顺序写，并固定总写入量：4 KiB 用例包含 4096 次同步写，从而持续触发 JBD2 提交路径；掉电通知后的冻结、回滚和批量写回不计入 fio 运行时间。
+
+<p align="center">
+  <img src="./docs/image/power-protected-fsync-throughput.png" width="48%" alt="高频 fsync 写吞吐对比" />
+  <img src="./docs/image/power-protected-fsync-ratio.png" width="48%" alt="高频 fsync 写性能提升" />
+</p>
+
+| 块大小 | 标准 JBD2 | 外部电源保护 | 相对性能 | 性能提升 |
+| --- | ---: | ---: | ---: | ---: |
+| 4 KiB | 1.04 MB/s | 2.65 MB/s | 254.81% | 154.81% |
+| 16 KiB | 4.56 MB/s | 10.20 MB/s | 223.68% | 123.68% |
+| 64 KiB | 16.4 MB/s | 39.5 MB/s | 240.85% | 140.85% |
+| 256 KiB | 74.2 MB/s | 134.0 MB/s | 180.59% | 80.59% |
+| 1 MiB | 197.0 MB/s | 357.0 MB/s | 181.22% | 81.22% |
+
+这组结果量化的是正常运行阶段减少日志 I/O 的收益，而不包含掉电通知后的处理时间。默认 JBD2 模式继续用于 xfstests、崩溃矩阵与 Linux 互操作；只有通知可靠送达且备用供电窗口充足时才启用该模式。
+
+#### 4.7.4 SQLite 真实负载
+
+SQLite speedtest1 同时覆盖文件增长、索引更新、PageCache、目录项变更、journal 文件创建删除和高频 `fsync`，比顺序 fio 更能反映真实应用的综合成本。两轮对比使用相同 workload，并将总时间与 `integrity_check` 结果绑定。耗时由 234.9 s 降至 86.2 s，降低约 63.3%。
+
+![SQLite speedtest1 优化效果](./docs/image/sqlite-speedtest1.png)
 
 ## 五、性能优化与创新
 
