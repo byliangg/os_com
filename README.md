@@ -4,6 +4,10 @@
 
 # Asterinas EXT4 - 面向 RustOS 的高性能强一致性 EXT4 文件系统
 
+<p align="center">
+  <img src="./docs/image/rust-logo.png" width="72" alt="Rust" />
+</p>
+
 > 2026 年全国大学生计算机系统能力大赛操作系统设计赛
 >
 > 赛题方向：面向 RustOS 的高性能强一致性文件系统研究
@@ -36,17 +40,17 @@
 
 ### 1.2 项目摘要
 
-本项目面向 2026 年全国大学生计算机系统能力大赛操作系统设计赛，在 Safe Rust 操作系统 Asterinas 中设计并实现原生 EXT4 文件系统。系统支持 POSIX 核心接口、Extent 块管理和 JBD2 日志，可读写标准 EXT4 磁盘格式，并支持 fio、SQLite 等应用运行。
+本项目面向 2026 年全国大学生计算机系统能力大赛操作系统设计赛，在 Safe Rust 操作系统 Asterinas 中设计并实现原生 EXT4 文件系统。系统支持 POSIX 核心接口、Extent 块管理和 JBD2 日志，可读写标准 EXT4 磁盘格式，并支持 fio 等真实 I/O 负载运行。
 
 在完成 EXT4 基本读写的基础上，项目进一步处理真实运行中必须面对的应用兼容、崩溃恢复、并发访问、缓存一致性和 I/O 性能问题。系统实现 Buffered I/O、基础 mmap、`fsync`/`fdatasync`、O_DIRECT 和并发读写，建立完整的 JBD2 事务提交、检查点与挂载恢复流程；同时围绕 Extent 管理、缓存访问和日志提交等瓶颈进行优化。
 
 针对带有 UPS 或备用电源的受控环境，项目提供可选的外部电源保护模式：正常运行时减少日志和元数据的同步写盘；收到掉电通知后停止新的文件系统操作、回滚未完成事务，并在供电窗口内将已完成修改统一写回磁盘。这一模式只在可靠供电和可受控卸载的前提下启用，默认的标准 JBD2 模式仍用于任意时刻可能突然掉电的场景。
 
-项目围绕四项目标展开：完成 Asterinas EXT4 主体功能与 VFS/块设备适配；实现 JBD2 日志和崩溃恢复；完成同口径 Linux EXT4 对照与 SQLite 真实负载评估；围绕 Extent、EsCache、NodeCache、写回、O_DIRECT 一致性、并发和受控供电进行性能优化。
+项目围绕四项目标展开：完成 Asterinas EXT4 主体功能与 VFS/块设备适配；实现 JBD2 日志和崩溃恢复；完成同口径 Linux EXT4 对照评估；围绕 Extent、EsCache、NodeCache、写回、O_DIRECT 一致性、并发和受控供电进行性能优化。
 
 正确性验证覆盖功能、并发、崩溃恢复和磁盘格式四个层面：xfstests 有 78 项通过，O_DIRECT 专项 10 项全部通过；标准日志和 4 MiB 小日志的崩溃矩阵合计覆盖 2560 个崩溃点，均为 0 red；数据持久化 oracle 覆盖 232 个工作负载、308 条断言，walcheck 核对 2360 个已提交元数据 after-image；并完成 Linux 双向互操作验证。
 
-性能方面，fio 顺序 O_DIRECT 读吞吐为 Linux EXT4 的 110.0%-113.4%，顺序写为 105.1%-110.4%；同文件并发写在 `numjobs=2/4` 下分别达到 1380 MB/s 和 2446 MB/s，对应 Linux EXT4 的 103% 和 111%。SQLite speedtest1 耗时由初赛阶段的 234.9 s 缩短至 86.2 s，降低约 63.3%。在外部电源保护模式下，高频 `fsync` 顺序写吞吐达到标准 JBD2 的 180.59%-254.81%，对应提升 80.59%-154.81%。
+性能方面，fio 顺序 O_DIRECT 读吞吐为 Linux EXT4 的 110.0%-113.4%，顺序写为 105.1%-110.4%；同文件并发写在 `numjobs=2/4` 下分别达到 1380 MB/s 和 2446 MB/s，对应 Linux EXT4 的 103% 和 111%。在外部电源保护模式下，高频 `fsync` 顺序写吞吐达到标准 JBD2 的 180.59%-254.81%，对应提升 80.59%-154.81%。
 
 ### 1.3 已实现功能
 
@@ -65,7 +69,7 @@
 | 多路径缓存一致性 | 已完成 | direct/buffered 混合 I/O、PageCache、mmap 与 O_DIRECT 专项验证 |
 | 并发正确性 | 已完成重点验证 | fsstress、同文件 direct/buffered 竞争、死锁压力和状态观察均 PASS |
 | Linux 互操作 | 已完成 | Linux 创建的镜像可由 Asterinas 读写；Asterinas 修改后的镜像可由 Linux 挂载并检查 |
-| 性能结果 | 已形成结果 | fio 顺序 I/O 达到 Linux EXT4 的 105.1%-113.4%，SQLite speedtest1 优化至 86.2 s |
+| 性能结果 | 已形成结果 | fio 顺序 I/O 达到 Linux EXT4 的 105.1%-113.4% |
 
 ### 1.5 分工说明
 
@@ -73,14 +77,14 @@
 | --- | --- |
 | 俞杰 | EXT4/JBD2 核心设计、崩溃一致性验证、比赛材料整理 |
 | 梁丙煜 | Asterinas VFS、PageCache/mmap/O_DIRECT 路径接入与性能优化 |
-| 王毅航 | xfstests 适配、并发测试、fio/SQLite 测试脚本与结果分析 |
+| 王毅航 | xfstests 适配、并发测试、fio 测试脚本与结果分析 |
 
 ### 1.6 文档索引
 
 - [决赛设计文档](决赛文档.pdf)：项目完整设计、实现和测试说明。
 - [决赛答辩幻灯片](决赛幻灯片.pptx)：决赛展示材料。
 - [xfstests 测试清单与运行脚本](test/initramfs/src/conformance/xfstests/)：文件系统兼容性测试。
-- [test/initramfs/src/benchmark/README.md](test/initramfs/src/benchmark/README.md)：测试目录中的 fio、SQLite 等性能测试组织方式。
+- [test/initramfs/src/benchmark/README.md](test/initramfs/src/benchmark/README.md)：测试目录中的 fio 性能测试组织方式。
 - `docs/aiuse/`：AI 使用说明与阶段记录，后续由参赛队补充维护。
 
 ## 二、项目背景与目标
@@ -91,13 +95,17 @@
 
 EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 Asterinas，一方面补齐 RustOS 的本地持久化能力，另一方面可直接复用标准 EXT4 磁盘格式、Linux 工具链与既有应用生态。项目以 Rust 的内存安全优势为基础，在性能、并发和崩溃一致性之间建立明确的实现边界。
 
+对数据库、消息队列和编译构建等应用而言，仅能创建、读取和写入文件还不够；`fsync`、`rename`、`truncate` 等操作在异常或重启后仍需保持正确、可预期的结果。同一个文件也可能同时经由 PageCache、mmap 和 O_DIRECT 访问，文件增长还会牵动 Extent、空间分配和日志事务。因此，一个可用的文件系统还必须处理缓存一致性、并发访问和崩溃恢复。
+
+成熟文件系统的共享状态、指针和并发操作使实现复杂度很高。Rust 的所有权、类型检查和错误处理机制有助于降低内存越界与悬垂引用风险；但 Asterinas 的 VFS、PageCache、虚拟内存和块设备接口与 Linux 内核不同，Linux 中的 EXT4/JBD2 不能直接移植，必须结合 Asterinas 的 framekernel 架构重新设计和实现。本项目选择标准 EXT4 格式，而非新建简化格式或封装用户态库，使镜像可直接利用 Linux 工具链创建、检查并作为功能与性能对照。
+
 ### 2.2 项目目标
 
 1. 在 Asterinas 上实现标准 EXT4 磁盘格式和 POSIX 核心文件系统接口。
 2. 实现 JBD2 ordered 日志语义，使元数据更新具备提交、检查点和崩溃恢复能力。
 3. 打通 PageCache、Buffered I/O、mmap、O_DIRECT、`fsync`/`fdatasync` 与块设备 I/O 路径。
 4. 通过 xfstests、崩溃恢复、数据 oracle、Linux 互操作和并发测试验证正确性。
-5. 在统一 QEMU/KVM + virtio-blk 环境中对照 Linux EXT4，评估 fio 与 SQLite 真实负载性能。
+5. 在统一 QEMU/KVM + virtio-blk 环境中对照 Linux EXT4，评估 fio 真实 I/O 负载性能。
 
 ### 2.3 核心挑战
 
@@ -113,9 +121,11 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 ### 3.1 总体架构
 
-系统从上到下分为用户负载、Asterinas 系统调用/VFS/VM 层、原生 EXT4 VFS 接入层、EXT4 核心和块设备层。fio、SQLite、xfstests 等负载通过 `read`、`write`、`mmap`、`fsync` 等接口进入 VFS；VFS 将路径解析、文件描述符和页缓存语义交由 EXT4 的 `FileSystem`、`Inode` 与 `FileOps` 实现。底层通过 Asterinas block layer、virtio-blk 和 QEMU 虚拟盘访问 EXT4 home blocks 与 JBD2 journal 区域。
+系统从上到下分为用户负载、Asterinas 系统调用/VFS/VM 层、原生 EXT4 VFS 接入层、EXT4 核心和块设备层。fio、xfstests 等负载通过 `read`、`write`、`mmap`、`fsync` 等接口进入 VFS；VFS 将路径解析、文件描述符和页缓存语义交由 EXT4 的 `FileSystem`、`Inode` 与 `FileOps` 实现。底层通过 Asterinas block layer、virtio-blk 和 QEMU 虚拟盘访问 EXT4 home blocks 与 JBD2 journal 区域。
 
 设计的核心是把三个原本容易割裂的问题放在同一条数据路径中处理：ExtentManager 是逻辑块到物理块映射的统一事实来源；PageCache 为 Buffered I/O 与 mmap 提供共享缓存页；JBD2 规定元数据和相关数据的提交顺序，并在重新挂载时完成恢复。内核单元测试、xfstests、崩溃矩阵、数据 oracle 和 Linux 互操作位于架构外侧，对每层实现施加可观察的验证。
+
+![Asterinas EXT4 分层架构与数据布局](./docs/image/architecture-overview-v2.png)
 
 ![Asterinas EXT4 总体架构](./docs/image/system-architecture.png)
 
@@ -133,13 +143,15 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 ExtentTree 是权威映射来源。EsCache 只缓存已经证实的区间状态：`AllWritten` 表示区间被 written Extent 完整覆盖，`AllMapped` 表示存在完整映射但可能含 unwritten 区间，`Unknown` 则要求重新遍历 ExtentTree。NodeCache 缓存热点外部节点，减少树遍历的块读，但不作为映射真值。该划分保证缓存失效最多退化为慢路径，而不会把不确定映射当成正确结果。
 
+![ExtentManager、缓存与块设备交互](./docs/image/extent-manager-design.png)
+
 ![三条 I/O 路径与 ExtentManager](./docs/image/extent-io-path.png)
 
 ### 3.4 Buffered I/O、mmap 与 PageCache
 
 普通 `read`/`write` 走 VFS、PageCache、ExtentManager 与 BIO。Buffered read 对空洞和 unwritten Extent 返回零；Buffered write 对已有稳定映射可直接更新缓存页并标记为 dirty。若写入引起文件扩展、空洞填充或块分配，系统先在事务内完成 Extent 与 inode 元数据更新，再将数据写入 PageCache。连续写回区间可合并为批量 BIO，减少逐页映射查询和设备提交开销。
 
-mmap 通过 VMO 与同一套 PageCache 基础设施共享页面，因此 mmap 写、普通写、读取和 `fsync` 需看到一致的文件内容。`fsync`/`fdatasync` 推进与本次文件变化有关的 journal 事务：创建 inode、目录项、写入、truncate 或 Extent 变化均需要等待对应事务；纯属性变化由 `fsync` 覆盖而不强制 `fdatasync` 等待。同步完成后只清除脏状态，按一致性边界失效必要页面，而不是清空整个文件缓存，从而避免 SQLite 等高频同步负载反复从设备读取仍有效的 clean 页。
+mmap 通过 VMO 与同一套 PageCache 基础设施共享页面，因此 mmap 写、普通写、读取和 `fsync` 需看到一致的文件内容。`fsync`/`fdatasync` 推进与本次文件变化有关的 journal 事务：创建 inode、目录项、写入、truncate 或 Extent 变化均需要等待对应事务；纯属性变化由 `fsync` 覆盖而不强制 `fdatasync` 等待。同步完成后只清除脏状态，按一致性边界失效必要页面，而不是清空整个文件缓存，避免高频同步负载反复从设备读取仍有效的 clean 页。
 
 ### 3.5 O_DIRECT 与缓存一致性协议
 
@@ -155,6 +167,8 @@ O_DIRECT 根据 Extent 映射直接构造 IoBatch/BIO，不传输 PageCache 中�
 
 JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Running 阶段由 Handle 在 credits 范围内捕获元数据 after-image，并登记 ordered 数据写回；Commit 阶段由 group commit 汇集运行事务，依次写入 descriptor、metadata payload、revoke 记录和带校验和的 commit block；Checkpoint 阶段以 lazy checkpoint 的方式按事务顺序将已提交元数据写回 home blocks，淘汰已不再需要的 after-image 并释放日志空间。
 
+![EXT4 与 JBD2 事务提交流程](./docs/image/jbd2-commit-flow.png)
+
 | 日志记录 | 作用 | 恢复语义 |
 | --- | --- | --- |
 | Descriptor | 记录 transaction 序号与一个或多个目标 home block tag | 指定后续 payload 的归属，不代表事务提交 |
@@ -163,13 +177,23 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 | Commit block | 记录 transaction 序号、提交时间和校验和 | 校验通过才建立提交边界，不完整事务被忽略 |
 | Journal superblock | 保存环形日志起点、序号和特性信息 | 定位扫描窗口，checkpoint 推进后更新可回收起点 |
 
+#### 去 Buffer Head 的元数据管理
+
+实现不沿用 Linux EXT4 的 `buffer_head` 链表作为元数据写入的中间层，而是以 typed metadata/dirty 对象保存 inode、Extent、位图、组描述符和 superblock 的修改，并以 transaction mirror/meta buffer 捕获 after-image。该设计仍保持 JBD2 的锁、事务边界和提交语义，但使元数据对象能够直接进入提交管线与 checkpoint，适配 Asterinas 的 Rust 内存管理模型。
+
+![Linux Buffer Head 路径与 Asterinas 去 Buffer Head 路径对比](./docs/image/jbd2-buffer-head-free.png)
+
 ### 3.7 挂载恢复、并发与外部电源保护
 
 系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败时，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。
 
+![EXT4 与 JBD2 挂载恢复流程](./docs/image/jbd2-recovery-flow.png)
+
 运行时锁分别保护 inode 状态、目录命名空间、ExtentTree、block group 和 journal state。多 inode 操作按 inode 号固定顺序加锁，Journal state 作为叶锁最后获取；EsCache 和 NodeCache 的临界区不跨设备 I/O 或日志调用。这样避免 rename、link 等跨 inode 操作形成 ABBA 死锁，也避免提交与前台 I/O 相互等待。
 
 外部电源保护模式面向可靠 UPS 或备用电源场景：运行期间优先完成文件数据写回，日志和部分元数据保留在内存；收到掉电通知后关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的数据和元数据。该模式默认关闭，只有掉电通知可靠送达、备用供电足以完成回滚和写回时才能启用。
+
+![外部电源保护模式的内存事务与数据路径](./docs/image/power-protected-memory-mode.png)
 
 ![标准 JBD2 与外部电源保护模式对比](./docs/image/power-protection-mode.png)
 
@@ -184,7 +208,7 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 | 容器镜像 | `asterinas/asterinas:0.17.0-20260227` |
 | 虚拟机配置 | 8 GiB 内存，单处理器 |
 | 对照系统 | 相同虚拟化与块设备环境下的 Linux EXT4 |
-| 测试类型 | xfstests、并发正确性、崩溃一致性、Linux 互操作、fio、SQLite speedtest1 |
+| 测试类型 | xfstests、并发正确性、崩溃一致性、Linux 互操作、fio |
 
 项目建立“接口行为、运行时一致性、崩溃恢复、独立 oracle、Linux 互操作”的验证链。xfstests 检查用户可见的 POSIX/EXT4 语义；并发与缓存测试检查不同 I/O 路径的可见性；崩溃矩阵枚举每个工作负载的持久化前缀；oracle、accounting、checksum 和 walcheck 分别独立验证数据、空间记账、元数据校验和与日志写序；Linux 双向互操作检查磁盘格式没有形成只能由本实现读取的私有状态。
 
@@ -219,6 +243,8 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 
 崩溃矩阵记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
 
+![崩溃恢复测试的四步验证流程](./docs/image/crash-recovery-test-flow.png)
+
 ![块写记录驱动的崩溃矩阵验证流程](./docs/image/crash-validation-flow.png)
 
 | 验证项 | 覆盖与检查内容 | 结果 |
@@ -241,7 +267,6 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 | 顺序读，4 KiB 至 1 MiB | 44、161、618、1898、3750 MB/s | 40、144、552、1705、3308 MB/s | 110.0%-113.4% |
 | 同文件并发写，`numjobs=2` | 1380 MB/s | 1340 MB/s | 103% |
 | 同文件并发写，`numjobs=4` | 2446 MB/s | 2194 MB/s | 111% |
-| SQLite speedtest1 | 86.2 s | 初赛阶段 234.9 s | 耗时降低 63.3%，速度约 2.73 倍 |
 
 <p align="center">
   <img src="./docs/image/sequential-write-throughput.png" width="48%" alt="顺序写吞吐对比" />
@@ -277,10 +302,6 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 | 256 KiB | 74.2 MB/s | 134.0 MB/s | 180.59% | 80.59% |
 | 1 MiB | 197.0 MB/s | 357.0 MB/s | 181.22% | 81.22% |
 
-SQLite speedtest1 同时覆盖文件增长、索引更新、PageCache、目录项变更、journal 文件创建删除和高频 `fsync`。两轮对比使用相同 workload，并将总时间与 `integrity_check` 结果绑定。耗时由 234.9 s 降至 86.2 s，降低约 63.3%。
-
-![SQLite speedtest1 优化效果](./docs/image/sqlite-speedtest1.png)
-
 ## 五、性能优化与创新
 
 ### 5.1 统一 Extent 映射与缓存优化
@@ -313,7 +334,7 @@ make run_kernel AUTO_TEST=conformance \
   XFSTESTS_RUNLIST=/opt/xfstests/full.list \
   XFSTESTS_DISK_SIZE=12G MEM=8G RELEASE=1
 
-# 进入测试目录查看 fio、SQLite 等用例及其运行脚本
+# 进入测试目录查看 fio 用例及其运行脚本
 cd test/initramfs/src/benchmark
 ```
 
@@ -338,7 +359,7 @@ cd test/initramfs/src/benchmark
 ├── test/
 │   └── initramfs/
 │       ├── src/conformance/xfstests/     # xfstests 用例清单与 guest 运行脚本
-│       ├── src/benchmark/                # fio、SQLite 等测试用例、run.sh 与结果描述
+│       ├── src/benchmark/                # fio 测试用例、run.sh 与结果描述
 │       └── nix/                          # initramfs 测试与 benchmark 配置
 ├── docs/
 │   ├── image/                            # README 使用的校徽、架构图与性能图表
