@@ -4,10 +4,6 @@
 
 # Asterinas EXT4 - 面向 RustOS 的高性能强一致性 EXT4 文件系统
 
-<p align="center">
-  <img src="./docs/image/rust-logo.png" width="72" alt="Rust" />
-</p>
-
 > 2026 年全国大学生计算机系统能力大赛操作系统设计赛
 >
 > 赛题方向：面向 RustOS 的高性能强一致性文件系统研究
@@ -127,8 +123,6 @@ EXT4 是 Linux 中应用广泛的通用文件系统。将其原生实现引入 A
 
 ![Asterinas EXT4 分层架构与数据布局](./docs/image/architecture-overview-v2.png)
 
-![Asterinas EXT4 总体架构](./docs/image/system-architecture.png)
-
 代码位于 `kernel/src/fs/fs_impls/ext4/`。`fs.rs` 管理挂载后的 EXT4 对象、同步和事务入口；`impl_for_vfs/` 提供 VFS 适配；`inode/` 负责文件、目录、截断和同步；`inode/extent_manager/` 维护 ExtentTree 与缓存；`journal/` 实现 JBD2 的提交、检查点、revoke 与恢复；`super_block.rs`、`block_group.rs`、`feature.rs` 与 `checksum.rs` 负责盘面解析、分配和格式校验。
 
 ### 3.2 VFS 接入与 EXT4 盘面对象
@@ -145,8 +139,6 @@ ExtentTree 是权威映射来源。EsCache 只缓存已经证实的区间状态�
 
 ![ExtentManager、缓存与块设备交互](./docs/image/extent-manager-design.png)
 
-![三条 I/O 路径与 ExtentManager](./docs/image/extent-io-path.png)
-
 ### 3.4 Buffered I/O、mmap 与 PageCache
 
 普通 `read`/`write` 走 VFS、PageCache、ExtentManager 与 BIO。Buffered read 对空洞和 unwritten Extent 返回零；Buffered write 对已有稳定映射可直接更新缓存页并标记为 dirty。若写入引起文件扩展、空洞填充或块分配，系统先在事务内完成 Extent 与 inode 元数据更新，再将数据写入 PageCache。连续写回区间可合并为批量 BIO，减少逐页映射查询和设备提交开销。
@@ -158,8 +150,6 @@ mmap 通过 VMO 与同一套 PageCache 基础设施共享页面，因此 mmap �
 O_DIRECT 根据 Extent 映射直接构造 IoBatch/BIO，不传输 PageCache 中的数据，但“绕过缓存”不意味着可以忽略缓存状态。所有 O_DIRECT 请求先校验文件偏移和长度的文件系统块对齐，不满足时返回 `EINVAL`；随后在 inode 写锁保护的顺序下完成缓存协调、映射更新和数据 I/O。
 
 对于 direct read，若重叠范围仍有脏页，先执行 `flush_range` 将脏页写回，再从块设备读取，避免 direct read 得到落后于缓存的新数据。对于 direct write，先写回重叠脏页，再通过 `invalidate_range` 逐页排空并失效重叠缓存页，防止后续 Buffered read 继续读取旧副本。空洞 direct write 先分配 unwritten Extent，连续物理区间合并为 IoBatch，待全部数据 BIO 成功后才将相应区间转为 written 并记录 inode after-image；事务提交前的 barrier 由此形成 O_DIRECT 下的 ordered-data 约束。
-
-![PageCache、mmap 与 O_DIRECT 协同](./docs/image/cache-coherency.png)
 
 ### 3.6 JBD2 事务、提交与检查点
 
@@ -177,12 +167,6 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 | Commit block | 记录 transaction 序号、提交时间和校验和 | 校验通过才建立提交边界，不完整事务被忽略 |
 | Journal superblock | 保存环形日志起点、序号和特性信息 | 定位扫描窗口，checkpoint 推进后更新可回收起点 |
 
-#### 去 Buffer Head 的元数据管理
-
-实现不沿用 Linux EXT4 的 `buffer_head` 链表作为元数据写入的中间层，而是以 typed metadata/dirty 对象保存 inode、Extent、位图、组描述符和 superblock 的修改，并以 transaction mirror/meta buffer 捕获 after-image。该设计仍保持 JBD2 的锁、事务边界和提交语义，但使元数据对象能够直接进入提交管线与 checkpoint，适配 Asterinas 的 Rust 内存管理模型。
-
-![Linux Buffer Head 路径与 Asterinas 去 Buffer Head 路径对比](./docs/image/jbd2-buffer-head-free.png)
-
 ### 3.7 挂载恢复、并发与外部电源保护
 
 系统采用 JBD2 ordered 模式：关联数据先完成写回，再写入日志记录；只有 commit block 经 barrier 持久化后，事务才获得可恢复资格。挂载恢复严格执行 `PASS_SCAN`、`PASS_REVOKE` 和 `PASS_REPLAY`：先识别完整提交事务，再收集 revoke 集合，最后只重放未被 revoke 覆盖的 after-image。日志校验和不匹配、journal 结构无效、空间预留错误或设备 I/O 失败时，系统进入 abort/只读降级路径，不继续接受可能破坏盘面的新写操作。
@@ -194,8 +178,6 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 外部电源保护模式面向可靠 UPS 或备用电源场景：运行期间优先完成文件数据写回，日志和部分元数据保留在内存；收到掉电通知后关闭操作入口、停止提交线程、回滚不完整事务，并在备用电源窗口内统一写回可信的数据和元数据。该模式默认关闭，只有掉电通知可靠送达、备用供电足以完成回滚和写回时才能启用。
 
 ![外部电源保护模式的内存事务与数据路径](./docs/image/power-protected-memory-mode.png)
-
-![标准 JBD2 与外部电源保护模式对比](./docs/image/power-protection-mode.png)
 
 ## 四、测试与评估
 
@@ -227,25 +209,22 @@ JBD2 事务经历 Running、Commit、Checkpoint 与 Recovery 四个阶段。Runn
 
 稳定失败的 `generic/127` 和 `generic/452` 集中在 mmap 实现边界；`generic/371` 在并发写与 `fallocate` 的 ENOSPC 竞争中表现为 FLAKY，统计中如实保留。
 
-### 4.3 并发与缓存一致性验证
+### 4.3 并发一致性验证
 
-并发测试使用确定性数据模式驱动多个 worker 读写，结束后校验每个文件的长度和内容 hash；xfstests 的 fsstress 与并发用例补充命名空间和空间操作。缓存一致性测试交叉组合 Buffered I/O、O_DIRECT、mmap、truncate 与 `fallocate`，重点确认路径切换后不会读到旧副本。
+并发测试覆盖命名空间、同文件混合读写、多 I/O 路径竞争和运行时元数据状态。测试在相同文件或共享目录上交叉施加并发操作，并以目录项、inode 生命周期、缓存可见性、锁顺序和 `stat` 结果作为判定依据。
 
-| 测试族 | 检查内容 | 判定方式 |
+| 测试类型 | 测试场景 | 验证内容 |
 | --- | --- | --- |
-| 多 worker 文件写入 | 是否出现错写、漏写或文件大小错误 | 结束后逐文件核对确定性 hash 和长度 |
-| Buffered 写后直接读 | direct read 能否观察到 PageCache 中尚未写回的新内容 | 对重叠范围先写回，再逐字节比较 |
-| 直接写后 Buffered 读 | 缓存是否保留 direct write 之前的旧副本 | direct write 完成后从普通 `read` 路径读回比较 |
-| mmap 基本路径 | 映射页修改与 `read`、`write`、`fsync` 间的可见性 | 对照读取内容和同步结果 |
-| namespace 与空间压力 | `rename`、`unlink`、truncate、`fallocate`、ENOSPC 的并发组合 | xfstests、fsstress、无 panic 与盘后检查 |
+| 多文件并发命名空间与空间管理 | 4 个进程运行 `fsstress`，混合 `rename`、`unlink`、`mkdir`、`rmdir` 等操作 | 目录项更新、inode 生命周期及锁顺序正确，PASS |
+| 同文件读写竞争 | 同一文件上交叉执行 direct writer、buffered reader、buffered writer 与 direct reader | direct I/O 与 PageCache 协同，不读取旧数据，PASS |
+| 同文件死锁压力 | 同一文件上并发执行 direct I/O、sync I/O 与 async I/O | 多条 I/O 路径交错时不发生死锁，PASS |
+| 并发状态观察 | 一个进程持续覆盖写，另一个进程持续执行 `fstat` | writeback 期间 `st_blocks` 等元数据状态正确，PASS |
 
 ### 4.4 崩溃矩阵、oracle 与格式验证
 
 崩溃矩阵记录单个工作负载产生的块设备写入及 FLUSH 边界，在每个可观察持久化前缀构造掉电镜像。每张镜像均独立重新挂载、执行 JBD2 recovery，再经过严格 `e2fsck`、数据 oracle、accounting、checksum、walcheck 检查，最后汇总为 green/red。该方法覆盖 descriptor、metadata payload、commit block、checkpoint 以及 journal 回绕之间的写序关系。
 
 ![崩溃恢复测试的四步验证流程](./docs/image/crash-recovery-test-flow.png)
-
-![块写记录驱动的崩溃矩阵验证流程](./docs/image/crash-validation-flow.png)
 
 | 验证项 | 覆盖与检查内容 | 结果 |
 | --- | --- | --- |
@@ -304,21 +283,13 @@ Linux 互操作从两个方向验证：Linux 创建或更新的标准 EXT4 镜�
 
 ## 五、性能优化与创新
 
-### 5.1 统一 Extent 映射与缓存优化
+| 创新功能 | 解决问题 | 说明 |
+| --- | --- | --- |
+| 无 Buffer Head 架构的事务镜像日志机制 | 缺少块级事务抽象 | 针对 Asterinas 缺少 Linux `buffer_head` 统一块缓存的问题，以物理块号定位元数据，在事务内维护完整的 metadata after-image，并将不同元数据修改聚合到统一事务镜像中；结合事务版本与最新镜像解析机制，在不引入 `buffer_head` 的情况下实现 JBD2 所需的块级事务语义。 |
+| 外部电源保护模式下元数据驻留内存的日志模式 | 频繁持久化 I/O 开销 | 针对 UPS、备用电源等高可靠供电场景，将普通文件数据正常落盘，日志与元数据更新主要驻留内存，减少传统 EXT4 的日志写入、barrier 和元数据回写开销，从而降低额外 I/O 与写放大，提升高频文件操作性能。 |
+| Extent 热点路径的轻量级 NodeCache | Extent 节点重复读取 | 针对 Extent 树节点被频繁重复访问的问题，在 inode 侧缓存近期访问的 Extent 节点；命中后直接复用，减少 journal 版本解析与底层块读取，降低元数据 I/O 开销。 |
 
-ExtentManager 汇总三条 I/O 路径的逻辑块到物理块映射。项目通过缩短 Extent 结构修改和事务持有时间、缓存已确认的映射事实、减少重复树遍历，降低小粒度写入和频繁映射准备的开销。EsCache 以可证明的区间状态加速查询，NodeCache 则用于热点外部节点访问，两者都不替代 ExtentTree 的权威判断。
-
-### 5.2 三路径一致性协议
-
-Buffered I/O、mmap 和 O_DIRECT 的实现不是三套彼此独立的读写逻辑，而是在同一 Extent 映射基础上定义缓存写回、排空与失效顺序。该设计将性能路径和正确性边界放在同一协议内处理，使缓存命中、混合 I/O 和映射更新可被统一验证。
-
-### 5.3 完整 JBD2 生命周期与可验证恢复
-
-项目实现从 credits、Handle、Transaction 到 ordered commit、checkpoint、revoke 与 recovery 的完整日志生命周期。再以 FLUSH 点故障注入、严格 `e2fsck` 与数据 oracle 验证恢复结果，将日志设计从功能实现延伸到可重复的崩溃一致性证明。
-
-### 5.4 面向可靠供电环境的持久化优化
-
-外部电源保护模式区分“任意时刻可能突然掉电”和“可靠供电、可受控关机”两类部署条件。在后者中延后日志与部分元数据写回，减少高频 `fsync` 的重复持久化开销；该能力通过显式配置启用，默认 JBD2 语义保持不变。
+外部电源保护模式通过显式配置启用，默认仍使用标准 JBD2 语义；因此在任意时刻可能突然掉电的环境中，文件系统仍按常规日志、提交、检查点与恢复流程工作。
 
 ## 六、运行与复现
 
