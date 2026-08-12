@@ -83,6 +83,18 @@
 - [test/initramfs/src/benchmark/README.md](test/initramfs/src/benchmark/README.md)：测试目录中的 fio 性能测试组织方式。
 - `docs/aiuse/`：AI 使用说明与阶段记录，后续由参赛队补充维护。
 
+### 1.7 初赛至决赛阶段进展
+
+项目并非在初赛实现基础功能后直接重复验证，而是围绕“可用 EXT4”向“具备强一致性、可恢复性和可验证性的 EXT4”逐步推进。初赛完成原生 EXT4 的主体读写和多路径 I/O 接入；决赛阶段进一步补齐日志事务、崩溃恢复、并发一致性和系统化验证，并据此开展性能优化。
+
+| 工作方向 | 初赛阶段完成内容 | 决赛阶段新增与深化内容 |
+| --- | --- | --- |
+| EXT4 盘面与 VFS 接入 | 完成 superblock、block group、inode、目录项、位图和 Extent 等基础盘面对象解析，实现挂载、文件和目录的基本 VFS 操作。 | 完善盘面特性、校验和、块分配、截断、预分配、统计和异常处理路径，并与 Linux EXT4 镜像进行双向挂载和检查。 |
+| 文件 I/O 与缓存路径 | 建立 Buffered I/O、PageCache、基础 mmap、`fsync`/`fdatasync` 与 O_DIRECT 路径，完成逻辑块到物理块的基本映射与数据传输。 | 以 ExtentManager 统一三条 I/O 路径；完善 direct read 的脏页写回、direct write 的缓存排空和失效、unwritten Extent 转换与 ordered-data 约束，验证路径切换时不读取旧数据。 |
+| 元数据一致性与日志 | 完成文件创建、写入、目录更新、Extent 修改等基本元数据更新，使系统能够正常读写标准 EXT4 镜像。 | 实现 JBD2 的 credits、Handle、Transaction、descriptor、metadata payload、revoke、commit、checkpoint 与挂载恢复；建立事务中止和只读降级边界。 |
+| 崩溃恢复与正确性验证 | 建立基础功能回归、手工检查和 fio 性能测试环境，验证主要读写路径可以运行。 | 建立块写记录与故障注入驱动的崩溃矩阵：标准 journal 覆盖 931 个崩溃点、4 MiB 小 journal 覆盖 1629 个崩溃点，均为 0 red；同时加入 `e2fsck`、数据 oracle、accounting、checksum 与 walcheck 验证。 |
+| 并发、兼容性与性能优化 | 完成初步并发访问和顺序 I/O 测试，形成与 Linux EXT4 对照的性能基线。 | 扩展为命名空间压力、同文件 mixed I/O、死锁压力和并发状态观察；xfstests 达到 78 PASS，并优化 Extent 热点 NodeCache、批量 I/O 和受控外部电源保护模式下的高频 `fsync` 路径。 |
+
 ## 二、项目背景与目标
 
 ### 2.1 项目背景
