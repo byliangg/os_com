@@ -10,7 +10,12 @@
 //! operation is a method, so only a constructed (i.e. proven well-formed) tree
 //! can be searched or mutated. Mirrors ext2's `BlockPtrTree`.
 
-use core::ops::ControlFlow;
+use core::{
+    ops::ControlFlow,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use spin::Once;
 
 use super::{
     super::{
@@ -45,6 +50,54 @@ const INTERIOR_MAX: usize = NODE_CAPACITY;
 
 /// 512-byte sectors per filesystem block; the unit `i_blocks` is counted in.
 const SECTORS_PER_BLOCK: u64 = (BLOCK_SIZE / SECTOR_SIZE) as u64;
+
+// Benchmark-only observability switches. `node_cache=0` preserves the old
+// journal-funnel read path while leaving all mapping and journal semantics
+// untouched, which makes it a valid A/B control for NodeCache.
+static NODE_CACHE_PARAM: Once<String> = Once::new();
+static NODE_CACHE_STATS_PARAM: Once<String> = Once::new();
+static NODE_CACHE_TOTAL_HITS: AtomicU64 = AtomicU64::new(0);
+static NODE_CACHE_TOTAL_MISSES: AtomicU64 = AtomicU64::new(0);
+static NODE_CACHE_TOTAL_BYPASSES: AtomicU64 = AtomicU64::new(0);
+static NODE_CACHE_TOTAL_STORES: AtomicU64 = AtomicU64::new(0);
+aster_cmdline::define_kv_param!("ext4.node_cache", NODE_CACHE_PARAM);
+aster_cmdline::define_kv_param!("ext4.node_cache_stats", NODE_CACHE_STATS_PARAM);
+
+fn node_cache_enabled() -> bool {
+    !matches!(
+        NODE_CACHE_PARAM.get().map(String::as_str),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+fn node_cache_stats_enabled() -> bool {
+    matches!(
+        NODE_CACHE_STATS_PARAM.get().map(String::as_str),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+fn record_node_cache_access(counter: &AtomicU64) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    if !node_cache_stats_enabled() {
+        return;
+    }
+
+    let hits = NODE_CACHE_TOTAL_HITS.load(Ordering::Relaxed);
+    let misses = NODE_CACHE_TOTAL_MISSES.load(Ordering::Relaxed);
+    let bypasses = NODE_CACHE_TOTAL_BYPASSES.load(Ordering::Relaxed);
+    let accesses = hits + misses + bypasses;
+    if accesses != 0 && accesses % 4096 == 0 {
+        warn!(
+            "NODECACHE_PROGRESS enabled={} hits={} misses={} bypasses={} stores={}",
+            node_cache_enabled() as u8,
+            hits,
+            misses,
+            bypasses,
+            NODE_CACHE_TOTAL_STORES.load(Ordering::Relaxed),
+        );
+    }
+}
 
 /// One cached external node: the physical block it was read from and a copy of
 /// its full-block bytes (already validated at the [`NodeBuf::read`] that filled
@@ -93,6 +146,11 @@ struct CachedNode {
 /// inode.
 pub(super) struct NodeCache {
     inner: SpinLock<NodeCacheInner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    bypasses: AtomicU64,
+    stores: AtomicU64,
+    clears: AtomicU64,
 }
 
 /// The node-cache capacity. Sized for SQLite's multi-hot-leaf working set (see
@@ -114,6 +172,11 @@ impl NodeCache {
                 slots: [const { None }; NODE_CACHE_SLOTS],
                 victim: 0,
             }),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            bypasses: AtomicU64::new(0),
+            stores: AtomicU64::new(0),
+            clears: AtomicU64::new(0),
         }
     }
 
@@ -121,20 +184,34 @@ impl NodeCache {
     /// lock is dropped before the caller reconstructs the node, so it is never
     /// held across a device read.
     fn get(&self, bid: Ext4Bid) -> Option<Box<[u8; BLOCK_SIZE]>> {
+        if !node_cache_enabled() {
+            self.bypasses.fetch_add(1, Ordering::Relaxed);
+            record_node_cache_access(&NODE_CACHE_TOTAL_BYPASSES);
+            return None;
+        }
         let inner = self.inner.lock();
         for slot in inner.slots.iter() {
             if let Some(cached) = slot
                 && cached.bid == bid
             {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                record_node_cache_access(&NODE_CACHE_TOTAL_HITS);
                 return Some(cached.bytes.clone());
             }
         }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        record_node_cache_access(&NODE_CACHE_TOTAL_MISSES);
         None
     }
 
     /// Installs `bytes` for `bid`: overwrites the same-`bid` slot in place if
     /// present, else fills an empty slot, else evicts the round-robin victim.
     pub(super) fn store(&self, bid: Ext4Bid, bytes: &[u8; BLOCK_SIZE]) {
+        if !node_cache_enabled() {
+            return;
+        }
+        self.stores.fetch_add(1, Ordering::Relaxed);
+        NODE_CACHE_TOTAL_STORES.fetch_add(1, Ordering::Relaxed);
         let mut guard = self.inner.lock();
         let inner = &mut *guard;
         for slot in inner.slots.iter_mut() {
@@ -165,9 +242,33 @@ impl NodeCache {
     /// Drops every slot — the conservative invalidation any node free or
     /// whole-tree rebuild takes (clearing only loses a refill, never coherence).
     fn clear(&self) {
+        self.clears.fetch_add(1, Ordering::Relaxed);
         let mut inner = self.inner.lock();
         inner.slots = [const { None }; NODE_CACHE_SLOTS];
         inner.victim = 0;
+    }
+}
+
+impl Drop for NodeCache {
+    fn drop(&mut self) {
+        if !node_cache_stats_enabled() {
+            return;
+        }
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let bypasses = self.bypasses.load(Ordering::Relaxed);
+        if hits == 0 && misses == 0 && bypasses == 0 {
+            return;
+        }
+        warn!(
+            "NODECACHE enabled={} hits={} misses={} bypasses={} stores={} clears={}",
+            node_cache_enabled() as u8,
+            hits,
+            misses,
+            bypasses,
+            self.stores.load(Ordering::Relaxed),
+            self.clears.load(Ordering::Relaxed),
+        );
     }
 }
 
